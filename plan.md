@@ -284,17 +284,16 @@ members = ["root"] # 仅顶层插件
 # plugins/root/Cargo.toml（父插件）
 [package.metadata.cordis]
 plugin_path = "root"
-children = ["./child"] # 仅直接下属
-
-[[package.metadata.cordis.children_meta]]
-source = "./child"
-required = true
-grants = ["service.db", "service.cache"]
+children = [
+  { source = "./child", required = true, grants = ["service.db", "service.cache"] }
+] # 仅直接下属，合并对象数组
 
 # plugins/root/child/Cargo.toml（子插件）
 [package.metadata.cordis]
 plugin_path = "root/child"
-children = ["./grandchild"] # 仅直接下属
+children = [
+  { source = "./grandchild", required = false, grants = [] }
+] # 仅直接下属，合并对象数组
 ```
 
 目录与路径一致性规则：
@@ -1124,12 +1123,32 @@ pub struct LoaderBudget {
 }
 ```
 
+预构建工件索引（文档级）：
+
+```rust
+pub struct ArtifactIndexEntry {
+    pub plugin_path: String,
+    pub version: String,
+    pub abi_fingerprint: AbiFingerprint,
+    pub artifact_path: String,
+    pub sha256: String,
+    pub built_at: String,
+}
+```
+
+约束：
+
+```text
+Loader 只消费索引与工件，不做运行时编译
+索引缺失/哈希不匹配/指纹不匹配一律 fail-fast
+```
+
 Kernel 侧加载流程：
 
 ```text
 Phase A: discover/resolve
 1) 读取 plugins/Cargo.toml 的顶层 workspace members
-2) 逐个读取 member 的 package.metadata.cordis.children
+2) 逐个读取 member 的 package.metadata.cordis.children（对象数组）
 3) 按 direct-children metadata 递归展开插件树
 4) 检测循环依赖（返回完整环路径）
 5) 校验目录与声明一致性：
@@ -1144,11 +1163,12 @@ Phase A: discover/resolve
 11) 校验预算：max_total_plugins / max_total_nodes / load_timeout_ms
 
 Phase B: instantiate
-1) 按拓扑顺序 load_library + dlsym("cordis_plugin_api_rust_v2")
-2) 为每个 plugin_path 创建 Local Context，并应用 grants 白名单
-3) 调用 docs() 并写入 doc_registry
-4) 注册到 PluginRegistry（key = plugin_path）
-5) 注册节点并进入调度
+1) 按拓扑顺序通过 ArtifactIndexEntry 定位并加载工件
+2) load_library + dlsym("cordis_plugin_api_rust_v2")
+3) 为每个 plugin_path 创建 Local Context，并应用 grants 白名单
+4) 调用 docs() 并写入 doc_registry
+5) 注册到 PluginRegistry（key = plugin_path）
+6) 注册节点并进入调度
 ```
 
 故障策略：
@@ -1275,7 +1295,42 @@ Kernel 需要补充的能力：
 
 ---
 
-# 17) 最终架构总结
+# 17) 架构设计阶段实施计划
+
+目标：把当前文档契约收敛为可直接分配给工程实现的设计包（接口、模块边界、数据流、错误码、验收门槛）。
+
+阶段与交付：
+
+```text
+Stage A: Package Contract Freeze
+  交付: children 合并对象数组规范 + Cargo metadata schema + direct-children 约束
+
+Stage B: Runtime Contract Freeze
+  交付: RustPluginApiV2 固定符号与签名 + AbiFingerprint 校验规则 + PluginLoadResult 语义
+
+Stage C: Loader Design Freeze
+  交付: discover/resolve/instantiate 时序图 + 冲突/越界/Unavailable 错误路径
+
+Stage D: Artifact Design Freeze
+  交付: ArtifactIndexEntry 字段定义 + 索引校验流程 + 预构建工件发布清单
+
+Stage E: Context & Security Freeze
+  交付: Local->Request->Session->Global 注入链 + grants 执行点 + PluginUnavailable 错误映射
+```
+
+设计验收门槛（DoD）：
+
+```text
+1) 无双语义结构：children 仅保留合并对象数组
+2) 无运行时编译路径：Loader 仅消费 ArtifactIndexEntry
+3) 无跨类型回退：dylib 失败不触发 cdylib/wasm
+4) required/optional 故障传播在示例与状态机中一致
+5) 验收场景全部可映射到明确错误码与日志字段
+```
+
+---
+
+# 18) 最终架构总结
 
 整个系统可以理解为：
 
