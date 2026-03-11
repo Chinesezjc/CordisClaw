@@ -1,0 +1,30 @@
+{
+  "entries": [
+    {
+      "plugin_path": "root",
+      "version": "0.1.0",
+      "abi_fingerprint": {
+        "rustc_version": "1.85.1",
+        "target_triple": "x86_64-unknown-linux-gnu",
+        "crate_hash": "crate_root_v1",
+        "api_hash": "api_v2"
+      },
+      "artifact_path": "root.json",
+      "sha256": "5aca33f36b14270d3c97f37f0808e9c2a692cb4d643e275daaf125162182c32c",
+      "built_at": "2026-03-11T00:00:00Z"
+    },
+    {
+      "plugin_path": "root/child",
+      "version": "0.1.0",
+      "abi_fingerprint": {
+        "rustc_version": "1.85.1",
+        "target_triple": "x86_64-unknown-linux-gnu",
+        "crate_hash": "crate_child_v1",
+        "api_hash": "api_v2"
+      },
+      "artifact_path": "root_child.json",
+      "sha256": "a6de25f1dc34e4beabd7a9fec587692440fb5d213a3fc110c0cc64d6b0d4fe23",
+      "built_at": "2026-03-11T00:00:00Z"
+    }
+  ]
+}

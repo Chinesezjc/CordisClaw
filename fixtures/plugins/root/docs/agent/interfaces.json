@@ -1,0 +1,16 @@
+{
+  "plugin_id": "root",
+  "plugin_path": "root",
+  "plugin_version": "0.1.0",
+  "abi_version": 2,
+  "nodes": [
+    {
+      "id": "root_entry",
+      "summary": "root task",
+      "input_schema": {"type": "object"},
+      "output_schema": {"type": "object"},
+      "side_effects": ["log"],
+      "failure_modes": ["failure"]
+    }
+  ]
+}

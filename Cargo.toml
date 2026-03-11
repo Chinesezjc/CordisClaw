@@ -1,0 +1,33 @@
+[workspace]
+members = [
+  "crates/cordis-runtime",
+  "crates/cordis-expr-plugin",
+]
+default-members = [
+  "crates/cordis-runtime",
+  "crates/cordis-expr-plugin",
+]
+exclude = [
+  "crates/cordis-expr-plugin/child/lexer",
+  "crates/cordis-expr-plugin/child/parser",
+  "crates/cordis-expr-plugin/child/evaluator",
+  "crates/cordis-expr-plugin/child/evaluator/child/add",
+  "crates/cordis-expr-plugin/child/evaluator/child/sub",
+  "crates/cordis-expr-plugin/child/evaluator/child/mul",
+  "crates/cordis-expr-plugin/child/evaluator/child/div",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+authors = ["CordisClaw"]
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+thiserror = "2"
+sha2 = "0.10"
+hex = "0.4"
+libloading = "0.8"

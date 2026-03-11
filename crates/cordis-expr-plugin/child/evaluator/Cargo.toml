@@ -1,0 +1,29 @@
+[package]
+name = "cordis-expr-evaluator-plugin"
+version = "0.1.0"
+edition = "2021"
+
+[package.metadata.cordis]
+plugin_path = "expr/child/evaluator"
+abi_kind = "rust"
+declared_nodes = ["expr_evaluator"]
+children = [
+  { source = "./child/add", required = true, grants = [] },
+  { source = "./child/sub", required = true, grants = [] },
+  { source = "./child/mul", required = true, grants = [] },
+  { source = "./child/div", required = true, grants = [] },
+]
+
+[package.metadata.cordis.abi_fingerprint]
+rustc_version = "1.85.1"
+target_triple = "x86_64-unknown-linux-gnu"
+crate_hash = "crate_expr_evaluator_v1"
+api_hash = "api_v2"
+
+[dependencies]
+thiserror = "2"
+cordis-expr-parser-plugin = { path = "../parser" }
+cordis-expr-add-plugin = { path = "./child/add" }
+cordis-expr-sub-plugin = { path = "./child/sub" }
+cordis-expr-mul-plugin = { path = "./child/mul" }
+cordis-expr-div-plugin = { path = "./child/div" }

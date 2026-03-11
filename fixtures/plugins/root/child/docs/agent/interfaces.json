@@ -1,0 +1,16 @@
+{
+  "plugin_id": "root_child",
+  "plugin_path": "root/child",
+  "plugin_version": "0.1.0",
+  "abi_version": 2,
+  "nodes": [
+    {
+      "id": "child_entry",
+      "summary": "child task",
+      "input_schema": {"type": "object"},
+      "output_schema": {"type": "object"},
+      "side_effects": [],
+      "failure_modes": ["timeout"]
+    }
+  ]
+}
