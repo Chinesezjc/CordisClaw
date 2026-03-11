@@ -1,0 +1,42 @@
+{
+  "plugin_path": "expr/evaluator",
+  "abi_fingerprint": {
+    "rustc_version": "1.85.1",
+    "target_triple": "x86_64-unknown-linux-gnu",
+    "crate_hash": "crate_expr_evaluator_v1",
+    "api_hash": "api_v2"
+  },
+  "docs": {
+    "plugin_id": "expr_evaluator",
+    "plugin_path": "expr/evaluator",
+    "plugin_version": "0.1.0",
+    "abi_version": 2,
+    "nodes": [
+      {
+        "id": "expr_evaluator",
+        "summary": "Evaluate the AST and delegate arithmetic to child operator plugins.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "ast": {
+              "type": "object"
+            }
+          }
+        },
+        "output_schema": {
+          "type": "object",
+          "properties": {
+            "value": {
+              "type": "number"
+            }
+          }
+        },
+        "side_effects": [],
+        "failure_modes": [
+          "division by zero"
+        ]
+      }
+    ]
+  },
+  "exports": []
+}

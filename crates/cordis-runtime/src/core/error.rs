@@ -98,6 +98,21 @@ pub enum RuntimeError {
         required: bool,
     },
 
+    #[error("plugin not registered: {plugin_path}")]
+    PluginNotRegistered { plugin_path: String },
+
+    #[error("plugin execution unsupported for {plugin_path}: artifact={artifact_path}")]
+    PluginExecutionUnsupported {
+        plugin_path: String,
+        artifact_path: PathBuf,
+    },
+
+    #[error("plugin invocation failed for {plugin_path}: {message}")]
+    PluginInvocationFailed {
+        plugin_path: String,
+        message: String,
+    },
+
     #[error("budget exceeded: max_total_plugins={max_total_plugins}, max_total_nodes={max_total_nodes}, actual_plugins={actual_plugins}, actual_nodes={actual_nodes}")]
     BudgetExceeded {
         max_total_plugins: usize,

@@ -1,0 +1,33 @@
+{
+  "plugin_id": "expr_parser",
+  "plugin_path": "expr/parser",
+  "plugin_version": "0.1.0",
+  "abi_version": 2,
+  "nodes": [
+    {
+      "id": "expr_parser",
+      "summary": "Build an AST from lexer tokens.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "tokens": {
+            "type": "array"
+          }
+        }
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "ast": {
+            "type": "object"
+          }
+        }
+      },
+      "side_effects": [],
+      "failure_modes": [
+        "missing right paren",
+        "unexpected token"
+      ]
+    }
+  ]
+}

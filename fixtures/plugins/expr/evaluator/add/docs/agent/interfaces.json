@@ -1,0 +1,20 @@
+{
+  "plugin_id": "expr_evaluator_add",
+  "plugin_path": "expr/evaluator/add",
+  "plugin_version": "0.1.0",
+  "abi_version": 2,
+  "nodes": [
+    {
+      "id": "expr_add",
+      "summary": "Add two numbers.",
+      "input_schema": {
+        "type": "object"
+      },
+      "output_schema": {
+        "type": "object"
+      },
+      "side_effects": [],
+      "failure_modes": []
+    }
+  ]
+}

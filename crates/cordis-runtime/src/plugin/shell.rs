@@ -3,7 +3,7 @@
 
 use crate::core::error::RuntimeError;
 use crate::plugin::abi::{PluginRequest, PluginResponse, RuntimePlugin};
-use cordis_expr_plugin::evaluate_expression;
+use crate::plugin::invoke::PluginInvoker;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::io::{self, Write};
@@ -18,6 +18,8 @@ pub struct ShellPluginRequest {
     pub command: Option<String>,
     #[serde(default)]
     pub cwd: Option<String>,
+    #[serde(default)]
+    pub fixtures_root: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -31,10 +33,24 @@ pub struct ShellPluginResponsePayload {
     pub output: Option<String>,
 }
 
-#[derive(Debug, Default, Clone)]
-pub struct ShellPlugin;
+#[derive(Debug, Clone)]
+pub struct ShellPlugin {
+    fixtures_root: Option<PathBuf>,
+}
+
+impl Default for ShellPlugin {
+    fn default() -> Self {
+        Self { fixtures_root: None }
+    }
+}
 
 impl ShellPlugin {
+    pub fn with_fixtures_root(fixtures_root: impl Into<PathBuf>) -> Self {
+        Self {
+            fixtures_root: Some(fixtures_root.into()),
+        }
+    }
+
     pub fn handle_request(
         &mut self,
         req: ShellPluginRequest,
@@ -61,7 +77,13 @@ impl ShellPlugin {
             }
         }
 
-        let mut shell = BuiltinShell::new(req.cwd)?;
+        let fixtures_root = req
+            .fixtures_root
+            .map(PathBuf::from)
+            .or_else(|| self.fixtures_root.clone())
+            .unwrap_or_else(PluginInvoker::default_fixtures_root);
+
+        let mut shell = BuiltinShell::new(req.cwd, fixtures_root)?;
         if let Some(script) = req.command {
             let run = shell.run_script(&script);
             let ok = run.exit_code == 0;
@@ -142,6 +164,7 @@ struct ScriptRunResult {
 struct BuiltinShell {
     cwd: PathBuf,
     env: BTreeMap<String, String>,
+    fixtures_root: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -151,7 +174,7 @@ enum CommandOutcome {
 }
 
 impl BuiltinShell {
-    fn new(cwd: Option<String>) -> Result<Self, RuntimeError> {
+    fn new(cwd: Option<String>, fixtures_root: PathBuf) -> Result<Self, RuntimeError> {
         let cwd = match cwd {
             Some(path) => PathBuf::from(path),
             None => std::env::current_dir().map_err(|e| RuntimeError::Io {
@@ -165,7 +188,11 @@ impl BuiltinShell {
         env.insert("LOGNAME".to_string(), "CordisClaw".to_string());
         env.insert("USERNAME".to_string(), "CordisClaw".to_string());
 
-        Ok(Self { cwd, env })
+        Ok(Self {
+            cwd,
+            env,
+            fixtures_root,
+        })
     }
 
     fn run_script(&mut self, script: &str) -> ScriptRunResult {
@@ -248,7 +275,7 @@ impl BuiltinShell {
         match tokens[0].as_str() {
             "help" => CommandOutcome::Continue {
                 exit_code: 0,
-                output: "builtins: help, pwd, cd, echo, whoami, env, Expr, exit".to_string(),
+                output: self.help_output(),
             },
             "pwd" => CommandOutcome::Continue {
                 exit_code: 0,
@@ -306,25 +333,6 @@ impl BuiltinShell {
                     output: out.join("\n"),
                 }
             }
-            "Expr" | "expr" => {
-                if tokens.len() < 2 {
-                    return CommandOutcome::Continue {
-                        exit_code: 1,
-                        output: "Expr: missing expression".to_string(),
-                    };
-                }
-                let expression = tokens[1..].join(" ");
-                match evaluate_expression(&expression) {
-                    Ok(value) => CommandOutcome::Continue {
-                        exit_code: 0,
-                        output: format!("Value: {}", format_number(value)),
-                    },
-                    Err(err) => CommandOutcome::Continue {
-                        exit_code: 1,
-                        output: format!("Expr error: {err}"),
-                    },
-                }
-            }
             "exit" => {
                 let code = tokens
                     .get(1)
@@ -332,11 +340,87 @@ impl BuiltinShell {
                     .unwrap_or(0);
                 CommandOutcome::Exit(code)
             }
-            other => CommandOutcome::Continue {
-                exit_code: 127,
-                output: format!("command not found: {other}"),
-            },
+            other => self.run_plugin_command(other, &tokens[1..]),
         }
+    }
+
+    fn help_output(&self) -> String {
+        let mut commands = vec![
+            "help".to_string(),
+            "pwd".to_string(),
+            "cd".to_string(),
+            "echo".to_string(),
+            "whoami".to_string(),
+            "env".to_string(),
+        ];
+
+        if let Ok(invoker) = PluginInvoker::load(&self.fixtures_root) {
+            commands.extend(invoker.available_shell_commands());
+        }
+        commands.push("exit".to_string());
+
+        format!("builtins: {}", commands.join(", "))
+    }
+
+    fn run_plugin_command(&self, command: &str, args: &[String]) -> CommandOutcome {
+        let invoker = match PluginInvoker::load(&self.fixtures_root) {
+            Ok(invoker) => invoker,
+            Err(err) => {
+                return CommandOutcome::Continue {
+                    exit_code: 1,
+                    output: format!("{command} error: {err}"),
+                };
+            }
+        };
+
+        let Some(binding) = (match invoker.resolve_shell_command(command) {
+            Ok(binding) => binding,
+            Err(RuntimeError::ShellPluginInvalidRequest { message }) => {
+                return CommandOutcome::Continue {
+                    exit_code: 1,
+                    output: message,
+                };
+            }
+            Err(err) => {
+                return CommandOutcome::Continue {
+                    exit_code: 1,
+                    output: format!("{command} error: {err}"),
+                };
+            }
+        }) else {
+            return CommandOutcome::Continue {
+                exit_code: 127,
+                output: format!("command not found: {command}"),
+            };
+        };
+
+        let payload = match invoker.build_shell_payload(&binding, command, &args.join(" ")) {
+            Ok(payload) => payload,
+            Err(RuntimeError::ShellPluginInvalidRequest { message }) => {
+                return CommandOutcome::Continue {
+                    exit_code: 1,
+                    output: message,
+                };
+            }
+            Err(err) => {
+                return CommandOutcome::Continue {
+                    exit_code: 1,
+                    output: format!("{command} error: {err}"),
+                };
+            }
+        };
+
+        let response = match invoker.invoke(&binding.plugin_path, &binding.node.id, payload) {
+            Ok(response) => response,
+            Err(err) => {
+                return CommandOutcome::Continue {
+                    exit_code: 1,
+                    output: format!("{command} error: {err}"),
+                };
+            }
+        };
+
+        format_plugin_response(command, &binding.node.output_schema, &response.payload)
     }
 }
 
@@ -381,6 +465,108 @@ fn split_tokens(line: &str) -> Vec<String> {
         tokens.push(current);
     }
     tokens
+}
+
+fn format_plugin_response(
+    command: &str,
+    output_schema: &serde_json::Value,
+    payload: &str,
+) -> CommandOutcome {
+    let parsed = match serde_json::from_str::<serde_json::Value>(payload) {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            return CommandOutcome::Continue {
+                exit_code: 1,
+                output: format!("{command} error: invalid plugin response: {err}"),
+            };
+        }
+    };
+
+    if let Some(error) = parsed
+        .get("error")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty())
+    {
+        return CommandOutcome::Continue {
+            exit_code: 1,
+            output: format!("{command} error: {error}"),
+        };
+    }
+
+    let output_fields = schema_property_names(output_schema)
+        .into_iter()
+        .filter(|field| field != "error")
+        .collect::<Vec<_>>();
+
+    if let [field] = output_fields.as_slice() {
+        if let Some(value) = parsed.get(field) {
+            return CommandOutcome::Continue {
+                exit_code: 0,
+                output: format!("{}: {}", display_field_name(field), format_json_value(value)),
+            };
+        }
+    }
+
+    if let Some(object) = parsed.as_object() {
+        let visible = object
+            .iter()
+            .filter(|(key, value)| key.as_str() != "error" && !value.is_null())
+            .collect::<Vec<_>>();
+        if visible.is_empty() {
+            return CommandOutcome::Continue {
+                exit_code: 1,
+                output: format!("{command} error: plugin returned no value"),
+            };
+        }
+        if visible.len() == 1 {
+            let (field, value) = visible[0];
+            return CommandOutcome::Continue {
+                exit_code: 0,
+                output: format!("{}: {}", display_field_name(field), format_json_value(value)),
+            };
+        }
+    }
+
+    CommandOutcome::Continue {
+        exit_code: 0,
+        output: format_json_value(&parsed),
+    }
+}
+
+fn schema_property_names(schema: &serde_json::Value) -> Vec<String> {
+    let Some(properties) = schema.get("properties").and_then(|value| value.as_object()) else {
+        return Vec::new();
+    };
+    let mut names = properties.keys().cloned().collect::<Vec<_>>();
+    names.sort();
+    names
+}
+
+fn display_field_name(name: &str) -> String {
+    name.split('_')
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let mut chars = part.chars();
+            match chars.next() {
+                Some(first) => format!("{}{}", first.to_ascii_uppercase(), chars.as_str()),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn format_json_value(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Null => "null".to_string(),
+        serde_json::Value::Bool(flag) => flag.to_string(),
+        serde_json::Value::Number(number) => number
+            .as_f64()
+            .map(format_number)
+            .unwrap_or_else(|| number.to_string()),
+        serde_json::Value::String(text) => text.clone(),
+        _ => serde_json::to_string(value).unwrap_or_else(|_| value.to_string()),
+    }
 }
 
 fn format_number(value: f64) -> String {

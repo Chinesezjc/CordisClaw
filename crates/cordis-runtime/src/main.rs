@@ -7,6 +7,7 @@ use cordis_runtime::kernel::r#loop::SelfIterationKernel;
 use cordis_runtime::plugin::abi::{PluginRequest, RuntimePlugin};
 use cordis_runtime::plugin::loader::{default_loader_config, Loader};
 use cordis_runtime::plugin::shell::{ShellPlugin, ShellPluginResponsePayload};
+use std::fs;
 use std::path::PathBuf;
 
 fn main() {
@@ -22,6 +23,22 @@ fn main() {
     if args.first().map(|x| x.as_str()) == Some("shell-terminal") {
         if let Err(err) = run_shell_terminal(&args[1..]) {
             eprintln!("shell-terminal failed: {err}");
+            eprintln!("{}", auto_update_usage());
+            std::process::exit(1);
+        }
+        return;
+    }
+    if args.first().map(|x| x.as_str()) == Some("graph-html") {
+        if let Err(err) = run_graph_html(&args[1..]) {
+            eprintln!("graph-html failed: {err}");
+            eprintln!("{}", auto_update_usage());
+            std::process::exit(1);
+        }
+        return;
+    }
+    if args.first().map(|x| x.as_str()) == Some("dag-html") {
+        if let Err(err) = run_dag_html(&args[1..]) {
+            eprintln!("dag-html failed: {err}");
             eprintln!("{}", auto_update_usage());
             std::process::exit(1);
         }
@@ -154,6 +171,7 @@ fn run_shell_terminal(args: &[String]) -> Result<(), Box<dyn std::error::Error>>
     let mut shell: Option<String> = None;
     let mut command: Option<String> = None;
     let mut cwd: Option<String> = None;
+    let mut fixtures_root: Option<String> = None;
 
     for token in args {
         if let Some(value) = token.strip_prefix("--shell=") {
@@ -168,6 +186,10 @@ fn run_shell_terminal(args: &[String]) -> Result<(), Box<dyn std::error::Error>>
             cwd = Some(value.to_string());
             continue;
         }
+        if let Some(value) = token.strip_prefix("--fixtures-root=") {
+            fixtures_root = Some(value.to_string());
+            continue;
+        }
         return Err(format!("unknown flag: {token}").into());
     }
 
@@ -175,10 +197,11 @@ fn run_shell_terminal(args: &[String]) -> Result<(), Box<dyn std::error::Error>>
         "action": "start_terminal",
         "shell": shell,
         "command": command,
-        "cwd": cwd
+        "cwd": cwd,
+        "fixtures_root": fixtures_root,
     })
     .to_string();
-    let mut plugin = ShellPlugin;
+    let mut plugin = ShellPlugin::default();
     let response = plugin.handle(PluginRequest { payload });
     let parsed: ShellPluginResponsePayload = serde_json::from_str(&response.payload)?;
     if let Some(output) = &parsed.output {
@@ -197,10 +220,95 @@ fn run_shell_terminal(args: &[String]) -> Result<(), Box<dyn std::error::Error>>
     }
 }
 
+fn run_graph_html(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut root: Option<PathBuf> = None;
+    let mut output_path = PathBuf::from("registered-nodes.html");
+
+    for token in args {
+        if let Some(value) = token.strip_prefix("--output=") {
+            output_path = PathBuf::from(value);
+            continue;
+        }
+        if token.starts_with("--") {
+            return Err(format!("unknown flag: {token}").into());
+        }
+        if root.is_none() {
+            root = Some(PathBuf::from(token));
+            continue;
+        }
+        return Err(format!("unexpected extra arg: {token}").into());
+    }
+
+    let root = root.unwrap_or_else(|| PathBuf::from("fixtures"));
+    let loader = Loader::new(default_loader_config(&root));
+    let output = loader.load()?;
+    let html = output
+        .graph_registry
+        .handle_get_html("/graphs/registered-nodes.html")?;
+    fs::write(&output_path, html)?;
+
+    let absolute = if output_path.is_absolute() {
+        output_path
+    } else {
+        std::env::current_dir()?.join(output_path)
+    };
+    println!("graph_html written to {}", absolute.display());
+    println!(
+        "plugins={} nodes={}",
+        output.graph_registry.graph().plugins.len(),
+        output.graph_registry.graph().nodes.len()
+    );
+    Ok(())
+}
+
+fn run_dag_html(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut root: Option<PathBuf> = None;
+    let mut output_path = PathBuf::from("registered-dag.html");
+
+    for token in args {
+        if let Some(value) = token.strip_prefix("--output=") {
+            output_path = PathBuf::from(value);
+            continue;
+        }
+        if token.starts_with("--") {
+            return Err(format!("unknown flag: {token}").into());
+        }
+        if root.is_none() {
+            root = Some(PathBuf::from(token));
+            continue;
+        }
+        return Err(format!("unexpected extra arg: {token}").into());
+    }
+
+    let root = root.unwrap_or_else(|| PathBuf::from("fixtures"));
+    let loader = Loader::new(default_loader_config(&root));
+    let output = loader.load()?;
+    let html = output
+        .graph_registry
+        .handle_get_html("/graphs/registered-dag.html")?;
+    fs::write(&output_path, html)?;
+
+    let absolute = if output_path.is_absolute() {
+        output_path
+    } else {
+        std::env::current_dir()?.join(output_path)
+    };
+    println!("dag_html written to {}", absolute.display());
+    println!(
+        "nodes={} edges={} diagnostics={}",
+        output.graph_registry.dag().nodes.len(),
+        output.graph_registry.dag().edges.len(),
+        output.graph_registry.dag().diagnostics.len()
+    );
+    Ok(())
+}
+
 fn auto_update_usage() -> String {
     "Usage:
   cargo run -p cordis-runtime -- <fixtures_root>
   cargo run -p cordis-runtime -- auto-update <workspace_root> <relative_path> <find> <replace> [--manual-approved] [--tests-passed=true|false] [--safety-checks-passed=true|false] [--quality-score=<u32>] [--diff-lines=<usize>]
-  cargo run -p cordis-runtime -- shell-terminal [--shell=cordis] [--command=\"echo hi\"] [--cwd=/root]"
+  cargo run -p cordis-runtime -- shell-terminal [--shell=cordis] [--command=\"echo hi\"] [--cwd=/root] [--fixtures-root=fixtures]
+  cargo run -p cordis-runtime -- graph-html [fixtures_root] [--output=registered-nodes.html]
+  cargo run -p cordis-runtime -- dag-html [fixtures_root] [--output=registered-dag.html]"
         .to_string()
 }

@@ -15,6 +15,7 @@ use crate::plugin::dynamic::{is_dylib_path, sidecar_json_path, LoadedDylibApi};
 use crate::plugin::package::PackageResolver;
 use crate::plugin::registry::{NodeRegistry, PluginRegistry};
 use crate::service::doc_registry::DocRegistry;
+use crate::service::graph_registry::GraphRegistry;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -45,6 +46,7 @@ pub struct LoadOutput {
     pub plugin_registry: PluginRegistry,
     pub node_registry: NodeRegistry,
     pub doc_registry: DocRegistry,
+    pub graph_registry: GraphRegistry,
     pub context: RuntimeContext,
     pub metrics: LoaderMetrics,
 }
@@ -354,7 +356,13 @@ impl Loader {
                     continue;
                 }
 
-                let runtime_fingerprint = api.abi_fingerprint.to_owned();
+                let runtime_fingerprint: crate::core::models::AbiFingerprint =
+                    serde_json::from_str(&(api.abi_fingerprint)().payload).map_err(|e| {
+                        RuntimeError::Io {
+                            path: artifact_path.clone(),
+                            message: format!("runtime fingerprint parse failed: {e}"),
+                        }
+                    })?;
                 // Validate runtime-exported fingerprint against resolved contract.
                 if runtime_fingerprint != plugin.metadata.abi_fingerprint {
                     let diff = plugin
@@ -388,8 +396,11 @@ impl Loader {
                     continue;
                 }
 
-                let plugin_handle = (api.init)();
-                let docs = (api.docs)(plugin_handle.as_ref());
+                let docs: crate::core::models::PluginDocs =
+                    serde_json::from_str(&(api.docs)().payload).map_err(|e| RuntimeError::Io {
+                        path: artifact_path.clone(),
+                        message: format!("runtime docs parse failed: {e}"),
+                    })?;
                 // Runtime docs must point back to the same plugin path.
                 if docs.plugin_path != *plugin_path {
                     plugin_registry.insert_unavailable(
@@ -406,7 +417,6 @@ impl Loader {
                     );
                     metrics.plugin_unavailable_total += 1;
                     metrics.dylib_no_fallback_total += 1;
-                    (api.drop)(plugin_handle);
                     if plugin.required {
                         self.propagate_parent_failure(
                             plugin_path,
@@ -430,7 +440,6 @@ impl Loader {
                 );
                 context.set_plugin_state(plugin_path, PluginLoadResult::Loaded);
                 context.ensure_local_scope(plugin_path);
-                (api.drop)(plugin_handle);
 
                 let sidecar_path = sidecar_json_path(&artifact_path);
                 // Optional sidecar can export Local services for child injection.
@@ -559,12 +568,14 @@ impl Loader {
         }
 
         let doc_registry = DocRegistry::from_plugin_registry(&plugin_registry);
+        let graph_registry = GraphRegistry::from_registries(&plugin_registry, &node_registry);
 
         Ok(LoadOutput {
             execution_id,
             plugin_registry,
             node_registry,
             doc_registry,
+            graph_registry,
             context,
             metrics,
         })

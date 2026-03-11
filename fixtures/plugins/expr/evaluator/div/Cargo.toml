@@ -1,0 +1,19 @@
+[package]
+name = "expr_evaluator_div"
+version = "0.1.0"
+edition = "2021"
+
+[package.metadata.cordis]
+plugin_path = "expr/evaluator/div"
+abi_kind = "rust"
+declared_nodes = ["expr_div"]
+children = []
+
+[package.metadata.cordis.abi_fingerprint]
+rustc_version = "1.85.1"
+target_triple = "x86_64-unknown-linux-gnu"
+crate_hash = "crate_expr_div_v1"
+api_hash = "api_v2"
+
+[dependencies]
+thiserror = "2"

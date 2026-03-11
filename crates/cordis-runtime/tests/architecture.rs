@@ -96,6 +96,110 @@ fn load_success_and_grants_enforced() {
 }
 
 #[test]
+fn registered_graph_json_and_html_are_available() {
+    let temp = setup_fixture_copy();
+    let config = default_loader_config(temp.path());
+    let loader = Loader::new(config);
+    let output = loader.load().expect("load should pass");
+
+    let graph_json = output
+        .graph_registry
+        .handle_get_json("/graphs/registered-nodes")
+        .expect("graph json should exist");
+    let plugins = graph_json
+        .get("plugins")
+        .and_then(|value| value.as_array())
+        .expect("plugins array");
+    let nodes = graph_json
+        .get("nodes")
+        .and_then(|value| value.as_array())
+        .expect("nodes array");
+
+    assert!(
+        plugins
+            .iter()
+            .any(|plugin| plugin.get("plugin_path").and_then(|v| v.as_str()) == Some("expr"))
+    );
+    assert!(
+        nodes.iter().any(|node| {
+            node.get("node_fqn").and_then(|v| v.as_str()) == Some("expr::expr_entry")
+        })
+    );
+
+    let html = output
+        .graph_registry
+        .handle_get_html("/graphs/registered-nodes.html")
+        .expect("graph html should exist");
+    assert!(html.contains("<!doctype html>"));
+    assert!(html.contains("Registered Nodes Graph"));
+    assert!(html.contains("expr::expr_entry"));
+    assert!(html.contains("root/child::child_entry"));
+}
+
+#[test]
+fn registered_dag_json_and_html_are_available() {
+    let temp = setup_fixture_copy();
+    let config = default_loader_config(temp.path());
+    let loader = Loader::new(config);
+    let output = loader.load().expect("load should pass");
+
+    let dag_json = output
+        .graph_registry
+        .handle_get_json("/graphs/registered-dag")
+        .expect("dag json should exist");
+    let nodes = dag_json
+        .get("nodes")
+        .and_then(|value| value.as_array())
+        .expect("nodes array");
+    let edges = dag_json
+        .get("edges")
+        .and_then(|value| value.as_array())
+        .expect("edges array");
+
+    assert!(
+        nodes.iter().any(|node| {
+            node.get("node_fqn").and_then(|v| v.as_str()) == Some("expr/lexer::expr_lexer")
+        }),
+        "lexer node should appear in dag"
+    );
+    assert!(
+        nodes.iter().any(|node| {
+            node.get("node_fqn").and_then(|v| v.as_str()) == Some("expr/parser::expr_parser")
+        }),
+        "parser node should appear in dag"
+    );
+    assert!(
+        nodes.iter().any(|node| {
+            node.get("node_fqn").and_then(|v| v.as_str()) == Some("expr/evaluator::expr_evaluator")
+        }),
+        "evaluator node should appear in dag"
+    );
+    assert!(
+        edges.iter().any(|edge| {
+            edge.get("from").and_then(|v| v.as_str()) == Some("expr/lexer::expr_lexer")
+                && edge.get("to").and_then(|v| v.as_str()) == Some("expr/parser::expr_parser")
+        }),
+        "lexer -> parser edge should be inferred"
+    );
+    assert!(
+        edges.iter().any(|edge| {
+            edge.get("from").and_then(|v| v.as_str()) == Some("expr/parser::expr_parser")
+                && edge.get("to").and_then(|v| v.as_str()) == Some("expr/evaluator::expr_evaluator")
+        }),
+        "parser -> evaluator edge should be inferred"
+    );
+
+    let html = output
+        .graph_registry
+        .handle_get_html("/graphs/registered-dag.html")
+        .expect("dag html should exist");
+    assert!(html.contains("<!doctype html>"));
+    assert!(html.contains("Registered DAG"));
+    assert!(html.contains("expr/lexer::expr_lexer"));
+    assert!(html.contains("expr/evaluator::expr_evaluator"));
+}
+
+#[test]
 fn undeclared_grandchild_is_not_discovered() {
     let temp = setup_fixture_copy();
 

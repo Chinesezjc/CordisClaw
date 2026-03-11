@@ -3,7 +3,7 @@ use cordis_runtime::plugin::shell::{ShellPlugin, ShellPluginResponsePayload};
 
 #[test]
 fn shell_plugin_start_terminal_success() {
-    let mut plugin = ShellPlugin;
+    let mut plugin = ShellPlugin::default();
     let request = PluginRequest {
         payload: r#"{
             "action":"start_terminal",
@@ -23,7 +23,7 @@ fn shell_plugin_start_terminal_success() {
 
 #[test]
 fn shell_plugin_expr_command_outputs_value() {
-    let mut plugin = ShellPlugin;
+    let mut plugin = ShellPlugin::default();
     let request = PluginRequest {
         payload: r#"{
             "action":"start_terminal",
@@ -42,7 +42,7 @@ fn shell_plugin_expr_command_outputs_value() {
 
 #[test]
 fn shell_plugin_start_terminal_non_zero_exit() {
-    let mut plugin = ShellPlugin;
+    let mut plugin = ShellPlugin::default();
     let request = PluginRequest {
         payload: r#"{
             "action":"start_terminal",
@@ -68,7 +68,7 @@ fn shell_plugin_start_terminal_non_zero_exit() {
 
 #[test]
 fn shell_plugin_rejects_unknown_action() {
-    let mut plugin = ShellPlugin;
+    let mut plugin = ShellPlugin::default();
     let request = PluginRequest {
         payload: r#"{"action":"unknown_action"}"#.to_string(),
     };
@@ -83,7 +83,7 @@ fn shell_plugin_rejects_unknown_action() {
 
 #[test]
 fn shell_plugin_sets_username_to_cordisclaw() {
-    let mut plugin = ShellPlugin;
+    let mut plugin = ShellPlugin::default();
     let request = PluginRequest {
         payload: r#"{
             "action":"start_terminal",
@@ -102,7 +102,7 @@ fn shell_plugin_sets_username_to_cordisclaw() {
 
 #[test]
 fn shell_plugin_rejects_external_shell_backend() {
-    let mut plugin = ShellPlugin;
+    let mut plugin = ShellPlugin::default();
     let request = PluginRequest {
         payload: r#"{
             "action":"start_terminal",

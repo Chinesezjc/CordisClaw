@@ -1,2 +1,3 @@
 [workspace]
-members = ["root"]
+members = ["root", "expr"]
+resolver = "2"

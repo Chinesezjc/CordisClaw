@@ -1,0 +1,20 @@
+{
+  "plugin_id": "expr_evaluator_sub",
+  "plugin_path": "expr/evaluator/sub",
+  "plugin_version": "0.1.0",
+  "abi_version": 2,
+  "nodes": [
+    {
+      "id": "expr_sub",
+      "summary": "Subtract two numbers.",
+      "input_schema": {
+        "type": "object"
+      },
+      "output_schema": {
+        "type": "object"
+      },
+      "side_effects": [],
+      "failure_modes": []
+    }
+  ]
+}

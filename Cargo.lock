@@ -30,63 +30,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 
 [[package]]
-name = "cordis-expr-add-plugin"
-version = "0.1.0"
-
-[[package]]
-name = "cordis-expr-div-plugin"
-version = "0.1.0"
-dependencies = [
- "thiserror",
-]
-
-[[package]]
-name = "cordis-expr-evaluator-plugin"
-version = "0.1.0"
-dependencies = [
- "cordis-expr-add-plugin",
- "cordis-expr-div-plugin",
- "cordis-expr-mul-plugin",
- "cordis-expr-parser-plugin",
- "cordis-expr-sub-plugin",
- "thiserror",
-]
-
-[[package]]
-name = "cordis-expr-lexer-plugin"
-version = "0.1.0"
-dependencies = [
- "thiserror",
-]
-
-[[package]]
-name = "cordis-expr-mul-plugin"
-version = "0.1.0"
-
-[[package]]
-name = "cordis-expr-parser-plugin"
-version = "0.1.0"
-dependencies = [
- "cordis-expr-lexer-plugin",
- "thiserror",
-]
-
-[[package]]
-name = "cordis-expr-plugin"
-version = "0.1.0"
-dependencies = [
- "cordis-expr-evaluator-plugin",
-]
-
-[[package]]
-name = "cordis-expr-sub-plugin"
-version = "0.1.0"
-
-[[package]]
 name = "cordis-runtime"
 version = "0.1.0"
 dependencies = [
- "cordis-expr-plugin",
  "hex",
  "libloading",
  "serde",

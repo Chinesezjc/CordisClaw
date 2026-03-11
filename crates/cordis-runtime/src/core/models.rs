@@ -10,6 +10,7 @@ fn default_required() -> bool {
     true
 }
 
+#[repr(u8)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum DylibAbiKind {
@@ -23,6 +24,7 @@ impl Default for DylibAbiKind {
     }
 }
 
+#[repr(C)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct AbiFingerprint {
     /// Rust compiler version used to build the artifact.
@@ -137,6 +139,7 @@ pub enum PluginLoadResult {
     Unavailable(PluginUnavailableReason),
 }
 
+#[repr(C)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PluginDocs {
     pub plugin_id: String,
@@ -147,6 +150,7 @@ pub struct PluginDocs {
     pub nodes: Vec<NodeDoc>,
 }
 
+#[repr(C)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NodeDoc {
     pub id: String,
@@ -169,6 +173,19 @@ pub struct PluginArtifact {
     /// Local services exported by the plugin for child injection.
     #[serde(default)]
     pub exports: Vec<String>,
+    /// Optional execution strategy used by runtime invocation.
+    #[serde(default)]
+    pub execution: Option<PluginExecution>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PluginExecution {
+    Process {
+        command: String,
+        #[serde(default)]
+        args: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

@@ -36,14 +36,36 @@ cargo run -p cordis-runtime -- auto-update /path/to/workspace README.md "old_tex
 cargo run -p cordis-runtime -- shell-terminal --command="echo terminal started"
 ```
 
+```bash
+cargo run -p cordis-runtime -- graph-html fixtures --output=registered-nodes.html
+```
+
+```bash
+cargo run -p cordis-runtime -- dag-html fixtures --output=registered-dag.html
+```
+
 `shell-terminal` 使用内置 Cordis shell，不会调用系统 `/bin/bash`、`/bin/sh` 或 `cmd.exe`。
-表达式计算能力由外部插件体系提供：`crates/cordis-expr-plugin` 负责编排，词法/语法/计算分别由 `crates/cordis-expr-plugin/child/{lexer,parser,evaluator}` 三个子插件 crate 提供。`evaluator` 内部再拆成 `add/sub/mul/div` 四个算子子插件。
-子插件拓扑通过各自 `Cargo.toml` 的 `package.metadata.cordis.children` 声明，`dependencies` 仅用于编译期链接。
-内置 shell 支持 `Expr` 计算：
+表达式计算能力现在完全位于外部插件样例树：`fixtures/plugins/expr` 负责编排，词法/语法/计算分别位于 `fixtures/plugins/expr/{lexer,parser,evaluator}`，`evaluator` 内部再拆成 `add/sub/mul/div` 四个算子子插件。
+这些插件通过 `package.metadata.cordis.children` 描述父子关系；运行时只消费 `fixtures/artifacts/index.json` 与预构建工件，不再由根 workspace 直接管理。
+`expr` 顶层执行工件采用 `JSON artifact + external process`。runtime 不再硬编码 `expr`/`expr_entry`/`expression`，而是按已加载插件的 docs 与 artifact 契约动态分发命令；`Expr` 只是当前样例里的一个外部插件命令：
 
 ```bash
 cargo run -p cordis-runtime -- shell-terminal --command="Expr 1 + 2 * 3"
 # output: Value: 7
+```
+
+已注册节点图支持导出为 HTML：
+
+```bash
+cargo run -p cordis-runtime -- graph-html fixtures --output=registered-nodes.html
+# output: graph_html written to /abs/path/registered-nodes.html
+```
+
+已注册节点的 DAG 也支持导出为 HTML。当前实现会根据 `docs/agent/interfaces.json` 中的 `input_schema` / `output_schema` 属性名推导数据边，再按拓扑层级布局：
+
+```bash
+cargo run -p cordis-runtime -- dag-html fixtures --output=registered-dag.html
+# output: dag_html written to /abs/path/registered-dag.html
 ```
 
 ## Test

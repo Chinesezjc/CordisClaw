@@ -1,0 +1,25 @@
+[package]
+name = "expr"
+version = "0.1.0"
+edition = "2021"
+
+[package.metadata.cordis]
+plugin_path = "expr"
+abi_kind = "rust"
+declared_nodes = ["expr_entry"]
+children = [
+  { source = "./lexer", required = true, grants = [] },
+  { source = "./parser", required = true, grants = [] },
+  { source = "./evaluator", required = true, grants = [] },
+]
+
+[package.metadata.cordis.abi_fingerprint]
+rustc_version = "1.85.1"
+target_triple = "x86_64-unknown-linux-gnu"
+crate_hash = "crate_expr_v1"
+api_hash = "api_v2"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"

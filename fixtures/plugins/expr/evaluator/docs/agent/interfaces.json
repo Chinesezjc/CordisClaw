@@ -1,0 +1,32 @@
+{
+  "plugin_id": "expr_evaluator",
+  "plugin_path": "expr/evaluator",
+  "plugin_version": "0.1.0",
+  "abi_version": 2,
+  "nodes": [
+    {
+      "id": "expr_evaluator",
+      "summary": "Evaluate the AST and delegate arithmetic to child operator plugins.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "ast": {
+            "type": "object"
+          }
+        }
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "value": {
+            "type": "number"
+          }
+        }
+      },
+      "side_effects": [],
+      "failure_modes": [
+        "division by zero"
+      ]
+    }
+  ]
+}

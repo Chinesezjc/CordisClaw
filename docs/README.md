@@ -5,6 +5,12 @@
 ## 文档清单
 
 - `rs-files-responsibility.md`：所有 `.rs` 文件的职责总表（按路径分组）。
+- `cargo-workspace-notes.md`：解释 `members/default-members/exclude` 和本地 `path` 依赖的区别。
+
+当前仓库还支持导出两类 HTML 图：
+
+1. 已注册节点图：见根 [README.md](/root/CordisClaw/README.md) 的 `graph-html` 示例。
+2. 已注册节点 DAG：见根 [README.md](/root/CordisClaw/README.md) 的 `dag-html` 示例。
 
 ## 维护约定
 
