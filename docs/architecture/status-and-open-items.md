@@ -20,10 +20,10 @@
 | Stage A-E 架构冻结 | 已完成 | 插件契约、ABI 契约、Loader、Artifact、Context/Security 都已有实现与文档归纳 |
 | Resolver / Loader 主链路 | 已完成 | 发现、解析、拓扑加载、预算、哈希、指纹、required/optional 传播都已落地 |
 | 文档契约、Graph/Doc helper、tooling | 已完成 | docs 回写、artifact index 刷新、注册图导出都可运行 |
-| Execution engine | 部分完成 | 语义与库实现已完成，但尚未成为主要运行入口 |
-| Kernel 自迭代 | 部分完成 | 已有评估、策略、记忆、回滚骨架，但没有真实 patch 生成与 canary 闭环 |
+| Execution engine | 部分完成 | 语义与库实现已完成，且已接入 `execute` / `serve execute` 入口；仍缺更真实的数据面与长期运行验证 |
+| Kernel 自迭代 | 部分完成 | 已有评估、策略、记忆、回滚骨架，并补上 verifier pipeline / plugin verifier / structured config patch；仍没有真正的语义级代码 patch 与 canary 闭环 |
 | 插件封装形态蓝图 | 部分完成 | 目前主要落地的是 `dylib` 与 JSON artifact / process，未覆盖最初蓝图全量形态 |
-| 更真实的运行入口与服务化边界 | 部分完成 | 已有 `RuntimeHost` 和 `serve` 常驻入口，但尚未服务化为稳定外部边界 |
+| 更真实的运行入口与服务化边界 | 部分完成 | 已有 `RuntimeHost`、`serve`、结构化 `reload`/`status`/`execute` 控制面；尚未服务化为稳定外部边界 |
 | YAML 配置入口 | 已完成 | 运行时已覆盖 runtime / kernel / llm_api / plugins 配置模型；模板位于 `config.example/`，本地配置目录为 `config/` |
 
 ## 3. 已完成
@@ -71,16 +71,16 @@
 
 ## 4. 部分完成
 
-### 4.1 Execution engine 已经实现，但还没有成为主运行入口
+### 4.1 Execution engine 已经实现，并已接到最小正式入口
 
 [runtime-semantics.md](./runtime-semantics.md) 明确写到：
 
 - DAG、Gate、Router、Actor、Scheduler、`execute_graph()` 这些执行语义已经作为库实现完成。
-- 但当前 CLI 主要暴露的仍然是 loader / invoke / tooling，而不是一条面向真实业务的 execution engine 入口。
+- 当前已新增 `execute` CLI 与 `serve execute` 控制面命令，可对注册节点跑一条受控的执行链路，并返回 `execution_id`、顺序、结果与 metrics。
 
-因此它更接近“语义原型已完成，产品入口未接通”。
+因此它已经从“纯库级语义”推进到了“有正式入口的运行时原型”。
 
-补充：当前已经新增了 `RuntimeHost` 与 `serve` 常驻入口，因此“更真实的运行入口”不再完全缺失；尚未完成的是把 execution engine 和更稳定的外部控制面真正接进来。
+尚未完成的是把 execution engine 接到更真实的数据流与业务图，而不只是保守的注册 DAG / 节点执行入口。
 
 ### 4.2 Kernel 已有最小闭环，但仍是骨架级实现
 
@@ -96,12 +96,14 @@
 - [kernel/evaluator.rs](../../crates/cordis-runtime/src/kernel/evaluator.rs)：验证结果与质量评分聚合
 - [kernel/memory.rs](../../crates/cordis-runtime/src/kernel/memory.rs)：问题-补丁-结果记忆
 - [kernel/loop.rs](../../crates/cordis-runtime/src/kernel/loop.rs)：`observe -> diagnose -> plan -> apply -> verify -> score -> safety_gate -> promote/rollback`
-- [kernel/auto_update.rs](../../crates/cordis-runtime/src/kernel/auto_update.rs)：最小文本补丁事务与失败回滚
+- [kernel/auto_update.rs](../../crates/cordis-runtime/src/kernel/auto_update.rs)：文本补丁事务、JSON/TOML 结构化补丁与失败回滚
+- [kernel/verifier.rs](../../crates/cordis-runtime/src/kernel/verifier.rs)：verification profile、`static_check/tests/safety` stage、shell/plugin verifier 统一输出
+- [host.rs](../../crates/cordis-runtime/src/host.rs)：`KernelPlanResult` / `KernelPlanApplyResult` 已带 verification plan，host 内保留 last reload diagnostics
 
 但文档同时也明确限制了当前边界：
 
-- Kernel 本身不负责生成补丁，只负责在“补丁已应用、验证结果已得出”之后做判定。
-- AutoUpdater 只支持文本级 `find -> replace`，不是 AST 级改写器，也还没有真实测试/基准/安全验证器集成。
+- Kernel 本身仍不负责语义级代码补丁生成，只负责在“补丁已应用、验证结果已得出”之后做判定。
+- AutoUpdater 虽已支持结构化 config patch，但还不是 AST 级 Rust 改写器；verification pipeline 也还没有接入真正的 benchmark / sandbox / canary。
 
 所以这里的状态应理解为“闭环骨架完成，真实自迭代能力未完成”。
 
@@ -131,7 +133,7 @@
 
 这些项在文档里被直接描述为“后续演进方向”或从当前实现边界可以明确看出仍未完成。
 
-### 5.1 把 execution engine 接到更真实的运行入口
+### 5.1 把 execution engine 接到更真实的数据面与运行入口
 
 [maintenance-guide.md](./maintenance-guide.md) 直接把这件事列为后续方向之一。
 
@@ -139,7 +141,8 @@
 
 - engine 语义存在
 - registry 与 context 也存在
-- 但主入口仍偏向 loader / invoke / graph / tooling
+- `execute` / `serve execute` 已提供最小正式入口
+- 但仍缺真实数据传递、更多节点类型和长期运行语义验证
 
 ### 5.2 为 Kernel 增加真实 patch 生成与验证器集成
 

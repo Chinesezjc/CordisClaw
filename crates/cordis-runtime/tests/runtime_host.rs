@@ -1,4 +1,4 @@
-use cordis_runtime::host::RuntimeHost;
+use cordis_runtime::host::{ReloadAttemptStatus, RuntimeHost};
 use cordis_runtime::kernel::auto_update::{AutoUpdatePlan, FilePatch};
 use cordis_runtime::kernel::evaluator::VerificationInput;
 use cordis_runtime::plugin::tooling::refresh_artifact_index;
@@ -223,6 +223,12 @@ fn append_demo_index_entry(root: &Path, version: &str) {
     let index_path = root.join("artifacts/index.json");
     let mut value: Value = serde_json::from_str(&fs::read_to_string(&index_path).expect("read index"))
         .expect("parse index");
+    value["generated_at"] = Value::String("2026-03-11T00:00:00Z".to_string());
+    value
+        .get_mut("topo_order")
+        .and_then(|items| items.as_array_mut())
+        .expect("topo order")
+        .push(Value::String("demo".to_string()));
     let entries = value
         .get_mut("entries")
         .and_then(|entries| entries.as_array_mut())
@@ -238,8 +244,71 @@ fn append_demo_index_entry(root: &Path, version: &str) {
         },
         "artifact_path": "demo.json",
         "sha256": "",
-        "built_at": "2026-03-11T00:00:00Z"
+        "built_at": "2026-03-11T00:00:00Z",
+        "parent": null,
+        "required": true,
+        "grants_from_parent": [],
+        "docs": {
+            "plugin_id": "demo",
+            "plugin_path": "demo",
+            "plugin_version": version,
+            "abi_version": 2,
+            "nodes": [
+                {
+                    "id": "demo_entry",
+                    "summary": "demo process task",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "message": { "type": "string" }
+                        },
+                        "required": ["message"]
+                    },
+                    "output_schema": {
+                        "type": "object",
+                        "properties": {
+                            "version": { "type": "string" }
+                        }
+                    },
+                    "side_effects": ["process"],
+                    "failure_modes": ["process_error"]
+                }
+            ]
+        },
+        "exports": [],
+        "execution": {
+            "kind": "process",
+            "command": "./demo_runner.sh",
+            "args": []
+        },
+        "artifact_kind": "json",
+        "build_fingerprint": format!("demo-{version}"),
+        "input_probe": { "files": [] },
+        "local_path_deps": []
     }));
+    fs::write(
+        &index_path,
+        serde_json::to_string_pretty(&value).expect("serialize index"),
+    )
+    .expect("write index");
+}
+
+fn sync_demo_index_entry(root: &Path, version: &str) {
+    let index_path = root.join("artifacts/index.json");
+    let mut value: Value = serde_json::from_str(&fs::read_to_string(&index_path).expect("read index"))
+        .expect("parse index");
+    let entries = value
+        .get_mut("entries")
+        .and_then(|entries| entries.as_array_mut())
+        .expect("entries array");
+    let entry = entries
+        .iter_mut()
+        .find(|entry| entry.get("plugin_path").and_then(|v| v.as_str()) == Some("demo"))
+        .expect("demo entry");
+    entry["version"] = Value::String(version.to_string());
+    entry["built_at"] = Value::String("2026-03-11T00:00:00Z".to_string());
+    entry["build_fingerprint"] = Value::String(format!("demo-{version}"));
+    entry["docs"]["plugin_version"] = Value::String(version.to_string());
     fs::write(
         &index_path,
         serde_json::to_string_pretty(&value).expect("serialize index"),
@@ -349,7 +418,24 @@ fn runtime_host_reload_removes_plugin_but_old_snapshot_stays_usable() {
     let host = RuntimeHost::boot(temp.path()).expect("host should boot");
     let old_snapshot = host.current_snapshot();
 
-    update_workspace_members(temp.path(), &["root", "expr"]);
+    let index_path = temp.path().join("artifacts/index.json");
+    let mut value: Value = serde_json::from_str(&fs::read_to_string(&index_path).expect("read index"))
+        .expect("parse index");
+    value
+        .get_mut("entries")
+        .and_then(|entries| entries.as_array_mut())
+        .expect("entries array")
+        .retain(|entry| entry.get("plugin_path").and_then(|v| v.as_str()) != Some("shell"));
+    value
+        .get_mut("topo_order")
+        .and_then(|items| items.as_array_mut())
+        .expect("topo order")
+        .retain(|entry| entry.as_str() != Some("shell"));
+    fs::write(
+        &index_path,
+        serde_json::to_string_pretty(&value).expect("serialize index"),
+    )
+    .expect("write updated index");
     let report = host.reload().expect("reload without shell should succeed");
 
     assert!(report.removed_plugins.iter().any(|plugin| plugin == "shell"));
@@ -397,6 +483,7 @@ fn runtime_host_snapshot_keeps_old_staged_process_artifact_after_reload() {
     let old_stage = old_snapshot.staged_artifact_root().to_path_buf();
 
     write_demo_artifacts(temp.path(), "v2");
+    sync_demo_index_entry(temp.path(), "v2");
     refresh_artifact_index(temp.path()).expect("refresh index after demo update");
     host.reload().expect("reload with updated demo should succeed");
 
@@ -435,11 +522,7 @@ fn runtime_host_kernel_state_persists_across_reload() {
                 patch_id: "patch-1".to_string(),
                 manual_approved: false,
                 diff_lines: 1,
-                patches: vec![FilePatch {
-                    path: "notes.txt".to_string(),
-                    find: "old".to_string(),
-                    replace: "new".to_string(),
-                }],
+                patches: vec![FilePatch::text("notes.txt", "old", "new")],
             },
             VerificationInput {
                 tests_passed: true,
@@ -464,11 +547,66 @@ fn runtime_host_kernel_state_persists_across_reload() {
 }
 
 #[test]
+fn runtime_host_execute_runs_registered_target_through_execution_engine() {
+    let host = RuntimeHost::boot(fixtures_root()).expect("host should boot");
+    let result = host
+        .execute("expr::expr_entry", json!({ "expression": "1 + 2 * 3" }))
+        .expect("execute should succeed");
+
+    assert_eq!(result.target_node_fqn, "expr::expr_entry");
+    assert!(result.output.order.iter().any(|node| node == "expr::expr_entry"));
+    assert_eq!(
+        result.output.outcomes.get("expr::expr_entry"),
+        Some(&cordis_runtime::core::models::NodeOutcome::Success)
+    );
+    let trace = result
+        .traces
+        .get("expr::expr_entry")
+        .expect("trace should exist");
+    assert_eq!(
+        trace
+            .response_payload
+            .as_ref()
+            .and_then(|value| value.get("value"))
+            .and_then(|value| value.as_f64()),
+        Some(7.0)
+    );
+}
+
+#[test]
+fn runtime_host_reload_with_diagnostics_reports_failure_summary() {
+    let temp = setup_fixture_copy();
+    let host = RuntimeHost::boot(temp.path()).expect("host should boot");
+    let snapshot_id = host.current_snapshot().snapshot_id().to_string();
+
+    overwrite_index_hash(temp.path(), "shell", "deadbeef");
+    let report = host.reload_with_diagnostics();
+
+    assert_eq!(report.status, ReloadAttemptStatus::Failed);
+    assert_eq!(report.from_snapshot_id, snapshot_id);
+    assert!(report.to_snapshot_id.is_none());
+    assert!(
+        report
+            .failure_summary
+            .as_deref()
+            .unwrap_or_default()
+            .contains("HashMismatch"),
+        "report: {report:?}"
+    );
+    assert_eq!(host.current_snapshot().snapshot_id(), snapshot_id);
+    assert_eq!(host.status().last_reload, Some(report));
+}
+
+#[test]
 fn serve_mode_supports_plugins_reload_and_kernel_status() {
     let temp = setup_fixture_copy();
     let bin = env!("CARGO_BIN_EXE_cordis-runtime");
     let mut child = Command::new(bin)
-        .args(["serve", temp.path().to_str().expect("temp path utf-8")])
+        .args([
+            "serve",
+            temp.path().to_str().expect("temp path utf-8"),
+            "--runtime-only",
+        ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -478,7 +616,9 @@ fn serve_mode_supports_plugins_reload_and_kernel_status() {
     let stdin = child.stdin.as_mut().expect("stdin pipe");
     use std::io::Write as _;
     stdin
-        .write_all(b"plugins\nkernel status\nreload\nexit\n")
+        .write_all(
+            b"status\nplugins\nexecute expr::expr_entry {\"expression\":\"1 + 2 * 3\"}\nkernel status\nreload\nexit\n",
+        )
         .expect("write serve commands");
 
     let output = child.wait_with_output().expect("wait for serve cli");
@@ -490,8 +630,10 @@ fn serve_mode_supports_plugins_reload_and_kernel_status() {
 
     let stdout = String::from_utf8(output.stdout).expect("stdout utf-8");
     assert!(stdout.contains("serve ready snapshot_id="));
+    assert!(stdout.contains("\"current_snapshot_id\""));
     assert!(stdout.contains("shell Loaded"));
+    assert!(stdout.contains("\"target_node_fqn\":\"expr::expr_entry\""));
     assert!(stdout.contains("\"iteration_total\":0"));
     assert!(stdout.contains("\"from_snapshot_id\""));
-    assert!(stdout.contains("\"to_snapshot_id\""));
+    assert!(stdout.contains("\"status\":\"reloaded\""));
 }

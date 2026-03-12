@@ -199,8 +199,14 @@ pub enum RuntimeError {
     #[error("auto update patch pattern not found in {path}: {pattern}")]
     AutoUpdatePatternNotFound { path: PathBuf, pattern: String },
 
+    #[error("auto update patch invalid for {path}: {reason}")]
+    AutoUpdatePatchInvalid { path: String, reason: String },
+
     #[error("auto update verify failed: {message}")]
     AutoUpdateVerifyFailed { message: String },
+
+    #[error("artifact build lock timeout at {path}: waited {waited_ms}ms")]
+    ArtifactBuildLockTimeout { path: PathBuf, waited_ms: u128 },
 
     #[error("command failed: {program} {args:?}: {message}")]
     CommandFailed {

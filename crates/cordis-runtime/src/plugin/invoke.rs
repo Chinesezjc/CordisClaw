@@ -1,7 +1,6 @@
 use crate::core::error::RuntimeError;
-use crate::core::models::{PluginExecution, PluginLoadResult};
+use crate::core::models::{ArtifactKind, DylibAbiKind, PluginExecution, PluginLoadResult, PluginUnavailableReason};
 use crate::plugin::abi::{PluginRequest, PluginResponse};
-use crate::plugin::artifact::load_plugin_artifact;
 use crate::plugin::dynamic::{is_dylib_path, LoadedDylibApi};
 use crate::plugin::loader::{default_loader_config, Loader};
 use crate::plugin::registry::PluginRegistry;
@@ -91,23 +90,97 @@ pub fn invoke_registered_plugin(
         message: format!("loaded plugin missing artifact path: {plugin_path}"),
     })?;
 
-    if !is_dylib_path(artifact_path) {
-        let artifact = load_plugin_artifact(artifact_path)?;
-        return invoke_json_artifact(plugin_path, artifact_path, artifact, payload);
+    let artifact_kind = plugin
+        .artifact_kind
+        .clone()
+        .ok_or_else(|| RuntimeError::Invariant {
+            message: format!("loaded plugin missing artifact kind: {plugin_path}"),
+        })?;
+
+    if !matches!(artifact_kind, ArtifactKind::Dylib) && !is_dylib_path(artifact_path) {
+        let execution = plugin.execution.clone();
+        return invoke_json_artifact(plugin_path, artifact_path, execution, payload);
     }
 
-    let dylib = LoadedDylibApi::open(artifact_path)?;
+    let dylib = match LoadedDylibApi::open(artifact_path) {
+        Ok(dylib) => dylib,
+        Err(err) => {
+            plugin_registry.mark_runtime_unavailable(
+                plugin_path,
+                PluginUnavailableReason::SymbolMissing,
+                vec![err.to_string()],
+            );
+            return Err(err);
+        }
+    };
     let api = dylib.api();
+    if api.abi_kind != DylibAbiKind::Rust {
+        plugin_registry.mark_runtime_unavailable(
+            plugin_path,
+            PluginUnavailableReason::AbiMismatch,
+            vec!["runtime exported abi_kind is not rust".to_string()],
+        );
+        return Err(RuntimeError::PluginUnavailable {
+            plugin_path: plugin_path.to_string(),
+            reason: PluginUnavailableReason::AbiMismatch,
+            required: plugin.required,
+        });
+    }
+
+    let expected_fingerprint = plugin
+        .abi_fingerprint
+        .clone()
+        .ok_or_else(|| RuntimeError::Invariant {
+            message: format!("loaded plugin missing abi_fingerprint: {plugin_path}"),
+        })?;
+    let runtime_fingerprint = serde_json::from_str(&(api.abi_fingerprint)().payload).map_err(|err| {
+        RuntimeError::Io {
+            path: artifact_path.to_path_buf(),
+            message: format!("runtime fingerprint parse failed: {err}"),
+        }
+    })?;
+    if runtime_fingerprint != expected_fingerprint {
+        let diff = expected_fingerprint.diff(&runtime_fingerprint);
+        plugin_registry.mark_runtime_unavailable(
+            plugin_path,
+            PluginUnavailableReason::AbiMismatch,
+            diff.clone(),
+        );
+        return Err(RuntimeError::AbiMismatch {
+            plugin_path: plugin_path.to_string(),
+            expected: expected_fingerprint,
+            actual: runtime_fingerprint,
+            fingerprint_diff: diff,
+        });
+    }
+
+    let runtime_docs = serde_json::from_str(&(api.docs)().payload).map_err(|err| RuntimeError::Io {
+        path: artifact_path.to_path_buf(),
+        message: format!("runtime docs parse failed: {err}"),
+    })?;
+    if plugin.docs.as_ref() != Some(&runtime_docs) {
+        plugin_registry.mark_runtime_unavailable(
+            plugin_path,
+            PluginUnavailableReason::ContractViolation,
+            vec!["runtime docs mismatch".to_string()],
+        );
+        return Err(RuntimeError::PluginUnavailable {
+            plugin_path: plugin_path.to_string(),
+            reason: PluginUnavailableReason::ContractViolation,
+            required: plugin.required,
+        });
+    }
+
     Ok((api.handle)(PluginRequest { payload }))
 }
 
 fn invoke_json_artifact(
     plugin_path: &str,
     artifact_path: &Path,
-    artifact: crate::core::models::PluginArtifact,
+    execution: Option<PluginExecution>,
     payload: String,
 ) -> Result<PluginResponse, RuntimeError> {
-    match artifact.execution {
+    match execution {
         Some(PluginExecution::Process { command, args }) => {
             let command_path = resolve_exec_path(artifact_path, &command);
             let mut child = Command::new(&command_path)

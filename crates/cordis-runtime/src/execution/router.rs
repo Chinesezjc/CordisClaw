@@ -4,9 +4,10 @@
 use crate::context::{ContextTxn, RuntimeContext};
 use crate::core::error::RuntimeError;
 use crate::core::models::NodeOutcome;
+use serde::{Deserialize, Serialize};
 use std::time::Instant;
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RouterMetrics {
     pub router_execute_total: u64,
     pub router_success_total: u64,

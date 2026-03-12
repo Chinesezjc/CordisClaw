@@ -320,3 +320,123 @@ fn llm_auto_update_uses_model_suggested_verification_commands() {
     let captured_request = request_rx.recv().expect("capture request");
     assert!(captured_request.contains("Replace old with new in demo.txt"));
 }
+
+#[cfg(not(windows))]
+#[test]
+fn llm_auto_update_supports_plugin_verifier_commands() {
+    let temp = TempDir::new().expect("tempdir");
+    let demo_path = temp.path().join("demo.txt");
+    fs::write(&demo_path, "alpha-old-omega\n").expect("write demo file");
+
+    let fixtures_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("fixtures")
+        .canonicalize()
+        .expect("fixtures root");
+    let output_text = json!({
+        "summary": "Replace old with new in the demo file.",
+        "tests_command": format!(
+            "plugin:{}",
+            json!({
+                "fixtures_root": fixtures_root,
+                "plugin_path": "expr",
+                "node_id": "expr_entry",
+                "payload_json": {
+                    "expression": "1 + 2 * 3"
+                },
+                "expect_substring": "\"value\":7.0"
+            })
+        ),
+        "safety_command": "grep -q alpha-new-omega demo.txt",
+        "patches": [
+            {
+                "path": "demo.txt",
+                "find": "old",
+                "replace": "new"
+            }
+        ]
+    })
+    .to_string();
+    let (base_url, _request_rx, handle) = spawn_mock_openai_server(&output_text);
+    write_config(temp.path(), "openai", &base_url, "OPENAI_API_KEY", "gpt-4.1-mini");
+
+    let bin = env!("CARGO_BIN_EXE_cordis-runtime");
+    let output = Command::new(bin)
+        .arg("llm-auto-update")
+        .arg(temp.path())
+        .arg("--instruction=Replace old with new in demo.txt")
+        .arg("--path=demo.txt")
+        .env("OPENAI_API_KEY", "test-key")
+        .output()
+        .expect("run llm-auto-update");
+
+    handle.join().expect("join mock server");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout utf-8");
+    assert!(stdout.contains("\"runner\": \"plugin\""), "stdout: {stdout}");
+    assert!(stdout.contains("\"verdict\": \"Promote\""), "stdout: {stdout}");
+    assert_eq!(
+        fs::read_to_string(&demo_path).expect("read demo file"),
+        "alpha-new-omega\n"
+    );
+}
+
+#[cfg(not(windows))]
+#[test]
+fn llm_auto_update_rust_workspace_profile_runs_static_check_stage() {
+    let temp = TempDir::new().expect("tempdir");
+    fs::write(
+        temp.path().join("Cargo.toml"),
+        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .expect("write manifest");
+    fs::create_dir_all(temp.path().join("src")).expect("src dir");
+    let source_path = temp.path().join("src/lib.rs");
+    fs::write(&source_path, "pub fn demo() -> &'static str { \"old\" }\n").expect("write source");
+
+    let output_text = json!({
+        "summary": "Replace old with new in the source file.",
+        "patches": [
+            {
+                "path": "src/lib.rs",
+                "find": "\"old\"",
+                "replace": "\"new\""
+            }
+        ]
+    })
+    .to_string();
+    let (base_url, _request_rx, handle) = spawn_mock_openai_server(&output_text);
+    write_config(temp.path(), "openai", &base_url, "OPENAI_API_KEY", "gpt-4.1-mini");
+
+    let bin = env!("CARGO_BIN_EXE_cordis-runtime");
+    let output = Command::new(bin)
+        .arg("llm-auto-update")
+        .arg(temp.path())
+        .arg("--instruction=Replace old with new in src/lib.rs")
+        .arg("--path=src/lib.rs")
+        .arg("--verify-profile=rust-workspace")
+        .env("OPENAI_API_KEY", "test-key")
+        .output()
+        .expect("run llm-auto-update");
+
+    handle.join().expect("join mock server");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout utf-8");
+    assert!(stdout.contains("\"profile\": \"rust_workspace\""), "stdout: {stdout}");
+    assert!(stdout.contains("\"kind\": \"static_check\""), "stdout: {stdout}");
+    assert!(stdout.contains("\"status\": \"passed\""), "stdout: {stdout}");
+    assert_eq!(
+        fs::read_to_string(&source_path).expect("read source"),
+        "pub fn demo() -> &'static str { \"new\" }\n"
+    );
+}

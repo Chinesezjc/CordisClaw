@@ -89,8 +89,9 @@ The repository already has a working prototype core:
 - `resolver`, `loader`, `registry`, and `context` are implemented
 - `shell`, `expr`, and `root` fixtures exercise the loading and invocation path
 - `RuntimeHost` and `serve` provide a long-running host with atomic snapshot reload
-- graph export, docs sync, and artifact index refresh are available from the CLI
-- Kernel and `auto-update` exist as a guarded prototype, not a production automation system
+- `execute`, graph export, docs sync, and artifact index refresh are available from the CLI
+- `reload` and `kernel` control-plane output are structured JSON with elapsed/failure diagnostics
+- Kernel and `auto-update` support verification pipelines, plugin verifiers, and structured JSON/TOML patch kinds as guarded prototype capabilities
 
 Current status and gaps are tracked in [docs/architecture/status-and-open-items.md](./docs/architecture/status-and-open-items.md).
 
@@ -98,7 +99,7 @@ Current status and gaps are tracked in [docs/architecture/status-and-open-items.
 
 `CordisClaw` is still a prototype, and the repository is explicit about what is not finished:
 
-- execution exists mainly as a library-level runtime prototype
+- execution now has explicit CLI/`serve` entrypoints, but the runtime still treats it as a conservative prototype
 - the Kernel is a guarded evaluate / promote / rollback loop, not a full autonomous patching system
 - docs and graph export are helper surfaces, not a polished external service boundary
 - the original multi-artifact vision is only partially implemented today
@@ -128,6 +129,12 @@ Invoke the expression plugin:
 cargo run -p cordis-runtime -- invoke expr expr_entry --payload-json='{"expression":"1 + 2 * 3"}'
 ```
 
+Execute a registered target through the runtime execution engine:
+
+```bash
+cargo run -p cordis-runtime -- execute expr::expr_entry --payload-json='{"expression":"1 + 2 * 3"}'
+```
+
 Run the long-lived host and reload plugins explicitly:
 
 ```bash
@@ -137,7 +144,9 @@ cargo run -p cordis-runtime -- serve fixtures
 Inside `serve`, use:
 
 ```text
+status
 plugins
+execute expr::expr_entry {"expression":"1 + 2 * 3"}
 reload
 kernel status
 ```
@@ -173,7 +182,7 @@ config/
 
 llm_api.yaml supports both OpenAI Responses API and DeepSeek Chat Completions when provider is set to deepseek.
 
-llm-auto-update verification commands can call plugins directly, for example expr::expr_entry.
+llm-auto-update verification commands can call plugins directly, for example expr::expr_entry, and `--verify-profile=rust-workspace` enables a default static `cargo check` stage when a workspace manifest is present.
 
 `config/` is intended for local runtime setup and is gitignored. Sample templates are provided in `config.example/`; copy the files you need into `config/`.
 

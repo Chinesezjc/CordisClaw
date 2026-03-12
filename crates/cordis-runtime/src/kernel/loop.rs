@@ -24,9 +24,11 @@ pub enum IterationStage {
 pub struct IterationInput {
     pub issue_id: String,
     pub patch_id: String,
+    pub patch_kind: String,
     pub changed_paths: Vec<String>,
     pub diff_lines: usize,
     pub manual_approved: bool,
+    pub verification_profile: Option<String>,
     pub verification: VerificationInput,
 }
 
@@ -130,8 +132,11 @@ impl SelfIterationKernel {
         self.memory.record(
             input.issue_id,
             input.patch_id,
+            input.patch_kind,
+            input.verification_profile,
             verdict,
             eval.quality_score,
+            eval.reasons.clone(),
         );
 
         IterationReport {

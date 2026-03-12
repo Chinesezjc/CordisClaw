@@ -1,15 +1,17 @@
 use cordis_runtime::config::RuntimeConfig;
 use cordis_runtime::context::ContextRegistry;
 use cordis_runtime::host::{KernelApplyRequest, KernelPlanRequest, RuntimeHost, RuntimeKernel};
-use cordis_runtime::kernel::auto_update::{AutoUpdatePlan, AutoUpdater, FilePatch};
+use cordis_runtime::kernel::auto_update::{AutoUpdatePlan, AutoUpdater, FilePatch, VerificationEnvelope};
 use cordis_runtime::kernel::evaluator::{EvalHarness, VerificationInput};
 use cordis_runtime::kernel::memory::ChangeMemory;
 use cordis_runtime::kernel::policy::IterationPolicy;
 use cordis_runtime::kernel::r#loop::SelfIterationKernel;
+use cordis_runtime::kernel::verifier::VerificationProfile;
 use cordis_runtime::plugin::invoke::PluginInvoker;
 use cordis_runtime::plugin::loader::{default_loader_config, Loader};
 use cordis_runtime::plugin::tooling::{
-    ensure_fixture_artifacts, rebuild_fixture_artifacts, refresh_artifact_index, sync_plugin_docs,
+    prepare_artifacts, rebuild_fixture_artifacts, refresh_artifact_index, sync_plugin_docs,
+    PrepareMode,
 };
 use serde_json::Value;
 use std::fs;
@@ -37,6 +39,14 @@ fn main() {
     if args.first().map(|x| x.as_str()) == Some("invoke") {
         if let Err(err) = run_invoke(&args[1..]) {
             eprintln!("invoke failed: {err}");
+            eprintln!("{}", usage());
+            std::process::exit(1);
+        }
+        return;
+    }
+    if args.first().map(|x| x.as_str()) == Some("execute") {
+        if let Err(err) = run_execute(&args[1..]) {
+            eprintln!("execute failed: {err}");
             eprintln!("{}", usage());
             std::process::exit(1);
         }
@@ -90,6 +100,14 @@ fn main() {
         }
         return;
     }
+    if args.first().map(|x| x.as_str()) == Some("prepare-artifacts") {
+        if let Err(err) = run_prepare_artifacts(&args[1..]) {
+            eprintln!("prepare-artifacts failed: {err}");
+            eprintln!("{}", usage());
+            std::process::exit(1);
+        }
+        return;
+    }
 
     if let Err(err) = run_loader(args.first().map(PathBuf::from)) {
         eprintln!("load failed: {err}");
@@ -99,7 +117,7 @@ fn main() {
 
 fn run_loader(root: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
     let root = root.unwrap_or_else(|| PathBuf::from("fixtures"));
-    prepare_fixtures_root(&root)?;
+    prepare_fixtures_root(&root, false)?;
     let config = default_loader_config(&root);
     let loader = Loader::new(config);
     let output = loader.load()?;
@@ -125,9 +143,9 @@ fn run_loader(root: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    let root = parse_optional_root_arg(args, "fixtures")?;
-    prepare_fixtures_root(&root)?;
-    let host = RuntimeHost::boot(&root)?;
+    let (root, runtime_only) = parse_root_and_runtime_only(args, "fixtures")?;
+    prepare_fixtures_root(&root, runtime_only)?;
+    let host = RuntimeHost::boot(&root).map_err(|err| runtime_mode_error(err, &root, runtime_only))?;
     println!(
         "serve ready snapshot_id={}",
         host.current_snapshot().snapshot_id()
@@ -175,8 +193,11 @@ fn handle_serve_command(
                 println!("{plugin_path} {:?}", plugin.load_result);
             }
         }
+        "status" => {
+            println!("{}", serde_json::to_string(&host.status())?);
+        }
         "reload" => {
-            let report = host.reload()?;
+            let report = host.reload_with_diagnostics();
             println!("{}", serde_json::to_string(&report)?);
         }
         "kernel status" => {
@@ -194,6 +215,12 @@ fn handle_serve_command(
                     split_first_token(remainder).ok_or("missing node_id/payload for invoke")?;
                 let response = host.invoke(plugin_path, node_id, payload_json.to_string())?;
                 emit_invoke_response(&response.payload)?;
+            } else if let Some(rest) = command.strip_prefix("execute ") {
+                let (target_node_fqn, payload_json) =
+                    split_first_token(rest).ok_or("missing node_fqn/payload for execute")?;
+                let payload = serde_json::from_str::<Value>(payload_json)?;
+                let response = host.execute(target_node_fqn, payload)?;
+                println!("{}", serde_json::to_string(&response)?);
             } else if let Some(json) = command.strip_prefix("kernel apply-plan ") {
                 let request: KernelApplyRequest = serde_json::from_str(json)?;
                 let result = host
@@ -223,6 +250,7 @@ fn run_invoke(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let node_id = args[1].clone();
     let mut fixtures_root: Option<PathBuf> = None;
     let mut payload_json: Option<String> = None;
+    let mut runtime_only = false;
 
     for token in &args[2..] {
         if let Some(value) = token.strip_prefix("--fixtures-root=") {
@@ -233,15 +261,63 @@ fn run_invoke(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             payload_json = Some(value.to_string());
             continue;
         }
+        if token == "--runtime-only" {
+            runtime_only = true;
+            continue;
+        }
         return Err(format!("unknown flag: {token}").into());
     }
 
     let payload = payload_json.ok_or("missing required flag: --payload-json=<json>")?;
     let fixtures_root = fixtures_root.unwrap_or_else(PluginInvoker::default_fixtures_root);
-    prepare_fixtures_root(&fixtures_root)?;
-    let invoker = PluginInvoker::load(fixtures_root)?;
+    prepare_fixtures_root(&fixtures_root, runtime_only)?;
+    let invoker = PluginInvoker::load(&fixtures_root)
+        .map_err(|err| runtime_mode_error(err, &fixtures_root, runtime_only))?;
     let response = invoker.invoke(&plugin_path, &node_id, payload)?;
     emit_invoke_response(&response.payload)
+}
+
+fn run_execute(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    if args.is_empty() {
+        return Err("missing required args: <node_fqn>".into());
+    }
+
+    let mut root = PathBuf::from("fixtures");
+    let mut target_node_fqn: Option<String> = None;
+    let mut payload_json: Option<String> = None;
+    let mut runtime_only = false;
+
+    for token in args {
+        if let Some(value) = token.strip_prefix("--fixtures-root=") {
+            root = PathBuf::from(value);
+            continue;
+        }
+        if let Some(value) = token.strip_prefix("--payload-json=") {
+            payload_json = Some(value.to_string());
+            continue;
+        }
+        if token == "--runtime-only" {
+            runtime_only = true;
+            continue;
+        }
+        if token.starts_with("--") {
+            return Err(format!("unknown flag: {token}").into());
+        }
+        if target_node_fqn.is_none() {
+            target_node_fqn = Some(token.clone());
+            continue;
+        }
+        return Err(format!("unexpected extra arg: {token}").into());
+    }
+
+    let target_node_fqn = target_node_fqn.ok_or("missing required arg: <node_fqn>")?;
+    let payload = payload_json.ok_or("missing required flag: --payload-json=<json>")?;
+    prepare_fixtures_root(&root, runtime_only)?;
+    let host = RuntimeHost::boot(&root).map_err(|err| runtime_mode_error(err, &root, runtime_only))?;
+    let payload = serde_json::from_str::<Value>(&payload)?;
+    let result = host.execute(&target_node_fqn, payload)?;
+    println!("{}", serde_json::to_string_pretty(&result)?);
+    Ok(())
 }
 
 fn emit_invoke_response(payload: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -348,18 +424,14 @@ fn run_auto_update(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             patch_id: "cli-patch".to_string(),
             manual_approved,
             diff_lines,
-            patches: vec![FilePatch {
-                path: patch_path,
-                find,
-                replace,
-            }],
+            patches: vec![FilePatch::text(patch_path, find, replace)],
         },
         |_| {
-            Ok(VerificationInput {
+            Ok(VerificationEnvelope::from(VerificationInput {
                 tests_passed,
                 safety_checks_passed,
                 quality_score,
-            })
+            }))
         },
     )?;
 
@@ -389,6 +461,7 @@ fn run_llm_auto_update(args: &[String]) -> Result<(), Box<dyn std::error::Error>
     let mut manual_approved = false;
     let mut tests_command: Option<String> = None;
     let mut safety_command: Option<String> = None;
+    let mut verify_profile: Option<VerificationProfile> = None;
     let mut quality_score: Option<u32> = None;
     let mut dry_run = false;
 
@@ -415,6 +488,10 @@ fn run_llm_auto_update(args: &[String]) -> Result<(), Box<dyn std::error::Error>
         }
         if let Some(value) = token.strip_prefix("--safety-command=") {
             safety_command = Some(value.to_string());
+            continue;
+        }
+        if let Some(value) = token.strip_prefix("--verify-profile=") {
+            verify_profile = Some(parse_verify_profile_flag(value)?);
             continue;
         }
         if let Some(value) = token.strip_prefix("--quality-score=") {
@@ -447,6 +524,7 @@ fn run_llm_auto_update(args: &[String]) -> Result<(), Box<dyn std::error::Error>
         manual_approved,
         tests_command,
         safety_command,
+        verify_profile,
         quality_score,
     };
 
@@ -466,6 +544,19 @@ fn parse_bool_flag(value: &str) -> Result<bool, Box<dyn std::error::Error>> {
         "true" => Ok(true),
         "false" => Ok(false),
         other => Err(format!("invalid bool: {other} (expected true/false)").into()),
+    }
+}
+
+fn parse_verify_profile_flag(
+    value: &str,
+) -> Result<VerificationProfile, Box<dyn std::error::Error>> {
+    match value {
+        "default" => Ok(VerificationProfile::Default),
+        "rust-workspace" | "rust_workspace" => Ok(VerificationProfile::RustWorkspace),
+        other => Err(format!(
+            "invalid verify profile: {other} (expected default|rust-workspace)"
+        )
+        .into()),
     }
 }
 
@@ -489,7 +580,7 @@ fn run_graph_html(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let root = root.unwrap_or_else(|| PathBuf::from("fixtures"));
-    prepare_fixtures_root(&root)?;
+    prepare_fixtures_root(&root, false)?;
     let loader = Loader::new(default_loader_config(&root));
     let output = loader.load()?;
     let html = output
@@ -550,7 +641,7 @@ fn run_dag_html(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let root = root.unwrap_or_else(|| PathBuf::from("fixtures"));
-    prepare_fixtures_root(&root)?;
+    prepare_fixtures_root(&root, false)?;
     let loader = Loader::new(default_loader_config(&root));
     let output = loader.load()?;
     let html = output
@@ -575,7 +666,7 @@ fn run_dag_html(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
 fn run_sync_plugin_docs(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let root = parse_optional_root_arg(args, "fixtures")?;
-    prepare_fixtures_root(&root)?;
+    prepare_fixtures_root(&root, false)?;
     let written = sync_plugin_docs(&root)?;
     println!("synced_plugin_docs={}", written.len());
     for path in written {
@@ -586,7 +677,7 @@ fn run_sync_plugin_docs(args: &[String]) -> Result<(), Box<dyn std::error::Error
 
 fn run_refresh_artifact_index(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let root = parse_optional_root_arg(args, "fixtures")?;
-    prepare_fixtures_root(&root)?;
+    prepare_fixtures_root(&root, false)?;
     let refreshed = refresh_artifact_index(&root)?;
     println!("refreshed_artifact_entries={}", refreshed.len());
     for (plugin_path, hash) in refreshed {
@@ -605,9 +696,47 @@ fn run_rebuild_fixture_artifacts(args: &[String]) -> Result<(), Box<dyn std::err
     Ok(())
 }
 
-fn prepare_fixtures_root(root: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    if ensure_fixture_artifacts(root)? {
-        println!("rebuilt fixture artifacts under {}", root.display());
+fn run_prepare_artifacts(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut root = PathBuf::from("fixtures");
+    let mut mode = PrepareMode::Incremental;
+
+    for token in args {
+        if token == "--full" {
+            mode = PrepareMode::Full;
+            continue;
+        }
+        if token.starts_with("--") {
+            return Err(format!("unknown flag: {token}").into());
+        }
+        root = PathBuf::from(token);
+    }
+
+    let report = prepare_artifacts(&root, mode)?;
+    println!(
+        "prepared_artifacts rebuilt={} reused={} full_rebuild={}",
+        report.rebuilt.len(),
+        report.reused.len(),
+        report.full_rebuild
+    );
+    for (plugin_path, hash) in report.rebuilt {
+        println!("{plugin_path} {hash}");
+    }
+    Ok(())
+}
+
+fn prepare_fixtures_root(root: &Path, runtime_only: bool) -> Result<(), Box<dyn std::error::Error>> {
+    if runtime_only {
+        return Ok(());
+    }
+    let report = prepare_artifacts(root, PrepareMode::Incremental)?;
+    if !report.rebuilt.is_empty() {
+        println!(
+            "prepared fixture artifacts under {} rebuilt={} reused={} full_rebuild={}",
+            root.display(),
+            report.rebuilt.len(),
+            report.reused.len(),
+            report.full_rebuild
+        );
     }
     Ok(())
 }
@@ -624,16 +753,59 @@ fn parse_optional_root_arg(
     }
 }
 
+fn parse_root_and_runtime_only(
+    args: &[String],
+    default_root: &str,
+) -> Result<(PathBuf, bool), Box<dyn std::error::Error>> {
+    let mut root = PathBuf::from(default_root);
+    let mut runtime_only = false;
+    let mut seen_root = false;
+
+    for token in args {
+        if token == "--runtime-only" {
+            runtime_only = true;
+            continue;
+        }
+        if token.starts_with("--") {
+            return Err(format!("unknown flag: {token}").into());
+        }
+        if seen_root {
+            return Err(format!("unexpected extra arg: {token}").into());
+        }
+        root = PathBuf::from(token);
+        seen_root = true;
+    }
+
+    Ok((root, runtime_only))
+}
+
+fn runtime_mode_error(
+    err: cordis_runtime::core::error::RuntimeError,
+    root: &Path,
+    runtime_only: bool,
+) -> Box<dyn std::error::Error> {
+    if runtime_only {
+        return format!(
+            "{err}; bundle is runtime-only, run `cargo run -p cordis-runtime -- prepare-artifacts {}` to rebuild artifacts",
+            root.display()
+        )
+        .into();
+    }
+    Box::new(err)
+}
+
 fn usage() -> String {
     "Usage:
   cargo run -p cordis-runtime -- <fixtures_root>
-  cargo run -p cordis-runtime -- serve [fixtures_root]
-  cargo run -p cordis-runtime -- invoke <plugin_path> <node_id> --payload-json=<json> [--fixtures-root=fixtures]
-  cargo run -p cordis-runtime -- llm-auto-update <workspace_root> --instruction=<text> --path=<relative_path> [--path=<relative_path> ...] [--issue-id=<id>] [--patch-id=<id>] [--manual-approved] [--tests-command=<shell>] [--safety-command=<shell>] [--quality-score=<u32>] [--dry-run]
+  cargo run -p cordis-runtime -- serve [fixtures_root] [--runtime-only]
+  cargo run -p cordis-runtime -- invoke <plugin_path> <node_id> --payload-json=<json> [--fixtures-root=fixtures] [--runtime-only]
+  cargo run -p cordis-runtime -- execute <node_fqn> --payload-json=<json> [--fixtures-root=fixtures] [--runtime-only]
+  cargo run -p cordis-runtime -- llm-auto-update <workspace_root> --instruction=<text> --path=<relative_path> [--path=<relative_path> ...] [--issue-id=<id>] [--patch-id=<id>] [--manual-approved] [--tests-command=<shell>] [--safety-command=<shell>] [--verify-profile=<default|rust-workspace>] [--quality-score=<u32>] [--dry-run]
     tests/safety commands also accept plugin:{\"plugin_path\":\"<plugin_path>\",\"node_id\":\"<node_id>\",\"payload_json\":{},\"expect_substring\":\"<expected text>\",\"fixtures_root\":\"<optional fixtures root>\"}
   cargo run -p cordis-runtime -- auto-update <workspace_root> <relative_path> <find> <replace> [--manual-approved] [--tests-passed=true|false] [--safety-checks-passed=true|false] [--quality-score=<u32>] [--diff-lines=<usize>]
   cargo run -p cordis-runtime -- graph-html [fixtures_root] [--output=registered-nodes.html]
   cargo run -p cordis-runtime -- dag-html [fixtures_root] [--output=registered-dag.html]
+  cargo run -p cordis-runtime -- prepare-artifacts [fixtures_root] [--full]
   cargo run -p cordis-runtime -- sync-plugin-docs [fixtures_root]
   cargo run -p cordis-runtime -- refresh-artifact-index [fixtures_root]
   cargo run -p cordis-runtime -- rebuild-fixture-artifacts [fixtures_root]"
@@ -643,9 +815,11 @@ fn usage() -> String {
 fn serve_usage() -> &'static str {
     "serve commands:
   help
+  status
   plugins
   reload
   invoke <plugin_path> <node_id> <payload-json>
+  execute <node_fqn> <payload-json>
   kernel status
   kernel history
   kernel apply-plan <json>

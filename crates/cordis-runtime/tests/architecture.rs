@@ -4,6 +4,7 @@ use cordis_runtime::core::models::{NodeOutcome, PluginLoadResult, PluginUnavaila
 use cordis_runtime::plugin::invoke::PluginInvoker;
 use cordis_runtime::execution::scheduler::{run_deterministic, ScheduledNode, SchedulerConfig};
 use cordis_runtime::plugin::loader::{default_loader_config, Loader};
+use cordis_runtime::plugin::tooling::{prepare_artifacts, PrepareMode};
 use serde_json::{json, Value};
 use std::fs;
 use std::path::Path;
@@ -326,10 +327,8 @@ fn child_path_escape_fails_fast() {
     let patched = content.replace("./child", "../child");
     fs::write(&root_manifest, patched).expect("write root manifest");
 
-    let config = default_loader_config(temp.path());
-    let loader = Loader::new(config);
-
-    let err = loader.load().expect_err("must fail due to path escape");
+    let err = prepare_artifacts(temp.path(), PrepareMode::Incremental)
+        .expect_err("must fail due to path escape");
     assert!(matches!(err, RuntimeError::InvalidChildSource { .. }));
 }
 
@@ -341,10 +340,8 @@ fn plugin_path_mismatch_fails_fast() {
     let patched = content.replace("plugin_path = \"root/child\"", "plugin_path = \"root/bad\"");
     fs::write(&child_manifest, patched).expect("write child manifest");
 
-    let config = default_loader_config(temp.path());
-    let loader = Loader::new(config);
-
-    let err = loader.load().expect_err("must fail due to plugin_path mismatch");
+    let err = prepare_artifacts(temp.path(), PrepareMode::Incremental)
+        .expect_err("must fail due to plugin_path mismatch");
     assert!(matches!(err, RuntimeError::PluginPathMismatch { .. }));
 }
 
@@ -352,15 +349,21 @@ fn plugin_path_mismatch_fails_fast() {
 fn optional_child_unavailable_does_not_block_parent() {
     let temp = setup_fixture_copy();
 
-    let root_manifest = temp.path().join("plugins/root/Cargo.toml");
-    let content = fs::read_to_string(&root_manifest).expect("read root manifest");
-    let patched = content.replace("required = true", "required = false");
-    fs::write(&root_manifest, patched).expect("write root manifest");
-
     let index_path = temp.path().join("artifacts/index.json");
     let index_content = fs::read_to_string(&index_path).expect("read index");
     let broken = index_content.replace("crate_child_v1", "crate_child_wrong");
     fs::write(&index_path, broken).expect("write broken index");
+    patch_index(&temp, |index| {
+        let entries = index
+            .get_mut("entries")
+            .and_then(|x| x.as_array_mut())
+            .expect("entries array");
+        let child = entries
+            .iter_mut()
+            .find(|x| x.get("plugin_path").and_then(|v| v.as_str()) == Some("root/child"))
+            .expect("child entry");
+        child["required"] = Value::Bool(false);
+    });
 
     let config = default_loader_config(temp.path());
     let loader = Loader::new(config);

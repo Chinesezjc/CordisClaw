@@ -9,8 +9,18 @@ pub use cordis_plugin_sdk::{
     RustPluginApiV2, RUST_PLUGIN_ENTRY_SYMBOL,
 };
 
+pub const ARTIFACT_INDEX_SCHEMA_VERSION: u32 = 2;
+
 fn default_required() -> bool {
     true
+}
+
+fn default_artifact_index_schema_version() -> u32 {
+    ARTIFACT_INDEX_SCHEMA_VERSION
+}
+
+fn default_artifact_kind() -> ArtifactKind {
+    ArtifactKind::Json
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -51,6 +61,26 @@ pub struct LoaderBudget {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactKind {
+    Dylib,
+    Json,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct InputProbe {
+    #[serde(default)]
+    pub files: Vec<InputProbeFile>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InputProbeFile {
+    pub path: String,
+    pub size: u64,
+    pub modified_at_ms: u128,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ArtifactIndexEntry {
     /// Identity key for lookup.
     pub plugin_path: String,
@@ -61,10 +91,33 @@ pub struct ArtifactIndexEntry {
     /// Content hash used to prevent tampering/drift.
     pub sha256: String,
     pub built_at: String,
+    #[serde(default)]
+    pub parent: Option<String>,
+    #[serde(default = "default_required")]
+    pub required: bool,
+    #[serde(default)]
+    pub grants_from_parent: Vec<String>,
+    pub docs: PluginDocs,
+    #[serde(default)]
+    pub exports: Vec<String>,
+    #[serde(default)]
+    pub execution: Option<PluginExecution>,
+    #[serde(default = "default_artifact_kind")]
+    pub artifact_kind: ArtifactKind,
+    pub build_fingerprint: String,
+    #[serde(default)]
+    pub input_probe: InputProbe,
+    #[serde(default)]
+    pub local_path_deps: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ArtifactIndex {
+    #[serde(default = "default_artifact_index_schema_version")]
+    pub schema_version: u32,
+    pub generated_at: String,
+    #[serde(default)]
+    pub topo_order: Vec<String>,
     pub entries: Vec<ArtifactIndexEntry>,
 }
 

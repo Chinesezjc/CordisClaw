@@ -1,19 +1,17 @@
 //! Plugin loader implementation.
 //! Flow:
-//! 1) resolve package tree and contracts
-//! 2) verify artifact index + fingerprint + hash
-//! 3) instantiate plugin runtime (dylib symbol or JSON artifact)
-//! 4) register plugins/nodes/context with required/optional propagation
+//! 1) read artifact index
+//! 2) verify artifact hash + availability
+//! 3) register plugins/nodes/context from index docs
+//! 4) defer dylib ABI/docs guard to first invoke
 
 use crate::core::error::RuntimeError;
-use crate::core::models::{DylibAbiKind, LoaderBudget, PluginLoadResult, PluginUnavailableReason};
+use crate::core::models::{ArtifactIndexEntry, ArtifactKind, LoaderBudget, PluginLoadResult, PluginUnavailableReason};
 use crate::context::{ContextRegistry, PluginHierarchy, RuntimeContext};
 use crate::plugin::artifact::{
-    load_artifact_index, load_plugin_artifact, resolve_artifact_path, sha256_file,
+    artifact_index_map, load_artifact_index, load_plugin_artifact, resolve_artifact_path, sha256_file,
     stage_artifact_bundle,
 };
-use crate::plugin::dynamic::{is_dylib_path, sidecar_json_path, LoadedDylibApi};
-use crate::plugin::package::PackageResolver;
 use crate::plugin::registry::{NodeRegistry, PluginRegistry};
 use crate::service::doc_registry::DocRegistry;
 use crate::service::graph_registry::GraphRegistry;
@@ -72,19 +70,15 @@ impl Loader {
     ) -> Result<LoadOutput, RuntimeError> {
         let started_at = Instant::now();
         let execution_id = make_execution_id();
-        // Phase A: discover + resolve tree from workspace roots.
-        let resolver = PackageResolver::new(&self.config.plugins_root);
-        let graph = resolver.resolve()?;
+        let index = load_artifact_index(&self.config.artifact_index_path)?;
         self.ensure_not_timed_out(started_at)?;
 
-        // Budget is enforced before touching artifacts.
-        let plugin_count = graph.plugins.len();
-        let declared_nodes = graph
-            .plugins
-            .values()
-            .map(|p| p.docs.nodes.len())
+        let plugin_count = index.entries.len();
+        let declared_nodes = index
+            .entries
+            .iter()
+            .map(|entry| entry.docs.nodes.len())
             .sum::<usize>();
-
         if plugin_count > self.config.budget.max_total_plugins
             || declared_nodes > self.config.budget.max_total_nodes
         {
@@ -96,48 +90,44 @@ impl Loader {
             });
         }
 
-        let index_map = load_artifact_index(&self.config.artifact_index_path)?;
-        self.ensure_not_timed_out(started_at)?;
-
-        let mut plugin_registry = PluginRegistry::default();
+        let index_map = artifact_index_map(&index);
+        let plugin_registry = PluginRegistry::default();
         let mut node_registry = NodeRegistry::default();
         let mut metrics = LoaderMetrics::default();
 
-        // Build parent/grants lookup table for context injection.
         let hierarchy = PluginHierarchy {
-            parent_of: graph
-                .plugins
+            parent_of: index_map
                 .iter()
-                .filter_map(|(path, plugin)| plugin.parent.as_ref().map(|p| (path.clone(), p.clone())))
+                .filter_map(|(path, entry)| entry.parent.as_ref().map(|parent| (path.clone(), parent.clone())))
                 .collect(),
-            grants_from_parent: graph
-                .plugins
+            grants_from_parent: index_map
                 .iter()
-                .map(|(path, plugin)| (path.clone(), plugin.grants_from_parent.clone()))
+                .map(|(path, entry)| {
+                    (
+                        path.clone(),
+                        entry.grants_from_parent.iter().cloned().collect(),
+                    )
+                })
                 .collect(),
         };
-
         let mut context = RuntimeContext::with_hierarchy(hierarchy);
 
-        // Phase B: instantiate plugins in resolved topological order.
-        for plugin_path in &graph.topo_order {
+        for plugin_path in &index.topo_order {
             self.ensure_not_timed_out(started_at)?;
-            let plugin = graph
-                .plugins
+            let entry = index_map
                 .get(plugin_path)
-                .ok_or_else(|| RuntimeError::Invariant {
-                    message: format!("missing plugin in graph: {plugin_path}"),
+                .ok_or_else(|| RuntimeError::ArtifactIndexMissing {
+                    plugin_path: plugin_path.clone(),
                 })?;
 
-            // Parent unavailable means this branch is blocked immediately.
-            if let Some(parent) = &plugin.parent {
+            if let Some(parent) = &entry.parent {
                 if let Some(parent_state) = plugin_registry.get(parent) {
                     if !matches!(parent_state.load_result, PluginLoadResult::Loaded) {
                         plugin_registry.insert_unavailable(
                             plugin_path.clone(),
-                            plugin.parent.clone(),
-                            plugin.required,
-                            plugin.grants_from_parent.clone(),
+                            entry.parent.clone(),
+                            entry.required,
+                            entry.grants_from_parent.iter().cloned().collect(),
                             PluginUnavailableReason::InitFailed,
                             Vec::new(),
                         );
@@ -151,108 +141,16 @@ impl Loader {
                 }
             }
 
-            // Current runtime only accepts pure Rust ABI for dylib.
-            if plugin.metadata.abi_kind != DylibAbiKind::Rust {
-                plugin_registry.insert_unavailable(
-                    plugin_path.clone(),
-                    plugin.parent.clone(),
-                    plugin.required,
-                    plugin.grants_from_parent.clone(),
-                    PluginUnavailableReason::ContractViolation,
-                    vec!["abi_kind must be rust".to_string()],
-                );
-                context.set_plugin_state(
-                    plugin_path,
-                    PluginLoadResult::Unavailable(PluginUnavailableReason::ContractViolation),
-                );
-                metrics.plugin_unavailable_total += 1;
-                if plugin.required {
-                    self.propagate_parent_failure(
-                        plugin_path,
-                        &graph.plugins,
-                        &mut plugin_registry,
-                        &mut node_registry,
-                        &mut context,
-                    );
-                }
-                continue;
-            }
-
-            // Every resolved plugin must have an explicit prebuilt artifact entry.
-            let index_entry = match index_map.get(plugin_path) {
-                Some(entry) => entry,
-                None => {
-                    plugin_registry.insert_unavailable(
-                        plugin_path.clone(),
-                        plugin.parent.clone(),
-                        plugin.required,
-                        plugin.grants_from_parent.clone(),
-                        PluginUnavailableReason::ArtifactMissing,
-                        vec!["artifact index entry missing".to_string()],
-                    );
-                    context.set_plugin_state(
-                        plugin_path,
-                        PluginLoadResult::Unavailable(PluginUnavailableReason::ArtifactMissing),
-                    );
-                    metrics.plugin_unavailable_total += 1;
-                    metrics.dylib_no_fallback_total += 1;
-                    if plugin.required {
-                        self.propagate_parent_failure(
-                            plugin_path,
-                            &graph.plugins,
-                            &mut plugin_registry,
-                            &mut node_registry,
-                            &mut context,
-                        );
-                    }
-                    continue;
-                }
-            };
-
-            // Strict fingerprint check: all fields must match.
-            if index_entry.abi_fingerprint != plugin.metadata.abi_fingerprint {
-                let diff = plugin
-                    .metadata
-                    .abi_fingerprint
-                    .diff(&index_entry.abi_fingerprint);
-                plugin_registry.insert_unavailable(
-                    plugin_path.clone(),
-                    plugin.parent.clone(),
-                    plugin.required,
-                    plugin.grants_from_parent.clone(),
-                    PluginUnavailableReason::AbiMismatch,
-                    diff,
-                );
-                context.set_plugin_state(
-                    plugin_path,
-                    PluginLoadResult::Unavailable(PluginUnavailableReason::AbiMismatch),
-                );
-                metrics.plugin_unavailable_total += 1;
-                metrics.dylib_abi_mismatch_total += 1;
-                metrics.dylib_no_fallback_total += 1;
-                if plugin.required {
-                    self.propagate_parent_failure(
-                        plugin_path,
-                        &graph.plugins,
-                        &mut plugin_registry,
-                        &mut node_registry,
-                        &mut context,
-                    );
-                }
-                continue;
-            }
-
             let resolved_artifact_path = resolve_artifact_path(
                 &self.config.artifact_index_path,
-                &index_entry.artifact_path,
+                &entry.artifact_path,
             );
-            // Missing artifact is terminal for this plugin (no cross-type fallback).
             if !resolved_artifact_path.exists() {
                 plugin_registry.insert_unavailable(
                     plugin_path.clone(),
-                    plugin.parent.clone(),
-                    plugin.required,
-                    plugin.grants_from_parent.clone(),
+                    entry.parent.clone(),
+                    entry.required,
+                    entry.grants_from_parent.iter().cloned().collect(),
                     PluginUnavailableReason::ArtifactMissing,
                     vec![format!(
                         "artifact does not exist: {}",
@@ -265,11 +163,11 @@ impl Loader {
                 );
                 metrics.plugin_unavailable_total += 1;
                 metrics.dylib_no_fallback_total += 1;
-                if plugin.required {
+                if entry.required {
                     self.propagate_parent_failure(
                         plugin_path,
-                        &graph.plugins,
-                        &mut plugin_registry,
+                        &index_map,
+                        &plugin_registry,
                         &mut node_registry,
                         &mut context,
                     );
@@ -277,16 +175,15 @@ impl Loader {
                 continue;
             }
 
-            // Hash check guarantees artifact content integrity.
             let actual_hash = sha256_file(&resolved_artifact_path)?;
-            if actual_hash != index_entry.sha256 {
+            if actual_hash != entry.sha256 {
                 plugin_registry.insert_unavailable(
                     plugin_path.clone(),
-                    plugin.parent.clone(),
-                    plugin.required,
-                    plugin.grants_from_parent.clone(),
+                    entry.parent.clone(),
+                    entry.required,
+                    entry.grants_from_parent.iter().cloned().collect(),
                     PluginUnavailableReason::HashMismatch,
-                    vec![format!("expected hash {}, got {}", index_entry.sha256, actual_hash)],
+                    vec![format!("expected hash {}, got {}", entry.sha256, actual_hash)],
                 );
                 context.set_plugin_state(
                     plugin_path,
@@ -294,11 +191,11 @@ impl Loader {
                 );
                 metrics.plugin_unavailable_total += 1;
                 metrics.dylib_no_fallback_total += 1;
-                if plugin.required {
+                if entry.required {
                     self.propagate_parent_failure(
                         plugin_path,
-                        &graph.plugins,
-                        &mut plugin_registry,
+                        &index_map,
+                        &plugin_registry,
                         &mut node_registry,
                         &mut context,
                     );
@@ -309,181 +206,21 @@ impl Loader {
             let artifact_path = match staged_root {
                 Some(root) => stage_artifact_bundle(
                     plugin_path,
-                    &index_entry.artifact_path,
+                    &entry.artifact_path,
                     &resolved_artifact_path,
                     root,
                 )?,
                 None => resolved_artifact_path,
             };
 
-            if is_dylib_path(&artifact_path) {
-                // Dylib path: load fixed Rust symbol table from shared object.
-                let dylib = match LoadedDylibApi::open(&artifact_path) {
-                    Ok(v) => v,
-                    Err(err) => {
-                        plugin_registry.insert_unavailable(
-                            plugin_path.clone(),
-                            plugin.parent.clone(),
-                            plugin.required,
-                            plugin.grants_from_parent.clone(),
-                            PluginUnavailableReason::SymbolMissing,
-                            vec![err.to_string()],
-                        );
-                        context.set_plugin_state(
-                            plugin_path,
-                            PluginLoadResult::Unavailable(PluginUnavailableReason::SymbolMissing),
-                        );
-                        metrics.plugin_unavailable_total += 1;
-                        metrics.dylib_no_fallback_total += 1;
-                        if plugin.required {
-                            self.propagate_parent_failure(
-                                plugin_path,
-                                &graph.plugins,
-                                &mut plugin_registry,
-                                &mut node_registry,
-                                &mut context,
-                            );
-                        }
-                        continue;
-                    }
-                };
-
-                let api = dylib.api();
-                if api.abi_kind != DylibAbiKind::Rust {
-                    plugin_registry.insert_unavailable(
-                        plugin_path.clone(),
-                        plugin.parent.clone(),
-                        plugin.required,
-                        plugin.grants_from_parent.clone(),
-                        PluginUnavailableReason::AbiMismatch,
-                        vec!["runtime exported abi_kind is not rust".to_string()],
-                    );
-                    context.set_plugin_state(
-                        plugin_path,
-                        PluginLoadResult::Unavailable(PluginUnavailableReason::AbiMismatch),
-                    );
-                    metrics.plugin_unavailable_total += 1;
-                    metrics.dylib_abi_mismatch_total += 1;
-                    metrics.dylib_no_fallback_total += 1;
-                    if plugin.required {
-                        self.propagate_parent_failure(
-                            plugin_path,
-                            &graph.plugins,
-                            &mut plugin_registry,
-                            &mut node_registry,
-                            &mut context,
-                        );
-                    }
-                    continue;
-                }
-
-                let runtime_fingerprint: crate::core::models::AbiFingerprint =
-                    serde_json::from_str(&(api.abi_fingerprint)().payload).map_err(|e| {
-                        RuntimeError::Io {
-                            path: artifact_path.clone(),
-                            message: format!("runtime fingerprint parse failed: {e}"),
-                        }
-                    })?;
-                // Validate runtime-exported fingerprint against resolved contract.
-                if runtime_fingerprint != plugin.metadata.abi_fingerprint {
-                    let diff = plugin
-                        .metadata
-                        .abi_fingerprint
-                        .diff(&runtime_fingerprint);
-                    plugin_registry.insert_unavailable(
-                        plugin_path.clone(),
-                        plugin.parent.clone(),
-                        plugin.required,
-                        plugin.grants_from_parent.clone(),
-                        PluginUnavailableReason::AbiMismatch,
-                        diff,
-                    );
-                    context.set_plugin_state(
-                        plugin_path,
-                        PluginLoadResult::Unavailable(PluginUnavailableReason::AbiMismatch),
-                    );
-                    metrics.plugin_unavailable_total += 1;
-                    metrics.dylib_abi_mismatch_total += 1;
-                    metrics.dylib_no_fallback_total += 1;
-                    if plugin.required {
-                        self.propagate_parent_failure(
-                            plugin_path,
-                            &graph.plugins,
-                            &mut plugin_registry,
-                            &mut node_registry,
-                            &mut context,
-                        );
-                    }
-                    continue;
-                }
-
-                let docs: crate::core::models::PluginDocs =
-                    serde_json::from_str(&(api.docs)().payload).map_err(|e| RuntimeError::Io {
-                        path: artifact_path.clone(),
-                        message: format!("runtime docs parse failed: {e}"),
-                    })?;
-                // Runtime docs must point back to the same plugin path.
-                if docs.plugin_path != *plugin_path {
-                    plugin_registry.insert_unavailable(
-                        plugin_path.clone(),
-                        plugin.parent.clone(),
-                        plugin.required,
-                        plugin.grants_from_parent.clone(),
-                        PluginUnavailableReason::ContractViolation,
-                        vec!["docs.plugin_path mismatch".to_string()],
-                    );
-                    context.set_plugin_state(
-                        plugin_path,
-                        PluginLoadResult::Unavailable(PluginUnavailableReason::ContractViolation),
-                    );
-                    metrics.plugin_unavailable_total += 1;
-                    metrics.dylib_no_fallback_total += 1;
-                    if plugin.required {
-                        self.propagate_parent_failure(
-                            plugin_path,
-                            &graph.plugins,
-                            &mut plugin_registry,
-                            &mut node_registry,
-                            &mut context,
-                        );
-                    }
-                    continue;
-                }
-
-                node_registry.register_from_docs(plugin_path, &docs)?;
-                plugin_registry.insert_loaded(
-                    plugin_path.clone(),
-                    plugin.parent.clone(),
-                    plugin.required,
-                    plugin.grants_from_parent.clone(),
-                    docs,
-                    artifact_path.clone(),
-                );
-                context.set_plugin_state(plugin_path, PluginLoadResult::Loaded);
-                context.ensure_local_scope(plugin_path);
-
-                let sidecar_path = sidecar_json_path(&artifact_path);
-                // Optional sidecar can export Local services for child injection.
-                if sidecar_path.exists() {
-                    let sidecar = load_plugin_artifact(&sidecar_path)?;
-                    for export in sidecar.exports {
-                        context.provide(
-                            crate::context::ContextScope::Local,
-                            Some(plugin_path),
-                            &export,
-                            format!("service:{plugin_path}:{export}"),
-                        )?;
-                    }
-                }
-            } else {
-                // JSON artifact path: fully materialized docs/exports in one file.
+            if matches!(entry.artifact_kind, ArtifactKind::Json) {
                 let artifact = load_plugin_artifact(&artifact_path)?;
                 if artifact.plugin_path != *plugin_path {
                     plugin_registry.insert_unavailable(
                         plugin_path.clone(),
-                        plugin.parent.clone(),
-                        plugin.required,
-                        plugin.grants_from_parent.clone(),
+                        entry.parent.clone(),
+                        entry.required,
+                        entry.grants_from_parent.iter().cloned().collect(),
                         PluginUnavailableReason::ContractViolation,
                         vec![format!(
                             "artifact.plugin_path mismatch, expected {}, got {}",
@@ -496,11 +233,11 @@ impl Loader {
                     );
                     metrics.plugin_unavailable_total += 1;
                     metrics.dylib_no_fallback_total += 1;
-                    if plugin.required {
+                    if entry.required {
                         self.propagate_parent_failure(
                             plugin_path,
-                            &graph.plugins,
-                            &mut plugin_registry,
+                            &index_map,
+                            &plugin_registry,
                             &mut node_registry,
                             &mut context,
                         );
@@ -508,18 +245,14 @@ impl Loader {
                     continue;
                 }
 
-                if artifact.abi_fingerprint != plugin.metadata.abi_fingerprint {
-                    let diff = plugin
-                        .metadata
-                        .abi_fingerprint
-                        .diff(&artifact.abi_fingerprint);
+                if artifact.abi_fingerprint != entry.abi_fingerprint {
                     plugin_registry.insert_unavailable(
                         plugin_path.clone(),
-                        plugin.parent.clone(),
-                        plugin.required,
-                        plugin.grants_from_parent.clone(),
+                        entry.parent.clone(),
+                        entry.required,
+                        entry.grants_from_parent.iter().cloned().collect(),
                         PluginUnavailableReason::AbiMismatch,
-                        diff,
+                        entry.abi_fingerprint.diff(&artifact.abi_fingerprint),
                     );
                     context.set_plugin_state(
                         plugin_path,
@@ -528,11 +261,11 @@ impl Loader {
                     metrics.plugin_unavailable_total += 1;
                     metrics.dylib_abi_mismatch_total += 1;
                     metrics.dylib_no_fallback_total += 1;
-                    if plugin.required {
+                    if entry.required {
                         self.propagate_parent_failure(
                             plugin_path,
-                            &graph.plugins,
-                            &mut plugin_registry,
+                            &index_map,
+                            &plugin_registry,
                             &mut node_registry,
                             &mut context,
                         );
@@ -540,57 +273,60 @@ impl Loader {
                     continue;
                 }
 
-                if artifact.docs.plugin_path != *plugin_path {
+                if artifact.docs != entry.docs {
                     plugin_registry.insert_unavailable(
                         plugin_path.clone(),
-                        plugin.parent.clone(),
-                        plugin.required,
-                        plugin.grants_from_parent.clone(),
+                        entry.parent.clone(),
+                        entry.required,
+                        entry.grants_from_parent.iter().cloned().collect(),
                         PluginUnavailableReason::ContractViolation,
-                        vec!["docs.plugin_path mismatch".to_string()],
+                        vec!["artifact docs mismatch".to_string()],
                     );
                     context.set_plugin_state(
                         plugin_path,
                         PluginLoadResult::Unavailable(PluginUnavailableReason::ContractViolation),
                     );
                     metrics.plugin_unavailable_total += 1;
-                    if plugin.required {
+                    metrics.dylib_no_fallback_total += 1;
+                    if entry.required {
                         self.propagate_parent_failure(
                             plugin_path,
-                            &graph.plugins,
-                            &mut plugin_registry,
+                            &index_map,
+                            &plugin_registry,
                             &mut node_registry,
                             &mut context,
                         );
                     }
                     continue;
                 }
+            }
 
-                node_registry.register_from_docs(plugin_path, &artifact.docs)?;
-                plugin_registry.insert_loaded(
-                    plugin_path.clone(),
-                    plugin.parent.clone(),
-                    plugin.required,
-                    plugin.grants_from_parent.clone(),
-                    artifact.docs,
-                    artifact_path,
-                );
-                context.set_plugin_state(plugin_path, PluginLoadResult::Loaded);
-                context.ensure_local_scope(plugin_path);
-                for export in artifact.exports {
-                    context.provide(
-                        crate::context::ContextScope::Local,
-                        Some(plugin_path),
-                        &export,
-                        format!("service:{plugin_path}:{export}"),
-                    )?;
-                }
+            node_registry.register_from_docs(plugin_path, &entry.docs)?;
+            plugin_registry.insert_loaded(
+                plugin_path.clone(),
+                entry.parent.clone(),
+                entry.required,
+                entry.grants_from_parent.iter().cloned().collect(),
+                entry.docs.clone(),
+                artifact_path,
+                entry.artifact_kind.clone(),
+                entry.abi_fingerprint.clone(),
+                entry.execution.clone(),
+            );
+            context.set_plugin_state(plugin_path, PluginLoadResult::Loaded);
+            context.ensure_local_scope(plugin_path);
+            for export in &entry.exports {
+                context.provide(
+                    crate::context::ContextScope::Local,
+                    Some(plugin_path),
+                    export,
+                    format!("service:{plugin_path}:{export}"),
+                )?;
             }
         }
 
         let doc_registry = DocRegistry::from_plugin_registry(&plugin_registry);
         let graph_registry = GraphRegistry::from_registries(&plugin_registry, &node_registry);
-
         Ok(LoadOutput {
             execution_id,
             plugin_registry,
@@ -605,15 +341,14 @@ impl Loader {
     fn propagate_parent_failure(
         &self,
         failed_plugin_path: &str,
-        plugins: &BTreeMap<String, crate::plugin::package::ResolvedPlugin>,
-        plugin_registry: &mut PluginRegistry,
+        entries: &BTreeMap<String, ArtifactIndexEntry>,
+        plugin_registry: &PluginRegistry,
         node_registry: &mut NodeRegistry,
         context: &mut RuntimeContext,
     ) {
-        // Required child failure bubbles upward until first non-required edge.
-        let mut current = plugins
+        let mut current = entries
             .get(failed_plugin_path)
-            .and_then(|plugin| plugin.parent.clone());
+            .and_then(|entry| entry.parent.clone());
 
         while let Some(parent_path) = current {
             plugin_registry.mark_unavailable(&parent_path, PluginUnavailableReason::InitFailed);
@@ -623,11 +358,9 @@ impl Loader {
                 PluginLoadResult::Unavailable(PluginUnavailableReason::InitFailed),
             );
 
-            let parent = match plugins.get(&parent_path) {
-                Some(v) => v,
-                None => break,
+            let Some(parent) = entries.get(&parent_path) else {
+                break;
             };
-
             if parent.required {
                 current = parent.parent.clone();
             } else {
@@ -654,7 +387,6 @@ pub fn default_loader_config(root: impl AsRef<Path>) -> LoaderConfig {
         plugins_root: root.join("plugins"),
         artifact_index_path: root.join("artifacts/index.json"),
         budget: LoaderBudget {
-            // Conservative defaults suitable for local prototype deployments.
             max_total_plugins: 256,
             max_total_nodes: 4096,
             load_timeout_ms: 30_000,

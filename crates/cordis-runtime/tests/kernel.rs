@@ -13,9 +13,11 @@ fn kernel_promotes_when_policy_and_evaluation_pass() {
     let report = kernel.run_once(IterationInput {
         issue_id: "issue-1".to_string(),
         patch_id: "patch-1".to_string(),
+        patch_kind: "text".to_string(),
         changed_paths: vec!["crates/cordis-runtime/src/execution/engine.rs".to_string()],
         diff_lines: 120,
         manual_approved: false,
+        verification_profile: Some("default".to_string()),
         verification: VerificationInput {
             tests_passed: true,
             safety_checks_passed: true,
@@ -48,9 +50,11 @@ fn kernel_rolls_back_on_path_violation() {
     let report = kernel.run_once(IterationInput {
         issue_id: "issue-2".to_string(),
         patch_id: "patch-2".to_string(),
+        patch_kind: "text".to_string(),
         changed_paths: vec!["scripts/unsafe.sh".to_string()],
         diff_lines: 10,
         manual_approved: false,
+        verification_profile: Some("default".to_string()),
         verification: VerificationInput {
             tests_passed: true,
             safety_checks_passed: true,
@@ -79,9 +83,11 @@ fn kernel_rolls_back_on_quality_failure() {
     let report = kernel.run_once(IterationInput {
         issue_id: "issue-3".to_string(),
         patch_id: "patch-3".to_string(),
+        patch_kind: "text".to_string(),
         changed_paths: vec!["docs/rs-files-responsibility.md".to_string()],
         diff_lines: 30,
         manual_approved: false,
+        verification_profile: Some("default".to_string()),
         verification: VerificationInput {
             tests_passed: true,
             safety_checks_passed: true,
@@ -112,9 +118,11 @@ fn kernel_rolls_back_when_sensitive_change_has_no_manual_approval() {
     let report = kernel.run_once(IterationInput {
         issue_id: "issue-4".to_string(),
         patch_id: "patch-4".to_string(),
+        patch_kind: "text".to_string(),
         changed_paths: vec!["crates/cordis-runtime/src/core/error.rs".to_string()],
         diff_lines: 20,
         manual_approved: false,
+        verification_profile: Some("default".to_string()),
         verification: VerificationInput {
             tests_passed: true,
             safety_checks_passed: true,

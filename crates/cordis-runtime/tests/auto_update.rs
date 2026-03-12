@@ -4,6 +4,7 @@ use cordis_runtime::kernel::evaluator::{EvalHarness, VerificationInput};
 use cordis_runtime::kernel::memory::ChangeVerdict;
 use cordis_runtime::kernel::policy::IterationPolicy;
 use cordis_runtime::kernel::r#loop::SelfIterationKernel;
+use serde_json::json;
 use std::fs;
 use tempfile::TempDir;
 
@@ -40,11 +41,7 @@ fn auto_update_apply_and_promote_keeps_changes() {
                 patch_id: "patch-1".to_string(),
                 manual_approved: false,
                 diff_lines: 1,
-                patches: vec![FilePatch {
-                    path: "demo.txt".to_string(),
-                    find: "old".to_string(),
-                    replace: "new".to_string(),
-                }],
+                patches: vec![FilePatch::text("demo.txt", "old", "new")],
             },
             |_| {
                 Ok(VerificationInput {
@@ -52,6 +49,7 @@ fn auto_update_apply_and_promote_keeps_changes() {
                     safety_checks_passed: true,
                     quality_score: 95,
                 })
+                .map(Into::into)
             },
         )
         .expect("auto update should succeed");
@@ -78,11 +76,7 @@ fn auto_update_verify_failure_rolls_back_changes() {
                 patch_id: "patch-2".to_string(),
                 manual_approved: false,
                 diff_lines: 1,
-                patches: vec![FilePatch {
-                    path: "demo.txt".to_string(),
-                    find: "old".to_string(),
-                    replace: "new".to_string(),
-                }],
+                patches: vec![FilePatch::text("demo.txt", "old", "new")],
             },
             |_| {
                 Ok(VerificationInput {
@@ -90,6 +84,7 @@ fn auto_update_verify_failure_rolls_back_changes() {
                     safety_checks_passed: true,
                     quality_score: 95,
                 })
+                .map(Into::into)
             },
         )
         .expect("auto update should complete with rollback verdict");
@@ -113,11 +108,7 @@ fn auto_update_rejects_parent_dir_traversal() {
                 patch_id: "patch-3".to_string(),
                 manual_approved: false,
                 diff_lines: 1,
-                patches: vec![FilePatch {
-                    path: "../escape.txt".to_string(),
-                    find: "a".to_string(),
-                    replace: "b".to_string(),
-                }],
+                patches: vec![FilePatch::text("../escape.txt", "a", "b")],
             },
             |_| {
                 Ok(VerificationInput {
@@ -125,9 +116,86 @@ fn auto_update_rejects_parent_dir_traversal() {
                     safety_checks_passed: true,
                     quality_score: 95,
                 })
+                .map(Into::into)
             },
         )
         .expect_err("traversal must be rejected");
 
     assert!(matches!(err, RuntimeError::AutoUpdateInvalidPath { .. }));
+}
+
+#[test]
+fn auto_update_supports_structured_json_patch() {
+    let temp = TempDir::new().expect("tempdir");
+    let file = temp.path().join("config.json");
+    fs::write(&file, "{\n  \"enabled\": false,\n  \"name\": \"demo\"\n}\n").expect("write config");
+
+    let mut kernel = make_kernel();
+    let updater = AutoUpdater::new(temp.path());
+    let result = updater
+        .execute(
+            &mut kernel,
+            AutoUpdatePlan {
+                issue_id: "issue-json".to_string(),
+                patch_id: "patch-json".to_string(),
+                manual_approved: false,
+                diff_lines: 1,
+                patches: vec![FilePatch::json_value("config.json", "/enabled", json!(true))],
+            },
+            |_| {
+                Ok(VerificationInput {
+                    tests_passed: true,
+                    safety_checks_passed: true,
+                    quality_score: 95,
+                })
+                .map(Into::into)
+            },
+        )
+        .expect("json patch should succeed");
+
+    assert_eq!(result.report.verdict, ChangeVerdict::Promote);
+    let content = fs::read_to_string(&file).expect("read config");
+    assert!(content.contains("\"enabled\": true"), "content: {content}");
+}
+
+#[test]
+fn auto_update_supports_structured_toml_patch() {
+    let temp = TempDir::new().expect("tempdir");
+    let file = temp.path().join("runtime.toml");
+    fs::write(
+        &file,
+        "[runtime]\nenabled = false\n[limits]\nmax_retries = 1\n",
+    )
+    .expect("write toml");
+
+    let mut kernel = make_kernel();
+    let updater = AutoUpdater::new(temp.path());
+    let result = updater
+        .execute(
+            &mut kernel,
+            AutoUpdatePlan {
+                issue_id: "issue-toml".to_string(),
+                patch_id: "patch-toml".to_string(),
+                manual_approved: false,
+                diff_lines: 1,
+                patches: vec![FilePatch::toml_value(
+                    "runtime.toml",
+                    "limits.max_retries",
+                    json!(3),
+                )],
+            },
+            |_| {
+                Ok(VerificationInput {
+                    tests_passed: true,
+                    safety_checks_passed: true,
+                    quality_score: 95,
+                })
+                .map(Into::into)
+            },
+        )
+        .expect("toml patch should succeed");
+
+    assert_eq!(result.report.verdict, ChangeVerdict::Promote);
+    let content = fs::read_to_string(&file).expect("read toml");
+    assert!(content.contains("max_retries = 3"), "content: {content}");
 }

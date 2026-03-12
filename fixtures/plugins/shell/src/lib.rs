@@ -2,8 +2,7 @@ use cordis_plugin_sdk::{
     export_plugin_api, json_response, node_doc, plugin_docs, AbiFingerprint, NodeDoc, PluginDocs,
     PluginRequest, PluginResponse,
 };
-use cordis_runtime::plugin::invoke::PluginInvoker;
-use cordis_runtime::plugin::registry::{PluginRegistry, RegisteredPlugin};
+use cordis_plugin_host::{default_fixtures_root, CatalogPlugin, PluginCatalog};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -69,7 +68,7 @@ impl ShellPlugin {
             .fixtures_root
             .map(PathBuf::from)
             .or_else(|| self.fixtures_root.clone())
-            .unwrap_or_else(PluginInvoker::default_fixtures_root);
+            .unwrap_or_else(default_fixtures_root);
 
         let mut shell = BuiltinShell::new(req.cwd, fixtures_root)?;
         if let Some(script) = req.command {
@@ -115,7 +114,8 @@ struct ScriptRunResult {
 struct BuiltinShell {
     cwd: PathBuf,
     env: BTreeMap<String, String>,
-    fixtures_root: PathBuf,
+    plugin_catalog: Option<PluginCatalog>,
+    plugin_catalog_error: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -136,10 +136,16 @@ impl BuiltinShell {
         env.insert("LOGNAME".to_string(), "CordisClaw".to_string());
         env.insert("USERNAME".to_string(), "CordisClaw".to_string());
 
+        let (plugin_catalog, plugin_catalog_error) = match PluginCatalog::load(&fixtures_root) {
+            Ok(catalog) => (Some(catalog), None),
+            Err(err) => (None, Some(err.to_string())),
+        };
+
         Ok(Self {
             cwd,
             env,
-            fixtures_root,
+            plugin_catalog,
+            plugin_catalog_error,
         })
     }
 
@@ -298,8 +304,8 @@ impl BuiltinShell {
             "env".to_string(),
         ];
 
-        if let Ok(invoker) = PluginInvoker::load(&self.fixtures_root) {
-            commands.extend(available_shell_commands(invoker.plugin_registry()));
+        if let Some(catalog) = &self.plugin_catalog {
+            commands.extend(available_shell_commands(catalog));
         }
         commands.push("exit".to_string());
 
@@ -307,17 +313,18 @@ impl BuiltinShell {
     }
 
     fn run_plugin_command(&self, command: &str, args: &[String]) -> CommandOutcome {
-        let invoker = match PluginInvoker::load(&self.fixtures_root) {
-            Ok(invoker) => invoker,
-            Err(err) => {
-                return CommandOutcome::Continue {
-                    exit_code: 1,
-                    output: format!("{command} error: {err}"),
-                };
-            }
+        let Some(catalog) = &self.plugin_catalog else {
+            let message = self
+                .plugin_catalog_error
+                .clone()
+                .unwrap_or_else(|| "plugin catalog unavailable".to_string());
+            return CommandOutcome::Continue {
+                exit_code: 1,
+                output: format!("{command} error: {message}"),
+            };
         };
 
-        let Some(binding) = (match resolve_shell_command(invoker.plugin_registry(), command) {
+        let Some(binding) = (match resolve_shell_command(catalog, command) {
             Ok(binding) => binding,
             Err(message) => {
                 return CommandOutcome::Continue {
@@ -342,7 +349,7 @@ impl BuiltinShell {
             }
         };
 
-        let response = match invoker.invoke(&binding.plugin_path, &binding.node.id, payload) {
+        let response = match catalog.invoke(&binding.plugin_path, &binding.node.id, payload) {
             Ok(response) => response,
             Err(err) => {
                 return CommandOutcome::Continue {
@@ -363,10 +370,10 @@ struct ShellCommandBinding {
     node: NodeDoc,
 }
 
-fn available_shell_commands(plugin_registry: &PluginRegistry) -> Vec<String> {
-    let mut commands = plugin_registry
-        .iter()
-        .filter_map(|(_, plugin)| shell_command_binding(plugin).ok().flatten())
+fn available_shell_commands(plugin_catalog: &PluginCatalog) -> Vec<String> {
+    let mut commands = plugin_catalog
+        .plugins()
+        .filter_map(shell_command_binding)
         .map(|binding| binding.display_name)
         .collect::<Vec<_>>();
     commands.sort();
@@ -374,17 +381,13 @@ fn available_shell_commands(plugin_registry: &PluginRegistry) -> Vec<String> {
     commands
 }
 
-fn resolve_shell_command(
-    plugin_registry: &PluginRegistry,
-    command: &str,
-) -> Result<Option<ShellCommandBinding>, String> {
+fn resolve_shell_command(plugin_catalog: &PluginCatalog, command: &str) -> Result<Option<ShellCommandBinding>, String> {
     let mut matches = Vec::new();
-    for (_, plugin) in plugin_registry.iter() {
-        if let Some(binding) = shell_command_binding(plugin).map_err(|err| err.to_string())? {
-            if !binding.display_name.eq_ignore_ascii_case(command) {
-                continue;
+    for plugin in plugin_catalog.plugins() {
+        if let Some(binding) = shell_command_binding(plugin) {
+            if binding.display_name.eq_ignore_ascii_case(command) {
+                matches.push(binding);
             }
-            matches.push(binding);
         }
     }
 
@@ -404,25 +407,20 @@ fn resolve_shell_command(
     }
 }
 
-fn shell_command_binding(plugin: &RegisteredPlugin) -> Result<Option<ShellCommandBinding>, String> {
+fn shell_command_binding(plugin: &CatalogPlugin) -> Option<ShellCommandBinding> {
     if plugin.plugin_path == "shell" {
-        return Ok(None);
+        return None;
     }
-    let Some(docs) = &plugin.docs else {
-        return Ok(None);
-    };
-    let Some(display_name) = docs.command_name.clone() else {
-        return Ok(None);
-    };
-    if docs.nodes.len() != 1 {
-        return Ok(None);
+    let display_name = plugin.docs.command_name.clone()?;
+    if plugin.docs.nodes.len() != 1 {
+        return None;
     }
 
-    Ok(Some(ShellCommandBinding {
+    Some(ShellCommandBinding {
         plugin_path: plugin.plugin_path.clone(),
         display_name,
-        node: docs.nodes[0].clone(),
-    }))
+        node: plugin.docs.nodes[0].clone(),
+    })
 }
 
 fn build_shell_payload(node: &NodeDoc, display_name: &str, raw_args: &str) -> Result<String, String> {

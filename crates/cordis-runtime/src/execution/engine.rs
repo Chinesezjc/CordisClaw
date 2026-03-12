@@ -10,6 +10,7 @@ use crate::execution::dag::{build_dag, DagBuildPolicy, DagGraph, DagNodeSpec};
 use crate::execution::gate::{evaluate_gate, BackoffPolicy, GateDecision, RunPolicy};
 use crate::execution::router::{execute_router, RouterMetrics};
 use crate::execution::scheduler::SchedulerConfig;
+use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::thread::sleep;
@@ -45,7 +46,7 @@ impl Default for ExecutionConfig {
     }
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ExecutionMetrics {
     pub dag_build_ms: u128,
     pub dag_cycle_detected_total: u64,
@@ -55,7 +56,7 @@ pub struct ExecutionMetrics {
     pub router: RouterMetrics,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ExecutionOutput {
     pub execution_id: String,
     /// Actual node execution attempts order (includes retries).

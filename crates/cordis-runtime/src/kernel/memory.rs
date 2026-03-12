@@ -14,8 +14,11 @@ pub enum ChangeVerdict {
 pub struct ChangeRecord {
     pub issue_id: String,
     pub patch_id: String,
+    pub patch_kind: String,
+    pub verification_profile: Option<String>,
     pub verdict: ChangeVerdict,
     pub quality_score: u32,
+    pub reasons: Vec<String>,
     pub observed_at_ms: u128,
 }
 
@@ -47,8 +50,11 @@ impl ChangeMemory {
         &mut self,
         issue_id: impl Into<String>,
         patch_id: impl Into<String>,
+        patch_kind: impl Into<String>,
+        verification_profile: Option<String>,
         verdict: ChangeVerdict,
         quality_score: u32,
+        reasons: Vec<String>,
     ) {
         let observed_at_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -57,8 +63,11 @@ impl ChangeMemory {
         self.records.push_back(ChangeRecord {
             issue_id: issue_id.into(),
             patch_id: patch_id.into(),
+            patch_kind: patch_kind.into(),
+            verification_profile,
             verdict,
             quality_score,
+            reasons,
             observed_at_ms,
         });
         while self.records.len() > self.limit {

@@ -1,9 +1,11 @@
 [workspace]
 members = [
+  "crates/cordis-plugin-host",
   "crates/cordis-plugin-sdk",
   "crates/cordis-runtime",
 ]
 default-members = [
+  "crates/cordis-plugin-host",
   "crates/cordis-plugin-sdk",
   "crates/cordis-runtime",
 ]

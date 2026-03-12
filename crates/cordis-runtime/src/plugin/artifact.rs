@@ -1,36 +1,43 @@
 use crate::core::error::RuntimeError;
-use crate::core::models::{ArtifactIndex, ArtifactIndexEntry, PluginArtifact, PluginExecution};
+use crate::core::models::{
+    ArtifactIndex, ArtifactIndexEntry, PluginArtifact, PluginExecution, ARTIFACT_INDEX_SCHEMA_VERSION,
+};
 use crate::plugin::dynamic::{is_dylib_path, sidecar_json_path};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
-pub fn load_artifact_index(path: &Path) -> Result<BTreeMap<String, ArtifactIndexEntry>, RuntimeError> {
+pub fn load_artifact_index(path: &Path) -> Result<ArtifactIndex, RuntimeError> {
     let text = fs::read_to_string(path).map_err(|e| RuntimeError::Io {
         path: path.to_path_buf(),
         message: e.to_string(),
     })?;
 
-    let entries: Vec<ArtifactIndexEntry> = if text.trim_start().starts_with('[') {
-        serde_json::from_str(&text).map_err(|e| RuntimeError::ArtifactIndexParse {
+    let index = serde_json::from_str::<ArtifactIndex>(&text).map_err(|e| RuntimeError::ArtifactIndexParse {
+        path: path.to_path_buf(),
+        message: e.to_string(),
+    })?;
+    if index.schema_version != ARTIFACT_INDEX_SCHEMA_VERSION {
+        return Err(RuntimeError::ArtifactIndexParse {
             path: path.to_path_buf(),
-            message: e.to_string(),
-        })?
-    } else {
-        serde_json::from_str::<ArtifactIndex>(&text)
-            .map_err(|e| RuntimeError::ArtifactIndexParse {
-                path: path.to_path_buf(),
-                message: e.to_string(),
-            })?
-            .entries
-    };
-
-    let mut map = BTreeMap::new();
-    for entry in entries {
-        map.insert(entry.plugin_path.clone(), entry);
+            message: format!(
+                "unsupported schema_version {}, expected {}",
+                index.schema_version, ARTIFACT_INDEX_SCHEMA_VERSION
+            ),
+        });
     }
-    Ok(map)
+    Ok(index)
+}
+
+pub fn artifact_index_map(index: &ArtifactIndex) -> BTreeMap<String, ArtifactIndexEntry> {
+    index
+        .entries
+        .iter()
+        .cloned()
+        .map(|entry| (entry.plugin_path.clone(), entry))
+        .collect()
 }
 
 pub fn resolve_artifact_path(index_path: &Path, artifact_path: &str) -> PathBuf {
@@ -46,13 +53,23 @@ pub fn resolve_artifact_path(index_path: &Path, artifact_path: &str) -> PathBuf 
 }
 
 pub fn sha256_file(path: &Path) -> Result<String, RuntimeError> {
-    let bytes = fs::read(path).map_err(|e| RuntimeError::Io {
+    let mut file = fs::File::open(path).map_err(|e| RuntimeError::Io {
         path: path.to_path_buf(),
         message: e.to_string(),
     })?;
 
     let mut hasher = Sha256::new();
-    hasher.update(bytes);
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let read = file.read(&mut buffer).map_err(|e| RuntimeError::Io {
+            path: path.to_path_buf(),
+            message: e.to_string(),
+        })?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
     Ok(hex::encode(hasher.finalize()))
 }
 

@@ -26,7 +26,7 @@ pub struct PlanRequest {
     pub manual_approved: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PlannedUpdate {
     pub plan: AutoUpdatePlan,
     pub summary: String,
@@ -36,7 +36,7 @@ pub struct PlannedUpdate {
     pub response_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 struct PlannerPayload {
     summary: String,
     #[serde(default)]
@@ -325,7 +325,12 @@ fn build_user_prompt(
     prompt.push_str("\nGeneric verifier command formats:\n");
     prompt.push_str("- shell command string executed in the workspace root\n");
     prompt.push_str("- plugin verifier spec: plugin:{\"plugin_path\":\"<plugin_path>\",\"node_id\":\"<node_id>\",\"payload_json\":{},\"expect_substring\":\"<expected text>\",\"fixtures_root\":\"<optional fixtures root>\"}\n");
+    prompt.push_str("Prefer plugin verifier specs over shell commands when a discovered plugin can validate the requested behavior directly.\n");
     prompt.push_str("Use only plugin_path/node_id pairs that appear in the discovered plugin catalog below. `command_name` is an optional human-facing alias and not required in plugin verifier specs.\n");
+    prompt.push_str("\nSupported patch kinds:\n");
+    prompt.push_str("- text: use `find` + `replace` for source edits\n");
+    prompt.push_str("- json_value: use `pointer` + `value` for JSON config edits\n");
+    prompt.push_str("- toml_value: use `dotted_key` + `value` for TOML config edits\n");
     prompt.push_str("\nDiscovered plugin capability catalog:\n");
     match plugin_catalog {
         Some(catalog) => prompt.push_str(&render_plugin_catalog(catalog)),
@@ -409,15 +414,16 @@ fn render_plugin_catalog(catalog: &PromptPluginCatalog) -> String {
 fn openai_system_prompt() -> &'static str {
     "You are a guarded patch planner for a Rust workspace. Return only JSON that matches the provided schema. \
 Only edit the allowed relative paths. Each patch must use an exact substring from the current file contents in `find`. \
-Keep changes minimal, deterministic, and safe. Do not invent files, do not use absolute paths, do not invent plugin capabilities beyond the provided catalog, and do not include markdown. \
+Keep changes minimal, deterministic, and safe. Prefer `json_value`/`toml_value` patches for JSON or TOML config files and prefer plugin verifier specs over shell commands when the plugin catalog is sufficient. \
+Do not invent files, do not use absolute paths, do not invent plugin capabilities beyond the provided catalog, and do not include markdown. \
 When you can infer reliable verification steps from the request and plugin catalog, include `tests_command` and/or `safety_command`; otherwise leave them null or omit them."
 }
 
 fn deepseek_system_prompt() -> &'static str {
     "You are a guarded patch planner for a Rust workspace. Return exactly one JSON object and no markdown. \
-The JSON must use this shape: {\"summary\":\"short summary\",\"tests_command\":\"optional verifier command or null\",\"safety_command\":\"optional verifier command or null\",\"patches\":[{\"path\":\"relative/path.txt\",\"find\":\"exact old text\",\"replace\":\"new text\"}]}. \
-Only edit the allowed relative paths. Each patch must use an exact substring from the current file contents in `find`. \
-Keep changes minimal, deterministic, and safe. Do not invent files, do not use absolute paths, do not invent plugin capabilities beyond the provided catalog, and do not include extra keys. \
+The JSON must use this shape: {\"summary\":\"short summary\",\"tests_command\":\"optional verifier command or null\",\"safety_command\":\"optional verifier command or null\",\"patches\":[{\"path\":\"relative/path.txt\",\"kind\":\"text|json_value|toml_value\",\"find\":\"exact old text when kind=text\",\"replace\":\"new text when kind=text\",\"pointer\":\"json pointer when kind=json_value\",\"dotted_key\":\"toml dotted key when kind=toml_value\",\"value\":\"replacement value when kind is structured\"}]}. \
+Only edit the allowed relative paths. Each text patch must use an exact substring from the current file contents in `find`. \
+Keep changes minimal, deterministic, and safe. Prefer `json_value`/`toml_value` patches for JSON or TOML config files and prefer plugin verifier specs over shell commands when the plugin catalog is sufficient. Do not invent files, do not use absolute paths, do not invent plugin capabilities beyond the provided catalog, and do not include extra keys. \
 When you can infer reliable verification steps from the request and plugin catalog, include `tests_command` and/or `safety_command`; otherwise set them to null."
 }
 
@@ -445,15 +451,28 @@ fn plan_schema() -> Value {
                         "path": {
                             "type": "string"
                         },
+                        "kind": {
+                            "type": "string",
+                            "enum": ["text", "json_value", "toml_value"]
+                        },
                         "find": {
                             "type": "string",
-                            "minLength": 1
+                            "default": ""
                         },
                         "replace": {
                             "type": "string"
+                        },
+                        "pointer": {
+                            "type": ["string", "null"]
+                        },
+                        "dotted_key": {
+                            "type": ["string", "null"]
+                        },
+                        "value": {
+                            "type": ["object", "array", "string", "number", "integer", "boolean", "null"]
                         }
                     },
-                    "required": ["path", "find", "replace"]
+                    "required": ["path"]
                 }
             }
         },
@@ -564,6 +583,7 @@ fn validate_patch_paths(
     allowed_paths: &BTreeSet<String>,
 ) -> Result<(), RuntimeError> {
     for patch in patches {
+        patch.validate_shape()?;
         let normalized = normalize_rel_path(&patch.path)?;
         if !allowed_paths.contains(&normalized) {
             return Err(RuntimeError::LlmResponseInvalid {
@@ -604,17 +624,7 @@ fn normalize_rel_path(path: &str) -> Result<String, RuntimeError> {
 }
 
 fn estimate_diff_lines(patches: &[FilePatch]) -> usize {
-    patches
-        .iter()
-        .map(|patch| {
-            patch
-                .find
-                .lines()
-                .count()
-                .max(patch.replace.lines().count())
-                .max(1)
-        })
-        .sum()
+    patches.iter().map(FilePatch::diff_line_estimate).sum()
 }
 
 fn api_key_env_looks_like_secret(value: &str) -> bool {
