@@ -217,6 +217,7 @@ pub struct ExecutionInvocationTrace {
 #[serde(rename_all = "snake_case")]
 pub enum ReloadAttemptStatus {
     Reloaded,
+    Staged,
     Failed,
 }
 
@@ -241,11 +242,27 @@ pub struct ReloadAttemptReport {
     pub snapshot_root: String,
     pub staged_artifact_root: String,
     pub elapsed_ms: u128,
+    pub plugin_count: Option<usize>,
+    pub node_count: Option<usize>,
     pub added_plugins: Vec<String>,
     pub removed_plugins: Vec<String>,
     pub changed_plugins: Vec<String>,
     pub changed_plugin_reasons: BTreeMap<String, Vec<String>>,
     pub failure_summary: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CandidateSnapshotStatus {
+    pub from_snapshot_id: String,
+    pub candidate_snapshot_id: String,
+    pub snapshot_root: String,
+    pub staged_artifact_root: String,
+    pub plugin_count: usize,
+    pub node_count: usize,
+    pub added_plugins: Vec<String>,
+    pub removed_plugins: Vec<String>,
+    pub changed_plugins: Vec<String>,
+    pub changed_plugin_reasons: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -264,7 +281,9 @@ pub struct RuntimeHostStatus {
     pub current_snapshot_id: String,
     pub plugin_count: usize,
     pub node_count: usize,
+    pub candidate_snapshot: Option<CandidateSnapshotStatus>,
     pub last_reload: Option<ReloadAttemptReport>,
+    pub last_candidate_reload: Option<ReloadAttemptReport>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -453,8 +472,10 @@ pub struct RuntimeHost {
     loader: Loader,
     snapshot_root: PathBuf,
     current_snapshot: RwLock<Arc<RuntimeSnapshot>>,
+    candidate_snapshot: Mutex<Option<StagedCandidateSnapshot>>,
     retired_snapshots: Mutex<Vec<RetiredSnapshot>>,
     last_reload_attempt: Mutex<Option<ReloadAttemptReport>>,
+    last_candidate_reload_attempt: Mutex<Option<ReloadAttemptReport>>,
     kernel: RuntimeKernel,
 }
 
@@ -462,6 +483,12 @@ pub struct RuntimeHost {
 struct RetiredSnapshot {
     snapshot: Weak<RuntimeSnapshot>,
     staged_artifact_root: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+struct StagedCandidateSnapshot {
+    snapshot: Arc<RuntimeSnapshot>,
+    status: CandidateSnapshotStatus,
 }
 
 impl RuntimeHost {
@@ -485,8 +512,10 @@ impl RuntimeHost {
             loader,
             snapshot_root,
             current_snapshot: RwLock::new(initial_snapshot),
+            candidate_snapshot: Mutex::new(None),
             retired_snapshots: Mutex::new(Vec::new()),
             last_reload_attempt: Mutex::new(None),
+            last_candidate_reload_attempt: Mutex::new(None),
         })
     }
 
@@ -513,7 +542,9 @@ impl RuntimeHost {
             current_snapshot_id: snapshot.snapshot_id().to_string(),
             plugin_count: snapshot.plugin_registry().iter().count(),
             node_count: snapshot.node_registry().len(),
+            candidate_snapshot: self.candidate_status(),
             last_reload: self.last_reload_attempt(),
+            last_candidate_reload: self.last_candidate_reload_attempt(),
         }
     }
 
@@ -522,6 +553,29 @@ impl RuntimeHost {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
             .clone()
+    }
+
+    pub fn last_candidate_reload_attempt(&self) -> Option<ReloadAttemptReport> {
+        self.last_candidate_reload_attempt
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone()
+    }
+
+    pub fn candidate_snapshot(&self) -> Option<Arc<RuntimeSnapshot>> {
+        self.candidate_snapshot
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .as_ref()
+            .map(|candidate| candidate.snapshot.clone())
+    }
+
+    pub fn candidate_status(&self) -> Option<CandidateSnapshotStatus> {
+        self.candidate_snapshot
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .as_ref()
+            .map(|candidate| candidate.status.clone())
     }
 
     pub fn invoke(
@@ -536,12 +590,39 @@ impl RuntimeHost {
         response
     }
 
+    pub fn invoke_candidate(
+        &self,
+        plugin_path: &str,
+        node_id: &str,
+        payload: String,
+    ) -> Result<PluginResponse, RuntimeError> {
+        let snapshot = self
+            .candidate_snapshot()
+            .ok_or(RuntimeError::CandidateSnapshotMissing)?;
+        let response = snapshot.invoke(plugin_path, node_id, payload);
+        self.cleanup_retired_snapshots();
+        response
+    }
+
     pub fn execute(
         &self,
         target_node_fqn: &str,
         payload: Value,
     ) -> Result<RuntimeExecutionResult, RuntimeError> {
         let snapshot = self.current_snapshot();
+        let result = snapshot.execute_registered_target(target_node_fqn, payload);
+        self.cleanup_retired_snapshots();
+        result
+    }
+
+    pub fn execute_candidate(
+        &self,
+        target_node_fqn: &str,
+        payload: Value,
+    ) -> Result<RuntimeExecutionResult, RuntimeError> {
+        let snapshot = self
+            .candidate_snapshot()
+            .ok_or(RuntimeError::CandidateSnapshotMissing)?;
         let result = snapshot.execute_registered_target(target_node_fqn, payload);
         self.cleanup_retired_snapshots();
         result
@@ -573,6 +654,77 @@ impl RuntimeHost {
         }
     }
 
+    pub fn reload_candidate(&self) -> Result<CandidateSnapshotStatus, RuntimeError> {
+        match self.reload_candidate_internal() {
+            Ok((status, attempt)) => {
+                self.record_candidate_reload_attempt(attempt);
+                Ok(status)
+            }
+            Err((err, attempt)) => {
+                self.record_candidate_reload_attempt(attempt);
+                Err(err)
+            }
+        }
+    }
+
+    pub fn reload_candidate_with_diagnostics(&self) -> ReloadAttemptReport {
+        match self.reload_candidate_internal() {
+            Ok((_, attempt)) => {
+                self.record_candidate_reload_attempt(attempt.clone());
+                attempt
+            }
+            Err((_, attempt)) => {
+                self.record_candidate_reload_attempt(attempt.clone());
+                attempt
+            }
+        }
+    }
+
+    pub fn promote_candidate(&self) -> Result<ReloadReport, RuntimeError> {
+        let previous_snapshot = self.current_snapshot();
+        let candidate = self
+            .candidate_snapshot
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .take()
+            .ok_or(RuntimeError::CandidateSnapshotMissing)?;
+        let next_snapshot = candidate.snapshot;
+        {
+            let mut guard = self
+                .current_snapshot
+                .write()
+                .unwrap_or_else(|poison| poison.into_inner());
+            *guard = next_snapshot.clone();
+        }
+
+        let report = ReloadReport::from_snapshots(
+            previous_snapshot.as_ref(),
+            next_snapshot.as_ref(),
+            &self.snapshot_root,
+            0,
+        );
+        self.record_reload_attempt(ReloadAttemptReport::from_report(
+            &report,
+            next_snapshot.as_ref(),
+        ));
+        self.retire_snapshot(previous_snapshot);
+        self.cleanup_retired_snapshots();
+        Ok(report)
+    }
+
+    pub fn rollback_candidate(&self) -> Result<CandidateSnapshotStatus, RuntimeError> {
+        let candidate = self
+            .candidate_snapshot
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .take()
+            .ok_or(RuntimeError::CandidateSnapshotMissing)?;
+        let status = candidate.status.clone();
+        self.retire_snapshot(candidate.snapshot);
+        self.cleanup_retired_snapshots();
+        Ok(status)
+    }
+
     pub fn kernel(&self) -> &RuntimeKernel {
         &self.kernel
     }
@@ -592,6 +744,8 @@ impl RuntimeHost {
                     snapshot_root: self.snapshot_root.display().to_string(),
                     staged_artifact_root: staged_artifact_root.display().to_string(),
                     elapsed_ms: started_at.elapsed().as_millis(),
+                    plugin_count: None,
+                    node_count: None,
                     added_plugins: Vec::new(),
                     removed_plugins: Vec::new(),
                     changed_plugins: Vec::new(),
@@ -609,6 +763,11 @@ impl RuntimeHost {
                 .unwrap_or_else(|poison| poison.into_inner());
             *guard = next_snapshot.clone();
         }
+        let replaced_candidate = self
+            .candidate_snapshot
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .take();
 
         let report = ReloadReport::from_snapshots(
             previous_snapshot.as_ref(),
@@ -626,15 +785,26 @@ impl RuntimeHost {
                 snapshot: retired_weak,
                 staged_artifact_root: retired_root,
             });
+        if let Some(candidate) = replaced_candidate {
+            self.retire_snapshot(candidate.snapshot);
+        }
         self.cleanup_retired_snapshots();
 
-        let attempt = ReloadAttemptReport::from_report(&report);
+        let attempt = ReloadAttemptReport::from_report(&report, next_snapshot.as_ref());
         Ok((report, attempt))
     }
 
     fn record_reload_attempt(&self, attempt: ReloadAttemptReport) {
         let mut guard = self
             .last_reload_attempt
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        *guard = Some(attempt);
+    }
+
+    fn record_candidate_reload_attempt(&self, attempt: ReloadAttemptReport) {
+        let mut guard = self
+            .last_candidate_reload_attempt
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         *guard = Some(attempt);
@@ -652,6 +822,78 @@ impl RuntimeHost {
             let _ = fs::remove_dir_all(&entry.staged_artifact_root);
             false
         });
+    }
+
+    fn reload_candidate_internal(
+        &self,
+    ) -> Result<(CandidateSnapshotStatus, ReloadAttemptReport), (RuntimeError, ReloadAttemptReport)> {
+        let previous_snapshot = self.current_snapshot();
+        let staged_artifact_root = next_staged_artifact_root(&self.snapshot_root);
+        let started_at = Instant::now();
+
+        let next_snapshot = match build_snapshot_with_staged_root(&self.loader, staged_artifact_root.clone()) {
+            Ok(snapshot) => Arc::new(snapshot),
+            Err(err) => {
+                let attempt = ReloadAttemptReport {
+                    status: ReloadAttemptStatus::Failed,
+                    from_snapshot_id: previous_snapshot.snapshot_id().to_string(),
+                    to_snapshot_id: None,
+                    snapshot_root: self.snapshot_root.display().to_string(),
+                    staged_artifact_root: staged_artifact_root.display().to_string(),
+                    elapsed_ms: started_at.elapsed().as_millis(),
+                    plugin_count: None,
+                    node_count: None,
+                    added_plugins: Vec::new(),
+                    removed_plugins: Vec::new(),
+                    changed_plugins: Vec::new(),
+                    changed_plugin_reasons: BTreeMap::new(),
+                    failure_summary: Some(err.to_string()),
+                };
+                return Err((err, attempt));
+            }
+        };
+
+        let report = ReloadReport::from_snapshots(
+            previous_snapshot.as_ref(),
+            next_snapshot.as_ref(),
+            &self.snapshot_root,
+            started_at.elapsed().as_millis(),
+        );
+        let status = CandidateSnapshotStatus::from_snapshots(
+            previous_snapshot.as_ref(),
+            next_snapshot.as_ref(),
+            &self.snapshot_root,
+            &report,
+        );
+        let attempt = ReloadAttemptReport::from_candidate_status(&status, report.elapsed_ms);
+        let candidate_entry = StagedCandidateSnapshot {
+            snapshot: next_snapshot,
+            status: status.clone(),
+        };
+
+        let mut guard = self
+            .candidate_snapshot
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if let Some(previous_candidate) = guard.replace(candidate_entry) {
+            self.retire_snapshot(previous_candidate.snapshot);
+        }
+        drop(guard);
+        self.cleanup_retired_snapshots();
+        Ok((status, attempt))
+    }
+
+    fn retire_snapshot(&self, snapshot: Arc<RuntimeSnapshot>) {
+        let staged_artifact_root = snapshot.staged_artifact_root.clone();
+        let retired_weak = Arc::downgrade(&snapshot);
+        drop(snapshot);
+        self.retired_snapshots
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .push(RetiredSnapshot {
+                snapshot: retired_weak,
+                staged_artifact_root,
+            });
     }
 }
 
@@ -701,7 +943,7 @@ impl ReloadReport {
 }
 
 impl ReloadAttemptReport {
-    fn from_report(report: &ReloadReport) -> Self {
+    fn from_report(report: &ReloadReport, next: &RuntimeSnapshot) -> Self {
         Self {
             status: ReloadAttemptStatus::Reloaded,
             from_snapshot_id: report.from_snapshot_id.clone(),
@@ -709,11 +951,53 @@ impl ReloadAttemptReport {
             snapshot_root: report.snapshot_root.clone(),
             staged_artifact_root: report.staged_artifact_root.clone(),
             elapsed_ms: report.elapsed_ms,
+            plugin_count: Some(next.plugin_registry().iter().count()),
+            node_count: Some(next.node_registry().len()),
             added_plugins: report.added_plugins.clone(),
             removed_plugins: report.removed_plugins.clone(),
             changed_plugins: report.changed_plugins.clone(),
             changed_plugin_reasons: report.changed_plugin_reasons.clone(),
             failure_summary: None,
+        }
+    }
+
+    fn from_candidate_status(status: &CandidateSnapshotStatus, elapsed_ms: u128) -> Self {
+        Self {
+            status: ReloadAttemptStatus::Staged,
+            from_snapshot_id: status.from_snapshot_id.clone(),
+            to_snapshot_id: Some(status.candidate_snapshot_id.clone()),
+            snapshot_root: status.snapshot_root.clone(),
+            staged_artifact_root: status.staged_artifact_root.clone(),
+            elapsed_ms,
+            plugin_count: Some(status.plugin_count),
+            node_count: Some(status.node_count),
+            added_plugins: status.added_plugins.clone(),
+            removed_plugins: status.removed_plugins.clone(),
+            changed_plugins: status.changed_plugins.clone(),
+            changed_plugin_reasons: status.changed_plugin_reasons.clone(),
+            failure_summary: None,
+        }
+    }
+}
+
+impl CandidateSnapshotStatus {
+    fn from_snapshots(
+        previous: &RuntimeSnapshot,
+        next: &RuntimeSnapshot,
+        snapshot_root: &Path,
+        report: &ReloadReport,
+    ) -> Self {
+        Self {
+            from_snapshot_id: previous.snapshot_id.clone(),
+            candidate_snapshot_id: next.snapshot_id.clone(),
+            snapshot_root: snapshot_root.display().to_string(),
+            staged_artifact_root: next.staged_artifact_root.display().to_string(),
+            plugin_count: next.plugin_registry().iter().count(),
+            node_count: next.node_registry().len(),
+            added_plugins: report.added_plugins.clone(),
+            removed_plugins: report.removed_plugins.clone(),
+            changed_plugins: report.changed_plugins.clone(),
+            changed_plugin_reasons: report.changed_plugin_reasons.clone(),
         }
     }
 }

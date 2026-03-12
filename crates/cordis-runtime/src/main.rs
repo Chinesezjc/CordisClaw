@@ -200,6 +200,21 @@ fn handle_serve_command(
             let report = host.reload_with_diagnostics();
             println!("{}", serde_json::to_string(&report)?);
         }
+        "candidate status" => {
+            println!("{}", serde_json::to_string(&host.candidate_status())?);
+        }
+        "candidate reload" => {
+            let report = host.reload_candidate_with_diagnostics();
+            println!("{}", serde_json::to_string(&report)?);
+        }
+        "candidate promote" => {
+            let report = host.promote_candidate()?;
+            println!("{}", serde_json::to_string(&report)?);
+        }
+        "candidate rollback" => {
+            let report = host.rollback_candidate()?;
+            println!("{}", serde_json::to_string(&report)?);
+        }
         "kernel status" => {
             println!("{}", serde_json::to_string(&host.kernel().status())?);
         }
@@ -220,6 +235,20 @@ fn handle_serve_command(
                     split_first_token(rest).ok_or("missing node_fqn/payload for execute")?;
                 let payload = serde_json::from_str::<Value>(payload_json)?;
                 let response = host.execute(target_node_fqn, payload)?;
+                println!("{}", serde_json::to_string(&response)?);
+            } else if let Some(rest) = command.strip_prefix("candidate invoke ") {
+                let (plugin_path, remainder) =
+                    split_first_token(rest).ok_or("missing plugin_path for candidate invoke")?;
+                let (node_id, payload_json) =
+                    split_first_token(remainder).ok_or("missing node_id/payload for candidate invoke")?;
+                let response =
+                    host.invoke_candidate(plugin_path, node_id, payload_json.to_string())?;
+                emit_invoke_response(&response.payload)?;
+            } else if let Some(rest) = command.strip_prefix("candidate execute ") {
+                let (target_node_fqn, payload_json) = split_first_token(rest)
+                    .ok_or("missing node_fqn/payload for candidate execute")?;
+                let payload = serde_json::from_str::<Value>(payload_json)?;
+                let response = host.execute_candidate(target_node_fqn, payload)?;
                 println!("{}", serde_json::to_string(&response)?);
             } else if let Some(json) = command.strip_prefix("kernel apply-plan ") {
                 let request: KernelApplyRequest = serde_json::from_str(json)?;
@@ -818,8 +847,14 @@ fn serve_usage() -> &'static str {
   status
   plugins
   reload
+  candidate status
+  candidate reload
+  candidate promote
+  candidate rollback
   invoke <plugin_path> <node_id> <payload-json>
   execute <node_fqn> <payload-json>
+  candidate invoke <plugin_path> <node_id> <payload-json>
+  candidate execute <node_fqn> <payload-json>
   kernel status
   kernel history
   kernel apply-plan <json>

@@ -598,6 +598,101 @@ fn runtime_host_reload_with_diagnostics_reports_failure_summary() {
 }
 
 #[test]
+fn runtime_host_candidate_reload_stages_snapshot_without_switching_current() {
+    let temp = setup_fixture_copy();
+    let host = RuntimeHost::boot(temp.path()).expect("host should boot");
+    let current_snapshot_id = host.current_snapshot().snapshot_id().to_string();
+
+    add_demo_process_plugin(temp.path(), "v1");
+    let status = host
+        .reload_candidate()
+        .expect("candidate reload with demo should succeed");
+
+    assert_eq!(status.from_snapshot_id, current_snapshot_id);
+    assert!(status.added_plugins.iter().any(|plugin| plugin == "demo"));
+    assert!(host.current_snapshot().plugin_registry().get("demo").is_none());
+    assert_eq!(host.candidate_status(), Some(status.clone()));
+    assert_eq!(
+        host.last_candidate_reload_attempt()
+            .expect("candidate reload attempt should be recorded")
+            .status,
+        ReloadAttemptStatus::Staged
+    );
+
+    let response = host
+        .invoke_candidate("demo", "demo_entry", json!({ "message": "hello" }).to_string())
+        .expect("candidate snapshot demo invoke should succeed");
+    let value: Value = serde_json::from_str(&response.payload).expect("candidate demo response json");
+    assert_eq!(value.get("version").and_then(|v| v.as_str()), Some("v1"));
+}
+
+#[test]
+fn runtime_host_promote_candidate_switches_current_and_keeps_old_snapshot_usable() {
+    let temp = setup_fixture_copy();
+    let host = RuntimeHost::boot(temp.path()).expect("host should boot");
+    let old_snapshot = host.current_snapshot();
+    let old_snapshot_id = old_snapshot.snapshot_id().to_string();
+
+    add_demo_process_plugin(temp.path(), "v1");
+    host.reload_candidate()
+        .expect("candidate reload with demo should succeed");
+
+    let report = host.promote_candidate().expect("promote should succeed");
+
+    assert_eq!(report.from_snapshot_id, old_snapshot_id);
+    assert!(report.added_plugins.iter().any(|plugin| plugin == "demo"));
+    assert!(host.candidate_snapshot().is_none());
+    assert!(host.status().candidate_snapshot.is_none());
+    assert!(host.current_snapshot().plugin_registry().get("demo").is_some());
+    assert_eq!(
+        host.last_reload_attempt()
+            .expect("promote should record last reload")
+            .status,
+        ReloadAttemptStatus::Reloaded
+    );
+
+    let old_response = old_snapshot
+        .invoke(
+            "expr",
+            "expr_entry",
+            json!({ "expression": "3 + 4" }).to_string(),
+        )
+        .expect("old snapshot should still invoke expr");
+    let old_value: Value = serde_json::from_str(&old_response.payload).expect("old expr response json");
+    assert_eq!(old_value.get("value").and_then(|v| v.as_f64()), Some(7.0));
+
+    let new_response = host
+        .invoke("demo", "demo_entry", json!({ "message": "hello" }).to_string())
+        .expect("promoted snapshot should invoke demo");
+    let new_value: Value = serde_json::from_str(&new_response.payload).expect("new demo response json");
+    assert_eq!(new_value.get("version").and_then(|v| v.as_str()), Some("v1"));
+}
+
+#[test]
+fn runtime_host_rollback_candidate_discards_staged_snapshot() {
+    let temp = setup_fixture_copy();
+    let host = RuntimeHost::boot(temp.path()).expect("host should boot");
+
+    add_demo_process_plugin(temp.path(), "v1");
+    let staged = host
+        .reload_candidate()
+        .expect("candidate reload with demo should succeed");
+
+    let rolled_back = host
+        .rollback_candidate()
+        .expect("rollback should discard candidate");
+
+    assert_eq!(rolled_back, staged);
+    assert!(host.candidate_snapshot().is_none());
+    assert!(host.status().candidate_snapshot.is_none());
+    assert!(host.current_snapshot().plugin_registry().get("demo").is_none());
+    let err = host
+        .invoke_candidate("demo", "demo_entry", json!({ "message": "hello" }).to_string())
+        .expect_err("candidate invoke should fail once candidate is rolled back");
+    assert!(err.to_string().contains("candidate snapshot not staged"));
+}
+
+#[test]
 fn serve_mode_supports_plugins_reload_and_kernel_status() {
     let temp = setup_fixture_copy();
     let bin = env!("CARGO_BIN_EXE_cordis-runtime");
@@ -636,4 +731,47 @@ fn serve_mode_supports_plugins_reload_and_kernel_status() {
     assert!(stdout.contains("\"iteration_total\":0"));
     assert!(stdout.contains("\"from_snapshot_id\""));
     assert!(stdout.contains("\"status\":\"reloaded\""));
+}
+
+#[test]
+fn serve_mode_supports_candidate_control_plane() {
+    let temp = setup_fixture_copy();
+    let bin = env!("CARGO_BIN_EXE_cordis-runtime");
+    let mut child = Command::new(bin)
+        .args([
+            "serve",
+            temp.path().to_str().expect("temp path utf-8"),
+            "--runtime-only",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn serve cli");
+
+    add_demo_process_plugin(temp.path(), "v1");
+
+    let stdin = child.stdin.as_mut().expect("stdin pipe");
+    use std::io::Write as _;
+    stdin
+        .write_all(
+            b"candidate status\ncandidate reload\ncandidate status\ncandidate invoke demo demo_entry {\"message\":\"hello\"}\ncandidate promote\nstatus\ncandidate status\nexit\n",
+        )
+        .expect("write serve candidate commands");
+
+    let output = child.wait_with_output().expect("wait for serve cli");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout utf-8");
+    assert!(stdout.contains("serve ready snapshot_id="));
+    assert!(stdout.contains("null"));
+    assert!(stdout.contains("\"status\":\"staged\""));
+    assert!(stdout.contains("\"candidate_snapshot_id\""));
+    assert!(stdout.contains("{\"version\":\"v1\"}"));
+    assert!(stdout.contains("\"current_snapshot_id\""));
+    assert!(stdout.contains("\"candidate_snapshot\":null"));
 }

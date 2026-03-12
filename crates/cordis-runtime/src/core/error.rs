@@ -158,6 +158,9 @@ pub enum RuntimeError {
     #[error("plugin unavailable in context: {plugin_path}")]
     ContextPluginUnavailable { plugin_path: String },
 
+    #[error("candidate snapshot not staged")]
+    CandidateSnapshotMissing,
+
     #[error("service not found in context for plugin {plugin_path}: {service}")]
     ServiceNotFound { plugin_path: String, service: String },
 
