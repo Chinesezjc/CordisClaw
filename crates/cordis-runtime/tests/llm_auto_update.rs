@@ -264,3 +264,59 @@ fn llm_auto_update_supports_deepseek_chat_completions() {
     assert!(captured_request.contains("\"response_format\":{\"type\":\"json_object\"}"));
     assert!(captured_request.contains("Replace old with new in demo.txt"));
 }
+
+#[cfg(not(windows))]
+#[test]
+fn llm_auto_update_uses_model_suggested_verification_commands() {
+    let temp = TempDir::new().expect("tempdir");
+    let demo_path = temp.path().join("demo.txt");
+    fs::write(&demo_path, "alpha-old-omega\n").expect("write demo file");
+
+    let output_text = json!({
+        "summary": "Replace old with new in the demo file.",
+        "tests_command": "grep -q new demo.txt",
+        "safety_command": "grep -q alpha-new-omega demo.txt",
+        "patches": [
+            {
+                "path": "demo.txt",
+                "find": "old",
+                "replace": "new"
+            }
+        ]
+    })
+    .to_string();
+    let (base_url, request_rx, handle) = spawn_mock_openai_server(&output_text);
+    write_config(temp.path(), "openai", &base_url, "OPENAI_API_KEY", "gpt-4.1-mini");
+
+    let bin = env!("CARGO_BIN_EXE_cordis-runtime");
+    let output = Command::new(bin)
+        .arg("llm-auto-update")
+        .arg(temp.path())
+        .arg("--instruction=Replace old with new in demo.txt")
+        .arg("--path=demo.txt")
+        .env("OPENAI_API_KEY", "test-key")
+        .output()
+        .expect("run llm-auto-update");
+
+    handle.join().expect("join mock server");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout utf-8");
+    assert!(stdout.contains("\"verdict\": \"Promote\""), "stdout: {stdout}");
+    assert!(stdout.contains("\"command\": \"grep -q new demo.txt\""), "stdout: {stdout}");
+    assert!(
+        stdout.contains("\"command\": \"grep -q alpha-new-omega demo.txt\""),
+        "stdout: {stdout}"
+    );
+    assert_eq!(
+        fs::read_to_string(&demo_path).expect("read demo file"),
+        "alpha-new-omega\n"
+    );
+
+    let captured_request = request_rx.recv().expect("capture request");
+    assert!(captured_request.contains("Replace old with new in demo.txt"));
+}

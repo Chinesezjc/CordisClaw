@@ -1,8 +1,10 @@
 //! LLM-backed patch planner for guarded auto-update workflows.
 
 use crate::config::LlmApiConfig;
+use crate::core::models::PluginDocs;
 use crate::core::error::RuntimeError;
 use crate::kernel::auto_update::{AutoUpdatePlan, FilePatch};
+use crate::plugin::invoke::PluginInvoker;
 use reqwest::blocking::Client;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
@@ -28,6 +30,8 @@ pub struct PlanRequest {
 pub struct PlannedUpdate {
     pub plan: AutoUpdatePlan,
     pub summary: String,
+    pub tests_command: Option<String>,
+    pub safety_command: Option<String>,
     pub planner_model: String,
     pub response_id: Option<String>,
 }
@@ -35,6 +39,10 @@ pub struct PlannedUpdate {
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 struct PlannerPayload {
     summary: String,
+    #[serde(default)]
+    tests_command: Option<String>,
+    #[serde(default)]
+    safety_command: Option<String>,
     patches: Vec<FilePatch>,
 }
 
@@ -42,6 +50,32 @@ struct PlannerPayload {
 struct ContextFile {
     path: String,
     content: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+struct PromptPluginCatalog {
+    discovery_root: String,
+    plugins: Vec<PromptPluginInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+struct PromptPluginInfo {
+    plugin_path: String,
+    plugin_id: String,
+    plugin_version: String,
+    command_name: Option<String>,
+    nodes: Vec<PromptPluginNodeInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+struct PromptPluginNodeInfo {
+    node_id: String,
+    node_fqn: String,
+    summary: String,
+    input_schema: Value,
+    output_schema: Value,
+    side_effects: Vec<String>,
+    failure_modes: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -79,7 +113,8 @@ impl LlmPatchPlanner {
 
         let allowed_paths = normalize_paths(&request.paths)?;
         let context_files = load_context_files(workspace_root, &allowed_paths)?;
-        let user_prompt = build_user_prompt(&request, &context_files);
+        let plugin_catalog = discover_plugin_catalog(workspace_root);
+        let user_prompt = build_user_prompt(&request, &context_files, plugin_catalog.as_ref());
         let provider = self.config.provider.trim().to_ascii_lowercase();
         let (payload, response_id) = match provider.as_str() {
             "openai" => self.plan_with_openai(&user_prompt)?,
@@ -231,6 +266,8 @@ impl LlmPatchPlanner {
                 patches: payload.patches,
             },
             summary: payload.summary,
+            tests_command: normalize_optional_command(payload.tests_command),
+            safety_command: normalize_optional_command(payload.safety_command),
             planner_model: self.config.model.clone(),
             response_id,
         })
@@ -265,7 +302,11 @@ fn load_context_files(
     Ok(files)
 }
 
-fn build_user_prompt(request: &PlanRequest, files: &[ContextFile]) -> String {
+fn build_user_prompt(
+    request: &PlanRequest,
+    files: &[ContextFile],
+    plugin_catalog: Option<&PromptPluginCatalog>,
+) -> String {
     let mut prompt = String::new();
     prompt.push_str("Issue ID: ");
     prompt.push_str(&request.issue_id);
@@ -281,6 +322,15 @@ fn build_user_prompt(request: &PlanRequest, files: &[ContextFile]) -> String {
         prompt.push_str(path);
         prompt.push('\n');
     }
+    prompt.push_str("\nGeneric verifier command formats:\n");
+    prompt.push_str("- shell command string executed in the workspace root\n");
+    prompt.push_str("- plugin verifier spec: plugin:{\"plugin_path\":\"<plugin_path>\",\"node_id\":\"<node_id>\",\"payload_json\":{},\"expect_substring\":\"<expected text>\",\"fixtures_root\":\"<optional fixtures root>\"}\n");
+    prompt.push_str("Use only plugin_path/node_id pairs that appear in the discovered plugin catalog below. `command_name` is an optional human-facing alias and not required in plugin verifier specs.\n");
+    prompt.push_str("\nDiscovered plugin capability catalog:\n");
+    match plugin_catalog {
+        Some(catalog) => prompt.push_str(&render_plugin_catalog(catalog)),
+        None => prompt.push_str("(none discovered for this workspace root)\n"),
+    }
     prompt.push_str("\nCurrent file contents:\n");
     for file in files {
         prompt.push_str("\n<<<FILE ");
@@ -295,17 +345,80 @@ fn build_user_prompt(request: &PlanRequest, files: &[ContextFile]) -> String {
     prompt
 }
 
+fn discover_plugin_catalog(workspace_root: &Path) -> Option<PromptPluginCatalog> {
+    let discovery_root = resolve_plugin_catalog_root(workspace_root)?;
+    let invoker = PluginInvoker::load(&discovery_root).ok()?;
+    let plugins = invoker
+        .plugin_registry()
+        .iter()
+        .filter_map(|(_, plugin)| plugin.docs.as_ref().map(prompt_plugin_info))
+        .collect::<Vec<_>>();
+    if plugins.is_empty() {
+        return None;
+    }
+
+    Some(PromptPluginCatalog {
+        discovery_root: discovery_root.display().to_string(),
+        plugins,
+    })
+}
+
+fn resolve_plugin_catalog_root(workspace_root: &Path) -> Option<PathBuf> {
+    if workspace_root.join("plugins").exists() {
+        return Some(workspace_root.to_path_buf());
+    }
+
+    let nested_fixtures = workspace_root.join("fixtures");
+    if nested_fixtures.join("plugins").exists() {
+        return Some(nested_fixtures);
+    }
+
+    None
+}
+
+fn prompt_plugin_info(docs: &PluginDocs) -> PromptPluginInfo {
+    PromptPluginInfo {
+        plugin_path: docs.plugin_path.clone(),
+        plugin_id: docs.plugin_id.clone(),
+        plugin_version: docs.plugin_version.clone(),
+        command_name: docs.command_name.clone(),
+        nodes: docs
+            .nodes
+            .iter()
+            .map(|node| PromptPluginNodeInfo {
+                node_id: node.id.clone(),
+                node_fqn: format!("{}::{}", docs.plugin_path, node.id),
+                summary: node.summary.clone(),
+                input_schema: node.input_schema.clone(),
+                output_schema: node.output_schema.clone(),
+                side_effects: node.side_effects.clone(),
+                failure_modes: node.failure_modes.clone(),
+            })
+            .collect(),
+    }
+}
+
+fn render_plugin_catalog(catalog: &PromptPluginCatalog) -> String {
+    let catalog_json = serde_json::to_string_pretty(catalog).unwrap_or_else(|_| "{}".to_string());
+    let mut rendered = String::new();
+    rendered.push_str(&catalog_json);
+    rendered.push('\n');
+    rendered
+}
+
 fn openai_system_prompt() -> &'static str {
     "You are a guarded patch planner for a Rust workspace. Return only JSON that matches the provided schema. \
 Only edit the allowed relative paths. Each patch must use an exact substring from the current file contents in `find`. \
-Keep changes minimal, deterministic, and safe. Do not invent files, do not use absolute paths, and do not include markdown."
+Keep changes minimal, deterministic, and safe. Do not invent files, do not use absolute paths, do not invent plugin capabilities beyond the provided catalog, and do not include markdown. \
+When you can infer reliable verification steps from the request and plugin catalog, include `tests_command` and/or `safety_command`; otherwise leave them null or omit them."
 }
 
 fn deepseek_system_prompt() -> &'static str {
     "You are a guarded patch planner for a Rust workspace. Return exactly one JSON object and no markdown. \
-The JSON must use this shape: {\"summary\":\"short summary\",\"patches\":[{\"path\":\"relative/path.txt\",\"find\":\"exact old text\",\"replace\":\"new text\"}]}. \
+The JSON must use this shape: {\"summary\":\"short summary\",\"tests_command\":\"optional verifier command or null\",\"safety_command\":\"optional verifier command or null\",\"patches\":[{\"path\":\"relative/path.txt\",\"find\":\"exact old text\",\"replace\":\"new text\"}]}. \
 Only edit the allowed relative paths. Each patch must use an exact substring from the current file contents in `find`. \
-Keep changes minimal, deterministic, and safe. Do not invent files, do not use absolute paths, and do not include extra keys."
+Keep changes minimal, deterministic, and safe. Do not invent files, do not use absolute paths, do not invent plugin capabilities beyond the provided catalog, and do not include extra keys. \
+When you can infer reliable verification steps from the request and plugin catalog, include `tests_command` and/or `safety_command`; otherwise set them to null."
 }
 
 fn plan_schema() -> Value {
@@ -315,6 +428,12 @@ fn plan_schema() -> Value {
         "properties": {
             "summary": {
                 "type": "string"
+            },
+            "tests_command": {
+                "type": ["string", "null"]
+            },
+            "safety_command": {
+                "type": ["string", "null"]
             },
             "patches": {
                 "type": "array",
@@ -339,6 +458,17 @@ fn plan_schema() -> Value {
             }
         },
         "required": ["summary", "patches"]
+    })
+}
+
+fn normalize_optional_command(command: Option<String>) -> Option<String> {
+    command.and_then(|value| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
     })
 }
 
@@ -494,10 +624,12 @@ fn api_key_env_looks_like_secret(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        api_key_env_looks_like_secret, extract_chat_completion_text, extract_error_message,
-        extract_output_text, normalize_rel_path,
+        api_key_env_looks_like_secret, build_user_prompt, discover_plugin_catalog,
+        extract_chat_completion_text, extract_error_message, extract_output_text,
+        normalize_optional_command, normalize_rel_path, ContextFile, PlanRequest,
     };
-    use serde_json::json;
+    use serde_json::{json, Value};
+    use std::path::Path;
 
     #[test]
     fn normalize_rel_path_rejects_parent_dir() {
@@ -550,5 +682,98 @@ mod tests {
         let message =
             extract_error_message("{\"detail\":\"invalid service token\"}").expect("detail");
         assert_eq!(message, "invalid service token");
+    }
+
+    #[test]
+    fn build_user_prompt_includes_generic_plugin_verifier_guidance_without_catalog() {
+        let request = PlanRequest {
+            issue_id: "issue-1".to_string(),
+            patch_id: "patch-1".to_string(),
+            instruction: "Update the doc".to_string(),
+            paths: vec!["README.md".to_string()],
+            manual_approved: false,
+        };
+        let files = vec![ContextFile {
+            path: "README.md".to_string(),
+            content: "hello\n".to_string(),
+        }];
+
+        let prompt = build_user_prompt(&request, &files, None);
+        assert!(prompt.contains("plugin verifier spec:"), "prompt: {prompt}");
+        assert!(prompt.contains("(none discovered for this workspace root)"), "prompt: {prompt}");
+    }
+
+    #[test]
+    fn discover_plugin_catalog_reads_current_fixtures_workspace() {
+        let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .expect("workspace root");
+        let catalog = discover_plugin_catalog(&workspace_root).expect("plugin catalog");
+        let expr = catalog
+            .plugins
+            .iter()
+            .find(|plugin| plugin.plugin_path == "expr")
+            .expect("expr plugin should exist");
+        assert_eq!(expr.command_name.as_deref(), Some("Expr"));
+        let node = expr
+            .nodes
+            .iter()
+            .find(|node| node.node_id == "expr_entry")
+            .expect("expr_entry should exist");
+        assert_eq!(node.node_fqn, "expr::expr_entry");
+        assert_eq!(
+            node.input_schema
+                .get("properties")
+                .and_then(|value| value.get("expression"))
+                .and_then(|value| value.get("type"))
+                .and_then(Value::as_str),
+            Some("string")
+        );
+        assert_eq!(
+            node.output_schema
+                .get("properties")
+                .and_then(|value| value.get("value"))
+                .and_then(|value| value.get("type"))
+                .and_then(Value::as_str),
+            Some("number")
+        );
+    }
+
+    #[test]
+    fn build_user_prompt_embeds_discovered_plugin_catalog() {
+        let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .expect("workspace root");
+        let catalog = discover_plugin_catalog(&workspace_root).expect("plugin catalog");
+        let request = PlanRequest {
+            issue_id: "issue-1".to_string(),
+            patch_id: "patch-1".to_string(),
+            instruction: "Update the doc".to_string(),
+            paths: vec!["README.md".to_string()],
+            manual_approved: false,
+        };
+        let files = vec![ContextFile {
+            path: "README.md".to_string(),
+            content: "hello\n".to_string(),
+        }];
+
+        let prompt = build_user_prompt(&request, &files, Some(&catalog));
+        assert!(prompt.contains("\"plugin_path\": \"expr\""), "prompt: {prompt}");
+        assert!(prompt.contains("\"command_name\": \"Expr\""), "prompt: {prompt}");
+        assert!(prompt.contains("\"node_fqn\": \"expr::expr_entry\""), "prompt: {prompt}");
+        assert!(prompt.contains("\"expression\""), "prompt: {prompt}");
+        assert!(prompt.contains("\"value\""), "prompt: {prompt}");
+    }
+
+    #[test]
+    fn normalize_optional_command_drops_blank_values() {
+        assert_eq!(normalize_optional_command(None), None);
+        assert_eq!(normalize_optional_command(Some("   ".to_string())), None);
+        assert_eq!(
+            normalize_optional_command(Some(" grep -q ok README.md ".to_string())),
+            Some("grep -q ok README.md".to_string())
+        );
     }
 }

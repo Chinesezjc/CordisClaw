@@ -118,6 +118,8 @@ pub struct KernelPlanRequest {
 pub struct KernelPlanResult {
     pub plan: AutoUpdatePlan,
     pub summary: String,
+    pub tests_command: Option<String>,
+    pub safety_command: Option<String>,
     pub planner_model: String,
     pub response_id: Option<String>,
 }
@@ -214,10 +216,16 @@ impl RuntimeKernel {
         &self,
         request: KernelPlanRequest,
     ) -> Result<KernelPlanApplyResult, RuntimeError> {
-        let tests_command = request.tests_command.clone();
-        let safety_command = request.safety_command.clone();
+        let planned = self.plan_update(request.clone())?;
+        let tests_command = request
+            .tests_command
+            .clone()
+            .or_else(|| planned.tests_command.clone());
+        let safety_command = request
+            .safety_command
+            .clone()
+            .or_else(|| planned.safety_command.clone());
         let quality_score = request.quality_score;
-        let planned = self.plan_update(request)?;
         let mut verification_report = None;
         let mut kernel = self.inner.lock().unwrap_or_else(|poison| poison.into_inner());
         let result = self.updater.execute(&mut kernel, planned.plan.clone(), |workspace_root| {
@@ -443,6 +451,8 @@ fn kernel_plan_result(planned: PlannedUpdate) -> KernelPlanResult {
     KernelPlanResult {
         plan: planned.plan,
         summary: planned.summary,
+        tests_command: planned.tests_command,
+        safety_command: planned.safety_command,
         planner_model: planned.planner_model,
         response_id: planned.response_id,
     }
