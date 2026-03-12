@@ -657,7 +657,7 @@ pub fn default_loader_config(root: impl AsRef<Path>) -> LoaderConfig {
             // Conservative defaults suitable for local prototype deployments.
             max_total_plugins: 256,
             max_total_nodes: 4096,
-            load_timeout_ms: 15_000,
+            load_timeout_ms: 30_000,
         },
     }
 }

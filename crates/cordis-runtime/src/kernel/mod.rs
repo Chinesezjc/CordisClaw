@@ -3,5 +3,7 @@
 pub mod auto_update;
 pub mod evaluator;
 pub mod memory;
+pub mod planner;
 pub mod policy;
 pub mod r#loop;
+pub mod verifier;

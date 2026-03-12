@@ -1,3 +1,5 @@
+# Set provider: deepseek, base_url: https://api.deepseek.com/v1,
+# api_key_env: DEEPSEEK_API_KEY, and model: deepseek-chat for DeepSeek.
 provider: openai
 base_url: https://api.openai.com/v1
 api_key_env: OPENAI_API_KEY

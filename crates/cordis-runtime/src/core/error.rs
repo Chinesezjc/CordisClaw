@@ -209,6 +209,21 @@ pub enum RuntimeError {
         message: String,
     },
 
+    #[error("invalid argument: {message}")]
+    InvalidArgument { message: String },
+
+    #[error("LLM API key missing: set {env_name} or config llm_api.api_key")]
+    MissingLlmApiKey { env_name: String },
+
+    #[error("LLM provider unsupported: {provider}")]
+    UnsupportedLlmProvider { provider: String },
+
+    #[error("LLM request failed: {message}")]
+    LlmRequestFailed { message: String },
+
+    #[error("LLM response invalid: {message}")]
+    LlmResponseInvalid { message: String },
+
     #[error("internal invariant broken: {message}")]
     Invariant { message: String },
 

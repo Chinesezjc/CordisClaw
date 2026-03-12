@@ -6,8 +6,10 @@ use crate::kernel::auto_update::{AutoUpdatePlan, AutoUpdateResult, AutoUpdater};
 use crate::kernel::evaluator::{EvalHarness, VerificationInput};
 use crate::kernel::memory::ChangeRecord;
 use crate::kernel::memory::ChangeMemory;
+use crate::kernel::planner::{LlmPatchPlanner, PlanRequest, PlannedUpdate};
 use crate::kernel::policy::IterationPolicy;
 use crate::kernel::r#loop::SelfIterationKernel;
+use crate::kernel::verifier::{CommandVerifier, VerificationReport};
 use crate::plugin::abi::PluginResponse;
 use crate::plugin::invoke::invoke_registered_plugin;
 use crate::plugin::loader::{default_loader_config, LoadOutput, Loader};
@@ -100,6 +102,33 @@ pub struct KernelApplyRequest {
     pub verification: VerificationInput,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct KernelPlanRequest {
+    pub issue_id: Option<String>,
+    pub patch_id: Option<String>,
+    pub instruction: String,
+    pub paths: Vec<String>,
+    pub manual_approved: bool,
+    pub tests_command: Option<String>,
+    pub safety_command: Option<String>,
+    pub quality_score: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct KernelPlanResult {
+    pub plan: AutoUpdatePlan,
+    pub summary: String,
+    pub planner_model: String,
+    pub response_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct KernelPlanApplyResult {
+    pub planned: KernelPlanResult,
+    pub verification: VerificationReport,
+    pub result: AutoUpdateResult,
+}
+
 #[derive(Debug)]
 pub struct RuntimeKernel {
     workspace_root: PathBuf,
@@ -164,6 +193,52 @@ impl RuntimeKernel {
     ) -> Result<AutoUpdateResult, RuntimeError> {
         let mut kernel = self.inner.lock().unwrap_or_else(|poison| poison.into_inner());
         self.updater.execute(&mut kernel, plan, |_| Ok(verification))
+    }
+
+    pub fn plan_update(&self, request: KernelPlanRequest) -> Result<KernelPlanResult, RuntimeError> {
+        let planner = LlmPatchPlanner::new(self.llm_api.clone())?;
+        let planned = planner.plan(
+            &self.workspace_root,
+            PlanRequest {
+                issue_id: normalize_request_id(request.issue_id, "llm-issue"),
+                patch_id: normalize_request_id(request.patch_id, "llm-patch"),
+                instruction: request.instruction,
+                paths: request.paths,
+                manual_approved: request.manual_approved,
+            },
+        )?;
+        Ok(kernel_plan_result(planned))
+    }
+
+    pub fn plan_and_run_iteration(
+        &self,
+        request: KernelPlanRequest,
+    ) -> Result<KernelPlanApplyResult, RuntimeError> {
+        let tests_command = request.tests_command.clone();
+        let safety_command = request.safety_command.clone();
+        let quality_score = request.quality_score;
+        let planned = self.plan_update(request)?;
+        let mut verification_report = None;
+        let mut kernel = self.inner.lock().unwrap_or_else(|poison| poison.into_inner());
+        let result = self.updater.execute(&mut kernel, planned.plan.clone(), |workspace_root| {
+            let report = CommandVerifier::verify(
+                workspace_root,
+                tests_command.as_deref(),
+                safety_command.as_deref(),
+                quality_score,
+            )?;
+            let input = report.input.clone();
+            verification_report = Some(report);
+            Ok(input)
+        })?;
+        let verification = verification_report.ok_or_else(|| RuntimeError::Invariant {
+            message: "verification report missing after updater execution".to_string(),
+        })?;
+        Ok(KernelPlanApplyResult {
+            planned,
+            verification,
+            result,
+        })
     }
 }
 
@@ -361,6 +436,28 @@ fn runtime_snapshot_from_output(output: LoadOutput, staged_artifact_root: PathBu
         graph_registry: output.graph_registry,
         context_baseline: output.context,
         staged_artifact_root,
+    }
+}
+
+fn kernel_plan_result(planned: PlannedUpdate) -> KernelPlanResult {
+    KernelPlanResult {
+        plan: planned.plan,
+        summary: planned.summary,
+        planner_model: planned.planner_model,
+        response_id: planned.response_id,
+    }
+}
+
+fn normalize_request_id(raw: Option<String>, prefix: &str) -> String {
+    match raw {
+        Some(value) if !value.trim().is_empty() => value,
+        _ => {
+            let now_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis();
+            format!("{prefix}-{now_ms}")
+        }
     }
 }
 

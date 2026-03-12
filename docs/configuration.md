@@ -11,6 +11,9 @@
   - RuntimeHost / Kernel 的基础运行参数
 - `llm_api.yaml`
   - 内建 kernel 后续接入大模型时使用的 API 配置
+  - `provider` 目前支持 `openai` 和 `deepseek`
+  - `openai` 走 `/responses` JSON schema
+  - `deepseek` 走 `/chat/completions` + `response_format.type=json_object`
 - `plugins/*.yaml`
   - 各插件自己的预留配置位
 
@@ -19,5 +22,6 @@
 建议：
 
 - 把真实密钥放到环境变量里，例如 `OPENAI_API_KEY`
+- DeepSeek 可使用 `DEEPSEEK_API_KEY`，并把 `provider` 设为 `deepseek`
 - 或者在本地新增 `config/*.local.yaml` / `config/plugins/*.local.yaml`
 - 不要把真实密钥直接提交到仓库

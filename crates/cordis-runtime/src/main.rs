@@ -1,5 +1,6 @@
+use cordis_runtime::config::RuntimeConfig;
 use cordis_runtime::context::ContextRegistry;
-use cordis_runtime::host::{KernelApplyRequest, RuntimeHost};
+use cordis_runtime::host::{KernelApplyRequest, KernelPlanRequest, RuntimeHost, RuntimeKernel};
 use cordis_runtime::kernel::auto_update::{AutoUpdatePlan, AutoUpdater, FilePatch};
 use cordis_runtime::kernel::evaluator::{EvalHarness, VerificationInput};
 use cordis_runtime::kernel::memory::ChangeMemory;
@@ -36,6 +37,14 @@ fn main() {
     if args.first().map(|x| x.as_str()) == Some("invoke") {
         if let Err(err) = run_invoke(&args[1..]) {
             eprintln!("invoke failed: {err}");
+            eprintln!("{}", usage());
+            std::process::exit(1);
+        }
+        return;
+    }
+    if args.first().map(|x| x.as_str()) == Some("llm-auto-update") {
+        if let Err(err) = run_llm_auto_update(&args[1..]) {
+            eprintln!("llm-auto-update failed: {err}");
             eprintln!("{}", usage());
             std::process::exit(1);
         }
@@ -190,6 +199,10 @@ fn handle_serve_command(
                 let result = host
                     .kernel()
                     .run_iteration(request.plan, request.verification)?;
+                println!("{}", serde_json::to_string(&result)?);
+            } else if let Some(json) = command.strip_prefix("kernel plan-apply ") {
+                let request: KernelPlanRequest = serde_json::from_str(json)?;
+                let result = host.kernel().plan_and_run_iteration(request)?;
                 println!("{}", serde_json::to_string(&result)?);
             } else {
                 println!("unknown serve command: {command}");
@@ -363,6 +376,91 @@ fn run_auto_update(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn run_llm_auto_update(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    if args.is_empty() {
+        return Err("missing required args: <workspace_root>".into());
+    }
+
+    let workspace_root = PathBuf::from(&args[0]);
+    let mut instruction: Option<String> = None;
+    let mut issue_id: Option<String> = None;
+    let mut patch_id: Option<String> = None;
+    let mut paths = Vec::new();
+    let mut manual_approved = false;
+    let mut tests_command: Option<String> = None;
+    let mut safety_command: Option<String> = None;
+    let mut quality_score: Option<u32> = None;
+    let mut dry_run = false;
+
+    for token in &args[1..] {
+        if let Some(value) = token.strip_prefix("--instruction=") {
+            instruction = Some(value.to_string());
+            continue;
+        }
+        if let Some(value) = token.strip_prefix("--issue-id=") {
+            issue_id = Some(value.to_string());
+            continue;
+        }
+        if let Some(value) = token.strip_prefix("--patch-id=") {
+            patch_id = Some(value.to_string());
+            continue;
+        }
+        if let Some(value) = token.strip_prefix("--path=") {
+            paths.push(value.to_string());
+            continue;
+        }
+        if let Some(value) = token.strip_prefix("--tests-command=") {
+            tests_command = Some(value.to_string());
+            continue;
+        }
+        if let Some(value) = token.strip_prefix("--safety-command=") {
+            safety_command = Some(value.to_string());
+            continue;
+        }
+        if let Some(value) = token.strip_prefix("--quality-score=") {
+            quality_score = Some(value.parse::<u32>()?);
+            continue;
+        }
+        if token == "--manual-approved" {
+            manual_approved = true;
+            continue;
+        }
+        if token == "--dry-run" {
+            dry_run = true;
+            continue;
+        }
+        return Err(format!("unknown flag: {token}").into());
+    }
+
+    let instruction = instruction.ok_or("missing required flag: --instruction=<text>")?;
+    if paths.is_empty() {
+        return Err("missing required flag: --path=<relative_path>".into());
+    }
+
+    let config = RuntimeConfig::load(&workspace_root)?;
+    let kernel = RuntimeKernel::new(&workspace_root, &config);
+    let request = KernelPlanRequest {
+        issue_id,
+        patch_id,
+        instruction,
+        paths,
+        manual_approved,
+        tests_command,
+        safety_command,
+        quality_score,
+    };
+
+    if dry_run {
+        let planned = kernel.plan_update(request)?;
+        println!("{}", serde_json::to_string_pretty(&planned)?);
+        return Ok(());
+    }
+
+    let result = kernel.plan_and_run_iteration(request)?;
+    println!("{}", serde_json::to_string_pretty(&result)?);
+    Ok(())
+}
+
 fn parse_bool_flag(value: &str) -> Result<bool, Box<dyn std::error::Error>> {
     match value {
         "true" => Ok(true),
@@ -531,6 +629,7 @@ fn usage() -> String {
   cargo run -p cordis-runtime -- <fixtures_root>
   cargo run -p cordis-runtime -- serve [fixtures_root]
   cargo run -p cordis-runtime -- invoke <plugin_path> <node_id> --payload-json=<json> [--fixtures-root=fixtures]
+  cargo run -p cordis-runtime -- llm-auto-update <workspace_root> --instruction=<text> --path=<relative_path> [--path=<relative_path> ...] [--issue-id=<id>] [--patch-id=<id>] [--manual-approved] [--tests-command=<shell>] [--safety-command=<shell>] [--quality-score=<u32>] [--dry-run]
   cargo run -p cordis-runtime -- auto-update <workspace_root> <relative_path> <find> <replace> [--manual-approved] [--tests-passed=true|false] [--safety-checks-passed=true|false] [--quality-score=<u32>] [--diff-lines=<usize>]
   cargo run -p cordis-runtime -- graph-html [fixtures_root] [--output=registered-nodes.html]
   cargo run -p cordis-runtime -- dag-html [fixtures_root] [--output=registered-dag.html]
@@ -549,5 +648,6 @@ fn serve_usage() -> &'static str {
   kernel status
   kernel history
   kernel apply-plan <json>
+  kernel plan-apply <json>
   exit"
 }
