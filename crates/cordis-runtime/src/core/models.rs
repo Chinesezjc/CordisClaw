@@ -1,66 +1,16 @@
 //! Core data contracts shared across resolver/loader/context.
-//! These types mirror the architecture contract in `plan.md`.
+//! Shared ABI/docs contracts are sourced from `cordis-plugin-sdk` so runtime and plugins
+//! compile against the same symbol table and JSON schema types.
 
 use serde::{Deserialize, Serialize};
 
-/// Fixed symbol name required by the Rust ABI dylib contract.
-pub const RUST_PLUGIN_ENTRY_SYMBOL: &str = "cordis_plugin_api_rust_v2";
+pub use cordis_plugin_sdk::{
+    AbiFingerprint, DylibAbiKind, NodeDoc, PluginDocs, PluginRequest, PluginResponse,
+    RustPluginApiV2, RUST_PLUGIN_ENTRY_SYMBOL,
+};
 
 fn default_required() -> bool {
     true
-}
-
-#[repr(u8)]
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum DylibAbiKind {
-    /// Only pure Rust ABI is accepted for `dylib` in this runtime.
-    Rust,
-}
-
-impl Default for DylibAbiKind {
-    fn default() -> Self {
-        Self::Rust
-    }
-}
-
-#[repr(C)]
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub struct AbiFingerprint {
-    /// Rust compiler version used to build the artifact.
-    pub rustc_version: String,
-    /// Target platform triple used for build.
-    pub target_triple: String,
-    /// Crate-level hash used to detect binary drift.
-    pub crate_hash: String,
-    /// API-level hash used to detect interface drift.
-    pub api_hash: String,
-}
-
-impl AbiFingerprint {
-    /// Human-readable mismatch list for logs/telemetry.
-    pub fn diff(&self, other: &Self) -> Vec<String> {
-        let mut out = Vec::new();
-        if self.rustc_version != other.rustc_version {
-            out.push(format!(
-                "rustc_version:{}!={}",
-                self.rustc_version, other.rustc_version
-            ));
-        }
-        if self.target_triple != other.target_triple {
-            out.push(format!(
-                "target_triple:{}!={}",
-                self.target_triple, other.target_triple
-            ));
-        }
-        if self.crate_hash != other.crate_hash {
-            out.push(format!("crate_hash:{}!={}", self.crate_hash, other.crate_hash));
-        }
-        if self.api_hash != other.api_hash {
-            out.push(format!("api_hash:{}!={}", self.api_hash, other.api_hash));
-        }
-        out
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -137,30 +87,6 @@ pub enum PluginLoadResult {
     Loaded,
     /// Plugin was discovered but not available for injection/execution.
     Unavailable(PluginUnavailableReason),
-}
-
-#[repr(C)]
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct PluginDocs {
-    pub plugin_id: String,
-    pub plugin_path: String,
-    pub plugin_version: String,
-    pub abi_version: u32,
-    #[serde(default)]
-    pub nodes: Vec<NodeDoc>,
-}
-
-#[repr(C)]
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct NodeDoc {
-    pub id: String,
-    pub summary: String,
-    pub input_schema: serde_json::Value,
-    pub output_schema: serde_json::Value,
-    #[serde(default)]
-    pub side_effects: Vec<String>,
-    #[serde(default)]
-    pub failure_modes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

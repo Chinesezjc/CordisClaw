@@ -1,75 +1,205 @@
-# CordisClaw Runtime Prototype
+# CordisClaw
 
-This repository now contains a runnable Rust prototype that implements Stage A-E from `plan.md`:
+`CordisClaw` is an experimental Rust runtime for contract-driven plugin trees.
 
-- Stage A: package contract (`children` merged object-array metadata, direct-children recursion)
-- Stage B: runtime ABI contract (`cordis_plugin_api_rust_v2`, strict ABI fingerprint model)
-- Stage C: loader architecture (`discover -> resolve -> instantiate`, fail-fast checks)
-- Stage D: artifact architecture (prebuilt artifact index + sha256/fingerprint verification)
-- Stage E: context/security (`provide/inject/dispose`, grants-based parent-chain access)
+It explores what a plugin system looks like when discovery is explicit, loading is strict, execution is DAG-oriented, and plugin capabilities are described through machine-readable docs instead of loose conventions.
 
-Additional runtime pieces now in code:
+Instead of treating plugins as opaque dynamic modules, `CordisClaw` treats them as a documented tree with explicit parent/child edges, prebuilt artifacts, and fail-fast loading rules.
 
-- Actor-style execution mailbox integrated into `execution::engine`
-- Kernel self-iteration skeleton (`observe -> diagnose -> plan -> apply -> verify -> score -> promote/rollback`)
-- Kernel `SafetyGate` (sensitive path changes require manual approval)
-- Kernel auto-update runner (apply text patch -> verify -> rollback on failed verdict)
+## The Problem
 
-## Layout
+Many plugin systems become hard to reason about for the same recurring reasons:
 
-- `crates/cordis-runtime`: runtime implementation + tests
-- `fixtures/plugins`: nested plugin project fixtures
-- `fixtures/artifacts`: prebuilt artifact fixtures + index
-- `docs`: architecture and Rust file responsibility documentation
+- discovery is implicit, so it is unclear why something was loaded
+- extension boundaries are loose, so compatibility failures show up late
+- service access is ambient, so plugins can depend on more than they declare
+- docs drift away from runtime behavior, so humans and tools read stale contracts
+- orchestration logic lives outside the plugin model, so execution and loading evolve separately
 
-## Run
+`CordisClaw` is an attempt to make those failure modes first-class design constraints instead of cleanup work after the fact.
+
+## Design Thesis
+
+Most plugin systems trade clarity for flexibility. `CordisClaw` pushes in the opposite direction:
+
+- plugins are discovered from explicit `package.metadata.cordis.children`
+- loading is guarded by ABI fingerprints, artifact indexes, and `sha256` checks
+- docs are runtime input through `docs/agent/interfaces.json`
+- parent/child service access is controlled through `grants`
+- execution semantics are organized around DAG, Gate, Router, Actor, and Kernel primitives
+- long-running host mode keeps an atomic runtime snapshot and supports explicit plugin reload
+- self-iteration is treated as a guarded runtime workflow, not unrestricted automation
+
+The result is less "drop anything into a folder and hope it works" and more "make contracts visible, make failures explainable."
+
+## Design Tradeoffs
+
+The project makes a few deliberate choices that are useful precisely because they are restrictive:
+
+- explicit discovery over directory scanning
+- fail-fast loading over best-effort fallback
+- prebuilt artifacts over runtime compilation
+- documented contracts over ad hoc runtime introspection
+- grants-based access over ambient service visibility
+- guarded iteration over unrestricted self-modification
+
+Those tradeoffs reduce convenience in the short term, but they make the runtime easier to inspect, test, and debug.
+
+## Example Runtime Flow
+
+At a high level, the runtime path looks like this:
+
+```text
+workspace members
+  -> resolve plugin tree from metadata.children
+  -> validate docs and contracts
+  -> load prebuilt artifacts from index.json
+  -> stage artifacts into a snapshot-specific runtime root
+  -> register plugins, nodes, and grants-aware context
+  -> invoke nodes or export graph views
+  -> evaluate / promote / rollback inside the Kernel loop
+```
+
+This is the core shape of the system: explicit discovery, strict loading, registered capabilities, then execution and evaluation on top.
+
+## Why It Is Interesting
+
+This repo is most useful if you care about runtime architecture questions such as:
+
+- how to model plugins as a tree instead of a flat extension list
+- how strict a loader can be before a plugin system becomes easier to reason about
+- how docs can double as machine-readable runtime input
+- how parent/child authorization can replace ambient service access
+- how DAG, Gate, and Router semantics can sit next to a plugin runtime
+- how a rollback-oriented Kernel loop might coexist with explicit safety boundaries
+
+## What It Demonstrates
+
+- Plugin tree discovery and fail-fast contract validation
+- Strict artifact loading for `dylib` and JSON-based plugin artifacts
+- Parent/child service injection with explicit authorization
+- Registry-backed docs queries and graph export
+- A deterministic execution prototype built around DAG and Gate semantics
+- A minimal self-iteration kernel prototype for evaluate / promote / rollback flows
+
+## What Works Today
+
+The repository already has a working prototype core:
+
+- `resolver`, `loader`, `registry`, and `context` are implemented
+- `shell`, `expr`, and `root` fixtures exercise the loading and invocation path
+- `RuntimeHost` and `serve` provide a long-running host with atomic snapshot reload
+- graph export, docs sync, and artifact index refresh are available from the CLI
+- Kernel and `auto-update` exist as a guarded prototype, not a production automation system
+
+Current status and gaps are tracked in [docs/architecture/status-and-open-items.md](./docs/architecture/status-and-open-items.md).
+
+## Current Boundaries
+
+`CordisClaw` is still a prototype, and the repository is explicit about what is not finished:
+
+- execution exists mainly as a library-level runtime prototype
+- the Kernel is a guarded evaluate / promote / rollback loop, not a full autonomous patching system
+- docs and graph export are helper surfaces, not a polished external service boundary
+- the original multi-artifact vision is only partially implemented today
+
+## Non-Goals
+
+At its current stage, this repo is not trying to be:
+
+- a generic drop-in plugin marketplace
+- a permissive hot-reload system with silent compatibility fallback
+- a production-ready orchestration platform
+- a fully autonomous code-changing agent
+
+The point is to make the architecture legible before making it maximally flexible.
+
+## Quick Demo
+
+Load the fixture workspace:
 
 ```bash
 cargo run -p cordis-runtime -- fixtures
 ```
 
-```bash
-cargo run -p cordis-runtime -- auto-update /path/to/workspace README.md "old_text" "new_text" --quality-score=95
-```
+Invoke the expression plugin:
 
 ```bash
-cargo run -p cordis-runtime -- shell-terminal --command="echo terminal started"
+cargo run -p cordis-runtime -- invoke expr expr_entry --payload-json='{"expression":"1 + 2 * 3"}'
 ```
+
+Run the long-lived host and reload plugins explicitly:
+
+```bash
+cargo run -p cordis-runtime -- serve fixtures
+```
+
+Inside `serve`, use:
+
+```text
+plugins
+reload
+kernel status
+```
+
+Export the registered plugin graph:
 
 ```bash
 cargo run -p cordis-runtime -- graph-html fixtures --output=registered-nodes.html
 ```
+
+Export the registered DAG view:
 
 ```bash
 cargo run -p cordis-runtime -- dag-html fixtures --output=registered-dag.html
 ```
 
-`shell-terminal` 使用内置 Cordis shell，不会调用系统 `/bin/bash`、`/bin/sh` 或 `cmd.exe`。
-表达式计算能力现在完全位于外部插件样例树：`fixtures/plugins/expr` 负责编排，词法/语法/计算分别位于 `fixtures/plugins/expr/{lexer,parser,evaluator}`，`evaluator` 内部再拆成 `add/sub/mul/div` 四个算子子插件。
-这些插件通过 `package.metadata.cordis.children` 描述父子关系；运行时只消费 `fixtures/artifacts/index.json` 与预构建工件，不再由根 workspace 直接管理。
-`expr` 顶层执行工件采用 `JSON artifact + external process`。runtime 不再硬编码 `expr`/`expr_entry`/`expression`，而是按已加载插件的 docs 与 artifact 契约动态分发命令；`Expr` 只是当前样例里的一个外部插件命令：
+Rebuild plugin artifacts, sync docs, and refresh the artifact index:
 
 ```bash
-cargo run -p cordis-runtime -- shell-terminal --command="Expr 1 + 2 * 3"
-# output: Value: 7
+./scripts/rebuild-plugin-artifacts.sh
 ```
 
-已注册节点图支持导出为 HTML：
+Configure kernel/runtime/LLM settings with YAML:
+
+```text
+config/
+  runtime.yaml
+  llm_api.yaml
+  plugins/*.yaml
+```
+
+`config/` is intended for local runtime setup and is gitignored. Sample templates are provided in `config.example/`; copy the files you need into `config/`.
+
+Run the test suite:
 
 ```bash
-cargo run -p cordis-runtime -- graph-html fixtures --output=registered-nodes.html
-# output: graph_html written to /abs/path/registered-nodes.html
+cargo test
 ```
 
-已注册节点的 DAG 也支持导出为 HTML。当前实现会根据 `docs/agent/interfaces.json` 中的 `input_schema` / `output_schema` 属性名推导数据边，再按拓扑层级布局：
+## Repository Shape
 
-```bash
-cargo run -p cordis-runtime -- dag-html fixtures --output=registered-dag.html
-# output: dag_html written to /abs/path/registered-dag.html
+```text
+.
+├── crates/
+│   ├── cordis-plugin-sdk/   # shared ABI, docs types, export helpers
+│   └── cordis-runtime/      # runtime, plugin, context, execution, kernel, service
+├── config.example/          # checked-in config templates
+├── config/                  # local runtime/kernel/LLM/plugin YAML config (gitignored)
+├── docs/                    # architecture and maintenance docs
+├── fixtures/
+│   ├── plugins/             # external plugin sample workspace
+│   └── artifacts/           # prebuilt artifacts and index
+└── scripts/                 # helper scripts
 ```
 
-## Test
+## Read the Architecture
 
-```bash
-cargo test -p cordis-runtime
-```
+- Project entry: [docs/project-overview.md](./docs/project-overview.md)
+- Architecture index: [docs/architecture/README.md](./docs/architecture/README.md)
+- System overview: [docs/architecture/system-overview.md](./docs/architecture/system-overview.md)
+- Design blueprint: [docs/architecture/design-blueprint.md](./docs/architecture/design-blueprint.md)
+- Contracts and loading: [docs/architecture/contracts-and-loading.md](./docs/architecture/contracts-and-loading.md)
+- Runtime semantics: [docs/architecture/runtime-semantics.md](./docs/architecture/runtime-semantics.md)
+- Plugins and tooling: [docs/architecture/plugins-and-tooling.md](./docs/architecture/plugins-and-tooling.md)
+- Completion status: [docs/architecture/status-and-open-items.md](./docs/architecture/status-and-open-items.md)

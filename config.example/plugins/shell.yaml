@@ -1,0 +1,5 @@
+plugin: shell
+enabled: true
+settings:
+  default_shell: cordis
+  allow_external_shell: false

@@ -5,11 +5,12 @@ use crate::core::error::RuntimeError;
 use crate::kernel::evaluator::VerificationInput;
 use crate::kernel::memory::ChangeVerdict;
 use crate::kernel::r#loop::{IterationInput, IterationReport, SelfIterationKernel};
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FilePatch {
     /// Relative path under workspace root.
     pub path: String,
@@ -19,7 +20,7 @@ pub struct FilePatch {
     pub replace: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AutoUpdatePlan {
     pub issue_id: String,
     pub patch_id: String,
@@ -28,7 +29,7 @@ pub struct AutoUpdatePlan {
     pub patches: Vec<FilePatch>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AutoUpdateResult {
     pub report: IterationReport,
     pub changed_paths: Vec<String>,

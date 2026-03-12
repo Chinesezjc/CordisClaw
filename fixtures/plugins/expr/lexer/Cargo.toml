@@ -3,6 +3,9 @@ name = "expr_lexer"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+crate-type = ["rlib", "dylib"]
+
 [package.metadata.cordis]
 plugin_path = "expr/lexer"
 abi_kind = "rust"
@@ -16,4 +19,9 @@ crate_hash = "crate_expr_lexer_v1"
 api_hash = "api_v2"
 
 [dependencies]
+cordis-plugin-sdk = { path = "../../../../crates/cordis-plugin-sdk" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 thiserror = "2"
+
+[workspace]

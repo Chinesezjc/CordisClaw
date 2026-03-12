@@ -1,0 +1,10 @@
+provider: openai
+base_url: https://api.openai.com/v1
+api_key_env: OPENAI_API_KEY
+api_key: null
+model: gpt-4.1-mini
+organization: null
+project: null
+temperature: 0.2
+max_tokens: 4096
+timeout_ms: 60000

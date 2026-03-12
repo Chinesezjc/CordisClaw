@@ -5,4 +5,4 @@ pub mod invoke;
 pub mod loader;
 pub mod package;
 pub mod registry;
-pub mod shell;
+pub mod tooling;

@@ -4,8 +4,10 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+cordis-plugin-sdk = { path = "../cordis-plugin-sdk" }
 serde.workspace = true
 serde_json.workspace = true
+serde_yaml.workspace = true
 toml.workspace = true
 thiserror.workspace = true
 sha2.workspace = true

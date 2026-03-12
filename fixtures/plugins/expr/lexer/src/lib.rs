@@ -1,121 +1,86 @@
 //! Lexer sub-plugin for expression runtime.
-//! It converts source text into a token stream.
+//! It converts source text into a token stream and exports a Rust dylib entrypoint.
 
-use thiserror::Error;
+mod core;
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum TokenKind {
-    Number(f64),
-    Plus,
-    Minus,
-    Star,
-    Slash,
-    LParen,
-    RParen,
+pub use core::*;
+
+use cordis_plugin_sdk::{
+    export_plugin_api, json_response, node_doc, plugin_docs, AbiFingerprint, PluginRequest,
+    PluginResponse,
+};
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+
+#[derive(Debug, Deserialize)]
+struct LexerRequest {
+    expression: String,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct Token {
-    pub kind: TokenKind,
-    pub position: usize,
+#[derive(Debug, Serialize)]
+struct LexerResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tokens: Option<Vec<Token>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
 }
 
-#[derive(Debug, Error, Clone, PartialEq, Eq)]
-pub enum LexError {
-    #[error("unexpected token at position {position}")]
-    UnexpectedToken { position: usize },
-    #[error("invalid number `{text}` at position {position}")]
-    InvalidNumber { text: String, position: usize },
+fn docs_value() -> cordis_plugin_sdk::PluginDocs {
+    plugin_docs(
+        "expr_lexer",
+        "expr/lexer",
+        "0.1.0",
+        None,
+        vec![node_doc(
+            "expr_lexer",
+            "Convert expression text into tokens.",
+            json!({
+                "type": "object",
+                "required": ["expression"],
+                "properties": { "expression": { "type": "string" } }
+            }),
+            json!({
+                "type": "object",
+                "properties": { "tokens": { "type": "array" } }
+            }),
+            &[],
+            &["invalid number", "unexpected token"],
+        )],
+    )
 }
 
-pub fn lex(src: &str) -> Result<Vec<Token>, LexError> {
-    let chars: Vec<char> = src.chars().collect();
-    let mut pos = 0;
-    let mut out = Vec::new();
-
-    while pos < chars.len() {
-        let ch = chars[pos];
-        if ch.is_whitespace() {
-            pos += 1;
-            continue;
-        }
-
-        let token = match ch {
-            '+' => {
-                pos += 1;
-                Token {
-                    kind: TokenKind::Plus,
-                    position: pos - 1,
-                }
-            }
-            '-' => {
-                pos += 1;
-                Token {
-                    kind: TokenKind::Minus,
-                    position: pos - 1,
-                }
-            }
-            '*' => {
-                pos += 1;
-                Token {
-                    kind: TokenKind::Star,
-                    position: pos - 1,
-                }
-            }
-            '/' => {
-                pos += 1;
-                Token {
-                    kind: TokenKind::Slash,
-                    position: pos - 1,
-                }
-            }
-            '(' => {
-                pos += 1;
-                Token {
-                    kind: TokenKind::LParen,
-                    position: pos - 1,
-                }
-            }
-            ')' => {
-                pos += 1;
-                Token {
-                    kind: TokenKind::RParen,
-                    position: pos - 1,
-                }
-            }
-            c if c.is_ascii_digit() || c == '.' => {
-                let start = pos;
-                let mut seen_dot = false;
-                while pos < chars.len() {
-                    let cur = chars[pos];
-                    if cur.is_ascii_digit() {
-                        pos += 1;
-                        continue;
-                    }
-                    if cur == '.' && !seen_dot {
-                        seen_dot = true;
-                        pos += 1;
-                        continue;
-                    }
-                    break;
-                }
-                let text = chars[start..pos].iter().collect::<String>();
-                let value = text.parse::<f64>().map_err(|_| LexError::InvalidNumber {
-                    text: text.clone(),
-                    position: start,
-                })?;
-                Token {
-                    kind: TokenKind::Number(value),
-                    position: start,
-                }
-            }
-            _ => {
-                return Err(LexError::UnexpectedToken { position: pos });
-            }
-        };
-
-        out.push(token);
+fn abi_fingerprint_value() -> AbiFingerprint {
+    AbiFingerprint {
+        rustc_version: "1.85.1".to_string(),
+        target_triple: "x86_64-unknown-linux-gnu".to_string(),
+        crate_hash: "crate_expr_lexer_v1".to_string(),
+        api_hash: "api_v2".to_string(),
     }
+}
 
-    Ok(out)
+fn api_handle(req: PluginRequest) -> PluginResponse {
+    let response = match serde_json::from_str::<LexerRequest>(&req.payload) {
+        Ok(request) => match lex(&request.expression) {
+            Ok(tokens) => LexerResponse {
+                tokens: Some(tokens),
+                error: None,
+            },
+            Err(err) => LexerResponse {
+                tokens: None,
+                error: Some(err.to_string()),
+            },
+        },
+        Err(err) => LexerResponse {
+            tokens: None,
+            error: Some(format!("invalid request: {err}")),
+        },
+    };
+
+    json_response(&response)
+}
+
+export_plugin_api! {
+    abi_fingerprint = abi_fingerprint_value(),
+    docs = docs_value(),
+    handle = api_handle,
 }

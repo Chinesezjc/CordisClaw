@@ -1,0 +1,77 @@
+{
+  "plugin_id": "shell",
+  "plugin_path": "shell",
+  "plugin_version": "0.1.0",
+  "abi_version": 2,
+  "command_name": null,
+  "nodes": [
+    {
+      "id": "shell_entry",
+      "summary": "Start the CordisClaw terminal in interactive or scripted mode.",
+      "input_schema": {
+        "properties": {
+          "action": {
+            "type": "string"
+          },
+          "command": {
+            "type": "string"
+          },
+          "cwd": {
+            "type": "string"
+          },
+          "fixtures_root": {
+            "type": "string"
+          },
+          "shell": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "action"
+        ],
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "action": {
+            "type": "string"
+          },
+          "exit_code": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "message": {
+            "type": "string"
+          },
+          "ok": {
+            "type": "boolean"
+          },
+          "output": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "shell": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "side_effects": [
+        "reads stdin",
+        "writes stdout"
+      ],
+      "failure_modes": [
+        "unsupported action",
+        "invalid shell backend",
+        "command not found"
+      ]
+    }
+  ]
+}

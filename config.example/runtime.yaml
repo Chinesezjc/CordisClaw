@@ -1,0 +1,7 @@
+runtime:
+  # Leave null to use the default snapshot staging directory.
+  snapshot_root: null
+
+kernel:
+  change_history_limit: 1024
+  min_quality_score: 80

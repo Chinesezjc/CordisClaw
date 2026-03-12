@@ -1,0 +1,305 @@
+# 设计蓝图
+
+本文档用于承接历史规划中的架构蓝图内容，并把它收敛进当前的文档体系。
+
+阅读约定：
+
+- 这里保留的是“设计基线”和“目标模型”。
+- 具体到当前已经实现了什么、代码边界在哪里，请同时对照：
+  - [system-overview.md](./system-overview.md)
+  - [contracts-and-loading.md](./contracts-and-loading.md)
+  - [runtime-semantics.md](./runtime-semantics.md)
+  - [plugins-and-tooling.md](./plugins-and-tooling.md)
+  - [status-and-open-items.md](./status-and-open-items.md)
+
+## 1. 总体分层
+
+原始规划的系统分层可以概括为：
+
+```text
+Plugin Packaging
+   -> Plugin Runtime Adapter
+   -> Node Registry
+   -> Execution Graph
+   -> Scheduler + Actor Executor
+   -> ExecutionState
+   -> OpenClaw Iteration Loop
+```
+
+这套分层强调四件事：
+
+- 插件负责声明能力，而不是手写整条业务 DAG。
+- DAG 负责描述依赖关系。
+- Scheduler / Actor 负责确定性执行。
+- Kernel 负责在安全边界内做观察、验证、评分与演进。
+
+在当前文档体系中的对应位置：
+
+- 系统边界与主流程：见 [system-overview.md](./system-overview.md)
+- 插件契约与加载：见 [contracts-and-loading.md](./contracts-and-loading.md)
+- 执行、Context、Kernel：见 [runtime-semantics.md](./runtime-semantics.md)
+
+## 2. 插件封装策略
+
+原始蓝图把插件封装形式分成五类：
+
+- `rlib`：内置核心插件
+- `dylib`：内部受控热更新插件
+- `cdylib`：跨版本、偏稳定 ABI 的扩展插件
+- `WASM`：第三方插件生态
+- `external process`：不可信插件
+
+当前架构文档已经稳定下来的关键原则是：
+
+- `dylib` 属于受控内部通道
+- ABI 指纹必须严格匹配
+- 不做 `dylib -> cdylib/wasm` 自动降级
+- loader 只消费预构建工件和索引
+
+这些“已经收敛为当前实现约束”的部分，见 [contracts-and-loading.md](./contracts-and-loading.md)。
+
+而 `cdylib` / `WASM` / 更完整 runtime adapter 生态，仍属于设计蓝图的一部分，当前完成度见 [status-and-open-items.md](./status-and-open-items.md)。
+
+## 3. 插件节点与插件树模型
+
+原始规划里，插件的核心职责是暴露节点能力：
+
+```rust
+pub struct NodeMeta {
+    pub id: &'static str,
+    pub consumes: Vec<TypeId>,
+    pub produces: Vec<TypeId>,
+    pub node_type: NodeType,
+}
+```
+
+节点类型分为：
+
+- `Task`
+- `Router`
+- `Gate`
+- `Terminal`
+
+插件树模型强调：
+
+- 支持完全嵌套插件树
+- `plugin_path` 全局唯一
+- `node_fqn = plugin_path::node_id` 全局唯一
+- 父子关系只看 `package.metadata.cordis.children`
+- 冲突在 resolve 阶段 fail-fast
+
+这些语义在当前实现中已经具体化为：
+
+- `plugin_path`
+- `declared_nodes`
+- `children`
+- `grants`
+- `required`
+
+对应实现和当前约束请看 [contracts-and-loading.md](./contracts-and-loading.md)。
+
+## 4. Execution Graph 设计基线
+
+原始蓝图把执行图拆成三部分：
+
+### 4.1 节点类型
+
+- `TaskNode`：普通执行步骤
+- `RouterNode`：动态选择子 pipeline
+- `GateNode`：聚合上游分支的控制策略
+- `TerminalNode`：产出最终结果或触发最终提交
+
+### 4.2 边类型
+
+- 数据依赖：`producer(output) -> consumer(input)`
+- 控制依赖：只表达先后顺序
+- 条件依赖：由 Router 根据分支结果选择
+
+### 4.3 自动 DAG 生成
+
+蓝图默认希望系统能根据 `produces / consumes` 自动连线，并遵守：
+
+- 多 producer 冲突时先看显式绑定
+- 其次看 priority
+- 再次看 `node_id`
+- 无法唯一确定时 fail-fast
+
+当前运行时文档里已经落地的部分包括：
+
+- DAG build
+- required input 缺失检测
+- 多 producer 冲突检测
+- 环检测
+
+对应实现与当前边界见 [runtime-semantics.md](./runtime-semantics.md)。
+
+## 5. Gate、Router、Scheduler 与 Actor
+
+原始规划要求的 Gate 策略包括：
+
+- `AllOf`
+- `AnyOf`
+- `FirstSuccess`
+- `FirstCompleted`
+- `AtLeast(k)`
+
+并且明确了三条重要语义：
+
+- `FirstSuccess` 可以在首个成功后取消其余分支
+- `timeout` 属于终态，并按失败类参与聚合
+- 被取消分支的下游应被标记为 `Skipped`
+
+Router 的设计基线是：
+
+- Router 负责实例化子图
+- 子图执行包在 overlay 事务中
+- 成功提交 overlay
+- 失败 / 超时 / 取消时回滚 overlay
+
+Scheduler / Actor 的设计基线是：
+
+- Scheduler 维护 ready queue、运行中节点、依赖计数和输出
+- Actor 负责执行节点，尽量通过 message passing 降低共享状态
+- ready queue 排序键固定，保证相同输入下执行顺序尽量确定
+
+这些内容已经被当前文档收敛到 [runtime-semantics.md](./runtime-semantics.md) 中。
+
+## 6. Context 设计基线
+
+原始规划里，Context 的核心目标是“一致性与隔离优先”。
+
+关键约束包括：
+
+- 分层作用域：`Global -> Session -> Request`
+- 再叠加按 `plugin_path` 组织的 `Local` 链
+- 默认写入发生在 request / overlay 内
+- session 写需要显式提交
+- global 默认只读
+
+服务注册与解析基线是：
+
+- `provide / inject / dispose`
+- 查找顺序：`Local(current -> parent...) -> Request -> Session -> Global`
+- 子插件默认不能继承父插件 Local 服务，必须经过 `grants`
+- required service 缺失要 fail-fast
+
+事务与一致性基线是：
+
+- `begin_subgraph`
+- `commit_overlay`
+- `rollback_overlay`
+- `commit_session` 使用 CAS 校验
+
+这些内容在当前实现里已经基本成型，并被整理到 [runtime-semantics.md](./runtime-semantics.md) 中。
+
+## 7. 一次命令执行的参考流程
+
+原始规划把一次命令执行抽象成：
+
+```text
+load_session_snapshot
+  -> build_request_overlay
+  -> parser
+  -> command_resolve
+  -> selected_pipeline
+  -> render
+  -> optional_commit_session
+  -> send
+```
+
+它想表达的不是某个具体命令，而是统一运行模式：
+
+- 先拿到 session 快照
+- 再建 request overlay
+- 中间通过 parser / router / pipeline 进入具体 DAG
+- 在结束时决定是否提交 session
+
+当前仓库里更贴近现实的调用路径与样例插件，请看 [plugins-and-tooling.md](./plugins-and-tooling.md)。
+
+## 8. Loader 与 ABI 设计基线
+
+原始规划里，loader 的设计重点有四个：
+
+- 只从顶层 workspace members 起步
+- 通过 direct-children metadata 递归展开插件树
+- 只消费预构建 artifact index
+- 用严格 ABI 指纹和哈希校验控制加载
+
+配套的故障策略是：
+
+- `ArtifactMissing`
+- `HashMismatch`
+- `AbiMismatch`
+- `SymbolMissing`
+- `InitFailed`
+- `BudgetExceeded`
+- `ContractViolation`
+
+以及：
+
+- `required` 子插件失败要沿父链传播
+- `optional` 子插件失败只标记为 `Unavailable`
+- 不做跨类型 fallback
+
+这些内容已经进入 [contracts-and-loading.md](./contracts-and-loading.md) 的正式文档语义。
+
+## 9. 推荐工程结构
+
+原始规划中给出的工程结构，核心意图不是逐目录照搬，而是强调职责边界：
+
+- plugin 层负责发现、解析、加载、注册、调用
+- execution 层负责 DAG、Gate、Router、Scheduler、Actor
+- context 层负责作用域、键模型、事务与注入
+- kernel 层负责策略、评估、记忆与自迭代闭环
+- service 层负责 doc / graph 等对外查询能力
+
+当前仓库已经按相近的方式落到了：
+
+- `crates/cordis-runtime/src/plugin`
+- `crates/cordis-runtime/src/execution`
+- `crates/cordis-runtime/src/context`
+- `crates/cordis-runtime/src/kernel`
+- `crates/cordis-runtime/src/service`
+
+具体职责分工见 [rs-files-responsibility.md](../rs-files-responsibility.md)。
+
+## 10. Kernel 规划与实施阶段
+
+原始规划里，Kernel 的目标是形成：
+
+```text
+observe -> diagnose -> plan -> apply -> verify -> score -> promote/rollback
+```
+
+并建议分成三阶段：
+
+1. 只读诊断
+2. 受限自动修复
+3. 小流量自迭代
+
+同时，原始“架构设计阶段实施计划”把整体收敛为 Stage A-E：
+
+- Stage A：Package Contract Freeze
+- Stage B：Runtime Contract Freeze
+- Stage C：Loader Design Freeze
+- Stage D：Artifact Design Freeze
+- Stage E：Context & Security Freeze
+
+这些阶段现在已经不再适合作为单独的根文档长期维护，而是应该分别落到当前文档集合里：
+
+- 设计基线：本文
+- 当前实现语义：见各架构主题文档
+- 当前完成度与未完成项：见 [status-and-open-items.md](./status-and-open-items.md)
+
+## 11. 现在应该怎么使用这套文档
+
+如果你关心的是：
+
+- “最初想把系统设计成什么样”：
+  看本文。
+- “现在代码真实实现到哪里了”：
+  看 [system-overview.md](./system-overview.md)、[contracts-and-loading.md](./contracts-and-loading.md)、[runtime-semantics.md](./runtime-semantics.md)。
+- “哪些已经做完，哪些还是计划”：
+  看 [status-and-open-items.md](./status-and-open-items.md)。
+
+这样历史蓝图、当前实现和当前完成度，就不会再混在同一个文件里。

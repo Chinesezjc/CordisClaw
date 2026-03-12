@@ -1,3 +1,12 @@
 [workspace]
-members = ["root", "expr"]
+members = ["root", "expr", "shell"]
+exclude = [
+  "expr/lexer",
+  "expr/parser",
+  "expr/evaluator",
+  "expr/evaluator/add",
+  "expr/evaluator/sub",
+  "expr/evaluator/mul",
+  "expr/evaluator/div",
+]
 resolver = "2"

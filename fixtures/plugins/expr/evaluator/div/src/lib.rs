@@ -1,26 +1,92 @@
 //! Divide sub-plugin for expression runtime.
+//! It exposes one arithmetic operation as a Rust dylib plugin.
 
-use thiserror::Error;
+mod core;
 
-#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
-pub enum DivError {
-    #[error("division by zero")]
-    DivisionByZero,
+pub use core::*;
+
+use cordis_plugin_sdk::{
+    export_plugin_api, json_response, node_doc, plugin_docs, AbiFingerprint, PluginRequest,
+    PluginResponse,
+};
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+
+#[derive(Debug, Deserialize)]
+struct BinaryOpRequest {
+    lhs: f64,
+    rhs: f64,
 }
 
-#[derive(Debug, Default, Clone, Copy)]
-pub struct DivPlugin;
+#[derive(Debug, Serialize)]
+struct DivResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    value: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
 
-impl DivPlugin {
-    pub fn apply(&self, lhs: f64, rhs: f64) -> Result<f64, DivError> {
-        if rhs == 0.0 {
-            return Err(DivError::DivisionByZero);
-        }
-        Ok(lhs / rhs)
+fn docs_value() -> cordis_plugin_sdk::PluginDocs {
+    plugin_docs(
+        "expr_evaluator_div",
+        "expr/evaluator/div",
+        "0.1.0",
+        None,
+        vec![node_doc(
+            "expr_div",
+            "Divide lhs by rhs with zero protection.",
+            json!({
+                "type": "object",
+                "required": ["lhs", "rhs"],
+                "properties": {
+                    "lhs": { "type": "number" },
+                    "rhs": { "type": "number" }
+                }
+            }),
+            json!({
+                "type": "object",
+                "properties": {
+                    "value": { "type": "number" },
+                    "error": { "type": "string" }
+                }
+            }),
+            &[],
+            &["division by zero"],
+        )],
+    )
+}
+
+fn abi_fingerprint_value() -> AbiFingerprint {
+    AbiFingerprint {
+        rustc_version: "1.85.1".to_string(),
+        target_triple: "x86_64-unknown-linux-gnu".to_string(),
+        crate_hash: "crate_expr_div_v1".to_string(),
+        api_hash: "api_v2".to_string(),
     }
 }
 
-#[allow(dead_code)]
-pub fn apply(lhs: f64, rhs: f64) -> Result<f64, DivError> {
-    DivPlugin.apply(lhs, rhs)
+fn api_handle(req: PluginRequest) -> PluginResponse {
+    let response = match serde_json::from_str::<BinaryOpRequest>(&req.payload) {
+        Ok(request) => match apply(request.lhs, request.rhs) {
+            Ok(value) => DivResponse {
+                value: Some(value),
+                error: None,
+            },
+            Err(err) => DivResponse {
+                value: None,
+                error: Some(err.to_string()),
+            },
+        },
+        Err(err) => DivResponse {
+            value: None,
+            error: Some(format!("invalid request: {err}")),
+        },
+    };
+    json_response(&response)
+}
+
+export_plugin_api! {
+    abi_fingerprint = abi_fingerprint_value(),
+    docs = docs_value(),
+    handle = api_handle,
 }

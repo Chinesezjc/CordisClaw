@@ -65,6 +65,9 @@ pub enum RuntimeError {
     #[error("artifact index parse failed at {path}: {message}")]
     ArtifactIndexParse { path: PathBuf, message: String },
 
+    #[error("config parse failed at {path}: {message}")]
+    ConfigParse { path: PathBuf, message: String },
+
     #[error("artifact index missing entry for plugin {plugin_path}")]
     ArtifactIndexMissing { plugin_path: String },
 
@@ -198,12 +201,6 @@ pub enum RuntimeError {
 
     #[error("auto update verify failed: {message}")]
     AutoUpdateVerifyFailed { message: String },
-
-    #[error("shell plugin invalid request: {message}")]
-    ShellPluginInvalidRequest { message: String },
-
-    #[error("shell plugin unsupported action: {action}")]
-    ShellPluginUnsupportedAction { action: String },
 
     #[error("internal invariant broken: {message}")]
     Invariant { message: String },

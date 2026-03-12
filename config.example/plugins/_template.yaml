@@ -1,0 +1,4 @@
+plugin: example
+enabled: true
+settings:
+  notes: "Copy this file and rename it to <plugin>.yaml for new plugin config."

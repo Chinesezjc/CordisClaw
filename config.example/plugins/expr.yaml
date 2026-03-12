@@ -1,0 +1,5 @@
+plugin: expr
+enabled: true
+settings:
+  command_name: Expr
+  max_expression_length: 1024

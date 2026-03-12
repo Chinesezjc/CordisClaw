@@ -4,9 +4,10 @@
 use crate::kernel::evaluator::{EvalHarness, EvaluationReport, VerificationInput};
 use crate::kernel::memory::{ChangeMemory, ChangeVerdict};
 use crate::kernel::policy::IterationPolicy;
+use serde::{Deserialize, Serialize};
 use std::time::Instant;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum IterationStage {
     Observe,
     Diagnose,
@@ -19,7 +20,7 @@ pub enum IterationStage {
     Rollback,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct IterationInput {
     pub issue_id: String,
     pub patch_id: String,
@@ -29,7 +30,7 @@ pub struct IterationInput {
     pub verification: VerificationInput,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct IterationReport {
     pub stages: Vec<IterationStage>,
     pub verdict: ChangeVerdict,
@@ -37,7 +38,7 @@ pub struct IterationReport {
     pub elapsed_ms: u128,
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct KernelLoopMetrics {
     pub iteration_total: u64,
     pub iteration_promote_total: u64,

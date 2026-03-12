@@ -10,6 +10,7 @@ use crate::core::models::{DylibAbiKind, LoaderBudget, PluginLoadResult, PluginUn
 use crate::context::{ContextRegistry, PluginHierarchy, RuntimeContext};
 use crate::plugin::artifact::{
     load_artifact_index, load_plugin_artifact, resolve_artifact_path, sha256_file,
+    stage_artifact_bundle,
 };
 use crate::plugin::dynamic::{is_dylib_path, sidecar_json_path, LoadedDylibApi};
 use crate::plugin::package::PackageResolver;
@@ -62,6 +63,13 @@ impl Loader {
     }
 
     pub fn load(&self) -> Result<LoadOutput, RuntimeError> {
+        self.load_with_staging_root(None)
+    }
+
+    pub fn load_with_staging_root(
+        &self,
+        staged_root: Option<&Path>,
+    ) -> Result<LoadOutput, RuntimeError> {
         let started_at = Instant::now();
         let execution_id = make_execution_id();
         // Phase A: discover + resolve tree from workspace roots.
@@ -234,19 +242,22 @@ impl Loader {
                 continue;
             }
 
-            let artifact_path = resolve_artifact_path(
+            let resolved_artifact_path = resolve_artifact_path(
                 &self.config.artifact_index_path,
                 &index_entry.artifact_path,
             );
             // Missing artifact is terminal for this plugin (no cross-type fallback).
-            if !artifact_path.exists() {
+            if !resolved_artifact_path.exists() {
                 plugin_registry.insert_unavailable(
                     plugin_path.clone(),
                     plugin.parent.clone(),
                     plugin.required,
                     plugin.grants_from_parent.clone(),
                     PluginUnavailableReason::ArtifactMissing,
-                    vec![format!("artifact does not exist: {}", artifact_path.display())],
+                    vec![format!(
+                        "artifact does not exist: {}",
+                        resolved_artifact_path.display()
+                    )],
                 );
                 context.set_plugin_state(
                     plugin_path,
@@ -267,7 +278,7 @@ impl Loader {
             }
 
             // Hash check guarantees artifact content integrity.
-            let actual_hash = sha256_file(&artifact_path)?;
+            let actual_hash = sha256_file(&resolved_artifact_path)?;
             if actual_hash != index_entry.sha256 {
                 plugin_registry.insert_unavailable(
                     plugin_path.clone(),
@@ -294,6 +305,16 @@ impl Loader {
                 }
                 continue;
             }
+
+            let artifact_path = match staged_root {
+                Some(root) => stage_artifact_bundle(
+                    plugin_path,
+                    &index_entry.artifact_path,
+                    &resolved_artifact_path,
+                    root,
+                )?,
+                None => resolved_artifact_path,
+            };
 
             if is_dylib_path(&artifact_path) {
                 // Dylib path: load fixed Rust symbol table from shared object.

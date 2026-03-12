@@ -1,9 +1,10 @@
 use cordis_runtime::context::ContextRegistry;
 use cordis_runtime::core::error::RuntimeError;
 use cordis_runtime::core::models::{NodeOutcome, PluginLoadResult, PluginUnavailableReason};
+use cordis_runtime::plugin::invoke::PluginInvoker;
 use cordis_runtime::execution::scheduler::{run_deterministic, ScheduledNode, SchedulerConfig};
 use cordis_runtime::plugin::loader::{default_loader_config, Loader};
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
@@ -20,6 +21,9 @@ fn copy_dir_all(src: &Path, dst: &Path) {
     for entry in fs::read_dir(src).expect("read dir") {
         let entry = entry.expect("dir entry");
         let ty = entry.file_type().expect("file type");
+        if ty.is_dir() && entry.file_name() == "target" {
+            continue;
+        }
         let target = dst.join(entry.file_name());
         if ty.is_dir() {
             copy_dir_all(&entry.path(), &target);
@@ -64,8 +68,13 @@ fn load_success_and_grants_enforced() {
         output.plugin_registry.get("root/child").unwrap().load_result,
         PluginLoadResult::Loaded
     ));
+    assert!(matches!(
+        output.plugin_registry.get("shell").unwrap().load_result,
+        PluginLoadResult::Loaded
+    ));
     assert!(output.node_registry.contains("root::root_entry"));
     assert!(output.node_registry.contains("root/child::child_entry"));
+    assert!(output.node_registry.contains("shell::shell_entry"));
 
     let plugin_docs = output
         .doc_registry
@@ -121,6 +130,11 @@ fn registered_graph_json_and_html_are_available() {
             .any(|plugin| plugin.get("plugin_path").and_then(|v| v.as_str()) == Some("expr"))
     );
     assert!(
+        plugins
+            .iter()
+            .any(|plugin| plugin.get("plugin_path").and_then(|v| v.as_str()) == Some("shell"))
+    );
+    assert!(
         nodes.iter().any(|node| {
             node.get("node_fqn").and_then(|v| v.as_str()) == Some("expr::expr_entry")
         })
@@ -134,6 +148,7 @@ fn registered_graph_json_and_html_are_available() {
     assert!(html.contains("Registered Nodes Graph"));
     assert!(html.contains("expr::expr_entry"));
     assert!(html.contains("root/child::child_entry"));
+    assert!(html.contains("shell::shell_entry"));
 }
 
 #[test]
@@ -197,6 +212,69 @@ fn registered_dag_json_and_html_are_available() {
     assert!(html.contains("Registered DAG"));
     assert!(html.contains("expr/lexer::expr_lexer"));
     assert!(html.contains("expr/evaluator::expr_evaluator"));
+}
+
+#[test]
+fn expr_dylib_subplugins_are_invokable() {
+    let temp = setup_fixture_copy();
+    let invoker = PluginInvoker::load(temp.path()).expect("fixtures should load");
+
+    let lexer = invoker
+        .invoke(
+            "expr/lexer",
+            "expr_lexer",
+            json!({ "expression": "1 + 2 * 3" }).to_string(),
+        )
+        .expect("lexer should be invokable");
+    let lexer_value: Value = serde_json::from_str(&lexer.payload).expect("lexer json");
+    let tokens = lexer_value.get("tokens").cloned().expect("tokens field");
+
+    let parser = invoker
+        .invoke(
+            "expr/parser",
+            "expr_parser",
+            json!({ "tokens": tokens }).to_string(),
+        )
+        .expect("parser should be invokable");
+    let parser_value: Value = serde_json::from_str(&parser.payload).expect("parser json");
+    let ast = parser_value.get("ast").cloned().expect("ast field");
+
+    let evaluator = invoker
+        .invoke(
+            "expr/evaluator",
+            "expr_evaluator",
+            json!({ "ast": ast }).to_string(),
+        )
+        .expect("evaluator should be invokable");
+    let evaluator_value: Value =
+        serde_json::from_str(&evaluator.payload).expect("evaluator json");
+    assert_eq!(
+        evaluator_value.get("value").and_then(|v| v.as_f64()),
+        Some(7.0)
+    );
+
+    let add = invoker
+        .invoke(
+            "expr/evaluator/add",
+            "expr_add",
+            json!({ "lhs": 1.0, "rhs": 2.0 }).to_string(),
+        )
+        .expect("add should be invokable");
+    let add_value: Value = serde_json::from_str(&add.payload).expect("add json");
+    assert_eq!(add_value.get("value").and_then(|v| v.as_f64()), Some(3.0));
+
+    let div = invoker
+        .invoke(
+            "expr/evaluator/div",
+            "expr_div",
+            json!({ "lhs": 1.0, "rhs": 0.0 }).to_string(),
+        )
+        .expect("div should be invokable");
+    let div_value: Value = serde_json::from_str(&div.payload).expect("div json");
+    assert_eq!(
+        div_value.get("error").and_then(|v| v.as_str()),
+        Some("division by zero")
+    );
 }
 
 #[test]

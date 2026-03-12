@@ -1,21 +1,10 @@
 //! Runtime ABI surface shared by host and dylib plugins.
-//! Host side resolves `cordis_plugin_api_rust_v2` and uses this table.
+//! Shared wire types come from `cordis-plugin-sdk`; runtime keeps only host-local metadata
+//! and traits in this module.
 
-use crate::core::models::DylibAbiKind;
-
-#[repr(C)]
-#[derive(Debug, Clone)]
-pub struct PluginRequest {
-    /// Runtime request payload passed into plugin handler.
-    pub payload: String,
-}
-
-#[repr(C)]
-#[derive(Debug, Clone)]
-pub struct PluginResponse {
-    /// Runtime response payload returned by plugin handler.
-    pub payload: String,
-}
+pub use cordis_plugin_sdk::{
+    DylibAbiKind, PluginRequest, PluginResponse, RustPluginApiV2,
+};
 
 #[repr(C)]
 #[derive(Debug, Clone)]
@@ -33,16 +22,4 @@ pub struct NodeMeta {
 pub trait RuntimePlugin: Send {
     /// Single plugin request entrypoint.
     fn handle(&mut self, req: PluginRequest) -> PluginResponse;
-}
-
-#[repr(C)]
-pub struct RustPluginApiV2 {
-    /// Must be `DylibAbiKind::Rust`.
-    pub abi_kind: DylibAbiKind,
-    /// Expose ABI fingerprint as JSON payload.
-    pub abi_fingerprint: fn() -> PluginResponse,
-    /// Expose agent/human-readable docs as JSON payload.
-    pub docs: fn() -> PluginResponse,
-    /// Handle a runtime request.
-    pub handle: fn(PluginRequest) -> PluginResponse,
 }

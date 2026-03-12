@@ -3,14 +3,32 @@
   "plugin_path": "expr/evaluator/add",
   "plugin_version": "0.1.0",
   "abi_version": 2,
+  "command_name": null,
   "nodes": [
     {
       "id": "expr_add",
       "summary": "Add two numbers.",
       "input_schema": {
+        "properties": {
+          "lhs": {
+            "type": "number"
+          },
+          "rhs": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "lhs",
+          "rhs"
+        ],
         "type": "object"
       },
       "output_schema": {
+        "properties": {
+          "value": {
+            "type": "number"
+          }
+        },
         "type": "object"
       },
       "side_effects": [],

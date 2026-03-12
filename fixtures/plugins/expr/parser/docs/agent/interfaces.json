@@ -3,25 +3,26 @@
   "plugin_path": "expr/parser",
   "plugin_version": "0.1.0",
   "abi_version": 2,
+  "command_name": null,
   "nodes": [
     {
       "id": "expr_parser",
       "summary": "Build an AST from lexer tokens.",
       "input_schema": {
-        "type": "object",
         "properties": {
           "tokens": {
             "type": "array"
           }
-        }
+        },
+        "type": "object"
       },
       "output_schema": {
-        "type": "object",
         "properties": {
           "ast": {
             "type": "object"
           }
-        }
+        },
+        "type": "object"
       },
       "side_effects": [],
       "failure_modes": [

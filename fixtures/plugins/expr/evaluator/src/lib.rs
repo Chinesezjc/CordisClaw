@@ -1,112 +1,85 @@
 //! Evaluator sub-plugin for expression runtime.
-//! It computes a numeric value from parser AST.
+//! It computes a numeric value from parser AST and exports a Rust dylib entrypoint.
 
-#[path = "../../parser/src/lib.rs"]
-mod parser_plugin;
-#[path = "../add/src/lib.rs"]
-mod add_plugin;
-#[path = "../sub/src/lib.rs"]
-mod sub_plugin;
-#[path = "../mul/src/lib.rs"]
-mod mul_plugin;
-#[path = "../div/src/lib.rs"]
-mod div_plugin;
+mod core;
 
-use add_plugin::AddPlugin;
-use div_plugin::{DivError, DivPlugin};
-use mul_plugin::MulPlugin;
-use parser_plugin::{
-    parse_expression,
-    BinaryOp,
-    ExprAst,
-    ParseExpressionError,
-    UnaryOp,
+pub use core::*;
+
+use cordis_plugin_sdk::{
+    export_plugin_api, json_response, node_doc, plugin_docs, AbiFingerprint, PluginRequest,
+    PluginResponse,
 };
-use sub_plugin::SubPlugin;
-use thiserror::Error;
+use serde::{Deserialize, Serialize};
+use serde_json::json;
 
-#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
-pub enum EvalError {
-    #[error("division by zero")]
-    DivisionByZero,
+#[derive(Debug, Deserialize)]
+struct EvaluatorRequest {
+    ast: ExprAst,
 }
 
-#[derive(Debug, Error, Clone, PartialEq, Eq)]
-pub enum EvaluateExpressionError {
-    #[error("division by zero")]
-    DivisionByZero,
-    #[error("unexpected token at position {position}")]
-    UnexpectedToken { position: usize },
-    #[error("missing ')' at position {position}")]
-    MissingRightParen { position: usize },
-    #[error("expected number at position {position}")]
-    ExpectedNumber { position: usize },
-    #[error("invalid number `{text}` at position {position}")]
-    InvalidNumber { text: String, position: usize },
+#[derive(Debug, Serialize)]
+struct EvaluatorResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    value: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
 }
 
-pub fn evaluate_expression(src: &str) -> Result<f64, EvaluateExpressionError> {
-    let ast = parse_expression(src).map_err(map_parse_expression_error)?;
-    evaluate(&ast).map_err(map_eval_error)
+fn docs_value() -> cordis_plugin_sdk::PluginDocs {
+    plugin_docs(
+        "expr_evaluator",
+        "expr/evaluator",
+        "0.1.0",
+        None,
+        vec![node_doc(
+            "expr_evaluator",
+            "Evaluate the AST and delegate arithmetic to child operator plugins.",
+            json!({
+                "type": "object",
+                "properties": { "ast": { "type": "object" } }
+            }),
+            json!({
+                "type": "object",
+                "properties": { "value": { "type": "number" } }
+            }),
+            &[],
+            &["division by zero"],
+        )],
+    )
 }
 
-pub fn evaluate(ast: &ExprAst) -> Result<f64, EvalError> {
-    let ops = OpPlugins::default();
-    evaluate_with_plugins(ast, &ops)
-}
-
-#[derive(Debug, Default, Clone, Copy)]
-struct OpPlugins {
-    add: AddPlugin,
-    sub: SubPlugin,
-    mul: MulPlugin,
-    div: DivPlugin,
-}
-
-fn evaluate_with_plugins(ast: &ExprAst, ops: &OpPlugins) -> Result<f64, EvalError> {
-    match ast {
-        ExprAst::Number(v) => Ok(*v),
-        ExprAst::Unary { op, expr } => {
-            let value = evaluate_with_plugins(expr, ops)?;
-            match op {
-                UnaryOp::Plus => Ok(value),
-                UnaryOp::Minus => Ok(ops.sub.apply(0.0, value)),
-            }
-        }
-        ExprAst::Binary { op, lhs, rhs } => {
-            let left = evaluate_with_plugins(lhs, ops)?;
-            let right = evaluate_with_plugins(rhs, ops)?;
-            match op {
-                BinaryOp::Add => Ok(ops.add.apply(left, right)),
-                BinaryOp::Sub => Ok(ops.sub.apply(left, right)),
-                BinaryOp::Mul => Ok(ops.mul.apply(left, right)),
-                BinaryOp::Div => ops.div.apply(left, right).map_err(|err| match err {
-                    DivError::DivisionByZero => EvalError::DivisionByZero,
-                }),
-            }
-        }
+fn abi_fingerprint_value() -> AbiFingerprint {
+    AbiFingerprint {
+        rustc_version: "1.85.1".to_string(),
+        target_triple: "x86_64-unknown-linux-gnu".to_string(),
+        crate_hash: "crate_expr_evaluator_v1".to_string(),
+        api_hash: "api_v2".to_string(),
     }
 }
 
-fn map_parse_expression_error(err: ParseExpressionError) -> EvaluateExpressionError {
-    match err {
-        ParseExpressionError::UnexpectedToken { position } => {
-            EvaluateExpressionError::UnexpectedToken { position }
-        }
-        ParseExpressionError::MissingRightParen { position } => {
-            EvaluateExpressionError::MissingRightParen { position }
-        }
-        ParseExpressionError::ExpectedNumber { position } => {
-            EvaluateExpressionError::ExpectedNumber { position }
-        }
-        ParseExpressionError::InvalidNumber { text, position } => {
-            EvaluateExpressionError::InvalidNumber { text, position }
-        }
-    }
+fn api_handle(req: PluginRequest) -> PluginResponse {
+    let response = match serde_json::from_str::<EvaluatorRequest>(&req.payload) {
+        Ok(request) => match evaluate(&request.ast) {
+            Ok(value) => EvaluatorResponse {
+                value: Some(value),
+                error: None,
+            },
+            Err(err) => EvaluatorResponse {
+                value: None,
+                error: Some(err.to_string()),
+            },
+        },
+        Err(err) => EvaluatorResponse {
+            value: None,
+            error: Some(format!("invalid request: {err}")),
+        },
+    };
+
+    json_response(&response)
 }
 
-fn map_eval_error(err: EvalError) -> EvaluateExpressionError {
-    match err {
-        EvalError::DivisionByZero => EvaluateExpressionError::DivisionByZero,
-    }
+export_plugin_api! {
+    abi_fingerprint = abi_fingerprint_value(),
+    docs = docs_value(),
+    handle = api_handle,
 }

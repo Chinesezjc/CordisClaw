@@ -1,13 +1,15 @@
 //! Verification and scoring harness for self-iteration.
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct VerificationInput {
     pub tests_passed: bool,
     pub safety_checks_passed: bool,
     pub quality_score: u32,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EvaluationReport {
     pub accepted: bool,
     pub tests_passed: bool,

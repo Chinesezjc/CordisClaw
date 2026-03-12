@@ -27,6 +27,19 @@
       "built_at": "2026-03-11T00:00:00Z"
     },
     {
+      "plugin_path": "shell",
+      "version": "0.1.0",
+      "abi_fingerprint": {
+        "rustc_version": "1.85.1",
+        "target_triple": "x86_64-unknown-linux-gnu",
+        "crate_hash": "crate_shell_v1",
+        "api_hash": "api_v2"
+      },
+      "artifact_path": "shell.so",
+      "sha256": "b3c89618bb9059a2cdb1a87962e61be418815a7c8b9f5c898915384d59a45670",
+      "built_at": "2026-03-11T00:00:00Z"
+    },
+    {
       "plugin_path": "expr",
       "version": "0.1.0",
       "abi_fingerprint": {
@@ -35,8 +48,8 @@
         "crate_hash": "crate_expr_v1",
         "api_hash": "api_v2"
       },
-      "artifact_path": "expr.json",
-      "sha256": "a17f94d20569c6e06a159b83671123b0698981539384ddff7c2bef4e95711708",
+      "artifact_path": "expr.so",
+      "sha256": "d254a64415ff7793672d1e2634e933487995ab16fcafc91bad7c3ba04c628835",
       "built_at": "2026-03-11T00:00:00Z"
     },
     {
@@ -48,8 +61,8 @@
         "crate_hash": "crate_expr_evaluator_v1",
         "api_hash": "api_v2"
       },
-      "artifact_path": "expr_evaluator.json",
-      "sha256": "e99dce1c4a0f11d858540f2dff3eb31535816922369aaa9532e4ca2462ea5bea",
+      "artifact_path": "expr_evaluator.so",
+      "sha256": "94a5322a3261c48717c2e9ac3129f29e2257962eaacab059004047727da3182c",
       "built_at": "2026-03-11T00:00:00Z"
     },
     {
@@ -61,8 +74,8 @@
         "crate_hash": "crate_expr_add_v1",
         "api_hash": "api_v2"
       },
-      "artifact_path": "expr_evaluator_add.json",
-      "sha256": "55a0010d9106391173e635919eab5383528280943fc3ea5a78b94da3c644c341",
+      "artifact_path": "expr_evaluator_add.so",
+      "sha256": "d686a7b04327e3b139092a968eade4812cdead8e18b6bf20559cb63930113bff",
       "built_at": "2026-03-11T00:00:00Z"
     },
     {
@@ -74,8 +87,8 @@
         "crate_hash": "crate_expr_div_v1",
         "api_hash": "api_v2"
       },
-      "artifact_path": "expr_evaluator_div.json",
-      "sha256": "a8c54a7495a531a03428532cf67d83b72f77423b3caf0bb3f6aa3e016c4daace",
+      "artifact_path": "expr_evaluator_div.so",
+      "sha256": "2d7d6df868bf01ecd94607d1583b0eb5cf5893ed770a97b1a4e546486fd67968",
       "built_at": "2026-03-11T00:00:00Z"
     },
     {
@@ -87,8 +100,8 @@
         "crate_hash": "crate_expr_mul_v1",
         "api_hash": "api_v2"
       },
-      "artifact_path": "expr_evaluator_mul.json",
-      "sha256": "a2ea080158f7b8259aa383e92a0690419c4f8a9a49d456b78c91be4b64595fa7",
+      "artifact_path": "expr_evaluator_mul.so",
+      "sha256": "a5a17524f0e46ec6f4cf37f2a62aa49effb94ad59b4986d375fee50c9fae34e5",
       "built_at": "2026-03-11T00:00:00Z"
     },
     {
@@ -100,8 +113,8 @@
         "crate_hash": "crate_expr_sub_v1",
         "api_hash": "api_v2"
       },
-      "artifact_path": "expr_evaluator_sub.json",
-      "sha256": "690a446b118cf6aa1891bf3c949428f4919c51218a18ef9ed503cc7554012920",
+      "artifact_path": "expr_evaluator_sub.so",
+      "sha256": "722503a3afc957da73c1bf3b8ee5bb9df68e842d710c2ca56c7bfe0cd248f589",
       "built_at": "2026-03-11T00:00:00Z"
     },
     {
@@ -113,8 +126,8 @@
         "crate_hash": "crate_expr_lexer_v1",
         "api_hash": "api_v2"
       },
-      "artifact_path": "expr_lexer.json",
-      "sha256": "dbb9eeaa17f4cd40a5186a13a4514ec1b7a11257250ff8d5b229037034e609d2",
+      "artifact_path": "expr_lexer.so",
+      "sha256": "28b4db2b6f027643bd80dd7ca9523cafe8c3c8b7573c810430cf96b38d73c770",
       "built_at": "2026-03-11T00:00:00Z"
     },
     {
@@ -126,8 +139,8 @@
         "crate_hash": "crate_expr_parser_v1",
         "api_hash": "api_v2"
       },
-      "artifact_path": "expr_parser.json",
-      "sha256": "71f0ed870bc984215f373dc62ccfe44a2e6adbe79f0c6b061a91033ac1fe0dde",
+      "artifact_path": "expr_parser.so",
+      "sha256": "cd455e1e66e89eb792f6614313086eb4a1e46845a982714684650759666121f0",
       "built_at": "2026-03-11T00:00:00Z"
     }
   ]
