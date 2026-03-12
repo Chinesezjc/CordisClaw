@@ -6,15 +6,12 @@ use cordis_runtime::execution::scheduler::{run_deterministic, ScheduledNode, Sch
 use cordis_runtime::plugin::loader::{default_loader_config, Loader};
 use serde_json::{json, Value};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use tempfile::TempDir;
 
-fn fixtures_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../fixtures")
-        .canonicalize()
-        .expect("fixtures must exist")
-}
+mod support;
+
+use support::fixtures_root;
 
 fn copy_dir_all(src: &Path, dst: &Path) {
     fs::create_dir_all(dst).expect("create destination");

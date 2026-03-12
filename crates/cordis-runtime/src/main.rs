@@ -7,11 +7,13 @@ use cordis_runtime::kernel::policy::IterationPolicy;
 use cordis_runtime::kernel::r#loop::SelfIterationKernel;
 use cordis_runtime::plugin::invoke::PluginInvoker;
 use cordis_runtime::plugin::loader::{default_loader_config, Loader};
-use cordis_runtime::plugin::tooling::{refresh_artifact_index, sync_plugin_docs};
+use cordis_runtime::plugin::tooling::{
+    ensure_fixture_artifacts, rebuild_fixture_artifacts, refresh_artifact_index, sync_plugin_docs,
+};
 use serde_json::Value;
 use std::fs;
 use std::io::{self, BufRead, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 fn main() {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
@@ -71,6 +73,14 @@ fn main() {
         }
         return;
     }
+    if args.first().map(|x| x.as_str()) == Some("rebuild-fixture-artifacts") {
+        if let Err(err) = run_rebuild_fixture_artifacts(&args[1..]) {
+            eprintln!("rebuild-fixture-artifacts failed: {err}");
+            eprintln!("{}", usage());
+            std::process::exit(1);
+        }
+        return;
+    }
 
     if let Err(err) = run_loader(args.first().map(PathBuf::from)) {
         eprintln!("load failed: {err}");
@@ -80,6 +90,7 @@ fn main() {
 
 fn run_loader(root: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
     let root = root.unwrap_or_else(|| PathBuf::from("fixtures"));
+    prepare_fixtures_root(&root)?;
     let config = default_loader_config(&root);
     let loader = Loader::new(config);
     let output = loader.load()?;
@@ -106,6 +117,7 @@ fn run_loader(root: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
 
 fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let root = parse_optional_root_arg(args, "fixtures")?;
+    prepare_fixtures_root(&root)?;
     let host = RuntimeHost::boot(&root)?;
     println!(
         "serve ready snapshot_id={}",
@@ -212,9 +224,9 @@ fn run_invoke(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let payload = payload_json.ok_or("missing required flag: --payload-json=<json>")?;
-    let invoker = PluginInvoker::load(
-        fixtures_root.unwrap_or_else(PluginInvoker::default_fixtures_root),
-    )?;
+    let fixtures_root = fixtures_root.unwrap_or_else(PluginInvoker::default_fixtures_root);
+    prepare_fixtures_root(&fixtures_root)?;
+    let invoker = PluginInvoker::load(fixtures_root)?;
     let response = invoker.invoke(&plugin_path, &node_id, payload)?;
     emit_invoke_response(&response.payload)
 }
@@ -379,6 +391,7 @@ fn run_graph_html(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let root = root.unwrap_or_else(|| PathBuf::from("fixtures"));
+    prepare_fixtures_root(&root)?;
     let loader = Loader::new(default_loader_config(&root));
     let output = loader.load()?;
     let html = output
@@ -439,6 +452,7 @@ fn run_dag_html(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let root = root.unwrap_or_else(|| PathBuf::from("fixtures"));
+    prepare_fixtures_root(&root)?;
     let loader = Loader::new(default_loader_config(&root));
     let output = loader.load()?;
     let html = output
@@ -463,6 +477,7 @@ fn run_dag_html(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
 fn run_sync_plugin_docs(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let root = parse_optional_root_arg(args, "fixtures")?;
+    prepare_fixtures_root(&root)?;
     let written = sync_plugin_docs(&root)?;
     println!("synced_plugin_docs={}", written.len());
     for path in written {
@@ -473,10 +488,28 @@ fn run_sync_plugin_docs(args: &[String]) -> Result<(), Box<dyn std::error::Error
 
 fn run_refresh_artifact_index(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let root = parse_optional_root_arg(args, "fixtures")?;
+    prepare_fixtures_root(&root)?;
     let refreshed = refresh_artifact_index(&root)?;
     println!("refreshed_artifact_entries={}", refreshed.len());
     for (plugin_path, hash) in refreshed {
         println!("{plugin_path} {hash}");
+    }
+    Ok(())
+}
+
+fn run_rebuild_fixture_artifacts(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let root = parse_optional_root_arg(args, "fixtures")?;
+    let rebuilt = rebuild_fixture_artifacts(&root)?;
+    println!("rebuilt_artifact_entries={}", rebuilt.len());
+    for (plugin_path, hash) in rebuilt {
+        println!("{plugin_path} {hash}");
+    }
+    Ok(())
+}
+
+fn prepare_fixtures_root(root: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    if ensure_fixture_artifacts(root)? {
+        println!("rebuilt fixture artifacts under {}", root.display());
     }
     Ok(())
 }
@@ -502,7 +535,8 @@ fn usage() -> String {
   cargo run -p cordis-runtime -- graph-html [fixtures_root] [--output=registered-nodes.html]
   cargo run -p cordis-runtime -- dag-html [fixtures_root] [--output=registered-dag.html]
   cargo run -p cordis-runtime -- sync-plugin-docs [fixtures_root]
-  cargo run -p cordis-runtime -- refresh-artifact-index [fixtures_root]"
+  cargo run -p cordis-runtime -- refresh-artifact-index [fixtures_root]
+  cargo run -p cordis-runtime -- rebuild-fixture-artifacts [fixtures_root]"
         .to_string()
 }
 

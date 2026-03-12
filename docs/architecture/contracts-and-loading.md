@@ -53,7 +53,7 @@
 
 ### 1.4 工件索引
 
-[fixtures/artifacts/index.json](../../fixtures/artifacts/index.json) 是运行时加载工件的总目录。每个条目至少包含：
+`fixtures/artifacts/index.json` 是运行时加载工件的总目录。它由源码生成，本地缺失或过期时会被 tooling 重建。每个条目至少包含：
 
 - `plugin_path`
 - `version`

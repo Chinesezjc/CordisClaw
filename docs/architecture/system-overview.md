@@ -45,7 +45,7 @@
 
 - 根 `cargo test` 主要覆盖 runtime/sdk。
 - `expr` 不再是“根项目直接依赖的库”，而是“被 runtime 发现和调用的外部插件树”。
-- 运行时真正消费的是 `fixtures/plugins` 中的 manifest/docs，加上 `fixtures/artifacts` 中的预构建工件与索引。
+- 运行时真正消费的是 `fixtures/plugins` 中的 manifest/docs，加上 `fixtures/artifacts` 中按需生成的工件与索引。
 
 更细的 workspace 说明见 [../cargo-workspace-notes.md](../cargo-workspace-notes.md)。
 
@@ -64,9 +64,7 @@ CordisClaw/
 │   │   ├── root/               # JSON artifact 样例父插件
 │   │   ├── shell/              # 外部 dylib shell 插件
 │   │   └── expr/               # 外部 dylib 表达式插件树
-│   └── artifacts/              # 预构建 JSON/.so 工件与 index.json
-└── scripts/
-    └── rebuild-plugin-artifacts.sh
+│   └── artifacts/              # 本地生成的 JSON/.so 工件与 index.json（gitignored）
 ```
 
 按职责可以把代码再切成六层：

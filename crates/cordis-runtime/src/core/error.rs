@@ -202,6 +202,13 @@ pub enum RuntimeError {
     #[error("auto update verify failed: {message}")]
     AutoUpdateVerifyFailed { message: String },
 
+    #[error("command failed: {program} {args:?}: {message}")]
+    CommandFailed {
+        program: String,
+        args: Vec<String>,
+        message: String,
+    },
+
     #[error("internal invariant broken: {message}")]
     Invariant { message: String },
 

@@ -154,11 +154,13 @@ Export the registered DAG view:
 cargo run -p cordis-runtime -- dag-html fixtures --output=registered-dag.html
 ```
 
-Rebuild plugin artifacts, sync docs, and refresh the artifact index:
+Generate plugin artifacts from source, sync docs, and refresh the artifact index:
 
 ```bash
-./scripts/rebuild-plugin-artifacts.sh
+cargo run -p cordis-runtime -- rebuild-fixture-artifacts
 ```
+
+`fixtures/artifacts/` is generated on demand and gitignored. The main CLI/test entrypoints rebuild it automatically when the checked-in plugin sources or docs are newer than the local artifact index.
 
 Configure kernel/runtime/LLM settings with YAML:
 
@@ -189,8 +191,7 @@ cargo test
 ├── docs/                    # architecture and maintenance docs
 ├── fixtures/
 │   ├── plugins/             # external plugin sample workspace
-│   └── artifacts/           # prebuilt artifacts and index
-└── scripts/                 # helper scripts
+│   └── artifacts/           # generated local artifacts and index (gitignored)
 ```
 
 ## Read the Architecture

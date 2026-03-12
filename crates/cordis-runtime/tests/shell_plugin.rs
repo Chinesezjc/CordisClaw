@@ -2,15 +2,11 @@ use cordis_runtime::core::models::PluginLoadResult;
 use cordis_runtime::plugin::invoke::PluginInvoker;
 use serde::Deserialize;
 use std::io::Write;
-use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-fn fixtures_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../fixtures")
-        .canonicalize()
-        .expect("fixtures must exist")
-}
+mod support;
+
+use support::fixtures_root;
 
 #[derive(Debug, Deserialize)]
 struct ShellResponse {

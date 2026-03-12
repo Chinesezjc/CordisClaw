@@ -79,12 +79,12 @@
 运行时启动时消费的是：
 
 - [fixtures/plugins](/root/CordisClaw/fixtures/plugins) 里的 manifest + docs 契约
-- [fixtures/artifacts/index.json](/root/CordisClaw/fixtures/artifacts/index.json) 里的工件索引
-- [fixtures/artifacts](/root/CordisClaw/fixtures/artifacts) 里的预构建 JSON / dylib 工件
+- `fixtures/artifacts/index.json` 里的工件索引
+- `fixtures/artifacts/` 里的本地生成 JSON / dylib 工件
 
 对 `expr` 来说，当前执行链是：
 
-- loader 通过 [expr.so](/root/CordisClaw/fixtures/artifacts/expr.so) 注册 `expr` 顶层 dylib
+- loader 通过 `fixtures/artifacts/expr.so` 注册 `expr` 顶层 dylib
 - loader 通过 `expr_lexer.so` / `expr_parser.so` / `expr_evaluator.so` 以及四个算子 `.so` 注册整棵 expr 子树
 - 外部 shell 插件先按插件 docs 里的 `command_name` 动态解析 `Expr` 命令
 - `PluginInvoker` 通过固定符号 `cordis_plugin_api_rust_v2` 调用 `expr`

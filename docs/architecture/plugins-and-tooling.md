@@ -102,20 +102,22 @@ expr
   - 从 dylib `docs()` 回写 `interfaces.json`
 - `cargo run -p cordis-runtime -- refresh-artifact-index fixtures`
   - 刷新工件索引中的 `sha256`
+- `cargo run -p cordis-runtime -- rebuild-fixture-artifacts [fixtures_root]`
+  - 从 `fixtures/plugins` 源码生成本地 `fixtures/artifacts`
 - `cargo run -p cordis-runtime -- auto-update ...`
   - 运行一次自动更新事务
 
 ### 2.2 插件工件重建入口
 
-[scripts/rebuild-plugin-artifacts.sh](../../scripts/rebuild-plugin-artifacts.sh) 是当前统一入口，它会做五件事：
+`cargo run -p cordis-runtime -- rebuild-fixture-artifacts [fixtures_root]` 是当前唯一入口。流程是：
 
-1. 构建顶层外部插件 `expr` 和 `shell`
-2. 构建 `expr` 的各层 dylib 子插件
-3. 把产物复制到 `fixtures/artifacts/*.so`
-4. 调用 `sync-plugin-docs` 回写 `docs/agent/interfaces.json`
-5. 调用 `refresh-artifact-index` 刷新索引哈希
+1. 构建所有 dylib 类型的 fixture 插件
+2. 生成 JSON 类型的 fixture artifacts
+3. 把产物写到本地 `fixtures/artifacts/`
+4. 从 dylib `docs()` 回写 `docs/agent/interfaces.json`
+5. 刷新 `index.json` 中的工件哈希
 
-这个脚本的意义是把“构建工件”“更新 docs”“刷新 index”三件经常忘记同步的事合成一步。
+这个入口的意义是把“构建工件”“更新 docs”“刷新 index”三件经常忘记同步的事合成一步，同时让仓库只保留 fixture 源文件。
 
 ### 2.3 YAML 配置目录
 

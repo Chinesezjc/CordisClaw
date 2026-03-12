@@ -1,3 +1,5 @@
 target/
 registered-*.html
 config/
+fixtures/artifacts/
+fixtures/plugins/**/Cargo.lock

@@ -26,7 +26,7 @@
 
 插件工件重建与 docs 同步入口：
 
-1. [scripts/rebuild-plugin-artifacts.sh](/root/CordisClaw/scripts/rebuild-plugin-artifacts.sh)
+1. `cargo run -p cordis-runtime -- rebuild-fixture-artifacts [fixtures_root]`
 2. `cargo run -p cordis-runtime -- sync-plugin-docs fixtures`
 3. `cargo run -p cordis-runtime -- refresh-artifact-index fixtures`
 
