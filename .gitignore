@@ -1,1 +1,6 @@
 target/
+registered-*.html
+config/*.local.yaml
+config/*.local.yml
+config/plugins/*.local.yaml
+config/plugins/*.local.yml
