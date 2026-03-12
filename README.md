@@ -171,6 +171,10 @@ config/
   plugins/*.yaml
 ```
 
+llm_api.yaml supports both OpenAI Responses API and DeepSeek Chat Completions when provider is set to deepseek.
+
+llm-auto-update verification commands can call plugins directly, for example expr::expr_entry.
+
 `config/` is intended for local runtime setup and is gitignored. Sample templates are provided in `config.example/`; copy the files you need into `config/`.
 
 Run the test suite:

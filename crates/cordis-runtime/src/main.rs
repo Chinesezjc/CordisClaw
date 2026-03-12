@@ -630,6 +630,7 @@ fn usage() -> String {
   cargo run -p cordis-runtime -- serve [fixtures_root]
   cargo run -p cordis-runtime -- invoke <plugin_path> <node_id> --payload-json=<json> [--fixtures-root=fixtures]
   cargo run -p cordis-runtime -- llm-auto-update <workspace_root> --instruction=<text> --path=<relative_path> [--path=<relative_path> ...] [--issue-id=<id>] [--patch-id=<id>] [--manual-approved] [--tests-command=<shell>] [--safety-command=<shell>] [--quality-score=<u32>] [--dry-run]
+    tests/safety commands also accept plugin:{\"plugin_path\":\"<plugin_path>\",\"node_id\":\"<node_id>\",\"payload_json\":{},\"expect_substring\":\"<expected text>\",\"fixtures_root\":\"<optional fixtures root>\"}
   cargo run -p cordis-runtime -- auto-update <workspace_root> <relative_path> <find> <replace> [--manual-approved] [--tests-passed=true|false] [--safety-checks-passed=true|false] [--quality-score=<u32>] [--diff-lines=<usize>]
   cargo run -p cordis-runtime -- graph-html [fixtures_root] [--output=registered-nodes.html]
   cargo run -p cordis-runtime -- dag-html [fixtures_root] [--output=registered-dag.html]

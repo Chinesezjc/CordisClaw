@@ -2,11 +2,14 @@
 
 use crate::core::error::RuntimeError;
 use crate::kernel::evaluator::VerificationInput;
+use crate::plugin::invoke::PluginInvoker;
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use serde_json::{Map, Value};
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const DEFAULT_QUALITY_SCORE: u32 = 90;
+const PLUGIN_COMMAND_PREFIX: &str = "plugin:";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CommandCheckResult {
@@ -23,6 +26,18 @@ pub struct VerificationReport {
     pub safety: Option<CommandCheckResult>,
 }
 
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+struct PluginCommandSpec {
+    #[serde(default)]
+    fixtures_root: Option<String>,
+    plugin_path: String,
+    node_id: String,
+    #[serde(default = "default_plugin_payload_json")]
+    payload_json: Value,
+    #[serde(default)]
+    expect_substring: Option<String>,
+}
+
 pub struct CommandVerifier;
 
 impl CommandVerifier {
@@ -33,11 +48,11 @@ impl CommandVerifier {
         quality_score_override: Option<u32>,
     ) -> Result<VerificationReport, RuntimeError> {
         let tests = match tests_command {
-            Some(command) => Some(run_shell_command(command, workspace_root)?),
+            Some(command) => Some(run_check_command(command, workspace_root)?),
             None => None,
         };
         let safety = match safety_command {
-            Some(command) => Some(run_shell_command(command, workspace_root)?),
+            Some(command) => Some(run_check_command(command, workspace_root)?),
             None => None,
         };
 
@@ -61,6 +76,94 @@ impl CommandVerifier {
             safety,
         })
     }
+}
+
+fn default_plugin_payload_json() -> Value {
+    Value::Object(Map::new())
+}
+
+fn run_check_command(command: &str, current_dir: &Path) -> Result<CommandCheckResult, RuntimeError> {
+    if let Some(spec_json) = command.strip_prefix(PLUGIN_COMMAND_PREFIX) {
+        return run_plugin_command(command, spec_json, current_dir);
+    }
+    run_shell_command(command, current_dir)
+}
+
+fn run_plugin_command(
+    original_command: &str,
+    spec_json: &str,
+    current_dir: &Path,
+) -> Result<CommandCheckResult, RuntimeError> {
+    let spec: PluginCommandSpec =
+        serde_json::from_str(spec_json).map_err(|err| RuntimeError::InvalidArgument {
+            message: format!("invalid plugin verifier spec: {err}"),
+        })?;
+    let fixtures_root = resolve_plugin_fixtures_root(current_dir, spec.fixtures_root.as_deref());
+    let payload = serde_json::to_string(&spec.payload_json).map_err(|err| RuntimeError::InvalidArgument {
+        message: format!("plugin payload_json was not serializable: {err}"),
+    })?;
+
+    let invoker = match PluginInvoker::load(&fixtures_root) {
+        Ok(invoker) => invoker,
+        Err(err) => {
+            return Ok(CommandCheckResult {
+                command: original_command.to_string(),
+                success: false,
+                stdout: String::new(),
+                stderr: err.to_string(),
+            });
+        }
+    };
+
+    let response = match invoker.invoke(&spec.plugin_path, &spec.node_id, payload) {
+        Ok(response) => response,
+        Err(err) => {
+            return Ok(CommandCheckResult {
+                command: original_command.to_string(),
+                success: false,
+                stdout: String::new(),
+                stderr: err.to_string(),
+            });
+        }
+    };
+
+    let mut success = true;
+    let mut stderr = String::new();
+    if let Some(expected) = &spec.expect_substring {
+        if !response.payload.contains(expected) {
+            success = false;
+            stderr = format!("plugin output missing expected substring: {expected}");
+        }
+    }
+
+    Ok(CommandCheckResult {
+        command: original_command.to_string(),
+        success,
+        stdout: response.payload,
+        stderr,
+    })
+}
+
+fn resolve_plugin_fixtures_root(current_dir: &Path, requested_root: Option<&str>) -> PathBuf {
+    if let Some(root) = requested_root {
+        let path = Path::new(root);
+        return if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            current_dir.join(path)
+        };
+    }
+
+    if current_dir.join("plugins").exists() {
+        return current_dir.to_path_buf();
+    }
+
+    let nested_fixtures = current_dir.join("fixtures");
+    if nested_fixtures.join("plugins").exists() {
+        return nested_fixtures;
+    }
+
+    current_dir.to_path_buf()
 }
 
 fn run_shell_command(command: &str, current_dir: &Path) -> Result<CommandCheckResult, RuntimeError> {
@@ -113,6 +216,8 @@ fn shell_args(command: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::CommandVerifier;
+    use serde_json::json;
+    use std::path::Path;
 
     #[test]
     fn verify_defaults_to_success_without_commands() {
@@ -134,5 +239,27 @@ mod tests {
         .expect("verify should return report");
         assert!(!report.input.tests_passed);
         assert_eq!(report.input.quality_score, 0);
+    }
+
+    #[test]
+    fn verify_supports_plugin_command_specs() {
+        let spec = format!(
+            "plugin:{}",
+            json!({
+                "fixtures_root": "../../fixtures",
+                "plugin_path": "expr",
+                "node_id": "expr_entry",
+                "payload_json": {
+                    "expression": "1 + 2 * 3"
+                },
+                "expect_substring": "\"value\":7.0"
+            })
+        );
+        let report = CommandVerifier::verify(Path::new(env!("CARGO_MANIFEST_DIR")), Some(&spec), None, None)
+            .expect("plugin verification should succeed");
+        assert!(report.input.tests_passed, "report: {report:?}");
+        let tests = report.tests.expect("tests report should exist");
+        assert!(tests.success, "tests: {tests:?}");
+        assert!(tests.stdout.contains("\"value\":7.0"), "stdout: {}", tests.stdout);
     }
 }
