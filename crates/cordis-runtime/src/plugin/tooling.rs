@@ -184,6 +184,12 @@ pub fn rebuild_fixture_artifacts(
     Ok(prepare_artifacts(fixtures_root, PrepareMode::Full)?.rebuilt)
 }
 
+pub fn rebuild_plugin_workspace(
+    workspace_root: &Path,
+) -> Result<Vec<(String, String)>, RuntimeError> {
+    rebuild_fixture_artifacts(workspace_root)
+}
+
 pub fn sync_plugin_docs(fixtures_root: &Path) -> Result<Vec<PathBuf>, RuntimeError> {
     let fixtures_root = absolute_path(fixtures_root)?;
     let plugins_root = fixtures_root.join("plugins");

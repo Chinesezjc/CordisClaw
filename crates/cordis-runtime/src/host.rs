@@ -1,7 +1,7 @@
 use crate::config::{LlmApiConfig, PluginConfigFile, RuntimeConfig};
 use crate::context::RuntimeContext;
 use crate::core::error::RuntimeError;
-use crate::core::models::{NodeOutcome, PluginLoadResult};
+use crate::core::models::{NodeOutcome, PluginLoadResult, PluginUnavailableReason};
 use crate::execution::engine::{
     execute_net, ExecutionConfig, ExecutionNetSpec, ExecutionOutput, ExecutionTransitionKind,
     ExecutionTransitionSpec, TransitionRunResult, TriggerInput,
@@ -14,7 +14,13 @@ use crate::kernel::auto_update::{
 };
 use crate::kernel::evaluator::{EvalHarness, VerificationInput};
 use crate::kernel::memory::{ChangeMemory, ChangeRecord};
-use crate::kernel::planner::{LlmPatchPlanner, PlanRequest, PlannedUpdate};
+use crate::kernel::planner::{LlmPatchPlanner, PlanRequest, PlannedUpdate, PluginPlanRequest};
+use crate::kernel::plugin_iteration::{
+    now_ms, CanaryReport, CanaryVerdict, KernelPluginIssue, KernelPluginIssueSource,
+    KernelPluginIssueStatus, KernelPluginIterationRequest, PluginEditExecutor, PluginEditPlan,
+    PluginIterationFinalVerdict, PluginIterationHistoryEntry, PluginIterationNetSpec,
+    PluginIterationPolicy, PluginIterationStatus, VerifierVerdict,
+};
 use crate::kernel::policy::IterationPolicy;
 use crate::kernel::r#loop::SelfIterationKernel;
 use crate::kernel::verifier::{
@@ -24,10 +30,11 @@ use crate::plugin::abi::PluginResponse;
 use crate::plugin::invoke::invoke_registered_plugin;
 use crate::plugin::loader::{default_loader_config, LoadOutput, Loader};
 use crate::plugin::registry::{NodeRegistry, PluginRegistry, RegisteredPlugin};
+use crate::plugin::tooling::rebuild_plugin_workspace;
 use crate::service::doc_registry::DocRegistry;
 use crate::service::graph_registry::{GraphRegistry, RegisteredNet, RegisteredNetEdgeKind};
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
@@ -310,6 +317,10 @@ pub struct KernelStatus {
     pub iteration_rollback_total: u64,
     pub history_len: usize,
     pub last_change: Option<ChangeRecord>,
+    pub plugin_issue_count: usize,
+    pub blocked_iteration_count: usize,
+    pub plugin_iteration_total: usize,
+    pub last_plugin_iteration: Option<PluginIterationStatus>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -349,12 +360,65 @@ pub struct KernelPlanApplyResult {
     pub result: AutoUpdateResult,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct KernelPluginIterationResult {
+    pub iteration_id: String,
+    pub issue_id: String,
+    pub root_plugin_path: String,
+    pub target_plugin_paths: Vec<String>,
+    pub source: Option<KernelPluginIssueSource>,
+    pub summary: String,
+    pub planned_edit_plan: PluginEditPlan,
+    pub changed_paths: Vec<String>,
+    pub rebuilt_artifacts: Vec<(String, String)>,
+    pub candidate: Option<CandidateSnapshotStatus>,
+    pub verification: Option<VerificationReport>,
+    pub verifier_verdict: Option<VerifierVerdict>,
+    pub canary: Option<CanaryReport>,
+    pub final_verdict: PluginIterationFinalVerdict,
+    pub blocked_reason: Option<String>,
+    pub net_output: ExecutionOutput,
+}
+
+#[derive(Debug, Clone)]
+struct PreparedPluginIteration {
+    iteration_id: String,
+    issue_id: String,
+    root_plugin_path: String,
+    target_plugin_paths: Vec<String>,
+    source: Option<KernelPluginIssueSource>,
+    summary: String,
+    manual_approved: bool,
+    tests_command: Option<String>,
+    safety_command: Option<String>,
+    verify_profile: VerificationProfile,
+    quality_score: Option<u32>,
+    edit_plan: Option<PluginEditPlan>,
+    instruction: Option<String>,
+    allowed_plugin_roots: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct InvocationSample {
+    plugin_path: String,
+    node_id: String,
+    payload: Value,
+    response: Value,
+    observed_at_ms: u128,
+}
+
 #[derive(Debug)]
 pub struct RuntimeKernel {
     workspace_root: PathBuf,
     config_dir: PathBuf,
     llm_api: LlmApiConfig,
     plugin_configs: BTreeMap<String, PluginConfigFile>,
+    plugin_iteration_policy: PluginIterationPolicy,
+    plugin_issues: Mutex<BTreeMap<String, KernelPluginIssue>>,
+    plugin_history: Mutex<VecDeque<PluginIterationHistoryEntry>>,
+    blocked_iterations: Mutex<BTreeMap<String, KernelPluginIterationResult>>,
+    last_plugin_iteration: Mutex<Option<KernelPluginIterationResult>>,
+    active_plugin_iteration: Mutex<Option<String>>,
     updater: AutoUpdater,
     inner: Mutex<SelfIterationKernel>,
 }
@@ -368,6 +432,12 @@ impl RuntimeKernel {
             config_dir: config.config_dir.clone(),
             llm_api: config.llm_api.clone(),
             plugin_configs: config.plugin_configs.clone(),
+            plugin_iteration_policy: PluginIterationPolicy::default(),
+            plugin_issues: Mutex::new(BTreeMap::new()),
+            plugin_history: Mutex::new(VecDeque::new()),
+            blocked_iterations: Mutex::new(BTreeMap::new()),
+            last_plugin_iteration: Mutex::new(None),
+            active_plugin_iteration: Mutex::new(None),
             updater: AutoUpdater::new(&workspace_root),
             workspace_root,
             inner: Mutex::new(SelfIterationKernel::new(
@@ -391,6 +461,23 @@ impl RuntimeKernel {
             .unwrap_or_else(|poison| poison.into_inner());
         let metrics = kernel.metrics();
         let memory = kernel.memory();
+        let plugin_issues = self
+            .plugin_issues
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let blocked_iterations = self
+            .blocked_iterations
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let plugin_history = self
+            .plugin_history
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let last_plugin_iteration = self
+            .last_plugin_iteration
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone();
         KernelStatus {
             workspace_root: self.workspace_root.display().to_string(),
             config_dir: self.config_dir.display().to_string(),
@@ -402,6 +489,12 @@ impl RuntimeKernel {
             iteration_rollback_total: metrics.iteration_rollback_total,
             history_len: memory.len(),
             last_change: memory.recent(1).into_iter().next(),
+            plugin_issue_count: plugin_issues.len(),
+            blocked_iteration_count: blocked_iterations.len(),
+            plugin_iteration_total: plugin_history.len(),
+            last_plugin_iteration: last_plugin_iteration
+                .as_ref()
+                .map(plugin_iteration_status_from_result),
         }
     }
 
@@ -411,6 +504,335 @@ impl RuntimeKernel {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         kernel.memory().recent(kernel.memory().len())
+    }
+
+    pub fn plugin_issues(&self) -> Vec<KernelPluginIssue> {
+        let mut issues = self
+            .plugin_issues
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        issues.sort_by(|left, right| {
+            left.status
+                .cmp(&right.status)
+                .then_with(|| left.source.priority().cmp(&right.source.priority()))
+                .then_with(|| left.first_observed_at_ms.cmp(&right.first_observed_at_ms))
+        });
+        issues
+    }
+
+    pub fn plugin_history(&self) -> Vec<PluginIterationHistoryEntry> {
+        self.plugin_history
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    pub fn blocked_iterations(&self) -> Vec<PluginIterationStatus> {
+        self.blocked_iterations
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .values()
+            .map(plugin_iteration_status_from_result)
+            .collect()
+    }
+
+    pub fn plugin_iteration_status(
+        &self,
+        iteration_id: &str,
+    ) -> Result<PluginIterationStatus, RuntimeError> {
+        if let Some(result) = self
+            .last_plugin_iteration
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone()
+            .filter(|result| result.iteration_id == iteration_id)
+        {
+            return Ok(plugin_iteration_status_from_result(&result));
+        }
+        if let Some(result) = self
+            .blocked_iterations
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .get(iteration_id)
+            .cloned()
+        {
+            return Ok(plugin_iteration_status_from_result(&result));
+        }
+        if let Some(entry) = self
+            .plugin_history
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .iter()
+            .find(|entry| entry.iteration_id == iteration_id)
+            .cloned()
+        {
+            return Ok(plugin_iteration_status_from_history(&entry));
+        }
+        Err(RuntimeError::PluginIterationStatusNotFound {
+            iteration_id: iteration_id.to_string(),
+        })
+    }
+
+    pub fn take_blocked_iteration(
+        &self,
+        iteration_id: &str,
+    ) -> Result<KernelPluginIterationResult, RuntimeError> {
+        let mut blocked = self
+            .blocked_iterations
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let result = blocked.remove(iteration_id).ok_or_else(|| {
+            RuntimeError::PluginIterationStatusNotFound {
+                iteration_id: iteration_id.to_string(),
+            }
+        })?;
+        if result.final_verdict != PluginIterationFinalVerdict::Blocked {
+            return Err(RuntimeError::InvalidArgument {
+                message: format!("iteration {iteration_id} is not blocked"),
+            });
+        }
+        Ok(result)
+    }
+
+    pub fn can_auto_iterate_plugins(&self) -> bool {
+        self.llm_api
+            .api_key
+            .as_ref()
+            .map(|key| !key.trim().is_empty())
+            .unwrap_or(false)
+            || std::env::var(&self.llm_api.api_key_env)
+                .map(|value| !value.trim().is_empty())
+                .unwrap_or(false)
+    }
+
+    pub fn observe_plugin_issue(
+        &self,
+        source: KernelPluginIssueSource,
+        root_plugin_path: impl Into<String>,
+        summary: impl Into<String>,
+    ) -> KernelPluginIssue {
+        let root_plugin_path = root_plugin_path.into();
+        let summary = summary.into();
+        let now_ms = now_ms();
+        let issue_id = format!(
+            "plugin-issue-{}-{}",
+            root_plugin_path.replace('/', "-"),
+            source.priority()
+        );
+        let mut guard = self
+            .plugin_issues
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let issue = guard
+            .entry(issue_id.clone())
+            .or_insert_with(|| KernelPluginIssue {
+                issue_id: issue_id.clone(),
+                root_plugin_path: root_plugin_path.clone(),
+                target_plugin_paths: vec![root_plugin_path.clone()],
+                source,
+                summary: summary.clone(),
+                status: KernelPluginIssueStatus::Open,
+                first_observed_at_ms: now_ms,
+                last_observed_at_ms: now_ms,
+                observe_count: 0,
+            });
+        issue.last_observed_at_ms = now_ms;
+        issue.observe_count += 1;
+        issue.summary = summary;
+        if !matches!(issue.status, KernelPluginIssueStatus::Running) {
+            issue.status = KernelPluginIssueStatus::Open;
+        }
+        issue.clone()
+    }
+
+    fn select_issue_for_request(
+        &self,
+        request: &KernelPluginIterationRequest,
+    ) -> Result<Option<KernelPluginIssue>, RuntimeError> {
+        let issues = self
+            .plugin_issues
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if let Some(issue_id) = &request.issue_id {
+            return issues.get(issue_id).cloned().map(Some).ok_or_else(|| {
+                RuntimeError::PluginIterationIssueNotFound {
+                    issue_id: issue_id.clone(),
+                }
+            });
+        }
+        let mut candidates = issues
+            .values()
+            .filter(|issue| issue.status == KernelPluginIssueStatus::Open)
+            .cloned()
+            .collect::<Vec<_>>();
+        candidates.sort_by(|left, right| {
+            left.source
+                .priority()
+                .cmp(&right.source.priority())
+                .then_with(|| left.first_observed_at_ms.cmp(&right.first_observed_at_ms))
+        });
+        Ok(candidates.into_iter().next())
+    }
+
+    fn begin_plugin_iteration(
+        &self,
+        snapshot: &RuntimeSnapshot,
+        request: &KernelPluginIterationRequest,
+    ) -> Result<PreparedPluginIteration, RuntimeError> {
+        let mut active = self
+            .active_plugin_iteration
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if let Some(iteration_id) = active.clone() {
+            return Err(RuntimeError::PluginIterationActive { iteration_id });
+        }
+
+        let selected_issue = self.select_issue_for_request(request)?;
+        let iteration_id = normalize_request_id(None, "plugin-iteration");
+        let root_plugin_path = if let Some(issue) = &selected_issue {
+            issue.root_plugin_path.clone()
+        } else {
+            determine_root_plugin_path(snapshot, &request.target_plugin_paths)?
+        };
+        let target_plugin_paths = snapshot
+            .plugin_registry()
+            .iter()
+            .map(|(plugin_path, _)| plugin_path)
+            .filter(|plugin_path| {
+                plugin_path == &root_plugin_path
+                    || plugin_path.starts_with(&format!("{root_plugin_path}/"))
+            })
+            .collect::<Vec<_>>();
+        if target_plugin_paths.is_empty() {
+            return Err(RuntimeError::InvalidArgument {
+                message: format!("plugin subtree not found for {root_plugin_path}"),
+            });
+        }
+        let issue_id = selected_issue
+            .as_ref()
+            .map(|issue| issue.issue_id.clone())
+            .unwrap_or_else(|| format!("plugin-issue-{iteration_id}"));
+        let summary = request
+            .instruction
+            .clone()
+            .or_else(|| selected_issue.as_ref().map(|issue| issue.summary.clone()))
+            .unwrap_or_else(|| format!("iterate plugin subtree {root_plugin_path}"));
+        let allowed_plugin_roots = target_plugin_paths
+            .iter()
+            .map(|plugin_path| (plugin_path.clone(), format!("plugins/{plugin_path}")))
+            .collect::<BTreeMap<_, _>>();
+
+        if let Some(ref issue) = selected_issue {
+            self.plugin_issues
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .entry(issue.issue_id.clone())
+                .and_modify(|entry| entry.status = KernelPluginIssueStatus::Running);
+        }
+        *active = Some(iteration_id.clone());
+
+        Ok(PreparedPluginIteration {
+            iteration_id,
+            issue_id,
+            root_plugin_path,
+            target_plugin_paths,
+            source: selected_issue.as_ref().map(|issue| issue.source),
+            summary,
+            manual_approved: request.manual_approved,
+            tests_command: request.tests_command.clone(),
+            safety_command: request.safety_command.clone(),
+            verify_profile: request
+                .verify_profile
+                .unwrap_or(VerificationProfile::RustWorkspace),
+            quality_score: request.quality_score,
+            edit_plan: request.edit_plan.clone(),
+            instruction: request.instruction.clone(),
+            allowed_plugin_roots,
+        })
+    }
+
+    pub fn finish_plugin_iteration(&self, iteration_id: &str) {
+        let mut active = self
+            .active_plugin_iteration
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if active.as_deref() == Some(iteration_id) {
+            *active = None;
+        }
+    }
+
+    fn update_issue_status(&self, issue_id: &str, status: KernelPluginIssueStatus) {
+        if let Some(issue) = self
+            .plugin_issues
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .get_mut(issue_id)
+        {
+            issue.status = status;
+        }
+    }
+
+    pub fn record_plugin_iteration_outcome(&self, result: &KernelPluginIterationResult) {
+        let completed_at_ms = now_ms();
+        let history_entry = PluginIterationHistoryEntry {
+            iteration_id: result.iteration_id.clone(),
+            issue_id: result.issue_id.clone(),
+            root_plugin_path: result.root_plugin_path.clone(),
+            target_plugin_paths: result.target_plugin_paths.clone(),
+            source: result.source,
+            summary: result.summary.clone(),
+            changed_paths: result.changed_paths.clone(),
+            verifier_verdict: result.verifier_verdict,
+            canary_verdict: result.canary.as_ref().map(|report| report.verdict),
+            final_verdict: result.final_verdict,
+            blocked_reason: result.blocked_reason.clone(),
+            observed_at_ms: completed_at_ms,
+            completed_at_ms,
+        };
+        let mut history = self
+            .plugin_history
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if let Some(existing) = history
+            .iter_mut()
+            .find(|entry| entry.iteration_id == result.iteration_id)
+        {
+            *existing = history_entry;
+        } else {
+            history.push_front(history_entry);
+        }
+        *self
+            .last_plugin_iteration
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = Some(result.clone());
+        match result.final_verdict {
+            PluginIterationFinalVerdict::Blocked => {
+                self.blocked_iterations
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .insert(result.iteration_id.clone(), result.clone());
+                self.update_issue_status(&result.issue_id, KernelPluginIssueStatus::Blocked);
+            }
+            PluginIterationFinalVerdict::Promoted => {
+                self.blocked_iterations
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .remove(&result.iteration_id);
+                self.update_issue_status(&result.issue_id, KernelPluginIssueStatus::Resolved);
+            }
+            PluginIterationFinalVerdict::RolledBack => {
+                self.blocked_iterations
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .remove(&result.iteration_id);
+                self.update_issue_status(&result.issue_id, KernelPluginIssueStatus::Open);
+            }
+        }
     }
 
     pub fn run_iteration(
@@ -503,6 +925,7 @@ pub struct RuntimeHost {
     snapshot_root: PathBuf,
     current_snapshot: RwLock<Arc<RuntimeSnapshot>>,
     candidate_snapshot: Mutex<Option<StagedCandidateSnapshot>>,
+    invocation_samples: Mutex<VecDeque<InvocationSample>>,
     retired_snapshots: Mutex<Vec<RetiredSnapshot>>,
     last_reload_attempt: Mutex<Option<ReloadAttemptReport>>,
     last_candidate_reload_attempt: Mutex<Option<ReloadAttemptReport>>,
@@ -543,6 +966,7 @@ impl RuntimeHost {
             snapshot_root,
             current_snapshot: RwLock::new(initial_snapshot),
             candidate_snapshot: Mutex::new(None),
+            invocation_samples: Mutex::new(VecDeque::new()),
             retired_snapshots: Mutex::new(Vec::new()),
             last_reload_attempt: Mutex::new(None),
             last_candidate_reload_attempt: Mutex::new(None),
@@ -615,8 +1039,25 @@ impl RuntimeHost {
         payload: String,
     ) -> Result<PluginResponse, RuntimeError> {
         let snapshot = self.current_snapshot();
+        let payload_for_sample = payload.clone();
         let response = snapshot.invoke(plugin_path, node_id, payload);
+        match &response {
+            Ok(response) => self.record_invocation_sample(
+                plugin_path,
+                node_id,
+                &payload_for_sample,
+                &response.payload,
+            ),
+            Err(err) => {
+                self.kernel.observe_plugin_issue(
+                    KernelPluginIssueSource::InvokeFailure,
+                    plugin_path.to_string(),
+                    format!("invoke failure for {plugin_path}::{node_id}: {err}"),
+                );
+            }
+        }
         self.cleanup_retired_snapshots();
+        self.try_auto_iterate_observed_plugins();
         response
     }
 
@@ -641,7 +1082,20 @@ impl RuntimeHost {
     ) -> Result<RuntimeExecutionResult, RuntimeError> {
         let snapshot = self.current_snapshot();
         let result = snapshot.execute_registered_target(target_node_fqn, payload);
+        if let Err(err) = &result {
+            let plugin_path = target_node_fqn
+                .split("::")
+                .next()
+                .unwrap_or(target_node_fqn)
+                .to_string();
+            self.kernel.observe_plugin_issue(
+                KernelPluginIssueSource::InvokeFailure,
+                plugin_path.clone(),
+                format!("execute failure for {target_node_fqn}: {err}"),
+            );
+        }
         self.cleanup_retired_snapshots();
+        self.try_auto_iterate_observed_plugins();
         result
     }
 
@@ -662,10 +1116,15 @@ impl RuntimeHost {
         match self.reload_internal() {
             Ok((report, attempt)) => {
                 self.record_reload_attempt(attempt);
+                let snapshot = self.current_snapshot();
+                self.observe_snapshot_plugin_issues(snapshot.as_ref(), &report, "reload");
+                self.try_auto_iterate_observed_plugins();
                 Ok(report)
             }
             Err((err, attempt)) => {
                 self.record_reload_attempt(attempt);
+                self.observe_reload_error("reload", &err);
+                self.try_auto_iterate_observed_plugins();
                 Err(err)
             }
         }
@@ -673,12 +1132,17 @@ impl RuntimeHost {
 
     pub fn reload_with_diagnostics(&self) -> ReloadAttemptReport {
         match self.reload_internal() {
-            Ok((_, attempt)) => {
+            Ok((report, attempt)) => {
                 self.record_reload_attempt(attempt.clone());
+                let snapshot = self.current_snapshot();
+                self.observe_snapshot_plugin_issues(snapshot.as_ref(), &report, "reload");
+                self.try_auto_iterate_observed_plugins();
                 attempt
             }
-            Err((_, attempt)) => {
+            Err((err, attempt)) => {
                 self.record_reload_attempt(attempt.clone());
+                self.observe_reload_error("reload", &err);
+                self.try_auto_iterate_observed_plugins();
                 attempt
             }
         }
@@ -688,10 +1152,31 @@ impl RuntimeHost {
         match self.reload_candidate_internal() {
             Ok((status, attempt)) => {
                 self.record_candidate_reload_attempt(attempt);
+                if let Some(snapshot) = self.candidate_snapshot() {
+                    let report = ReloadReport {
+                        from_snapshot_id: status.from_snapshot_id.clone(),
+                        to_snapshot_id: status.candidate_snapshot_id.clone(),
+                        snapshot_root: status.snapshot_root.clone(),
+                        staged_artifact_root: status.staged_artifact_root.clone(),
+                        elapsed_ms: 0,
+                        added_plugins: status.added_plugins.clone(),
+                        removed_plugins: status.removed_plugins.clone(),
+                        changed_plugins: status.changed_plugins.clone(),
+                        changed_plugin_reasons: status.changed_plugin_reasons.clone(),
+                    };
+                    self.observe_snapshot_plugin_issues(
+                        snapshot.as_ref(),
+                        &report,
+                        "candidate_reload",
+                    );
+                }
+                self.try_auto_iterate_observed_plugins();
                 Ok(status)
             }
             Err((err, attempt)) => {
                 self.record_candidate_reload_attempt(attempt);
+                self.observe_reload_error("candidate_reload", &err);
+                self.try_auto_iterate_observed_plugins();
                 Err(err)
             }
         }
@@ -699,12 +1184,33 @@ impl RuntimeHost {
 
     pub fn reload_candidate_with_diagnostics(&self) -> ReloadAttemptReport {
         match self.reload_candidate_internal() {
-            Ok((_, attempt)) => {
+            Ok((status, attempt)) => {
                 self.record_candidate_reload_attempt(attempt.clone());
+                if let Some(snapshot) = self.candidate_snapshot() {
+                    let report = ReloadReport {
+                        from_snapshot_id: status.from_snapshot_id.clone(),
+                        to_snapshot_id: status.candidate_snapshot_id.clone(),
+                        snapshot_root: status.snapshot_root.clone(),
+                        staged_artifact_root: status.staged_artifact_root.clone(),
+                        elapsed_ms: 0,
+                        added_plugins: status.added_plugins.clone(),
+                        removed_plugins: status.removed_plugins.clone(),
+                        changed_plugins: status.changed_plugins.clone(),
+                        changed_plugin_reasons: status.changed_plugin_reasons.clone(),
+                    };
+                    self.observe_snapshot_plugin_issues(
+                        snapshot.as_ref(),
+                        &report,
+                        "candidate_reload",
+                    );
+                }
+                self.try_auto_iterate_observed_plugins();
                 attempt
             }
-            Err((_, attempt)) => {
+            Err((err, attempt)) => {
                 self.record_candidate_reload_attempt(attempt.clone());
+                self.observe_reload_error("candidate_reload", &err);
+                self.try_auto_iterate_observed_plugins();
                 attempt
             }
         }
@@ -757,6 +1263,564 @@ impl RuntimeHost {
 
     pub fn kernel(&self) -> &RuntimeKernel {
         &self.kernel
+    }
+
+    pub fn approve_blocked_iteration(
+        &self,
+        iteration_id: &str,
+    ) -> Result<KernelPluginIterationResult, RuntimeError> {
+        let mut result = self.kernel.take_blocked_iteration(iteration_id)?;
+        let report = match self.promote_candidate() {
+            Ok(report) => report,
+            Err(err) => {
+                self.kernel
+                    .blocked_iterations
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .insert(iteration_id.to_string(), result);
+                return Err(err);
+            }
+        };
+        result.final_verdict = PluginIterationFinalVerdict::Promoted;
+        result.blocked_reason = None;
+        result.candidate = Some(CandidateSnapshotStatus {
+            from_snapshot_id: report.from_snapshot_id.clone(),
+            candidate_snapshot_id: report.to_snapshot_id.clone(),
+            snapshot_root: report.snapshot_root.clone(),
+            staged_artifact_root: report.staged_artifact_root.clone(),
+            plugin_count: self.current_snapshot().plugin_registry().iter().count(),
+            node_count: self.current_snapshot().node_registry().len(),
+            added_plugins: report.added_plugins.clone(),
+            removed_plugins: report.removed_plugins.clone(),
+            changed_plugins: report.changed_plugins.clone(),
+            changed_plugin_reasons: report.changed_plugin_reasons.clone(),
+        });
+        self.kernel.record_plugin_iteration_outcome(&result);
+        Ok(result)
+    }
+
+    pub fn iterate_plugins(
+        &self,
+        request: KernelPluginIterationRequest,
+    ) -> Result<KernelPluginIterationResult, RuntimeError> {
+        let snapshot = self.current_snapshot();
+        let prepared = self
+            .kernel
+            .begin_plugin_iteration(snapshot.as_ref(), &request)?;
+        let iteration_id = prepared.iteration_id.clone();
+        let net = build_plugin_iteration_execution_net();
+        let mut context = snapshot.context_baseline().clone();
+        let mut state = PluginIterationRunState::new(prepared.clone());
+        let result = execute_net(
+            ExecutionConfig {
+                scheduler: SchedulerConfig { max_parallelism: 1 },
+                ..ExecutionConfig::default()
+            },
+            net,
+            &mut context,
+            |spec, _, _, _| {
+                let transition_id = spec.transition.transition_id.as_str();
+                if state.stage_error.is_some() && transition_id != "promote_or_rollback" {
+                    return TransitionRunResult {
+                        outcome: NodeOutcome::Skipped,
+                        payload: json!({ "skipped_after_failure": true }),
+                    };
+                }
+                let stage_result: Result<Value, RuntimeError> = match transition_id {
+                    "observe" => Ok(json!({
+                        "issue_id": state.prepared.issue_id,
+                        "root_plugin_path": state.prepared.root_plugin_path,
+                    })),
+                    "select_issue" => Ok(json!({
+                        "target_plugin_paths": state.prepared.target_plugin_paths,
+                    })),
+                    "plan" => (|| {
+                        let (plan, planner_tests_command, planner_safety_command) =
+                            self.plan_plugin_iteration(&state.prepared)?;
+                        state.planned = Some(plan.clone());
+                        state.planner_tests_command = planner_tests_command;
+                        state.planner_safety_command = planner_safety_command;
+                        Ok(json!({
+                            "planned_operation_count": plan.operations.len(),
+                        }))
+                    })(),
+                    "edit" => (|| {
+                        let plan = state.planned.as_ref().ok_or_else(|| RuntimeError::Invariant {
+                            message: "plugin iteration plan missing".to_string(),
+                        })?;
+                        let executor = PluginEditExecutor::new(&self.fixtures_root);
+                        let (apply_result, rollback) = executor.execute(
+                            &self.kernel.plugin_iteration_policy,
+                            &state.prepared.allowed_plugin_roots,
+                            plan,
+                        )?;
+                        state.rollback = Some(rollback);
+                        state.changed_paths = apply_result.changed_paths.clone();
+                        state.diff_lines = apply_result.diff_lines;
+                        Ok(json!({
+                            "changed_paths": apply_result.changed_paths,
+                            "diff_lines": apply_result.diff_lines,
+                        }))
+                    })(),
+                    "rebuild" => (|| {
+                        let rebuilt = rebuild_plugin_workspace(&self.fixtures_root)?;
+                        state.rebuilt_artifacts = rebuilt.clone();
+                        Ok(json!({
+                            "rebuilt_count": rebuilt.len(),
+                        }))
+                    })(),
+                    "stage_candidate" => (|| {
+                        let candidate = self.reload_candidate()?;
+                        state.candidate = Some(candidate.clone());
+                        Ok(json!({
+                            "candidate_snapshot_id": candidate.candidate_snapshot_id,
+                        }))
+                    })(),
+                    "verify" => (|| {
+                        let report = self.verify_plugin_iteration(&state)?;
+                        let verdict = if report.input.tests_passed && report.input.safety_checks_passed {
+                            VerifierVerdict::Pass
+                        } else {
+                            VerifierVerdict::Fail
+                        };
+                        if verdict == VerifierVerdict::Fail {
+                            self.kernel.observe_plugin_issue(
+                                KernelPluginIssueSource::VerifierFailure,
+                                state.prepared.root_plugin_path.clone(),
+                                format!(
+                                    "plugin verifier failed for {}: tests_passed={}, safety_checks_passed={}",
+                                    state.prepared.root_plugin_path,
+                                    report.input.tests_passed,
+                                    report.input.safety_checks_passed,
+                                ),
+                            );
+                        }
+                        state.verification = Some(report.clone());
+                        state.verifier_verdict = Some(verdict);
+                        Ok(json!({
+                            "verifier_verdict": verdict,
+                        }))
+                    })(),
+                    "canary" => (|| {
+                        let report = self.run_plugin_canary(&state)?;
+                        if report.verdict == CanaryVerdict::Fail {
+                            self.kernel.observe_plugin_issue(
+                                KernelPluginIssueSource::CanaryFailure,
+                                state.prepared.root_plugin_path.clone(),
+                                format!(
+                                    "plugin canary failed for {}: {}",
+                                    state.prepared.root_plugin_path, report.message
+                                ),
+                            );
+                        }
+                        state.canary = Some(report.clone());
+                        Ok(json!({
+                            "canary_verdict": report.verdict,
+                            "mode": report.mode,
+                        }))
+                    })(),
+                    "promote_or_rollback" => (|| {
+                        let final_verdict = self.finalize_plugin_iteration(&mut state)?;
+                        Ok(json!({
+                            "final_verdict": final_verdict,
+                        }))
+                    })(),
+                    other => Err(RuntimeError::Invariant {
+                        message: format!("unknown plugin iteration stage: {other}"),
+                    }),
+                };
+                match stage_result {
+                    Ok(payload) => TransitionRunResult {
+                        outcome: NodeOutcome::Success,
+                        payload,
+                    },
+                    Err(err) => {
+                        self.observe_plugin_iteration_failure(
+                            &state.prepared,
+                            transition_id,
+                            &err,
+                        );
+                        state.stage_error = Some(err.to_string());
+                        TransitionRunResult {
+                            outcome: NodeOutcome::Failure,
+                            payload: json!({ "error": err.to_string() }),
+                        }
+                    }
+                }
+            },
+        )
+        .and_then(|output| state.into_result(output));
+        self.kernel.finish_plugin_iteration(&iteration_id);
+        match result {
+            Ok(result) => {
+                self.kernel.record_plugin_iteration_outcome(&result);
+                self.cleanup_retired_snapshots();
+                Ok(result)
+            }
+            Err(err) => {
+                self.cleanup_retired_snapshots();
+                Err(err)
+            }
+        }
+    }
+
+    fn plan_plugin_iteration(
+        &self,
+        prepared: &PreparedPluginIteration,
+    ) -> Result<(PluginEditPlan, Option<String>, Option<String>), RuntimeError> {
+        if let Some(plan) = &prepared.edit_plan {
+            self.kernel
+                .plugin_iteration_policy
+                .validate_plan(&prepared.allowed_plugin_roots, plan)?;
+            return Ok((
+                plan.clone(),
+                prepared.tests_command.clone(),
+                prepared.safety_command.clone(),
+            ));
+        }
+        let instruction = prepared
+            .instruction
+            .clone()
+            .unwrap_or_else(|| prepared.summary.clone());
+        let planner = LlmPatchPlanner::new(self.config.llm_api.clone())?;
+        let context_paths = collect_plugin_context_paths(
+            &self.fixtures_root,
+            prepared.allowed_plugin_roots.values(),
+        )?;
+        let planned = planner.plan_plugin_edits(
+            &self.fixtures_root,
+            PluginPlanRequest {
+                issue_id: prepared.issue_id.clone(),
+                patch_id: format!("{}-plan", prepared.iteration_id),
+                instruction,
+                context_paths,
+                writable_roots: prepared.allowed_plugin_roots.values().cloned().collect(),
+                manual_approved: prepared.manual_approved,
+            },
+        )?;
+        self.kernel
+            .plugin_iteration_policy
+            .validate_plan(&prepared.allowed_plugin_roots, &planned.plan)?;
+        Ok((planned.plan, planned.tests_command, planned.safety_command))
+    }
+
+    fn verify_plugin_iteration(
+        &self,
+        state: &PluginIterationRunState,
+    ) -> Result<VerificationReport, RuntimeError> {
+        let tests_command = state
+            .prepared
+            .tests_command
+            .clone()
+            .or_else(|| state.planner_tests_command.clone())
+            .or_else(|| Some("cargo test --quiet --manifest-path plugins/Cargo.toml".to_string()));
+        let safety_command = state
+            .prepared
+            .safety_command
+            .clone()
+            .or_else(|| state.planner_safety_command.clone());
+        let report = CommandVerifier::verify(
+            &self.fixtures_root,
+            state.prepared.verify_profile,
+            tests_command.as_deref(),
+            safety_command.as_deref(),
+            state.prepared.quality_score,
+        )?;
+        Ok(report)
+    }
+
+    fn run_plugin_canary(
+        &self,
+        state: &PluginIterationRunState,
+    ) -> Result<CanaryReport, RuntimeError> {
+        let target_plugins = state
+            .prepared
+            .target_plugin_paths
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let samples = self
+            .invocation_samples
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        for sample in samples {
+            if !target_plugins.contains(&sample.plugin_path) {
+                continue;
+            }
+            let response = self.invoke_candidate(
+                &sample.plugin_path,
+                &sample.node_id,
+                serde_json::to_string(&sample.payload).map_err(|err| RuntimeError::Invariant {
+                    message: format!("canary payload serialize failed: {err}"),
+                })?,
+            )?;
+            let actual = parse_response_payload(&response.payload);
+            let verdict = if actual == sample.response {
+                CanaryVerdict::Pass
+            } else {
+                CanaryVerdict::Fail
+            };
+            return Ok(CanaryReport {
+                verdict,
+                mode: "recent_successful_invocation_replay".to_string(),
+                plugin_path: Some(sample.plugin_path),
+                node_id: Some(sample.node_id),
+                payload: Some(sample.payload),
+                expected_response: Some(sample.response),
+                actual_response: Some(actual.clone()),
+                message: if verdict == CanaryVerdict::Pass {
+                    "candidate replay matched current response".to_string()
+                } else {
+                    "candidate replay response diverged from current response".to_string()
+                },
+            });
+        }
+
+        if let Some(candidate) = self.candidate_snapshot() {
+            for plugin_path in &state.prepared.target_plugin_paths {
+                let Some(plugin) = candidate.plugin_registry().get(plugin_path) else {
+                    continue;
+                };
+                let Some(docs) = plugin.docs else {
+                    continue;
+                };
+                if let Some(node) = docs
+                    .nodes
+                    .iter()
+                    .find(|node| node.id.contains("canary") || node.id.contains("verify"))
+                {
+                    let response =
+                        self.invoke_candidate(plugin_path, &node.id, "{}".to_string())?;
+                    let actual = parse_response_payload(&response.payload);
+                    return Ok(CanaryReport {
+                        verdict: CanaryVerdict::Pass,
+                        mode: "declared_plugin_verifier_node".to_string(),
+                        plugin_path: Some(plugin_path.clone()),
+                        node_id: Some(node.id.clone()),
+                        payload: Some(Value::Object(Map::new())),
+                        expected_response: None,
+                        actual_response: Some(actual),
+                        message: "plugin-declared canary/verifier node completed successfully"
+                            .to_string(),
+                    });
+                }
+            }
+        }
+
+        Ok(CanaryReport {
+            verdict: CanaryVerdict::Partial,
+            mode: "no_canary_evidence".to_string(),
+            plugin_path: None,
+            node_id: None,
+            payload: None,
+            expected_response: None,
+            actual_response: None,
+            message: "no recent successful invocation or declared canary/verifier node found"
+                .to_string(),
+        })
+    }
+
+    fn finalize_plugin_iteration(
+        &self,
+        state: &mut PluginIterationRunState,
+    ) -> Result<PluginIterationFinalVerdict, RuntimeError> {
+        if let Some(stage_error) = state.stage_error.clone() {
+            if self.candidate_snapshot().is_some() {
+                let _ = self.rollback_candidate();
+            }
+            if let Some(rollback) = &state.rollback {
+                rollback.rollback()?;
+                let _ = rebuild_plugin_workspace(&self.fixtures_root);
+            }
+            state.blocked_reason = Some(stage_error);
+            state.final_verdict = Some(PluginIterationFinalVerdict::RolledBack);
+            return Ok(PluginIterationFinalVerdict::RolledBack);
+        }
+        let verifier_verdict = state.verifier_verdict.unwrap_or(VerifierVerdict::Partial);
+        let canary_verdict = state
+            .canary
+            .as_ref()
+            .map(|report| report.verdict)
+            .unwrap_or(CanaryVerdict::Partial);
+        let final_verdict =
+            if verifier_verdict == VerifierVerdict::Pass && canary_verdict == CanaryVerdict::Pass {
+                self.promote_candidate()?;
+                PluginIterationFinalVerdict::Promoted
+            } else if canary_verdict == CanaryVerdict::Partial {
+                state.blocked_reason = Some(
+                    state
+                        .canary
+                        .as_ref()
+                        .map(|report| report.message.clone())
+                        .unwrap_or_else(|| "canary returned partial".to_string()),
+                );
+                PluginIterationFinalVerdict::Blocked
+            } else {
+                if self.candidate_snapshot().is_some() {
+                    let _ = self.rollback_candidate();
+                }
+                if let Some(rollback) = &state.rollback {
+                    rollback.rollback()?;
+                    let _ = rebuild_plugin_workspace(&self.fixtures_root);
+                }
+                PluginIterationFinalVerdict::RolledBack
+            };
+        state.final_verdict = Some(final_verdict);
+        Ok(final_verdict)
+    }
+
+    fn record_invocation_sample(
+        &self,
+        plugin_path: &str,
+        node_id: &str,
+        payload: &str,
+        response_payload: &str,
+    ) {
+        let payload =
+            serde_json::from_str(payload).unwrap_or_else(|_| Value::String(payload.to_string()));
+        let response = parse_response_payload(response_payload);
+        let mut samples = self
+            .invocation_samples
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        samples.push_front(InvocationSample {
+            plugin_path: plugin_path.to_string(),
+            node_id: node_id.to_string(),
+            payload,
+            response,
+            observed_at_ms: now_ms(),
+        });
+        while samples.len() > 64 {
+            samples.pop_back();
+        }
+    }
+
+    fn observe_plugin_iteration_failure(
+        &self,
+        prepared: &PreparedPluginIteration,
+        stage: &str,
+        err: &RuntimeError,
+    ) {
+        let source = match err {
+            RuntimeError::PluginIterationPolicyBlocked { .. } => {
+                Some(KernelPluginIssueSource::PolicyBlocked)
+            }
+            _ if matches!(stage, "rebuild" | "stage_candidate") => {
+                Some(KernelPluginIssueSource::LoadFailure)
+            }
+            _ => None,
+        };
+        let Some(source) = source else {
+            return;
+        };
+        self.kernel.observe_plugin_issue(
+            source,
+            prepared.root_plugin_path.clone(),
+            format!(
+                "plugin iteration {stage} failed for {}: {err}",
+                prepared.root_plugin_path
+            ),
+        );
+    }
+
+    fn observe_snapshot_plugin_issues(
+        &self,
+        snapshot: &RuntimeSnapshot,
+        report: &ReloadReport,
+        stage: &str,
+    ) {
+        for (plugin_path, plugin) in snapshot.plugin_registry().iter() {
+            let changed_reasons = report
+                .changed_plugin_reasons
+                .get(&plugin_path)
+                .cloned()
+                .unwrap_or_default();
+            match plugin.load_result {
+                PluginLoadResult::Unavailable(reason) => {
+                    let source = match reason {
+                        PluginUnavailableReason::ContractViolation => {
+                            KernelPluginIssueSource::DocsDrift
+                        }
+                        _ => KernelPluginIssueSource::LoadFailure,
+                    };
+                    self.kernel.observe_plugin_issue(
+                        source,
+                        plugin_path.clone(),
+                        format!("{stage} observed plugin {plugin_path} unavailable: {reason:?}"),
+                    );
+                }
+                PluginLoadResult::Loaded => {
+                    if changed_reasons.iter().any(|reason| {
+                        matches!(reason.as_str(), "docs_changed" | "fingerprint_diff_changed")
+                    }) {
+                        self.kernel.observe_plugin_issue(
+                            KernelPluginIssueSource::DocsDrift,
+                            plugin_path.clone(),
+                            format!(
+                                "{stage} detected docs/contract drift for {plugin_path}: {}",
+                                changed_reasons.join(", ")
+                            ),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    fn observe_reload_error(&self, stage: &str, err: &RuntimeError) {
+        let Some(plugin_path) = plugin_path_from_runtime_error(err) else {
+            return;
+        };
+        let source = match err {
+            RuntimeError::DocsContract { .. } => KernelPluginIssueSource::DocsDrift,
+            RuntimeError::PluginUnavailable {
+                reason: PluginUnavailableReason::ContractViolation,
+                ..
+            } => KernelPluginIssueSource::DocsDrift,
+            _ => KernelPluginIssueSource::LoadFailure,
+        };
+        self.kernel.observe_plugin_issue(
+            source,
+            plugin_path.clone(),
+            format!("{stage} failed for {plugin_path}: {err}"),
+        );
+    }
+
+    fn try_auto_iterate_observed_plugins(&self) {
+        if !self.kernel.can_auto_iterate_plugins() {
+            return;
+        }
+        if self
+            .kernel
+            .active_plugin_iteration
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .is_some()
+        {
+            return;
+        }
+        let Some(issue) = self
+            .kernel
+            .plugin_issues()
+            .into_iter()
+            .find(|issue| issue.status == KernelPluginIssueStatus::Open)
+        else {
+            return;
+        };
+        let _ = self.iterate_plugins(KernelPluginIterationRequest {
+            issue_id: Some(issue.issue_id.clone()),
+            target_plugin_paths: Vec::new(),
+            instruction: Some(issue.summary.clone()),
+            edit_plan: None,
+            manual_approved: false,
+            tests_command: None,
+            safety_command: None,
+            verify_profile: Some(VerificationProfile::RustWorkspace),
+            quality_score: None,
+        });
     }
 
     fn reload_internal(
@@ -1312,6 +2376,305 @@ fn runtime_snapshot_from_output(
         context_baseline: output.context,
         staged_artifact_root,
     }
+}
+
+#[derive(Debug, Clone)]
+struct PluginIterationRunState {
+    prepared: PreparedPluginIteration,
+    planned: Option<PluginEditPlan>,
+    planner_tests_command: Option<String>,
+    planner_safety_command: Option<String>,
+    rollback: Option<crate::kernel::plugin_iteration::PluginEditRollback>,
+    changed_paths: Vec<String>,
+    diff_lines: usize,
+    rebuilt_artifacts: Vec<(String, String)>,
+    candidate: Option<CandidateSnapshotStatus>,
+    verification: Option<VerificationReport>,
+    verifier_verdict: Option<VerifierVerdict>,
+    canary: Option<CanaryReport>,
+    blocked_reason: Option<String>,
+    stage_error: Option<String>,
+    final_verdict: Option<PluginIterationFinalVerdict>,
+}
+
+impl PluginIterationRunState {
+    fn new(prepared: PreparedPluginIteration) -> Self {
+        Self {
+            prepared,
+            planned: None,
+            planner_tests_command: None,
+            planner_safety_command: None,
+            rollback: None,
+            changed_paths: Vec::new(),
+            diff_lines: 0,
+            rebuilt_artifacts: Vec::new(),
+            candidate: None,
+            verification: None,
+            verifier_verdict: None,
+            canary: None,
+            blocked_reason: None,
+            stage_error: None,
+            final_verdict: None,
+        }
+    }
+
+    fn into_result(
+        self,
+        net_output: ExecutionOutput,
+    ) -> Result<KernelPluginIterationResult, RuntimeError> {
+        let planned_edit_plan = self
+            .planned
+            .or(self.prepared.edit_plan.clone())
+            .unwrap_or_else(|| PluginEditPlan {
+                issue_id: self.prepared.issue_id.clone(),
+                patch_id: format!("{}-empty", self.prepared.iteration_id),
+                summary: self.prepared.summary.clone(),
+                operations: Vec::new(),
+            });
+        Ok(KernelPluginIterationResult {
+            iteration_id: self.prepared.iteration_id,
+            issue_id: self.prepared.issue_id,
+            root_plugin_path: self.prepared.root_plugin_path,
+            target_plugin_paths: self.prepared.target_plugin_paths,
+            source: self.prepared.source,
+            summary: self.prepared.summary,
+            planned_edit_plan,
+            changed_paths: self.changed_paths,
+            rebuilt_artifacts: self.rebuilt_artifacts,
+            candidate: self.candidate,
+            verification: self.verification,
+            verifier_verdict: self.verifier_verdict,
+            canary: self.canary,
+            final_verdict: self
+                .final_verdict
+                .unwrap_or(PluginIterationFinalVerdict::RolledBack),
+            blocked_reason: self.blocked_reason.or(self.stage_error),
+            net_output,
+        })
+    }
+}
+
+fn build_plugin_iteration_execution_net() -> ExecutionNetSpec {
+    let spec = PluginIterationNetSpec::default();
+    let transitions = spec
+        .transition_ids
+        .iter()
+        .enumerate()
+        .map(|(idx, transition_id)| ExecutionTransitionSpec {
+            transition: TransitionSpec {
+                transition_id: transition_id.clone(),
+                priority: -(idx as i32),
+                join_policy: JoinPolicy::AnyOf,
+            },
+            run_policy: RunPolicy::default(),
+            kind: if transition_id == "promote_or_rollback" {
+                ExecutionTransitionKind::Terminal
+            } else {
+                ExecutionTransitionKind::Task
+            },
+            logical_group: Some("plugin_iteration".to_string()),
+        })
+        .collect::<Vec<_>>();
+    let mut places = Vec::new();
+    let mut arcs = Vec::new();
+    for window in spec.transition_ids.windows(2) {
+        let from = &window[0];
+        let to = &window[1];
+        let place_id = format!("plugin_iteration::{from}::{to}");
+        places.push(PlaceSpec {
+            place_id: place_id.clone(),
+        });
+        arcs.push(ArcSpec {
+            arc_id: format!("plugin_iteration::{from}::out"),
+            place_id: place_id.clone(),
+            transition_id: from.clone(),
+            direction: ArcDirection::TransitionToPlace,
+            label: Some("control".to_string()),
+            required: false,
+        });
+        arcs.push(ArcSpec {
+            arc_id: format!("plugin_iteration::{to}::in"),
+            place_id,
+            transition_id: to.clone(),
+            direction: ArcDirection::PlaceToTransition,
+            label: Some("control".to_string()),
+            required: false,
+        });
+    }
+    ExecutionNetSpec {
+        places,
+        transitions,
+        arcs,
+    }
+}
+
+fn plugin_iteration_status_from_result(
+    result: &KernelPluginIterationResult,
+) -> PluginIterationStatus {
+    PluginIterationStatus {
+        iteration_id: result.iteration_id.clone(),
+        issue_id: result.issue_id.clone(),
+        root_plugin_path: result.root_plugin_path.clone(),
+        target_plugin_paths: result.target_plugin_paths.clone(),
+        summary: result.summary.clone(),
+        changed_paths: result.changed_paths.clone(),
+        verifier_verdict: result.verifier_verdict,
+        canary_verdict: result.canary.as_ref().map(|report| report.verdict),
+        final_verdict: result.final_verdict,
+        blocked_reason: result.blocked_reason.clone(),
+    }
+}
+
+fn plugin_iteration_status_from_history(
+    entry: &PluginIterationHistoryEntry,
+) -> PluginIterationStatus {
+    PluginIterationStatus {
+        iteration_id: entry.iteration_id.clone(),
+        issue_id: entry.issue_id.clone(),
+        root_plugin_path: entry.root_plugin_path.clone(),
+        target_plugin_paths: entry.target_plugin_paths.clone(),
+        summary: entry.summary.clone(),
+        changed_paths: entry.changed_paths.clone(),
+        verifier_verdict: entry.verifier_verdict,
+        canary_verdict: entry.canary_verdict,
+        final_verdict: entry.final_verdict,
+        blocked_reason: entry.blocked_reason.clone(),
+    }
+}
+
+fn plugin_path_from_runtime_error(err: &RuntimeError) -> Option<String> {
+    match err {
+        RuntimeError::InvalidChildSource { parent, .. } => Some(parent.clone()),
+        RuntimeError::ChildNotFound { parent, .. } => Some(parent.clone()),
+        RuntimeError::DuplicatePluginPath { plugin_path, .. } => Some(plugin_path.clone()),
+        RuntimeError::CycleDetected { cycle } => cycle.first().cloned(),
+        RuntimeError::MissingScaffold { plugin_path, .. } => Some(plugin_path.clone()),
+        RuntimeError::DocsContract { plugin_path, .. } => Some(plugin_path.clone()),
+        RuntimeError::ArtifactIndexMissing { plugin_path } => Some(plugin_path.clone()),
+        RuntimeError::ArtifactFileMissing { plugin_path, .. } => Some(plugin_path.clone()),
+        RuntimeError::ArtifactHashMismatch { plugin_path, .. } => Some(plugin_path.clone()),
+        RuntimeError::AbiMismatch { plugin_path, .. } => Some(plugin_path.clone()),
+        RuntimeError::PluginUnavailable { plugin_path, .. } => Some(plugin_path.clone()),
+        RuntimeError::PluginNotRegistered { plugin_path } => Some(plugin_path.clone()),
+        RuntimeError::PluginExecutionUnsupported { plugin_path, .. } => Some(plugin_path.clone()),
+        RuntimeError::PluginInvocationFailed { plugin_path, .. } => Some(plugin_path.clone()),
+        RuntimeError::PluginDocsNotFound { plugin_path } => Some(plugin_path.clone()),
+        RuntimeError::NodeDocsNotFound { plugin_path, .. } => Some(plugin_path.clone()),
+        RuntimeError::PermissionDenied { plugin_path, .. } => Some(plugin_path.clone()),
+        RuntimeError::ContextPluginUnavailable { plugin_path } => Some(plugin_path.clone()),
+        RuntimeError::ServiceNotFound { plugin_path, .. } => Some(plugin_path.clone()),
+        RuntimeError::ServiceTypeMismatch { plugin_path, .. } => Some(plugin_path.clone()),
+        RuntimeError::DuplicateService { plugin_path, .. } => Some(plugin_path.clone()),
+        _ => None,
+    }
+}
+
+fn determine_root_plugin_path(
+    snapshot: &RuntimeSnapshot,
+    target_plugin_paths: &[String],
+) -> Result<String, RuntimeError> {
+    if target_plugin_paths.is_empty() {
+        return Err(RuntimeError::InvalidArgument {
+            message: "plugin iteration requires target_plugin_paths or an observed issue"
+                .to_string(),
+        });
+    }
+    let mut split_paths = target_plugin_paths
+        .iter()
+        .map(|path| path.split('/').collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+    split_paths.sort_by_key(Vec::len);
+    let shortest = split_paths.first().cloned().unwrap_or_default();
+    let mut common = Vec::new();
+    'outer: for (idx, segment) in shortest.iter().enumerate() {
+        for other in &split_paths[1..] {
+            if other.get(idx) != Some(segment) {
+                break 'outer;
+            }
+        }
+        common.push(*segment);
+    }
+    while !common.is_empty() {
+        let candidate = common.join("/");
+        if snapshot.plugin_registry().get(&candidate).is_some() {
+            return Ok(candidate);
+        }
+        common.pop();
+    }
+    Err(RuntimeError::InvalidArgument {
+        message: format!(
+            "target plugin paths do not share a loaded subtree root: {}",
+            target_plugin_paths.join(", ")
+        ),
+    })
+}
+
+fn collect_plugin_context_paths<'a>(
+    workspace_root: &Path,
+    allowed_plugin_roots: impl IntoIterator<Item = &'a String>,
+) -> Result<Vec<String>, RuntimeError> {
+    let mut files = BTreeSet::new();
+    for plugin_root in allowed_plugin_roots {
+        let manifest_path = format!("{plugin_root}/Cargo.toml");
+        if workspace_root.join(&manifest_path).exists() {
+            files.insert(manifest_path);
+        }
+        for subdir in ["src", "tests", "docs/agent", "docs/human"] {
+            let dir = workspace_root.join(plugin_root).join(subdir);
+            if !dir.exists() {
+                continue;
+            }
+            collect_context_files_recursive(workspace_root, &dir, &mut files)?;
+        }
+    }
+    if files.is_empty() {
+        return Err(RuntimeError::InvalidArgument {
+            message: "no planner context files discovered for plugin iteration".to_string(),
+        });
+    }
+    Ok(files.into_iter().collect())
+}
+
+fn collect_context_files_recursive(
+    workspace_root: &Path,
+    dir: &Path,
+    files: &mut BTreeSet<String>,
+) -> Result<(), RuntimeError> {
+    let entries = fs::read_dir(dir).map_err(|err| RuntimeError::Io {
+        path: dir.to_path_buf(),
+        message: err.to_string(),
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|err| RuntimeError::Io {
+            path: dir.to_path_buf(),
+            message: err.to_string(),
+        })?;
+        let path = entry.path();
+        let file_type = entry.file_type().map_err(|err| RuntimeError::Io {
+            path: path.clone(),
+            message: err.to_string(),
+        })?;
+        if file_type.is_dir() {
+            collect_context_files_recursive(workspace_root, &path, files)?;
+            continue;
+        }
+        match path.extension().and_then(|extension| extension.to_str()) {
+            Some("rs") | Some("json") | Some("toml") | Some("md") => {
+                let relative =
+                    path.strip_prefix(workspace_root)
+                        .map_err(|_| RuntimeError::Invariant {
+                            message: format!(
+                                "planner context path {} escaped workspace root {}",
+                                path.display(),
+                                workspace_root.display()
+                            ),
+                        })?;
+                files.insert(relative.to_string_lossy().to_string());
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 fn kernel_plan_result(

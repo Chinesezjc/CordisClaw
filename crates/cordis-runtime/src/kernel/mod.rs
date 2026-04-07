@@ -5,5 +5,6 @@ pub mod evaluator;
 pub mod r#loop;
 pub mod memory;
 pub mod planner;
+pub mod plugin_iteration;
 pub mod policy;
 pub mod verifier;

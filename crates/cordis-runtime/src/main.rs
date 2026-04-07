@@ -6,6 +6,7 @@ use cordis_runtime::kernel::auto_update::{
 };
 use cordis_runtime::kernel::evaluator::{EvalHarness, VerificationInput};
 use cordis_runtime::kernel::memory::ChangeMemory;
+use cordis_runtime::kernel::plugin_iteration::KernelPluginIterationRequest;
 use cordis_runtime::kernel::policy::IterationPolicy;
 use cordis_runtime::kernel::r#loop::SelfIterationKernel;
 use cordis_runtime::kernel::verifier::VerificationProfile;
@@ -222,7 +223,19 @@ fn handle_serve_command(
             println!("{}", serde_json::to_string(&host.kernel().status())?);
         }
         "kernel history" => {
-            println!("{}", serde_json::to_string(&host.kernel().history())?);
+            println!(
+                "{}",
+                serde_json::to_string(&host.kernel().plugin_history())?
+            );
+        }
+        "kernel issues" => {
+            println!("{}", serde_json::to_string(&host.kernel().plugin_issues())?);
+        }
+        "kernel blocked" => {
+            println!(
+                "{}",
+                serde_json::to_string(&host.kernel().blocked_iterations())?
+            );
         }
         "exit" | "quit" => return Ok(false),
         _ => {
@@ -262,6 +275,16 @@ fn handle_serve_command(
             } else if let Some(json) = command.strip_prefix("kernel plan-apply ") {
                 let request: KernelPlanRequest = serde_json::from_str(json)?;
                 let result = host.kernel().plan_and_run_iteration(request)?;
+                println!("{}", serde_json::to_string(&result)?);
+            } else if let Some(json) = command.strip_prefix("kernel iterate-plugins ") {
+                let request: KernelPluginIterationRequest = serde_json::from_str(json)?;
+                let result = host.iterate_plugins(request)?;
+                println!("{}", serde_json::to_string(&result)?);
+            } else if let Some(iteration_id) = command.strip_prefix("kernel iteration-status ") {
+                let result = host.kernel().plugin_iteration_status(iteration_id.trim())?;
+                println!("{}", serde_json::to_string(&result)?);
+            } else if let Some(iteration_id) = command.strip_prefix("kernel approve ") {
+                let result = host.approve_blocked_iteration(iteration_id.trim())?;
                 println!("{}", serde_json::to_string(&result)?);
             } else {
                 println!("unknown serve command: {command}");
@@ -863,7 +886,12 @@ fn serve_usage() -> &'static str {
   candidate execute <node_fqn> <payload-json>
   kernel status
   kernel history
+  kernel issues
+  kernel blocked
   kernel apply-plan <json>
   kernel plan-apply <json>
+  kernel iterate-plugins <json>
+  kernel iteration-status <iteration-id>
+  kernel approve <iteration-id>
   exit"
 }

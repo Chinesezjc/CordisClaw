@@ -4,11 +4,16 @@ use crate::config::LlmApiConfig;
 use crate::core::error::RuntimeError;
 use crate::core::models::PluginDocs;
 use crate::kernel::auto_update::{AutoUpdatePlan, FilePatch};
+use crate::kernel::plugin_iteration::{
+    normalize_rel_path as normalize_plugin_rel_path, PluginEditOpKind, PluginEditOperation,
+    PluginEditPlan,
+};
 use crate::plugin::invoke::PluginInvoker;
 use reqwest::blocking::Client;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::env;
 use std::fs;
@@ -16,6 +21,7 @@ use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 const PLAN_SCHEMA_NAME: &str = "cordis_auto_update_plan";
+const PLUGIN_EDIT_PLAN_SCHEMA_NAME: &str = "cordis_plugin_edit_plan";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PlanRequest {
@@ -36,6 +42,26 @@ pub struct PlannedUpdate {
     pub response_id: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PluginPlanRequest {
+    pub issue_id: String,
+    pub patch_id: String,
+    pub instruction: String,
+    pub context_paths: Vec<String>,
+    pub writable_roots: Vec<String>,
+    pub manual_approved: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PlannedPluginEdit {
+    pub plan: PluginEditPlan,
+    pub summary: String,
+    pub tests_command: Option<String>,
+    pub safety_command: Option<String>,
+    pub planner_model: String,
+    pub response_id: Option<String>,
+}
+
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 struct PlannerPayload {
     summary: String,
@@ -46,9 +72,20 @@ struct PlannerPayload {
     patches: Vec<FilePatch>,
 }
 
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+struct PluginPlannerPayload {
+    summary: String,
+    #[serde(default)]
+    tests_command: Option<String>,
+    #[serde(default)]
+    safety_command: Option<String>,
+    operations: Vec<PluginEditOperation>,
+}
+
 #[derive(Debug, Clone)]
 struct ContextFile {
     path: String,
+    sha256: String,
     content: String,
 }
 
@@ -129,6 +166,47 @@ impl LlmPatchPlanner {
         self.build_planned_update(request, payload, &allowed_paths, response_id)
     }
 
+    pub fn plan_plugin_edits(
+        &self,
+        workspace_root: &Path,
+        request: PluginPlanRequest,
+    ) -> Result<PlannedPluginEdit, RuntimeError> {
+        if request.instruction.trim().is_empty() {
+            return Err(RuntimeError::InvalidArgument {
+                message: "instruction must not be empty".to_string(),
+            });
+        }
+        if request.context_paths.is_empty() {
+            return Err(RuntimeError::InvalidArgument {
+                message: "at least one plugin context path is required".to_string(),
+            });
+        }
+        if request.writable_roots.is_empty() {
+            return Err(RuntimeError::InvalidArgument {
+                message: "at least one writable plugin root is required".to_string(),
+            });
+        }
+
+        let context_paths = normalize_paths(&request.context_paths)?;
+        let writable_roots = normalize_paths(&request.writable_roots)?;
+        let context_files = load_context_files(workspace_root, &context_paths)?;
+        let plugin_catalog = discover_plugin_catalog(workspace_root);
+        let user_prompt =
+            build_plugin_edit_prompt(&request, &context_files, plugin_catalog.as_ref());
+        let provider = self.config.provider.trim().to_ascii_lowercase();
+        let (payload, response_id) = match provider.as_str() {
+            "openai" => self.plan_plugin_edits_with_openai(&user_prompt)?,
+            "deepseek" => self.plan_plugin_edits_with_deepseek(&user_prompt)?,
+            _ => {
+                return Err(RuntimeError::UnsupportedLlmProvider {
+                    provider: self.config.provider.clone(),
+                });
+            }
+        };
+
+        self.build_planned_plugin_edit(request, payload, &writable_roots, response_id)
+    }
+
     fn plan_with_openai(
         &self,
         user_prompt: &str,
@@ -162,6 +240,41 @@ impl LlmPatchPlanner {
                 message: "missing output_text in Responses API payload".to_string(),
             })?;
         Ok((parse_planner_payload(&output_text)?, response_id))
+    }
+
+    fn plan_plugin_edits_with_openai(
+        &self,
+        user_prompt: &str,
+    ) -> Result<(PluginPlannerPayload, Option<String>), RuntimeError> {
+        let request_body = json!({
+            "model": self.config.model,
+            "instructions": plugin_edit_openai_system_prompt(),
+            "input": user_prompt,
+            "temperature": self.config.temperature,
+            "max_output_tokens": self.config.max_tokens,
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": PLUGIN_EDIT_PLAN_SCHEMA_NAME,
+                    "strict": true,
+                    "schema": plugin_edit_plan_schema(),
+                }
+            }
+        });
+
+        let raw_json = self.send_json_request(
+            format!("{}/responses", self.config.base_url.trim_end_matches('/')),
+            request_body,
+        )?;
+        let response_id = raw_json
+            .get("id")
+            .and_then(Value::as_str)
+            .map(ToString::to_string);
+        let output_text =
+            extract_output_text(&raw_json).ok_or_else(|| RuntimeError::LlmResponseInvalid {
+                message: "missing output_text in Responses API payload".to_string(),
+            })?;
+        Ok((parse_plugin_planner_payload(&output_text)?, response_id))
     }
 
     fn plan_with_deepseek(
@@ -205,6 +318,49 @@ impl LlmPatchPlanner {
             }
         })?;
         Ok((parse_planner_payload(&output_text)?, response_id))
+    }
+
+    fn plan_plugin_edits_with_deepseek(
+        &self,
+        user_prompt: &str,
+    ) -> Result<(PluginPlannerPayload, Option<String>), RuntimeError> {
+        let request_body = json!({
+            "model": self.config.model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": plugin_edit_deepseek_system_prompt(),
+                },
+                {
+                    "role": "user",
+                    "content": user_prompt,
+                }
+            ],
+            "temperature": self.config.temperature,
+            "max_tokens": self.config.max_tokens,
+            "response_format": {
+                "type": "json_object"
+            }
+        });
+
+        let raw_json = self.send_json_request(
+            format!(
+                "{}/chat/completions",
+                self.config.base_url.trim_end_matches('/')
+            ),
+            request_body,
+        )?;
+        let response_id = raw_json
+            .get("id")
+            .and_then(Value::as_str)
+            .map(ToString::to_string);
+        let output_text = extract_chat_completion_text(&raw_json).ok_or_else(|| {
+            RuntimeError::LlmResponseInvalid {
+                message: "missing choices[0].message.content in chat completion payload"
+                    .to_string(),
+            }
+        })?;
+        Ok((parse_plugin_planner_payload(&output_text)?, response_id))
     }
 
     fn send_json_request(
@@ -283,6 +439,35 @@ impl LlmPatchPlanner {
             response_id,
         })
     }
+
+    fn build_planned_plugin_edit(
+        &self,
+        request: PluginPlanRequest,
+        payload: PluginPlannerPayload,
+        writable_roots: &BTreeSet<String>,
+        response_id: Option<String>,
+    ) -> Result<PlannedPluginEdit, RuntimeError> {
+        if payload.operations.is_empty() {
+            return Err(RuntimeError::LlmResponseInvalid {
+                message: "model returned zero plugin edit operations".to_string(),
+            });
+        }
+        validate_plugin_operation_paths(&payload.operations, writable_roots)?;
+
+        Ok(PlannedPluginEdit {
+            plan: PluginEditPlan {
+                issue_id: request.issue_id,
+                patch_id: request.patch_id,
+                summary: payload.summary.clone(),
+                operations: payload.operations,
+            },
+            summary: payload.summary,
+            tests_command: normalize_optional_command(payload.tests_command),
+            safety_command: normalize_optional_command(payload.safety_command),
+            planner_model: self.config.model.clone(),
+            response_id,
+        })
+    }
 }
 
 fn normalize_paths(paths: &[String]) -> Result<BTreeSet<String>, RuntimeError> {
@@ -307,6 +492,7 @@ fn load_context_files(
         })?;
         files.push(ContextFile {
             path: rel_path.clone(),
+            sha256: sha256_text(&content),
             content,
         });
     }
@@ -355,6 +541,75 @@ fn build_user_prompt(
     for file in files {
         prompt.push_str("\n<<<FILE ");
         prompt.push_str(&file.path);
+        prompt.push_str(">>>\n");
+        prompt.push_str(&file.content);
+        if !file.content.ends_with('\n') {
+            prompt.push('\n');
+        }
+        prompt.push_str("<<<END FILE>>>\n");
+    }
+    prompt
+}
+
+fn build_plugin_edit_prompt(
+    request: &PluginPlanRequest,
+    files: &[ContextFile],
+    plugin_catalog: Option<&PromptPluginCatalog>,
+) -> String {
+    let mut prompt = String::new();
+    prompt.push_str("Issue ID: ");
+    prompt.push_str(&request.issue_id);
+    prompt.push_str("\nPatch ID: ");
+    prompt.push_str(&request.patch_id);
+    prompt.push_str("\nManual approval: ");
+    prompt.push_str(if request.manual_approved {
+        "true"
+    } else {
+        "false"
+    });
+    prompt.push_str("\nInstruction:\n");
+    prompt.push_str(request.instruction.trim());
+    prompt.push_str("\n\nWritable plugin roots:\n");
+    for root in &request.writable_roots {
+        prompt.push_str("- ");
+        prompt.push_str(root);
+        prompt.push('\n');
+        prompt.push_str("  surface: ");
+        prompt.push_str(root);
+        prompt.push_str("/Cargo.toml, ");
+        prompt.push_str(root);
+        prompt.push_str("/src/**, ");
+        prompt.push_str(root);
+        prompt.push_str("/tests/**, ");
+        prompt.push_str(root);
+        prompt.push_str("/docs/agent/**, ");
+        prompt.push_str(root);
+        prompt.push_str("/docs/human/**\n");
+    }
+    prompt.push_str("\nPlugin edit operation rules:\n");
+    prompt.push_str("- `replace_exact`: requires `path`, `expected_old_string`, `new_content`\n");
+    prompt.push_str(
+        "- `create_file`: requires `path`, `expected_old_string` set to \"\", `new_content`\n",
+    );
+    prompt.push_str("- `delete_file`: requires `path`, `expected_sha256`\n");
+    prompt.push_str("- `json_set`: requires `path`, `expected_sha256`, `pointer`, `value`\n");
+    prompt.push_str("- `toml_set`: requires `path`, `expected_sha256`, `dotted_key`, `value`\n");
+    prompt.push_str("Every operation must stay inside the writable plugin roots and include the required precondition fields.\n");
+    prompt.push_str("\nGeneric verifier command formats:\n");
+    prompt.push_str("- shell command string executed in the workspace root\n");
+    prompt.push_str("- plugin verifier spec: plugin:{\"plugin_path\":\"<plugin_path>\",\"node_id\":\"<node_id>\",\"payload_json\":{},\"expect_substring\":\"<expected text>\",\"fixtures_root\":\"<optional fixtures root>\"}\n");
+    prompt.push_str("Prefer plugin verifier specs over shell commands when a discovered plugin can validate the requested behavior directly.\n");
+    prompt.push_str("\nDiscovered plugin capability catalog:\n");
+    match plugin_catalog {
+        Some(catalog) => prompt.push_str(&render_plugin_catalog(catalog)),
+        None => prompt.push_str("(none discovered for this workspace root)\n"),
+    }
+    prompt.push_str("\nCurrent file contents with sha256 preconditions:\n");
+    for file in files {
+        prompt.push_str("\n<<<FILE ");
+        prompt.push_str(&file.path);
+        prompt.push_str(" sha256=");
+        prompt.push_str(&file.sha256);
         prompt.push_str(">>>\n");
         prompt.push_str(&file.content);
         if !file.content.ends_with('\n') {
@@ -434,12 +689,28 @@ Do not invent files, do not use absolute paths, do not invent plugin capabilitie
 When you can infer reliable verification steps from the request and plugin catalog, include `tests_command` and/or `safety_command`; otherwise leave them null or omit them."
 }
 
+fn plugin_edit_openai_system_prompt() -> &'static str {
+    "You are a guarded plugin-edit planner for a Rust plugin workspace. Return only JSON that matches the provided schema. \
+Only emit operations inside the writable plugin roots. Do not modify runtime crates, root manifests, config, .git, target, or artifacts. \
+Prefer replace_exact/json_set/toml_set over broad rewrites, and only use create_file/delete_file when necessary. \
+For existing files, use the provided sha256 values as expected preconditions. For create_file, set expected_old_string to an empty string. \
+Do not invent plugin capabilities beyond the provided catalog and do not include markdown."
+}
+
 fn deepseek_system_prompt() -> &'static str {
     "You are a guarded patch planner for a Rust workspace. Return exactly one JSON object and no markdown. \
 The JSON must use this shape: {\"summary\":\"short summary\",\"tests_command\":\"optional verifier command or null\",\"safety_command\":\"optional verifier command or null\",\"patches\":[{\"path\":\"relative/path.txt\",\"kind\":\"text|json_value|toml_value\",\"find\":\"exact old text when kind=text\",\"replace\":\"new text when kind=text\",\"pointer\":\"json pointer when kind=json_value\",\"dotted_key\":\"toml dotted key when kind=toml_value\",\"value\":\"replacement value when kind is structured\"}]}. \
 Only edit the allowed relative paths. Each text patch must use an exact substring from the current file contents in `find`. \
 Keep changes minimal, deterministic, and safe. Prefer `json_value`/`toml_value` patches for JSON or TOML config files and prefer plugin verifier specs over shell commands when the plugin catalog is sufficient. Do not invent files, do not use absolute paths, do not invent plugin capabilities beyond the provided catalog, and do not include extra keys. \
 When you can infer reliable verification steps from the request and plugin catalog, include `tests_command` and/or `safety_command`; otherwise set them to null."
+}
+
+fn plugin_edit_deepseek_system_prompt() -> &'static str {
+    "You are a guarded plugin-edit planner for a Rust plugin workspace. Return exactly one JSON object and no markdown. \
+The JSON must use this shape: {\"summary\":\"short summary\",\"tests_command\":\"optional verifier command or null\",\"safety_command\":\"optional verifier command or null\",\"operations\":[{\"path\":\"relative/path\",\"kind\":\"replace_exact|create_file|delete_file|json_set|toml_set\",\"expected_old_string\":\"required for replace_exact/create_file\",\"expected_sha256\":\"required for delete_file/json_set/toml_set\",\"new_content\":\"required for replace_exact/create_file\",\"pointer\":\"required for json_set\",\"dotted_key\":\"required for toml_set\",\"value\":\"required for json_set/toml_set\"}]}. \
+Only emit operations inside the writable plugin roots. Do not modify runtime crates, root manifests, config, .git, target, or artifacts. \
+For existing files, use the provided sha256 values as expected preconditions. For create_file, set expected_old_string to an empty string. \
+Do not invent plugin capabilities beyond the provided catalog and do not include extra keys."
 }
 
 fn plan_schema() -> Value {
@@ -492,6 +763,67 @@ fn plan_schema() -> Value {
             }
         },
         "required": ["summary", "patches"]
+    })
+}
+
+fn plugin_edit_plan_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "summary": {
+                "type": "string"
+            },
+            "tests_command": {
+                "type": ["string", "null"]
+            },
+            "safety_command": {
+                "type": ["string", "null"]
+            },
+            "operations": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "path": {
+                            "type": "string"
+                        },
+                        "kind": {
+                            "type": "string",
+                            "enum": [
+                                "replace_exact",
+                                "create_file",
+                                "delete_file",
+                                "json_set",
+                                "toml_set"
+                            ]
+                        },
+                        "expected_old_string": {
+                            "type": ["string", "null"]
+                        },
+                        "expected_sha256": {
+                            "type": ["string", "null"]
+                        },
+                        "new_content": {
+                            "type": ["string", "null"]
+                        },
+                        "pointer": {
+                            "type": ["string", "null"]
+                        },
+                        "dotted_key": {
+                            "type": ["string", "null"]
+                        },
+                        "value": {
+                            "type": ["object", "array", "string", "number", "integer", "boolean", "null"]
+                        }
+                    },
+                    "required": ["path", "kind"]
+                }
+            }
+        },
+        "required": ["summary", "operations"]
     })
 }
 
@@ -602,6 +934,12 @@ fn parse_planner_payload(raw_text: &str) -> Result<PlannerPayload, RuntimeError>
     })
 }
 
+fn parse_plugin_planner_payload(raw_text: &str) -> Result<PluginPlannerPayload, RuntimeError> {
+    serde_json::from_str(raw_text).map_err(|err| RuntimeError::LlmResponseInvalid {
+        message: format!("model output was not valid plugin edit JSON: {err}"),
+    })
+}
+
 fn validate_patch_paths(
     patches: &[FilePatch],
     allowed_paths: &BTreeSet<String>,
@@ -616,6 +954,93 @@ fn validate_patch_paths(
         }
     }
     Ok(())
+}
+
+fn validate_plugin_operation_paths(
+    operations: &[PluginEditOperation],
+    writable_roots: &BTreeSet<String>,
+) -> Result<(), RuntimeError> {
+    for operation in operations {
+        let normalized = normalize_plugin_rel_path(&operation.path)?;
+        if !path_within_writable_surface(&normalized, writable_roots) {
+            return Err(RuntimeError::LlmResponseInvalid {
+                message: format!(
+                    "model returned disallowed plugin edit path: {}",
+                    operation.path
+                ),
+            });
+        }
+        validate_plugin_operation_shape(operation, &normalized)?;
+    }
+    Ok(())
+}
+
+fn validate_plugin_operation_shape(
+    operation: &PluginEditOperation,
+    normalized_path: &str,
+) -> Result<(), RuntimeError> {
+    match operation.kind {
+        PluginEditOpKind::ReplaceExact => {
+            if operation.expected_old_string.is_none() || operation.new_content.is_none() {
+                return Err(RuntimeError::LlmResponseInvalid {
+                    message: format!(
+                        "replace_exact requires expected_old_string and new_content for {normalized_path}"
+                    ),
+                });
+            }
+        }
+        PluginEditOpKind::CreateFile => {
+            if operation.expected_old_string.is_none() || operation.new_content.is_none() {
+                return Err(RuntimeError::LlmResponseInvalid {
+                    message: format!(
+                        "create_file requires expected_old_string and new_content for {normalized_path}"
+                    ),
+                });
+            }
+        }
+        PluginEditOpKind::DeleteFile => {
+            if operation.expected_sha256.is_none() {
+                return Err(RuntimeError::LlmResponseInvalid {
+                    message: format!("delete_file requires expected_sha256 for {normalized_path}"),
+                });
+            }
+        }
+        PluginEditOpKind::JsonSet => {
+            if operation.expected_sha256.is_none()
+                || operation.pointer.is_none()
+                || operation.value.is_none()
+            {
+                return Err(RuntimeError::LlmResponseInvalid {
+                    message: format!(
+                        "json_set requires expected_sha256, pointer, and value for {normalized_path}"
+                    ),
+                });
+            }
+        }
+        PluginEditOpKind::TomlSet => {
+            if operation.expected_sha256.is_none()
+                || operation.dotted_key.is_none()
+                || operation.value.is_none()
+            {
+                return Err(RuntimeError::LlmResponseInvalid {
+                    message: format!(
+                        "toml_set requires expected_sha256, dotted_key, and value for {normalized_path}"
+                    ),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn path_within_writable_surface(path: &str, writable_roots: &BTreeSet<String>) -> bool {
+    writable_roots.iter().any(|root| {
+        path == format!("{root}/Cargo.toml")
+            || path.starts_with(&format!("{root}/src/"))
+            || path.starts_with(&format!("{root}/tests/"))
+            || path.starts_with(&format!("{root}/docs/agent/"))
+            || path.starts_with(&format!("{root}/docs/human/"))
+    })
 }
 
 fn normalize_rel_path(path: &str) -> Result<String, RuntimeError> {
@@ -651,6 +1076,12 @@ fn estimate_diff_lines(patches: &[FilePatch]) -> usize {
     patches.iter().map(FilePatch::diff_line_estimate).sum()
 }
 
+fn sha256_text(text: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(text.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
 fn api_key_env_looks_like_secret(value: &str) -> bool {
     value.trim_start().starts_with("sk-")
 }
@@ -658,11 +1089,15 @@ fn api_key_env_looks_like_secret(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        api_key_env_looks_like_secret, build_user_prompt, discover_plugin_catalog,
-        extract_chat_completion_text, extract_error_message, extract_output_text,
-        normalize_optional_command, normalize_rel_path, ContextFile, PlanRequest,
+        api_key_env_looks_like_secret, build_plugin_edit_prompt, build_user_prompt,
+        discover_plugin_catalog, extract_chat_completion_text, extract_error_message,
+        extract_output_text, normalize_optional_command, normalize_rel_path,
+        path_within_writable_surface, sha256_text, validate_plugin_operation_paths, ContextFile,
+        PlanRequest, PluginPlanRequest,
     };
+    use crate::kernel::plugin_iteration::{PluginEditOpKind, PluginEditOperation};
     use serde_json::{json, Value};
+    use std::collections::BTreeSet;
     use std::path::Path;
 
     #[test]
@@ -729,6 +1164,7 @@ mod tests {
         };
         let files = vec![ContextFile {
             path: "README.md".to_string(),
+            sha256: sha256_text("hello\n"),
             content: "hello\n".to_string(),
         }];
 
@@ -793,6 +1229,7 @@ mod tests {
         };
         let files = vec![ContextFile {
             path: "README.md".to_string(),
+            sha256: sha256_text("hello\n"),
             content: "hello\n".to_string(),
         }];
 
@@ -821,5 +1258,59 @@ mod tests {
             normalize_optional_command(Some(" grep -q ok README.md ".to_string())),
             Some("grep -q ok README.md".to_string())
         );
+    }
+
+    #[test]
+    fn build_plugin_edit_prompt_mentions_writable_roots_and_sha256() {
+        let request = PluginPlanRequest {
+            issue_id: "issue-1".to_string(),
+            patch_id: "patch-1".to_string(),
+            instruction: "Update shell docs".to_string(),
+            context_paths: vec!["plugins/shell/src/lib.rs".to_string()],
+            writable_roots: vec!["plugins/shell".to_string()],
+            manual_approved: false,
+        };
+        let files = vec![ContextFile {
+            path: "plugins/shell/src/lib.rs".to_string(),
+            sha256: "abc123".to_string(),
+            content: "pub fn demo() {}\n".to_string(),
+        }];
+
+        let prompt = build_plugin_edit_prompt(&request, &files, None);
+        assert!(
+            prompt.contains("plugins/shell/Cargo.toml"),
+            "prompt: {prompt}"
+        );
+        assert!(prompt.contains("sha256=abc123"), "prompt: {prompt}");
+        assert!(prompt.contains("create_file"), "prompt: {prompt}");
+    }
+
+    #[test]
+    fn validate_plugin_operation_paths_rejects_path_outside_writable_surface() {
+        let mut writable_roots = BTreeSet::new();
+        writable_roots.insert("plugins/shell".to_string());
+        let err = validate_plugin_operation_paths(
+            &[PluginEditOperation {
+                path: "crates/cordis-runtime/src/lib.rs".to_string(),
+                kind: PluginEditOpKind::ReplaceExact,
+                expected_old_string: Some("pub mod".to_string()),
+                expected_sha256: None,
+                new_content: Some("pub(crate) mod".to_string()),
+                pointer: None,
+                dotted_key: None,
+                value: None,
+            }],
+            &writable_roots,
+        )
+        .expect_err("path should be rejected");
+        assert!(err.to_string().contains("disallowed plugin edit path"));
+        assert!(path_within_writable_surface(
+            "plugins/shell/src/lib.rs",
+            &writable_roots
+        ));
+        assert!(!path_within_writable_surface(
+            "plugins/expr/src/lib.rs",
+            &writable_roots
+        ));
     }
 }

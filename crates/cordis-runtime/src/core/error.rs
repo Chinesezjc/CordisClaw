@@ -169,6 +169,18 @@ pub enum RuntimeError {
     #[error("candidate snapshot not staged")]
     CandidateSnapshotMissing,
 
+    #[error("plugin iteration already active: {iteration_id}")]
+    PluginIterationActive { iteration_id: String },
+
+    #[error("plugin iteration issue not found: {issue_id}")]
+    PluginIterationIssueNotFound { issue_id: String },
+
+    #[error("plugin iteration status not found: {iteration_id}")]
+    PluginIterationStatusNotFound { iteration_id: String },
+
+    #[error("plugin iteration policy blocked path {path}: {reason}")]
+    PluginIterationPolicyBlocked { path: String, reason: String },
+
     #[error("service not found in context for plugin {plugin_path}: {service}")]
     ServiceNotFound {
         plugin_path: String,
