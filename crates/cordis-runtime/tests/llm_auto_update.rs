@@ -25,7 +25,9 @@ fn write_config(
     .expect("write llm config");
 }
 
-fn spawn_mock_llm_server(response_body: String) -> (String, mpsc::Receiver<String>, thread::JoinHandle<()>) {
+fn spawn_mock_llm_server(
+    response_body: String,
+) -> (String, mpsc::Receiver<String>, thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
     let address = listener.local_addr().expect("listener addr");
     let (sender, receiver) = mpsc::channel();
@@ -36,7 +38,9 @@ fn spawn_mock_llm_server(response_body: String) -> (String, mpsc::Receiver<Strin
         let mut request = String::new();
 
         let mut first_line = String::new();
-        reader.read_line(&mut first_line).expect("read request line");
+        reader
+            .read_line(&mut first_line)
+            .expect("read request line");
         request.push_str(&first_line);
 
         let mut content_length = 0usize;
@@ -99,6 +103,33 @@ fn spawn_mock_deepseek_server(
     spawn_mock_llm_server(response_body)
 }
 
+fn assert_authorization_bearer(request: &str, expected_token: &str) {
+    let expected_value = format!("Bearer {expected_token}");
+    let mut matched = false;
+    for line in request.lines() {
+        if line.is_empty() {
+            break;
+        }
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if name.eq_ignore_ascii_case("authorization") {
+            assert_eq!(
+                value.trim(),
+                expected_value,
+                "authorization header value mismatch"
+            );
+            matched = true;
+            break;
+        }
+    }
+
+    assert!(
+        matched,
+        "authorization header missing in request:\n{request}"
+    );
+}
+
 #[cfg(not(windows))]
 #[test]
 fn llm_auto_update_promotes_and_keeps_changes() {
@@ -118,7 +149,13 @@ fn llm_auto_update_promotes_and_keeps_changes() {
     })
     .to_string();
     let (base_url, request_rx, handle) = spawn_mock_openai_server(&output_text);
-    write_config(temp.path(), "openai", &base_url, "OPENAI_API_KEY", "gpt-4.1-mini");
+    write_config(
+        temp.path(),
+        "openai",
+        &base_url,
+        "OPENAI_API_KEY",
+        "gpt-4.1-mini",
+    );
 
     let bin = env!("CARGO_BIN_EXE_cordis-runtime");
     let output = Command::new(bin)
@@ -140,8 +177,14 @@ fn llm_auto_update_promotes_and_keeps_changes() {
     );
 
     let stdout = String::from_utf8(output.stdout).expect("stdout utf-8");
-    assert!(stdout.contains("\"verdict\": \"Promote\""), "stdout: {stdout}");
-    assert!(stdout.contains("\"rolled_back\": false"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("\"verdict\": \"Promote\""),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("\"rolled_back\": false"),
+        "stdout: {stdout}"
+    );
     assert_eq!(
         fs::read_to_string(&demo_path).expect("read demo file"),
         "alpha-new-omega\n"
@@ -149,7 +192,7 @@ fn llm_auto_update_promotes_and_keeps_changes() {
 
     let captured_request = request_rx.recv().expect("capture request");
     assert!(captured_request.starts_with("POST /v1/responses HTTP/1.1"));
-    assert!(captured_request.contains("Authorization: Bearer test-key"));
+    assert_authorization_bearer(&captured_request, "test-key");
     assert!(captured_request.contains("Replace old with new in demo.txt"));
     assert!(captured_request.contains("alpha-old-omega"));
 }
@@ -173,7 +216,13 @@ fn llm_auto_update_rolls_back_when_tests_fail() {
     })
     .to_string();
     let (base_url, _request_rx, handle) = spawn_mock_openai_server(&output_text);
-    write_config(temp.path(), "openai", &base_url, "OPENAI_API_KEY", "gpt-4.1-mini");
+    write_config(
+        temp.path(),
+        "openai",
+        &base_url,
+        "OPENAI_API_KEY",
+        "gpt-4.1-mini",
+    );
 
     let bin = env!("CARGO_BIN_EXE_cordis-runtime");
     let output = Command::new(bin)
@@ -195,9 +244,15 @@ fn llm_auto_update_rolls_back_when_tests_fail() {
     );
 
     let stdout = String::from_utf8(output.stdout).expect("stdout utf-8");
-    assert!(stdout.contains("\"verdict\": \"Rollback\""), "stdout: {stdout}");
+    assert!(
+        stdout.contains("\"verdict\": \"Rollback\""),
+        "stdout: {stdout}"
+    );
     assert!(stdout.contains("\"rolled_back\": true"), "stdout: {stdout}");
-    assert!(stdout.contains("\"tests_passed\": false"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("\"tests_passed\": false"),
+        "stdout: {stdout}"
+    );
     assert_eq!(
         fs::read_to_string(&demo_path).expect("read demo file"),
         "alpha-old-omega\n"
@@ -251,7 +306,10 @@ fn llm_auto_update_supports_deepseek_chat_completions() {
     );
 
     let stdout = String::from_utf8(output.stdout).expect("stdout utf-8");
-    assert!(stdout.contains("\"verdict\": \"Promote\""), "stdout: {stdout}");
+    assert!(
+        stdout.contains("\"verdict\": \"Promote\""),
+        "stdout: {stdout}"
+    );
     assert_eq!(
         fs::read_to_string(&demo_path).expect("read demo file"),
         "alpha-new-omega\n"
@@ -259,7 +317,7 @@ fn llm_auto_update_supports_deepseek_chat_completions() {
 
     let captured_request = request_rx.recv().expect("capture request");
     assert!(captured_request.starts_with("POST /v1/chat/completions HTTP/1.1"));
-    assert!(captured_request.contains("Authorization: Bearer test-key"));
+    assert_authorization_bearer(&captured_request, "test-key");
     assert!(captured_request.contains("\"model\":\"deepseek-chat\""));
     assert!(captured_request.contains("\"response_format\":{\"type\":\"json_object\"}"));
     assert!(captured_request.contains("Replace old with new in demo.txt"));
@@ -286,7 +344,13 @@ fn llm_auto_update_uses_model_suggested_verification_commands() {
     })
     .to_string();
     let (base_url, request_rx, handle) = spawn_mock_openai_server(&output_text);
-    write_config(temp.path(), "openai", &base_url, "OPENAI_API_KEY", "gpt-4.1-mini");
+    write_config(
+        temp.path(),
+        "openai",
+        &base_url,
+        "OPENAI_API_KEY",
+        "gpt-4.1-mini",
+    );
 
     let bin = env!("CARGO_BIN_EXE_cordis-runtime");
     let output = Command::new(bin)
@@ -306,8 +370,14 @@ fn llm_auto_update_uses_model_suggested_verification_commands() {
     );
 
     let stdout = String::from_utf8(output.stdout).expect("stdout utf-8");
-    assert!(stdout.contains("\"verdict\": \"Promote\""), "stdout: {stdout}");
-    assert!(stdout.contains("\"command\": \"grep -q new demo.txt\""), "stdout: {stdout}");
+    assert!(
+        stdout.contains("\"verdict\": \"Promote\""),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("\"command\": \"grep -q new demo.txt\""),
+        "stdout: {stdout}"
+    );
     assert!(
         stdout.contains("\"command\": \"grep -q alpha-new-omega demo.txt\""),
         "stdout: {stdout}"
@@ -358,7 +428,13 @@ fn llm_auto_update_supports_plugin_verifier_commands() {
     })
     .to_string();
     let (base_url, _request_rx, handle) = spawn_mock_openai_server(&output_text);
-    write_config(temp.path(), "openai", &base_url, "OPENAI_API_KEY", "gpt-4.1-mini");
+    write_config(
+        temp.path(),
+        "openai",
+        &base_url,
+        "OPENAI_API_KEY",
+        "gpt-4.1-mini",
+    );
 
     let bin = env!("CARGO_BIN_EXE_cordis-runtime");
     let output = Command::new(bin)
@@ -378,8 +454,14 @@ fn llm_auto_update_supports_plugin_verifier_commands() {
     );
 
     let stdout = String::from_utf8(output.stdout).expect("stdout utf-8");
-    assert!(stdout.contains("\"runner\": \"plugin\""), "stdout: {stdout}");
-    assert!(stdout.contains("\"verdict\": \"Promote\""), "stdout: {stdout}");
+    assert!(
+        stdout.contains("\"runner\": \"plugin\""),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("\"verdict\": \"Promote\""),
+        "stdout: {stdout}"
+    );
     assert_eq!(
         fs::read_to_string(&demo_path).expect("read demo file"),
         "alpha-new-omega\n"
@@ -411,7 +493,13 @@ fn llm_auto_update_rust_workspace_profile_runs_static_check_stage() {
     })
     .to_string();
     let (base_url, _request_rx, handle) = spawn_mock_openai_server(&output_text);
-    write_config(temp.path(), "openai", &base_url, "OPENAI_API_KEY", "gpt-4.1-mini");
+    write_config(
+        temp.path(),
+        "openai",
+        &base_url,
+        "OPENAI_API_KEY",
+        "gpt-4.1-mini",
+    );
 
     let bin = env!("CARGO_BIN_EXE_cordis-runtime");
     let output = Command::new(bin)
@@ -432,9 +520,18 @@ fn llm_auto_update_rust_workspace_profile_runs_static_check_stage() {
     );
 
     let stdout = String::from_utf8(output.stdout).expect("stdout utf-8");
-    assert!(stdout.contains("\"profile\": \"rust_workspace\""), "stdout: {stdout}");
-    assert!(stdout.contains("\"kind\": \"static_check\""), "stdout: {stdout}");
-    assert!(stdout.contains("\"status\": \"passed\""), "stdout: {stdout}");
+    assert!(
+        stdout.contains("\"profile\": \"rust_workspace\""),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("\"kind\": \"static_check\""),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("\"status\": \"passed\""),
+        "stdout: {stdout}"
+    );
     assert_eq!(
         fs::read_to_string(&source_path).expect("read source"),
         "pub fn demo() -> &'static str { \"new\" }\n"

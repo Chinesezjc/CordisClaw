@@ -7,6 +7,7 @@
 | 文件 | 职责定位 | 关键入口 |
 |---|---|---|
 | `crates/cordis-plugin-sdk/src/lib.rs` | shell/expr 等外部 dylib 插件共用的 Rust ABI、docs helper 与导出宏 | `RustPluginApiV2`、`plugin_docs()`、`node_doc()`、`export_plugin_api!` |
+| `crates/cordis-plugin-sdk/src/workflow.rs` | 非宏 async workflow 作者接口：受控 await 原语、wait 句柄、runtime 提交/轮询/取消边界 | `WorkflowRuntime`、`WorkflowSession`、`WaitSpec`、`WaitFuture` |
 
 ## 2. Core 层 (`crates/cordis-runtime/src/core`)
 
@@ -145,7 +146,7 @@
 
 ## 14. 推荐阅读顺序
 
-1. `crates/cordis-plugin-sdk/src/lib.rs`（先看共享 ABI / docs 契约）。
+1. `crates/cordis-plugin-sdk/src/lib.rs` + `crates/cordis-plugin-sdk/src/workflow.rs`（先看共享 ABI / docs 契约和非宏 workflow 接口）。
 2. `core/models.rs` + `core/error.rs`（再看 runtime 专属契约与错误语义）。
 3. `plugin/package.rs` + `plugin/loader.rs`（发现/解析/实例化主流程）。
 4. `context/mod.rs`（注入链、overlay、CAS）。
@@ -159,6 +160,7 @@
 当前文档覆盖以下 `.rs` 文件（通过 `rg --files -g "*.rs" -g "!target/**"` 校验）：
 
 - `crates/cordis-plugin-sdk/src/lib.rs`
+- `crates/cordis-plugin-sdk/src/workflow.rs`
 - `crates/cordis-runtime/src/context/mod.rs`
 - `crates/cordis-runtime/src/core/error.rs`
 - `crates/cordis-runtime/src/core/mod.rs`

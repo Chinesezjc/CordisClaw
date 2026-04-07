@@ -1,5 +1,13 @@
 use serde::{Deserialize, Serialize};
 
+pub mod workflow;
+
+pub use workflow::{
+    session, AskUserSpec, CallSpec, EventSpec, JoinPolicy, JoinSpec, RacePolicy, RaceSpec,
+    SleepSpec, WaitFuture, WaitHandle, WaitKind, WaitOutcome, WaitSpec, WorkflowError,
+    WorkflowErrorKind, WorkflowRuntime, WorkflowSession,
+};
+
 pub const RUST_PLUGIN_ENTRY_SYMBOL: &str = "cordis_plugin_api_rust_v2";
 pub const DEFAULT_ABI_VERSION: u32 = 2;
 
@@ -41,7 +49,10 @@ impl AbiFingerprint {
             ));
         }
         if self.crate_hash != other.crate_hash {
-            out.push(format!("crate_hash:{}!={}", self.crate_hash, other.crate_hash));
+            out.push(format!(
+                "crate_hash:{}!={}",
+                self.crate_hash, other.crate_hash
+            ));
         }
         if self.api_hash != other.api_hash {
             out.push(format!("api_hash:{}!={}", self.api_hash, other.api_hash));

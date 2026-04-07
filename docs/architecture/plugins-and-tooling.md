@@ -81,6 +81,18 @@ expr
 
 它不是复杂功能插件，而是用来验证 grants、exports 和 JSON artifact 路径的最小样例。
 
+### 1.5 非宏 async workflow 草案
+
+`cordis-plugin-sdk` 里新增了不依赖宏的 workflow 作者接口草案，核心是：
+
+1. 作者写普通 `async fn`。
+2. 只 `await` 受控 primitive（`call`/`join`/`race`/`wait_event`/`sleep`/`ask_user`）。
+3. runtime 通过 `WorkflowRuntime` trait 接管 `submit/poll/cancel`。
+
+完整说明见：
+
+- [async-workflow-api.md](./async-workflow-api.md)
+
 ## 2. 工具链与日常开发流程
 
 ### 2.1 CLI 能力

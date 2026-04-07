@@ -12,6 +12,7 @@
 - `architecture/system-overview.md`：项目定位、仓库边界、目录、核心原则与主流程。
 - `architecture/design-blueprint.md`：承接历史设计蓝图，说明目标分层、执行模型、Context 与 Kernel 规划基线。
 - `architecture/contracts-and-loading.md`：共享契约、artifact index、resolver、loader、registry 与图服务。
+- `architecture/async-workflow-api.md`：非宏 async workflow API 草案（受控 await 原语、WaitHandle 边界与 runtime 契约）。
 - `architecture/runtime-semantics.md`：Context、执行引擎、Kernel 与 auto-update 语义。
 - `architecture/plugins-and-tooling.md`：样例插件、调用路径、CLI 与工件构建流程。
 - `architecture/maintenance-guide.md`：测试矩阵、阅读顺序、常见坑点与扩展方向。

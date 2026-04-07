@@ -214,6 +214,7 @@ cargo test
 - System overview: [docs/architecture/system-overview.md](./docs/architecture/system-overview.md)
 - Design blueprint: [docs/architecture/design-blueprint.md](./docs/architecture/design-blueprint.md)
 - Contracts and loading: [docs/architecture/contracts-and-loading.md](./docs/architecture/contracts-and-loading.md)
+- Async workflow API: [docs/architecture/async-workflow-api.md](./docs/architecture/async-workflow-api.md)
 - Runtime semantics: [docs/architecture/runtime-semantics.md](./docs/architecture/runtime-semantics.md)
 - Plugins and tooling: [docs/architecture/plugins-and-tooling.md](./docs/architecture/plugins-and-tooling.md)
 - Completion status: [docs/architecture/status-and-open-items.md](./docs/architecture/status-and-open-items.md)

@@ -13,6 +13,7 @@
 - `NodeDoc`
 - `AbiFingerprint`
 - `export_plugin_api!`
+- `workflow`（`WorkflowRuntime`、`WaitHandle`、`WaitSpec` 等非宏 async workflow 原语）
 
 这让 runtime 和 dylib 插件共用同一份符号表与 JSON 类型定义，避免 host/plugin 两边各维护一套结构。
 
