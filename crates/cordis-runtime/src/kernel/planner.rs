@@ -11,8 +11,9 @@ use crate::kernel::plugin_iteration::{
 use crate::plugin::invoke::PluginInvoker;
 use reqwest::blocking::Client;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::env;
@@ -22,6 +23,12 @@ use std::time::Duration;
 
 const PLAN_SCHEMA_NAME: &str = "cordis_auto_update_plan";
 const PLUGIN_EDIT_PLAN_SCHEMA_NAME: &str = "cordis_plugin_edit_plan";
+const DEEPSEEK_REASONER_MAX_TURNS: usize = 8;
+const DEEPSEEK_TOOL_LIST_CONTEXT_FILES: &str = "list_context_files";
+const DEEPSEEK_TOOL_READ_CONTEXT_FILE: &str = "read_context_file";
+const DEEPSEEK_TOOL_INSPECT_PLUGIN_CATALOG: &str = "inspect_plugin_catalog";
+const DEEPSEEK_TOOL_SUBMIT_PATCH_PLAN: &str = "submit_patch_plan";
+const DEEPSEEK_TOOL_SUBMIT_PLUGIN_EDIT_PLAN: &str = "submit_plugin_edit_plan";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PlanRequest {
@@ -115,6 +122,75 @@ struct PromptPluginNodeInfo {
     failure_modes: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct DeepSeekToolFunctionCall {
+    name: String,
+    arguments: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct DeepSeekToolCall {
+    id: String,
+    #[serde(rename = "type")]
+    call_type: String,
+    function: DeepSeekToolFunctionCall,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Default)]
+struct DeepSeekChatMessage {
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    reasoning_content: Option<String>,
+    #[serde(default)]
+    tool_calls: Vec<DeepSeekToolCall>,
+}
+
+impl DeepSeekChatMessage {
+    fn to_request_message(&self) -> Value {
+        let mut message = Map::new();
+        message.insert("role".to_string(), Value::String("assistant".to_string()));
+        message.insert(
+            "content".to_string(),
+            self.content
+                .as_ref()
+                .map(|value| Value::String(value.clone()))
+                .unwrap_or(Value::Null),
+        );
+        if let Some(reasoning_content) = self.reasoning_content.as_ref() {
+            if !reasoning_content.trim().is_empty() {
+                message.insert(
+                    "reasoning_content".to_string(),
+                    Value::String(reasoning_content.clone()),
+                );
+            }
+        }
+        if !self.tool_calls.is_empty() {
+            message.insert(
+                "tool_calls".to_string(),
+                serde_json::to_value(&self.tool_calls).unwrap_or_else(|_| Value::Array(Vec::new())),
+            );
+        }
+        Value::Object(message)
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+struct ReadContextFileArgs {
+    path: String,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
+struct InspectPluginCatalogArgs {
+    #[serde(default)]
+    plugin_path: Option<String>,
+}
+
+enum DeepSeekToolOutcome<T> {
+    ToolResult(String),
+    Final(T),
+}
+
 #[derive(Debug, Clone)]
 pub struct LlmPatchPlanner {
     config: LlmApiConfig,
@@ -151,11 +227,18 @@ impl LlmPatchPlanner {
         let allowed_paths = normalize_paths(&request.paths)?;
         let context_files = load_context_files(workspace_root, &allowed_paths)?;
         let plugin_catalog = discover_plugin_catalog(workspace_root);
-        let user_prompt = build_user_prompt(&request, &context_files, plugin_catalog.as_ref());
         let provider = self.config.provider.trim().to_ascii_lowercase();
+        let user_prompt =
+            if provider == "deepseek" && model_uses_deepseek_reasoner(&self.config.model) {
+                build_deepseek_patch_tool_prompt(&request, &context_files, plugin_catalog.as_ref())
+            } else {
+                build_user_prompt(&request, &context_files, plugin_catalog.as_ref())
+            };
         let (payload, response_id) = match provider.as_str() {
             "openai" => self.plan_with_openai(&user_prompt)?,
-            "deepseek" => self.plan_with_deepseek(&user_prompt)?,
+            "deepseek" => {
+                self.plan_with_deepseek(&user_prompt, &context_files, plugin_catalog.as_ref())?
+            }
             _ => {
                 return Err(RuntimeError::UnsupportedLlmProvider {
                     provider: self.config.provider.clone(),
@@ -191,12 +274,20 @@ impl LlmPatchPlanner {
         let writable_roots = normalize_paths(&request.writable_roots)?;
         let context_files = load_context_files(workspace_root, &context_paths)?;
         let plugin_catalog = discover_plugin_catalog(workspace_root);
-        let user_prompt =
-            build_plugin_edit_prompt(&request, &context_files, plugin_catalog.as_ref());
         let provider = self.config.provider.trim().to_ascii_lowercase();
+        let user_prompt =
+            if provider == "deepseek" && model_uses_deepseek_reasoner(&self.config.model) {
+                build_deepseek_plugin_tool_prompt(&request, &context_files, plugin_catalog.as_ref())
+            } else {
+                build_plugin_edit_prompt(&request, &context_files, plugin_catalog.as_ref())
+            };
         let (payload, response_id) = match provider.as_str() {
             "openai" => self.plan_plugin_edits_with_openai(&user_prompt)?,
-            "deepseek" => self.plan_plugin_edits_with_deepseek(&user_prompt)?,
+            "deepseek" => self.plan_plugin_edits_with_deepseek(
+                &user_prompt,
+                &context_files,
+                plugin_catalog.as_ref(),
+            )?,
             _ => {
                 return Err(RuntimeError::UnsupportedLlmProvider {
                     provider: self.config.provider.clone(),
@@ -280,87 +371,356 @@ impl LlmPatchPlanner {
     fn plan_with_deepseek(
         &self,
         user_prompt: &str,
+        context_files: &[ContextFile],
+        plugin_catalog: Option<&PromptPluginCatalog>,
     ) -> Result<(PlannerPayload, Option<String>), RuntimeError> {
-        let request_body = json!({
-            "model": self.config.model,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": deepseek_system_prompt(),
-                },
-                {
-                    "role": "user",
-                    "content": user_prompt,
+        if !model_uses_deepseek_reasoner(&self.config.model) {
+            let request_body = json!({
+                "model": self.config.model,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": deepseek_system_prompt(),
+                    },
+                    {
+                        "role": "user",
+                        "content": user_prompt,
+                    }
+                ],
+                "temperature": self.config.temperature,
+                "max_tokens": self.config.max_tokens,
+                "response_format": {
+                    "type": "json_object"
                 }
-            ],
-            "temperature": self.config.temperature,
-            "max_tokens": self.config.max_tokens,
-            "response_format": {
-                "type": "json_object"
-            }
-        });
+            });
 
-        let raw_json = self.send_json_request(
-            format!(
-                "{}/chat/completions",
-                self.config.base_url.trim_end_matches('/')
-            ),
-            request_body,
-        )?;
-        let response_id = raw_json
-            .get("id")
-            .and_then(Value::as_str)
-            .map(ToString::to_string);
-        let output_text = extract_chat_completion_text(&raw_json).ok_or_else(|| {
-            RuntimeError::LlmResponseInvalid {
-                message: "missing choices[0].message.content in chat completion payload"
-                    .to_string(),
-            }
-        })?;
-        Ok((parse_planner_payload(&output_text)?, response_id))
+            let raw_json = self.send_json_request(
+                format!(
+                    "{}/chat/completions",
+                    self.config.base_url.trim_end_matches('/')
+                ),
+                request_body,
+            )?;
+            let response_id = raw_json
+                .get("id")
+                .and_then(Value::as_str)
+                .map(ToString::to_string);
+            let output_text = extract_chat_completion_text(&raw_json).ok_or_else(|| {
+                RuntimeError::LlmResponseInvalid {
+                    message: "missing choices[0].message.content in chat completion payload"
+                        .to_string(),
+                }
+            })?;
+            return Ok((parse_planner_payload(&output_text)?, response_id));
+        }
+
+        self.run_deepseek_tool_loop(
+            deepseek_patch_tool_system_prompt(),
+            user_prompt,
+            deepseek_patch_tools(),
+            parse_planner_payload,
+            |tool_call| {
+                self.execute_deepseek_patch_tool_call(tool_call, context_files, plugin_catalog)
+            },
+        )
     }
 
     fn plan_plugin_edits_with_deepseek(
         &self,
         user_prompt: &str,
+        context_files: &[ContextFile],
+        plugin_catalog: Option<&PromptPluginCatalog>,
     ) -> Result<(PluginPlannerPayload, Option<String>), RuntimeError> {
-        let request_body = json!({
-            "model": self.config.model,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": plugin_edit_deepseek_system_prompt(),
-                },
-                {
-                    "role": "user",
-                    "content": user_prompt,
+        if !model_uses_deepseek_reasoner(&self.config.model) {
+            let request_body = json!({
+                "model": self.config.model,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": plugin_edit_deepseek_system_prompt(),
+                    },
+                    {
+                        "role": "user",
+                        "content": user_prompt,
+                    }
+                ],
+                "temperature": self.config.temperature,
+                "max_tokens": self.config.max_tokens,
+                "response_format": {
+                    "type": "json_object"
                 }
-            ],
-            "temperature": self.config.temperature,
-            "max_tokens": self.config.max_tokens,
-            "response_format": {
-                "type": "json_object"
-            }
-        });
+            });
 
-        let raw_json = self.send_json_request(
-            format!(
-                "{}/chat/completions",
-                self.config.base_url.trim_end_matches('/')
-            ),
-            request_body,
-        )?;
-        let response_id = raw_json
-            .get("id")
-            .and_then(Value::as_str)
-            .map(ToString::to_string);
-        let output_text = extract_chat_completion_text(&raw_json).ok_or_else(|| {
-            RuntimeError::LlmResponseInvalid {
-                message: "missing choices[0].message.content in chat completion payload"
-                    .to_string(),
+            let raw_json = self.send_json_request(
+                format!(
+                    "{}/chat/completions",
+                    self.config.base_url.trim_end_matches('/')
+                ),
+                request_body,
+            )?;
+            let response_id = raw_json
+                .get("id")
+                .and_then(Value::as_str)
+                .map(ToString::to_string);
+            let output_text = extract_chat_completion_text(&raw_json).ok_or_else(|| {
+                RuntimeError::LlmResponseInvalid {
+                    message: "missing choices[0].message.content in chat completion payload"
+                        .to_string(),
+                }
+            })?;
+            return Ok((parse_plugin_planner_payload(&output_text)?, response_id));
+        }
+
+        self.run_deepseek_tool_loop(
+            deepseek_plugin_tool_system_prompt(),
+            user_prompt,
+            deepseek_plugin_tools(),
+            parse_plugin_planner_payload,
+            |tool_call| {
+                self.execute_deepseek_plugin_tool_call(tool_call, context_files, plugin_catalog)
+            },
+        )
+    }
+
+    fn run_deepseek_tool_loop<T, F, P>(
+        &self,
+        system_prompt: &str,
+        user_prompt: &str,
+        tools: Value,
+        parse_final_content: P,
+        mut handle_tool_call: F,
+    ) -> Result<(T, Option<String>), RuntimeError>
+    where
+        F: FnMut(&DeepSeekToolCall) -> Result<DeepSeekToolOutcome<T>, RuntimeError>,
+        P: Fn(&str) -> Result<T, RuntimeError>,
+    {
+        let endpoint = format!(
+            "{}/chat/completions",
+            self.config.base_url.trim_end_matches('/')
+        );
+        let mut messages = vec![
+            json!({
+                "role": "system",
+                "content": system_prompt,
+            }),
+            json!({
+                "role": "user",
+                "content": user_prompt,
+            }),
+        ];
+        for _ in 0..DEEPSEEK_REASONER_MAX_TURNS {
+            let request_body = json!({
+                "model": self.config.model,
+                "messages": messages,
+                "temperature": self.config.temperature,
+                "max_tokens": self.config.max_tokens,
+                "tools": tools,
+                "tool_choice": "auto",
+            });
+            let raw_json = self.send_json_request(endpoint.clone(), request_body)?;
+            let response_id = raw_json
+                .get("id")
+                .and_then(Value::as_str)
+                .map(ToString::to_string);
+            let message = parse_deepseek_chat_message(&raw_json)?;
+            if !message.tool_calls.is_empty() {
+                messages.push(message.to_request_message());
+                for tool_call in &message.tool_calls {
+                    match handle_tool_call(tool_call)? {
+                        DeepSeekToolOutcome::ToolResult(tool_output) => {
+                            messages.push(json!({
+                                "role": "tool",
+                                "tool_call_id": tool_call.id,
+                                "content": tool_output,
+                            }));
+                        }
+                        DeepSeekToolOutcome::Final(payload) => {
+                            if message.tool_calls.len() != 1 {
+                                return Err(RuntimeError::LlmResponseInvalid {
+                                    message: format!(
+                                        "terminal planner tool {} must be the only tool call in a DeepSeek reasoner turn",
+                                        tool_call.function.name
+                                    ),
+                                });
+                            }
+                            return Ok((payload, response_id));
+                        }
+                    }
+                }
+                continue;
             }
-        })?;
-        Ok((parse_plugin_planner_payload(&output_text)?, response_id))
+
+            if let Some(content) = message.content.as_deref() {
+                return Ok((parse_final_content(content)?, response_id));
+            }
+
+            return Err(RuntimeError::LlmResponseInvalid {
+                message: "DeepSeek reasoner response had neither tool_calls nor final content"
+                    .to_string(),
+            });
+        }
+
+        Err(RuntimeError::LlmResponseInvalid {
+            message: format!(
+                "DeepSeek reasoner exceeded {DEEPSEEK_REASONER_MAX_TURNS} turns without producing a final plan"
+            ),
+        })
+    }
+
+    fn execute_deepseek_patch_tool_call(
+        &self,
+        tool_call: &DeepSeekToolCall,
+        context_files: &[ContextFile],
+        plugin_catalog: Option<&PromptPluginCatalog>,
+    ) -> Result<DeepSeekToolOutcome<PlannerPayload>, RuntimeError> {
+        match tool_call.function.name.as_str() {
+            DEEPSEEK_TOOL_LIST_CONTEXT_FILES => {
+                parse_tool_arguments::<Value>(
+                    &tool_call.function.arguments,
+                    &tool_call.function.name,
+                )?;
+                Ok(DeepSeekToolOutcome::ToolResult(
+                    json!({
+                        "paths": context_files
+                            .iter()
+                            .map(|file| json!({
+                                "path": file.path,
+                                "sha256": file.sha256,
+                            }))
+                            .collect::<Vec<_>>(),
+                    })
+                    .to_string(),
+                ))
+            }
+            DEEPSEEK_TOOL_READ_CONTEXT_FILE => {
+                let args = parse_tool_arguments::<ReadContextFileArgs>(
+                    &tool_call.function.arguments,
+                    &tool_call.function.name,
+                )?;
+                let file = find_context_file(context_files, &args.path)?;
+                Ok(DeepSeekToolOutcome::ToolResult(
+                    json!({
+                        "path": file.path,
+                        "sha256": file.sha256,
+                        "content": file.content,
+                    })
+                    .to_string(),
+                ))
+            }
+            DEEPSEEK_TOOL_INSPECT_PLUGIN_CATALOG => {
+                let args = parse_tool_arguments::<InspectPluginCatalogArgs>(
+                    &tool_call.function.arguments,
+                    &tool_call.function.name,
+                )?;
+                Ok(DeepSeekToolOutcome::ToolResult(
+                    render_plugin_catalog_tool_result(plugin_catalog, args.plugin_path.as_deref())?
+                        .to_string(),
+                ))
+            }
+            DEEPSEEK_TOOL_SUBMIT_PATCH_PLAN => {
+                let payload = parse_tool_arguments::<PlannerPayload>(
+                    &tool_call.function.arguments,
+                    &tool_call.function.name,
+                )?;
+                let allowed_paths = context_files
+                    .iter()
+                    .map(|file| file.path.clone())
+                    .collect::<BTreeSet<_>>();
+                match validate_submitted_patch_payload(&payload, &allowed_paths) {
+                    Ok(()) => Ok(DeepSeekToolOutcome::Final(payload)),
+                    Err(err) => Ok(DeepSeekToolOutcome::ToolResult(
+                        tool_feedback_error(&tool_call.function.name, &err.to_string()).to_string(),
+                    )),
+                }
+            }
+            other => Err(RuntimeError::LlmResponseInvalid {
+                message: format!("unknown DeepSeek planner tool call: {other}"),
+            }),
+        }
+    }
+
+    fn execute_deepseek_plugin_tool_call(
+        &self,
+        tool_call: &DeepSeekToolCall,
+        context_files: &[ContextFile],
+        plugin_catalog: Option<&PromptPluginCatalog>,
+    ) -> Result<DeepSeekToolOutcome<PluginPlannerPayload>, RuntimeError> {
+        let writable_roots = context_files
+            .iter()
+            .filter_map(|file| {
+                file.path
+                    .strip_suffix("/Cargo.toml")
+                    .map(ToString::to_string)
+            })
+            .collect::<BTreeSet<_>>();
+        match tool_call.function.name.as_str() {
+            DEEPSEEK_TOOL_LIST_CONTEXT_FILES => {
+                parse_tool_arguments::<Value>(
+                    &tool_call.function.arguments,
+                    &tool_call.function.name,
+                )?;
+                Ok(DeepSeekToolOutcome::ToolResult(
+                    json!({
+                        "paths": context_files
+                            .iter()
+                            .map(|file| {
+                                let writable = path_within_writable_surface(&file.path, &writable_roots);
+                                json!({
+                                    "path": file.path,
+                                    "sha256": file.sha256,
+                                    "writable": writable,
+                                    "generated_read_only": !writable,
+                                })
+                            })
+                            .collect::<Vec<_>>(),
+                    })
+                    .to_string(),
+                ))
+            }
+            DEEPSEEK_TOOL_READ_CONTEXT_FILE => {
+                let args = parse_tool_arguments::<ReadContextFileArgs>(
+                    &tool_call.function.arguments,
+                    &tool_call.function.name,
+                )?;
+                let file = find_context_file(context_files, &args.path)?;
+                let writable = path_within_writable_surface(&file.path, &writable_roots);
+                Ok(DeepSeekToolOutcome::ToolResult(
+                    json!({
+                        "path": file.path,
+                        "sha256": file.sha256,
+                        "writable": writable,
+                        "generated_read_only": !writable,
+                        "content": file.content,
+                    })
+                    .to_string(),
+                ))
+            }
+            DEEPSEEK_TOOL_INSPECT_PLUGIN_CATALOG => {
+                let args = parse_tool_arguments::<InspectPluginCatalogArgs>(
+                    &tool_call.function.arguments,
+                    &tool_call.function.name,
+                )?;
+                Ok(DeepSeekToolOutcome::ToolResult(
+                    render_plugin_catalog_tool_result(plugin_catalog, args.plugin_path.as_deref())?
+                        .to_string(),
+                ))
+            }
+            DEEPSEEK_TOOL_SUBMIT_PLUGIN_EDIT_PLAN => {
+                let payload = parse_tool_arguments::<PluginPlannerPayload>(
+                    &tool_call.function.arguments,
+                    &tool_call.function.name,
+                )?;
+                match validate_submitted_plugin_payload(&payload, &writable_roots) {
+                    Ok(()) => Ok(DeepSeekToolOutcome::Final(payload)),
+                    Err(err) => Ok(DeepSeekToolOutcome::ToolResult(
+                        tool_feedback_error(&tool_call.function.name, &err.to_string()).to_string(),
+                    )),
+                }
+            }
+            other => Err(RuntimeError::LlmResponseInvalid {
+                message: format!("unknown DeepSeek plugin planner tool call: {other}"),
+            }),
+        }
     }
 
     fn send_json_request(
@@ -556,6 +916,11 @@ fn build_plugin_edit_prompt(
     files: &[ContextFile],
     plugin_catalog: Option<&PromptPluginCatalog>,
 ) -> String {
+    let writable_roots = request
+        .writable_roots
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
     let mut prompt = String::new();
     prompt.push_str("Issue ID: ");
     prompt.push_str(&request.issue_id);
@@ -582,9 +947,10 @@ fn build_plugin_edit_prompt(
         prompt.push_str(root);
         prompt.push_str("/tests/**, ");
         prompt.push_str(root);
-        prompt.push_str("/docs/agent/**, ");
-        prompt.push_str(root);
         prompt.push_str("/docs/human/**\n");
+        prompt.push_str("  read-only generated context: ");
+        prompt.push_str(root);
+        prompt.push_str("/docs/agent/**\n");
     }
     prompt.push_str("\nPlugin edit operation rules:\n");
     prompt.push_str("- `replace_exact`: requires `path`, `expected_old_string`, `new_content`\n");
@@ -595,6 +961,7 @@ fn build_plugin_edit_prompt(
     prompt.push_str("- `json_set`: requires `path`, `expected_sha256`, `pointer`, `value`\n");
     prompt.push_str("- `toml_set`: requires `path`, `expected_sha256`, `dotted_key`, `value`\n");
     prompt.push_str("Every operation must stay inside the writable plugin roots and include the required precondition fields.\n");
+    prompt.push_str("Files under `docs/agent/**` may appear below as read-only generated context to help you choose the real source edit, but you must not emit operations that modify them.\n");
     prompt.push_str("\nGeneric verifier command formats:\n");
     prompt.push_str("- shell command string executed in the workspace root\n");
     prompt.push_str("- plugin verifier spec: plugin:{\"plugin_path\":\"<plugin_path>\",\"node_id\":\"<node_id>\",\"payload_json\":{},\"expect_substring\":\"<expected text>\",\"fixtures_root\":\"<optional fixtures root>\"}\n");
@@ -603,6 +970,19 @@ fn build_plugin_edit_prompt(
     match plugin_catalog {
         Some(catalog) => prompt.push_str(&render_plugin_catalog(catalog)),
         None => prompt.push_str("(none discovered for this workspace root)\n"),
+    }
+    let read_only_paths = files
+        .iter()
+        .filter(|file| !path_within_writable_surface(&file.path, &writable_roots))
+        .map(|file| file.path.as_str())
+        .collect::<Vec<_>>();
+    if !read_only_paths.is_empty() {
+        prompt.push_str("\nRead-only context files:\n");
+        for path in read_only_paths {
+            prompt.push_str("- ");
+            prompt.push_str(path);
+            prompt.push('\n');
+        }
     }
     prompt.push_str("\nCurrent file contents with sha256 preconditions:\n");
     for file in files {
@@ -617,6 +997,109 @@ fn build_plugin_edit_prompt(
         }
         prompt.push_str("<<<END FILE>>>\n");
     }
+    prompt
+}
+
+fn build_deepseek_patch_tool_prompt(
+    request: &PlanRequest,
+    files: &[ContextFile],
+    plugin_catalog: Option<&PromptPluginCatalog>,
+) -> String {
+    let mut prompt = String::new();
+    prompt.push_str("Issue ID: ");
+    prompt.push_str(&request.issue_id);
+    prompt.push_str("\nPatch ID: ");
+    prompt.push_str(&request.patch_id);
+    prompt.push_str("\nManual approval: ");
+    prompt.push_str(if request.manual_approved {
+        "true"
+    } else {
+        "false"
+    });
+    prompt.push_str("\nInstruction:\n");
+    prompt.push_str(request.instruction.trim());
+    prompt.push_str("\n\nUse the available tools to inspect current workspace state before submitting a plan.\n");
+    prompt.push_str(
+        "When you are ready, call `submit_patch_plan` as the only tool call in that message.\n",
+    );
+    prompt.push_str("If a tool responds with ok=false, revise your plan and submit again.\n");
+    prompt.push_str("Do not emit markdown or prose summaries outside tool calls.\n");
+    prompt.push_str("\nAvailable context files:\n");
+    for file in files {
+        prompt.push_str("- ");
+        prompt.push_str(&file.path);
+        prompt.push_str(" sha256=");
+        prompt.push_str(&file.sha256);
+        prompt.push('\n');
+    }
+    prompt.push_str("\nPlugin catalog: ");
+    prompt.push_str(if plugin_catalog.is_some() {
+        "available via inspect_plugin_catalog"
+    } else {
+        "not available for this workspace"
+    });
+    prompt.push('\n');
+    prompt
+}
+
+fn build_deepseek_plugin_tool_prompt(
+    request: &PluginPlanRequest,
+    files: &[ContextFile],
+    plugin_catalog: Option<&PromptPluginCatalog>,
+) -> String {
+    let writable_roots = request
+        .writable_roots
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let mut prompt = String::new();
+    prompt.push_str("Issue ID: ");
+    prompt.push_str(&request.issue_id);
+    prompt.push_str("\nPatch ID: ");
+    prompt.push_str(&request.patch_id);
+    prompt.push_str("\nManual approval: ");
+    prompt.push_str(if request.manual_approved {
+        "true"
+    } else {
+        "false"
+    });
+    prompt.push_str("\nInstruction:\n");
+    prompt.push_str(request.instruction.trim());
+    prompt.push_str(
+        "\n\nUse the available tools to inspect current plugin context before submitting a plan.\n",
+    );
+    prompt.push_str("When you are ready, call `submit_plugin_edit_plan` as the only tool call in that message.\n");
+    prompt.push_str("If a tool responds with ok=false, revise your plan and submit again.\n");
+    prompt.push_str("Files under docs/agent/** are read-only generated context and must never appear in submitted operations.\n");
+    prompt.push_str("\nWritable plugin roots:\n");
+    for root in &request.writable_roots {
+        prompt.push_str("- ");
+        prompt.push_str(root);
+        prompt.push_str(
+            " (writable: Cargo.toml, src/**, tests/**, docs/human/**; read-only: docs/agent/**)\n",
+        );
+    }
+    prompt.push_str("\nAvailable context files:\n");
+    for file in files {
+        let writable = path_within_writable_surface(&file.path, &writable_roots);
+        prompt.push_str("- ");
+        prompt.push_str(&file.path);
+        prompt.push_str(" sha256=");
+        prompt.push_str(&file.sha256);
+        prompt.push_str(if writable {
+            " writable"
+        } else {
+            " read_only_generated"
+        });
+        prompt.push('\n');
+    }
+    prompt.push_str("\nPlugin catalog: ");
+    prompt.push_str(if plugin_catalog.is_some() {
+        "available via inspect_plugin_catalog"
+    } else {
+        "not available for this workspace"
+    });
+    prompt.push('\n');
     prompt
 }
 
@@ -691,7 +1174,7 @@ When you can infer reliable verification steps from the request and plugin catal
 
 fn plugin_edit_openai_system_prompt() -> &'static str {
     "You are a guarded plugin-edit planner for a Rust plugin workspace. Return only JSON that matches the provided schema. \
-Only emit operations inside the writable plugin roots. Do not modify runtime crates, root manifests, config, .git, target, or artifacts. \
+Only emit operations inside the writable plugin roots. Do not modify runtime crates, root manifests, config, .git, target, artifacts, or generated agent docs under docs/agent/**. \
 Prefer replace_exact/json_set/toml_set over broad rewrites, and only use create_file/delete_file when necessary. \
 For existing files, use the provided sha256 values as expected preconditions. For create_file, set expected_old_string to an empty string. \
 Do not invent plugin capabilities beyond the provided catalog and do not include markdown."
@@ -708,9 +1191,139 @@ When you can infer reliable verification steps from the request and plugin catal
 fn plugin_edit_deepseek_system_prompt() -> &'static str {
     "You are a guarded plugin-edit planner for a Rust plugin workspace. Return exactly one JSON object and no markdown. \
 The JSON must use this shape: {\"summary\":\"short summary\",\"tests_command\":\"optional verifier command or null\",\"safety_command\":\"optional verifier command or null\",\"operations\":[{\"path\":\"relative/path\",\"kind\":\"replace_exact|create_file|delete_file|json_set|toml_set\",\"expected_old_string\":\"required for replace_exact/create_file\",\"expected_sha256\":\"required for delete_file/json_set/toml_set\",\"new_content\":\"required for replace_exact/create_file\",\"pointer\":\"required for json_set\",\"dotted_key\":\"required for toml_set\",\"value\":\"required for json_set/toml_set\"}]}. \
-Only emit operations inside the writable plugin roots. Do not modify runtime crates, root manifests, config, .git, target, or artifacts. \
+Only emit operations inside the writable plugin roots. Do not modify runtime crates, root manifests, config, .git, target, artifacts, or generated agent docs under docs/agent/**. \
 For existing files, use the provided sha256 values as expected preconditions. For create_file, set expected_old_string to an empty string. \
 Do not invent plugin capabilities beyond the provided catalog and do not include extra keys."
+}
+
+fn deepseek_patch_tool_system_prompt() -> &'static str {
+    "You are a guarded patch planner for a Rust workspace running in DeepSeek reasoner tool mode. \
+Inspect files with the provided tools before finalizing a patch plan. \
+When ready, call submit_patch_plan as the only tool call in that assistant turn. \
+Do not invent files, paths, plugin capabilities, or command outputs."
+}
+
+fn deepseek_plugin_tool_system_prompt() -> &'static str {
+    "You are a guarded plugin-edit planner for a Rust plugin workspace running in DeepSeek reasoner tool mode. \
+Inspect files and plugin capabilities with the provided read-only tools before finalizing a plugin edit plan. \
+Files under docs/agent/** are generated read-only context and must never be modified. \
+When ready, call submit_plugin_edit_plan as the only tool call in that assistant turn. \
+Do not invent files, paths, plugin capabilities, or command outputs."
+}
+
+fn deepseek_patch_tools() -> Value {
+    json!([
+        {
+            "type": "function",
+            "function": {
+                "name": DEEPSEEK_TOOL_LIST_CONTEXT_FILES,
+                "description": "List all allowed workspace files available to the planner with sha256 preconditions.",
+                "parameters": empty_tool_parameters(),
+                "strict": true
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": DEEPSEEK_TOOL_READ_CONTEXT_FILE,
+                "description": "Read one allowed workspace file by relative path.",
+                "parameters": read_context_file_parameters(),
+                "strict": true
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": DEEPSEEK_TOOL_INSPECT_PLUGIN_CATALOG,
+                "description": "Inspect the discovered plugin capability catalog. Optionally filter by plugin_path.",
+                "parameters": inspect_plugin_catalog_parameters(),
+                "strict": true
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": DEEPSEEK_TOOL_SUBMIT_PATCH_PLAN,
+                "description": "Submit the final guarded patch plan. Use this only when you are done inspecting context.",
+                "parameters": plan_schema(),
+                "strict": true
+            }
+        }
+    ])
+}
+
+fn deepseek_plugin_tools() -> Value {
+    json!([
+        {
+            "type": "function",
+            "function": {
+                "name": DEEPSEEK_TOOL_LIST_CONTEXT_FILES,
+                "description": "List all plugin context files available to the planner, including which ones are writable versus read-only generated docs.",
+                "parameters": empty_tool_parameters(),
+                "strict": true
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": DEEPSEEK_TOOL_READ_CONTEXT_FILE,
+                "description": "Read one plugin context file by relative path.",
+                "parameters": read_context_file_parameters(),
+                "strict": true
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": DEEPSEEK_TOOL_INSPECT_PLUGIN_CATALOG,
+                "description": "Inspect the discovered plugin capability catalog. Optionally filter by plugin_path.",
+                "parameters": inspect_plugin_catalog_parameters(),
+                "strict": true
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": DEEPSEEK_TOOL_SUBMIT_PLUGIN_EDIT_PLAN,
+                "description": "Submit the final guarded plugin edit plan. Use this only when you are done inspecting context.",
+                "parameters": plugin_edit_plan_schema(),
+                "strict": true
+            }
+        }
+    ])
+}
+
+fn empty_tool_parameters() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {}
+    })
+}
+
+fn read_context_file_parameters() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "path": {
+                "type": "string"
+            }
+        },
+        "required": ["path"]
+    })
+}
+
+fn inspect_plugin_catalog_parameters() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "plugin_path": {
+                "type": ["string", "null"]
+            }
+        }
+    })
 }
 
 fn plan_schema() -> Value {
@@ -854,6 +1467,68 @@ fn resolve_api_key(config: &LlmApiConfig) -> Result<String, RuntimeError> {
     })
 }
 
+fn model_uses_deepseek_reasoner(model: &str) -> bool {
+    model.trim().eq_ignore_ascii_case("deepseek-reasoner")
+}
+
+fn parse_tool_arguments<T: DeserializeOwned>(
+    raw_arguments: &str,
+    tool_name: &str,
+) -> Result<T, RuntimeError> {
+    serde_json::from_str(raw_arguments).map_err(|err| RuntimeError::LlmResponseInvalid {
+        message: format!("tool {tool_name} arguments were not valid JSON: {err}"),
+    })
+}
+
+fn find_context_file<'a>(
+    context_files: &'a [ContextFile],
+    path: &str,
+) -> Result<&'a ContextFile, RuntimeError> {
+    let normalized = normalize_rel_path(path)?;
+    context_files
+        .iter()
+        .find(|file| file.path == normalized)
+        .ok_or_else(|| RuntimeError::LlmResponseInvalid {
+            message: format!("tool requested unknown context file: {path}"),
+        })
+}
+
+fn render_plugin_catalog_tool_result(
+    plugin_catalog: Option<&PromptPluginCatalog>,
+    plugin_path: Option<&str>,
+) -> Result<Value, RuntimeError> {
+    let Some(catalog) = plugin_catalog else {
+        return Ok(json!({
+            "discovery_root": null,
+            "plugins": [],
+        }));
+    };
+
+    let plugins = match plugin_path.map(str::trim).filter(|path| !path.is_empty()) {
+        Some(filter) => catalog
+            .plugins
+            .iter()
+            .filter(|plugin| plugin.plugin_path == filter)
+            .cloned()
+            .collect::<Vec<_>>(),
+        None => catalog.plugins.clone(),
+    };
+
+    Ok(json!({
+        "discovery_root": catalog.discovery_root,
+        "plugins": plugins,
+    }))
+}
+
+fn tool_feedback_error(tool_name: &str, error: &str) -> Value {
+    json!({
+        "ok": false,
+        "tool": tool_name,
+        "error": error,
+        "hint": "Revise the arguments and call the submit tool again only after the payload satisfies the required shape and writable-path rules."
+    })
+}
+
 fn extract_error_message(raw_body: &str) -> Option<String> {
     let json: Value = serde_json::from_str(raw_body).ok()?;
     json.get("error")
@@ -928,6 +1603,21 @@ fn extract_chat_completion_text(raw_json: &Value) -> Option<String> {
         .map(ToString::to_string)
 }
 
+fn parse_deepseek_chat_message(raw_json: &Value) -> Result<DeepSeekChatMessage, RuntimeError> {
+    let message = raw_json
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.first())
+        .and_then(|choice| choice.get("message"))
+        .cloned()
+        .ok_or_else(|| RuntimeError::LlmResponseInvalid {
+            message: "missing choices[0].message in chat completion payload".to_string(),
+        })?;
+    serde_json::from_value(message).map_err(|err| RuntimeError::LlmResponseInvalid {
+        message: format!("chat completion message shape was invalid: {err}"),
+    })
+}
+
 fn parse_planner_payload(raw_text: &str) -> Result<PlannerPayload, RuntimeError> {
     serde_json::from_str(raw_text).map_err(|err| RuntimeError::LlmResponseInvalid {
         message: format!("model output was not valid plan JSON: {err}"),
@@ -956,12 +1646,32 @@ fn validate_patch_paths(
     Ok(())
 }
 
+fn validate_submitted_patch_payload(
+    payload: &PlannerPayload,
+    allowed_paths: &BTreeSet<String>,
+) -> Result<(), RuntimeError> {
+    if payload.patches.is_empty() {
+        return Err(RuntimeError::LlmResponseInvalid {
+            message: "submit_patch_plan requires at least one patch".to_string(),
+        });
+    }
+    validate_patch_paths(&payload.patches, allowed_paths)
+}
+
 fn validate_plugin_operation_paths(
     operations: &[PluginEditOperation],
     writable_roots: &BTreeSet<String>,
 ) -> Result<(), RuntimeError> {
     for operation in operations {
         let normalized = normalize_plugin_rel_path(&operation.path)?;
+        if path_within_read_only_generated_context(&normalized, writable_roots) {
+            return Err(RuntimeError::LlmResponseInvalid {
+                message: format!(
+                    "model returned read-only generated plugin path: {}",
+                    operation.path
+                ),
+            });
+        }
         if !path_within_writable_surface(&normalized, writable_roots) {
             return Err(RuntimeError::LlmResponseInvalid {
                 message: format!(
@@ -973,6 +1683,18 @@ fn validate_plugin_operation_paths(
         validate_plugin_operation_shape(operation, &normalized)?;
     }
     Ok(())
+}
+
+fn validate_submitted_plugin_payload(
+    payload: &PluginPlannerPayload,
+    writable_roots: &BTreeSet<String>,
+) -> Result<(), RuntimeError> {
+    if payload.operations.is_empty() {
+        return Err(RuntimeError::LlmResponseInvalid {
+            message: "submit_plugin_edit_plan requires at least one operation".to_string(),
+        });
+    }
+    validate_plugin_operation_paths(&payload.operations, writable_roots)
 }
 
 fn validate_plugin_operation_shape(
@@ -1038,9 +1760,14 @@ fn path_within_writable_surface(path: &str, writable_roots: &BTreeSet<String>) -
         path == format!("{root}/Cargo.toml")
             || path.starts_with(&format!("{root}/src/"))
             || path.starts_with(&format!("{root}/tests/"))
-            || path.starts_with(&format!("{root}/docs/agent/"))
             || path.starts_with(&format!("{root}/docs/human/"))
     })
+}
+
+fn path_within_read_only_generated_context(path: &str, writable_roots: &BTreeSet<String>) -> bool {
+    writable_roots
+        .iter()
+        .any(|root| path.starts_with(&format!("{root}/docs/agent/")))
 }
 
 fn normalize_rel_path(path: &str) -> Result<String, RuntimeError> {
@@ -1092,8 +1819,8 @@ mod tests {
         api_key_env_looks_like_secret, build_plugin_edit_prompt, build_user_prompt,
         discover_plugin_catalog, extract_chat_completion_text, extract_error_message,
         extract_output_text, normalize_optional_command, normalize_rel_path,
-        path_within_writable_surface, sha256_text, validate_plugin_operation_paths, ContextFile,
-        PlanRequest, PluginPlanRequest,
+        path_within_read_only_generated_context, path_within_writable_surface, sha256_text,
+        validate_plugin_operation_paths, ContextFile, PlanRequest, PluginPlanRequest,
     };
     use crate::kernel::plugin_iteration::{PluginEditOpKind, PluginEditOperation};
     use serde_json::{json, Value};
@@ -1266,15 +1993,25 @@ mod tests {
             issue_id: "issue-1".to_string(),
             patch_id: "patch-1".to_string(),
             instruction: "Update shell docs".to_string(),
-            context_paths: vec!["plugins/shell/src/lib.rs".to_string()],
+            context_paths: vec![
+                "plugins/shell/src/lib.rs".to_string(),
+                "plugins/shell/docs/agent/interfaces.json".to_string(),
+            ],
             writable_roots: vec!["plugins/shell".to_string()],
             manual_approved: false,
         };
-        let files = vec![ContextFile {
-            path: "plugins/shell/src/lib.rs".to_string(),
-            sha256: "abc123".to_string(),
-            content: "pub fn demo() {}\n".to_string(),
-        }];
+        let files = vec![
+            ContextFile {
+                path: "plugins/shell/src/lib.rs".to_string(),
+                sha256: "abc123".to_string(),
+                content: "pub fn demo() {}\n".to_string(),
+            },
+            ContextFile {
+                path: "plugins/shell/docs/agent/interfaces.json".to_string(),
+                sha256: "def456".to_string(),
+                content: "{ \"nodes\": [] }\n".to_string(),
+            },
+        ];
 
         let prompt = build_plugin_edit_prompt(&request, &files, None);
         assert!(
@@ -1282,6 +2019,14 @@ mod tests {
             "prompt: {prompt}"
         );
         assert!(prompt.contains("sha256=abc123"), "prompt: {prompt}");
+        assert!(
+            prompt.contains("plugins/shell/docs/agent/**"),
+            "prompt: {prompt}"
+        );
+        assert!(
+            prompt.contains("Read-only context files:\n- plugins/shell/docs/agent/interfaces.json"),
+            "prompt: {prompt}"
+        );
         assert!(prompt.contains("create_file"), "prompt: {prompt}");
     }
 
@@ -1304,12 +2049,37 @@ mod tests {
         )
         .expect_err("path should be rejected");
         assert!(err.to_string().contains("disallowed plugin edit path"));
+        let read_only_err = validate_plugin_operation_paths(
+            &[PluginEditOperation {
+                path: "plugins/shell/docs/agent/interfaces.json".to_string(),
+                kind: PluginEditOpKind::JsonSet,
+                expected_old_string: None,
+                expected_sha256: Some("abc123".to_string()),
+                new_content: None,
+                pointer: Some("/nodes/0/summary".to_string()),
+                dotted_key: None,
+                value: Some(json!("updated")),
+            }],
+            &writable_roots,
+        )
+        .expect_err("generated agent docs should be rejected");
+        assert!(read_only_err
+            .to_string()
+            .contains("read-only generated plugin path"));
         assert!(path_within_writable_surface(
             "plugins/shell/src/lib.rs",
             &writable_roots
         ));
         assert!(!path_within_writable_surface(
+            "plugins/shell/docs/agent/interfaces.json",
+            &writable_roots
+        ));
+        assert!(!path_within_writable_surface(
             "plugins/expr/src/lib.rs",
+            &writable_roots
+        ));
+        assert!(path_within_read_only_generated_context(
+            "plugins/shell/docs/agent/interfaces.json",
             &writable_roots
         ));
     }

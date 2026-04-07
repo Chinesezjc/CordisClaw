@@ -25,54 +25,78 @@ fn write_config(
     .expect("write llm config");
 }
 
-fn spawn_mock_llm_server(
-    response_body: String,
-) -> (String, mpsc::Receiver<String>, thread::JoinHandle<()>) {
+fn spawn_mock_llm_server_sequence(
+    response_bodies: Vec<String>,
+) -> (String, mpsc::Receiver<Vec<String>>, thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
     let address = listener.local_addr().expect("listener addr");
     let (sender, receiver) = mpsc::channel();
 
     let handle = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("accept request");
-        let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
-        let mut request = String::new();
+        let mut requests = Vec::new();
+        for response_body in response_bodies {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+            let mut request = String::new();
 
-        let mut first_line = String::new();
-        reader
-            .read_line(&mut first_line)
-            .expect("read request line");
-        request.push_str(&first_line);
+            let mut first_line = String::new();
+            reader
+                .read_line(&mut first_line)
+                .expect("read request line");
+            request.push_str(&first_line);
 
-        let mut content_length = 0usize;
-        loop {
-            let mut line = String::new();
-            reader.read_line(&mut line).expect("read header line");
-            request.push_str(&line);
-            if line == "\r\n" {
-                break;
+            let mut content_length = 0usize;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).expect("read header line");
+                request.push_str(&line);
+                if line == "\r\n" {
+                    break;
+                }
+
+                let lowercase = line.to_ascii_lowercase();
+                if let Some(value) = lowercase.strip_prefix("content-length:") {
+                    content_length = value.trim().parse::<usize>().expect("parse content length");
+                }
             }
 
-            let lowercase = line.to_ascii_lowercase();
-            if let Some(value) = lowercase.strip_prefix("content-length:") {
-                content_length = value.trim().parse::<usize>().expect("parse content length");
-            }
+            let mut body = vec![0_u8; content_length];
+            reader.read_exact(&mut body).expect("read request body");
+            request.push_str(&String::from_utf8_lossy(&body));
+            requests.push(request);
+
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            )
+            .expect("write response");
         }
-
-        let mut body = vec![0_u8; content_length];
-        reader.read_exact(&mut body).expect("read request body");
-        request.push_str(&String::from_utf8_lossy(&body));
-        sender.send(request).expect("send captured request");
-
-        write!(
-            stream,
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            response_body.len(),
-            response_body
-        )
-        .expect("write response");
+        sender.send(requests).expect("send captured requests");
     });
 
     (format!("http://{}/v1", address), receiver, handle)
+}
+
+fn spawn_mock_llm_server(
+    response_body: String,
+) -> (String, mpsc::Receiver<String>, thread::JoinHandle<()>) {
+    let (base_url, requests_rx, handle) = spawn_mock_llm_server_sequence(vec![response_body]);
+    let (sender, receiver) = mpsc::channel();
+    let unwrap_handle = thread::spawn(move || {
+        let requests = requests_rx.recv().expect("receive captured requests");
+        sender
+            .send(
+                requests
+                    .into_iter()
+                    .next()
+                    .expect("single request should be captured"),
+            )
+            .expect("send single request");
+        handle.join().expect("join mock llm server");
+    });
+    (base_url, receiver, unwrap_handle)
 }
 
 fn spawn_mock_openai_server(
@@ -321,6 +345,273 @@ fn llm_auto_update_supports_deepseek_chat_completions() {
     assert!(captured_request.contains("\"model\":\"deepseek-chat\""));
     assert!(captured_request.contains("\"response_format\":{\"type\":\"json_object\"}"));
     assert!(captured_request.contains("Replace old with new in demo.txt"));
+}
+
+#[cfg(not(windows))]
+#[test]
+fn llm_auto_update_supports_deepseek_reasoner_tool_calls() {
+    let temp = TempDir::new().expect("tempdir");
+    let demo_path = temp.path().join("demo.txt");
+    fs::write(&demo_path, "alpha-old-omega\n").expect("write demo file");
+
+    let first_response = json!({
+        "id": "chatcmpl_reasoner_1",
+        "choices": [
+            {
+                "message": {
+                    "content": null,
+                    "reasoning_content": "Need to inspect the target file before planning.",
+                    "tool_calls": [
+                        {
+                            "id": "call_read_demo",
+                            "type": "function",
+                            "function": {
+                                "name": "read_context_file",
+                                "arguments": "{\"path\":\"demo.txt\"}"
+                            }
+                        }
+                    ]
+                }
+            }
+        ]
+    })
+    .to_string();
+    let second_response = json!({
+        "id": "chatcmpl_reasoner_2",
+        "choices": [
+            {
+                "message": {
+                    "content": null,
+                    "reasoning_content": "The file contains old and should be updated.",
+                    "tool_calls": [
+                        {
+                            "id": "call_submit_plan",
+                            "type": "function",
+                            "function": {
+                                "name": "submit_patch_plan",
+                                "arguments": json!({
+                                    "summary": "Replace old with new in the demo file.",
+                                    "tests_command": "grep -q new demo.txt",
+                                    "safety_command": "grep -q alpha-new-omega demo.txt",
+                                    "patches": [
+                                        {
+                                            "path": "demo.txt",
+                                            "find": "old",
+                                            "replace": "new"
+                                        }
+                                    ]
+                                })
+                                .to_string()
+                            }
+                        }
+                    ]
+                }
+            }
+        ]
+    })
+    .to_string();
+    let (base_url, requests_rx, handle) =
+        spawn_mock_llm_server_sequence(vec![first_response, second_response]);
+    write_config(
+        temp.path(),
+        "deepseek",
+        &base_url,
+        "DEEPSEEK_API_KEY",
+        "deepseek-reasoner",
+    );
+
+    let bin = env!("CARGO_BIN_EXE_cordis-runtime");
+    let output = Command::new(bin)
+        .arg("llm-auto-update")
+        .arg(temp.path())
+        .arg("--instruction=Replace old with new in demo.txt")
+        .arg("--path=demo.txt")
+        .env("DEEPSEEK_API_KEY", "test-key")
+        .output()
+        .expect("run llm-auto-update");
+
+    handle.join().expect("join mock server");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout utf-8");
+    assert!(
+        stdout.contains("\"verdict\": \"Promote\""),
+        "stdout: {stdout}"
+    );
+    assert_eq!(
+        fs::read_to_string(&demo_path).expect("read demo file"),
+        "alpha-new-omega\n"
+    );
+
+    let captured_requests = requests_rx.recv().expect("capture requests");
+    assert_eq!(
+        captured_requests.len(),
+        2,
+        "requests: {captured_requests:?}"
+    );
+    assert!(captured_requests[0].starts_with("POST /v1/chat/completions HTTP/1.1"));
+    assert_authorization_bearer(&captured_requests[0], "test-key");
+    assert!(captured_requests[0].contains("\"model\":\"deepseek-reasoner\""));
+    assert!(captured_requests[0].contains("\"tools\""));
+    assert!(captured_requests[0].contains("submit_patch_plan"));
+    assert!(captured_requests[0].contains("read_context_file"));
+    assert!(captured_requests[1]
+        .contains("\"reasoning_content\":\"Need to inspect the target file before planning.\""));
+    assert!(captured_requests[1].contains("\"tool_call_id\":\"call_read_demo\""));
+    assert!(captured_requests[1].contains("alpha-old-omega"));
+}
+
+#[cfg(not(windows))]
+#[test]
+fn llm_auto_update_deepseek_reasoner_retries_after_tool_feedback() {
+    let temp = TempDir::new().expect("tempdir");
+    let demo_path = temp.path().join("demo.txt");
+    fs::write(&demo_path, "alpha-old-omega\n").expect("write demo file");
+
+    let first_response = json!({
+        "id": "chatcmpl_reasoner_retry_1",
+        "choices": [
+            {
+                "message": {
+                    "content": null,
+                    "reasoning_content": "I should inspect the file first.",
+                    "tool_calls": [
+                        {
+                            "id": "call_read_demo",
+                            "type": "function",
+                            "function": {
+                                "name": "read_context_file",
+                                "arguments": "{\"path\":\"demo.txt\"}"
+                            }
+                        }
+                    ]
+                }
+            }
+        ]
+    })
+    .to_string();
+    let second_response = json!({
+        "id": "chatcmpl_reasoner_retry_2",
+        "choices": [
+            {
+                "message": {
+                    "content": null,
+                    "reasoning_content": "I'll try submitting a patch plan.",
+                    "tool_calls": [
+                        {
+                            "id": "call_submit_invalid",
+                            "type": "function",
+                            "function": {
+                                "name": "submit_patch_plan",
+                                "arguments": json!({
+                                    "summary": "Broken first try.",
+                                    "patches": [
+                                        {
+                                            "path": "demo.txt",
+                                            "replace": "new"
+                                        }
+                                    ]
+                                })
+                                .to_string()
+                            }
+                        }
+                    ]
+                }
+            }
+        ]
+    })
+    .to_string();
+    let third_response = json!({
+        "id": "chatcmpl_reasoner_retry_3",
+        "choices": [
+            {
+                "message": {
+                    "content": null,
+                    "reasoning_content": "The tool rejected the shape, so I will fix and resubmit.",
+                    "tool_calls": [
+                        {
+                            "id": "call_submit_valid",
+                            "type": "function",
+                            "function": {
+                                "name": "submit_patch_plan",
+                                "arguments": json!({
+                                    "summary": "Replace old with new in the demo file.",
+                                    "tests_command": "grep -q new demo.txt",
+                                    "safety_command": "grep -q alpha-new-omega demo.txt",
+                                    "patches": [
+                                        {
+                                            "path": "demo.txt",
+                                            "find": "old",
+                                            "replace": "new"
+                                        }
+                                    ]
+                                })
+                                .to_string()
+                            }
+                        }
+                    ]
+                }
+            }
+        ]
+    })
+    .to_string();
+    let (base_url, requests_rx, handle) =
+        spawn_mock_llm_server_sequence(vec![first_response, second_response, third_response]);
+    write_config(
+        temp.path(),
+        "deepseek",
+        &base_url,
+        "DEEPSEEK_API_KEY",
+        "deepseek-reasoner",
+    );
+
+    let bin = env!("CARGO_BIN_EXE_cordis-runtime");
+    let output = Command::new(bin)
+        .arg("llm-auto-update")
+        .arg(temp.path())
+        .arg("--instruction=Replace old with new in demo.txt")
+        .arg("--path=demo.txt")
+        .env("DEEPSEEK_API_KEY", "test-key")
+        .output()
+        .expect("run llm-auto-update");
+
+    handle.join().expect("join mock server");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout utf-8");
+    assert!(
+        stdout.contains("\"verdict\": \"Promote\""),
+        "stdout: {stdout}"
+    );
+    assert_eq!(
+        fs::read_to_string(&demo_path).expect("read demo file"),
+        "alpha-new-omega\n"
+    );
+
+    let captured_requests = requests_rx.recv().expect("capture requests");
+    assert_eq!(
+        captured_requests.len(),
+        3,
+        "requests: {captured_requests:?}"
+    );
+    assert!(
+        captured_requests[2].contains("\\\"ok\\\":false"),
+        "request: {}",
+        captured_requests[2]
+    );
+    assert!(
+        captured_requests[2].contains("text patch for demo.txt is missing `find`"),
+        "request: {}",
+        captured_requests[2]
+    );
 }
 
 #[cfg(not(windows))]

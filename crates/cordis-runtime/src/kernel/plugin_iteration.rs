@@ -304,10 +304,15 @@ impl PluginIterationPolicy {
                     reason: "plugin manifest edits are disabled".to_string(),
                 });
             }
+            if normalized.starts_with(&format!("{plugin_root}/docs/agent/")) {
+                return Err(RuntimeError::PluginIterationPolicyBlocked {
+                    path: normalized,
+                    reason: "generated agent docs are read-only context; edit source code or human docs instead".to_string(),
+                });
+            }
             for allowed_prefix in [
                 format!("{plugin_root}/src/"),
                 format!("{plugin_root}/tests/"),
-                format!("{plugin_root}/docs/agent/"),
                 format!("{plugin_root}/docs/human/"),
             ] {
                 if normalized.starts_with(&allowed_prefix) {
@@ -811,6 +816,31 @@ mod tests {
         assert!(err
             .to_string()
             .contains("outside the plugin iteration surface"));
+    }
+
+    #[test]
+    fn plugin_iteration_policy_blocks_generated_agent_docs() {
+        let mut allowed = BTreeMap::new();
+        allowed.insert("demo".to_string(), "plugins/demo".to_string());
+        let plan = PluginEditPlan {
+            issue_id: "issue-1".to_string(),
+            patch_id: "patch-1".to_string(),
+            summary: "bad".to_string(),
+            operations: vec![PluginEditOperation {
+                path: "plugins/demo/docs/agent/interfaces.json".to_string(),
+                kind: PluginEditOpKind::JsonSet,
+                expected_old_string: None,
+                expected_sha256: Some("abc123".to_string()),
+                new_content: None,
+                pointer: Some("/nodes/0/summary".to_string()),
+                dotted_key: None,
+                value: Some(serde_json::json!("updated")),
+            }],
+        };
+        let err = PluginIterationPolicy::default()
+            .validate_plan(&allowed, &plan)
+            .expect_err("generated agent docs should be blocked");
+        assert!(err.to_string().contains("read-only context"));
     }
 
     #[test]
