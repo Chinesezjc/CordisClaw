@@ -63,7 +63,10 @@ pub fn evaluate_gate(
     }
 }
 
-fn eval_all_of(upstream_nodes: &[String], outcomes: &BTreeMap<String, NodeOutcome>) -> GateDecision {
+fn eval_all_of(
+    upstream_nodes: &[String],
+    outcomes: &BTreeMap<String, NodeOutcome>,
+) -> GateDecision {
     if upstream_nodes.is_empty() {
         return GateDecision::CompleteSuccess;
     }
@@ -71,7 +74,9 @@ fn eval_all_of(upstream_nodes: &[String], outcomes: &BTreeMap<String, NodeOutcom
     for node in upstream_nodes {
         match outcomes.get(node) {
             Some(NodeOutcome::Success) => {}
-            Some(NodeOutcome::Failure | NodeOutcome::Timeout) => return GateDecision::CompleteFailure,
+            Some(NodeOutcome::Failure | NodeOutcome::Timeout) => {
+                return GateDecision::CompleteFailure
+            }
             Some(NodeOutcome::Cancelled | NodeOutcome::Skipped) | None => all_success = false,
         }
     }
@@ -82,7 +87,10 @@ fn eval_all_of(upstream_nodes: &[String], outcomes: &BTreeMap<String, NodeOutcom
     }
 }
 
-fn eval_any_of(upstream_nodes: &[String], outcomes: &BTreeMap<String, NodeOutcome>) -> GateDecision {
+fn eval_any_of(
+    upstream_nodes: &[String],
+    outcomes: &BTreeMap<String, NodeOutcome>,
+) -> GateDecision {
     if upstream_nodes.is_empty() {
         return GateDecision::CompleteFailure;
     }
@@ -91,7 +99,10 @@ fn eval_any_of(upstream_nodes: &[String], outcomes: &BTreeMap<String, NodeOutcom
         match outcomes.get(node) {
             Some(NodeOutcome::Success) => return GateDecision::CompleteSuccess,
             Some(
-                NodeOutcome::Failure | NodeOutcome::Timeout | NodeOutcome::Cancelled | NodeOutcome::Skipped,
+                NodeOutcome::Failure
+                | NodeOutcome::Timeout
+                | NodeOutcome::Cancelled
+                | NodeOutcome::Skipped,
             ) => {}
             None => all_terminal_non_success = false,
         }
@@ -206,7 +217,12 @@ fn eval_at_least(
     for node in upstream_nodes {
         match outcomes.get(node) {
             Some(NodeOutcome::Success) => success += 1,
-            Some(NodeOutcome::Failure | NodeOutcome::Timeout | NodeOutcome::Cancelled | NodeOutcome::Skipped) => {}
+            Some(
+                NodeOutcome::Failure
+                | NodeOutcome::Timeout
+                | NodeOutcome::Cancelled
+                | NodeOutcome::Skipped,
+            ) => {}
             None => possible_more += 1,
         }
     }

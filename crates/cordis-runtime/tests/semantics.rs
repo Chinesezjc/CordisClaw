@@ -1,133 +1,325 @@
 use cordis_runtime::context::{
     ContextKey, ContextRead, ContextTxn, ContextWrite, RuntimeContext, Sensitivity, SlotMeta,
 };
-use cordis_runtime::execution::dag::{
-    build_dag, DagBuildError, DagBuildPolicy, DagInputSpec, DagNodeSpec,
-};
 use cordis_runtime::core::error::RuntimeError;
-use cordis_runtime::core::models::{GatePolicy, NodeOutcome};
+use cordis_runtime::core::models::NodeOutcome;
 use cordis_runtime::execution::engine::{
-    execute_graph, ExecutionConfig, ExecutionNodeKind, ExecutionNodeSpec,
+    execute_net, ExecutionConfig, ExecutionNetSpec, ExecutionTransitionKind,
+    ExecutionTransitionSpec, SchedulerMode, TransitionRunResult,
 };
-use cordis_runtime::execution::gate::{evaluate_gate, BackoffPolicy, GateDecision, RunPolicy};
+use cordis_runtime::execution::gate::{BackoffPolicy, RunPolicy};
+use cordis_runtime::execution::net::{
+    build_petri_net, ArcDirection, ArcSpec, JoinPolicy, PetriNetBuildError, PetriNetSpec,
+    PlaceSpec, TransitionSpec,
+};
 use cordis_runtime::execution::scheduler::SchedulerConfig;
-use std::collections::BTreeMap;
+use serde_json::json;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
-fn node(id: &str, priority: i32, produces: &[&str], consumes: Vec<DagInputSpec>) -> DagNodeSpec {
-    DagNodeSpec {
-        node_id: id.to_string(),
-        priority,
-        consumes,
-        produces: produces.iter().map(|x| x.to_string()).collect(),
-        control_deps: Vec::new(),
-    }
-}
-
-fn exec_node(
+fn transition(
     id: &str,
+    join_policy: JoinPolicy,
     priority: i32,
-    control_deps: &[&str],
-    max_retries: u32,
-    kind: ExecutionNodeKind,
-) -> ExecutionNodeSpec {
-    ExecutionNodeSpec {
-        dag: DagNodeSpec {
-            node_id: id.to_string(),
+    kind: ExecutionTransitionKind,
+) -> ExecutionTransitionSpec {
+    ExecutionTransitionSpec {
+        transition: TransitionSpec {
+            transition_id: id.to_string(),
             priority,
-            consumes: Vec::new(),
-            produces: Vec::new(),
-            control_deps: control_deps.iter().map(|x| x.to_string()).collect(),
+            join_policy,
         },
-        run_policy: RunPolicy {
-            max_retries,
-            ..RunPolicy::default()
-        },
+        run_policy: RunPolicy::default(),
         kind,
+        logical_group: None,
     }
 }
 
-fn exec_node_with_policy(
+fn transition_grouped(
     id: &str,
+    join_policy: JoinPolicy,
     priority: i32,
-    control_deps: &[&str],
-    run_policy: RunPolicy,
-    kind: ExecutionNodeKind,
-) -> ExecutionNodeSpec {
-    ExecutionNodeSpec {
-        dag: DagNodeSpec {
-            node_id: id.to_string(),
-            priority,
-            consumes: Vec::new(),
-            produces: Vec::new(),
-            control_deps: control_deps.iter().map(|x| x.to_string()).collect(),
+    kind: ExecutionTransitionKind,
+    group: &str,
+) -> ExecutionTransitionSpec {
+    let mut spec = transition(id, join_policy, priority, kind);
+    spec.logical_group = Some(group.to_string());
+    spec
+}
+
+fn place(id: &str) -> PlaceSpec {
+    PlaceSpec {
+        place_id: id.to_string(),
+    }
+}
+
+fn arc_out(transition_id: &str, place_id: &str, label: Option<&str>) -> ArcSpec {
+    ArcSpec {
+        arc_id: format!("out::{transition_id}::{place_id}"),
+        place_id: place_id.to_string(),
+        transition_id: transition_id.to_string(),
+        direction: ArcDirection::TransitionToPlace,
+        label: label.map(|x| x.to_string()),
+        required: false,
+    }
+}
+
+fn arc_in(transition_id: &str, place_id: &str, label: Option<&str>) -> ArcSpec {
+    ArcSpec {
+        arc_id: format!("in::{transition_id}::{place_id}"),
+        place_id: place_id.to_string(),
+        transition_id: transition_id.to_string(),
+        direction: ArcDirection::PlaceToTransition,
+        label: label.map(|x| x.to_string()),
+        required: true,
+    }
+}
+
+#[test]
+fn petri_net_build_fails_on_duplicate_transition_id() {
+    let err = build_petri_net(PetriNetSpec {
+        places: vec![place("p")],
+        transitions: vec![
+            TransitionSpec {
+                transition_id: "t".to_string(),
+                priority: 0,
+                join_policy: JoinPolicy::AllOf,
+            },
+            TransitionSpec {
+                transition_id: "t".to_string(),
+                priority: 0,
+                join_policy: JoinPolicy::AllOf,
+            },
+        ],
+        arcs: vec![],
+    })
+    .expect_err("duplicate transition id should fail");
+
+    assert!(matches!(
+        err,
+        PetriNetBuildError::DuplicateTransitionId { .. }
+    ));
+}
+
+#[test]
+fn petri_net_build_fails_on_unknown_place_arc() {
+    let err = build_petri_net(PetriNetSpec {
+        places: vec![place("p")],
+        transitions: vec![TransitionSpec {
+            transition_id: "t".to_string(),
+            priority: 0,
+            join_policy: JoinPolicy::AllOf,
+        }],
+        arcs: vec![ArcSpec {
+            arc_id: "bad".to_string(),
+            place_id: "missing".to_string(),
+            transition_id: "t".to_string(),
+            direction: ArcDirection::PlaceToTransition,
+            label: None,
+            required: true,
+        }],
+    })
+    .expect_err("unknown place should fail");
+
+    assert!(matches!(err, PetriNetBuildError::ArcPlaceNotFound { .. }));
+}
+
+#[test]
+fn keyed_pair_matches_same_group_without_cross_wiring() {
+    let net = ExecutionNetSpec {
+        places: vec![place("pa"), place("pb"), place("pj")],
+        transitions: vec![
+            transition_grouped(
+                "a1",
+                JoinPolicy::AllOf,
+                0,
+                ExecutionTransitionKind::Task,
+                "g1",
+            ),
+            transition_grouped(
+                "b1",
+                JoinPolicy::AllOf,
+                0,
+                ExecutionTransitionKind::Task,
+                "g1",
+            ),
+            transition_grouped(
+                "a2",
+                JoinPolicy::AllOf,
+                0,
+                ExecutionTransitionKind::Task,
+                "g2",
+            ),
+            transition_grouped(
+                "b2",
+                JoinPolicy::AllOf,
+                0,
+                ExecutionTransitionKind::Task,
+                "g2",
+            ),
+            transition(
+                "join",
+                JoinPolicy::KeyedPair,
+                0,
+                ExecutionTransitionKind::Task,
+            ),
+            transition(
+                "terminal",
+                JoinPolicy::AllOf,
+                0,
+                ExecutionTransitionKind::Terminal,
+            ),
+        ],
+        arcs: vec![
+            arc_out("a1", "pa", Some("x")),
+            arc_out("a2", "pa", Some("x")),
+            arc_out("b1", "pb", Some("y")),
+            arc_out("b2", "pb", Some("y")),
+            arc_in("join", "pa", Some("x")),
+            arc_in("join", "pb", Some("y")),
+            arc_out("join", "pj", Some("joined")),
+            arc_in("terminal", "pj", Some("joined")),
+        ],
+    };
+
+    let mut ctx = RuntimeContext::default();
+    let mut join_seen = 0usize;
+    let output = execute_net(
+        ExecutionConfig::default(),
+        net,
+        &mut ctx,
+        |spec, _, trigger, _| {
+            if spec.transition.transition_id == "join" {
+                join_seen += 1;
+                return TransitionRunResult {
+                    outcome: NodeOutcome::Success,
+                    payload: json!({ "joined": trigger.key.0 }),
+                };
+            }
+            TransitionRunResult::from_outcome(NodeOutcome::Success)
         },
-        run_policy,
-        kind,
-    }
+    )
+    .expect("engine run should pass");
+
+    assert_eq!(join_seen, 2, "join should fire once for each group key");
+    let join_keys = output
+        .keyed_outcomes
+        .get("join")
+        .expect("join keyed outcomes must exist");
+    assert_eq!(join_keys.len(), 2);
+    assert!(join_keys.keys().any(|key| key.contains("group:g1")));
+    assert!(join_keys.keys().any(|key| key.contains("group:g2")));
 }
 
 #[test]
-fn dag_fails_on_multi_producer_without_explicit_binding() {
-    let nodes = vec![
-        node("a", 1, &["X"], vec![]),
-        node("b", 2, &["X"], vec![]),
-        node(
-            "c",
-            1,
-            &[],
-            vec![DagInputSpec {
-                input_type: "X".to_string(),
-                required: true,
-                explicit_producer: None,
-            }],
-        ),
-    ];
+fn join_policy_first_success_marks_late_tokens_as_zombie() {
+    let net = ExecutionNetSpec {
+        places: vec![place("pa"), place("pb")],
+        transitions: vec![
+            transition_grouped(
+                "a",
+                JoinPolicy::AllOf,
+                10,
+                ExecutionTransitionKind::Task,
+                "grp",
+            ),
+            transition_grouped(
+                "b",
+                JoinPolicy::AllOf,
+                -1,
+                ExecutionTransitionKind::Task,
+                "grp",
+            ),
+            transition(
+                "join",
+                JoinPolicy::FirstSuccess,
+                0,
+                ExecutionTransitionKind::Task,
+            ),
+        ],
+        arcs: vec![
+            arc_out("a", "pa", Some("va")),
+            arc_out("b", "pb", Some("vb")),
+            arc_in("join", "pa", Some("va")),
+            arc_in("join", "pb", Some("vb")),
+        ],
+    };
 
-    let err = build_dag(nodes, DagBuildPolicy::default()).expect_err("must fail");
-    assert!(matches!(err, DagBuildError::ProducerConflict { .. }));
+    let mut ctx = RuntimeContext::default();
+    let output = execute_net(
+        ExecutionConfig {
+            scheduler: SchedulerConfig { max_parallelism: 1 },
+            scheduler_mode: SchedulerMode::Deterministic,
+        },
+        net,
+        &mut ctx,
+        |spec, _, _, _| match spec.transition.transition_id.as_str() {
+            "a" => TransitionRunResult::from_outcome(NodeOutcome::Success),
+            "b" => TransitionRunResult::from_outcome(NodeOutcome::Success),
+            "join" => TransitionRunResult::from_outcome(NodeOutcome::Success),
+            _ => TransitionRunResult::from_outcome(NodeOutcome::Success),
+        },
+    )
+    .expect("engine run should pass");
+
+    assert_eq!(output.outcomes.get("join"), Some(&NodeOutcome::Success));
+    assert!(output.metrics.late_token_total >= 1);
+    assert!(output.metrics.zombie_token_total >= 1);
 }
 
 #[test]
-fn dag_cycle_detection_returns_full_path() {
-    let mut a = node("a", 1, &["A"], vec![]);
-    a.control_deps = vec!["b".to_string()];
-    let mut b = node("b", 1, &["B"], vec![]);
-    b.control_deps = vec!["a".to_string()];
+fn join_policy_any_of_and_quorum_fire() {
+    for policy in [JoinPolicy::AnyOf, JoinPolicy::Quorum(2)] {
+        let net = ExecutionNetSpec {
+            places: vec![place("p1"), place("p2")],
+            transitions: vec![
+                transition_grouped(
+                    "u1",
+                    JoinPolicy::AllOf,
+                    0,
+                    ExecutionTransitionKind::Task,
+                    "g",
+                ),
+                transition_grouped(
+                    "u2",
+                    JoinPolicy::AllOf,
+                    0,
+                    ExecutionTransitionKind::Task,
+                    "g",
+                ),
+                transition("join", policy, 0, ExecutionTransitionKind::Task),
+            ],
+            arcs: vec![
+                arc_out("u1", "p1", Some("a")),
+                arc_out("u2", "p2", Some("b")),
+                arc_in("join", "p1", Some("a")),
+                arc_in("join", "p2", Some("b")),
+            ],
+        };
 
-    let err = build_dag(vec![a, b], DagBuildPolicy::default()).expect_err("must fail");
-    match err {
-        DagBuildError::CycleDetected { cycle_path } => {
-            assert!(cycle_path.len() >= 3);
-            assert_eq!(cycle_path.first().unwrap(), cycle_path.last().unwrap());
-            assert!(cycle_path.contains(&"a".to_string()));
-            assert!(cycle_path.contains(&"b".to_string()));
-        }
-        _ => panic!("expected cycle error"),
-    }
-}
+        let mut ctx = RuntimeContext::default();
+        let output = execute_net(
+            ExecutionConfig::default(),
+            net,
+            &mut ctx,
+            |spec, _, trigger, _| {
+                if spec.transition.transition_id == "join" {
+                    let has_success = trigger
+                        .inputs
+                        .iter()
+                        .any(|input| input.token.meta.outcome == NodeOutcome::Success);
+                    return TransitionRunResult::from_outcome(if has_success {
+                        NodeOutcome::Success
+                    } else {
+                        NodeOutcome::Failure
+                    });
+                }
+                TransitionRunResult::from_outcome(NodeOutcome::Success)
+            },
+        )
+        .expect("engine run should pass");
 
-#[test]
-fn gate_first_success_cancels_other_pending_branches() {
-    let upstream = vec!["a".to_string(), "b".to_string(), "c".to_string()];
-    let mut outcomes = BTreeMap::new();
-    outcomes.insert("a".to_string(), NodeOutcome::Failure);
-    outcomes.insert("b".to_string(), NodeOutcome::Success);
-    let completion_order = vec!["a".to_string(), "b".to_string()];
-
-    let decision = evaluate_gate(
-        GatePolicy::FirstSuccess,
-        &upstream,
-        &outcomes,
-        &completion_order,
-    );
-
-    match decision {
-        GateDecision::CompleteAndCancel { cancel_nodes, .. } => {
-            assert_eq!(cancel_nodes, vec!["c".to_string()]);
-        }
-        _ => panic!("unexpected gate decision: {decision:?}"),
+        assert_eq!(output.outcomes.get("join"), Some(&NodeOutcome::Success));
     }
 }
 
@@ -184,7 +376,8 @@ fn context_session_commit_uses_cas() {
     };
 
     ctx.put(key, 42_u64, meta).unwrap();
-    ctx.commit_session("s1", 0).expect("first commit should pass");
+    ctx.commit_session("s1", 0)
+        .expect("first commit should pass");
     assert_eq!(ctx.session_version(), 1);
 
     let err = ctx.commit_session("s1", 0).expect_err("must fail by CAS");
@@ -196,61 +389,30 @@ fn context_session_commit_uses_cas() {
 }
 
 #[test]
-fn engine_first_success_cancels_pending_branch() {
-    let nodes = vec![
-        exec_node("mirror_a", 10, &[], 0, ExecutionNodeKind::Task),
-        exec_node("mirror_b", 1, &[], 0, ExecutionNodeKind::Task),
-        exec_node(
-            "gate",
-            1,
-            &["mirror_a", "mirror_b"],
-            0,
-            ExecutionNodeKind::Gate {
-                policy: GatePolicy::FirstSuccess,
-            },
-        ),
-        exec_node("terminal", 1, &["gate"], 0, ExecutionNodeKind::Terminal),
-    ];
-
-    let mut ctx = RuntimeContext::default();
-    let output = execute_graph(
-        ExecutionConfig {
-            scheduler: SchedulerConfig { max_parallelism: 1 },
-            ..ExecutionConfig::default()
-        },
-        nodes,
-        &mut ctx,
-        |spec, _, _| match spec.dag.node_id.as_str() {
-            "mirror_a" => NodeOutcome::Success,
-            "mirror_b" => NodeOutcome::Success,
-            "terminal" => NodeOutcome::Success,
-            _ => NodeOutcome::Success,
-        },
-    )
-    .expect("engine run should pass");
-
-    assert_eq!(output.outcomes.get("mirror_a"), Some(&NodeOutcome::Success));
-    assert_eq!(output.outcomes.get("mirror_b"), Some(&NodeOutcome::Cancelled));
-    assert_eq!(output.outcomes.get("gate"), Some(&NodeOutcome::Success));
-    assert_eq!(output.outcomes.get("terminal"), Some(&NodeOutcome::Success));
-    assert_eq!(output.metrics.execution_cancel_total, 1);
-    assert_eq!(output.order, vec!["mirror_a", "terminal"]);
-}
-
-#[test]
 fn engine_router_failure_rolls_back_overlay() {
-    let nodes = vec![
-        exec_node(
-            "router",
-            1,
-            &[],
-            0,
-            ExecutionNodeKind::Router {
-                subgraph_id: "sg1".to_string(),
-            },
-        ),
-        exec_node("after_router", 1, &["router"], 0, ExecutionNodeKind::Terminal),
-    ];
+    let net = ExecutionNetSpec {
+        places: vec![place("p_router")],
+        transitions: vec![
+            transition(
+                "router",
+                JoinPolicy::AllOf,
+                0,
+                ExecutionTransitionKind::Router {
+                    subgraph_id: "sg1".to_string(),
+                },
+            ),
+            transition(
+                "after_router",
+                JoinPolicy::AllOf,
+                0,
+                ExecutionTransitionKind::Terminal,
+            ),
+        ],
+        arcs: vec![
+            arc_out("router", "p_router", Some("v")),
+            arc_in("after_router", "p_router", Some("v")),
+        ],
+    };
 
     let mut ctx = RuntimeContext::default();
     let key = ContextKey {
@@ -265,17 +427,17 @@ fn engine_router_failure_rolls_back_overlay() {
         owner: "test".to_string(),
     };
 
-    let output = execute_graph(
+    let output = execute_net(
         ExecutionConfig::default(),
-        nodes,
+        net,
         &mut ctx,
-        |spec, _, ctx| {
-            if spec.dag.node_id == "router" {
+        |spec, _, _, ctx| {
+            if spec.transition.transition_id == "router" {
                 ctx.put(key.clone(), 42_u64, meta.clone())
                     .expect("write to overlay");
-                NodeOutcome::Failure
+                TransitionRunResult::from_outcome(NodeOutcome::Failure)
             } else {
-                NodeOutcome::Success
+                TransitionRunResult::from_outcome(NodeOutcome::Success)
             }
         },
     )
@@ -296,18 +458,29 @@ fn engine_router_failure_rolls_back_overlay() {
 
 #[test]
 fn engine_router_success_commits_overlay_and_metrics() {
-    let nodes = vec![
-        exec_node(
-            "router",
-            1,
-            &[],
-            0,
-            ExecutionNodeKind::Router {
-                subgraph_id: "sg_ok".to_string(),
-            },
-        ),
-        exec_node("after_router", 1, &["router"], 0, ExecutionNodeKind::Terminal),
-    ];
+    let net = ExecutionNetSpec {
+        places: vec![place("p_router")],
+        transitions: vec![
+            transition(
+                "router",
+                JoinPolicy::AllOf,
+                0,
+                ExecutionTransitionKind::Router {
+                    subgraph_id: "sg_ok".to_string(),
+                },
+            ),
+            transition(
+                "after_router",
+                JoinPolicy::AllOf,
+                0,
+                ExecutionTransitionKind::Terminal,
+            ),
+        ],
+        arcs: vec![
+            arc_out("router", "p_router", Some("v")),
+            arc_in("after_router", "p_router", Some("v")),
+        ],
+    };
 
     let mut ctx = RuntimeContext::default();
     let key = ContextKey {
@@ -322,16 +495,16 @@ fn engine_router_success_commits_overlay_and_metrics() {
         owner: "test".to_string(),
     };
 
-    let output = execute_graph(
+    let output = execute_net(
         ExecutionConfig::default(),
-        nodes,
+        net,
         &mut ctx,
-        |spec, _, ctx| {
-            if spec.dag.node_id == "router" {
+        |spec, _, _, ctx| {
+            if spec.transition.transition_id == "router" {
                 ctx.put(key.clone(), 7_u64, meta.clone())
                     .expect("write to overlay");
             }
-            NodeOutcome::Success
+            TransitionRunResult::from_outcome(NodeOutcome::Success)
         },
     )
     .expect("engine run should pass");
@@ -349,26 +522,38 @@ fn engine_router_success_commits_overlay_and_metrics() {
 }
 
 #[test]
-fn engine_order_and_outcome_are_deterministic_across_runs() {
-    let nodes = vec![
-        exec_node("a", 1, &[], 1, ExecutionNodeKind::Task),
-        exec_node("b", 1, &["a"], 0, ExecutionNodeKind::Terminal),
-    ];
+fn engine_deterministic_mode_is_reproducible() {
+    let make_net = || {
+        let mut a = transition("a", JoinPolicy::AllOf, 1, ExecutionTransitionKind::Task);
+        a.run_policy = RunPolicy {
+            timeout_ms: 30_000,
+            max_retries: 1,
+            backoff: BackoffPolicy::None,
+        };
+        ExecutionNetSpec {
+            places: vec![],
+            transitions: vec![
+                a,
+                transition("b", JoinPolicy::AllOf, 1, ExecutionTransitionKind::Task),
+            ],
+            arcs: vec![],
+        }
+    };
 
     let run_once = || {
         let mut ctx = RuntimeContext::default();
-        execute_graph(
+        execute_net(
             ExecutionConfig {
                 scheduler: SchedulerConfig { max_parallelism: 1 },
-                ..ExecutionConfig::default()
+                scheduler_mode: SchedulerMode::Deterministic,
             },
-            nodes.clone(),
+            make_net(),
             &mut ctx,
-            |spec, attempt, _| {
-                if spec.dag.node_id == "a" && attempt == 0 {
-                    NodeOutcome::Failure
+            |spec, attempt, _, _| {
+                if spec.transition.transition_id == "a" && attempt == 0 {
+                    TransitionRunResult::from_outcome(NodeOutcome::Failure)
                 } else {
-                    NodeOutcome::Success
+                    TransitionRunResult::from_outcome(NodeOutcome::Success)
                 }
             },
         )
@@ -378,71 +563,100 @@ fn engine_order_and_outcome_are_deterministic_across_runs() {
     let first = run_once();
     let second = run_once();
 
-    assert_eq!(first.order, vec!["a", "a", "b"]);
     assert_eq!(first.order, second.order);
     assert_eq!(first.outcomes, second.outcomes);
     assert_eq!(first.metrics.node_retry_total, 1);
-    assert_eq!(second.metrics.node_retry_total, 1);
 }
 
 #[test]
 fn engine_timeout_is_enforced() {
-    let nodes = vec![
-        exec_node_with_policy(
-            "slow",
-            1,
-            &[],
-            RunPolicy {
-                timeout_ms: 1,
-                max_retries: 0,
-                backoff: BackoffPolicy::None,
-            },
-            ExecutionNodeKind::Task,
-        ),
-        exec_node("after_slow", 1, &["slow"], 0, ExecutionNodeKind::Terminal),
-    ];
+    let mut slow = transition("slow", JoinPolicy::AllOf, 0, ExecutionTransitionKind::Task);
+    slow.run_policy = RunPolicy {
+        timeout_ms: 1,
+        max_retries: 0,
+        backoff: BackoffPolicy::None,
+    };
+
+    let net = ExecutionNetSpec {
+        places: vec![place("p")],
+        transitions: vec![
+            slow,
+            transition(
+                "after_slow",
+                JoinPolicy::AllOf,
+                0,
+                ExecutionTransitionKind::Terminal,
+            ),
+        ],
+        arcs: vec![
+            arc_out("slow", "p", Some("v")),
+            arc_in("after_slow", "p", Some("v")),
+        ],
+    };
 
     let mut ctx = RuntimeContext::default();
-    let output = execute_graph(ExecutionConfig::default(), nodes, &mut ctx, |spec, _, _| {
-        if spec.dag.node_id == "slow" {
-            sleep(Duration::from_millis(5));
-        }
-        NodeOutcome::Success
-    })
+    let output = execute_net(
+        ExecutionConfig::default(),
+        net,
+        &mut ctx,
+        |spec, _, _, _| {
+            if spec.transition.transition_id == "slow" {
+                sleep(Duration::from_millis(5));
+            }
+            TransitionRunResult::from_outcome(NodeOutcome::Success)
+        },
+    )
     .expect("engine run should pass");
 
     assert_eq!(output.outcomes.get("slow"), Some(&NodeOutcome::Timeout));
-    assert_eq!(output.outcomes.get("after_slow"), Some(&NodeOutcome::Skipped));
+    assert_eq!(
+        output.outcomes.get("after_slow"),
+        Some(&NodeOutcome::Skipped)
+    );
 }
 
 #[test]
 fn engine_backoff_is_applied_for_retry() {
-    let nodes = vec![exec_node_with_policy(
+    let mut retry_task = transition(
         "retry_task",
-        1,
-        &[],
-        RunPolicy {
-            timeout_ms: 5_000,
-            max_retries: 1,
-            backoff: BackoffPolicy::Fixed { delay_ms: 20 },
-        },
-        ExecutionNodeKind::Task,
-    )];
+        JoinPolicy::AllOf,
+        0,
+        ExecutionTransitionKind::Task,
+    );
+    retry_task.run_policy = RunPolicy {
+        timeout_ms: 5_000,
+        max_retries: 1,
+        backoff: BackoffPolicy::Fixed { delay_ms: 20 },
+    };
+
+    let net = ExecutionNetSpec {
+        places: vec![],
+        transitions: vec![retry_task],
+        arcs: vec![],
+    };
 
     let mut ctx = RuntimeContext::default();
     let started = Instant::now();
-    let output = execute_graph(ExecutionConfig::default(), nodes, &mut ctx, |_, attempt, _| {
-        if attempt == 0 {
-            NodeOutcome::Failure
-        } else {
-            NodeOutcome::Success
-        }
-    })
+    let output = execute_net(
+        ExecutionConfig::default(),
+        net,
+        &mut ctx,
+        |_, attempt, _, _| {
+            if attempt == 0 {
+                TransitionRunResult::from_outcome(NodeOutcome::Failure)
+            } else {
+                TransitionRunResult::from_outcome(NodeOutcome::Success)
+            }
+        },
+    )
     .expect("engine run should pass");
     let elapsed_ms = started.elapsed().as_millis();
 
     assert_eq!(output.order, vec!["retry_task", "retry_task"]);
-    assert_eq!(output.outcomes.get("retry_task"), Some(&NodeOutcome::Success));
+    assert_eq!(
+        output.outcomes.get("retry_task"),
+        Some(&NodeOutcome::Success)
+    );
     assert_eq!(output.metrics.node_retry_total, 1);
     assert!(
         elapsed_ms >= 15,
@@ -451,28 +665,23 @@ fn engine_backoff_is_applied_for_retry() {
 }
 
 #[test]
-fn engine_error_contains_execution_id() {
-    let nodes = vec![ExecutionNodeSpec {
-        dag: DagNodeSpec {
-            node_id: "consumer".to_string(),
-            priority: 1,
-            consumes: vec![DagInputSpec {
-                input_type: "X".to_string(),
-                required: true,
-                explicit_producer: None,
-            }],
-            produces: vec![],
-            control_deps: vec![],
-        },
-        run_policy: RunPolicy::default(),
-        kind: ExecutionNodeKind::Task,
-    }];
+fn engine_error_contains_execution_id_and_net_build_message() {
+    let net = ExecutionNetSpec {
+        places: vec![],
+        transitions: vec![transition(
+            "consumer",
+            JoinPolicy::AllOf,
+            0,
+            ExecutionTransitionKind::Task,
+        )],
+        arcs: vec![arc_in("consumer", "missing_place", Some("X"))],
+    };
 
     let mut ctx = RuntimeContext::default();
-    let err = execute_graph(ExecutionConfig::default(), nodes, &mut ctx, |_, _, _| {
-        NodeOutcome::Success
+    let err = execute_net(ExecutionConfig::default(), net, &mut ctx, |_, _, _, _| {
+        TransitionRunResult::from_outcome(NodeOutcome::Success)
     })
-    .expect_err("must fail in dag build phase");
+    .expect_err("must fail in net build phase");
 
     match err {
         RuntimeError::ExecutionFailed {
@@ -480,7 +689,7 @@ fn engine_error_contains_execution_id() {
             message,
         } => {
             assert!(execution_id.starts_with("exec-"));
-            assert!(message.contains("dag build failed"));
+            assert!(message.contains("net build failed"));
         }
         other => panic!("expected ExecutionFailed, got {other:?}"),
     }

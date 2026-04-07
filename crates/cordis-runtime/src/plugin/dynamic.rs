@@ -17,12 +17,13 @@ impl LoadedDylibApi {
         })?;
 
         let symbol_name = format!("{RUST_PLUGIN_ENTRY_SYMBOL}\0");
-        let symbol = unsafe { lib.get::<*const RustPluginApiV2>(symbol_name.as_bytes()) }.map_err(
-            |e| RuntimeError::Io {
-                path: path.to_path_buf(),
-                message: format!("symbol lookup failed ({RUST_PLUGIN_ENTRY_SYMBOL}): {e}"),
-            },
-        )?;
+        let symbol =
+            unsafe { lib.get::<*const RustPluginApiV2>(symbol_name.as_bytes()) }.map_err(|e| {
+                RuntimeError::Io {
+                    path: path.to_path_buf(),
+                    message: format!("symbol lookup failed ({RUST_PLUGIN_ENTRY_SYMBOL}): {e}"),
+                }
+            })?;
 
         let api_ptr = *symbol;
         if api_ptr.is_null() {

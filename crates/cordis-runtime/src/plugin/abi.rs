@@ -2,9 +2,7 @@
 //! Shared wire types come from `cordis-plugin-sdk`; runtime keeps only host-local metadata
 //! and traits in this module.
 
-pub use cordis_plugin_sdk::{
-    DylibAbiKind, PluginRequest, PluginResponse, RustPluginApiV2,
-};
+pub use cordis_plugin_sdk::{DylibAbiKind, PluginRequest, PluginResponse, RustPluginApiV2};
 
 #[repr(C)]
 #[derive(Debug, Clone)]

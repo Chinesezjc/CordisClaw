@@ -42,7 +42,10 @@ fn sync_plugin_docs_rewrites_dylib_interfaces_json() {
 
     let content = fs::read_to_string(&expr_docs).expect("read synced docs");
     let value: Value = serde_json::from_str(&content).expect("valid synced json");
-    assert_eq!(value.get("plugin_path").and_then(|v| v.as_str()), Some("expr"));
+    assert_eq!(
+        value.get("plugin_path").and_then(|v| v.as_str()),
+        Some("expr")
+    );
     assert_eq!(
         value.get("command_name").and_then(|v| v.as_str()),
         Some("Expr")
@@ -53,8 +56,9 @@ fn sync_plugin_docs_rewrites_dylib_interfaces_json() {
 fn refresh_artifact_index_recomputes_hashes() {
     let temp = setup_fixture_copy();
     let index_path = temp.path().join("artifacts/index.json");
-    let mut value: Value = serde_json::from_str(&fs::read_to_string(&index_path).expect("read index"))
-        .expect("parse index");
+    let mut value: Value =
+        serde_json::from_str(&fs::read_to_string(&index_path).expect("read index"))
+            .expect("parse index");
 
     let entries = value
         .get_mut("entries")
@@ -65,8 +69,11 @@ fn refresh_artifact_index_recomputes_hashes() {
         .find(|entry| entry.get("plugin_path").and_then(|v| v.as_str()) == Some("shell"))
         .expect("shell entry");
     shell["sha256"] = Value::String("deadbeef".to_string());
-    fs::write(&index_path, serde_json::to_string_pretty(&value).expect("serialize index"))
-        .expect("write broken index");
+    fs::write(
+        &index_path,
+        serde_json::to_string_pretty(&value).expect("serialize index"),
+    )
+    .expect("write broken index");
 
     let refreshed = refresh_artifact_index(temp.path()).expect("refresh index should succeed");
     let (_, shell_hash) = refreshed
@@ -74,8 +81,9 @@ fn refresh_artifact_index_recomputes_hashes() {
         .find(|(plugin_path, _)| plugin_path == "shell")
         .expect("shell hash refreshed");
 
-    let updated: Value = serde_json::from_str(&fs::read_to_string(&index_path).expect("read updated index"))
-        .expect("parse updated index");
+    let updated: Value =
+        serde_json::from_str(&fs::read_to_string(&index_path).expect("read updated index"))
+            .expect("parse updated index");
     let updated_hash = updated
         .get("entries")
         .and_then(|v| v.as_array())

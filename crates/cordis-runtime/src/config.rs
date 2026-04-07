@@ -256,7 +256,9 @@ pub fn discover_config_dir(fixtures_root: &Path) -> PathBuf {
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join("config");
-    if sibling.exists() || fixtures_root.file_name().and_then(|name| name.to_str()) == Some("fixtures") {
+    if sibling.exists()
+        || fixtures_root.file_name().and_then(|name| name.to_str()) == Some("fixtures")
+    {
         return sibling;
     }
     fixtures_root.join("config")

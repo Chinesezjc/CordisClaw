@@ -25,10 +25,16 @@ pub enum PluginHostError {
     PluginNotFound { plugin_path: String },
 
     #[error("node docs not found: {plugin_path}::{node_id}")]
-    NodeNotFound { plugin_path: String, node_id: String },
+    NodeNotFound {
+        plugin_path: String,
+        node_id: String,
+    },
 
     #[error("plugin invocation failed for {plugin_path}: {message}")]
-    PluginInvocationFailed { plugin_path: String, message: String },
+    PluginInvocationFailed {
+        plugin_path: String,
+        message: String,
+    },
 
     #[error("plugin execution unsupported for {plugin_path}: artifact={artifact_path}")]
     PluginExecutionUnsupported {
@@ -173,7 +179,10 @@ fn resolve_artifact_path(index_path: &Path, artifact_path: &str) -> PathBuf {
     }
 }
 
-fn invoke_artifact(plugin: &CatalogPlugin, payload: String) -> Result<PluginResponse, PluginHostError> {
+fn invoke_artifact(
+    plugin: &CatalogPlugin,
+    payload: String,
+) -> Result<PluginResponse, PluginHostError> {
     if is_dylib_path(&plugin.artifact_path) {
         return invoke_dylib(plugin, payload);
     }
@@ -181,18 +190,23 @@ fn invoke_artifact(plugin: &CatalogPlugin, payload: String) -> Result<PluginResp
     invoke_json_artifact(plugin, payload)
 }
 
-fn invoke_dylib(plugin: &CatalogPlugin, payload: String) -> Result<PluginResponse, PluginHostError> {
-    let lib = unsafe { Library::new(&plugin.artifact_path) }.map_err(|err| PluginHostError::Io {
-        path: plugin.artifact_path.clone(),
-        message: format!("load dylib failed: {err}"),
-    })?;
-    let symbol_name = format!("{RUST_PLUGIN_ENTRY_SYMBOL}\0");
-    let symbol = unsafe { lib.get::<*const RustPluginApiV2>(symbol_name.as_bytes()) }.map_err(
-        |err| PluginHostError::Io {
+fn invoke_dylib(
+    plugin: &CatalogPlugin,
+    payload: String,
+) -> Result<PluginResponse, PluginHostError> {
+    let lib =
+        unsafe { Library::new(&plugin.artifact_path) }.map_err(|err| PluginHostError::Io {
             path: plugin.artifact_path.clone(),
-            message: format!("symbol lookup failed ({RUST_PLUGIN_ENTRY_SYMBOL}): {err}"),
-        },
-    )?;
+            message: format!("load dylib failed: {err}"),
+        })?;
+    let symbol_name = format!("{RUST_PLUGIN_ENTRY_SYMBOL}\0");
+    let symbol =
+        unsafe { lib.get::<*const RustPluginApiV2>(symbol_name.as_bytes()) }.map_err(|err| {
+            PluginHostError::Io {
+                path: plugin.artifact_path.clone(),
+                message: format!("symbol lookup failed ({RUST_PLUGIN_ENTRY_SYMBOL}): {err}"),
+            }
+        })?;
     let api_ptr = *symbol;
     if api_ptr.is_null() {
         return Err(PluginHostError::Io {
@@ -224,20 +238,20 @@ fn invoke_json_artifact(
                 })?;
 
             if let Some(stdin) = child.stdin.as_mut() {
-                stdin
-                    .write_all(payload.as_bytes())
-                    .map_err(|err| PluginHostError::PluginInvocationFailed {
+                stdin.write_all(payload.as_bytes()).map_err(|err| {
+                    PluginHostError::PluginInvocationFailed {
                         plugin_path: plugin.plugin_path.clone(),
                         message: format!("write stdin failed: {err}"),
-                    })?;
+                    }
+                })?;
             }
 
-            let output = child
-                .wait_with_output()
-                .map_err(|err| PluginHostError::PluginInvocationFailed {
+            let output = child.wait_with_output().map_err(|err| {
+                PluginHostError::PluginInvocationFailed {
                     plugin_path: plugin.plugin_path.clone(),
                     message: format!("wait failed: {err}"),
-                })?;
+                }
+            })?;
 
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();

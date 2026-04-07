@@ -123,11 +123,15 @@ pub struct ContextMetricsSnapshot {
 
 impl ContextMetrics {
     fn inc_read(&self) {
-        self.inner.context_read_total.fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .context_read_total
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     fn inc_write(&self) {
-        self.inner.context_write_total.fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .context_write_total
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     fn inc_overlay_rollback(&self) {
@@ -234,8 +238,11 @@ pub trait ContextTxn {
     fn begin_subgraph(&mut self, subgraph_id: &str) -> Result<(), RuntimeError>;
     fn commit_overlay(&mut self, subgraph_id: &str) -> Result<(), RuntimeError>;
     fn rollback_overlay(&mut self, subgraph_id: &str) -> Result<(), RuntimeError>;
-    fn commit_session(&mut self, session_id: &str, expected_version: u64)
-        -> Result<(), RuntimeError>;
+    fn commit_session(
+        &mut self,
+        session_id: &str,
+        expected_version: u64,
+    ) -> Result<(), RuntimeError>;
 }
 
 impl RuntimeContext {
@@ -270,9 +277,7 @@ impl RuntimeContext {
         Ok(self.lookup_slot_entry(key)?.map(|x| x.meta.clone()))
     }
 
-    fn with_active_overlay_mut(
-        &mut self,
-    ) -> Option<&mut BTreeMap<ContextKey, Option<SlotEntry>>> {
+    fn with_active_overlay_mut(&mut self) -> Option<&mut BTreeMap<ContextKey, Option<SlotEntry>>> {
         let active = self.active_subgraph.clone()?;
         self.subgraph_overlays.get_mut(&active)
     }
@@ -346,9 +351,7 @@ impl RuntimeContext {
                 Some(PluginLoadResult::Unavailable(_))
             ) {
                 // Parent/local unavailable should fail explicitly, not silently skip.
-                return Err(RuntimeError::ContextPluginUnavailable {
-                    plugin_path: path,
-                });
+                return Err(RuntimeError::ContextPluginUnavailable { plugin_path: path });
             }
 
             if let Some(scope) = self.local.get(&path) {
@@ -397,10 +400,12 @@ impl ContextRegistry for RuntimeContext {
                     message: "local scope provide requires plugin_path".to_string(),
                 })?;
                 let scope = self.local.entry(path.to_string()).or_default();
-                scope.provide(id, service, false).map_err(|_| RuntimeError::DuplicateService {
-                    plugin_path: path.to_string(),
-                    service: id.to_string(),
-                })
+                scope
+                    .provide(id, service, false)
+                    .map_err(|_| RuntimeError::DuplicateService {
+                        plugin_path: path.to_string(),
+                        service: id.to_string(),
+                    })
             }
         }
     }
@@ -460,7 +465,10 @@ impl ContextRegistry for RuntimeContext {
                 let path = plugin_path.ok_or_else(|| RuntimeError::Invariant {
                     message: "local scope dispose requires plugin_path".to_string(),
                 })?;
-                self.local.get_mut(path).map(|x| x.remove(id)).unwrap_or(false)
+                self.local
+                    .get_mut(path)
+                    .map(|x| x.remove(id))
+                    .unwrap_or(false)
             }
         };
 
@@ -481,12 +489,12 @@ impl ContextRead for RuntimeContext {
         let Some(entry) = self.lookup_slot_entry(key)? else {
             return Ok(None);
         };
-        serde_json::from_value::<T>(entry.value.clone()).map(Some).map_err(|e| {
-            RuntimeError::ContextDeserialize {
+        serde_json::from_value::<T>(entry.value.clone())
+            .map(Some)
+            .map_err(|e| RuntimeError::ContextDeserialize {
                 key: key.as_compact(),
                 message: e.to_string(),
-            }
-        })
+            })
     }
 
     fn contains(&self, key: &ContextKey) -> bool {
@@ -590,12 +598,11 @@ impl ContextTxn for RuntimeContext {
                 subgraph_id: subgraph_id.to_string(),
             });
         }
-        let overlay = self
-            .subgraph_overlays
-            .remove(subgraph_id)
-            .ok_or_else(|| RuntimeError::SubgraphNotFound {
+        let overlay = self.subgraph_overlays.remove(subgraph_id).ok_or_else(|| {
+            RuntimeError::SubgraphNotFound {
                 subgraph_id: subgraph_id.to_string(),
-            })?;
+            }
+        })?;
 
         for (key, delta) in overlay {
             match delta {
@@ -651,8 +658,13 @@ impl ContextTxn for RuntimeContext {
         }
         self.request_slots.clear();
         self.session_version += 1;
-        self.metrics
-            .add_commit_latency_ms(started_at.elapsed().as_millis().try_into().unwrap_or(u64::MAX));
+        self.metrics.add_commit_latency_ms(
+            started_at
+                .elapsed()
+                .as_millis()
+                .try_into()
+                .unwrap_or(u64::MAX),
+        );
         Ok(())
     }
 }

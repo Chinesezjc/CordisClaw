@@ -8,7 +8,7 @@
 - 插件加载是严格的，依赖 ABI 指纹、工件索引和 `sha256` 校验。
 - 插件对外能力是文档驱动的，运行时通过 `docs/agent/interfaces.json` 建立节点注册、文档查询和图可视化。
 - 插件之间的服务访问不是默认开放的，而是通过父子边上的 `grants` 精确授权。
-- 执行层不是“直接调函数”，而是围绕 DAG、Gate、Router、Actor mailbox 和确定性调度组织。
+- 执行层不是“直接调函数”，而是围绕 CPN Net、Router、Actor mailbox 与受控调度组织。
 - 内核层保留了一个最小的自迭代闭环，用来验证自动修改、验证、评分、回滚这条链。
 - 宿主层现在支持常驻 `RuntimeHost`，通过原子快照切换完成显式插件热插拔。
 
@@ -75,7 +75,7 @@ CordisClaw/
 | Core | `crates/cordis-runtime/src/core` | 统一错误模型和基础数据契约 |
 | Plugin | `crates/cordis-runtime/src/plugin` | 发现、解析、工件校验、动态加载、调用、注册 |
 | Context | `crates/cordis-runtime/src/context` | `provide/inject/dispose`、overlay、session CAS |
-| Execution | `crates/cordis-runtime/src/execution` | DAG、Gate、Router、Actor、Scheduler、Engine |
+| Execution | `crates/cordis-runtime/src/execution` | CPN Net、Router、Actor、Scheduler、Engine |
 | Kernel / Service | `crates/cordis-runtime/src/kernel`、`src/service` | 自迭代闭环、文档服务、图服务 |
 | Host / Config | `crates/cordis-runtime/src/host.rs`、`src/config.rs`、`config.example/`、`config/` | 常驻宿主、快照切换、Kernel 配置模板与本地 YAML 入口 |
 
@@ -126,7 +126,7 @@ CordisClaw/
 - 文档路由查询。
 - Shell 命令发现。
 - 注册图导出。
-- 已注册 DAG 推导。
+- 已注册 net 推导。
 
 ## 5. 主流程总览
 
@@ -141,7 +141,7 @@ fixtures/plugins/Cargo.toml
   -> staged snapshot artifacts
   -> PluginRegistry + NodeRegistry + RuntimeContext
   -> DocRegistry + GraphRegistry
-  -> RuntimeHost / PluginInvoker / graph-html / dag-html / tests
+  -> RuntimeHost / PluginInvoker / graph-html / net-html / tests
 ```
 
 更细一点：
@@ -151,5 +151,5 @@ fixtures/plugins/Cargo.toml
 3. `Loader` 读取 `fixtures/artifacts/index.json`，逐个插件做预算检查、ABI 指纹检查、哈希检查和 artifact 实例化。
 4. `RuntimeHost` 会把候选工件复制到 snapshot 专属 staging 目录，避免旧请求被新工件覆盖。
 5. 成功加载的插件进入 `PluginRegistry`，其节点进入 `NodeRegistry`，上下文权限映射进入 `RuntimeContext`。
-6. `DocRegistry` 从已注册插件收集 docs，`GraphRegistry` 从注册表派生插件图和节点 DAG。
+6. `DocRegistry` 从已注册插件收集 docs，`GraphRegistry` 从注册表派生插件图和节点 net。
 7. CLI 或测试再基于这些结果做 invoke、显式 `reload`、导图、上下文验证或执行语义验证。

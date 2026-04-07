@@ -96,15 +96,17 @@ impl PackageResolver {
     pub fn resolve(&self) -> Result<ResolvedPluginGraph, RuntimeError> {
         // Start from top-level workspace members only. No implicit filesystem scan.
         let workspace_manifest = self.plugins_root.join("Cargo.toml");
-        let workspace_text = fs::read_to_string(&workspace_manifest).map_err(|e| RuntimeError::Io {
-            path: workspace_manifest.clone(),
-            message: e.to_string(),
-        })?;
+        let workspace_text =
+            fs::read_to_string(&workspace_manifest).map_err(|e| RuntimeError::Io {
+                path: workspace_manifest.clone(),
+                message: e.to_string(),
+            })?;
 
-        let workspace: WorkspaceToml = toml::from_str(&workspace_text).map_err(|e| RuntimeError::CargoParse {
-            path: workspace_manifest.clone(),
-            message: e.to_string(),
-        })?;
+        let workspace: WorkspaceToml =
+            toml::from_str(&workspace_text).map_err(|e| RuntimeError::CargoParse {
+                path: workspace_manifest.clone(),
+                message: e.to_string(),
+            })?;
 
         let members = workspace
             .workspace
@@ -132,13 +134,7 @@ impl PackageResolver {
         for member in members {
             let member_dir = self.plugins_root.join(member);
             // Root plugins are treated as required roots.
-            self.visit_plugin(
-                &member_dir,
-                None,
-                true,
-                BTreeSet::new(),
-                &mut state,
-            )?;
+            self.visit_plugin(&member_dir, None, true, BTreeSet::new(), &mut state)?;
         }
 
         Ok(ResolvedPluginGraph {
@@ -170,10 +166,11 @@ impl PackageResolver {
             message: e.to_string(),
         })?;
 
-        let plugin_toml: PluginCargoToml = toml::from_str(&cargo_text).map_err(|e| RuntimeError::CargoParse {
-            path: cargo_path.clone(),
-            message: e.to_string(),
-        })?;
+        let plugin_toml: PluginCargoToml =
+            toml::from_str(&cargo_text).map_err(|e| RuntimeError::CargoParse {
+                path: cargo_path.clone(),
+                message: e.to_string(),
+            })?;
 
         let package = plugin_toml
             .package
@@ -181,12 +178,11 @@ impl PackageResolver {
                 path: cargo_path.clone(),
             })?;
 
-        let metadata = package
-            .metadata
-            .and_then(|m| m.cordis)
-            .ok_or_else(|| RuntimeError::MissingCordisMetadata {
+        let metadata = package.metadata.and_then(|m| m.cordis).ok_or_else(|| {
+            RuntimeError::MissingCordisMetadata {
                 path: cargo_path.clone(),
-            })?;
+            }
+        })?;
 
         let expected_plugin_path = self.expected_plugin_path(dir)?;
         if metadata.plugin_path != expected_plugin_path {
@@ -309,15 +305,15 @@ impl PackageResolver {
 
     fn expected_plugin_path(&self, dir: &Path) -> Result<String, RuntimeError> {
         // Canonical plugin_path is derived from directory relative to plugins_root.
-        let relative = dir
-            .strip_prefix(&self.plugins_root)
-            .map_err(|_| RuntimeError::Invariant {
-                message: format!(
-                    "plugin dir {} is not under plugins root {}",
-                    dir.display(),
-                    self.plugins_root.display()
-                ),
-            })?;
+        let relative =
+            dir.strip_prefix(&self.plugins_root)
+                .map_err(|_| RuntimeError::Invariant {
+                    message: format!(
+                        "plugin dir {} is not under plugins root {}",
+                        dir.display(),
+                        self.plugins_root.display()
+                    ),
+                })?;
 
         let mut segments = Vec::new();
         for component in relative.components() {
@@ -356,7 +352,11 @@ impl PackageResolver {
         }
     }
 
-    fn validate_docs_contract(&self, plugin_path: &str, dir: &Path) -> Result<PluginDocs, RuntimeError> {
+    fn validate_docs_contract(
+        &self,
+        plugin_path: &str,
+        dir: &Path,
+    ) -> Result<PluginDocs, RuntimeError> {
         // `interfaces.json` is machine-facing contract; parsing failure is fatal.
         let docs_path = dir.join("docs/agent/interfaces.json");
         let docs_text = fs::read_to_string(&docs_path).map_err(|e| RuntimeError::Io {
@@ -364,10 +364,11 @@ impl PackageResolver {
             message: e.to_string(),
         })?;
 
-        let docs: PluginDocs = serde_json::from_str(&docs_text).map_err(|e| RuntimeError::DocsContract {
-            plugin_path: plugin_path.to_string(),
-            message: format!("interfaces.json parse failed: {e}"),
-        })?;
+        let docs: PluginDocs =
+            serde_json::from_str(&docs_text).map_err(|e| RuntimeError::DocsContract {
+                plugin_path: plugin_path.to_string(),
+                message: format!("interfaces.json parse failed: {e}"),
+            })?;
 
         if docs.plugin_path != plugin_path {
             return Err(RuntimeError::DocsContract {

@@ -54,15 +54,15 @@
 
 - `docs/agent/interfaces.json` 作为运行时输入，参与节点注册、文档查询和图导出。
 - `DocRegistry` 已提供稳定的 route-style 查询约定。
-- `GraphRegistry` 已能导出“已注册节点图”和“已注册 DAG”的 JSON/HTML。
-- CLI 已暴露 `invoke`、`graph-html`、`dag-html`、`sync-plugin-docs`、`refresh-artifact-index`、`auto-update` 等入口。
+- `GraphRegistry` 已能导出“已注册节点图”和“已注册 net”的 JSON/HTML。
+- CLI 已暴露 `invoke`、`graph-html`、`net-html`、`sync-plugin-docs`、`refresh-artifact-index`、`auto-update` 等入口。
 
 ### 3.4 测试矩阵覆盖了当前原型的主线契约
 
 [maintenance-guide.md](./maintenance-guide.md) 已把测试矩阵列出来，覆盖：
 
 - `architecture.rs`：resolver / loader / grants / graph / invoke
-- `semantics.rs`：DAG / Gate / Context / Engine
+- `semantics.rs`：CPN Net / Context / Engine
 - `kernel.rs`：自迭代闭环判定
 - `auto_update.rs`：补丁应用、回滚、路径安全
 - `tooling.rs`：docs 回写与工件索引刷新
@@ -75,12 +75,12 @@
 
 [runtime-semantics.md](./runtime-semantics.md) 明确写到：
 
-- DAG、Gate、Router、Actor、Scheduler、`execute_graph()` 这些执行语义已经作为库实现完成。
+- CPN Net、Router、Actor、Scheduler、`execute_net()` 这些执行语义已经作为库实现完成。
 - 当前已新增 `execute` CLI 与 `serve execute` 控制面命令，可对注册节点跑一条受控的执行链路，并返回 `execution_id`、顺序、结果与 metrics。
 
 因此它已经从“纯库级语义”推进到了“有正式入口的运行时原型”。
 
-尚未完成的是把 execution engine 接到更真实的数据流与业务图，而不只是保守的注册 DAG / 节点执行入口。
+尚未完成的是把 execution engine 接到更真实的数据流与业务图，而不只是保守的注册 net / 节点执行入口。
 
 ### 4.2 Kernel 已有最小闭环，但仍是骨架级实现
 
@@ -174,9 +174,9 @@
 
 当前 `DocRegistry` 的“GET”只是 route-style helper，不是 HTTP 服务。
 
-`GraphRegistry` 导出的 DAG 也是“注册视图”，并不等于真实业务执行流。现有 DAG 推导仍然偏保守，主要基于 schema 属性名匹配。
+`GraphRegistry` 导出的 net 也是“注册视图”，并不等于真实业务执行流。现有 net 推导仍然偏保守，主要基于 schema 属性名匹配。
 
-因此“服务边界稳定化”和“更丰富的 DAG 推导规则”都还没有完成。
+因此“服务边界稳定化”和“更丰富的 net 推导规则”都还没有完成。
 
 ### 5.5 更多插件样例与 loader 边界验证还可以继续补
 
@@ -194,7 +194,7 @@
 
 1. 把 execution engine 接到一个真实入口，避免执行层长期只停留在库语义。
 2. 把 Kernel 从“已应用补丁后的判定器”升级为“能生成 patch proposal 并运行真实验证”的闭环。
-3. 把 graph/doc helper 收敛成更稳定的服务边界，并增强 DAG 推导规则。
+3. 把 graph/doc helper 收敛成更稳定的服务边界，并增强 net 推导规则。
 4. 补更多插件样例与契约测试，再决定是否继续扩展到 `cdylib` / `WASM`。
 
 ## 7. 当前最准确的总体判断

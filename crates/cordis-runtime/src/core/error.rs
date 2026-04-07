@@ -77,7 +77,9 @@ pub enum RuntimeError {
         artifact_path: PathBuf,
     },
 
-    #[error("artifact hash mismatch for plugin {plugin_path}: expected {expected}, actual {actual}")]
+    #[error(
+        "artifact hash mismatch for plugin {plugin_path}: expected {expected}, actual {actual}"
+    )]
     ArtifactHashMismatch {
         plugin_path: String,
         expected: String,
@@ -134,8 +136,8 @@ pub enum RuntimeError {
         second: String,
     },
 
-    #[error("dag build failed: {message}")]
-    DagBuild { message: String },
+    #[error("net build failed: {message}")]
+    NetBuild { message: String },
 
     #[error("execution failed: execution_id={execution_id}, message={message}")]
     ExecutionFailed {
@@ -147,13 +149,19 @@ pub enum RuntimeError {
     PluginDocsNotFound { plugin_path: String },
 
     #[error("node docs not found: {plugin_path}::{node_id}")]
-    NodeDocsNotFound { plugin_path: String, node_id: String },
+    NodeDocsNotFound {
+        plugin_path: String,
+        node_id: String,
+    },
 
     #[error("invalid docs route path: {path}")]
     InvalidDocsRoute { path: String },
 
     #[error("service permission denied for plugin {plugin_path}: {service}")]
-    PermissionDenied { plugin_path: String, service: String },
+    PermissionDenied {
+        plugin_path: String,
+        service: String,
+    },
 
     #[error("plugin unavailable in context: {plugin_path}")]
     ContextPluginUnavailable { plugin_path: String },
@@ -162,13 +170,22 @@ pub enum RuntimeError {
     CandidateSnapshotMissing,
 
     #[error("service not found in context for plugin {plugin_path}: {service}")]
-    ServiceNotFound { plugin_path: String, service: String },
+    ServiceNotFound {
+        plugin_path: String,
+        service: String,
+    },
 
     #[error("service type mismatch in context for plugin {plugin_path}: {service}")]
-    ServiceTypeMismatch { plugin_path: String, service: String },
+    ServiceTypeMismatch {
+        plugin_path: String,
+        service: String,
+    },
 
     #[error("duplicate service in same scope for plugin {plugin_path}: {service}")]
-    DuplicateService { plugin_path: String, service: String },
+    DuplicateService {
+        plugin_path: String,
+        service: String,
+    },
 
     #[error("context serialize failed for key {key}: {message}")]
     ContextSerialize { key: String, message: String },
@@ -176,7 +193,9 @@ pub enum RuntimeError {
     #[error("context deserialize failed for key {key}: {message}")]
     ContextDeserialize { key: String, message: String },
 
-    #[error("context schema version incompatible for key {key}: expected={expected}, actual={actual}")]
+    #[error(
+        "context schema version incompatible for key {key}: expected={expected}, actual={actual}"
+    )]
     ContextVersionIncompatible {
         key: String,
         expected: u32,

@@ -18,7 +18,11 @@ pub struct IterationPolicy {
 impl Default for IterationPolicy {
     fn default() -> Self {
         Self {
-            path_allowlist: vec!["crates/".to_string(), "docs/".to_string(), "tests/".to_string()],
+            path_allowlist: vec![
+                "crates/".to_string(),
+                "docs/".to_string(),
+                "tests/".to_string(),
+            ],
             sensitive_path_prefixes: vec![
                 "crates/cordis-runtime/src/core/".to_string(),
                 "crates/cordis-runtime/src/plugin/".to_string(),

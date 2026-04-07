@@ -16,7 +16,7 @@
 - 插件加载依赖 ABI 指纹、artifact index 与 `sha256` 校验
 - 插件能力通过 `docs/agent/interfaces.json` 暴露
 - 服务注入通过父子边上的 `grants` 控制
-- 运行时围绕 DAG、Gate、Router、Actor 和 Kernel 原型组织
+- 运行时围绕 CPN/Net、Gate、Router、Actor 和 Kernel 原型组织
 
 ## 文档地图
 

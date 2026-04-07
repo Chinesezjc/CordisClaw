@@ -209,9 +209,7 @@ fn write_demo_artifacts(root: &Path, version: &str) {
 
 #[cfg(unix)]
 fn make_executable(path: &Path) {
-    let mut permissions = fs::metadata(path)
-        .expect("runner metadata")
-        .permissions();
+    let mut permissions = fs::metadata(path).expect("runner metadata").permissions();
     permissions.set_mode(0o755);
     fs::set_permissions(path, permissions).expect("set runner executable");
 }
@@ -221,8 +219,9 @@ fn make_executable(_path: &Path) {}
 
 fn append_demo_index_entry(root: &Path, version: &str) {
     let index_path = root.join("artifacts/index.json");
-    let mut value: Value = serde_json::from_str(&fs::read_to_string(&index_path).expect("read index"))
-        .expect("parse index");
+    let mut value: Value =
+        serde_json::from_str(&fs::read_to_string(&index_path).expect("read index"))
+            .expect("parse index");
     value["generated_at"] = Value::String("2026-03-11T00:00:00Z".to_string());
     value
         .get_mut("topo_order")
@@ -295,8 +294,9 @@ fn append_demo_index_entry(root: &Path, version: &str) {
 
 fn sync_demo_index_entry(root: &Path, version: &str) {
     let index_path = root.join("artifacts/index.json");
-    let mut value: Value = serde_json::from_str(&fs::read_to_string(&index_path).expect("read index"))
-        .expect("parse index");
+    let mut value: Value =
+        serde_json::from_str(&fs::read_to_string(&index_path).expect("read index"))
+            .expect("parse index");
     let entries = value
         .get_mut("entries")
         .and_then(|entries| entries.as_array_mut())
@@ -318,8 +318,9 @@ fn sync_demo_index_entry(root: &Path, version: &str) {
 
 fn overwrite_index_hash(root: &Path, plugin_path: &str, hash: &str) {
     let index_path = root.join("artifacts/index.json");
-    let mut value: Value = serde_json::from_str(&fs::read_to_string(&index_path).expect("read index"))
-        .expect("parse index");
+    let mut value: Value =
+        serde_json::from_str(&fs::read_to_string(&index_path).expect("read index"))
+            .expect("parse index");
     let entries = value
         .get_mut("entries")
         .and_then(|entries| entries.as_array_mut())
@@ -403,10 +404,18 @@ fn runtime_host_reload_adds_top_level_plugin() {
     let report = host.reload().expect("reload with demo should succeed");
 
     assert!(report.added_plugins.iter().any(|plugin| plugin == "demo"));
-    assert!(host.current_snapshot().plugin_registry().get("demo").is_some());
+    assert!(host
+        .current_snapshot()
+        .plugin_registry()
+        .get("demo")
+        .is_some());
 
     let response = host
-        .invoke("demo", "demo_entry", json!({ "message": "hello" }).to_string())
+        .invoke(
+            "demo",
+            "demo_entry",
+            json!({ "message": "hello" }).to_string(),
+        )
         .expect("demo invoke should succeed");
     let value: Value = serde_json::from_str(&response.payload).expect("demo response json");
     assert_eq!(value.get("version").and_then(|v| v.as_str()), Some("v1"));
@@ -419,8 +428,9 @@ fn runtime_host_reload_removes_plugin_but_old_snapshot_stays_usable() {
     let old_snapshot = host.current_snapshot();
 
     let index_path = temp.path().join("artifacts/index.json");
-    let mut value: Value = serde_json::from_str(&fs::read_to_string(&index_path).expect("read index"))
-        .expect("parse index");
+    let mut value: Value =
+        serde_json::from_str(&fs::read_to_string(&index_path).expect("read index"))
+            .expect("parse index");
     value
         .get_mut("entries")
         .and_then(|entries| entries.as_array_mut())
@@ -438,8 +448,15 @@ fn runtime_host_reload_removes_plugin_but_old_snapshot_stays_usable() {
     .expect("write updated index");
     let report = host.reload().expect("reload without shell should succeed");
 
-    assert!(report.removed_plugins.iter().any(|plugin| plugin == "shell"));
-    assert!(host.current_snapshot().plugin_registry().get("shell").is_none());
+    assert!(report
+        .removed_plugins
+        .iter()
+        .any(|plugin| plugin == "shell"));
+    assert!(host
+        .current_snapshot()
+        .plugin_registry()
+        .get("shell")
+        .is_none());
 
     let response = old_snapshot
         .invoke(
@@ -459,7 +476,9 @@ fn runtime_host_reload_failure_keeps_current_snapshot() {
     let snapshot_id = host.current_snapshot().snapshot_id().to_string();
 
     overwrite_index_hash(temp.path(), "shell", "deadbeef");
-    let err = host.reload().expect_err("reload should fail on hash mismatch");
+    let err = host
+        .reload()
+        .expect_err("reload should fail on hash mismatch");
     assert!(err.to_string().contains("HashMismatch") || err.to_string().contains("hash"));
 
     assert_eq!(host.current_snapshot().snapshot_id(), snapshot_id);
@@ -485,22 +504,41 @@ fn runtime_host_snapshot_keeps_old_staged_process_artifact_after_reload() {
     write_demo_artifacts(temp.path(), "v2");
     sync_demo_index_entry(temp.path(), "v2");
     refresh_artifact_index(temp.path()).expect("refresh index after demo update");
-    host.reload().expect("reload with updated demo should succeed");
+    host.reload()
+        .expect("reload with updated demo should succeed");
 
     let old_response = old_snapshot
-        .invoke("demo", "demo_entry", json!({ "message": "hello" }).to_string())
+        .invoke(
+            "demo",
+            "demo_entry",
+            json!({ "message": "hello" }).to_string(),
+        )
         .expect("old snapshot invoke should succeed");
     let new_response = host
-        .invoke("demo", "demo_entry", json!({ "message": "hello" }).to_string())
+        .invoke(
+            "demo",
+            "demo_entry",
+            json!({ "message": "hello" }).to_string(),
+        )
         .expect("new snapshot invoke should succeed");
 
     let old_value: Value = serde_json::from_str(&old_response.payload).expect("old demo json");
     let new_value: Value = serde_json::from_str(&new_response.payload).expect("new demo json");
-    assert_eq!(old_value.get("version").and_then(|v| v.as_str()), Some("v1"));
-    assert_eq!(new_value.get("version").and_then(|v| v.as_str()), Some("v2"));
+    assert_eq!(
+        old_value.get("version").and_then(|v| v.as_str()),
+        Some("v1")
+    );
+    assert_eq!(
+        new_value.get("version").and_then(|v| v.as_str()),
+        Some("v2")
+    );
 
     drop(old_snapshot);
-    let _ = host.invoke("demo", "demo_entry", json!({ "message": "hello" }).to_string());
+    let _ = host.invoke(
+        "demo",
+        "demo_entry",
+        json!({ "message": "hello" }).to_string(),
+    );
     assert!(
         !old_stage.exists(),
         "old staged artifact root should be cleaned after snapshot drop"
@@ -554,7 +592,11 @@ fn runtime_host_execute_runs_registered_target_through_execution_engine() {
         .expect("execute should succeed");
 
     assert_eq!(result.target_node_fqn, "expr::expr_entry");
-    assert!(result.output.order.iter().any(|node| node == "expr::expr_entry"));
+    assert!(result
+        .output
+        .order
+        .iter()
+        .any(|node| node == "expr::expr_entry"));
     assert_eq!(
         result.output.outcomes.get("expr::expr_entry"),
         Some(&cordis_runtime::core::models::NodeOutcome::Success)
@@ -610,7 +652,11 @@ fn runtime_host_candidate_reload_stages_snapshot_without_switching_current() {
 
     assert_eq!(status.from_snapshot_id, current_snapshot_id);
     assert!(status.added_plugins.iter().any(|plugin| plugin == "demo"));
-    assert!(host.current_snapshot().plugin_registry().get("demo").is_none());
+    assert!(host
+        .current_snapshot()
+        .plugin_registry()
+        .get("demo")
+        .is_none());
     assert_eq!(host.candidate_status(), Some(status.clone()));
     assert_eq!(
         host.last_candidate_reload_attempt()
@@ -620,9 +666,14 @@ fn runtime_host_candidate_reload_stages_snapshot_without_switching_current() {
     );
 
     let response = host
-        .invoke_candidate("demo", "demo_entry", json!({ "message": "hello" }).to_string())
+        .invoke_candidate(
+            "demo",
+            "demo_entry",
+            json!({ "message": "hello" }).to_string(),
+        )
         .expect("candidate snapshot demo invoke should succeed");
-    let value: Value = serde_json::from_str(&response.payload).expect("candidate demo response json");
+    let value: Value =
+        serde_json::from_str(&response.payload).expect("candidate demo response json");
     assert_eq!(value.get("version").and_then(|v| v.as_str()), Some("v1"));
 }
 
@@ -643,7 +694,11 @@ fn runtime_host_promote_candidate_switches_current_and_keeps_old_snapshot_usable
     assert!(report.added_plugins.iter().any(|plugin| plugin == "demo"));
     assert!(host.candidate_snapshot().is_none());
     assert!(host.status().candidate_snapshot.is_none());
-    assert!(host.current_snapshot().plugin_registry().get("demo").is_some());
+    assert!(host
+        .current_snapshot()
+        .plugin_registry()
+        .get("demo")
+        .is_some());
     assert_eq!(
         host.last_reload_attempt()
             .expect("promote should record last reload")
@@ -658,14 +713,23 @@ fn runtime_host_promote_candidate_switches_current_and_keeps_old_snapshot_usable
             json!({ "expression": "3 + 4" }).to_string(),
         )
         .expect("old snapshot should still invoke expr");
-    let old_value: Value = serde_json::from_str(&old_response.payload).expect("old expr response json");
+    let old_value: Value =
+        serde_json::from_str(&old_response.payload).expect("old expr response json");
     assert_eq!(old_value.get("value").and_then(|v| v.as_f64()), Some(7.0));
 
     let new_response = host
-        .invoke("demo", "demo_entry", json!({ "message": "hello" }).to_string())
+        .invoke(
+            "demo",
+            "demo_entry",
+            json!({ "message": "hello" }).to_string(),
+        )
         .expect("promoted snapshot should invoke demo");
-    let new_value: Value = serde_json::from_str(&new_response.payload).expect("new demo response json");
-    assert_eq!(new_value.get("version").and_then(|v| v.as_str()), Some("v1"));
+    let new_value: Value =
+        serde_json::from_str(&new_response.payload).expect("new demo response json");
+    assert_eq!(
+        new_value.get("version").and_then(|v| v.as_str()),
+        Some("v1")
+    );
 }
 
 #[test]
@@ -685,9 +749,17 @@ fn runtime_host_rollback_candidate_discards_staged_snapshot() {
     assert_eq!(rolled_back, staged);
     assert!(host.candidate_snapshot().is_none());
     assert!(host.status().candidate_snapshot.is_none());
-    assert!(host.current_snapshot().plugin_registry().get("demo").is_none());
+    assert!(host
+        .current_snapshot()
+        .plugin_registry()
+        .get("demo")
+        .is_none());
     let err = host
-        .invoke_candidate("demo", "demo_entry", json!({ "message": "hello" }).to_string())
+        .invoke_candidate(
+            "demo",
+            "demo_entry",
+            json!({ "message": "hello" }).to_string(),
+        )
         .expect_err("candidate invoke should fail once candidate is rolled back");
     assert!(err.to_string().contains("candidate snapshot not staged"));
 }
@@ -736,6 +808,8 @@ fn serve_mode_supports_plugins_reload_and_kernel_status() {
 #[test]
 fn serve_mode_supports_candidate_control_plane() {
     let temp = setup_fixture_copy();
+    add_demo_process_plugin(temp.path(), "v1");
+
     let bin = env!("CARGO_BIN_EXE_cordis-runtime");
     let mut child = Command::new(bin)
         .args([
@@ -748,8 +822,6 @@ fn serve_mode_supports_candidate_control_plane() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn serve cli");
-
-    add_demo_process_plugin(temp.path(), "v1");
 
     let stdin = child.stdin.as_mut().expect("stdin pipe");
     use std::io::Write as _;

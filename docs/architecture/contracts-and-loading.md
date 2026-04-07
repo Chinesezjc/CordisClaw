@@ -50,7 +50,7 @@
 其中：
 
 - `command_name` 主要被 shell 插件用于命令发现和分发。
-- `input_schema` / `output_schema` 的属性名会被 `GraphRegistry` 用来推导已注册 DAG。
+- `input_schema` / `output_schema` 的属性名会被 `GraphRegistry` 用来推导已注册 net。
 
 ### 1.4 工件索引
 
@@ -167,8 +167,8 @@ required 子插件失败后，`Loader::propagate_parent_failure()` 会沿着 req
 - 已注册节点图：
   - 关注插件树与节点归属关系
   - 可导出 JSON 和自包含 HTML
-- 已注册 DAG：
+- 已注册 net：
   - 从节点 docs 的 `input_schema` / `output_schema` 推导数据边
   - 也可导出 JSON 和自包含 HTML
 
-注意这里的 DAG 是“文档推导的注册 DAG”，不是执行引擎真实运行时传入的任意 DAG。当前推导规则比较保守，主要基于 schema 属性名匹配。
+注意这里的 net 是“文档推导的注册 net”，不是执行引擎真实运行时传入的任意 net。当前推导规则比较保守，主要基于 schema 属性名匹配。

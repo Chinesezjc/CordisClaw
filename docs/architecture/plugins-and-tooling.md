@@ -69,7 +69,7 @@ expr
 这棵树有两个价值：
 
 - 演示 runtime 如何处理多层插件树与 required 子链。
-- 演示 docs 驱动的 DAG 推导可以自然得到 `lexer -> parser -> evaluator` 这条链。
+- 演示 docs 驱动的 net 推导可以自然得到 `lexer -> parser -> evaluator` 这条链。
 
 ### 1.4 `root` / `root/child` 样例
 
@@ -108,8 +108,8 @@ expr
   - 调用任意插件节点
 - `cargo run -p cordis-runtime -- graph-html fixtures --output=...`
   - 导出已注册节点图 HTML
-- `cargo run -p cordis-runtime -- dag-html fixtures --output=...`
-  - 导出已注册 DAG HTML
+- `cargo run -p cordis-runtime -- net-html fixtures --output=...`
+  - 导出已注册 net HTML
 - `cargo run -p cordis-runtime -- sync-plugin-docs fixtures`
   - 从 dylib `docs()` 回写 `interfaces.json`
 - `cargo run -p cordis-runtime -- refresh-artifact-index fixtures`

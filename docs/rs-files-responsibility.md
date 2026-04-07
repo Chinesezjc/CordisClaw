@@ -37,12 +37,12 @@
 | 文件 | 职责定位 | 关键入口 |
 |---|---|---|
 | `crates/cordis-runtime/src/execution/actor.rs` | Actor 执行原语：mailbox、批量派发、事件回传 | `ActorExecutor::dispatch_batch()` |
-| `crates/cordis-runtime/src/execution/dag.rs` | DAG 构图语义：冲突消解、缺失输入、环检测 | `build_dag()` |
-| `crates/cordis-runtime/src/execution/gate.rs` | Gate 策略评估：AllOf/AnyOf/FirstSuccess/... | `evaluate_gate()` |
+| `crates/cordis-runtime/src/execution/net.rs` | CPN Net 模型与校验：Place/Transition/Arc、join policy、token/correlation key 载体 | `build_petri_net()` |
+| `crates/cordis-runtime/src/execution/gate.rs` | 运行策略配置（retry/backoff/timeout） | `RunPolicy`、`BackoffPolicy` |
 | `crates/cordis-runtime/src/execution/router.rs` | Router 子图事务边界：begin/commit/rollback + 指标 | `execute_router()` |
 | `crates/cordis-runtime/src/execution/scheduler.rs` | 确定性调度原型与 ready 队列规则 | `run_deterministic()` |
-| `crates/cordis-runtime/src/execution/engine.rs` | 集成执行引擎：调度 + actor + retry/backoff + cancel 传播 | `execute_graph()` |
-| `crates/cordis-runtime/src/execution/mod.rs` | Execution 模块导出聚合 | `pub mod actor/dag/...` |
+| `crates/cordis-runtime/src/execution/engine.rs` | 集成执行引擎：调度 + actor + retry/backoff + cancel 传播 | `execute_net()` |
+| `crates/cordis-runtime/src/execution/mod.rs` | Execution 模块导出聚合 | `pub mod actor/net/...` |
 
 ## 5. Context 层 (`crates/cordis-runtime/src/context`)
 
@@ -66,7 +66,7 @@
 | 文件 | 职责定位 | 关键入口 |
 |---|---|---|
 | `crates/cordis-runtime/src/service/doc_registry.rs` | docs 注册与查询（含 GET 路径解析） | `DocRegistry::handle_get()` |
-| `crates/cordis-runtime/src/service/graph_registry.rs` | 已注册插件/节点图与推导 DAG 服务：输出 JSON 图模型与自包含 HTML 可视化 | `GraphRegistry::render_registered_nodes_html()`、`GraphRegistry::render_registered_dag_html()` |
+| `crates/cordis-runtime/src/service/graph_registry.rs` | 已注册插件/节点图与推导 net 服务：输出 JSON 图模型与自包含 HTML 可视化 | `GraphRegistry::render_registered_nodes_html()`、`GraphRegistry::render_registered_net_html()` |
 | `crates/cordis-runtime/src/service/mod.rs` | Service 模块导出聚合 | `pub mod doc_registry/graph_registry` |
 
 ## 8. Crate 根与 CLI
@@ -82,7 +82,7 @@
 | 文件 | 职责定位 | 关键入口 |
 |---|---|---|
 | `crates/cordis-runtime/tests/architecture.rs` | 架构契约验收：discover/resolve/load、grants、required/optional、hash mismatch、Unavailable 注入行为 | `load_success_and_grants_enforced` 等 |
-| `crates/cordis-runtime/tests/semantics.rs` | 语义契约验收：DAG/Gate/Context/Engine 确定性 | `dag_*`、`engine_*`、`context_*` |
+| `crates/cordis-runtime/tests/semantics.rs` | 语义契约验收：CPN Net/Context/Engine（join policy、late token、deterministic mode） | `petri_net_*`、`engine_*`、`context_*` |
 | `crates/cordis-runtime/tests/actor_executor.rs` | Actor 执行批次和并发上限行为 | `actor_executor_respects_parallel_limit_and_order` |
 | `crates/cordis-runtime/tests/auto_update.rs` | 自动更新行为验收：应用成功保留、验证失败回滚、路径越界拒绝 | `auto_update_*` |
 | `crates/cordis-runtime/tests/shell_plugin.rs` | 外部 shell 插件验收：loader 注册、generic invoke、交互 REPL、Expr 分发 | `shell_plugin_*` |
@@ -150,8 +150,8 @@
 2. `core/models.rs` + `core/error.rs`（再看 runtime 专属契约与错误语义）。
 3. `plugin/package.rs` + `plugin/loader.rs`（发现/解析/实例化主流程）。
 4. `context/mod.rs`（注入链、overlay、CAS）。
-5. `execution/dag.rs` + `execution/gate.rs` + `execution/actor.rs`（执行语义骨架）。
-6. `execution/engine.rs` + `execution/router.rs`（运行时集成与子图边界）。
+5. `execution/net.rs` + `execution/gate.rs` + `execution/actor.rs`（执行语义骨架）。
+6. `execution/engine.rs` + `execution/router.rs`（CPN 运行时集成与子图边界）。
 7. `kernel/` 五文件（含自动更新执行器）。
 8. `tests/*.rs`（对照验收场景）。
 
@@ -166,7 +166,7 @@
 - `crates/cordis-runtime/src/core/mod.rs`
 - `crates/cordis-runtime/src/core/models.rs`
 - `crates/cordis-runtime/src/execution/actor.rs`
-- `crates/cordis-runtime/src/execution/dag.rs`
+- `crates/cordis-runtime/src/execution/net.rs`
 - `crates/cordis-runtime/src/execution/engine.rs`
 - `crates/cordis-runtime/src/execution/gate.rs`
 - `crates/cordis-runtime/src/execution/mod.rs`

@@ -1,5 +1,7 @@
 use crate::core::error::RuntimeError;
-use crate::core::models::{ArtifactKind, DylibAbiKind, PluginExecution, PluginLoadResult, PluginUnavailableReason};
+use crate::core::models::{
+    ArtifactKind, DylibAbiKind, PluginExecution, PluginLoadResult, PluginUnavailableReason,
+};
 use crate::plugin::abi::{PluginRequest, PluginResponse};
 use crate::plugin::dynamic::{is_dylib_path, LoadedDylibApi};
 use crate::plugin::loader::{default_loader_config, Loader};
@@ -56,11 +58,12 @@ pub fn invoke_registered_plugin(
     node_id: &str,
     payload: String,
 ) -> Result<PluginResponse, RuntimeError> {
-    let plugin = plugin_registry
-        .get(plugin_path)
-        .ok_or_else(|| RuntimeError::PluginNotRegistered {
-            plugin_path: plugin_path.to_string(),
-        })?;
+    let plugin =
+        plugin_registry
+            .get(plugin_path)
+            .ok_or_else(|| RuntimeError::PluginNotRegistered {
+                plugin_path: plugin_path.to_string(),
+            })?;
 
     match &plugin.load_result {
         PluginLoadResult::Loaded => {}
@@ -86,9 +89,12 @@ pub fn invoke_registered_plugin(
         });
     }
 
-    let artifact_path = plugin.artifact_path.as_ref().ok_or_else(|| RuntimeError::Invariant {
-        message: format!("loaded plugin missing artifact path: {plugin_path}"),
-    })?;
+    let artifact_path = plugin
+        .artifact_path
+        .as_ref()
+        .ok_or_else(|| RuntimeError::Invariant {
+            message: format!("loaded plugin missing artifact path: {plugin_path}"),
+        })?;
 
     let artifact_kind = plugin
         .artifact_kind
@@ -127,18 +133,18 @@ pub fn invoke_registered_plugin(
         });
     }
 
-    let expected_fingerprint = plugin
-        .abi_fingerprint
-        .clone()
-        .ok_or_else(|| RuntimeError::Invariant {
-            message: format!("loaded plugin missing abi_fingerprint: {plugin_path}"),
-        })?;
-    let runtime_fingerprint = serde_json::from_str(&(api.abi_fingerprint)().payload).map_err(|err| {
-        RuntimeError::Io {
+    let expected_fingerprint =
+        plugin
+            .abi_fingerprint
+            .clone()
+            .ok_or_else(|| RuntimeError::Invariant {
+                message: format!("loaded plugin missing abi_fingerprint: {plugin_path}"),
+            })?;
+    let runtime_fingerprint =
+        serde_json::from_str(&(api.abi_fingerprint)().payload).map_err(|err| RuntimeError::Io {
             path: artifact_path.to_path_buf(),
             message: format!("runtime fingerprint parse failed: {err}"),
-        }
-    })?;
+        })?;
     if runtime_fingerprint != expected_fingerprint {
         let diff = expected_fingerprint.diff(&runtime_fingerprint);
         plugin_registry.mark_runtime_unavailable(
@@ -154,10 +160,11 @@ pub fn invoke_registered_plugin(
         });
     }
 
-    let runtime_docs = serde_json::from_str(&(api.docs)().payload).map_err(|err| RuntimeError::Io {
-        path: artifact_path.to_path_buf(),
-        message: format!("runtime docs parse failed: {err}"),
-    })?;
+    let runtime_docs =
+        serde_json::from_str(&(api.docs)().payload).map_err(|err| RuntimeError::Io {
+            path: artifact_path.to_path_buf(),
+            message: format!("runtime docs parse failed: {err}"),
+        })?;
     if plugin.docs.as_ref() != Some(&runtime_docs) {
         plugin_registry.mark_runtime_unavailable(
             plugin_path,
@@ -195,20 +202,21 @@ fn invoke_json_artifact(
                 })?;
 
             if let Some(stdin) = child.stdin.as_mut() {
-                stdin
-                    .write_all(payload.as_bytes())
-                    .map_err(|e| RuntimeError::PluginInvocationFailed {
+                stdin.write_all(payload.as_bytes()).map_err(|e| {
+                    RuntimeError::PluginInvocationFailed {
                         plugin_path: plugin_path.to_string(),
                         message: format!("write stdin failed: {e}"),
-                    })?;
+                    }
+                })?;
             }
 
-            let output = child
-                .wait_with_output()
-                .map_err(|e| RuntimeError::PluginInvocationFailed {
-                    plugin_path: plugin_path.to_string(),
-                    message: format!("wait failed: {e}"),
-                })?;
+            let output =
+                child
+                    .wait_with_output()
+                    .map_err(|e| RuntimeError::PluginInvocationFailed {
+                        plugin_path: plugin_path.to_string(),
+                        message: format!("wait failed: {e}"),
+                    })?;
 
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();

@@ -65,7 +65,11 @@ fn kernel_rolls_back_on_path_violation() {
     assert_eq!(report.verdict, ChangeVerdict::Rollback);
     assert_eq!(report.stages.last(), Some(&IterationStage::Rollback));
     assert!(
-        report.evaluation.reasons.iter().any(|r| r == "path_not_allowed"),
+        report
+            .evaluation
+            .reasons
+            .iter()
+            .any(|r| r == "path_not_allowed"),
         "expected path_not_allowed reason, got {:?}",
         report.evaluation.reasons
     );

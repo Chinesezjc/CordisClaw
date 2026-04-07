@@ -99,7 +99,12 @@ impl FilePatch {
 
     pub fn diff_line_estimate(&self) -> usize {
         match self.kind {
-            FilePatchKind::Text => self.find.lines().count().max(self.replace.lines().count()).max(1),
+            FilePatchKind::Text => self
+                .find
+                .lines()
+                .count()
+                .max(self.replace.lines().count())
+                .max(1),
             FilePatchKind::JsonValue | FilePatchKind::TomlValue => 1,
         }
     }
@@ -128,7 +133,10 @@ impl FilePatch {
             FilePatchKind::TomlValue => {
                 if self.dotted_key.as_deref().unwrap_or_default().is_empty() {
                     return Err(RuntimeError::LlmResponseInvalid {
-                        message: format!("toml_value patch for {} is missing `dotted_key`", self.path),
+                        message: format!(
+                            "toml_value patch for {} is missing `dotted_key`",
+                            self.path
+                        ),
                     });
                 }
                 if self.value.is_none() {
@@ -272,7 +280,10 @@ impl AutoUpdater {
                 reason: "absolute path is not allowed".to_string(),
             });
         }
-        if rel_path.components().any(|c| matches!(c, Component::ParentDir)) {
+        if rel_path
+            .components()
+            .any(|c| matches!(c, Component::ParentDir))
+        {
             return Err(RuntimeError::AutoUpdateInvalidPath {
                 path: rel.to_string(),
                 reason: "parent directory traversal (..) is not allowed".to_string(),
@@ -330,10 +341,13 @@ fn apply_json_patch(
     original: &str,
 ) -> Result<String, RuntimeError> {
     let pointer = patch.pointer.as_deref().unwrap_or_default();
-    let replacement = patch.value.clone().ok_or_else(|| RuntimeError::AutoUpdatePatchInvalid {
-        path: patch.path.clone(),
-        reason: "json_value patch missing replacement value".to_string(),
-    })?;
+    let replacement = patch
+        .value
+        .clone()
+        .ok_or_else(|| RuntimeError::AutoUpdatePatchInvalid {
+            path: patch.path.clone(),
+            reason: "json_value patch missing replacement value".to_string(),
+        })?;
     let mut document: Value =
         serde_json::from_str(original).map_err(|err| RuntimeError::AutoUpdatePatchInvalid {
             path: patch.path.clone(),
@@ -360,14 +374,18 @@ fn apply_toml_patch(
     original: &str,
 ) -> Result<String, RuntimeError> {
     let dotted_key = patch.dotted_key.as_deref().unwrap_or_default();
-    let replacement = patch.value.clone().ok_or_else(|| RuntimeError::AutoUpdatePatchInvalid {
-        path: patch.path.clone(),
-        reason: "toml_value patch missing replacement value".to_string(),
-    })?;
-    let replacement = TomlValue::try_from(replacement).map_err(|err| RuntimeError::AutoUpdatePatchInvalid {
-        path: patch.path.clone(),
-        reason: format!("toml value conversion failed: {err}"),
-    })?;
+    let replacement = patch
+        .value
+        .clone()
+        .ok_or_else(|| RuntimeError::AutoUpdatePatchInvalid {
+            path: patch.path.clone(),
+            reason: "toml_value patch missing replacement value".to_string(),
+        })?;
+    let replacement =
+        TomlValue::try_from(replacement).map_err(|err| RuntimeError::AutoUpdatePatchInvalid {
+            path: patch.path.clone(),
+            reason: format!("toml value conversion failed: {err}"),
+        })?;
     let mut document: TomlValue =
         toml::from_str(original).map_err(|err| RuntimeError::AutoUpdatePatchInvalid {
             path: patch.path.clone(),
@@ -397,10 +415,12 @@ fn apply_toml_patch(
             });
         }
 
-        cursor = table.get_mut(segment).ok_or_else(|| RuntimeError::AutoUpdatePatchInvalid {
-            path: patch.path.clone(),
-            reason: format!("toml dotted key not found: {dotted_key}"),
-        })?;
+        cursor = table
+            .get_mut(segment)
+            .ok_or_else(|| RuntimeError::AutoUpdatePatchInvalid {
+                path: patch.path.clone(),
+                reason: format!("toml dotted key not found: {dotted_key}"),
+            })?;
     }
 
     Err(RuntimeError::AutoUpdatePatchInvalid {

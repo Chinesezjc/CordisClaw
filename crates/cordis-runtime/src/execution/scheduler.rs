@@ -52,10 +52,8 @@ pub fn run_deterministic<F>(
 where
     F: FnMut(&ScheduledNode, u32) -> NodeOutcome,
 {
-    let node_map: HashMap<String, ScheduledNode> = nodes
-        .into_iter()
-        .map(|n| (n.id.clone(), n))
-        .collect();
+    let node_map: HashMap<String, ScheduledNode> =
+        nodes.into_iter().map(|n| (n.id.clone(), n)).collect();
 
     let mut dep_count: HashMap<String, usize> = HashMap::new();
     let mut dependents: HashMap<String, Vec<String>> = HashMap::new();
@@ -115,7 +113,8 @@ where
                                 if *counter > 0 {
                                     *counter -= 1;
                                     if *counter == 0 {
-                                        let child_node = node_map.get(child).expect("child node exists");
+                                        let child_node =
+                                            node_map.get(child).expect("child node exists");
                                         ready.push_back(ReadyItem {
                                             node_id: child_node.id.clone(),
                                             topo_level: child_node.topo_level,

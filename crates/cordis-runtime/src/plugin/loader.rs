@@ -5,12 +5,14 @@
 //! 3) register plugins/nodes/context from index docs
 //! 4) defer dylib ABI/docs guard to first invoke
 
-use crate::core::error::RuntimeError;
-use crate::core::models::{ArtifactIndexEntry, ArtifactKind, LoaderBudget, PluginLoadResult, PluginUnavailableReason};
 use crate::context::{ContextRegistry, PluginHierarchy, RuntimeContext};
+use crate::core::error::RuntimeError;
+use crate::core::models::{
+    ArtifactIndexEntry, ArtifactKind, LoaderBudget, PluginLoadResult, PluginUnavailableReason,
+};
 use crate::plugin::artifact::{
-    artifact_index_map, load_artifact_index, load_plugin_artifact, resolve_artifact_path, sha256_file,
-    stage_artifact_bundle,
+    artifact_index_map, load_artifact_index, load_plugin_artifact, resolve_artifact_path,
+    sha256_file, stage_artifact_bundle,
 };
 use crate::plugin::registry::{NodeRegistry, PluginRegistry};
 use crate::service::doc_registry::DocRegistry;
@@ -98,7 +100,12 @@ impl Loader {
         let hierarchy = PluginHierarchy {
             parent_of: index_map
                 .iter()
-                .filter_map(|(path, entry)| entry.parent.as_ref().map(|parent| (path.clone(), parent.clone())))
+                .filter_map(|(path, entry)| {
+                    entry
+                        .parent
+                        .as_ref()
+                        .map(|parent| (path.clone(), parent.clone()))
+                })
                 .collect(),
             grants_from_parent: index_map
                 .iter()
@@ -114,11 +121,12 @@ impl Loader {
 
         for plugin_path in &index.topo_order {
             self.ensure_not_timed_out(started_at)?;
-            let entry = index_map
-                .get(plugin_path)
-                .ok_or_else(|| RuntimeError::ArtifactIndexMissing {
-                    plugin_path: plugin_path.clone(),
-                })?;
+            let entry =
+                index_map
+                    .get(plugin_path)
+                    .ok_or_else(|| RuntimeError::ArtifactIndexMissing {
+                        plugin_path: plugin_path.clone(),
+                    })?;
 
             if let Some(parent) = &entry.parent {
                 if let Some(parent_state) = plugin_registry.get(parent) {
@@ -141,10 +149,8 @@ impl Loader {
                 }
             }
 
-            let resolved_artifact_path = resolve_artifact_path(
-                &self.config.artifact_index_path,
-                &entry.artifact_path,
-            );
+            let resolved_artifact_path =
+                resolve_artifact_path(&self.config.artifact_index_path, &entry.artifact_path);
             if !resolved_artifact_path.exists() {
                 plugin_registry.insert_unavailable(
                     plugin_path.clone(),
@@ -183,7 +189,10 @@ impl Loader {
                     entry.required,
                     entry.grants_from_parent.iter().cloned().collect(),
                     PluginUnavailableReason::HashMismatch,
-                    vec![format!("expected hash {}, got {}", entry.sha256, actual_hash)],
+                    vec![format!(
+                        "expected hash {}, got {}",
+                        entry.sha256, actual_hash
+                    )],
                 );
                 context.set_plugin_state(
                     plugin_path,

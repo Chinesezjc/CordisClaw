@@ -23,7 +23,7 @@
 当前仓库还支持导出两类 HTML 图：
 
 1. 已注册节点图：使用 `cargo run -p cordis-runtime -- graph-html fixtures --output=registered-nodes.html`。
-2. 已注册节点 DAG：使用 `cargo run -p cordis-runtime -- dag-html fixtures --output=registered-dag.html`。
+2. 已注册节点 Net：使用 `cargo run -p cordis-runtime -- net-html fixtures --output=registered-net.html`。
 
 插件工件重建与 docs 同步入口：
 

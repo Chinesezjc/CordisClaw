@@ -1,8 +1,8 @@
 //! LLM-backed patch planner for guarded auto-update workflows.
 
 use crate::config::LlmApiConfig;
-use crate::core::models::PluginDocs;
 use crate::core::error::RuntimeError;
+use crate::core::models::PluginDocs;
 use crate::kernel::auto_update::{AutoUpdatePlan, FilePatch};
 use crate::plugin::invoke::PluginInvoker;
 use reqwest::blocking::Client;
@@ -129,7 +129,10 @@ impl LlmPatchPlanner {
         self.build_planned_update(request, payload, &allowed_paths, response_id)
     }
 
-    fn plan_with_openai(&self, user_prompt: &str) -> Result<(PlannerPayload, Option<String>), RuntimeError> {
+    fn plan_with_openai(
+        &self,
+        user_prompt: &str,
+    ) -> Result<(PlannerPayload, Option<String>), RuntimeError> {
         let request_body = json!({
             "model": self.config.model,
             "instructions": openai_system_prompt(),
@@ -154,9 +157,10 @@ impl LlmPatchPlanner {
             .get("id")
             .and_then(Value::as_str)
             .map(ToString::to_string);
-        let output_text = extract_output_text(&raw_json).ok_or_else(|| RuntimeError::LlmResponseInvalid {
-            message: "missing output_text in Responses API payload".to_string(),
-        })?;
+        let output_text =
+            extract_output_text(&raw_json).ok_or_else(|| RuntimeError::LlmResponseInvalid {
+                message: "missing output_text in Responses API payload".to_string(),
+            })?;
         Ok((parse_planner_payload(&output_text)?, response_id))
     }
 
@@ -194,14 +198,20 @@ impl LlmPatchPlanner {
             .get("id")
             .and_then(Value::as_str)
             .map(ToString::to_string);
-        let output_text =
-            extract_chat_completion_text(&raw_json).ok_or_else(|| RuntimeError::LlmResponseInvalid {
-                message: "missing choices[0].message.content in chat completion payload".to_string(),
-            })?;
+        let output_text = extract_chat_completion_text(&raw_json).ok_or_else(|| {
+            RuntimeError::LlmResponseInvalid {
+                message: "missing choices[0].message.content in chat completion payload"
+                    .to_string(),
+            }
+        })?;
         Ok((parse_planner_payload(&output_text)?, response_id))
     }
 
-    fn send_json_request(&self, endpoint: String, request_body: Value) -> Result<Value, RuntimeError> {
+    fn send_json_request(
+        &self,
+        endpoint: String,
+        request_body: Value,
+    ) -> Result<Value, RuntimeError> {
         let api_key = resolve_api_key(&self.config)?;
         let mut http_request = self
             .client
@@ -219,17 +229,18 @@ impl LlmPatchPlanner {
             }
         }
 
-        let response = http_request
-            .json(&request_body)
-            .send()
+        let response = http_request.json(&request_body).send().map_err(|err| {
+            RuntimeError::LlmRequestFailed {
+                message: err.to_string(),
+            }
+        })?;
+
+        let status = response.status();
+        let raw_body = response
+            .text()
             .map_err(|err| RuntimeError::LlmRequestFailed {
                 message: err.to_string(),
             })?;
-
-        let status = response.status();
-        let raw_body = response.text().map_err(|err| RuntimeError::LlmRequestFailed {
-            message: err.to_string(),
-        })?;
 
         if !status.is_success() {
             let message = extract_error_message(&raw_body)
@@ -313,7 +324,11 @@ fn build_user_prompt(
     prompt.push_str("\nPatch ID: ");
     prompt.push_str(&request.patch_id);
     prompt.push_str("\nManual approval: ");
-    prompt.push_str(if request.manual_approved { "true" } else { "false" });
+    prompt.push_str(if request.manual_approved {
+        "true"
+    } else {
+        "false"
+    });
     prompt.push_str("\nInstruction:\n");
     prompt.push_str(request.instruction.trim());
     prompt.push_str("\n\nAllowed relative paths:\n");
@@ -513,7 +528,11 @@ fn extract_error_message(raw_body: &str) -> Option<String> {
         .and_then(|value| value.get("message"))
         .and_then(Value::as_str)
         .map(ToString::to_string)
-        .or_else(|| json.get("detail").and_then(Value::as_str).map(ToString::to_string))
+        .or_else(|| {
+            json.get("detail")
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+        })
 }
 
 fn extract_output_text(raw_json: &Value) -> Option<String> {
@@ -525,7 +544,12 @@ fn extract_output_text(raw_json: &Value) -> Option<String> {
     }
 
     let mut chunks = Vec::new();
-    for item in raw_json.get("output").and_then(Value::as_array).into_iter().flatten() {
+    for item in raw_json
+        .get("output")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
         for content in item
             .get("content")
             .and_then(Value::as_array)
@@ -710,7 +734,10 @@ mod tests {
 
         let prompt = build_user_prompt(&request, &files, None);
         assert!(prompt.contains("plugin verifier spec:"), "prompt: {prompt}");
-        assert!(prompt.contains("(none discovered for this workspace root)"), "prompt: {prompt}");
+        assert!(
+            prompt.contains("(none discovered for this workspace root)"),
+            "prompt: {prompt}"
+        );
     }
 
     #[test]
@@ -770,9 +797,18 @@ mod tests {
         }];
 
         let prompt = build_user_prompt(&request, &files, Some(&catalog));
-        assert!(prompt.contains("\"plugin_path\": \"expr\""), "prompt: {prompt}");
-        assert!(prompt.contains("\"command_name\": \"Expr\""), "prompt: {prompt}");
-        assert!(prompt.contains("\"node_fqn\": \"expr::expr_entry\""), "prompt: {prompt}");
+        assert!(
+            prompt.contains("\"plugin_path\": \"expr\""),
+            "prompt: {prompt}"
+        );
+        assert!(
+            prompt.contains("\"command_name\": \"Expr\""),
+            "prompt: {prompt}"
+        );
+        assert!(
+            prompt.contains("\"node_fqn\": \"expr::expr_entry\""),
+            "prompt: {prompt}"
+        );
         assert!(prompt.contains("\"expression\""), "prompt: {prompt}");
         assert!(prompt.contains("\"value\""), "prompt: {prompt}");
     }

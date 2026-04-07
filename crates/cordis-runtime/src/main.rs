@@ -1,7 +1,9 @@
 use cordis_runtime::config::RuntimeConfig;
 use cordis_runtime::context::ContextRegistry;
 use cordis_runtime::host::{KernelApplyRequest, KernelPlanRequest, RuntimeHost, RuntimeKernel};
-use cordis_runtime::kernel::auto_update::{AutoUpdatePlan, AutoUpdater, FilePatch, VerificationEnvelope};
+use cordis_runtime::kernel::auto_update::{
+    AutoUpdatePlan, AutoUpdater, FilePatch, VerificationEnvelope,
+};
 use cordis_runtime::kernel::evaluator::{EvalHarness, VerificationInput};
 use cordis_runtime::kernel::memory::ChangeMemory;
 use cordis_runtime::kernel::policy::IterationPolicy;
@@ -68,9 +70,9 @@ fn main() {
         }
         return;
     }
-    if args.first().map(|x| x.as_str()) == Some("dag-html") {
-        if let Err(err) = run_dag_html(&args[1..]) {
-            eprintln!("dag-html failed: {err}");
+    if args.first().map(|x| x.as_str()) == Some("net-html") {
+        if let Err(err) = run_net_html(&args[1..]) {
+            eprintln!("net-html failed: {err}");
             eprintln!("{}", usage());
             std::process::exit(1);
         }
@@ -145,7 +147,8 @@ fn run_loader(root: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
 fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let (root, runtime_only) = parse_root_and_runtime_only(args, "fixtures")?;
     prepare_fixtures_root(&root, runtime_only)?;
-    let host = RuntimeHost::boot(&root).map_err(|err| runtime_mode_error(err, &root, runtime_only))?;
+    let host =
+        RuntimeHost::boot(&root).map_err(|err| runtime_mode_error(err, &root, runtime_only))?;
     println!(
         "serve ready snapshot_id={}",
         host.current_snapshot().snapshot_id()
@@ -239,8 +242,8 @@ fn handle_serve_command(
             } else if let Some(rest) = command.strip_prefix("candidate invoke ") {
                 let (plugin_path, remainder) =
                     split_first_token(rest).ok_or("missing plugin_path for candidate invoke")?;
-                let (node_id, payload_json) =
-                    split_first_token(remainder).ok_or("missing node_id/payload for candidate invoke")?;
+                let (node_id, payload_json) = split_first_token(remainder)
+                    .ok_or("missing node_id/payload for candidate invoke")?;
                 let response =
                     host.invoke_candidate(plugin_path, node_id, payload_json.to_string())?;
                 emit_invoke_response(&response.payload)?;
@@ -342,7 +345,8 @@ fn run_execute(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let target_node_fqn = target_node_fqn.ok_or("missing required arg: <node_fqn>")?;
     let payload = payload_json.ok_or("missing required flag: --payload-json=<json>")?;
     prepare_fixtures_root(&root, runtime_only)?;
-    let host = RuntimeHost::boot(&root).map_err(|err| runtime_mode_error(err, &root, runtime_only))?;
+    let host =
+        RuntimeHost::boot(&root).map_err(|err| runtime_mode_error(err, &root, runtime_only))?;
     let payload = serde_json::from_str::<Value>(&payload)?;
     let result = host.execute(&target_node_fqn, payload)?;
     println!("{}", serde_json::to_string_pretty(&result)?);
@@ -582,10 +586,9 @@ fn parse_verify_profile_flag(
     match value {
         "default" => Ok(VerificationProfile::Default),
         "rust-workspace" | "rust_workspace" => Ok(VerificationProfile::RustWorkspace),
-        other => Err(format!(
-            "invalid verify profile: {other} (expected default|rust-workspace)"
-        )
-        .into()),
+        other => {
+            Err(format!("invalid verify profile: {other} (expected default|rust-workspace)").into())
+        }
     }
 }
 
@@ -650,9 +653,9 @@ fn split_first_token(input: &str) -> Option<(&str, &str)> {
     Some((token, remainder))
 }
 
-fn run_dag_html(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+fn run_net_html(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut root: Option<PathBuf> = None;
-    let mut output_path = PathBuf::from("registered-dag.html");
+    let mut output_path = PathBuf::from("registered-net.html");
 
     for token in args {
         if let Some(value) = token.strip_prefix("--output=") {
@@ -675,7 +678,7 @@ fn run_dag_html(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let output = loader.load()?;
     let html = output
         .graph_registry
-        .handle_get_html("/graphs/registered-dag.html")?;
+        .handle_get_html("/graphs/registered-net.html")?;
     fs::write(&output_path, html)?;
 
     let absolute = if output_path.is_absolute() {
@@ -683,12 +686,12 @@ fn run_dag_html(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     } else {
         std::env::current_dir()?.join(output_path)
     };
-    println!("dag_html written to {}", absolute.display());
+    println!("net_html written to {}", absolute.display());
     println!(
         "nodes={} edges={} diagnostics={}",
-        output.graph_registry.dag().nodes.len(),
-        output.graph_registry.dag().edges.len(),
-        output.graph_registry.dag().diagnostics.len()
+        output.graph_registry.net().nodes.len(),
+        output.graph_registry.net().edges.len(),
+        output.graph_registry.net().diagnostics.len()
     );
     Ok(())
 }
@@ -753,7 +756,10 @@ fn run_prepare_artifacts(args: &[String]) -> Result<(), Box<dyn std::error::Erro
     Ok(())
 }
 
-fn prepare_fixtures_root(root: &Path, runtime_only: bool) -> Result<(), Box<dyn std::error::Error>> {
+fn prepare_fixtures_root(
+    root: &Path,
+    runtime_only: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     if runtime_only {
         return Ok(());
     }
@@ -833,7 +839,7 @@ fn usage() -> String {
     tests/safety commands also accept plugin:{\"plugin_path\":\"<plugin_path>\",\"node_id\":\"<node_id>\",\"payload_json\":{},\"expect_substring\":\"<expected text>\",\"fixtures_root\":\"<optional fixtures root>\"}
   cargo run -p cordis-runtime -- auto-update <workspace_root> <relative_path> <find> <replace> [--manual-approved] [--tests-passed=true|false] [--safety-checks-passed=true|false] [--quality-score=<u32>] [--diff-lines=<usize>]
   cargo run -p cordis-runtime -- graph-html [fixtures_root] [--output=registered-nodes.html]
-  cargo run -p cordis-runtime -- dag-html [fixtures_root] [--output=registered-dag.html]
+  cargo run -p cordis-runtime -- net-html [fixtures_root] [--output=registered-net.html]
   cargo run -p cordis-runtime -- prepare-artifacts [fixtures_root] [--full]
   cargo run -p cordis-runtime -- sync-plugin-docs [fixtures_root]
   cargo run -p cordis-runtime -- refresh-artifact-index [fixtures_root]

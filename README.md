@@ -2,7 +2,7 @@
 
 `CordisClaw` is an experimental Rust runtime for contract-driven plugin trees.
 
-It explores what a plugin system looks like when discovery is explicit, loading is strict, execution is DAG-oriented, and plugin capabilities are described through machine-readable docs instead of loose conventions.
+It explores what a plugin system looks like when discovery is explicit, loading is strict, execution is CPN-net-oriented, and plugin capabilities are described through machine-readable docs instead of loose conventions.
 
 Instead of treating plugins as opaque dynamic modules, `CordisClaw` treats them as a documented tree with explicit parent/child edges, prebuilt artifacts, and fail-fast loading rules.
 
@@ -26,7 +26,7 @@ Most plugin systems trade clarity for flexibility. `CordisClaw` pushes in the op
 - loading is guarded by ABI fingerprints, artifact indexes, and `sha256` checks
 - docs are runtime input through `docs/agent/interfaces.json`
 - parent/child service access is controlled through `grants`
-- execution semantics are organized around DAG, Gate, Router, Actor, and Kernel primitives
+- execution semantics are organized around CPN Net, Router, Actor, and Kernel primitives
 - long-running host mode keeps an atomic runtime snapshot and supports explicit plugin reload
 - self-iteration is treated as a guarded runtime workflow, not unrestricted automation
 
@@ -70,7 +70,7 @@ This repo is most useful if you care about runtime architecture questions such a
 - how strict a loader can be before a plugin system becomes easier to reason about
 - how docs can double as machine-readable runtime input
 - how parent/child authorization can replace ambient service access
-- how DAG, Gate, and Router semantics can sit next to a plugin runtime
+- how CPN Net and Router semantics can sit next to a plugin runtime
 - how a rollback-oriented Kernel loop might coexist with explicit safety boundaries
 
 ## What It Demonstrates
@@ -79,7 +79,7 @@ This repo is most useful if you care about runtime architecture questions such a
 - Strict artifact loading for `dylib` and JSON-based plugin artifacts
 - Parent/child service injection with explicit authorization
 - Registry-backed docs queries and graph export
-- A deterministic execution prototype built around DAG and Gate semantics
+- A deterministic execution prototype built around CPN Net semantics
 - A minimal self-iteration kernel prototype for evaluate / promote / rollback flows
 
 ## What Works Today
@@ -157,10 +157,10 @@ Export the registered plugin graph:
 cargo run -p cordis-runtime -- graph-html fixtures --output=registered-nodes.html
 ```
 
-Export the registered DAG view:
+Export the registered net view:
 
 ```bash
-cargo run -p cordis-runtime -- dag-html fixtures --output=registered-dag.html
+cargo run -p cordis-runtime -- net-html fixtures --output=registered-net.html
 ```
 
 Generate plugin artifacts from source, sync docs, and refresh the artifact index:

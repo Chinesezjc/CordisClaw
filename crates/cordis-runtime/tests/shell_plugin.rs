@@ -68,13 +68,11 @@ fn shell_plugin_start_terminal_non_zero_exit() {
     assert!(!parsed.ok);
     assert_eq!(parsed.action, "start_terminal");
     assert_eq!(parsed.exit_code, Some(127));
-    assert!(
-        parsed
-            .output
-            .as_deref()
-            .unwrap_or_default()
-            .contains("command not found"),
-    );
+    assert!(parsed
+        .output
+        .as_deref()
+        .unwrap_or_default()
+        .contains("command not found"),);
 }
 
 #[test]
@@ -88,16 +86,18 @@ fn shell_plugin_rejects_unknown_action() {
 #[test]
 fn shell_plugin_sets_username_to_cordisclaw() {
     let parsed = invoke_shell(r#"{"action":"start_terminal","command":"whoami"}"#);
-    assert!(parsed.ok, "expected whoami to be CordisClaw, got: {parsed:?}");
+    assert!(
+        parsed.ok,
+        "expected whoami to be CordisClaw, got: {parsed:?}"
+    );
     assert_eq!(parsed.exit_code, Some(0));
     assert_eq!(parsed.output.as_deref(), Some("CordisClaw"));
 }
 
 #[test]
 fn shell_plugin_rejects_external_shell_backend() {
-    let parsed = invoke_shell(
-        r#"{"action":"start_terminal","shell":"/bin/bash","command":"echo hi"}"#,
-    );
+    let parsed =
+        invoke_shell(r#"{"action":"start_terminal","shell":"/bin/bash","command":"echo hi"}"#);
     assert!(!parsed.ok);
     assert_eq!(parsed.action, "error");
     assert!(parsed.message.contains("only builtin shell is supported"));
@@ -125,7 +125,11 @@ fn invoke_cli_runs_interactive_shell_session() {
         .expect("write repl commands");
 
     let output = child.wait_with_output().expect("wait for invoke cli");
-    assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     let stdout = String::from_utf8(output.stdout).expect("stdout utf-8");
     assert!(stdout.contains("CordisClaw@runtime:"));

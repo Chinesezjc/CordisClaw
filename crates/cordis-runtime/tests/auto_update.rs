@@ -140,7 +140,11 @@ fn auto_update_supports_structured_json_patch() {
                 patch_id: "patch-json".to_string(),
                 manual_approved: false,
                 diff_lines: 1,
-                patches: vec![FilePatch::json_value("config.json", "/enabled", json!(true))],
+                patches: vec![FilePatch::json_value(
+                    "config.json",
+                    "/enabled",
+                    json!(true),
+                )],
             },
             |_| {
                 Ok(VerificationInput {

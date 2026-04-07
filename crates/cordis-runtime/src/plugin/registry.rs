@@ -56,21 +56,21 @@ impl PluginRegistry {
             .write()
             .expect("plugin registry lock poisoned")
             .insert(
-            plugin_path.clone(),
-            RegisteredPlugin {
-                plugin_path,
-                parent,
-                required,
-                grants_from_parent,
-                load_result: PluginLoadResult::Loaded,
-                docs: Some(docs),
-                artifact_path: Some(artifact_path),
-                artifact_kind: Some(artifact_kind),
-                abi_fingerprint: Some(abi_fingerprint),
-                execution,
-                fingerprint_diff: Vec::new(),
-            },
-        );
+                plugin_path.clone(),
+                RegisteredPlugin {
+                    plugin_path,
+                    parent,
+                    required,
+                    grants_from_parent,
+                    load_result: PluginLoadResult::Loaded,
+                    docs: Some(docs),
+                    artifact_path: Some(artifact_path),
+                    artifact_kind: Some(artifact_kind),
+                    abi_fingerprint: Some(abi_fingerprint),
+                    execution,
+                    fingerprint_diff: Vec::new(),
+                },
+            );
     }
 
     pub fn insert_unavailable(
@@ -86,21 +86,21 @@ impl PluginRegistry {
             .write()
             .expect("plugin registry lock poisoned")
             .insert(
-            plugin_path.clone(),
-            RegisteredPlugin {
-                plugin_path,
-                parent,
-                required,
-                grants_from_parent,
-                load_result: PluginLoadResult::Unavailable(reason),
-                docs: None,
-                artifact_path: None,
-                artifact_kind: None,
-                abi_fingerprint: None,
-                execution: None,
-                fingerprint_diff,
-            },
-        );
+                plugin_path.clone(),
+                RegisteredPlugin {
+                    plugin_path,
+                    parent,
+                    required,
+                    grants_from_parent,
+                    load_result: PluginLoadResult::Unavailable(reason),
+                    docs: None,
+                    artifact_path: None,
+                    artifact_kind: None,
+                    abi_fingerprint: None,
+                    execution: None,
+                    fingerprint_diff,
+                },
+            );
     }
 
     pub fn mark_unavailable(&self, plugin_path: &str, reason: PluginUnavailableReason) {

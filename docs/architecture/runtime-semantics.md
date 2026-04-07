@@ -51,36 +51,19 @@ Local(当前插件 -> 祖先插件中被 grants 明确允许的服务)
 - `session_commit_conflict_total`
 - `session_commit_latency_ms`
 
-## 2. 执行层：DAG、Gate、Router、Actor、Engine
+## 2. 执行层：CPN Net、Router、Actor、Engine
 
 当前 CLI 主要暴露 loader / invoke / tooling，但执行层已经作为库实现完成了原型。
 
-### 2.1 DAG 构建
+### 2.1 Net 构建
 
-[execution/dag.rs](../../crates/cordis-runtime/src/execution/dag.rs) 负责：
+[execution/net.rs](../../crates/cordis-runtime/src/execution/net.rs) 负责：
 
-- 节点唯一性检查。
-- 根据 `produces` / `consumes` 建立数据边。
-- 根据 `control_deps` 建立控制边。
-- required input 缺失检测。
-- 多 producer 冲突检测。
-- 环检测。
+- `Place / Transition / Arc` 唯一性与引用检查。
+- `JoinPolicy`（`all_of/any_of/quorum/first_success/first_completed/keyed_pair/keyed_group`）语义入口。
+- Correlation key 和 token metadata（`execution_id/transition_id/logical_group/outcome`）载体。
 
-默认策略 `DagBuildPolicy` 要求：如果一个输入类型存在多个候选 producer，必须显式绑定，否则 fail-fast。
-
-### 2.2 Gate 语义
-
-[execution/gate.rs](../../crates/cordis-runtime/src/execution/gate.rs) 支持：
-
-- `AllOf`
-- `AnyOf`
-- `FirstSuccess`
-- `FirstCompleted`
-- `AtLeast(k)`
-
-当策略需要时，Gate 还能返回“完成并取消其他分支”的决策。
-
-### 2.3 Router 语义
+### 2.2 Router 语义
 
 [execution/router.rs](../../crates/cordis-runtime/src/execution/router.rs) 把子图执行包在 overlay 事务里：
 
@@ -89,28 +72,22 @@ Local(当前插件 -> 祖先插件中被 grants 明确允许的服务)
 
 这让子图可以有类似事务边界的上下文语义。
 
-### 2.4 Actor 与调度器
+### 2.3 Actor 与调度器
 
 - [execution/actor.rs](../../crates/cordis-runtime/src/execution/actor.rs) 提供 mailbox 风格批量分发。
-- [execution/scheduler.rs](../../crates/cordis-runtime/src/execution/scheduler.rs) 提供确定性 ready queue 调度。
+- [execution/scheduler.rs](../../crates/cordis-runtime/src/execution/scheduler.rs) 提供调度配置。
 
-当前 ready 队列排序遵循：
+当前引擎默认吞吐优先调度，并保留 `SchedulerMode::Deterministic` 供测试/排障复现。
 
-- topo level 升序
-- priority 降序
-- node id 升序
-- retry 项优先级最后参与比较
-
-### 2.5 `execute_graph()`
+### 2.4 `execute_net()`
 
 [execution/engine.rs](../../crates/cordis-runtime/src/execution/engine.rs) 把前面几层集成起来，负责：
 
-- DAG build
-- ready queue 管理
-- Actor dispatch
-- retry / backoff
+- Net build
+- keyed token 匹配与 join policy 评估
+- ready queue / retry / backoff
 - timeout
-- cancel 传播
+- late token tombstone（zombie drop）
 - Router overlay commit/rollback
 - metrics 汇总
 

@@ -1,6 +1,7 @@
 use crate::core::error::RuntimeError;
 use crate::core::models::{
-    ArtifactIndex, ArtifactIndexEntry, PluginArtifact, PluginExecution, ARTIFACT_INDEX_SCHEMA_VERSION,
+    ArtifactIndex, ArtifactIndexEntry, PluginArtifact, PluginExecution,
+    ARTIFACT_INDEX_SCHEMA_VERSION,
 };
 use crate::plugin::dynamic::{is_dylib_path, sidecar_json_path};
 use sha2::{Digest, Sha256};
@@ -15,9 +16,11 @@ pub fn load_artifact_index(path: &Path) -> Result<ArtifactIndex, RuntimeError> {
         message: e.to_string(),
     })?;
 
-    let index = serde_json::from_str::<ArtifactIndex>(&text).map_err(|e| RuntimeError::ArtifactIndexParse {
-        path: path.to_path_buf(),
-        message: e.to_string(),
+    let index = serde_json::from_str::<ArtifactIndex>(&text).map_err(|e| {
+        RuntimeError::ArtifactIndexParse {
+            path: path.to_path_buf(),
+            message: e.to_string(),
+        }
     })?;
     if index.schema_version != ARTIFACT_INDEX_SCHEMA_VERSION {
         return Err(RuntimeError::ArtifactIndexParse {
@@ -91,7 +94,8 @@ pub fn stage_artifact_bundle(
     artifact_path: &Path,
     staged_root: &Path,
 ) -> Result<PathBuf, RuntimeError> {
-    let staged_artifact_path = staged_artifact_path(plugin_path, artifact_reference, artifact_path, staged_root)?;
+    let staged_artifact_path =
+        staged_artifact_path(plugin_path, artifact_reference, artifact_path, staged_root)?;
     stage_file(artifact_path, &staged_artifact_path)?;
 
     if is_dylib_path(artifact_path) {
@@ -119,14 +123,15 @@ fn staged_artifact_path(
 ) -> Result<PathBuf, RuntimeError> {
     let artifact_ref = Path::new(artifact_reference);
     let relative = if artifact_ref.is_absolute() {
-        let file_name = artifact_path.file_name().ok_or_else(|| RuntimeError::Invariant {
-            message: format!(
-                "artifact path missing file name for plugin {plugin_path}: {}",
-                artifact_path.display()
-            ),
-        })?;
-        PathBuf::from(plugin_path.replace('/', std::path::MAIN_SEPARATOR_STR))
-            .join(file_name)
+        let file_name = artifact_path
+            .file_name()
+            .ok_or_else(|| RuntimeError::Invariant {
+                message: format!(
+                    "artifact path missing file name for plugin {plugin_path}: {}",
+                    artifact_path.display()
+                ),
+            })?;
+        PathBuf::from(plugin_path.replace('/', std::path::MAIN_SEPARATOR_STR)).join(file_name)
     } else {
         artifact_ref.to_path_buf()
     };
@@ -154,9 +159,14 @@ fn stage_process_command(
         .unwrap_or_else(|| Path::new("."))
         .join(command_path);
 
-    let target_parent = target_path.parent().ok_or_else(|| RuntimeError::Invariant {
-        message: format!("staged process command missing parent: {}", target_path.display()),
-    })?;
+    let target_parent = target_path
+        .parent()
+        .ok_or_else(|| RuntimeError::Invariant {
+            message: format!(
+                "staged process command missing parent: {}",
+                target_path.display()
+            ),
+        })?;
     fs::create_dir_all(target_parent).map_err(|e| RuntimeError::Io {
         path: target_parent.to_path_buf(),
         message: e.to_string(),

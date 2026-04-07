@@ -2,13 +2,16 @@ use crate::config::{LlmApiConfig, PluginConfigFile, RuntimeConfig};
 use crate::context::RuntimeContext;
 use crate::core::error::RuntimeError;
 use crate::core::models::{NodeOutcome, PluginLoadResult};
-use crate::execution::dag::{DagInputSpec, DagNodeSpec};
 use crate::execution::engine::{
-    execute_graph, ExecutionConfig, ExecutionOutput, ExecutionNodeKind, ExecutionNodeSpec,
+    execute_net, ExecutionConfig, ExecutionNetSpec, ExecutionOutput, ExecutionTransitionKind,
+    ExecutionTransitionSpec, TransitionRunResult, TriggerInput,
 };
 use crate::execution::gate::RunPolicy;
+use crate::execution::net::{ArcDirection, ArcSpec, JoinPolicy, PlaceSpec, TransitionSpec};
 use crate::execution::scheduler::SchedulerConfig;
-use crate::kernel::auto_update::{AutoUpdatePlan, AutoUpdateResult, AutoUpdater, VerificationEnvelope};
+use crate::kernel::auto_update::{
+    AutoUpdatePlan, AutoUpdateResult, AutoUpdater, VerificationEnvelope,
+};
 use crate::kernel::evaluator::{EvalHarness, VerificationInput};
 use crate::kernel::memory::{ChangeMemory, ChangeRecord};
 use crate::kernel::planner::{LlmPatchPlanner, PlanRequest, PlannedUpdate};
@@ -22,9 +25,7 @@ use crate::plugin::invoke::invoke_registered_plugin;
 use crate::plugin::loader::{default_loader_config, LoadOutput, Loader};
 use crate::plugin::registry::{NodeRegistry, PluginRegistry, RegisteredPlugin};
 use crate::service::doc_registry::DocRegistry;
-use crate::service::graph_registry::{
-    GraphRegistry, RegisteredDag, RegisteredDagEdgeKind, RegisteredDagNode,
-};
+use crate::service::graph_registry::{GraphRegistry, RegisteredNet, RegisteredNetEdgeKind};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
@@ -88,35 +89,43 @@ impl RuntimeSnapshot {
         target_node_fqn: &str,
         payload: Value,
     ) -> Result<RuntimeExecutionResult, RuntimeError> {
-        let request_seed = payload.as_object().cloned().ok_or_else(|| RuntimeError::InvalidArgument {
-            message: "execute payload must be a JSON object".to_string(),
-        })?;
-        let target_node = self
-            .node_registry
-            .get(target_node_fqn)
-            .ok_or_else(|| RuntimeError::InvalidArgument {
+        let request_seed =
+            payload
+                .as_object()
+                .cloned()
+                .ok_or_else(|| RuntimeError::InvalidArgument {
+                    message: "execute payload must be a JSON object".to_string(),
+                })?;
+        let target_node = self.node_registry.get(target_node_fqn).ok_or_else(|| {
+            RuntimeError::InvalidArgument {
                 message: format!("registered node not found: {target_node_fqn}"),
-            })?;
-        let registered_dag = self.graph_registry.dag();
-        let selected_nodes = select_registered_dag_subgraph(registered_dag, target_node_fqn);
-        let specs = build_execution_specs(registered_dag, &selected_nodes, target_node_fqn, target_node);
+            }
+        })?;
+        let registered_net = self.graph_registry.net();
+        let selected_nodes = select_registered_net_subgraph(registered_net, target_node_fqn);
+        let net = build_execution_net(
+            registered_net,
+            &selected_nodes,
+            target_node_fqn,
+            target_node,
+        );
 
         let mut context = self.context_baseline.clone();
-        let mut node_responses = BTreeMap::<String, Value>::new();
         let mut traces = BTreeMap::<String, ExecutionInvocationTrace>::new();
-        let output = execute_graph(
+        let output = execute_net(
             ExecutionConfig {
                 scheduler: SchedulerConfig { max_parallelism: 1 },
                 ..ExecutionConfig::default()
             },
-            specs,
+            net,
             &mut context,
-            |spec, attempt, _| {
-                let Some(node) = self.node_registry.get(&spec.dag.node_id) else {
+            |spec, attempt, trigger, _| {
+                let transition_id = &spec.transition.transition_id;
+                let Some(node) = self.node_registry.get(transition_id) else {
                     traces.insert(
-                        spec.dag.node_id.clone(),
+                        transition_id.clone(),
                         ExecutionInvocationTrace {
-                            node_fqn: spec.dag.node_id.clone(),
+                            node_fqn: transition_id.clone(),
                             plugin_path: String::new(),
                             node_id: String::new(),
                             attempt,
@@ -126,55 +135,58 @@ impl RuntimeSnapshot {
                             error: Some("node missing from registry".to_string()),
                         },
                     );
-                    return NodeOutcome::Failure;
+                    return TransitionRunResult::from_outcome(NodeOutcome::Failure);
                 };
 
-                let request_payload = build_execution_payload(&request_seed, &spec.dag.consumes, &node_responses);
-                let request_text = match serde_json::to_string(&Value::Object(request_payload.clone())) {
-                    Ok(payload) => payload,
-                    Err(err) => {
-                        traces.insert(
-                            spec.dag.node_id.clone(),
-                            ExecutionInvocationTrace {
-                                node_fqn: spec.dag.node_id.clone(),
-                                plugin_path: node.plugin_path.clone(),
-                                node_id: node.node_id.clone(),
-                                attempt,
-                                outcome: Some(NodeOutcome::Failure),
-                                request_payload: Some(Value::Object(request_payload)),
-                                response_payload: None,
-                                error: Some(format!("request serialize failed: {err}")),
-                            },
-                        );
-                        return NodeOutcome::Failure;
-                    }
-                };
+                let request_payload = build_execution_payload(&request_seed, &trigger.inputs);
+                let request_text =
+                    match serde_json::to_string(&Value::Object(request_payload.clone())) {
+                        Ok(payload) => payload,
+                        Err(err) => {
+                            traces.insert(
+                                transition_id.clone(),
+                                ExecutionInvocationTrace {
+                                    node_fqn: transition_id.clone(),
+                                    plugin_path: node.plugin_path.clone(),
+                                    node_id: node.node_id.clone(),
+                                    attempt,
+                                    outcome: Some(NodeOutcome::Failure),
+                                    request_payload: Some(Value::Object(request_payload)),
+                                    response_payload: None,
+                                    error: Some(format!("request serialize failed: {err}")),
+                                },
+                            );
+                            return TransitionRunResult::from_outcome(NodeOutcome::Failure);
+                        }
+                    };
 
                 match self.invoke(&node.plugin_path, &node.node_id, request_text) {
                     Ok(response) => {
                         let response_payload = parse_response_payload(&response.payload);
                         let outcome = infer_outcome_from_payload(&response_payload);
-                        node_responses.insert(spec.dag.node_id.clone(), response_payload.clone());
                         traces.insert(
-                            spec.dag.node_id.clone(),
+                            transition_id.clone(),
                             ExecutionInvocationTrace {
-                                node_fqn: spec.dag.node_id.clone(),
+                                node_fqn: transition_id.clone(),
                                 plugin_path: node.plugin_path.clone(),
                                 node_id: node.node_id.clone(),
                                 attempt,
                                 outcome: Some(outcome),
                                 request_payload: Some(Value::Object(request_payload)),
-                                response_payload: Some(response_payload),
+                                response_payload: Some(response_payload.clone()),
                                 error: None,
                             },
                         );
-                        outcome
+                        TransitionRunResult {
+                            outcome,
+                            payload: response_payload,
+                        }
                     }
                     Err(err) => {
                         traces.insert(
-                            spec.dag.node_id.clone(),
+                            transition_id.clone(),
                             ExecutionInvocationTrace {
-                                node_fqn: spec.dag.node_id.clone(),
+                                node_fqn: transition_id.clone(),
                                 plugin_path: node.plugin_path.clone(),
                                 node_id: node.node_id.clone(),
                                 attempt,
@@ -184,7 +196,7 @@ impl RuntimeSnapshot {
                                 error: Some(err.to_string()),
                             },
                         );
-                        NodeOutcome::Failure
+                        TransitionRunResult::from_outcome(NodeOutcome::Failure)
                     }
                 }
             },
@@ -194,7 +206,7 @@ impl RuntimeSnapshot {
         Ok(RuntimeExecutionResult {
             target_node_fqn: target_node_fqn.to_string(),
             selected_nodes: selected_nodes.into_iter().collect(),
-            dag_diagnostics: registered_dag.diagnostics.clone(),
+            net_diagnostics: registered_net.diagnostics.clone(),
             output,
             traces,
         })
@@ -269,7 +281,7 @@ pub struct CandidateSnapshotStatus {
 pub struct RuntimeExecutionResult {
     pub target_node_fqn: String,
     pub selected_nodes: Vec<String>,
-    pub dag_diagnostics: Vec<String>,
+    pub net_diagnostics: Vec<String>,
     pub output: ExecutionOutput,
     pub traces: BTreeMap<String, ExecutionInvocationTrace>,
 }
@@ -373,7 +385,10 @@ impl RuntimeKernel {
     }
 
     pub fn status(&self) -> KernelStatus {
-        let kernel = self.inner.lock().unwrap_or_else(|poison| poison.into_inner());
+        let kernel = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let metrics = kernel.metrics();
         let memory = kernel.memory();
         KernelStatus {
@@ -391,7 +406,10 @@ impl RuntimeKernel {
     }
 
     pub fn history(&self) -> Vec<ChangeRecord> {
-        let kernel = self.inner.lock().unwrap_or_else(|poison| poison.into_inner());
+        let kernel = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         kernel.memory().recent(kernel.memory().len())
     }
 
@@ -400,12 +418,19 @@ impl RuntimeKernel {
         plan: AutoUpdatePlan,
         verification: VerificationInput,
     ) -> Result<AutoUpdateResult, RuntimeError> {
-        let mut kernel = self.inner.lock().unwrap_or_else(|poison| poison.into_inner());
-        self.updater
-            .execute(&mut kernel, plan, |_| Ok(VerificationEnvelope::from(verification)))
+        let mut kernel = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        self.updater.execute(&mut kernel, plan, |_| {
+            Ok(VerificationEnvelope::from(verification))
+        })
     }
 
-    pub fn plan_update(&self, request: KernelPlanRequest) -> Result<KernelPlanResult, RuntimeError> {
+    pub fn plan_update(
+        &self,
+        request: KernelPlanRequest,
+    ) -> Result<KernelPlanResult, RuntimeError> {
         let verify_profile = request.verify_profile.unwrap_or_default();
         let user_tests_command = request.tests_command.clone();
         let user_safety_command = request.safety_command.clone();
@@ -438,22 +463,27 @@ impl RuntimeKernel {
         let planned = self.plan_update(request.clone())?;
         let quality_score = request.quality_score;
         let mut verification_report = None;
-        let mut kernel = self.inner.lock().unwrap_or_else(|poison| poison.into_inner());
-        let result = self.updater.execute(&mut kernel, planned.plan.clone(), |workspace_root| {
-            let report = CommandVerifier::verify(
-                workspace_root,
-                planned.verification_plan.profile,
-                planned.verification_plan.tests_command.as_deref(),
-                planned.verification_plan.safety_command.as_deref(),
-                quality_score,
-            )?;
-            let envelope = VerificationEnvelope {
-                input: report.input.clone(),
-                verification_profile: Some(report.plan.profile.as_str().to_string()),
-            };
-            verification_report = Some(report);
-            Ok(envelope)
-        })?;
+        let mut kernel = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let result = self
+            .updater
+            .execute(&mut kernel, planned.plan.clone(), |workspace_root| {
+                let report = CommandVerifier::verify(
+                    workspace_root,
+                    planned.verification_plan.profile,
+                    planned.verification_plan.tests_command.as_deref(),
+                    planned.verification_plan.safety_command.as_deref(),
+                    quality_score,
+                )?;
+                let envelope = VerificationEnvelope {
+                    input: report.input.clone(),
+                    verification_profile: Some(report.plan.profile.as_str().to_string()),
+                };
+                verification_report = Some(report);
+                Ok(envelope)
+            })?;
         let verification = verification_report.ok_or_else(|| RuntimeError::Invariant {
             message: "verification report missing after updater execution".to_string(),
         })?;
@@ -729,32 +759,35 @@ impl RuntimeHost {
         &self.kernel
     }
 
-    fn reload_internal(&self) -> Result<(ReloadReport, ReloadAttemptReport), (RuntimeError, ReloadAttemptReport)> {
+    fn reload_internal(
+        &self,
+    ) -> Result<(ReloadReport, ReloadAttemptReport), (RuntimeError, ReloadAttemptReport)> {
         let previous_snapshot = self.current_snapshot();
         let staged_artifact_root = next_staged_artifact_root(&self.snapshot_root);
         let started_at = Instant::now();
 
-        let next_snapshot = match build_snapshot_with_staged_root(&self.loader, staged_artifact_root.clone()) {
-            Ok(snapshot) => Arc::new(snapshot),
-            Err(err) => {
-                let attempt = ReloadAttemptReport {
-                    status: ReloadAttemptStatus::Failed,
-                    from_snapshot_id: previous_snapshot.snapshot_id().to_string(),
-                    to_snapshot_id: None,
-                    snapshot_root: self.snapshot_root.display().to_string(),
-                    staged_artifact_root: staged_artifact_root.display().to_string(),
-                    elapsed_ms: started_at.elapsed().as_millis(),
-                    plugin_count: None,
-                    node_count: None,
-                    added_plugins: Vec::new(),
-                    removed_plugins: Vec::new(),
-                    changed_plugins: Vec::new(),
-                    changed_plugin_reasons: BTreeMap::new(),
-                    failure_summary: Some(err.to_string()),
-                };
-                return Err((err, attempt));
-            }
-        };
+        let next_snapshot =
+            match build_snapshot_with_staged_root(&self.loader, staged_artifact_root.clone()) {
+                Ok(snapshot) => Arc::new(snapshot),
+                Err(err) => {
+                    let attempt = ReloadAttemptReport {
+                        status: ReloadAttemptStatus::Failed,
+                        from_snapshot_id: previous_snapshot.snapshot_id().to_string(),
+                        to_snapshot_id: None,
+                        snapshot_root: self.snapshot_root.display().to_string(),
+                        staged_artifact_root: staged_artifact_root.display().to_string(),
+                        elapsed_ms: started_at.elapsed().as_millis(),
+                        plugin_count: None,
+                        node_count: None,
+                        added_plugins: Vec::new(),
+                        removed_plugins: Vec::new(),
+                        changed_plugins: Vec::new(),
+                        changed_plugin_reasons: BTreeMap::new(),
+                        failure_summary: Some(err.to_string()),
+                    };
+                    return Err((err, attempt));
+                }
+            };
 
         {
             let mut guard = self
@@ -826,32 +859,34 @@ impl RuntimeHost {
 
     fn reload_candidate_internal(
         &self,
-    ) -> Result<(CandidateSnapshotStatus, ReloadAttemptReport), (RuntimeError, ReloadAttemptReport)> {
+    ) -> Result<(CandidateSnapshotStatus, ReloadAttemptReport), (RuntimeError, ReloadAttemptReport)>
+    {
         let previous_snapshot = self.current_snapshot();
         let staged_artifact_root = next_staged_artifact_root(&self.snapshot_root);
         let started_at = Instant::now();
 
-        let next_snapshot = match build_snapshot_with_staged_root(&self.loader, staged_artifact_root.clone()) {
-            Ok(snapshot) => Arc::new(snapshot),
-            Err(err) => {
-                let attempt = ReloadAttemptReport {
-                    status: ReloadAttemptStatus::Failed,
-                    from_snapshot_id: previous_snapshot.snapshot_id().to_string(),
-                    to_snapshot_id: None,
-                    snapshot_root: self.snapshot_root.display().to_string(),
-                    staged_artifact_root: staged_artifact_root.display().to_string(),
-                    elapsed_ms: started_at.elapsed().as_millis(),
-                    plugin_count: None,
-                    node_count: None,
-                    added_plugins: Vec::new(),
-                    removed_plugins: Vec::new(),
-                    changed_plugins: Vec::new(),
-                    changed_plugin_reasons: BTreeMap::new(),
-                    failure_summary: Some(err.to_string()),
-                };
-                return Err((err, attempt));
-            }
-        };
+        let next_snapshot =
+            match build_snapshot_with_staged_root(&self.loader, staged_artifact_root.clone()) {
+                Ok(snapshot) => Arc::new(snapshot),
+                Err(err) => {
+                    let attempt = ReloadAttemptReport {
+                        status: ReloadAttemptStatus::Failed,
+                        from_snapshot_id: previous_snapshot.snapshot_id().to_string(),
+                        to_snapshot_id: None,
+                        snapshot_root: self.snapshot_root.display().to_string(),
+                        staged_artifact_root: staged_artifact_root.display().to_string(),
+                        elapsed_ms: started_at.elapsed().as_millis(),
+                        plugin_count: None,
+                        node_count: None,
+                        added_plugins: Vec::new(),
+                        removed_plugins: Vec::new(),
+                        changed_plugins: Vec::new(),
+                        changed_plugin_reasons: BTreeMap::new(),
+                        failure_summary: Some(err.to_string()),
+                    };
+                    return Err((err, attempt));
+                }
+            };
 
         let report = ReloadReport::from_snapshots(
             previous_snapshot.as_ref(),
@@ -1025,12 +1060,12 @@ fn plugin_change_reasons(previous: &RegisteredPlugin, next: &RegisteredPlugin) -
     reasons
 }
 
-fn select_registered_dag_subgraph(dag: &RegisteredDag, target_node_fqn: &str) -> BTreeSet<String> {
+fn select_registered_net_subgraph(net: &RegisteredNet, target_node_fqn: &str) -> BTreeSet<String> {
     let mut selected = BTreeSet::from([target_node_fqn.to_string()]);
     let mut queue = VecDeque::from([target_node_fqn.to_string()]);
 
     while let Some(current) = queue.pop_front() {
-        for edge in dag.edges.iter().filter(|edge| edge.to == current) {
+        for edge in net.edges.iter().filter(|edge| edge.to == current) {
             if selected.insert(edge.from.clone()) {
                 queue.push_back(edge.from.clone());
             }
@@ -1040,121 +1075,140 @@ fn select_registered_dag_subgraph(dag: &RegisteredDag, target_node_fqn: &str) ->
     selected
 }
 
-fn build_execution_specs(
-    dag: &RegisteredDag,
+fn build_execution_net(
+    net: &RegisteredNet,
     selected_nodes: &BTreeSet<String>,
     target_node_fqn: &str,
     fallback_target: &crate::plugin::registry::RegisteredNode,
-) -> Vec<ExecutionNodeSpec> {
-    let mut dag_nodes = dag
+) -> ExecutionNetSpec {
+    let mut net_nodes = net
         .nodes
         .iter()
         .filter(|node| selected_nodes.contains(&node.node_fqn))
         .cloned()
         .collect::<Vec<_>>();
-    dag_nodes.sort_by(|left, right| {
+    net_nodes.sort_by(|left, right| {
         left.topo_level
             .cmp(&right.topo_level)
             .then_with(|| left.node_fqn.cmp(&right.node_fqn))
     });
 
-    if dag_nodes.is_empty() {
-        return vec![ExecutionNodeSpec {
-            dag: DagNodeSpec {
-                node_id: target_node_fqn.to_string(),
-                priority: 0,
-                consumes: Vec::new(),
-                produces: Vec::new(),
-                control_deps: Vec::new(),
-            },
-            run_policy: RunPolicy::default(),
-            kind: ExecutionNodeKind::Terminal,
-        }];
-    }
-
-    dag_nodes
-        .into_iter()
-        .map(|node| execution_spec_from_registered_dag_node(dag, selected_nodes, target_node_fqn, &node))
-        .chain(
-            (!selected_nodes.contains(target_node_fqn)).then(|| ExecutionNodeSpec {
-                dag: DagNodeSpec {
-                    node_id: fallback_target.node_fqn.clone(),
+    if net_nodes.is_empty() {
+        return ExecutionNetSpec {
+            places: Vec::new(),
+            transitions: vec![ExecutionTransitionSpec {
+                transition: TransitionSpec {
+                    transition_id: target_node_fqn.to_string(),
                     priority: 0,
-                    consumes: Vec::new(),
-                    produces: Vec::new(),
-                    control_deps: Vec::new(),
+                    join_policy: JoinPolicy::AllOf,
                 },
                 run_policy: RunPolicy::default(),
-                kind: ExecutionNodeKind::Terminal,
-            }),
-        )
-        .collect()
-}
+                kind: ExecutionTransitionKind::Terminal,
+                logical_group: Some("execute".to_string()),
+            }],
+            arcs: Vec::new(),
+        };
+    }
 
-fn execution_spec_from_registered_dag_node(
-    dag: &RegisteredDag,
-    selected_nodes: &BTreeSet<String>,
-    target_node_fqn: &str,
-    node: &RegisteredDagNode,
-) -> ExecutionNodeSpec {
-    let consumes = dag
-        .edges
+    let transitions = net_nodes
         .iter()
-        .filter(|edge| edge.to == node.node_fqn && selected_nodes.contains(&edge.from))
-        .filter_map(|edge| match edge.kind {
-            RegisteredDagEdgeKind::Data => Some(DagInputSpec {
-                input_type: edge
-                    .label
-                    .clone()
-                    .unwrap_or_else(|| format!("input_from_{}", edge.from)),
-                required: false,
-                explicit_producer: Some(edge.from.clone()),
-            }),
-            RegisteredDagEdgeKind::Control => None,
+        .map(|node| {
+            let incoming = net
+                .edges
+                .iter()
+                .filter(|edge| edge.to == node.node_fqn && selected_nodes.contains(&edge.from))
+                .count();
+            ExecutionTransitionSpec {
+                transition: TransitionSpec {
+                    transition_id: node.node_fqn.clone(),
+                    priority: -(node.topo_level as i32),
+                    join_policy: if incoming == 0 {
+                        JoinPolicy::AnyOf
+                    } else {
+                        JoinPolicy::AllOf
+                    },
+                },
+                run_policy: RunPolicy::default(),
+                kind: if node.node_fqn == target_node_fqn {
+                    ExecutionTransitionKind::Terminal
+                } else {
+                    ExecutionTransitionKind::Task
+                },
+                logical_group: Some("execute".to_string()),
+            }
         })
         .collect::<Vec<_>>();
-    let control_deps = dag
+
+    let mut places = BTreeSet::<String>::new();
+    let mut arcs = Vec::<ArcSpec>::new();
+
+    for edge in net
         .edges
         .iter()
-        .filter(|edge| edge.to == node.node_fqn && selected_nodes.contains(&edge.from))
-        .filter(|edge| matches!(edge.kind, RegisteredDagEdgeKind::Control))
-        .map(|edge| edge.from.clone())
-        .collect::<Vec<_>>();
+        .filter(|edge| selected_nodes.contains(&edge.from) && selected_nodes.contains(&edge.to))
+    {
+        let place_id = format!(
+            "place::{}::{}::{}",
+            edge.from,
+            edge.to,
+            edge.label.clone().unwrap_or_else(|| "control".to_string())
+        );
+        places.insert(place_id.clone());
+        arcs.push(ArcSpec {
+            arc_id: format!("arc::{}::out::{}", edge.from, place_id),
+            place_id: place_id.clone(),
+            transition_id: edge.from.clone(),
+            direction: ArcDirection::TransitionToPlace,
+            label: edge.label.clone(),
+            required: false,
+        });
+        arcs.push(ArcSpec {
+            arc_id: format!("arc::{}::in::{}", edge.to, place_id),
+            place_id,
+            transition_id: edge.to.clone(),
+            direction: ArcDirection::PlaceToTransition,
+            label: edge.label.clone(),
+            required: matches!(edge.kind, RegisteredNetEdgeKind::Data),
+        });
+    }
 
-    ExecutionNodeSpec {
-        dag: DagNodeSpec {
-            node_id: node.node_fqn.clone(),
-            priority: 0,
-            consumes,
-            produces: node.produces.clone(),
-            control_deps,
-        },
-        run_policy: RunPolicy::default(),
-        kind: if node.node_fqn == target_node_fqn {
-            ExecutionNodeKind::Terminal
-        } else {
-            ExecutionNodeKind::Task
-        },
+    let mut transitions = transitions;
+    if !selected_nodes.contains(target_node_fqn) {
+        transitions.push(ExecutionTransitionSpec {
+            transition: TransitionSpec {
+                transition_id: fallback_target.node_fqn.clone(),
+                priority: 0,
+                join_policy: JoinPolicy::AllOf,
+            },
+            run_policy: RunPolicy::default(),
+            kind: ExecutionTransitionKind::Terminal,
+            logical_group: Some("execute".to_string()),
+        });
+    }
+
+    ExecutionNetSpec {
+        places: places
+            .into_iter()
+            .map(|place_id| PlaceSpec { place_id })
+            .collect(),
+        transitions,
+        arcs,
     }
 }
 
 fn build_execution_payload(
     base_payload: &Map<String, Value>,
-    consumes: &[DagInputSpec],
-    node_responses: &BTreeMap<String, Value>,
+    inputs: &[TriggerInput],
 ) -> Map<String, Value> {
     let mut payload = base_payload.clone();
-    for input in consumes {
-        let Some(producer) = &input.explicit_producer else {
+    for input in inputs {
+        let Some(field) = &input.label else {
             continue;
         };
-        let Some(response_payload) = node_responses.get(producer) else {
+        let Some(value) = extract_response_field(&input.token.payload, field) else {
             continue;
         };
-        let Some(value) = extract_response_field(response_payload, &input.input_type) else {
-            continue;
-        };
-        payload.insert(input.input_type.clone(), value);
+        payload.insert(field.clone(), value);
     }
     payload
 }
@@ -1193,16 +1247,18 @@ fn fill_missing_execution_traces(
     traces: &mut BTreeMap<String, ExecutionInvocationTrace>,
 ) {
     for (node_fqn, outcome) in &output.outcomes {
-        let entry = traces.entry(node_fqn.clone()).or_insert_with(|| ExecutionInvocationTrace {
-            node_fqn: node_fqn.clone(),
-            plugin_path: String::new(),
-            node_id: String::new(),
-            attempt: 0,
-            outcome: None,
-            request_payload: None,
-            response_payload: None,
-            error: None,
-        });
+        let entry = traces
+            .entry(node_fqn.clone())
+            .or_insert_with(|| ExecutionInvocationTrace {
+                node_fqn: node_fqn.clone(),
+                plugin_path: String::new(),
+                node_id: String::new(),
+                attempt: 0,
+                outcome: None,
+                request_payload: None,
+                response_payload: None,
+                error: None,
+            });
         entry.outcome = Some(*outcome);
     }
 }
@@ -1243,7 +1299,10 @@ fn build_snapshot_with_staged_root(
     Ok(runtime_snapshot_from_output(output, staged_artifact_root))
 }
 
-fn runtime_snapshot_from_output(output: LoadOutput, staged_artifact_root: PathBuf) -> RuntimeSnapshot {
+fn runtime_snapshot_from_output(
+    output: LoadOutput,
+    staged_artifact_root: PathBuf,
+) -> RuntimeSnapshot {
     RuntimeSnapshot {
         snapshot_id: output.execution_id,
         plugin_registry: output.plugin_registry,
@@ -1255,7 +1314,10 @@ fn runtime_snapshot_from_output(output: LoadOutput, staged_artifact_root: PathBu
     }
 }
 
-fn kernel_plan_result(planned: PlannedUpdate, verification_plan: VerificationPlan) -> KernelPlanResult {
+fn kernel_plan_result(
+    planned: PlannedUpdate,
+    verification_plan: VerificationPlan,
+) -> KernelPlanResult {
     KernelPlanResult {
         plan: planned.plan,
         summary: planned.summary,

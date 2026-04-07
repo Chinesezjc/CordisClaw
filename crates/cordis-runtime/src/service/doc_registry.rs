@@ -33,7 +33,11 @@ impl DocRegistry {
             })
     }
 
-    pub fn get_node_docs(&self, plugin_path: &str, node_id: &str) -> Result<&NodeDoc, RuntimeError> {
+    pub fn get_node_docs(
+        &self,
+        plugin_path: &str,
+        node_id: &str,
+    ) -> Result<&NodeDoc, RuntimeError> {
         let docs = self.get_plugin_docs(plugin_path)?;
         docs.nodes
             .iter()

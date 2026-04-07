@@ -7,7 +7,7 @@
 - `architecture.rs`
   - resolver / loader / grants / graph 导出 / 子插件 invoke
 - `semantics.rs`
-  - DAG / Gate / Context / Engine 语义
+  - CPN Net / Context / Engine 语义
 - `actor_executor.rs`
   - Actor 批量调度与并发上限
 - `shell_plugin.rs`
@@ -45,7 +45,7 @@
 - `docs/agent/interfaces.json` 是运行时输入，不能把它当可有可无的说明文件。
 - 插件加载失败时，很多场景是设计上的 fail-fast，不是“为什么不自动兜底”。
 - shell 插件虽然叫 shell，但它调用的是 CordisClaw builtin shell，不是系统 shell。
-- `graph-html` / `dag-html` 展示的是“已注册视图”，不等于真实业务执行流。
+- `graph-html` / `net-html` 展示的是“已注册视图”，不等于真实业务执行流。
 - auto-update 目前是文本补丁事务，不是 AST 级重写器。
 
 ## 4. 适合继续扩展的方向
@@ -53,7 +53,7 @@
 如果后续要继续演进，这个仓库最自然的方向包括：
 
 - 增加更多外部插件样例，验证 loader 边界。
-- 丰富 `interfaces.json` 与 DAG 推导规则。
+- 丰富 `interfaces.json` 与 net 推导规则。
 - 把 execution engine 接到更真实的运行入口。
 - 为 Kernel 增加更真实的 patch 生成与验证器集成。
 - 给 graph/doc registry 加上更稳定的服务边界，而不只是 route-style helper。

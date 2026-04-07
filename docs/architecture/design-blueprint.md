@@ -28,8 +28,8 @@ Plugin Packaging
 
 这套分层强调四件事：
 
-- 插件负责声明能力，而不是手写整条业务 DAG。
-- DAG 负责描述依赖关系。
+- 插件负责声明能力，而不是手写整条业务 net。
+- CPN net 负责描述依赖关系。
 - Scheduler / Actor 负责确定性执行。
 - Kernel 负责在安全边界内做观察、验证、评分与演进。
 
@@ -115,7 +115,7 @@ pub struct NodeMeta {
 - 控制依赖：只表达先后顺序
 - 条件依赖：由 Router 根据分支结果选择
 
-### 4.3 自动 DAG 生成
+### 4.3 自动 Net 生成
 
 蓝图默认希望系统能根据 `produces / consumes` 自动连线，并遵守：
 
@@ -126,7 +126,7 @@ pub struct NodeMeta {
 
 当前运行时文档里已经落地的部分包括：
 
-- DAG build
+- net build
 - required input 缺失检测
 - 多 producer 冲突检测
 - 环检测
@@ -211,7 +211,7 @@ load_session_snapshot
 
 - 先拿到 session 快照
 - 再建 request overlay
-- 中间通过 parser / router / pipeline 进入具体 DAG
+- 中间通过 parser / router / pipeline 进入具体 net
 - 在结束时决定是否提交 session
 
 当前仓库里更贴近现实的调用路径与样例插件，请看 [plugins-and-tooling.md](./plugins-and-tooling.md)。
@@ -248,7 +248,7 @@ load_session_snapshot
 原始规划中给出的工程结构，核心意图不是逐目录照搬，而是强调职责边界：
 
 - plugin 层负责发现、解析、加载、注册、调用
-- execution 层负责 DAG、Gate、Router、Scheduler、Actor
+- execution 层负责 CPN Net、Router、Scheduler、Actor
 - context 层负责作用域、键模型、事务与注入
 - kernel 层负责策略、评估、记忆与自迭代闭环
 - service 层负责 doc / graph 等对外查询能力

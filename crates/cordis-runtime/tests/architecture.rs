@@ -1,8 +1,8 @@
 use cordis_runtime::context::ContextRegistry;
 use cordis_runtime::core::error::RuntimeError;
 use cordis_runtime::core::models::{NodeOutcome, PluginLoadResult, PluginUnavailableReason};
-use cordis_runtime::plugin::invoke::PluginInvoker;
 use cordis_runtime::execution::scheduler::{run_deterministic, ScheduledNode, SchedulerConfig};
+use cordis_runtime::plugin::invoke::PluginInvoker;
 use cordis_runtime::plugin::loader::{default_loader_config, Loader};
 use cordis_runtime::plugin::tooling::{prepare_artifacts, PrepareMode};
 use serde_json::{json, Value};
@@ -63,7 +63,11 @@ fn load_success_and_grants_enforced() {
         PluginLoadResult::Loaded
     ));
     assert!(matches!(
-        output.plugin_registry.get("root/child").unwrap().load_result,
+        output
+            .plugin_registry
+            .get("root/child")
+            .unwrap()
+            .load_result,
         PluginLoadResult::Loaded
     ));
     assert!(matches!(
@@ -90,7 +94,10 @@ fn load_success_and_grants_enforced() {
         .doc_registry
         .handle_get("/plugins/root/child/nodes/child_entry/docs")
         .expect("route query should succeed");
-    assert_eq!(route_value.get("id").and_then(|x| x.as_str()), Some("child_entry"));
+    assert_eq!(
+        route_value.get("id").and_then(|x| x.as_str()),
+        Some("child_entry")
+    );
 
     let allowed = output
         .context
@@ -98,7 +105,9 @@ fn load_success_and_grants_enforced() {
         .expect("service.db should be granted");
     assert!(allowed.contains("service:root:service.db"));
 
-    let denied = output.context.inject::<String>("root/child", "service.cache");
+    let denied = output
+        .context
+        .inject::<String>("root/child", "service.cache");
     assert!(matches!(denied, Err(RuntimeError::PermissionDenied { .. })));
 }
 
@@ -122,21 +131,15 @@ fn registered_graph_json_and_html_are_available() {
         .and_then(|value| value.as_array())
         .expect("nodes array");
 
-    assert!(
-        plugins
-            .iter()
-            .any(|plugin| plugin.get("plugin_path").and_then(|v| v.as_str()) == Some("expr"))
-    );
-    assert!(
-        plugins
-            .iter()
-            .any(|plugin| plugin.get("plugin_path").and_then(|v| v.as_str()) == Some("shell"))
-    );
-    assert!(
-        nodes.iter().any(|node| {
-            node.get("node_fqn").and_then(|v| v.as_str()) == Some("expr::expr_entry")
-        })
-    );
+    assert!(plugins
+        .iter()
+        .any(|plugin| plugin.get("plugin_path").and_then(|v| v.as_str()) == Some("expr")));
+    assert!(plugins
+        .iter()
+        .any(|plugin| plugin.get("plugin_path").and_then(|v| v.as_str()) == Some("shell")));
+    assert!(nodes
+        .iter()
+        .any(|node| { node.get("node_fqn").and_then(|v| v.as_str()) == Some("expr::expr_entry") }));
 
     let html = output
         .graph_registry
@@ -150,21 +153,21 @@ fn registered_graph_json_and_html_are_available() {
 }
 
 #[test]
-fn registered_dag_json_and_html_are_available() {
+fn registered_net_json_and_html_are_available() {
     let temp = setup_fixture_copy();
     let config = default_loader_config(temp.path());
     let loader = Loader::new(config);
     let output = loader.load().expect("load should pass");
 
-    let dag_json = output
+    let net_json = output
         .graph_registry
-        .handle_get_json("/graphs/registered-dag")
-        .expect("dag json should exist");
-    let nodes = dag_json
+        .handle_get_json("/graphs/registered-net")
+        .expect("net json should exist");
+    let nodes = net_json
         .get("nodes")
         .and_then(|value| value.as_array())
         .expect("nodes array");
-    let edges = dag_json
+    let edges = net_json
         .get("edges")
         .and_then(|value| value.as_array())
         .expect("edges array");
@@ -173,19 +176,19 @@ fn registered_dag_json_and_html_are_available() {
         nodes.iter().any(|node| {
             node.get("node_fqn").and_then(|v| v.as_str()) == Some("expr/lexer::expr_lexer")
         }),
-        "lexer node should appear in dag"
+        "lexer node should appear in net"
     );
     assert!(
         nodes.iter().any(|node| {
             node.get("node_fqn").and_then(|v| v.as_str()) == Some("expr/parser::expr_parser")
         }),
-        "parser node should appear in dag"
+        "parser node should appear in net"
     );
     assert!(
         nodes.iter().any(|node| {
             node.get("node_fqn").and_then(|v| v.as_str()) == Some("expr/evaluator::expr_evaluator")
         }),
-        "evaluator node should appear in dag"
+        "evaluator node should appear in net"
     );
     assert!(
         edges.iter().any(|edge| {
@@ -204,10 +207,10 @@ fn registered_dag_json_and_html_are_available() {
 
     let html = output
         .graph_registry
-        .handle_get_html("/graphs/registered-dag.html")
-        .expect("dag html should exist");
+        .handle_get_html("/graphs/registered-net.html")
+        .expect("net html should exist");
     assert!(html.contains("<!doctype html>"));
-    assert!(html.contains("Registered DAG"));
+    assert!(html.contains("Registered Net"));
     assert!(html.contains("expr/lexer::expr_lexer"));
     assert!(html.contains("expr/evaluator::expr_evaluator"));
 }
@@ -244,8 +247,7 @@ fn expr_dylib_subplugins_are_invokable() {
             json!({ "ast": ast }).to_string(),
         )
         .expect("evaluator should be invokable");
-    let evaluator_value: Value =
-        serde_json::from_str(&evaluator.payload).expect("evaluator json");
+    let evaluator_value: Value = serde_json::from_str(&evaluator.payload).expect("evaluator json");
     assert_eq!(
         evaluator_value.get("value").and_then(|v| v.as_f64()),
         Some(7.0)
@@ -367,14 +369,20 @@ fn optional_child_unavailable_does_not_block_parent() {
 
     let config = default_loader_config(temp.path());
     let loader = Loader::new(config);
-    let output = loader.load().expect("optional child failure should not abort");
+    let output = loader
+        .load()
+        .expect("optional child failure should not abort");
 
     assert!(matches!(
         output.plugin_registry.get("root").unwrap().load_result,
         PluginLoadResult::Loaded
     ));
     assert!(matches!(
-        output.plugin_registry.get("root/child").unwrap().load_result,
+        output
+            .plugin_registry
+            .get("root/child")
+            .unwrap()
+            .load_result,
         PluginLoadResult::Unavailable(PluginUnavailableReason::AbiMismatch)
     ));
     assert!(output.metrics.dylib_no_fallback_total >= 1);
@@ -398,10 +406,16 @@ fn required_child_unavailable_blocks_parent_chain() {
 
     let config = default_loader_config(temp.path());
     let loader = Loader::new(config);
-    let output = loader.load().expect("loader should continue with unavailable state");
+    let output = loader
+        .load()
+        .expect("loader should continue with unavailable state");
 
     assert!(matches!(
-        output.plugin_registry.get("root/child").unwrap().load_result,
+        output
+            .plugin_registry
+            .get("root/child")
+            .unwrap()
+            .load_result,
         PluginLoadResult::Unavailable(PluginUnavailableReason::AbiMismatch)
     ));
     assert!(matches!(
@@ -428,10 +442,16 @@ fn hash_mismatch_marks_child_unavailable_and_no_fallback() {
 
     let config = default_loader_config(temp.path());
     let loader = Loader::new(config);
-    let output = loader.load().expect("loader should continue with unavailable state");
+    let output = loader
+        .load()
+        .expect("loader should continue with unavailable state");
 
     assert!(matches!(
-        output.plugin_registry.get("root/child").unwrap().load_result,
+        output
+            .plugin_registry
+            .get("root/child")
+            .unwrap()
+            .load_result,
         PluginLoadResult::Unavailable(PluginUnavailableReason::HashMismatch)
     ));
     assert!(matches!(
@@ -459,12 +479,12 @@ fn inject_on_unavailable_plugin_returns_unavailable_error() {
 
     let config = default_loader_config(temp.path());
     let loader = Loader::new(config);
-    let output = loader.load().expect("loader should continue with unavailable state");
+    let output = loader
+        .load()
+        .expect("loader should continue with unavailable state");
 
     assert!(matches!(
-        output
-            .context
-            .inject::<String>("root/child", "service.db"),
+        output.context.inject::<String>("root/child", "service.db"),
         Err(RuntimeError::ContextPluginUnavailable { .. })
     ));
 }

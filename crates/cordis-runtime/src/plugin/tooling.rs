@@ -4,7 +4,8 @@ use crate::core::models::{
     PluginDocs, PluginExecution, ARTIFACT_INDEX_SCHEMA_VERSION,
 };
 use crate::plugin::artifact::{
-    artifact_index_map, load_artifact_index, load_plugin_artifact, resolve_artifact_path, sha256_file,
+    artifact_index_map, load_artifact_index, load_plugin_artifact, resolve_artifact_path,
+    sha256_file,
 };
 use crate::plugin::dynamic::{is_dylib_path, LoadedDylibApi};
 use crate::plugin::package::{PackageResolver, ResolvedPlugin, ResolvedPluginGraph};
@@ -177,7 +178,9 @@ pub fn prepare_artifacts(
     prepare_artifacts_locked(&fixtures_root, mode)
 }
 
-pub fn rebuild_fixture_artifacts(fixtures_root: &Path) -> Result<Vec<(String, String)>, RuntimeError> {
+pub fn rebuild_fixture_artifacts(
+    fixtures_root: &Path,
+) -> Result<Vec<(String, String)>, RuntimeError> {
     Ok(prepare_artifacts(fixtures_root, PrepareMode::Full)?.rebuilt)
 }
 
@@ -190,7 +193,11 @@ pub fn sync_plugin_docs(fixtures_root: &Path) -> Result<Vec<PathBuf>, RuntimeErr
     let mut written = Vec::new();
     for entry in index.entries {
         let docs_path = plugins_root
-            .join(entry.plugin_path.replace('/', std::path::MAIN_SEPARATOR_STR))
+            .join(
+                entry
+                    .plugin_path
+                    .replace('/', std::path::MAIN_SEPARATOR_STR),
+            )
             .join("docs/agent/interfaces.json");
         let docs_dir = docs_path.parent().ok_or_else(|| RuntimeError::Invariant {
             message: format!("docs path missing parent: {}", docs_path.display()),
@@ -248,9 +255,11 @@ fn prepare_artifacts_locked(
     fixtures_root: &Path,
     mode: PrepareMode,
 ) -> Result<PrepareArtifactsReport, RuntimeError> {
-    let repo_root = fixtures_root.parent().ok_or_else(|| RuntimeError::Invariant {
-        message: format!("fixtures root missing parent: {}", fixtures_root.display()),
-    })?;
+    let repo_root = fixtures_root
+        .parent()
+        .ok_or_else(|| RuntimeError::Invariant {
+            message: format!("fixtures root missing parent: {}", fixtures_root.display()),
+        })?;
     let plugins_root = fixtures_root.join("plugins");
     let artifacts_dir = fixtures_root.join("artifacts");
     let artifact_index_path = artifacts_dir.join("index.json");
@@ -270,12 +279,8 @@ fn prepare_artifacts_locked(
         message: e.to_string(),
     })?;
 
-    let mut contexts = build_plugin_contexts(
-        repo_root,
-        &graph,
-        &artifacts_dir,
-        &dependency_snapshot,
-    )?;
+    let mut contexts =
+        build_plugin_contexts(repo_root, &graph, &artifacts_dir, &dependency_snapshot)?;
     let existing_map = existing_index
         .as_ref()
         .map(artifact_index_map)
@@ -285,32 +290,28 @@ fn prepare_artifacts_locked(
         context.dirty = if full_rebuild {
             true
         } else {
-            compute_dirty_state(repo_root, context, existing_map.get(&context.plugin.plugin_path))?
+            compute_dirty_state(
+                repo_root,
+                context,
+                existing_map.get(&context.plugin.plugin_path),
+            )?
         };
         if context.dirty {
-            context.build_fingerprint = Some(compute_build_fingerprint(
-                repo_root,
-                &context.input_files,
-            )?);
+            context.build_fingerprint =
+                Some(compute_build_fingerprint(repo_root, &context.input_files)?);
         }
     }
 
     if full_rebuild {
         full_rebuild = true;
-    } else if contexts.iter().any(|context| {
-        existing_map
-            .get(&context.plugin.plugin_path)
-            .is_none()
-            || context.dirty
-    }) {
+    } else if contexts
+        .iter()
+        .any(|context| existing_map.get(&context.plugin.plugin_path).is_none() || context.dirty)
+    {
         full_rebuild = false;
     }
 
-    build_dirty_dylib_plugins(
-        fixtures_root,
-        &dependency_snapshot,
-        &contexts,
-    )?;
+    build_dirty_dylib_plugins(fixtures_root, &dependency_snapshot, &contexts)?;
 
     let built_at = current_build_marker();
     let mut report = PrepareArtifactsReport {
@@ -367,13 +368,14 @@ fn build_plugin_contexts(
 ) -> Result<Vec<PluginBuildContext>, RuntimeError> {
     let mut contexts = Vec::new();
     for plugin_path in &graph.topo_order {
-        let plugin = graph
-            .plugins
-            .get(plugin_path)
-            .cloned()
-            .ok_or_else(|| RuntimeError::Invariant {
-                message: format!("missing plugin in resolved graph: {plugin_path}"),
-            })?;
+        let plugin =
+            graph
+                .plugins
+                .get(plugin_path)
+                .cloned()
+                .ok_or_else(|| RuntimeError::Invariant {
+                    message: format!("missing plugin in resolved graph: {plugin_path}"),
+                })?;
         let manifest_path = plugin.dir.join("Cargo.toml");
         let build_spec = read_plugin_build_spec(&manifest_path)?;
         let artifact_kind = if build_spec.is_dylib {
@@ -446,11 +448,15 @@ fn materialize_artifact_entry(
     built_at: &str,
 ) -> Result<ArtifactIndexEntry, RuntimeError> {
     let docs = if matches!(context.artifact_kind, ArtifactKind::Dylib) {
-        let built_path = if dependency_snapshot.is_workspace_member(&context.build_spec.package_name) {
-            dependency_snapshot.built_dylib_path(&context.build_spec.package_name)
-        } else {
-            built_dylib_path(&context.plugin.dir.join("Cargo.toml"), &context.build_spec.package_name)?
-        };
+        let built_path =
+            if dependency_snapshot.is_workspace_member(&context.build_spec.package_name) {
+                dependency_snapshot.built_dylib_path(&context.build_spec.package_name)
+            } else {
+                built_dylib_path(
+                    &context.plugin.dir.join("Cargo.toml"),
+                    &context.build_spec.package_name,
+                )?
+            };
         fs::copy(&built_path, &context.artifact_path).map_err(|e| RuntimeError::Io {
             path: context.artifact_path.clone(),
             message: format!("copy from {} failed: {e}", built_path.display()),
@@ -525,9 +531,11 @@ fn build_dirty_dylib_plugins(
     dependency_snapshot: &DependencySnapshot,
     contexts: &[PluginBuildContext],
 ) -> Result<(), RuntimeError> {
-    let repo_root = fixtures_root.parent().ok_or_else(|| RuntimeError::Invariant {
-        message: format!("fixtures root missing parent: {}", fixtures_root.display()),
-    })?;
+    let repo_root = fixtures_root
+        .parent()
+        .ok_or_else(|| RuntimeError::Invariant {
+            message: format!("fixtures root missing parent: {}", fixtures_root.display()),
+        })?;
     let mut workspace_packages = Vec::new();
 
     for context in contexts {
@@ -567,18 +575,18 @@ fn inspect_dylib_contract(
     artifact_path: &Path,
 ) -> Result<(PluginDocs, crate::core::models::AbiFingerprint), RuntimeError> {
     let dylib = LoadedDylibApi::open(artifact_path)?;
-    let docs: PluginDocs = serde_json::from_str(&(dylib.api().docs)().payload).map_err(|e| {
-        RuntimeError::Io {
+    let docs: PluginDocs =
+        serde_json::from_str(&(dylib.api().docs)().payload).map_err(|e| RuntimeError::Io {
             path: artifact_path.to_path_buf(),
             message: format!("runtime docs parse failed: {e}"),
-        }
-    })?;
-    let fingerprint = serde_json::from_str(&(dylib.api().abi_fingerprint)().payload).map_err(|e| {
-        RuntimeError::Io {
-            path: artifact_path.to_path_buf(),
-            message: format!("runtime fingerprint parse failed: {e}"),
-        }
-    })?;
+        })?;
+    let fingerprint =
+        serde_json::from_str(&(dylib.api().abi_fingerprint)().payload).map_err(|e| {
+            RuntimeError::Io {
+                path: artifact_path.to_path_buf(),
+                message: format!("runtime fingerprint parse failed: {e}"),
+            }
+        })?;
     Ok((docs, fingerprint))
 }
 
@@ -587,7 +595,11 @@ impl DependencySnapshot {
         let workspace_manifest_path = plugins_root.join("Cargo.toml");
         let metadata = load_workspace_metadata(&workspace_manifest_path)?;
         let target_directory = PathBuf::from(metadata.target_directory.clone());
-        let workspace_member_ids = metadata.workspace_members.iter().cloned().collect::<HashSet<_>>();
+        let workspace_member_ids = metadata
+            .workspace_members
+            .iter()
+            .cloned()
+            .collect::<HashSet<_>>();
         let packages_by_id = metadata
             .packages
             .iter()
@@ -687,7 +699,9 @@ fn collect_local_dependency_dirs(
     local_deps.into_iter().collect()
 }
 
-fn load_workspace_metadata(workspace_manifest_path: &Path) -> Result<CargoMetadataOutput, RuntimeError> {
+fn load_workspace_metadata(
+    workspace_manifest_path: &Path,
+) -> Result<CargoMetadataOutput, RuntimeError> {
     let output = run_command(
         "cargo",
         &[
@@ -705,7 +719,10 @@ fn load_workspace_metadata(workspace_manifest_path: &Path) -> Result<CargoMetada
     })
 }
 
-fn collect_plugin_inputs(plugin_dir: &Path, local_dep_dirs: &[PathBuf]) -> Result<Vec<PathBuf>, RuntimeError> {
+fn collect_plugin_inputs(
+    plugin_dir: &Path,
+    local_dep_dirs: &[PathBuf],
+) -> Result<Vec<PathBuf>, RuntimeError> {
     let mut files = collect_crate_inputs(plugin_dir, true)?;
     for dep_dir in local_dep_dirs {
         files.extend(collect_crate_inputs(dep_dir, false)?);
@@ -715,7 +732,10 @@ fn collect_plugin_inputs(plugin_dir: &Path, local_dep_dirs: &[PathBuf]) -> Resul
     Ok(files)
 }
 
-fn collect_crate_inputs(crate_dir: &Path, include_docs: bool) -> Result<Vec<PathBuf>, RuntimeError> {
+fn collect_crate_inputs(
+    crate_dir: &Path,
+    include_docs: bool,
+) -> Result<Vec<PathBuf>, RuntimeError> {
     let mut files = Vec::new();
     let manifest_path = crate_dir.join("Cargo.toml");
     if manifest_path.exists() {
@@ -854,9 +874,11 @@ fn read_plugin_build_spec(manifest_path: &Path) -> Result<PluginBuildSpec, Runti
 }
 
 fn build_plugin_artifact(fixtures_root: &Path, manifest_path: &Path) -> Result<(), RuntimeError> {
-    let repo_root = fixtures_root.parent().ok_or_else(|| RuntimeError::Invariant {
-        message: format!("fixtures root missing parent: {}", fixtures_root.display()),
-    })?;
+    let repo_root = fixtures_root
+        .parent()
+        .ok_or_else(|| RuntimeError::Invariant {
+            message: format!("fixtures root missing parent: {}", fixtures_root.display()),
+        })?;
     run_command(
         "cargo",
         &[

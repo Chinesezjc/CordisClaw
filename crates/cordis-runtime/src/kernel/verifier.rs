@@ -108,16 +108,15 @@ impl CommandVerifier {
     ) -> VerificationPlan {
         let static_check_command = match profile {
             VerificationProfile::Default => None,
-            VerificationProfile::RustWorkspace => {
-                discover_rust_workspace_manifest(workspace_root).map(|manifest| {
+            VerificationProfile::RustWorkspace => discover_rust_workspace_manifest(workspace_root)
+                .map(|manifest| {
                     let relative = manifest
                         .strip_prefix(workspace_root)
                         .unwrap_or(&manifest)
                         .display()
                         .to_string();
                     format!("cargo check --quiet --manifest-path {relative}")
-                })
-            }
+                }),
         };
 
         VerificationPlan {
@@ -258,7 +257,10 @@ fn run_optional_stage(
     })
 }
 
-fn run_check_command(command: &str, current_dir: &Path) -> Result<CommandCheckResult, RuntimeError> {
+fn run_check_command(
+    command: &str,
+    current_dir: &Path,
+) -> Result<CommandCheckResult, RuntimeError> {
     if let Some(spec_json) = command.strip_prefix(PLUGIN_COMMAND_PREFIX) {
         return run_plugin_command(command, spec_json, current_dir);
     }
@@ -346,7 +348,10 @@ fn resolve_plugin_fixtures_root(current_dir: &Path, requested_root: Option<&str>
     current_dir.to_path_buf()
 }
 
-fn run_shell_command(command: &str, current_dir: &Path) -> Result<CommandCheckResult, RuntimeError> {
+fn run_shell_command(
+    command: &str,
+    current_dir: &Path,
+) -> Result<CommandCheckResult, RuntimeError> {
     #[cfg(windows)]
     let output = Command::new("cmd")
         .args(["/C", command])
@@ -396,7 +401,10 @@ fn shell_args(command: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CommandVerifier, VerificationProfile, VerificationRunner, VerificationStageKind, VerificationStageStatus};
+    use super::{
+        CommandVerifier, VerificationProfile, VerificationRunner, VerificationStageKind,
+        VerificationStageStatus,
+    };
     use serde_json::json;
     use std::fs;
     use std::path::Path;
@@ -476,8 +484,11 @@ mod tests {
         )
         .expect("write manifest");
         fs::create_dir_all(temp.path().join("src")).expect("src dir");
-        fs::write(temp.path().join("src/lib.rs"), "pub fn demo() -> u32 { 1 }\n")
-            .expect("write source");
+        fs::write(
+            temp.path().join("src/lib.rs"),
+            "pub fn demo() -> u32 { 1 }\n",
+        )
+        .expect("write source");
 
         let report = CommandVerifier::verify(
             temp.path(),
@@ -490,13 +501,11 @@ mod tests {
         assert!(report.input.tests_passed, "report: {report:?}");
         assert_eq!(report.plan.profile, VerificationProfile::RustWorkspace);
         assert_eq!(report.stages[0].status, VerificationStageStatus::Passed);
-        assert!(
-            report.stages[0]
-                .check
-                .as_ref()
-                .expect("static check")
-                .command
-                .contains("cargo check --quiet --manifest-path Cargo.toml")
-        );
+        assert!(report.stages[0]
+            .check
+            .as_ref()
+            .expect("static check")
+            .command
+            .contains("cargo check --quiet --manifest-path Cargo.toml"));
     }
 }
