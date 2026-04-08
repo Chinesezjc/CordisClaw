@@ -3,6 +3,7 @@
 
 use crate::core::error::RuntimeError;
 use crate::core::models::{ChildPluginSpec, CordisMetadata, PluginDocs};
+use cordis_plugin_sdk::DEFAULT_ABI_VERSION;
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
@@ -62,17 +63,25 @@ struct WorkspaceSection {
 #[derive(Debug, Deserialize)]
 struct PluginCargoToml {
     package: Option<PackageSection>,
+    lib: Option<LibSection>,
 }
 
 #[derive(Debug, Deserialize)]
 struct PackageSection {
     name: String,
+    version: String,
     metadata: Option<MetadataSection>,
 }
 
 #[derive(Debug, Deserialize)]
 struct MetadataSection {
     cordis: Option<CordisMetadata>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct LibSection {
+    #[serde(rename = "crate-type", default)]
+    crate_type: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -202,9 +211,19 @@ impl PackageResolver {
             });
         }
 
+        let generated_agent_docs_allowed = plugin_toml
+            .lib
+            .as_ref()
+            .is_some_and(|lib| lib.crate_type.iter().any(|crate_type| crate_type == "dylib"));
+
         // Hard scaffold checks keep plugin projects uniform for both humans and agents.
-        self.validate_scaffold(&metadata.plugin_path, dir)?;
-        let docs = self.validate_docs_contract(&metadata.plugin_path, dir)?;
+        self.validate_scaffold(&metadata.plugin_path, dir, generated_agent_docs_allowed)?;
+        let docs = self.validate_docs_contract(
+            &metadata.plugin_path,
+            &package.version,
+            dir,
+            generated_agent_docs_allowed,
+        )?;
 
         let plugin_path = metadata.plugin_path.clone();
 
@@ -325,14 +344,16 @@ impl PackageResolver {
         Ok(segments.join("/"))
     }
 
-    fn validate_scaffold(&self, plugin_path: &str, dir: &Path) -> Result<(), RuntimeError> {
-        let required = [
-            "src",
-            "tests",
-            "docs",
-            "docs/agent/interfaces.json",
-            "docs/human/overview.md",
-        ];
+    fn validate_scaffold(
+        &self,
+        plugin_path: &str,
+        dir: &Path,
+        generated_agent_docs_allowed: bool,
+    ) -> Result<(), RuntimeError> {
+        let mut required = vec!["src", "tests", "docs", "docs/human/overview.md"];
+        if !generated_agent_docs_allowed {
+            required.push("docs/agent/interfaces.json");
+        }
 
         let mut missing = Vec::new();
         for item in required {
@@ -355,14 +376,26 @@ impl PackageResolver {
     fn validate_docs_contract(
         &self,
         plugin_path: &str,
+        plugin_version: &str,
         dir: &Path,
+        generated_agent_docs_allowed: bool,
     ) -> Result<PluginDocs, RuntimeError> {
-        // `interfaces.json` is machine-facing contract; parsing failure is fatal.
         let docs_path = dir.join("docs/agent/interfaces.json");
-        let docs_text = fs::read_to_string(&docs_path).map_err(|e| RuntimeError::Io {
-            path: docs_path.clone(),
-            message: e.to_string(),
-        })?;
+        let docs_text = match fs::read_to_string(&docs_path) {
+            Ok(text) => text,
+            Err(err) if generated_agent_docs_allowed && err.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(synthesized_generated_docs_placeholder(
+                    plugin_path,
+                    plugin_version,
+                ));
+            }
+            Err(err) => {
+                return Err(RuntimeError::Io {
+                    path: docs_path.clone(),
+                    message: err.to_string(),
+                });
+            }
+        };
 
         let docs: PluginDocs =
             serde_json::from_str(&docs_text).map_err(|e| RuntimeError::DocsContract {
@@ -449,6 +482,17 @@ impl PackageResolver {
         }
 
         Ok((child_dir, child_component))
+    }
+}
+
+fn synthesized_generated_docs_placeholder(plugin_path: &str, plugin_version: &str) -> PluginDocs {
+    PluginDocs {
+        plugin_id: normalize_crate_name(plugin_path),
+        plugin_path: plugin_path.to_string(),
+        plugin_version: plugin_version.to_string(),
+        abi_version: DEFAULT_ABI_VERSION,
+        command_name: None,
+        nodes: Vec::new(),
     }
 }
 

@@ -1,3 +1,4 @@
+use cordis_runtime::plugin::package::PackageResolver;
 use cordis_runtime::plugin::tooling::{refresh_artifact_index, sync_plugin_docs};
 use serde_json::Value;
 use std::fs;
@@ -29,6 +30,168 @@ fn setup_fixture_copy() -> TempDir {
     let temp = TempDir::new().expect("tempdir");
     copy_dir_all(&fixtures_root(), temp.path());
     temp
+}
+
+fn append_expr_evaluator_child(root: &Path, child_name: &str) {
+    let manifest_path = root.join("plugins/expr/evaluator/Cargo.toml");
+    let content = fs::read_to_string(&manifest_path).expect("read evaluator manifest");
+    let needle = "]\n\n[package.metadata.cordis.abi_fingerprint]";
+    let replacement = format!(
+        "  {{ source = \"./{child_name}\", required = true, grants = [] }},\n]\n\n[package.metadata.cordis.abi_fingerprint]"
+    );
+    let patched = content.replacen(needle, &replacement, 1);
+    assert_ne!(patched, content, "evaluator manifest should gain child entry");
+    fs::write(&manifest_path, patched).expect("write evaluator manifest");
+}
+
+fn write_expr_mod_child_without_generated_docs(root: &Path) {
+    let plugin_dir = root.join("plugins/expr/evaluator/mod");
+    fs::create_dir_all(plugin_dir.join("src")).expect("mkdir mod src");
+    fs::create_dir_all(plugin_dir.join("tests")).expect("mkdir mod tests");
+    fs::create_dir_all(plugin_dir.join("docs/human")).expect("mkdir mod docs human");
+
+    fs::write(
+        plugin_dir.join("Cargo.toml"),
+        r#"[package]
+name = "expr_evaluator_mod"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["rlib", "dylib"]
+
+[package.metadata.cordis]
+plugin_path = "expr/evaluator/mod"
+abi_kind = "rust"
+declared_nodes = ["expr_mod"]
+children = []
+
+[package.metadata.cordis.abi_fingerprint]
+rustc_version = "1.85.1"
+target_triple = "x86_64-unknown-linux-gnu"
+crate_hash = "crate_expr_mod_v1"
+api_hash = "api_v2"
+
+[dependencies]
+cordis-plugin-sdk = { path = "../../../../../crates/cordis-plugin-sdk" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[workspace]
+"#,
+    )
+    .expect("write mod manifest");
+    fs::write(
+        plugin_dir.join("src/core.rs"),
+        r#"#[derive(Debug, Default, Clone, Copy)]
+pub struct ModPlugin;
+
+impl ModPlugin {
+    pub fn apply(&self, lhs: f64, rhs: f64) -> f64 {
+        lhs % rhs
+    }
+}
+
+pub fn apply(lhs: f64, rhs: f64) -> f64 {
+    ModPlugin.apply(lhs, rhs)
+}
+"#,
+    )
+    .expect("write mod core");
+    fs::write(
+        plugin_dir.join("src/lib.rs"),
+        r#"mod core;
+
+pub use core::*;
+
+use cordis_plugin_sdk::{
+    export_plugin_api, json_response, node_doc, plugin_docs, AbiFingerprint, PluginRequest,
+    PluginResponse,
+};
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+
+#[derive(Debug, Deserialize)]
+struct BinaryOpRequest {
+    lhs: f64,
+    rhs: f64,
+}
+
+#[derive(Debug, Serialize)]
+struct BinaryOpResponse {
+    value: f64,
+}
+
+fn docs_value() -> cordis_plugin_sdk::PluginDocs {
+    plugin_docs(
+        "expr_evaluator_mod",
+        "expr/evaluator/mod",
+        "0.1.0",
+        None,
+        vec![node_doc(
+            "expr_mod",
+            "Compute lhs modulo rhs.",
+            json!({
+                "type": "object",
+                "required": ["lhs", "rhs"],
+                "properties": {
+                    "lhs": { "type": "number" },
+                    "rhs": { "type": "number" }
+                }
+            }),
+            json!({
+                "type": "object",
+                "properties": { "value": { "type": "number" } }
+            }),
+            &[],
+            &["division_by_zero"],
+        )],
+    )
+}
+
+fn abi_fingerprint_value() -> AbiFingerprint {
+    AbiFingerprint {
+        rustc_version: "1.85.1".to_string(),
+        target_triple: "x86_64-unknown-linux-gnu".to_string(),
+        crate_hash: "crate_expr_mod_v1".to_string(),
+        api_hash: "api_v2".to_string(),
+    }
+}
+
+fn api_handle(req: PluginRequest) -> PluginResponse {
+    let response = match serde_json::from_str::<BinaryOpRequest>(&req.payload) {
+        Ok(request) => BinaryOpResponse {
+            value: apply(request.lhs, request.rhs),
+        },
+        Err(_) => BinaryOpResponse { value: f64::NAN },
+    };
+    json_response(&response)
+}
+
+export_plugin_api! {
+    abi_fingerprint = abi_fingerprint_value(),
+    docs = docs_value(),
+    handle = api_handle,
+}
+"#,
+    )
+    .expect("write mod lib");
+    fs::write(
+        plugin_dir.join("tests/mod.rs"),
+        r#"use expr_evaluator_mod::apply;
+
+#[test]
+fn modulo_returns_remainder() {
+    assert_eq!(apply(5.0, 2.0), 1.0);
+}
+"#,
+    )
+    .expect("write mod tests");
+    fs::write(
+        plugin_dir.join("docs/human/overview.md"),
+        "# Expr Mod\n\nSibling child plugin for modulo evaluation.\n",
+    )
+    .expect("write mod human docs");
 }
 
 #[test]
@@ -98,4 +261,24 @@ fn refresh_artifact_index_recomputes_hashes() {
 
     assert_eq!(updated_hash, shell_hash);
     assert_ne!(updated_hash, "deadbeef");
+}
+
+#[test]
+fn package_resolver_allows_new_dylib_child_without_generated_agent_docs() {
+    let temp = setup_fixture_copy();
+    append_expr_evaluator_child(temp.path(), "mod");
+    write_expr_mod_child_without_generated_docs(temp.path());
+
+    let graph = PackageResolver::new(temp.path().join("plugins"))
+        .resolve()
+        .expect("resolver should allow generated docs for new dylib child");
+    let plugin = graph
+        .plugins
+        .get("expr/evaluator/mod")
+        .expect("new child plugin should be discovered");
+    assert_eq!(plugin.docs.plugin_path, "expr/evaluator/mod");
+    assert!(
+        plugin.docs.nodes.is_empty(),
+        "missing generated docs should synthesize a placeholder until rebuild writes real docs"
+    );
 }

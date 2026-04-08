@@ -813,6 +813,7 @@ impl LlmPatchPlanner {
         };
 
         match self.build_planned_plugin_edit(
+            workspace_root,
             request.clone(),
             payload.clone(),
             &writable_roots,
@@ -843,6 +844,7 @@ impl LlmPatchPlanner {
                         ),
                     })?;
                 self.build_planned_plugin_edit(
+                    workspace_root,
                     request,
                     repaired_payload,
                     &writable_roots,
@@ -995,7 +997,7 @@ impl LlmPatchPlanner {
             serde_json::to_string(invalid_payload).unwrap_or_else(|_| "{}".to_string())
         });
         let repair_prompt = format!(
-            "{user_prompt}\n\nLocal validation rejected the previous JSON plugin edit plan.\nValidation error:\n{validation_error}\n\nPrevious invalid JSON plan:\n```json\n{invalid_json}\n```\n\nReturn a corrected JSON object for the same task.\nKeep the intended change, but fix the local validation failure.\nImportant rules:\n- Every operation.path must be a writable file path, never a directory path.\n- To scaffold a new child plugin, create concrete files such as `plugins/.../Cargo.toml`, `plugins/.../src/lib.rs`, and `plugins/.../src/core.rs`.\n- Do not use directory paths like `plugins/.../mod` as an operation.path.\n- Return only JSON.\n"
+            "{user_prompt}\n\nLocal validation rejected the previous JSON plugin edit plan.\nValidation error:\n{validation_error}\n\nPrevious invalid JSON plan:\n```json\n{invalid_json}\n```\n\nReturn a corrected JSON object for the same task.\nKeep the intended change, but fix the local validation failure.\nImportant rules:\n- Every operation.path must be a writable file path, never a directory path.\n- To scaffold a new child plugin, create concrete files such as `plugins/.../Cargo.toml`, `plugins/.../src/lib.rs`, and `plugins/.../src/core.rs`.\n- Do not use directory paths like `plugins/.../mod` as an operation.path.\n- If a new child plugin path contains a Rust keyword such as `mod`, keep that keyword only in filesystem/plugin_path positions and use non-keyword Rust identifiers such as `modulo`, `mod_plugin`, or `modulo_op` inside code.\n- Return only JSON.\n"
         );
         self.complete_with_deepseek_json(
             plugin_edit_deepseek_system_prompt(),
@@ -1297,7 +1299,6 @@ impl LlmPatchPlanner {
                     tool_names_from_definition(&tools),
                 ),
             );
-            let tool_choice = deepseek_plugin_tool_choice_for_state(&inspection_state);
             let request_body = json!({
                 "model": self.config.model,
                 "messages": messages,
@@ -1307,7 +1308,7 @@ impl LlmPatchPlanner {
                     DeepSeekPlannerMode::Plugin,
                 ),
                 "tools": tools,
-                "tool_choice": tool_choice,
+                "tool_choice": "auto",
             });
             let (message, response_id, finish_reason) =
                 self.send_deepseek_chat_request(endpoint.clone(), request_body)?;
@@ -2267,6 +2268,7 @@ impl LlmPatchPlanner {
 
     fn build_planned_plugin_edit(
         &self,
+        workspace_root: &Path,
         request: PluginPlanRequest,
         payload: PluginPlannerPayload,
         writable_roots: &BTreeSet<String>,
@@ -2278,6 +2280,10 @@ impl LlmPatchPlanner {
             });
         }
         validate_plugin_operation_paths(&payload.operations, writable_roots)?;
+        validate_new_child_plugin_scaffold(&payload.operations, writable_roots)?;
+        validate_new_child_plugin_manifest_dependencies(workspace_root, &payload.operations)?;
+        validate_reserved_child_keyword_identifiers(&payload.operations, writable_roots)?;
+        validate_rust_source_dependencies(&payload.operations)?;
 
         Ok(PlannedPluginEdit {
             plan: PluginEditPlan {
@@ -2457,6 +2463,8 @@ fn build_plugin_edit_prompt(
         prompt.push_str("- Human docs under docs/human/overview.md describe intended plugin topology and preferred extension patterns.\n");
         prompt.push_str("- When these docs explain how new behavior should be added, prefer following that architecture over choosing the smallest immediate diff.\n");
     }
+    prompt.push_str("\nRust identifier guidance:\n");
+    prompt.push_str("- If a new plugin path component is a Rust keyword such as `mod`, keep it in filesystem/plugin_path positions only; use non-keyword Rust identifiers like `modulo` or `mod_plugin` inside source code.\n");
     prompt.push_str("\nCurrent file contents with sha256 preconditions:\n");
     for file in files {
         let writable = path_within_writable_surface(&file.path, &writable_roots);
@@ -2569,6 +2577,7 @@ fn build_deepseek_plugin_tool_prompt(
     prompt.push_str("Files under docs/agent/** are read-only generated context and must never appear in submitted operations.\n");
     prompt.push_str("Human docs under docs/human/overview.md describe intended plugin topology and preferred extension patterns; treat them as architecture guidance, not just prose.\n");
     prompt.push_str("You may create a new child plugin inside the selected plugin subtree. New child plugin paths are valid when they stay within plugin Cargo.toml, src/**, tests/**, or docs/human/** surfaces under that subtree.\n");
+    prompt.push_str("When a new child plugin path contains a Rust keyword such as `mod`, keep that keyword only in filesystem/plugin_path positions. In Rust source code, use non-keyword identifiers such as `modulo`, `mod_plugin`, or `modulo_op` instead of raw `mod` field/local names.\n");
     prompt.push_str("\nWritable plugin roots:\n");
     for root in &request.writable_roots {
         prompt.push_str("- ");
@@ -2721,6 +2730,7 @@ fn plugin_edit_deepseek_system_prompt() -> &'static str {
 The JSON must use this shape: {\"summary\":\"short summary\",\"tests_command\":\"optional verifier command or null\",\"safety_command\":\"optional verifier command or null\",\"operations\":[{\"path\":\"relative/path\",\"kind\":\"replace_exact|create_file|delete_file|json_set|toml_set\",\"expected_old_string\":\"required for replace_exact/create_file\",\"expected_sha256\":\"required for delete_file/json_set/toml_set\",\"new_content\":\"required for replace_exact/create_file\",\"pointer\":\"required for json_set\",\"dotted_key\":\"required for toml_set\",\"value\":\"required for json_set/toml_set\"}]}. \
 Only emit operations inside the writable plugin roots. Do not modify runtime crates, root manifests, config, .git, target, artifacts, or generated agent docs under docs/agent/**. \
 For existing files, use the provided sha256 values as expected preconditions. For create_file, set expected_old_string to an empty string. \
+If a new child plugin path contains a Rust keyword such as `mod`, keep that keyword in filesystem/plugin_path positions only and use a non-keyword Rust identifier such as `modulo` or `mod_plugin` inside code. \
 Do not invent plugin capabilities beyond the provided catalog and do not include extra keys."
 }
 
@@ -2744,6 +2754,7 @@ Use submit_change_strategy once you know the implementation direction, especiall
 After submit_change_strategy, use at most two additional context inspection tool calls before either submitting the final plan or revising the strategy. \
 The available tools narrow by phase: when a strategy is required, only submit_change_strategy and submit_plugin_edit_plan remain; after a strategy is recorded, only read_context_* plus those submit tools remain until finalization is required. \
 You may create a new child plugin inside the selected plugin subtree as long as the new files stay within plugin Cargo.toml, src/**, tests/**, or docs/human/** surfaces. \
+If a new child plugin path contains a Rust keyword such as `mod`, keep that keyword only in filesystem/plugin_path positions and use a non-keyword Rust identifier such as `modulo`, `mod_plugin`, or `modulo_op` inside code. \
 When ready, call submit_plugin_edit_plan as the only tool call in that assistant turn. \
 Do not invent files, paths, plugin capabilities, or command outputs."
 }
@@ -2867,11 +2878,12 @@ fn deepseek_plugin_tools_for_state(inspection_state: &DeepSeekReadInspectionStat
             DEEPSEEK_TOOL_SUBMIT_CHANGE_STRATEGY,
             DEEPSEEK_TOOL_SUBMIT_PLUGIN_EDIT_PLAN,
         ],
-        DeepSeekPluginPlanningPhase::DecideStrategy | DeepSeekPluginPlanningPhase::Finalize => {
-            vec![
-                DEEPSEEK_TOOL_SUBMIT_CHANGE_STRATEGY,
-                DEEPSEEK_TOOL_SUBMIT_PLUGIN_EDIT_PLAN,
-            ]
+        DeepSeekPluginPlanningPhase::DecideStrategy => vec![
+            DEEPSEEK_TOOL_SUBMIT_CHANGE_STRATEGY,
+            DEEPSEEK_TOOL_SUBMIT_PLUGIN_EDIT_PLAN,
+        ],
+        DeepSeekPluginPlanningPhase::Finalize => {
+            vec![DEEPSEEK_TOOL_SUBMIT_PLUGIN_EDIT_PLAN]
         }
         DeepSeekPluginPlanningPhase::RefineAfterStrategy => vec![
             DEEPSEEK_TOOL_READ_CONTEXT_FILE,
@@ -2881,18 +2893,6 @@ fn deepseek_plugin_tools_for_state(inspection_state: &DeepSeekReadInspectionStat
         ],
     };
     filter_tool_definitions(&deepseek_plugin_tools(), &allowed)
-}
-
-fn deepseek_plugin_tool_choice_for_state(inspection_state: &DeepSeekReadInspectionState) -> Value {
-    match inspection_state.plugin_phase() {
-        DeepSeekPluginPlanningPhase::Finalize => json!({
-            "type": "function",
-            "function": {
-                "name": DEEPSEEK_TOOL_SUBMIT_PLUGIN_EDIT_PLAN,
-            }
-        }),
-        _ => Value::String("auto".to_string()),
-    }
 }
 
 fn filter_tool_definitions(all_tools: &Value, allowed_names: &[&str]) -> Value {
@@ -3899,6 +3899,256 @@ fn validate_plugin_operation_paths(
     Ok(())
 }
 
+fn validate_new_child_plugin_scaffold(
+    operations: &[PluginEditOperation],
+    writable_roots: &BTreeSet<String>,
+) -> Result<(), RuntimeError> {
+    let created_paths = operations
+        .iter()
+        .filter(|operation| operation.kind == PluginEditOpKind::CreateFile)
+        .map(|operation| normalize_plugin_rel_path(&operation.path))
+        .collect::<Result<BTreeSet<_>, RuntimeError>>()?;
+
+    let mut new_child_roots = BTreeSet::new();
+    for path in &created_paths {
+        if !path.ends_with("/Cargo.toml") {
+            continue;
+        }
+        let Some(root) = deepest_matching_writable_root(path, writable_roots) else {
+            continue;
+        };
+        if path == &format!("{root}/Cargo.toml") {
+            continue;
+        }
+        let Some(relative) = path
+            .strip_prefix(root)
+            .and_then(|value| value.strip_prefix('/'))
+            .and_then(|value| value.strip_suffix("/Cargo.toml"))
+        else {
+            continue;
+        };
+        if relative.is_empty() {
+            continue;
+        }
+        new_child_roots.insert(format!("{root}/{relative}"));
+    }
+
+    for child_root in new_child_roots {
+        let mut missing = Vec::new();
+        if !created_paths.contains(&format!("{child_root}/Cargo.toml")) {
+            missing.push(format!("{child_root}/Cargo.toml"));
+        }
+        if !created_paths
+            .iter()
+            .any(|path| path.starts_with(&format!("{child_root}/src/")))
+        {
+            missing.push(format!("{child_root}/src/**"));
+        }
+        if !created_paths
+            .iter()
+            .any(|path| path.starts_with(&format!("{child_root}/tests/")))
+        {
+            missing.push(format!("{child_root}/tests/**"));
+        }
+        if !created_paths.contains(&format!("{child_root}/docs/human/overview.md")) {
+            missing.push(format!("{child_root}/docs/human/overview.md"));
+        }
+        if !missing.is_empty() {
+            return Err(RuntimeError::LlmResponseInvalid {
+                message: format!(
+                    "new child plugin scaffold is incomplete for {child_root}: missing {}",
+                    missing.join(", ")
+                ),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_new_child_plugin_manifest_dependencies(
+    workspace_root: &Path,
+    operations: &[PluginEditOperation],
+) -> Result<(), RuntimeError> {
+    for operation in operations {
+        if operation.kind != PluginEditOpKind::CreateFile || !operation.path.ends_with("/Cargo.toml") {
+            continue;
+        }
+        let manifest_text = operation.new_content.as_deref().ok_or_else(|| {
+            RuntimeError::LlmResponseInvalid {
+                message: format!("create_file Cargo.toml is missing new_content: {}", operation.path),
+            }
+        })?;
+        let manifest: toml::Value = toml::from_str(manifest_text).map_err(|err| {
+            RuntimeError::LlmResponseInvalid {
+                message: format!("new plugin manifest {} is not valid TOML: {err}", operation.path),
+            }
+        })?;
+        let manifest_path = normalize_plugin_rel_path(&operation.path)?;
+        let manifest_dir = workspace_root.join(
+            Path::new(&manifest_path)
+                .parent()
+                .unwrap_or_else(|| Path::new("")),
+        );
+        for section in ["dependencies", "dev-dependencies", "build-dependencies"] {
+            let Some(table) = manifest.get(section).and_then(toml::Value::as_table) else {
+                continue;
+            };
+            for (dependency_name, spec) in table {
+                let Some(path_value) = spec
+                    .as_table()
+                    .and_then(|table| table.get("path"))
+                    .and_then(toml::Value::as_str)
+                else {
+                    continue;
+                };
+                let resolved = lexically_resolve_relative_path(&manifest_dir, path_value);
+                if !resolved.exists() {
+                    return Err(RuntimeError::LlmResponseInvalid {
+                        message: format!(
+                            "new plugin manifest {} references missing local dependency path {} for dependency {}",
+                            operation.path, path_value, dependency_name
+                        ),
+                    });
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn lexically_resolve_relative_path(base_dir: &Path, relative_path: &str) -> PathBuf {
+    let mut resolved = PathBuf::new();
+    resolved.push(base_dir);
+    for component in Path::new(relative_path).components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                resolved.pop();
+            }
+            Component::Normal(segment) => resolved.push(segment),
+            Component::RootDir => resolved.push(Path::new("/")),
+            Component::Prefix(prefix) => resolved.push(prefix.as_os_str()),
+        }
+    }
+    resolved
+}
+
+fn validate_reserved_child_keyword_identifiers(
+    operations: &[PluginEditOperation],
+    writable_roots: &BTreeSet<String>,
+) -> Result<(), RuntimeError> {
+    let reserved_child_keywords = operations
+        .iter()
+        .filter(|operation| operation.kind == PluginEditOpKind::CreateFile)
+        .filter_map(|operation| normalize_plugin_rel_path(&operation.path).ok())
+        .filter(|path| path.ends_with("/Cargo.toml"))
+        .filter_map(|path| {
+            let root = deepest_matching_writable_root(&path, writable_roots)?;
+            let relative = path
+                .strip_prefix(root)?
+                .strip_prefix('/')
+                .and_then(|value| value.strip_suffix("/Cargo.toml"))?;
+            let child_name = relative.rsplit('/').next()?;
+            matches!(child_name, "mod").then_some(child_name.to_string())
+        })
+        .collect::<BTreeSet<_>>();
+
+    if reserved_child_keywords.is_empty() {
+        return Ok(());
+    }
+
+    for operation in operations {
+        if !operation.path.ends_with(".rs") {
+            continue;
+        }
+        let Some(content) = operation.new_content.as_deref() else {
+            continue;
+        };
+        for keyword in &reserved_child_keywords {
+            let raw_field = format!(" {keyword}:");
+            let raw_access_dot = format!(".{keyword}.");
+            let raw_access_space = format!(".{keyword} ");
+            let raw_access_comma = format!(".{keyword},");
+            let raw_access_paren = format!(".{keyword})");
+            if content.contains(&raw_field)
+                || content.contains(&raw_access_dot)
+                || content.contains(&raw_access_space)
+                || content.contains(&raw_access_comma)
+                || content.contains(&raw_access_paren)
+            {
+                return Err(RuntimeError::LlmResponseInvalid {
+                    message: format!(
+                        "new child plugin path component `{keyword}` is a Rust keyword and must not be used as a raw Rust identifier in {}",
+                        operation.path
+                    ),
+                });
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_rust_source_dependencies(
+    operations: &[PluginEditOperation],
+) -> Result<(), RuntimeError> {
+    let created_manifests = operations
+        .iter()
+        .filter(|operation| operation.kind == PluginEditOpKind::CreateFile)
+        .filter(|operation| operation.path.ends_with("/Cargo.toml"))
+        .filter_map(|operation| {
+            operation
+                .new_content
+                .as_ref()
+                .map(|content| (operation.path.clone(), content.clone()))
+        })
+        .collect::<Vec<_>>();
+
+    for operation in operations {
+        if !operation.path.ends_with(".rs") {
+            continue;
+        }
+        let Some(content) = operation.new_content.as_deref() else {
+            continue;
+        };
+        if !(content.contains("thiserror::Error") || content.contains("#[error(")) {
+            continue;
+        }
+
+        let Some(plugin_root) = Path::new(&operation.path)
+            .parent()
+            .and_then(Path::parent)
+            .and_then(|dir| dir.parent())
+        else {
+            continue;
+        };
+        let expected_manifest = plugin_root.join("Cargo.toml");
+        let Some((manifest_path, manifest_text)) = created_manifests
+            .iter()
+            .find(|(manifest_path, _)| Path::new(manifest_path) == expected_manifest)
+        else {
+            return Err(RuntimeError::LlmResponseInvalid {
+                message: format!(
+                    "Rust source {} uses thiserror but no matching new plugin Cargo.toml was found in the plan",
+                    operation.path
+                ),
+            });
+        };
+        if !manifest_text.contains("thiserror") {
+            return Err(RuntimeError::LlmResponseInvalid {
+                message: format!(
+                    "Rust source {} uses thiserror but {} does not declare the thiserror dependency",
+                    operation.path, manifest_path
+                ),
+            });
+        }
+    }
+
+    Ok(())
+}
+
 fn validate_submitted_plugin_payload(
     payload: &PluginPlannerPayload,
     writable_roots: &BTreeSet<String>,
@@ -3910,6 +4160,9 @@ fn validate_submitted_plugin_payload(
         });
     }
     validate_plugin_operation_paths(&payload.operations, writable_roots)?;
+    validate_new_child_plugin_scaffold(&payload.operations, writable_roots)?;
+    validate_reserved_child_keyword_identifiers(&payload.operations, writable_roots)?;
+    validate_rust_source_dependencies(&payload.operations)?;
     validate_plugin_payload_against_strategy(payload, strategy)
 }
 
@@ -4220,15 +4473,15 @@ fn api_key_env_looks_like_secret(value: &str) -> bool {
 mod tests {
     use super::{
         api_key_env_looks_like_secret, build_plugin_edit_prompt, build_read_tool_result,
-        build_user_prompt, deepseek_plugin_tool_choice_for_state,
-        deepseek_plugin_tools_for_state, discover_plugin_catalog, extract_error_message,
-        extract_output_text, normalize_optional_command, normalize_rel_path,
+        build_user_prompt, deepseek_plugin_tools_for_state, discover_plugin_catalog,
+        extract_error_message, extract_output_text, normalize_optional_command,
+        normalize_rel_path,
         path_within_read_only_generated_context, path_within_writable_surface,
         select_plugin_planner_context_files, sha256_text, tool_names_from_definition,
         validate_plugin_operation_paths, ContextFile, DeepSeekPlannerMode,
         DeepSeekPluginPlanningPhase, DeepSeekReadInspectionState, DeepSeekToolCall,
         DeepSeekToolFunctionCall, LlmPatchPlanner, PlanRequest, PluginChangeStrategy,
-        PluginPlanRequest,
+        PluginPlanRequest, PluginPlannerPayload,
         DEEPSEEK_PRE_STRATEGY_CONTEXT_TOOL_LIMIT, DEEPSEEK_TOOL_READ_CONTEXT_FILE,
         DEEPSEEK_TOOL_READ_CONTEXT_FILES, DEEPSEEK_TOOL_SUBMIT_CHANGE_STRATEGY,
         DEEPSEEK_TOOL_SUBMIT_PLUGIN_EDIT_PLAN,
@@ -4557,6 +4810,201 @@ mod tests {
             "plugins/expr/evaluator/mod/docs/agent/interfaces.json",
             &writable_roots
         ));
+    }
+
+    #[test]
+    fn validate_submitted_plugin_payload_rejects_incomplete_new_child_scaffold() {
+        let writable_roots = BTreeSet::from([
+            "plugins/expr".to_string(),
+            "plugins/expr/evaluator".to_string(),
+        ]);
+        let payload = PluginPlannerPayload {
+            summary: "create modulo child".to_string(),
+            tests_command: None,
+            safety_command: None,
+            operations: vec![
+                PluginEditOperation {
+                    path: "plugins/expr/evaluator/mod/Cargo.toml".to_string(),
+                    kind: PluginEditOpKind::CreateFile,
+                    expected_old_string: Some(String::new()),
+                    expected_sha256: None,
+                    new_content: Some("[package]\nname = \"expr_evaluator_mod\"\n".to_string()),
+                    pointer: None,
+                    dotted_key: None,
+                    value: None,
+                },
+                PluginEditOperation {
+                    path: "plugins/expr/evaluator/mod/src/lib.rs".to_string(),
+                    kind: PluginEditOpKind::CreateFile,
+                    expected_old_string: Some(String::new()),
+                    expected_sha256: None,
+                    new_content: Some("pub fn modulo() {}\n".to_string()),
+                    pointer: None,
+                    dotted_key: None,
+                    value: None,
+                },
+            ],
+        };
+
+        let err = super::validate_submitted_plugin_payload(&payload, &writable_roots, None)
+            .expect_err("incomplete child scaffold should be rejected");
+        assert!(err
+            .to_string()
+            .contains("docs/human/overview.md"));
+    }
+
+    #[test]
+    fn validate_submitted_plugin_payload_rejects_raw_mod_identifier() {
+        let writable_roots = BTreeSet::from([
+            "plugins/expr".to_string(),
+            "plugins/expr/evaluator".to_string(),
+        ]);
+        let payload = PluginPlannerPayload {
+            summary: "create modulo child".to_string(),
+            tests_command: None,
+            safety_command: None,
+            operations: vec![
+                PluginEditOperation {
+                    path: "plugins/expr/evaluator/mod/Cargo.toml".to_string(),
+                    kind: PluginEditOpKind::CreateFile,
+                    expected_old_string: Some(String::new()),
+                    expected_sha256: None,
+                    new_content: Some("[package]\nname = \"expr_evaluator_mod\"\n".to_string()),
+                    pointer: None,
+                    dotted_key: None,
+                    value: None,
+                },
+                PluginEditOperation {
+                    path: "plugins/expr/evaluator/mod/src/lib.rs".to_string(),
+                    kind: PluginEditOpKind::CreateFile,
+                    expected_old_string: Some(String::new()),
+                    expected_sha256: None,
+                    new_content: Some("pub fn modulo() {}\n".to_string()),
+                    pointer: None,
+                    dotted_key: None,
+                    value: None,
+                },
+                PluginEditOperation {
+                    path: "plugins/expr/evaluator/mod/tests/modulo.rs".to_string(),
+                    kind: PluginEditOpKind::CreateFile,
+                    expected_old_string: Some(String::new()),
+                    expected_sha256: None,
+                    new_content: Some("#[test]\nfn ok() {}\n".to_string()),
+                    pointer: None,
+                    dotted_key: None,
+                    value: None,
+                },
+                PluginEditOperation {
+                    path: "plugins/expr/evaluator/mod/docs/human/overview.md".to_string(),
+                    kind: PluginEditOpKind::CreateFile,
+                    expected_old_string: Some(String::new()),
+                    expected_sha256: None,
+                    new_content: Some("# Mod\n".to_string()),
+                    pointer: None,
+                    dotted_key: None,
+                    value: None,
+                },
+                PluginEditOperation {
+                    path: "plugins/expr/evaluator/src/core.rs".to_string(),
+                    kind: PluginEditOpKind::ReplaceExact,
+                    expected_old_string: Some("struct OpPlugins {\n}\n".to_string()),
+                    expected_sha256: None,
+                    new_content: Some("struct OpPlugins {\n    mod: ModPlugin,\n}\n".to_string()),
+                    pointer: None,
+                    dotted_key: None,
+                    value: None,
+                },
+            ],
+        };
+
+        let err = super::validate_submitted_plugin_payload(&payload, &writable_roots, None)
+            .expect_err("raw mod identifier should be rejected");
+        assert!(err.to_string().contains("Rust keyword"));
+    }
+
+    #[test]
+    fn validate_new_child_plugin_manifest_dependencies_rejects_missing_local_path() {
+        let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .expect("workspace root");
+        let operations = vec![PluginEditOperation {
+            path: "plugins/expr/evaluator/mod/Cargo.toml".to_string(),
+            kind: PluginEditOpKind::CreateFile,
+            expected_old_string: Some(String::new()),
+            expected_sha256: None,
+            new_content: Some(
+                "[package]\nname = \"expr_evaluator_mod\"\nversion = \"0.1.0\"\n[dependencies]\ncordis-plugin-sdk = { path = \"../../../../../../crates/cordis-plugin-sdk\" }\n"
+                    .to_string(),
+            ),
+            pointer: None,
+            dotted_key: None,
+            value: None,
+        }];
+
+        let err = super::validate_new_child_plugin_manifest_dependencies(&workspace_root, &operations)
+            .expect_err("missing local dependency path should be rejected");
+        assert!(err.to_string().contains("references missing local dependency path"));
+    }
+
+    #[test]
+    fn validate_new_child_plugin_manifest_dependencies_allows_real_repo_relative_path() {
+        let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .expect("workspace root");
+        let operations = vec![PluginEditOperation {
+            path: "plugins/expr/evaluator/modulo/Cargo.toml".to_string(),
+            kind: PluginEditOpKind::CreateFile,
+            expected_old_string: Some(String::new()),
+            expected_sha256: None,
+            new_content: Some(
+                "[package]\nname = \"expr_evaluator_modulo\"\nversion = \"0.1.0\"\n[dependencies]\ncordis-plugin-sdk = { path = \"../../../../../crates/cordis-plugin-sdk\" }\n"
+                    .to_string(),
+            ),
+            pointer: None,
+            dotted_key: None,
+            value: None,
+        }];
+
+        super::validate_new_child_plugin_manifest_dependencies(&workspace_root, &operations)
+            .expect("repo-relative path should resolve lexically for a new child plugin");
+    }
+
+    #[test]
+    fn validate_rust_source_dependencies_requires_thiserror_dependency() {
+        let operations = vec![
+            PluginEditOperation {
+                path: "plugins/expr/evaluator/modulo/Cargo.toml".to_string(),
+                kind: PluginEditOpKind::CreateFile,
+                expected_old_string: Some(String::new()),
+                expected_sha256: None,
+                new_content: Some(
+                    "[package]\nname = \"expr_evaluator_modulo\"\nversion = \"0.1.0\"\n[dependencies]\nserde = { version = \"1\", features = [\"derive\"] }\n"
+                        .to_string(),
+                ),
+                pointer: None,
+                dotted_key: None,
+                value: None,
+            },
+            PluginEditOperation {
+                path: "plugins/expr/evaluator/modulo/src/core.rs".to_string(),
+                kind: PluginEditOpKind::CreateFile,
+                expected_old_string: Some(String::new()),
+                expected_sha256: None,
+                new_content: Some(
+                    "use thiserror::Error;\n#[derive(Debug, Error)]\npub enum ModError {\n    #[error(\"boom\")]\n    Boom,\n}\n"
+                        .to_string(),
+                ),
+                pointer: None,
+                dotted_key: None,
+                value: None,
+            },
+        ];
+
+        let err = super::validate_rust_source_dependencies(&operations)
+            .expect_err("missing thiserror dependency should be rejected");
+        assert!(err.to_string().contains("does not declare the thiserror dependency"));
     }
 
     #[test]
@@ -5116,7 +5564,7 @@ mod tests {
     }
 
     #[test]
-    fn plugin_tool_choice_targets_final_plan_during_finalize() {
+    fn finalize_phase_only_exposes_final_plugin_submit_tool() {
         let mut inspection = DeepSeekReadInspectionState::default();
         inspection.note_plugin_strategy(PluginChangeStrategy {
             strategy: "new_child_plugin".to_string(),
@@ -5127,13 +5575,10 @@ mod tests {
         inspection.note_plugin_context_tool_call();
         assert_eq!(inspection.plugin_phase(), DeepSeekPluginPlanningPhase::Finalize);
 
-        let tool_choice = deepseek_plugin_tool_choice_for_state(&inspection);
+        let tool_names = tool_names_from_definition(&deepseek_plugin_tools_for_state(&inspection));
         assert_eq!(
-            tool_choice
-                .get("function")
-                .and_then(|value| value.get("name"))
-                .and_then(Value::as_str),
-            Some(DEEPSEEK_TOOL_SUBMIT_PLUGIN_EDIT_PLAN)
+            tool_names,
+            vec![DEEPSEEK_TOOL_SUBMIT_PLUGIN_EDIT_PLAN.to_string()]
         );
     }
 
