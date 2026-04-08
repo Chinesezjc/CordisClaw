@@ -1,3 +1,4 @@
+use cordis_runtime::agent::{ShellAgentReply, ShellAgentSession};
 use cordis_runtime::config::RuntimeConfig;
 use cordis_runtime::context::ContextRegistry;
 use cordis_runtime::host::{KernelApplyRequest, KernelPlanRequest, RuntimeHost, RuntimeKernel};
@@ -20,6 +21,17 @@ use serde_json::Value;
 use std::fs;
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServeMode {
+    Command,
+    AgentChat,
+}
+
+struct ServeState {
+    agent_session: ShellAgentSession,
+    mode: ServeMode,
+}
 
 fn main() {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
@@ -150,6 +162,10 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     prepare_fixtures_root(&root, runtime_only)?;
     let host =
         RuntimeHost::boot(&root).map_err(|err| runtime_mode_error(err, &root, runtime_only))?;
+    let mut state = ServeState {
+        agent_session: ShellAgentSession::new(host.config().llm_api.clone())?,
+        mode: ServeMode::Command,
+    };
     println!(
         "serve ready snapshot_id={}",
         host.current_snapshot().snapshot_id()
@@ -165,7 +181,14 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             break;
         }
 
-        match handle_serve_command(&host, line.trim()) {
+        let line = line.trim();
+        let handled = if state.mode == ServeMode::AgentChat {
+            handle_agent_chat_line(&host, &mut state, line)
+        } else {
+            handle_serve_command(&host, &mut state, line)
+        };
+
+        match handled {
             Ok(true) => {}
             Ok(false) => break,
             Err(err) => {
@@ -180,6 +203,7 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
 fn handle_serve_command(
     host: &RuntimeHost,
+    state: &mut ServeState,
     command: &str,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     if command.is_empty() {
@@ -189,6 +213,17 @@ fn handle_serve_command(
     match command {
         "help" => {
             println!("{}", serve_usage());
+        }
+        "agent" => {
+            state.mode = ServeMode::AgentChat;
+            println!("{}", agent_chat_usage());
+        }
+        "agent status" => {
+            println!("{}", serde_json::to_string(&state.agent_session.status())?);
+        }
+        "agent reset" => {
+            state.agent_session.reset();
+            println!("agent session reset");
         }
         "plugins" => {
             let snapshot = host.current_snapshot();
@@ -239,7 +274,10 @@ fn handle_serve_command(
         }
         "exit" | "quit" => return Ok(false),
         _ => {
-            if let Some(rest) = command.strip_prefix("invoke ") {
+            if let Some(rest) = command.strip_prefix("agent ") {
+                let reply = state.agent_session.respond(host, rest)?;
+                emit_agent_reply(&reply)?;
+            } else if let Some(rest) = command.strip_prefix("invoke ") {
                 let (plugin_path, remainder) =
                     split_first_token(rest).ok_or("missing plugin_path for invoke")?;
                 let (node_id, payload_json) =
@@ -289,6 +327,38 @@ fn handle_serve_command(
             } else {
                 println!("unknown serve command: {command}");
             }
+        }
+    }
+
+    io::stdout().flush()?;
+    Ok(true)
+}
+
+fn handle_agent_chat_line(
+    host: &RuntimeHost,
+    state: &mut ServeState,
+    line: &str,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    if line.is_empty() {
+        return Ok(true);
+    }
+
+    match line {
+        "/help" => println!("{}", agent_chat_usage()),
+        "/status" => {
+            println!("{}", serde_json::to_string(&state.agent_session.status())?);
+        }
+        "/reset" => {
+            state.agent_session.reset();
+            println!("agent session reset");
+        }
+        "/exit" | "/quit" => {
+            state.mode = ServeMode::Command;
+            println!("left agent chat mode");
+        }
+        _ => {
+            let reply = state.agent_session.respond(host, line)?;
+            emit_agent_reply(&reply)?;
         }
     }
 
@@ -415,6 +485,22 @@ fn emit_invoke_response(payload: &str) -> Result<(), Box<dyn std::error::Error>>
     }
 
     println!("{payload}");
+    Ok(())
+}
+
+fn emit_agent_reply(reply: &ShellAgentReply) -> Result<(), Box<dyn std::error::Error>> {
+    for event in &reply.tool_events {
+        println!(
+            "[agent-tool] {} {}",
+            event.name,
+            serde_json::to_string(&event.arguments)?
+        );
+    }
+    if reply.content.trim().is_empty() {
+        println!("(agent returned an empty response)");
+    } else {
+        println!("{}", reply.content);
+    }
     Ok(())
 }
 
@@ -873,6 +959,10 @@ fn usage() -> String {
 fn serve_usage() -> &'static str {
     "serve commands:
   help
+  agent
+  agent <message>
+  agent status
+  agent reset
   status
   plugins
   reload
@@ -894,4 +984,12 @@ fn serve_usage() -> &'static str {
   kernel iteration-status <iteration-id>
   kernel approve <iteration-id>
   exit"
+}
+
+fn agent_chat_usage() -> &'static str {
+    "agent chat mode:
+  Type any message to talk with the agent.
+  /status  show the current shell agent session status
+  /reset   clear the shell agent conversation history
+  /exit    leave agent chat mode and return to serve commands"
 }

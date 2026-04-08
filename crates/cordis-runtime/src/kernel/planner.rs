@@ -9,7 +9,7 @@ use crate::kernel::plugin_iteration::{
     PluginEditPlan,
 };
 use crate::plugin::invoke::PluginInvoker;
-use reqwest::blocking::Client;
+use reqwest::blocking::{Client, Response};
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -18,16 +18,18 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::env;
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::path::{Component, Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 
 const PLAN_SCHEMA_NAME: &str = "cordis_auto_update_plan";
 const PLUGIN_EDIT_PLAN_SCHEMA_NAME: &str = "cordis_plugin_edit_plan";
-// Multi-file plugin edits often need several read/validate iterations before submit.
-const DEEPSEEK_REASONER_MAX_TURNS: usize = 16;
+// Keep a generous hard ceiling as a safety net, but prefer wall-clock budgeting.
+const DEEPSEEK_REASONER_MAX_TURNS_SAFETY: usize = 128;
 const LLM_REQUEST_MAX_ATTEMPTS: usize = 3;
 const LLM_REQUEST_RETRY_BACKOFF_MS: u64 = 500;
+const DEEPSEEK_REPEAT_READ_STRATEGY_THRESHOLD: usize = 2;
 const DEEPSEEK_TOOL_LIST_CONTEXT_FILES: &str = "list_context_files";
 const DEEPSEEK_TOOL_READ_CONTEXT_FILES: &str = "read_context_files";
 const DEEPSEEK_TOOL_READ_CONTEXT_FILE: &str = "read_context_file";
@@ -181,6 +183,188 @@ impl DeepSeekChatMessage {
     }
 }
 
+#[derive(Debug, Clone, Deserialize, PartialEq, Default)]
+struct DeepSeekChatChunk {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    choices: Vec<DeepSeekChatChunkChoice>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Default)]
+struct DeepSeekChatChunkChoice {
+    #[serde(default)]
+    delta: DeepSeekChatChunkDelta,
+    #[serde(default)]
+    finish_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Default)]
+struct DeepSeekChatChunkDelta {
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    reasoning_content: Option<String>,
+    #[serde(default)]
+    tool_calls: Vec<DeepSeekToolCallDelta>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
+struct DeepSeekToolCallDelta {
+    #[serde(default)]
+    index: usize,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(rename = "type", default)]
+    call_type: Option<String>,
+    #[serde(default)]
+    function: Option<DeepSeekToolFunctionCallDelta>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
+struct DeepSeekToolFunctionCallDelta {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct DeepSeekChatMessageAccumulator {
+    response_id: Option<String>,
+    content: String,
+    reasoning_content: String,
+    tool_calls: Vec<DeepSeekToolCallAccumulator>,
+}
+
+#[derive(Debug, Default)]
+struct DeepSeekToolCallAccumulator {
+    id: String,
+    call_type: String,
+    name: String,
+    arguments: String,
+}
+
+#[derive(Debug, Default)]
+struct DeepSeekStreamEventSummary {
+    delta_reasoning_chars: usize,
+    delta_content_chars: usize,
+    delta_tool_call_count: usize,
+    finish_reason: Option<String>,
+}
+
+#[derive(Debug)]
+struct DeepSeekChatStreamReadResult {
+    response_id: Option<String>,
+    message: DeepSeekChatMessage,
+    raw_bytes: usize,
+    event_count: usize,
+    saw_done: bool,
+    finish_reason: Option<String>,
+}
+
+#[derive(Debug)]
+enum DeepSeekStreamReadError {
+    Io(std::io::Error),
+    InvalidResponse(String),
+}
+
+impl DeepSeekChatMessageAccumulator {
+    fn apply_chunk(
+        &mut self,
+        chunk: DeepSeekChatChunk,
+    ) -> Result<DeepSeekStreamEventSummary, RuntimeError> {
+        if self.response_id.is_none() {
+            self.response_id = chunk.id;
+        }
+
+        let mut summary = DeepSeekStreamEventSummary::default();
+        for choice in chunk.choices {
+            if let Some(content) = choice.delta.content {
+                summary.delta_content_chars += content.chars().count();
+                self.content.push_str(&content);
+            }
+            if let Some(reasoning_content) = choice.delta.reasoning_content {
+                summary.delta_reasoning_chars += reasoning_content.chars().count();
+                self.reasoning_content.push_str(&reasoning_content);
+            }
+            for tool_call in choice.delta.tool_calls {
+                summary.delta_tool_call_count += 1;
+                while self.tool_calls.len() <= tool_call.index {
+                    self.tool_calls.push(DeepSeekToolCallAccumulator::default());
+                }
+                let slot = &mut self.tool_calls[tool_call.index];
+                if let Some(id) = tool_call.id {
+                    merge_stream_field(&mut slot.id, &id, false);
+                }
+                if let Some(call_type) = tool_call.call_type {
+                    merge_stream_field(&mut slot.call_type, &call_type, false);
+                }
+                if let Some(function) = tool_call.function {
+                    if let Some(name) = function.name {
+                        merge_stream_field(&mut slot.name, &name, false);
+                    }
+                    if let Some(arguments) = function.arguments {
+                        merge_stream_field(&mut slot.arguments, &arguments, true);
+                    }
+                }
+            }
+            if choice.finish_reason.is_some() {
+                summary.finish_reason = choice.finish_reason;
+            }
+        }
+
+        Ok(summary)
+    }
+
+    fn finish(self) -> Result<(DeepSeekChatMessage, Option<String>), RuntimeError> {
+        let tool_calls = self
+            .tool_calls
+            .into_iter()
+            .filter(|tool| {
+                !(tool.id.is_empty()
+                    && tool.call_type.is_empty()
+                    && tool.name.is_empty()
+                    && tool.arguments.is_empty())
+            })
+            .map(|tool| {
+                if tool.id.is_empty()
+                    || tool.call_type.is_empty()
+                    || tool.name.is_empty()
+                    || tool.arguments.is_empty()
+                {
+                    return Err(RuntimeError::LlmResponseInvalid {
+                        message: format!(
+                            "streamed DeepSeek tool call was incomplete: id_present={} type_present={} name_present={} arguments_present={}",
+                            !tool.id.is_empty(),
+                            !tool.call_type.is_empty(),
+                            !tool.name.is_empty(),
+                            !tool.arguments.is_empty(),
+                        ),
+                    });
+                }
+                Ok(DeepSeekToolCall {
+                    id: tool.id,
+                    call_type: tool.call_type,
+                    function: DeepSeekToolFunctionCall {
+                        name: tool.name,
+                        arguments: tool.arguments,
+                    },
+                })
+            })
+            .collect::<Result<Vec<_>, RuntimeError>>()?;
+
+        Ok((
+            DeepSeekChatMessage {
+                content: normalize_streamed_optional_text(self.content),
+                reasoning_content: normalize_streamed_optional_text(self.reasoning_content),
+                tool_calls,
+            },
+            self.response_id,
+        ))
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 struct ReadContextFileArgs {
     path: String,
@@ -200,6 +384,87 @@ struct InspectPluginCatalogArgs {
 enum DeepSeekToolOutcome<T> {
     ToolResult(String),
     Final(T),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeepSeekPlannerMode {
+    Patch,
+    Plugin,
+}
+
+#[derive(Debug, Default)]
+struct DeepSeekReadInspectionState {
+    seen_context_paths: BTreeSet<String>,
+    consecutive_repeated_reads: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DeepSeekReadObservation {
+    requested_paths: Vec<String>,
+    new_paths: Vec<String>,
+    already_seen_paths: Vec<String>,
+    consecutive_repeated_reads: usize,
+}
+
+impl DeepSeekReadInspectionState {
+    fn record_read<'a, I>(&mut self, paths: I) -> DeepSeekReadObservation
+    where
+        I: IntoIterator<Item = &'a str>,
+    {
+        let requested_paths = paths
+            .into_iter()
+            .map(ToString::to_string)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let (already_seen_paths, new_paths): (Vec<_>, Vec<_>) = requested_paths
+            .iter()
+            .cloned()
+            .partition(|path| self.seen_context_paths.contains(path));
+
+        if !requested_paths.is_empty() && new_paths.is_empty() {
+            self.consecutive_repeated_reads += 1;
+        } else {
+            self.consecutive_repeated_reads = 0;
+        }
+        self.seen_context_paths
+            .extend(requested_paths.iter().cloned());
+
+        DeepSeekReadObservation {
+            requested_paths,
+            new_paths,
+            already_seen_paths,
+            consecutive_repeated_reads: self.consecutive_repeated_reads,
+        }
+    }
+}
+
+impl DeepSeekReadObservation {
+    fn is_repeated_only(&self) -> bool {
+        !self.requested_paths.is_empty() && self.new_paths.is_empty()
+    }
+
+    fn requires_change_strategy_hint(&self) -> bool {
+        self.consecutive_repeated_reads >= DEEPSEEK_REPEAT_READ_STRATEGY_THRESHOLD
+    }
+
+    fn hint(&self, planner_mode: DeepSeekPlannerMode) -> Option<String> {
+        if !self.is_repeated_only() {
+            return None;
+        }
+
+        if self.requires_change_strategy_hint() {
+            return Some(match planner_mode {
+                DeepSeekPlannerMode::Patch => "You have already inspected these files in multiple consecutive turns. Before reading more context, decide your change strategy, then either call submit_patch_plan or inspect only one missing file that would change that strategy.".to_string(),
+                DeepSeekPlannerMode::Plugin => "You have already inspected these files in multiple consecutive turns. Before reading more context, decide your change strategy (for example new_child_plugin, inline_core_patch, metadata_only, or docs_only), then either call submit_plugin_edit_plan or inspect only one missing file that would change that strategy.".to_string(),
+            });
+        }
+
+        Some(format!(
+            "These files were already inspected in previous turns: {}. Prefer reading only files you have not seen yet unless they would materially change the plan.",
+            self.already_seen_paths.join(", ")
+        ))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -508,13 +773,19 @@ impl LlmPatchPlanner {
             return self.plan_with_deepseek_completion(user_prompt);
         }
 
+        let mut inspection_state = DeepSeekReadInspectionState::default();
         self.run_deepseek_tool_loop(
             deepseek_patch_tool_system_prompt(),
             user_prompt,
             deepseek_patch_tools(),
             parse_planner_payload,
             |tool_call| {
-                self.execute_deepseek_patch_tool_call(tool_call, context_files, plugin_catalog)
+                self.execute_deepseek_patch_tool_call(
+                    tool_call,
+                    context_files,
+                    plugin_catalog,
+                    &mut inspection_state,
+                )
             },
         )
     }
@@ -529,13 +800,19 @@ impl LlmPatchPlanner {
             return self.plan_plugin_edits_with_deepseek_completion(user_prompt);
         }
 
+        let mut inspection_state = DeepSeekReadInspectionState::default();
         self.run_deepseek_tool_loop(
             deepseek_plugin_tool_system_prompt(),
             user_prompt,
             deepseek_plugin_tools(),
             parse_plugin_planner_payload,
             |tool_call| {
-                self.execute_deepseek_plugin_tool_call(tool_call, context_files, plugin_catalog)
+                self.execute_deepseek_plugin_tool_call(
+                    tool_call,
+                    context_files,
+                    plugin_catalog,
+                    &mut inspection_state,
+                )
             },
         )
     }
@@ -591,23 +868,24 @@ impl LlmPatchPlanner {
             }
         });
 
-        let raw_json = self.send_json_request(
+        let (message, response_id, _finish_reason) = self.send_deepseek_chat_request(
             format!(
                 "{}/chat/completions",
                 self.config.base_url.trim_end_matches('/')
             ),
             request_body,
         )?;
-        let response_id = raw_json
-            .get("id")
-            .and_then(Value::as_str)
-            .map(ToString::to_string);
-        let output_text = extract_chat_completion_text(&raw_json).ok_or_else(|| {
-            RuntimeError::LlmResponseInvalid {
-                message: "missing choices[0].message.content in chat completion payload"
+        if !message.tool_calls.is_empty() {
+            return Err(RuntimeError::LlmResponseInvalid {
+                message: "DeepSeek chat completion returned unexpected tool calls without a tools request".to_string(),
+            });
+        }
+        let output_text = message
+            .content
+            .ok_or_else(|| RuntimeError::LlmResponseInvalid {
+                message: "missing streamed message.content in DeepSeek chat completion payload"
                     .to_string(),
-            }
-        })?;
+            })?;
         Ok((parse_payload(&output_text)?, response_id))
     }
 
@@ -637,14 +915,31 @@ impl LlmPatchPlanner {
                 "content": user_prompt,
             }),
         ];
-        for turn_idx in 0..DEEPSEEK_REASONER_MAX_TURNS {
+        let loop_started = Instant::now();
+        let total_budget = Duration::from_millis(self.config.timeout_ms);
+        let mut turn_idx = 0usize;
+        while turn_idx < DEEPSEEK_REASONER_MAX_TURNS_SAFETY {
+            let elapsed_before_turn = loop_started.elapsed();
+            if elapsed_before_turn >= total_budget {
+                return Err(RuntimeError::LlmResponseInvalid {
+                    message: format!(
+                        "DeepSeek reasoner exceeded total planning budget after {} turns; elapsed_ms={} timeout_ms={} model={} endpoint={}/chat/completions",
+                        turn_idx,
+                        elapsed_before_turn.as_millis(),
+                        self.config.timeout_ms,
+                        self.config.model,
+                        self.config.base_url.trim_end_matches('/'),
+                    ),
+                });
+            }
             let turn_started = Instant::now();
             emit_llm_diagnostic(
                 false,
                 format!(
-                    "reasoner_turn_start turn={}/{} model={} messages={} tool_count={}",
+                    "reasoner_turn_start turn={} elapsed_ms={} budget_ms={} model={} messages={} tool_count={}",
                     turn_idx + 1,
-                    DEEPSEEK_REASONER_MAX_TURNS,
+                    elapsed_before_turn.as_millis(),
+                    self.config.timeout_ms,
                     self.config.model,
                     messages.len(),
                     tools.as_array().map(|items| items.len()).unwrap_or(0),
@@ -658,12 +953,8 @@ impl LlmPatchPlanner {
                 "tools": tools,
                 "tool_choice": "auto",
             });
-            let raw_json = self.send_json_request(endpoint.clone(), request_body)?;
-            let response_id = raw_json
-                .get("id")
-                .and_then(Value::as_str)
-                .map(ToString::to_string);
-            let message = parse_deepseek_chat_message(&raw_json)?;
+            let (message, response_id, finish_reason) =
+                self.send_deepseek_chat_request(endpoint.clone(), request_body)?;
             let tool_names = message
                 .tool_calls
                 .iter()
@@ -672,10 +963,10 @@ impl LlmPatchPlanner {
             emit_llm_diagnostic(
                 false,
                 format!(
-                    "reasoner_turn_result turn={}/{} elapsed_ms={} response_id={} tool_calls={} tool_names={:?} reasoning_chars={} content_chars={}",
+                    "reasoner_turn_result turn={} elapsed_ms={} total_elapsed_ms={} response_id={} tool_calls={} tool_names={:?} reasoning_chars={} content_chars={}",
                     turn_idx + 1,
-                    DEEPSEEK_REASONER_MAX_TURNS,
                     turn_started.elapsed().as_millis(),
+                    loop_started.elapsed().as_millis(),
                     response_id.as_deref().unwrap_or("-"),
                     message.tool_calls.len(),
                     tool_names,
@@ -695,9 +986,8 @@ impl LlmPatchPlanner {
                             emit_llm_diagnostic(
                                 false,
                                 format!(
-                                    "reasoner_tool_feedback turn={}/{} tool={} tool_call_id={} feedback_bytes={}",
+                                    "reasoner_tool_feedback turn={} tool={} tool_call_id={} feedback_bytes={}",
                                     turn_idx + 1,
-                                    DEEPSEEK_REASONER_MAX_TURNS,
                                     tool_call.function.name,
                                     tool_call.id,
                                     tool_output.len(),
@@ -713,9 +1003,8 @@ impl LlmPatchPlanner {
                             emit_llm_diagnostic(
                                 false,
                                 format!(
-                                    "reasoner_turn_submit turn={}/{} tool={} tool_call_id={}",
+                                    "reasoner_turn_submit turn={} tool={} tool_call_id={}",
                                     turn_idx + 1,
-                                    DEEPSEEK_REASONER_MAX_TURNS,
                                     tool_call.function.name,
                                     tool_call.id,
                                 ),
@@ -732,11 +1021,38 @@ impl LlmPatchPlanner {
                         }
                     }
                 }
+                turn_idx += 1;
                 continue;
             }
 
             if let Some(content) = message.content.as_deref() {
                 return Ok((parse_final_content(content)?, response_id));
+            }
+
+            if matches!(finish_reason.as_deref(), Some("length"))
+                && message
+                    .reasoning_content
+                    .as_deref()
+                    .is_some_and(|value| !value.trim().is_empty())
+            {
+                emit_llm_diagnostic(
+                    true,
+                    format!(
+                        "reasoner_turn_continue turn={} response_id={} finish_reason=length action=continue_reasoning reasoning_chars={} total_elapsed_ms={} budget_ms={}",
+                        turn_idx + 1,
+                        response_id.as_deref().unwrap_or("-"),
+                        message
+                            .reasoning_content
+                            .as_deref()
+                            .map(str::len)
+                            .unwrap_or(0),
+                        loop_started.elapsed().as_millis(),
+                        self.config.timeout_ms,
+                    ),
+                );
+                messages.push(message.to_request_message());
+                turn_idx += 1;
+                continue;
             }
 
             return Err(RuntimeError::LlmResponseInvalid {
@@ -747,11 +1063,251 @@ impl LlmPatchPlanner {
 
         Err(RuntimeError::LlmResponseInvalid {
             message: format!(
-                "DeepSeek reasoner exceeded {DEEPSEEK_REASONER_MAX_TURNS} turns without producing a final plan; model={} endpoint={}/chat/completions timeout_ms={}",
+                "DeepSeek reasoner exceeded safety turn limit {} without producing a final plan; elapsed_ms={} timeout_ms={} model={} endpoint={}/chat/completions",
+                DEEPSEEK_REASONER_MAX_TURNS_SAFETY,
+                loop_started.elapsed().as_millis(),
+                self.config.timeout_ms,
                 self.config.model,
                 self.config.base_url.trim_end_matches('/'),
-                self.config.timeout_ms,
             ),
+        })
+    }
+
+    fn send_deepseek_chat_request(
+        &self,
+        endpoint: String,
+        mut request_body: Value,
+    ) -> Result<(DeepSeekChatMessage, Option<String>, Option<String>), RuntimeError> {
+        request_body["stream"] = Value::Bool(true);
+        let api_key = resolve_api_key(&self.config)?;
+        let request_summary =
+            summarize_llm_request(&endpoint, &request_body, self.config.timeout_ms);
+        let overall_started = Instant::now();
+        emit_llm_diagnostic(
+            false,
+            format!(
+                "request_start attempts={} {}",
+                LLM_REQUEST_MAX_ATTEMPTS, request_summary
+            ),
+        );
+        for attempt in 1..=LLM_REQUEST_MAX_ATTEMPTS {
+            let attempt_started = Instant::now();
+            let mut http_request = self
+                .client
+                .post(endpoint.clone())
+                .header(CONTENT_TYPE, "application/json")
+                .header(AUTHORIZATION, format!("Bearer {api_key}"));
+            if let Some(org) = &self.config.organization {
+                if !org.trim().is_empty() {
+                    http_request = http_request.header("OpenAI-Organization", org);
+                }
+            }
+            if let Some(project) = &self.config.project {
+                if !project.trim().is_empty() {
+                    http_request = http_request.header("OpenAI-Project", project);
+                }
+            }
+
+            let response = match http_request.json(&request_body).send() {
+                Ok(response) => response,
+                Err(err) => {
+                    let detail = format_llm_transport_error(&err, self.config.timeout_ms);
+                    let message = format!(
+                        "llm request failed: attempt={attempt}/{LLM_REQUEST_MAX_ATTEMPTS} phase=send elapsed_ms={} total_elapsed_ms={} {} detail={detail}",
+                        attempt_started.elapsed().as_millis(),
+                        overall_started.elapsed().as_millis(),
+                        request_summary,
+                    );
+                    if attempt < LLM_REQUEST_MAX_ATTEMPTS {
+                        emit_llm_diagnostic(
+                            true,
+                            format!("{message} retry_backoff_ms={LLM_REQUEST_RETRY_BACKOFF_MS}"),
+                        );
+                        thread::sleep(Duration::from_millis(LLM_REQUEST_RETRY_BACKOFF_MS));
+                        continue;
+                    }
+                    emit_llm_diagnostic(true, message.clone());
+                    return Err(RuntimeError::LlmRequestFailed { message });
+                }
+            };
+
+            let status = response.status();
+            if !status.is_success() {
+                let raw_body = match response.text() {
+                    Ok(body) => body,
+                    Err(err) => {
+                        let detail = format_llm_transport_error(&err, self.config.timeout_ms);
+                        let message = format!(
+                            "llm request failed: attempt={attempt}/{LLM_REQUEST_MAX_ATTEMPTS} phase=read_error_body elapsed_ms={} total_elapsed_ms={} {} detail={detail}",
+                            attempt_started.elapsed().as_millis(),
+                            overall_started.elapsed().as_millis(),
+                            request_summary,
+                        );
+                        if attempt < LLM_REQUEST_MAX_ATTEMPTS {
+                            emit_llm_diagnostic(
+                                true,
+                                format!(
+                                    "{message} retry_backoff_ms={LLM_REQUEST_RETRY_BACKOFF_MS}"
+                                ),
+                            );
+                            thread::sleep(Duration::from_millis(LLM_REQUEST_RETRY_BACKOFF_MS));
+                            continue;
+                        }
+                        emit_llm_diagnostic(true, message.clone());
+                        return Err(RuntimeError::LlmRequestFailed { message });
+                    }
+                };
+                let message = format!(
+                    "llm request failed: attempt={attempt}/{LLM_REQUEST_MAX_ATTEMPTS} phase=http_status status={} elapsed_ms={} total_elapsed_ms={} {} error={} body_preview={}",
+                    status.as_u16(),
+                    attempt_started.elapsed().as_millis(),
+                    overall_started.elapsed().as_millis(),
+                    request_summary,
+                    extract_error_message(&raw_body)
+                        .unwrap_or_else(|| format!("status={} body={}", status, raw_body.trim())),
+                    truncate_for_error(&raw_body, 400),
+                );
+                if attempt < LLM_REQUEST_MAX_ATTEMPTS
+                    && (status.is_server_error() || status.as_u16() == 429)
+                {
+                    emit_llm_diagnostic(
+                        true,
+                        format!("{message} retry_backoff_ms={LLM_REQUEST_RETRY_BACKOFF_MS}"),
+                    );
+                    thread::sleep(Duration::from_millis(LLM_REQUEST_RETRY_BACKOFF_MS));
+                    continue;
+                }
+                emit_llm_diagnostic(true, message.clone());
+                return Err(RuntimeError::LlmRequestFailed { message });
+            }
+
+            let streamed = match self.read_deepseek_chat_stream(response, &request_summary, attempt)
+            {
+                Ok(streamed) => streamed,
+                Err(DeepSeekStreamReadError::Io(err)) => {
+                    let detail = format_llm_stream_io_error(&err, self.config.timeout_ms);
+                    let message = format!(
+                        "llm request failed: attempt={attempt}/{LLM_REQUEST_MAX_ATTEMPTS} phase=read_stream elapsed_ms={} total_elapsed_ms={} {} detail={detail}",
+                        attempt_started.elapsed().as_millis(),
+                        overall_started.elapsed().as_millis(),
+                        request_summary,
+                    );
+                    if attempt < LLM_REQUEST_MAX_ATTEMPTS {
+                        emit_llm_diagnostic(
+                            true,
+                            format!("{message} retry_backoff_ms={LLM_REQUEST_RETRY_BACKOFF_MS}"),
+                        );
+                        thread::sleep(Duration::from_millis(LLM_REQUEST_RETRY_BACKOFF_MS));
+                        continue;
+                    }
+                    emit_llm_diagnostic(true, message.clone());
+                    return Err(RuntimeError::LlmRequestFailed { message });
+                }
+                Err(DeepSeekStreamReadError::InvalidResponse(message)) => {
+                    emit_llm_diagnostic(true, message.clone());
+                    return Err(RuntimeError::LlmResponseInvalid { message });
+                }
+            };
+
+            emit_llm_diagnostic(
+                false,
+                format!(
+                    "request_success attempt={attempt}/{LLM_REQUEST_MAX_ATTEMPTS} status={} elapsed_ms={} total_elapsed_ms={} response_bytes={} stream_events={} stream_done={} {}",
+                    status.as_u16(),
+                    attempt_started.elapsed().as_millis(),
+                    overall_started.elapsed().as_millis(),
+                    streamed.raw_bytes,
+                    streamed.event_count,
+                    streamed.saw_done,
+                    request_summary,
+                ),
+            );
+            return Ok((
+                streamed.message,
+                streamed.response_id,
+                streamed.finish_reason,
+            ));
+        }
+
+        let message = format!(
+            "llm request exhausted retries without returning a streamed response: total_elapsed_ms={} {}",
+            overall_started.elapsed().as_millis(),
+            request_summary,
+        );
+        emit_llm_diagnostic(true, message.clone());
+        Err(RuntimeError::LlmRequestFailed { message })
+    }
+
+    fn read_deepseek_chat_stream(
+        &self,
+        response: Response,
+        request_summary: &str,
+        attempt: usize,
+    ) -> Result<DeepSeekChatStreamReadResult, DeepSeekStreamReadError> {
+        let mut reader = BufReader::new(response);
+        let mut raw_bytes = 0usize;
+        let mut event_count = 0usize;
+        let mut saw_done = false;
+        let mut finish_reason = None;
+        let mut pending_data_lines = Vec::new();
+        let mut accumulator = DeepSeekChatMessageAccumulator::default();
+
+        loop {
+            let mut line = String::new();
+            let bytes_read = reader
+                .read_line(&mut line)
+                .map_err(DeepSeekStreamReadError::Io)?;
+            raw_bytes += bytes_read;
+            if bytes_read == 0 {
+                if !pending_data_lines.is_empty() {
+                    saw_done = process_deepseek_stream_event(
+                        &pending_data_lines.join("\n"),
+                        &mut accumulator,
+                        &mut event_count,
+                        &mut finish_reason,
+                        request_summary,
+                        attempt,
+                    )?;
+                }
+                break;
+            }
+
+            let trimmed = line.trim_end_matches(['\r', '\n']);
+            if trimmed.is_empty() {
+                if pending_data_lines.is_empty() {
+                    continue;
+                }
+                let event_payload = pending_data_lines.join("\n");
+                pending_data_lines.clear();
+                if process_deepseek_stream_event(
+                    &event_payload,
+                    &mut accumulator,
+                    &mut event_count,
+                    &mut finish_reason,
+                    request_summary,
+                    attempt,
+                )? {
+                    saw_done = true;
+                    break;
+                }
+                continue;
+            }
+
+            if let Some(data) = trimmed.strip_prefix("data:") {
+                pending_data_lines.push(data.trim_start().to_string());
+            }
+        }
+
+        let (message, response_id) = accumulator
+            .finish()
+            .map_err(|err| DeepSeekStreamReadError::InvalidResponse(err.to_string()))?;
+        Ok(DeepSeekChatStreamReadResult {
+            response_id,
+            message,
+            raw_bytes,
+            event_count,
+            saw_done,
+            finish_reason,
         })
     }
 
@@ -760,6 +1316,7 @@ impl LlmPatchPlanner {
         tool_call: &DeepSeekToolCall,
         context_files: &[ContextFile],
         plugin_catalog: Option<&PromptPluginCatalog>,
+        inspection_state: &mut DeepSeekReadInspectionState,
     ) -> Result<DeepSeekToolOutcome<PlannerPayload>, RuntimeError> {
         match tool_call.function.name.as_str() {
             DEEPSEEK_TOOL_LIST_CONTEXT_FILES => {
@@ -786,7 +1343,15 @@ impl LlmPatchPlanner {
                     &tool_call.function.name,
                 )?;
                 let files = find_context_files(context_files, &args.paths)?;
-                Ok(DeepSeekToolOutcome::ToolResult(
+                let observation =
+                    inspection_state.record_read(files.iter().map(|file| file.path.as_str()));
+                emit_read_observation_diagnostic(
+                    DeepSeekPlannerMode::Patch,
+                    &tool_call.function.name,
+                    &observation,
+                );
+                Ok(DeepSeekToolOutcome::ToolResult(build_read_tool_result(
+                    DeepSeekPlannerMode::Patch,
                     json!({
                         "files": files
                             .into_iter()
@@ -796,9 +1361,9 @@ impl LlmPatchPlanner {
                                 "content": file.content,
                             }))
                             .collect::<Vec<_>>(),
-                    })
-                    .to_string(),
-                ))
+                    }),
+                    &observation,
+                )))
             }
             DEEPSEEK_TOOL_READ_CONTEXT_FILE => {
                 let args = parse_tool_arguments::<ReadContextFileArgs>(
@@ -806,14 +1371,21 @@ impl LlmPatchPlanner {
                     &tool_call.function.name,
                 )?;
                 let file = find_context_file(context_files, &args.path)?;
-                Ok(DeepSeekToolOutcome::ToolResult(
+                let observation = inspection_state.record_read([file.path.as_str()]);
+                emit_read_observation_diagnostic(
+                    DeepSeekPlannerMode::Patch,
+                    &tool_call.function.name,
+                    &observation,
+                );
+                Ok(DeepSeekToolOutcome::ToolResult(build_read_tool_result(
+                    DeepSeekPlannerMode::Patch,
                     json!({
                         "path": file.path,
                         "sha256": file.sha256,
                         "content": file.content,
-                    })
-                    .to_string(),
-                ))
+                    }),
+                    &observation,
+                )))
             }
             DEEPSEEK_TOOL_INSPECT_PLUGIN_CATALOG => {
                 let args = parse_tool_arguments::<InspectPluginCatalogArgs>(
@@ -852,6 +1424,7 @@ impl LlmPatchPlanner {
         tool_call: &DeepSeekToolCall,
         context_files: &[ContextFile],
         plugin_catalog: Option<&PromptPluginCatalog>,
+        inspection_state: &mut DeepSeekReadInspectionState,
     ) -> Result<DeepSeekToolOutcome<PluginPlannerPayload>, RuntimeError> {
         let writable_roots = context_files
             .iter()
@@ -891,7 +1464,15 @@ impl LlmPatchPlanner {
                     &tool_call.function.name,
                 )?;
                 let files = find_context_files(context_files, &args.paths)?;
-                Ok(DeepSeekToolOutcome::ToolResult(
+                let observation =
+                    inspection_state.record_read(files.iter().map(|file| file.path.as_str()));
+                emit_read_observation_diagnostic(
+                    DeepSeekPlannerMode::Plugin,
+                    &tool_call.function.name,
+                    &observation,
+                );
+                Ok(DeepSeekToolOutcome::ToolResult(build_read_tool_result(
+                    DeepSeekPlannerMode::Plugin,
                     json!({
                         "files": files
                             .into_iter()
@@ -907,9 +1488,9 @@ impl LlmPatchPlanner {
                                 })
                             })
                             .collect::<Vec<_>>(),
-                    })
-                    .to_string(),
-                ))
+                    }),
+                    &observation,
+                )))
             }
             DEEPSEEK_TOOL_READ_CONTEXT_FILE => {
                 let args = parse_tool_arguments::<ReadContextFileArgs>(
@@ -918,16 +1499,23 @@ impl LlmPatchPlanner {
                 )?;
                 let file = find_context_file(context_files, &args.path)?;
                 let writable = path_within_writable_surface(&file.path, &writable_roots);
-                Ok(DeepSeekToolOutcome::ToolResult(
+                let observation = inspection_state.record_read([file.path.as_str()]);
+                emit_read_observation_diagnostic(
+                    DeepSeekPlannerMode::Plugin,
+                    &tool_call.function.name,
+                    &observation,
+                );
+                Ok(DeepSeekToolOutcome::ToolResult(build_read_tool_result(
+                    DeepSeekPlannerMode::Plugin,
                     json!({
                         "path": file.path,
                         "sha256": file.sha256,
                         "writable": writable,
                         "generated_read_only": !writable,
                         "content": file.content,
-                    })
-                    .to_string(),
-                ))
+                    }),
+                    &observation,
+                )))
             }
             DEEPSEEK_TOOL_INSPECT_PLUGIN_CATALOG => {
                 let args = parse_tool_arguments::<InspectPluginCatalogArgs>(
@@ -1369,6 +1957,9 @@ fn build_deepseek_patch_tool_prompt(
         "Prefer `read_context_files` to inspect several related files in one turn when the task spans multiple sources.\n",
     );
     prompt.push_str(
+        "If a read tool reports that the same files were already inspected, stop looping on context gathering: decide the change strategy and either submit the plan or inspect only one missing file that would materially change it.\n",
+    );
+    prompt.push_str(
         "When you are ready, call `submit_patch_plan` as the only tool call in that message.\n",
     );
     prompt.push_str("If a tool responds with ok=false, revise your plan and submit again.\n");
@@ -1420,6 +2011,7 @@ fn build_deepseek_plugin_tool_prompt(
     prompt.push_str(
         "Prefer `read_context_files` to inspect the most relevant writable source and test files together instead of reading them one by one.\n",
     );
+    prompt.push_str("If a read tool reports that the same files were already inspected, stop looping on context gathering: decide the change strategy (for example new_child_plugin, inline_core_patch, metadata_only, or docs_only) and either submit the plan or inspect only one missing file that would materially change it.\n");
     prompt.push_str("When you are ready, call `submit_plugin_edit_plan` as the only tool call in that message.\n");
     prompt.push_str("If a tool responds with ok=false, revise your plan and submit again.\n");
     prompt.push_str("Files under docs/agent/** are read-only generated context and must never appear in submitted operations.\n");
@@ -1583,6 +2175,7 @@ fn deepseek_patch_tool_system_prompt() -> &'static str {
     "You are a guarded patch planner for a Rust workspace running in DeepSeek reasoner tool mode. \
 Inspect files with the provided tools before finalizing a patch plan. \
 Prefer batch inspection with read_context_files when several files are relevant. \
+If a read tool tells you the same files were already inspected, stop looping on context gathering: decide the change strategy and either submit a plan or inspect only one missing file that would materially change the plan. \
 When ready, call submit_patch_plan as the only tool call in that assistant turn. \
 Do not invent files, paths, plugin capabilities, or command outputs."
 }
@@ -1592,6 +2185,7 @@ fn deepseek_plugin_tool_system_prompt() -> &'static str {
 Inspect files and plugin capabilities with the provided read-only tools before finalizing a plugin edit plan. \
 Prefer batch inspection with read_context_files so multi-file edits finish in fewer turns. \
 Files under docs/agent/** are generated read-only context and must never be modified. \
+If a read tool tells you the same files were already inspected, stop looping on context gathering: decide the change strategy (for example new_child_plugin, inline_core_patch, metadata_only, or docs_only) and either submit a plan or inspect only one missing file that would materially change the plan. \
 When ready, call submit_plugin_edit_plan as the only tool call in that assistant turn. \
 Do not invent files, paths, plugin capabilities, or command outputs."
 }
@@ -2097,6 +2691,63 @@ fn render_plugin_catalog_tool_result(
     }))
 }
 
+fn build_read_tool_result(
+    planner_mode: DeepSeekPlannerMode,
+    base_payload: Value,
+    observation: &DeepSeekReadObservation,
+) -> String {
+    let mut payload = match base_payload {
+        Value::Object(map) => map,
+        other => {
+            let mut map = Map::new();
+            map.insert("result".to_string(), other);
+            map
+        }
+    };
+    payload.insert("ok".to_string(), Value::Bool(true));
+    payload.insert(
+        "inspection".to_string(),
+        json!({
+            "requested_paths": observation.requested_paths,
+            "new_paths": observation.new_paths,
+            "already_seen_paths": observation.already_seen_paths,
+            "consecutive_repeated_reads": observation.consecutive_repeated_reads,
+            "requires_change_strategy": observation.requires_change_strategy_hint(),
+        }),
+    );
+    if let Some(hint) = observation.hint(planner_mode) {
+        payload.insert("hint".to_string(), Value::String(hint));
+    }
+    Value::Object(payload).to_string()
+}
+
+fn emit_read_observation_diagnostic(
+    planner_mode: DeepSeekPlannerMode,
+    tool_name: &str,
+    observation: &DeepSeekReadObservation,
+) {
+    if observation.already_seen_paths.is_empty() {
+        return;
+    }
+
+    emit_llm_diagnostic(
+        false,
+        format!(
+            "reasoner_repeat_read planner_mode={} tool={} requested_paths={:?} already_seen_paths={:?} new_paths={:?} consecutive_repeated_reads={} requires_change_strategy={}",
+            match planner_mode {
+                DeepSeekPlannerMode::Patch => "patch",
+                DeepSeekPlannerMode::Plugin => "plugin",
+            },
+            tool_name,
+            observation.requested_paths,
+            observation.already_seen_paths,
+            observation.new_paths,
+            observation.consecutive_repeated_reads,
+            observation.requires_change_strategy_hint(),
+        ),
+    );
+}
+
 fn tool_feedback_error(tool_name: &str, error: &str) -> Value {
     json!({
         "ok": false,
@@ -2153,9 +2804,21 @@ fn summarize_llm_request(endpoint: &str, request_body: &Value, timeout_ms: u64) 
         .get("response_format")
         .map(compact_json_value)
         .unwrap_or_else(|| "-".to_string());
+    let stream = request_body
+        .get("stream")
+        .and_then(Value::as_bool)
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "-".to_string());
     format!(
-        "endpoint={} model={} timeout_ms={} messages={} tools={} tool_choice={} response_format={}",
-        endpoint, model, timeout_ms, message_count, tool_count, tool_choice, response_format
+        "endpoint={} model={} timeout_ms={} messages={} tools={} tool_choice={} response_format={} stream={}",
+        endpoint,
+        model,
+        timeout_ms,
+        message_count,
+        tool_count,
+        tool_choice,
+        response_format,
+        stream
     )
 }
 
@@ -2178,6 +2841,99 @@ fn format_llm_transport_error(err: &reqwest::Error, timeout_ms: u64) -> String {
     } else {
         err.to_string()
     }
+}
+
+fn format_llm_stream_io_error(err: &std::io::Error, timeout_ms: u64) -> String {
+    match err.kind() {
+        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => {
+            format!("stream read timed out after timeout_ms={timeout_ms}: {err}")
+        }
+        std::io::ErrorKind::UnexpectedEof => {
+            format!("stream ended unexpectedly: {err}")
+        }
+        _ => err.to_string(),
+    }
+}
+
+fn merge_stream_field(target: &mut String, delta: &str, append: bool) {
+    if delta.is_empty() {
+        return;
+    }
+    if append {
+        target.push_str(delta);
+        return;
+    }
+    if target.is_empty() || target == delta || delta.starts_with(target.as_str()) {
+        target.clear();
+        target.push_str(delta);
+        return;
+    }
+    if !target.starts_with(delta) {
+        target.push_str(delta);
+    }
+}
+
+fn normalize_streamed_optional_text(value: String) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn process_deepseek_stream_event(
+    payload: &str,
+    accumulator: &mut DeepSeekChatMessageAccumulator,
+    event_count: &mut usize,
+    finish_reason: &mut Option<String>,
+    request_summary: &str,
+    attempt: usize,
+) -> Result<bool, DeepSeekStreamReadError> {
+    let trimmed = payload.trim();
+    if trimmed.is_empty() {
+        return Ok(false);
+    }
+    if trimmed == "[DONE]" {
+        emit_llm_diagnostic(
+            false,
+            format!(
+                "stream_done attempt={} events={} {}",
+                attempt, *event_count, request_summary
+            ),
+        );
+        return Ok(true);
+    }
+
+    let chunk: DeepSeekChatChunk = serde_json::from_str(trimmed).map_err(|err| {
+        DeepSeekStreamReadError::InvalidResponse(format!(
+            "invalid streamed DeepSeek chat chunk JSON: {err}; body_preview={}",
+            truncate_for_error(trimmed, 800)
+        ))
+    })?;
+    let summary = accumulator
+        .apply_chunk(chunk)
+        .map_err(|err| DeepSeekStreamReadError::InvalidResponse(err.to_string()))?;
+    if let Some(reason) = summary.finish_reason.clone() {
+        *finish_reason = Some(reason);
+    }
+    *event_count += 1;
+    emit_llm_diagnostic(
+        false,
+        format!(
+            "stream_event attempt={} event={} delta_reasoning_chars={} delta_content_chars={} delta_tool_calls={} finish_reason={} total_reasoning_chars={} total_content_chars={} {}",
+            attempt,
+            *event_count,
+            summary.delta_reasoning_chars,
+            summary.delta_content_chars,
+            summary.delta_tool_call_count,
+            summary.finish_reason.as_deref().unwrap_or("-"),
+            accumulator.reasoning_content.chars().count(),
+            accumulator.content.chars().count(),
+            request_summary,
+        ),
+    );
+    Ok(false)
 }
 
 fn extract_error_message(raw_body: &str) -> Option<String> {
@@ -2239,38 +2995,6 @@ fn extract_output_text(raw_json: &Value) -> Option<String> {
     } else {
         Some(chunks.join("\n"))
     }
-}
-
-fn extract_chat_completion_text(raw_json: &Value) -> Option<String> {
-    raw_json
-        .get("choices")
-        .and_then(Value::as_array)
-        .and_then(|choices| choices.first())
-        .and_then(|choice| choice.get("message"))
-        .and_then(|message| message.get("content"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|content| !content.is_empty())
-        .map(ToString::to_string)
-}
-
-fn parse_deepseek_chat_message(raw_json: &Value) -> Result<DeepSeekChatMessage, RuntimeError> {
-    let message = raw_json
-        .get("choices")
-        .and_then(Value::as_array)
-        .and_then(|choices| choices.first())
-        .and_then(|choice| choice.get("message"))
-        .cloned()
-        .ok_or_else(|| RuntimeError::LlmResponseInvalid {
-            message: "missing choices[0].message in chat completion payload".to_string(),
-        })?;
-    let message_preview = truncate_for_error(&message.to_string(), 800);
-    serde_json::from_value(message).map_err(|err| RuntimeError::LlmResponseInvalid {
-        message: format!(
-            "chat completion message shape was invalid: {err}; message_preview={}",
-            message_preview
-        ),
-    })
 }
 
 fn parse_planner_payload(raw_text: &str) -> Result<PlannerPayload, RuntimeError> {
@@ -2471,12 +3195,12 @@ fn api_key_env_looks_like_secret(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        api_key_env_looks_like_secret, build_plugin_edit_prompt, build_user_prompt,
-        discover_plugin_catalog, extract_chat_completion_text, extract_error_message,
-        extract_output_text, normalize_optional_command, normalize_rel_path,
-        path_within_read_only_generated_context, path_within_writable_surface,
-        select_plugin_planner_context_files, sha256_text, validate_plugin_operation_paths,
-        ContextFile, PlanRequest, PluginPlanRequest,
+        api_key_env_looks_like_secret, build_plugin_edit_prompt, build_read_tool_result,
+        build_user_prompt, discover_plugin_catalog, extract_error_message, extract_output_text,
+        normalize_optional_command, normalize_rel_path, path_within_read_only_generated_context,
+        path_within_writable_surface, select_plugin_planner_context_files, sha256_text,
+        validate_plugin_operation_paths, ContextFile, DeepSeekPlannerMode,
+        DeepSeekReadInspectionState, PlanRequest, PluginPlanRequest,
     };
     use crate::kernel::plugin_iteration::{PluginEditOpKind, PluginEditOperation};
     use serde_json::{json, Value};
@@ -2511,22 +3235,6 @@ mod tests {
     fn api_key_env_secret_detection_catches_project_keys() {
         assert!(api_key_env_looks_like_secret("sk-proj-demo"));
         assert!(!api_key_env_looks_like_secret("OPENAI_API_KEY"));
-    }
-
-    #[test]
-    fn extract_chat_completion_text_reads_first_choice() {
-        let raw_json = json!({
-            "choices": [
-                {
-                    "message": {
-                        "content": "{\"summary\":\"ok\",\"patches\":[]}"
-                    }
-                }
-            ]
-        });
-
-        let text = extract_chat_completion_text(&raw_json).expect("content should exist");
-        assert_eq!(text, "{\"summary\":\"ok\",\"patches\":[]}");
     }
 
     #[test]
@@ -2852,5 +3560,75 @@ mod tests {
                 "plugins/expr/evaluator/src/core.rs",
             ]
         );
+    }
+
+    #[test]
+    fn deepseek_read_inspection_tracks_repeated_reads_and_strategy_hint() {
+        let mut inspection = DeepSeekReadInspectionState::default();
+
+        let first =
+            inspection.record_read(["plugins/expr/src/lib.rs", "plugins/expr/tests/eval.rs"]);
+        assert_eq!(first.new_paths.len(), 2);
+        assert!(first.already_seen_paths.is_empty());
+        assert_eq!(first.consecutive_repeated_reads, 0);
+        assert_eq!(first.hint(DeepSeekPlannerMode::Plugin), None);
+
+        let second =
+            inspection.record_read(["plugins/expr/tests/eval.rs", "plugins/expr/src/lib.rs"]);
+        assert!(second.new_paths.is_empty());
+        assert_eq!(
+            second.already_seen_paths,
+            vec![
+                "plugins/expr/src/lib.rs".to_string(),
+                "plugins/expr/tests/eval.rs".to_string(),
+            ]
+        );
+        assert_eq!(second.consecutive_repeated_reads, 1);
+        let second_hint = second
+            .hint(DeepSeekPlannerMode::Plugin)
+            .expect("repeat hint");
+        assert!(second_hint.contains("already inspected"));
+        assert!(!second_hint.contains("new_child_plugin"));
+
+        let third = inspection.record_read(["plugins/expr/src/lib.rs"]);
+        assert!(third.new_paths.is_empty());
+        assert_eq!(third.consecutive_repeated_reads, 2);
+        let third_hint = third
+            .hint(DeepSeekPlannerMode::Plugin)
+            .expect("strategy hint");
+        assert!(third_hint.contains("change strategy"));
+        assert!(third_hint.contains("new_child_plugin"));
+        assert!(third_hint.contains("submit_plugin_edit_plan"));
+    }
+
+    #[test]
+    fn build_read_tool_result_includes_inspection_feedback() {
+        let mut inspection = DeepSeekReadInspectionState::default();
+        inspection.record_read(["demo.txt"]);
+        let repeated = inspection.record_read(["demo.txt"]);
+
+        let result = build_read_tool_result(
+            DeepSeekPlannerMode::Patch,
+            json!({
+                "path": "demo.txt",
+                "sha256": "abc123",
+                "content": "alpha-old-omega\n",
+            }),
+            &repeated,
+        );
+        let parsed: Value = serde_json::from_str(&result).expect("valid json");
+        assert_eq!(parsed.get("ok").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            parsed
+                .get("inspection")
+                .and_then(|value| value.get("already_seen_paths"))
+                .and_then(Value::as_array)
+                .map(|items| items.len()),
+            Some(1)
+        );
+        assert!(parsed
+            .get("hint")
+            .and_then(Value::as_str)
+            .is_some_and(|hint| hint.contains("already inspected")));
     }
 }

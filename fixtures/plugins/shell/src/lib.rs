@@ -112,6 +112,9 @@ struct ScriptRunResult {
 
 #[derive(Debug, Clone)]
 struct BuiltinShell {
+    // TODO(shell-agent): Move the interactive agent chat window into this shell
+    // plugin so users can talk to the agent here directly, while runtime only
+    // exposes the backend/tooling surface.
     cwd: PathBuf,
     env: BTreeMap<String, String>,
     plugin_catalog: Option<PluginCatalog>,
