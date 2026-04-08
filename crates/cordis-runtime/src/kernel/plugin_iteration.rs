@@ -294,30 +294,25 @@ impl PluginIterationPolicy {
             });
         }
 
-        for plugin_root in allowed_plugin_roots.values() {
-            if normalized == format!("{plugin_root}/Cargo.toml") {
-                if self.allow_plugin_manifest_edits {
-                    return Ok(());
+        for subtree_root in plugin_subtree_roots(allowed_plugin_roots.values()) {
+            match plugin_subtree_surface_kind(&normalized, &subtree_root) {
+                Some(PluginSubtreeSurfaceKind::WritableManifest) => {
+                    if self.allow_plugin_manifest_edits {
+                        return Ok(());
+                    }
+                    return Err(RuntimeError::PluginIterationPolicyBlocked {
+                        path: normalized,
+                        reason: "plugin manifest edits are disabled".to_string(),
+                    });
                 }
-                return Err(RuntimeError::PluginIterationPolicyBlocked {
-                    path: normalized,
-                    reason: "plugin manifest edits are disabled".to_string(),
-                });
-            }
-            if normalized.starts_with(&format!("{plugin_root}/docs/agent/")) {
-                return Err(RuntimeError::PluginIterationPolicyBlocked {
-                    path: normalized,
-                    reason: "generated agent docs are read-only context; edit source code or human docs instead".to_string(),
-                });
-            }
-            for allowed_prefix in [
-                format!("{plugin_root}/src/"),
-                format!("{plugin_root}/tests/"),
-                format!("{plugin_root}/docs/human/"),
-            ] {
-                if normalized.starts_with(&allowed_prefix) {
-                    return Ok(());
+                Some(PluginSubtreeSurfaceKind::WritableOther) => return Ok(()),
+                Some(PluginSubtreeSurfaceKind::ReadOnlyGenerated) => {
+                    return Err(RuntimeError::PluginIterationPolicyBlocked {
+                        path: normalized,
+                        reason: "generated agent docs are read-only context; edit source code or human docs instead".to_string(),
+                    });
                 }
+                None => {}
             }
         }
 
@@ -325,6 +320,79 @@ impl PluginIterationPolicy {
             path: normalized,
             reason: "path is not inside the selected plugin subtree".to_string(),
         })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PluginSubtreeSurfaceKind {
+    WritableManifest,
+    WritableOther,
+    ReadOnlyGenerated,
+}
+
+fn plugin_subtree_roots<'a>(
+    allowed_plugin_roots: impl IntoIterator<Item = &'a String>,
+) -> BTreeSet<String> {
+    let roots = allowed_plugin_roots
+        .into_iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    roots
+        .iter()
+        .filter(|root| {
+            !roots
+                .iter()
+                .any(|other| *root != other && root.starts_with(&format!("{other}/")))
+        })
+        .cloned()
+        .collect()
+}
+
+fn plugin_subtree_surface_kind(path: &str, subtree_root: &str) -> Option<PluginSubtreeSurfaceKind> {
+    let root_manifest = format!("{subtree_root}/Cargo.toml");
+    if path == root_manifest {
+        return Some(PluginSubtreeSurfaceKind::WritableManifest);
+    }
+    let rel = path.strip_prefix(&format!("{subtree_root}/"))?;
+    let segments = rel.split('/').collect::<Vec<_>>();
+    if segments.is_empty() {
+        return None;
+    }
+
+    if segments.len() >= 2 && segments.last() == Some(&"Cargo.toml") {
+        let plugin_segments = &segments[..segments.len() - 1];
+        if !plugin_segments.is_empty()
+            && plugin_segments
+                .iter()
+                .all(|segment| !matches!(*segment, "src" | "tests" | "docs"))
+        {
+            return Some(PluginSubtreeSurfaceKind::WritableManifest);
+        }
+    }
+
+    let Some(surface_idx) = segments
+        .iter()
+        .position(|segment| matches!(*segment, "src" | "tests" | "docs"))
+    else {
+        return None;
+    };
+    if segments[..surface_idx]
+        .iter()
+        .any(|segment| matches!(*segment, "src" | "tests" | "docs"))
+    {
+        return None;
+    }
+    match segments[surface_idx] {
+        "src" | "tests" if surface_idx + 1 < segments.len() => {
+            Some(PluginSubtreeSurfaceKind::WritableOther)
+        }
+        "docs" if surface_idx + 2 < segments.len() && segments[surface_idx + 1] == "human" => {
+            Some(PluginSubtreeSurfaceKind::WritableOther)
+        }
+        "docs" if surface_idx + 2 < segments.len() && segments[surface_idx + 1] == "agent" => {
+            Some(PluginSubtreeSurfaceKind::ReadOnlyGenerated)
+        }
+        _ => None,
     }
 }
 
@@ -946,6 +1014,50 @@ mod tests {
             .validate_plan(&allowed, &plan)
             .expect_err("generated agent docs should be blocked");
         assert!(err.to_string().contains("read-only context"));
+    }
+
+    #[test]
+    fn plugin_iteration_policy_allows_new_child_plugin_inside_selected_subtree() {
+        let mut allowed = BTreeMap::new();
+        allowed.insert("expr".to_string(), "plugins/expr".to_string());
+        allowed.insert(
+            "expr/evaluator".to_string(),
+            "plugins/expr/evaluator".to_string(),
+        );
+        allowed.insert(
+            "expr/evaluator/add".to_string(),
+            "plugins/expr/evaluator/add".to_string(),
+        );
+        let plan = PluginEditPlan {
+            issue_id: "issue-1".to_string(),
+            patch_id: "patch-1".to_string(),
+            summary: "add modulo child plugin".to_string(),
+            operations: vec![
+                PluginEditOperation {
+                    path: "plugins/expr/evaluator/mod/Cargo.toml".to_string(),
+                    kind: PluginEditOpKind::CreateFile,
+                    expected_old_string: Some(String::new()),
+                    expected_sha256: None,
+                    new_content: Some("[package]\nname = \"expr-evaluator-mod\"\n".to_string()),
+                    pointer: None,
+                    dotted_key: None,
+                    value: None,
+                },
+                PluginEditOperation {
+                    path: "plugins/expr/evaluator/mod/src/core.rs".to_string(),
+                    kind: PluginEditOpKind::CreateFile,
+                    expected_old_string: Some(String::new()),
+                    expected_sha256: None,
+                    new_content: Some("pub fn eval_mod() {}\n".to_string()),
+                    pointer: None,
+                    dotted_key: None,
+                    value: None,
+                },
+            ],
+        };
+        PluginIterationPolicy::default()
+            .validate_plan(&allowed, &plan)
+            .expect("new child plugin inside subtree should be allowed");
     }
 
     #[test]
