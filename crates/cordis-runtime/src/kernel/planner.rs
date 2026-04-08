@@ -19,16 +19,22 @@ use std::collections::BTreeSet;
 use std::env;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
-use std::time::Duration;
+use std::thread;
+use std::time::{Duration, Instant};
 
 const PLAN_SCHEMA_NAME: &str = "cordis_auto_update_plan";
 const PLUGIN_EDIT_PLAN_SCHEMA_NAME: &str = "cordis_plugin_edit_plan";
-const DEEPSEEK_REASONER_MAX_TURNS: usize = 8;
+// Multi-file plugin edits often need several read/validate iterations before submit.
+const DEEPSEEK_REASONER_MAX_TURNS: usize = 16;
+const LLM_REQUEST_MAX_ATTEMPTS: usize = 3;
+const LLM_REQUEST_RETRY_BACKOFF_MS: u64 = 500;
 const DEEPSEEK_TOOL_LIST_CONTEXT_FILES: &str = "list_context_files";
+const DEEPSEEK_TOOL_READ_CONTEXT_FILES: &str = "read_context_files";
 const DEEPSEEK_TOOL_READ_CONTEXT_FILE: &str = "read_context_file";
 const DEEPSEEK_TOOL_INSPECT_PLUGIN_CATALOG: &str = "inspect_plugin_catalog";
 const DEEPSEEK_TOOL_SUBMIT_PATCH_PLAN: &str = "submit_patch_plan";
 const DEEPSEEK_TOOL_SUBMIT_PLUGIN_EDIT_PLAN: &str = "submit_plugin_edit_plan";
+const LLM_DEBUG_ENV: &str = "CORDIS_LLM_DEBUG";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PlanRequest {
@@ -180,6 +186,11 @@ struct ReadContextFileArgs {
     path: String,
 }
 
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+struct ReadContextFilesArgs {
+    paths: Vec<String>,
+}
+
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
 struct InspectPluginCatalogArgs {
     #[serde(default)]
@@ -228,16 +239,53 @@ impl LlmPatchPlanner {
         let context_files = load_context_files(workspace_root, &allowed_paths)?;
         let plugin_catalog = discover_plugin_catalog(workspace_root);
         let provider = self.config.provider.trim().to_ascii_lowercase();
-        let user_prompt =
-            if provider == "deepseek" && model_uses_deepseek_reasoner(&self.config.model) {
-                build_deepseek_patch_tool_prompt(&request, &context_files, plugin_catalog.as_ref())
-            } else {
-                build_user_prompt(&request, &context_files, plugin_catalog.as_ref())
-            };
         let (payload, response_id) = match provider.as_str() {
-            "openai" => self.plan_with_openai(&user_prompt)?,
+            "openai" => self.plan_with_openai(&build_user_prompt(
+                &request,
+                &context_files,
+                plugin_catalog.as_ref(),
+            ))?,
             "deepseek" => {
-                self.plan_with_deepseek(&user_prompt, &context_files, plugin_catalog.as_ref())?
+                if model_uses_deepseek_reasoner(&self.config.model) {
+                    let tool_prompt = build_deepseek_patch_tool_prompt(
+                        &request,
+                        &context_files,
+                        plugin_catalog.as_ref(),
+                    );
+                    let fallback_prompt =
+                        build_user_prompt(&request, &context_files, plugin_catalog.as_ref());
+                    match self.plan_with_deepseek(
+                        &tool_prompt,
+                        &context_files,
+                        plugin_catalog.as_ref(),
+                    ) {
+                        Ok(result) => result,
+                        Err(reasoner_err) if should_fallback_deepseek_reasoner(&reasoner_err) => {
+                            emit_llm_diagnostic(
+                                true,
+                                format!(
+                                    "reasoner_fallback operation=patch_planning mode=one_shot_completion reason={}",
+                                    reasoner_err
+                                ),
+                            );
+                            self.plan_with_deepseek_completion(&fallback_prompt)
+                                .map_err(|fallback_err| {
+                                    combine_reasoner_fallback_errors(
+                                        "patch planning",
+                                        reasoner_err,
+                                        fallback_err,
+                                    )
+                                })?
+                        }
+                        Err(err) => return Err(err),
+                    }
+                } else {
+                    self.plan_with_deepseek(
+                        &build_user_prompt(&request, &context_files, plugin_catalog.as_ref()),
+                        &context_files,
+                        plugin_catalog.as_ref(),
+                    )?
+                }
             }
             _ => {
                 return Err(RuntimeError::UnsupportedLlmProvider {
@@ -273,21 +321,103 @@ impl LlmPatchPlanner {
         let context_paths = normalize_paths(&request.context_paths)?;
         let writable_roots = normalize_paths(&request.writable_roots)?;
         let context_files = load_context_files(workspace_root, &context_paths)?;
+        let planner_context_files = select_plugin_planner_context_files(
+            request.instruction.as_str(),
+            &context_files,
+            &writable_roots,
+        );
         let plugin_catalog = discover_plugin_catalog(workspace_root);
         let provider = self.config.provider.trim().to_ascii_lowercase();
-        let user_prompt =
-            if provider == "deepseek" && model_uses_deepseek_reasoner(&self.config.model) {
-                build_deepseek_plugin_tool_prompt(&request, &context_files, plugin_catalog.as_ref())
-            } else {
-                build_plugin_edit_prompt(&request, &context_files, plugin_catalog.as_ref())
-            };
         let (payload, response_id) = match provider.as_str() {
-            "openai" => self.plan_plugin_edits_with_openai(&user_prompt)?,
-            "deepseek" => self.plan_plugin_edits_with_deepseek(
-                &user_prompt,
-                &context_files,
+            "openai" => self.plan_plugin_edits_with_openai(&build_plugin_edit_prompt(
+                &request,
+                &planner_context_files,
                 plugin_catalog.as_ref(),
-            )?,
+            ))?,
+            "deepseek" => {
+                if model_uses_deepseek_reasoner(&self.config.model) {
+                    let tool_prompt = build_deepseek_plugin_tool_prompt(
+                        &request,
+                        &planner_context_files,
+                        plugin_catalog.as_ref(),
+                    );
+                    let fallback_prompt = build_plugin_edit_prompt(
+                        &request,
+                        &planner_context_files,
+                        plugin_catalog.as_ref(),
+                    );
+                    if should_try_inline_deepseek_completion(&planner_context_files) {
+                        match self.plan_plugin_edits_with_deepseek_completion(&fallback_prompt) {
+                            Ok(result) => result,
+                            Err(inline_err) if should_fallback_deepseek_reasoner(&inline_err) => {
+                                emit_llm_diagnostic(
+                                    true,
+                                    format!(
+                                        "reasoner_fallback operation=plugin_edit_planning mode=tool_loop_retry reason={}",
+                                        inline_err
+                                    ),
+                                );
+                                match self.plan_plugin_edits_with_deepseek(
+                                    &tool_prompt,
+                                    &planner_context_files,
+                                    plugin_catalog.as_ref(),
+                                ) {
+                                    Ok(result) => result,
+                                    Err(reasoner_err)
+                                        if should_fallback_deepseek_reasoner(&reasoner_err) =>
+                                    {
+                                        return Err(RuntimeError::LlmRequestFailed {
+                                            message: format!(
+                                                "DeepSeek inline plugin edit planning failed: {inline_err}; reasoner tool-mode retry failed: {reasoner_err}"
+                                            ),
+                                        });
+                                    }
+                                    Err(err) => return Err(err),
+                                }
+                            }
+                            Err(err) => return Err(err),
+                        }
+                    } else {
+                        match self.plan_plugin_edits_with_deepseek(
+                            &tool_prompt,
+                            &planner_context_files,
+                            plugin_catalog.as_ref(),
+                        ) {
+                            Ok(result) => result,
+                            Err(reasoner_err)
+                                if should_fallback_deepseek_reasoner(&reasoner_err) =>
+                            {
+                                emit_llm_diagnostic(
+                                    true,
+                                    format!(
+                                        "reasoner_fallback operation=plugin_edit_planning mode=one_shot_completion reason={}",
+                                        reasoner_err
+                                    ),
+                                );
+                                self.plan_plugin_edits_with_deepseek_completion(&fallback_prompt)
+                                    .map_err(|fallback_err| {
+                                        combine_reasoner_fallback_errors(
+                                            "plugin edit planning",
+                                            reasoner_err,
+                                            fallback_err,
+                                        )
+                                    })?
+                            }
+                            Err(err) => return Err(err),
+                        }
+                    }
+                } else {
+                    self.plan_plugin_edits_with_deepseek(
+                        &build_plugin_edit_prompt(
+                            &request,
+                            &planner_context_files,
+                            plugin_catalog.as_ref(),
+                        ),
+                        &planner_context_files,
+                        plugin_catalog.as_ref(),
+                    )?
+                }
+            }
             _ => {
                 return Err(RuntimeError::UnsupportedLlmProvider {
                     provider: self.config.provider.clone(),
@@ -375,43 +505,7 @@ impl LlmPatchPlanner {
         plugin_catalog: Option<&PromptPluginCatalog>,
     ) -> Result<(PlannerPayload, Option<String>), RuntimeError> {
         if !model_uses_deepseek_reasoner(&self.config.model) {
-            let request_body = json!({
-                "model": self.config.model,
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": deepseek_system_prompt(),
-                    },
-                    {
-                        "role": "user",
-                        "content": user_prompt,
-                    }
-                ],
-                "temperature": self.config.temperature,
-                "max_tokens": self.config.max_tokens,
-                "response_format": {
-                    "type": "json_object"
-                }
-            });
-
-            let raw_json = self.send_json_request(
-                format!(
-                    "{}/chat/completions",
-                    self.config.base_url.trim_end_matches('/')
-                ),
-                request_body,
-            )?;
-            let response_id = raw_json
-                .get("id")
-                .and_then(Value::as_str)
-                .map(ToString::to_string);
-            let output_text = extract_chat_completion_text(&raw_json).ok_or_else(|| {
-                RuntimeError::LlmResponseInvalid {
-                    message: "missing choices[0].message.content in chat completion payload"
-                        .to_string(),
-                }
-            })?;
-            return Ok((parse_planner_payload(&output_text)?, response_id));
+            return self.plan_with_deepseek_completion(user_prompt);
         }
 
         self.run_deepseek_tool_loop(
@@ -432,43 +526,7 @@ impl LlmPatchPlanner {
         plugin_catalog: Option<&PromptPluginCatalog>,
     ) -> Result<(PluginPlannerPayload, Option<String>), RuntimeError> {
         if !model_uses_deepseek_reasoner(&self.config.model) {
-            let request_body = json!({
-                "model": self.config.model,
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": plugin_edit_deepseek_system_prompt(),
-                    },
-                    {
-                        "role": "user",
-                        "content": user_prompt,
-                    }
-                ],
-                "temperature": self.config.temperature,
-                "max_tokens": self.config.max_tokens,
-                "response_format": {
-                    "type": "json_object"
-                }
-            });
-
-            let raw_json = self.send_json_request(
-                format!(
-                    "{}/chat/completions",
-                    self.config.base_url.trim_end_matches('/')
-                ),
-                request_body,
-            )?;
-            let response_id = raw_json
-                .get("id")
-                .and_then(Value::as_str)
-                .map(ToString::to_string);
-            let output_text = extract_chat_completion_text(&raw_json).ok_or_else(|| {
-                RuntimeError::LlmResponseInvalid {
-                    message: "missing choices[0].message.content in chat completion payload"
-                        .to_string(),
-                }
-            })?;
-            return Ok((parse_plugin_planner_payload(&output_text)?, response_id));
+            return self.plan_plugin_edits_with_deepseek_completion(user_prompt);
         }
 
         self.run_deepseek_tool_loop(
@@ -480,6 +538,77 @@ impl LlmPatchPlanner {
                 self.execute_deepseek_plugin_tool_call(tool_call, context_files, plugin_catalog)
             },
         )
+    }
+
+    fn plan_with_deepseek_completion(
+        &self,
+        user_prompt: &str,
+    ) -> Result<(PlannerPayload, Option<String>), RuntimeError> {
+        self.complete_with_deepseek_json(
+            deepseek_system_prompt(),
+            user_prompt,
+            parse_planner_payload,
+        )
+    }
+
+    fn plan_plugin_edits_with_deepseek_completion(
+        &self,
+        user_prompt: &str,
+    ) -> Result<(PluginPlannerPayload, Option<String>), RuntimeError> {
+        self.complete_with_deepseek_json(
+            plugin_edit_deepseek_system_prompt(),
+            user_prompt,
+            parse_plugin_planner_payload,
+        )
+    }
+
+    fn complete_with_deepseek_json<T, P>(
+        &self,
+        system_prompt: &str,
+        user_prompt: &str,
+        parse_payload: P,
+    ) -> Result<(T, Option<String>), RuntimeError>
+    where
+        P: Fn(&str) -> Result<T, RuntimeError>,
+    {
+        let completion_model = deepseek_completion_model(&self.config.model);
+        let request_body = json!({
+            "model": completion_model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": system_prompt,
+                },
+                {
+                    "role": "user",
+                    "content": user_prompt,
+                }
+            ],
+            "temperature": self.config.temperature,
+            "max_tokens": self.config.max_tokens,
+            "response_format": {
+                "type": "json_object"
+            }
+        });
+
+        let raw_json = self.send_json_request(
+            format!(
+                "{}/chat/completions",
+                self.config.base_url.trim_end_matches('/')
+            ),
+            request_body,
+        )?;
+        let response_id = raw_json
+            .get("id")
+            .and_then(Value::as_str)
+            .map(ToString::to_string);
+        let output_text = extract_chat_completion_text(&raw_json).ok_or_else(|| {
+            RuntimeError::LlmResponseInvalid {
+                message: "missing choices[0].message.content in chat completion payload"
+                    .to_string(),
+            }
+        })?;
+        Ok((parse_payload(&output_text)?, response_id))
     }
 
     fn run_deepseek_tool_loop<T, F, P>(
@@ -508,7 +637,19 @@ impl LlmPatchPlanner {
                 "content": user_prompt,
             }),
         ];
-        for _ in 0..DEEPSEEK_REASONER_MAX_TURNS {
+        for turn_idx in 0..DEEPSEEK_REASONER_MAX_TURNS {
+            let turn_started = Instant::now();
+            emit_llm_diagnostic(
+                false,
+                format!(
+                    "reasoner_turn_start turn={}/{} model={} messages={} tool_count={}",
+                    turn_idx + 1,
+                    DEEPSEEK_REASONER_MAX_TURNS,
+                    self.config.model,
+                    messages.len(),
+                    tools.as_array().map(|items| items.len()).unwrap_or(0),
+                ),
+            );
             let request_body = json!({
                 "model": self.config.model,
                 "messages": messages,
@@ -523,11 +664,45 @@ impl LlmPatchPlanner {
                 .and_then(Value::as_str)
                 .map(ToString::to_string);
             let message = parse_deepseek_chat_message(&raw_json)?;
+            let tool_names = message
+                .tool_calls
+                .iter()
+                .map(|tool_call| tool_call.function.name.as_str())
+                .collect::<Vec<_>>();
+            emit_llm_diagnostic(
+                false,
+                format!(
+                    "reasoner_turn_result turn={}/{} elapsed_ms={} response_id={} tool_calls={} tool_names={:?} reasoning_chars={} content_chars={}",
+                    turn_idx + 1,
+                    DEEPSEEK_REASONER_MAX_TURNS,
+                    turn_started.elapsed().as_millis(),
+                    response_id.as_deref().unwrap_or("-"),
+                    message.tool_calls.len(),
+                    tool_names,
+                    message
+                        .reasoning_content
+                        .as_deref()
+                        .map(str::len)
+                        .unwrap_or(0),
+                    message.content.as_deref().map(str::len).unwrap_or(0),
+                ),
+            );
             if !message.tool_calls.is_empty() {
                 messages.push(message.to_request_message());
                 for tool_call in &message.tool_calls {
                     match handle_tool_call(tool_call)? {
                         DeepSeekToolOutcome::ToolResult(tool_output) => {
+                            emit_llm_diagnostic(
+                                false,
+                                format!(
+                                    "reasoner_tool_feedback turn={}/{} tool={} tool_call_id={} feedback_bytes={}",
+                                    turn_idx + 1,
+                                    DEEPSEEK_REASONER_MAX_TURNS,
+                                    tool_call.function.name,
+                                    tool_call.id,
+                                    tool_output.len(),
+                                ),
+                            );
                             messages.push(json!({
                                 "role": "tool",
                                 "tool_call_id": tool_call.id,
@@ -535,6 +710,16 @@ impl LlmPatchPlanner {
                             }));
                         }
                         DeepSeekToolOutcome::Final(payload) => {
+                            emit_llm_diagnostic(
+                                false,
+                                format!(
+                                    "reasoner_turn_submit turn={}/{} tool={} tool_call_id={}",
+                                    turn_idx + 1,
+                                    DEEPSEEK_REASONER_MAX_TURNS,
+                                    tool_call.function.name,
+                                    tool_call.id,
+                                ),
+                            );
                             if message.tool_calls.len() != 1 {
                                 return Err(RuntimeError::LlmResponseInvalid {
                                     message: format!(
@@ -562,7 +747,10 @@ impl LlmPatchPlanner {
 
         Err(RuntimeError::LlmResponseInvalid {
             message: format!(
-                "DeepSeek reasoner exceeded {DEEPSEEK_REASONER_MAX_TURNS} turns without producing a final plan"
+                "DeepSeek reasoner exceeded {DEEPSEEK_REASONER_MAX_TURNS} turns without producing a final plan; model={} endpoint={}/chat/completions timeout_ms={}",
+                self.config.model,
+                self.config.base_url.trim_end_matches('/'),
+                self.config.timeout_ms,
             ),
         })
     }
@@ -586,6 +774,26 @@ impl LlmPatchPlanner {
                             .map(|file| json!({
                                 "path": file.path,
                                 "sha256": file.sha256,
+                            }))
+                            .collect::<Vec<_>>(),
+                    })
+                    .to_string(),
+                ))
+            }
+            DEEPSEEK_TOOL_READ_CONTEXT_FILES => {
+                let args = parse_tool_arguments::<ReadContextFilesArgs>(
+                    &tool_call.function.arguments,
+                    &tool_call.function.name,
+                )?;
+                let files = find_context_files(context_files, &args.paths)?;
+                Ok(DeepSeekToolOutcome::ToolResult(
+                    json!({
+                        "files": files
+                            .into_iter()
+                            .map(|file| json!({
+                                "path": file.path,
+                                "sha256": file.sha256,
+                                "content": file.content,
                             }))
                             .collect::<Vec<_>>(),
                     })
@@ -677,6 +885,32 @@ impl LlmPatchPlanner {
                     .to_string(),
                 ))
             }
+            DEEPSEEK_TOOL_READ_CONTEXT_FILES => {
+                let args = parse_tool_arguments::<ReadContextFilesArgs>(
+                    &tool_call.function.arguments,
+                    &tool_call.function.name,
+                )?;
+                let files = find_context_files(context_files, &args.paths)?;
+                Ok(DeepSeekToolOutcome::ToolResult(
+                    json!({
+                        "files": files
+                            .into_iter()
+                            .map(|file| {
+                                let writable =
+                                    path_within_writable_surface(&file.path, &writable_roots);
+                                json!({
+                                    "path": file.path,
+                                    "sha256": file.sha256,
+                                    "writable": writable,
+                                    "generated_read_only": !writable,
+                                    "content": file.content,
+                                })
+                            })
+                            .collect::<Vec<_>>(),
+                    })
+                    .to_string(),
+                ))
+            }
             DEEPSEEK_TOOL_READ_CONTEXT_FILE => {
                 let args = parse_tool_arguments::<ReadContextFileArgs>(
                     &tool_call.function.arguments,
@@ -729,44 +963,141 @@ impl LlmPatchPlanner {
         request_body: Value,
     ) -> Result<Value, RuntimeError> {
         let api_key = resolve_api_key(&self.config)?;
-        let mut http_request = self
-            .client
-            .post(endpoint)
-            .header(CONTENT_TYPE, "application/json")
-            .header(AUTHORIZATION, format!("Bearer {api_key}"));
-        if let Some(org) = &self.config.organization {
-            if !org.trim().is_empty() {
-                http_request = http_request.header("OpenAI-Organization", org);
+        let request_summary =
+            summarize_llm_request(&endpoint, &request_body, self.config.timeout_ms);
+        let overall_started = Instant::now();
+        emit_llm_diagnostic(
+            false,
+            format!(
+                "request_start attempts={} {}",
+                LLM_REQUEST_MAX_ATTEMPTS, request_summary
+            ),
+        );
+        for attempt in 1..=LLM_REQUEST_MAX_ATTEMPTS {
+            let attempt_started = Instant::now();
+            let mut http_request = self
+                .client
+                .post(endpoint.clone())
+                .header(CONTENT_TYPE, "application/json")
+                .header(AUTHORIZATION, format!("Bearer {api_key}"));
+            if let Some(org) = &self.config.organization {
+                if !org.trim().is_empty() {
+                    http_request = http_request.header("OpenAI-Organization", org);
+                }
             }
-        }
-        if let Some(project) = &self.config.project {
-            if !project.trim().is_empty() {
-                http_request = http_request.header("OpenAI-Project", project);
+            if let Some(project) = &self.config.project {
+                if !project.trim().is_empty() {
+                    http_request = http_request.header("OpenAI-Project", project);
+                }
             }
-        }
 
-        let response = http_request.json(&request_body).send().map_err(|err| {
-            RuntimeError::LlmRequestFailed {
-                message: err.to_string(),
+            let response = match http_request.json(&request_body).send() {
+                Ok(response) => response,
+                Err(err) => {
+                    let detail = format_llm_transport_error(&err, self.config.timeout_ms);
+                    let message = format!(
+                        "llm request failed: attempt={attempt}/{LLM_REQUEST_MAX_ATTEMPTS} phase=send elapsed_ms={} total_elapsed_ms={} {} detail={detail}",
+                        attempt_started.elapsed().as_millis(),
+                        overall_started.elapsed().as_millis(),
+                        request_summary,
+                    );
+                    if attempt < LLM_REQUEST_MAX_ATTEMPTS {
+                        emit_llm_diagnostic(
+                            true,
+                            format!("{message} retry_backoff_ms={LLM_REQUEST_RETRY_BACKOFF_MS}"),
+                        );
+                        thread::sleep(Duration::from_millis(LLM_REQUEST_RETRY_BACKOFF_MS));
+                        continue;
+                    }
+                    emit_llm_diagnostic(true, message.clone());
+                    return Err(RuntimeError::LlmRequestFailed { message });
+                }
+            };
+
+            let status = response.status();
+            let raw_body = match response.text() {
+                Ok(body) => body,
+                Err(err) => {
+                    let detail = format_llm_transport_error(&err, self.config.timeout_ms);
+                    let message = format!(
+                        "llm request failed: attempt={attempt}/{LLM_REQUEST_MAX_ATTEMPTS} phase=read_body elapsed_ms={} total_elapsed_ms={} {} detail={detail}",
+                        attempt_started.elapsed().as_millis(),
+                        overall_started.elapsed().as_millis(),
+                        request_summary,
+                    );
+                    if attempt < LLM_REQUEST_MAX_ATTEMPTS {
+                        emit_llm_diagnostic(
+                            true,
+                            format!("{message} retry_backoff_ms={LLM_REQUEST_RETRY_BACKOFF_MS}"),
+                        );
+                        thread::sleep(Duration::from_millis(LLM_REQUEST_RETRY_BACKOFF_MS));
+                        continue;
+                    }
+                    emit_llm_diagnostic(true, message.clone());
+                    return Err(RuntimeError::LlmRequestFailed { message });
+                }
+            };
+
+            if !status.is_success() {
+                let message = format!(
+                    "llm request failed: attempt={attempt}/{LLM_REQUEST_MAX_ATTEMPTS} phase=http_status status={} elapsed_ms={} total_elapsed_ms={} {} error={} body_preview={}",
+                    status.as_u16(),
+                    attempt_started.elapsed().as_millis(),
+                    overall_started.elapsed().as_millis(),
+                    request_summary,
+                    extract_error_message(&raw_body)
+                        .unwrap_or_else(|| format!("status={} body={}", status, raw_body.trim())),
+                    truncate_for_error(&raw_body, 400),
+                );
+                if attempt < LLM_REQUEST_MAX_ATTEMPTS
+                    && (status.is_server_error() || status.as_u16() == 429)
+                {
+                    emit_llm_diagnostic(
+                        true,
+                        format!("{message} retry_backoff_ms={LLM_REQUEST_RETRY_BACKOFF_MS}"),
+                    );
+                    thread::sleep(Duration::from_millis(LLM_REQUEST_RETRY_BACKOFF_MS));
+                    continue;
+                }
+                emit_llm_diagnostic(true, message.clone());
+                return Err(RuntimeError::LlmRequestFailed { message });
             }
-        })?;
 
-        let status = response.status();
-        let raw_body = response
-            .text()
-            .map_err(|err| RuntimeError::LlmRequestFailed {
-                message: err.to_string(),
-            })?;
-
-        if !status.is_success() {
-            let message = extract_error_message(&raw_body)
-                .unwrap_or_else(|| format!("status={} body={}", status, raw_body.trim()));
-            return Err(RuntimeError::LlmRequestFailed { message });
+            let parsed = match serde_json::from_str(&raw_body) {
+                Ok(parsed) => parsed,
+                Err(err) => {
+                    let message = format!(
+                        "invalid JSON response: attempt={attempt}/{LLM_REQUEST_MAX_ATTEMPTS} phase=parse_json elapsed_ms={} total_elapsed_ms={} {} parse_error={err}; body_preview={}",
+                        attempt_started.elapsed().as_millis(),
+                        overall_started.elapsed().as_millis(),
+                        request_summary,
+                        truncate_for_error(&raw_body, 800)
+                    );
+                    emit_llm_diagnostic(true, message.clone());
+                    return Err(RuntimeError::LlmResponseInvalid { message });
+                }
+            };
+            emit_llm_diagnostic(
+                false,
+                format!(
+                    "request_success attempt={attempt}/{LLM_REQUEST_MAX_ATTEMPTS} status={} elapsed_ms={} total_elapsed_ms={} response_bytes={} {}",
+                    status.as_u16(),
+                    attempt_started.elapsed().as_millis(),
+                    overall_started.elapsed().as_millis(),
+                    raw_body.len(),
+                    request_summary,
+                ),
+            );
+            return Ok(parsed);
         }
 
-        serde_json::from_str(&raw_body).map_err(|err| RuntimeError::LlmResponseInvalid {
-            message: format!("invalid JSON response: {err}"),
-        })
+        let message = format!(
+            "llm request exhausted retries without returning a response: total_elapsed_ms={} {}",
+            overall_started.elapsed().as_millis(),
+            request_summary,
+        );
+        emit_llm_diagnostic(true, message.clone());
+        Err(RuntimeError::LlmRequestFailed { message })
     }
 
     fn build_planned_update(
@@ -967,8 +1298,8 @@ fn build_plugin_edit_prompt(
     prompt.push_str("- plugin verifier spec: plugin:{\"plugin_path\":\"<plugin_path>\",\"node_id\":\"<node_id>\",\"payload_json\":{},\"expect_substring\":\"<expected text>\",\"fixtures_root\":\"<optional fixtures root>\"}\n");
     prompt.push_str("Prefer plugin verifier specs over shell commands when a discovered plugin can validate the requested behavior directly.\n");
     prompt.push_str("\nDiscovered plugin capability catalog:\n");
-    match plugin_catalog {
-        Some(catalog) => prompt.push_str(&render_plugin_catalog(catalog)),
+    match filter_plugin_catalog(plugin_catalog, &writable_roots) {
+        Some(catalog) => prompt.push_str(&render_plugin_catalog(&catalog)),
         None => prompt.push_str("(none discovered for this workspace root)\n"),
     }
     let read_only_paths = files
@@ -984,16 +1315,31 @@ fn build_plugin_edit_prompt(
             prompt.push('\n');
         }
     }
+    if files
+        .iter()
+        .any(|file| is_plugin_architecture_guidance_path(&file.path, &writable_roots))
+    {
+        prompt.push_str("\nArchitecture guidance:\n");
+        prompt.push_str("- Human docs under docs/human/overview.md describe intended plugin topology and preferred extension patterns.\n");
+        prompt.push_str("- When these docs explain how new behavior should be added, prefer following that architecture over choosing the smallest immediate diff.\n");
+    }
     prompt.push_str("\nCurrent file contents with sha256 preconditions:\n");
     for file in files {
+        let writable = path_within_writable_surface(&file.path, &writable_roots);
         prompt.push_str("\n<<<FILE ");
         prompt.push_str(&file.path);
         prompt.push_str(" sha256=");
         prompt.push_str(&file.sha256);
         prompt.push_str(">>>\n");
-        prompt.push_str(&file.content);
-        if !file.content.ends_with('\n') {
-            prompt.push('\n');
+        if writable {
+            prompt.push_str(&file.content);
+            if !file.content.ends_with('\n') {
+                prompt.push('\n');
+            }
+        } else {
+            prompt.push_str(
+                "Read-only generated context omitted from the inline prompt to conserve tokens. Use tool mode if you need this file's exact content.\n",
+            );
         }
         prompt.push_str("<<<END FILE>>>\n");
     }
@@ -1019,6 +1365,9 @@ fn build_deepseek_patch_tool_prompt(
     prompt.push_str("\nInstruction:\n");
     prompt.push_str(request.instruction.trim());
     prompt.push_str("\n\nUse the available tools to inspect current workspace state before submitting a plan.\n");
+    prompt.push_str(
+        "Prefer `read_context_files` to inspect several related files in one turn when the task spans multiple sources.\n",
+    );
     prompt.push_str(
         "When you are ready, call `submit_patch_plan` as the only tool call in that message.\n",
     );
@@ -1068,9 +1417,13 @@ fn build_deepseek_plugin_tool_prompt(
     prompt.push_str(
         "\n\nUse the available tools to inspect current plugin context before submitting a plan.\n",
     );
+    prompt.push_str(
+        "Prefer `read_context_files` to inspect the most relevant writable source and test files together instead of reading them one by one.\n",
+    );
     prompt.push_str("When you are ready, call `submit_plugin_edit_plan` as the only tool call in that message.\n");
     prompt.push_str("If a tool responds with ok=false, revise your plan and submit again.\n");
     prompt.push_str("Files under docs/agent/** are read-only generated context and must never appear in submitted operations.\n");
+    prompt.push_str("Human docs under docs/human/overview.md describe intended plugin topology and preferred extension patterns; treat them as architecture guidance, not just prose.\n");
     prompt.push_str("\nWritable plugin roots:\n");
     for root in &request.writable_roots {
         prompt.push_str("- ");
@@ -1164,6 +1517,36 @@ fn render_plugin_catalog(catalog: &PromptPluginCatalog) -> String {
     rendered
 }
 
+fn filter_plugin_catalog(
+    plugin_catalog: Option<&PromptPluginCatalog>,
+    writable_roots: &BTreeSet<String>,
+) -> Option<PromptPluginCatalog> {
+    let catalog = plugin_catalog?;
+    let roots = writable_roots
+        .iter()
+        .map(|root| root.trim_start_matches("plugins/"))
+        .collect::<Vec<_>>();
+    let plugins = catalog
+        .plugins
+        .iter()
+        .filter(|plugin| {
+            roots.iter().any(|root| {
+                plugin.plugin_path == *root || plugin.plugin_path.starts_with(&format!("{root}/"))
+            })
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+
+    if plugins.is_empty() {
+        None
+    } else {
+        Some(PromptPluginCatalog {
+            discovery_root: catalog.discovery_root.clone(),
+            plugins,
+        })
+    }
+}
+
 fn openai_system_prompt() -> &'static str {
     "You are a guarded patch planner for a Rust workspace. Return only JSON that matches the provided schema. \
 Only edit the allowed relative paths. Each patch must use an exact substring from the current file contents in `find`. \
@@ -1199,6 +1582,7 @@ Do not invent plugin capabilities beyond the provided catalog and do not include
 fn deepseek_patch_tool_system_prompt() -> &'static str {
     "You are a guarded patch planner for a Rust workspace running in DeepSeek reasoner tool mode. \
 Inspect files with the provided tools before finalizing a patch plan. \
+Prefer batch inspection with read_context_files when several files are relevant. \
 When ready, call submit_patch_plan as the only tool call in that assistant turn. \
 Do not invent files, paths, plugin capabilities, or command outputs."
 }
@@ -1206,6 +1590,7 @@ Do not invent files, paths, plugin capabilities, or command outputs."
 fn deepseek_plugin_tool_system_prompt() -> &'static str {
     "You are a guarded plugin-edit planner for a Rust plugin workspace running in DeepSeek reasoner tool mode. \
 Inspect files and plugin capabilities with the provided read-only tools before finalizing a plugin edit plan. \
+Prefer batch inspection with read_context_files so multi-file edits finish in fewer turns. \
 Files under docs/agent/** are generated read-only context and must never be modified. \
 When ready, call submit_plugin_edit_plan as the only tool call in that assistant turn. \
 Do not invent files, paths, plugin capabilities, or command outputs."
@@ -1228,6 +1613,15 @@ fn deepseek_patch_tools() -> Value {
                 "name": DEEPSEEK_TOOL_READ_CONTEXT_FILE,
                 "description": "Read one allowed workspace file by relative path.",
                 "parameters": read_context_file_parameters(),
+                "strict": true
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": DEEPSEEK_TOOL_READ_CONTEXT_FILES,
+                "description": "Read several allowed workspace files by relative path in a single tool call.",
+                "parameters": read_context_files_parameters(),
                 "strict": true
             }
         },
@@ -1275,6 +1669,15 @@ fn deepseek_plugin_tools() -> Value {
         {
             "type": "function",
             "function": {
+                "name": DEEPSEEK_TOOL_READ_CONTEXT_FILES,
+                "description": "Read several plugin context files by relative path in a single tool call.",
+                "parameters": read_context_files_parameters(),
+                "strict": true
+            }
+        },
+        {
+            "type": "function",
+            "function": {
                 "name": DEEPSEEK_TOOL_INSPECT_PLUGIN_CATALOG,
                 "description": "Inspect the discovered plugin capability catalog. Optionally filter by plugin_path.",
                 "parameters": inspect_plugin_catalog_parameters(),
@@ -1311,6 +1714,23 @@ fn read_context_file_parameters() -> Value {
             }
         },
         "required": ["path"]
+    })
+}
+
+fn read_context_files_parameters() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "paths": {
+                "type": "array",
+                "items": {
+                    "type": "string"
+                },
+                "minItems": 1
+            }
+        },
+        "required": ["paths"]
     })
 }
 
@@ -1471,6 +1891,45 @@ fn model_uses_deepseek_reasoner(model: &str) -> bool {
     model.trim().eq_ignore_ascii_case("deepseek-reasoner")
 }
 
+fn deepseek_completion_model(configured_model: &str) -> &str {
+    if model_uses_deepseek_reasoner(configured_model) {
+        "deepseek-chat"
+    } else {
+        configured_model
+    }
+}
+
+fn should_fallback_deepseek_reasoner(err: &RuntimeError) -> bool {
+    matches!(
+        err,
+        RuntimeError::LlmRequestFailed { .. } | RuntimeError::LlmResponseInvalid { .. }
+    )
+}
+
+fn should_try_inline_deepseek_completion(context_files: &[ContextFile]) -> bool {
+    const MAX_INLINE_CONTEXT_FILES: usize = 32;
+    const MAX_INLINE_CONTEXT_CHARS: usize = 120_000;
+
+    context_files.len() <= MAX_INLINE_CONTEXT_FILES
+        && context_files
+            .iter()
+            .map(|file| file.path.len() + file.content.len())
+            .sum::<usize>()
+            <= MAX_INLINE_CONTEXT_CHARS
+}
+
+fn combine_reasoner_fallback_errors(
+    operation: &str,
+    reasoner_err: RuntimeError,
+    fallback_err: RuntimeError,
+) -> RuntimeError {
+    RuntimeError::LlmRequestFailed {
+        message: format!(
+            "DeepSeek reasoner {operation} failed: {reasoner_err}; one-shot fallback failed: {fallback_err}"
+        ),
+    }
+}
+
 fn parse_tool_arguments<T: DeserializeOwned>(
     raw_arguments: &str,
     tool_name: &str,
@@ -1491,6 +1950,124 @@ fn find_context_file<'a>(
         .ok_or_else(|| RuntimeError::LlmResponseInvalid {
             message: format!("tool requested unknown context file: {path}"),
         })
+}
+
+fn find_context_files<'a>(
+    context_files: &'a [ContextFile],
+    paths: &[String],
+) -> Result<Vec<&'a ContextFile>, RuntimeError> {
+    if paths.is_empty() {
+        return Err(RuntimeError::LlmResponseInvalid {
+            message: "tool requested zero context files".to_string(),
+        });
+    }
+
+    paths
+        .iter()
+        .map(|path| find_context_file(context_files, path))
+        .collect()
+}
+
+fn select_plugin_planner_context_files(
+    instruction: &str,
+    context_files: &[ContextFile],
+    writable_roots: &BTreeSet<String>,
+) -> Vec<ContextFile> {
+    let mut selected = context_files
+        .iter()
+        .filter(|file| {
+            path_within_writable_surface(&file.path, writable_roots)
+                && instruction.contains(&file.path)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+
+    if selected.is_empty() {
+        let mut all = context_files.to_vec();
+        sort_plugin_planner_context_files(&mut all, writable_roots);
+        return all;
+    }
+
+    let selected_paths = selected
+        .iter()
+        .map(|file| file.path.clone())
+        .collect::<BTreeSet<_>>();
+    for file in context_files {
+        if is_plugin_architecture_guidance_path(&file.path, writable_roots)
+            && !selected_paths.contains(&file.path)
+        {
+            selected.push(file.clone());
+        }
+    }
+    let selected_paths = selected
+        .iter()
+        .map(|file| file.path.clone())
+        .collect::<BTreeSet<_>>();
+    for file in context_files {
+        if writable_roots
+            .iter()
+            .any(|root| file.path == format!("{root}/Cargo.toml"))
+            && !selected_paths.contains(&file.path)
+        {
+            selected.push(file.clone());
+        }
+    }
+
+    sort_plugin_planner_context_files(&mut selected, writable_roots);
+    selected
+}
+
+fn sort_plugin_planner_context_files(
+    files: &mut Vec<ContextFile>,
+    writable_roots: &BTreeSet<String>,
+) {
+    files.sort_by(|left, right| {
+        plugin_context_file_priority(&left.path, writable_roots)
+            .cmp(&plugin_context_file_priority(&right.path, writable_roots))
+            .then_with(|| {
+                left.path
+                    .matches('/')
+                    .count()
+                    .cmp(&right.path.matches('/').count())
+            })
+            .then_with(|| left.path.cmp(&right.path))
+    });
+}
+
+fn plugin_context_file_priority(path: &str, writable_roots: &BTreeSet<String>) -> u8 {
+    if is_plugin_architecture_guidance_path(path, writable_roots) {
+        0
+    } else if writable_roots
+        .iter()
+        .any(|root| path == format!("{root}/Cargo.toml"))
+    {
+        1
+    } else if writable_roots
+        .iter()
+        .any(|root| path.starts_with(&format!("{root}/docs/human/")))
+    {
+        2
+    } else if writable_roots
+        .iter()
+        .any(|root| path.starts_with(&format!("{root}/src/")))
+    {
+        3
+    } else if writable_roots
+        .iter()
+        .any(|root| path.starts_with(&format!("{root}/tests/")))
+    {
+        4
+    } else if path_within_read_only_generated_context(path, writable_roots) {
+        5
+    } else {
+        6
+    }
+}
+
+fn is_plugin_architecture_guidance_path(path: &str, writable_roots: &BTreeSet<String>) -> bool {
+    writable_roots
+        .iter()
+        .any(|root| path == format!("{root}/docs/human/overview.md"))
 }
 
 fn render_plugin_catalog_tool_result(
@@ -1527,6 +2104,80 @@ fn tool_feedback_error(tool_name: &str, error: &str) -> Value {
         "error": error,
         "hint": "Revise the arguments and call the submit tool again only after the payload satisfies the required shape and writable-path rules."
     })
+}
+
+fn truncate_for_error(value: &str, max_chars: usize) -> String {
+    let truncated = value.chars().take(max_chars).collect::<String>();
+    if value.chars().count() > max_chars {
+        format!("{truncated}...")
+    } else {
+        truncated
+    }
+}
+
+fn llm_debug_enabled() -> bool {
+    env::var(LLM_DEBUG_ENV)
+        .map(|value| {
+            let normalized = value.trim().to_ascii_lowercase();
+            !normalized.is_empty() && !matches!(normalized.as_str(), "0" | "false" | "off" | "no")
+        })
+        .unwrap_or(false)
+}
+
+fn emit_llm_diagnostic(force: bool, message: String) {
+    if force || llm_debug_enabled() {
+        eprintln!("[cordis-runtime][llm] {message}");
+    }
+}
+
+fn summarize_llm_request(endpoint: &str, request_body: &Value, timeout_ms: u64) -> String {
+    let model = request_body
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or("-");
+    let message_count = request_body
+        .get("messages")
+        .and_then(Value::as_array)
+        .map(|messages| messages.len())
+        .unwrap_or(0);
+    let tool_count = request_body
+        .get("tools")
+        .and_then(Value::as_array)
+        .map(|tools| tools.len())
+        .unwrap_or(0);
+    let tool_choice = request_body
+        .get("tool_choice")
+        .map(compact_json_value)
+        .unwrap_or_else(|| "-".to_string());
+    let response_format = request_body
+        .get("response_format")
+        .map(compact_json_value)
+        .unwrap_or_else(|| "-".to_string());
+    format!(
+        "endpoint={} model={} timeout_ms={} messages={} tools={} tool_choice={} response_format={}",
+        endpoint, model, timeout_ms, message_count, tool_count, tool_choice, response_format
+    )
+}
+
+fn compact_json_value(value: &Value) -> String {
+    let serialized = serde_json::to_string(value).unwrap_or_else(|_| value.to_string());
+    truncate_for_error(&serialized, 120)
+}
+
+fn format_llm_transport_error(err: &reqwest::Error, timeout_ms: u64) -> String {
+    if err.is_timeout() {
+        format!("request timed out after timeout_ms={timeout_ms}: {err}")
+    } else if err.is_connect() {
+        format!("connection failed: {err}")
+    } else if err.is_body() {
+        format!("response body transport failed: {err}")
+    } else if err.is_decode() {
+        format!("response decode failed: {err}")
+    } else if err.is_request() {
+        format!("request build/dispatch failed: {err}")
+    } else {
+        err.to_string()
+    }
 }
 
 fn extract_error_message(raw_body: &str) -> Option<String> {
@@ -1613,8 +2264,12 @@ fn parse_deepseek_chat_message(raw_json: &Value) -> Result<DeepSeekChatMessage, 
         .ok_or_else(|| RuntimeError::LlmResponseInvalid {
             message: "missing choices[0].message in chat completion payload".to_string(),
         })?;
+    let message_preview = truncate_for_error(&message.to_string(), 800);
     serde_json::from_value(message).map_err(|err| RuntimeError::LlmResponseInvalid {
-        message: format!("chat completion message shape was invalid: {err}"),
+        message: format!(
+            "chat completion message shape was invalid: {err}; message_preview={}",
+            message_preview
+        ),
     })
 }
 
@@ -1819,8 +2474,9 @@ mod tests {
         api_key_env_looks_like_secret, build_plugin_edit_prompt, build_user_prompt,
         discover_plugin_catalog, extract_chat_completion_text, extract_error_message,
         extract_output_text, normalize_optional_command, normalize_rel_path,
-        path_within_read_only_generated_context, path_within_writable_surface, sha256_text,
-        validate_plugin_operation_paths, ContextFile, PlanRequest, PluginPlanRequest,
+        path_within_read_only_generated_context, path_within_writable_surface,
+        select_plugin_planner_context_files, sha256_text, validate_plugin_operation_paths,
+        ContextFile, PlanRequest, PluginPlanRequest,
     };
     use crate::kernel::plugin_iteration::{PluginEditOpKind, PluginEditOperation};
     use serde_json::{json, Value};
@@ -1994,6 +2650,7 @@ mod tests {
             patch_id: "patch-1".to_string(),
             instruction: "Update shell docs".to_string(),
             context_paths: vec![
+                "plugins/shell/docs/human/overview.md".to_string(),
                 "plugins/shell/src/lib.rs".to_string(),
                 "plugins/shell/docs/agent/interfaces.json".to_string(),
             ],
@@ -2001,6 +2658,11 @@ mod tests {
             manual_approved: false,
         };
         let files = vec![
+            ContextFile {
+                path: "plugins/shell/docs/human/overview.md".to_string(),
+                sha256: "human789".to_string(),
+                content: "# shell\n\nKeep shell behavior isolated.\n".to_string(),
+            },
             ContextFile {
                 path: "plugins/shell/src/lib.rs".to_string(),
                 sha256: "abc123".to_string(),
@@ -2028,6 +2690,14 @@ mod tests {
             "prompt: {prompt}"
         );
         assert!(prompt.contains("create_file"), "prompt: {prompt}");
+        assert!(
+            prompt.contains("Architecture guidance:"),
+            "prompt: {prompt}"
+        );
+        assert!(
+            prompt.contains("preferred extension patterns"),
+            "prompt: {prompt}"
+        );
     }
 
     #[test]
@@ -2082,5 +2752,105 @@ mod tests {
             "plugins/shell/docs/agent/interfaces.json",
             &writable_roots
         ));
+    }
+
+    #[test]
+    fn select_plugin_planner_context_files_prefers_explicit_instruction_paths() {
+        let writable_roots = BTreeSet::from(["plugins/expr".to_string()]);
+        let files = vec![
+            ContextFile {
+                path: "plugins/expr/docs/human/overview.md".to_string(),
+                sha256: "human".to_string(),
+                content: "# expr\n\nUse child plugins.\n".to_string(),
+            },
+            ContextFile {
+                path: "plugins/expr/Cargo.toml".to_string(),
+                sha256: "manifest".to_string(),
+                content: "[package]\nname = \"expr\"\n".to_string(),
+            },
+            ContextFile {
+                path: "plugins/expr/src/lib.rs".to_string(),
+                sha256: "lib".to_string(),
+                content: "pub fn evaluate() {}\n".to_string(),
+            },
+            ContextFile {
+                path: "plugins/expr/tests/eval.rs".to_string(),
+                sha256: "tests".to_string(),
+                content: "#[test]\nfn ok() {}\n".to_string(),
+            },
+            ContextFile {
+                path: "plugins/expr/docs/agent/interfaces.json".to_string(),
+                sha256: "agent".to_string(),
+                content: "{}\n".to_string(),
+            },
+        ];
+
+        let selected = select_plugin_planner_context_files(
+            "Update plugins/expr/src/lib.rs and plugins/expr/tests/eval.rs for modulo support.",
+            &files,
+            &writable_roots,
+        );
+        let selected_paths = selected
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            selected_paths,
+            vec![
+                "plugins/expr/docs/human/overview.md",
+                "plugins/expr/Cargo.toml",
+                "plugins/expr/src/lib.rs",
+                "plugins/expr/tests/eval.rs",
+            ]
+        );
+    }
+
+    #[test]
+    fn select_plugin_planner_context_files_prioritizes_architecture_docs_without_explicit_paths() {
+        let writable_roots = BTreeSet::from([
+            "plugins/expr".to_string(),
+            "plugins/expr/evaluator".to_string(),
+        ]);
+        let files = vec![
+            ContextFile {
+                path: "plugins/expr/evaluator/src/core.rs".to_string(),
+                sha256: "core".to_string(),
+                content: "pub fn eval() {}\n".to_string(),
+            },
+            ContextFile {
+                path: "plugins/expr/evaluator/docs/human/overview.md".to_string(),
+                sha256: "evaluator-human".to_string(),
+                content: "# expr_evaluator\n\nUse child plugins.\n".to_string(),
+            },
+            ContextFile {
+                path: "plugins/expr/Cargo.toml".to_string(),
+                sha256: "manifest".to_string(),
+                content: "[package]\nname = \"expr\"\n".to_string(),
+            },
+            ContextFile {
+                path: "plugins/expr/docs/human/overview.md".to_string(),
+                sha256: "expr-human".to_string(),
+                content: "# expr\n\nNested child plugins.\n".to_string(),
+            },
+        ];
+
+        let selected = select_plugin_planner_context_files(
+            "Add modulo support to expr.",
+            &files,
+            &writable_roots,
+        );
+        let selected_paths = selected
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            selected_paths,
+            vec![
+                "plugins/expr/docs/human/overview.md",
+                "plugins/expr/evaluator/docs/human/overview.md",
+                "plugins/expr/Cargo.toml",
+                "plugins/expr/evaluator/src/core.rs",
+            ]
+        );
     }
 }

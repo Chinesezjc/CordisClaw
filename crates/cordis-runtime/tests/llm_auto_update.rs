@@ -14,12 +14,23 @@ fn write_config(
     api_key_env: &str,
     model: &str,
 ) {
+    write_config_with_timeout(root, provider, base_url, api_key_env, model, 30000);
+}
+
+fn write_config_with_timeout(
+    root: &std::path::Path,
+    provider: &str,
+    base_url: &str,
+    api_key_env: &str,
+    model: &str,
+    timeout_ms: u64,
+) {
     let config_dir = root.join("config");
     fs::create_dir_all(&config_dir).expect("create config dir");
     fs::write(
         config_dir.join("llm_api.yaml"),
         format!(
-            "provider: {provider}\nbase_url: {base_url}\napi_key_env: {api_key_env}\nmodel: {model}\ntemperature: 0.0\nmax_tokens: 1024\ntimeout_ms: 30000\n"
+            "provider: {provider}\nbase_url: {base_url}\napi_key_env: {api_key_env}\nmodel: {model}\ntemperature: 0.0\nmax_tokens: 1024\ntimeout_ms: {timeout_ms}\n"
         ),
     )
     .expect("write llm config");
@@ -28,13 +39,23 @@ fn write_config(
 fn spawn_mock_llm_server_sequence(
     response_bodies: Vec<String>,
 ) -> (String, mpsc::Receiver<Vec<String>>, thread::JoinHandle<()>) {
+    let responses = response_bodies
+        .into_iter()
+        .map(|body| (200_u16, body))
+        .collect();
+    spawn_mock_llm_server_sequence_with_statuses(responses)
+}
+
+fn spawn_mock_llm_server_sequence_with_statuses(
+    responses: Vec<(u16, String)>,
+) -> (String, mpsc::Receiver<Vec<String>>, thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
     let address = listener.local_addr().expect("listener addr");
     let (sender, receiver) = mpsc::channel();
 
     let handle = thread::spawn(move || {
         let mut requests = Vec::new();
-        for response_body in response_bodies {
+        for (status_code, response_body) in responses {
             let (mut stream, _) = listener.accept().expect("accept request");
             let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
             let mut request = String::new();
@@ -67,7 +88,9 @@ fn spawn_mock_llm_server_sequence(
 
             write!(
                 stream,
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                status_code,
+                mock_reason_phrase(status_code),
                 response_body.len(),
                 response_body
             )
@@ -77,6 +100,63 @@ fn spawn_mock_llm_server_sequence(
     });
 
     (format!("http://{}/v1", address), receiver, handle)
+}
+
+fn spawn_slow_mock_llm_server_sequence(
+    delays_ms: Vec<u64>,
+    response_body: String,
+) -> (String, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
+    let address = listener.local_addr().expect("listener addr");
+
+    let handle = thread::spawn(move || {
+        for delay_ms in delays_ms {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+
+            let mut first_line = String::new();
+            reader
+                .read_line(&mut first_line)
+                .expect("read request line");
+
+            let mut content_length = 0usize;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).expect("read header line");
+                if line == "\r\n" {
+                    break;
+                }
+                let lowercase = line.to_ascii_lowercase();
+                if let Some(value) = lowercase.strip_prefix("content-length:") {
+                    content_length = value.trim().parse::<usize>().expect("parse content length");
+                }
+            }
+
+            let mut body = vec![0_u8; content_length];
+            reader.read_exact(&mut body).expect("read request body");
+
+            thread::sleep(std::time::Duration::from_millis(delay_ms));
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            );
+        }
+    });
+
+    (format!("http://{}/v1", address), handle)
+}
+
+fn mock_reason_phrase(status_code: u16) -> &'static str {
+    match status_code {
+        200 => "OK",
+        429 => "Too Many Requests",
+        500 => "Internal Server Error",
+        502 => "Bad Gateway",
+        503 => "Service Unavailable",
+        _ => "Mock Response",
+    }
 }
 
 fn spawn_mock_llm_server(
@@ -349,6 +429,174 @@ fn llm_auto_update_supports_deepseek_chat_completions() {
 
 #[cfg(not(windows))]
 #[test]
+fn llm_auto_update_retries_transient_llm_http_failures() {
+    let temp = TempDir::new().expect("tempdir");
+    let demo_path = temp.path().join("demo.txt");
+    fs::write(&demo_path, "alpha-old-omega\n").expect("write demo file");
+
+    let error_response = json!({
+        "error": {
+            "message": "temporary upstream overload"
+        }
+    })
+    .to_string();
+    let success_response = json!({
+        "id": "chatcmpl_test_retry",
+        "choices": [
+            {
+                "message": {
+                    "content": json!({
+                        "summary": "Replace old with new in the demo file.",
+                        "patches": [
+                            {
+                                "path": "demo.txt",
+                                "find": "old",
+                                "replace": "new"
+                            }
+                        ]
+                    })
+                    .to_string()
+                }
+            }
+        ]
+    })
+    .to_string();
+    let (base_url, requests_rx, handle) = spawn_mock_llm_server_sequence_with_statuses(vec![
+        (500, error_response),
+        (200, success_response),
+    ]);
+    write_config(
+        temp.path(),
+        "deepseek",
+        &base_url,
+        "DEEPSEEK_API_KEY",
+        "deepseek-chat",
+    );
+
+    let bin = env!("CARGO_BIN_EXE_cordis-runtime");
+    let output = Command::new(bin)
+        .arg("llm-auto-update")
+        .arg(temp.path())
+        .arg("--instruction=Replace old with new in demo.txt")
+        .arg("--path=demo.txt")
+        .arg("--tests-command=grep -q new demo.txt")
+        .arg("--safety-command=grep -q new demo.txt")
+        .env("DEEPSEEK_API_KEY", "test-key")
+        .env("CORDIS_LLM_DEBUG", "1")
+        .output()
+        .expect("run llm-auto-update");
+
+    handle.join().expect("join mock server");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout utf-8");
+    let stderr = String::from_utf8(output.stderr).expect("stderr utf-8");
+    assert!(
+        stdout.contains("\"verdict\": \"Promote\""),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stderr.contains("[cordis-runtime][llm] request_start"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("phase=http_status status=500"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("request_success attempt=2/3"),
+        "stderr: {stderr}"
+    );
+    assert_eq!(
+        fs::read_to_string(&demo_path).expect("read demo file"),
+        "alpha-new-omega\n"
+    );
+
+    let captured_requests = requests_rx.recv().expect("capture requests");
+    assert_eq!(
+        captured_requests.len(),
+        2,
+        "requests: {captured_requests:?}"
+    );
+}
+
+#[cfg(not(windows))]
+#[test]
+fn llm_auto_update_reports_timeout_diagnostics() {
+    let temp = TempDir::new().expect("tempdir");
+    let demo_path = temp.path().join("demo.txt");
+    fs::write(&demo_path, "alpha-old-omega\n").expect("write demo file");
+
+    let response_body = json!({
+        "id": "resp_slow",
+        "output_text": json!({
+            "summary": "Replace old with new in the demo file.",
+            "patches": [
+                {
+                    "path": "demo.txt",
+                    "find": "old",
+                    "replace": "new"
+                }
+            ]
+        })
+        .to_string(),
+    })
+    .to_string();
+    let (base_url, handle) =
+        spawn_slow_mock_llm_server_sequence(vec![300, 300, 300], response_body);
+    write_config_with_timeout(
+        temp.path(),
+        "openai",
+        &base_url,
+        "OPENAI_API_KEY",
+        "gpt-4.1-mini",
+        100,
+    );
+
+    let bin = env!("CARGO_BIN_EXE_cordis-runtime");
+    let output = Command::new(bin)
+        .arg("llm-auto-update")
+        .arg(temp.path())
+        .arg("--instruction=Replace old with new in demo.txt")
+        .arg("--path=demo.txt")
+        .arg("--tests-command=grep -q new demo.txt")
+        .arg("--safety-command=grep -q new demo.txt")
+        .env("OPENAI_API_KEY", "test-key")
+        .env("CORDIS_LLM_DEBUG", "1")
+        .output()
+        .expect("run llm-auto-update");
+
+    handle.join().expect("join slow mock server");
+    assert!(
+        !output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stderr = String::from_utf8(output.stderr).expect("stderr utf-8");
+    assert!(
+        stderr.contains("request timed out after timeout_ms=100"),
+        "stderr: {stderr}"
+    );
+    assert!(stderr.contains("attempt=3/3"), "stderr: {stderr}");
+    assert!(stderr.contains("total_elapsed_ms="), "stderr: {stderr}");
+    assert!(
+        stderr.contains("endpoint=") && stderr.contains("/v1/responses"),
+        "stderr: {stderr}"
+    );
+    assert_eq!(
+        fs::read_to_string(&demo_path).expect("read demo file"),
+        "alpha-old-omega\n"
+    );
+}
+
+#[cfg(not(windows))]
+#[test]
 fn llm_auto_update_supports_deepseek_reasoner_tool_calls() {
     let temp = TempDir::new().expect("tempdir");
     let demo_path = temp.path().join("demo.txt");
@@ -363,11 +611,11 @@ fn llm_auto_update_supports_deepseek_reasoner_tool_calls() {
                     "reasoning_content": "Need to inspect the target file before planning.",
                     "tool_calls": [
                         {
-                            "id": "call_read_demo",
+                            "id": "call_read_demo_batch",
                             "type": "function",
                             "function": {
-                                "name": "read_context_file",
-                                "arguments": "{\"path\":\"demo.txt\"}"
+                                "name": "read_context_files",
+                                "arguments": "{\"paths\":[\"demo.txt\"]}"
                             }
                         }
                     ]
@@ -458,11 +706,118 @@ fn llm_auto_update_supports_deepseek_reasoner_tool_calls() {
     assert!(captured_requests[0].contains("\"model\":\"deepseek-reasoner\""));
     assert!(captured_requests[0].contains("\"tools\""));
     assert!(captured_requests[0].contains("submit_patch_plan"));
-    assert!(captured_requests[0].contains("read_context_file"));
+    assert!(captured_requests[0].contains("read_context_files"));
     assert!(captured_requests[1]
         .contains("\"reasoning_content\":\"Need to inspect the target file before planning.\""));
-    assert!(captured_requests[1].contains("\"tool_call_id\":\"call_read_demo\""));
+    assert!(captured_requests[1].contains("\"tool_call_id\":\"call_read_demo_batch\""));
     assert!(captured_requests[1].contains("alpha-old-omega"));
+}
+
+#[cfg(not(windows))]
+#[test]
+fn llm_auto_update_deepseek_reasoner_falls_back_after_tool_timeout() {
+    let temp = TempDir::new().expect("tempdir");
+    let demo_path = temp.path().join("demo.txt");
+    fs::write(&demo_path, "alpha-old-omega\n").expect("write demo file");
+
+    let mut responses = Vec::new();
+    for idx in 0..16 {
+        responses.push(
+            json!({
+                "id": format!("chatcmpl_reasoner_timeout_{idx}"),
+                "choices": [
+                    {
+                        "message": {
+                            "content": null,
+                            "reasoning_content": "I am still inspecting context.",
+                            "tool_calls": [
+                                {
+                                    "id": format!("call_list_{idx}"),
+                                    "type": "function",
+                                    "function": {
+                                        "name": "list_context_files",
+                                        "arguments": "{}"
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                ]
+            })
+            .to_string(),
+        );
+    }
+    responses.push(
+        json!({
+            "id": "chatcmpl_reasoner_timeout_fallback",
+            "choices": [
+                {
+                    "message": {
+                        "content": json!({
+                            "summary": "Replace old with new in the demo file.",
+                            "patches": [
+                                {
+                                    "path": "demo.txt",
+                                    "find": "old",
+                                    "replace": "new"
+                                }
+                            ]
+                        })
+                        .to_string()
+                    }
+                }
+            ]
+        })
+        .to_string(),
+    );
+    let (base_url, requests_rx, handle) = spawn_mock_llm_server_sequence(responses);
+    write_config(
+        temp.path(),
+        "deepseek",
+        &base_url,
+        "DEEPSEEK_API_KEY",
+        "deepseek-reasoner",
+    );
+
+    let bin = env!("CARGO_BIN_EXE_cordis-runtime");
+    let output = Command::new(bin)
+        .arg("llm-auto-update")
+        .arg(temp.path())
+        .arg("--instruction=Replace old with new in demo.txt")
+        .arg("--path=demo.txt")
+        .arg("--tests-command=grep -q new demo.txt")
+        .arg("--safety-command=grep -q new demo.txt")
+        .env("DEEPSEEK_API_KEY", "test-key")
+        .output()
+        .expect("run llm-auto-update");
+
+    handle.join().expect("join mock server");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout utf-8");
+    assert!(
+        stdout.contains("\"verdict\": \"Promote\""),
+        "stdout: {stdout}"
+    );
+    assert_eq!(
+        fs::read_to_string(&demo_path).expect("read demo file"),
+        "alpha-new-omega\n"
+    );
+
+    let captured_requests = requests_rx.recv().expect("capture requests");
+    assert_eq!(
+        captured_requests.len(),
+        17,
+        "requests: {captured_requests:?}"
+    );
+    assert!(captured_requests[0].contains("\"tools\""));
+    assert!(captured_requests[15].contains("\"tools\""));
+    assert!(!captured_requests[16].contains("\"tools\""));
+    assert!(captured_requests[16].contains("alpha-old-omega"));
 }
 
 #[cfg(not(windows))]

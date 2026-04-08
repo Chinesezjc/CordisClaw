@@ -331,6 +331,15 @@ fn resolve_plugin_fixtures_root(current_dir: &Path, requested_root: Option<&str>
         let path = Path::new(root);
         return if path.is_absolute() {
             path.to_path_buf()
+        } else if current_dir.ends_with(path) {
+            current_dir.to_path_buf()
+        } else if let Some(parent) = current_dir.parent() {
+            let sibling = parent.join(path);
+            if sibling.join("plugins").exists() {
+                sibling
+            } else {
+                current_dir.join(path)
+            }
         } else {
             current_dir.join(path)
         };
@@ -402,8 +411,8 @@ fn shell_args(command: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CommandVerifier, VerificationProfile, VerificationRunner, VerificationStageKind,
-        VerificationStageStatus,
+        resolve_plugin_fixtures_root, CommandVerifier, VerificationProfile, VerificationRunner,
+        VerificationStageKind, VerificationStageStatus,
     };
     use serde_json::json;
     use std::fs;
@@ -473,6 +482,12 @@ mod tests {
             report.tests.as_ref().map(|check| check.runner),
             Some(VerificationRunner::Plugin)
         );
+    }
+
+    #[test]
+    fn resolve_plugin_fixtures_root_uses_current_fixtures_dir_without_duplication() {
+        let resolved = resolve_plugin_fixtures_root(Path::new("fixtures"), Some("fixtures"));
+        assert_eq!(resolved, Path::new("fixtures"));
     }
 
     #[test]

@@ -408,13 +408,27 @@ pub struct PluginEditApplyResult {
 
 #[derive(Debug, Clone)]
 pub struct PluginEditRollback {
+    workspace_root: PathBuf,
     backups: Vec<AppliedEditBackup>,
 }
 
 #[derive(Debug, Clone)]
 struct AppliedEditBackup {
-    abs_path: PathBuf,
+    rel_path: String,
     original: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct PluginEditRollbackJournal {
+    iteration_id: String,
+    backups: Vec<PluginEditRollbackJournalBackup>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct PluginEditRollbackJournalBackup {
+    rel_path: String,
+    #[serde(default)]
+    original_hex: Option<String>,
 }
 
 impl PluginEditExecutor {
@@ -465,7 +479,10 @@ impl PluginEditExecutor {
                 }
             }
 
-            backups.push(AppliedEditBackup { abs_path, original });
+            backups.push(AppliedEditBackup {
+                rel_path: normalized.clone(),
+                original,
+            });
             changed_paths.insert(normalized);
         }
 
@@ -474,7 +491,10 @@ impl PluginEditExecutor {
                 changed_paths: changed_paths.into_iter().collect(),
                 diff_lines: plan.diff_lines(),
             },
-            PluginEditRollback { backups },
+            PluginEditRollback {
+                workspace_root: self.workspace_root.clone(),
+                backups,
+            },
         ))
     }
 }
@@ -482,28 +502,113 @@ impl PluginEditExecutor {
 impl PluginEditRollback {
     pub fn rollback(&self) -> Result<(), RuntimeError> {
         for backup in self.backups.iter().rev() {
+            let abs_path = self.workspace_root.join(&backup.rel_path);
             match &backup.original {
                 Some(original) => {
-                    if let Some(parent) = backup.abs_path.parent() {
+                    if let Some(parent) = abs_path.parent() {
                         fs::create_dir_all(parent).map_err(|err| RuntimeError::Io {
                             path: parent.to_path_buf(),
                             message: err.to_string(),
                         })?;
                     }
-                    fs::write(&backup.abs_path, original).map_err(|err| RuntimeError::Io {
-                        path: backup.abs_path.clone(),
+                    fs::write(&abs_path, original).map_err(|err| RuntimeError::Io {
+                        path: abs_path.clone(),
                         message: err.to_string(),
                     })?;
                 }
                 None => {
-                    if backup.abs_path.exists() {
-                        fs::remove_file(&backup.abs_path).map_err(|err| RuntimeError::Io {
-                            path: backup.abs_path.clone(),
+                    if abs_path.exists() {
+                        fs::remove_file(&abs_path).map_err(|err| RuntimeError::Io {
+                            path: abs_path.clone(),
                             message: err.to_string(),
                         })?;
                     }
                 }
             }
+        }
+        Ok(())
+    }
+
+    pub fn persist_journal(
+        &self,
+        journal_path: &Path,
+        iteration_id: &str,
+    ) -> Result<(), RuntimeError> {
+        let journal = PluginEditRollbackJournal {
+            iteration_id: iteration_id.to_string(),
+            backups: self
+                .backups
+                .iter()
+                .map(|backup| PluginEditRollbackJournalBackup {
+                    rel_path: backup.rel_path.clone(),
+                    original_hex: backup.original.as_ref().map(hex::encode),
+                })
+                .collect(),
+        };
+        if let Some(parent) = journal_path.parent() {
+            fs::create_dir_all(parent).map_err(|err| RuntimeError::Io {
+                path: parent.to_path_buf(),
+                message: err.to_string(),
+            })?;
+        }
+        let bytes = serde_json::to_vec_pretty(&journal).map_err(|err| RuntimeError::Invariant {
+            message: format!("plugin edit rollback journal serialize failed: {err}"),
+        })?;
+        fs::write(journal_path, bytes).map_err(|err| RuntimeError::Io {
+            path: journal_path.to_path_buf(),
+            message: err.to_string(),
+        })?;
+        Ok(())
+    }
+
+    pub fn load_journal(
+        workspace_root: impl Into<PathBuf>,
+        journal_path: &Path,
+    ) -> Result<Option<Self>, RuntimeError> {
+        if !journal_path.exists() {
+            return Ok(None);
+        }
+        let bytes = fs::read(journal_path).map_err(|err| RuntimeError::Io {
+            path: journal_path.to_path_buf(),
+            message: err.to_string(),
+        })?;
+        let journal: PluginEditRollbackJournal =
+            serde_json::from_slice(&bytes).map_err(|err| RuntimeError::Invariant {
+                message: format!("plugin edit rollback journal parse failed: {err}"),
+            })?;
+        let backups = journal
+            .backups
+            .into_iter()
+            .map(|backup| {
+                let original = backup
+                    .original_hex
+                    .map(|value| {
+                        hex::decode(&value).map_err(|err| RuntimeError::Invariant {
+                            message: format!(
+                                "plugin edit rollback journal hex decode failed for {}: {err}",
+                                backup.rel_path
+                            ),
+                        })
+                    })
+                    .transpose()?;
+                Ok(AppliedEditBackup {
+                    rel_path: backup.rel_path,
+                    original,
+                })
+            })
+            .collect::<Result<Vec<_>, RuntimeError>>()?;
+        Ok(Some(Self {
+            workspace_root: workspace_root.into(),
+            backups,
+        }))
+    }
+
+    pub fn clear_journal(journal_path: &Path) -> Result<(), RuntimeError> {
+        if journal_path.exists() {
+            fs::remove_file(journal_path).map_err(|err| RuntimeError::Io {
+                path: journal_path.to_path_buf(),
+                message: err.to_string(),
+            })?;
         }
         Ok(())
     }

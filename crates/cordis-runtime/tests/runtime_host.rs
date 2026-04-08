@@ -84,6 +84,10 @@ fn workspace_manifest_path(root: &Path) -> PathBuf {
     root.join("plugins/Cargo.toml")
 }
 
+fn plugin_iteration_journal_path(snapshot_root: &str) -> PathBuf {
+    PathBuf::from(snapshot_root).join("plugin-iteration-edit-journal.json")
+}
+
 fn update_workspace_members(root: &Path, members: &[&str]) {
     let manifest_path = workspace_manifest_path(root);
     let mut text = fs::read_to_string(&manifest_path).expect("read workspace manifest");
@@ -878,6 +882,7 @@ fn runtime_host_iterate_plugins_promotes_after_canary_replay() {
     let temp = setup_fixture_workspace_copy();
     let fixtures = temp.path().join("fixtures");
     let host = RuntimeHost::boot(&fixtures).expect("host should boot");
+    let journal_path = plugin_iteration_journal_path(&host.status().snapshot_root);
     let original_summary =
         plugin_node_summary(host.current_snapshot().as_ref(), "shell", "shell_entry");
     let updated_summary = format!("{original_summary} (plugin iteration)");
@@ -929,6 +934,7 @@ fn runtime_host_iterate_plugins_promotes_after_canary_replay() {
         Some(CanaryVerdict::Pass)
     );
     assert!(host.candidate_snapshot().is_none());
+    assert!(!journal_path.exists());
     assert_eq!(
         plugin_node_summary(host.current_snapshot().as_ref(), "shell", "shell_entry"),
         updated_summary
@@ -967,6 +973,7 @@ fn runtime_host_iterate_plugins_blocks_without_canary_evidence_and_approve_promo
     let temp = setup_fixture_workspace_copy();
     let fixtures = temp.path().join("fixtures");
     let host = RuntimeHost::boot(&fixtures).expect("host should boot");
+    let journal_path = plugin_iteration_journal_path(&host.status().snapshot_root);
     let original_summary =
         plugin_node_summary(host.current_snapshot().as_ref(), "shell", "shell_entry");
     let updated_summary = format!("{original_summary} (blocked candidate)");
@@ -1008,6 +1015,7 @@ fn runtime_host_iterate_plugins_blocks_without_canary_evidence_and_approve_promo
         Some(CanaryVerdict::Partial)
     );
     assert!(host.candidate_snapshot().is_some());
+    assert!(journal_path.exists());
     assert_eq!(
         plugin_node_summary(host.current_snapshot().as_ref(), "shell", "shell_entry"),
         original_summary
@@ -1033,6 +1041,7 @@ fn runtime_host_iterate_plugins_blocks_without_canary_evidence_and_approve_promo
     );
     assert!(host.candidate_snapshot().is_none());
     assert!(host.kernel().blocked_iterations().is_empty());
+    assert!(!journal_path.exists());
     assert_eq!(
         plugin_node_summary(host.current_snapshot().as_ref(), "shell", "shell_entry"),
         updated_summary
@@ -1106,6 +1115,7 @@ fn runtime_host_iterate_plugins_rolls_back_invalid_plugin_manifest_and_keeps_run
     let temp = setup_fixture_workspace_copy();
     let fixtures = temp.path().join("fixtures");
     let host = RuntimeHost::boot(&fixtures).expect("host should boot");
+    let journal_path = plugin_iteration_journal_path(&host.status().snapshot_root);
     let manifest_path = fixtures.join("plugins/root/Cargo.toml");
     let original_manifest = fs::read_to_string(&manifest_path).expect("read root manifest");
 
@@ -1142,6 +1152,7 @@ fn runtime_host_iterate_plugins_rolls_back_invalid_plugin_manifest_and_keeps_run
         PluginIterationFinalVerdict::RolledBack
     );
     assert!(host.candidate_snapshot().is_none());
+    assert!(!journal_path.exists());
     assert_eq!(
         fs::read_to_string(&manifest_path).expect("manifest should be restored"),
         original_manifest
@@ -1159,6 +1170,136 @@ fn runtime_host_iterate_plugins_rolls_back_invalid_plugin_manifest_and_keeps_run
         .expect("runtime should stay usable after rollback");
     let value: Value = serde_json::from_str(&response.payload).expect("expr response json");
     assert_eq!(value.get("value").and_then(|v| v.as_f64()), Some(5.0));
+}
+
+#[test]
+fn runtime_host_rollback_candidate_restores_plugin_sources_and_clears_journal() {
+    let temp = setup_fixture_workspace_copy();
+    let fixtures = temp.path().join("fixtures");
+    let host = RuntimeHost::boot(&fixtures).expect("host should boot");
+    let journal_path = plugin_iteration_journal_path(&host.status().snapshot_root);
+    let source_path = fixtures.join("plugins/shell/src/lib.rs");
+    let original_source = fs::read_to_string(&source_path).expect("read shell source");
+    let original_summary =
+        plugin_node_summary(host.current_snapshot().as_ref(), "shell", "shell_entry");
+    let updated_summary = format!("{original_summary} (rollback candidate)");
+
+    let result = host
+        .iterate_plugins(KernelPluginIterationRequest {
+            issue_id: None,
+            target_plugin_paths: vec!["shell".to_string()],
+            instruction: Some("update shell docs summary without replay evidence".to_string()),
+            edit_plan: Some(PluginEditPlan {
+                issue_id: "issue-shell-rollback".to_string(),
+                patch_id: "patch-shell-rollback".to_string(),
+                summary: "update shell docs summary without replay evidence".to_string(),
+                operations: vec![PluginEditOperation {
+                    path: "plugins/shell/src/lib.rs".to_string(),
+                    kind: PluginEditOpKind::ReplaceExact,
+                    expected_old_string: Some(original_summary.clone()),
+                    expected_sha256: None,
+                    new_content: Some(updated_summary.clone()),
+                    pointer: None,
+                    dotted_key: None,
+                    value: None,
+                }],
+            }),
+            manual_approved: false,
+            tests_command: Some(
+                "cargo test --quiet --manifest-path plugins/shell/Cargo.toml".to_string(),
+            ),
+            safety_command: None,
+            verify_profile: Some(VerificationProfile::RustWorkspace),
+            quality_score: Some(95),
+        })
+        .expect("plugin iteration should enter blocked state");
+
+    assert_eq!(result.final_verdict, PluginIterationFinalVerdict::Blocked);
+    assert!(journal_path.exists());
+    assert!(fs::read_to_string(&source_path)
+        .expect("read updated shell source")
+        .contains(&updated_summary));
+
+    host.rollback_candidate()
+        .expect("manual rollback should discard candidate and restore sources");
+
+    assert!(host.candidate_snapshot().is_none());
+    assert!(!journal_path.exists());
+    assert_eq!(
+        fs::read_to_string(&source_path).expect("shell source should be restored"),
+        original_source
+    );
+    assert_eq!(
+        plugin_node_summary(host.current_snapshot().as_ref(), "shell", "shell_entry"),
+        original_summary
+    );
+}
+
+#[test]
+fn runtime_host_boot_recovers_plugin_iteration_journal() {
+    let temp = setup_fixture_workspace_copy();
+    let fixtures = temp.path().join("fixtures");
+    let host = RuntimeHost::boot(&fixtures).expect("host should boot");
+    let journal_path = plugin_iteration_journal_path(&host.status().snapshot_root);
+    let source_path = fixtures.join("plugins/shell/src/lib.rs");
+    let original_source = fs::read_to_string(&source_path).expect("read shell source");
+    let original_summary =
+        plugin_node_summary(host.current_snapshot().as_ref(), "shell", "shell_entry");
+    let updated_summary = format!("{original_summary} (recovery candidate)");
+
+    let result = host
+        .iterate_plugins(KernelPluginIterationRequest {
+            issue_id: None,
+            target_plugin_paths: vec!["shell".to_string()],
+            instruction: Some("update shell docs summary without replay evidence".to_string()),
+            edit_plan: Some(PluginEditPlan {
+                issue_id: "issue-shell-recovery".to_string(),
+                patch_id: "patch-shell-recovery".to_string(),
+                summary: "update shell docs summary without replay evidence".to_string(),
+                operations: vec![PluginEditOperation {
+                    path: "plugins/shell/src/lib.rs".to_string(),
+                    kind: PluginEditOpKind::ReplaceExact,
+                    expected_old_string: Some(original_summary.clone()),
+                    expected_sha256: None,
+                    new_content: Some(updated_summary.clone()),
+                    pointer: None,
+                    dotted_key: None,
+                    value: None,
+                }],
+            }),
+            manual_approved: false,
+            tests_command: Some(
+                "cargo test --quiet --manifest-path plugins/shell/Cargo.toml".to_string(),
+            ),
+            safety_command: None,
+            verify_profile: Some(VerificationProfile::RustWorkspace),
+            quality_score: Some(95),
+        })
+        .expect("plugin iteration should enter blocked state");
+
+    assert_eq!(result.final_verdict, PluginIterationFinalVerdict::Blocked);
+    assert!(journal_path.exists());
+    assert!(fs::read_to_string(&source_path)
+        .expect("read updated shell source")
+        .contains(&updated_summary));
+
+    drop(host);
+
+    let recovered = RuntimeHost::boot(&fixtures).expect("host should recover and boot");
+    assert!(recovered.candidate_snapshot().is_none());
+    assert!(!journal_path.exists());
+    assert_eq!(
+        fs::read_to_string(&source_path).expect("shell source should be restored"),
+        original_source
+    );
+    assert_eq!(
+        plugin_node_summary(
+            recovered.current_snapshot().as_ref(),
+            "shell",
+            "shell_entry"
+        ),
+        original_summary
+    );
 }
 
 #[test]

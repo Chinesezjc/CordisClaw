@@ -956,6 +956,7 @@ impl RuntimeHost {
             path: snapshot_root.clone(),
             message: e.to_string(),
         })?;
+        recover_plugin_iteration_workspace(&fixtures_root, &snapshot_root)?;
 
         let initial_snapshot = Arc::new(build_snapshot(&loader, &snapshot_root)?);
         Ok(Self {
@@ -1217,6 +1218,10 @@ impl RuntimeHost {
     }
 
     pub fn promote_candidate(&self) -> Result<ReloadReport, RuntimeError> {
+        if self.candidate_snapshot().is_none() {
+            return Err(RuntimeError::CandidateSnapshotMissing);
+        }
+        clear_plugin_iteration_journal(&self.snapshot_root)?;
         let previous_snapshot = self.current_snapshot();
         let candidate = self
             .candidate_snapshot
@@ -1249,6 +1254,10 @@ impl RuntimeHost {
     }
 
     pub fn rollback_candidate(&self) -> Result<CandidateSnapshotStatus, RuntimeError> {
+        if self.candidate_snapshot().is_none() {
+            return Err(RuntimeError::CandidateSnapshotMissing);
+        }
+        restore_plugin_iteration_workspace(&self.fixtures_root, &self.snapshot_root, None)?;
         let candidate = self
             .candidate_snapshot
             .lock()
@@ -1353,6 +1362,10 @@ impl RuntimeHost {
                             &self.kernel.plugin_iteration_policy,
                             &state.prepared.allowed_plugin_roots,
                             plan,
+                        )?;
+                        rollback.persist_journal(
+                            &plugin_iteration_journal_path(&self.snapshot_root),
+                            &state.prepared.iteration_id,
                         )?;
                         state.rollback = Some(rollback);
                         state.changed_paths = apply_result.changed_paths.clone();
@@ -1631,10 +1644,11 @@ impl RuntimeHost {
             if self.candidate_snapshot().is_some() {
                 let _ = self.rollback_candidate();
             }
-            if let Some(rollback) = &state.rollback {
-                rollback.rollback()?;
-                let _ = rebuild_plugin_workspace(&self.fixtures_root);
-            }
+            let _ = restore_plugin_iteration_workspace(
+                &self.fixtures_root,
+                &self.snapshot_root,
+                state.rollback.as_ref(),
+            );
             state.blocked_reason = Some(stage_error);
             state.final_verdict = Some(PluginIterationFinalVerdict::RolledBack);
             return Ok(PluginIterationFinalVerdict::RolledBack);
@@ -1662,10 +1676,11 @@ impl RuntimeHost {
                 if self.candidate_snapshot().is_some() {
                     let _ = self.rollback_candidate();
                 }
-                if let Some(rollback) = &state.rollback {
-                    rollback.rollback()?;
-                    let _ = rebuild_plugin_workspace(&self.fixtures_root);
-                }
+                restore_plugin_iteration_workspace(
+                    &self.fixtures_root,
+                    &self.snapshot_root,
+                    state.rollback.as_ref(),
+                )?;
                 PluginIterationFinalVerdict::RolledBack
             };
         state.final_verdict = Some(final_verdict);
@@ -2715,6 +2730,49 @@ fn make_snapshot_dir_name() -> String {
 
 fn next_staged_artifact_root(snapshot_root: &Path) -> PathBuf {
     snapshot_root.join(make_snapshot_dir_name())
+}
+
+fn plugin_iteration_journal_path(snapshot_root: &Path) -> PathBuf {
+    snapshot_root.join("plugin-iteration-edit-journal.json")
+}
+
+fn clear_plugin_iteration_journal(snapshot_root: &Path) -> Result<(), RuntimeError> {
+    crate::kernel::plugin_iteration::PluginEditRollback::clear_journal(
+        &plugin_iteration_journal_path(snapshot_root),
+    )
+}
+
+fn restore_plugin_iteration_workspace(
+    fixtures_root: &Path,
+    snapshot_root: &Path,
+    in_memory_rollback: Option<&crate::kernel::plugin_iteration::PluginEditRollback>,
+) -> Result<bool, RuntimeError> {
+    let journal_path = plugin_iteration_journal_path(snapshot_root);
+    if let Some(rollback) = crate::kernel::plugin_iteration::PluginEditRollback::load_journal(
+        fixtures_root,
+        &journal_path,
+    )? {
+        rollback.rollback()?;
+        rebuild_plugin_workspace(fixtures_root)?;
+        crate::kernel::plugin_iteration::PluginEditRollback::clear_journal(&journal_path)?;
+        return Ok(true);
+    }
+
+    if let Some(rollback) = in_memory_rollback {
+        rollback.rollback()?;
+        rebuild_plugin_workspace(fixtures_root)?;
+        return Ok(true);
+    }
+
+    Ok(false)
+}
+
+fn recover_plugin_iteration_workspace(
+    fixtures_root: &Path,
+    snapshot_root: &Path,
+) -> Result<(), RuntimeError> {
+    let _ = restore_plugin_iteration_workspace(fixtures_root, snapshot_root, None)?;
+    Ok(())
 }
 
 fn default_snapshot_root(fixtures_root: &Path) -> PathBuf {
