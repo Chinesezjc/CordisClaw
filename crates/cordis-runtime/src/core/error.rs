@@ -181,6 +181,9 @@ pub enum RuntimeError {
     #[error("plugin iteration policy blocked path {path}: {reason}")]
     PluginIterationPolicyBlocked { path: String, reason: String },
 
+    #[error("agent session not found: {session_id}")]
+    AgentSessionNotFound { session_id: String },
+
     #[error("service not found in context for plugin {plugin_path}: {service}")]
     ServiceNotFound {
         plugin_path: String,

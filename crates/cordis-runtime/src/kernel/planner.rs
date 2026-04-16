@@ -32,12 +32,15 @@ const LLM_REQUEST_RETRY_BACKOFF_MS: u64 = 500;
 const DEEPSEEK_REPEAT_READ_STRATEGY_THRESHOLD: usize = 2;
 const DEEPSEEK_PRE_STRATEGY_CONTEXT_TOOL_LIMIT: usize = 6;
 const DEEPSEEK_POST_STRATEGY_CONTEXT_TOOL_LIMIT: usize = 2;
+const DEEPSEEK_FINALIZE_APPEND_LIMIT: usize = 3;
 const DEEPSEEK_TOOL_LIST_CONTEXT_FILES: &str = "list_context_files";
 const DEEPSEEK_TOOL_READ_CONTEXT_FILES: &str = "read_context_files";
 const DEEPSEEK_TOOL_READ_CONTEXT_FILE: &str = "read_context_file";
 const DEEPSEEK_TOOL_INSPECT_PLUGIN_CATALOG: &str = "inspect_plugin_catalog";
 const DEEPSEEK_TOOL_SUBMIT_PATCH_PLAN: &str = "submit_patch_plan";
 const DEEPSEEK_TOOL_SUBMIT_CHANGE_STRATEGY: &str = "submit_change_strategy";
+const DEEPSEEK_TOOL_APPEND_PLUGIN_EDIT_OPERATIONS: &str = "append_plugin_edit_operations";
+const DEEPSEEK_TOOL_FINALIZE_PLUGIN_EDIT_PLAN: &str = "finalize_plugin_edit_plan";
 const DEEPSEEK_TOOL_SUBMIT_PLUGIN_EDIT_PLAN: &str = "submit_plugin_edit_plan";
 const LLM_DEBUG_ENV: &str = "CORDIS_LLM_DEBUG";
 
@@ -106,6 +109,20 @@ struct PluginChangeStrategy {
     reason: String,
     #[serde(default)]
     expected_paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+struct PluginEditOperationsChunkPayload {
+    operations: Vec<PluginEditOperation>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+struct PluginEditPlanFinalizePayload {
+    summary: String,
+    #[serde(default)]
+    tests_command: Option<String>,
+    #[serde(default)]
+    safety_command: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -435,6 +452,9 @@ struct DeepSeekReadInspectionState {
     submitted_plugin_strategy: Option<PluginChangeStrategy>,
     pre_strategy_context_tool_calls: usize,
     post_strategy_context_tool_calls: usize,
+    staged_plugin_operations: Vec<PluginEditOperation>,
+    finalize_phase_append_calls: usize,
+    latest_staged_missing_expected_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -443,6 +463,12 @@ struct DeepSeekReadObservation {
     new_paths: Vec<String>,
     already_seen_paths: Vec<String>,
     consecutive_repeated_reads: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StagedPluginOperationUpdate {
+    staged_paths: Vec<String>,
+    replaced_paths: Vec<String>,
 }
 
 impl DeepSeekReadInspectionState {
@@ -486,6 +512,8 @@ impl DeepSeekReadInspectionState {
         self.submitted_plugin_strategy = Some(strategy);
         self.requires_strategy_submission = false;
         self.consecutive_repeated_reads = 0;
+        self.finalize_phase_append_calls = 0;
+        self.latest_staged_missing_expected_paths.clear();
         if !keep_finalize_phase {
             self.post_strategy_context_tool_calls = 0;
         }
@@ -499,11 +527,70 @@ impl DeepSeekReadInspectionState {
         self.submitted_plugin_strategy.as_ref()
     }
 
+    fn stage_plugin_operations(
+        &mut self,
+        operations: Vec<PluginEditOperation>,
+    ) -> Result<StagedPluginOperationUpdate, RuntimeError> {
+        if operations.is_empty() {
+            return Err(RuntimeError::LlmResponseInvalid {
+                message: "append_plugin_edit_operations requires at least one operation"
+                    .to_string(),
+            });
+        }
+
+        let mut replaced_paths = Vec::new();
+        for operation in operations {
+            let normalized = normalize_plugin_rel_path(&operation.path)?;
+            if let Some(idx) = self.staged_plugin_operations.iter().position(|existing| {
+                normalize_plugin_rel_path(&existing.path).ok() == Some(normalized.clone())
+            }) {
+                self.staged_plugin_operations.remove(idx);
+                replaced_paths.push(normalized.clone());
+            }
+            self.staged_plugin_operations.push(operation);
+        }
+
+        Ok(StagedPluginOperationUpdate {
+            staged_paths: collect_changed_plugin_paths(&self.staged_plugin_operations)?
+                .into_iter()
+                .collect(),
+            replaced_paths,
+        })
+    }
+
+    fn staged_plugin_operations(&self) -> &[PluginEditOperation] {
+        &self.staged_plugin_operations
+    }
+
+    fn build_staged_plugin_payload(
+        &self,
+        finalize: PluginEditPlanFinalizePayload,
+    ) -> PluginPlannerPayload {
+        PluginPlannerPayload {
+            summary: finalize.summary,
+            tests_command: finalize.tests_command,
+            safety_command: finalize.safety_command,
+            operations: self.staged_plugin_operations.clone(),
+        }
+    }
+
     fn lock_plugin_finalization(&mut self) {
         if self.submitted_plugin_strategy.is_some() {
-            self.post_strategy_context_tool_calls =
-                self.post_strategy_context_tool_calls.max(DEEPSEEK_POST_STRATEGY_CONTEXT_TOOL_LIMIT);
+            self.post_strategy_context_tool_calls = self
+                .post_strategy_context_tool_calls
+                .max(DEEPSEEK_POST_STRATEGY_CONTEXT_TOOL_LIMIT);
         }
+    }
+
+    fn note_staged_plugin_operations(
+        &mut self,
+        phase: DeepSeekPluginPlanningPhase,
+        missing_expected_paths: &[String],
+    ) {
+        if matches!(phase, DeepSeekPluginPlanningPhase::Finalize) {
+            self.finalize_phase_append_calls += 1;
+        }
+        self.latest_staged_missing_expected_paths = missing_expected_paths.to_vec();
     }
 
     fn note_plugin_context_tool_call(&mut self) -> usize {
@@ -544,6 +631,13 @@ impl DeepSeekReadInspectionState {
             && self.post_strategy_context_tool_calls >= DEEPSEEK_POST_STRATEGY_CONTEXT_TOOL_LIMIT
     }
 
+    fn should_force_plugin_finalize_submission(&self) -> bool {
+        self.submitted_plugin_strategy.is_some()
+            && self.should_enter_plugin_finalize_phase()
+            && self.finalize_phase_append_calls >= DEEPSEEK_FINALIZE_APPEND_LIMIT
+            && self.latest_staged_missing_expected_paths.is_empty()
+    }
+
     fn plugin_phase(&self) -> DeepSeekPluginPlanningPhase {
         if self.submitted_plugin_strategy.is_some() {
             if self.should_enter_plugin_finalize_phase() {
@@ -578,7 +672,7 @@ impl DeepSeekReadObservation {
         if self.requires_change_strategy_hint() {
             return Some(match planner_mode {
                 DeepSeekPlannerMode::Patch => "You have already inspected these files in multiple consecutive turns. Before reading more context, decide your change strategy, then either call submit_patch_plan or inspect only one missing file that would change that strategy.".to_string(),
-                DeepSeekPlannerMode::Plugin => "You have already inspected these files in multiple consecutive turns. Before reading more context, decide your change strategy (for example new_child_plugin, inline_core_patch, metadata_only, or docs_only), then either call submit_plugin_edit_plan or inspect only one missing file that would change that strategy.".to_string(),
+                DeepSeekPlannerMode::Plugin => "You have already inspected these files in multiple consecutive turns. Before reading more context, decide your change strategy (for example new_child_plugin, inline_core_patch, metadata_only, or docs_only), then either stage operations with append_plugin_edit_operations or finalize the staged plan.".to_string(),
             });
         }
 
@@ -829,8 +923,11 @@ impl LlmPatchPlanner {
                         response_id.as_deref().unwrap_or("-"),
                     ),
                 );
-                let repair_prompt =
-                    build_plugin_edit_prompt(&request, &planner_context_files, plugin_catalog.as_ref());
+                let repair_prompt = build_plugin_edit_prompt(
+                    &request,
+                    &planner_context_files,
+                    plugin_catalog.as_ref(),
+                );
                 let (repaired_payload, repaired_response_id) = self
                     .repair_plugin_edits_with_deepseek_completion(
                         &repair_prompt,
@@ -1100,6 +1197,9 @@ impl LlmPatchPlanner {
                 });
             }
             let turn_started = Instant::now();
+            let allowed_tool_names = tool_names_from_definition(&tools)
+                .into_iter()
+                .collect::<BTreeSet<_>>();
             emit_llm_diagnostic(
                 false,
                 format!(
@@ -1151,6 +1251,28 @@ impl LlmPatchPlanner {
             if !message.tool_calls.is_empty() {
                 messages.push(message.to_request_message());
                 for tool_call in &message.tool_calls {
+                    if !allowed_tool_names.contains(&tool_call.function.name) {
+                        let tool_output = unavailable_tool_feedback(
+                            &tool_call.function.name,
+                            &allowed_tool_names,
+                            None,
+                        );
+                        emit_llm_diagnostic(
+                            true,
+                            format!(
+                                "reasoner_unavailable_tool turn={} tool={} available_tools={:?}",
+                                turn_idx + 1,
+                                tool_call.function.name,
+                                allowed_tool_names
+                            ),
+                        );
+                        messages.push(json!({
+                            "role": "tool",
+                            "tool_call_id": tool_call.id,
+                            "content": tool_output,
+                        }));
+                        continue;
+                    }
                     match handle_tool_call(tool_call)? {
                         DeepSeekToolOutcome::ToolResult(tool_output) => {
                             emit_llm_diagnostic(
@@ -1179,10 +1301,14 @@ impl LlmPatchPlanner {
                                     tool_call.id,
                                 ),
                             );
-                            if message.tool_calls.len() != 1 {
+                            if message
+                                .tool_calls
+                                .last()
+                                .is_some_and(|last| last.id != tool_call.id)
+                            {
                                 return Err(RuntimeError::LlmResponseInvalid {
                                     message: format!(
-                                        "terminal planner tool {} must be the only tool call in a DeepSeek reasoner turn",
+                                        "terminal planner tool {} must be the last tool call in a DeepSeek reasoner turn",
                                         tool_call.function.name
                                     ),
                                 });
@@ -1285,6 +1411,9 @@ impl LlmPatchPlanner {
             let tools = deepseek_plugin_tools_for_state(&inspection_state);
             let phase = inspection_state.plugin_phase();
             let turn_started = Instant::now();
+            let allowed_tool_names = tool_names_from_definition(&tools)
+                .into_iter()
+                .collect::<BTreeSet<_>>();
             emit_llm_diagnostic(
                 false,
                 format!(
@@ -1339,6 +1468,29 @@ impl LlmPatchPlanner {
             if !message.tool_calls.is_empty() {
                 messages.push(message.to_request_message());
                 for tool_call in &message.tool_calls {
+                    if !allowed_tool_names.contains(&tool_call.function.name) {
+                        let tool_output = unavailable_tool_feedback(
+                            &tool_call.function.name,
+                            &allowed_tool_names,
+                            Some(phase.as_str()),
+                        );
+                        emit_llm_diagnostic(
+                            true,
+                            format!(
+                                "reasoner_unavailable_tool turn={} phase={} tool={} available_tools={:?}",
+                                turn_idx + 1,
+                                phase.as_str(),
+                                tool_call.function.name,
+                                allowed_tool_names
+                            ),
+                        );
+                        messages.push(json!({
+                            "role": "tool",
+                            "tool_call_id": tool_call.id,
+                            "content": tool_output,
+                        }));
+                        continue;
+                    }
                     match self.execute_deepseek_plugin_tool_call(
                         tool_call,
                         context_files,
@@ -1374,10 +1526,14 @@ impl LlmPatchPlanner {
                                     inspection_state.plugin_phase().as_str(),
                                 ),
                             );
-                            if message.tool_calls.len() != 1 {
+                            if message
+                                .tool_calls
+                                .last()
+                                .is_some_and(|last| last.id != tool_call.id)
+                            {
                                 return Err(RuntimeError::LlmResponseInvalid {
                                     message: format!(
-                                        "terminal planner tool {} must be the only tool call in a DeepSeek reasoner turn",
+                                        "terminal planner tool {} must be the last tool call in a DeepSeek reasoner turn",
                                         tool_call.function.name
                                     ),
                                 });
@@ -2021,16 +2177,205 @@ impl LlmPatchPlanner {
                     ));
                 }
                 inspection_state.note_plugin_strategy(strategy.clone());
+                emit_llm_diagnostic(
+                    false,
+                    format!(
+                        "reasoner_strategy_recorded tool={} strategy={} expected_paths={:?} staged_operation_count={}",
+                        tool_call.function.name,
+                        strategy.strategy,
+                        strategy.expected_paths,
+                        inspection_state.staged_plugin_operations().len(),
+                    ),
+                );
                 Ok(DeepSeekToolOutcome::ToolResult(
                     json!({
                         "ok": true,
                         "strategy": strategy.strategy,
                         "reason": strategy.reason,
                         "expected_paths": strategy.expected_paths,
-                        "message": "Change strategy recorded. Now either inspect one missing file that would materially change this strategy or submit_plugin_edit_plan.",
+                        "staged_operation_count": inspection_state.staged_plugin_operations().len(),
+                        "message": "Change strategy recorded. Now either inspect one missing file that would materially change this strategy, stage operations with append_plugin_edit_operations, or finalize the staged plan.",
                     })
                     .to_string(),
                 ))
+            }
+            DEEPSEEK_TOOL_APPEND_PLUGIN_EDIT_OPERATIONS => {
+                if inspection_state.requires_plugin_strategy_submission() {
+                    return Ok(DeepSeekToolOutcome::ToolResult(
+                        json!({
+                            "ok": false,
+                            "tool": tool_call.function.name,
+                            "error": "submit_change_strategy is required before staging more plugin edit operations because the planner has already looped on repeated context reads",
+                            "hint": "Call submit_change_strategy with a concise strategy such as new_child_plugin, inline_core_patch, metadata_only, or docs_only before staging more operations.",
+                        })
+                        .to_string(),
+                    ));
+                }
+                if inspection_state.should_force_plugin_finalize_submission() {
+                    return Ok(DeepSeekToolOutcome::ToolResult(
+                        json!({
+                            "ok": false,
+                            "tool": tool_call.function.name,
+                            "error": "enough plugin edit operation chunks are already staged for this finalization pass",
+                            "staged_operation_count": inspection_state.staged_plugin_operations().len(),
+                            "hint": "Call finalize_plugin_edit_plan next with summary/tests/safety metadata only.",
+                        })
+                        .to_string(),
+                    ));
+                }
+                let append_phase = inspection_state.plugin_phase();
+                let payload = match parse_tool_arguments::<PluginEditOperationsChunkPayload>(
+                    &tool_call.function.arguments,
+                    &tool_call.function.name,
+                ) {
+                    Ok(payload) => payload,
+                    Err(err) => {
+                        emit_llm_diagnostic(
+                            true,
+                            format!(
+                                "reasoner_submit_validation_error tool={} error={}",
+                                tool_call.function.name, err
+                            ),
+                        );
+                        return Ok(DeepSeekToolOutcome::ToolResult(
+                            tool_feedback_error(&tool_call.function.name, &err.to_string())
+                                .to_string(),
+                        ));
+                    }
+                };
+                if let Err(err) =
+                    validate_staged_plugin_operation_chunk(&payload.operations, &writable_roots)
+                {
+                    emit_llm_diagnostic(
+                        true,
+                        format!(
+                            "reasoner_submit_validation_error tool={} error={}",
+                            tool_call.function.name, err
+                        ),
+                    );
+                    return Ok(DeepSeekToolOutcome::ToolResult(
+                        tool_feedback_error(&tool_call.function.name, &err.to_string()).to_string(),
+                    ));
+                }
+                let staged_update =
+                    match inspection_state.stage_plugin_operations(payload.operations) {
+                        Ok(update) => update,
+                        Err(err) => {
+                            emit_llm_diagnostic(
+                                true,
+                                format!(
+                                    "reasoner_submit_validation_error tool={} error={}",
+                                    tool_call.function.name, err
+                                ),
+                            );
+                            return Ok(DeepSeekToolOutcome::ToolResult(
+                                tool_feedback_error(&tool_call.function.name, &err.to_string())
+                                    .to_string(),
+                            ));
+                        }
+                    };
+                let missing_expected_paths = missing_strategy_paths_for_operations(
+                    inspection_state.staged_plugin_operations(),
+                    inspection_state.submitted_plugin_strategy(),
+                )?;
+                inspection_state
+                    .note_staged_plugin_operations(append_phase, &missing_expected_paths);
+                let finalize_required = inspection_state.should_force_plugin_finalize_submission();
+                emit_llm_diagnostic(
+                    false,
+                    format!(
+                        "reasoner_append_stage_status phase={} staged_operation_count={} staged_paths={:?} replaced_paths={:?} missing_expected_paths={:?} finalize_required={}",
+                        append_phase.as_str(),
+                        inspection_state.staged_plugin_operations().len(),
+                        staged_update.staged_paths,
+                        staged_update.replaced_paths,
+                        missing_expected_paths,
+                        finalize_required,
+                    ),
+                );
+                Ok(DeepSeekToolOutcome::ToolResult(
+                    json!({
+                        "ok": true,
+                        "staged_operation_count": inspection_state.staged_plugin_operations().len(),
+                        "staged_paths": staged_update.staged_paths,
+                        "replaced_paths": staged_update.replaced_paths,
+                        "missing_expected_paths": missing_expected_paths,
+                        "finalize_required": finalize_required,
+                        "message": if finalize_required {
+                            "Operations staged. Finalize the plugin edit plan now with finalize_plugin_edit_plan."
+                        } else if missing_expected_paths.is_empty() {
+                            "Operations staged. If no more edits are needed, call finalize_plugin_edit_plan next."
+                        } else {
+                            "Operations staged. Add the remaining strategy anchor paths or revise the strategy before finalizing."
+                        }
+                    })
+                    .to_string(),
+                ))
+            }
+            DEEPSEEK_TOOL_FINALIZE_PLUGIN_EDIT_PLAN => {
+                if inspection_state.requires_plugin_strategy_submission() {
+                    return Ok(DeepSeekToolOutcome::ToolResult(
+                        json!({
+                            "ok": false,
+                            "tool": tool_call.function.name,
+                            "error": "submit_change_strategy is required before finalizing the plugin edit plan because the planner has already looped on repeated context reads",
+                            "hint": "Call submit_change_strategy with a concise strategy such as new_child_plugin, inline_core_patch, metadata_only, or docs_only, then finalize the staged plan.",
+                        })
+                        .to_string(),
+                    ));
+                }
+                let finalize = match parse_tool_arguments::<PluginEditPlanFinalizePayload>(
+                    &tool_call.function.arguments,
+                    &tool_call.function.name,
+                ) {
+                    Ok(payload) => payload,
+                    Err(err) => {
+                        inspection_state.lock_plugin_finalization();
+                        emit_llm_diagnostic(
+                            true,
+                            format!(
+                                "reasoner_submit_validation_error tool={} error={}",
+                                tool_call.function.name, err
+                            ),
+                        );
+                        return Ok(DeepSeekToolOutcome::ToolResult(
+                            tool_feedback_error(&tool_call.function.name, &err.to_string())
+                                .to_string(),
+                        ));
+                    }
+                };
+                if inspection_state.staged_plugin_operations().is_empty() {
+                    inspection_state.lock_plugin_finalization();
+                    return Ok(DeepSeekToolOutcome::ToolResult(
+                        tool_feedback_error(
+                            &tool_call.function.name,
+                            "finalize_plugin_edit_plan requires at least one staged operation",
+                        )
+                        .to_string(),
+                    ));
+                }
+                let payload = inspection_state.build_staged_plugin_payload(finalize);
+                match validate_submitted_plugin_payload(
+                    &payload,
+                    &writable_roots,
+                    inspection_state.submitted_plugin_strategy(),
+                ) {
+                    Ok(()) => Ok(DeepSeekToolOutcome::Final(payload)),
+                    Err(err) => {
+                        inspection_state.lock_plugin_finalization();
+                        emit_llm_diagnostic(
+                            true,
+                            format!(
+                                "reasoner_submit_validation_error tool={} error={}",
+                                tool_call.function.name, err
+                            ),
+                        );
+                        Ok(DeepSeekToolOutcome::ToolResult(
+                            tool_feedback_error(&tool_call.function.name, &err.to_string())
+                                .to_string(),
+                        ))
+                    }
+                }
             }
             DEEPSEEK_TOOL_SUBMIT_PLUGIN_EDIT_PLAN => {
                 if inspection_state.requires_plugin_strategy_submission() {
@@ -2566,14 +2911,15 @@ fn build_deepseek_plugin_tool_prompt(
         "Prefer `read_context_files` to inspect the most relevant writable source and test files together instead of reading them one by one.\n",
     );
     prompt.push_str("Use at most six context-inspection tool calls before deciding the implementation direction with `submit_change_strategy`.\n");
-    prompt.push_str("If a read tool reports that the same files were already inspected, stop looping on context gathering: decide the change strategy (for example new_child_plugin, inline_core_patch, metadata_only, or docs_only) and either submit the plan or inspect only one missing file that would materially change it.\n");
+    prompt.push_str("If a read tool reports that the same files were already inspected, stop looping on context gathering: decide the change strategy (for example new_child_plugin, inline_core_patch, metadata_only, or docs_only) and either stage operations with `append_plugin_edit_operations` or inspect only one missing file that would materially change it.\n");
     prompt.push_str("When you have enough context to decide the implementation direction, call `submit_change_strategy` before the final plugin edit plan. Keep it concise and architecture-focused.\n");
     prompt.push_str("In `submit_change_strategy.expected_paths`, list only the minimum architecture-defining anchor files you are confident must change for this strategy. Do not list every tentative supporting edit.\n");
-    prompt.push_str("After `submit_change_strategy`, use at most two additional context-inspection tool calls before either submitting `submit_plugin_edit_plan` or revising the strategy.\n");
-    prompt.push_str("The available tool surface narrows by phase: once a strategy is required, only strategy/final-plan tools remain; after a strategy is recorded, only read_context_* plus the submit tools remain until finalization is required.\n");
-    prompt.push_str("When you are ready, call `submit_plugin_edit_plan` as the only tool call in that message.\n");
+    prompt.push_str("After `submit_change_strategy`, use at most two additional context-inspection tool calls before either staging the remaining edits or revising the strategy.\n");
+    prompt.push_str("Use `append_plugin_edit_operations` to stage the plan in small chunks. Prefer 1-4 operations per call and group related edits together. Reusing a path replaces the previously staged operation for that path.\n");
+    prompt.push_str("When all required operations are staged, call `finalize_plugin_edit_plan` with only `summary`, `tests_command`, and `safety_command`. Do not repeat operations in the finalize payload.\n");
+    prompt.push_str("The available tool surface narrows by phase: once a strategy is required, only strategy/staging/finalize tools remain; after a strategy is recorded, only read_context_* plus those tools remain until finalization is required.\n");
     prompt.push_str("If a tool responds with ok=false, revise your plan and submit again.\n");
-    prompt.push_str("Every submitted operation must be complete on its own. Example replace_exact: {\"path\":\"plugins/expr/lexer/src/core.rs\",\"kind\":\"replace_exact\",\"expected_old_string\":\"Slash\",\"new_content\":\"Slash | Percent\"}. Example create_file: {\"path\":\"plugins/expr/evaluator/mod/Cargo.toml\",\"kind\":\"create_file\",\"expected_old_string\":\"\",\"new_content\":\"[package]\\nname = \\\"expr-evaluator-mod\\\"\\n\"}.\n");
+    prompt.push_str("Every staged operation must be complete on its own. Example replace_exact: {\"path\":\"plugins/expr/lexer/src/core.rs\",\"kind\":\"replace_exact\",\"expected_old_string\":\"Slash\",\"new_content\":\"Slash | Percent\"}. Example create_file: {\"path\":\"plugins/expr/evaluator/mod/Cargo.toml\",\"kind\":\"create_file\",\"expected_old_string\":\"\",\"new_content\":\"[package]\\nname = \\\"expr-evaluator-mod\\\"\\n\"}. Example finalize payload: {\"summary\":\"Add modulo child plugin\",\"tests_command\":\"cargo test --quiet --manifest-path plugins/expr/Cargo.toml\"}.\n");
     prompt.push_str("Files under docs/agent/** are read-only generated context and must never appear in submitted operations.\n");
     prompt.push_str("Human docs under docs/human/overview.md describe intended plugin topology and preferred extension patterns; treat them as architecture guidance, not just prose.\n");
     prompt.push_str("You may create a new child plugin inside the selected plugin subtree. New child plugin paths are valid when they stay within plugin Cargo.toml, src/**, tests/**, or docs/human/** surfaces under that subtree.\n");
@@ -2749,13 +3095,14 @@ Inspect files and plugin capabilities with the provided read-only tools before f
 Prefer batch inspection with read_context_files so multi-file edits finish in fewer turns. \
 Use at most six context-inspection tool calls before deciding the implementation direction with submit_change_strategy. \
 Files under docs/agent/** are generated read-only context and must never be modified. \
-If a read tool tells you the same files were already inspected, stop looping on context gathering: decide the change strategy (for example new_child_plugin, inline_core_patch, metadata_only, or docs_only) and either submit a plan or inspect only one missing file that would materially change the plan. \
+If a read tool tells you the same files were already inspected, stop looping on context gathering: decide the change strategy (for example new_child_plugin, inline_core_patch, metadata_only, or docs_only) and either stage operations or inspect only one missing file that would materially change the plan. \
 Use submit_change_strategy once you know the implementation direction, especially before the final plan after repeated reads. \
-After submit_change_strategy, use at most two additional context inspection tool calls before either submitting the final plan or revising the strategy. \
-The available tools narrow by phase: when a strategy is required, only submit_change_strategy and submit_plugin_edit_plan remain; after a strategy is recorded, only read_context_* plus those submit tools remain until finalization is required. \
+After submit_change_strategy, use at most two additional context inspection tool calls before either staging the remaining edits or revising the strategy. \
+Stage plugin edits in small chunks with append_plugin_edit_operations. Prefer 1-4 operations per call and group related paths together. Reusing a path replaces the previously staged operation for that path. \
+Finalize with finalize_plugin_edit_plan after all operations are staged. The finalize payload must contain only summary/tests/safety metadata and no operations. \
+The available tools narrow by phase: when a strategy is required, only submit_change_strategy, append_plugin_edit_operations, and finalize_plugin_edit_plan remain; after a strategy is recorded, only read_context_* plus those tools remain until finalization is required. \
 You may create a new child plugin inside the selected plugin subtree as long as the new files stay within plugin Cargo.toml, src/**, tests/**, or docs/human/** surfaces. \
 If a new child plugin path contains a Rust keyword such as `mod`, keep that keyword only in filesystem/plugin_path positions and use a non-keyword Rust identifier such as `modulo`, `mod_plugin`, or `modulo_op` inside code. \
-When ready, call submit_plugin_edit_plan as the only tool call in that assistant turn. \
 Do not invent files, paths, plugin capabilities, or command outputs."
 }
 
@@ -2859,9 +3206,18 @@ fn deepseek_plugin_tools() -> Value {
         {
             "type": "function",
             "function": {
-                "name": DEEPSEEK_TOOL_SUBMIT_PLUGIN_EDIT_PLAN,
-                "description": "Submit the final guarded plugin edit plan. Use this only when you are done inspecting context.",
-                "parameters": plugin_edit_plan_schema(),
+                "name": DEEPSEEK_TOOL_APPEND_PLUGIN_EDIT_OPERATIONS,
+                "description": "Stage one small chunk of guarded plugin edit operations. Prefer 1-4 operations per call. Reusing a path replaces the previously staged operation for that path.",
+                "parameters": plugin_edit_operations_chunk_schema(),
+                "strict": true
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": DEEPSEEK_TOOL_FINALIZE_PLUGIN_EDIT_PLAN,
+                "description": "Finalize the guarded plugin edit plan using the currently staged operations. The finalize payload must only contain summary/tests/safety metadata, not operations.",
+                "parameters": plugin_edit_plan_finalize_schema(),
                 "strict": true
             }
         }
@@ -2869,6 +3225,13 @@ fn deepseek_plugin_tools() -> Value {
 }
 
 fn deepseek_plugin_tools_for_state(inspection_state: &DeepSeekReadInspectionState) -> Value {
+    if inspection_state.should_force_plugin_finalize_submission() {
+        return filter_tool_definitions(
+            &deepseek_plugin_tools(),
+            &[DEEPSEEK_TOOL_FINALIZE_PLUGIN_EDIT_PLAN],
+        );
+    }
+
     let allowed = match inspection_state.plugin_phase() {
         DeepSeekPluginPlanningPhase::Explore => vec![
             DEEPSEEK_TOOL_LIST_CONTEXT_FILES,
@@ -2876,20 +3239,25 @@ fn deepseek_plugin_tools_for_state(inspection_state: &DeepSeekReadInspectionStat
             DEEPSEEK_TOOL_READ_CONTEXT_FILES,
             DEEPSEEK_TOOL_INSPECT_PLUGIN_CATALOG,
             DEEPSEEK_TOOL_SUBMIT_CHANGE_STRATEGY,
-            DEEPSEEK_TOOL_SUBMIT_PLUGIN_EDIT_PLAN,
+            DEEPSEEK_TOOL_APPEND_PLUGIN_EDIT_OPERATIONS,
+            DEEPSEEK_TOOL_FINALIZE_PLUGIN_EDIT_PLAN,
         ],
         DeepSeekPluginPlanningPhase::DecideStrategy => vec![
             DEEPSEEK_TOOL_SUBMIT_CHANGE_STRATEGY,
-            DEEPSEEK_TOOL_SUBMIT_PLUGIN_EDIT_PLAN,
+            DEEPSEEK_TOOL_APPEND_PLUGIN_EDIT_OPERATIONS,
+            DEEPSEEK_TOOL_FINALIZE_PLUGIN_EDIT_PLAN,
         ],
-        DeepSeekPluginPlanningPhase::Finalize => {
-            vec![DEEPSEEK_TOOL_SUBMIT_PLUGIN_EDIT_PLAN]
-        }
+        DeepSeekPluginPlanningPhase::Finalize => vec![
+            DEEPSEEK_TOOL_SUBMIT_CHANGE_STRATEGY,
+            DEEPSEEK_TOOL_APPEND_PLUGIN_EDIT_OPERATIONS,
+            DEEPSEEK_TOOL_FINALIZE_PLUGIN_EDIT_PLAN,
+        ],
         DeepSeekPluginPlanningPhase::RefineAfterStrategy => vec![
             DEEPSEEK_TOOL_READ_CONTEXT_FILE,
             DEEPSEEK_TOOL_READ_CONTEXT_FILES,
             DEEPSEEK_TOOL_SUBMIT_CHANGE_STRATEGY,
-            DEEPSEEK_TOOL_SUBMIT_PLUGIN_EDIT_PLAN,
+            DEEPSEEK_TOOL_APPEND_PLUGIN_EDIT_OPERATIONS,
+            DEEPSEEK_TOOL_FINALIZE_PLUGIN_EDIT_PLAN,
         ],
     };
     filter_tool_definitions(&deepseek_plugin_tools(), &allowed)
@@ -2911,6 +3279,33 @@ fn filter_tool_definitions(all_tools: &Value, allowed_names: &[&str]) -> Value {
             .cloned()
             .collect(),
     )
+}
+
+fn unavailable_tool_feedback(
+    tool_name: &str,
+    available_tools: &BTreeSet<String>,
+    phase: Option<&str>,
+) -> String {
+    let mut feedback = json!({
+        "ok": false,
+        "tool": tool_name,
+        "error": "tool is not available in the current planner phase",
+        "available_tools": available_tools.iter().cloned().collect::<Vec<_>>(),
+    });
+    if let Some(phase) = phase {
+        feedback["phase"] = Value::String(phase.to_string());
+    }
+    if let Some(message) = feedback.as_object_mut() {
+        let hint = if available_tools.contains(DEEPSEEK_TOOL_FINALIZE_PLUGIN_EDIT_PLAN) {
+            "Use one of the available tools above. If the plan is already staged, call finalize_plugin_edit_plan next."
+        } else if available_tools.contains(DEEPSEEK_TOOL_SUBMIT_CHANGE_STRATEGY) {
+            "Use one of the available tools above. If you have enough context, submit_change_strategy before trying to read more files."
+        } else {
+            "Use one of the available tools above instead of inventing a hidden tool call."
+        };
+        message.insert("hint".to_string(), Value::String(hint.to_string()));
+    }
+    feedback.to_string()
 }
 
 fn tool_names_from_definition(tools: &Value) -> Vec<String> {
@@ -3185,6 +3580,40 @@ fn plugin_edit_plan_schema() -> Value {
             }
         },
         "required": ["summary", "operations"]
+    })
+}
+
+fn plugin_edit_operations_chunk_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "operations": {
+                "type": "array",
+                "minItems": 1,
+                "items": plugin_edit_operation_schema()
+            }
+        },
+        "required": ["operations"]
+    })
+}
+
+fn plugin_edit_plan_finalize_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "summary": {
+                "type": "string"
+            },
+            "tests_command": {
+                "type": ["string", "null"]
+            },
+            "safety_command": {
+                "type": ["string", "null"]
+            }
+        },
+        "required": ["summary"]
     })
 }
 
@@ -3513,7 +3942,7 @@ fn repeated_read_after_strategy_feedback(
         "tool": "read_context",
         "error": "the requested files were already inspected after a change strategy was recorded",
         "strategy": strategy,
-        "hint": "Do not loop on already-inspected files after submit_change_strategy. Either submit_plugin_edit_plan now or inspect one new file that would materially change the recorded strategy.",
+        "hint": "Do not loop on already-inspected files after submit_change_strategy. Either stage the remaining edits with append_plugin_edit_operations, finalize the staged plan, or inspect one new file that would materially change the recorded strategy.",
         "inspection": {
             "requested_paths": observation.requested_paths,
             "already_seen_paths": observation.already_seen_paths,
@@ -3535,7 +3964,7 @@ fn pre_strategy_context_feedback(
         "ok": false,
         "tool": tool_name,
         "error": "context inspection budget before submit_change_strategy is exhausted",
-        "hint": "Stop gathering more context for now. Call submit_change_strategy with the current implementation direction, or submit_plugin_edit_plan directly if the final plan is already ready.",
+        "hint": "Stop gathering more context for now. Call submit_change_strategy with the current implementation direction, then stage edits with append_plugin_edit_operations or finalize the staged plan if it is already ready.",
         "inspection": {
             "pre_strategy_context_tool_calls": inspection_state.pre_strategy_context_tool_calls(),
             "pre_strategy_context_tool_limit": DEEPSEEK_PRE_STRATEGY_CONTEXT_TOOL_LIMIT,
@@ -3557,7 +3986,7 @@ fn post_strategy_context_feedback(
         "tool": tool_name,
         "error": "post-strategy context inspection budget is exhausted",
         "strategy": strategy,
-        "hint": "Do not keep gathering context after submit_change_strategy. Either call submit_plugin_edit_plan now or revise the strategy with submit_change_strategy if the implementation direction has materially changed.",
+        "hint": "Do not keep gathering context after submit_change_strategy. Either stage/finalize the plan now or revise the strategy with submit_change_strategy if the implementation direction has materially changed.",
         "inspection": {
             "post_strategy_context_tool_calls": inspection_state.post_strategy_context_tool_calls(),
             "post_strategy_context_tool_limit": DEEPSEEK_POST_STRATEGY_CONTEXT_TOOL_LIMIT,
@@ -3570,8 +3999,10 @@ fn tool_feedback_error(tool_name: &str, error: &str) -> Value {
         "Revise the replace_exact operation: include the exact `expected_old_string` copied from the current file and provide the complete `new_content` for the replacement."
     } else if error.contains("create_file requires expected_old_string and new_content") {
         "Revise the create_file operation: include `expected_old_string` as an empty string and provide the complete `new_content` for the new file."
+    } else if error.contains("requires at least one staged operation") {
+        "Stage at least one operation with append_plugin_edit_operations before calling finalize_plugin_edit_plan."
     } else if error.contains("does not match the recorded change strategy") {
-        "Revise the final plan so it edits the strategy's anchor paths, or resubmit submit_change_strategy with only the high-confidence architecture-defining expected_paths if the previous strategy listed too many tentative supporting edits."
+        "Stage operations that cover the strategy's anchor paths, or resubmit submit_change_strategy with only the high-confidence architecture-defining expected_paths if the previous strategy listed too many tentative supporting edits."
     } else if error.contains("not valid JSON") {
         "Return a valid JSON object for the submit tool arguments. Do not truncate strings, omit closing braces, or mix prose outside the JSON payload."
     } else {
@@ -3971,19 +4402,28 @@ fn validate_new_child_plugin_manifest_dependencies(
     operations: &[PluginEditOperation],
 ) -> Result<(), RuntimeError> {
     for operation in operations {
-        if operation.kind != PluginEditOpKind::CreateFile || !operation.path.ends_with("/Cargo.toml") {
+        if operation.kind != PluginEditOpKind::CreateFile
+            || !operation.path.ends_with("/Cargo.toml")
+        {
             continue;
         }
-        let manifest_text = operation.new_content.as_deref().ok_or_else(|| {
-            RuntimeError::LlmResponseInvalid {
-                message: format!("create_file Cargo.toml is missing new_content: {}", operation.path),
-            }
-        })?;
-        let manifest: toml::Value = toml::from_str(manifest_text).map_err(|err| {
-            RuntimeError::LlmResponseInvalid {
-                message: format!("new plugin manifest {} is not valid TOML: {err}", operation.path),
-            }
-        })?;
+        let manifest_text =
+            operation
+                .new_content
+                .as_deref()
+                .ok_or_else(|| RuntimeError::LlmResponseInvalid {
+                    message: format!(
+                        "create_file Cargo.toml is missing new_content: {}",
+                        operation.path
+                    ),
+                })?;
+        let manifest: toml::Value =
+            toml::from_str(manifest_text).map_err(|err| RuntimeError::LlmResponseInvalid {
+                message: format!(
+                    "new plugin manifest {} is not valid TOML: {err}",
+                    operation.path
+                ),
+            })?;
         let manifest_path = normalize_plugin_rel_path(&operation.path)?;
         let manifest_dir = workspace_root.join(
             Path::new(&manifest_path)
@@ -4117,14 +4557,19 @@ fn validate_rust_source_dependencies(
             continue;
         }
 
-        let Some(plugin_root) = Path::new(&operation.path)
-            .parent()
-            .and_then(Path::parent)
-            .and_then(|dir| dir.parent())
+        let normalized_path = normalize_plugin_rel_path(&operation.path)?;
+        let components = normalized_path.split('/').collect::<Vec<_>>();
+        let Some(surface_idx) = components
+            .iter()
+            .position(|segment| matches!(*segment, "src" | "tests"))
         else {
             continue;
         };
-        let expected_manifest = plugin_root.join("Cargo.toml");
+        if surface_idx == 0 {
+            continue;
+        }
+        let expected_manifest =
+            PathBuf::from(components[..surface_idx].join("/")).join("Cargo.toml");
         let Some((manifest_path, manifest_text)) = created_manifests
             .iter()
             .find(|(manifest_path, _)| Path::new(manifest_path) == expected_manifest)
@@ -4156,7 +4601,7 @@ fn validate_submitted_plugin_payload(
 ) -> Result<(), RuntimeError> {
     if payload.operations.is_empty() {
         return Err(RuntimeError::LlmResponseInvalid {
-            message: "submit_plugin_edit_plan requires at least one operation".to_string(),
+            message: "plugin edit plan requires at least one operation".to_string(),
         });
     }
     validate_plugin_operation_paths(&payload.operations, writable_roots)?;
@@ -4166,22 +4611,40 @@ fn validate_submitted_plugin_payload(
     validate_plugin_payload_against_strategy(payload, strategy)
 }
 
-fn validate_plugin_payload_against_strategy(
-    payload: &PluginPlannerPayload,
-    strategy: Option<&PluginChangeStrategy>,
+fn validate_staged_plugin_operation_chunk(
+    operations: &[PluginEditOperation],
+    writable_roots: &BTreeSet<String>,
 ) -> Result<(), RuntimeError> {
-    let Some(strategy) = strategy else {
-        return Ok(());
-    };
-    if strategy.expected_paths.is_empty() {
-        return Ok(());
+    if operations.is_empty() {
+        return Err(RuntimeError::LlmResponseInvalid {
+            message: "append_plugin_edit_operations requires at least one operation".to_string(),
+        });
     }
+    validate_plugin_operation_paths(operations, writable_roots)?;
+    validate_reserved_child_keyword_identifiers(operations, writable_roots)
+}
 
-    let changed_paths = payload
-        .operations
+fn collect_changed_plugin_paths(
+    operations: &[PluginEditOperation],
+) -> Result<BTreeSet<String>, RuntimeError> {
+    operations
         .iter()
         .map(|operation| normalize_rel_path(&operation.path))
-        .collect::<Result<BTreeSet<_>, RuntimeError>>()?;
+        .collect()
+}
+
+fn missing_strategy_paths_for_operations(
+    operations: &[PluginEditOperation],
+    strategy: Option<&PluginChangeStrategy>,
+) -> Result<Vec<String>, RuntimeError> {
+    let Some(strategy) = strategy else {
+        return Ok(Vec::new());
+    };
+    if strategy.expected_paths.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let changed_paths = collect_changed_plugin_paths(operations)?;
     let missing_paths = strategy
         .expected_paths
         .iter()
@@ -4190,13 +4653,24 @@ fn validate_plugin_payload_against_strategy(
         .into_iter()
         .filter(|expected_path| !changed_paths.contains(expected_path))
         .collect::<Vec<_>>();
+    Ok(missing_paths)
+}
+
+fn validate_plugin_payload_against_strategy(
+    payload: &PluginPlannerPayload,
+    strategy: Option<&PluginChangeStrategy>,
+) -> Result<(), RuntimeError> {
+    let missing_paths = missing_strategy_paths_for_operations(&payload.operations, strategy)?;
     if missing_paths.is_empty() {
         return Ok(());
     }
 
+    let strategy = strategy.ok_or_else(|| RuntimeError::Invariant {
+        message: "missing plugin change strategy during plugin payload validation".to_string(),
+    })?;
     Err(RuntimeError::LlmResponseInvalid {
         message: format!(
-            "submit_plugin_edit_plan does not match the recorded change strategy `{}`; missing expected_paths={:?}",
+            "plugin edit plan does not match the recorded change strategy `{}`; missing expected_paths={:?}",
             strategy.strategy, missing_paths
         ),
     })
@@ -4286,7 +4760,12 @@ fn deepest_matching_writable_root<'a>(
     writable_roots
         .iter()
         .map(String::as_str)
-        .filter(|root| path == *root || path.strip_prefix(root).is_some_and(|rest| rest.starts_with('/')))
+        .filter(|root| {
+            path == *root
+                || path
+                    .strip_prefix(root)
+                    .is_some_and(|rest| rest.starts_with('/'))
+        })
         .max_by_key(|root| root.len())
 }
 
@@ -4474,17 +4953,16 @@ mod tests {
     use super::{
         api_key_env_looks_like_secret, build_plugin_edit_prompt, build_read_tool_result,
         build_user_prompt, deepseek_plugin_tools_for_state, discover_plugin_catalog,
-        extract_error_message, extract_output_text, normalize_optional_command,
-        normalize_rel_path,
+        extract_error_message, extract_output_text, normalize_optional_command, normalize_rel_path,
         path_within_read_only_generated_context, path_within_writable_surface,
         select_plugin_planner_context_files, sha256_text, tool_names_from_definition,
         validate_plugin_operation_paths, ContextFile, DeepSeekPlannerMode,
         DeepSeekPluginPlanningPhase, DeepSeekReadInspectionState, DeepSeekToolCall,
         DeepSeekToolFunctionCall, LlmPatchPlanner, PlanRequest, PluginChangeStrategy,
-        PluginPlanRequest, PluginPlannerPayload,
-        DEEPSEEK_PRE_STRATEGY_CONTEXT_TOOL_LIMIT, DEEPSEEK_TOOL_READ_CONTEXT_FILE,
+        PluginPlanRequest, PluginPlannerPayload, DEEPSEEK_FINALIZE_APPEND_LIMIT,
+        DEEPSEEK_PRE_STRATEGY_CONTEXT_TOOL_LIMIT, DEEPSEEK_TOOL_APPEND_PLUGIN_EDIT_OPERATIONS,
+        DEEPSEEK_TOOL_FINALIZE_PLUGIN_EDIT_PLAN, DEEPSEEK_TOOL_READ_CONTEXT_FILE,
         DEEPSEEK_TOOL_READ_CONTEXT_FILES, DEEPSEEK_TOOL_SUBMIT_CHANGE_STRATEGY,
-        DEEPSEEK_TOOL_SUBMIT_PLUGIN_EDIT_PLAN,
     };
     use crate::config::LlmApiConfig;
     use crate::kernel::plugin_iteration::{PluginEditOpKind, PluginEditOperation};
@@ -4848,9 +5326,7 @@ mod tests {
 
         let err = super::validate_submitted_plugin_payload(&payload, &writable_roots, None)
             .expect_err("incomplete child scaffold should be rejected");
-        assert!(err
-            .to_string()
-            .contains("docs/human/overview.md"));
+        assert!(err.to_string().contains("docs/human/overview.md"));
     }
 
     #[test]
@@ -4942,9 +5418,12 @@ mod tests {
             value: None,
         }];
 
-        let err = super::validate_new_child_plugin_manifest_dependencies(&workspace_root, &operations)
-            .expect_err("missing local dependency path should be rejected");
-        assert!(err.to_string().contains("references missing local dependency path"));
+        let err =
+            super::validate_new_child_plugin_manifest_dependencies(&workspace_root, &operations)
+                .expect_err("missing local dependency path should be rejected");
+        assert!(err
+            .to_string()
+            .contains("references missing local dependency path"));
     }
 
     #[test]
@@ -4959,7 +5438,7 @@ mod tests {
             expected_old_string: Some(String::new()),
             expected_sha256: None,
             new_content: Some(
-                "[package]\nname = \"expr_evaluator_modulo\"\nversion = \"0.1.0\"\n[dependencies]\ncordis-plugin-sdk = { path = \"../../../../../crates/cordis-plugin-sdk\" }\n"
+                "[package]\nname = \"expr_evaluator_modulo\"\nversion = \"0.1.0\"\n[dependencies]\ncordis-plugin-sdk = { path = \"../../../../crates/cordis-plugin-sdk\" }\n"
                     .to_string(),
             ),
             pointer: None,
@@ -5004,7 +5483,9 @@ mod tests {
 
         let err = super::validate_rust_source_dependencies(&operations)
             .expect_err("missing thiserror dependency should be rejected");
-        assert!(err.to_string().contains("does not declare the thiserror dependency"));
+        assert!(err
+            .to_string()
+            .contains("does not declare the thiserror dependency"));
     }
 
     #[test]
@@ -5143,7 +5624,8 @@ mod tests {
             .expect("strategy hint");
         assert!(third_hint.contains("change strategy"));
         assert!(third_hint.contains("new_child_plugin"));
-        assert!(third_hint.contains("submit_plugin_edit_plan"));
+        assert!(third_hint.contains("append_plugin_edit_operations"));
+        assert!(third_hint.contains("finalize"));
     }
 
     #[test]
@@ -5246,7 +5728,10 @@ mod tests {
         let prompt = super::build_deepseek_plugin_tool_prompt(&request, &files, None);
         assert!(prompt.contains("Example replace_exact"), "prompt: {prompt}");
         assert!(prompt.contains("Example create_file"), "prompt: {prompt}");
-        assert!(prompt.contains("\"expected_old_string\":\"\""), "prompt: {prompt}");
+        assert!(
+            prompt.contains("\"expected_old_string\":\"\""),
+            "prompt: {prompt}"
+        );
         assert!(
             prompt.contains("minimum architecture-defining anchor files"),
             "prompt: {prompt}"
@@ -5254,7 +5739,7 @@ mod tests {
     }
 
     #[test]
-    fn submit_plugin_edit_plan_requires_strategy_after_repeated_reads() {
+    fn append_plugin_edit_operations_requires_strategy_after_repeated_reads() {
         let planner = LlmPatchPlanner::new(LlmApiConfig::default()).expect("planner should build");
         let context_files = vec![
             ContextFile {
@@ -5277,12 +5762,11 @@ mod tests {
         let result = planner
             .execute_deepseek_plugin_tool_call(
                 &DeepSeekToolCall {
-                    id: "call-submit-plan".to_string(),
+                    id: "call-append-ops".to_string(),
                     call_type: "function".to_string(),
                     function: DeepSeekToolFunctionCall {
-                        name: "submit_plugin_edit_plan".to_string(),
+                        name: "append_plugin_edit_operations".to_string(),
                         arguments: json!({
-                            "summary": "Add modulo support",
                             "operations": [{
                                 "path": "plugins/expr/src/lib.rs",
                                 "kind": "replace_exact",
@@ -5311,7 +5795,7 @@ mod tests {
     }
 
     #[test]
-    fn submit_plugin_edit_plan_invalid_json_returns_tool_feedback() {
+    fn append_plugin_edit_operations_invalid_json_returns_tool_feedback() {
         let planner = LlmPatchPlanner::new(LlmApiConfig::default()).expect("planner should build");
         let context_files = vec![ContextFile {
             path: "plugins/expr/Cargo.toml".to_string(),
@@ -5331,8 +5815,8 @@ mod tests {
                     id: "call-invalid-json".to_string(),
                     call_type: "function".to_string(),
                     function: DeepSeekToolFunctionCall {
-                        name: "submit_plugin_edit_plan".to_string(),
-                        arguments: "{\"summary\":\"broken".to_string(),
+                        name: "append_plugin_edit_operations".to_string(),
+                        arguments: "{\"operations\":".to_string(),
                     },
                 },
                 &context_files,
@@ -5353,7 +5837,7 @@ mod tests {
     }
 
     #[test]
-    fn submit_plugin_edit_plan_must_cover_strategy_expected_paths() {
+    fn finalize_plugin_edit_plan_must_cover_strategy_expected_paths() {
         let planner = LlmPatchPlanner::new(LlmApiConfig::default()).expect("planner should build");
         let context_files = vec![
             ContextFile {
@@ -5377,21 +5861,44 @@ mod tests {
             ],
         });
 
-        let result = planner
+        let staged = planner
             .execute_deepseek_plugin_tool_call(
                 &DeepSeekToolCall {
-                    id: "call-missing-strategy-paths".to_string(),
+                    id: "call-stage-missing-strategy-paths".to_string(),
                     call_type: "function".to_string(),
                     function: DeepSeekToolFunctionCall {
-                        name: "submit_plugin_edit_plan".to_string(),
+                        name: "append_plugin_edit_operations".to_string(),
                         arguments: json!({
-                            "summary": "Add modulo token only",
                             "operations": [{
                                 "path": "plugins/expr/lexer/src/core.rs",
                                 "kind": "replace_exact",
                                 "expected_old_string": "pub enum TokenKind { Slash }\n",
                                 "new_content": "pub enum TokenKind { Slash, Percent }\n"
                             }]
+                        })
+                        .to_string(),
+                    },
+                },
+                &context_files,
+                None,
+                &mut inspection,
+            )
+            .expect("tool execution");
+        let super::DeepSeekToolOutcome::ToolResult(staged_feedback) = staged else {
+            panic!("expected staging feedback");
+        };
+        let staged_parsed: Value = serde_json::from_str(&staged_feedback).expect("feedback json");
+        assert_eq!(staged_parsed.get("ok").and_then(Value::as_bool), Some(true));
+
+        let result = planner
+            .execute_deepseek_plugin_tool_call(
+                &DeepSeekToolCall {
+                    id: "call-finalize-missing-strategy-paths".to_string(),
+                    call_type: "function".to_string(),
+                    function: DeepSeekToolFunctionCall {
+                        name: "finalize_plugin_edit_plan".to_string(),
+                        arguments: json!({
+                            "summary": "Add modulo token only"
                         })
                         .to_string(),
                     },
@@ -5414,13 +5921,20 @@ mod tests {
     }
 
     #[test]
-    fn submit_plugin_edit_plan_validation_error_locks_finalize_phase() {
+    fn finalize_plugin_edit_plan_validation_error_locks_finalize_phase() {
         let planner = LlmPatchPlanner::new(LlmApiConfig::default()).expect("planner should build");
-        let context_files = vec![ContextFile {
-            path: "plugins/expr/lexer/src/core.rs".to_string(),
-            sha256: "lexer".to_string(),
-            content: "pub enum TokenKind { Slash }\n".to_string(),
-        }];
+        let context_files = vec![
+            ContextFile {
+                path: "plugins/expr/Cargo.toml".to_string(),
+                sha256: "expr-manifest".to_string(),
+                content: "[package]\nname = \"expr\"\n".to_string(),
+            },
+            ContextFile {
+                path: "plugins/expr/lexer/src/core.rs".to_string(),
+                sha256: "lexer".to_string(),
+                content: "pub enum TokenKind { Slash }\n".to_string(),
+            },
+        ];
         let mut inspection = DeepSeekReadInspectionState::default();
         inspection.note_plugin_strategy(PluginChangeStrategy {
             strategy: "new_child_plugin".to_string(),
@@ -5428,15 +5942,14 @@ mod tests {
             expected_paths: vec!["plugins/expr/evaluator/mod/Cargo.toml".to_string()],
         });
 
-        let result = planner
+        let staged = planner
             .execute_deepseek_plugin_tool_call(
                 &DeepSeekToolCall {
-                    id: "call-plan-validation-error".to_string(),
+                    id: "call-stage-plan-validation-error".to_string(),
                     call_type: "function".to_string(),
                     function: DeepSeekToolFunctionCall {
-                        name: "submit_plugin_edit_plan".to_string(),
+                        name: "append_plugin_edit_operations".to_string(),
                         arguments: json!({
-                            "summary": "Bad strategy alignment",
                             "operations": [{
                                 "path": "plugins/expr/lexer/src/core.rs",
                                 "kind": "replace_exact",
@@ -5452,13 +5965,256 @@ mod tests {
                 &mut inspection,
             )
             .expect("tool execution");
+        let super::DeepSeekToolOutcome::ToolResult(staged_feedback) = staged else {
+            panic!("expected staging feedback");
+        };
+        let staged_parsed: Value = serde_json::from_str(&staged_feedback).expect("feedback json");
+        assert_eq!(staged_parsed.get("ok").and_then(Value::as_bool), Some(true));
+
+        let result = planner
+            .execute_deepseek_plugin_tool_call(
+                &DeepSeekToolCall {
+                    id: "call-finalize-plan-validation-error".to_string(),
+                    call_type: "function".to_string(),
+                    function: DeepSeekToolFunctionCall {
+                        name: "finalize_plugin_edit_plan".to_string(),
+                        arguments: json!({
+                            "summary": "Bad strategy alignment"
+                        })
+                        .to_string(),
+                    },
+                },
+                &context_files,
+                None,
+                &mut inspection,
+            )
+            .expect("tool execution");
 
         let super::DeepSeekToolOutcome::ToolResult(feedback) = result else {
             panic!("expected tool feedback");
         };
         let parsed: Value = serde_json::from_str(&feedback).expect("feedback json");
         assert_eq!(parsed.get("ok").and_then(Value::as_bool), Some(false));
-        assert_eq!(inspection.plugin_phase(), DeepSeekPluginPlanningPhase::Finalize);
+        assert_eq!(
+            inspection.plugin_phase(),
+            DeepSeekPluginPlanningPhase::Finalize
+        );
+    }
+
+    #[test]
+    fn append_plugin_edit_operations_replaces_staged_paths_and_reports_missing_anchors() {
+        let planner = LlmPatchPlanner::new(LlmApiConfig::default()).expect("planner should build");
+        let context_files = vec![
+            ContextFile {
+                path: "plugins/expr/evaluator/Cargo.toml".to_string(),
+                sha256: "manifest".to_string(),
+                content: "[package]\nname = \"expr_evaluator\"\n".to_string(),
+            },
+            ContextFile {
+                path: "plugins/expr/evaluator/src/core.rs".to_string(),
+                sha256: "core".to_string(),
+                content: "pub fn eval() {}\n".to_string(),
+            },
+        ];
+        let mut inspection = DeepSeekReadInspectionState::default();
+        inspection.note_plugin_strategy(PluginChangeStrategy {
+            strategy: "new_child_plugin".to_string(),
+            reason: "modulo should live in a sibling evaluator child plugin".to_string(),
+            expected_paths: vec![
+                "plugins/expr/evaluator/src/core.rs".to_string(),
+                "plugins/expr/evaluator/mod/Cargo.toml".to_string(),
+            ],
+        });
+
+        let first = planner
+            .execute_deepseek_plugin_tool_call(
+                &DeepSeekToolCall {
+                    id: "call-stage-first".to_string(),
+                    call_type: "function".to_string(),
+                    function: DeepSeekToolFunctionCall {
+                        name: "append_plugin_edit_operations".to_string(),
+                        arguments: json!({
+                            "operations": [{
+                                "path": "plugins/expr/evaluator/src/core.rs",
+                                "kind": "replace_exact",
+                                "expected_old_string": "pub fn eval() {}\n",
+                                "new_content": "pub fn eval_modulo() {}\n"
+                            }]
+                        })
+                        .to_string(),
+                    },
+                },
+                &context_files,
+                None,
+                &mut inspection,
+            )
+            .expect("first append");
+        let super::DeepSeekToolOutcome::ToolResult(first_feedback) = first else {
+            panic!("expected tool feedback");
+        };
+        let first_parsed: Value = serde_json::from_str(&first_feedback).expect("feedback json");
+        assert_eq!(first_parsed.get("ok").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            first_parsed
+                .get("missing_expected_paths")
+                .and_then(Value::as_array)
+                .map(|items| items.len()),
+            Some(1)
+        );
+
+        let second = planner
+            .execute_deepseek_plugin_tool_call(
+                &DeepSeekToolCall {
+                    id: "call-stage-second".to_string(),
+                    call_type: "function".to_string(),
+                    function: DeepSeekToolFunctionCall {
+                        name: "append_plugin_edit_operations".to_string(),
+                        arguments: json!({
+                            "operations": [
+                                {
+                                    "path": "plugins/expr/evaluator/src/core.rs",
+                                    "kind": "replace_exact",
+                                    "expected_old_string": "pub fn eval() {}\n",
+                                    "new_content": "pub fn eval_modulo_dispatch() {}\n"
+                                },
+                                {
+                                    "path": "plugins/expr/evaluator/mod/Cargo.toml",
+                                    "kind": "create_file",
+                                    "expected_old_string": "",
+                                    "new_content": "[package]\nname = \"expr_evaluator_mod\"\nversion = \"0.1.0\"\n"
+                                }
+                            ]
+                        })
+                        .to_string(),
+                    },
+                },
+                &context_files,
+                None,
+                &mut inspection,
+            )
+            .expect("second append");
+        let super::DeepSeekToolOutcome::ToolResult(second_feedback) = second else {
+            panic!("expected tool feedback");
+        };
+        let second_parsed: Value = serde_json::from_str(&second_feedback).expect("feedback json");
+        assert_eq!(second_parsed.get("ok").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            second_parsed
+                .get("replaced_paths")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default(),
+            vec![Value::String(
+                "plugins/expr/evaluator/src/core.rs".to_string()
+            )]
+        );
+        assert_eq!(
+            second_parsed
+                .get("missing_expected_paths")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default(),
+            Vec::<Value>::new()
+        );
+    }
+
+    #[test]
+    fn finalize_plugin_edit_plan_requires_staged_operations() {
+        let planner = LlmPatchPlanner::new(LlmApiConfig::default()).expect("planner should build");
+        let context_files = vec![ContextFile {
+            path: "plugins/expr/Cargo.toml".to_string(),
+            sha256: "manifest".to_string(),
+            content: "[package]\nname = \"expr\"\n".to_string(),
+        }];
+        let mut inspection = DeepSeekReadInspectionState::default();
+        inspection.note_plugin_strategy(PluginChangeStrategy {
+            strategy: "new_child_plugin".to_string(),
+            reason: "modulo should live in a sibling evaluator child plugin".to_string(),
+            expected_paths: vec!["plugins/expr/evaluator/mod/Cargo.toml".to_string()],
+        });
+
+        let result = planner
+            .execute_deepseek_plugin_tool_call(
+                &DeepSeekToolCall {
+                    id: "call-finalize-no-staged-ops".to_string(),
+                    call_type: "function".to_string(),
+                    function: DeepSeekToolFunctionCall {
+                        name: "finalize_plugin_edit_plan".to_string(),
+                        arguments: json!({
+                            "summary": "Add modulo child plugin"
+                        })
+                        .to_string(),
+                    },
+                },
+                &context_files,
+                None,
+                &mut inspection,
+            )
+            .expect("tool execution");
+        let super::DeepSeekToolOutcome::ToolResult(feedback) = result else {
+            panic!("expected tool feedback");
+        };
+        let parsed: Value = serde_json::from_str(&feedback).expect("feedback json");
+        assert_eq!(parsed.get("ok").and_then(Value::as_bool), Some(false));
+        assert!(parsed
+            .get("hint")
+            .and_then(Value::as_str)
+            .is_some_and(|hint| hint.contains("append_plugin_edit_operations")));
+    }
+
+    #[test]
+    fn append_plugin_edit_operations_requires_finalize_after_enough_finalize_chunks() {
+        let planner = LlmPatchPlanner::new(LlmApiConfig::default()).expect("planner should build");
+        let context_files = vec![ContextFile {
+            path: "plugins/expr/evaluator/mod/Cargo.toml".to_string(),
+            sha256: "manifest".to_string(),
+            content: "".to_string(),
+        }];
+        let mut inspection = DeepSeekReadInspectionState::default();
+        inspection.note_plugin_strategy(PluginChangeStrategy {
+            strategy: "new_child_plugin".to_string(),
+            reason: "modulo should live in a sibling evaluator child plugin".to_string(),
+            expected_paths: vec!["plugins/expr/evaluator/mod/Cargo.toml".to_string()],
+        });
+        inspection.note_plugin_context_tool_call();
+        inspection.note_plugin_context_tool_call();
+        for _ in 0..DEEPSEEK_FINALIZE_APPEND_LIMIT {
+            inspection
+                .note_staged_plugin_operations(DeepSeekPluginPlanningPhase::Finalize, &Vec::new());
+        }
+
+        let result = planner
+            .execute_deepseek_plugin_tool_call(
+                &DeepSeekToolCall {
+                    id: "call-stage-after-finalize-limit".to_string(),
+                    call_type: "function".to_string(),
+                    function: DeepSeekToolFunctionCall {
+                        name: "append_plugin_edit_operations".to_string(),
+                        arguments: json!({
+                            "operations": [{
+                                "path": "plugins/expr/evaluator/mod/Cargo.toml",
+                                "kind": "create_file",
+                                "expected_old_string": "",
+                                "new_content": "[package]\nname = \"expr_evaluator_modulo\"\nversion = \"0.1.0\"\n"
+                            }]
+                        })
+                        .to_string(),
+                    },
+                },
+                &context_files,
+                None,
+                &mut inspection,
+            )
+            .expect("tool execution");
+        let super::DeepSeekToolOutcome::ToolResult(feedback) = result else {
+            panic!("expected tool feedback");
+        };
+        let parsed: Value = serde_json::from_str(&feedback).expect("feedback json");
+        assert_eq!(parsed.get("ok").and_then(Value::as_bool), Some(false));
+        assert!(parsed
+            .get("hint")
+            .and_then(Value::as_str)
+            .is_some_and(|hint| hint.contains("finalize_plugin_edit_plan")));
     }
 
     #[test]
@@ -5496,8 +6252,8 @@ mod tests {
     #[test]
     fn tool_feedback_error_mentions_strategy_anchor_recovery() {
         let feedback = super::tool_feedback_error(
-            "submit_plugin_edit_plan",
-            "submit_plugin_edit_plan does not match the recorded change strategy `new_child_plugin`; missing expected_paths=[\"plugins/expr/evaluator/mod/Cargo.toml\"]",
+            "finalize_plugin_edit_plan",
+            "plugin edit plan does not match the recorded change strategy `new_child_plugin`; missing expected_paths=[\"plugins/expr/evaluator/mod/Cargo.toml\"]",
         );
         assert!(feedback
             .get("hint")
@@ -5507,6 +6263,31 @@ mod tests {
             .get("hint")
             .and_then(Value::as_str)
             .is_some_and(|hint| hint.contains("submit_change_strategy")));
+    }
+
+    #[test]
+    fn unavailable_tool_feedback_mentions_available_tools_and_phase() {
+        let available = BTreeSet::from([
+            DEEPSEEK_TOOL_FINALIZE_PLUGIN_EDIT_PLAN.to_string(),
+            DEEPSEEK_TOOL_SUBMIT_CHANGE_STRATEGY.to_string(),
+        ]);
+        let feedback: Value = serde_json::from_str(&super::unavailable_tool_feedback(
+            DEEPSEEK_TOOL_READ_CONTEXT_FILE,
+            &available,
+            Some("finalize"),
+        ))
+        .expect("feedback json");
+        assert_eq!(feedback.get("ok").and_then(Value::as_bool), Some(false));
+        assert_eq!(
+            feedback.get("phase").and_then(Value::as_str),
+            Some("finalize")
+        );
+        assert!(feedback
+            .get("available_tools")
+            .and_then(Value::as_array)
+            .is_some_and(|tools| tools
+                .iter()
+                .any(|tool| { tool.as_str() == Some(DEEPSEEK_TOOL_FINALIZE_PLUGIN_EDIT_PLAN) })));
     }
 
     #[test]
@@ -5537,7 +6318,8 @@ mod tests {
             tool_names,
             vec![
                 DEEPSEEK_TOOL_SUBMIT_CHANGE_STRATEGY.to_string(),
-                DEEPSEEK_TOOL_SUBMIT_PLUGIN_EDIT_PLAN.to_string(),
+                DEEPSEEK_TOOL_APPEND_PLUGIN_EDIT_OPERATIONS.to_string(),
+                DEEPSEEK_TOOL_FINALIZE_PLUGIN_EDIT_PLAN.to_string(),
             ]
         );
     }
@@ -5558,13 +6340,14 @@ mod tests {
                 DEEPSEEK_TOOL_READ_CONTEXT_FILE.to_string(),
                 DEEPSEEK_TOOL_READ_CONTEXT_FILES.to_string(),
                 DEEPSEEK_TOOL_SUBMIT_CHANGE_STRATEGY.to_string(),
-                DEEPSEEK_TOOL_SUBMIT_PLUGIN_EDIT_PLAN.to_string(),
+                DEEPSEEK_TOOL_APPEND_PLUGIN_EDIT_OPERATIONS.to_string(),
+                DEEPSEEK_TOOL_FINALIZE_PLUGIN_EDIT_PLAN.to_string(),
             ]
         );
     }
 
     #[test]
-    fn finalize_phase_only_exposes_final_plugin_submit_tool() {
+    fn finalize_phase_only_exposes_strategy_and_staged_submit_tools() {
         let mut inspection = DeepSeekReadInspectionState::default();
         inspection.note_plugin_strategy(PluginChangeStrategy {
             strategy: "new_child_plugin".to_string(),
@@ -5573,12 +6356,46 @@ mod tests {
         });
         inspection.note_plugin_context_tool_call();
         inspection.note_plugin_context_tool_call();
-        assert_eq!(inspection.plugin_phase(), DeepSeekPluginPlanningPhase::Finalize);
+        assert_eq!(
+            inspection.plugin_phase(),
+            DeepSeekPluginPlanningPhase::Finalize
+        );
 
         let tool_names = tool_names_from_definition(&deepseek_plugin_tools_for_state(&inspection));
         assert_eq!(
             tool_names,
-            vec![DEEPSEEK_TOOL_SUBMIT_PLUGIN_EDIT_PLAN.to_string()]
+            vec![
+                DEEPSEEK_TOOL_SUBMIT_CHANGE_STRATEGY.to_string(),
+                DEEPSEEK_TOOL_APPEND_PLUGIN_EDIT_OPERATIONS.to_string(),
+                DEEPSEEK_TOOL_FINALIZE_PLUGIN_EDIT_PLAN.to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn finalize_phase_only_exposes_finalize_after_enough_staged_chunks() {
+        let mut inspection = DeepSeekReadInspectionState::default();
+        inspection.note_plugin_strategy(PluginChangeStrategy {
+            strategy: "new_child_plugin".to_string(),
+            reason: "new operators should prefer sibling plugins".to_string(),
+            expected_paths: vec!["plugins/expr/evaluator/mod/Cargo.toml".to_string()],
+        });
+        inspection.note_plugin_context_tool_call();
+        inspection.note_plugin_context_tool_call();
+        assert_eq!(
+            inspection.plugin_phase(),
+            DeepSeekPluginPlanningPhase::Finalize
+        );
+
+        for _ in 0..DEEPSEEK_FINALIZE_APPEND_LIMIT {
+            inspection
+                .note_staged_plugin_operations(DeepSeekPluginPlanningPhase::Finalize, &Vec::new());
+        }
+
+        let tool_names = tool_names_from_definition(&deepseek_plugin_tools_for_state(&inspection));
+        assert_eq!(
+            tool_names,
+            vec![DEEPSEEK_TOOL_FINALIZE_PLUGIN_EDIT_PLAN.to_string()]
         );
     }
 
@@ -5832,7 +6649,10 @@ mod tests {
             let parsed: Value = serde_json::from_str(&feedback).expect("feedback json");
             assert_eq!(parsed.get("ok").and_then(Value::as_bool), Some(true));
         }
-        assert_eq!(inspection.plugin_phase(), DeepSeekPluginPlanningPhase::DecideStrategy);
+        assert_eq!(
+            inspection.plugin_phase(),
+            DeepSeekPluginPlanningPhase::DecideStrategy
+        );
 
         let result = planner
             .execute_deepseek_plugin_tool_call(
@@ -5929,7 +6749,10 @@ mod tests {
             let parsed: Value = serde_json::from_str(&feedback).expect("feedback json");
             assert_eq!(parsed.get("ok").and_then(Value::as_bool), Some(true));
         }
-        assert_eq!(inspection.plugin_phase(), DeepSeekPluginPlanningPhase::Finalize);
+        assert_eq!(
+            inspection.plugin_phase(),
+            DeepSeekPluginPlanningPhase::Finalize
+        );
 
         let result = planner
             .execute_deepseek_plugin_tool_call(
@@ -5971,11 +6794,18 @@ mod tests {
     #[test]
     fn submit_change_strategy_resets_post_strategy_context_budget() {
         let planner = LlmPatchPlanner::new(LlmApiConfig::default()).expect("planner should build");
-        let context_files = vec![ContextFile {
-            path: "plugins/expr/evaluator/div/src/core.rs".to_string(),
-            sha256: "div-core".to_string(),
-            content: "pub fn eval_div() {}\n".to_string(),
-        }];
+        let context_files = vec![
+            ContextFile {
+                path: "plugins/expr/evaluator/Cargo.toml".to_string(),
+                sha256: "evaluator-manifest".to_string(),
+                content: "[package]\nname = \"expr_evaluator\"\n".to_string(),
+            },
+            ContextFile {
+                path: "plugins/expr/evaluator/div/src/core.rs".to_string(),
+                sha256: "div-core".to_string(),
+                content: "pub fn eval_div() {}\n".to_string(),
+            },
+        ];
         let mut inspection = DeepSeekReadInspectionState::default();
         inspection.note_plugin_strategy(PluginChangeStrategy {
             strategy: "new_child_plugin".to_string(),
@@ -6022,11 +6852,18 @@ mod tests {
     #[test]
     fn submit_change_strategy_does_not_escape_finalize_phase_once_reached() {
         let planner = LlmPatchPlanner::new(LlmApiConfig::default()).expect("planner should build");
-        let context_files = vec![ContextFile {
-            path: "plugins/expr/evaluator/div/src/core.rs".to_string(),
-            sha256: "div-core".to_string(),
-            content: "pub fn eval_div() {}\n".to_string(),
-        }];
+        let context_files = vec![
+            ContextFile {
+                path: "plugins/expr/evaluator/Cargo.toml".to_string(),
+                sha256: "evaluator-manifest".to_string(),
+                content: "[package]\nname = \"expr_evaluator\"\n".to_string(),
+            },
+            ContextFile {
+                path: "plugins/expr/evaluator/div/src/core.rs".to_string(),
+                sha256: "div-core".to_string(),
+                content: "pub fn eval_div() {}\n".to_string(),
+            },
+        ];
         let mut inspection = DeepSeekReadInspectionState::default();
         inspection.note_plugin_strategy(PluginChangeStrategy {
             strategy: "new_child_plugin".to_string(),
@@ -6035,7 +6872,10 @@ mod tests {
         });
         inspection.note_plugin_context_tool_call();
         inspection.note_plugin_context_tool_call();
-        assert_eq!(inspection.plugin_phase(), DeepSeekPluginPlanningPhase::Finalize);
+        assert_eq!(
+            inspection.plugin_phase(),
+            DeepSeekPluginPlanningPhase::Finalize
+        );
 
         let strategy_result = planner
             .execute_deepseek_plugin_tool_call(
@@ -6063,7 +6903,10 @@ mod tests {
         };
         let parsed: Value = serde_json::from_str(&feedback).expect("feedback json");
         assert_eq!(parsed.get("ok").and_then(Value::as_bool), Some(true));
-        assert_eq!(inspection.plugin_phase(), DeepSeekPluginPlanningPhase::Finalize);
+        assert_eq!(
+            inspection.plugin_phase(),
+            DeepSeekPluginPlanningPhase::Finalize
+        );
         assert_eq!(inspection.post_strategy_context_tool_calls(), 2);
     }
 }

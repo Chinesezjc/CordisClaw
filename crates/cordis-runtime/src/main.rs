@@ -1,7 +1,9 @@
-use cordis_runtime::agent::{ShellAgentReply, ShellAgentSession};
+use cordis_runtime::agent::ShellAgentReply;
 use cordis_runtime::config::RuntimeConfig;
 use cordis_runtime::context::ContextRegistry;
-use cordis_runtime::host::{KernelApplyRequest, KernelPlanRequest, RuntimeHost, RuntimeKernel};
+use cordis_runtime::host::{
+    AgentSessionKind, KernelApplyRequest, KernelPlanRequest, RuntimeHost, RuntimeKernel,
+};
 use cordis_runtime::kernel::auto_update::{
     AutoUpdatePlan, AutoUpdater, FilePatch, VerificationEnvelope,
 };
@@ -29,7 +31,7 @@ enum ServeMode {
 }
 
 struct ServeState {
-    agent_session: ShellAgentSession,
+    agent_session_id: String,
     mode: ServeMode,
 }
 
@@ -162,8 +164,9 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     prepare_fixtures_root(&root, runtime_only)?;
     let host =
         RuntimeHost::boot(&root).map_err(|err| runtime_mode_error(err, &root, runtime_only))?;
+    let agent_session = host.agent_start(AgentSessionKind::RuntimeShell)?;
     let mut state = ServeState {
-        agent_session: ShellAgentSession::new(host.config().llm_api.clone())?,
+        agent_session_id: agent_session.session_id,
         mode: ServeMode::Command,
     };
     println!(
@@ -219,11 +222,19 @@ fn handle_serve_command(
             println!("{}", agent_chat_usage());
         }
         "agent status" => {
-            println!("{}", serde_json::to_string(&state.agent_session.status())?);
+            println!(
+                "{}",
+                serde_json::to_string(&host.agent_status(&state.agent_session_id)?)?
+            );
         }
         "agent reset" => {
-            state.agent_session.reset();
+            let session = host.agent_start(AgentSessionKind::RuntimeShell)?;
+            state.agent_session_id = session.session_id;
             println!("agent session reset");
+        }
+        "agent start" => {
+            let session = host.agent_start(AgentSessionKind::RuntimeShell)?;
+            println!("{}", serde_json::to_string(&session)?);
         }
         "plugins" => {
             let snapshot = host.current_snapshot();
@@ -274,8 +285,19 @@ fn handle_serve_command(
         }
         "exit" | "quit" => return Ok(false),
         _ => {
-            if let Some(rest) = command.strip_prefix("agent ") {
-                let reply = state.agent_session.respond(host, rest)?;
+            if let Some(rest) = command.strip_prefix("agent send ") {
+                let (session_id, message) =
+                    split_first_token(rest).ok_or("missing session_id/message for agent send")?;
+                let reply = host.agent_send(session_id, message)?;
+                emit_agent_reply(&reply)?;
+            } else if let Some(session_id) = command.strip_prefix("agent status ") {
+                let status = host.agent_status(session_id.trim())?;
+                println!("{}", serde_json::to_string(&status)?);
+            } else if let Some(session_id) = command.strip_prefix("agent transcript ") {
+                let transcript = host.agent_transcript(session_id.trim())?;
+                println!("{}", serde_json::to_string(&transcript)?);
+            } else if let Some(rest) = command.strip_prefix("agent ") {
+                let reply = host.agent_send(&state.agent_session_id, rest)?;
                 emit_agent_reply(&reply)?;
             } else if let Some(rest) = command.strip_prefix("invoke ") {
                 let (plugin_path, remainder) =
@@ -346,10 +368,14 @@ fn handle_agent_chat_line(
     match line {
         "/help" => println!("{}", agent_chat_usage()),
         "/status" => {
-            println!("{}", serde_json::to_string(&state.agent_session.status())?);
+            println!(
+                "{}",
+                serde_json::to_string(&host.agent_status(&state.agent_session_id)?)?
+            );
         }
         "/reset" => {
-            state.agent_session.reset();
+            let session = host.agent_start(AgentSessionKind::RuntimeShell)?;
+            state.agent_session_id = session.session_id;
             println!("agent session reset");
         }
         "/exit" | "/quit" => {
@@ -357,7 +383,7 @@ fn handle_agent_chat_line(
             println!("left agent chat mode");
         }
         _ => {
-            let reply = state.agent_session.respond(host, line)?;
+            let reply = host.agent_send(&state.agent_session_id, line)?;
             emit_agent_reply(&reply)?;
         }
     }
@@ -961,8 +987,12 @@ fn serve_usage() -> &'static str {
   help
   agent
   agent <message>
+  agent start
+  agent send <session-id> <message>
   agent status
+  agent status <session-id>
   agent reset
+  agent transcript <session-id>
   status
   plugins
   reload
@@ -989,7 +1019,7 @@ fn serve_usage() -> &'static str {
 fn agent_chat_usage() -> &'static str {
     "agent chat mode:
   Type any message to talk with the agent.
-  /status  show the current shell agent session status
-  /reset   clear the shell agent conversation history
+  /status  show the current shared agent session status
+  /reset   start a fresh shared agent session
   /exit    leave agent chat mode and return to serve commands"
 }

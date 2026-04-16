@@ -568,6 +568,27 @@ impl PluginEditExecutor {
 }
 
 impl PluginEditRollback {
+    pub fn empty(workspace_root: impl Into<PathBuf>) -> Self {
+        Self {
+            workspace_root: workspace_root.into(),
+            backups: Vec::new(),
+        }
+    }
+
+    pub fn absorb(&mut self, mut other: Self) -> Result<(), RuntimeError> {
+        if self.workspace_root != other.workspace_root {
+            return Err(RuntimeError::Invariant {
+                message: format!(
+                    "plugin edit rollback workspace mismatch: {} vs {}",
+                    self.workspace_root.display(),
+                    other.workspace_root.display()
+                ),
+            });
+        }
+        self.backups.append(&mut other.backups);
+        Ok(())
+    }
+
     pub fn rollback(&self) -> Result<(), RuntimeError> {
         for backup in self.backups.iter().rev() {
             let abs_path = self.workspace_root.join(&backup.rel_path);

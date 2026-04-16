@@ -6,6 +6,7 @@ use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
+use std::collections::BTreeSet;
 use std::env;
 use std::io::{BufRead, BufReader};
 use std::thread;
@@ -136,15 +137,17 @@ impl AgentToolHost for RuntimeHost {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub struct ShellAgentStatus {
+pub struct AgentSessionStatus {
+    pub kind: String,
     pub provider: String,
     pub model: String,
     pub completed_turns: usize,
     pub stored_messages: usize,
+    pub transcript_events: usize,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
-pub struct ShellAgentReply {
+pub struct AgentReply {
     pub response_id: Option<String>,
     pub content: String,
     pub tool_events: Vec<AgentToolEvent>,
@@ -154,48 +157,146 @@ pub struct ShellAgentReply {
 pub struct AgentToolEvent {
     pub name: String,
     pub arguments: Value,
+    pub ok: bool,
+    #[serde(default)]
+    pub output: Option<Value>,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AgentTranscriptEntry {
+    User {
+        content: String,
+    },
+    Assistant {
+        content: String,
+        #[serde(default)]
+        response_id: Option<String>,
+    },
+    Tool {
+        name: String,
+        arguments: Value,
+        ok: bool,
+        #[serde(default)]
+        output: Option<Value>,
+        #[serde(default)]
+        error: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentToolExecutionSummary {
+    pub total_calls: usize,
+    pub successful_calls: usize,
+    pub failed_calls: usize,
+    pub tool_names: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
-pub struct ShellAgentSession {
+pub struct AgentToolSpec {
+    pub name: &'static str,
+    pub description: &'static str,
+    pub parameters: Value,
+}
+
+pub trait AgentBackend {
+    fn system_prompt(&self) -> String;
+    fn tool_specs(&self) -> Vec<AgentToolSpec>;
+    fn execute_tool(&mut self, name: &str, arguments: Value) -> Result<Value, RuntimeError>;
+    fn tool_scope_label(&self) -> String {
+        "agent".to_string()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct AgentSession {
+    kind: String,
     config: LlmApiConfig,
     client: Client,
     history: Vec<Value>,
+    transcript: Vec<AgentTranscriptEntry>,
+    completed_turns: usize,
 }
 
-impl ShellAgentSession {
-    pub fn new(config: LlmApiConfig) -> Result<Self, RuntimeError> {
+pub type ShellAgentStatus = AgentSessionStatus;
+pub type ShellAgentReply = AgentReply;
+
+#[derive(Debug, Clone)]
+pub struct ShellAgentSession {
+    inner: AgentSession,
+}
+
+impl AgentSession {
+    pub fn new(config: LlmApiConfig, kind: impl Into<String>) -> Result<Self, RuntimeError> {
         let client = Client::builder()
             .timeout(Duration::from_millis(config.timeout_ms))
             .build()
             .map_err(|err| RuntimeError::LlmRequestFailed {
-                message: format!("failed to build shell agent HTTP client: {err}"),
+                message: format!("failed to build agent HTTP client: {err}"),
             })?;
         Ok(Self {
+            kind: kind.into(),
             config,
             client,
             history: Vec::new(),
+            transcript: Vec::new(),
+            completed_turns: 0,
         })
     }
 
     pub fn reset(&mut self) {
         self.history.clear();
+        self.transcript.clear();
+        self.completed_turns = 0;
     }
 
-    pub fn status(&self) -> ShellAgentStatus {
-        ShellAgentStatus {
+    pub fn status(&self) -> AgentSessionStatus {
+        AgentSessionStatus {
+            kind: self.kind.clone(),
             provider: self.config.provider.clone(),
             model: self.config.model.clone(),
-            completed_turns: self.history.len() / 2,
+            completed_turns: self.completed_turns,
             stored_messages: self.history.len(),
+            transcript_events: self.transcript.len(),
         }
     }
 
-    pub fn respond<H: AgentToolHost + ?Sized>(
+    pub fn transcript(&self) -> &[AgentTranscriptEntry] {
+        &self.transcript
+    }
+
+    pub fn tool_execution_summary(&self) -> AgentToolExecutionSummary {
+        let mut tool_names = BTreeSet::new();
+        let mut total_calls = 0usize;
+        let mut successful_calls = 0usize;
+        let mut failed_calls = 0usize;
+        for entry in &self.transcript {
+            let AgentTranscriptEntry::Tool { name, ok, .. } = entry else {
+                continue;
+            };
+            total_calls += 1;
+            if *ok {
+                successful_calls += 1;
+            } else {
+                failed_calls += 1;
+            }
+            tool_names.insert(name.clone());
+        }
+        AgentToolExecutionSummary {
+            total_calls,
+            successful_calls,
+            failed_calls,
+            tool_names: tool_names.into_iter().collect(),
+        }
+    }
+
+    pub fn respond<B: AgentBackend + ?Sized>(
         &mut self,
-        host: &H,
+        backend: &mut B,
         user_input: &str,
-    ) -> Result<ShellAgentReply, RuntimeError> {
+    ) -> Result<AgentReply, RuntimeError> {
         let trimmed = user_input.trim();
         if trimmed.is_empty() {
             return Err(RuntimeError::InvalidArgument {
@@ -217,15 +318,17 @@ impl ShellAgentSession {
         let mut messages = Vec::with_capacity(self.history.len() + 3);
         messages.push(json!({
             "role": "system",
-            "content": shell_agent_system_prompt(),
+            "content": backend.system_prompt(),
         }));
         messages.extend(self.history.clone());
         messages.push(json!({
             "role": "user",
             "content": trimmed,
         }));
+        self.transcript.push(AgentTranscriptEntry::User {
+            content: trimmed.to_string(),
+        });
 
-        let tools = shell_agent_tools();
         let turn_started = Instant::now();
         let mut tool_events = Vec::new();
 
@@ -233,7 +336,7 @@ impl ShellAgentSession {
             if turn_started.elapsed() >= Duration::from_millis(self.config.timeout_ms) {
                 return Err(RuntimeError::LlmResponseInvalid {
                     message: format!(
-                        "shell agent exceeded total response budget after {} tool turns; elapsed_ms={} timeout_ms={}",
+                        "agent exceeded total response budget after {} tool turns; elapsed_ms={} timeout_ms={}",
                         turn,
                         turn_started.elapsed().as_millis(),
                         self.config.timeout_ms,
@@ -241,12 +344,14 @@ impl ShellAgentSession {
                 });
             }
 
+            let tool_specs = backend.tool_specs();
             emit_agent_diagnostic(format!(
-                "agent_turn_start turn={} elapsed_ms={} messages={} tools={}",
+                "agent_turn_start kind={} turn={} elapsed_ms={} messages={} tools={}",
+                self.kind,
                 turn + 1,
                 turn_started.elapsed().as_millis(),
                 messages.len(),
-                tools.len(),
+                tool_specs.len(),
             ));
 
             let request_body = json!({
@@ -254,14 +359,15 @@ impl ShellAgentSession {
                 "messages": messages,
                 "temperature": self.config.temperature,
                 "max_tokens": self.config.max_tokens,
-                "tools": tools,
+                "tools": tool_specs_to_request_payload(&tool_specs),
                 "tool_choice": "auto",
             });
             let (message, response_id, finish_reason) =
                 self.send_chat_request(endpoint.clone(), request_body)?;
 
             emit_agent_diagnostic(format!(
-                "agent_turn_result turn={} response_id={} tool_calls={} content_chars={} reasoning_chars={} finish_reason={}",
+                "agent_turn_result kind={} turn={} response_id={} tool_calls={} content_chars={} reasoning_chars={} finish_reason={}",
+                self.kind,
                 turn + 1,
                 response_id.as_deref().unwrap_or("-"),
                 message.tool_calls.len(),
@@ -272,8 +378,20 @@ impl ShellAgentSession {
 
             if !message.tool_calls.is_empty() {
                 messages.push(message.to_request_message());
+                let available_tools = tool_specs
+                    .iter()
+                    .map(|tool| tool.name.to_string())
+                    .collect::<BTreeSet<_>>();
                 for tool_call in &message.tool_calls {
-                    let (event, tool_output) = execute_agent_tool_call(host, tool_call)?;
+                    let (event, tool_output) =
+                        execute_agent_tool_call(backend, &available_tools, &self.kind, tool_call);
+                    self.transcript.push(AgentTranscriptEntry::Tool {
+                        name: event.name.clone(),
+                        arguments: event.arguments.clone(),
+                        ok: event.ok,
+                        output: event.output.clone(),
+                        error: event.error.clone(),
+                    });
                     tool_events.push(event);
                     messages.push(json!({
                         "role": "tool",
@@ -291,7 +409,12 @@ impl ShellAgentSession {
                 .filter(|content| !content.is_empty())
             {
                 self.remember_exchange(trimmed, content);
-                return Ok(ShellAgentReply {
+                self.completed_turns += 1;
+                self.transcript.push(AgentTranscriptEntry::Assistant {
+                    content: content.to_string(),
+                    response_id: response_id.clone(),
+                });
+                return Ok(AgentReply {
                     response_id,
                     content: content.to_string(),
                     tool_events,
@@ -309,17 +432,25 @@ impl ShellAgentSession {
             }
 
             return Err(RuntimeError::LlmResponseInvalid {
-                message: "shell agent response had neither tool_calls nor final content"
-                    .to_string(),
+                message: "agent response had neither tool_calls nor final content".to_string(),
             });
         }
 
         Err(RuntimeError::LlmResponseInvalid {
             message: format!(
-                "shell agent exceeded safety turn limit {} without producing a final response",
+                "agent exceeded safety turn limit {} without producing a final response",
                 AGENT_MAX_TOOL_TURNS
             ),
         })
+    }
+
+    pub fn respond_with_runtime_host<H: AgentToolHost + ?Sized>(
+        &mut self,
+        host: &H,
+        user_input: &str,
+    ) -> Result<AgentReply, RuntimeError> {
+        let mut backend = RuntimeShellAgentBackend { host };
+        self.respond(&mut backend, user_input)
     }
 
     fn remember_exchange(&mut self, user_input: &str, assistant_output: &str) {
@@ -488,6 +619,44 @@ impl ShellAgentSession {
                 request_summary
             ),
         })
+    }
+}
+
+impl ShellAgentSession {
+    pub fn new(config: LlmApiConfig) -> Result<Self, RuntimeError> {
+        Ok(Self {
+            inner: AgentSession::new(config, "runtime_shell")?,
+        })
+    }
+
+    pub fn reset(&mut self) {
+        self.inner.reset();
+    }
+
+    pub fn status(&self) -> ShellAgentStatus {
+        self.inner.status()
+    }
+
+    pub fn transcript(&self) -> &[AgentTranscriptEntry] {
+        self.inner.transcript()
+    }
+
+    pub fn tool_execution_summary(&self) -> AgentToolExecutionSummary {
+        self.inner.tool_execution_summary()
+    }
+
+    pub fn respond<H: AgentToolHost + ?Sized>(
+        &mut self,
+        host: &H,
+        user_input: &str,
+    ) -> Result<ShellAgentReply, RuntimeError> {
+        self.inner.respond_with_runtime_host(host, user_input)
+    }
+
+    #[cfg(test)]
+    fn remember_exchange(&mut self, user_input: &str, assistant_output: &str) {
+        self.inner.remember_exchange(user_input, assistant_output);
+        self.inner.completed_turns += 1;
     }
 }
 
@@ -739,94 +908,101 @@ struct ExecuteTargetArgs {
     payload_json: Value,
 }
 
-fn execute_agent_tool_call<H: AgentToolHost + ?Sized>(
-    host: &H,
+fn execute_agent_tool_call<B: AgentBackend + ?Sized>(
+    backend: &mut B,
+    available_tools: &BTreeSet<String>,
+    session_kind: &str,
     tool_call: &ToolCall,
-) -> Result<(AgentToolEvent, String), RuntimeError> {
+) -> (AgentToolEvent, String) {
+    let tool_name = tool_call.function.name.clone();
+    if !available_tools.contains(&tool_name) {
+        let error = json!({
+            "ok": false,
+            "error": format!(
+                "tool {tool_name} is not available in the current {} scope",
+                backend.tool_scope_label()
+            ),
+            "session_kind": session_kind,
+            "available_tools": available_tools.iter().cloned().collect::<Vec<_>>(),
+        });
+        return (
+            AgentToolEvent {
+                name: tool_name,
+                arguments: json!({}),
+                ok: false,
+                output: None,
+                error: error
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string),
+            },
+            error.to_string(),
+        );
+    }
+
     let args_json = if tool_call.function.arguments.trim().is_empty() {
         json!({})
     } else {
-        serde_json::from_str::<Value>(&tool_call.function.arguments).map_err(|err| {
-            RuntimeError::LlmResponseInvalid {
-                message: format!(
-                    "shell agent tool {} received invalid JSON arguments: {err}",
-                    tool_call.function.name
-                ),
+        match serde_json::from_str::<Value>(&tool_call.function.arguments) {
+            Ok(value) => value,
+            Err(err) => {
+                let error = json!({
+                    "ok": false,
+                    "error": format!(
+                        "tool {tool_name} received invalid JSON arguments: {err}"
+                    ),
+                });
+                return (
+                    AgentToolEvent {
+                        name: tool_name,
+                        arguments: json!({}),
+                        ok: false,
+                        output: None,
+                        error: error
+                            .get("error")
+                            .and_then(Value::as_str)
+                            .map(ToString::to_string),
+                    },
+                    error.to_string(),
+                );
             }
-        })?
+        }
     };
 
-    let output = match tool_call.function.name.as_str() {
-        AGENT_TOOL_GET_RUNTIME_STATUS => {
-            parse_tool_arguments::<EmptyArgs>(
-                &tool_call.function.arguments,
-                &tool_call.function.name,
-            )?;
-            host.agent_runtime_status()?
-        }
-        AGENT_TOOL_LIST_PLUGINS => {
-            parse_tool_arguments::<EmptyArgs>(
-                &tool_call.function.arguments,
-                &tool_call.function.name,
-            )?;
-            host.agent_list_plugins()?
-        }
-        AGENT_TOOL_LIST_NODES => {
-            parse_tool_arguments::<EmptyArgs>(
-                &tool_call.function.arguments,
-                &tool_call.function.name,
-            )?;
-            host.agent_list_nodes()?
-        }
-        AGENT_TOOL_GET_KERNEL_STATUS => {
-            parse_tool_arguments::<EmptyArgs>(
-                &tool_call.function.arguments,
-                &tool_call.function.name,
-            )?;
-            host.agent_kernel_status()?
-        }
-        AGENT_TOOL_GET_KERNEL_ISSUES => {
-            parse_tool_arguments::<EmptyArgs>(
-                &tool_call.function.arguments,
-                &tool_call.function.name,
-            )?;
-            host.agent_kernel_issues()?
-        }
-        AGENT_TOOL_RELOAD_RUNTIME => {
-            parse_tool_arguments::<EmptyArgs>(
-                &tool_call.function.arguments,
-                &tool_call.function.name,
-            )?;
-            host.agent_reload_runtime()?
-        }
-        AGENT_TOOL_INVOKE_PLUGIN => {
-            let args = parse_tool_arguments::<InvokePluginArgs>(
-                &tool_call.function.arguments,
-                &tool_call.function.name,
-            )?;
-            host.agent_invoke_plugin(&args.plugin_path, &args.node_id, args.payload_json)?
-        }
-        AGENT_TOOL_EXECUTE_TARGET => {
-            let args = parse_tool_arguments::<ExecuteTargetArgs>(
-                &tool_call.function.arguments,
-                &tool_call.function.name,
-            )?;
-            host.agent_execute_target(&args.node_fqn, args.payload_json)?
-        }
-        other => {
-            return Err(RuntimeError::LlmResponseInvalid {
-                message: format!("shell agent returned unsupported tool call: {other}"),
+    match backend.execute_tool(&tool_name, args_json.clone()) {
+        Ok(output) => {
+            let wrapped = json!({
+                "ok": true,
+                "result": output,
             });
+            (
+                AgentToolEvent {
+                    name: tool_name,
+                    arguments: args_json,
+                    ok: true,
+                    output: wrapped.get("result").cloned(),
+                    error: None,
+                },
+                wrapped.to_string(),
+            )
         }
-    };
-
-    Ok((
-        AgentToolEvent {
-            name: tool_call.function.name.clone(),
-            arguments: args_json,
-        },
-        output.to_string(),
-    ))
+        Err(err) => {
+            let wrapped = json!({
+                "ok": false,
+                "error": err.to_string(),
+            });
+            (
+                AgentToolEvent {
+                    name: tool_name,
+                    arguments: args_json,
+                    ok: false,
+                    output: None,
+                    error: Some(err.to_string()),
+                },
+                wrapped.to_string(),
+            )
+        }
+    }
 }
 
 fn read_chat_stream(
@@ -949,119 +1125,171 @@ fn process_stream_event(
     Ok(false)
 }
 
-fn shell_agent_tools() -> Vec<Value> {
+struct RuntimeShellAgentBackend<'a, H: AgentToolHost + ?Sized> {
+    host: &'a H,
+}
+
+impl<'a, H: AgentToolHost + ?Sized> AgentBackend for RuntimeShellAgentBackend<'a, H> {
+    fn system_prompt(&self) -> String {
+        shell_agent_system_prompt().to_string()
+    }
+
+    fn tool_specs(&self) -> Vec<AgentToolSpec> {
+        shell_agent_tools()
+    }
+
+    fn execute_tool(&mut self, name: &str, arguments: Value) -> Result<Value, RuntimeError> {
+        match name {
+            AGENT_TOOL_GET_RUNTIME_STATUS => {
+                parse_tool_value_arguments::<EmptyArgs>(arguments, name)?;
+                self.host.agent_runtime_status()
+            }
+            AGENT_TOOL_LIST_PLUGINS => {
+                parse_tool_value_arguments::<EmptyArgs>(arguments, name)?;
+                self.host.agent_list_plugins()
+            }
+            AGENT_TOOL_LIST_NODES => {
+                parse_tool_value_arguments::<EmptyArgs>(arguments, name)?;
+                self.host.agent_list_nodes()
+            }
+            AGENT_TOOL_GET_KERNEL_STATUS => {
+                parse_tool_value_arguments::<EmptyArgs>(arguments, name)?;
+                self.host.agent_kernel_status()
+            }
+            AGENT_TOOL_GET_KERNEL_ISSUES => {
+                parse_tool_value_arguments::<EmptyArgs>(arguments, name)?;
+                self.host.agent_kernel_issues()
+            }
+            AGENT_TOOL_RELOAD_RUNTIME => {
+                parse_tool_value_arguments::<EmptyArgs>(arguments, name)?;
+                self.host.agent_reload_runtime()
+            }
+            AGENT_TOOL_INVOKE_PLUGIN => {
+                let args = parse_tool_value_arguments::<InvokePluginArgs>(arguments, name)?;
+                self.host
+                    .agent_invoke_plugin(&args.plugin_path, &args.node_id, args.payload_json)
+            }
+            AGENT_TOOL_EXECUTE_TARGET => {
+                let args = parse_tool_value_arguments::<ExecuteTargetArgs>(arguments, name)?;
+                self.host
+                    .agent_execute_target(&args.node_fqn, args.payload_json)
+            }
+            other => Err(RuntimeError::InvalidArgument {
+                message: format!("runtime shell agent does not support tool {other}"),
+            }),
+        }
+    }
+
+    fn tool_scope_label(&self) -> String {
+        "runtime_shell".to_string()
+    }
+}
+
+fn tool_specs_to_request_payload(specs: &[AgentToolSpec]) -> Vec<Value> {
+    specs
+        .iter()
+        .map(|tool| {
+            json!({
+                "type": "function",
+                "function": {
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": tool.parameters,
+                },
+            })
+        })
+        .collect()
+}
+
+fn shell_agent_tools() -> Vec<AgentToolSpec> {
     vec![
-        json!({
-            "type": "function",
-            "function": {
-                "name": AGENT_TOOL_GET_RUNTIME_STATUS,
-                "description": "Get the current runtime host status, snapshot ids, candidate status, and recent reload reports.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {},
-                    "additionalProperties": false,
+        AgentToolSpec {
+            name: AGENT_TOOL_GET_RUNTIME_STATUS,
+            description: "Get the current runtime host status, snapshot ids, candidate status, and recent reload reports.",
+            parameters: json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false,
+            }),
+        },
+        AgentToolSpec {
+            name: AGENT_TOOL_LIST_PLUGINS,
+            description: "List currently registered plugins, their load status, parent relationship, and known node ids.",
+            parameters: json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false,
+            }),
+        },
+        AgentToolSpec {
+            name: AGENT_TOOL_LIST_NODES,
+            description: "List currently registered node FQNs so you can choose a valid execute target.",
+            parameters: json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false,
+            }),
+        },
+        AgentToolSpec {
+            name: AGENT_TOOL_GET_KERNEL_STATUS,
+            description: "Get kernel status including plugin issue counts and blocked iteration counts.",
+            parameters: json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false,
+            }),
+        },
+        AgentToolSpec {
+            name: AGENT_TOOL_GET_KERNEL_ISSUES,
+            description: "List observed kernel plugin issues that may require iteration or reload investigation.",
+            parameters: json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false,
+            }),
+        },
+        AgentToolSpec {
+            name: AGENT_TOOL_RELOAD_RUNTIME,
+            description: "Reload the runtime snapshot and return the full reload diagnostics report.",
+            parameters: json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false,
+            }),
+        },
+        AgentToolSpec {
+            name: AGENT_TOOL_INVOKE_PLUGIN,
+            description: "Invoke a plugin node directly by plugin path and node id.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "plugin_path": { "type": "string" },
+                    "node_id": { "type": "string" },
+                    "payload_json": {
+                        "type": "object",
+                        "description": "JSON object payload for the plugin invoke request."
+                    }
                 },
-            },
-        }),
-        json!({
-            "type": "function",
-            "function": {
-                "name": AGENT_TOOL_LIST_PLUGINS,
-                "description": "List currently registered plugins, their load status, parent relationship, and known node ids.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {},
-                    "additionalProperties": false,
+                "required": ["plugin_path", "node_id", "payload_json"],
+                "additionalProperties": false,
+            }),
+        },
+        AgentToolSpec {
+            name: AGENT_TOOL_EXECUTE_TARGET,
+            description: "Execute a registered node target through the runtime execution engine.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "node_fqn": { "type": "string" },
+                    "payload_json": {
+                        "type": "object",
+                        "description": "JSON object payload for the execute request."
+                    }
                 },
-            },
-        }),
-        json!({
-            "type": "function",
-            "function": {
-                "name": AGENT_TOOL_LIST_NODES,
-                "description": "List currently registered node FQNs so you can choose a valid execute target.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {},
-                    "additionalProperties": false,
-                },
-            },
-        }),
-        json!({
-            "type": "function",
-            "function": {
-                "name": AGENT_TOOL_GET_KERNEL_STATUS,
-                "description": "Get kernel status including plugin issue counts and blocked iteration counts.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {},
-                    "additionalProperties": false,
-                },
-            },
-        }),
-        json!({
-            "type": "function",
-            "function": {
-                "name": AGENT_TOOL_GET_KERNEL_ISSUES,
-                "description": "List observed kernel plugin issues that may require iteration or reload investigation.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {},
-                    "additionalProperties": false,
-                },
-            },
-        }),
-        json!({
-            "type": "function",
-            "function": {
-                "name": AGENT_TOOL_RELOAD_RUNTIME,
-                "description": "Reload the runtime snapshot and return the full reload diagnostics report.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {},
-                    "additionalProperties": false,
-                },
-            },
-        }),
-        json!({
-            "type": "function",
-            "function": {
-                "name": AGENT_TOOL_INVOKE_PLUGIN,
-                "description": "Invoke a plugin node directly by plugin path and node id.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "plugin_path": { "type": "string" },
-                        "node_id": { "type": "string" },
-                        "payload_json": {
-                            "type": "object",
-                            "description": "JSON object payload for the plugin invoke request."
-                        }
-                    },
-                    "required": ["plugin_path", "node_id", "payload_json"],
-                    "additionalProperties": false,
-                },
-            },
-        }),
-        json!({
-            "type": "function",
-            "function": {
-                "name": AGENT_TOOL_EXECUTE_TARGET,
-                "description": "Execute a registered node target through the runtime execution engine.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "node_fqn": { "type": "string" },
-                        "payload_json": {
-                            "type": "object",
-                            "description": "JSON object payload for the execute request."
-                        }
-                    },
-                    "required": ["node_fqn", "payload_json"],
-                    "additionalProperties": false,
-                },
-            },
-        }),
+                "required": ["node_fqn", "payload_json"],
+                "additionalProperties": false,
+            }),
+        },
     ]
 }
 
@@ -1190,16 +1418,11 @@ fn parse_json_or_string(text: &str) -> Value {
     serde_json::from_str(text).unwrap_or_else(|_| Value::String(text.to_string()))
 }
 
-fn parse_tool_arguments<T>(raw_args: &str, tool_name: &str) -> Result<T, RuntimeError>
+fn parse_tool_value_arguments<T>(args: Value, tool_name: &str) -> Result<T, RuntimeError>
 where
     T: DeserializeOwned,
 {
-    let normalized = if raw_args.trim().is_empty() {
-        "{}"
-    } else {
-        raw_args
-    };
-    serde_json::from_str::<T>(normalized).map_err(|err| RuntimeError::LlmResponseInvalid {
+    serde_json::from_value::<T>(args).map_err(|err| RuntimeError::LlmResponseInvalid {
         message: format!("shell agent tool {tool_name} had invalid arguments: {err}"),
     })
 }

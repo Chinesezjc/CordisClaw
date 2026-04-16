@@ -1,3 +1,7 @@
+use crate::agent::{
+    AgentBackend, AgentReply, AgentSession, AgentSessionStatus, AgentToolExecutionSummary,
+    AgentToolSpec, AgentTranscriptEntry,
+};
 use crate::config::{LlmApiConfig, PluginConfigFile, RuntimeConfig};
 use crate::context::RuntimeContext;
 use crate::core::error::RuntimeError;
@@ -14,10 +18,11 @@ use crate::kernel::auto_update::{
 };
 use crate::kernel::evaluator::{EvalHarness, VerificationInput};
 use crate::kernel::memory::{ChangeMemory, ChangeRecord};
-use crate::kernel::planner::{LlmPatchPlanner, PlanRequest, PlannedUpdate, PluginPlanRequest};
+use crate::kernel::planner::{LlmPatchPlanner, PlanRequest, PlannedUpdate};
 use crate::kernel::plugin_iteration::{
-    now_ms, CanaryReport, CanaryVerdict, KernelPluginIssue, KernelPluginIssueSource,
-    KernelPluginIssueStatus, KernelPluginIterationRequest, PluginEditExecutor, PluginEditPlan,
+    file_sha256, normalize_rel_path, now_ms, CanaryReport, CanaryVerdict, KernelPluginIssue,
+    KernelPluginIssueSource, KernelPluginIssueStatus, KernelPluginIterationRequest,
+    PluginEditExecutor, PluginEditOpKind, PluginEditOperation, PluginEditPlan, PluginEditRollback,
     PluginIterationFinalVerdict, PluginIterationHistoryEntry, PluginIterationNetSpec,
     PluginIterationPolicy, PluginIterationStatus, VerifierVerdict,
 };
@@ -33,14 +38,17 @@ use crate::plugin::registry::{NodeRegistry, PluginRegistry, RegisteredPlugin};
 use crate::plugin::tooling::rebuild_plugin_workspace;
 use crate::service::doc_registry::DocRegistry;
 use crate::service::graph_registry::{GraphRegistry, RegisteredNet, RegisteredNetEdgeKind};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use toml::Value as TomlValue;
 
 #[derive(Debug, Clone)]
 pub struct RuntimeSnapshot {
@@ -368,7 +376,10 @@ pub struct KernelPluginIterationResult {
     pub target_plugin_paths: Vec<String>,
     pub source: Option<KernelPluginIssueSource>,
     pub summary: String,
-    pub planned_edit_plan: PluginEditPlan,
+    pub agent_session_id: Option<String>,
+    pub tool_execution_summary: Option<AgentToolExecutionSummary>,
+    pub derived_edit_plan: PluginEditPlan,
+    pub transcript_excerpt: Vec<AgentTranscriptEntry>,
     pub changed_paths: Vec<String>,
     pub rebuilt_artifacts: Vec<(String, String)>,
     pub candidate: Option<CandidateSnapshotStatus>,
@@ -388,6 +399,7 @@ struct PreparedPluginIteration {
     target_plugin_paths: Vec<String>,
     source: Option<KernelPluginIssueSource>,
     summary: String,
+    #[allow(dead_code)]
     manual_approved: bool,
     tests_command: Option<String>,
     safety_command: Option<String>,
@@ -929,6 +941,7 @@ pub struct RuntimeHost {
     retired_snapshots: Mutex<Vec<RetiredSnapshot>>,
     last_reload_attempt: Mutex<Option<ReloadAttemptReport>>,
     last_candidate_reload_attempt: Mutex<Option<ReloadAttemptReport>>,
+    agent_sessions: Mutex<BTreeMap<String, ManagedAgentSession>>,
     kernel: RuntimeKernel,
 }
 
@@ -942,6 +955,100 @@ struct RetiredSnapshot {
 struct StagedCandidateSnapshot {
     snapshot: Arc<RuntimeSnapshot>,
     status: CandidateSnapshotStatus,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentSessionKind {
+    RuntimeShell,
+    PluginIteration,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentSessionHandle {
+    pub session_id: String,
+    pub kind: AgentSessionKind,
+}
+
+#[derive(Debug)]
+struct ManagedAgentSession {
+    #[allow(dead_code)]
+    handle: AgentSessionHandle,
+    session: AgentSession,
+    state: ManagedAgentState,
+}
+
+#[derive(Debug)]
+enum ManagedAgentState {
+    RuntimeShell,
+    PluginIteration(PluginIterationAgentState),
+}
+
+#[derive(Debug, Clone)]
+struct PluginIterationAgentSnapshot {
+    tests_command: Option<String>,
+    safety_command: Option<String>,
+    changed_paths: Vec<String>,
+    rollback: PluginEditRollback,
+    derived_edit_plan: PluginEditPlan,
+}
+
+#[derive(Debug, Clone)]
+struct PluginIterationAgentState {
+    prepared: PreparedPluginIteration,
+    context_paths: Vec<String>,
+    recorded_summary: Option<String>,
+    tests_command: Option<String>,
+    safety_command: Option<String>,
+    verification_runs: usize,
+    rollback: PluginEditRollback,
+    operations: Vec<PluginEditOperation>,
+}
+
+#[derive(Debug, Clone)]
+struct PluginIterationAgentRun {
+    session_id: Option<String>,
+    tool_summary: Option<AgentToolExecutionSummary>,
+    transcript_excerpt: Vec<AgentTranscriptEntry>,
+    snapshot: PluginIterationAgentSnapshot,
+}
+
+impl PluginIterationAgentState {
+    fn new(
+        prepared: PreparedPluginIteration,
+        context_paths: Vec<String>,
+        workspace_root: &Path,
+    ) -> Self {
+        Self {
+            prepared,
+            context_paths,
+            recorded_summary: None,
+            tests_command: None,
+            safety_command: None,
+            verification_runs: 0,
+            rollback: PluginEditRollback::empty(workspace_root),
+            operations: Vec::new(),
+        }
+    }
+
+    fn snapshot(&self) -> PluginIterationAgentSnapshot {
+        let derived_edit_plan = PluginEditPlan {
+            issue_id: self.prepared.issue_id.clone(),
+            patch_id: format!("{}-agent", self.prepared.iteration_id),
+            summary: self
+                .recorded_summary
+                .clone()
+                .unwrap_or_else(|| self.prepared.summary.clone()),
+            operations: self.operations.clone(),
+        };
+        PluginIterationAgentSnapshot {
+            tests_command: self.tests_command.clone(),
+            safety_command: self.safety_command.clone(),
+            changed_paths: derived_edit_plan.changed_paths(),
+            rollback: self.rollback.clone(),
+            derived_edit_plan,
+        }
+    }
 }
 
 impl RuntimeHost {
@@ -971,6 +1078,7 @@ impl RuntimeHost {
             retired_snapshots: Mutex::new(Vec::new()),
             last_reload_attempt: Mutex::new(None),
             last_candidate_reload_attempt: Mutex::new(None),
+            agent_sessions: Mutex::new(BTreeMap::new()),
         })
     }
 
@@ -987,6 +1095,137 @@ impl RuntimeHost {
             .read()
             .unwrap_or_else(|poison| poison.into_inner())
             .clone()
+    }
+
+    pub fn agent_start(&self, kind: AgentSessionKind) -> Result<AgentSessionHandle, RuntimeError> {
+        let handle = AgentSessionHandle {
+            session_id: normalize_request_id(None, "agent-session"),
+            kind,
+        };
+        let session_kind_label = match kind {
+            AgentSessionKind::RuntimeShell => "runtime_shell",
+            AgentSessionKind::PluginIteration => "plugin_iteration",
+        };
+        let state = match kind {
+            AgentSessionKind::RuntimeShell => ManagedAgentState::RuntimeShell,
+            AgentSessionKind::PluginIteration => {
+                return Err(RuntimeError::InvalidArgument {
+                    message: "plugin_iteration agent sessions must be started by iterate_plugins"
+                        .to_string(),
+                });
+            }
+        };
+        let session = AgentSession::new(self.config.llm_api.clone(), session_kind_label)?;
+        self.agent_sessions
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .insert(
+                handle.session_id.clone(),
+                ManagedAgentSession {
+                    handle: handle.clone(),
+                    session,
+                    state,
+                },
+            );
+        Ok(handle)
+    }
+
+    pub fn agent_send(&self, session_id: &str, input: &str) -> Result<AgentReply, RuntimeError> {
+        let mut session = {
+            let mut guard = self
+                .agent_sessions
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            guard
+                .remove(session_id)
+                .ok_or_else(|| RuntimeError::AgentSessionNotFound {
+                    session_id: session_id.to_string(),
+                })?
+        };
+        let result = session.respond(self, input);
+        self.agent_sessions
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .insert(session_id.to_string(), session);
+        result
+    }
+
+    pub fn agent_status(&self, session_id: &str) -> Result<AgentSessionStatus, RuntimeError> {
+        let guard = self
+            .agent_sessions
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let session = guard
+            .get(session_id)
+            .ok_or_else(|| RuntimeError::AgentSessionNotFound {
+                session_id: session_id.to_string(),
+            })?;
+        Ok(session.session.status())
+    }
+
+    pub fn agent_transcript(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<AgentTranscriptEntry>, RuntimeError> {
+        let guard = self
+            .agent_sessions
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let session = guard
+            .get(session_id)
+            .ok_or_else(|| RuntimeError::AgentSessionNotFound {
+                session_id: session_id.to_string(),
+            })?;
+        Ok(session.session.transcript().to_vec())
+    }
+
+    fn start_plugin_iteration_agent_session(
+        &self,
+        prepared: PreparedPluginIteration,
+        context_paths: Vec<String>,
+    ) -> Result<String, RuntimeError> {
+        let session_id = normalize_request_id(None, "plugin-agent-session");
+        let session = AgentSession::new(self.config.llm_api.clone(), "plugin_iteration")?;
+        self.agent_sessions
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .insert(
+                session_id.clone(),
+                ManagedAgentSession {
+                    handle: AgentSessionHandle {
+                        session_id: session_id.clone(),
+                        kind: AgentSessionKind::PluginIteration,
+                    },
+                    session,
+                    state: ManagedAgentState::PluginIteration(PluginIterationAgentState::new(
+                        prepared,
+                        context_paths,
+                        &self.fixtures_root,
+                    )),
+                },
+            );
+        Ok(session_id)
+    }
+
+    fn plugin_iteration_agent_snapshot(
+        &self,
+        session_id: &str,
+    ) -> Result<PluginIterationAgentSnapshot, RuntimeError> {
+        let guard = self
+            .agent_sessions
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let managed = guard
+            .get(session_id)
+            .ok_or_else(|| RuntimeError::AgentSessionNotFound {
+                session_id: session_id.to_string(),
+            })?;
+        let ManagedAgentState::PluginIteration(state) = &managed.state else {
+            return Err(RuntimeError::InvalidArgument {
+                message: format!("agent session {session_id} is not a plugin iteration session"),
+            });
+        };
+        Ok(state.snapshot())
     }
 
     pub fn status(&self) -> RuntimeHostStatus {
@@ -1344,35 +1583,37 @@ impl RuntimeHost {
                         "target_plugin_paths": state.prepared.target_plugin_paths,
                     })),
                     "plan" => (|| {
-                        let (plan, planner_tests_command, planner_safety_command) =
-                            self.plan_plugin_iteration(&state.prepared)?;
-                        state.planned = Some(plan.clone());
-                        state.planner_tests_command = planner_tests_command;
-                        state.planner_safety_command = planner_safety_command;
+                        let agent = self.run_plugin_iteration_agent(&state.prepared)?;
+                        state.agent_session_id = agent.session_id;
+                        state.tool_execution_summary = agent.tool_summary;
+                        state.derived_edit_plan = Some(agent.snapshot.derived_edit_plan.clone());
+                        state.transcript_excerpt = agent.transcript_excerpt;
+                        state.rollback = Some(agent.snapshot.rollback);
+                        state.changed_paths = agent.snapshot.changed_paths;
+                        state.diff_lines = agent.snapshot.derived_edit_plan.diff_lines();
+                        state.tests_command = agent.snapshot.tests_command;
+                        state.safety_command = agent.snapshot.safety_command;
                         Ok(json!({
-                            "planned_operation_count": plan.operations.len(),
+                            "agent_session_id": state.agent_session_id,
+                            "planned_operation_count": state
+                                .derived_edit_plan
+                                .as_ref()
+                                .map(|plan| plan.operations.len())
+                                .unwrap_or(0),
+                            "tool_execution_summary": state.tool_execution_summary,
                         }))
                     })(),
                     "edit" => (|| {
-                        let plan = state.planned.as_ref().ok_or_else(|| RuntimeError::Invariant {
-                            message: "plugin iteration plan missing".to_string(),
+                        let rollback = state.rollback.as_ref().ok_or_else(|| RuntimeError::Invariant {
+                            message: "plugin iteration rollback journal missing after agent execution".to_string(),
                         })?;
-                        let executor = PluginEditExecutor::new(&self.fixtures_root);
-                        let (apply_result, rollback) = executor.execute(
-                            &self.kernel.plugin_iteration_policy,
-                            &state.prepared.allowed_plugin_roots,
-                            plan,
-                        )?;
                         rollback.persist_journal(
                             &plugin_iteration_journal_path(&self.snapshot_root),
                             &state.prepared.iteration_id,
                         )?;
-                        state.rollback = Some(rollback);
-                        state.changed_paths = apply_result.changed_paths.clone();
-                        state.diff_lines = apply_result.diff_lines;
                         Ok(json!({
-                            "changed_paths": apply_result.changed_paths,
-                            "diff_lines": apply_result.diff_lines,
+                            "changed_paths": state.changed_paths,
+                            "diff_lines": state.diff_lines,
                         }))
                     })(),
                     "rebuild" => (|| {
@@ -1477,44 +1718,71 @@ impl RuntimeHost {
         }
     }
 
-    fn plan_plugin_iteration(
+    fn run_plugin_iteration_agent(
         &self,
         prepared: &PreparedPluginIteration,
-    ) -> Result<(PluginEditPlan, Option<String>, Option<String>), RuntimeError> {
+    ) -> Result<PluginIterationAgentRun, RuntimeError> {
         if let Some(plan) = &prepared.edit_plan {
             self.kernel
                 .plugin_iteration_policy
                 .validate_plan(&prepared.allowed_plugin_roots, plan)?;
-            return Ok((
-                plan.clone(),
-                prepared.tests_command.clone(),
-                prepared.safety_command.clone(),
-            ));
+            let mut rollback = PluginEditRollback::empty(&self.fixtures_root);
+            let executor = PluginEditExecutor::new(&self.fixtures_root);
+            for (idx, operation) in plan.operations.iter().enumerate() {
+                let single = PluginEditPlan {
+                    issue_id: plan.issue_id.clone(),
+                    patch_id: format!("{}-manual-{idx}", prepared.iteration_id),
+                    summary: plan.summary.clone(),
+                    operations: vec![operation.clone()],
+                };
+                let (_, op_rollback) = executor.execute(
+                    &self.kernel.plugin_iteration_policy,
+                    &prepared.allowed_plugin_roots,
+                    &single,
+                )?;
+                rollback.absorb(op_rollback)?;
+            }
+            return Ok(PluginIterationAgentRun {
+                session_id: None,
+                tool_summary: None,
+                transcript_excerpt: Vec::new(),
+                snapshot: PluginIterationAgentSnapshot {
+                    tests_command: prepared.tests_command.clone(),
+                    safety_command: prepared.safety_command.clone(),
+                    changed_paths: plan.changed_paths(),
+                    rollback,
+                    derived_edit_plan: plan.clone(),
+                },
+            });
         }
-        let instruction = prepared
-            .instruction
-            .clone()
-            .unwrap_or_else(|| prepared.summary.clone());
-        let planner = LlmPatchPlanner::new(self.config.llm_api.clone())?;
         let context_paths = collect_plugin_context_paths(
             &self.fixtures_root,
             prepared.allowed_plugin_roots.values(),
         )?;
-        let planned = planner.plan_plugin_edits(
-            &self.fixtures_root,
-            PluginPlanRequest {
-                issue_id: prepared.issue_id.clone(),
-                patch_id: format!("{}-plan", prepared.iteration_id),
-                instruction,
-                context_paths,
-                writable_roots: prepared.allowed_plugin_roots.values().cloned().collect(),
-                manual_approved: prepared.manual_approved,
-            },
-        )?;
-        self.kernel
-            .plugin_iteration_policy
-            .validate_plan(&prepared.allowed_plugin_roots, &planned.plan)?;
-        Ok((planned.plan, planned.tests_command, planned.safety_command))
+        let session_id =
+            self.start_plugin_iteration_agent_session(prepared.clone(), context_paths)?;
+        let input = prepared
+            .instruction
+            .clone()
+            .unwrap_or_else(|| prepared.summary.clone());
+        let _reply = self.agent_send(&session_id, &input)?;
+        let snapshot = self.plugin_iteration_agent_snapshot(&session_id)?;
+        let transcript = self.agent_transcript(&session_id)?;
+        let transcript_excerpt = transcript.into_iter().rev().take(12).collect::<Vec<_>>();
+        let transcript_excerpt = transcript_excerpt.into_iter().rev().collect::<Vec<_>>();
+        let tool_summary = self.agent_status(&session_id).ok().and_then(|_| {
+            self.agent_sessions
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .get(&session_id)
+                .map(|managed| managed.session.tool_execution_summary())
+        });
+        Ok(PluginIterationAgentRun {
+            session_id: Some(session_id),
+            tool_summary,
+            transcript_excerpt,
+            snapshot,
+        })
     }
 
     fn verify_plugin_iteration(
@@ -1522,16 +1790,14 @@ impl RuntimeHost {
         state: &PluginIterationRunState,
     ) -> Result<VerificationReport, RuntimeError> {
         let tests_command = state
-            .prepared
             .tests_command
             .clone()
-            .or_else(|| state.planner_tests_command.clone())
+            .or_else(|| state.prepared.tests_command.clone())
             .or_else(|| Some("cargo test --quiet --manifest-path plugins/Cargo.toml".to_string()));
         let safety_command = state
-            .prepared
             .safety_command
             .clone()
-            .or_else(|| state.planner_safety_command.clone());
+            .or_else(|| state.prepared.safety_command.clone());
         let report = CommandVerifier::verify(
             &self.fixtures_root,
             state.prepared.verify_profile,
@@ -2116,6 +2382,843 @@ impl CandidateSnapshotStatus {
     }
 }
 
+const PLUGIN_AGENT_TOOL_LIST_CONTEXT_FILES: &str = "list_context_files";
+const PLUGIN_AGENT_TOOL_READ_CONTEXT_FILE: &str = "read_context_file";
+const PLUGIN_AGENT_TOOL_READ_CONTEXT_FILES: &str = "read_context_files";
+const PLUGIN_AGENT_TOOL_INSPECT_PLUGIN_CATALOG: &str = "inspect_plugin_catalog";
+const PLUGIN_AGENT_TOOL_SCAFFOLD_CHILD_PLUGIN: &str = "scaffold_child_plugin";
+const PLUGIN_AGENT_TOOL_REPLACE_FILE_EXACT: &str = "replace_file_exact";
+const PLUGIN_AGENT_TOOL_CREATE_FILE: &str = "create_file";
+const PLUGIN_AGENT_TOOL_DELETE_FILE: &str = "delete_file";
+const PLUGIN_AGENT_TOOL_TOML_SET: &str = "toml_set";
+const PLUGIN_AGENT_TOOL_JSON_SET: &str = "json_set";
+const PLUGIN_AGENT_TOOL_RUN_PLUGIN_CHECK: &str = "run_plugin_check";
+const PLUGIN_AGENT_TOOL_RUN_PLUGIN_TEST: &str = "run_plugin_test";
+const PLUGIN_AGENT_TOOL_REBUILD_PLUGIN_WORKSPACE: &str = "rebuild_plugin_workspace";
+const PLUGIN_AGENT_TOOL_RECORD_ITERATION_SUMMARY: &str = "record_iteration_summary";
+
+#[derive(Debug, Clone, Deserialize)]
+struct ReadContextFileArgs {
+    path: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ReadContextFilesArgs {
+    paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ScaffoldChildPluginArgs {
+    parent_plugin_path: String,
+    child_name: String,
+    #[serde(default)]
+    template_plugin_path: Option<String>,
+    #[serde(default)]
+    node_id: Option<String>,
+    #[serde(default)]
+    summary: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ReplaceFileExactArgs {
+    path: String,
+    expected_old_string: String,
+    new_content: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct CreateFileArgs {
+    path: String,
+    new_content: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct DeleteFileArgs {
+    path: String,
+    expected_sha256: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct TomlSetArgs {
+    path: String,
+    expected_sha256: String,
+    dotted_key: String,
+    value: Value,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct JsonSetArgs {
+    path: String,
+    expected_sha256: String,
+    pointer: String,
+    value: Value,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct RunPluginCommandArgs {
+    #[serde(default)]
+    command: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RecordIterationSummaryArgs {
+    summary: String,
+    #[serde(default)]
+    tests_command: Option<String>,
+    #[serde(default)]
+    safety_command: Option<String>,
+}
+
+impl ManagedAgentSession {
+    fn respond(&mut self, host: &RuntimeHost, input: &str) -> Result<AgentReply, RuntimeError> {
+        match &mut self.state {
+            ManagedAgentState::RuntimeShell => self.session.respond_with_runtime_host(host, input),
+            ManagedAgentState::PluginIteration(state) => {
+                let mut backend = PluginIterationAgentBackend { host, state };
+                self.session.respond(&mut backend, input)
+            }
+        }
+    }
+}
+
+struct PluginIterationAgentBackend<'a> {
+    host: &'a RuntimeHost,
+    state: &'a mut PluginIterationAgentState,
+}
+
+impl<'a> PluginIterationAgentBackend<'a> {
+    fn phase(&self) -> &'static str {
+        if self.state.recorded_summary.is_some() {
+            "finalized"
+        } else if self.state.operations.is_empty() {
+            "exploration"
+        } else if self.state.verification_runs == 0 {
+            "editing"
+        } else {
+            "verification"
+        }
+    }
+
+    fn apply_operations(
+        &mut self,
+        summary: &str,
+        operations: Vec<PluginEditOperation>,
+    ) -> Result<Value, RuntimeError> {
+        let executor = PluginEditExecutor::new(&self.host.fixtures_root);
+        let mut local_rollback = PluginEditRollback::empty(&self.host.fixtures_root);
+        for (idx, operation) in operations.iter().enumerate() {
+            let single = PluginEditPlan {
+                issue_id: self.state.prepared.issue_id.clone(),
+                patch_id: format!("{}-tool-{}", self.state.prepared.iteration_id, idx),
+                summary: summary.to_string(),
+                operations: vec![operation.clone()],
+            };
+            let execute = executor.execute(
+                &self.host.kernel.plugin_iteration_policy,
+                &self.state.prepared.allowed_plugin_roots,
+                &single,
+            );
+            match execute {
+                Ok((_apply_result, rollback)) => {
+                    local_rollback.absorb(rollback)?;
+                }
+                Err(err) => {
+                    let _ = local_rollback.rollback();
+                    return Err(err);
+                }
+            }
+        }
+        self.state.rollback.absorb(local_rollback)?;
+        self.state.operations.extend(operations.clone());
+        for path in operations.into_iter().map(|operation| operation.path) {
+            if should_track_context_file(&path) {
+                self.state.context_paths.push(path);
+            }
+        }
+        self.state.context_paths.sort();
+        self.state.context_paths.dedup();
+        let derived = self.state.snapshot().derived_edit_plan;
+        Ok(json!({
+            "changed_paths": derived.changed_paths(),
+            "operation_count": derived.operations.len(),
+        }))
+    }
+
+    fn list_context_files(&self) -> Value {
+        let mut paths = self.state.context_paths.clone();
+        sort_plugin_context_paths(&mut paths);
+        json!({
+            "root_plugin_path": self.state.prepared.root_plugin_path,
+            "phase": self.phase(),
+            "paths": paths,
+        })
+    }
+
+    fn read_context_file(&self, path: &str) -> Result<Value, RuntimeError> {
+        let normalized = normalize_rel_path(path)?;
+        if !self
+            .state
+            .context_paths
+            .iter()
+            .any(|item| item == &normalized)
+        {
+            return Err(RuntimeError::InvalidArgument {
+                message: format!(
+                    "context file is not available in this plugin iteration session: {normalized}"
+                ),
+            });
+        }
+        let abs_path = self.host.fixtures_root.join(&normalized);
+        let content = fs::read_to_string(&abs_path).map_err(|err| RuntimeError::Io {
+            path: abs_path.clone(),
+            message: err.to_string(),
+        })?;
+        Ok(json!({
+            "path": normalized,
+            "sha256": sha256_text(&content),
+            "content": content,
+        }))
+    }
+
+    fn read_context_files(&self, paths: &[String]) -> Result<Value, RuntimeError> {
+        let files = paths
+            .iter()
+            .map(|path| self.read_context_file(path))
+            .collect::<Result<Vec<_>, RuntimeError>>()?;
+        Ok(json!({ "files": files }))
+    }
+
+    fn inspect_plugin_catalog(&self) -> Value {
+        let snapshot = self.host.current_snapshot();
+        let plugins = snapshot
+            .plugin_registry()
+            .iter()
+            .filter(|(plugin_path, _)| {
+                plugin_path == &self.state.prepared.root_plugin_path
+                    || plugin_path.starts_with(&format!("{}/", self.state.prepared.root_plugin_path))
+            })
+            .map(|(plugin_path, plugin)| {
+                json!({
+                    "plugin_path": plugin_path,
+                    "parent": plugin.parent,
+                    "required": plugin.required,
+                    "node_ids": plugin
+                        .docs
+                        .as_ref()
+                        .map(|docs| docs.nodes.iter().map(|node| node.id.clone()).collect::<Vec<_>>())
+                        .unwrap_or_default(),
+                    "node_summaries": plugin
+                        .docs
+                        .as_ref()
+                        .map(|docs| docs.nodes.iter().map(|node| {
+                            json!({
+                                "node_id": node.id,
+                                "summary": node.summary,
+                            })
+                        }).collect::<Vec<_>>())
+                        .unwrap_or_default(),
+                })
+            })
+            .collect::<Vec<_>>();
+        json!({
+            "root_plugin_path": self.state.prepared.root_plugin_path,
+            "plugins": plugins,
+        })
+    }
+
+    fn scaffold_child_plugin(
+        &mut self,
+        args: ScaffoldChildPluginArgs,
+    ) -> Result<Value, RuntimeError> {
+        if !self
+            .state
+            .prepared
+            .target_plugin_paths
+            .iter()
+            .any(|path| path == &args.parent_plugin_path)
+        {
+            return Err(RuntimeError::InvalidArgument {
+                message: format!(
+                    "parent plugin path {} is outside the selected subtree",
+                    args.parent_plugin_path
+                ),
+            });
+        }
+
+        let child_segment = sanitize_child_plugin_segment(&args.child_name);
+        let child_plugin_path = format!("{}/{}", args.parent_plugin_path, child_segment);
+        let child_root = format!("plugins/{child_plugin_path}");
+        let node_id = args
+            .node_id
+            .clone()
+            .unwrap_or_else(|| format!("{}_entry", child_segment.replace('-', "_")));
+        let crate_name = child_plugin_path.replace('/', "_").replace('-', "_");
+        let summary = args
+            .summary
+            .clone()
+            .unwrap_or_else(|| format!("Child plugin scaffold for {child_plugin_path}"));
+
+        let parent_manifest_rel = format!("plugins/{}/Cargo.toml", args.parent_plugin_path);
+        let parent_manifest_abs = self.host.fixtures_root.join(&parent_manifest_rel);
+        let parent_manifest_text =
+            fs::read_to_string(&parent_manifest_abs).map_err(|err| RuntimeError::Io {
+                path: parent_manifest_abs.clone(),
+                message: err.to_string(),
+            })?;
+        let parent_manifest_sha = file_sha256(&parent_manifest_abs)?;
+        let parent_toml: TomlValue =
+            toml::from_str(&parent_manifest_text).map_err(|err| RuntimeError::CargoParse {
+                path: parent_manifest_abs.clone(),
+                message: err.to_string(),
+            })?;
+        let mut children = parent_toml
+            .get("package")
+            .and_then(TomlValue::as_table)
+            .and_then(|value| value.get("metadata"))
+            .and_then(TomlValue::as_table)
+            .and_then(|value| value.get("cordis"))
+            .and_then(TomlValue::as_table)
+            .and_then(|value| value.get("children"))
+            .and_then(TomlValue::as_array)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|entry| serde_json::to_value(entry).unwrap_or(Value::Null))
+            .collect::<Vec<_>>();
+        let child_source = format!("./{child_segment}");
+        if !children.iter().any(|entry| {
+            entry
+                .get("source")
+                .and_then(Value::as_str)
+                .is_some_and(|value| value == child_source)
+        }) {
+            children.push(json!({
+                "source": child_source,
+                "required": true,
+                "grants": [],
+            }));
+        }
+
+        let manifest_path = format!("{child_root}/Cargo.toml");
+        let lib_path = format!("{child_root}/src/lib.rs");
+        let core_path = format!("{child_root}/src/core.rs");
+        let test_path = format!(
+            "{child_root}/tests/{}_scaffold.rs",
+            child_segment.replace('-', "_")
+        );
+        let human_path = format!("{child_root}/docs/human/overview.md");
+
+        let operations = vec![
+            PluginEditOperation {
+                path: parent_manifest_rel,
+                kind: PluginEditOpKind::TomlSet,
+                expected_old_string: None,
+                expected_sha256: Some(parent_manifest_sha),
+                new_content: None,
+                pointer: None,
+                dotted_key: Some("package.metadata.cordis.children".to_string()),
+                value: Some(Value::Array(children)),
+            },
+            PluginEditOperation {
+                path: manifest_path.clone(),
+                kind: PluginEditOpKind::CreateFile,
+                expected_old_string: Some(String::new()),
+                expected_sha256: None,
+                new_content: Some(render_child_plugin_manifest(
+                    &crate_name,
+                    &child_plugin_path,
+                    &node_id,
+                )),
+                pointer: None,
+                dotted_key: None,
+                value: None,
+            },
+            PluginEditOperation {
+                path: lib_path.clone(),
+                kind: PluginEditOpKind::CreateFile,
+                expected_old_string: Some(String::new()),
+                expected_sha256: None,
+                new_content: Some(render_child_plugin_lib(
+                    &crate_name,
+                    &child_plugin_path,
+                    &node_id,
+                    &summary,
+                )),
+                pointer: None,
+                dotted_key: None,
+                value: None,
+            },
+            PluginEditOperation {
+                path: core_path.clone(),
+                kind: PluginEditOpKind::CreateFile,
+                expected_old_string: Some(String::new()),
+                expected_sha256: None,
+                new_content: Some(render_child_plugin_core(&child_segment)),
+                pointer: None,
+                dotted_key: None,
+                value: None,
+            },
+            PluginEditOperation {
+                path: test_path.clone(),
+                kind: PluginEditOpKind::CreateFile,
+                expected_old_string: Some(String::new()),
+                expected_sha256: None,
+                new_content: Some(render_child_plugin_test(&crate_name)),
+                pointer: None,
+                dotted_key: None,
+                value: None,
+            },
+            PluginEditOperation {
+                path: human_path.clone(),
+                kind: PluginEditOpKind::CreateFile,
+                expected_old_string: Some(String::new()),
+                expected_sha256: None,
+                new_content: Some(render_child_plugin_overview(&child_plugin_path)),
+                pointer: None,
+                dotted_key: None,
+                value: None,
+            },
+        ];
+        let applied = self.apply_operations("scaffold_child_plugin", operations)?;
+        Ok(json!({
+            "child_plugin_path": child_plugin_path,
+            "template_plugin_path": args.template_plugin_path,
+            "normalized_child_name": child_segment,
+            "node_id": node_id,
+            "result": applied,
+        }))
+    }
+
+    fn run_checked_command(&mut self, stage: &str, command: String) -> Result<Value, RuntimeError> {
+        let output = Command::new("bash")
+            .arg("-lc")
+            .arg(&command)
+            .current_dir(&self.host.fixtures_root)
+            .output()
+            .map_err(|err| RuntimeError::CommandFailed {
+                program: "bash".to_string(),
+                args: vec!["-lc".to_string(), command.clone()],
+                message: err.to_string(),
+            })?;
+        self.state.verification_runs += 1;
+        Ok(json!({
+            "stage": stage,
+            "command": command,
+            "success": output.status.success(),
+            "exit_code": output.status.code(),
+            "stdout": String::from_utf8_lossy(&output.stdout).to_string(),
+            "stderr": String::from_utf8_lossy(&output.stderr).to_string(),
+        }))
+    }
+}
+
+impl<'a> AgentBackend for PluginIterationAgentBackend<'a> {
+    fn system_prompt(&self) -> String {
+        format!(
+            "You are the Cordis plugin-iteration agent.\n\
+Work directly through tools instead of proposing a large final JSON plan.\n\
+You may only modify the selected plugin subtree rooted at {}.\n\
+Use read and catalog tools to understand the existing plugin family, then use scaffold and file-edit tools to make incremental changes.\n\
+Use run_plugin_check, run_plugin_test, and rebuild_plugin_workspace to validate real changes.\n\
+When the iteration is ready, call record_iteration_summary with a concise summary and any recommended verification commands, then provide a short final response.\n\
+Do not attempt to modify runtime crates, repository root manifests, config, .git, target, or generated docs under docs/agent.",
+            self.state.prepared.root_plugin_path
+        )
+    }
+
+    fn tool_specs(&self) -> Vec<AgentToolSpec> {
+        let mut tools = vec![
+            AgentToolSpec {
+                name: PLUGIN_AGENT_TOOL_LIST_CONTEXT_FILES,
+                description: "List readable context files for the selected plugin subtree.",
+                parameters: json!({"type":"object","properties":{},"additionalProperties":false}),
+            },
+            AgentToolSpec {
+                name: PLUGIN_AGENT_TOOL_READ_CONTEXT_FILE,
+                description: "Read one context file and return its content and sha256.",
+                parameters: json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"],"additionalProperties":false}),
+            },
+            AgentToolSpec {
+                name: PLUGIN_AGENT_TOOL_READ_CONTEXT_FILES,
+                description: "Read multiple context files in one call.",
+                parameters: json!({"type":"object","properties":{"paths":{"type":"array","items":{"type":"string"}}},"required":["paths"],"additionalProperties":false}),
+            },
+            AgentToolSpec {
+                name: PLUGIN_AGENT_TOOL_INSPECT_PLUGIN_CATALOG,
+                description: "Inspect the currently loaded plugin subtree, including child plugins and node summaries.",
+                parameters: json!({"type":"object","properties":{},"additionalProperties":false}),
+            },
+        ];
+        if self.state.recorded_summary.is_none() {
+            tools.extend([
+                AgentToolSpec {
+                    name: PLUGIN_AGENT_TOOL_SCAFFOLD_CHILD_PLUGIN,
+                    description: "Create a sibling child plugin scaffold under the selected subtree and register it in the parent manifest.",
+                    parameters: json!({"type":"object","properties":{"parent_plugin_path":{"type":"string"},"child_name":{"type":"string"},"template_plugin_path":{"type":"string"},"node_id":{"type":"string"},"summary":{"type":"string"}},"required":["parent_plugin_path","child_name"],"additionalProperties":false}),
+                },
+                AgentToolSpec {
+                    name: PLUGIN_AGENT_TOOL_REPLACE_FILE_EXACT,
+                    description: "Replace an exact string in a writable file.",
+                    parameters: json!({"type":"object","properties":{"path":{"type":"string"},"expected_old_string":{"type":"string"},"new_content":{"type":"string"}},"required":["path","expected_old_string","new_content"],"additionalProperties":false}),
+                },
+                AgentToolSpec {
+                    name: PLUGIN_AGENT_TOOL_CREATE_FILE,
+                    description: "Create a new writable file inside the selected plugin subtree.",
+                    parameters: json!({"type":"object","properties":{"path":{"type":"string"},"new_content":{"type":"string"}},"required":["path","new_content"],"additionalProperties":false}),
+                },
+                AgentToolSpec {
+                    name: PLUGIN_AGENT_TOOL_DELETE_FILE,
+                    description: "Delete a writable file when you know its expected sha256.",
+                    parameters: json!({"type":"object","properties":{"path":{"type":"string"},"expected_sha256":{"type":"string"}},"required":["path","expected_sha256"],"additionalProperties":false}),
+                },
+                AgentToolSpec {
+                    name: PLUGIN_AGENT_TOOL_TOML_SET,
+                    description: "Set one TOML dotted key inside a writable manifest using an expected sha256 guard.",
+                    parameters: json!({"type":"object","properties":{"path":{"type":"string"},"expected_sha256":{"type":"string"},"dotted_key":{"type":"string"},"value":{}},"required":["path","expected_sha256","dotted_key","value"],"additionalProperties":false}),
+                },
+                AgentToolSpec {
+                    name: PLUGIN_AGENT_TOOL_JSON_SET,
+                    description: "Set one JSON pointer inside a writable file using an expected sha256 guard.",
+                    parameters: json!({"type":"object","properties":{"path":{"type":"string"},"expected_sha256":{"type":"string"},"pointer":{"type":"string"},"value":{}},"required":["path","expected_sha256","pointer","value"],"additionalProperties":false}),
+                },
+            ]);
+        }
+        if !self.state.operations.is_empty() && self.state.recorded_summary.is_none() {
+            tools.extend([
+                AgentToolSpec {
+                    name: PLUGIN_AGENT_TOOL_RUN_PLUGIN_CHECK,
+                    description: "Run a restricted cargo check for the plugin workspace.",
+                    parameters: json!({"type":"object","properties":{"command":{"type":"string"}},"additionalProperties":false}),
+                },
+                AgentToolSpec {
+                    name: PLUGIN_AGENT_TOOL_RUN_PLUGIN_TEST,
+                    description: "Run a restricted cargo test for the plugin workspace.",
+                    parameters: json!({"type":"object","properties":{"command":{"type":"string"}},"additionalProperties":false}),
+                },
+                AgentToolSpec {
+                    name: PLUGIN_AGENT_TOOL_REBUILD_PLUGIN_WORKSPACE,
+                    description: "Rebuild plugin artifacts and sync generated docs for the whole plugin workspace.",
+                    parameters: json!({"type":"object","properties":{},"additionalProperties":false}),
+                },
+            ]);
+        }
+        if !self.state.operations.is_empty()
+            && self.state.verification_runs > 0
+            && self.state.recorded_summary.is_none()
+        {
+            tools.push(AgentToolSpec {
+                name: PLUGIN_AGENT_TOOL_RECORD_ITERATION_SUMMARY,
+                description: "Record the final iteration summary and optional verification commands before you answer the user.",
+                parameters: json!({"type":"object","properties":{"summary":{"type":"string"},"tests_command":{"type":"string"},"safety_command":{"type":"string"}},"required":["summary"],"additionalProperties":false}),
+            });
+        }
+        tools
+    }
+
+    fn execute_tool(&mut self, name: &str, arguments: Value) -> Result<Value, RuntimeError> {
+        match name {
+            PLUGIN_AGENT_TOOL_LIST_CONTEXT_FILES => Ok(self.list_context_files()),
+            PLUGIN_AGENT_TOOL_READ_CONTEXT_FILE => {
+                let args = parse_agent_args::<ReadContextFileArgs>(arguments, name)?;
+                self.read_context_file(&args.path)
+            }
+            PLUGIN_AGENT_TOOL_READ_CONTEXT_FILES => {
+                let args = parse_agent_args::<ReadContextFilesArgs>(arguments, name)?;
+                self.read_context_files(&args.paths)
+            }
+            PLUGIN_AGENT_TOOL_INSPECT_PLUGIN_CATALOG => Ok(self.inspect_plugin_catalog()),
+            PLUGIN_AGENT_TOOL_SCAFFOLD_CHILD_PLUGIN => {
+                let args = parse_agent_args::<ScaffoldChildPluginArgs>(arguments, name)?;
+                self.scaffold_child_plugin(args)
+            }
+            PLUGIN_AGENT_TOOL_REPLACE_FILE_EXACT => {
+                let args = parse_agent_args::<ReplaceFileExactArgs>(arguments, name)?;
+                self.apply_operations(
+                    "replace_file_exact",
+                    vec![PluginEditOperation {
+                        path: args.path,
+                        kind: PluginEditOpKind::ReplaceExact,
+                        expected_old_string: Some(args.expected_old_string),
+                        expected_sha256: None,
+                        new_content: Some(args.new_content),
+                        pointer: None,
+                        dotted_key: None,
+                        value: None,
+                    }],
+                )
+            }
+            PLUGIN_AGENT_TOOL_CREATE_FILE => {
+                let args = parse_agent_args::<CreateFileArgs>(arguments, name)?;
+                self.apply_operations(
+                    "create_file",
+                    vec![PluginEditOperation {
+                        path: args.path,
+                        kind: PluginEditOpKind::CreateFile,
+                        expected_old_string: Some(String::new()),
+                        expected_sha256: None,
+                        new_content: Some(args.new_content),
+                        pointer: None,
+                        dotted_key: None,
+                        value: None,
+                    }],
+                )
+            }
+            PLUGIN_AGENT_TOOL_DELETE_FILE => {
+                let args = parse_agent_args::<DeleteFileArgs>(arguments, name)?;
+                self.apply_operations(
+                    "delete_file",
+                    vec![PluginEditOperation {
+                        path: args.path,
+                        kind: PluginEditOpKind::DeleteFile,
+                        expected_old_string: None,
+                        expected_sha256: Some(args.expected_sha256),
+                        new_content: None,
+                        pointer: None,
+                        dotted_key: None,
+                        value: None,
+                    }],
+                )
+            }
+            PLUGIN_AGENT_TOOL_TOML_SET => {
+                let args = parse_agent_args::<TomlSetArgs>(arguments, name)?;
+                self.apply_operations(
+                    "toml_set",
+                    vec![PluginEditOperation {
+                        path: args.path,
+                        kind: PluginEditOpKind::TomlSet,
+                        expected_old_string: None,
+                        expected_sha256: Some(args.expected_sha256),
+                        new_content: None,
+                        pointer: None,
+                        dotted_key: Some(args.dotted_key),
+                        value: Some(args.value),
+                    }],
+                )
+            }
+            PLUGIN_AGENT_TOOL_JSON_SET => {
+                let args = parse_agent_args::<JsonSetArgs>(arguments, name)?;
+                self.apply_operations(
+                    "json_set",
+                    vec![PluginEditOperation {
+                        path: args.path,
+                        kind: PluginEditOpKind::JsonSet,
+                        expected_old_string: None,
+                        expected_sha256: Some(args.expected_sha256),
+                        new_content: None,
+                        pointer: Some(args.pointer),
+                        dotted_key: None,
+                        value: Some(args.value),
+                    }],
+                )
+            }
+            PLUGIN_AGENT_TOOL_RUN_PLUGIN_CHECK => {
+                let args = parse_agent_args::<RunPluginCommandArgs>(arguments, name)?;
+                let command = validated_verification_command(
+                    args.command,
+                    Some("cargo check --quiet --manifest-path plugins/Cargo.toml".to_string()),
+                    "cargo check",
+                )?;
+                self.run_checked_command("check", command)
+            }
+            PLUGIN_AGENT_TOOL_RUN_PLUGIN_TEST => {
+                let args = parse_agent_args::<RunPluginCommandArgs>(arguments, name)?;
+                let command = validated_verification_command(
+                    args.command
+                        .or_else(|| self.state.prepared.tests_command.clone()),
+                    Some("cargo test --quiet --manifest-path plugins/Cargo.toml".to_string()),
+                    "cargo test",
+                )?;
+                self.run_checked_command("test", command)
+            }
+            PLUGIN_AGENT_TOOL_REBUILD_PLUGIN_WORKSPACE => {
+                let rebuilt = rebuild_plugin_workspace(&self.host.fixtures_root)?;
+                self.state.verification_runs += 1;
+                Ok(json!({
+                    "rebuilt_count": rebuilt.len(),
+                    "rebuilt": rebuilt,
+                }))
+            }
+            PLUGIN_AGENT_TOOL_RECORD_ITERATION_SUMMARY => {
+                if self.state.operations.is_empty() || self.state.verification_runs == 0 {
+                    return Err(RuntimeError::InvalidArgument {
+                        message: "record_iteration_summary requires at least one edit and one verification step".to_string(),
+                    });
+                }
+                let args = parse_agent_args::<RecordIterationSummaryArgs>(arguments, name)?;
+                self.state.recorded_summary = Some(args.summary.clone());
+                self.state.tests_command = normalize_optional_command(args.tests_command);
+                self.state.safety_command = normalize_optional_command(args.safety_command);
+                Ok(json!({
+                    "summary": args.summary,
+                    "tests_command": self.state.tests_command,
+                    "safety_command": self.state.safety_command,
+                }))
+            }
+            other => Err(RuntimeError::InvalidArgument {
+                message: format!("unsupported plugin iteration tool: {other}"),
+            }),
+        }
+    }
+
+    fn tool_scope_label(&self) -> String {
+        format!("plugin_iteration:{}", self.phase())
+    }
+}
+
+fn parse_agent_args<T>(arguments: Value, tool_name: &str) -> Result<T, RuntimeError>
+where
+    T: DeserializeOwned,
+{
+    serde_json::from_value(arguments).map_err(|err| RuntimeError::InvalidArgument {
+        message: format!("agent tool {tool_name} received invalid arguments: {err}"),
+    })
+}
+
+fn normalize_optional_command(command: Option<String>) -> Option<String> {
+    command.and_then(|value| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
+}
+
+fn validated_verification_command(
+    explicit: Option<String>,
+    fallback: Option<String>,
+    required_prefix: &str,
+) -> Result<String, RuntimeError> {
+    let command = explicit
+        .or(fallback)
+        .ok_or_else(|| RuntimeError::InvalidArgument {
+            message: format!("missing verification command for {required_prefix}"),
+        })?;
+    let trimmed = command.trim();
+    if !trimmed.starts_with(required_prefix) {
+        return Err(RuntimeError::InvalidArgument {
+            message: format!(
+                "verification tool only allows commands starting with `{required_prefix}`, got `{trimmed}`"
+            ),
+        });
+    }
+    Ok(trimmed.to_string())
+}
+
+fn should_track_context_file(path: &str) -> bool {
+    matches!(
+        Path::new(path)
+            .extension()
+            .and_then(|extension| extension.to_str()),
+        Some("rs") | Some("json") | Some("toml") | Some("md")
+    )
+}
+
+fn sort_plugin_context_paths(paths: &mut [String]) {
+    paths.sort_by_key(|path| plugin_context_priority(path));
+}
+
+fn plugin_context_priority(path: &str) -> (u8, String) {
+    if path.ends_with("docs/human/overview.md") {
+        (0, path.to_string())
+    } else if path.ends_with("Cargo.toml") {
+        (1, path.to_string())
+    } else if path.contains("/docs/human/") {
+        (2, path.to_string())
+    } else if path.contains("/src/") {
+        (3, path.to_string())
+    } else if path.contains("/tests/") {
+        (4, path.to_string())
+    } else if path.contains("/docs/agent/") {
+        (5, path.to_string())
+    } else {
+        (6, path.to_string())
+    }
+}
+
+fn sanitize_child_plugin_segment(raw: &str) -> String {
+    let trimmed = raw.trim().trim_matches('/');
+    let normalized = trimmed
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .split('-')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+    match normalized.as_str() {
+        "" => "child".to_string(),
+        "mod" => "modulo".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn sha256_text(content: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(content.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+fn render_child_plugin_manifest(crate_name: &str, plugin_path: &str, node_id: &str) -> String {
+    format!(
+        "[package]\nname = \"{crate_name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\ncrate-type = [\"rlib\", \"dylib\"]\n\n[package.metadata.cordis]\nplugin_path = \"{plugin_path}\"\nabi_kind = \"rust\"\ndeclared_nodes = [\"{node_id}\"]\nchildren = []\n\n[package.metadata.cordis.abi_fingerprint]\nrustc_version = \"1.85.1\"\ntarget_triple = \"x86_64-unknown-linux-gnu\"\ncrate_hash = \"crate_{crate_name}_v1\"\napi_hash = \"api_v2\"\n\n[dependencies]\ncordis-plugin-sdk = {{ path = \"../../../../../crates/cordis-plugin-sdk\" }}\nserde = {{ version = \"1\", features = [\"derive\"] }}\nserde_json = \"1\"\nthiserror = \"2\"\n\n[workspace]\n",
+        crate_name = crate_name.replace('-', "_"),
+        plugin_path = plugin_path,
+        node_id = node_id,
+    )
+}
+
+fn render_child_plugin_lib(
+    crate_name: &str,
+    plugin_path: &str,
+    node_id: &str,
+    summary: &str,
+) -> String {
+    format!(
+        "mod core;\n\npub use core::*;\n\nuse cordis_plugin_sdk::{{\n    export_plugin_api, json_response, node_doc, plugin_docs, AbiFingerprint, PluginRequest,\n    PluginResponse,\n}};\nuse serde::{{Deserialize, Serialize}};\nuse serde_json::json;\n\n#[derive(Debug, Deserialize)]\nstruct BinaryOpRequest {{\n    lhs: f64,\n    rhs: f64,\n}}\n\n#[derive(Debug, Serialize)]\nstruct BinaryOpResponse {{\n    #[serde(skip_serializing_if = \"Option::is_none\")]\n    value: Option<f64>,\n    #[serde(skip_serializing_if = \"Option::is_none\")]\n    error: Option<String>,\n}}\n\nfn docs_value() -> cordis_plugin_sdk::PluginDocs {{\n    plugin_docs(\n        \"{crate_name}\",\n        \"{plugin_path}\",\n        \"0.1.0\",\n        None,\n        vec![node_doc(\n            \"{node_id}\",\n            \"{summary}\",\n            json!({{\"type\":\"object\",\"required\":[\"lhs\",\"rhs\"],\"properties\":{{\"lhs\":{{\"type\":\"number\"}},\"rhs\":{{\"type\":\"number\"}}}}}}),\n            json!({{\"type\":\"object\",\"properties\":{{\"value\":{{\"type\":\"number\"}},\"error\":{{\"type\":\"string\"}}}}}}),\n            &[],\n            &[\"not implemented\"],\n        )],\n    )\n}}\n\nfn abi_fingerprint_value() -> AbiFingerprint {{\n    AbiFingerprint {{\n        rustc_version: \"1.85.1\".to_string(),\n        target_triple: \"x86_64-unknown-linux-gnu\".to_string(),\n        crate_hash: \"crate_{crate_name}_v1\".to_string(),\n        api_hash: \"api_v2\".to_string(),\n    }}\n}}\n\nfn api_handle(req: PluginRequest) -> PluginResponse {{\n    let response = match serde_json::from_str::<BinaryOpRequest>(&req.payload) {{\n        Ok(request) => match apply(request.lhs, request.rhs) {{\n            Ok(value) => BinaryOpResponse {{ value: Some(value), error: None }},\n            Err(err) => BinaryOpResponse {{ value: None, error: Some(err.to_string()) }},\n        }},\n        Err(err) => BinaryOpResponse {{ value: None, error: Some(format!(\"invalid request: {{err}}\")) }},\n    }};\n    json_response(&response)\n}}\n\nexport_plugin_api! {{\n    abi_fingerprint = abi_fingerprint_value(),\n    docs = docs_value(),\n    handle = api_handle,\n}}\n",
+        crate_name = crate_name,
+        plugin_path = plugin_path,
+        node_id = node_id,
+        summary = summary.replace('"', "\\\""),
+    )
+}
+
+fn render_child_plugin_core(child_segment: &str) -> String {
+    let type_name = child_segment
+        .split('-')
+        .map(|part| {
+            let mut chars = part.chars();
+            match chars.next() {
+                Some(first) => format!("{}{}", first.to_ascii_uppercase(), chars.as_str()),
+                None => String::new(),
+            }
+        })
+        .collect::<String>();
+    format!(
+        "use serde::{{Deserialize, Serialize}};\nuse thiserror::Error;\n\n#[derive(Debug, Error, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]\n#[serde(rename_all = \"snake_case\")]\npub enum {type_name}Error {{\n    #[error(\"not implemented\")]\n    NotImplemented,\n}}\n\n#[derive(Debug, Default, Clone, Copy)]\npub struct {type_name}Plugin;\n\nimpl {type_name}Plugin {{\n    pub fn apply(&self, _lhs: f64, _rhs: f64) -> Result<f64, {type_name}Error> {{\n        Err({type_name}Error::NotImplemented)\n    }}\n}}\n\npub fn apply(lhs: f64, rhs: f64) -> Result<f64, {type_name}Error> {{\n    {type_name}Plugin.apply(lhs, rhs)\n}}\n"
+    )
+}
+
+fn render_child_plugin_test(crate_name: &str) -> String {
+    format!(
+        "use {crate_name}::apply;\n\n#[test]\nfn scaffold_reports_not_implemented() {{\n    let result = apply(5.0, 2.0);\n    assert!(result.is_err());\n}}\n"
+    )
+}
+
+fn render_child_plugin_overview(plugin_path: &str) -> String {
+    format!(
+        "# {}\n\nThis child plugin scaffold was created by the Cordis plugin-iteration agent. Replace the placeholder implementation in `src/core.rs` and tighten the docs once the behavior is real.\n",
+        plugin_path
+    )
+}
+
 fn plugin_change_reasons(previous: &RegisteredPlugin, next: &RegisteredPlugin) -> Vec<String> {
     let mut reasons = Vec::new();
     if previous.parent != next.parent {
@@ -2396,10 +3499,11 @@ fn runtime_snapshot_from_output(
 #[derive(Debug, Clone)]
 struct PluginIterationRunState {
     prepared: PreparedPluginIteration,
-    planned: Option<PluginEditPlan>,
-    planner_tests_command: Option<String>,
-    planner_safety_command: Option<String>,
-    rollback: Option<crate::kernel::plugin_iteration::PluginEditRollback>,
+    agent_session_id: Option<String>,
+    tool_execution_summary: Option<AgentToolExecutionSummary>,
+    derived_edit_plan: Option<PluginEditPlan>,
+    transcript_excerpt: Vec<AgentTranscriptEntry>,
+    rollback: Option<PluginEditRollback>,
     changed_paths: Vec<String>,
     diff_lines: usize,
     rebuilt_artifacts: Vec<(String, String)>,
@@ -2410,15 +3514,18 @@ struct PluginIterationRunState {
     blocked_reason: Option<String>,
     stage_error: Option<String>,
     final_verdict: Option<PluginIterationFinalVerdict>,
+    tests_command: Option<String>,
+    safety_command: Option<String>,
 }
 
 impl PluginIterationRunState {
     fn new(prepared: PreparedPluginIteration) -> Self {
         Self {
             prepared,
-            planned: None,
-            planner_tests_command: None,
-            planner_safety_command: None,
+            agent_session_id: None,
+            tool_execution_summary: None,
+            derived_edit_plan: None,
+            transcript_excerpt: Vec::new(),
             rollback: None,
             changed_paths: Vec::new(),
             diff_lines: 0,
@@ -2430,6 +3537,8 @@ impl PluginIterationRunState {
             blocked_reason: None,
             stage_error: None,
             final_verdict: None,
+            tests_command: None,
+            safety_command: None,
         }
     }
 
@@ -2437,8 +3546,8 @@ impl PluginIterationRunState {
         self,
         net_output: ExecutionOutput,
     ) -> Result<KernelPluginIterationResult, RuntimeError> {
-        let planned_edit_plan = self
-            .planned
+        let derived_edit_plan = self
+            .derived_edit_plan
             .or(self.prepared.edit_plan.clone())
             .unwrap_or_else(|| PluginEditPlan {
                 issue_id: self.prepared.issue_id.clone(),
@@ -2453,7 +3562,10 @@ impl PluginIterationRunState {
             target_plugin_paths: self.prepared.target_plugin_paths,
             source: self.prepared.source,
             summary: self.prepared.summary,
-            planned_edit_plan,
+            agent_session_id: self.agent_session_id,
+            tool_execution_summary: self.tool_execution_summary,
+            derived_edit_plan,
+            transcript_excerpt: self.transcript_excerpt,
             changed_paths: self.changed_paths,
             rebuilt_artifacts: self.rebuilt_artifacts,
             candidate: self.candidate,

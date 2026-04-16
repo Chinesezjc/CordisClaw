@@ -40,7 +40,10 @@ fn append_expr_evaluator_child(root: &Path, child_name: &str) {
         "  {{ source = \"./{child_name}\", required = true, grants = [] }},\n]\n\n[package.metadata.cordis.abi_fingerprint]"
     );
     let patched = content.replacen(needle, &replacement, 1);
-    assert_ne!(patched, content, "evaluator manifest should gain child entry");
+    assert_ne!(
+        patched, content,
+        "evaluator manifest should gain child entry"
+    );
     fs::write(&manifest_path, patched).expect("write evaluator manifest");
 }
 

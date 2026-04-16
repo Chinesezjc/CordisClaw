@@ -211,10 +211,11 @@ impl PackageResolver {
             });
         }
 
-        let generated_agent_docs_allowed = plugin_toml
-            .lib
-            .as_ref()
-            .is_some_and(|lib| lib.crate_type.iter().any(|crate_type| crate_type == "dylib"));
+        let generated_agent_docs_allowed = plugin_toml.lib.as_ref().is_some_and(|lib| {
+            lib.crate_type
+                .iter()
+                .any(|crate_type| crate_type == "dylib")
+        });
 
         // Hard scaffold checks keep plugin projects uniform for both humans and agents.
         self.validate_scaffold(&metadata.plugin_path, dir, generated_agent_docs_allowed)?;
@@ -383,7 +384,9 @@ impl PackageResolver {
         let docs_path = dir.join("docs/agent/interfaces.json");
         let docs_text = match fs::read_to_string(&docs_path) {
             Ok(text) => text,
-            Err(err) if generated_agent_docs_allowed && err.kind() == std::io::ErrorKind::NotFound => {
+            Err(err)
+                if generated_agent_docs_allowed && err.kind() == std::io::ErrorKind::NotFound =>
+            {
                 return Ok(synthesized_generated_docs_placeholder(
                     plugin_path,
                     plugin_version,
