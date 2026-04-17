@@ -18,7 +18,9 @@ use crate::kernel::auto_update::{
 };
 use crate::kernel::evaluator::{EvalHarness, VerificationInput};
 use crate::kernel::memory::{ChangeMemory, ChangeRecord};
-use crate::kernel::planner::{LlmPatchPlanner, PlanRequest, PlannedUpdate};
+use crate::kernel::planner::{
+    validate_reserved_child_keyword_identifiers, LlmPatchPlanner, PlanRequest, PlannedUpdate,
+};
 use crate::kernel::plugin_iteration::{
     file_sha256, normalize_rel_path, now_ms, CanaryReport, CanaryVerdict, KernelPluginIssue,
     KernelPluginIssueSource, KernelPluginIssueStatus, KernelPluginIterationRequest,
@@ -986,6 +988,7 @@ enum ManagedAgentState {
 
 #[derive(Debug, Clone)]
 struct PluginIterationAgentSnapshot {
+    recorded_summary: Option<String>,
     tests_command: Option<String>,
     safety_command: Option<String>,
     changed_paths: Vec<String>,
@@ -1000,7 +1003,8 @@ struct PluginIterationAgentState {
     recorded_summary: Option<String>,
     tests_command: Option<String>,
     safety_command: Option<String>,
-    verification_runs: usize,
+    verification_attempts: usize,
+    verification_successes: usize,
     rollback: PluginEditRollback,
     operations: Vec<PluginEditOperation>,
 }
@@ -1025,7 +1029,8 @@ impl PluginIterationAgentState {
             recorded_summary: None,
             tests_command: None,
             safety_command: None,
-            verification_runs: 0,
+            verification_attempts: 0,
+            verification_successes: 0,
             rollback: PluginEditRollback::empty(workspace_root),
             operations: Vec::new(),
         }
@@ -1042,6 +1047,7 @@ impl PluginIterationAgentState {
             operations: self.operations.clone(),
         };
         PluginIterationAgentSnapshot {
+            recorded_summary: self.recorded_summary.clone(),
             tests_command: self.tests_command.clone(),
             safety_command: self.safety_command.clone(),
             changed_paths: derived_edit_plan.changed_paths(),
@@ -1185,7 +1191,11 @@ impl RuntimeHost {
         context_paths: Vec<String>,
     ) -> Result<String, RuntimeError> {
         let session_id = normalize_request_id(None, "plugin-agent-session");
-        let session = AgentSession::new(self.config.llm_api.clone(), "plugin_iteration")?;
+        let mut llm_config = self.config.llm_api.clone();
+        llm_config.timeout_ms = llm_config
+            .timeout_ms
+            .min(PLUGIN_ITERATION_AGENT_TIMEOUT_CAP_MS);
+        let session = AgentSession::new(llm_config, "plugin_iteration")?;
         self.agent_sessions
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
@@ -1593,6 +1603,17 @@ impl RuntimeHost {
                         state.diff_lines = agent.snapshot.derived_edit_plan.diff_lines();
                         state.tests_command = agent.snapshot.tests_command;
                         state.safety_command = agent.snapshot.safety_command;
+                        if agent.snapshot.recorded_summary.is_none() {
+                            return Err(RuntimeError::LlmResponseInvalid {
+                                message: format!(
+                                    "plugin iteration agent session {} exited without calling record_iteration_summary",
+                                    state
+                                        .agent_session_id
+                                        .as_deref()
+                                        .unwrap_or("unknown-session")
+                                ),
+                            });
+                        }
                         Ok(json!({
                             "agent_session_id": state.agent_session_id,
                             "planned_operation_count": state
@@ -1747,6 +1768,7 @@ impl RuntimeHost {
                 tool_summary: None,
                 transcript_excerpt: Vec::new(),
                 snapshot: PluginIterationAgentSnapshot {
+                    recorded_summary: Some(plan.summary.clone()),
                     tests_command: prepared.tests_command.clone(),
                     safety_command: prepared.safety_command.clone(),
                     changed_paths: plan.changed_paths(),
@@ -2396,6 +2418,7 @@ const PLUGIN_AGENT_TOOL_RUN_PLUGIN_CHECK: &str = "run_plugin_check";
 const PLUGIN_AGENT_TOOL_RUN_PLUGIN_TEST: &str = "run_plugin_test";
 const PLUGIN_AGENT_TOOL_REBUILD_PLUGIN_WORKSPACE: &str = "rebuild_plugin_workspace";
 const PLUGIN_AGENT_TOOL_RECORD_ITERATION_SUMMARY: &str = "record_iteration_summary";
+const PLUGIN_ITERATION_AGENT_TIMEOUT_CAP_MS: u64 = 120_000;
 
 #[derive(Debug, Clone, Deserialize)]
 struct ReadContextFileArgs {
@@ -2492,8 +2515,10 @@ impl<'a> PluginIterationAgentBackend<'a> {
             "finalized"
         } else if self.state.operations.is_empty() {
             "exploration"
-        } else if self.state.verification_runs == 0 {
+        } else if self.state.verification_attempts == 0 {
             "editing"
+        } else if self.state.verification_successes == 0 {
+            "verification_retry"
         } else {
             "verification"
         }
@@ -2504,6 +2529,17 @@ impl<'a> PluginIterationAgentBackend<'a> {
         summary: &str,
         operations: Vec<PluginEditOperation>,
     ) -> Result<Value, RuntimeError> {
+        let mut combined_operations = self.state.operations.clone();
+        combined_operations.extend(operations.clone());
+        let writable_roots = self
+            .state
+            .prepared
+            .allowed_plugin_roots
+            .values()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        validate_reserved_child_keyword_identifiers(&combined_operations, &writable_roots)?;
+
         let executor = PluginEditExecutor::new(&self.host.fixtures_root);
         let mut local_rollback = PluginEditRollback::empty(&self.host.fixtures_root);
         for (idx, operation) in operations.iter().enumerate() {
@@ -2710,7 +2746,7 @@ impl<'a> PluginIterationAgentBackend<'a> {
 
         let operations = vec![
             PluginEditOperation {
-                path: parent_manifest_rel,
+                path: parent_manifest_rel.clone(),
                 kind: PluginEditOpKind::TomlSet,
                 expected_old_string: None,
                 expected_sha256: Some(parent_manifest_sha),
@@ -2785,11 +2821,14 @@ impl<'a> PluginIterationAgentBackend<'a> {
             "template_plugin_path": args.template_plugin_path,
             "normalized_child_name": child_segment,
             "node_id": node_id,
+            "parent_manifest_path": parent_manifest_rel,
+            "created_paths": [manifest_path, lib_path, core_path, test_path, human_path],
             "result": applied,
         }))
     }
 
     fn run_checked_command(&mut self, stage: &str, command: String) -> Result<Value, RuntimeError> {
+        self.state.verification_attempts += 1;
         let output = Command::new("bash")
             .arg("-lc")
             .arg(&command)
@@ -2800,7 +2839,9 @@ impl<'a> PluginIterationAgentBackend<'a> {
                 args: vec!["-lc".to_string(), command.clone()],
                 message: err.to_string(),
             })?;
-        self.state.verification_runs += 1;
+        if output.status.success() {
+            self.state.verification_successes += 1;
+        }
         Ok(json!({
             "stage": stage,
             "command": command,
@@ -2820,7 +2861,9 @@ Work directly through tools instead of proposing a large final JSON plan.\n\
 You may only modify the selected plugin subtree rooted at {}.\n\
 Use read and catalog tools to understand the existing plugin family, then use scaffold and file-edit tools to make incremental changes.\n\
 Use run_plugin_check, run_plugin_test, and rebuild_plugin_workspace to validate real changes.\n\
-When the iteration is ready, call record_iteration_summary with a concise summary and any recommended verification commands, then provide a short final response.\n\
+If a child plugin path uses a Rust keyword such as `mod`, keep that keyword in filesystem and `plugin_path` positions like `expr/evaluator/mod`, but never use raw `mod` as a Rust source identifier.\n\
+Replace placeholder scaffold implementations, tests, and docs together once the behavior is real.\n\
+When the iteration is ready, call record_iteration_summary with a concise summary and any recommended verification commands. record_iteration_summary must be your last tool call and it ends the session immediately.\n\
 Do not attempt to modify runtime crates, repository root manifests, config, .git, target, or generated docs under docs/agent.",
             self.state.prepared.root_plugin_path
         )
@@ -2903,12 +2946,12 @@ Do not attempt to modify runtime crates, repository root manifests, config, .git
             ]);
         }
         if !self.state.operations.is_empty()
-            && self.state.verification_runs > 0
+            && self.state.verification_successes > 0
             && self.state.recorded_summary.is_none()
         {
             tools.push(AgentToolSpec {
                 name: PLUGIN_AGENT_TOOL_RECORD_ITERATION_SUMMARY,
-                description: "Record the final iteration summary and optional verification commands before you answer the user.",
+                description: "Record the final iteration summary and optional verification commands. This must be your last tool call and ends the iteration session immediately.",
                 parameters: json!({"type":"object","properties":{"summary":{"type":"string"},"tests_command":{"type":"string"},"safety_command":{"type":"string"}},"required":["summary"],"additionalProperties":false}),
             });
         }
@@ -3031,17 +3074,18 @@ Do not attempt to modify runtime crates, repository root manifests, config, .git
                 self.run_checked_command("test", command)
             }
             PLUGIN_AGENT_TOOL_REBUILD_PLUGIN_WORKSPACE => {
+                self.state.verification_attempts += 1;
                 let rebuilt = rebuild_plugin_workspace(&self.host.fixtures_root)?;
-                self.state.verification_runs += 1;
+                self.state.verification_successes += 1;
                 Ok(json!({
                     "rebuilt_count": rebuilt.len(),
                     "rebuilt": rebuilt,
                 }))
             }
             PLUGIN_AGENT_TOOL_RECORD_ITERATION_SUMMARY => {
-                if self.state.operations.is_empty() || self.state.verification_runs == 0 {
+                if self.state.operations.is_empty() || self.state.verification_successes == 0 {
                     return Err(RuntimeError::InvalidArgument {
-                        message: "record_iteration_summary requires at least one edit and one verification step".to_string(),
+                        message: "record_iteration_summary requires at least one edit and one successful verification step".to_string(),
                     });
                 }
                 let args = parse_agent_args::<RecordIterationSummaryArgs>(arguments, name)?;
@@ -3052,12 +3096,19 @@ Do not attempt to modify runtime crates, repository root manifests, config, .git
                     "summary": args.summary,
                     "tests_command": self.state.tests_command,
                     "safety_command": self.state.safety_command,
+                    "verification_attempts": self.state.verification_attempts,
+                    "verification_successes": self.state.verification_successes,
                 }))
             }
             other => Err(RuntimeError::InvalidArgument {
                 message: format!("unsupported plugin iteration tool: {other}"),
             }),
         }
+    }
+
+    fn terminal_tool_reply(&self, name: &str, _output: &Value) -> Option<String> {
+        (name == PLUGIN_AGENT_TOOL_RECORD_ITERATION_SUMMARY)
+            .then_some("Plugin iteration summary recorded.".to_string())
     }
 
     fn tool_scope_label(&self) -> String {
@@ -3155,7 +3206,6 @@ fn sanitize_child_plugin_segment(raw: &str) -> String {
         .join("-");
     match normalized.as_str() {
         "" => "child".to_string(),
-        "mod" => "modulo".to_string(),
         other => other.to_string(),
     }
 }
@@ -3208,13 +3258,13 @@ fn render_child_plugin_core(child_segment: &str) -> String {
 
 fn render_child_plugin_test(crate_name: &str) -> String {
     format!(
-        "use {crate_name}::apply;\n\n#[test]\nfn scaffold_reports_not_implemented() {{\n    let result = apply(5.0, 2.0);\n    assert!(result.is_err());\n}}\n"
+        "use {crate_name}::apply;\n\n#[test]\nfn scaffold_exports_apply() {{\n    let _ = apply(5.0, 2.0);\n}}\n"
     )
 }
 
 fn render_child_plugin_overview(plugin_path: &str) -> String {
     format!(
-        "# {}\n\nThis child plugin scaffold was created by the Cordis plugin-iteration agent. Replace the placeholder implementation in `src/core.rs` and tighten the docs once the behavior is real.\n",
+        "# {}\n\nThis child plugin scaffold was created by the Cordis plugin-iteration agent. Replace the placeholder implementation in `src/core.rs`, then update the placeholder smoke test and docs once the behavior is real.\n",
         plugin_path
     )
 }
@@ -3896,4 +3946,22 @@ fn default_snapshot_root(fixtures_root: &Path) -> PathBuf {
     std::env::temp_dir()
         .join("cordis-runtime-host")
         .join(hex::encode(hasher.finalize()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{render_child_plugin_test, sanitize_child_plugin_segment};
+
+    #[test]
+    fn sanitize_child_plugin_segment_keeps_mod_path_component() {
+        assert_eq!(sanitize_child_plugin_segment("mod"), "mod");
+    }
+
+    #[test]
+    fn child_plugin_test_template_is_smoke_only() {
+        let rendered = render_child_plugin_test("expr_evaluator_mod");
+        assert!(rendered.contains("scaffold_exports_apply"));
+        assert!(rendered.contains("let _ = apply(5.0, 2.0);"));
+        assert!(!rendered.contains("is_err"));
+    }
 }

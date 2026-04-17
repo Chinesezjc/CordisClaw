@@ -205,6 +205,9 @@ pub trait AgentBackend {
     fn system_prompt(&self) -> String;
     fn tool_specs(&self) -> Vec<AgentToolSpec>;
     fn execute_tool(&mut self, name: &str, arguments: Value) -> Result<Value, RuntimeError>;
+    fn terminal_tool_reply(&self, _name: &str, _output: &Value) -> Option<String> {
+        None
+    }
     fn tool_scope_label(&self) -> String {
         "agent".to_string()
     }
@@ -385,6 +388,12 @@ impl AgentSession {
                 for tool_call in &message.tool_calls {
                     let (event, tool_output) =
                         execute_agent_tool_call(backend, &available_tools, &self.kind, tool_call);
+                    let event_name = event.name.clone();
+                    let terminal_reply = event
+                        .ok
+                        .then_some(())
+                        .and_then(|_| event.output.as_ref())
+                        .and_then(|output| backend.terminal_tool_reply(&event.name, output));
                     self.transcript.push(AgentTranscriptEntry::Tool {
                         name: event.name.clone(),
                         arguments: event.arguments.clone(),
@@ -398,6 +407,31 @@ impl AgentSession {
                         "tool_call_id": tool_call.id,
                         "content": tool_output,
                     }));
+                    if let Some(reply_content) = terminal_reply {
+                        if message
+                            .tool_calls
+                            .last()
+                            .is_some_and(|last| last.id != tool_call.id)
+                        {
+                            return Err(RuntimeError::LlmResponseInvalid {
+                                message: format!(
+                                    "terminal agent tool {} must be the last tool call in a {} turn",
+                                    event_name, self.kind
+                                ),
+                            });
+                        }
+                        self.remember_exchange(trimmed, &reply_content);
+                        self.completed_turns += 1;
+                        self.transcript.push(AgentTranscriptEntry::Assistant {
+                            content: reply_content.clone(),
+                            response_id: response_id.clone(),
+                        });
+                        return Ok(AgentReply {
+                            response_id,
+                            content: reply_content,
+                            tool_events,
+                        });
+                    }
                 }
                 continue;
             }
@@ -1441,8 +1475,46 @@ mod tests {
     use std::sync::mpsc;
     use std::thread;
 
+    const TEST_TOOL_RECORD: &str = "record_summary";
+    const TEST_TOOL_READ: &str = "read_context";
+
     #[derive(Default)]
     struct FakeHost;
+
+    #[derive(Default)]
+    struct TerminalTestBackend {
+        executed_tools: Vec<String>,
+    }
+
+    impl AgentBackend for TerminalTestBackend {
+        fn system_prompt(&self) -> String {
+            "test backend".to_string()
+        }
+
+        fn tool_specs(&self) -> Vec<AgentToolSpec> {
+            vec![
+                AgentToolSpec {
+                    name: TEST_TOOL_RECORD,
+                    description: "Record a terminal summary.",
+                    parameters: json!({"type":"object","properties":{},"additionalProperties":false}),
+                },
+                AgentToolSpec {
+                    name: TEST_TOOL_READ,
+                    description: "Read extra context.",
+                    parameters: json!({"type":"object","properties":{},"additionalProperties":false}),
+                },
+            ]
+        }
+
+        fn execute_tool(&mut self, name: &str, _arguments: Value) -> Result<Value, RuntimeError> {
+            self.executed_tools.push(name.to_string());
+            Ok(json!({ "tool": name }))
+        }
+
+        fn terminal_tool_reply(&self, name: &str, _output: &Value) -> Option<String> {
+            (name == TEST_TOOL_RECORD).then_some("Terminal summary recorded.".to_string())
+        }
+    }
 
     impl AgentToolHost for FakeHost {
         fn agent_runtime_status(&self) -> Result<Value, RuntimeError> {
@@ -1592,6 +1664,123 @@ mod tests {
         assert_eq!(requests.len(), 2);
         assert!(requests[0].contains("\"tools\""));
         assert!(requests[1].contains("snapshot-demo"));
+    }
+
+    #[test]
+    fn terminal_tool_reply_ends_agent_session_without_extra_turn() {
+        let response = sse_response(vec![
+            json!({
+                "id": "chatcmpl_agent_terminal",
+                "choices": [{
+                    "delta": {
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": "call_record_summary",
+                            "type": "function",
+                            "function": {
+                                "name": TEST_TOOL_RECORD,
+                                "arguments": "{}"
+                            }
+                        }]
+                    }
+                }]
+            }),
+            json!({
+                "id": "chatcmpl_agent_terminal",
+                "choices": [{
+                    "delta": {},
+                    "finish_reason": "tool_calls"
+                }]
+            }),
+        ]);
+        let (base_url, requests_rx, handle) =
+            spawn_chunked_mock_llm_server_sequence(vec![response]);
+
+        let config = LlmApiConfig {
+            provider: "deepseek".to_string(),
+            base_url,
+            api_key: Some("test-key".to_string()),
+            model: "deepseek-reasoner".to_string(),
+            timeout_ms: 30_000,
+            ..LlmApiConfig::default()
+        };
+        let mut session = AgentSession::new(config, "plugin_iteration").expect("build session");
+        let mut backend = TerminalTestBackend::default();
+
+        let reply = session
+            .respond(&mut backend, "Finish the iteration")
+            .expect("terminal tool should end session");
+
+        let requests = requests_rx.recv().expect("captured requests");
+        handle.join().expect("join mock server");
+
+        assert_eq!(reply.content, "Terminal summary recorded.");
+        assert_eq!(reply.tool_events.len(), 1);
+        assert_eq!(backend.executed_tools, vec![TEST_TOOL_RECORD.to_string()]);
+        assert_eq!(requests.len(), 1);
+    }
+
+    #[test]
+    fn terminal_tool_must_be_last_tool_call_in_turn() {
+        let response = sse_response(vec![
+            json!({
+                "id": "chatcmpl_agent_bad_terminal",
+                "choices": [{
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call_record_summary",
+                                "type": "function",
+                                "function": {
+                                    "name": TEST_TOOL_RECORD,
+                                    "arguments": "{}"
+                                }
+                            },
+                            {
+                                "index": 1,
+                                "id": "call_read_context",
+                                "type": "function",
+                                "function": {
+                                    "name": TEST_TOOL_READ,
+                                    "arguments": "{}"
+                                }
+                            }
+                        ]
+                    }
+                }]
+            }),
+            json!({
+                "id": "chatcmpl_agent_bad_terminal",
+                "choices": [{
+                    "delta": {},
+                    "finish_reason": "tool_calls"
+                }]
+            }),
+        ]);
+        let (base_url, _requests_rx, handle) =
+            spawn_chunked_mock_llm_server_sequence(vec![response]);
+
+        let config = LlmApiConfig {
+            provider: "deepseek".to_string(),
+            base_url,
+            api_key: Some("test-key".to_string()),
+            model: "deepseek-reasoner".to_string(),
+            timeout_ms: 30_000,
+            ..LlmApiConfig::default()
+        };
+        let mut session = AgentSession::new(config, "plugin_iteration").expect("build session");
+        let mut backend = TerminalTestBackend::default();
+
+        let err = session
+            .respond(&mut backend, "Bad terminal ordering")
+            .expect_err("terminal tool should be last");
+        handle.join().expect("join mock server");
+
+        assert!(err
+            .to_string()
+            .contains("terminal agent tool record_summary must be the last tool call"));
+        assert_eq!(backend.executed_tools, vec![TEST_TOOL_RECORD.to_string()]);
     }
 
     fn spawn_chunked_mock_llm_server_sequence(

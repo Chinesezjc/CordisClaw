@@ -2257,6 +2257,23 @@ impl LlmPatchPlanner {
                         tool_feedback_error(&tool_call.function.name, &err.to_string()).to_string(),
                     ));
                 }
+                let mut combined_operations = inspection_state.staged_plugin_operations().to_vec();
+                combined_operations.extend(payload.operations.clone());
+                if let Err(err) = validate_reserved_child_keyword_identifiers(
+                    &combined_operations,
+                    &writable_roots,
+                ) {
+                    emit_llm_diagnostic(
+                        true,
+                        format!(
+                            "reasoner_submit_validation_error tool={} error={}",
+                            tool_call.function.name, err
+                        ),
+                    );
+                    return Ok(DeepSeekToolOutcome::ToolResult(
+                        tool_feedback_error(&tool_call.function.name, &err.to_string()).to_string(),
+                    ));
+                }
                 let staged_update =
                     match inspection_state.stage_plugin_operations(payload.operations) {
                         Ok(update) => update,
@@ -3994,11 +4011,13 @@ fn post_strategy_context_feedback(
     }))
 }
 
-fn tool_feedback_error(tool_name: &str, error: &str) -> Value {
+pub(crate) fn tool_feedback_error(tool_name: &str, error: &str) -> Value {
     let hint = if error.contains("replace_exact requires expected_old_string and new_content") {
         "Revise the replace_exact operation: include the exact `expected_old_string` copied from the current file and provide the complete `new_content` for the replacement."
     } else if error.contains("create_file requires expected_old_string and new_content") {
         "Revise the create_file operation: include `expected_old_string` as an empty string and provide the complete `new_content` for the new file."
+    } else if error.contains("raw Rust identifier") {
+        "The filesystem path `.../mod` is valid. Rename only the Rust field/local/access identifier inside source code, then resubmit the tool call."
     } else if error.contains("requires at least one staged operation") {
         "Stage at least one operation with append_plugin_edit_operations before calling finalize_plugin_edit_plan."
     } else if error.contains("does not match the recorded change strategy") {
@@ -4475,7 +4494,7 @@ fn lexically_resolve_relative_path(base_dir: &Path, relative_path: &str) -> Path
     resolved
 }
 
-fn validate_reserved_child_keyword_identifiers(
+pub(crate) fn validate_reserved_child_keyword_identifiers(
     operations: &[PluginEditOperation],
     writable_roots: &BTreeSet<String>,
 ) -> Result<(), RuntimeError> {
@@ -4507,28 +4526,62 @@ fn validate_reserved_child_keyword_identifiers(
             continue;
         };
         for keyword in &reserved_child_keywords {
-            let raw_field = format!(" {keyword}:");
-            let raw_access_dot = format!(".{keyword}.");
-            let raw_access_space = format!(".{keyword} ");
-            let raw_access_comma = format!(".{keyword},");
-            let raw_access_paren = format!(".{keyword})");
-            if content.contains(&raw_field)
-                || content.contains(&raw_access_dot)
-                || content.contains(&raw_access_space)
-                || content.contains(&raw_access_comma)
-                || content.contains(&raw_access_paren)
-            {
-                return Err(RuntimeError::LlmResponseInvalid {
-                    message: format!(
-                        "new child plugin path component `{keyword}` is a Rust keyword and must not be used as a raw Rust identifier in {}",
-                        operation.path
-                    ),
-                });
+            if contains_raw_reserved_identifier_usage(content, keyword) {
+                return Err(reserved_child_keyword_identifier_error(
+                    &operation.path,
+                    keyword,
+                ));
             }
         }
     }
 
     Ok(())
+}
+
+fn contains_raw_reserved_identifier_usage(content: &str, keyword: &str) -> bool {
+    let direct_patterns = [
+        format!(" {keyword}:"),
+        format!("({keyword}:"),
+        format!(", {keyword}:"),
+        format!("let {keyword} "),
+        format!("let mut {keyword} "),
+        format!("for {keyword} in "),
+        format!("as {keyword};"),
+        format!("as {keyword},"),
+        format!("as {keyword}\n"),
+        format!("fn {keyword}("),
+        format!("type {keyword} "),
+        format!("const {keyword}:"),
+        format!("static {keyword}:"),
+        format!(" {keyword} ="),
+        format!(" {keyword} @"),
+    ];
+    direct_patterns
+        .iter()
+        .any(|pattern| content.contains(pattern))
+        || contains_raw_member_access(content, keyword)
+}
+
+fn contains_raw_member_access(content: &str, keyword: &str) -> bool {
+    let needle = format!(".{keyword}");
+    let mut haystack = content;
+    while let Some(idx) = haystack.find(&needle) {
+        let suffix = &haystack[idx + needle.len()..];
+        let next = suffix.chars().next();
+        if next.is_none_or(|ch| !(ch.is_ascii_alphanumeric() || ch == '_')) {
+            return true;
+        }
+        haystack = suffix;
+    }
+    false
+}
+
+fn reserved_child_keyword_identifier_error(path: &str, keyword: &str) -> RuntimeError {
+    RuntimeError::LlmResponseInvalid {
+        message: format!(
+            "child plugin path component `{keyword}` is allowed in filesystem paths like `expr/evaluator/{keyword}`, but raw Rust identifier `{keyword}` is invalid in source code; rename the source identifier in {path} and retry"
+        ),
+    }
 }
 
 fn validate_rust_source_dependencies(
@@ -4620,8 +4673,7 @@ fn validate_staged_plugin_operation_chunk(
             message: "append_plugin_edit_operations requires at least one operation".to_string(),
         });
     }
-    validate_plugin_operation_paths(operations, writable_roots)?;
-    validate_reserved_child_keyword_identifiers(operations, writable_roots)
+    validate_plugin_operation_paths(operations, writable_roots)
 }
 
 fn collect_changed_plugin_paths(
@@ -5395,7 +5447,100 @@ mod tests {
 
         let err = super::validate_submitted_plugin_payload(&payload, &writable_roots, None)
             .expect_err("raw mod identifier should be rejected");
-        assert!(err.to_string().contains("Rust keyword"));
+        assert!(err.to_string().contains("expr/evaluator/mod"));
+        assert!(err
+            .to_string()
+            .contains("raw Rust identifier `mod` is invalid"));
+    }
+
+    #[test]
+    fn append_plugin_edit_operations_rejects_raw_mod_identifier_after_scaffold_chunk() {
+        let planner = LlmPatchPlanner::new(LlmApiConfig::default()).expect("planner should build");
+        let context_files = vec![
+            ContextFile {
+                path: "plugins/expr/evaluator/Cargo.toml".to_string(),
+                sha256: "manifest".to_string(),
+                content: "[package]\nname = \"expr_evaluator\"\n".to_string(),
+            },
+            ContextFile {
+                path: "plugins/expr/evaluator/src/core.rs".to_string(),
+                sha256: "core".to_string(),
+                content: "struct OpPlugins {\n    add: AddPlugin,\n}\n".to_string(),
+            },
+        ];
+        let mut inspection = DeepSeekReadInspectionState::default();
+        inspection.note_plugin_strategy(PluginChangeStrategy {
+            strategy: "new_child_plugin".to_string(),
+            reason: "modulo should live in a sibling evaluator child plugin".to_string(),
+            expected_paths: vec!["plugins/expr/evaluator/mod/Cargo.toml".to_string()],
+        });
+
+        let staged_manifest = planner
+            .execute_deepseek_plugin_tool_call(
+                &DeepSeekToolCall {
+                    id: "call-stage-mod-manifest".to_string(),
+                    call_type: "function".to_string(),
+                    function: DeepSeekToolFunctionCall {
+                        name: "append_plugin_edit_operations".to_string(),
+                        arguments: json!({
+                            "operations": [{
+                                "path": "plugins/expr/evaluator/mod/Cargo.toml",
+                                "kind": "create_file",
+                                "expected_old_string": "",
+                                "new_content": "[package]\nname = \"expr_evaluator_mod\"\nversion = \"0.1.0\"\n"
+                            }]
+                        })
+                        .to_string(),
+                    },
+                },
+                &context_files,
+                None,
+                &mut inspection,
+            )
+            .expect("stage manifest");
+        let super::DeepSeekToolOutcome::ToolResult(staged_feedback) = staged_manifest else {
+            panic!("expected tool feedback");
+        };
+        let staged_parsed: Value = serde_json::from_str(&staged_feedback).expect("feedback json");
+        assert_eq!(staged_parsed.get("ok").and_then(Value::as_bool), Some(true));
+
+        let result = planner
+            .execute_deepseek_plugin_tool_call(
+                &DeepSeekToolCall {
+                    id: "call-stage-raw-mod".to_string(),
+                    call_type: "function".to_string(),
+                    function: DeepSeekToolFunctionCall {
+                        name: "append_plugin_edit_operations".to_string(),
+                        arguments: json!({
+                            "operations": [{
+                                "path": "plugins/expr/evaluator/src/core.rs",
+                                "kind": "replace_exact",
+                                "expected_old_string": "struct OpPlugins {\n    add: AddPlugin,\n}\n",
+                                "new_content": "struct OpPlugins {\n    add: AddPlugin,\n    mod: ModPlugin,\n}\n"
+                            }]
+                        })
+                        .to_string(),
+                    },
+                },
+                &context_files,
+                None,
+                &mut inspection,
+            )
+            .expect("tool execution");
+
+        let super::DeepSeekToolOutcome::ToolResult(feedback) = result else {
+            panic!("expected tool feedback");
+        };
+        let parsed: Value = serde_json::from_str(&feedback).expect("feedback json");
+        assert_eq!(parsed.get("ok").and_then(Value::as_bool), Some(false));
+        assert!(parsed
+            .get("error")
+            .and_then(Value::as_str)
+            .is_some_and(|error| error.contains("expr/evaluator/mod")));
+        assert!(parsed
+            .get("hint")
+            .and_then(Value::as_str)
+            .is_some_and(|hint| hint.contains("filesystem path `.../mod` is valid")));
     }
 
     #[test]
@@ -5433,12 +5578,12 @@ mod tests {
             .canonicalize()
             .expect("workspace root");
         let operations = vec![PluginEditOperation {
-            path: "plugins/expr/evaluator/modulo/Cargo.toml".to_string(),
+            path: "plugins/expr/evaluator/mod/Cargo.toml".to_string(),
             kind: PluginEditOpKind::CreateFile,
             expected_old_string: Some(String::new()),
             expected_sha256: None,
             new_content: Some(
-                "[package]\nname = \"expr_evaluator_modulo\"\nversion = \"0.1.0\"\n[dependencies]\ncordis-plugin-sdk = { path = \"../../../../crates/cordis-plugin-sdk\" }\n"
+                "[package]\nname = \"expr_evaluator_mod\"\nversion = \"0.1.0\"\n[dependencies]\ncordis-plugin-sdk = { path = \"../../../../crates/cordis-plugin-sdk\" }\n"
                     .to_string(),
             ),
             pointer: None,
@@ -5454,12 +5599,12 @@ mod tests {
     fn validate_rust_source_dependencies_requires_thiserror_dependency() {
         let operations = vec![
             PluginEditOperation {
-                path: "plugins/expr/evaluator/modulo/Cargo.toml".to_string(),
+                path: "plugins/expr/evaluator/mod/Cargo.toml".to_string(),
                 kind: PluginEditOpKind::CreateFile,
                 expected_old_string: Some(String::new()),
                 expected_sha256: None,
                 new_content: Some(
-                    "[package]\nname = \"expr_evaluator_modulo\"\nversion = \"0.1.0\"\n[dependencies]\nserde = { version = \"1\", features = [\"derive\"] }\n"
+                    "[package]\nname = \"expr_evaluator_mod\"\nversion = \"0.1.0\"\n[dependencies]\nserde = { version = \"1\", features = [\"derive\"] }\n"
                         .to_string(),
                 ),
                 pointer: None,
@@ -5467,7 +5612,7 @@ mod tests {
                 value: None,
             },
             PluginEditOperation {
-                path: "plugins/expr/evaluator/modulo/src/core.rs".to_string(),
+                path: "plugins/expr/evaluator/mod/src/core.rs".to_string(),
                 kind: PluginEditOpKind::CreateFile,
                 expected_old_string: Some(String::new()),
                 expected_sha256: None,
@@ -6195,7 +6340,7 @@ mod tests {
                                 "path": "plugins/expr/evaluator/mod/Cargo.toml",
                                 "kind": "create_file",
                                 "expected_old_string": "",
-                                "new_content": "[package]\nname = \"expr_evaluator_modulo\"\nversion = \"0.1.0\"\n"
+                                "new_content": "[package]\nname = \"expr_evaluator_mod\"\nversion = \"0.1.0\"\n"
                             }]
                         })
                         .to_string(),
@@ -6263,6 +6408,21 @@ mod tests {
             .get("hint")
             .and_then(Value::as_str)
             .is_some_and(|hint| hint.contains("submit_change_strategy")));
+    }
+
+    #[test]
+    fn tool_feedback_error_mentions_reserved_keyword_recovery() {
+        let feedback = super::tool_feedback_error(
+            "append_plugin_edit_operations",
+            "child plugin path component `mod` is allowed in filesystem paths like `expr/evaluator/mod`, but raw Rust identifier `mod` is invalid in source code; rename the source identifier in plugins/expr/evaluator/src/core.rs and retry",
+        );
+        assert!(feedback
+            .get("hint")
+            .and_then(Value::as_str)
+            .is_some_and(|hint| hint.contains("`.../mod` is valid")));
+        assert!(feedback.get("hint").and_then(Value::as_str).is_some_and(
+            |hint| hint.contains("Rename only the Rust field/local/access identifier")
+        ));
     }
 
     #[test]
