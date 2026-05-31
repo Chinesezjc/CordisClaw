@@ -4579,7 +4579,7 @@ fn contains_raw_member_access(content: &str, keyword: &str) -> bool {
 fn reserved_child_keyword_identifier_error(path: &str, keyword: &str) -> RuntimeError {
     RuntimeError::LlmResponseInvalid {
         message: format!(
-            "child plugin path component `{keyword}` is allowed in filesystem paths like `expr/evaluator/{keyword}`, but raw Rust identifier `{keyword}` is invalid in source code; rename the source identifier in {path} and retry"
+            "child plugin path component `{keyword}` is allowed in filesystem paths like `expr/evaluator/{keyword}`, but raw Rust identifier `{keyword}` is invalid in source code; keep the path as `expr/evaluator/{keyword}`, keep PascalCase type names like `ModPlugin` or `ModError` if needed, and rename only the lower-case Rust identifier in {path} to something like `modulo` or `mod_plugin` before retrying"
         ),
     }
 }
@@ -6414,7 +6414,7 @@ mod tests {
     fn tool_feedback_error_mentions_reserved_keyword_recovery() {
         let feedback = super::tool_feedback_error(
             "append_plugin_edit_operations",
-            "child plugin path component `mod` is allowed in filesystem paths like `expr/evaluator/mod`, but raw Rust identifier `mod` is invalid in source code; rename the source identifier in plugins/expr/evaluator/src/core.rs and retry",
+            "child plugin path component `mod` is allowed in filesystem paths like `expr/evaluator/mod`, but raw Rust identifier `mod` is invalid in source code; keep the path as `expr/evaluator/mod`, keep PascalCase type names like `ModPlugin` or `ModError` if needed, and rename only the lower-case Rust identifier in plugins/expr/evaluator/src/core.rs to something like `modulo` or `mod_plugin` before retrying",
         );
         assert!(feedback
             .get("hint")

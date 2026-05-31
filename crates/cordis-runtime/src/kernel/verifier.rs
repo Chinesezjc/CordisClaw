@@ -368,7 +368,7 @@ fn run_shell_command(
         .output();
 
     #[cfg(not(windows))]
-    let output = Command::new("sh")
+    let output = Command::new("bash")
         .args(["-lc", command])
         .current_dir(current_dir)
         .output();
@@ -395,7 +395,7 @@ fn shell_program() -> &'static str {
 
 #[cfg(not(windows))]
 fn shell_program() -> &'static str {
-    "sh"
+    "bash"
 }
 
 #[cfg(windows)]

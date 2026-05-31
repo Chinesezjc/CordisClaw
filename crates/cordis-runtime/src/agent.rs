@@ -13,7 +13,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const AGENT_HISTORY_MESSAGE_LIMIT: usize = 24;
-const AGENT_MAX_TOOL_TURNS: usize = 32;
+const AGENT_MAX_TOOL_TURNS: usize = 48;
 const AGENT_REQUEST_MAX_ATTEMPTS: usize = 3;
 const AGENT_REQUEST_RETRY_BACKOFF_MS: u64 = 500;
 const AGENT_TOOL_GET_RUNTIME_STATUS: &str = "get_runtime_status";
@@ -722,13 +722,18 @@ impl ChatMessage {
     fn to_request_message(&self) -> Value {
         let mut message = Map::new();
         message.insert("role".to_string(), Value::String("assistant".to_string()));
-        message.insert(
-            "content".to_string(),
-            self.content
-                .as_ref()
-                .map(|content| Value::String(content.clone()))
-                .unwrap_or(Value::Null),
-        );
+        let content_value = self
+            .content
+            .as_ref()
+            .map(|content| Value::String(content.clone()))
+            .unwrap_or_else(|| {
+                if self.reasoning_content.is_some() || !self.tool_calls.is_empty() {
+                    Value::String(String::new())
+                } else {
+                    Value::Null
+                }
+            });
+        message.insert("content".to_string(), content_value);
         if let Some(reasoning_content) = self.reasoning_content.as_ref() {
             if !reasoning_content.trim().is_empty() {
                 message.insert(
@@ -980,10 +985,18 @@ fn execute_agent_tool_call<B: AgentBackend + ?Sized>(
         match serde_json::from_str::<Value>(&tool_call.function.arguments) {
             Ok(value) => value,
             Err(err) => {
+                let recovery_hint = if matches!(
+                    tool_name.as_str(),
+                    "replace_files_exact" | "replace_file_exact"
+                ) {
+                    " Retry with valid JSON. If the batch got too large or only one file needs follow-up, reread the affected file and retry with a smaller replace_files_exact call or replace_file_exact."
+                } else {
+                    ""
+                };
                 let error = json!({
                     "ok": false,
                     "error": format!(
-                        "tool {tool_name} received invalid JSON arguments: {err}"
+                        "tool {tool_name} received invalid JSON arguments: {err}{recovery_hint}"
                     ),
                 });
                 return (
@@ -1575,6 +1588,22 @@ mod tests {
                 "payload": payload_json,
             }))
         }
+    }
+
+    #[test]
+    fn reasoning_only_request_message_uses_empty_content() {
+        let message = ChatMessage {
+            content: None,
+            reasoning_content: Some("Need another reasoning pass".to_string()),
+            tool_calls: Vec::new(),
+        };
+        let request = message.to_request_message();
+        assert_eq!(request.get("role").and_then(Value::as_str), Some("assistant"));
+        assert_eq!(request.get("content").and_then(Value::as_str), Some(""));
+        assert_eq!(
+            request.get("reasoning_content").and_then(Value::as_str),
+            Some("Need another reasoning pass")
+        );
     }
 
     #[test]

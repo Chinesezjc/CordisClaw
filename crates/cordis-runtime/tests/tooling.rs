@@ -95,6 +95,7 @@ impl ModPlugin {
     }
 }
 
+#[allow(dead_code)]
 pub fn apply(lhs: f64, rhs: f64) -> f64 {
     ModPlugin.apply(lhs, rhs)
 }
