@@ -148,11 +148,15 @@ fn assistant_response(response_id: &str, content: &str) -> Vec<(u64, String)> {
 }
 
 fn generated_mod_scaffold_core() -> &'static str {
-    "use serde::{Deserialize, Serialize};\nuse thiserror::Error;\n\n#[derive(Debug, Error, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]\n#[serde(rename_all = \"snake_case\")]\npub enum ModError {\n    #[error(\"not implemented\")]\n    NotImplemented,\n}\n\n#[derive(Debug, Default, Clone, Copy)]\npub struct ModPlugin;\n\nimpl ModPlugin {\n    pub fn apply(&self, _lhs: f64, _rhs: f64) -> Result<f64, ModError> {\n        Err(ModError::NotImplemented)\n    }\n}\n\npub fn apply(lhs: f64, rhs: f64) -> Result<f64, ModError> {\n    ModPlugin.apply(lhs, rhs)\n}\n"
+    "use serde::{Deserialize, Serialize};\nuse thiserror::Error;\n\n#[derive(Debug, Error, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]\n#[serde(rename_all = \"snake_case\")]\npub enum ModError {\n    #[error(\"not implemented\")]\n    NotImplemented,\n}\n\n#[derive(Debug, Default, Clone, Copy)]\npub struct ModPlugin;\n\nimpl ModPlugin {\n    pub fn apply(&self, _lhs: f64, _rhs: f64) -> Result<f64, ModError> {\n        Err(ModError::NotImplemented)\n    }\n}\n\n#[allow(dead_code)]\npub fn apply(lhs: f64, rhs: f64) -> Result<f64, ModError> {\n    ModPlugin.apply(lhs, rhs)\n}\n"
 }
 
 fn implemented_mod_core() -> &'static str {
-    "use serde::{Deserialize, Serialize};\nuse thiserror::Error;\n\n#[derive(Debug, Error, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]\n#[serde(rename_all = \"snake_case\")]\npub enum ModError {\n    #[error(\"division by zero\")]\n    DivisionByZero,\n}\n\n#[derive(Debug, Default, Clone, Copy)]\npub struct ModPlugin;\n\nimpl ModPlugin {\n    pub fn apply(&self, lhs: f64, rhs: f64) -> Result<f64, ModError> {\n        if rhs == 0.0 {\n            return Err(ModError::DivisionByZero);\n        }\n        Ok(lhs % rhs)\n    }\n}\n\npub fn apply(lhs: f64, rhs: f64) -> Result<f64, ModError> {\n    ModPlugin.apply(lhs, rhs)\n}\n"
+    "use serde::{Deserialize, Serialize};\nuse thiserror::Error;\n\n#[derive(Debug, Error, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]\n#[serde(rename_all = \"snake_case\")]\npub enum ModError {\n    #[error(\"division by zero\")]\n    DivisionByZero,\n}\n\n#[derive(Debug, Default, Clone, Copy)]\npub struct ModPlugin;\n\nimpl ModPlugin {\n    pub fn apply(&self, lhs: f64, rhs: f64) -> Result<f64, ModError> {\n        if rhs == 0.0 {\n            return Err(ModError::DivisionByZero);\n        }\n        Ok(lhs % rhs)\n    }\n}\n\n#[allow(dead_code)]\npub fn apply(lhs: f64, rhs: f64) -> Result<f64, ModError> {\n    ModPlugin.apply(lhs, rhs)\n}\n"
+}
+
+fn implemented_mod_core_with_warning() -> &'static str {
+    "use serde::{Deserialize, Serialize};\nuse std::fmt;\nuse thiserror::Error;\n\n#[derive(Debug, Error, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]\n#[serde(rename_all = \"snake_case\")]\npub enum ModError {\n    #[error(\"division by zero\")]\n    DivisionByZero,\n}\n\n#[derive(Debug, Default, Clone, Copy)]\npub struct ModPlugin;\n\nimpl ModPlugin {\n    pub fn apply(&self, lhs: f64, rhs: f64) -> Result<f64, ModError> {\n        if rhs == 0.0 {\n            return Err(ModError::DivisionByZero);\n        }\n        Ok(lhs % rhs)\n    }\n}\n\n#[allow(dead_code)]\npub fn apply(lhs: f64, rhs: f64) -> Result<f64, ModError> {\n    ModPlugin.apply(lhs, rhs)\n}\n"
 }
 
 fn plugin_node_summary(snapshot: &RuntimeSnapshot, plugin_path: &str, node_id: &str) -> String {
@@ -1269,6 +1273,216 @@ fn runtime_host_iterate_plugins_agent_adds_modulo_child_plugin_and_promotes() {
         modulo_value.get("value").and_then(|v| v.as_f64()),
         Some(4.0)
     );
+}
+
+#[test]
+fn runtime_host_iterate_plugins_agent_retries_on_warning_and_promotes() {
+    let temp = setup_fixture_workspace_copy();
+    let fixtures = temp.path().join("fixtures");
+
+    let lexer_before = read_rel(&fixtures, "plugins/expr/lexer/src/core.rs");
+    let lexer_after = replace_once(
+        &lexer_before,
+        "    Slash,\n    LParen,\n",
+        "    Slash,\n    Percent,\n    LParen,\n",
+    );
+    let lexer_after = replace_once(
+        &lexer_after,
+        "            '/' => {\n                pos += 1;\n                Token {\n                    kind: TokenKind::Slash,\n                    position: pos - 1,\n                }\n            }\n            '(' => {\n",
+        "            '/' => {\n                pos += 1;\n                Token {\n                    kind: TokenKind::Slash,\n                    position: pos - 1,\n                }\n            }\n            '%' => {\n                pos += 1;\n                Token {\n                    kind: TokenKind::Percent,\n                    position: pos - 1,\n                }\n            }\n            '(' => {\n",
+    );
+
+    let parser_before = read_rel(&fixtures, "plugins/expr/parser/src/core.rs");
+    let parser_after = replace_once(&parser_before, "    Div,\n}\n", "    Div,\n    Mod,\n}\n");
+    let parser_after = replace_once(
+        &parser_after,
+        "                Some(TokenKind::Star) => BinaryOp::Mul,\n                Some(TokenKind::Slash) => BinaryOp::Div,\n                _ => break,\n",
+        "                Some(TokenKind::Star) => BinaryOp::Mul,\n                Some(TokenKind::Slash) => BinaryOp::Div,\n                Some(TokenKind::Percent) => BinaryOp::Mod,\n                _ => break,\n",
+    );
+
+    let evaluator_before = read_rel(&fixtures, "plugins/expr/evaluator/src/core.rs");
+    let evaluator_after = replace_once(
+        &evaluator_before,
+        "#[path = \"../div/src/core.rs\"]\npub mod div_core;\n",
+        "#[path = \"../div/src/core.rs\"]\npub mod div_core;\n#[path = \"../mod/src/core.rs\"]\npub mod mod_core;\n",
+    );
+    let evaluator_after = replace_once(
+        &evaluator_after,
+        "pub use div_core::{DivError, DivPlugin};\n",
+        "pub use div_core::{DivError, DivPlugin};\npub use mod_core::{ModError, ModPlugin};\n",
+    );
+    let evaluator_after = replace_once(
+        &evaluator_after,
+        "    div: DivPlugin,\n",
+        "    div: DivPlugin,\n    modulo: ModPlugin,\n",
+    );
+    let evaluator_after = replace_once(
+        &evaluator_after,
+        "                BinaryOp::Div => ops.div.apply(left, right).map_err(|err| match err {\n                    DivError::DivisionByZero => EvalError::DivisionByZero,\n                }),\n",
+        "                BinaryOp::Div => ops.div.apply(left, right).map_err(|err| match err {\n                    DivError::DivisionByZero => EvalError::DivisionByZero,\n                }),\n                BinaryOp::Mod => ops.modulo.apply(left, right).map_err(|err| match err {\n                    ModError::DivisionByZero => EvalError::DivisionByZero,\n                }),\n",
+    );
+
+    let eval_tests_before = read_rel(&fixtures, "plugins/expr/tests/eval.rs");
+    let eval_tests_after = format!(
+        "{eval_tests_before}\n#[test]\nfn evaluates_modulo_expression() {{\n    let value = evaluate_expression(\"7 % 4 + 1\").expect(\"must evaluate\");\n    assert_eq!(value, 4.0);\n}}\n"
+    );
+
+    let responses = vec![
+        tool_call_response(
+            "chatcmpl_plugin_iter_warning_1",
+            vec![(
+                "call_scaffold_mod",
+                "scaffold_child_plugin",
+                json!({
+                    "parent_plugin_path": "expr/evaluator",
+                    "child_name": "mod",
+                    "node_id": "expr_mod",
+                    "summary": "Compute lhs modulo rhs."
+                }),
+            )],
+        ),
+        tool_call_response(
+            "chatcmpl_plugin_iter_warning_2",
+            vec![
+                (
+                    "call_replace_lexer",
+                    "replace_file_exact",
+                    json!({
+                        "path": "plugins/expr/lexer/src/core.rs",
+                        "expected_old_string": lexer_before,
+                        "new_content": lexer_after,
+                    }),
+                ),
+                (
+                    "call_replace_parser",
+                    "replace_file_exact",
+                    json!({
+                        "path": "plugins/expr/parser/src/core.rs",
+                        "expected_old_string": parser_before,
+                        "new_content": parser_after,
+                    }),
+                ),
+                (
+                    "call_replace_evaluator",
+                    "replace_file_exact",
+                    json!({
+                        "path": "plugins/expr/evaluator/src/core.rs",
+                        "expected_old_string": evaluator_before,
+                        "new_content": evaluator_after,
+                    }),
+                ),
+                (
+                    "call_replace_mod_core_warning",
+                    "replace_file_exact",
+                    json!({
+                        "path": "plugins/expr/evaluator/mod/src/core.rs",
+                        "expected_old_string": generated_mod_scaffold_core(),
+                        "new_content": implemented_mod_core_with_warning(),
+                    }),
+                ),
+                (
+                    "call_replace_eval_tests",
+                    "replace_file_exact",
+                    json!({
+                        "path": "plugins/expr/tests/eval.rs",
+                        "expected_old_string": eval_tests_before,
+                        "new_content": eval_tests_after,
+                    }),
+                ),
+            ],
+        ),
+        tool_call_response(
+            "chatcmpl_plugin_iter_warning_3",
+            vec![(
+                "call_run_tests_warning",
+                "run_plugin_test",
+                json!({
+                    "command": "cargo test --quiet --manifest-path plugins/expr/Cargo.toml"
+                }),
+            )],
+        ),
+        tool_call_response(
+            "chatcmpl_plugin_iter_warning_4",
+            vec![(
+                "call_fix_mod_warning",
+                "replace_file_exact",
+                json!({
+                    "path": "plugins/expr/evaluator/mod/src/core.rs",
+                    "expected_old_string": implemented_mod_core_with_warning(),
+                    "new_content": implemented_mod_core(),
+                }),
+            )],
+        ),
+        tool_call_response(
+            "chatcmpl_plugin_iter_warning_5",
+            vec![(
+                "call_run_tests_clean",
+                "run_plugin_test",
+                json!({
+                    "command": "cargo test --quiet --manifest-path plugins/expr/Cargo.toml"
+                }),
+            )],
+        ),
+        tool_call_response(
+            "chatcmpl_plugin_iter_warning_6",
+            vec![(
+                "call_record_summary",
+                "record_iteration_summary",
+                json!({
+                    "summary": "Add modulo child plugin support under expr/evaluator/mod and clean warnings before promotion.",
+                    "tests_command": "cargo test --quiet --manifest-path plugins/expr/Cargo.toml"
+                }),
+            )],
+        ),
+    ];
+    let (base_url, requests_rx, handle) = spawn_chunked_mock_llm_server_sequence(responses);
+    write_llm_api_config(temp.path(), &base_url, 120_000);
+
+    let host = RuntimeHost::boot(&fixtures).expect("host should boot");
+
+    let seed = host
+        .invoke(
+            "expr",
+            "expr_entry",
+            json!({ "expression": "1 + 2 * 3" }).to_string(),
+        )
+        .expect("expr invoke should seed canary replay");
+    let seed_value: Value = serde_json::from_str(&seed.payload).expect("seed response json");
+    assert_eq!(seed_value.get("value").and_then(|v| v.as_f64()), Some(7.0));
+
+    let result = host
+        .iterate_plugins(KernelPluginIterationRequest {
+            issue_id: None,
+            target_plugin_paths: vec!["expr".to_string()],
+            instruction: Some("Add modulo operator support with a sibling evaluator child plugin at expr/evaluator/mod.".to_string()),
+            edit_plan: None,
+            manual_approved: false,
+            tests_command: None,
+            safety_command: None,
+            verify_profile: Some(VerificationProfile::RustWorkspace),
+            quality_score: Some(95),
+        })
+        .expect("agent-driven plugin iteration should recover from warnings");
+
+    let requests = requests_rx.recv().expect("captured requests");
+    handle.join().expect("join mock server");
+
+    assert!(requests.len() >= 3);
+    assert!(requests.iter().any(|request| {
+        request.contains("still emitted warnings in files changed during this iteration")
+    }));
+    assert!(requests
+        .iter()
+        .any(|request| request.contains("unused import: `std::fmt`")));
+    assert_eq!(result.final_verdict, PluginIterationFinalVerdict::Promoted);
+
+    let core_after = read_rel(&fixtures, "plugins/expr/evaluator/mod/src/core.rs");
+    assert_eq!(core_after, implemented_mod_core());
+    assert!(host
+        .current_snapshot()
+        .plugin_registry()
+        .get("expr/evaluator/mod")
+        .is_some());
 }
 
 #[test]

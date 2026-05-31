@@ -930,14 +930,22 @@ fn run_command(
     args: &[String],
     current_dir: Option<&Path>,
 ) -> Result<Vec<u8>, RuntimeError> {
+    let command_args = if program == "cargo" {
+        prepare_local_cargo_args(args)
+    } else {
+        args.to_vec()
+    };
     let mut command = Command::new(program);
-    command.args(args);
+    command.args(&command_args);
+    if program == "cargo" {
+        strip_proxy_envs(&mut command);
+    }
     if let Some(dir) = current_dir {
         command.current_dir(dir);
     }
     let output = command.output().map_err(|e| RuntimeError::CommandFailed {
         program: program.to_string(),
-        args: args.to_vec(),
+        args: command_args.clone(),
         message: e.to_string(),
     })?;
     if !output.status.success() {
@@ -946,11 +954,36 @@ fn run_command(
         let message = if stderr.is_empty() { stdout } else { stderr };
         return Err(RuntimeError::CommandFailed {
             program: program.to_string(),
-            args: args.to_vec(),
+            args: command_args,
             message,
         });
     }
     Ok(output.stdout)
+}
+
+fn prepare_local_cargo_args(args: &[String]) -> Vec<String> {
+    let mut command_args = args.to_vec();
+    if cargo_command_prefers_offline(args) && !command_args.iter().any(|arg| arg == "--offline") {
+        command_args.push("--offline".to_string());
+    }
+    command_args
+}
+
+fn cargo_command_prefers_offline(args: &[String]) -> bool {
+    matches!(args.first().map(String::as_str), Some("metadata"))
+}
+
+fn strip_proxy_envs(command: &mut Command) {
+    for key in [
+        "ALL_PROXY",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "all_proxy",
+        "http_proxy",
+        "https_proxy",
+    ] {
+        command.env_remove(key);
+    }
 }
 
 fn expected_artifact_name(plugin_path: &str, is_dylib: bool) -> String {
@@ -959,6 +992,41 @@ fn expected_artifact_name(plugin_path: &str, is_dylib: bool) -> String {
         format!("{stem}.{DLL_EXTENSION}")
     } else {
         format!("{stem}.json")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{cargo_command_prefers_offline, prepare_local_cargo_args};
+
+    #[test]
+    fn metadata_commands_run_offline_for_local_fixture_tooling() {
+        let args = vec![
+            "metadata".to_string(),
+            "--format-version".to_string(),
+            "1".to_string(),
+        ];
+        assert!(cargo_command_prefers_offline(&args));
+        assert_eq!(
+            prepare_local_cargo_args(&args),
+            vec![
+                "metadata".to_string(),
+                "--format-version".to_string(),
+                "1".to_string(),
+                "--offline".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn non_metadata_commands_keep_original_cargo_args() {
+        let args = vec![
+            "build".to_string(),
+            "--manifest-path".to_string(),
+            "fixtures/plugins/Cargo.toml".to_string(),
+        ];
+        assert!(!cargo_command_prefers_offline(&args));
+        assert_eq!(prepare_local_cargo_args(&args), args);
     }
 }
 
