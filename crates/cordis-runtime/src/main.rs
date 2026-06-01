@@ -27,6 +27,7 @@ use std::sync::Arc;
 enum ServeMode {
     Command,
     AgentChat,
+    ShellConsole,
 }
 
 struct ServeState {
@@ -203,10 +204,10 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let _ = rl.load_history(&history_path);
 
     loop {
-        let prompt = if state.mode == ServeMode::AgentChat {
-            ">> "
-        } else {
-            "> "
+        let prompt = match state.mode {
+            ServeMode::AgentChat => ">> ",
+            ServeMode::ShellConsole => "$ ",
+            ServeMode::Command => "> ",
         };
         let line = match rl.readline(prompt) {
             Ok(line) => {
@@ -230,10 +231,10 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         };
 
         let line = line.trim();
-        let handled = if state.mode == ServeMode::AgentChat {
-            handle_agent_chat_line(&host, &mut state, line)
-        } else {
-            handle_serve_command(&host, &mut state, line)
+        let handled = match state.mode {
+            ServeMode::AgentChat => handle_agent_chat_line(&host, &mut state, line),
+            ServeMode::ShellConsole => handle_shell_line(&host, &mut state, line),
+            ServeMode::Command => handle_serve_command(&host, &mut state, line),
         };
 
         match handled {
@@ -268,6 +269,10 @@ fn handle_serve_command(
         "agent" => {
             state.mode = ServeMode::AgentChat;
             println!("agent chat mode (>> prompt). /exit to leave, /reset to clear.");
+        }
+        "shell" => {
+            state.mode = ServeMode::ShellConsole;
+            println!("shell console ($ prompt). Type commands directly. /exit to leave.");
         }
         "agent status" => {
             println!(
@@ -489,6 +494,41 @@ fn handle_agent_chat_line(
         }
     }
 
+    io::stdout().flush()?;
+    Ok(true)
+}
+
+fn handle_shell_line(
+    host: &RuntimeHost,
+    state: &mut ServeState,
+    line: &str,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    if line.is_empty() {
+        return Ok(true);
+    }
+    if line == "/exit" || line == "/quit" {
+        state.mode = ServeMode::Command;
+        println!("back to serve commands (> prompt).");
+        return Ok(true);
+    }
+    // Route through the Shell plugin: start_terminal with a single command.
+    let payload = json!({"action": "start_terminal", "command": line});
+    match host.invoke("shell", "shell_entry", serde_json::to_string(&payload)?) {
+        Ok(response) => {
+            let value: Value = serde_json::from_str(&response.payload)
+                .unwrap_or(Value::String(response.payload.clone()));
+            if let Some(output) = value.get("output").and_then(Value::as_str) {
+                if output.ends_with('\n') {
+                    print!("{output}");
+                } else {
+                    println!("{output}");
+                }
+            } else if let Some(msg) = value.get("message").and_then(Value::as_str) {
+                println!("{msg}");
+            }
+        }
+        Err(err) => println!("shell error: {err}"),
+    }
     io::stdout().flush()?;
     Ok(true)
 }
@@ -1205,6 +1245,7 @@ fn serve_usage() -> &'static str {
     "serve commands:
   help
   agent
+  shell
   agent <message>
   agent start
   agent send <session-id> <message>
