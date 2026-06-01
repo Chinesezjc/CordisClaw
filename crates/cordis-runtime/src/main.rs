@@ -1,17 +1,13 @@
 use cordis_runtime::agent::ShellAgentReply;
-use cordis_runtime::config::RuntimeConfig;
 use cordis_runtime::context::ContextRegistry;
 use cordis_runtime::host::{
-    AgentSessionKind, KernelApplyRequest, KernelPlanRequest, RuntimeHost, RuntimeKernel,
+    AgentSessionKind, KernelApplyRequest, RuntimeHost,
 };
 use cordis_runtime::kernel::auto_update::{
     AutoUpdatePlan, AutoUpdater, FilePatch, VerificationEnvelope,
 };
-use cordis_runtime::kernel::evaluator::{EvalHarness, VerificationInput};
-use cordis_runtime::kernel::memory::ChangeMemory;
+use cordis_runtime::kernel::evaluator::VerificationInput;
 use cordis_runtime::kernel::plugin_iteration::KernelPluginIterationRequest;
-use cordis_runtime::kernel::policy::IterationPolicy;
-use cordis_runtime::kernel::r#loop::SelfIterationKernel;
 use cordis_runtime::kernel::verifier::VerificationProfile;
 use cordis_runtime::plugin::invoke::PluginInvoker;
 use cordis_runtime::plugin::loader::{default_loader_config, Loader};
@@ -19,7 +15,8 @@ use cordis_runtime::plugin::tooling::{
     prepare_artifacts, rebuild_fixture_artifacts, refresh_artifact_index, sync_plugin_docs,
     PrepareMode,
 };
-use serde_json::Value;
+use serde_json::{json, Value};
+use std::collections::BTreeSet;
 use std::fs;
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -333,8 +330,8 @@ fn handle_serve_command(
                     .run_iteration(request.plan, request.verification)?;
                 println!("{}", serde_json::to_string(&result)?);
             } else if let Some(json) = command.strip_prefix("kernel plan-apply ") {
-                let request: KernelPlanRequest = serde_json::from_str(json)?;
-                let result = host.kernel().plan_and_run_iteration(request)?;
+                let request: KernelPluginIterationRequest = serde_json::from_str(json)?;
+                let result = host.iterate_plugins(request)?;
                 println!("{}", serde_json::to_string(&result)?);
             } else if let Some(json) = command.strip_prefix("kernel iterate-plugins ") {
                 let request: KernelPluginIterationRequest = serde_json::from_str(json)?;
@@ -515,17 +512,11 @@ fn emit_invoke_response(payload: &str) -> Result<(), Box<dyn std::error::Error>>
 }
 
 fn emit_agent_reply(reply: &ShellAgentReply) -> Result<(), Box<dyn std::error::Error>> {
-    for event in &reply.tool_events {
-        println!(
-            "[agent-tool] {} {}",
-            event.name,
-            serde_json::to_string(&event.arguments)?
-        );
-    }
-    if reply.content.trim().is_empty() {
+    // Tool calls are already announced in real-time during agent execution.
+    // Content is already streamed in real-time.
+    // Only print a note if the agent returned nothing at all.
+    if reply.tool_events.is_empty() && reply.content.trim().is_empty() {
         println!("(agent returned an empty response)");
-    } else {
-        println!("{}", reply.content);
     }
     Ok(())
 }
@@ -580,13 +571,8 @@ fn run_auto_update(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         return Err(format!("unknown flag: {token}").into());
     }
 
-    let mut policy = IterationPolicy::default();
-    policy.path_allowlist = vec!["".to_string()];
-    let mut kernel =
-        SelfIterationKernel::new(policy, EvalHarness::default(), ChangeMemory::default());
     let updater = AutoUpdater::new(&workspace_root);
     let result = updater.execute(
-        &mut kernel,
         AutoUpdatePlan {
             issue_id: "cli-issue".to_string(),
             patch_id: "cli-patch".to_string(),
@@ -603,16 +589,9 @@ fn run_auto_update(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         },
     )?;
 
-    println!("auto_update verdict: {:?}", result.report.verdict);
+    println!("auto_update verdict: {}", result.verdict);
     println!("rolled_back: {}", result.rolled_back);
     println!("changed_paths: {:?}", result.changed_paths);
-    println!("evaluation_reasons: {:?}", result.report.evaluation.reasons);
-    println!(
-        "kernel_metrics: total={}, promote={}, rollback={}",
-        kernel.metrics().iteration_total,
-        kernel.metrics().iteration_promote_total,
-        kernel.metrics().iteration_rollback_total
-    );
     Ok(())
 }
 
@@ -624,7 +603,7 @@ fn run_llm_auto_update(args: &[String]) -> Result<(), Box<dyn std::error::Error>
     let workspace_root = PathBuf::from(&args[0]);
     let mut instruction: Option<String> = None;
     let mut issue_id: Option<String> = None;
-    let mut patch_id: Option<String> = None;
+    let mut _patch_id: Option<String> = None;
     let mut paths = Vec::new();
     let mut manual_approved = false;
     let mut tests_command: Option<String> = None;
@@ -643,7 +622,7 @@ fn run_llm_auto_update(args: &[String]) -> Result<(), Box<dyn std::error::Error>
             continue;
         }
         if let Some(value) = token.strip_prefix("--patch-id=") {
-            patch_id = Some(value.to_string());
+            _patch_id = Some(value.to_string());
             continue;
         }
         if let Some(value) = token.strip_prefix("--path=") {
@@ -682,13 +661,31 @@ fn run_llm_auto_update(args: &[String]) -> Result<(), Box<dyn std::error::Error>
         return Err("missing required flag: --path=<relative_path>".into());
     }
 
-    let config = RuntimeConfig::load(&workspace_root)?;
-    let kernel = RuntimeKernel::new(&workspace_root, &config);
-    let request = KernelPlanRequest {
+    // Derive target plugin paths from the file paths: "plugins/expr/lexer/src/core.rs" -> "expr/lexer"
+    let target_plugin_paths: Vec<String> = paths
+        .iter()
+        .filter_map(|path| {
+            let stripped = path.strip_prefix("plugins/")?;
+            if stripped.contains("/src/") {
+                Some(stripped.split("/src/").next()?.to_string())
+            } else if stripped.contains("/tests/") {
+                Some(stripped.split("/tests/").next()?.to_string())
+            } else if stripped.ends_with("/Cargo.toml") {
+                Some(stripped.strip_suffix("/Cargo.toml")?.to_string())
+            } else {
+                None
+            }
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+
+    let host = RuntimeHost::boot(&workspace_root)?;
+    let request = KernelPluginIterationRequest {
         issue_id,
-        patch_id,
-        instruction,
-        paths,
+        target_plugin_paths,
+        instruction: Some(instruction),
+        edit_plan: None,
         manual_approved,
         tests_command,
         safety_command,
@@ -697,12 +694,16 @@ fn run_llm_auto_update(args: &[String]) -> Result<(), Box<dyn std::error::Error>
     };
 
     if dry_run {
-        let planned = kernel.plan_update(request)?;
-        println!("{}", serde_json::to_string_pretty(&planned)?);
+        println!("{}", serde_json::to_string_pretty(&json!({
+            "dry_run": true,
+            "message": "agent loop dry-run",
+            "paths": paths,
+            "target_plugin_paths": request.target_plugin_paths,
+        }))?);
         return Ok(());
     }
 
-    let result = kernel.plan_and_run_iteration(request)?;
+    let result = host.iterate_plugins(request)?;
     println!("{}", serde_json::to_string_pretty(&result)?);
     Ok(())
 }

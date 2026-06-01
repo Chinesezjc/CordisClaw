@@ -575,6 +575,26 @@ impl PluginEditRollback {
         }
     }
 
+    /// Create a rollback containing a single file backup.
+    pub fn single_backup(
+        workspace_root: impl Into<PathBuf>,
+        rel_path: &str,
+        original: Option<Vec<u8>>,
+    ) -> Self {
+        Self {
+            workspace_root: workspace_root.into(),
+            backups: vec![AppliedEditBackup {
+                rel_path: rel_path.to_string(),
+                original,
+            }],
+        }
+    }
+
+    /// Number of backed-up files in this rollback.
+    pub fn len(&self) -> usize {
+        self.backups.len()
+    }
+
     pub fn absorb(&mut self, mut other: Self) -> Result<(), RuntimeError> {
         if self.workspace_root != other.workspace_root {
             return Err(RuntimeError::Invariant {
@@ -1117,4 +1137,114 @@ mod tests {
             KernelPluginIssueSource::InvokeFailure.priority()
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Reserved keyword validation (moved from kernel/planner)
+// ---------------------------------------------------------------------------
+
+pub(crate) fn validate_reserved_child_keyword_identifiers(
+    operations: &[PluginEditOperation],
+    writable_roots: &BTreeSet<String>,
+) -> Result<(), RuntimeError> {
+    let reserved_child_keywords = operations
+        .iter()
+        .filter(|operation| operation.kind == PluginEditOpKind::CreateFile)
+        .filter_map(|operation| normalize_rel_path(&operation.path).ok())
+        .filter(|path| path.ends_with("/Cargo.toml"))
+        .filter_map(|path| {
+            let root = deepest_matching_writable_root(&path, writable_roots)?;
+            let relative = path
+                .strip_prefix(root)?
+                .strip_prefix('/')
+                .and_then(|value| value.strip_suffix("/Cargo.toml"))?;
+            let child_name = relative.rsplit('/').next()?;
+            matches!(child_name, "mod").then_some(child_name.to_string())
+        })
+        .collect::<BTreeSet<_>>();
+
+    if reserved_child_keywords.is_empty() {
+        return Ok(());
+    }
+
+    for operation in operations {
+        if !operation.path.ends_with(".rs") {
+            continue;
+        }
+        let Some(content) = operation.new_content.as_deref() else {
+            continue;
+        };
+        for keyword in &reserved_child_keywords {
+            if contains_raw_reserved_identifier_usage(content, keyword) {
+                return Err(reserved_child_keyword_identifier_error(
+                    &operation.path,
+                    keyword,
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn contains_raw_reserved_identifier_usage(content: &str, keyword: &str) -> bool {
+    let direct_patterns = [
+        format!(" {keyword}:"),
+        format!("({keyword}:"),
+        format!(", {keyword}:"),
+        format!("let {keyword} "),
+        format!("let mut {keyword} "),
+        format!("for {keyword} in "),
+        format!("as {keyword};"),
+        format!("as {keyword},"),
+        format!("as {keyword}\n"),
+        format!("fn {keyword}("),
+        format!("type {keyword} "),
+        format!("const {keyword}:"),
+        format!("static {keyword}:"),
+        format!(" {keyword} ="),
+        format!(" {keyword} @"),
+    ];
+    direct_patterns
+        .iter()
+        .any(|pattern| content.contains(pattern))
+        || contains_raw_member_access(content, keyword)
+}
+
+fn contains_raw_member_access(content: &str, keyword: &str) -> bool {
+    let needle = format!(".{keyword}");
+    let mut haystack = content;
+    while let Some(idx) = haystack.find(&needle) {
+        let suffix = &haystack[idx + needle.len()..];
+        let next = suffix.chars().next();
+        if next.is_none_or(|ch| !(ch.is_ascii_alphanumeric() || ch == '_')) {
+            return true;
+        }
+        haystack = suffix;
+    }
+    false
+}
+
+fn reserved_child_keyword_identifier_error(path: &str, keyword: &str) -> RuntimeError {
+    RuntimeError::LlmResponseInvalid {
+        message: format!(
+            "child plugin path component `{keyword}` is allowed in filesystem paths like `expr/evaluator/{keyword}`, but raw Rust identifier `{keyword}` is invalid in source code; keep the path as `expr/evaluator/{keyword}`, keep PascalCase type names like `ModPlugin` or `ModError` if needed, and rename only the lower-case Rust identifier in {path} to something like `modulo` or `mod_plugin` before retrying"
+        ),
+    }
+}
+
+pub(crate) fn deepest_matching_writable_root<'a>(
+    path: &str,
+    writable_roots: &'a BTreeSet<String>,
+) -> Option<&'a str> {
+    writable_roots
+        .iter()
+        .map(String::as_str)
+        .filter(|root| {
+            path == *root
+                || path
+                    .strip_prefix(root)
+                    .is_some_and(|rest| rest.starts_with('/'))
+        })
+        .max_by_key(|root| root.len())
 }

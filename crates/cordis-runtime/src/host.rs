@@ -16,22 +16,18 @@ use crate::execution::scheduler::SchedulerConfig;
 use crate::kernel::auto_update::{
     AutoUpdatePlan, AutoUpdateResult, AutoUpdater, VerificationEnvelope,
 };
-use crate::kernel::evaluator::{EvalHarness, VerificationInput};
+use crate::kernel::evaluator::VerificationInput;
 use crate::kernel::memory::{ChangeMemory, ChangeRecord};
-use crate::kernel::planner::{
-    validate_reserved_child_keyword_identifiers, LlmPatchPlanner, PlanRequest, PlannedUpdate,
-};
 use crate::kernel::plugin_iteration::{
+    validate_reserved_child_keyword_identifiers,
     file_sha256, normalize_rel_path, now_ms, CanaryReport, CanaryVerdict, KernelPluginIssue,
     KernelPluginIssueSource, KernelPluginIssueStatus, KernelPluginIterationRequest,
     PluginEditExecutor, PluginEditOpKind, PluginEditOperation, PluginEditPlan, PluginEditRollback,
-    PluginIterationFinalVerdict, PluginIterationHistoryEntry, PluginIterationNetSpec,
+    PluginIterationFinalVerdict, PluginIterationHistoryEntry,
     PluginIterationPolicy, PluginIterationStatus, VerifierVerdict,
 };
-use crate::kernel::policy::IterationPolicy;
-use crate::kernel::r#loop::SelfIterationKernel;
 use crate::kernel::verifier::{
-    CommandVerifier, VerificationPlan, VerificationProfile, VerificationReport,
+    CommandVerifier, VerificationProfile, VerificationReport,
 };
 use crate::plugin::abi::PluginResponse;
 use crate::plugin::invoke::invoke_registered_plugin;
@@ -339,37 +335,6 @@ pub struct KernelApplyRequest {
     pub verification: VerificationInput,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct KernelPlanRequest {
-    pub issue_id: Option<String>,
-    pub patch_id: Option<String>,
-    pub instruction: String,
-    pub paths: Vec<String>,
-    pub manual_approved: bool,
-    pub tests_command: Option<String>,
-    pub safety_command: Option<String>,
-    pub verify_profile: Option<VerificationProfile>,
-    pub quality_score: Option<u32>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct KernelPlanResult {
-    pub plan: AutoUpdatePlan,
-    pub summary: String,
-    pub verification_plan: VerificationPlan,
-    pub tests_command: Option<String>,
-    pub safety_command: Option<String>,
-    pub planner_model: String,
-    pub response_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct KernelPlanApplyResult {
-    pub planned: KernelPlanResult,
-    pub verification: VerificationReport,
-    pub result: AutoUpdateResult,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct KernelPluginIterationResult {
     pub iteration_id: String,
@@ -421,6 +386,13 @@ struct InvocationSample {
     observed_at_ms: u128,
 }
 
+#[derive(Debug, Default, Clone)]
+struct KernelIterationMetrics {
+    iteration_total: u64,
+    iteration_promote_total: u64,
+    iteration_rollback_total: u64,
+}
+
 #[derive(Debug)]
 pub struct RuntimeKernel {
     workspace_root: PathBuf,
@@ -433,15 +405,14 @@ pub struct RuntimeKernel {
     blocked_iterations: Mutex<BTreeMap<String, KernelPluginIterationResult>>,
     last_plugin_iteration: Mutex<Option<KernelPluginIterationResult>>,
     active_plugin_iteration: Mutex<Option<String>>,
+    iteration_metrics: Mutex<KernelIterationMetrics>,
+    memory: Mutex<ChangeMemory>,
     updater: AutoUpdater,
-    inner: Mutex<SelfIterationKernel>,
 }
 
 impl RuntimeKernel {
     pub fn new(workspace_root: impl Into<PathBuf>, config: &RuntimeConfig) -> Self {
         let workspace_root = workspace_root.into();
-        let mut policy = IterationPolicy::default();
-        policy.path_allowlist = vec!["".to_string()];
         Self {
             config_dir: config.config_dir.clone(),
             llm_api: config.llm_api.clone(),
@@ -452,15 +423,10 @@ impl RuntimeKernel {
             blocked_iterations: Mutex::new(BTreeMap::new()),
             last_plugin_iteration: Mutex::new(None),
             active_plugin_iteration: Mutex::new(None),
+            iteration_metrics: Mutex::new(KernelIterationMetrics::default()),
+            memory: Mutex::new(ChangeMemory::with_limit(config.kernel.change_history_limit)),
             updater: AutoUpdater::new(&workspace_root),
             workspace_root,
-            inner: Mutex::new(SelfIterationKernel::new(
-                policy,
-                EvalHarness {
-                    min_quality_score: config.kernel.min_quality_score,
-                },
-                ChangeMemory::with_limit(config.kernel.change_history_limit),
-            )),
         }
     }
 
@@ -469,12 +435,6 @@ impl RuntimeKernel {
     }
 
     pub fn status(&self) -> KernelStatus {
-        let kernel = self
-            .inner
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        let metrics = kernel.metrics();
-        let memory = kernel.memory();
         let plugin_issues = self
             .plugin_issues
             .lock()
@@ -492,7 +452,11 @@ impl RuntimeKernel {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
             .clone();
-        KernelStatus {
+        let metrics = self
+            .iteration_metrics
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let status = KernelStatus {
             workspace_root: self.workspace_root.display().to_string(),
             config_dir: self.config_dir.display().to_string(),
             llm_provider: self.llm_api.provider.clone(),
@@ -501,23 +465,34 @@ impl RuntimeKernel {
             iteration_total: metrics.iteration_total,
             iteration_promote_total: metrics.iteration_promote_total,
             iteration_rollback_total: metrics.iteration_rollback_total,
-            history_len: memory.len(),
-            last_change: memory.recent(1).into_iter().next(),
+            history_len: self
+                .memory
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .len(),
+            last_change: self
+                .memory
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .recent(1)
+                .into_iter()
+                .next(),
             plugin_issue_count: plugin_issues.len(),
             blocked_iteration_count: blocked_iterations.len(),
             plugin_iteration_total: plugin_history.len(),
             last_plugin_iteration: last_plugin_iteration
                 .as_ref()
                 .map(plugin_iteration_status_from_result),
-        }
+        };
+        status
     }
 
     pub fn history(&self) -> Vec<ChangeRecord> {
-        let kernel = self
-            .inner
+        let memory = self
+            .memory
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        kernel.memory().recent(kernel.memory().len())
+        memory.recent(memory.len())
     }
 
     pub fn plugin_issues(&self) -> Vec<KernelPluginIssue> {
@@ -792,6 +767,10 @@ impl RuntimeKernel {
     }
 
     pub fn record_plugin_iteration_outcome(&self, result: &KernelPluginIterationResult) {
+        self.iteration_metrics
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .iteration_total += 1;
         let completed_at_ms = now_ms();
         let history_entry = PluginIterationHistoryEntry {
             iteration_id: result.iteration_id.clone(),
@@ -833,6 +812,10 @@ impl RuntimeKernel {
                 self.update_issue_status(&result.issue_id, KernelPluginIssueStatus::Blocked);
             }
             PluginIterationFinalVerdict::Promoted => {
+                self.iteration_metrics
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .iteration_promote_total += 1;
                 self.blocked_iterations
                     .lock()
                     .unwrap_or_else(|poison| poison.into_inner())
@@ -840,6 +823,10 @@ impl RuntimeKernel {
                 self.update_issue_status(&result.issue_id, KernelPluginIssueStatus::Resolved);
             }
             PluginIterationFinalVerdict::RolledBack => {
+                self.iteration_metrics
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .iteration_rollback_total += 1;
                 self.blocked_iterations
                     .lock()
                     .unwrap_or_else(|poison| poison.into_inner())
@@ -854,80 +841,46 @@ impl RuntimeKernel {
         plan: AutoUpdatePlan,
         verification: VerificationInput,
     ) -> Result<AutoUpdateResult, RuntimeError> {
-        let mut kernel = self
-            .inner
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        self.updater.execute(&mut kernel, plan, |_| {
+        let issue_id = plan.issue_id.clone();
+        let patch_id = plan.patch_id.clone();
+        {
+            let mut metrics = self
+                .iteration_metrics
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            metrics.iteration_total += 1;
+        }
+        let result = self.updater.execute(plan, |_| {
             Ok(VerificationEnvelope::from(verification))
-        })
-    }
-
-    pub fn plan_update(
-        &self,
-        request: KernelPlanRequest,
-    ) -> Result<KernelPlanResult, RuntimeError> {
-        let verify_profile = request.verify_profile.unwrap_or_default();
-        let user_tests_command = request.tests_command.clone();
-        let user_safety_command = request.safety_command.clone();
-        let planner = LlmPatchPlanner::new(self.llm_api.clone())?;
-        let planned = planner.plan(
-            &self.workspace_root,
-            PlanRequest {
-                issue_id: normalize_request_id(request.issue_id, "llm-issue"),
-                patch_id: normalize_request_id(request.patch_id, "llm-patch"),
-                instruction: request.instruction,
-                paths: request.paths,
-                manual_approved: request.manual_approved,
-            },
-        )?;
-        let tests_command = user_tests_command.or_else(|| planned.tests_command.clone());
-        let safety_command = user_safety_command.or_else(|| planned.safety_command.clone());
-        let verification_plan = CommandVerifier::resolve_plan(
-            &self.workspace_root,
-            verify_profile,
-            tests_command.as_deref(),
-            safety_command.as_deref(),
-        );
-        Ok(kernel_plan_result(planned, verification_plan))
-    }
-
-    pub fn plan_and_run_iteration(
-        &self,
-        request: KernelPlanRequest,
-    ) -> Result<KernelPlanApplyResult, RuntimeError> {
-        let planned = self.plan_update(request.clone())?;
-        let quality_score = request.quality_score;
-        let mut verification_report = None;
-        let mut kernel = self
-            .inner
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        let result = self
-            .updater
-            .execute(&mut kernel, planned.plan.clone(), |workspace_root| {
-                let report = CommandVerifier::verify(
-                    workspace_root,
-                    planned.verification_plan.profile,
-                    planned.verification_plan.tests_command.as_deref(),
-                    planned.verification_plan.safety_command.as_deref(),
-                    quality_score,
-                )?;
-                let envelope = VerificationEnvelope {
-                    input: report.input.clone(),
-                    verification_profile: Some(report.plan.profile.as_str().to_string()),
-                };
-                verification_report = Some(report);
-                Ok(envelope)
-            })?;
-        let verification = verification_report.ok_or_else(|| RuntimeError::Invariant {
-            message: "verification report missing after updater execution".to_string(),
         })?;
-        Ok(KernelPlanApplyResult {
-            planned,
-            verification,
-            result,
-        })
+        {
+            let mut metrics = self
+                .iteration_metrics
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            if result.rolled_back {
+                metrics.iteration_rollback_total += 1;
+            } else {
+                metrics.iteration_promote_total += 1;
+            }
+        }
+        self.memory
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .record(
+                issue_id,
+                patch_id,
+                "auto_update".to_string(),
+                None,
+                if result.rolled_back {
+                    crate::kernel::memory::ChangeVerdict::Rollback
+                } else {
+                    crate::kernel::memory::ChangeVerdict::Promote
+                },
+                result.quality_score,
+                Vec::new(),
+            );
+        Ok(result)
     }
 }
 
@@ -944,6 +897,8 @@ pub struct RuntimeHost {
     last_reload_attempt: Mutex<Option<ReloadAttemptReport>>,
     last_candidate_reload_attempt: Mutex<Option<ReloadAttemptReport>>,
     agent_sessions: Mutex<BTreeMap<String, ManagedAgentSession>>,
+    /// Accumulated rollback for interactive agent file edits.
+    interactive_rollback: Mutex<PluginEditRollback>,
     kernel: RuntimeKernel,
 }
 
@@ -1096,6 +1051,7 @@ impl RuntimeHost {
         recover_plugin_iteration_workspace(&fixtures_root, &snapshot_root)?;
 
         let initial_snapshot = Arc::new(build_snapshot(&loader, &snapshot_root)?);
+        let interactive_rollback = Mutex::new(PluginEditRollback::empty(&fixtures_root));
         Ok(Self {
             kernel: RuntimeKernel::new(&fixtures_root, &config),
             config,
@@ -1109,11 +1065,104 @@ impl RuntimeHost {
             last_reload_attempt: Mutex::new(None),
             last_candidate_reload_attempt: Mutex::new(None),
             agent_sessions: Mutex::new(BTreeMap::new()),
+            interactive_rollback,
         })
     }
 
     pub fn fixtures_root(&self) -> &Path {
         &self.fixtures_root
+    }
+
+    pub(crate) fn interactive_rollback(
+        &self,
+    ) -> std::sync::MutexGuard<'_, PluginEditRollback> {
+        self.interactive_rollback
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    /// Resolve a relative path within the fixtures root, rejecting traversal
+    /// attempts (absolute paths, `..` components) and symlink escapes.
+    pub fn resolve_sandboxed_path(&self, rel: &str) -> Result<PathBuf, RuntimeError> {
+        let rel_path = Path::new(rel);
+        if rel_path.is_absolute() {
+            return Err(RuntimeError::InvalidArgument {
+                message: format!("absolute path is not allowed: {rel}"),
+            });
+        }
+        if rel_path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err(RuntimeError::InvalidArgument {
+                message: format!("parent directory traversal (..) is not allowed: {rel}"),
+            });
+        }
+        let resolved = self.fixtures_root.join(rel_path);
+        // Canonicalize to resolve symlinks, then verify containment.
+        let canonical = resolved.canonicalize().unwrap_or(resolved.clone());
+        let canonical_root = self
+            .fixtures_root
+            .canonicalize()
+            .unwrap_or_else(|_| self.fixtures_root.clone());
+        if !canonical.starts_with(&canonical_root) {
+            return Err(RuntimeError::InvalidArgument {
+                message: format!("path escapes fixtures root: {rel}"),
+            });
+        }
+        Ok(canonical)
+    }
+
+    /// Walk code files under `root`, calling `f` for each regular file that
+    /// looks like source code (by extension). Skips `target/`, `.git/`, and
+    /// binary-looking files. Stops early when `f` returns sufficiently many
+    /// results (the callback tracks its own limit).
+    pub fn walk_code_files(
+        &self,
+        root: &Path,
+        f: &mut dyn FnMut(&str, &Path),
+    ) -> Result<(), RuntimeError> {
+        if !root.is_dir() {
+            return Ok(());
+        }
+        let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let entries = match std::fs::read_dir(&dir) {
+                Ok(iter) => iter,
+                Err(_) => continue,
+            };
+            for entry in entries {
+                let entry = match entry {
+                    Ok(e) => e,
+                    Err(_) => continue,
+                };
+                let ft = match entry.file_type() {
+                    Ok(ft) => ft,
+                    Err(_) => continue,
+                };
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy();
+                // Skip well-known generated / VCS directories.
+                if ft.is_dir() {
+                    if name_str == "target" || name_str == ".git" || name_str == "node_modules" {
+                        continue;
+                    }
+                    stack.push(entry.path());
+                    continue;
+                }
+                if !ft.is_file() {
+                    continue;
+                }
+                // Only index source-like files.
+                if !is_source_like_file_name(&name_str) {
+                    continue;
+                }
+                if let Ok(rel) = entry.path().strip_prefix(root) {
+                    f(rel.to_string_lossy().as_ref(), &entry.path());
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn config(&self) -> &RuntimeConfig {
@@ -1590,93 +1639,94 @@ impl RuntimeHost {
             .kernel
             .begin_plugin_iteration(snapshot.as_ref(), &request)?;
         let iteration_id = prepared.iteration_id.clone();
-        let net = build_plugin_iteration_execution_net();
-        let mut context = snapshot.context_baseline().clone();
-        let mut state = PluginIterationRunState::new(prepared.clone());
-        let result = execute_net(
-            ExecutionConfig {
-                scheduler: SchedulerConfig { max_parallelism: 1 },
-                ..ExecutionConfig::default()
-            },
-            net,
-            &mut context,
-            |spec, _, _, _| {
-                let transition_id = spec.transition.transition_id.as_str();
-                if state.stage_error.is_some() && transition_id != "promote_or_rollback" {
-                    return TransitionRunResult {
-                        outcome: NodeOutcome::Skipped,
-                        payload: json!({ "skipped_after_failure": true }),
-                    };
+
+        // Wrap the entire iteration body in a panic guard: if any step panics
+        // (e.g. inside the agent loop, rebuild, or verification), we catch it
+        // and perform emergency rollback instead of crashing the server.
+        let result: std::thread::Result<
+            Result<KernelPluginIterationResult, RuntimeError>,
+        > = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut state = PluginIterationRunState::new(prepared.clone());
+
+            // Step 1: Run the agent loop — the agent freely decides what to do.
+            match self.run_plugin_iteration_agent(&state.prepared) {
+                Ok(agent) => {
+                    state.agent_session_id = agent.session_id;
+                    state.tool_execution_summary = agent.tool_summary;
+                    state.derived_edit_plan = Some(agent.snapshot.derived_edit_plan.clone());
+                    state.transcript_excerpt = agent.transcript_excerpt;
+                    state.rollback = Some(agent.snapshot.rollback);
+                    state.changed_paths = agent.snapshot.changed_paths;
+                    state.diff_lines = agent.snapshot.derived_edit_plan.diff_lines();
+                    state.tests_command = agent.snapshot.tests_command;
+                    state.safety_command = agent.snapshot.safety_command;
+                    if agent.snapshot.recorded_summary.is_none() {
+                        let err_msg = format!(
+                            "plugin iteration agent session {} exited without calling record_iteration_summary",
+                            state.agent_session_id.as_deref().unwrap_or("unknown-session")
+                        );
+                        self.observe_plugin_iteration_failure(&state.prepared, "agent", &RuntimeError::LlmResponseInvalid { message: err_msg.clone() });
+                        state.stage_error = Some(err_msg);
+                    }
                 }
-                let stage_result: Result<Value, RuntimeError> = match transition_id {
-                    "observe" => Ok(json!({
-                        "issue_id": state.prepared.issue_id,
-                        "root_plugin_path": state.prepared.root_plugin_path,
-                    })),
-                    "select_issue" => Ok(json!({
-                        "target_plugin_paths": state.prepared.target_plugin_paths,
-                    })),
-                    "plan" => (|| {
-                        let agent = self.run_plugin_iteration_agent(&state.prepared)?;
-                        state.agent_session_id = agent.session_id;
-                        state.tool_execution_summary = agent.tool_summary;
-                        state.derived_edit_plan = Some(agent.snapshot.derived_edit_plan.clone());
-                        state.transcript_excerpt = agent.transcript_excerpt;
-                        state.rollback = Some(agent.snapshot.rollback);
-                        state.changed_paths = agent.snapshot.changed_paths;
-                        state.diff_lines = agent.snapshot.derived_edit_plan.diff_lines();
-                        state.tests_command = agent.snapshot.tests_command;
-                        state.safety_command = agent.snapshot.safety_command;
-                        if agent.snapshot.recorded_summary.is_none() {
-                            return Err(RuntimeError::LlmResponseInvalid {
-                                message: format!(
-                                    "plugin iteration agent session {} exited without calling record_iteration_summary",
-                                    state
-                                        .agent_session_id
-                                        .as_deref()
-                                        .unwrap_or("unknown-session")
-                                ),
-                            });
-                        }
-                        Ok(json!({
-                            "agent_session_id": state.agent_session_id,
-                            "planned_operation_count": state
-                                .derived_edit_plan
-                                .as_ref()
-                                .map(|plan| plan.operations.len())
-                                .unwrap_or(0),
-                            "tool_execution_summary": state.tool_execution_summary,
-                        }))
-                    })(),
-                    "edit" => (|| {
-                        let rollback = state.rollback.as_ref().ok_or_else(|| RuntimeError::Invariant {
-                            message: "plugin iteration rollback journal missing after agent execution".to_string(),
-                        })?;
-                        rollback.persist_journal(
+                Err(err) => {
+                    self.observe_plugin_iteration_failure(&state.prepared, "agent", &err);
+                    state.stage_error = Some(err.to_string());
+                }
+            }
+
+            // Step 2: Persist the rollback journal.
+            if state.stage_error.is_none() {
+                match state.rollback.as_ref() {
+                    Some(rollback) => {
+                        if let Err(err) = rollback.persist_journal(
                             &plugin_iteration_journal_path(&self.snapshot_root),
                             &state.prepared.iteration_id,
-                        )?;
-                        Ok(json!({
-                            "changed_paths": state.changed_paths,
-                            "diff_lines": state.diff_lines,
-                        }))
-                    })(),
-                    "rebuild" => (|| {
-                        let rebuilt = rebuild_plugin_workspace(&self.fixtures_root)?;
-                        state.rebuilt_artifacts = rebuilt.clone();
-                        Ok(json!({
-                            "rebuilt_count": rebuilt.len(),
-                        }))
-                    })(),
-                    "stage_candidate" => (|| {
-                        let candidate = self.reload_candidate()?;
-                        state.candidate = Some(candidate.clone());
-                        Ok(json!({
-                            "candidate_snapshot_id": candidate.candidate_snapshot_id,
-                        }))
-                    })(),
-                    "verify" => (|| {
-                        let report = self.verify_plugin_iteration(&state)?;
+                        ) {
+                            self.observe_plugin_iteration_failure(&state.prepared, "edit", &err);
+                            state.stage_error = Some(err.to_string());
+                        }
+                    }
+                    None => {
+                        let err = RuntimeError::Invariant {
+                            message: "plugin iteration rollback journal missing after agent execution".to_string(),
+                        };
+                        self.observe_plugin_iteration_failure(&state.prepared, "edit", &err);
+                        state.stage_error = Some(err.to_string());
+                    }
+                }
+            }
+
+            // Step 3: Rebuild plugin workspace.
+            if state.stage_error.is_none() {
+                match rebuild_plugin_workspace(&self.fixtures_root) {
+                    Ok(rebuilt) => {
+                        state.rebuilt_artifacts = rebuilt;
+                    }
+                    Err(err) => {
+                        self.observe_plugin_iteration_failure(&state.prepared, "rebuild", &err);
+                        state.stage_error = Some(err.to_string());
+                    }
+                }
+            }
+
+            // Step 4: Stage candidate snapshot.
+            if state.stage_error.is_none() {
+                match self.reload_candidate() {
+                    Ok(candidate) => {
+                        state.candidate = Some(candidate);
+                    }
+                    Err(err) => {
+                        self.observe_plugin_iteration_failure(&state.prepared, "stage_candidate", &err);
+                        state.stage_error = Some(err.to_string());
+                    }
+                }
+            }
+
+            // Step 5: Verify.
+            if state.stage_error.is_none() {
+                match self.verify_plugin_iteration(&state) {
+                    Ok(report) => {
                         let verdict = if report.input.tests_passed && report.input.safety_checks_passed {
                             VerifierVerdict::Pass
                         } else {
@@ -1694,14 +1744,20 @@ impl RuntimeHost {
                                 ),
                             );
                         }
-                        state.verification = Some(report.clone());
+                        state.verification = Some(report);
                         state.verifier_verdict = Some(verdict);
-                        Ok(json!({
-                            "verifier_verdict": verdict,
-                        }))
-                    })(),
-                    "canary" => (|| {
-                        let report = self.run_plugin_canary(&state)?;
+                    }
+                    Err(err) => {
+                        self.observe_plugin_iteration_failure(&state.prepared, "verify", &err);
+                        state.stage_error = Some(err.to_string());
+                    }
+                }
+            }
+
+            // Step 6: Canary replay.
+            if state.stage_error.is_none() {
+                match self.run_plugin_canary(&state) {
+                    Ok(report) => {
                         if report.verdict == CanaryVerdict::Fail {
                             self.kernel.observe_plugin_issue(
                                 KernelPluginIssueSource::CanaryFailure,
@@ -1712,53 +1768,72 @@ impl RuntimeHost {
                                 ),
                             );
                         }
-                        state.canary = Some(report.clone());
-                        Ok(json!({
-                            "canary_verdict": report.verdict,
-                            "mode": report.mode,
-                        }))
-                    })(),
-                    "promote_or_rollback" => (|| {
-                        let final_verdict = self.finalize_plugin_iteration(&mut state)?;
-                        Ok(json!({
-                            "final_verdict": final_verdict,
-                        }))
-                    })(),
-                    other => Err(RuntimeError::Invariant {
-                        message: format!("unknown plugin iteration stage: {other}"),
-                    }),
-                };
-                match stage_result {
-                    Ok(payload) => TransitionRunResult {
-                        outcome: NodeOutcome::Success,
-                        payload,
-                    },
+                        state.canary = Some(report);
+                    }
                     Err(err) => {
-                        self.observe_plugin_iteration_failure(
-                            &state.prepared,
-                            transition_id,
-                            &err,
-                        );
+                        self.observe_plugin_iteration_failure(&state.prepared, "canary", &err);
                         state.stage_error = Some(err.to_string());
-                        TransitionRunResult {
-                            outcome: NodeOutcome::Failure,
-                            payload: json!({ "error": err.to_string() }),
-                        }
                     }
                 }
-            },
-        )
-        .and_then(|output| state.into_result(output));
+            }
+
+            // Step 7: Promote or rollback (always runs, even after stage errors).
+            let _final_verdict = self.finalize_plugin_iteration(&mut state)?;
+
+            let net_output = ExecutionOutput {
+                execution_id: format!("plugin-iteration-{iteration_id}"),
+                order: vec![
+                    "plugin_iteration::agent".to_string(),
+                    "plugin_iteration::edit".to_string(),
+                    "plugin_iteration::rebuild".to_string(),
+                    "plugin_iteration::stage_candidate".to_string(),
+                    "plugin_iteration::verify".to_string(),
+                    "plugin_iteration::canary".to_string(),
+                    "plugin_iteration::promote_or_rollback".to_string(),
+                ],
+                outcomes: std::collections::BTreeMap::new(),
+                keyed_outcomes: std::collections::BTreeMap::new(),
+                metrics: crate::execution::engine::ExecutionMetrics::default(),
+            };
+            state.into_result(net_output)
+        }));
+
         self.kernel.finish_plugin_iteration(&iteration_id);
+
         match result {
-            Ok(result) => {
+            Ok(Ok(result)) => {
                 self.kernel.record_plugin_iteration_outcome(&result);
                 self.cleanup_retired_snapshots();
                 Ok(result)
             }
-            Err(err) => {
+            Ok(Err(err)) => {
                 self.cleanup_retired_snapshots();
                 Err(err)
+            }
+            Err(panic_payload) => {
+                // Emergency cleanup: restore workspace files, rollback candidate,
+                // and clear journal so the system stays in a consistent state.
+                let _ = restore_plugin_iteration_workspace(
+                    &self.fixtures_root,
+                    &self.snapshot_root,
+                    None,
+                );
+                if self.candidate_snapshot().is_some() {
+                    let _ = self.rollback_candidate();
+                }
+                self.cleanup_retired_snapshots();
+                let msg = if let Some(s) = panic_payload.downcast_ref::<&str>() {
+                    s.to_string()
+                } else if let Some(s) = panic_payload.downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    "unknown panic payload".to_string()
+                };
+                Err(RuntimeError::Invariant {
+                    message: format!(
+                        "plugin iteration panicked at an unexpected point; workspace has been restored: {msg}"
+                    ),
+                })
             }
         }
     }
@@ -1971,15 +2046,28 @@ impl RuntimeHost {
         state: &mut PluginIterationRunState,
     ) -> Result<PluginIterationFinalVerdict, RuntimeError> {
         if let Some(stage_error) = state.stage_error.clone() {
+            let mut rollback_errors = Vec::new();
             if self.candidate_snapshot().is_some() {
-                let _ = self.rollback_candidate();
+                if let Err(err) = self.rollback_candidate() {
+                    rollback_errors.push(format!("candidate rollback: {err}"));
+                }
             }
-            let _ = restore_plugin_iteration_workspace(
+            if let Err(err) = restore_plugin_iteration_workspace(
                 &self.fixtures_root,
                 &self.snapshot_root,
                 state.rollback.as_ref(),
-            );
-            state.blocked_reason = Some(stage_error);
+            ) {
+                rollback_errors.push(format!("workspace restore: {err}"));
+            }
+            state.blocked_reason = Some(if rollback_errors.is_empty() {
+                stage_error
+            } else {
+                format!(
+                    "{}; rollback errors: [{}]",
+                    stage_error,
+                    rollback_errors.join(", ")
+                )
+            });
             state.final_verdict = Some(PluginIterationFinalVerdict::RolledBack);
             return Ok(PluginIterationFinalVerdict::RolledBack);
         }
@@ -1993,6 +2081,13 @@ impl RuntimeHost {
             if verifier_verdict == VerifierVerdict::Pass && canary_verdict == CanaryVerdict::Pass {
                 self.promote_candidate()?;
                 PluginIterationFinalVerdict::Promoted
+            } else if verifier_verdict == VerifierVerdict::Pass
+                && canary_verdict == CanaryVerdict::Partial
+                && state.prepared.manual_approved
+            {
+                // When the user explicitly approves, allow promotion without canary evidence.
+                self.promote_candidate()?;
+                PluginIterationFinalVerdict::Promoted
             } else if canary_verdict == CanaryVerdict::Partial {
                 state.blocked_reason = Some(
                     state
@@ -2003,14 +2098,22 @@ impl RuntimeHost {
                 );
                 PluginIterationFinalVerdict::Blocked
             } else {
+                let mut rollback_errors = Vec::new();
                 if self.candidate_snapshot().is_some() {
-                    let _ = self.rollback_candidate();
+                    if let Err(err) = self.rollback_candidate() {
+                        rollback_errors.push(format!("candidate rollback: {err}"));
+                    }
                 }
                 restore_plugin_iteration_workspace(
                     &self.fixtures_root,
                     &self.snapshot_root,
                     state.rollback.as_ref(),
                 )?;
+                if let Some(first_err) = rollback_errors.into_iter().next() {
+                    state.blocked_reason = Some(format!(
+                        "verdict rollback with partial candidate cleanup error: {first_err}"
+                    ));
+                }
                 PluginIterationFinalVerdict::RolledBack
             };
         state.final_verdict = Some(final_verdict);
@@ -2607,16 +2710,34 @@ impl<'a> PluginIterationAgentBackend<'a> {
                     local_rollback.absorb(rollback)?;
                 }
                 Err(err) => {
-                    let _ = local_rollback.rollback();
-                    return Err(enrich_plugin_iteration_edit_error(
+                    let rollback_err = local_rollback.rollback().err();
+                    let mut enriched = enrich_plugin_iteration_edit_error(
                         operation,
                         &self.host.fixtures_root,
                         err,
-                    ));
+                    );
+                    if let Some(rollback_err) = rollback_err {
+                        enriched = RuntimeError::Invariant {
+                            message: format!(
+                                "{}; additionally, partial-batch rollback failed: {rollback_err}",
+                                enriched
+                            ),
+                        };
+                    }
+                    return Err(enriched);
                 }
             }
         }
         self.state.rollback.absorb(local_rollback)?;
+
+        // Persist the rollback journal to disk after every tool execution so
+        // that a crash mid-agent-loop still leaves a recoverable journal on
+        // restart — no window where files are modified but no backup exists.
+        self.state.rollback.persist_journal(
+            &plugin_iteration_journal_path(&self.host.snapshot_root),
+            &self.state.prepared.iteration_id,
+        )?;
+
         self.state.operations.extend(operations.clone());
         for path in operations.into_iter().map(|operation| operation.path) {
             if should_track_context_file(&path) {
@@ -4110,60 +4231,6 @@ impl PluginIterationRunState {
     }
 }
 
-fn build_plugin_iteration_execution_net() -> ExecutionNetSpec {
-    let spec = PluginIterationNetSpec::default();
-    let transitions = spec
-        .transition_ids
-        .iter()
-        .enumerate()
-        .map(|(idx, transition_id)| ExecutionTransitionSpec {
-            transition: TransitionSpec {
-                transition_id: transition_id.clone(),
-                priority: -(idx as i32),
-                join_policy: JoinPolicy::AnyOf,
-            },
-            run_policy: RunPolicy::default(),
-            kind: if transition_id == "promote_or_rollback" {
-                ExecutionTransitionKind::Terminal
-            } else {
-                ExecutionTransitionKind::Task
-            },
-            logical_group: Some("plugin_iteration".to_string()),
-        })
-        .collect::<Vec<_>>();
-    let mut places = Vec::new();
-    let mut arcs = Vec::new();
-    for window in spec.transition_ids.windows(2) {
-        let from = &window[0];
-        let to = &window[1];
-        let place_id = format!("plugin_iteration::{from}::{to}");
-        places.push(PlaceSpec {
-            place_id: place_id.clone(),
-        });
-        arcs.push(ArcSpec {
-            arc_id: format!("plugin_iteration::{from}::out"),
-            place_id: place_id.clone(),
-            transition_id: from.clone(),
-            direction: ArcDirection::TransitionToPlace,
-            label: Some("control".to_string()),
-            required: false,
-        });
-        arcs.push(ArcSpec {
-            arc_id: format!("plugin_iteration::{to}::in"),
-            place_id,
-            transition_id: to.clone(),
-            direction: ArcDirection::PlaceToTransition,
-            label: Some("control".to_string()),
-            required: false,
-        });
-    }
-    ExecutionNetSpec {
-        places,
-        transitions,
-        arcs,
-    }
-}
-
 fn plugin_iteration_status_from_result(
     result: &KernelPluginIterationResult,
 ) -> PluginIterationStatus {
@@ -4431,21 +4498,6 @@ fn collect_context_files_recursive(
         }
     }
     Ok(())
-}
-
-fn kernel_plan_result(
-    planned: PlannedUpdate,
-    verification_plan: VerificationPlan,
-) -> KernelPlanResult {
-    KernelPlanResult {
-        plan: planned.plan,
-        summary: planned.summary,
-        tests_command: verification_plan.tests_command.clone(),
-        safety_command: verification_plan.safety_command.clone(),
-        verification_plan,
-        planner_model: planned.planner_model,
-        response_id: planned.response_id,
-    }
 }
 
 fn normalize_request_id(raw: Option<String>, prefix: &str) -> String {
@@ -4931,4 +4983,28 @@ mod tests {
         .expect("empty command should fall back to default");
         assert_eq!(empty, "cargo check --quiet --manifest-path plugins/Cargo.toml");
     }
+}
+
+fn is_source_like_file_name(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    // Rust / TOML / YAML / JSON / Markdown / text
+    lower.ends_with(".rs")
+        || lower.ends_with(".toml")
+        || lower.ends_with(".yaml")
+        || lower.ends_with(".yml")
+        || lower.ends_with(".json")
+        || lower.ends_with(".md")
+        || lower.ends_with(".txt")
+        || lower.ends_with(".lock")
+        || lower == "cargo.toml"
+        || lower == "makefile"
+        || lower == "dockerfile"
+        || lower == "justfile"
+        || lower.starts_with("dockerfile")
+        || lower.ends_with(".sh")
+        || lower.ends_with(".py")
+        || lower.ends_with(".js")
+        || lower.ends_with(".ts")
+        || lower.ends_with(".html")
+        || lower.ends_with(".css")
 }
