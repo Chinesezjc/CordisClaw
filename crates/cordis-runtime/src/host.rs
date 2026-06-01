@@ -897,6 +897,8 @@ pub struct RuntimeHost {
     last_reload_attempt: Mutex<Option<ReloadAttemptReport>>,
     last_candidate_reload_attempt: Mutex<Option<ReloadAttemptReport>>,
     agent_sessions: Mutex<BTreeMap<String, ManagedAgentSession>>,
+    /// Registry of background services (Task nodes).
+    pub service_registry: Arc<crate::context::ServiceRegistry>,
     /// Accumulated rollback for interactive agent file edits.
     interactive_rollback: Mutex<PluginEditRollback>,
     kernel: RuntimeKernel,
@@ -1052,6 +1054,7 @@ impl RuntimeHost {
 
         let initial_snapshot = Arc::new(build_snapshot(&loader, &snapshot_root)?);
         let interactive_rollback = Mutex::new(PluginEditRollback::empty(&fixtures_root));
+        let service_registry = Arc::new(crate::context::ServiceRegistry::new());
         Ok(Self {
             kernel: RuntimeKernel::new(&fixtures_root, &config),
             config,
@@ -1065,12 +1068,24 @@ impl RuntimeHost {
             last_reload_attempt: Mutex::new(None),
             last_candidate_reload_attempt: Mutex::new(None),
             agent_sessions: Mutex::new(BTreeMap::new()),
+            service_registry,
             interactive_rollback,
         })
     }
 
     pub fn fixtures_root(&self) -> &Path {
         &self.fixtures_root
+    }
+
+    /// Register and start a background service for a Task node.
+    pub fn start_service(
+        &self,
+        plugin_path: &str,
+        node_id: &str,
+        svc: Box<dyn crate::context::Service>,
+    ) -> Result<(), RuntimeError> {
+        self.service_registry
+            .start_service(plugin_path, node_id, svc)
     }
 
     pub(crate) fn interactive_rollback(

@@ -85,6 +85,31 @@ pub struct NodeDoc {
     pub side_effects: Vec<String>,
     #[serde(default)]
     pub failure_modes: Vec<String>,
+    /// Node type: Task (long-running background service), Router, Gate, or
+    /// Terminal.  Defaults to Router for backward compatibility.
+    #[serde(default)]
+    pub node_type: NodeType,
+}
+
+/// Class of execution semantics for a plugin node.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeType {
+    /// Long-running background service with lifecycle (start/stop).
+    Task,
+    /// Conditionally routes execution to one of several downstream nodes.
+    Router,
+    /// Guards a subgraph behind a policy check.
+    Gate,
+    /// Terminal node — produces a final output and ends the execution.
+    Terminal,
+}
+
+impl Default for NodeType {
+    fn default() -> Self {
+        NodeType::Router
+    }
 }
 
 #[repr(C)]
@@ -149,6 +174,26 @@ pub fn node_doc(
         output_schema,
         side_effects: side_effects.iter().map(|v| (*v).to_string()).collect(),
         failure_modes: failure_modes.iter().map(|v| (*v).to_string()).collect(),
+        node_type: NodeType::Router,
+    }
+}
+
+pub fn task_node_doc(
+    id: impl Into<String>,
+    summary: impl Into<String>,
+    input_schema: serde_json::Value,
+    output_schema: serde_json::Value,
+    side_effects: &[&str],
+    failure_modes: &[&str],
+) -> NodeDoc {
+    NodeDoc {
+        id: id.into(),
+        summary: summary.into(),
+        input_schema,
+        output_schema,
+        side_effects: side_effects.iter().map(|v| (*v).to_string()).collect(),
+        failure_modes: failure_modes.iter().map(|v| (*v).to_string()).collect(),
+        node_type: NodeType::Task,
     }
 }
 
