@@ -20,6 +20,8 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ServeMode {
@@ -171,6 +173,25 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         host.current_snapshot().snapshot_id()
     );
     io::stdout().flush()?;
+
+    // Ctrl+C handler: save draft + revert, then exit cleanly.
+    // Second Ctrl+C does a hard exit in case cleanup hangs.
+    let interrupted = Arc::new(AtomicBool::new(false));
+    let fixtures_root = host.fixtures_root().to_path_buf();
+    {
+        let interrupted = Arc::clone(&interrupted);
+        ctrlc::set_handler(move || {
+            if interrupted.swap(true, Ordering::SeqCst) {
+                eprintln!("\nforced exit");
+                std::process::exit(1);
+            }
+            eprint!("\n⏸ interrupted, saving draft...");
+            let _ = std::io::stderr().flush();
+            save_draft_and_revert(&fixtures_root, "ctrl-c");
+            std::process::exit(0);
+        })
+        .ok();
+    }
 
     let stdin = io::stdin();
     let mut locked = stdin.lock();
@@ -422,46 +443,15 @@ fn handle_agent_chat_line(
                         emit_agent_reply(&reply)?;
                     }
                     Err(err) => {
-                        // Save the agent's partial changes as a draft patch,
-                        // then revert to keep the workspace clean.  The user
-                        // can replay the draft with `git apply` later.
-                        let draft_dir = host
-                            .fixtures_root()
-                            .join(".cordis-drafts");
-                        let _ = std::fs::create_dir_all(&draft_dir);
-                        let ts = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs();
-                        let draft_path = draft_dir.join(format!("draft-{ts}.patch"));
-                        // Generate diff of all modified files under plugins/.
-                        let diff = std::process::Command::new("sh")
-                            .arg("-c")
-                            .arg("git diff -- plugins/ 2>/dev/null")
-                            .current_dir(host.fixtures_root())
-                            .output();
-                        let saved = if let Ok(output) = diff {
-                            let patch = String::from_utf8_lossy(&output.stdout);
-                            if patch.trim().is_empty() {
-                                false
-                            } else {
-                                std::fs::write(&draft_path, patch.as_bytes()).is_ok()
-                            }
-                        } else {
-                            false
-                        };
-                        // Revert in-memory rollback + git checkout files.
+                        // Save partial changes as draft, revert workspace.
                         let reverted = host
                             .revert_interactive_changes()
                             .unwrap_or(0);
-                        let _ = std::process::Command::new("sh")
-                            .arg("-c")
-                            .arg("git checkout -- plugins/ 2>/dev/null")
-                            .current_dir(host.fixtures_root())
-                            .output();
-                        if saved {
+                        let saved =
+                            save_draft_and_revert(host.fixtures_root(), "error");
+                        if let Some(path) = saved {
                             println!(
-                                "\n💾 draft saved: .cordis-drafts/draft-{ts}.patch ({n} file(s) reverted)\n   replay: cd fixtures && git apply .cordis-drafts/draft-{ts}.patch",
+                                "\n💾 draft saved: {path} ({n} file(s) reverted)\n   replay: cd fixtures && git apply {path}",
                                 n = reverted
                             );
                         } else if reverted > 0 {
@@ -470,12 +460,6 @@ fn handle_agent_chat_line(
                                 n = reverted
                             );
                         }
-                        // Also revert any new untracked files the agent created.
-                        let _ = std::process::Command::new("sh")
-                            .arg("-c")
-                            .arg("git clean -fd -- plugins/ 2>/dev/null")
-                            .current_dir(host.fixtures_root())
-                            .output();
                         return Err(err.into());
                     }
                 }
@@ -607,6 +591,44 @@ fn emit_invoke_response(payload: &str) -> Result<(), Box<dyn std::error::Error>>
 
     println!("{payload}");
     Ok(())
+}
+
+/// Save the current git diff as a draft patch in `.cordis-drafts/`, then
+/// revert all modified and untracked files under `plugins/`.  Used both by
+/// agent-error recovery and by the Ctrl+C handler.
+fn save_draft_and_revert(fixtures_root: &Path, reason: &str) -> Option<String> {
+    let draft_dir = fixtures_root.join(".cordis-drafts");
+    let _ = std::fs::create_dir_all(&draft_dir);
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let draft_path = draft_dir.join(format!("draft-{ts}-{reason}.patch"));
+    let diff = std::process::Command::new("sh")
+        .arg("-c")
+        .arg("git diff -- plugins/ 2>/dev/null")
+        .current_dir(fixtures_root)
+        .output()
+        .ok()?;
+    let patch = String::from_utf8_lossy(&diff.stdout);
+    if patch.trim().is_empty() {
+        return None;
+    }
+    std::fs::write(&draft_path, patch.as_bytes()).ok()?;
+    // Revert modified files and remove untracked files.
+    let _ = std::process::Command::new("sh")
+        .arg("-c")
+        .arg("git checkout -- plugins/ 2>/dev/null")
+        .current_dir(fixtures_root)
+        .output();
+    let _ = std::process::Command::new("sh")
+        .arg("-c")
+        .arg("git clean -fd -- plugins/ 2>/dev/null")
+        .current_dir(fixtures_root)
+        .output();
+    Some(format!(
+        ".cordis-drafts/draft-{ts}-{reason}.patch"
+    ))
 }
 
 /// Handle `/node_fqn args...` or `/ShellCommand args...` shortcuts in agent chat.
