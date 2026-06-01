@@ -3,11 +3,12 @@
 
 use crate::core::error::RuntimeError;
 use crate::core::models::PluginLoadResult;
+use cordis_plugin_sdk::NodeType;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -666,5 +667,211 @@ impl ContextTxn for RuntimeContext {
                 .unwrap_or(u64::MAX),
         );
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Service lifecycle — Task nodes that run as background threads.
+// ---------------------------------------------------------------------------
+
+/// A long-running background service attached to a plugin `Task` node.
+///
+/// Implementations should return quickly from `start()` after spawning any
+/// worker threads.  `stop()` should signal shutdown and join threads.
+pub trait Service: Send + Sync {
+    /// Start the service.  Called when the owning plugin is loaded.
+    fn start(&self) -> Result<(), String>;
+    /// Signal the service to stop and wait for workers to exit.
+    fn stop(&self) -> Result<(), String>;
+}
+
+/// A named service handle that tracks running state.
+struct ServiceEntry {
+    name: String,
+    plugin_path: String,
+    svc: Box<dyn Service>,
+    running: AtomicBool,
+}
+
+/// Registry of background services, keyed by `"plugin_path::node_id"`.
+pub struct ServiceRegistry {
+    entries: Mutex<BTreeMap<String, ServiceEntry>>,
+}
+
+impl std::fmt::Debug for ServiceRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let len = self.len();
+        f.debug_struct("ServiceRegistry")
+            .field("service_count", &len)
+            .finish()
+    }
+}
+
+impl ServiceRegistry {
+    pub fn new() -> Self {
+        Self {
+            entries: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    /// Register and immediately start a service for a plugin Task node.
+    pub fn start_service(
+        &self,
+        plugin_path: &str,
+        node_id: &str,
+        svc: Box<dyn Service>,
+    ) -> Result<(), RuntimeError> {
+        let key = format!("{plugin_path}::{node_id}");
+        let entry = ServiceEntry {
+            name: node_id.to_string(),
+            plugin_path: plugin_path.to_string(),
+            svc,
+            running: AtomicBool::new(false),
+        };
+        if let Err(e) = entry.svc.start() {
+            return Err(RuntimeError::Invariant {
+                message: format!("service {key} failed to start: {e}"),
+            });
+        }
+        entry.running.store(true, Ordering::SeqCst);
+        let mut guard = self
+            .entries
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if guard.contains_key(&key) {
+            return Err(RuntimeError::DuplicateService {
+                plugin_path: plugin_path.to_string(),
+                service: key,
+            });
+        }
+        guard.insert(key, entry);
+        Ok(())
+    }
+
+    /// Stop all services belonging to `plugin_path` (and its descendants).
+    pub fn stop_plugin_services(&self, plugin_path: &str) {
+        let mut guard = self
+            .entries
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let keys: Vec<String> = guard
+            .keys()
+            .filter(|k| k.starts_with(plugin_path))
+            .cloned()
+            .collect();
+        for key in keys {
+            if let Some(entry) = guard.remove(&key) {
+                entry.running.store(false, Ordering::SeqCst);
+                if let Err(e) = entry.svc.stop() {
+                    eprintln!("service {key} stop error: {e}");
+                }
+            }
+        }
+    }
+
+    /// Stop and remove all registered services.
+    pub fn stop_all(&self) {
+        let mut guard = self
+            .entries
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let drained: BTreeMap<_, _> = std::mem::take(&mut *guard);
+        for (key, entry) in drained {
+            entry.running.store(false, Ordering::SeqCst);
+            if let Err(e) = entry.svc.stop() {
+                eprintln!("service {key} stop error: {e}");
+            }
+        }
+    }
+
+    /// Return the number of registered (running) services.
+    pub fn len(&self) -> usize {
+        self.entries
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .len()
+    }
+}
+
+impl Drop for ServiceRegistry {
+    fn drop(&mut self) {
+        self.stop_all();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    struct CounterService {
+        starts: AtomicUsize,
+        stops: AtomicUsize,
+    }
+
+    impl CounterService {
+        fn new() -> Self {
+            Self {
+                starts: AtomicUsize::new(0),
+                stops: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl Service for CounterService {
+        fn start(&self) -> Result<(), String> {
+            self.starts.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        fn stop(&self) -> Result<(), String> {
+            self.stops.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn service_start_stop_lifecycle() {
+        let registry = ServiceRegistry::new();
+        let svc = CounterService::new();
+        registry
+            .start_service("test/plugin", "bg_worker", Box::new(svc))
+            .expect("start");
+
+        assert_eq!(registry.len(), 1);
+
+        registry.stop_plugin_services("test/plugin");
+
+        assert_eq!(registry.len(), 0);
+    }
+
+    #[test]
+    fn service_stop_subtree() {
+        let registry = ServiceRegistry::new();
+        registry
+            .start_service("root", "svc_a", Box::new(CounterService::new()))
+            .expect("start");
+        registry
+            .start_service("root/child", "svc_b", Box::new(CounterService::new()))
+            .expect("start");
+        registry
+            .start_service("other", "svc_c", Box::new(CounterService::new()))
+            .expect("start");
+        assert_eq!(registry.len(), 3);
+
+        // Stopping "root" should stop root and root/child, but not "other".
+        registry.stop_plugin_services("root");
+        assert_eq!(registry.len(), 1);
+    }
+
+    #[test]
+    fn duplicate_service_rejected() {
+        let registry = ServiceRegistry::new();
+        registry
+            .start_service("root", "dup", Box::new(CounterService::new()))
+            .expect("start");
+        let err = registry
+            .start_service("root", "dup", Box::new(CounterService::new()))
+            .expect_err("should reject");
+        assert!(err.to_string().contains("dup"));
     }
 }
