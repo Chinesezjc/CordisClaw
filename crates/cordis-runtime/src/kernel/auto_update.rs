@@ -3,8 +3,6 @@
 
 use crate::core::error::RuntimeError;
 use crate::kernel::evaluator::VerificationInput;
-use crate::kernel::memory::ChangeVerdict;
-use crate::kernel::r#loop::{IterationInput, IterationReport, SelfIterationKernel};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeSet;
@@ -161,9 +159,12 @@ pub struct AutoUpdatePlan {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AutoUpdateResult {
-    pub report: IterationReport,
     pub changed_paths: Vec<String>,
     pub rolled_back: bool,
+    pub tests_passed: bool,
+    pub safety_checks_passed: bool,
+    pub quality_score: u32,
+    pub verdict: &'static str,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -202,11 +203,9 @@ impl AutoUpdater {
     /// Execute one automatic update transaction.
     /// - apply all patches
     /// - run verification callback
-    /// - evaluate with kernel policy
-    /// - rollback when verdict is Rollback
+    /// - rollback on verification failure or if tests/safety fail
     pub fn execute<F>(
         &self,
-        kernel: &mut SelfIterationKernel,
         plan: AutoUpdatePlan,
         verify: F,
     ) -> Result<AutoUpdateResult, RuntimeError>
@@ -215,7 +214,6 @@ impl AutoUpdater {
     {
         let mut backups = Vec::new();
         let mut changed_paths = BTreeSet::new();
-        let patch_kind = summarize_patch_kinds(&plan.patches);
 
         for patch in &plan.patches {
             patch.validate_shape()?;
@@ -249,26 +247,23 @@ impl AutoUpdater {
             }
         };
 
-        let report = kernel.run_once(IterationInput {
-            issue_id: plan.issue_id,
-            patch_id: plan.patch_id,
-            patch_kind,
-            changed_paths: changed_paths.iter().cloned().collect(),
-            diff_lines: plan.diff_lines,
-            manual_approved: plan.manual_approved,
-            verification_profile: verification.verification_profile,
-            verification: verification.input,
-        });
+        let tests_passed = verification.input.tests_passed;
+        let safety_checks_passed = verification.input.safety_checks_passed;
+        let quality_score = verification.input.quality_score;
+        let accepted = tests_passed && safety_checks_passed;
 
-        let rolled_back = report.verdict == ChangeVerdict::Rollback;
+        let rolled_back = !accepted;
         if rolled_back {
             self.rollback(&backups)?;
         }
 
         Ok(AutoUpdateResult {
-            report,
             changed_paths: changed_paths.into_iter().collect(),
             rolled_back,
+            tests_passed,
+            safety_checks_passed,
+            quality_score,
+            verdict: if accepted { "promote" } else { "rollback" },
         })
     }
 
@@ -302,22 +297,6 @@ impl AutoUpdater {
         }
         Ok(())
     }
-}
-
-fn summarize_patch_kinds(patches: &[FilePatch]) -> String {
-    let mut kinds = patches
-        .iter()
-        .map(|patch| patch.patch_kind_name())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
-    if kinds.is_empty() {
-        return "none".to_string();
-    }
-    if kinds.len() == 1 {
-        return kinds.remove(0).to_string();
-    }
-    "mixed".to_string()
 }
 
 fn apply_text_patch(

@@ -7,6 +7,7 @@ use cordis_runtime::kernel::plugin_iteration::{
 };
 use cordis_runtime::kernel::verifier::VerificationProfile;
 use cordis_runtime::plugin::tooling::refresh_artifact_index;
+use serial_test::serial;
 use serde_json::{json, Value};
 use std::fs;
 #[cfg(unix)]
@@ -1061,6 +1062,7 @@ fn runtime_host_iterate_plugins_promotes_after_canary_replay() {
     );
 }
 
+#[serial]
 #[test]
 fn runtime_host_iterate_plugins_agent_adds_modulo_child_plugin_and_promotes() {
     let temp = setup_fixture_workspace_copy();

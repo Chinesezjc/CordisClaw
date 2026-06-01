@@ -8,12 +8,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::collections::BTreeSet;
 use std::env;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::thread;
 use std::time::{Duration, Instant};
 
 const AGENT_HISTORY_MESSAGE_LIMIT: usize = 24;
-const AGENT_MAX_TOOL_TURNS: usize = 48;
+const AGENT_MAX_TOOL_TURNS: usize = 96;
 const AGENT_REQUEST_MAX_ATTEMPTS: usize = 3;
 const AGENT_REQUEST_RETRY_BACKOFF_MS: u64 = 500;
 const AGENT_TOOL_GET_RUNTIME_STATUS: &str = "get_runtime_status";
@@ -24,6 +24,13 @@ const AGENT_TOOL_GET_KERNEL_ISSUES: &str = "get_kernel_issues";
 const AGENT_TOOL_RELOAD_RUNTIME: &str = "reload_runtime";
 const AGENT_TOOL_INVOKE_PLUGIN: &str = "invoke_plugin";
 const AGENT_TOOL_EXECUTE_TARGET: &str = "execute_target";
+const AGENT_TOOL_READ_FILE: &str = "read_file";
+const AGENT_TOOL_LIST_DIRECTORY: &str = "list_directory";
+const AGENT_TOOL_SEARCH_CODE: &str = "search_code";
+const AGENT_TOOL_WRITE_FILE: &str = "write_file";
+const AGENT_TOOL_REPLACE_IN_FILE: &str = "replace_in_file";
+const AGENT_TOOL_RUN_COMMAND: &str = "run_command";
+const AGENT_TOOL_REVERT_CHANGES: &str = "revert_changes";
 const LLM_DEBUG_ENV: &str = "CORDIS_LLM_DEBUG";
 
 pub trait AgentToolHost {
@@ -44,6 +51,27 @@ pub trait AgentToolHost {
         node_fqn: &str,
         payload_json: Value,
     ) -> Result<Value, RuntimeError>;
+    fn agent_read_file(
+        &self,
+        path: &str,
+        offset: Option<usize>,
+        limit: Option<usize>,
+    ) -> Result<Value, RuntimeError>;
+    fn agent_list_directory(&self, path: &str) -> Result<Value, RuntimeError>;
+    fn agent_search_code(
+        &self,
+        pattern: &str,
+        path: Option<&str>,
+    ) -> Result<Value, RuntimeError>;
+    fn agent_write_file(&self, path: &str, content: &str) -> Result<Value, RuntimeError>;
+    fn agent_replace_in_file(
+        &self,
+        path: &str,
+        find: &str,
+        replace: &str,
+    ) -> Result<Value, RuntimeError>;
+    fn agent_run_command(&self, command: &str) -> Result<Value, RuntimeError>;
+    fn agent_revert_changes(&self) -> Result<Value, RuntimeError>;
 }
 
 impl AgentToolHost for RuntimeHost {
@@ -133,6 +161,209 @@ impl AgentToolHost for RuntimeHost {
     ) -> Result<Value, RuntimeError> {
         let response = self.execute(node_fqn, payload_json)?;
         to_json_value("execution result", response)
+    }
+
+    fn agent_read_file(
+        &self,
+        path: &str,
+        offset: Option<usize>,
+        limit: Option<usize>,
+    ) -> Result<Value, RuntimeError> {
+        let resolved = self.resolve_sandboxed_path(path)?;
+        let content = std::fs::read_to_string(&resolved).map_err(|err| RuntimeError::Io {
+            path: resolved,
+            message: err.to_string(),
+        })?;
+        let lines: Vec<&str> = content.lines().collect();
+        let total = lines.len();
+        let start = offset.unwrap_or(0).min(total);
+        let end = limit.map(|n| (start + n).min(total)).unwrap_or(total);
+        let excerpt: Vec<serde_json::Value> = lines[start..end]
+            .iter()
+            .enumerate()
+            .map(|(i, line)| {
+                json!({"line": start + i + 1, "text": line})
+            })
+            .collect();
+        Ok(json!({
+            "path": path,
+            "total_lines": total,
+            "offset": start,
+            "limit": end - start,
+            "lines": excerpt,
+        }))
+    }
+
+    fn agent_list_directory(&self, path: &str) -> Result<Value, RuntimeError> {
+        let resolved = self.resolve_sandboxed_path(path)?;
+        let mut entries = Vec::new();
+        if resolved.is_dir() {
+            for entry in std::fs::read_dir(&resolved).map_err(|err| RuntimeError::Io {
+                path: resolved.clone(),
+                message: err.to_string(),
+            })? {
+                let entry = entry.map_err(|err| RuntimeError::Io {
+                    path: resolved.clone(),
+                    message: err.to_string(),
+                })?;
+                let ft = entry.file_type().map_err(|err| RuntimeError::Io {
+                    path: entry.path(),
+                    message: err.to_string(),
+                })?;
+                entries.push(json!({
+                    "name": entry.file_name().to_string_lossy(),
+                    "kind": if ft.is_dir() { "dir" } else { "file" },
+                }));
+            }
+        }
+        entries.sort_by(|a, b| {
+            let kind_cmp = a["kind"].as_str().cmp(&b["kind"].as_str());
+            if kind_cmp == std::cmp::Ordering::Equal {
+                a["name"].as_str().cmp(&b["name"].as_str())
+            } else {
+                kind_cmp
+            }
+        });
+        Ok(json!({
+            "path": path,
+            "entries": entries,
+        }))
+    }
+
+    fn agent_search_code(
+        &self,
+        pattern: &str,
+        path: Option<&str>,
+    ) -> Result<Value, RuntimeError> {
+        let search_root = match path {
+            Some(p) => self.resolve_sandboxed_path(p)?,
+            None => self.fixtures_root().to_path_buf(),
+        };
+        let mut matches = Vec::new();
+        let mut walked = 0usize;
+        self.walk_code_files(&search_root, &mut |rel_path, abs_path| {
+            walked += 1;
+            let content = match std::fs::read_to_string(abs_path) {
+                Ok(c) => c,
+                Err(_) => return,
+            };
+            for (line_no, line_text) in content.lines().enumerate() {
+                if line_text.contains(pattern) {
+                    matches.push(json!({
+                        "path": rel_path,
+                        "line": line_no + 1,
+                        "text": line_text.trim(),
+                    }));
+                    if matches.len() >= 40 {
+                        break;
+                    }
+                }
+            }
+        })?;
+        Ok(json!({
+            "pattern": pattern,
+            "search_root": search_root.strip_prefix(self.fixtures_root()).unwrap_or(&search_root).to_string_lossy(),
+            "files_walked": walked,
+            "matches": matches,
+        }))
+    }
+
+    fn agent_write_file(&self, path: &str, content: &str) -> Result<Value, RuntimeError> {
+        let resolved = self.resolve_sandboxed_path(path)?;
+        // Backup original before writing.
+        let original = std::fs::read(&resolved).ok();
+        if let Some(parent) = resolved.parent() {
+            std::fs::create_dir_all(parent).map_err(|err| RuntimeError::Io {
+                path: parent.to_path_buf(),
+                message: err.to_string(),
+            })?;
+        }
+        std::fs::write(&resolved, content).map_err(|err| RuntimeError::Io {
+            path: resolved,
+            message: err.to_string(),
+        })?;
+        // Accumulate rollback backup.
+        {
+            let mut rollback = self.interactive_rollback();
+            let backup = crate::kernel::plugin_iteration::PluginEditRollback::single_backup(
+                self.fixtures_root(),
+                path,
+                original,
+            );
+            rollback.absorb(backup)?;
+        }
+        Ok(json!({
+            "path": path,
+            "written_bytes": content.len(),
+        }))
+    }
+
+    fn agent_replace_in_file(
+        &self,
+        path: &str,
+        find: &str,
+        replace: &str,
+    ) -> Result<Value, RuntimeError> {
+        let resolved = self.resolve_sandboxed_path(path)?;
+        let original = std::fs::read_to_string(&resolved).map_err(|err| RuntimeError::Io {
+            path: resolved.clone(),
+            message: err.to_string(),
+        })?;
+        if !original.contains(find) {
+            return Err(RuntimeError::InvalidArgument {
+                message: format!(
+                    "replace_in_file: pattern not found in {path}: {find}"
+                ),
+            });
+        }
+        let updated = original.replacen(find, replace, 1);
+        // Backup original bytes before writing.
+        let original_bytes = Some(original.into_bytes());
+        std::fs::write(&resolved, &updated).map_err(|err| RuntimeError::Io {
+            path: resolved.clone(),
+            message: err.to_string(),
+        })?;
+        {
+            let mut rollback = self.interactive_rollback();
+            let backup = crate::kernel::plugin_iteration::PluginEditRollback::single_backup(
+                self.fixtures_root(),
+                path,
+                original_bytes,
+            );
+            rollback.absorb(backup)?;
+        }
+        Ok(json!({
+            "path": path,
+            "replaced": true,
+        }))
+    }
+
+    fn agent_run_command(&self, command: &str) -> Result<Value, RuntimeError> {
+        use std::process::Command;
+        let output = Command::new("sh")
+            .arg("-c")
+            .arg(command)
+            .current_dir(self.fixtures_root())
+            .output()
+            .map_err(|err| RuntimeError::Io {
+                path: self.fixtures_root().to_path_buf(),
+                message: format!("failed to run command: {err}"),
+            })?;
+        Ok(json!({
+            "stdout": String::from_utf8_lossy(&output.stdout).to_string(),
+            "stderr": String::from_utf8_lossy(&output.stderr).to_string(),
+            "exit_code": output.status.code(),
+        }))
+    }
+
+    fn agent_revert_changes(&self) -> Result<Value, RuntimeError> {
+        let mut rollback = self.interactive_rollback();
+        let count = rollback.len();
+        rollback.rollback()?;
+        *rollback = crate::kernel::plugin_iteration::PluginEditRollback::empty(self.fixtures_root());
+        Ok(json!({
+            "reverted_files": count,
+        }))
     }
 }
 
@@ -386,6 +617,22 @@ impl AgentSession {
                     .map(|tool| tool.name.to_string())
                     .collect::<BTreeSet<_>>();
                 for tool_call in &message.tool_calls {
+                    // Announce tool execution in real-time.
+                    let tool_args_preview: String = serde_json::from_str::<Value>(
+                        &tool_call.function.arguments,
+                    )
+                    .ok()
+                    .and_then(|v| {
+                        serde_json::to_string(&v).ok()
+                    })
+                    .unwrap_or_else(|| tool_call.function.arguments.clone());
+                    let _ = writeln!(
+                        std::io::stdout(),
+                        "\n[agent-tool] {} {}",
+                        tool_call.function.name,
+                        tool_args_preview
+                    );
+                    let _ = std::io::stdout().flush();
                     let (event, tool_output) =
                         execute_agent_tool_call(backend, &available_tools, &self.kind, tool_call);
                     let event_name = event.name.clone();
@@ -947,6 +1194,46 @@ struct ExecuteTargetArgs {
     payload_json: Value,
 }
 
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+struct ReadFileArgs {
+    path: String,
+    #[serde(default)]
+    offset: Option<usize>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+struct ListDirectoryArgs {
+    #[serde(default)]
+    path: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+struct SearchCodeArgs {
+    pattern: String,
+    #[serde(default)]
+    path: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+struct WriteFileArgs {
+    path: String,
+    content: String,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+struct ReplaceInFileArgs {
+    path: String,
+    find: String,
+    replace: String,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+struct RunCommandArgs {
+    command: String,
+}
+
 fn execute_agent_tool_call<B: AgentBackend + ?Sized>(
     backend: &mut B,
     available_tools: &BTreeSet<String>,
@@ -1064,6 +1351,9 @@ fn read_chat_stream(
     let mut finish_reason = None;
     let mut pending_data_lines = Vec::new();
     let mut accumulator = ChatMessageAccumulator::default();
+    // Track how much content has been flushed to stdout so we only print new text.
+    let mut flushed_content_len = 0usize;
+    let mut flushed_reasoning_len = 0usize;
 
     loop {
         let mut line = String::new();
@@ -1103,12 +1393,42 @@ fn read_chat_stream(
                 saw_done = true;
                 break;
             }
+            // Stream new content to the user in real-time.
+            let new_reasoning = &accumulator.reasoning_content[flushed_reasoning_len..];
+            if !new_reasoning.is_empty() {
+                // Reasoning is thinking — print dimmed with a prefix.
+                for line in new_reasoning.lines() {
+                    let _ = writeln!(std::io::stdout(), "\x1b[2m  … {line}\x1b[0m");
+                }
+                let _ = std::io::stdout().flush();
+                flushed_reasoning_len = accumulator.reasoning_content.len();
+            }
+            let new_content = &accumulator.content[flushed_content_len..];
+            if !new_content.is_empty() {
+                print!("{new_content}");
+                let _ = std::io::stdout().flush();
+                flushed_content_len = accumulator.content.len();
+            }
             continue;
         }
 
         if let Some(data) = trimmed.strip_prefix("data:") {
             pending_data_lines.push(data.trim_start().to_string());
         }
+    }
+
+    // Final flush: print any remaining unprinted content.
+    let new_reasoning = &accumulator.reasoning_content[flushed_reasoning_len..];
+    if !new_reasoning.is_empty() {
+        for line in new_reasoning.lines() {
+            let _ = writeln!(std::io::stdout(), "\x1b[2m  … {line}\x1b[0m");
+        }
+        let _ = std::io::stdout().flush();
+    }
+    let new_content = &accumulator.content[flushed_content_len..];
+    if !new_content.is_empty() {
+        print!("{new_content}");
+        let _ = std::io::stdout().flush();
     }
 
     let (message, response_id) = accumulator
@@ -1220,6 +1540,38 @@ impl<'a, H: AgentToolHost + ?Sized> AgentBackend for RuntimeShellAgentBackend<'a
                 let args = parse_tool_value_arguments::<ExecuteTargetArgs>(arguments, name)?;
                 self.host
                     .agent_execute_target(&args.node_fqn, args.payload_json)
+            }
+            AGENT_TOOL_READ_FILE => {
+                let args = parse_tool_value_arguments::<ReadFileArgs>(arguments, name)?;
+                self.host
+                    .agent_read_file(&args.path, args.offset, args.limit)
+            }
+            AGENT_TOOL_LIST_DIRECTORY => {
+                let args = parse_tool_value_arguments::<ListDirectoryArgs>(arguments, name)?;
+                self.host
+                    .agent_list_directory(args.path.as_deref().unwrap_or("."))
+            }
+            AGENT_TOOL_SEARCH_CODE => {
+                let args = parse_tool_value_arguments::<SearchCodeArgs>(arguments, name)?;
+                self.host
+                    .agent_search_code(&args.pattern, args.path.as_deref())
+            }
+            AGENT_TOOL_WRITE_FILE => {
+                let args = parse_tool_value_arguments::<WriteFileArgs>(arguments, name)?;
+                self.host.agent_write_file(&args.path, &args.content)
+            }
+            AGENT_TOOL_REPLACE_IN_FILE => {
+                let args = parse_tool_value_arguments::<ReplaceInFileArgs>(arguments, name)?;
+                self.host
+                    .agent_replace_in_file(&args.path, &args.find, &args.replace)
+            }
+            AGENT_TOOL_RUN_COMMAND => {
+                let args = parse_tool_value_arguments::<RunCommandArgs>(arguments, name)?;
+                self.host.agent_run_command(&args.command)
+            }
+            AGENT_TOOL_REVERT_CHANGES => {
+                parse_tool_value_arguments::<EmptyArgs>(arguments, name)?;
+                self.host.agent_revert_changes()
             }
             other => Err(RuntimeError::InvalidArgument {
                 message: format!("runtime shell agent does not support tool {other}"),
@@ -1337,16 +1689,110 @@ fn shell_agent_tools() -> Vec<AgentToolSpec> {
                 "additionalProperties": false,
             }),
         },
+        AgentToolSpec {
+            name: AGENT_TOOL_READ_FILE,
+            description: "Read a file within the fixtures workspace. Returns line-numbered content. Use offset/limit for large files.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Relative path within the fixtures root." },
+                    "offset": { "type": "integer", "description": "Optional 0-based line offset." },
+                    "limit": { "type": "integer", "description": "Optional max lines to return." }
+                },
+                "required": ["path"],
+                "additionalProperties": false,
+            }),
+        },
+        AgentToolSpec {
+            name: AGENT_TOOL_LIST_DIRECTORY,
+            description: "List files and directories under a path within the fixtures workspace.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Relative path within the fixtures root. Defaults to root." }
+                },
+                "required": [],
+                "additionalProperties": false,
+            }),
+        },
+        AgentToolSpec {
+            name: AGENT_TOOL_SEARCH_CODE,
+            description: "Search for a text pattern across source files in the fixtures workspace. Returns up to 40 matches with file path, line number, and line text.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "pattern": { "type": "string", "description": "Text pattern to search for (simple substring match)." },
+                    "path": { "type": "string", "description": "Optional subdirectory to limit the search scope." }
+                },
+                "required": ["pattern"],
+                "additionalProperties": false,
+            }),
+        },
+        AgentToolSpec {
+            name: AGENT_TOOL_WRITE_FILE,
+            description: "Create or overwrite a file in the fixtures workspace. The previous content is backed up and can be restored with revert_changes.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Relative path within the fixtures root." },
+                    "content": { "type": "string", "description": "Full file content to write." }
+                },
+                "required": ["path", "content"],
+                "additionalProperties": false,
+            }),
+        },
+        AgentToolSpec {
+            name: AGENT_TOOL_REPLACE_IN_FILE,
+            description: "Find and replace the first occurrence of a string in a file. The previous content is backed up and can be restored with revert_changes.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Relative path within the fixtures root." },
+                    "find": { "type": "string", "description": "Exact string to find (first occurrence only)." },
+                    "replace": { "type": "string", "description": "Replacement string." }
+                },
+                "required": ["path", "find", "replace"],
+                "additionalProperties": false,
+            }),
+        },
+        AgentToolSpec {
+            name: AGENT_TOOL_RUN_COMMAND,
+            description: "Run a shell command inside the fixtures root directory. Use for cargo build, cargo test, cargo check, etc. Returns stdout, stderr, and exit code. Commands are NOT sandboxed beyond running in the fixtures directory.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "command": { "type": "string", "description": "Shell command to execute." }
+                },
+                "required": ["command"],
+                "additionalProperties": false,
+            }),
+        },
+        AgentToolSpec {
+            name: AGENT_TOOL_REVERT_CHANGES,
+            description: "Revert all file changes made by write_file and replace_in_file in this session. Restores all touched files to their original content.",
+            parameters: json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false,
+            }),
+        },
     ]
 }
 
 fn shell_agent_system_prompt() -> &'static str {
     "You are the Cordis shell agent running inside the cordis-runtime serve REPL.\n\
 You are helping the user operate the live runtime from a shell window.\n\
-Use tools whenever the user asks about current runtime state, plugin status, kernel issues, reload behavior, or asks you to run something.\n\
+You can read source files, list directories, search code, write files, replace text in files, run shell commands (cargo build/test/check), inspect runtime status, list plugins/nodes, invoke plugins, execute targets, and reload the runtime.\n\
+When the user asks you to add a feature or fix a bug, follow this workflow:\n\
+1. Read the relevant source files to understand the codebase structure.\n\
+2. Plan the edits needed (which files to create/modify).\n\
+3. Make the edits using write_file and replace_in_file.\n\
+4. Run `cargo build` or `cargo check` to verify compilation.\n\
+5. Run `cargo test` to verify correctness.\n\
+6. If something goes wrong, use revert_changes to undo, then try a different approach.\n\
+Always verify edits compile before claiming success. If a command fails, read the error output and fix it.\n\
 Prefer concise, operator-friendly replies. Mention important tool outcomes plainly.\n\
-Do not invent runtime state or claim a command succeeded unless a tool confirmed it.\n\
-If the user asks for an action that your tools cannot perform, say that clearly and explain the closest supported action."
+Do not invent runtime state or claim a command succeeded unless a tool confirmed it."
 }
 
 fn resolve_api_key(config: &LlmApiConfig) -> Result<String, RuntimeError> {
@@ -1587,6 +2033,58 @@ mod tests {
                 "node_fqn": node_fqn,
                 "payload": payload_json,
             }))
+        }
+
+        fn agent_read_file(
+            &self,
+            path: &str,
+            _offset: Option<usize>,
+            _limit: Option<usize>,
+        ) -> Result<Value, RuntimeError> {
+            Ok(json!({
+                "path": path,
+                "total_lines": 1,
+                "lines": [{"line": 1, "text": "fake content"}],
+            }))
+        }
+
+        fn agent_list_directory(&self, path: &str) -> Result<Value, RuntimeError> {
+            Ok(json!({
+                "path": path,
+                "entries": [{"name": "lib.rs", "kind": "file"}],
+            }))
+        }
+
+        fn agent_search_code(
+            &self,
+            pattern: &str,
+            _path: Option<&str>,
+        ) -> Result<Value, RuntimeError> {
+            Ok(json!({
+                "pattern": pattern,
+                "matches": [],
+            }))
+        }
+
+        fn agent_write_file(&self, path: &str, _content: &str) -> Result<Value, RuntimeError> {
+            Ok(json!({ "path": path, "written_bytes": 0 }))
+        }
+
+        fn agent_replace_in_file(
+            &self,
+            path: &str,
+            _find: &str,
+            _replace: &str,
+        ) -> Result<Value, RuntimeError> {
+            Ok(json!({ "path": path, "replaced": true }))
+        }
+
+        fn agent_run_command(&self, _command: &str) -> Result<Value, RuntimeError> {
+            Ok(json!({ "stdout": "", "stderr": "", "exit_code": 0 }))
+        }
+
+        fn agent_revert_changes(&self) -> Result<Value, RuntimeError> {
+            Ok(json!({ "reverted_files": 0 }))
         }
     }
 

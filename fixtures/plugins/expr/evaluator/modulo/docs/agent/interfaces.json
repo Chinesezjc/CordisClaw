@@ -1,0 +1,43 @@
+{
+  "plugin_id": "expr_evaluator_modulo",
+  "plugin_path": "expr/evaluator/modulo",
+  "plugin_version": "0.1.0",
+  "abi_version": 2,
+  "command_name": null,
+  "nodes": [
+    {
+      "id": "expr_modulo",
+      "summary": "Compute lhs modulo rhs with zero protection.",
+      "input_schema": {
+        "properties": {
+          "lhs": {
+            "type": "number"
+          },
+          "rhs": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "lhs",
+          "rhs"
+        ],
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "error": {
+            "type": "string"
+          },
+          "value": {
+            "type": "number"
+          }
+        },
+        "type": "object"
+      },
+      "side_effects": [],
+      "failure_modes": [
+        "modulo by zero"
+      ]
+    }
+  ]
+}
