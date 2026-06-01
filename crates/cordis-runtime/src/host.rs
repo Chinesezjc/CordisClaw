@@ -1099,18 +1099,33 @@ impl RuntimeHost {
             });
         }
         let resolved = self.fixtures_root.join(rel_path);
-        // Canonicalize to resolve symlinks, then verify containment.
-        let canonical = resolved.canonicalize().unwrap_or(resolved.clone());
+        // Verify containment.  Try canonical form first (catches symlink
+        // escapes); when the path does not exist yet (canonicalize fails),
+        // walk up to the nearest existing ancestor and canonicalize that.
         let canonical_root = self
             .fixtures_root
             .canonicalize()
             .unwrap_or_else(|_| self.fixtures_root.clone());
-        if !canonical.starts_with(&canonical_root) {
+        let check = resolved
+            .canonicalize()
+            .or_else(|_| {
+                // Path doesn't exist — find nearest existing ancestor.
+                let mut ancestor = resolved.clone();
+                while !ancestor.exists() {
+                    ancestor = match ancestor.parent() {
+                        Some(p) => p.to_path_buf(),
+                        None => return Err(()),
+                    };
+                }
+                ancestor.canonicalize().map_err(|_| ())
+            })
+            .unwrap_or_else(|()| resolved.clone());
+        if !check.starts_with(&canonical_root) {
             return Err(RuntimeError::InvalidArgument {
                 message: format!("path escapes fixtures root: {rel}"),
             });
         }
-        Ok(canonical)
+        Ok(resolved)
     }
 
     /// Walk code files under `root`, calling `f` for each regular file that
@@ -1163,6 +1178,16 @@ impl RuntimeHost {
             }
         }
         Ok(())
+    }
+
+    /// Revert all file changes made by the interactive agent in this session.
+    /// Returns the number of files restored.
+    pub fn revert_interactive_changes(&self) -> Result<usize, RuntimeError> {
+        let mut rollback = self.interactive_rollback();
+        let count = rollback.len();
+        rollback.rollback()?;
+        *rollback = PluginEditRollback::empty(&self.fixtures_root);
+        Ok(count)
     }
 
     pub fn config(&self) -> &RuntimeConfig {
@@ -1227,6 +1252,27 @@ impl RuntimeHost {
             .unwrap_or_else(|poison| poison.into_inner())
             .insert(session_id.to_string(), session);
         result
+    }
+
+    /// Inject a user→assistant exchange into the agent's history without
+    /// triggering an LLM call. Used by `/` shortcuts.
+    pub fn agent_inject(
+        &self,
+        session_id: &str,
+        user_input: &str,
+        assistant_output: &str,
+    ) -> Result<(), RuntimeError> {
+        let mut guard = self
+            .agent_sessions
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let session = guard
+            .get_mut(session_id)
+            .ok_or_else(|| RuntimeError::AgentSessionNotFound {
+                session_id: session_id.to_string(),
+            })?;
+        session.session.inject_exchange(user_input, assistant_output);
+        Ok(())
     }
 
     pub fn agent_status(&self, session_id: &str) -> Result<AgentSessionStatus, RuntimeError> {
@@ -2563,7 +2609,7 @@ const PLUGIN_AGENT_TOOL_RUN_PLUGIN_CHECK: &str = "run_plugin_check";
 const PLUGIN_AGENT_TOOL_RUN_PLUGIN_TEST: &str = "run_plugin_test";
 const PLUGIN_AGENT_TOOL_REBUILD_PLUGIN_WORKSPACE: &str = "rebuild_plugin_workspace";
 const PLUGIN_AGENT_TOOL_RECORD_ITERATION_SUMMARY: &str = "record_iteration_summary";
-const PLUGIN_ITERATION_AGENT_TIMEOUT_CAP_MS: u64 = 600_000;
+const PLUGIN_ITERATION_AGENT_TIMEOUT_CAP_MS: u64 = 1_200_000;
 
 #[derive(Debug, Clone, Deserialize)]
 struct ListContextFilesArgs {

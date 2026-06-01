@@ -14,6 +14,8 @@ pub enum BinaryOp {
     Sub,
     Mul,
     Div,
+    Mod,
+    Pow,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -144,15 +146,16 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_term(&mut self) -> Result<ExprAst, ParseError> {
-        let mut lhs = self.parse_factor()?;
+        let mut lhs = self.parse_power()?;
         loop {
             let op = match self.peek().map(|t| &t.kind) {
                 Some(TokenKind::Star) => BinaryOp::Mul,
                 Some(TokenKind::Slash) => BinaryOp::Div,
+                Some(TokenKind::Percent) => BinaryOp::Mod,
                 _ => break,
             };
             self.bump();
-            let rhs = self.parse_factor()?;
+            let rhs = self.parse_power()?;
             lhs = ExprAst::Binary {
                 op,
                 lhs: Box::new(lhs),
@@ -160,6 +163,21 @@ impl<'a> Parser<'a> {
             };
         }
         Ok(lhs)
+    }
+
+    fn parse_power(&mut self) -> Result<ExprAst, ParseError> {
+        let lhs = self.parse_factor()?;
+        if let Some(TokenKind::Caret) = self.peek().map(|t| &t.kind) {
+            self.bump();
+            let rhs = self.parse_power()?;
+            Ok(ExprAst::Binary {
+                op: BinaryOp::Pow,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+            })
+        } else {
+            Ok(lhs)
+        }
     }
 
     fn parse_factor(&mut self) -> Result<ExprAst, ParseError> {
