@@ -616,6 +616,8 @@ impl AgentSession {
                     .iter()
                     .map(|tool| tool.name.to_string())
                     .collect::<BTreeSet<_>>();
+                // One blank line before the tool call block.
+                let _ = writeln!(std::io::stdout());
                 for tool_call in &message.tool_calls {
                     // Announce tool execution in real-time.
                     let tool_args_preview: String = serde_json::from_str::<Value>(
@@ -628,7 +630,7 @@ impl AgentSession {
                     .unwrap_or_else(|| tool_call.function.arguments.clone());
                     let _ = writeln!(
                         std::io::stdout(),
-                        "\n[agent-tool] {} {}",
+                        "⚙ {} {}",
                         tool_call.function.name,
                         tool_args_preview
                     );
@@ -751,6 +753,20 @@ impl AgentSession {
             let remove = if drain % 2 == 0 { drain } else { drain + 1 };
             self.history.drain(0..remove.min(self.history.len()));
         }
+    }
+
+    /// Inject a user→assistant exchange into the agent's history without
+    /// triggering an LLM call. Used by `/` shortcuts so the agent stays
+    /// aware of direct invocations.
+    pub fn inject_exchange(&mut self, user_input: &str, assistant_output: &str) {
+        self.remember_exchange(user_input, assistant_output);
+        self.transcript.push(AgentTranscriptEntry::User {
+            content: user_input.to_string(),
+        });
+        self.transcript.push(AgentTranscriptEntry::Assistant {
+            content: assistant_output.to_string(),
+            response_id: None,
+        });
     }
 
     fn send_chat_request(
@@ -1396,15 +1412,21 @@ fn read_chat_stream(
             // Stream new content to the user in real-time.
             let new_reasoning = &accumulator.reasoning_content[flushed_reasoning_len..];
             if !new_reasoning.is_empty() {
-                // Reasoning is thinking — print dimmed with a prefix.
-                for line in new_reasoning.lines() {
-                    let _ = writeln!(std::io::stdout(), "\x1b[2m  … {line}\x1b[0m");
+                // First reasoning delta: print the prefix.
+                if flushed_reasoning_len == 0 {
+                    let _ = write!(std::io::stdout(), "\x1b[2m💭 ");
                 }
+                // Print reasoning continuously without newlines.
+                let _ = write!(std::io::stdout(), "{new_reasoning}");
                 let _ = std::io::stdout().flush();
                 flushed_reasoning_len = accumulator.reasoning_content.len();
             }
             let new_content = &accumulator.content[flushed_content_len..];
             if !new_content.is_empty() {
+                // First content after reasoning: close the dim span and add a blank line.
+                if flushed_reasoning_len > 0 && flushed_content_len == 0 {
+                    let _ = writeln!(std::io::stdout(), "\x1b[0m");
+                }
                 print!("{new_content}");
                 let _ = std::io::stdout().flush();
                 flushed_content_len = accumulator.content.len();
@@ -1420,15 +1442,22 @@ fn read_chat_stream(
     // Final flush: print any remaining unprinted content.
     let new_reasoning = &accumulator.reasoning_content[flushed_reasoning_len..];
     if !new_reasoning.is_empty() {
-        for line in new_reasoning.lines() {
-            let _ = writeln!(std::io::stdout(), "\x1b[2m  … {line}\x1b[0m");
+        if flushed_reasoning_len == 0 {
+            let _ = write!(std::io::stdout(), "\x1b[2m💭 ");
         }
+        let _ = write!(std::io::stdout(), "{new_reasoning}");
         let _ = std::io::stdout().flush();
     }
     let new_content = &accumulator.content[flushed_content_len..];
     if !new_content.is_empty() {
+        if flushed_reasoning_len > 0 && flushed_content_len == 0 {
+            let _ = writeln!(std::io::stdout(), "\x1b[0m");
+        }
         print!("{new_content}");
         let _ = std::io::stdout().flush();
+    } else if flushed_reasoning_len > 0 {
+        // Reasoning-only response (no content): close the dim span.
+        let _ = writeln!(std::io::stdout(), "\x1b[0m");
     }
 
     let (message, response_id) = accumulator
@@ -1783,13 +1812,29 @@ fn shell_agent_system_prompt() -> &'static str {
     "You are the Cordis shell agent running inside the cordis-runtime serve REPL.\n\
 You are helping the user operate the live runtime from a shell window.\n\
 You can read source files, list directories, search code, write files, replace text in files, run shell commands (cargo build/test/check), inspect runtime status, list plugins/nodes, invoke plugins, execute targets, and reload the runtime.\n\
+\n\
+IMPORTANT — workspace layout:\n\
+- The plugins workspace is under the `plugins/` directory.\n\
+- ALWAYS run cargo commands from the plugins directory: `cd plugins && cargo ...`\n\
+  Example: `cd plugins && cargo build 2>&1`\n\
+  Example: `cd plugins && cargo test -p expr 2>&1`\n\
+- Plugin source files are under `plugins/<name>/src/`, e.g. `plugins/expr/src/lib.rs`.\n\
+- The fixtures root is `./`, but cargo needs `plugins/` as the working directory.\n\
+- When creating NEW files/directories under plugins/, use `run_command` with shell commands\n\
+  (e.g. `mkdir -p plugins/expr/evaluator/pow/src`) first — write_file may reject non-existent paths.\n\
+- After a successful `cargo build`, the built .so files need to be synced to `artifacts/`\n\
+  for the runtime to pick them up:\n\
+  `cp plugins/target/debug/libexpr*.so artifacts/ 2>/dev/null; cp plugins/target/debug/*.so artifacts/ 2>/dev/null`\n\
+  Then use `reload_runtime` to load the changes into the live runtime.\n\
+\n\
 When the user asks you to add a feature or fix a bug, follow this workflow:\n\
 1. Read the relevant source files to understand the codebase structure.\n\
 2. Plan the edits needed (which files to create/modify).\n\
-3. Make the edits using write_file and replace_in_file.\n\
-4. Run `cargo build` or `cargo check` to verify compilation.\n\
-5. Run `cargo test` to verify correctness.\n\
-6. If something goes wrong, use revert_changes to undo, then try a different approach.\n\
+3. Make the edits using write_file and replace_in_file (and run_command for new files/dirs).\n\
+4. Run `cd plugins && cargo build 2>&1` to verify compilation.\n\
+5. Run `cd plugins && cargo test -p <name> 2>&1` to verify correctness.\n\
+6. Sync artifacts and reload for runtime changes (if needed).\n\
+7. If something goes wrong, use revert_changes to undo, then try a different approach.\n\
 Always verify edits compile before claiming success. If a command fails, read the error output and fix it.\n\
 Prefer concise, operator-friendly replies. Mention important tool outcomes plainly.\n\
 Do not invent runtime state or claim a command succeeded unless a tool confirmed it."

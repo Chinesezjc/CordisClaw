@@ -30,7 +30,8 @@ struct ExprResponse {
 ///
 /// Grammar:
 /// Expr   := Term (('+'|'-') Term)*
-/// Term   := Factor (('*'|'/') Factor)*
+/// Term   := Power (('*'|'/'|'%') Power)*
+/// Power  := Factor ('^' Power)?
 /// Factor := Number | '(' Expr ')' | ('+'|'-') Factor
 pub fn evaluate_expression(expr: &str) -> Result<f64, ExprError> {
     evaluator_core::evaluate_expression(expr)

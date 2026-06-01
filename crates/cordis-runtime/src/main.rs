@@ -175,9 +175,17 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let stdin = io::stdin();
     let mut locked = stdin.lock();
     loop {
+        let prompt = if state.mode == ServeMode::AgentChat {
+            ">> "
+        } else {
+            "> "
+        };
+        print!("{prompt}");
+        io::stdout().flush()?;
         let mut line = String::new();
         let read = locked.read_line(&mut line)?;
         if read == 0 {
+            println!();
             break;
         }
 
@@ -216,7 +224,7 @@ fn handle_serve_command(
         }
         "agent" => {
             state.mode = ServeMode::AgentChat;
-            println!("{}", agent_chat_usage());
+            println!("agent chat mode (>> prompt). /exit to leave, /reset to clear.");
         }
         "agent status" => {
             println!(
@@ -343,6 +351,16 @@ fn handle_serve_command(
             } else if let Some(iteration_id) = command.strip_prefix("kernel approve ") {
                 let result = host.approve_blocked_iteration(iteration_id.trim())?;
                 println!("{}", serde_json::to_string(&result)?);
+            } else if command.contains("::") || command.starts_with('/') {
+                let input = if let Some(rest) = command.strip_prefix('/') {
+                    rest.trim()
+                } else {
+                    command
+                };
+                match invoke_shortcut(host, input) {
+                    Ok(_) => {}
+                    Err(err) => println!("invoke failed: {err}"),
+                }
             } else {
                 println!("unknown serve command: {command}");
             }
@@ -377,11 +395,91 @@ fn handle_agent_chat_line(
         }
         "/exit" | "/quit" => {
             state.mode = ServeMode::Command;
-            println!("left agent chat mode");
+            println!("back to serve commands (> prompt).");
         }
         _ => {
-            let reply = host.agent_send(&state.agent_session_id, line)?;
-            emit_agent_reply(&reply)?;
+            // `/node_fqn args...` — direct plugin invocation, bypass agent.
+            if let Some(rest) = line.strip_prefix('/') {
+                let rest = rest.trim();
+                if rest.is_empty() {
+                    println!("usage: /<node_fqn> [args...]");
+                    return Ok(true);
+                }
+                match invoke_shortcut(host, rest) {
+                    Ok(result) => {
+                        // Let the agent know what just happened.
+                        let _ = host.agent_inject(
+                            &state.agent_session_id,
+                            &format!("[direct] /{rest}"),
+                            &result,
+                        );
+                    }
+                    Err(err) => println!("invoke failed: {err}"),
+                }
+            } else {
+                match host.agent_send(&state.agent_session_id, line) {
+                    Ok(reply) => {
+                        emit_agent_reply(&reply)?;
+                    }
+                    Err(err) => {
+                        // Save the agent's partial changes as a draft patch,
+                        // then revert to keep the workspace clean.  The user
+                        // can replay the draft with `git apply` later.
+                        let draft_dir = host
+                            .fixtures_root()
+                            .join(".cordis-drafts");
+                        let _ = std::fs::create_dir_all(&draft_dir);
+                        let ts = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        let draft_path = draft_dir.join(format!("draft-{ts}.patch"));
+                        // Generate diff of all modified files under plugins/.
+                        let diff = std::process::Command::new("sh")
+                            .arg("-c")
+                            .arg("git diff -- plugins/ 2>/dev/null")
+                            .current_dir(host.fixtures_root())
+                            .output();
+                        let saved = if let Ok(output) = diff {
+                            let patch = String::from_utf8_lossy(&output.stdout);
+                            if patch.trim().is_empty() {
+                                false
+                            } else {
+                                std::fs::write(&draft_path, patch.as_bytes()).is_ok()
+                            }
+                        } else {
+                            false
+                        };
+                        // Revert in-memory rollback + git checkout files.
+                        let reverted = host
+                            .revert_interactive_changes()
+                            .unwrap_or(0);
+                        let _ = std::process::Command::new("sh")
+                            .arg("-c")
+                            .arg("git checkout -- plugins/ 2>/dev/null")
+                            .current_dir(host.fixtures_root())
+                            .output();
+                        if saved {
+                            println!(
+                                "\n💾 draft saved: .cordis-drafts/draft-{ts}.patch ({n} file(s) reverted)\n   replay: cd fixtures && git apply .cordis-drafts/draft-{ts}.patch",
+                                n = reverted
+                            );
+                        } else if reverted > 0 {
+                            println!(
+                                "\n⚠ agent error, reverted {n} file(s) back to original state.",
+                                n = reverted
+                            );
+                        }
+                        // Also revert any new untracked files the agent created.
+                        let _ = std::process::Command::new("sh")
+                            .arg("-c")
+                            .arg("git clean -fd -- plugins/ 2>/dev/null")
+                            .current_dir(host.fixtures_root())
+                            .output();
+                        return Err(err.into());
+                    }
+                }
+            }
         }
     }
 
@@ -511,12 +609,88 @@ fn emit_invoke_response(payload: &str) -> Result<(), Box<dyn std::error::Error>>
     Ok(())
 }
 
+/// Handle `/node_fqn args...` or `/ShellCommand args...` shortcuts in agent chat.
+/// Parses the input, looks up the target node, and executes it directly.
+/// Returns the formatted result line for injection into agent history.
+fn invoke_shortcut(host: &RuntimeHost, input: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let (first, rest) = split_first_token(input).unwrap_or((input, ""));
+    let node_fqn = if first.contains("::") {
+        // Already a fully-qualified node name.
+        first.to_string()
+    } else {
+        // Look up by shell command name in the plugin registry.
+        let snapshot = host.current_snapshot();
+        let mut found: Option<String> = None;
+        for (plugin_path, plugin) in snapshot.plugin_registry().iter() {
+            if let Some(docs) = &plugin.docs {
+                if docs
+                    .command_name
+                    .as_ref()
+                    .is_some_and(|cmd| cmd.eq_ignore_ascii_case(first))
+                {
+                    // Use the first declared node for this plugin.
+                    if let Some(node) = docs.nodes.first() {
+                        found = Some(format!("{plugin_path}::{node_id}", node_id = node.id));
+                        break;
+                    }
+                }
+            }
+        }
+        found.unwrap_or_else(|| first.to_string())
+    };
+
+    // Build payload: try JSON first, fall back to wrapping as expression.
+    let payload: Value = if rest.is_empty() {
+        json!({})
+    } else {
+        match serde_json::from_str::<Value>(rest) {
+            Ok(v) => v,
+            Err(_) => {
+                // Single number or plain expression: wrap as {"expression": "..."}
+                // or try numeric parsing.
+                if let Ok(n) = rest.parse::<f64>() {
+                    json!({"expression": n.to_string()})
+                } else {
+                    json!({"expression": rest})
+                }
+            }
+        }
+    };
+
+    let response = host.execute(&node_fqn, payload)?;
+    let mut lines = Vec::new();
+    for (_key, trace) in &response.traces {
+        let outcome = match trace.outcome {
+            Some(cordis_runtime::core::models::NodeOutcome::Success) => "ok",
+            Some(_) => "fail",
+            None => "?",
+        };
+        let payload = trace
+            .response_payload
+            .as_ref()
+            .map(|p| serde_json::to_string(p).unwrap_or_else(|_| "?".to_string()))
+            .unwrap_or_else(|| "null".to_string());
+        let error = trace.error.as_deref().unwrap_or("");
+        let line = if error.is_empty() {
+            format!("→ {outcome}: {payload}")
+        } else {
+            format!("→ {outcome}: {error}")
+        };
+        println!("{line}");
+        lines.push(line);
+    }
+    Ok(lines.join("\n"))
+}
+
 fn emit_agent_reply(reply: &ShellAgentReply) -> Result<(), Box<dyn std::error::Error>> {
     // Tool calls are already announced in real-time during agent execution.
     // Content is already streamed in real-time.
-    // Only print a note if the agent returned nothing at all.
     if reply.tool_events.is_empty() && reply.content.trim().is_empty() {
         println!("(agent returned an empty response)");
+    } else {
+        // Ensure a trailing newline after streamed content so the next
+        // input prompt starts on a fresh line.
+        println!();
     }
     Ok(())
 }

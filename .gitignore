@@ -5,3 +5,4 @@ fixtures/artifacts/
 fixtures/plugins/**/Cargo.lock
 .codex
 .claude/
+.cordis-drafts/

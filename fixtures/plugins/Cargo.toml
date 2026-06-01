@@ -8,5 +8,6 @@ exclude = [
   "expr/evaluator/sub",
   "expr/evaluator/mul",
   "expr/evaluator/div",
+  "expr/evaluator/pow",
 ]
 resolver = "2"

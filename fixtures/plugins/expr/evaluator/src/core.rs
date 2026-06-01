@@ -10,10 +10,16 @@ pub mod sub_core;
 pub mod mul_core;
 #[path = "../div/src/core.rs"]
 pub mod div_core;
+#[path = "../modulo/src/core.rs"]
+pub mod modulo_core;
+#[path = "../pow/src/core.rs"]
+pub mod pow_core;
 
 pub use add_core::AddPlugin;
 pub use div_core::{DivError, DivPlugin};
+pub use modulo_core::{ModError, ModPlugin};
 pub use mul_core::MulPlugin;
+pub use pow_core::PowPlugin;
 pub use parser_core::{BinaryOp, ExprAst, ParseExpressionError, UnaryOp};
 pub use sub_core::SubPlugin;
 use thiserror::Error;
@@ -24,6 +30,8 @@ use serde::{Deserialize, Serialize};
 pub enum EvalError {
     #[error("division by zero")]
     DivisionByZero,
+    #[error("modulo by zero")]
+    ModuloByZero,
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -31,6 +39,8 @@ pub enum EvalError {
 pub enum EvaluateExpressionError {
     #[error("division by zero")]
     DivisionByZero,
+    #[error("modulo by zero")]
+    ModuloByZero,
     #[error("unexpected token at position {position}")]
     UnexpectedToken { position: usize },
     #[error("missing ')' at position {position}")]
@@ -57,6 +67,8 @@ struct OpPlugins {
     sub: SubPlugin,
     mul: MulPlugin,
     div: DivPlugin,
+    modulo: ModPlugin,
+    pow: PowPlugin,
 }
 
 fn evaluate_with_plugins(ast: &ExprAst, ops: &OpPlugins) -> Result<f64, EvalError> {
@@ -79,6 +91,10 @@ fn evaluate_with_plugins(ast: &ExprAst, ops: &OpPlugins) -> Result<f64, EvalErro
                 BinaryOp::Div => ops.div.apply(left, right).map_err(|err| match err {
                     DivError::DivisionByZero => EvalError::DivisionByZero,
                 }),
+                BinaryOp::Mod => ops.modulo.apply(left, right).map_err(|err| match err {
+                    ModError::ModuloByZero => EvalError::ModuloByZero,
+                }),
+                BinaryOp::Pow => Ok(ops.pow.apply(left, right)),
             }
         }
     }
@@ -104,5 +120,6 @@ fn map_parse_expression_error(err: ParseExpressionError) -> EvaluateExpressionEr
 fn map_eval_error(err: EvalError) -> EvaluateExpressionError {
     match err {
         EvalError::DivisionByZero => EvaluateExpressionError::DivisionByZero,
+        EvalError::ModuloByZero => EvaluateExpressionError::ModuloByZero,
     }
 }
