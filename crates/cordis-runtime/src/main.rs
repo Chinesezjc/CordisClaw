@@ -18,7 +18,7 @@ use cordis_runtime::plugin::tooling::{
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
 use std::fs;
-use std::io::{self, BufRead, Write};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -193,22 +193,41 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         .ok();
     }
 
-    let stdin = io::stdin();
-    let mut locked = stdin.lock();
+    // Use rustyline for readline-like editing: history, cursor movement, etc.
+    let mut rl = rustyline::DefaultEditor::new()?;
+    // Persist history so it survives restarts.
+    let history_path = host
+        .fixtures_root()
+        .join(".cordis-drafts")
+        .join("repl-history.txt");
+    let _ = rl.load_history(&history_path);
+
     loop {
         let prompt = if state.mode == ServeMode::AgentChat {
             ">> "
         } else {
             "> "
         };
-        print!("{prompt}");
-        io::stdout().flush()?;
-        let mut line = String::new();
-        let read = locked.read_line(&mut line)?;
-        if read == 0 {
-            println!();
-            break;
-        }
+        let line = match rl.readline(prompt) {
+            Ok(line) => {
+                rl.add_history_entry(&line)?;
+                line
+            }
+            Err(rustyline::error::ReadlineError::Interrupted) => {
+                // Ctrl+C: if we get here, the ctrlc handler didn't fire
+                // (e.g. rustyline caught it). Treat as exit request.
+                println!("^C");
+                continue;
+            }
+            Err(rustyline::error::ReadlineError::Eof) => {
+                println!();
+                break;
+            }
+            Err(err) => {
+                println!("read error: {err}");
+                continue;
+            }
+        };
 
         let line = line.trim();
         let handled = if state.mode == ServeMode::AgentChat {
@@ -225,8 +244,11 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 io::stdout().flush()?;
             }
         }
+        // Persist history after every command.
+        let _ = rl.save_history(&history_path);
     }
 
+    let _ = rl.save_history(&history_path);
     Ok(())
 }
 
