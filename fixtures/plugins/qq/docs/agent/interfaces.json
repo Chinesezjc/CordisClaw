@@ -7,7 +7,7 @@
   "nodes": [
     {
       "id": "qq_entry",
-      "summary": "QQ adapter using the NoneBot (OneBot v11) protocol. Connect to a OneBot-compatible QQ client for sending messages.",
+      "summary": "QQ adapter using the NoneBot (OneBot v11) protocol.",
       "input_schema": {
         "type": "object",
         "required": ["action"],
