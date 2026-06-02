@@ -102,19 +102,16 @@ Local(当前插件 -> 祖先插件中被 grants 明确允许的服务)
 
 在当前原型里，Kernel 不再只是一次性 CLI 辅助逻辑；它现在挂在常驻 [host.rs](../../crates/cordis-runtime/src/host.rs) 的 `RuntimeHost` 上，跨 `reload` 持续保留历史和指标。
 
-### 3.1 Self-Iteration Kernel
+### 3.1 自迭代（Agent Loop）
 
-[kernel/loop.rs](../../crates/cordis-runtime/src/kernel/loop.rs) 实现了一个 OpenClaw 风格的最小闭环：
+自迭代已经从固定 9 阶段 Petri Net 管道升级为 open-ended agent loop。
+原 `kernel/loop.rs` 和 `kernel/planner.rs`（~9200 行）已被删除，替换为：
 
-```text
-observe -> diagnose -> plan -> apply -> verify -> score -> safety_gate -> promote/rollback
-```
+- [host.rs](../../crates/cordis-runtime/src/host.rs)：`iterate_plugins()` — agent loop + 顺序 finalization（rebuild → stage → verify → canary → promote/rollback）
+- [agent.rs](../../crates/cordis-runtime/src/agent.rs)：`AgentSession::respond()` — 统一的 tool-calling loop（最多 96 轮），代理可以自主决定每一步做什么
+- [kernel/plugin_iteration.rs](../../crates/cordis-runtime/src/kernel/plugin_iteration.rs)：策略验证、回滚日志持久化、canary 回放
 
-它本身不负责生成补丁，而是负责在“补丁已应用、验证结果已得出”的前提下进行：
-
-- 策略检查
-- 评分
-- promote / rollback 判定
+回退安全网有四层：panic guard、增量 journal 持久化、draft patch 保存、workspace 恢复。
 - 记忆记录
 
 `RuntimeHost` 对外提供：
