@@ -12,8 +12,8 @@
   - Actor 批量调度与并发上限
 - `shell_plugin.rs`
   - shell 外部插件调用、REPL 和 `Expr` 命令分发
-- `kernel.rs`
-  - Self-Iteration Kernel 的闭环判定
+- `runtime_host.rs`
+  - Agent 插件迭代、rollback、canary 回放、Kernel 状态持久化
 - `auto_update.rs`
   - 自动更新应用、验证失败回滚、路径安全
 - `tooling.rs`
@@ -34,7 +34,7 @@
 7. [crates/cordis-runtime/src/service/doc_registry.rs](../../crates/cordis-runtime/src/service/doc_registry.rs)
 8. [crates/cordis-runtime/src/service/graph_registry.rs](../../crates/cordis-runtime/src/service/graph_registry.rs)
 9. [crates/cordis-runtime/src/execution/engine.rs](../../crates/cordis-runtime/src/execution/engine.rs)
-10. [crates/cordis-runtime/src/kernel/loop.rs](../../crates/cordis-runtime/src/kernel/loop.rs)
+10. [crates/cordis-runtime/src/kernel/plugin_iteration.rs](../../crates/cordis-runtime/src/kernel/plugin_iteration.rs)
 11. `crates/cordis-runtime/tests/*.rs`
 12. `fixtures/plugins/*`
 

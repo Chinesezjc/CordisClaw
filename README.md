@@ -45,64 +45,29 @@ The project makes a few deliberate choices that are useful precisely because the
 
 Those tradeoffs reduce convenience in the short term, but they make the runtime easier to inspect, test, and debug.
 
-## Example Runtime Flow
-
-At a high level, the runtime path looks like this:
-
-```text
-workspace members
-  -> resolve plugin tree from metadata.children
-  -> validate docs and contracts
-  -> load prebuilt artifacts from index.json
-  -> stage artifacts into a snapshot-specific runtime root
-  -> register plugins, nodes, and grants-aware context
-  -> invoke nodes or export graph views
-  -> evaluate / promote / rollback inside the Kernel loop
-```
-
-This is the core shape of the system: explicit discovery, strict loading, registered capabilities, then execution and evaluation on top.
-
-## Why It Is Interesting
-
-This repo is most useful if you care about runtime architecture questions such as:
-
-- how to model plugins as a tree instead of a flat extension list
-- how strict a loader can be before a plugin system becomes easier to reason about
-- how docs can double as machine-readable runtime input
-- how parent/child authorization can replace ambient service access
-- how CPN Net and Router semantics can sit next to a plugin runtime
-- how a rollback-oriented Kernel loop might coexist with explicit safety boundaries
-
-## What It Demonstrates
-
-- Plugin tree discovery and fail-fast contract validation
-- Strict artifact loading for `dylib` and JSON-based plugin artifacts
-- Parent/child service injection with explicit authorization
-- Registry-backed docs queries and graph export
-- A deterministic execution prototype built around CPN Net semantics
-- A minimal self-iteration kernel prototype for evaluate / promote / rollback flows
-
 ## What Works Today
 
-The repository already has a working prototype core:
-
-- `resolver`, `loader`, `registry`, and `context` are implemented
-- `shell`, `expr`, and `root` fixtures exercise the loading and invocation path
-- `RuntimeHost` and `serve` provide a long-running host with atomic snapshot reload
-- `execute`, graph export, docs sync, and artifact index refresh are available from the CLI
-- `reload` and `kernel` control-plane output are structured JSON with elapsed/failure diagnostics
-- Kernel and `auto-update` support verification pipelines, plugin verifiers, and structured JSON/TOML patch kinds as guarded prototype capabilities
-
-Current status and gaps are tracked in [docs/architecture/status-and-open-items.md](./docs/architecture/status-and-open-items.md).
+- **Plugin tree discovery** — resolver walks `package.metadata.cordis.children`, validates paths, crate names, docs contracts, and cycle detection at resolve time
+- **Strict artifact loading** — ABI fingerprint matching, `sha256` artifact index, fail-fast on mismatch
+- **Parent/child service injection** — `grants`-based authorization, typed service container with `provide`/`inject`, and `Service` trait with `start`/`stop` lifecycle for background Task nodes
+- **Docs as runtime input** — `docs/agent/interfaces.json` feeds `DocRegistry`, `GraphRegistry`, node registration, and CLI graph export
+- **CPN Net execution engine** — deterministic scheduler, Router with overlay transactions, Gate policies (AllOf/AnyOf/FirstSuccess/AtLeast), retry/backoff/timeout
+- **Long-running host** — `serve` REPL with atomic snapshot reload, candidate staging, promote/rollback, structured JSON diagnostics
+- **Interactive agent chat** — streaming LLM conversation, 15 tools (read/write/search/shell), readline editing with history, Ctrl+C draft safety, direct `/plugin` shortcuts
+- **Shell console mode** — type commands directly, routed through Shell plugin's catalog-based command dispatch (NoneBot console pattern)
+- **Self-iteration** — open-ended agent loop replaces the fixed 9-stage Petri Net pipeline; agent can read code, write files, run builds, and verify changes autonomously
+- **Rollback safety net** — panic guard, incremental journal persistence, draft patches on error, workspace auto-restore
+- **Plugin samples** — `expr` (recursive-descent arithmetic with lexer/parser/evaluator + add/sub/mul/div/modulo/pow operators), `shell` (command catalog dispatch), `qq` (OneBot v11 adapter), `root` (scaffold placeholder)
 
 ## Current Boundaries
 
 `CordisClaw` is still a prototype, and the repository is explicit about what is not finished:
 
-- execution now has explicit CLI/`serve` entrypoints, but the runtime still treats it as a conservative prototype
-- the Kernel is a guarded evaluate / promote / rollback loop, not a full autonomous patching system
+- the agent loop is functional but tool surface and safety boundaries are still evolving
+- the `Service` trait exists for Task nodes but auto-start on plugin load is not yet wired
+- `cdylib` / `WASM` / `external process` plugin forms are designed but not implemented
 - docs and graph export are helper surfaces, not a polished external service boundary
-- the original multi-artifact vision is only partially implemented today
+- TODO: full canary release (traffic splitting, auto-promotion) [see status doc]
 
 ## Non-Goals
 
@@ -117,79 +82,48 @@ The point is to make the architecture legible before making it maximally flexibl
 
 ## Quick Demo
 
-Load the fixture workspace:
-
-```bash
-cargo run -p cordis-runtime -- fixtures
-```
-
-Invoke the expression plugin:
-
-```bash
-cargo run -p cordis-runtime -- invoke expr expr_entry --payload-json='{"expression":"1 + 2 * 3"}'
-```
-
-Execute a registered target through the runtime execution engine:
-
-```bash
-cargo run -p cordis-runtime -- execute expr::expr_entry --payload-json='{"expression":"1 + 2 * 3"}'
-```
-
-Run the long-lived host and reload plugins explicitly:
+Load and interact with the runtime:
 
 ```bash
 cargo run -p cordis-runtime -- serve fixtures
 ```
 
-Inside `serve`, use:
+Inside `serve`, three modes are available:
 
 ```text
-status
-plugins
-execute expr::expr_entry {"expression":"1 + 2 * 3"}
-reload
-kernel status
+> agent              # enter AI agent chat (>> prompt)
+> shell              # enter shell console, type commands directly ($ prompt)
+> /exit              # return from agent/shell to command mode
+
+> status             # runtime status
+> plugins            # list loaded plugins
+> reload             # reload plugin workspace
+> kernel status      # kernel metrics and issues
+> kernel issues      # list observed plugin issues
+> exit               # quit serve
 ```
 
-Export the registered plugin graph:
-
-```bash
-cargo run -p cordis-runtime -- graph-html fixtures --output=registered-nodes.html
-```
-
-Export the registered net view:
-
-```bash
-cargo run -p cordis-runtime -- net-html fixtures --output=registered-net.html
-```
-
-Generate plugin artifacts from source, sync docs, and refresh the artifact index:
-
-```bash
-cargo run -p cordis-runtime -- rebuild-fixture-artifacts
-```
-
-`fixtures/artifacts/` is generated on demand and gitignored. The main CLI/test entrypoints rebuild it automatically when the checked-in plugin sources or docs are newer than the local artifact index.
-
-Configure kernel/runtime/LLM settings with YAML:
+Agent chat mode (`>>`):
 
 ```text
-config/
-  runtime.yaml
-  llm_api.yaml
-  plugins/*.yaml
+>> 列出当前加载的插件
+>> 为 expr 实现幂运算
+>> /expr::expr_entry 2^10          # direct plugin call, bypasses LLM
+>> /reset                          # reset agent session
 ```
 
-llm_api.yaml supports both OpenAI Responses API and DeepSeek Chat Completions when provider is set to deepseek.
+Shell console mode (`$`):
 
-llm-auto-update verification commands can call plugins directly, for example expr::expr_entry, and `--verify-profile=rust-workspace` enables a default static `cargo check` stage when a workspace manifest is present.
+```text
+$ Expr 1+2*3
+$ Qq configure url=http://127.0.0.1:5700 target=group:123456
+$ help
+```
 
-`config/` is intended for local runtime setup and is gitignored. Sample templates are provided in `config.example/`; copy the files you need into `config/`.
-
-Run the test suite:
+One-shot CLI invocation:
 
 ```bash
-cargo test
+cargo run -p cordis-runtime -- execute expr::expr_entry --payload-json='{"expression":"1 + 2 * 3"}'
 ```
 
 ## Repository Shape
@@ -197,13 +131,17 @@ cargo test
 ```text
 .
 ├── crates/
-│   ├── cordis-plugin-sdk/   # shared ABI, docs types, export helpers
-│   └── cordis-runtime/      # runtime, plugin, context, execution, kernel, service
+│   ├── cordis-plugin-sdk/   # shared ABI, docs types, NodeType, export helpers
+│   └── cordis-runtime/      # runtime, plugin, context, execution, kernel, service, agent
 ├── config.example/          # checked-in config templates
 ├── config/                  # local runtime/kernel/LLM/plugin YAML config (gitignored)
 ├── docs/                    # architecture and maintenance docs
 ├── fixtures/
 │   ├── plugins/             # external plugin sample workspace
+│   │   ├── expr/            # recursive-descent arithmetic (lexer/parser/evaluator + 6 operators)
+│   │   ├── shell/           # command-catalog dispatch (NoneBot console pattern)
+│   │   ├── qq/              # OneBot v11 QQ adapter
+│   │   └── root/            # scaffold placeholder
 │   └── artifacts/           # generated local artifacts and index (gitignored)
 ```
 
@@ -218,3 +156,4 @@ cargo test
 - Runtime semantics: [docs/architecture/runtime-semantics.md](./docs/architecture/runtime-semantics.md)
 - Plugins and tooling: [docs/architecture/plugins-and-tooling.md](./docs/architecture/plugins-and-tooling.md)
 - Completion status: [docs/architecture/status-and-open-items.md](./docs/architecture/status-and-open-items.md)
+- File responsibility map: [docs/rs-files-responsibility.md](./docs/rs-files-responsibility.md)

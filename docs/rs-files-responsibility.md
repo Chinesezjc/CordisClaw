@@ -48,18 +48,27 @@
 
 | 文件 | 职责定位 | 关键入口 |
 |---|---|---|
-| `crates/cordis-runtime/src/context/mod.rs` | `provide/inject/dispose`、overlay 事务、session CAS、context 指标 | `ContextRegistry`、`ContextTxn`、`RuntimeContext::metrics()` |
+| `crates/cordis-runtime/src/context/mod.rs` | `provide/inject/dispose`、overlay 事务、session CAS、context 指标，以及 `Service` trait + `ServiceRegistry` 后台服务生命周期管理 | `ContextRegistry`、`ContextTxn`、`Service`、`ServiceRegistry::start_service()` |
 
 ## 6. Kernel 层 (`crates/cordis-runtime/src/kernel`)
 
 | 文件 | 职责定位 | 关键入口 |
 |---|---|---|
-| `crates/cordis-runtime/src/kernel/policy.rs` | 自迭代策略边界：路径白名单、敏感路径人工确认（SafetyGate）、diff/时间预算 | `IterationPolicy` |
+| `crates/cordis-runtime/src/kernel/policy.rs` | 自迭代策略边界：路径白名单、敏感路径人工确认、diff 预算 | `IterationPolicy` |
 | `crates/cordis-runtime/src/kernel/evaluator.rs` | 验证结果聚合与评分判定 | `EvalHarness::evaluate()` |
 | `crates/cordis-runtime/src/kernel/memory.rs` | 迭代历史记忆（问题-补丁-结果） | `ChangeMemory::record()` |
-| `crates/cordis-runtime/src/kernel/loop.rs` | OpenClaw 最小闭环状态机骨架 + promote/rollback 计数指标 | `SelfIterationKernel::run_once()` |
 | `crates/cordis-runtime/src/kernel/auto_update.rs` | 自动更新执行器：应用补丁、回调验证、失败回滚 | `AutoUpdater::execute()` |
-| `crates/cordis-runtime/src/kernel/mod.rs` | Kernel 模块导出聚合 | `pub mod auto_update/policy/evaluator/memory/loop` |
+| `crates/cordis-runtime/src/kernel/plugin_iteration.rs` | 插件迭代：策略校验、编辑执行器、回滚日志、canary 判定 | `PluginEditExecutor`、`PluginEditRollback`、`CanaryReport` |
+| `crates/cordis-runtime/src/kernel/verifier.rs` | 验证 pipeline：static_check / tests / safety stage、shell/plugin verifier | `CommandVerifier`、`VerificationProfile` |
+| `crates/cordis-runtime/src/kernel/mod.rs` | Kernel 模块导出聚合 | `pub mod auto_update/plugin_iteration/verifier/...` |
+
+> **已删除**: `kernel/loop.rs`（9 阶段 Petri Net 替换为 agent loop）、`kernel/planner.rs`（独立 LLM 路径合并到 AgentSession）
+
+## 6b. Agent 层 (`crates/cordis-runtime/src/agent.rs`)
+
+| 职责定位 | 关键入口 |
+|---|---|
+| 统一的 LLM agent 会话：SSE 流解析、tool-calling loop（最多 96 轮）、重试/超时管理、消息历史；两个后端：`RuntimeShellAgentBackend`（15 个交互式工具）和 `PluginIterationAgentBackend`（14 个 plugin-editing 工具） | `AgentSession::respond()`、`ShellAgentSession`、`AgentToolHost` trait |
 
 ## 7. Service 层 (`crates/cordis-runtime/src/service`)
 
@@ -86,9 +95,10 @@
 | `crates/cordis-runtime/tests/actor_executor.rs` | Actor 执行批次和并发上限行为 | `actor_executor_respects_parallel_limit_and_order` |
 | `crates/cordis-runtime/tests/auto_update.rs` | 自动更新行为验收：应用成功保留、验证失败回滚、路径越界拒绝 | `auto_update_*` |
 | `crates/cordis-runtime/tests/shell_plugin.rs` | 外部 shell 插件验收：loader 注册、generic invoke、交互 REPL、Expr 分发 | `shell_plugin_*` |
-| `crates/cordis-runtime/tests/kernel.rs` | Kernel 自迭代闭环规则（含 SafetyGate 与迭代计数） | `kernel_*` |
 | `crates/cordis-runtime/tests/tooling.rs` | 工具链验收：自动回写 `interfaces.json` 与自动刷新 artifact index 哈希 | `sync_plugin_docs_*`、`refresh_artifact_index_*` |
-| `crates/cordis-runtime/tests/runtime_host.rs` | RuntimeHost 验收：boot/invoke、显式 `reload`、旧快照隔离、serve CLI、YAML config | `runtime_host_*`、`serve_mode_*` |
+| `crates/cordis-runtime/tests/runtime_host.rs` | RuntimeHost 验收：boot/invoke、reload、旧快照隔离、agent 迭代、rollback、canary、serve CLI、YAML config | `runtime_host_*`、`serve_mode_*` |
+
+> **已删除**: `tests/kernel.rs`（测试已删除的 SelfIterationKernel）、`tests/llm_auto_update.rs`（测试已删除的 LlmPatchPlanner）
 
 ## 10. 外部表达式聚合插件 (`fixtures/plugins/expr`)
 
@@ -128,6 +138,17 @@
 | `fixtures/plugins/expr/evaluator/div/src/core.rs` | 除法算子核心逻辑（含除零保护） | `DivPlugin::apply()` |
 | `fixtures/plugins/expr/evaluator/div/tests/div.rs` | 除法算子实现测试 | `div_*` |
 
+## 11b. Evaluator 算子子插件（取模、幂）
+
+| 文件 | 职责定位 | 关键入口 |
+|---|---|---|
+| `fixtures/plugins/expr/evaluator/modulo/src/lib.rs` | 取模算子 dylib 包装层（含除零保护） | `cordis_plugin_api_rust_v2`、`apply()` |
+| `fixtures/plugins/expr/evaluator/modulo/src/core.rs` | 取模算子核心逻辑 | `ModPlugin::apply()` |
+| `fixtures/plugins/expr/evaluator/modulo/tests/modulo.rs` | 取模算子实现测试 | `modulo_works`、`modulo_rejects_zero` |
+| `fixtures/plugins/expr/evaluator/pow/src/lib.rs` | 幂算子 dylib 包装层 | `cordis_plugin_api_rust_v2`、`apply()` |
+| `fixtures/plugins/expr/evaluator/pow/src/core.rs` | 幂算子核心逻辑 | `PowPlugin::apply()` |
+| `fixtures/plugins/expr/evaluator/pow/tests/pow.rs` | 幂算子实现测试 | `pow_*` |
+
 ## 12. 外部 Shell Dylib 插件 (`fixtures/plugins/shell`)
 
 | 文件 | 职责定位 | 关键入口 |
@@ -135,7 +156,14 @@
 | `fixtures/plugins/shell/src/lib.rs` | 外部 shell dylib 插件：通过共享 SDK 导出 Rust ABI，承接 REPL、脚本执行和基于 `command_name` 的外部命令分发 | `cordis_plugin_api_rust_v2` |
 | `fixtures/plugins/shell/tests/basic.rs` | shell 插件工程测试占位 | `shell_scaffold_test()` |
 
-## 13. 插件样例工程 (`fixtures/plugins`)
+## 13. QQ Adapter 插件 (`fixtures/plugins/qq`)
+
+| 文件 | 职责定位 | 关键入口 |
+|---|---|---|
+| `fixtures/plugins/qq/src/lib.rs` | QQ 适配器 dylib：OneBot v11 协议 HTTP 客户端，支持 configure/send/status/call | `onebot_call()`、`parse_target()` |
+| `fixtures/plugins/qq/tests/test_parse.rs` | QQ 适配器测试：target 字符串解析 | `test_parse_target` |
+
+## 14. 插件样例工程 (`fixtures/plugins`)
 
 | 文件 | 职责定位 | 关键入口 |
 |---|---|---|
@@ -144,87 +172,17 @@
 | `fixtures/plugins/root/child/src/lib.rs` | 子插件样例源码占位 | `child_plugin_marker()` |
 | `fixtures/plugins/root/child/tests/basic.rs` | 子插件样例测试占位 | `child_scaffold_test()` |
 
-## 14. 推荐阅读顺序
+## 15. 推荐阅读顺序
 
-1. `crates/cordis-plugin-sdk/src/lib.rs` + `crates/cordis-plugin-sdk/src/workflow.rs`（先看共享 ABI / docs 契约和非宏 workflow 接口）。
-2. `core/models.rs` + `core/error.rs`（再看 runtime 专属契约与错误语义）。
+1. `crates/cordis-plugin-sdk/src/lib.rs` + `crates/cordis-plugin-sdk/src/workflow.rs`（共享 ABI / docs 契约和 workflow 接口）。
+2. `core/models.rs` + `core/error.rs`（runtime 专属契约与错误语义）。
 3. `plugin/package.rs` + `plugin/loader.rs`（发现/解析/实例化主流程）。
-4. `context/mod.rs`（注入链、overlay、CAS）。
-5. `execution/net.rs` + `execution/gate.rs` + `execution/actor.rs`（执行语义骨架）。
-6. `execution/engine.rs` + `execution/router.rs`（CPN 运行时集成与子图边界）。
-7. `kernel/` 五文件（含自动更新执行器）。
-8. `tests/*.rs`（对照验收场景）。
+4. `context/mod.rs`（注入链、overlay、CAS、Service 生命周期）。
+5. `agent.rs`（LLM agent 会话、工具执行、流式输出）。
+6. `host.rs`（常驻宿主、iterate_plugins、自迭代 agent loop、回退安全网）。
+7. `execution/net.rs` + `execution/gate.rs` + `execution/actor.rs`（执行语义骨架）。
+8. `execution/engine.rs` + `execution/router.rs`（CPN 运行时集成与子图边界）。
+9. `kernel/` 各文件（策略、评估、记忆、自动更新、插件迭代、验证器）。
+10. `tests/*.rs`（对照验收场景）。
 
-## 15. 覆盖声明
-
-当前文档覆盖以下 `.rs` 文件（通过 `rg --files -g "*.rs" -g "!target/**"` 校验）：
-
-- `crates/cordis-plugin-sdk/src/lib.rs`
-- `crates/cordis-plugin-sdk/src/workflow.rs`
-- `crates/cordis-runtime/src/context/mod.rs`
-- `crates/cordis-runtime/src/core/error.rs`
-- `crates/cordis-runtime/src/core/mod.rs`
-- `crates/cordis-runtime/src/core/models.rs`
-- `crates/cordis-runtime/src/execution/actor.rs`
-- `crates/cordis-runtime/src/execution/net.rs`
-- `crates/cordis-runtime/src/execution/engine.rs`
-- `crates/cordis-runtime/src/execution/gate.rs`
-- `crates/cordis-runtime/src/execution/mod.rs`
-- `crates/cordis-runtime/src/execution/router.rs`
-- `crates/cordis-runtime/src/execution/scheduler.rs`
-- `crates/cordis-runtime/src/kernel/evaluator.rs`
-- `crates/cordis-runtime/src/kernel/auto_update.rs`
-- `crates/cordis-runtime/src/kernel/loop.rs`
-- `crates/cordis-runtime/src/kernel/memory.rs`
-- `crates/cordis-runtime/src/kernel/mod.rs`
-- `crates/cordis-runtime/src/kernel/policy.rs`
-- `crates/cordis-runtime/src/lib.rs`
-- `crates/cordis-runtime/src/main.rs`
-- `crates/cordis-runtime/src/plugin/abi.rs`
-- `crates/cordis-runtime/src/plugin/artifact.rs`
-- `crates/cordis-runtime/src/plugin/dynamic.rs`
-- `crates/cordis-runtime/src/plugin/invoke.rs`
-- `crates/cordis-runtime/src/plugin/loader.rs`
-- `crates/cordis-runtime/src/plugin/mod.rs`
-- `crates/cordis-runtime/src/plugin/package.rs`
-- `crates/cordis-runtime/src/plugin/registry.rs`
-- `crates/cordis-runtime/src/plugin/tooling.rs`
-- `crates/cordis-runtime/src/service/doc_registry.rs`
-- `crates/cordis-runtime/src/service/graph_registry.rs`
-- `crates/cordis-runtime/src/service/mod.rs`
-- `crates/cordis-runtime/tests/actor_executor.rs`
-- `crates/cordis-runtime/tests/auto_update.rs`
-- `crates/cordis-runtime/tests/architecture.rs`
-- `crates/cordis-runtime/tests/kernel.rs`
-- `crates/cordis-runtime/tests/shell_plugin.rs`
-- `crates/cordis-runtime/tests/semantics.rs`
-- `crates/cordis-runtime/tests/tooling.rs`
-- `fixtures/plugins/expr/src/lib.rs`
-- `fixtures/plugins/expr/tests/eval.rs`
-- `fixtures/plugins/expr/lexer/src/core.rs`
-- `fixtures/plugins/expr/lexer/src/lib.rs`
-- `fixtures/plugins/expr/lexer/tests/lexer.rs`
-- `fixtures/plugins/expr/parser/src/core.rs`
-- `fixtures/plugins/expr/parser/src/lib.rs`
-- `fixtures/plugins/expr/parser/tests/parser.rs`
-- `fixtures/plugins/expr/evaluator/src/core.rs`
-- `fixtures/plugins/expr/evaluator/src/lib.rs`
-- `fixtures/plugins/expr/evaluator/tests/evaluator.rs`
-- `fixtures/plugins/expr/evaluator/add/src/core.rs`
-- `fixtures/plugins/expr/evaluator/add/src/lib.rs`
-- `fixtures/plugins/expr/evaluator/add/tests/add.rs`
-- `fixtures/plugins/expr/evaluator/sub/src/core.rs`
-- `fixtures/plugins/expr/evaluator/sub/src/lib.rs`
-- `fixtures/plugins/expr/evaluator/sub/tests/sub.rs`
-- `fixtures/plugins/expr/evaluator/mul/src/core.rs`
-- `fixtures/plugins/expr/evaluator/mul/src/lib.rs`
-- `fixtures/plugins/expr/evaluator/mul/tests/mul.rs`
-- `fixtures/plugins/expr/evaluator/div/src/core.rs`
-- `fixtures/plugins/expr/evaluator/div/src/lib.rs`
-- `fixtures/plugins/expr/evaluator/div/tests/div.rs`
-- `fixtures/plugins/shell/src/lib.rs`
-- `fixtures/plugins/shell/tests/basic.rs`
-- `fixtures/plugins/root/child/src/lib.rs`
-- `fixtures/plugins/root/child/tests/basic.rs`
-- `fixtures/plugins/root/src/lib.rs`
-- `fixtures/plugins/root/tests/basic.rs`
+## 16. 覆盖声明
