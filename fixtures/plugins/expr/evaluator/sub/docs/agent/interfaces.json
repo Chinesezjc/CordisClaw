@@ -32,7 +32,8 @@
         "type": "object"
       },
       "side_effects": [],
-      "failure_modes": []
+      "failure_modes": [],
+      "node_type": "router"
     }
   ]
 }

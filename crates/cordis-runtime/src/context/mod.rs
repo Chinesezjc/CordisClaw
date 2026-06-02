@@ -3,7 +3,6 @@
 
 use crate::core::error::RuntimeError;
 use crate::core::models::PluginLoadResult;
-use cordis_plugin_sdk::NodeType;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
@@ -686,6 +685,7 @@ pub trait Service: Send + Sync {
 }
 
 /// A named service handle that tracks running state.
+#[allow(dead_code)]
 struct ServiceEntry {
     name: String,
     plugin_path: String,

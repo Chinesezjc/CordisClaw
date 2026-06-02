@@ -35,7 +35,8 @@
         "division by zero",
         "invalid number",
         "unexpected token"
-      ]
+      ],
+      "node_type": "router"
     }
   ]
 }

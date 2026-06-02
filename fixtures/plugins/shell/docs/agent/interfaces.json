@@ -71,7 +71,8 @@
         "unsupported action",
         "invalid shell backend",
         "command not found"
-      ]
+      ],
+      "node_type": "router"
     }
   ]
 }

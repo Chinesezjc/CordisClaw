@@ -1,0 +1,36 @@
+{
+  "plugin_id": "qq",
+  "plugin_path": "qq",
+  "plugin_version": "0.1.0",
+  "abi_version": 2,
+  "command_name": "Qq",
+  "nodes": [
+    {
+      "id": "qq_entry",
+      "summary": "QQ adapter using the NoneBot (OneBot v11) protocol. Connect to a OneBot-compatible QQ client for sending messages.",
+      "input_schema": {
+        "type": "object",
+        "required": ["action"],
+        "properties": {
+          "action": { "type": "string" },
+          "url": { "type": "string" },
+          "target": { "type": "string" },
+          "message": { "type": "string" },
+          "payload": { "type": "object" }
+        }
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "ok": { "type": "boolean" },
+          "action": { "type": "string" },
+          "message": { "type": ["string", "null"] },
+          "data": {}
+        }
+      },
+      "side_effects": ["requires OneBot HTTP server running"],
+      "failure_modes": ["no OneBot URL configured", "invalid target format", "message is empty", "OneBot API error", "unsupported action"],
+      "node_type": "router"
+    }
+  ]
+}

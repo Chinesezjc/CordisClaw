@@ -37,7 +37,8 @@
       "side_effects": [],
       "failure_modes": [
         "division by zero"
-      ]
+      ],
+      "node_type": "router"
     }
   ]
 }
