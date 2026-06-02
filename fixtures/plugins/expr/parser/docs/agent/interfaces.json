@@ -28,7 +28,8 @@
       "failure_modes": [
         "missing right paren",
         "unexpected token"
-      ]
+      ],
+      "node_type": "router"
     }
   ]
 }

@@ -31,7 +31,8 @@
       "failure_modes": [
         "invalid number",
         "unexpected token"
-      ]
+      ],
+      "node_type": "router"
     }
   ]
 }
