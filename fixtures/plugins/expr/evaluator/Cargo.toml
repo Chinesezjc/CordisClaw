@@ -15,6 +15,8 @@ children = [
   { source = "./sub", required = true, grants = [] },
   { source = "./mul", required = true, grants = [] },
   { source = "./div", required = true, grants = [] },
+  { source = "./modulo", required = true, grants = [] },
+  { source = "./pow", required = true, grants = [] },
 ]
 
 [package.metadata.cordis.abi_fingerprint]
