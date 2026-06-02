@@ -7,29 +7,63 @@
   "nodes": [
     {
       "id": "qq_entry",
-      "summary": "QQ adapter using the NoneBot (OneBot v11) protocol.",
+      "summary": "QQ adapter using the NoneBot (OneBot v11) protocol. Connect to a OneBot-compatible QQ client for sending messages.",
       "input_schema": {
-        "type": "object",
-        "required": ["action"],
         "properties": {
-          "action": { "type": "string" },
-          "url": { "type": "string" },
-          "target": { "type": "string" },
-          "message": { "type": "string" },
-          "payload": { "type": "object" }
-        }
+          "action": {
+            "description": "configure | send | status | call",
+            "type": "string"
+          },
+          "message": {
+            "description": "Message text (for send)",
+            "type": "string"
+          },
+          "payload": {
+            "description": "Raw API call payload (for call)",
+            "type": "object"
+          },
+          "target": {
+            "description": "group:<id> or private:<id> (for configure / send)",
+            "type": "string"
+          },
+          "url": {
+            "description": "OneBot HTTP API base URL (for configure)",
+            "type": "string"
+          }
+        },
+        "required": [
+          "action"
+        ],
+        "type": "object"
       },
       "output_schema": {
-        "type": "object",
         "properties": {
-          "ok": { "type": "boolean" },
-          "action": { "type": "string" },
-          "message": { "type": ["string", "null"] },
-          "data": {}
-        }
+          "action": {
+            "type": "string"
+          },
+          "data": {},
+          "message": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ok": {
+            "type": "boolean"
+          }
+        },
+        "type": "object"
       },
-      "side_effects": ["requires OneBot HTTP server running"],
-      "failure_modes": ["no OneBot URL configured", "invalid target format", "message is empty", "OneBot API error", "unsupported action"],
+      "side_effects": [
+        "requires OneBot HTTP server running"
+      ],
+      "failure_modes": [
+        "no OneBot URL configured",
+        "invalid target format",
+        "message is empty",
+        "OneBot API error",
+        "unsupported action"
+      ],
       "node_type": "router"
     }
   ]

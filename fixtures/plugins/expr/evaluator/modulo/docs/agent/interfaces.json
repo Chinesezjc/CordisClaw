@@ -37,7 +37,8 @@
       "side_effects": [],
       "failure_modes": [
         "modulo by zero"
-      ]
+      ],
+      "node_type": "router"
     }
   ]
 }
