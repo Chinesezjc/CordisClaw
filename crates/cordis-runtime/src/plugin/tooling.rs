@@ -193,6 +193,20 @@ pub fn rebuild_plugin_workspace(
 pub fn sync_plugin_docs(fixtures_root: &Path) -> Result<Vec<PathBuf>, RuntimeError> {
     let fixtures_root = absolute_path(fixtures_root)?;
     let plugins_root = fixtures_root.join("plugins");
+    // Defence: fixtures_root must contain a `plugins/` directory with a
+    // Cargo workspace manifest.  If `fixtures_root` is already pointing
+    // inside `plugins/`, reject it so we don't create nested paths like
+    // `fixtures/plugins/plugins/qq/docs/`.
+    if !plugins_root.join("Cargo.toml").exists() {
+        return Err(RuntimeError::Invariant {
+            message: format!(
+                "plugins workspace not found at {}; \
+                 fixtures_root must be the project fixtures/ directory, \
+                 not the plugins/ subdirectory",
+                plugins_root.display()
+            ),
+        });
+    }
     let artifact_index_path = fixtures_root.join("artifacts/index.json");
     let index = load_artifact_index(&artifact_index_path)?;
 
