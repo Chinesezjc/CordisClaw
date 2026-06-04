@@ -1,18 +1,86 @@
 use cordis_runtime::context::ContextRegistry;
 use cordis_runtime::core::error::RuntimeError;
-use cordis_runtime::core::models::{NodeOutcome, PluginLoadResult, PluginUnavailableReason};
+use cordis_runtime::core::models::{
+    ArtifactKind, NodeOutcome, PluginLoadResult, PluginUnavailableReason,
+};
 use cordis_runtime::execution::scheduler::{run_deterministic, ScheduledNode, SchedulerConfig};
 use cordis_runtime::plugin::invoke::PluginInvoker;
 use cordis_runtime::plugin::loader::{default_loader_config, Loader};
+use cordis_runtime::plugin::registry::{NodeRegistry, PluginRegistry};
 use cordis_runtime::plugin::tooling::{prepare_artifacts, PrepareMode};
+use cordis_runtime::service::graph_registry::GraphRegistry;
+use cordis_plugin_sdk::{AbiFingerprint, NodeDoc, PluginDocs};
 use serde_json::{json, Value};
+use std::collections::BTreeSet;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
 mod support;
 
 use support::fixtures_root;
+
+// ---------------------------------------------------------------------------
+// test helpers for building registries directly
+// ---------------------------------------------------------------------------
+
+fn dummy_abi() -> AbiFingerprint {
+    AbiFingerprint {
+        rustc_version: "test".to_string(),
+        target_triple: "x86_64-unknown-linux-gnu".to_string(),
+        crate_hash: "deadbeef".to_string(),
+        api_hash: "cafebabe".to_string(),
+    }
+}
+
+fn make_plugin_docs(plugin_path: &str, nodes: Vec<NodeDoc>) -> PluginDocs {
+    PluginDocs {
+        plugin_id: plugin_path.replace('/', "_"),
+        plugin_path: plugin_path.to_string(),
+        plugin_version: "0.1.0".to_string(),
+        abi_version: 1,
+        command_name: None,
+        nodes,
+    }
+}
+
+fn make_node_doc(id: &str, consumes: &[&str], produces: &[&str]) -> NodeDoc {
+    let mut input_props = serde_json::Map::new();
+    for field in consumes {
+        input_props.insert(field.to_string(), json!({"type": "string"}));
+    }
+    let mut output_props = serde_json::Map::new();
+    for field in produces {
+        output_props.insert(field.to_string(), json!({"type": "string"}));
+    }
+    NodeDoc {
+        id: id.to_string(),
+        summary: format!("test node {id}"),
+        input_schema: json!({"type": "object", "properties": input_props}),
+        output_schema: json!({"type": "object", "properties": output_props}),
+        side_effects: vec![],
+        failure_modes: vec![],
+        node_type: Default::default(),
+    }
+}
+
+fn insert_test_plugin(
+    plugin_registry: &PluginRegistry,
+    plugin_path: &str,
+    docs: &PluginDocs,
+) {
+    plugin_registry.insert_loaded(
+        plugin_path.to_string(),
+        None,
+        true,
+        BTreeSet::new(),
+        docs.clone(),
+        PathBuf::from("/tmp/test.so"),
+        ArtifactKind::Dylib,
+        dummy_abi(),
+        None,
+    );
+}
 
 fn copy_dir_all(src: &Path, dst: &Path) {
     fs::create_dir_all(dst).expect("create destination");
@@ -535,4 +603,186 @@ fn scheduler_is_deterministic_across_runs() {
     assert_eq!(first.order, second.order);
     assert_eq!(first.outcomes, second.outcomes);
     assert_eq!(first.order, vec!["a", "a", "b", "c"]);
+}
+
+// ---------------------------------------------------------------------------
+// registered-net edge-case tests (direct GraphRegistry construction)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn empty_net_from_empty_registries() {
+    let plugin_registry = PluginRegistry::default();
+    let node_registry = NodeRegistry::default();
+    let graph_registry = GraphRegistry::from_registries(&plugin_registry, &node_registry);
+    let net = graph_registry.net();
+    assert!(net.nodes.is_empty());
+    assert!(net.edges.is_empty());
+    assert!(net.diagnostics.is_empty());
+}
+
+#[test]
+fn multi_producer_input_generates_warning() {
+    let plugin_registry = PluginRegistry::default();
+    let mut node_registry = NodeRegistry::default();
+
+    // Two producers of "result"
+    let producer_a = make_node_doc("producer_a", &[], &["result"]);
+    let producer_b = make_node_doc("producer_b", &[], &["result"]);
+    let consumer = make_node_doc("consumer", &["result"], &[]);
+
+    let docs_a = make_plugin_docs("pkg/a", vec![producer_a]);
+    let docs_b = make_plugin_docs("pkg/b", vec![producer_b]);
+    let docs_c = make_plugin_docs("pkg/c", vec![consumer]);
+
+    insert_test_plugin(&plugin_registry, "pkg/a", &docs_a);
+    insert_test_plugin(&plugin_registry, "pkg/b", &docs_b);
+    insert_test_plugin(&plugin_registry, "pkg/c", &docs_c);
+
+    node_registry
+        .register_from_docs("pkg/a", &docs_a)
+        .unwrap();
+    node_registry
+        .register_from_docs("pkg/b", &docs_b)
+        .unwrap();
+    node_registry
+        .register_from_docs("pkg/c", &docs_c)
+        .unwrap();
+
+    let graph_registry = GraphRegistry::from_registries(&plugin_registry, &node_registry);
+    let net = graph_registry.net();
+
+    // Consumer should appear
+    assert!(net.nodes.iter().any(|n| n.node_fqn == "pkg/c::consumer"));
+
+    // One Data edge should exist: the alphabetically first producer wins.
+    let consumer_edges: Vec<_> = net
+        .edges
+        .iter()
+        .filter(|e| e.to == "pkg/c::consumer")
+        .collect();
+    assert_eq!(consumer_edges.len(), 1);
+
+    // A diagnostic about multiple producers should be emitted.
+    let has_multi = net
+        .diagnostics
+        .iter()
+        .any(|d| d.contains("multiple producers") && d.contains("result"));
+    assert!(has_multi, "expected multi-producer diagnostic, got: {net:?}");
+}
+
+#[test]
+fn cycle_detection_produces_diagnostic() {
+    let plugin_registry = PluginRegistry::default();
+    let mut node_registry = NodeRegistry::default();
+
+    // A produces x, consumes z
+    let node_a = make_node_doc("a", &["z"], &["x"]);
+    // B produces y, consumes x
+    let node_b = make_node_doc("b", &["x"], &["y"]);
+    // C produces z, consumes y
+    let node_c = make_node_doc("c", &["y"], &["z"]);
+
+    let docs = make_plugin_docs("cycle", vec![node_a, node_b, node_c]);
+    insert_test_plugin(&plugin_registry, "cycle", &docs);
+    node_registry
+        .register_from_docs("cycle", &docs)
+        .unwrap();
+
+    let graph_registry = GraphRegistry::from_registries(&plugin_registry, &node_registry);
+    let net = graph_registry.net();
+
+    // All three nodes should appear.
+    assert_eq!(net.nodes.len(), 3);
+
+    // A cycle diagnostic should be emitted.
+    let has_cycle = net
+        .diagnostics
+        .iter()
+        .any(|d| d.contains("cycle-like dependencies"));
+    assert!(has_cycle, "expected cycle diagnostic, got: {net:?}");
+}
+
+#[test]
+fn orphan_node_appears_without_edges() {
+    let plugin_registry = PluginRegistry::default();
+    let mut node_registry = NodeRegistry::default();
+
+    // A node that neither consumes nor produces anything from others.
+    let orphan = make_node_doc("orphan", &[], &[]);
+    let docs = make_plugin_docs("pkg", vec![orphan]);
+    insert_test_plugin(&plugin_registry, "pkg", &docs);
+    node_registry
+        .register_from_docs("pkg", &docs)
+        .unwrap();
+
+    let graph_registry = GraphRegistry::from_registries(&plugin_registry, &node_registry);
+    let net = graph_registry.net();
+
+    // The orphan node should still be listed.
+    assert!(net.nodes.iter().any(|n| n.node_fqn == "pkg::orphan"));
+    assert!(net
+        .nodes
+        .iter()
+        .find(|n| n.node_fqn == "pkg::orphan")
+        .unwrap()
+        .consumes
+        .is_empty());
+    assert!(net
+        .nodes
+        .iter()
+        .find(|n| n.node_fqn == "pkg::orphan")
+        .unwrap()
+        .produces
+        .is_empty());
+
+    // No edges should reference the orphan node.
+    let orphan_refs = net
+        .edges
+        .iter()
+        .filter(|e| e.from == "pkg::orphan" || e.to == "pkg::orphan")
+        .count();
+    assert_eq!(orphan_refs, 0);
+}
+
+#[test]
+fn edge_deduplication_keeps_single_edge() {
+    let plugin_registry = PluginRegistry::default();
+    let mut node_registry = NodeRegistry::default();
+
+    // Producer produces two fields that the consumer both consumes.
+    // If they share a label name they should be deduplicated.
+    let producer = make_node_doc("producer", &[], &["value", "extra"]);
+    let consumer = make_node_doc("consumer", &["value", "value"], &[]);
+
+    let docs_p = make_plugin_docs("pkg/p", vec![producer]);
+    let docs_c = make_plugin_docs("pkg/c", vec![consumer]);
+    insert_test_plugin(&plugin_registry, "pkg/p", &docs_p);
+    insert_test_plugin(&plugin_registry, "pkg/c", &docs_c);
+    node_registry
+        .register_from_docs("pkg/p", &docs_p)
+        .unwrap();
+    node_registry
+        .register_from_docs("pkg/c", &docs_c)
+        .unwrap();
+
+    let graph_registry = GraphRegistry::from_registries(&plugin_registry, &node_registry);
+    let net = graph_registry.net();
+
+    // Edge from producer to consumer for label "value" should appear exactly once.
+    let matching: Vec<_> = net
+        .edges
+        .iter()
+        .filter(|e| {
+            e.from == "pkg/p::producer"
+                && e.to == "pkg/c::consumer"
+                && e.label.as_deref() == Some("value")
+        })
+        .collect();
+    // dedup_by should have collapsed duplicates.
+    assert_eq!(
+        matching.len(),
+        1,
+        "expected exactly one deduplicated edge, got {}",
+        matching.len()
+    );
 }

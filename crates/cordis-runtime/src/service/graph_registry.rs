@@ -1,6 +1,7 @@
 use crate::core::error::RuntimeError;
 use crate::core::models::{NodeDoc, PluginLoadResult};
 use crate::plugin::registry::{NodeRegistry, PluginRegistry};
+use crate::service::html_render::HtmlWriter;
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -72,6 +73,9 @@ pub struct RegisteredNetEdge {
 #[serde(rename_all = "snake_case")]
 pub enum RegisteredNetEdgeKind {
     Data,
+    /// Reserved: pure ordering edge (B runs after A, no data dependency).
+    /// Not yet inferred from schemas — requires explicit dependency
+    /// declarations in [`NodeDoc`] or a separate control-flow inference pass.
     Control,
 }
 
@@ -130,76 +134,79 @@ impl GraphRegistry {
     }
 
     pub fn render_registered_nodes_html(&self) -> String {
-        let mut html = String::new();
-        html.push_str("<!doctype html><html><head><meta charset=\"utf-8\"><title>Registered Nodes Graph</title></head><body>");
-        html.push_str("<h1>Registered Nodes Graph</h1>");
+        let mut w = HtmlWriter::new();
+        w.raw("<!doctype html><html><head><meta charset=\"utf-8\"><title>Registered Nodes Graph</title></head><body>");
+        w.raw("<h1>Registered Nodes Graph</h1>");
 
-        html.push_str("<h2>Plugins</h2><ul>");
+        w.raw("<h2>Plugins</h2><ul>");
         for plugin in &self.registration_graph.plugins {
-            html.push_str(&format!(
-                "<li>{} ({:?})</li>",
-                escape_html(&plugin.plugin_path),
-                plugin.load_result
-            ));
+            w.open_tag("li");
+            w.text(&plugin.plugin_path);
+            w.raw(" (");
+            w.text(&format!("{:?}", plugin.load_result));
+            w.raw(")");
+            w.close_tag("li");
         }
-        html.push_str("</ul>");
+        w.raw("</ul>");
 
-        html.push_str("<h2>Nodes</h2><ul>");
+        w.raw("<h2>Nodes</h2><ul>");
         for node in &self.registration_graph.nodes {
-            html.push_str(&format!(
-                "<li>{} :: {}</li>",
-                escape_html(&node.node_fqn),
-                escape_html(&node.node_id)
-            ));
+            w.open_tag("li");
+            w.text(&node.node_fqn);
+            w.raw(" :: ");
+            w.text(&node.node_id);
+            w.close_tag("li");
         }
-        html.push_str("</ul>");
+        w.raw("</ul>");
 
-        html.push_str("</body></html>");
-        html
+        w.raw("</body></html>");
+        w.into_string()
     }
 
     pub fn render_registered_net_html(&self) -> String {
-        let mut html = String::new();
-        html.push_str("<!doctype html><html><head><meta charset=\"utf-8\"><title>Registered Net</title></head><body>");
-        html.push_str("<h1>Registered Net</h1>");
+        let mut w = HtmlWriter::new();
+        w.raw("<!doctype html><html><head><meta charset=\"utf-8\"><title>Registered Net</title></head><body>");
+        w.raw("<h1>Registered Net</h1>");
 
         if !self.net_graph.diagnostics.is_empty() {
-            html.push_str("<h2>Net diagnostics</h2><ul>");
+            w.raw("<h2>Net diagnostics</h2><ul>");
             for item in &self.net_graph.diagnostics {
-                html.push_str(&format!("<li>{}</li>", escape_html(item)));
+                w.text_element("li", item);
             }
-            html.push_str("</ul>");
+            w.raw("</ul>");
         }
 
-        html.push_str("<h2>Nodes</h2><ul>");
+        w.raw("<h2>Nodes</h2><ul>");
         for node in &self.net_graph.nodes {
-            html.push_str(&format!(
-                "<li>{} (level={}) consumes=[{}] produces=[{}]</li>",
-                escape_html(&node.node_fqn),
-                node.topo_level,
-                escape_html(&join_or_dash(&node.consumes)),
-                escape_html(&join_or_dash(&node.produces))
-            ));
+            w.open_tag("li");
+            w.text(&node.node_fqn);
+            w.raw(&format!(" (level={}) consumes=[", node.topo_level));
+            w.text(&join_or_dash(&node.consumes));
+            w.raw("] produces=[");
+            w.text(&join_or_dash(&node.produces));
+            w.raw("]");
+            w.close_tag("li");
         }
-        html.push_str("</ul>");
+        w.raw("</ul>");
 
-        html.push_str("<h2>Edges</h2><ul>");
+        w.raw("<h2>Edges</h2><ul>");
         for edge in &self.net_graph.edges {
-            html.push_str(&format!(
-                "<li>{} -> {} ({:?}{})</li>",
-                escape_html(&edge.from),
-                escape_html(&edge.to),
-                edge.kind,
-                edge.label
-                    .as_ref()
-                    .map(|x| format!(", label={}", escape_html(x)))
-                    .unwrap_or_default()
-            ));
+            w.open_tag("li");
+            w.text(&edge.from);
+            w.raw(" -> ");
+            w.text(&edge.to);
+            w.raw(&format!(" ({:?}", edge.kind));
+            if let Some(label) = &edge.label {
+                w.raw(", label=");
+                w.text(label);
+            }
+            w.raw(")");
+            w.close_tag("li");
         }
-        html.push_str("</ul>");
+        w.raw("</ul>");
 
-        html.push_str("</body></html>");
-        html
+        w.raw("</body></html>");
+        w.into_string()
     }
 }
 
@@ -377,6 +384,10 @@ fn build_registered_net(
             .then_with(|| left.node_fqn.cmp(&right.node_fqn))
     });
 
+    for diagnostic in &diagnostics {
+        eprintln!("[registered-net] {diagnostic}");
+    }
+
     RegisteredNet {
         nodes,
         edges,
@@ -482,12 +493,4 @@ fn join_or_dash(items: &[String]) -> String {
     } else {
         items.join(", ")
     }
-}
-
-fn escape_html(text: &str) -> String {
-    text.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&#39;")
 }

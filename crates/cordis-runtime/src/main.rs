@@ -145,6 +145,13 @@ fn run_loader(root: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
         println!("- {path}: {:?}", plugin.load_result);
     }
     println!("registered nodes: {}", output.node_registry.len());
+    let net = output.graph_registry.net();
+    if !net.diagnostics.is_empty() {
+        println!("net diagnostics ({}):", net.diagnostics.len());
+        for diagnostic in &net.diagnostics {
+            println!("  - {diagnostic}");
+        }
+    }
     println!(
         "metrics: abi_mismatch={}, no_fallback={}, unavailable={}",
         output.metrics.dylib_abi_mismatch_total,
@@ -1081,12 +1088,16 @@ fn run_net_html(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         std::env::current_dir()?.join(output_path)
     };
     println!("net_html written to {}", absolute.display());
+    let net = output.graph_registry.net();
     println!(
         "nodes={} edges={} diagnostics={}",
-        output.graph_registry.net().nodes.len(),
-        output.graph_registry.net().edges.len(),
-        output.graph_registry.net().diagnostics.len()
+        net.nodes.len(),
+        net.edges.len(),
+        net.diagnostics.len()
     );
+    for diagnostic in &net.diagnostics {
+        println!("  net diagnostic: {diagnostic}");
+    }
     Ok(())
 }
 

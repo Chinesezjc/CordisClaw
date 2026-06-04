@@ -1466,6 +1466,11 @@ impl RuntimeHost {
     ) -> Result<RuntimeExecutionResult, RuntimeError> {
         let snapshot = self.current_snapshot();
         let result = snapshot.execute_registered_target(target_node_fqn, payload);
+        if let Ok(ref exec_result) = result {
+            for diagnostic in &exec_result.net_diagnostics {
+                eprintln!("[execute] net diagnostic for {target_node_fqn}: {diagnostic}");
+            }
+        }
         if let Err(err) = &result {
             let plugin_path = target_node_fqn
                 .split("::")
@@ -3998,6 +4003,7 @@ fn build_execution_net(
                 run_policy: RunPolicy::default(),
                 kind: ExecutionTransitionKind::Terminal,
                 logical_group: Some("execute".to_string()),
+                topo_level: 0,
             }],
             arcs: Vec::new(),
         };
@@ -4014,7 +4020,7 @@ fn build_execution_net(
             ExecutionTransitionSpec {
                 transition: TransitionSpec {
                     transition_id: node.node_fqn.clone(),
-                    priority: -(node.topo_level as i32),
+                    priority: 0,
                     join_policy: if incoming == 0 {
                         JoinPolicy::AnyOf
                     } else {
@@ -4028,6 +4034,7 @@ fn build_execution_net(
                     ExecutionTransitionKind::Task
                 },
                 logical_group: Some("execute".to_string()),
+                topo_level: node.topo_level,
             }
         })
         .collect::<Vec<_>>();
@@ -4076,6 +4083,7 @@ fn build_execution_net(
             run_policy: RunPolicy::default(),
             kind: ExecutionTransitionKind::Terminal,
             logical_group: Some("execute".to_string()),
+            topo_level: 0,
         });
     }
 

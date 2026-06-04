@@ -29,11 +29,29 @@ pub struct RegisteredNode {
     pub node_id: String,
 }
 
+/// Registry of all discovered plugins, indexed by plugin path.
+///
+/// Wraps the inner map in `Arc<RwLock<>>` for two reasons:
+///
+/// 1. **Interior mutability during loading.**  Methods like
+///    [`insert_unavailable`](Self::insert_unavailable) and
+///    [`mark_unavailable`](Self::mark_unavailable) take `&self` so they can
+///    be called from contexts that already hold a `&mut NodeRegistry`.
+/// 2. **Snapshot sharing.**  The `Arc` allows cheap cloning for snapshot
+///    captures; the `RwLock` allows concurrent reads after loading completes.
 #[derive(Debug, Default, Clone)]
 pub struct PluginRegistry {
     plugins: Arc<RwLock<BTreeMap<String, RegisteredPlugin>>>,
 }
 
+/// Registry of all discovered nodes, indexed by fully-qualified name
+/// (format: `"{plugin_path}::{node_id}"`).
+///
+/// Uses a plain `BTreeMap` (no locking) because nodes are populated once
+/// during the loading phase behind `&mut self` and are treated as read-only
+/// thereafter.  References returned by [`get`](Self::get) borrow from the
+/// inner map directly, avoiding the clone overhead required by
+/// [`PluginRegistry`]'s `RwLock`-wrapped map.
 #[derive(Debug, Default, Clone)]
 pub struct NodeRegistry {
     nodes: BTreeMap<String, RegisteredNode>,
