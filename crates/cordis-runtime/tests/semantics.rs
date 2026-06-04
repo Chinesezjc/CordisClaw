@@ -32,6 +32,7 @@ fn transition(
         run_policy: RunPolicy::default(),
         kind,
         logical_group: None,
+        topo_level: 0,
     }
 }
 

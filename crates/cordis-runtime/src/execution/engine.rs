@@ -38,6 +38,8 @@ pub struct ExecutionTransitionSpec {
     pub run_policy: RunPolicy,
     pub kind: ExecutionTransitionKind,
     pub logical_group: Option<String>,
+    /// Topological level from the registered net; lower levels execute first.
+    pub topo_level: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -118,13 +120,15 @@ pub struct ExecutionOutput {
 struct ReadyItem {
     transition_id: String,
     key: CorrelationKey,
+    topo_level: usize,
     priority: i32,
     retry: bool,
 }
 
 fn cmp_ready(a: &ReadyItem, b: &ReadyItem) -> Ordering {
-    b.priority
-        .cmp(&a.priority)
+    a.topo_level
+        .cmp(&b.topo_level)
+        .then_with(|| b.priority.cmp(&a.priority))
         .then_with(|| a.transition_id.cmp(&b.transition_id))
         .then_with(|| a.key.cmp(&b.key))
         .then_with(|| b.retry.cmp(&a.retry))
@@ -443,6 +447,7 @@ impl EngineState {
         self.ready.push_back(ReadyItem {
             transition_id: transition_id.to_string(),
             key,
+            topo_level: spec.topo_level,
             priority: spec.transition.priority,
             retry,
         });

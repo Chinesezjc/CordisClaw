@@ -76,6 +76,9 @@ pub struct ArcSpec {
     pub direction: ArcDirection,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    /// Reserved: when `true`, the input arc must carry a token for the
+    /// transition to be enabled.  Not yet enforced by the execution engine —
+    /// all arcs are currently treated as optional.
     #[serde(default)]
     pub required: bool,
 }
