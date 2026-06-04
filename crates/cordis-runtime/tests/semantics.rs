@@ -14,6 +14,7 @@ use cordis_runtime::execution::net::{
 };
 use cordis_runtime::execution::scheduler::SchedulerConfig;
 use serde_json::json;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
@@ -185,14 +186,14 @@ fn keyed_pair_matches_same_group_without_cross_wiring() {
     };
 
     let mut ctx = RuntimeContext::default();
-    let mut join_seen = 0usize;
+    let join_seen = AtomicUsize::new(0);
     let output = execute_net(
         ExecutionConfig::default(),
         net,
         &mut ctx,
         |spec, _, trigger, _| {
             if spec.transition.transition_id == "join" {
-                join_seen += 1;
+                join_seen.fetch_add(1, Ordering::SeqCst);
                 return TransitionRunResult {
                     outcome: NodeOutcome::Success,
                     payload: json!({ "joined": trigger.key.0 }),
@@ -203,7 +204,7 @@ fn keyed_pair_matches_same_group_without_cross_wiring() {
     )
     .expect("engine run should pass");
 
-    assert_eq!(join_seen, 2, "join should fire once for each group key");
+    assert_eq!(join_seen.load(Ordering::SeqCst), 2, "join should fire once for each group key");
     let join_keys = output
         .keyed_outcomes
         .get("join")
@@ -268,7 +269,7 @@ fn join_policy_first_success_marks_late_tokens_as_zombie() {
     let mut ctx = RuntimeContext::default();
     let output = execute_net(
         ExecutionConfig {
-            scheduler: SchedulerConfig { max_parallelism: 1 },
+            scheduler: SchedulerConfig { max_parallelism: 1, max_concurrency: 1 },
             scheduler_mode: SchedulerMode::Deterministic,
         },
         net,
@@ -564,7 +565,7 @@ fn engine_deterministic_mode_is_reproducible() {
         let mut ctx = RuntimeContext::default();
         execute_net(
             ExecutionConfig {
-                scheduler: SchedulerConfig { max_parallelism: 1 },
+                scheduler: SchedulerConfig { max_parallelism: 1, max_concurrency: 1 },
                 scheduler_mode: SchedulerMode::Deterministic,
             },
             make_net(),
@@ -713,4 +714,116 @@ fn engine_error_contains_execution_id_and_net_build_message() {
         }
         other => panic!("expected ExecutionFailed, got {other:?}"),
     }
+}
+
+#[test]
+fn parallel_execution_of_independent_key_groups() {
+    // Three independent key groups, each producing a token consumed by a
+    // single transition.  With max_concurrency=3, all three can run in
+    // parallel because they use different correlation keys.
+    let net = ExecutionNetSpec {
+        places: vec![place("p_a"), place("p_b"), place("p_c")],
+        transitions: vec![
+            transition_grouped(
+                "prod_a", JoinPolicy::AllOf, 0,
+                ExecutionTransitionKind::Task, "ka",
+            ),
+            transition_grouped(
+                "prod_b", JoinPolicy::AllOf, 0,
+                ExecutionTransitionKind::Task, "kb",
+            ),
+            transition_grouped(
+                "prod_c", JoinPolicy::AllOf, 0,
+                ExecutionTransitionKind::Task, "kc",
+            ),
+            transition_grouped(
+                "cons_a", JoinPolicy::AllOf, 0,
+                ExecutionTransitionKind::Task, "ka",
+            ),
+            transition_grouped(
+                "cons_b", JoinPolicy::AllOf, 0,
+                ExecutionTransitionKind::Task, "kb",
+            ),
+            transition_grouped(
+                "cons_c", JoinPolicy::AllOf, 0,
+                ExecutionTransitionKind::Task, "kc",
+            ),
+        ],
+        arcs: vec![
+            arc_out("prod_a", "p_a", None),
+            arc_out("prod_b", "p_b", None),
+            arc_out("prod_c", "p_c", None),
+            arc_in("cons_a", "p_a", None),
+            arc_in("cons_b", "p_b", None),
+            arc_in("cons_c", "p_c", None),
+        ],
+    };
+
+    let mut ctx = RuntimeContext::default();
+    let counter = AtomicUsize::new(0);
+    let output = execute_net(
+        ExecutionConfig {
+            scheduler: SchedulerConfig {
+                max_parallelism: 1,
+                max_concurrency: 3,
+            },
+            scheduler_mode: SchedulerMode::Deterministic,
+        },
+        net,
+        &mut ctx,
+        |spec, _, _, _| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            match spec.transition.transition_id.as_str() {
+                id if id.starts_with("cons_") => {
+                    // Simulate IO-bound work.
+                    sleep(Duration::from_millis(5));
+                }
+                _ => {}
+            }
+            TransitionRunResult::from_outcome(NodeOutcome::Success)
+        },
+    )
+    .expect("parallel execution should succeed");
+
+    // All 6 transitions should have executed.
+    assert_eq!(counter.load(Ordering::SeqCst), 6);
+    // Each consumer should have its outcome recorded.
+    for cons in &["cons_a", "cons_b", "cons_c"] {
+        assert_eq!(output.outcomes.get(*cons), Some(&NodeOutcome::Success));
+    }
+}
+
+#[test]
+fn single_threaded_mode_unchanged() {
+    // Verify that max_concurrency=1 produces the same results as before.
+    let net = ExecutionNetSpec {
+        places: vec![place("p")],
+        transitions: vec![
+            transition("t1", JoinPolicy::AllOf, 0, ExecutionTransitionKind::Task),
+            transition("t2", JoinPolicy::AllOf, 0, ExecutionTransitionKind::Task),
+        ],
+        arcs: vec![
+            arc_out("t1", "p", None),
+            arc_in("t2", "p", None),
+        ],
+    };
+
+    let mut ctx = RuntimeContext::default();
+    let output = execute_net(
+        ExecutionConfig {
+            scheduler: SchedulerConfig {
+                max_parallelism: 1,
+                max_concurrency: 1,
+            },
+            scheduler_mode: SchedulerMode::Deterministic,
+        },
+        net,
+        &mut ctx,
+        |_, _, _, _| TransitionRunResult::from_outcome(NodeOutcome::Success),
+    )
+    .expect("single threaded execution should succeed");
+
+    assert_eq!(output.order, vec!["t1", "t2"]);
+    assert_eq!(output.outcomes.get("t1"), Some(&NodeOutcome::Success));
+    assert_eq!(output.outcomes.get("t2"), Some(&NodeOutcome::Success));
 }

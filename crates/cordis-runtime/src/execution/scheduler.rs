@@ -13,7 +13,13 @@ pub struct ScheduledNode {
 
 #[derive(Debug, Clone)]
 pub struct SchedulerConfig {
+    /// Maximum number of transitions to batch per single-threaded iteration.
     pub max_parallelism: usize,
+    /// Maximum number of correlation-key groups to execute concurrently.
+    /// Transitions sharing the same key always run sequentially; transitions
+    /// from different keys may run in parallel when `max_concurrency > 1`.
+    /// Set to 1 (the default) for deterministic single-threaded execution.
+    pub max_concurrency: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -32,7 +38,10 @@ pub struct ExecutionReport {
 
 impl SchedulerConfig {
     pub fn conservative() -> Self {
-        Self { max_parallelism: 1 }
+        Self {
+            max_parallelism: 1,
+            max_concurrency: 1,
+        }
     }
 }
 

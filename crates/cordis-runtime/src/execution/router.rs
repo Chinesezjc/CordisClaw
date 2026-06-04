@@ -33,13 +33,13 @@ pub fn execute_router<F>(
     timeout_ms: u64,
 ) -> Result<RouterRunResult, RuntimeError>
 where
-    F: FnOnce(&mut RuntimeContext) -> NodeOutcome,
+    F: FnOnce(&RuntimeContext) -> NodeOutcome,
 {
     metrics.router_execute_total += 1;
     let started_at = Instant::now();
 
     context.begin_subgraph(subgraph_id)?;
-    let raw_outcome = run(context);
+    let raw_outcome = run(&*context);
     let elapsed = started_at.elapsed();
     let outcome = if timeout_ms > 0 && elapsed > std::time::Duration::from_millis(timeout_ms) {
         NodeOutcome::Timeout
