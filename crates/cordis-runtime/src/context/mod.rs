@@ -169,19 +169,26 @@ impl ContextMetrics {
     }
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug)]
 pub struct RuntimeContext {
     global: ScopeStore,
     session: ScopeStore,
     request: ScopeStore,
     local: BTreeMap<String, ScopeStore>,
-    global_slots: BTreeMap<ContextKey, SlotEntry>,
-    session_slots: BTreeMap<ContextKey, SlotEntry>,
-    request_slots: BTreeMap<ContextKey, SlotEntry>,
-    subgraph_overlays: BTreeMap<String, BTreeMap<ContextKey, Option<SlotEntry>>>,
-    active_subgraph: Option<String>,
-    session_version: u64,
-    skipped_nodes: BTreeSet<String>,
+    // Slot maps use Arc<Mutex<>> for thread-safe interior mutability,
+    // enabling &self writes from parallel runner closures.
+    #[allow(clippy::type_complexity)]
+    global_slots: Arc<Mutex<BTreeMap<ContextKey, SlotEntry>>>,
+    #[allow(clippy::type_complexity)]
+    session_slots: Arc<Mutex<BTreeMap<ContextKey, SlotEntry>>>,
+    #[allow(clippy::type_complexity)]
+    request_slots: Arc<Mutex<BTreeMap<ContextKey, SlotEntry>>>,
+    #[allow(clippy::type_complexity)]
+    subgraph_overlays:
+        Arc<Mutex<BTreeMap<String, BTreeMap<ContextKey, Option<SlotEntry>>>>>,
+    active_subgraph: Arc<Mutex<Option<String>>>,
+    session_version: AtomicU64,
+    skipped_nodes: Arc<Mutex<BTreeSet<String>>>,
     hierarchy: PluginHierarchy,
     /// Plugin availability snapshot; Unavailable plugin cannot be injected from.
     plugin_state: BTreeMap<String, PluginLoadResult>,
@@ -225,24 +232,78 @@ pub trait ContextRead {
 
 pub trait ContextWrite {
     fn put<T: Serialize>(
-        &mut self,
+        &self,
         key: ContextKey,
         value: T,
         meta: SlotMeta,
     ) -> Result<(), RuntimeError>;
-    fn remove(&mut self, key: &ContextKey) -> Result<(), RuntimeError>;
-    fn mark_skipped(&mut self, node_id: &str) -> Result<(), RuntimeError>;
+    fn remove(&self, key: &ContextKey) -> Result<(), RuntimeError>;
+    fn mark_skipped(&self, node_id: &str) -> Result<(), RuntimeError>;
 }
 
 pub trait ContextTxn {
-    fn begin_subgraph(&mut self, subgraph_id: &str) -> Result<(), RuntimeError>;
-    fn commit_overlay(&mut self, subgraph_id: &str) -> Result<(), RuntimeError>;
-    fn rollback_overlay(&mut self, subgraph_id: &str) -> Result<(), RuntimeError>;
+    fn begin_subgraph(&self, subgraph_id: &str) -> Result<(), RuntimeError>;
+    fn commit_overlay(&self, subgraph_id: &str) -> Result<(), RuntimeError>;
+    fn rollback_overlay(&self, subgraph_id: &str) -> Result<(), RuntimeError>;
     fn commit_session(
-        &mut self,
+        &self,
         session_id: &str,
         expected_version: u64,
     ) -> Result<(), RuntimeError>;
+}
+
+impl Default for RuntimeContext {
+    fn default() -> Self {
+        Self {
+            global: ScopeStore::default(),
+            session: ScopeStore::default(),
+            request: ScopeStore::default(),
+            local: BTreeMap::new(),
+            global_slots: Arc::new(Mutex::new(BTreeMap::new())),
+            session_slots: Arc::new(Mutex::new(BTreeMap::new())),
+            request_slots: Arc::new(Mutex::new(BTreeMap::new())),
+            subgraph_overlays: Arc::new(Mutex::new(BTreeMap::new())),
+            active_subgraph: Arc::new(Mutex::new(None)),
+            session_version: AtomicU64::new(0),
+            skipped_nodes: Arc::new(Mutex::new(BTreeSet::new())),
+            hierarchy: PluginHierarchy::default(),
+            plugin_state: BTreeMap::new(),
+            metrics: ContextMetrics::default(),
+        }
+    }
+}
+
+impl Clone for RuntimeContext {
+    fn clone(&self) -> Self {
+        Self {
+            global: self.global.clone(),
+            session: self.session.clone(),
+            request: self.request.clone(),
+            local: self.local.clone(),
+            global_slots: Arc::new(Mutex::new(
+                self.global_slots.lock().unwrap().clone(),
+            )),
+            session_slots: Arc::new(Mutex::new(
+                self.session_slots.lock().unwrap().clone(),
+            )),
+            request_slots: Arc::new(Mutex::new(
+                self.request_slots.lock().unwrap().clone(),
+            )),
+            subgraph_overlays: Arc::new(Mutex::new(
+                self.subgraph_overlays.lock().unwrap().clone(),
+            )),
+            active_subgraph: Arc::new(Mutex::new(
+                self.active_subgraph.lock().unwrap().clone(),
+            )),
+            session_version: AtomicU64::new(self.session_version.load(Ordering::SeqCst)),
+            skipped_nodes: Arc::new(Mutex::new(
+                self.skipped_nodes.lock().unwrap().clone(),
+            )),
+            hierarchy: self.hierarchy.clone(),
+            plugin_state: self.plugin_state.clone(),
+            metrics: self.metrics.clone(),
+        }
+    }
 }
 
 impl RuntimeContext {
@@ -262,53 +323,70 @@ impl RuntimeContext {
     }
 
     pub fn session_version(&self) -> u64 {
-        self.session_version
+        self.session_version.load(Ordering::SeqCst)
     }
 
     pub fn metrics(&self) -> ContextMetricsSnapshot {
         self.metrics.snapshot()
     }
 
-    pub fn skipped_nodes(&self) -> &BTreeSet<String> {
-        &self.skipped_nodes
+    /// Return a snapshot of currently skipped node ids.
+    pub fn skipped_nodes(&self) -> BTreeSet<String> {
+        self.skipped_nodes
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone()
     }
 
     pub fn meta(&self, key: &ContextKey) -> Result<Option<SlotMeta>, RuntimeError> {
         Ok(self.lookup_slot_entry(key)?.map(|x| x.meta.clone()))
     }
 
-    fn with_active_overlay_mut(&mut self) -> Option<&mut BTreeMap<ContextKey, Option<SlotEntry>>> {
-        let active = self.active_subgraph.clone()?;
-        self.subgraph_overlays.get_mut(&active)
-    }
-
-    fn lookup_slot_entry(&self, key: &ContextKey) -> Result<Option<&SlotEntry>, RuntimeError> {
-        if let Some(active) = &self.active_subgraph {
-            if let Some(overlay) = self.subgraph_overlays.get(active) {
+    fn lookup_slot_entry(&self, key: &ContextKey) -> Result<Option<SlotEntry>, RuntimeError> {
+        let active = self
+            .active_subgraph
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if let Some(active_id) = active.as_ref() {
+            let overlays = self
+                .subgraph_overlays
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            if let Some(overlay) = overlays.get(active_id) {
                 if let Some(delta) = overlay.get(key) {
-                    return Ok(delta.as_ref());
+                    return Ok(delta.clone());
                 }
             }
         }
 
-        if let Some(entry) = self.request_slots.get(key) {
-            return Ok(Some(entry));
+        let request = self
+            .request_slots
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if let Some(entry) = request.get(key) {
+            return Ok(Some(entry.clone()));
         }
-        if let Some(entry) = self.session_slots.get(key) {
-            return Ok(Some(entry));
+        let session = self
+            .session_slots
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if let Some(entry) = session.get(key) {
+            return Ok(Some(entry.clone()));
         }
-        if let Some(entry) = self.global_slots.get(key) {
-            return Ok(Some(entry));
+        let global = self
+            .global_slots
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if let Some(entry) = global.get(key) {
+            return Ok(Some(entry.clone()));
         }
 
-        // Schema compatibility check: same namespace/name with different major version
-        // should report incompatibility instead of silent miss.
+        // Schema compatibility check.
         let requested_major = key.version / 100;
-        for existing in self
-            .request_slots
+        for existing in request
             .keys()
-            .chain(self.session_slots.keys())
-            .chain(self.global_slots.keys())
+            .chain(session.keys())
+            .chain(global.keys())
         {
             if existing.namespace == key.namespace && existing.name == key.name {
                 let existing_major = existing.version / 100;
@@ -505,18 +583,36 @@ impl ContextRead for RuntimeContext {
     fn list_by_ns(&self, namespace: &str) -> Vec<ContextKey> {
         self.metrics.inc_read();
         let mut out = BTreeSet::new();
-        for key in self
+        let global = self
             .global_slots
-            .keys()
-            .chain(self.session_slots.keys())
-            .chain(self.request_slots.keys())
-        {
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let session = self
+            .session_slots
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let request = self
+            .request_slots
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        for key in global.keys().chain(session.keys()).chain(request.keys()) {
             if key.namespace == namespace {
                 out.insert(key.clone());
             }
         }
-        if let Some(active) = &self.active_subgraph {
-            if let Some(overlay) = self.subgraph_overlays.get(active) {
+        drop(request);
+        drop(session);
+        drop(global);
+        let active = self
+            .active_subgraph
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if let Some(active_id) = active.as_ref() {
+            let overlays = self
+                .subgraph_overlays
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            if let Some(overlay) = overlays.get(active_id) {
                 for (key, delta) in overlay {
                     if key.namespace == namespace {
                         if delta.is_some() {
@@ -534,7 +630,7 @@ impl ContextRead for RuntimeContext {
 
 impl ContextWrite for RuntimeContext {
     fn put<T: Serialize>(
-        &mut self,
+        &self,
         key: ContextKey,
         value: T,
         meta: SlotMeta,
@@ -545,119 +641,196 @@ impl ContextWrite for RuntimeContext {
             message: e.to_string(),
         })?;
         let entry = SlotEntry { value, meta };
-        if let Some(overlay) = self.with_active_overlay_mut() {
+        let active = self
+            .active_subgraph
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if let Some(active_id) = active.as_ref() {
+            let mut overlays = self
+                .subgraph_overlays
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            let overlay = overlays
+                .get_mut(active_id)
+                .expect("active subgraph overlay must exist");
             overlay.insert(key, Some(entry));
         } else {
-            self.request_slots.insert(key, entry);
+            self.request_slots
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .insert(key, entry);
         }
         Ok(())
     }
 
-    fn remove(&mut self, key: &ContextKey) -> Result<(), RuntimeError> {
+    fn remove(&self, key: &ContextKey) -> Result<(), RuntimeError> {
         self.metrics.inc_write();
-        if let Some(overlay) = self.with_active_overlay_mut() {
+        let active = self
+            .active_subgraph
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if let Some(active_id) = active.as_ref() {
+            let mut overlays = self
+                .subgraph_overlays
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            let overlay = overlays
+                .get_mut(active_id)
+                .expect("active subgraph overlay must exist");
             overlay.insert(key.clone(), None);
         } else {
-            self.request_slots.remove(key);
+            self.request_slots
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .remove(key);
         }
         Ok(())
     }
 
-    fn mark_skipped(&mut self, node_id: &str) -> Result<(), RuntimeError> {
-        self.skipped_nodes.insert(node_id.to_string());
+    fn mark_skipped(&self, node_id: &str) -> Result<(), RuntimeError> {
+        self.skipped_nodes
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .insert(node_id.to_string());
         Ok(())
     }
 }
 
 impl ContextTxn for RuntimeContext {
-    fn begin_subgraph(&mut self, subgraph_id: &str) -> Result<(), RuntimeError> {
-        if let Some(current) = &self.active_subgraph {
+    fn begin_subgraph(&self, subgraph_id: &str) -> Result<(), RuntimeError> {
+        let mut active = self
+            .active_subgraph
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if let Some(current) = active.as_ref() {
             return Err(RuntimeError::SubgraphAlreadyActive {
                 current: current.clone(),
             });
         }
-        if self.subgraph_overlays.contains_key(subgraph_id) {
+        let mut overlays = self
+            .subgraph_overlays
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if overlays.contains_key(subgraph_id) {
             return Err(RuntimeError::SubgraphAlreadyActive {
                 current: subgraph_id.to_string(),
             });
         }
-        self.subgraph_overlays
-            .insert(subgraph_id.to_string(), BTreeMap::new());
-        self.active_subgraph = Some(subgraph_id.to_string());
+        overlays.insert(subgraph_id.to_string(), BTreeMap::new());
+        *active = Some(subgraph_id.to_string());
         Ok(())
     }
 
-    fn commit_overlay(&mut self, subgraph_id: &str) -> Result<(), RuntimeError> {
-        let Some(active) = &self.active_subgraph else {
-            return Err(RuntimeError::SubgraphNotFound {
-                subgraph_id: subgraph_id.to_string(),
-            });
-        };
-        if active != subgraph_id {
-            return Err(RuntimeError::SubgraphNotFound {
-                subgraph_id: subgraph_id.to_string(),
-            });
+    fn commit_overlay(&self, subgraph_id: &str) -> Result<(), RuntimeError> {
+        let mut active = self
+            .active_subgraph
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        match active.as_ref() {
+            Some(current) if current == subgraph_id => {}
+            _ => {
+                return Err(RuntimeError::SubgraphNotFound {
+                    subgraph_id: subgraph_id.to_string(),
+                });
+            }
         }
-        let overlay = self.subgraph_overlays.remove(subgraph_id).ok_or_else(|| {
+        let mut overlays = self
+            .subgraph_overlays
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let overlay = overlays.remove(subgraph_id).ok_or_else(|| {
             RuntimeError::SubgraphNotFound {
                 subgraph_id: subgraph_id.to_string(),
             }
         })?;
+        *active = None;
+        drop(active);
+        drop(overlays);
 
+        let mut request = self
+            .request_slots
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         for (key, delta) in overlay {
             match delta {
                 Some(entry) => {
-                    self.request_slots.insert(key, entry);
+                    request.insert(key, entry);
                 }
                 None => {
-                    self.request_slots.remove(&key);
+                    request.remove(&key);
                 }
             }
         }
-        self.active_subgraph = None;
         Ok(())
     }
 
-    fn rollback_overlay(&mut self, subgraph_id: &str) -> Result<(), RuntimeError> {
-        let Some(active) = &self.active_subgraph else {
-            return Err(RuntimeError::SubgraphNotFound {
-                subgraph_id: subgraph_id.to_string(),
-            });
-        };
-        if active != subgraph_id {
+    fn rollback_overlay(&self, subgraph_id: &str) -> Result<(), RuntimeError> {
+        let mut active = self
+            .active_subgraph
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        match active.as_ref() {
+            Some(current) if current == subgraph_id => {}
+            _ => {
+                return Err(RuntimeError::SubgraphNotFound {
+                    subgraph_id: subgraph_id.to_string(),
+                });
+            }
+        }
+        let mut overlays = self
+            .subgraph_overlays
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if overlays.remove(subgraph_id).is_none() {
             return Err(RuntimeError::SubgraphNotFound {
                 subgraph_id: subgraph_id.to_string(),
             });
         }
-        if self.subgraph_overlays.remove(subgraph_id).is_none() {
-            return Err(RuntimeError::SubgraphNotFound {
-                subgraph_id: subgraph_id.to_string(),
-            });
-        }
-        self.active_subgraph = None;
+        *active = None;
+        drop(active);
+        drop(overlays);
         self.metrics.inc_overlay_rollback();
         Ok(())
     }
 
     fn commit_session(
-        &mut self,
+        &self,
         session_id: &str,
         expected_version: u64,
     ) -> Result<(), RuntimeError> {
+        // session_version is not behind a Mutex — it's only accessed from
+        // the main thread in the engine.  For parallel safety, it should
+        // eventually be AtomicU64, but for now the single-threaded path
+        // is sufficient.
+        // Safety: this is a &self method; the caller must ensure external
+        // synchronization if called from multiple threads.
         let started_at = Instant::now();
-        if self.session_version != expected_version {
+        let current_version = self.session_version.load(Ordering::SeqCst);
+        if current_version != expected_version {
             self.metrics.inc_commit_conflict();
             return Err(RuntimeError::CommitConflict {
                 session_id: session_id.to_string(),
                 expected_version,
-                actual_version: self.session_version,
+                actual_version: current_version,
             });
         }
-        for (key, value) in &self.request_slots {
-            self.session_slots.insert(key.clone(), value.clone());
+        let request = self
+            .request_slots
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let mut session = self
+            .session_slots
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        for (key, value) in request.iter() {
+            session.insert(key.clone(), value.clone());
         }
-        self.request_slots.clear();
-        self.session_version += 1;
+        drop(request);
+        self.request_slots
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clear();
+        self.session_version.fetch_add(1, Ordering::SeqCst);
         self.metrics.add_commit_latency_ms(
             started_at
                 .elapsed()

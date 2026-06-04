@@ -142,15 +142,17 @@ pub fn execute_net<F>(
     config: ExecutionConfig,
     net: ExecutionNetSpec,
     context: &mut RuntimeContext,
-    mut runner: F,
+    runner: F,
 ) -> Result<ExecutionOutput, RuntimeError>
 where
-    F: FnMut(
-        &ExecutionTransitionSpec,
-        u32,
-        &TransitionTrigger,
-        &mut RuntimeContext,
-    ) -> TransitionRunResult,
+    F: Fn(
+            &ExecutionTransitionSpec,
+            u32,
+            &TransitionTrigger,
+            &RuntimeContext,
+        ) -> TransitionRunResult
+        + Send
+        + Sync,
 {
     let execution_id = make_execution_id();
     let run_result = (|| {
@@ -185,84 +187,218 @@ where
 
         let mut terminal_fired = false;
         while !state.ready.is_empty() && !terminal_fired {
-            let batch = state.next_batch(&config);
-            for item in batch {
-                let ready_key = (item.transition_id.clone(), item.key.clone());
-                state.ready_set.remove(&ready_key);
+            if config.scheduler.max_concurrency <= 1 {
+                // ---- single-threaded path (unchanged) ----
+                let batch = state.next_batch(&config);
+                for item in batch {
+                    terminal_fired =
+                        process_one_item(&mut state, item, context, &runner, &config)?;
+                    if terminal_fired {
+                        break;
+                    }
+                }
+            } else {
+                // ---- parallel key-sharded path ----
+                // Group ready items by correlation key; pick the highest-priority
+                // item per key.
+                let mut key_items: BTreeMap<CorrelationKey, ReadyItem> = BTreeMap::new();
+                while let Some(item) = state.ready.pop_front() {
+                    let key = item.key.clone();
+                    let ready_key = (item.transition_id.clone(), key.clone());
+                    state.ready_set.remove(&ready_key);
+                    key_items.entry(key).or_insert(item);
+                }
 
-                if state.is_key_done(&item.transition_id, &item.key) {
+                // Take up to max_concurrency items (one per key).
+                let batch: Vec<ReadyItem> = key_items
+                    .into_values()
+                    .take(config.scheduler.max_concurrency)
+                    .collect();
+
+                if batch.is_empty() {
                     continue;
                 }
 
-                let attempt = *state
-                    .attempts
-                    .get(&(item.transition_id.clone(), item.key.clone()))
-                    .unwrap_or(&0);
-
-                let trigger = state.ensure_trigger_inputs(&item.transition_id, &item.key)?;
-                let spec = state.specs.get(&item.transition_id).ok_or_else(|| {
-                    RuntimeError::Invariant {
-                        message: format!("ready transition missing spec: {}", item.transition_id),
+                // Pre-compute all inputs (serial phase — needs &mut state).
+                // Router transitions are handled inline here because they
+                // require &mut RuntimeContext for overlay operations.
+                struct ParallelJob {
+                    transition_id: String,
+                    key: CorrelationKey,
+                    spec: ExecutionTransitionSpec,
+                    attempt: u32,
+                    trigger: TransitionTrigger,
+                    skip: bool,
+                    /// Router result pre-computed in the serial phase (None = run in parallel).
+                    router_run: Option<TransitionRunResult>,
+                }
+                let mut jobs: Vec<ParallelJob> = Vec::with_capacity(batch.len());
+                for item in batch {
+                    if state.is_key_done(&item.transition_id, &item.key) {
+                        continue;
                     }
-                })?;
+                    let attempt = *state
+                        .attempts
+                        .get(&(item.transition_id.clone(), item.key.clone()))
+                        .unwrap_or(&0);
+                    let trigger =
+                        state.ensure_trigger_inputs(&item.transition_id, &item.key)?;
+                    let spec = state.specs.get(&item.transition_id).cloned().ok_or_else(
+                        || RuntimeError::Invariant {
+                            message: format!(
+                                "ready transition missing spec: {}",
+                                item.transition_id
+                            ),
+                        },
+                    )?;
 
-                state.order.push(item.transition_id.clone());
-                let run = if spec.transition.join_policy == JoinPolicy::AllOf
-                    && trigger
-                        .inputs
-                        .iter()
-                        .any(|input| input.token.meta.outcome != NodeOutcome::Success)
-                {
-                    TransitionRunResult::from_outcome(NodeOutcome::Skipped)
-                } else {
-                    run_transition(
+                    state.order.push(item.transition_id.clone());
+
+                    // Router transitions need &mut context — run them now.
+                    let router_run = if matches!(
+                        spec.kind,
+                        ExecutionTransitionKind::Router { .. }
+                    ) {
+                        Some(run_transition_router(
+                            &spec,
+                            attempt,
+                            &trigger,
+                            &mut state.metrics,
+                            context,
+                            &runner,
+                        )?)
+                    } else {
+                        None
+                    };
+
+                    let skip = spec.transition.join_policy == JoinPolicy::AllOf
+                        && trigger
+                            .inputs
+                            .iter()
+                            .any(|i| i.token.meta.outcome != NodeOutcome::Success);
+                    jobs.push(ParallelJob {
+                        transition_id: item.transition_id,
+                        key: item.key,
                         spec,
                         attempt,
-                        &trigger,
-                        &mut state.metrics,
-                        context,
-                        &mut runner,
-                    )?
-                };
-                let outcome = run.outcome;
-
-                match outcome {
-                    NodeOutcome::Failure | NodeOutcome::Timeout => {
-                        let next_attempt = attempt + 1;
-                        if next_attempt <= spec.run_policy.max_retries {
-                            state.attempts.insert(
-                                (item.transition_id.clone(), item.key.clone()),
-                                next_attempt,
-                            );
-                            state.metrics.node_retry_total += 1;
-                            let delay_ms = retry_backoff_delay_ms(&spec.run_policy, next_attempt);
-                            if delay_ms > 0 {
-                                sleep(Duration::from_millis(delay_ms));
-                            }
-                            state.push_ready(&item.transition_id, item.key, true)?;
-                            continue;
-                        }
-                    }
-                    NodeOutcome::Success | NodeOutcome::Cancelled | NodeOutcome::Skipped => {}
+                        trigger,
+                        skip: skip && router_run.is_none(),
+                        router_run,
+                    });
                 }
 
-                let is_terminal = spec.kind == ExecutionTransitionKind::Terminal;
+                if jobs.is_empty() {
+                    continue;
+                }
 
-                state.complete_transition(&item.transition_id, &item.key, run, context)?;
-
-                // Terminal node end semantics: when a Terminal transition fires,
-                // stop the engine, discard remaining ready items, and mark all
-                // incomplete transitions as Cancelled.
-                if is_terminal {
-                    state.ready.clear();
-                    state.ready_set.clear();
-                    for (tid, _) in &state.specs {
-                        if !state.outcomes.contains_key(tid) {
-                            state.outcomes.insert(tid.clone(), NodeOutcome::Cancelled);
+                // Parallel execution of runner closures (Task/Terminal/Gate only).
+                // Router jobs were already handled in the pre-compute phase.
+                let ctx: &RuntimeContext = &*context;
+                let runner_ref: &F = &runner;
+                let parallel_results: Vec<(
+                    usize,
+                    Result<TransitionRunResult, RuntimeError>,
+                )> = std::thread::scope(|s| {
+                    let mut handles = Vec::new();
+                    for (idx, job) in jobs.iter().enumerate() {
+                        if job.skip || job.router_run.is_some() {
+                            continue;
                         }
+                        let spec = &job.spec;
+                        let attempt = job.attempt;
+                        let trigger = &job.trigger;
+                        handles.push((
+                            idx,
+                            s.spawn(move || {
+                                run_transition(spec, attempt, trigger, ctx, runner_ref)
+                            }),
+                        ));
                     }
-                    terminal_fired = true;
-                    break;
+                    handles
+                        .into_iter()
+                        .map(|(idx, h)| (idx, h.join().unwrap()))
+                        .collect()
+                });
+
+                // Merge parallel + pre-computed Router results (serial phase).
+                let mut run_results: Vec<(usize, TransitionRunResult)> =
+                    Vec::with_capacity(jobs.len());
+                for (idx, result) in parallel_results {
+                    match result {
+                        Ok(run) => run_results.push((idx, run)),
+                        Err(err) => return Err(err),
+                    }
+                }
+                // Add pre-computed Router results and Skipped jobs.
+                for (idx, job) in jobs.iter().enumerate() {
+                    if let Some(run) = job.router_run.clone() {
+                        run_results.push((idx, run));
+                    } else if job.skip {
+                        run_results.push((
+                            idx,
+                            TransitionRunResult::from_outcome(NodeOutcome::Skipped),
+                        ));
+                    }
+                }
+                run_results.sort_by_key(|(idx, _)| *idx);
+
+                for (idx, run) in run_results {
+                    let job = &jobs[idx];
+                    let outcome = run.outcome;
+
+                    match outcome {
+                        NodeOutcome::Failure | NodeOutcome::Timeout => {
+                            let next_attempt = job.attempt + 1;
+                            if next_attempt <= job.spec.run_policy.max_retries {
+                                state.attempts.insert(
+                                    (job.transition_id.clone(), job.key.clone()),
+                                    next_attempt,
+                                );
+                                state.metrics.node_retry_total += 1;
+                                let delay_ms = retry_backoff_delay_ms(
+                                    &job.spec.run_policy,
+                                    next_attempt,
+                                );
+                                if delay_ms > 0 {
+                                    sleep(Duration::from_millis(delay_ms));
+                                }
+                                state.push_ready(
+                                    &job.transition_id,
+                                    job.key.clone(),
+                                    true,
+                                )?;
+                                continue;
+                            }
+                        }
+                        NodeOutcome::Success
+                        | NodeOutcome::Cancelled
+                        | NodeOutcome::Skipped => {}
+                    }
+
+                    let is_terminal =
+                        job.spec.kind == ExecutionTransitionKind::Terminal;
+
+                    state.complete_transition(
+                        &job.transition_id,
+                        &job.key,
+                        run,
+                        context,
+                    )?;
+
+                    if is_terminal {
+                        state.ready.clear();
+                        state.ready_set.clear();
+                        for (tid, _) in &state.specs {
+                            if !state.outcomes.contains_key(tid) {
+                                state.outcomes.insert(
+                                    tid.clone(),
+                                    NodeOutcome::Cancelled,
+                                );
+                            }
+                        }
+                        terminal_fired = true;
+                        break;
+                    }
                 }
             }
         }
@@ -291,41 +427,128 @@ fn map_build_error(err: PetriNetBuildError) -> RuntimeError {
     }
 }
 
+/// Process a single ready item in single-threaded mode.
+/// Returns `Ok(true)` if a Terminal transition fired.
+fn process_one_item<F>(
+    state: &mut EngineState,
+    item: ReadyItem,
+    context: &mut RuntimeContext,
+    runner: &F,
+    _config: &ExecutionConfig,
+) -> Result<bool, RuntimeError>
+where
+    F: Fn(
+            &ExecutionTransitionSpec,
+            u32,
+            &TransitionTrigger,
+            &RuntimeContext,
+        ) -> TransitionRunResult
+        + Send
+        + Sync,
+{
+    let ready_key = (item.transition_id.clone(), item.key.clone());
+    state.ready_set.remove(&ready_key);
+
+    if state.is_key_done(&item.transition_id, &item.key) {
+        return Ok(false);
+    }
+
+    let attempt = *state
+        .attempts
+        .get(&(item.transition_id.clone(), item.key.clone()))
+        .unwrap_or(&0);
+
+    let trigger = state.ensure_trigger_inputs(&item.transition_id, &item.key)?;
+    let spec = state.specs.get(&item.transition_id).ok_or_else(|| {
+        RuntimeError::Invariant {
+            message: format!("ready transition missing spec: {}", item.transition_id),
+        }
+    })?;
+
+    state.order.push(item.transition_id.clone());
+    let run = if spec.transition.join_policy == JoinPolicy::AllOf
+        && trigger
+            .inputs
+            .iter()
+            .any(|input| input.token.meta.outcome != NodeOutcome::Success)
+    {
+        TransitionRunResult::from_outcome(NodeOutcome::Skipped)
+    } else if matches!(spec.kind, ExecutionTransitionKind::Router { .. }) {
+        run_transition_router(spec, attempt, &trigger, &mut state.metrics, context, runner)?
+    } else {
+        run_transition(spec, attempt, &trigger, &*context, runner)?
+    };
+    let outcome = run.outcome;
+
+    match outcome {
+        NodeOutcome::Failure | NodeOutcome::Timeout => {
+            let next_attempt = attempt + 1;
+            if next_attempt <= spec.run_policy.max_retries {
+                state.attempts.insert(
+                    (item.transition_id.clone(), item.key.clone()),
+                    next_attempt,
+                );
+                state.metrics.node_retry_total += 1;
+                let delay_ms = retry_backoff_delay_ms(&spec.run_policy, next_attempt);
+                if delay_ms > 0 {
+                    sleep(Duration::from_millis(delay_ms));
+                }
+                state.push_ready(&item.transition_id, item.key, true)?;
+                return Ok(false);
+            }
+        }
+        NodeOutcome::Success | NodeOutcome::Cancelled | NodeOutcome::Skipped => {}
+    }
+
+    let is_terminal = spec.kind == ExecutionTransitionKind::Terminal;
+
+    state.complete_transition(&item.transition_id, &item.key, run, context)?;
+
+    if is_terminal {
+        state.ready.clear();
+        state.ready_set.clear();
+        for (tid, _) in &state.specs {
+            if !state.outcomes.contains_key(tid) {
+                state.outcomes
+                    .insert(tid.clone(), NodeOutcome::Cancelled);
+            }
+        }
+        return Ok(true);
+    }
+
+    Ok(false)
+}
+
+/// Run a single transition, dispatching on [`ExecutionTransitionKind`].
+///
+/// Router transitions require `&mut RuntimeContext` for overlay
+/// begin/commit/rollback; all other kinds only need `&RuntimeContext`.
 fn run_transition<F>(
     spec: &ExecutionTransitionSpec,
     attempt: u32,
     trigger: &TransitionTrigger,
-    metrics: &mut ExecutionMetrics,
-    context: &mut RuntimeContext,
-    runner: &mut F,
+    context: &RuntimeContext,
+    runner: &F,
 ) -> Result<TransitionRunResult, RuntimeError>
 where
-    F: FnMut(
-        &ExecutionTransitionSpec,
-        u32,
-        &TransitionTrigger,
-        &mut RuntimeContext,
-    ) -> TransitionRunResult,
+    F: Fn(
+            &ExecutionTransitionSpec,
+            u32,
+            &TransitionTrigger,
+            &RuntimeContext,
+        ) -> TransitionRunResult
+        + Send
+        + Sync,
 {
     let started_at = Instant::now();
 
     match &spec.kind {
-        ExecutionTransitionKind::Router { subgraph_id } => {
-            let mut payload = Value::Null;
-            let result = execute_router(
-                context,
-                subgraph_id,
-                &mut metrics.router,
-                |ctx| {
-                    let run = runner(spec, attempt, trigger, ctx);
-                    payload = run.payload;
-                    run.outcome
-                },
-                spec.run_policy.timeout_ms,
-            )?;
-            Ok(TransitionRunResult {
-                outcome: result.outcome,
-                payload,
+        ExecutionTransitionKind::Router { .. } => {
+            Err(RuntimeError::Invariant {
+                message: format!(
+                    "Router transition {} must be run via run_transition_router",
+                    spec.transition.transition_id,
+                ),
             })
         }
         ExecutionTransitionKind::Task | ExecutionTransitionKind::Terminal => {
@@ -338,15 +561,57 @@ where
             Ok(result)
         }
         ExecutionTransitionKind::Gate { .. } => {
-            // Gate transitions are not executed via the runner callback;
-            // they evaluate upstream outcomes when triggered.  If the
-            // scheduler has already determined the gate is ready, the
-            // gate should succeed by construction — the readiness check
-            // (evaluate_gate in is_transition_ready) would have prevented
-            // firing otherwise.
             Ok(TransitionRunResult::from_outcome(NodeOutcome::Success))
         }
     }
+}
+
+/// Run a Router transition with overlay semantics (requires `&mut` context).
+fn run_transition_router<F>(
+    spec: &ExecutionTransitionSpec,
+    attempt: u32,
+    trigger: &TransitionTrigger,
+    metrics: &mut ExecutionMetrics,
+    context: &mut RuntimeContext,
+    runner: &F,
+) -> Result<TransitionRunResult, RuntimeError>
+where
+    F: Fn(
+            &ExecutionTransitionSpec,
+            u32,
+            &TransitionTrigger,
+            &RuntimeContext,
+        ) -> TransitionRunResult
+        + Send
+        + Sync,
+{
+    let subgraph_id = match &spec.kind {
+        ExecutionTransitionKind::Router { subgraph_id } => subgraph_id.clone(),
+        _ => {
+            return Err(RuntimeError::Invariant {
+                message: format!(
+                    "run_transition_router called on non-Router transition {}",
+                    spec.transition.transition_id,
+                ),
+            });
+        }
+    };
+    let mut payload = Value::Null;
+    let result = execute_router(
+        context,
+        &subgraph_id,
+        &mut metrics.router,
+        |ctx| {
+            let run = runner(spec, attempt, trigger, ctx);
+            payload = run.payload;
+            run.outcome
+        },
+        spec.run_policy.timeout_ms,
+    )?;
+    Ok(TransitionRunResult {
+        outcome: result.outcome,
+        payload,
+    })
 }
 
 struct EngineState {

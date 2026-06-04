@@ -585,7 +585,7 @@ fn scheduler_is_deterministic_across_runs() {
 
     let run_once = || {
         run_deterministic(
-            SchedulerConfig { max_parallelism: 1 },
+            SchedulerConfig { max_parallelism: 1, max_concurrency: 1 },
             nodes.clone(),
             |node, attempt| {
                 if node.id == "a" && attempt == 0 {

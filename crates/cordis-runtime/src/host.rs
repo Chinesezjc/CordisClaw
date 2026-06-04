@@ -125,10 +125,10 @@ impl RuntimeSnapshot {
         );
 
         let mut context = self.context_baseline.clone();
-        let mut traces = BTreeMap::<String, ExecutionInvocationTrace>::new();
+        let traces = Mutex::new(BTreeMap::<String, ExecutionInvocationTrace>::new());
         let output = execute_net(
             ExecutionConfig {
-                scheduler: SchedulerConfig { max_parallelism: 1 },
+                scheduler: SchedulerConfig { max_parallelism: 1, max_concurrency: 1 },
                 ..ExecutionConfig::default()
             },
             net,
@@ -136,7 +136,7 @@ impl RuntimeSnapshot {
             |spec, attempt, trigger, _| {
                 let transition_id = &spec.transition.transition_id;
                 let Some(node) = self.node_registry.get(transition_id) else {
-                    traces.insert(
+                    traces.lock().unwrap().insert(
                         transition_id.clone(),
                         ExecutionInvocationTrace {
                             node_fqn: transition_id.clone(),
@@ -157,7 +157,7 @@ impl RuntimeSnapshot {
                     match serde_json::to_string(&Value::Object(request_payload.clone())) {
                         Ok(payload) => payload,
                         Err(err) => {
-                            traces.insert(
+                            traces.lock().unwrap().insert(
                                 transition_id.clone(),
                                 ExecutionInvocationTrace {
                                     node_fqn: transition_id.clone(),
@@ -178,7 +178,7 @@ impl RuntimeSnapshot {
                     Ok(response) => {
                         let response_payload = parse_response_payload(&response.payload);
                         let outcome = infer_outcome_from_payload(&response_payload);
-                        traces.insert(
+                        traces.lock().unwrap().insert(
                             transition_id.clone(),
                             ExecutionInvocationTrace {
                                 node_fqn: transition_id.clone(),
@@ -197,7 +197,7 @@ impl RuntimeSnapshot {
                         }
                     }
                     Err(err) => {
-                        traces.insert(
+                        traces.lock().unwrap().insert(
                             transition_id.clone(),
                             ExecutionInvocationTrace {
                                 node_fqn: transition_id.clone(),
@@ -216,6 +216,7 @@ impl RuntimeSnapshot {
             },
         )?;
 
+        let mut traces = traces.into_inner().unwrap();
         fill_missing_execution_traces(&output, &mut traces);
         Ok(RuntimeExecutionResult {
             target_node_fqn: target_node_fqn.to_string(),
