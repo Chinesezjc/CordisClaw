@@ -1,0 +1,108 @@
+{
+  "plugin_id": "git",
+  "plugin_path": "git",
+  "plugin_version": "0.1.0",
+  "abi_version": 2,
+  "command_name": null,
+  "nodes": [
+    {
+      "id": "git_diff",
+      "summary": "Show git working tree diff (unified format). Use to review changes before committing.",
+      "input_schema": {
+        "type": "object",
+        "required": ["node_id", "fixtures_root"],
+        "properties": {
+          "node_id": { "type": "string" },
+          "fixtures_root": { "type": "string", "description": "Path to the git repository root" },
+          "path": { "type": "string", "description": "Optional: limit diff to a specific file or directory" },
+          "staged": { "type": "boolean", "description": "Show staged changes only (default false)" }
+        }
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "ok": { "type": "boolean" },
+          "diff": { "type": ["string", "null"] },
+          "error": { "type": ["string", "null"] }
+        }
+      },
+      "side_effects": ["reads git working tree"],
+      "failure_modes": ["not a git repository", "path escapes root"],
+      "node_type": "router"
+    },
+    {
+      "id": "git_log",
+      "summary": "Show recent git commit history (oneline format).",
+      "input_schema": {
+        "type": "object",
+        "required": ["node_id", "fixtures_root"],
+        "properties": {
+          "node_id": { "type": "string" },
+          "fixtures_root": { "type": "string", "description": "Path to the git repository root" },
+          "max_count": { "type": "integer", "description": "Max commits to show (default 10)" },
+          "path": { "type": "string", "description": "Optional: limit log to a specific file" }
+        }
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "ok": { "type": "boolean" },
+          "log": { "type": ["string", "null"] },
+          "error": { "type": ["string", "null"] }
+        }
+      },
+      "side_effects": ["reads git history"],
+      "failure_modes": ["not a git repository"],
+      "node_type": "router"
+    },
+    {
+      "id": "git_status",
+      "summary": "Show git working tree status (short format).",
+      "input_schema": {
+        "type": "object",
+        "required": ["node_id", "fixtures_root"],
+        "properties": {
+          "node_id": { "type": "string" },
+          "fixtures_root": { "type": "string", "description": "Path to the git repository root" }
+        }
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "ok": { "type": "boolean" },
+          "status": { "type": ["string", "null"] },
+          "error": { "type": ["string", "null"] }
+        }
+      },
+      "side_effects": ["reads git working tree"],
+      "failure_modes": ["not a git repository"],
+      "node_type": "router"
+    },
+    {
+      "id": "git_commit",
+      "summary": "Stage and commit changes. Dangerous operations (push, force, amend) are blocked.",
+      "input_schema": {
+        "type": "object",
+        "required": ["node_id", "fixtures_root", "message"],
+        "properties": {
+          "node_id": { "type": "string" },
+          "fixtures_root": { "type": "string", "description": "Path to the git repository root" },
+          "message": { "type": "string", "description": "Commit message" },
+          "paths": { "type": "array", "items": { "type": "string" }, "description": "Optional: specific files to add and commit" }
+        }
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "ok": { "type": "boolean" },
+          "committed": { "type": "boolean" },
+          "head": { "type": ["string", "null"] },
+          "error": { "type": ["string", "null"] }
+        }
+      },
+      "side_effects": ["modifies git history (local only)"],
+      "failure_modes": ["commit message empty", "forbidden operation", "path escapes root", "not a git repository"],
+      "node_type": "router"
+    }
+  ]
+}

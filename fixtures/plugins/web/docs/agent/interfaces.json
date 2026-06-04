@@ -1,0 +1,57 @@
+{
+  "plugin_id": "web",
+  "plugin_path": "web",
+  "plugin_version": "0.1.0",
+  "abi_version": 2,
+  "command_name": null,
+  "nodes": [
+    {
+      "id": "web_search",
+      "summary": "Search the web using DuckDuckGo. Returns up to max_results items with title, url, and snippet.",
+      "input_schema": {
+        "type": "object",
+        "required": ["node_id", "query"],
+        "properties": {
+          "node_id": { "type": "string" },
+          "query": { "type": "string", "description": "Search query" },
+          "max_results": { "type": "integer", "description": "Max results (default 5, max 20)" }
+        }
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "ok": { "type": "boolean" },
+          "results": { "type": "array", "items": { "type": "object" } },
+          "error": { "type": ["string", "null"] }
+        }
+      },
+      "side_effects": ["makes HTTP request to DuckDuckGo API"],
+      "failure_modes": ["network unavailable", "rate limited", "no results found"],
+      "node_type": "router"
+    },
+    {
+      "id": "web_fetch",
+      "summary": "Fetch a web page and return plain-text content (HTML tags stripped). Max 8000 chars. Only http/https allowed.",
+      "input_schema": {
+        "type": "object",
+        "required": ["node_id", "url"],
+        "properties": {
+          "node_id": { "type": "string" },
+          "url": { "type": "string", "description": "URL to fetch" }
+        }
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "ok": { "type": "boolean" },
+          "text": { "type": ["string", "null"] },
+          "truncated": { "type": "boolean" },
+          "error": { "type": ["string", "null"] }
+        }
+      },
+      "side_effects": ["makes HTTP GET request to the target URL"],
+      "failure_modes": ["invalid URL", "network timeout", "localhost/private IP blocked"],
+      "node_type": "router"
+    }
+  ]
+}
