@@ -3,6 +3,7 @@ use crate::core::models::{
     AbiFingerprint, ArtifactKind, PluginDocs, PluginExecution, PluginLoadResult,
     PluginUnavailableReason,
 };
+use cordis_plugin_sdk::NodeType;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
@@ -27,6 +28,7 @@ pub struct RegisteredNode {
     pub node_fqn: String,
     pub plugin_path: String,
     pub node_id: String,
+    pub node_type: NodeType,
 }
 
 /// Registry of all discovered plugins, indexed by plugin path.
@@ -206,6 +208,7 @@ impl NodeRegistry {
                     node_fqn,
                     plugin_path: plugin_path.to_string(),
                     node_id: node.id.clone(),
+                    node_type: node.node_type,
                 },
             );
         }
@@ -227,5 +230,14 @@ impl NodeRegistry {
 
     pub fn iter(&self) -> impl Iterator<Item = (&String, &RegisteredNode)> {
         self.nodes.iter()
+    }
+
+    /// Return fully-qualified names of all nodes declared as [`NodeType::Task`].
+    pub fn task_node_fqns(&self) -> Vec<String> {
+        self.nodes
+            .iter()
+            .filter(|(_, node)| node.node_type == NodeType::Task)
+            .map(|(fqn, _)| fqn.clone())
+            .collect()
     }
 }

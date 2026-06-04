@@ -2,6 +2,7 @@ use crate::core::error::RuntimeError;
 use crate::core::models::{NodeDoc, PluginLoadResult};
 use crate::plugin::registry::{NodeRegistry, PluginRegistry};
 use crate::service::html_render::HtmlWriter;
+use cordis_plugin_sdk::NodeType;
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -59,6 +60,7 @@ pub struct RegisteredNetNode {
     pub consumes: Vec<String>,
     pub produces: Vec<String>,
     pub topo_level: usize,
+    pub node_type: NodeType,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -276,7 +278,8 @@ fn build_registered_net(
     plugin_registry: &PluginRegistry,
     node_registry: &NodeRegistry,
 ) -> RegisteredNet {
-    let mut meta = BTreeMap::<String, (String, String, Vec<String>, Vec<String>)>::new();
+    let mut meta =
+        BTreeMap::<String, (String, String, Vec<String>, Vec<String>, NodeType)>::new();
     let mut producers_by_output = BTreeMap::<String, Vec<String>>::new();
 
     for (_, node) in node_registry.iter() {
@@ -307,6 +310,7 @@ fn build_registered_net(
                 node.node_id.clone(),
                 consumes,
                 produces,
+                node_doc.node_type,
             ),
         );
     }
@@ -318,7 +322,7 @@ fn build_registered_net(
     let mut diagnostics = Vec::new();
     let mut edges = Vec::new();
 
-    for (consumer_fqn, (_, _, consumes, _)) in &meta {
+    for (consumer_fqn, (_, _, consumes, _, _)) in &meta {
         for input in consumes {
             let mut candidates = producers_by_output
                 .get(input)
@@ -368,13 +372,16 @@ fn build_registered_net(
     let mut nodes = meta
         .into_iter()
         .map(
-            |(node_fqn, (plugin_path, node_id, consumes, produces))| RegisteredNetNode {
-                topo_level: levels.get(&node_fqn).copied().unwrap_or(0),
-                node_fqn,
-                plugin_path,
-                node_id,
-                consumes,
-                produces,
+            |(node_fqn, (plugin_path, node_id, consumes, produces, node_type))| {
+                RegisteredNetNode {
+                    topo_level: levels.get(&node_fqn).copied().unwrap_or(0),
+                    node_fqn,
+                    plugin_path,
+                    node_id,
+                    consumes,
+                    produces,
+                    node_type,
+                }
             },
         )
         .collect::<Vec<_>>();
