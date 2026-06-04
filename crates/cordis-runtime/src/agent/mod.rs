@@ -1,3 +1,6 @@
+pub mod git;
+pub mod web;
+
 use crate::config::LlmApiConfig;
 use crate::core::error::RuntimeError;
 use crate::host::RuntimeHost;
@@ -31,6 +34,12 @@ const AGENT_TOOL_WRITE_FILE: &str = "write_file";
 const AGENT_TOOL_REPLACE_IN_FILE: &str = "replace_in_file";
 const AGENT_TOOL_RUN_COMMAND: &str = "run_command";
 const AGENT_TOOL_REVERT_CHANGES: &str = "revert_changes";
+const AGENT_TOOL_WEB_SEARCH: &str = "web_search";
+const AGENT_TOOL_WEB_FETCH: &str = "web_fetch";
+const AGENT_TOOL_GIT_DIFF: &str = "git_diff";
+const AGENT_TOOL_GIT_LOG: &str = "git_log";
+const AGENT_TOOL_GIT_STATUS: &str = "git_status";
+const AGENT_TOOL_GIT_COMMIT: &str = "git_commit";
 const LLM_DEBUG_ENV: &str = "CORDIS_LLM_DEBUG";
 
 pub trait AgentToolHost {
@@ -72,6 +81,8 @@ pub trait AgentToolHost {
     ) -> Result<Value, RuntimeError>;
     fn agent_run_command(&self, command: &str) -> Result<Value, RuntimeError>;
     fn agent_revert_changes(&self) -> Result<Value, RuntimeError>;
+    /// Return the fixtures (workspace) root for git operations.
+    fn fixtures_root_path(&self) -> std::path::PathBuf;
 }
 
 impl AgentToolHost for RuntimeHost {
@@ -364,6 +375,10 @@ impl AgentToolHost for RuntimeHost {
         Ok(json!({
             "reverted_files": count,
         }))
+    }
+
+    fn fixtures_root_path(&self) -> std::path::PathBuf {
+        self.fixtures_root().to_path_buf()
     }
 }
 
@@ -1250,6 +1265,35 @@ struct RunCommandArgs {
     command: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct WebSearchArgs {
+    query: String,
+    max_results: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WebFetchArgs {
+    url: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitDiffArgs {
+    path: Option<String>,
+    staged: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitLogArgs {
+    max_count: Option<usize>,
+    path: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitCommitArgs {
+    message: String,
+    paths: Option<Vec<String>>,
+}
+
 fn execute_agent_tool_call<B: AgentBackend + ?Sized>(
     backend: &mut B,
     available_tools: &BTreeSet<String>,
@@ -1602,6 +1646,42 @@ impl<'a, H: AgentToolHost + ?Sized> AgentBackend for RuntimeShellAgentBackend<'a
                 parse_tool_value_arguments::<EmptyArgs>(arguments, name)?;
                 self.host.agent_revert_changes()
             }
+            AGENT_TOOL_WEB_SEARCH => {
+                let args = parse_tool_value_arguments::<WebSearchArgs>(arguments, name)?;
+                web::web_search(&args.query, args.max_results.unwrap_or(5))
+            }
+            AGENT_TOOL_WEB_FETCH => {
+                let args = parse_tool_value_arguments::<WebFetchArgs>(arguments, name)?;
+                web::web_fetch(&args.url)
+            }
+            AGENT_TOOL_GIT_DIFF => {
+                let args = parse_tool_value_arguments::<GitDiffArgs>(arguments, name)?;
+                git::git_diff(
+                    &self.host.fixtures_root_path(),
+                    args.path.as_deref(),
+                    args.staged.unwrap_or(false),
+                )
+            }
+            AGENT_TOOL_GIT_LOG => {
+                let args = parse_tool_value_arguments::<GitLogArgs>(arguments, name)?;
+                git::git_log(
+                    &self.host.fixtures_root_path(),
+                    args.max_count.unwrap_or(10),
+                    args.path.as_deref(),
+                )
+            }
+            AGENT_TOOL_GIT_STATUS => {
+                parse_tool_value_arguments::<EmptyArgs>(arguments, name)?;
+                git::git_status(&self.host.fixtures_root_path())
+            }
+            AGENT_TOOL_GIT_COMMIT => {
+                let args = parse_tool_value_arguments::<GitCommitArgs>(arguments, name)?;
+                git::git_commit(
+                    &self.host.fixtures_root_path(),
+                    &args.message,
+                    args.paths.as_deref(),
+                )
+            }
             other => Err(RuntimeError::InvalidArgument {
                 message: format!("runtime shell agent does not support tool {other}"),
             }),
@@ -1805,13 +1885,84 @@ fn shell_agent_tools() -> Vec<AgentToolSpec> {
                 "additionalProperties": false,
             }),
         },
+        AgentToolSpec {
+            name: AGENT_TOOL_WEB_SEARCH,
+            description: "Search the web using DuckDuckGo. Returns up to max_results items with title, url, and snippet. Use this to find documentation, examples, or current information.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "Search query string." },
+                    "max_results": { "type": "integer", "description": "Maximum number of results to return (default 5)." }
+                },
+                "required": ["query"],
+                "additionalProperties": false,
+            }),
+        },
+        AgentToolSpec {
+            name: AGENT_TOOL_WEB_FETCH,
+            description: "Fetch a web page and return its plain-text content (HTML tags stripped). Truncated to 8000 characters. Only http/https URLs are allowed; localhost and private IPs are blocked.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "url": { "type": "string", "description": "URL to fetch." }
+                },
+                "required": ["url"],
+                "additionalProperties": false,
+            }),
+        },
+        AgentToolSpec {
+            name: AGENT_TOOL_GIT_DIFF,
+            description: "Show git diff (unified format) for changes in the workspace. Use to review what you have changed before committing.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Optional: limit diff to a specific file or directory." },
+                    "staged": { "type": "boolean", "description": "Show staged changes only (default false)." }
+                },
+                "additionalProperties": false,
+            }),
+        },
+        AgentToolSpec {
+            name: AGENT_TOOL_GIT_LOG,
+            description: "Show recent git commit history. Use to understand recent changes.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "max_count": { "type": "integer", "description": "Maximum number of commits to show (default 10)." },
+                    "path": { "type": "string", "description": "Optional: limit log to a specific file or directory." }
+                },
+                "additionalProperties": false,
+            }),
+        },
+        AgentToolSpec {
+            name: AGENT_TOOL_GIT_STATUS,
+            description: "Show git working tree status (short format). Use to see which files have been changed, added, or deleted.",
+            parameters: json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false,
+            }),
+        },
+        AgentToolSpec {
+            name: AGENT_TOOL_GIT_COMMIT,
+            description: "Stage and commit changes to git. Pass specific file paths to commit only those files, or omit to commit all changes. Commit message must not be empty. Dangerous operations (push, force, amend) are blocked.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "message": { "type": "string", "description": "Commit message." },
+                    "paths": { "type": "array", "items": { "type": "string" }, "description": "Optional: specific file paths to add and commit." }
+                },
+                "required": ["message"],
+                "additionalProperties": false,
+            }),
+        },
     ]
 }
 
 fn shell_agent_system_prompt() -> &'static str {
     "You are the Cordis shell agent running inside the cordis-runtime serve REPL.\n\
 You are helping the user operate the live runtime from a shell window.\n\
-You can read source files, list directories, search code, write files, replace text in files, run shell commands (cargo build/test/check), inspect runtime status, list plugins/nodes, invoke plugins, execute targets, and reload the runtime.\n\
+You can read source files, list directories, search code, write files, replace text in files, run shell commands (cargo build/test/check), inspect runtime status, list plugins/nodes, invoke plugins, execute targets, reload the runtime, search the web, fetch web pages, and use git (diff, log, status, commit).\n\
 \n\
 SAFETY RULES — never do these without explicit user request:\n\
 - NEVER remove a plugin from its parent's `children` list in Cargo.toml.\n\
@@ -2141,6 +2292,10 @@ mod tests {
 
         fn agent_revert_changes(&self) -> Result<Value, RuntimeError> {
             Ok(json!({ "reverted_files": 0 }))
+        }
+
+        fn fixtures_root_path(&self) -> std::path::PathBuf {
+            std::path::PathBuf::from(".")
         }
     }
 
