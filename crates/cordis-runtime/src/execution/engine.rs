@@ -4,7 +4,8 @@
 
 use crate::context::{ContextWrite, RuntimeContext};
 use crate::core::error::RuntimeError;
-use crate::core::models::NodeOutcome;
+use crate::core::models::{GatePolicy, NodeOutcome};
+use cordis_plugin_sdk::NodeType;
 use crate::execution::gate::{BackoffPolicy, RunPolicy};
 use crate::execution::net::{
     build_petri_net, ArcDirection, ArcSpec, CorrelationKey, JoinPolicy, PetriNetBuildError,
@@ -29,6 +30,7 @@ pub enum SchedulerMode {
 pub enum ExecutionTransitionKind {
     Task,
     Router { subgraph_id: String },
+    Gate { policy: GatePolicy },
     Terminal,
 }
 
@@ -40,6 +42,8 @@ pub struct ExecutionTransitionSpec {
     pub logical_group: Option<String>,
     /// Topological level from the registered net; lower levels execute first.
     pub topo_level: usize,
+    /// Plugin-declared node type, propagated for execution semantics.
+    pub node_type: Option<NodeType>,
 }
 
 #[derive(Debug, Clone)]
@@ -179,7 +183,8 @@ where
         let mut state = EngineState::new(execution_id.clone(), specs, graph, metrics);
         state.enqueue_roots()?;
 
-        while !state.ready.is_empty() {
+        let mut terminal_fired = false;
+        while !state.ready.is_empty() && !terminal_fired {
             let batch = state.next_batch(&config);
             for item in batch {
                 let ready_key = (item.transition_id.clone(), item.key.clone());
@@ -241,7 +246,24 @@ where
                     NodeOutcome::Success | NodeOutcome::Cancelled | NodeOutcome::Skipped => {}
                 }
 
+                let is_terminal = spec.kind == ExecutionTransitionKind::Terminal;
+
                 state.complete_transition(&item.transition_id, &item.key, run, context)?;
+
+                // Terminal node end semantics: when a Terminal transition fires,
+                // stop the engine, discard remaining ready items, and mark all
+                // incomplete transitions as Cancelled.
+                if is_terminal {
+                    state.ready.clear();
+                    state.ready_set.clear();
+                    for (tid, _) in &state.specs {
+                        if !state.outcomes.contains_key(tid) {
+                            state.outcomes.insert(tid.clone(), NodeOutcome::Cancelled);
+                        }
+                    }
+                    terminal_fired = true;
+                    break;
+                }
             }
         }
 
@@ -314,6 +336,15 @@ where
                 result.outcome = NodeOutcome::Timeout;
             }
             Ok(result)
+        }
+        ExecutionTransitionKind::Gate { .. } => {
+            // Gate transitions are not executed via the runner callback;
+            // they evaluate upstream outcomes when triggered.  If the
+            // scheduler has already determined the gate is ready, the
+            // gate should succeed by construction — the readiness check
+            // (evaluate_gate in is_transition_ready) would have prevented
+            // firing otherwise.
+            Ok(TransitionRunResult::from_outcome(NodeOutcome::Success))
         }
     }
 }
@@ -520,6 +551,23 @@ impl EngineState {
             return Ok(true);
         }
 
+        // Enforce required arcs: if any input arc is marked `required` and
+        // its place has no tokens for this correlation key, the transition
+        // is not enabled regardless of join policy.
+        for arc in &input_arcs {
+            if arc.required {
+                let has_tokens = self
+                    .place_tokens
+                    .get(&arc.place_id)
+                    .and_then(|by_key| by_key.get(key))
+                    .map(|q| !q.is_empty())
+                    .unwrap_or(false);
+                if !has_tokens {
+                    return Ok(false);
+                }
+            }
+        }
+
         let mut tokens_per_place = Vec::<(String, Vec<Token>)>::new();
         for arc in &input_arcs {
             let tokens = self
@@ -690,7 +738,7 @@ impl EngineState {
 
 fn evaluate_join_policy(policy: JoinPolicy, tokens_per_place: &[(String, Vec<Token>)]) -> bool {
     match policy {
-        JoinPolicy::AllOf | JoinPolicy::KeyedPair => {
+        JoinPolicy::AllOf => {
             !tokens_per_place.is_empty() && tokens_per_place.iter().all(|(_, t)| !t.is_empty())
         }
         JoinPolicy::AnyOf => tokens_per_place.iter().any(|(_, t)| !t.is_empty()),
@@ -713,7 +761,20 @@ fn evaluate_join_policy(policy: JoinPolicy, tokens_per_place: &[(String, Vec<Tok
             !tokens_per_place.is_empty() && tokens_per_place.iter().all(|(_, t)| !t.is_empty())
         }
         JoinPolicy::FirstCompleted => tokens_per_place.iter().any(|(_, t)| !t.is_empty()),
-        JoinPolicy::KeyedGroup => tokens_per_place.iter().any(|(_, t)| !t.is_empty()),
+        // KeyedPair: requires exactly two input places, both non-empty.
+        // The engine's per-correlation-key token isolation ensures tokens
+        // within each key-group are matched correctly.
+        JoinPolicy::KeyedPair => {
+            tokens_per_place.len() == 2
+                && tokens_per_place.iter().all(|(_, t)| !t.is_empty())
+        }
+        // KeyedGroup: requires all input places to be non-empty within the
+        // same correlation-key bucket (enforced by the engine's key-based
+        // token storage).
+        JoinPolicy::KeyedGroup => {
+            !tokens_per_place.is_empty()
+                && tokens_per_place.iter().all(|(_, t)| !t.is_empty())
+        }
     }
 }
 

@@ -5,7 +5,8 @@ use crate::agent::{
 use crate::config::{LlmApiConfig, PluginConfigFile, RuntimeConfig};
 use crate::context::RuntimeContext;
 use crate::core::error::RuntimeError;
-use crate::core::models::{NodeOutcome, PluginLoadResult, PluginUnavailableReason};
+use crate::core::models::{GatePolicy, NodeOutcome, PluginLoadResult, PluginUnavailableReason};
+use cordis_plugin_sdk::NodeType;
 use crate::execution::engine::{
     execute_net, ExecutionConfig, ExecutionNetSpec, ExecutionOutput, ExecutionTransitionKind,
     ExecutionTransitionSpec, TransitionRunResult, TriggerInput,
@@ -2367,6 +2368,40 @@ impl RuntimeHost {
                 }
             };
 
+        // Stop services for plugins that are being removed or changed in the
+        // new snapshot before swapping it in.
+        let previous_plugins: BTreeSet<String> = previous_snapshot
+            .plugin_registry()
+            .iter()
+            .map(|(path, _)| path)
+            .collect();
+        let next_plugins: BTreeSet<String> = next_snapshot
+            .plugin_registry()
+            .iter()
+            .map(|(path, _)| path)
+            .collect();
+        for plugin_path in &previous_plugins {
+            if !next_plugins.contains(plugin_path) {
+                // Plugin removed — stop its services.
+                self.service_registry.stop_plugin_services(plugin_path);
+            }
+        }
+        // Also stop services for plugins whose docs changed (the new snapshot
+        // may have different Task nodes).
+        for plugin_path in &next_plugins {
+            if previous_plugins.contains(plugin_path) {
+                let prev_plugin = previous_snapshot.plugin_registry().get(plugin_path);
+                let next_plugin = next_snapshot.plugin_registry().get(plugin_path);
+                let prev_docs = prev_plugin.as_ref().and_then(|p| p.docs.as_ref());
+                let next_docs = next_plugin.as_ref().and_then(|p| p.docs.as_ref());
+                // Compare docs by JSON representation — if they differ, restart
+                // services so the new plugin version's services are used.
+                if prev_docs != next_docs {
+                    self.service_registry.stop_plugin_services(plugin_path);
+                }
+            }
+        }
+
         {
             let mut guard = self
                 .current_snapshot
@@ -4004,6 +4039,7 @@ fn build_execution_net(
                 kind: ExecutionTransitionKind::Terminal,
                 logical_group: Some("execute".to_string()),
                 topo_level: 0,
+                node_type: None,
             }],
             arcs: Vec::new(),
         };
@@ -4028,13 +4064,19 @@ fn build_execution_net(
                     },
                 },
                 run_policy: RunPolicy::default(),
-                kind: if node.node_fqn == target_node_fqn {
-                    ExecutionTransitionKind::Terminal
-                } else {
-                    ExecutionTransitionKind::Task
+                kind: match node.node_type {
+                    NodeType::Task => ExecutionTransitionKind::Task,
+                    NodeType::Router => ExecutionTransitionKind::Router {
+                        subgraph_id: node.node_fqn.clone(),
+                    },
+                    NodeType::Gate => ExecutionTransitionKind::Gate {
+                        policy: GatePolicy::AllOf,
+                    },
+                    NodeType::Terminal => ExecutionTransitionKind::Terminal,
                 },
                 logical_group: Some("execute".to_string()),
                 topo_level: node.topo_level,
+                node_type: Some(node.node_type),
             }
         })
         .collect::<Vec<_>>();
@@ -4084,6 +4126,7 @@ fn build_execution_net(
             kind: ExecutionTransitionKind::Terminal,
             logical_group: Some("execute".to_string()),
             topo_level: 0,
+            node_type: None,
         });
     }
 
@@ -4195,6 +4238,17 @@ fn build_snapshot_with_staged_root(
                 required: plugin.required,
             });
         }
+    }
+
+    // Log Task nodes so operators know they exist (actual service start
+    // happens later via auto_start_task_services or manual start_service).
+    let task_fqns = output.node_registry.task_node_fqns();
+    if !task_fqns.is_empty() {
+        eprintln!(
+            "[snapshot] detected {} Task node(s): {}",
+            task_fqns.len(),
+            task_fqns.join(", ")
+        );
     }
 
     Ok(runtime_snapshot_from_output(output, staged_artifact_root))

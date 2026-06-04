@@ -33,6 +33,7 @@ fn transition(
         kind,
         logical_group: None,
         topo_level: 0,
+        node_type: None,
     }
 }
 
@@ -241,8 +242,26 @@ fn join_policy_first_success_marks_late_tokens_as_zombie() {
         arcs: vec![
             arc_out("a", "pa", Some("va")),
             arc_out("b", "pb", Some("vb")),
-            arc_in("join", "pa", Some("va")),
-            arc_in("join", "pb", Some("vb")),
+            // Input arcs are NOT required so FirstSuccess can fire as soon as
+            // the first upstream producer completes.  Required-arc enforcement
+            // (added 2026-06-05) would otherwise block the join until both
+            // places have tokens.
+            ArcSpec {
+                arc_id: "in::join::pa".to_string(),
+                place_id: "pa".to_string(),
+                transition_id: "join".to_string(),
+                direction: ArcDirection::PlaceToTransition,
+                label: Some("va".to_string()),
+                required: false,
+            },
+            ArcSpec {
+                arc_id: "in::join::pb".to_string(),
+                place_id: "pb".to_string(),
+                transition_id: "join".to_string(),
+                direction: ArcDirection::PlaceToTransition,
+                label: Some("vb".to_string()),
+                required: false,
+            },
         ],
     };
 
