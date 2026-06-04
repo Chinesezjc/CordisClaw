@@ -9,7 +9,7 @@ crate-type = ["rlib", "dylib"]
 [package.metadata.cordis]
 plugin_path = "qq"
 abi_kind = "rust"
-declared_nodes = ["qq_entry"]
+declared_nodes = ["qq_entry", "qq_serve", "qq_fetch_messages", "qq_send"]
 children = []
 
 [package.metadata.cordis.abi_fingerprint]
@@ -22,4 +22,5 @@ api_hash = "api_v2"
 cordis-plugin-sdk = { path = "../../../crates/cordis-plugin-sdk" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+tiny_http = "0.12"
 ureq = "2"

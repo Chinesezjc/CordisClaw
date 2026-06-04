@@ -7,63 +7,106 @@
   "nodes": [
     {
       "id": "qq_entry",
-      "summary": "QQ adapter using the NoneBot (OneBot v11) protocol. Connect to a OneBot-compatible QQ client for sending messages.",
+      "summary": "QQ adapter using the NoneBot (OneBot v11) protocol. Connect to a OneBot-compatible QQ client for sending messages. Actions: configure, send, status, call.",
       "input_schema": {
         "properties": {
-          "action": {
-            "description": "configure | send | status | call",
-            "type": "string"
-          },
-          "message": {
-            "description": "Message text (for send)",
-            "type": "string"
-          },
-          "payload": {
-            "description": "Raw API call payload (for call)",
-            "type": "object"
-          },
-          "target": {
-            "description": "group:<id> or private:<id> (for configure / send)",
-            "type": "string"
-          },
-          "url": {
-            "description": "OneBot HTTP API base URL (for configure)",
-            "type": "string"
-          }
+          "action": { "type": "string", "description": "configure | send | status | call" },
+          "url": { "type": "string", "description": "OneBot HTTP API base URL" },
+          "target": { "type": "string", "description": "group:<id> or private:<id>" },
+          "message": { "type": "string", "description": "Message text (for send)" },
+          "payload": { "type": "object", "description": "Raw API call payload (for call)" }
         },
-        "required": [
-          "action"
-        ],
+        "required": ["action"],
         "type": "object"
       },
       "output_schema": {
         "properties": {
-          "action": {
-            "type": "string"
-          },
-          "data": {},
-          "message": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "ok": {
-            "type": "boolean"
-          }
+          "ok": { "type": "boolean" },
+          "action": { "type": "string" },
+          "message": { "type": ["string", "null"] },
+          "data": {}
         },
         "type": "object"
       },
-      "side_effects": [
-        "requires OneBot HTTP server running"
-      ],
-      "failure_modes": [
-        "no OneBot URL configured",
-        "invalid target format",
-        "message is empty",
-        "OneBot API error",
-        "unsupported action"
-      ],
+      "side_effects": ["requires OneBot HTTP server running"],
+      "failure_modes": ["no OneBot URL configured", "invalid target format", "message is empty", "OneBot API error", "unsupported action"],
+      "node_type": "router"
+    },
+    {
+      "id": "qq_serve",
+      "summary": "Start an HTTP server to receive OneBot v11 message events. Configure your OneBot client to POST events to http://<host>:<port>/onebot/event. Supports grayscale group whitelist.",
+      "input_schema": {
+        "type": "object",
+        "required": ["node_id"],
+        "properties": {
+          "node_id": { "type": "string" },
+          "payload": {
+            "type": "object",
+            "properties": {
+              "port": { "type": "integer", "description": "HTTP listen port (default 8080)" },
+              "onebot_url": { "type": "string", "description": "OneBot HTTP API URL" },
+              "allow_groups": { "type": "array", "items": { "type": "string" }, "description": "Group whitelist for grayscale testing" }
+            }
+          },
+          "agent_session_id": { "type": "string", "description": "Optional: agent session ID for message routing" }
+        }
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "ok": { "type": "boolean" },
+          "message": { "type": ["string", "null"] },
+          "error": { "type": ["string", "null"] }
+        }
+      },
+      "side_effects": ["starts an HTTP server thread", "listens on configured port"],
+      "failure_modes": ["port already in use", "OneBot client not configured to POST events"],
+      "node_type": "task"
+    },
+    {
+      "id": "qq_fetch_messages",
+      "summary": "Fetch queued incoming QQ messages received by qq_serve. Returns all messages and drains the queue. Agent should poll this periodically.",
+      "input_schema": {
+        "type": "object",
+        "required": ["node_id"],
+        "properties": {
+          "node_id": { "type": "string" }
+        }
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "ok": { "type": "boolean" },
+          "messages": { "type": "array", "items": { "type": "object" } },
+          "error": { "type": ["string", "null"] }
+        }
+      },
+      "side_effects": ["drains the message queue"],
+      "failure_modes": [],
+      "node_type": "router"
+    },
+    {
+      "id": "qq_send",
+      "summary": "Send a message to a QQ group or private chat via OneBot v11 HTTP API.",
+      "input_schema": {
+        "type": "object",
+        "required": ["node_id", "target", "message"],
+        "properties": {
+          "node_id": { "type": "string" },
+          "target": { "type": "string", "description": "group:<id> or private:<id>" },
+          "message": { "type": "string", "description": "Message text to send" }
+        }
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "ok": { "type": "boolean" },
+          "message": { "type": ["string", "null"] },
+          "error": { "type": ["string", "null"] }
+        }
+      },
+      "side_effects": ["sends HTTP request to OneBot API"],
+      "failure_modes": ["no OneBot URL configured", "invalid target format", "message is empty"],
       "node_type": "router"
     }
   ]
