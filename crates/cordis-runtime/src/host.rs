@@ -4224,7 +4224,7 @@ fn build_snapshot_with_staged_root(
         message: e.to_string(),
     })?;
 
-    let output = match loader.load_with_staging_root(Some(&staged_artifact_root)) {
+    let mut output = match loader.load_with_staging_root(Some(&staged_artifact_root)) {
         Ok(output) => output,
         Err(err) => {
             let _ = fs::remove_dir_all(&staged_artifact_root);
@@ -4243,6 +4243,12 @@ fn build_snapshot_with_staged_root(
         }
     }
 
+    // ── Register built-in Kernel nodes ──────────────────────────────────
+    // These nodes are not plugins; they are part of the Kernel's
+    // execution graph.  They appear in the RegisteredNet so the engine
+    // can route tokens through them.
+    register_builtin_agent_node(&output.plugin_registry, &mut output.node_registry);
+
     // Log Task nodes so operators know they exist (actual service start
     // happens later via auto_start_task_services or manual start_service).
     let task_fqns = output.node_registry.task_node_fqns();
@@ -4255,6 +4261,66 @@ fn build_snapshot_with_staged_root(
     }
 
     Ok(runtime_snapshot_from_output(output, staged_artifact_root))
+}
+
+fn register_builtin_agent_node(
+    plugin_registry: &PluginRegistry,
+    node_registry: &mut NodeRegistry,
+) {
+    use crate::core::models::{PluginDocs, PluginLoadResult};
+    use cordis_plugin_sdk::NodeDoc;
+
+    let docs = PluginDocs {
+        plugin_id: "cordis".to_string(),
+        plugin_path: "cordis".to_string(),
+        plugin_version: "0.1.0".to_string(),
+        abi_version: 2,
+        command_name: None,
+        nodes: vec![NodeDoc {
+            id: "agent_router".to_string(),
+            summary: "Kernel agent router — receives messages and routes them through the LLM agent.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "message": { "type": "string" },
+                    "sender": { "type": "string" }
+                }
+            }),
+            output_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "target": { "type": "string" },
+                    "message": { "type": "string" }
+                }
+            }),
+            side_effects: vec!["calls the LLM agent session".to_string()],
+            failure_modes: vec!["agent session not started".to_string()],
+            node_type: cordis_plugin_sdk::NodeType::Router,
+        }],
+    };
+
+    // Register a virtual plugin entry.
+    plugin_registry.insert_loaded(
+        "cordis".to_string(),
+        None,
+        false,
+        BTreeSet::new(),
+        docs.clone(),
+        PathBuf::from("cordis:builtin"),
+        crate::core::models::ArtifactKind::Json,
+        crate::core::models::AbiFingerprint {
+            rustc_version: "builtin".to_string(),
+            target_triple: "builtin".to_string(),
+            crate_hash: "builtin".to_string(),
+            api_hash: "builtin".to_string(),
+        },
+        None,
+    );
+
+    // Register nodes.
+    if let Err(e) = node_registry.register_from_docs("cordis", &docs) {
+        eprintln!("[builtin] agent_router registration failed: {e}");
+    }
 }
 
 fn runtime_snapshot_from_output(
