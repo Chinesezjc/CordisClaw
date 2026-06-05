@@ -1,7 +1,7 @@
 //! Web access plugin — search and fetch.
 //!
 //! Nodes:
-//! - `web_search`  — search DuckDuckGo and return results
+//! - `web_search`  — search Bing and return results
 //! - `web_fetch`   — fetch a URL and return plain-text content
 //!
 //! Safety: only http/https URLs are allowed; localhost, loopback, and private
@@ -9,7 +9,7 @@
 
 use cordis_plugin_sdk::{
     export_plugin_api, json_response, node_doc, plugin_docs, AbiFingerprint, PluginRequest,
-    PluginResponse, NodeType,
+    PluginResponse,
 };
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
@@ -64,82 +64,49 @@ struct SearchResult {
 }
 
 // ---------------------------------------------------------------------------
-// DDG response types
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Deserialize)]
-#[allow(non_snake_case)]
-struct DdgInstantAnswer {
-    #[serde(default)]
-    AbstractText: String,
-    #[serde(default)]
-    AbstractURL: String,
-    #[serde(default)]
-    AbstractSource: String,
-    #[serde(default)]
-    RelatedTopics: Vec<DdgRelatedTopic>,
-}
-
-#[derive(Debug, Deserialize)]
-#[allow(non_snake_case)]
-struct DdgRelatedTopic {
-    #[serde(default)]
-    Text: String,
-    #[serde(default)]
-    FirstURL: String,
-}
-
-// ---------------------------------------------------------------------------
-// Web fetch types
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Deserialize)]
-struct FetchPayload {
-    url: String,
-}
-
-// ---------------------------------------------------------------------------
-// Web search
+// Web search — Bing API
 // ---------------------------------------------------------------------------
 
 fn web_search(query: &str, max_results: usize) -> Result<Vec<SearchResult>, String> {
+    let api_key = std::env::var("BING_API_KEY")
+        .map_err(|_| "BING_API_KEY environment variable not set".to_string())?;
+
     let client = Client::builder()
         .timeout(Duration::from_secs(TIMEOUT_SECS))
         .build()
         .map_err(|e| format!("build HTTP client: {e}"))?;
 
-    let url = format!(
-        "https://api.duckduckgo.com/?q={}&format=json&no_html=1&skip_disambig=1",
-        urlencode(query)
-    );
+    let resp = client
+        .get("https://api.bing.microsoft.com/v7.0/search")
+        .header("Ocp-Apim-Subscription-Key", &api_key)
+        .query(&[
+            ("q", query),
+            ("count", &max_results.min(20).to_string()),
+            ("mkt", "zh-CN"),
+        ])
+        .send()
+        .map_err(|e| format!("HTTP request: {e}"))?;
 
-    let resp = client.get(&url).send().map_err(|e| format!("HTTP request: {e}"))?;
-    let body: DdgInstantAnswer =
-        resp.json().map_err(|e| format!("parse response: {e}"))?;
+    let body = resp.text().map_err(|e| format!("read body: {e}"))?;
+    let json: Value = serde_json::from_str(&body).map_err(|e| format!("parse JSON: {e}"))?;
 
-    let mut items = Vec::new();
+    let web_pages = json["webPages"]["value"]
+        .as_array()
+        .ok_or_else(|| "no search results found (check BING_API_KEY)".to_string())?;
 
-    if !body.AbstractText.is_empty() {
-        items.push(SearchResult {
-            title: body.AbstractSource,
-            url: body.AbstractURL,
-            snippet: body.AbstractText,
-        });
-    }
+    let items: Vec<SearchResult> = web_pages
+        .iter()
+        .take(max_results)
+        .map(|item| SearchResult {
+            title: item["name"].as_str().unwrap_or("").to_string(),
+            url: item["url"].as_str().unwrap_or("").to_string(),
+            snippet: item["snippet"].as_str().unwrap_or("").to_string(),
+        })
+        .filter(|r| !r.title.is_empty() && !r.url.is_empty())
+        .collect();
 
-    for topic in body.RelatedTopics.iter().take(max_results.saturating_sub(items.len())) {
-        if topic.Text.is_empty() {
-            continue;
-        }
-        let (title, snippet) = match topic.Text.split_once(" — ") {
-            Some((t, s)) => (t.to_string(), s.to_string()),
-            None => (topic.Text.clone(), String::new()),
-        };
-        items.push(SearchResult {
-            title,
-            url: topic.FirstURL.clone(),
-            snippet,
-        });
+    if items.is_empty() {
+        return Err("no search results found".to_string());
     }
 
     Ok(items)
@@ -211,20 +178,6 @@ fn strip_html(html: &str) -> String {
         .replace("&nbsp;", " ")
 }
 
-fn urlencode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for &b in s.as_bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(b as char);
-            }
-            b' ' => out.push_str("%20"),
-            _ => out.push_str(&format!("%{:02X}", b)),
-        }
-    }
-    out
-}
-
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
@@ -288,7 +241,7 @@ fn docs_value() -> cordis_plugin_sdk::PluginDocs {
         vec![
             node_doc(
                 "web_search",
-                "Search the web using DuckDuckGo. Returns up to max_results items with title, url, and snippet.",
+                "Search the web using Bing API. Requires BING_API_KEY env var. Returns up to max_results items with title, url, and snippet.",
                 json!({
                     "type": "object",
                     "required": ["node_id", "query"],
@@ -306,8 +259,8 @@ fn docs_value() -> cordis_plugin_sdk::PluginDocs {
                         "error": { "type": ["string", "null"] }
                     }
                 }),
-                &["makes HTTP request to DuckDuckGo API"],
-                &["network unavailable", "rate limited", "no results found"],
+                &["makes HTTP request to Bing API"],
+                &["BING_API_KEY not set", "network unavailable", "rate limited", "no results found"],
             ),
             node_doc(
                 "web_fetch",
