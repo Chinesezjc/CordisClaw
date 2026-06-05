@@ -1,0 +1,21 @@
+[Unit]
+Description=CordisClaw Runtime
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/CordisClaw
+ExecStart=/root/CordisClaw/target/debug/cordis-runtime serve fixtures --runtime-only
+Restart=always
+RestartSec=5
+User=root
+StandardOutput=journal
+StandardError=journal
+
+# Limit restart loops
+StartLimitBurst=10
+StartLimitIntervalSec=120
+
+[Install]
+WantedBy=multi-user.target

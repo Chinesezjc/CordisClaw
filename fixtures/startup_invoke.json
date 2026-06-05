@@ -7,6 +7,10 @@
       "payload": {
         "port": 8099,
         "onebot_url": "http://127.0.0.1:5700",
+        "access_token": "1145141919810",
+        "llm_api_url": "https://api.deepseek.com/v1/chat/completions",
+        "llm_api_key": "sk-ec39e4c3619043d2940deeb5059197d7",
+        "llm_model": "deepseek-v4-pro",
         "allow_groups": []
       }
     }
