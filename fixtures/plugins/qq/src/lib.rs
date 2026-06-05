@@ -31,12 +31,22 @@ struct QqState {
     default_target: Option<String>,
     /// Groups allowed to trigger agent (grayscale whitelist)
     allow_groups: Vec<String>,
+    /// OneBot access token
+    access_token: Option<String>,
+    /// LLM API config
+    llm_api_url: Option<String>,
+    llm_api_key: Option<String>,
+    llm_model: Option<String>,
 }
 
 static STATE: Mutex<QqState> = Mutex::new(QqState {
     onebot_url: None,
     default_target: None,
     allow_groups: Vec::new(),
+    access_token: None,
+    llm_api_url: None,
+    llm_api_key: None,
+    llm_model: None,
 });
 
 /// Incoming message queue — populated by the HTTP server, drained by
@@ -446,6 +456,18 @@ fn handle_qq_serve(req: &NodeRequest) -> Result<NodeResponse, String> {
         if let Some(url) = req.payload.as_ref().and_then(|p| p.get("onebot_url")).and_then(|v| v.as_str()) {
             state.onebot_url = Some(url.to_string());
         }
+        if let Some(t) = req.payload.as_ref().and_then(|p| p.get("access_token")).and_then(|v| v.as_str()) {
+            state.access_token = Some(t.to_string());
+        }
+        if let Some(u) = req.payload.as_ref().and_then(|p| p.get("llm_api_url")).and_then(|v| v.as_str()) {
+            state.llm_api_url = Some(u.to_string());
+        }
+        if let Some(k) = req.payload.as_ref().and_then(|p| p.get("llm_api_key")).and_then(|v| v.as_str()) {
+            state.llm_api_key = Some(k.to_string());
+        }
+        if let Some(m) = req.payload.as_ref().and_then(|p| p.get("llm_model")).and_then(|v| v.as_str()) {
+            state.llm_model = Some(m.to_string());
+        }
     }
 
     // Store agent session ID if provided.
@@ -463,6 +485,7 @@ fn handle_qq_serve(req: &NodeRequest) -> Result<NodeResponse, String> {
         });
         // Give the server a moment to start.
         thread::sleep(std::time::Duration::from_millis(100));
+        start_agent_poller();
     }
 
     Ok(NodeResponse {
@@ -698,6 +721,72 @@ fn api_handle(req: PluginRequest) -> PluginResponse {
             error: Some(e),
         }),
     }
+}
+
+// ── Agent poller ───────────────────────────────────────────────────────
+use std::time::Duration;
+
+fn should_process(text: &str) -> bool {
+    if text.is_empty() || text.starts_with("[CQ:") { return false; }
+    if text.starts_with('/') && !text.contains("Cordis") { return false; }
+    if text.chars().count() <= 2 { return false; }
+    true
+}
+
+fn call_llm(input: &str) -> Result<String, String> {
+    let state = STATE.lock().map_err(|e| format!("lock: {e}"))?;
+    let url = state.llm_api_url.as_ref().ok_or("llm_api_url not configured")?.clone();
+    let key = state.llm_api_key.as_ref().ok_or("llm_api_key not configured")?.clone();
+    let model = state.llm_model.clone().unwrap_or_else(|| "deepseek-chat".to_string());
+    let body = serde_json::json!({
+        "model": model,
+        "messages": [
+            {"role": "system", "content": "You are in a QQ group. If casual chat NOT directed at you, reply IGNORE. If directed at you, reply concisely. Use available tools when helpful."},
+            {"role": "user", "content": input},
+        ],
+        "temperature": 0.2, "max_tokens": 1024,
+    });
+    let resp = ureq::post(&url).set("Content-Type", "application/json")
+        .set("Authorization", &format!("Bearer {key}"))
+        .send_string(&body.to_string()).map_err(|e| format!("LLM: {e}"))?;
+    let text = resp.into_string().map_err(|e| format!("read: {e}"))?;
+    let json: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("parse: {e}"))?;
+    json["choices"][0]["message"]["content"].as_str()
+        .map(|s: &str| s.to_string())
+        .ok_or_else(|| format!("unexpected: {json}"))
+}
+
+fn start_agent_poller() {
+    thread::spawn(move || {
+        thread::sleep(Duration::from_secs(2));
+        loop {
+            thread::sleep(Duration::from_secs(5));
+            let msgs: Vec<IncomingMessage> = MESSAGE_QUEUE.lock()
+                .map(|mut q| q.drain(..).collect()).unwrap_or_default();
+            for msg in msgs {
+                let text = msg.message.trim().to_string();
+                if !should_process(&text) { continue; }
+                let prompt = format!("[QQ {} from {}]: {}", msg.message_type, msg.sender_id, text);
+                match call_llm(&prompt) {
+                    Ok(reply) => {
+                        let a = reply.trim().to_string();
+                        if a.is_empty() || a.eq_ignore_ascii_case("IGNORE") { continue; }
+                        let base_url = STATE.lock().ok().and_then(|s| s.onebot_url.clone());
+                        let Some(ref base_url) = base_url else { continue };
+                        let _ = ureq::post(&format!("{}/send_group_msg", base_url.trim_end_matches('/')))
+                            .set("Content-Type", "application/json")
+                            .set("Authorization", &format!("Bearer {}",
+                                STATE.lock().ok().and_then(|s| s.access_token.clone()).unwrap_or_default()))
+                            .send_string(&serde_json::json!({
+                                "group_id": msg.sender_id.parse::<i64>().unwrap_or(0),
+                                "message": a,
+                            }).to_string());
+                    }
+                    Err(e) => eprintln!("qq-poller LLM error: {e}"),
+                }
+            }
+        }
+    });
 }
 
 export_plugin_api! {

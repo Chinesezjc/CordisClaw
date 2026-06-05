@@ -5,7 +5,7 @@ Provides web access capabilities for the CordisClaw agent.
 ## Nodes
 
 ### `web_search`
-Search the web using DuckDuckGo's Instant Answer API (no API key required).
+Search the web using Baidu's Instant Answer API (no API key required).
 Returns title, URL, and snippet for each result.
 
 ### `web_fetch`
