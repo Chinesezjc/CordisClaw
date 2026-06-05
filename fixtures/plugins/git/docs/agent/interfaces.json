@@ -9,99 +9,227 @@
       "id": "git_diff",
       "summary": "Show git working tree diff (unified format). Use to review changes before committing.",
       "input_schema": {
-        "type": "object",
-        "required": ["node_id", "fixtures_root"],
         "properties": {
-          "node_id": { "type": "string" },
-          "fixtures_root": { "type": "string", "description": "Path to the git repository root" },
-          "path": { "type": "string", "description": "Optional: limit diff to a specific file or directory" },
-          "staged": { "type": "boolean", "description": "Show staged changes only (default false)" }
-        }
+          "fixtures_root": {
+            "description": "Path to the git repository root",
+            "type": "string"
+          },
+          "node_id": {
+            "const": "git_diff",
+            "type": "string"
+          },
+          "path": {
+            "description": "Optional: limit diff to a specific file or directory",
+            "type": "string"
+          },
+          "staged": {
+            "description": "Show staged changes only (default false)",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "node_id",
+          "fixtures_root"
+        ],
+        "type": "object"
       },
       "output_schema": {
-        "type": "object",
         "properties": {
-          "ok": { "type": "boolean" },
-          "diff": { "type": ["string", "null"] },
-          "error": { "type": ["string", "null"] }
-        }
+          "diff": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ok": {
+            "type": "boolean"
+          }
+        },
+        "type": "object"
       },
-      "side_effects": ["reads git working tree"],
-      "failure_modes": ["not a git repository", "path escapes root"],
+      "side_effects": [
+        "reads git working tree"
+      ],
+      "failure_modes": [
+        "not a git repository",
+        "path escapes root"
+      ],
       "node_type": "router"
     },
     {
       "id": "git_log",
       "summary": "Show recent git commit history (oneline format).",
       "input_schema": {
-        "type": "object",
-        "required": ["node_id", "fixtures_root"],
         "properties": {
-          "node_id": { "type": "string" },
-          "fixtures_root": { "type": "string", "description": "Path to the git repository root" },
-          "max_count": { "type": "integer", "description": "Max commits to show (default 10)" },
-          "path": { "type": "string", "description": "Optional: limit log to a specific file" }
-        }
+          "fixtures_root": {
+            "description": "Path to the git repository root",
+            "type": "string"
+          },
+          "max_count": {
+            "description": "Max commits to show (default 10)",
+            "type": "integer"
+          },
+          "node_id": {
+            "const": "git_log",
+            "type": "string"
+          },
+          "path": {
+            "description": "Optional: limit log to a specific file",
+            "type": "string"
+          }
+        },
+        "required": [
+          "node_id",
+          "fixtures_root"
+        ],
+        "type": "object"
       },
       "output_schema": {
-        "type": "object",
         "properties": {
-          "ok": { "type": "boolean" },
-          "log": { "type": ["string", "null"] },
-          "error": { "type": ["string", "null"] }
-        }
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "log": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ok": {
+            "type": "boolean"
+          }
+        },
+        "type": "object"
       },
-      "side_effects": ["reads git history"],
-      "failure_modes": ["not a git repository"],
+      "side_effects": [
+        "reads git history"
+      ],
+      "failure_modes": [
+        "not a git repository"
+      ],
       "node_type": "router"
     },
     {
       "id": "git_status",
       "summary": "Show git working tree status (short format).",
       "input_schema": {
-        "type": "object",
-        "required": ["node_id", "fixtures_root"],
         "properties": {
-          "node_id": { "type": "string" },
-          "fixtures_root": { "type": "string", "description": "Path to the git repository root" }
-        }
+          "fixtures_root": {
+            "description": "Path to the git repository root",
+            "type": "string"
+          },
+          "node_id": {
+            "const": "git_status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "node_id",
+          "fixtures_root"
+        ],
+        "type": "object"
       },
       "output_schema": {
-        "type": "object",
         "properties": {
-          "ok": { "type": "boolean" },
-          "status": { "type": ["string", "null"] },
-          "error": { "type": ["string", "null"] }
-        }
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ok": {
+            "type": "boolean"
+          },
+          "status": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
       },
-      "side_effects": ["reads git working tree"],
-      "failure_modes": ["not a git repository"],
+      "side_effects": [
+        "reads git working tree"
+      ],
+      "failure_modes": [
+        "not a git repository"
+      ],
       "node_type": "router"
     },
     {
       "id": "git_commit",
-      "summary": "Stage and commit changes. Dangerous operations (push, force, amend) are blocked.",
+      "summary": "Stage and commit changes. Pass specific file paths or omit to commit all changes. Dangerous operations (push, force, amend) are blocked.",
       "input_schema": {
-        "type": "object",
-        "required": ["node_id", "fixtures_root", "message"],
         "properties": {
-          "node_id": { "type": "string" },
-          "fixtures_root": { "type": "string", "description": "Path to the git repository root" },
-          "message": { "type": "string", "description": "Commit message" },
-          "paths": { "type": "array", "items": { "type": "string" }, "description": "Optional: specific files to add and commit" }
-        }
+          "fixtures_root": {
+            "description": "Path to the git repository root",
+            "type": "string"
+          },
+          "message": {
+            "description": "Commit message",
+            "type": "string"
+          },
+          "node_id": {
+            "const": "git_commit",
+            "type": "string"
+          },
+          "paths": {
+            "description": "Optional: specific files to add and commit",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "node_id",
+          "fixtures_root",
+          "message"
+        ],
+        "type": "object"
       },
       "output_schema": {
-        "type": "object",
         "properties": {
-          "ok": { "type": "boolean" },
-          "committed": { "type": "boolean" },
-          "head": { "type": ["string", "null"] },
-          "error": { "type": ["string", "null"] }
-        }
+          "committed": {
+            "type": "boolean"
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "head": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ok": {
+            "type": "boolean"
+          }
+        },
+        "type": "object"
       },
-      "side_effects": ["modifies git history (local only)"],
-      "failure_modes": ["commit message empty", "forbidden operation", "path escapes root", "not a git repository"],
+      "side_effects": [
+        "modifies git history (local only)"
+      ],
+      "failure_modes": [
+        "commit message empty",
+        "forbidden operation",
+        "path escapes root",
+        "not a git repository"
+      ],
       "node_type": "router"
     }
   ]

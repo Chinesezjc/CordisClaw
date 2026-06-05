@@ -1,0 +1,14 @@
+[
+  {
+    "plugin_path": "qq",
+    "node_id": "qq_serve",
+    "payload": {
+      "node_id": "qq_serve",
+      "payload": {
+        "port": 8099,
+        "onebot_url": "http://127.0.0.1:5700",
+        "allow_groups": []
+      }
+    }
+  }
+]
