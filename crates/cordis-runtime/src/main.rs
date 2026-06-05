@@ -201,6 +201,45 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         .ok();
     }
 
+    // ── Startup invocations ──────────────────────────────────────────────
+    // Read startup_invoke.json from fixtures root and execute each
+    // invocation before entering the REPL.  This is used to start
+    // background services (e.g. qq_serve HTTP server).
+    let startup_file = root.join("startup_invoke.json");
+    if startup_file.exists() {
+        match fs::read_to_string(&startup_file) {
+            Ok(text) => match serde_json::from_str::<Value>(&text) {
+                Ok(Value::Array(items)) => {
+                    for item in &items {
+                        let plugin_path = item["plugin_path"].as_str().unwrap_or("");
+                        let node_id = item["node_id"].as_str().unwrap_or("");
+                        let payload = item["payload"].as_object()
+                            .map(|o| serde_json::to_string(o).unwrap_or_default())
+                            .unwrap_or_else(|| "{}".to_string());
+                        if !plugin_path.is_empty() && !node_id.is_empty() {
+                            match host.invoke(plugin_path, node_id, payload) {
+                                Ok(response) => {
+                                    eprintln!(
+                                        "[startup] invoke {plugin_path}::{node_id} ok={}",
+                                        response.payload
+                                    );
+                                }
+                                Err(err) => {
+                                    eprintln!(
+                                        "[startup] invoke {plugin_path}::{node_id} failed: {err}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(_) => eprintln!("[startup] startup_invoke.json must be an array"),
+                Err(e) => eprintln!("[startup] startup_invoke.json parse error: {e}"),
+            },
+            Err(e) => eprintln!("[startup] cannot read startup_invoke.json: {e}"),
+        }
+    }
+
     // Use rustyline for readline-like editing: history, cursor movement, etc.
     let mut rl = rustyline::DefaultEditor::new()?;
     // Persist history so it survives restarts.
@@ -209,6 +248,20 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         .join(".cordis-drafts")
         .join("repl-history.txt");
     let _ = rl.load_history(&history_path);
+
+    // In runtime-only mode, park the main thread instead of entering the
+    // REPL.  Background services (HTTP servers, etc.) keep running because
+    // they were spawned as detached threads during startup invocations.
+    if runtime_only {
+        eprintln!(
+            "runtime-only mode: runtime is running. Press Ctrl+C to stop."
+        );
+        // Park the main thread indefinitely — background threads (HTTP
+        // servers etc.) keep running.  Ctrl+C handler above does cleanup.
+        loop {
+            std::thread::park();
+        }
+    }
 
     loop {
         let prompt = match state.mode {
