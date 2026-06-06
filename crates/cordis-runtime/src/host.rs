@@ -1054,6 +1054,16 @@ impl RuntimeHost {
             path: snapshot_root.clone(),
             message: e.to_string(),
         })?;
+        // Clean up stale snapshot directories from previous runs.
+        if let Ok(entries) = fs::read_dir(&snapshot_root) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy();
+                if name_str.starts_with("snapshot-") && entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                    let _ = fs::remove_dir_all(entry.path());
+                }
+            }
+        }
         recover_plugin_iteration_workspace(&fixtures_root, &snapshot_root)?;
 
         let initial_snapshot = Arc::new(build_snapshot(&loader, &snapshot_root)?);
@@ -4297,6 +4307,7 @@ fn register_builtin_agent_node(
             failure_modes: vec!["agent session not started".to_string()],
             node_type: cordis_plugin_sdk::NodeType::Router,
         }],
+        system_hint: None,
     };
 
     // Register a virtual plugin entry.

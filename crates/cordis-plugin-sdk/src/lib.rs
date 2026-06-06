@@ -72,6 +72,12 @@ pub struct PluginDocs {
     pub command_name: Option<String>,
     #[serde(default)]
     pub nodes: Vec<NodeDoc>,
+    /// Optional hint injected into the Agent's system prompt when this plugin
+    /// is loaded. Use for plugin-specific usage instructions, protocol
+    /// conventions (e.g. "reply IGNORE for casual chat"), or behavioural
+    /// rules that the Agent should follow when interacting with this plugin.
+    #[serde(default)]
+    pub system_hint: Option<String>,
 }
 
 #[repr(C)]
@@ -138,6 +144,20 @@ pub fn json_response<T: Serialize>(value: &T) -> PluginResponse {
     }
 }
 
+pub fn agent_trigger(msg: &str) {
+    // Resolve at runtime via dlsym so plugins don't get a hard
+    // undefined-symbol dependency on the host binary.
+    type TriggerFn = extern "C" fn(*const std::ffi::c_char);
+    let ptr = unsafe {
+        libc::dlsym(libc::RTLD_DEFAULT, b"_cordis_agent_trigger\0".as_ptr() as *const _)
+    };
+    if !ptr.is_null() {
+        let trigger: TriggerFn = unsafe { std::mem::transmute(ptr) };
+        let c_str = std::ffi::CString::new(msg).unwrap();
+        trigger(c_str.as_ptr());
+    }
+}
+
 pub fn pretty_json<T: Serialize>(value: &T) -> String {
     serde_json::to_string_pretty(value).expect("plugin sdk serialize pretty json")
 }
@@ -148,6 +168,7 @@ pub fn plugin_docs(
     plugin_version: impl Into<String>,
     command_name: Option<&str>,
     nodes: Vec<NodeDoc>,
+    system_hint: Option<&str>,
 ) -> PluginDocs {
     PluginDocs {
         plugin_id: plugin_id.into(),
@@ -156,6 +177,7 @@ pub fn plugin_docs(
         abi_version: DEFAULT_ABI_VERSION,
         command_name: command_name.map(ToString::to_string),
         nodes,
+        system_hint: system_hint.map(ToString::to_string),
     }
 }
 
@@ -220,4 +242,37 @@ macro_rules! export_plugin_api {
             handle: $handle,
         };
     };
+}
+
+
+// ── Service Factory Bridge ─────────────────────────────────────────────
+
+/// C-compatible function table for a Service.
+/// Plugins fill this in and return it from `_cordis_create_service`.
+#[repr(C)]
+pub struct ServiceVTable {
+    /// Opaque data pointer passed to start/stop.
+    pub data: *mut std::ffi::c_void,
+    /// Start the service. Returns 0 on success, non-zero on error.
+    pub start: extern "C" fn(*mut std::ffi::c_void) -> i32,
+    /// Stop the service. Returns 0 on success, non-zero on error.
+    pub stop: extern "C" fn(*mut std::ffi::c_void) -> i32,
+}
+
+// Safety: function pointers in the vtable are thread-safe (they only
+// access plugin-local state behind mutexes).
+unsafe impl Send for ServiceVTable {}
+unsafe impl Sync for ServiceVTable {}
+
+#[cfg(not(test))]
+extern "C" {
+    /// Plugin exports this.  Called with a node_id; returns a ServiceVTable
+    /// or null if the node doesn't have a Service implementation.
+    fn _cordis_create_service(node_id: *const std::ffi::c_char) -> *const ServiceVTable;
+}
+
+#[cfg(test)]
+#[no_mangle]
+pub extern "C" fn _cordis_create_service(_node_id: *const std::ffi::c_char) -> *const ServiceVTable {
+    std::ptr::null()
 }

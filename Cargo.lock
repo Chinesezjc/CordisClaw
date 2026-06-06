@@ -92,6 +92,7 @@ name = "cordis-plugin-host"
 version = "0.1.0"
 dependencies = [
  "cordis-plugin-sdk",
+ "libc",
  "libloading",
  "serde",
  "serde_json",
@@ -102,6 +103,7 @@ dependencies = [
 name = "cordis-plugin-sdk"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "serde",
  "serde_json",
 ]
@@ -113,6 +115,7 @@ dependencies = [
  "cordis-plugin-sdk",
  "ctrlc",
  "hex",
+ "libc",
  "libloading",
  "reqwest",
  "rustyline",

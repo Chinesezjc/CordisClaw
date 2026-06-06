@@ -47,6 +47,7 @@ fn docs_value() -> cordis_plugin_sdk::PluginDocs {
             &[],
             &[],
         )],
+    None
     )
 }
 

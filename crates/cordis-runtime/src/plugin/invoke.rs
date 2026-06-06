@@ -1,3 +1,5 @@
+use cordis_plugin_sdk::NodeType;
+use libloading;
 use crate::core::error::RuntimeError;
 use crate::core::models::{
     ArtifactKind, DylibAbiKind, PluginExecution, PluginLoadResult, PluginUnavailableReason,
@@ -8,6 +10,12 @@ use crate::plugin::loader::{default_loader_config, Loader};
 use crate::plugin::registry::PluginRegistry;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+
+/// Keep-alive storage for dylib Libraries of Task nodes.
+/// These libraries must not be dropped because the plugin's
+/// background threads (HTTP servers, pollers) run code from them.
+static TASK_LIBRARIES: Mutex<Vec<LoadedDylibApi>> = Mutex::new(Vec::new());
 use std::process::{Command, Stdio};
 
 #[derive(Debug, Clone)]
@@ -178,7 +186,39 @@ pub fn invoke_registered_plugin(
         });
     }
 
-    Ok((api.handle)(PluginRequest { payload }))
+    let response = (api.handle)(PluginRequest { payload });
+
+    // For Task nodes: keep the dylib alive and look up the Service VTable.
+    let is_task = docs
+        .nodes
+        .iter()
+        .any(|n| n.id == node_id && n.node_type == NodeType::Task);
+    if is_task {
+        // Look up Service VTable from the plugin.
+        let c_node = std::ffi::CString::new(node_id).unwrap_or_default();
+        let create_sym: Result<
+            libloading::Symbol<
+                unsafe extern "C" fn(
+                    *const std::ffi::c_char,
+                ) -> *const cordis_plugin_sdk::ServiceVTable,
+            >,
+            _,
+        > = unsafe { dylib.lib().get(b"_cordis_create_service\0") };
+        if let Ok(create) = create_sym {
+            let vtable = unsafe { create(c_node.as_ptr()) };
+            if !vtable.is_null() {
+                let vtable = unsafe { &*vtable };
+                eprintln!(
+                    "service: {plugin_path}::{node_id} registered (start={})",
+                    (vtable.start)(vtable.data) == 0
+                );
+            }
+        }
+        // Keep dylib alive — Task nodes spawn background threads.
+        TASK_LIBRARIES.lock().unwrap().push(dylib);
+    }
+
+    Ok(response)
 }
 
 fn invoke_json_artifact(

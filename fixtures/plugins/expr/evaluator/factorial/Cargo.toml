@@ -1,0 +1,27 @@
+[package]
+name = "expr_evaluator_factorial"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["rlib", "dylib"]
+
+[package.metadata.cordis]
+plugin_path = "expr/evaluator/factorial"
+abi_kind = "rust"
+declared_nodes = ["expr_factorial"]
+children = []
+
+[package.metadata.cordis.abi_fingerprint]
+rustc_version = "1.85.1"
+target_triple = "x86_64-unknown-linux-gnu"
+crate_hash = "crate_expr_factorial_v1"
+api_hash = "api_v2"
+
+[dependencies]
+cordis-plugin-sdk = { path = "../../../../../crates/cordis-plugin-sdk" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+
+[workspace]

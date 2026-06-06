@@ -46,6 +46,7 @@ fn docs_value() -> cordis_plugin_sdk::PluginDocs {
             &[],
             &["invalid number", "unexpected token"],
         )],
+        None
     )
 }
 

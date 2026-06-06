@@ -32,7 +32,7 @@ fn docs_value() -> cordis_plugin_sdk::PluginDocs {
         "0.1.0",
         None,
         vec![node_doc(
-            "expr_evaluator",
+            "expr_eval",
             "Evaluate the AST and delegate arithmetic to child operator plugins.",
             json!({
                 "type": "object",
@@ -45,6 +45,7 @@ fn docs_value() -> cordis_plugin_sdk::PluginDocs {
             &[],
             &["division by zero"],
         )],
+    None
     )
 }
 

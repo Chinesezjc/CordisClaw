@@ -4,11 +4,41 @@ use cordis_plugin_sdk::{
 use libloading::Library;
 use serde::Deserialize;
 use std::collections::BTreeMap;
+use std::ffi::{CStr, CString};
 use std::fs;
 use std::io::Write;
+use std::os::raw::c_char;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 use thiserror::Error;
+
+// ── Message Handler Registry ──────────────────────────────────────────────
+/// Plugins register a handler function that transforms raw messages into
+/// tagged routing items.  The host calls this handler for each message
+/// fetched from the plugin's output queue.
+
+type HandlerFn = extern "C" fn(*const c_char) -> *mut c_char;
+static HANDLER: OnceLock<HandlerFn> = OnceLock::new();
+
+/// Registered by the runtime at boot.  Plugins export this symbol.
+#[no_mangle]
+pub extern "C" fn _cordis_register_handler(f: HandlerFn) {
+    let _ = HANDLER.set(f);
+}
+
+/// Called by the host for each raw message.  Returns a tagged JSON string
+/// like `{"tag":"agent","content":"..."}`, or `None` if no handler is
+/// registered.
+pub fn call_handler(input: &str) -> Option<String> {
+    HANDLER.get().map(|f| {
+        let c_in = CString::new(input).unwrap();
+        let c_out = f(c_in.as_ptr());
+        let s = unsafe { CStr::from_ptr(c_out) }.to_string_lossy().into_owned();
+        unsafe { libc::free(c_out as *mut std::ffi::c_void) };
+        s
+    })
+}
 
 #[derive(Debug, Error)]
 pub enum PluginHostError {

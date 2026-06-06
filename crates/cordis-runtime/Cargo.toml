@@ -20,3 +20,4 @@ rustyline = "15"
 [dev-dependencies]
 serial_test = "3"
 tempfile = "3"
+libc = "0.2"
