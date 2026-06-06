@@ -286,6 +286,7 @@ fn docs_value() -> cordis_plugin_sdk::PluginDocs {
                 &["invalid URL", "network timeout", "localhost/private IP blocked"],
             ),
         ],
+    None
     )
 }
 

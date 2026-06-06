@@ -35,6 +35,24 @@ struct ServeState {
     mode: ServeMode,
 }
 
+static mut AGENT_TRIGGER_TX: Option<std::sync::mpsc::Sender<String>> = None;
+static mut AGENT_INBOX_QUEUE: Option<std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>> = None;
+
+#[no_mangle]
+pub extern "C" fn _cordis_agent_trigger(msg: *const std::ffi::c_char) {
+    if msg.is_null() { return; }
+    let s = unsafe { std::ffi::CStr::from_ptr(msg).to_string_lossy().to_string() };
+    let _ = std::fs::write("/tmp/trigger_called.txt", &s);
+    unsafe {
+        if let Some(ref tx) = AGENT_TRIGGER_TX {
+            let _ = tx.send(s.clone());
+        }
+        if let Some(ref q) = AGENT_INBOX_QUEUE {
+            q.lock().unwrap_or_else(|p| p.into_inner()).push_back(s);
+        }
+    }
+}
+
 fn main() {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     if args.first().map(|x| x.as_str()) == Some("auto-update") {
@@ -172,6 +190,7 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let host =
         RuntimeHost::boot(&root).map_err(|err| runtime_mode_error(err, &root, runtime_only))?;
     let agent_session = host.agent_start(AgentSessionKind::RuntimeShell)?;
+    let session_id = agent_session.session_id.clone();
     let mut state = ServeState {
         agent_session_id: agent_session.session_id,
         mode: ServeMode::Command,
@@ -253,11 +272,93 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     // REPL.  Background services (HTTP servers, etc.) keep running because
     // they were spawned as detached threads during startup invocations.
     if runtime_only {
-        eprintln!(
-            "runtime-only mode: runtime is running. Press Ctrl+C to stop."
-        );
-        // Park the main thread indefinitely — background threads (HTTP
-        // servers etc.) keep running.  Ctrl+C handler above does cleanup.
+        eprintln!("runtime-only: inbox started");
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        let inject_queue = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::<String>::new()));
+        unsafe {
+            AGENT_TRIGGER_TX = Some(tx);
+            AGENT_INBOX_QUEUE = Some(std::sync::Arc::clone(&inject_queue));
+        }
+        cordis_runtime::agent::set_agent_inject_queue(inject_queue);
+        let session_id_bg = session_id.clone();
+        std::thread::spawn(move || {
+            loop {
+                let mut msgs: Vec<String> = Vec::new();
+                match rx.recv() {
+                    Ok(m) => msgs.push(m),
+                    Err(_) => break,
+                }
+                while let Ok(m) = rx.try_recv() {
+                    msgs.push(m);
+                }
+                let group_id = msgs.last()
+                    .and_then(|msg| {
+                        let rest = msg.strip_prefix("[QQ group from ")?;
+                        let end = rest.find("]: ")?;
+                        let prefix = &rest[..end];
+                        let gid = prefix.split_once(" (user ").map(|(g, _)| g).unwrap_or(prefix);
+                        Some(gid.to_string())
+                    }).unwrap_or_default();
+                if group_id.is_empty() { continue; }
+                let combined = msgs.join("\n");
+                eprintln!("inbox: [{}] batch {} msgs", group_id, msgs.len());
+                match host.agent_send(&session_id_bg, &combined) {
+                    Ok(reply) => {
+                        let raw = reply.content.trim().to_string();
+                        if raw.is_empty() { continue; }
+                        // Parse JSON output: {"action":"respond","message":"..."} or {"action":"suspend"}
+                        match serde_json::from_str::<Value>(&raw) {
+                            Ok(ref cmd) if cmd.get("action").and_then(|v| v.as_str()) == Some("suspend") => {
+                                eprintln!("inbox: session suspended");
+                                continue;
+                            }
+                            Ok(ref cmd) if cmd.get("action").and_then(|v| v.as_str()) == Some("respond") => {
+                                let msg = cmd.get("message").and_then(|v| v.as_str()).unwrap_or("");
+                                if msg.is_empty() { continue; }
+                                eprintln!("inbox: agent reply: {}...", msg.chars().take(100).collect::<String>());
+                                let payload = serde_json::json!({
+                                    "node_id": "qq_send",
+                                    "target": format!("group:{}", group_id),
+                                    "message": msg,
+                                    "payload": {
+                                        "onebot_url": "http://127.0.0.1:5700",
+                                        "access_token": "1145141919810",
+                                    },
+                                });
+                                match host.invoke("qq", "qq_send", payload.to_string()) {
+                                    Ok(_) => eprintln!("inbox: qq_send OK"),
+                                    Err(e) => eprintln!("inbox: qq_send failed: {e}"),
+                                }
+                                continue;
+                            }
+                            Ok(_) => {
+                                // Parsed as JSON but unknown action — don't send.
+                                eprintln!("inbox: unknown JSON action, dropping");
+                                continue;
+                            }
+                            Err(_) => {}
+                        }
+                        // Fallback: plain text that failed JSON parse.
+                        eprintln!("inbox: agent reply (plain): {}...", raw.chars().take(100).collect::<String>());
+                        let payload = serde_json::json!({
+                            "node_id": "qq_send",
+                            "target": format!("group:{}", group_id),
+                            "message": raw,
+                            "payload": {
+                                "onebot_url": "http://127.0.0.1:5700",
+                                "access_token": "1145141919810",
+                            },
+                        });
+                        match host.invoke("qq", "qq_send", payload.to_string()) {
+                            Ok(_) => eprintln!("inbox: qq_send OK"),
+                            Err(e) => eprintln!("inbox: qq_send failed: {e}"),
+                        }
+                    }
+                    Err(e) => eprintln!("inbox: {e}"),
+                }
+            }
+        });
+        // Park — background threads keep running.
         loop {
             std::thread::park();
         }

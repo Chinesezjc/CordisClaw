@@ -496,6 +496,7 @@ fn synthesized_generated_docs_placeholder(plugin_path: &str, plugin_version: &st
         abi_version: DEFAULT_ABI_VERSION,
         command_name: None,
         nodes: Vec::new(),
+        system_hint: None,
     }
 }
 

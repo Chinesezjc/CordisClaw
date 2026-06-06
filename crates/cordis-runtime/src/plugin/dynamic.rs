@@ -9,6 +9,9 @@ pub struct LoadedDylibApi {
     api_ptr: *const RustPluginApiV2,
 }
 
+// Safety: _lib is owned and stays in memory; api_ptr is valid as long as _lib is alive.
+unsafe impl Send for LoadedDylibApi {}
+
 impl LoadedDylibApi {
     pub fn open(path: &Path) -> Result<Self, RuntimeError> {
         let lib = unsafe { Library::new(path) }.map_err(|e| RuntimeError::Io {
@@ -38,6 +41,10 @@ impl LoadedDylibApi {
 
     pub fn api(&self) -> &RustPluginApiV2 {
         unsafe { &*self.api_ptr }
+    }
+
+    pub fn lib(&self) -> &Library {
+        &self._lib
     }
 }
 

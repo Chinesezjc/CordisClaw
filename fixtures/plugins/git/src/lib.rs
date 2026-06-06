@@ -366,6 +366,7 @@ fn docs_value() -> cordis_plugin_sdk::PluginDocs {
                 &["commit message empty", "forbidden operation", "path escapes root", "not a git repository"],
             ),
         ],
+    None
     )
 }
 

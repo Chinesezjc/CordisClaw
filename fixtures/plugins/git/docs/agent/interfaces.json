@@ -232,5 +232,6 @@
       ],
       "node_type": "router"
     }
-  ]
+  ],
+  "system_hint": null
 }

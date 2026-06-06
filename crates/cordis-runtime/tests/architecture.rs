@@ -41,6 +41,7 @@ fn make_plugin_docs(plugin_path: &str, nodes: Vec<NodeDoc>) -> PluginDocs {
         abi_version: 1,
         command_name: None,
         nodes,
+        system_hint: None,
     }
 }
 

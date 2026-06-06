@@ -13,6 +13,7 @@ pub enum TokenKind {
     Slash,
     Percent,
     Caret,
+    Exclamation,
     LParen,
     RParen,
 }
@@ -84,6 +85,13 @@ pub fn lex(src: &str) -> Result<Vec<Token>, LexError> {
                 pos += 1;
                 Token {
                     kind: TokenKind::Caret,
+                    position: pos - 1,
+                }
+            }
+            '!' => {
+                pos += 1;
+                Token {
+                    kind: TokenKind::Exclamation,
                     position: pos - 1,
                 }
             }

@@ -6,7 +6,7 @@
   "command_name": null,
   "nodes": [
     {
-      "id": "expr_evaluator",
+      "id": "expr_eval",
       "summary": "Evaluate the AST and delegate arithmetic to child operator plugins.",
       "input_schema": {
         "properties": {
@@ -30,5 +30,6 @@
       ],
       "node_type": "router"
     }
-  ]
+  ],
+  "system_hint": null
 }
