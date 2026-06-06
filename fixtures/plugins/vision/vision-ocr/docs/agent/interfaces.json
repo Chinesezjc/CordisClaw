@@ -1,0 +1,61 @@
+{
+  "plugin_id": "vision_vision_ocr",
+  "plugin_path": "vision/vision-ocr",
+  "plugin_version": "0.1.0",
+  "abi_version": 2,
+  "command_name": null,
+  "nodes": [
+    {
+      "id": "vision_ocr",
+      "summary": "Download an image from URL and run tesseract OCR to extract text. Requires tesseract installed on the system. Default language: chi_sim+eng.",
+      "input_schema": {
+        "properties": {
+          "lang": {
+            "description": "Tesseract language code (default: chi_sim+eng)",
+            "type": "string"
+          },
+          "url": {
+            "description": "Image URL to OCR",
+            "type": "string"
+          }
+        },
+        "required": [
+          "url"
+        ],
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ok": {
+            "type": "boolean"
+          },
+          "text": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "side_effects": [
+        "downloads image from URL",
+        "runs tesseract OCR"
+      ],
+      "failure_modes": [
+        "tesseract not installed",
+        "network error",
+        "language pack missing",
+        "no text in image"
+      ],
+      "node_type": "task"
+    }
+  ],
+  "system_hint": null
+}

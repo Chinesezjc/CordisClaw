@@ -68,3 +68,70 @@ fn unary_minus_binds_before_power() {
     let value = evaluate_expression("-2 ^ 2").expect("must evaluate");
     assert_eq!(value, 4.0);
 }
+
+// --- Factorial tests ---
+
+#[test]
+fn factorial_of_zero() {
+    let value = evaluate_expression("0!").expect("must evaluate");
+    assert_eq!(value, 1.0);
+}
+
+#[test]
+fn factorial_of_five() {
+    let value = evaluate_expression("5!").expect("must evaluate");
+    assert_eq!(value, 120.0);
+}
+
+#[test]
+fn factorial_of_ten() {
+    let value = evaluate_expression("10!").expect("must evaluate");
+    assert_eq!(value, 3628800.0);
+}
+
+#[test]
+fn factorial_binds_tighter_than_power() {
+    // 3!^2 = (3!)^2 = 6^2 = 36
+    let value = evaluate_expression("3! ^ 2").expect("must evaluate");
+    assert_eq!(value, 36.0);
+}
+
+#[test]
+fn power_rhs_factorial() {
+    // 2 ^ 3! = 2 ^ (3!) = 2 ^ 6 = 64
+    let value = evaluate_expression("2 ^ 3!").expect("must evaluate");
+    assert_eq!(value, 64.0);
+}
+
+#[test]
+fn factorial_binds_tighter_than_unary_minus() {
+    // -5! = -(5!) = -120
+    let value = evaluate_expression("-5!").expect("must evaluate");
+    assert_eq!(value, -120.0);
+}
+
+#[test]
+fn double_factorial() {
+    // 3!! = (3!)! = 6! = 720
+    let value = evaluate_expression("3!!").expect("must evaluate");
+    assert_eq!(value, 720.0);
+}
+
+#[test]
+fn factorial_in_expression() {
+    // 2 * 3! + 4 = 2 * 6 + 4 = 16
+    let value = evaluate_expression("2 * 3! + 4").expect("must evaluate");
+    assert_eq!(value, 16.0);
+}
+
+#[test]
+fn rejects_factorial_negative() {
+    let err = evaluate_expression("(-5)!").expect_err("must fail");
+    assert_eq!(err, ExprError::FactorialDomainError);
+}
+
+#[test]
+fn rejects_factorial_non_integer() {
+    let err = evaluate_expression("3.5!").expect_err("must fail");
+    assert_eq!(err, ExprError::FactorialDomainError);
+}

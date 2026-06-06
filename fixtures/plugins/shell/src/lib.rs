@@ -652,6 +652,7 @@ fn docs_value() -> PluginDocs {
             &["reads stdin", "writes stdout"],
             &["unsupported action", "invalid shell backend", "command not found"],
         )],
+    None
     )
 }
 

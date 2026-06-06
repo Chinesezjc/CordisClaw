@@ -14,9 +14,12 @@ pub mod div_core;
 pub mod modulo_core;
 #[path = "../pow/src/core.rs"]
 pub mod pow_core;
+#[path = "../factorial/src/core.rs"]
+pub mod factorial_core;
 
 pub use add_core::AddPlugin;
 pub use div_core::{DivError, DivPlugin};
+pub use factorial_core::{FactorialError, FactorialPlugin};
 pub use modulo_core::{ModError, ModPlugin};
 pub use mul_core::MulPlugin;
 pub use pow_core::PowPlugin;
@@ -32,6 +35,8 @@ pub enum EvalError {
     DivisionByZero,
     #[error("modulo by zero")]
     ModuloByZero,
+    #[error("factorial requires a non-negative integer")]
+    FactorialDomainError,
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -41,6 +46,8 @@ pub enum EvaluateExpressionError {
     DivisionByZero,
     #[error("modulo by zero")]
     ModuloByZero,
+    #[error("factorial requires a non-negative integer")]
+    FactorialDomainError,
     #[error("unexpected token at position {position}")]
     UnexpectedToken { position: usize },
     #[error("missing ')' at position {position}")]
@@ -69,6 +76,7 @@ struct OpPlugins {
     div: DivPlugin,
     modulo: ModPlugin,
     pow: PowPlugin,
+    factorial: FactorialPlugin,
 }
 
 fn evaluate_with_plugins(ast: &ExprAst, ops: &OpPlugins) -> Result<f64, EvalError> {
@@ -97,6 +105,12 @@ fn evaluate_with_plugins(ast: &ExprAst, ops: &OpPlugins) -> Result<f64, EvalErro
                 BinaryOp::Pow => Ok(ops.pow.apply(left, right)),
             }
         }
+        ExprAst::Factorial { expr } => {
+            let value = evaluate_with_plugins(expr, ops)?;
+            ops.factorial.apply(value).map_err(|err| match err {
+                FactorialError::FactorialDomainError => EvalError::FactorialDomainError,
+            })
+        }
     }
 }
 
@@ -121,5 +135,6 @@ fn map_eval_error(err: EvalError) -> EvaluateExpressionError {
     match err {
         EvalError::DivisionByZero => EvaluateExpressionError::DivisionByZero,
         EvalError::ModuloByZero => EvaluateExpressionError::ModuloByZero,
+        EvalError::FactorialDomainError => EvaluateExpressionError::FactorialDomainError,
     }
 }

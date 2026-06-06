@@ -1,0 +1,41 @@
+{
+  "plugin_id": "expr_evaluator_factorial",
+  "plugin_path": "expr/evaluator/factorial",
+  "plugin_version": "0.1.0",
+  "abi_version": 2,
+  "command_name": null,
+  "nodes": [
+    {
+      "id": "expr_factorial",
+      "summary": "Compute the factorial of a non-negative integer n.",
+      "input_schema": {
+        "properties": {
+          "n": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "n"
+        ],
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "error": {
+            "type": "string"
+          },
+          "value": {
+            "type": "number"
+          }
+        },
+        "type": "object"
+      },
+      "side_effects": [],
+      "failure_modes": [
+        "factorial requires a non-negative integer"
+      ],
+      "node_type": "router"
+    }
+  ],
+  "system_hint": null
+}

@@ -6,11 +6,33 @@ use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::env;
 use std::io::{BufRead, BufReader, Write};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
+
+/// Shared queue for Agent message injection.  The inbox thread pushes new
+/// incoming messages here, and the Agent's respond loop drains them
+/// between LLM turns so that late-arriving messages are seen.
+static AGENT_INJECT_QUEUE: Mutex<Option<Arc<Mutex<VecDeque<String>>>>> = Mutex::new(None);
+
+/// Set the injection queue from the main binary.  Must be called once
+/// before the Agent starts processing messages.
+pub fn set_agent_inject_queue(q: Arc<Mutex<VecDeque<String>>>) {
+    *AGENT_INJECT_QUEUE.lock().unwrap_or_else(|p| p.into_inner()) = Some(q);
+}
+
+/// Drain queued messages for injection into the current Agent turn.
+fn drain_inject_queue() -> Vec<String> {
+    let guard = AGENT_INJECT_QUEUE.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(ref q) = *guard {
+        q.lock().unwrap_or_else(|p| p.into_inner()).drain(..).collect()
+    } else {
+        Vec::new()
+    }
+}
 
 const AGENT_HISTORY_MESSAGE_LIMIT: usize = 24;
 const AGENT_MAX_TOOL_TURNS: usize = 96;
@@ -40,6 +62,11 @@ pub trait AgentToolHost {
     fn agent_kernel_status(&self) -> Result<Value, RuntimeError>;
     fn agent_kernel_issues(&self) -> Result<Value, RuntimeError>;
     fn agent_reload_runtime(&self) -> Result<Value, RuntimeError>;
+    /// Collect system_hint strings from all loaded plugins. The Agent's
+    /// system prompt should include these so that plugin-specific usage
+    /// conventions (e.g. chat mode vs IGNORE for a QQ plugin) are
+    /// injected automatically without hardcoding them in the kernel.
+    fn agent_plugin_hints(&self) -> Vec<String>;
     fn agent_invoke_plugin(
         &self,
         plugin_path: &str,
@@ -134,6 +161,16 @@ impl AgentToolHost for RuntimeHost {
 
     fn agent_reload_runtime(&self) -> Result<Value, RuntimeError> {
         to_json_value("reload diagnostics", self.reload_with_diagnostics())
+    }
+
+    fn agent_plugin_hints(&self) -> Vec<String> {
+        let snapshot = self.current_snapshot();
+        snapshot
+            .plugin_registry()
+            .iter()
+            .filter_map(|(_, plugin)| plugin.docs)
+            .filter_map(|docs| docs.system_hint)
+            .collect()
     }
 
     fn agent_invoke_plugin(
@@ -578,6 +615,17 @@ impl AgentSession {
                 });
             }
 
+            // Check for new messages since last turn and inject them.
+            {
+                let new_msgs = drain_inject_queue();
+                for m in new_msgs {
+                    if m.trim().is_empty() { continue; }
+                    emit_agent_diagnostic(format!("agent_inject kind={} turn={} len={}", self.kind, turn + 1, m.len()));
+                    messages.push(json!({"role": "user", "content": &m}));
+                    self.transcript.push(AgentTranscriptEntry::User { content: m });
+                }
+            }
+
             let tool_specs = backend.tool_specs();
             emit_agent_diagnostic(format!(
                 "agent_turn_start kind={} turn={} elapsed_ms={} messages={} tools={}",
@@ -595,6 +643,7 @@ impl AgentSession {
                 "max_tokens": self.config.max_tokens,
                 "tools": tool_specs_to_request_payload(&tool_specs),
                 "tool_choice": "auto",
+                "response_format": {"type": "json_object"},
             });
             let (message, response_id, finish_reason) =
                 self.send_chat_request(endpoint.clone(), request_body)?;
@@ -669,6 +718,16 @@ impl AgentSession {
                                 ),
                             });
                         }
+                        // Check for late-arriving messages before replying.
+                        let new_msgs = drain_inject_queue();
+                        if !new_msgs.is_empty() {
+                            for m in new_msgs {
+                                if m.trim().is_empty() { continue; }
+                                messages.push(json!({"role": "user", "content": &m}));
+                                self.transcript.push(AgentTranscriptEntry::User { content: m });
+                            }
+                            continue;
+                        }
                         self.remember_exchange(trimmed, &reply_content);
                         self.completed_turns += 1;
                         self.transcript.push(AgentTranscriptEntry::Assistant {
@@ -691,6 +750,16 @@ impl AgentSession {
                 .map(str::trim)
                 .filter(|content| !content.is_empty())
             {
+                // Before returning, check if new messages arrived during this turn.
+                let new_msgs = drain_inject_queue();
+                if !new_msgs.is_empty() {
+                    for m in new_msgs {
+                        if m.trim().is_empty() { continue; }
+                        messages.push(json!({"role": "user", "content": &m}));
+                        self.transcript.push(AgentTranscriptEntry::User { content: m });
+                    }
+                    continue; // re-enter loop with new messages
+                }
                 self.remember_exchange(trimmed, content);
                 self.completed_turns += 1;
                 self.transcript.push(AgentTranscriptEntry::Assistant {
@@ -1527,7 +1596,16 @@ struct RuntimeShellAgentBackend<'a, H: AgentToolHost + ?Sized> {
 
 impl<'a, H: AgentToolHost + ?Sized> AgentBackend for RuntimeShellAgentBackend<'a, H> {
     fn system_prompt(&self) -> String {
-        shell_agent_system_prompt().to_string()
+        let mut prompt = shell_agent_system_prompt().to_string();
+        let hints = self.host.agent_plugin_hints();
+        if !hints.is_empty() {
+            prompt.push_str("\n\n--- Plugin-specific instructions ---\n\n");
+            for hint in &hints {
+                prompt.push_str(hint);
+                prompt.push_str("\n\n");
+            }
+        }
+        prompt
     }
 
     fn tool_specs(&self) -> Vec<AgentToolSpec> {
@@ -1810,28 +1888,11 @@ fn shell_agent_tools() -> Vec<AgentToolSpec> {
 
 fn shell_agent_system_prompt() -> &'static str {
     "You are the Cordis shell agent running inside the cordis-runtime serve REPL.\n\
-You are helping the user operate the live runtime from a shell window.\n\
 You can read source files, list directories, search code, write files, replace text in files, run shell commands (cargo build/test/check), inspect runtime status, list plugins/nodes, invoke plugins, execute targets, and reload the runtime.\n\
 \n\
-QQ GROUP CHAT MODE — when you receive messages forwarded from a QQ group:\n\
-- You are running in a QQ group. Messages may be casual chat NOT directed at you.\n\
-- CRITICAL: Always decide whether the message is actually talking to YOU before responding.\n\
-- A message is directed at you if:\n\
-  - Someone explicitly mentions your name, \"机器人\", \"bot\", or \"Cordis\"\n\
-  - Someone asks a direct question (even without @mention)\n\
-  - Someone gives a clear command or instruction\n\
-  - The message has a question word (how, why, what, when, where, 怎么, 为什么, 如何, 帮我)\n\
-- A message is NOT directed at you if:\n\
-  - It's casual chat between group members\n\
-  - It's an emoji, sticker, or single-word reply\n\
-  - It's someone talking about another person/topic without involving you\n\
-  - It's a statement not asking for anything\n\
-- If the message is NOT directed at you, reply with EXACTLY: IGNORE\n\
-  (this single word, nothing else — the caller will skip it)\n\
-- If the message IS directed at you, reply normally — be concise and helpful.\n\
-  Your reply will be sent directly to the QQ group.\n\
-- To send a proactive notification to a QQ group, use:\n\
-  invoke_plugin(qq, qq_send, {\"node_id\":\"qq_send\",\"target\":\"group:<id>\",\"message\":\"<text>\"})\n\
+Plugins may provide additional instructions (chat mode protocols, etc.) — see the \"plugin-specific instructions\" section below if present.\n\
+\n\
+Before calling any tool that may block for more than a moment, tell the user what you are about to do. If the platform you're talking through has a send-message ability (check available plugins), use it to send a brief heads-up. Then report the outcome when done. Never go silent for long.\n\
 \n\
 SAFETY RULES — never do these without explicit user request:\n\
 - NEVER remove a plugin from its parent's `children` list in Cargo.toml.\n\
@@ -1868,7 +1929,11 @@ When the user asks you to add a feature or fix a bug, follow this workflow:\n\
 7. If something goes wrong, use revert_changes to undo, then try a different approach.\n\
 Always verify edits compile before claiming success. If a command fails, read the error output and fix it.\n\
 Prefer concise, operator-friendly replies. Mention important tool outcomes plainly.\n\
-Do not invent runtime state or claim a command succeeded unless a tool confirmed it."
+Do not invent runtime state or claim a command succeeded unless a tool confirmed it.\n\
+\n\
+CRITICAL: Your reply must be one JSON object, nothing else.\n\
+If the message is directed at you or needs a reply: {\"action\":\"respond\",\"message\":\"your reply here\"}\n\
+If the message is NOT directed at you and needs no reply: {\"action\":\"suspend\"}"
 }
 
 fn resolve_api_key(config: &LlmApiConfig) -> Result<String, RuntimeError> {

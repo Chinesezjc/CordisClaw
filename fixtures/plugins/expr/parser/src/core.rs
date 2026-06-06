@@ -38,6 +38,9 @@ pub enum ExprAst {
         lhs: Box<ExprAst>,
         rhs: Box<ExprAst>,
     },
+    Factorial {
+        expr: Box<ExprAst>,
+    },
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -187,43 +190,57 @@ impl<'a> Parser<'a> {
             });
         };
 
-        match &token.kind {
+        let mut expr = match &token.kind {
             TokenKind::Number(value) => {
                 self.bump();
-                Ok(ExprAst::Number(*value))
+                ExprAst::Number(*value)
             }
             TokenKind::Plus => {
                 self.bump();
-                let expr = self.parse_factor()?;
-                Ok(ExprAst::Unary {
+                let inner = self.parse_factor()?;
+                ExprAst::Unary {
                     op: UnaryOp::Plus,
-                    expr: Box::new(expr),
-                })
+                    expr: Box::new(inner),
+                }
             }
             TokenKind::Minus => {
                 self.bump();
-                let expr = self.parse_factor()?;
-                Ok(ExprAst::Unary {
+                let inner = self.parse_factor()?;
+                ExprAst::Unary {
                     op: UnaryOp::Minus,
-                    expr: Box::new(expr),
-                })
+                    expr: Box::new(inner),
+                }
             }
             TokenKind::LParen => {
                 self.bump();
-                let expr = self.parse_expr()?;
+                let inner = self.parse_expr()?;
                 match self.bump() {
                     Some(Token {
                         kind: TokenKind::RParen,
                         ..
-                    }) => Ok(expr),
-                    _ => Err(ParseError::MissingRightParen {
-                        position: self.current_position(),
-                    }),
+                    }) => inner,
+                    _ => {
+                        return Err(ParseError::MissingRightParen {
+                            position: self.current_position(),
+                        })
+                    }
                 }
             }
-            _ => Err(ParseError::ExpectedNumber {
-                position: token.position,
-            }),
+            _ => {
+                return Err(ParseError::ExpectedNumber {
+                    position: token.position,
+                })
+            }
+        };
+
+        // Postfix factorial: binds tighter than any other operator.
+        while let Some(TokenKind::Exclamation) = self.peek().map(|t| &t.kind) {
+            self.bump();
+            expr = ExprAst::Factorial {
+                expr: Box::new(expr),
+            };
         }
+
+        Ok(expr)
     }
 }

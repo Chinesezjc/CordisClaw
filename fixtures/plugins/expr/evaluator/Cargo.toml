@@ -9,7 +9,7 @@ crate-type = ["rlib", "dylib"]
 [package.metadata.cordis]
 plugin_path = "expr/evaluator"
 abi_kind = "rust"
-declared_nodes = ["expr_evaluator"]
+declared_nodes = ["expr_eval"]
 children = [
   { source = "./add", required = true, grants = [] },
   { source = "./sub", required = true, grants = [] },
@@ -17,6 +17,7 @@ children = [
   { source = "./div", required = true, grants = [] },
   { source = "./modulo", required = true, grants = [] },
   { source = "./pow", required = true, grants = [] },
+  { source = "./factorial", required = true, grants = [] },
 ]
 
 [package.metadata.cordis.abi_fingerprint]

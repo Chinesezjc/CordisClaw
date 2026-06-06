@@ -1,5 +1,5 @@
 [workspace]
-members = ["root", "expr", "shell", "qq", "web", "git"]
+members = ["root", "expr", "shell", "qq", "web", "git", "vision"]
 exclude = [
   "expr/lexer",
   "expr/parser",
@@ -10,5 +10,6 @@ exclude = [
   "expr/evaluator/div",
   "expr/evaluator/pow",
   "expr/evaluator/modulo",
+  "expr/evaluator/factorial",
 ]
 resolver = "2"

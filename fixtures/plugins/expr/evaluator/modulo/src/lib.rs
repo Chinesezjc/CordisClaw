@@ -53,6 +53,7 @@ fn docs_value() -> cordis_plugin_sdk::PluginDocs {
             &[],
             &["modulo by zero"],
         )],
+    None
     )
 }
 
