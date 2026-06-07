@@ -18,6 +18,7 @@ use serde_json::{json, Value};
 use std::collections::VecDeque;
 use std::sync::Mutex;
 use std::thread;
+extern "C" { fn _cordis_agent_trigger(msg: *const std::ffi::c_char); }
 
 // ---------------------------------------------------------------------------
 // Plugin state
@@ -834,7 +835,7 @@ QQ GROUP CHAT MODE — you are running in a QQ group. Messages may be casual cha
 CRITICAL: Always decide whether the message is actually talking to YOU before responding.\n\
 A message IS directed at you if: mentions \"机器人\", \"bot\", \"Cordis\"; asks a direct question; gives a command; has question words (how, why, what, 怎么, 为什么, 如何, 帮我).\n\
 A message is NOT directed at you if: casual chat between members; emoji/sticker/single-word; talking about someone else; statements not asking for anything.\n\
-If NOT directed at you: use {\"action\":\"ignore\"}.\n\
+If NOT directed at you: use {\"action\":\"suspend\"}.\n\
 If directed at you: use {\"action\":\"respond\",\"message\":\"your reply here\"}.\n\
 \n\
 To send a progress update or proactive message to the group you're talking to:\n\

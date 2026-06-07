@@ -74,7 +74,7 @@ pub struct PluginDocs {
     pub nodes: Vec<NodeDoc>,
     /// Optional hint injected into the Agent's system prompt when this plugin
     /// is loaded. Use for plugin-specific usage instructions, protocol
-    /// conventions (e.g. "reply IGNORE for casual chat"), or behavioural
+    /// conventions (e.g. "output suspend for casual chat"), or behavioural
     /// rules that the Agent should follow when interacting with this plugin.
     #[serde(default)]
     pub system_hint: Option<String>,
