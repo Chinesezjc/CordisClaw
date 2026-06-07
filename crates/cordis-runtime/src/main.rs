@@ -16,7 +16,7 @@ use cordis_runtime::plugin::tooling::{
     PrepareMode,
 };
 use serde_json::{json, Value};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -291,71 +291,62 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 while let Ok(m) = rx.try_recv() {
                     msgs.push(m);
                 }
-                let group_id = msgs.last()
-                    .and_then(|msg| {
-                        let rest = msg.strip_prefix("[QQ group from ")?;
-                        let end = rest.find("]: ")?;
-                        let prefix = &rest[..end];
-                        let gid = prefix.split_once(" (user ").map(|(g, _)| g).unwrap_or(prefix);
-                        Some(gid.to_string())
-                    }).unwrap_or_default();
-                if group_id.is_empty() { continue; }
-                let combined = msgs.join("\n");
-                eprintln!("inbox: [{}] batch {} msgs", group_id, msgs.len());
-                match host.agent_send(&session_id_bg, &combined) {
-                    Ok(reply) => {
-                        let raw = reply.content.trim().to_string();
-                        if raw.is_empty() { continue; }
-                        // Preprocess: escape literal newlines inside JSON strings so that
-                        // serde_json can parse the Agent's output even when the message
-                        // contains bare line breaks (which are illegal in JSON strings).
-                        let mut fixed = String::with_capacity(raw.len());
-                        let mut in_string = false;
-                        let mut escape = false;
-                        for ch in raw.chars() {
-                            match ch {
-                                '"' if !escape => {
-                                    in_string = !in_string;
-                                    fixed.push('"');
+                // Group by group_id so replies never leak across groups.
+                let mut by_group: BTreeMap<String, Vec<String>> = BTreeMap::new();
+                for msg in msgs {
+                    let gid = msg.strip_prefix("[QQ group from ")
+                        .and_then(|rest| rest.find("]: ").map(|end| &rest[..end]))
+                        .map(|prefix| prefix.split_once(" (user ").map(|(g, _)| g).unwrap_or(prefix).to_string())
+                        .unwrap_or_default();
+                    if !gid.is_empty() {
+                        by_group.entry(gid).or_default().push(msg);
+                    }
+                }
+                for (group_id, group_msgs) in &by_group {
+                    if group_id.is_empty() || group_msgs.is_empty() { continue; }
+                    let combined = group_msgs.join("\n");
+                    eprintln!("inbox: [{group_id}] batch {} msgs", group_msgs.len());
+                    match host.agent_send(&session_id_bg, &combined) {
+                        Ok(reply) => {
+                            let raw = reply.content.trim().to_string();
+                            if raw.is_empty() { continue; }
+                            let mut fixed = String::with_capacity(raw.len());
+                            let mut in_string = false;
+                            let mut escape = false;
+                            for ch in raw.chars() {
+                                match ch {
+                                    '"' if !escape => { in_string = !in_string; fixed.push('"'); }
+                                    '\n' if in_string => fixed.push_str("\\n"),
+                                    _ => fixed.push(ch),
                                 }
-                                '\n' if in_string => fixed.push_str("\\n"),
-                                _ => fixed.push(ch),
+                                escape = !escape && ch == '\\';
                             }
-                            escape = !escape && ch == '\\';
-                        }
-                        // Parse as JSON: {"action":"respond","message":"..."} or {"action":"suspend"}
-                        match serde_json::from_str::<Value>(&fixed) {
-                            Ok(ref cmd) if cmd.get("action").and_then(|v| v.as_str()) == Some("suspend") => {
-                                eprintln!("inbox: session suspended");
-                            }
-                            Ok(ref cmd) if cmd.get("action").and_then(|v| v.as_str()) == Some("respond") => {
-                                let msg = cmd.get("message").and_then(|v| v.as_str()).unwrap_or("");
-                                if !msg.is_empty() {
-                                    eprintln!("inbox: agent reply: {}...", msg.chars().take(100).collect::<String>());
-                                    let payload = serde_json::json!({
-                                        "node_id": "qq_send",
-                                        "target": format!("group:{}", group_id),
-                                        "message": msg,
-                                        "payload": {
-                                            "onebot_url": "http://127.0.0.1:5700",
-                                            "access_token": "1145141919810",
-                                        },
-                                    });
-                                    match host.invoke("qq", "qq_send", payload.to_string()) {
-                                        Ok(_) => eprintln!("inbox: qq_send OK"),
-                                        Err(e) => eprintln!("inbox: qq_send failed: {e}"),
+                            match serde_json::from_str::<Value>(&fixed) {
+                                Ok(ref cmd) if cmd.get("action").and_then(|v| v.as_str()) == Some("suspend") => {
+                                    eprintln!("inbox: session suspended");
+                                }
+                                Ok(ref cmd) if cmd.get("action").and_then(|v| v.as_str()) == Some("respond") => {
+                                    let msg = cmd.get("message").and_then(|v| v.as_str()).unwrap_or("");
+                                    if !msg.is_empty() {
+                                        eprintln!("inbox: agent reply: {}...", msg.chars().take(100).collect::<String>());
+                                        let payload = serde_json::json!({
+                                            "node_id": "qq_send",
+                                            "target": format!("group:{}", group_id),
+                                            "message": msg,
+                                            "payload": { "onebot_url": "http://127.0.0.1:5700", "access_token": "1145141919810" },
+                                        });
+                                        match host.invoke("qq", "qq_send", payload.to_string()) {
+                                            Ok(_) => eprintln!("inbox: qq_send OK"),
+                                            Err(e) => eprintln!("inbox: qq_send failed: {e}"),
+                                        }
                                     }
                                 }
-                            }
-                            Ok(_) => {
-                                eprintln!("inbox: unknown JSON action, dropping");
-                            }
-                            Err(_) => {
-                                eprintln!("inbox: non-JSON output dropped: {}...", raw.chars().take(100).collect::<String>());
+                                Ok(_) => { eprintln!("inbox: unknown JSON action, dropping"); }
+                                Err(_) => { eprintln!("inbox: non-JSON output dropped: {}...", raw.chars().take(100).collect::<String>()); }
                             }
                         }
+                        Err(e) => eprintln!("inbox: {e}"),
                     }
-                    Err(e) => eprintln!("inbox: {e}"),
                 }
             }
         });
