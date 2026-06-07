@@ -280,7 +280,7 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             AGENT_INBOX_QUEUE = Some(std::sync::Arc::clone(&inject_queue));
         }
         cordis_runtime::agent::set_agent_inject_queue(inject_queue);
-        let session_id_bg = session_id.clone();
+        let mut sessions: BTreeMap<String, String> = BTreeMap::new();
         std::thread::spawn(move || {
             loop {
                 let mut msgs: Vec<String> = Vec::new();
@@ -306,7 +306,10 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     if group_id.is_empty() || group_msgs.is_empty() { continue; }
                     let combined = group_msgs.join("\n");
                     eprintln!("inbox: [{group_id}] batch {} msgs", group_msgs.len());
-                    match host.agent_send(&session_id_bg, &combined) {
+                    let sid = sessions.entry(group_id.clone())
+                        .or_insert_with(|| host.agent_start(AgentSessionKind::RuntimeShell)
+                            .map(|s| s.session_id).unwrap_or_default());
+                    match host.agent_send(sid, &combined) {
                         Ok(reply) => {
                             let raw = reply.content.trim().to_string();
                             if raw.is_empty() { continue; }
