@@ -1,0 +1,200 @@
+{
+  "plugin_id": "filesystem",
+  "plugin_path": "filesystem",
+  "plugin_version": "0.1.0",
+  "abi_version": 2,
+  "command_name": null,
+  "nodes": [
+    {
+      "id": "fs_read",
+      "summary": "Read a file with line numbers.",
+      "input_schema": {
+        "properties": {
+          "limit": {
+            "type": "integer"
+          },
+          "node_id": {
+            "const": "fs_read"
+          },
+          "offset": {
+            "type": "integer"
+          },
+          "path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "node_id",
+          "path"
+        ],
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "lines": {
+            "type": "array"
+          },
+          "ok": {
+            "type": "boolean"
+          },
+          "total_lines": {
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "side_effects": [
+        "reads file from disk"
+      ],
+      "failure_modes": [
+        "path outside whitelist",
+        "file not found"
+      ],
+      "node_type": "router"
+    },
+    {
+      "id": "fs_write",
+      "summary": "Write a file (plugins/ subtree only).",
+      "input_schema": {
+        "properties": {
+          "content": {
+            "type": "string"
+          },
+          "node_id": {
+            "const": "fs_write"
+          },
+          "path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "node_id",
+          "path",
+          "content"
+        ],
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ok": {
+            "type": "boolean"
+          },
+          "path": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "side_effects": [
+        "writes file to disk",
+        "creates parent dirs"
+      ],
+      "failure_modes": [
+        "path outside whitelist",
+        "permission denied"
+      ],
+      "node_type": "router"
+    },
+    {
+      "id": "fs_list",
+      "summary": "List directory contents.",
+      "input_schema": {
+        "properties": {
+          "node_id": {
+            "const": "fs_list"
+          },
+          "path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "node_id"
+        ],
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "entries": {
+            "type": "array"
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ok": {
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      },
+      "side_effects": [
+        "reads directory from disk"
+      ],
+      "failure_modes": [
+        "path outside whitelist"
+      ],
+      "node_type": "router"
+    },
+    {
+      "id": "fs_search",
+      "summary": "Search for a pattern in files.",
+      "input_schema": {
+        "properties": {
+          "node_id": {
+            "const": "fs_search"
+          },
+          "path": {
+            "type": "string"
+          },
+          "pattern": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "node_id",
+          "pattern"
+        ],
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "matches": {
+            "type": "array"
+          },
+          "ok": {
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      },
+      "side_effects": [
+        "reads files from disk"
+      ],
+      "failure_modes": [
+        "path outside whitelist"
+      ],
+      "node_type": "router"
+    }
+  ],
+  "system_hint": null
+}
