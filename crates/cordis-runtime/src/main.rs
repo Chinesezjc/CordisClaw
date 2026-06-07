@@ -333,7 +333,7 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                                             "node_id": "qq_send",
                                             "target": format!("group:{}", group_id),
                                             "message": msg,
-                                            "payload": { "onebot_url": "http://127.0.0.1:5700", "access_token": "1145141919810" },
+                                            "payload": {},
                                         });
                                         match host.invoke("qq", "qq_send", payload.to_string()) {
                                             Ok(_) => eprintln!("inbox: qq_send OK"),

@@ -564,6 +564,14 @@ fn handle_qq_serve(req: &NodeRequest) -> Result<NodeResponse, String> {
         if let Some(t) = req.payload.as_ref().and_then(|p| p.get("access_token")).and_then(|v| v.as_str()) {
             state.access_token = Some(t.to_string());
         }
+        // Persist to config file so subsequent dylib loads (via invoke_plugin) can read them.
+        let _ = std::fs::write(
+            "/root/CordisClaw/fixtures/.cordis-drafts/qq_runtime_config.json",
+            &serde_json::json!({
+                "onebot_url": state.onebot_url,
+                "access_token": state.access_token,
+            }).to_string(),
+        );
         if let Some(u) = req.payload.as_ref().and_then(|p| p.get("llm_api_url")).and_then(|v| v.as_str()) {
             state.llm_api_url = Some(u.to_string());
         }
@@ -646,6 +654,12 @@ fn handle_qq_fetch_messages() -> Result<NodeResponse, String> {
     })
 }
 
+fn load_runtime_config() -> Option<serde_json::Value> {
+    let path = "/root/CordisClaw/fixtures/.cordis-drafts/qq_runtime_config.json";
+    let data = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&data).ok()
+}
+
 fn handle_qq_send(req: &NodeRequest) -> Result<NodeResponse, String> {
     let target = req.target.as_deref().unwrap_or("").trim();
     let message = req.message.as_deref().unwrap_or("").trim();
@@ -653,16 +667,18 @@ fn handle_qq_send(req: &NodeRequest) -> Result<NodeResponse, String> {
     if target.is_empty() { return Err("target is required for qq_send".to_string()); }
     if message.is_empty() { return Err("message is required for qq_send".to_string()); }
 
-    // Use payload-supplied config if available, otherwise fall back to STATE.
+    // Read config: payload → STATE → config file (persisted by qq_serve).
     let base_url = req.payload.as_ref()
         .and_then(|p| p.get("onebot_url")).and_then(|v| v.as_str())
         .map(|s| s.to_string())
         .or_else(|| STATE.lock().ok().and_then(|s| s.onebot_url.clone()))
+        .or_else(|| load_runtime_config().and_then(|c| c.get("onebot_url")?.as_str().map(|s| s.to_string())))
         .ok_or("no OneBot URL configured")?;
     let token = req.payload.as_ref()
         .and_then(|p| p.get("access_token")).and_then(|v| v.as_str())
         .map(|s| s.to_string())
-        .or_else(|| STATE.lock().ok().and_then(|s| s.access_token.clone()));
+        .or_else(|| STATE.lock().ok().and_then(|s| s.access_token.clone()))
+        .or_else(|| load_runtime_config().and_then(|c| c.get("access_token")?.as_str().map(|s| s.to_string())));
 
     let (kind, id) = parse_target(target)?;
     let data = match kind {
@@ -839,12 +855,12 @@ If NOT directed at you: use {\"action\":\"suspend\"}.\n\
 If directed at you: use {\"action\":\"respond\",\"message\":\"your reply here\"}.\n\
 \n\
 To send a progress update or proactive message to the group you're talking to:\n\
-  invoke_plugin(qq, qq_send, {\"node_id\":\"qq_send\",\"target\":\"group:<group_id>\",\"message\":\"<your message>\",\"onebot_url\":\"http://127.0.0.1:5700\",\"access_token\":\"1145141919810\"})
+  invoke_plugin(qq, qq_send, {\"node_id\":\"qq_send\",\"target\":\"group:<group_id>\",\"message\":\"<your message>\"})
 Replace <group_id> with the actual group ID from the incoming message.
 Send a brief progress message BEFORE any tool that may take more than a moment (build, test, search, etc.), and a follow-up when the tool completes.
 
 To query group members: invoke_plugin(qq, qq_get_group_members, {\"node_id\":\"qq_get_group_members\",\"target\":\"group:<id>\"})\n\
-To proactively send to a group: invoke_plugin(qq, qq_send, {\"node_id\":\"qq_send\",\"target\":\"group:<id>\",\"message\":\"<text>\",\"onebot_url\":\"http://127.0.0.1:5700\",\"access_token\":\"1145141919810\"})")
+To proactively send to a group: invoke_plugin(qq, qq_send, {\"node_id\":\"qq_send\",\"target\":\"group:<id>\",\"message\":\"<text>\"})")
     )
 }
 
