@@ -313,23 +313,13 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                         Ok(reply) => {
                             let raw = reply.content.trim().to_string();
                             if raw.is_empty() { continue; }
-                            let mut fixed = String::with_capacity(raw.len());
-                            let mut in_string = false;
-                            let mut escape = false;
-                            for ch in raw.chars() {
-                                match ch {
-                                    '"' if !escape => { in_string = !in_string; fixed.push('"'); }
-                                    '\n' if in_string => fixed.push_str("\\n"),
-                                    _ => fixed.push(ch),
-                                }
-                                escape = !escape && ch == '\\';
-                            }
-                            match serde_json::from_str::<Value>(&fixed) {
-                                Ok(ref cmd) if cmd.get("action").and_then(|v| v.as_str()) == Some("suspend") => {
-                                    eprintln!("inbox: session suspended");
-                                }
-                                Ok(ref cmd) if cmd.get("action").and_then(|v| v.as_str()) == Some("respond") => {
-                                    let msg = cmd.get("message").and_then(|v| v.as_str()).unwrap_or("");
+                            // Extract message from Agent's JSON output.  Use prefix matching
+                            // so that literal newlines (illegal in JSON strings) are handled.
+                            if raw.starts_with("{\"action\":\"respond\",\"message\":\"") {
+                                let inner = &raw["{\"action\":\"respond\",\"message\":\"".len()..];
+                                if let Some(msg_end) = inner.rfind("\"}") {
+                                    let msg = &inner[..msg_end];
+                                    let msg = msg.replace("\\n", "\n").replace("\\\"", "\"").replace("\\\\", "\\");
                                     if !msg.is_empty() {
                                         eprintln!("inbox: agent reply: {}...", msg.chars().take(100).collect::<String>());
                                         let payload = serde_json::json!({
@@ -343,10 +333,38 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                                             Err(e) => eprintln!("inbox: qq_send failed: {e}"),
                                         }
                                     }
+                                    continue;
                                 }
-                                Ok(_) => { eprintln!("inbox: unknown JSON action, dropping"); }
-                                Err(_) => { eprintln!("inbox: non-JSON output dropped: {}...", raw.chars().take(100).collect::<String>()); }
                             }
+                            if raw.starts_with("{\"action\":\"suspend\"") {
+                                eprintln!("inbox: session suspended");
+                                continue;
+                            }
+                            // Fallback: standard JSON parse for well-formed output.
+                            if let Ok(cmd) = serde_json::from_str::<Value>(&raw) {
+                                match cmd.get("action").and_then(|v| v.as_str()) {
+                                    Some("suspend") => { eprintln!("inbox: session suspended"); }
+                                    Some("respond") => {
+                                        if let Some(msg) = cmd.get("message").and_then(|v| v.as_str()) {
+                                            if !msg.is_empty() {
+                                                eprintln!("inbox: agent reply (json): {}...", msg.chars().take(100).collect::<String>());
+                                                let payload = serde_json::json!({
+                                                    "node_id": "qq_send",
+                                                    "target": format!("group:{}", group_id),
+                                                    "message": msg,
+                                                    "payload": {},
+                                                });
+                                                match host.invoke("qq", "qq_send", payload.to_string()) {
+                                                    Ok(_) => eprintln!("inbox: qq_send OK"),
+                                                    Err(e) => eprintln!("inbox: qq_send failed: {e}"),
+                                                }
+                                            }
+                                        }
+                                    }
+                                    _ => { eprintln!("inbox: unknown JSON action, dropping"); }
+                                }
+                            }
+                            // Non-JSON — drop silently.
                         }
                         Err(e) => eprintln!("inbox: {e}"),
                     }
