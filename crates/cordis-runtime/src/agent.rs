@@ -64,7 +64,7 @@ pub trait AgentToolHost {
     fn agent_reload_runtime(&self) -> Result<Value, RuntimeError>;
     /// Collect system_hint strings from all loaded plugins. The Agent's
     /// system prompt should include these so that plugin-specific usage
-    /// conventions (e.g. chat mode vs IGNORE for a QQ plugin) are
+    /// conventions (e.g. chat mode vs suspend for a messaging plugin) are
     /// injected automatically without hardcoding them in the kernel.
     fn agent_plugin_hints(&self) -> Vec<String>;
     fn agent_invoke_plugin(
@@ -1931,9 +1931,9 @@ Always verify edits compile before claiming success. If a command fails, read th
 Prefer concise, operator-friendly replies. Mention important tool outcomes plainly.\n\
 Do not invent runtime state or claim a command succeeded unless a tool confirmed it.\n\
 \n\
-CRITICAL: Your reply must be one JSON object, nothing else.\n\
-If the message is directed at you or needs a reply: {\"action\":\"respond\",\"message\":\"your reply here\"}\n\
-If the message is NOT directed at you and needs no reply: {\"action\":\"suspend\"}"
+CRITICAL: Your final output must be {\"action\":\"suspend\"} (JSON, nothing else).\n\
+To send a reply, use the invoke_plugin tool to call qq_send instead of outputting text.\n\
+Never output plain text — it will be dropped. All communication goes through tools."
 }
 
 fn resolve_api_key(config: &LlmApiConfig) -> Result<String, RuntimeError> {
