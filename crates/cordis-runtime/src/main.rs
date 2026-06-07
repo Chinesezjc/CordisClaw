@@ -306,52 +306,53 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     Ok(reply) => {
                         let raw = reply.content.trim().to_string();
                         if raw.is_empty() { continue; }
-                        // Parse JSON output: {"action":"respond","message":"..."} or {"action":"suspend"}
-                        match serde_json::from_str::<Value>(&raw) {
+                        // Preprocess: escape literal newlines inside JSON strings so that
+                        // serde_json can parse the Agent's output even when the message
+                        // contains bare line breaks (which are illegal in JSON strings).
+                        let mut fixed = String::with_capacity(raw.len());
+                        let mut in_string = false;
+                        let mut escape = false;
+                        for ch in raw.chars() {
+                            match ch {
+                                '"' if !escape => {
+                                    in_string = !in_string;
+                                    fixed.push('"');
+                                }
+                                '\n' if in_string => fixed.push_str("\\n"),
+                                _ => fixed.push(ch),
+                            }
+                            escape = !escape && ch == '\\';
+                        }
+                        // Parse as JSON: {"action":"respond","message":"..."} or {"action":"suspend"}
+                        match serde_json::from_str::<Value>(&fixed) {
                             Ok(ref cmd) if cmd.get("action").and_then(|v| v.as_str()) == Some("suspend") => {
                                 eprintln!("inbox: session suspended");
-                                continue;
                             }
                             Ok(ref cmd) if cmd.get("action").and_then(|v| v.as_str()) == Some("respond") => {
                                 let msg = cmd.get("message").and_then(|v| v.as_str()).unwrap_or("");
-                                if msg.is_empty() { continue; }
-                                eprintln!("inbox: agent reply: {}...", msg.chars().take(100).collect::<String>());
-                                let payload = serde_json::json!({
-                                    "node_id": "qq_send",
-                                    "target": format!("group:{}", group_id),
-                                    "message": msg,
-                                    "payload": {
-                                        "onebot_url": "http://127.0.0.1:5700",
-                                        "access_token": "1145141919810",
-                                    },
-                                });
-                                match host.invoke("qq", "qq_send", payload.to_string()) {
-                                    Ok(_) => eprintln!("inbox: qq_send OK"),
-                                    Err(e) => eprintln!("inbox: qq_send failed: {e}"),
+                                if !msg.is_empty() {
+                                    eprintln!("inbox: agent reply: {}...", msg.chars().take(100).collect::<String>());
+                                    let payload = serde_json::json!({
+                                        "node_id": "qq_send",
+                                        "target": format!("group:{}", group_id),
+                                        "message": msg,
+                                        "payload": {
+                                            "onebot_url": "http://127.0.0.1:5700",
+                                            "access_token": "1145141919810",
+                                        },
+                                    });
+                                    match host.invoke("qq", "qq_send", payload.to_string()) {
+                                        Ok(_) => eprintln!("inbox: qq_send OK"),
+                                        Err(e) => eprintln!("inbox: qq_send failed: {e}"),
+                                    }
                                 }
-                                continue;
                             }
                             Ok(_) => {
-                                // Parsed as JSON but unknown action — don't send.
                                 eprintln!("inbox: unknown JSON action, dropping");
-                                continue;
                             }
-                            Err(_) => {}
-                        }
-                        // Fallback: plain text that failed JSON parse.
-                        eprintln!("inbox: agent reply (plain): {}...", raw.chars().take(100).collect::<String>());
-                        let payload = serde_json::json!({
-                            "node_id": "qq_send",
-                            "target": format!("group:{}", group_id),
-                            "message": raw,
-                            "payload": {
-                                "onebot_url": "http://127.0.0.1:5700",
-                                "access_token": "1145141919810",
-                            },
-                        });
-                        match host.invoke("qq", "qq_send", payload.to_string()) {
-                            Ok(_) => eprintln!("inbox: qq_send OK"),
-                            Err(e) => eprintln!("inbox: qq_send failed: {e}"),
+                            Err(_) => {
+                                eprintln!("inbox: non-JSON output dropped: {}...", raw.chars().take(100).collect::<String>());
+                            }
                         }
                     }
                     Err(e) => eprintln!("inbox: {e}"),
