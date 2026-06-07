@@ -19,7 +19,6 @@ use std::collections::VecDeque;
 use std::sync::Mutex;
 use std::thread;
 extern "C" { fn _cordis_agent_trigger(msg: *const std::ffi::c_char); }
-
 // ---------------------------------------------------------------------------
 // Plugin state
 // ---------------------------------------------------------------------------
@@ -564,14 +563,6 @@ fn handle_qq_serve(req: &NodeRequest) -> Result<NodeResponse, String> {
         if let Some(t) = req.payload.as_ref().and_then(|p| p.get("access_token")).and_then(|v| v.as_str()) {
             state.access_token = Some(t.to_string());
         }
-        // Persist to config file so subsequent dylib loads (via invoke_plugin) can read them.
-        let _ = std::fs::write(
-            "/root/CordisClaw/fixtures/.cordis-drafts/qq_runtime_config.json",
-            &serde_json::json!({
-                "onebot_url": state.onebot_url,
-                "access_token": state.access_token,
-            }).to_string(),
-        );
         if let Some(u) = req.payload.as_ref().and_then(|p| p.get("llm_api_url")).and_then(|v| v.as_str()) {
             state.llm_api_url = Some(u.to_string());
         }
@@ -589,21 +580,20 @@ fn handle_qq_serve(req: &NodeRequest) -> Result<NodeResponse, String> {
     }
 
     // Start HTTP server + WebSocket server in background threads.
-    let running = *SERVER_RUNNING.lock().map_err(|e| format!("lock: {e}"))?;
-    if !running {
-        thread::spawn(move || {
-            if let Err(e) = start_event_server(port) {
-                eprintln!("qq_serve HTTP server error: {e}");
-            }
-        });
-        thread::spawn(|| {
-            if let Err(e) = start_ws_server() {
-                eprintln!("qq_serve WS server error: {e}");
-            }
-        });
-        // Give servers a moment to start.
-        thread::sleep(std::time::Duration::from_millis(100));
-        start_agent_poller();
+    {
+        let mut running = SERVER_RUNNING.lock().map_err(|e| format!("lock: {e}"))?;
+        if !*running {
+            *running = true;
+            drop(running);
+            thread::spawn(move || {
+                if let Err(e) = start_event_server(port) {
+                    eprintln!("qq_serve HTTP server error: {e}");
+                }
+            });
+            // Give the server a moment to start.
+            thread::sleep(std::time::Duration::from_millis(100));
+            start_agent_poller();
+        }
     }
 
     Ok(NodeResponse {
@@ -619,20 +609,24 @@ fn handle_qq_serve(req: &NodeRequest) -> Result<NodeResponse, String> {
     })
 }
 
+fn should_process(text: &str) -> bool {
+    if text.len() <= 2 { return false; }
+    if text.starts_with('/') || text.starts_with("[CQ:") { return false; }
+    true
+}
+
 fn start_agent_poller() {
     thread::spawn(move || {
         thread::sleep(std::time::Duration::from_secs(2));
         loop {
             let msgs: Vec<IncomingMessage> = {
-                let mut queue = MESSAGE_QUEUE.lock().unwrap_or_else(|poison| poison.into_inner());
-                let drained: Vec<_> = queue.drain(..).collect();
-                drained
+                let mut queue = MESSAGE_QUEUE.lock().unwrap_or_else(|p| p.into_inner());
+                queue.drain(..).collect()
             };
             for msg in msgs {
+                if !should_process(&msg.message) { continue; }
                 let prompt = format!("[QQ group from {} (user {})]: {}", msg.sender_id, msg.user_id, msg.message);
-                if should_process(&msg.message) {
-                    cordis_plugin_sdk::agent_trigger(&prompt);
-                }
+                cordis_plugin_sdk::agent_trigger(&prompt);
             }
             thread::sleep(std::time::Duration::from_secs(5));
         }
@@ -888,16 +882,6 @@ fn api_handle(req: PluginRequest) -> PluginResponse {
             error: Some(e),
         }),
     }
-}
-
-// ── Agent poller ───────────────────────────────────────────────────────
-use std::time::Duration;
-
-fn should_process(text: &str) -> bool {
-    if text.is_empty() || text.starts_with("[CQ:") { return false; }
-    if text.starts_with('/') && !text.contains("Cordis") { return false; }
-    if text.chars().count() <= 2 { return false; }
-    true
 }
 
 export_plugin_api! {

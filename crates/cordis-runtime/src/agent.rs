@@ -1672,10 +1672,6 @@ impl<'a, H: AgentToolHost + ?Sized> AgentBackend for RuntimeShellAgentBackend<'a
                 self.host
                     .agent_replace_in_file(&args.path, &args.find, &args.replace)
             }
-            AGENT_TOOL_RUN_COMMAND => {
-                let args = parse_tool_value_arguments::<RunCommandArgs>(arguments, name)?;
-                self.host.agent_run_command(&args.command)
-            }
             AGENT_TOOL_REVERT_CHANGES => {
                 parse_tool_value_arguments::<EmptyArgs>(arguments, name)?;
                 self.host.agent_revert_changes()
@@ -1863,18 +1859,6 @@ fn shell_agent_tools() -> Vec<AgentToolSpec> {
             }),
         },
         AgentToolSpec {
-            name: AGENT_TOOL_RUN_COMMAND,
-            description: "Run a shell command inside the fixtures root directory. Use for cargo build, cargo test, cargo check, etc. Returns stdout, stderr, and exit code. Commands are NOT sandboxed beyond running in the fixtures directory.",
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "command": { "type": "string", "description": "Shell command to execute." }
-                },
-                "required": ["command"],
-                "additionalProperties": false,
-            }),
-        },
-        AgentToolSpec {
             name: AGENT_TOOL_REVERT_CHANGES,
             description: "Revert all file changes made by write_file and replace_in_file in this session. Restores all touched files to their original content.",
             parameters: json!({
@@ -1888,7 +1872,7 @@ fn shell_agent_tools() -> Vec<AgentToolSpec> {
 
 fn shell_agent_system_prompt() -> &'static str {
     "You are the Cordis shell agent running inside the cordis-runtime serve REPL.\n\
-You can read source files, list directories, search code, write files, replace text in files, run shell commands (cargo build/test/check), inspect runtime status, list plugins/nodes, invoke plugins, execute targets, and reload the runtime.\n\
+You can read source files, list directories, search code, write files, replace text in files, inspect runtime status, list plugins/nodes, invoke plugins, execute targets, and reload the runtime.\n\
 \n\
 Plugins may provide additional instructions (chat mode protocols, etc.) — see the \"plugin-specific instructions\" section below if present.\n\
 \n\
@@ -1915,7 +1899,7 @@ IMPORTANT — workspace layout:\n\
   Example: `cd plugins && cargo test -p expr 2>&1`\n\
 - Plugin source files are under `plugins/<name>/src/`, e.g. `plugins/expr/src/lib.rs`.\n\
 - The fixtures root is `./`, but cargo needs `plugins/` as the working directory.\n\
-- When creating NEW files/directories under plugins/, use `run_command` with shell commands\n\
+- When creating NEW files/directories under plugins/, use write_file or invoke_plugin\n\
   (e.g. `mkdir -p plugins/expr/evaluator/pow/src`) first — write_file may reject non-existent paths.\n\
 - After a successful `cargo build`, the built .so files need to be synced to `artifacts/`\n\
   for the runtime to pick them up:\n\
@@ -1925,7 +1909,7 @@ IMPORTANT — workspace layout:\n\
 When the user asks you to add a feature or fix a bug, follow this workflow:\n\
 1. Read the relevant source files to understand the codebase structure.\n\
 2. Plan the edits needed (which files to create/modify).\n\
-3. Make the edits using write_file and replace_in_file (and run_command for new files/dirs).\n\
+3. Make the edits using write_file and replace_in_file (or invoke_plugin for new files/dirs).\n\
 4. Run `cd plugins && cargo build 2>&1` to verify compilation.\n\
 5. Run `cd plugins && cargo test -p <name> 2>&1` to verify correctness.\n\
 6. Sync artifacts and reload for runtime changes (if needed).\n\
