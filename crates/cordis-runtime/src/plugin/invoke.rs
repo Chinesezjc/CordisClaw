@@ -186,6 +186,14 @@ pub fn invoke_registered_plugin(
         });
     }
 
+    // Inject node_id into the payload so plugins don't need to duplicate it.
+    let mut payload_value: serde_json::Value = serde_json::from_str(&payload)
+        .unwrap_or(serde_json::Value::Null);
+    if let Some(obj) = payload_value.as_object_mut() {
+        obj.entry("node_id").or_insert_with(|| serde_json::json!(node_id));
+    }
+    let payload = serde_json::to_string(&payload_value).unwrap_or(payload);
+
     let response = (api.handle)(PluginRequest { payload });
 
     // For Task nodes: keep the dylib alive and look up the Service VTable.

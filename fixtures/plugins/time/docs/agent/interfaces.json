@@ -1,0 +1,60 @@
+{
+  "plugin_id": "time",
+  "plugin_path": "time",
+  "plugin_version": "0.1.0",
+  "abi_version": 2,
+  "command_name": "Time",
+  "nodes": [
+    {
+      "id": "time_now",
+      "summary": "Get the current system time. Returns a Unix timestamp and a human-readable datetime string. Supports an optional format string (chrono strftime syntax).",
+      "input_schema": {
+        "properties": {
+          "format": {
+            "description": "Optional chrono strftime format string, e.g. %Y-%m-%d %H:%M:%S",
+            "type": "string"
+          },
+          "node_id": {
+            "const": "time_now",
+            "type": "string"
+          }
+        },
+        "required": [
+          "node_id"
+        ],
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "datetime": {
+            "description": "Formatted datetime string",
+            "type": "string"
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "node_id": {
+            "type": "string"
+          },
+          "ok": {
+            "type": "boolean"
+          },
+          "timestamp": {
+            "description": "Unix timestamp (seconds)",
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "side_effects": [],
+      "failure_modes": [
+        "unknown node_id"
+      ],
+      "node_type": "router"
+    }
+  ],
+  "system_hint": null
+}
