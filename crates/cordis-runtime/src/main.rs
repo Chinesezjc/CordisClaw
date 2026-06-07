@@ -313,13 +313,45 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                         Ok(reply) => {
                             let raw = reply.content.trim().to_string();
                             if raw.is_empty() { continue; }
-                            // Extract message from Agent's JSON output.  Use prefix matching
-                            // so that literal newlines (illegal in JSON strings) are handled.
-                            if raw.starts_with("{\"action\":\"respond\",\"message\":\"") {
-                                let inner = &raw["{\"action\":\"respond\",\"message\":\"".len()..];
-                                if let Some(msg_end) = inner.rfind("\"}") {
-                                    let msg = &inner[..msg_end];
-                                    let msg = msg.replace("\\n", "\n").replace("\\\"", "\"").replace("\\\\", "\\");
+                            // Preprocess: escape newlines and embedded quotes inside JSON
+                            // strings so serde_json can parse even when the model outputs
+                            // literal line breaks or bare double-quotes in message values.
+                            let chars: Vec<char> = raw.chars().collect();
+                            let mut out = String::with_capacity(raw.len() + 64);
+                            let mut in_string = false;
+                            let mut i = 0;
+                            while i < chars.len() {
+                                let ch = chars[i];
+                                if ch == '"' {
+                                    if in_string {
+                                        // Peek ahead: if next non-whitespace is : , } or ]
+                                        // this is a JSON structure close, otherwise embedded quote.
+                                        let mut j = i + 1;
+                                        while j < chars.len() && chars[j] == ' ' { j += 1; }
+                                        let next = chars.get(j).copied();
+                                        if matches!(next, Some(':') | Some(',') | Some('}') | Some(']') | None) {
+                                            in_string = false;
+                                            out.push('"');
+                                        } else {
+                                            out.push_str("\\\"");
+                                        }
+                                    } else {
+                                        in_string = true;
+                                        out.push('"');
+                                    }
+                                } else if ch == '\n' && in_string {
+                                    out.push_str("\\n");
+                                } else {
+                                    out.push(ch);
+                                }
+                                i += 1;
+                            }
+                            match serde_json::from_str::<Value>(&out) {
+                                Ok(ref cmd) if cmd.get("action").and_then(|v| v.as_str()) == Some("suspend") => {
+                                    eprintln!("inbox: session suspended");
+                                }
+                                Ok(ref cmd) if cmd.get("action").and_then(|v| v.as_str()) == Some("respond") => {
+                                    let msg = cmd.get("message").and_then(|v| v.as_str()).unwrap_or("");
                                     if !msg.is_empty() {
                                         eprintln!("inbox: agent reply: {}...", msg.chars().take(100).collect::<String>());
                                         let payload = serde_json::json!({
@@ -333,38 +365,10 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                                             Err(e) => eprintln!("inbox: qq_send failed: {e}"),
                                         }
                                     }
-                                    continue;
                                 }
+                                Ok(_) => { eprintln!("inbox: unknown JSON action, dropping"); }
+                                Err(_) => { eprintln!("inbox: JSON parse failed, dropping"); }
                             }
-                            if raw.starts_with("{\"action\":\"suspend\"") {
-                                eprintln!("inbox: session suspended");
-                                continue;
-                            }
-                            // Fallback: standard JSON parse for well-formed output.
-                            if let Ok(cmd) = serde_json::from_str::<Value>(&raw) {
-                                match cmd.get("action").and_then(|v| v.as_str()) {
-                                    Some("suspend") => { eprintln!("inbox: session suspended"); }
-                                    Some("respond") => {
-                                        if let Some(msg) = cmd.get("message").and_then(|v| v.as_str()) {
-                                            if !msg.is_empty() {
-                                                eprintln!("inbox: agent reply (json): {}...", msg.chars().take(100).collect::<String>());
-                                                let payload = serde_json::json!({
-                                                    "node_id": "qq_send",
-                                                    "target": format!("group:{}", group_id),
-                                                    "message": msg,
-                                                    "payload": {},
-                                                });
-                                                match host.invoke("qq", "qq_send", payload.to_string()) {
-                                                    Ok(_) => eprintln!("inbox: qq_send OK"),
-                                                    Err(e) => eprintln!("inbox: qq_send failed: {e}"),
-                                                }
-                                            }
-                                        }
-                                    }
-                                    _ => { eprintln!("inbox: unknown JSON action, dropping"); }
-                                }
-                            }
-                            // Non-JSON — drop silently.
                         }
                         Err(e) => eprintln!("inbox: {e}"),
                     }
