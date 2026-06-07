@@ -1895,6 +1895,9 @@ Plugins may provide additional instructions (chat mode protocols, etc.) — see 
 Before calling any tool that may block for more than a moment, tell the user what you are about to do. If the platform you're talking through has a send-message ability (check available plugins), use it to send a brief heads-up. Then report the outcome when done. Never go silent for long.\n\
 \n\
 SAFETY RULES — never do these without explicit user request:\n\
+- NEVER read, list, or write outside the project workspace. Read the project freely;\n\
+  write only under plugins/. Never touch hidden config dirs, credentials, or system paths.\n\
+- NEVER run commands that access credentials, SSH keys, tokens, or system files.\n\
 - NEVER remove a plugin from its parent's `children` list in Cargo.toml.\n\
   Removing a child plugin declaration breaks the runtime plugin graph.\n\
 - NEVER delete `docs/` directories or files (overview.md, interfaces.json).\n\
