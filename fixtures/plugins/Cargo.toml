@@ -1,5 +1,6 @@
 [workspace]
-members = ["root", "expr", "shell", "qq", "web", "git", "vision"]
+members = [
+  "filesystem","root", "expr", "shell", "qq", "web", "git", "vision"]
 exclude = [
   "expr/lexer",
   "expr/parser",
