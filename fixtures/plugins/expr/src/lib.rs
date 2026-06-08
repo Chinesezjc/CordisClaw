@@ -62,7 +62,7 @@ fn docs_value() -> cordis_plugin_sdk::PluginDocs {
             }),
             &[],
             &["division by zero", "invalid number", "unexpected token"],
-        )],
+        ).with_agent_accessible()],
         None
     )
 }

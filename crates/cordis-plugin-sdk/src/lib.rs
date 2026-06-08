@@ -95,6 +95,17 @@ pub struct NodeDoc {
     /// Terminal.  Defaults to Router for backward compatibility.
     #[serde(default)]
     pub node_type: NodeType,
+    /// Set to true if the Agent (LLM) is allowed to invoke this node
+    /// directly via invoke_plugin/execute_target.  Default: false.
+    #[serde(default)]
+    pub agent_accessible: bool,
+}
+
+impl NodeDoc {
+    pub fn with_agent_accessible(mut self) -> Self {
+        self.agent_accessible = true;
+        self
+    }
 }
 
 /// Class of execution semantics for a plugin node.
@@ -197,6 +208,7 @@ pub fn node_doc(
         side_effects: side_effects.iter().map(|v| (*v).to_string()).collect(),
         failure_modes: failure_modes.iter().map(|v| (*v).to_string()).collect(),
         node_type: NodeType::Router,
+        agent_accessible: false,
     }
 }
 
@@ -216,6 +228,7 @@ pub fn task_node_doc(
         side_effects: side_effects.iter().map(|v| (*v).to_string()).collect(),
         failure_modes: failure_modes.iter().map(|v| (*v).to_string()).collect(),
         node_type: NodeType::Task,
+        agent_accessible: false,
     }
 }
 

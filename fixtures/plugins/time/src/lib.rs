@@ -7,9 +7,9 @@ use cordis_plugin_sdk::{
     export_plugin_api, json_response, node_doc, plugin_docs, AbiFingerprint,
     PluginRequest, PluginResponse,
 };
-use chrono::Local;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 // ---------------------------------------------------------------------------
 // Request / Response types
@@ -38,14 +38,34 @@ struct NodeResponse {
 // Handlers
 // ---------------------------------------------------------------------------
 
-fn handle_time_now(format: Option<&str>) -> Result<NodeResponse, String> {
-    let now = Local::now();
-    let timestamp = now.timestamp();
-
-    let datetime = match format {
-        Some(fmt) => now.format(fmt).to_string(),
-        None => now.format("%Y-%m-%d %H:%M:%S").to_string(),
-    };
+fn handle_time_now(_format: Option<&str>) -> Result<NodeResponse, String> {
+    let dur = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| format!("system time error: {e}"))?;
+    let timestamp = dur.as_secs() as i64;
+    // Convert to UTC datetime string.
+    let secs = timestamp;
+    let days_since_epoch = secs / 86400;
+    // Simple Gregorian calendar calculation (good enough for year 1970-2100).
+    let mut y = 1970i64;
+    let mut d = days_since_epoch;
+    loop {
+        let days_in_year = if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 { 366 } else { 365 };
+        if d < days_in_year { break; }
+        d -= days_in_year;
+        y += 1;
+    }
+    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    let mdays = [31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let mut m = 0usize;
+    while m < 12 && d >= mdays[m] as i64 { d -= mdays[m] as i64; m += 1; }
+    let day = d + 1;
+    let month = m + 1;
+    let remaining = secs % 86400;
+    let h = remaining / 3600;
+    let mi = (remaining % 3600) / 60;
+    let s = remaining % 60;
+    let datetime = format!("{y:04}-{month:02}-{day:02} {h:02}:{mi:02}:{s:02} UTC");
 
     Ok(NodeResponse {
         ok: true,
@@ -97,7 +117,7 @@ fn docs_value() -> cordis_plugin_sdk::PluginDocs {
                 }),
                 &[],
                 &["unknown node_id"],
-            ),
+            ).with_agent_accessible(),
         ],
         None,
     )

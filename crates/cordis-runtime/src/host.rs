@@ -1112,6 +1112,24 @@ impl RuntimeHost {
 
     /// Resolve a relative path within the fixtures root, rejecting traversal
     /// attempts (absolute paths, `..` components) and symlink escapes.
+    pub fn check_agent_accessible(&self, plugin_path: &str, node_id: &str) -> Result<(), RuntimeError> {
+        let snapshot = self.current_snapshot();
+        let registry = snapshot.plugin_registry();
+        let plugin = registry.get(plugin_path).ok_or_else(|| RuntimeError::PluginNotRegistered {
+            plugin_path: plugin_path.to_string(),
+        })?;
+        if let Some(docs) = &plugin.docs {
+            if let Some(node) = docs.nodes.iter().find(|n| n.id == node_id) {
+                if node.agent_accessible {
+                    return Ok(());
+                }
+            }
+        }
+        Err(RuntimeError::InvalidArgument {
+            message: format!("Agent is not allowed to call {plugin_path}::{node_id}"),
+        })
+    }
+
     pub fn check_sensitive_path(&self, path: &str) -> Result<(), RuntimeError> {
         let lower = path.to_lowercase();
         for kw in &[".ssh", ".claude", "auth.json", "credentials", ".env",
