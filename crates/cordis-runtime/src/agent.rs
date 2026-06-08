@@ -228,6 +228,7 @@ impl AgentToolHost for RuntimeHost {
         offset: Option<usize>,
         limit: Option<usize>,
     ) -> Result<Value, RuntimeError> {
+        self.check_sensitive_path(path)?;
         let resolved = self.resolve_sandboxed_path(path)?;
         let content = std::fs::read_to_string(&resolved).map_err(|err| RuntimeError::Io {
             path: resolved,
@@ -254,6 +255,7 @@ impl AgentToolHost for RuntimeHost {
     }
 
     fn agent_list_directory(&self, path: &str) -> Result<Value, RuntimeError> {
+        self.check_sensitive_path(path)?;
         let resolved = self.resolve_sandboxed_path(path)?;
         let mut entries = Vec::new();
         if resolved.is_dir() {
@@ -294,6 +296,7 @@ impl AgentToolHost for RuntimeHost {
         pattern: &str,
         path: Option<&str>,
     ) -> Result<Value, RuntimeError> {
+        if let Some(p) = path { self.check_sensitive_path(p)?; }
         let search_root = match path {
             Some(p) => self.resolve_sandboxed_path(p)?,
             None => self.fixtures_root().to_path_buf(),
@@ -328,6 +331,7 @@ impl AgentToolHost for RuntimeHost {
     }
 
     fn agent_write_file(&self, path: &str, content: &str) -> Result<Value, RuntimeError> {
+        self.check_sensitive_path(path)?;
         let resolved = self.resolve_sandboxed_path(path)?;
         // Backup original before writing.
         let original = std::fs::read(&resolved).ok();
@@ -398,6 +402,7 @@ impl AgentToolHost for RuntimeHost {
     }
 
     fn agent_run_command(&self, command: &str) -> Result<Value, RuntimeError> {
+        self.check_sensitive_command(command)?;
         use std::process::Command;
         let output = Command::new("sh")
             .arg("-c")
