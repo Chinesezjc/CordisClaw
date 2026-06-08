@@ -54,6 +54,9 @@ const AGENT_TOOL_WRITE_FILE: &str = "write_file";
 const AGENT_TOOL_REPLACE_IN_FILE: &str = "replace_in_file";
 const AGENT_TOOL_RUN_COMMAND: &str = "run_command";
 const AGENT_TOOL_REVERT_CHANGES: &str = "revert_changes";
+const AGENT_TOOL_DELETE_FILE: &str = "delete_file";
+const AGENT_TOOL_RENAME_FILE: &str = "rename_file";
+const AGENT_TOOL_MOVE_FILE: &str = "move_file";
 const LLM_DEBUG_ENV: &str = "CORDIS_LLM_DEBUG";
 
 pub trait AgentToolHost {
@@ -101,6 +104,9 @@ pub trait AgentToolHost {
     ) -> Result<Value, RuntimeError>;
     fn agent_run_command(&self, command: &str) -> Result<Value, RuntimeError>;
     fn agent_revert_changes(&self) -> Result<Value, RuntimeError>;
+    fn agent_delete_file(&self, path: &str) -> Result<Value, RuntimeError>;
+    fn agent_rename_file(&self, path: &str, new_path: &str) -> Result<Value, RuntimeError>;
+    fn agent_move_file(&self, path: &str, new_path: &str) -> Result<Value, RuntimeError>;
 }
 
 impl AgentToolHost for RuntimeHost {
@@ -432,6 +438,69 @@ impl AgentToolHost for RuntimeHost {
         Ok(json!({
             "reverted_files": count,
         }))
+    }
+
+    fn agent_delete_file(&self, path: &str) -> Result<Value, RuntimeError> {
+        self.check_sensitive_path(path)?;
+        let resolved = self.resolve_sandboxed_path(path)?;
+        if resolved.is_dir() {
+            return Err(RuntimeError::InvalidArgument {
+                message: format!("delete_file: path is a directory, not a file: {path}"),
+            });
+        }
+        let original = std::fs::read(&resolved).map_err(|err| RuntimeError::Io {
+            path: resolved.clone(),
+            message: err.to_string(),
+        })?;
+        std::fs::remove_file(&resolved).map_err(|err| RuntimeError::Io {
+            path: resolved.clone(),
+            message: err.to_string(),
+        })?;
+        let mut rollback = self.interactive_rollback();
+        let backup = crate::kernel::plugin_iteration::PluginEditRollback::single_backup(
+            self.fixtures_root(),
+            path,
+            Some(original),
+        );
+        rollback.absorb(backup)?;
+        Ok(json!({
+            "path": path,
+            "deleted": true,
+        }))
+    }
+
+    fn agent_rename_file(&self, path: &str, new_path: &str) -> Result<Value, RuntimeError> {
+        self.check_sensitive_path(path)?;
+        self.check_sensitive_path(new_path)?;
+        let resolved_src = self.resolve_sandboxed_path(path)?;
+        let resolved_dst = self.resolve_sandboxed_path(new_path)?;
+        let original = std::fs::read(&resolved_src).ok();
+        if let Some(parent) = resolved_dst.parent() {
+            std::fs::create_dir_all(parent).map_err(|err| RuntimeError::Io {
+                path: parent.to_path_buf(),
+                message: err.to_string(),
+            })?;
+        }
+        std::fs::rename(&resolved_src, &resolved_dst).map_err(|err| RuntimeError::Io {
+            path: resolved_src.clone(),
+            message: err.to_string(),
+        })?;
+        let mut rollback = self.interactive_rollback();
+        let backup = crate::kernel::plugin_iteration::PluginEditRollback::single_backup(
+            self.fixtures_root(),
+            path,
+            original,
+        );
+        rollback.absorb(backup)?;
+        Ok(json!({
+            "path": path,
+            "new_path": new_path,
+            "renamed": true,
+        }))
+    }
+
+    fn agent_move_file(&self, path: &str, new_path: &str) -> Result<Value, RuntimeError> {
+        self.agent_rename_file(path, new_path)
     }
 }
 
@@ -1361,6 +1430,23 @@ struct ReplaceInFileArgs {
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
+struct DeleteFileArgs {
+    path: String,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+struct RenameFileArgs {
+    path: String,
+    new_path: String,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+struct MoveFileArgs {
+    path: String,
+    new_path: String,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 struct BuildPluginsArgs { plugin_name: String }
 
 struct RunCommandArgs {
@@ -1728,6 +1814,20 @@ impl<'a, H: AgentToolHost + ?Sized> AgentBackend for RuntimeShellAgentBackend<'a
                 parse_tool_value_arguments::<EmptyArgs>(arguments, name)?;
                 self.host.agent_revert_changes()
             }
+            AGENT_TOOL_DELETE_FILE => {
+                let args = parse_tool_value_arguments::<DeleteFileArgs>(arguments, name)?;
+                self.host.agent_delete_file(&args.path)
+            }
+            AGENT_TOOL_RENAME_FILE => {
+                let args = parse_tool_value_arguments::<RenameFileArgs>(arguments, name)?;
+                self.host
+                    .agent_rename_file(&args.path, &args.new_path)
+            }
+            AGENT_TOOL_MOVE_FILE => {
+                let args = parse_tool_value_arguments::<MoveFileArgs>(arguments, name)?;
+                self.host
+                    .agent_move_file(&args.path, &args.new_path)
+            }
             other => Err(RuntimeError::InvalidArgument {
                 message: format!("runtime shell agent does not support tool {other}"),
             }),
@@ -1924,10 +2024,48 @@ fn shell_agent_tools() -> Vec<AgentToolSpec> {
         },
         AgentToolSpec {
             name: AGENT_TOOL_REVERT_CHANGES,
-            description: "Revert all file changes made by write_file and replace_in_file in this session. Restores all touched files to their original content.",
+            description: "Revert all file changes made by write_file, replace_in_file, delete_file, rename_file, and move_file in this session. Restores all touched files to their original content.",
             parameters: json!({
                 "type": "object",
                 "properties": {},
+                "additionalProperties": false,
+            }),
+        },
+        AgentToolSpec {
+            name: AGENT_TOOL_DELETE_FILE,
+            description: "Delete a file within the fixtures workspace. The file content is backed up and can be restored with revert_changes. Fails if the path is a directory.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Relative path within the fixtures root." }
+                },
+                "required": ["path"],
+                "additionalProperties": false,
+            }),
+        },
+        AgentToolSpec {
+            name: AGENT_TOOL_RENAME_FILE,
+            description: "Rename or move a file or directory within the fixtures workspace. Creates parent directories for the destination if needed. The original is backed up and can be restored with revert_changes.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Current relative path within the fixtures root." },
+                    "new_path": { "type": "string", "description": "New relative path within the fixtures root. Parent directories are created automatically." }
+                },
+                "required": ["path", "new_path"],
+                "additionalProperties": false,
+            }),
+        },
+        AgentToolSpec {
+            name: AGENT_TOOL_MOVE_FILE,
+            description: "Move a file or directory to a new location within the fixtures workspace. Alias for rename_file. The original is backed up and can be restored with revert_changes.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Current relative path within the fixtures root." },
+                    "new_path": { "type": "string", "description": "New relative path within the fixtures root. Parent directories are created automatically." }
+                },
+                "required": ["path", "new_path"],
                 "additionalProperties": false,
             }),
         },
@@ -2277,6 +2415,21 @@ mod tests {
 
         fn agent_revert_changes(&self) -> Result<Value, RuntimeError> {
             Ok(json!({ "reverted_files": 0 }))
+        }
+
+        fn agent_delete_file(&self, path: &str) -> Result<Value, RuntimeError> {
+            let _ = path;
+            Ok(json!({ "deleted": true }))
+        }
+
+        fn agent_rename_file(&self, path: &str, new_path: &str) -> Result<Value, RuntimeError> {
+            let _ = (path, new_path);
+            Ok(json!({ "renamed": true }))
+        }
+
+        fn agent_move_file(&self, path: &str, new_path: &str) -> Result<Value, RuntimeError> {
+            let _ = (path, new_path);
+            Ok(json!({ "moved": true }))
         }
     }
 
