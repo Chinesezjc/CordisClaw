@@ -261,7 +261,7 @@ fn docs_value() -> cordis_plugin_sdk::PluginDocs {
                 }),
                 &["makes HTTP request to Bing API"],
                 &["BING_API_KEY not set", "network unavailable", "rate limited", "no results found"],
-            ),
+            ).with_agent_accessible(),
             node_doc(
                 "web_fetch",
                 "Fetch a web page and return plain-text content (HTML tags stripped). Max 8000 chars. Only http/https allowed.",
@@ -284,7 +284,7 @@ fn docs_value() -> cordis_plugin_sdk::PluginDocs {
                 }),
                 &["makes HTTP GET request to the target URL"],
                 &["invalid URL", "network timeout", "localhost/private IP blocked"],
-            ),
+            ).with_agent_accessible(),
         ],
     None
     )

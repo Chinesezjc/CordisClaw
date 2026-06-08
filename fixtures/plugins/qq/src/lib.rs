@@ -868,7 +868,7 @@ fn docs_value() -> cordis_plugin_sdk::PluginDocs {
                 }),
                 &["requires OneBot HTTP server running"],
                 &["no OneBot URL configured", "invalid target format", "message is empty", "OneBot API error", "unsupported action"],
-            ),
+    ).with_agent_accessible(),
             task_node_doc(
                 "qq_serve",
                 "Start an HTTP server to receive OneBot v11 message events. Configure your OneBot client to POST events to http://<host>:<port>/onebot/event. Supports grayscale group whitelist.",
@@ -897,7 +897,7 @@ fn docs_value() -> cordis_plugin_sdk::PluginDocs {
                 }),
                 &["starts an HTTP server thread", "listens on configured port"],
                 &["port already in use", "OneBot client not configured to POST events"],
-            ),
+            ).with_agent_accessible(),
             node_doc(
                 "qq_fetch_messages",
                 "Fetch queued incoming QQ messages received by qq_serve. Returns all messages and drains the queue. Agent should poll this periodically.",
@@ -939,7 +939,7 @@ fn docs_value() -> cordis_plugin_sdk::PluginDocs {
                 }),
                 &["sends HTTP request to OneBot API"],
                 &["no OneBot URL configured", "invalid target format", "message is empty"],
-            ),
+    ).with_agent_accessible(),
         ],
     Some("\
 QQ GROUP CHAT MODE — you are running in a QQ group. Messages may be casual chat NOT directed at you.\n\
