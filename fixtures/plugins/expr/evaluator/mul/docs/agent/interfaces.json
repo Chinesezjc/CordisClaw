@@ -33,7 +33,8 @@
       },
       "side_effects": [],
       "failure_modes": [],
-      "node_type": "router"
+      "node_type": "router",
+      "agent_accessible": false
     }
   ],
   "system_hint": null

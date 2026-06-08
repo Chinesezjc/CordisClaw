@@ -53,7 +53,8 @@
       "failure_modes": [
         "unknown node_id"
       ],
-      "node_type": "router"
+      "node_type": "router",
+      "agent_accessible": true
     }
   ],
   "system_hint": null
