@@ -1112,6 +1112,35 @@ impl RuntimeHost {
 
     /// Resolve a relative path within the fixtures root, rejecting traversal
     /// attempts (absolute paths, `..` components) and symlink escapes.
+    pub fn check_sensitive_path(&self, path: &str) -> Result<(), RuntimeError> {
+        let lower = path.to_lowercase();
+        for kw in &[".ssh", ".claude", "auth.json", "credentials", ".env",
+                    "id_rsa", "id_ed25519", "id_ecdsa", "known_hosts",
+                    "access_token", "api_key", "api_secret", "private_key",
+                    "/etc/passwd", "/etc/shadow", "/proc/", "/sys/"] {
+            if lower.contains(kw) {
+                return Err(RuntimeError::InvalidArgument {
+                    message: format!("blocked: path references sensitive resource ({kw})"),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    pub fn check_sensitive_command(&self, command: &str) -> Result<(), RuntimeError> {
+        let lower = command.to_lowercase();
+        for kw in &["ssh", "scp", "ssh-keygen", "cat /etc/passwd", "cat /etc/shadow",
+                    ".ssh/id", ".claude/", "auth.json", "token", "password",
+                    "secret", "credential", "export ", "unset ", "declare -"] {
+            if lower.contains(kw) {
+                return Err(RuntimeError::InvalidArgument {
+                    message: format!("blocked: command references sensitive operation ({kw})"),
+                });
+            }
+        }
+        Ok(())
+    }
+
     pub fn resolve_sandboxed_path(&self, rel: &str) -> Result<PathBuf, RuntimeError> {
         let rel_path = Path::new(rel);
         if rel_path.is_absolute() {
