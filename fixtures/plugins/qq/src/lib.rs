@@ -8,6 +8,9 @@
 //! - `qq_serve`         — Task node: starts HTTP server to receive OneBot events
 //! - `qq_fetch_messages` — return queued incoming messages (agent polls this)
 //! - `qq_send`          — send a message to a group or private chat
+//!
+//! ## Child Plugins
+//! - `cd`               — Continuous Deployment: handles automated deployment tasks
 
 use cordis_plugin_sdk::{
     export_plugin_api, json_response, node_doc, plugin_docs, task_node_doc, AbiFingerprint,
@@ -458,6 +461,7 @@ fn start_event_server(port: u16) -> Result<(), String> {
 // WebSocket Server — receives OneBot events via WS reverse connection
 // ---------------------------------------------------------------------------
 
+#[allow(dead_code)]
 fn start_ws_server() -> Result<(), String> {
     use std::net::TcpListener;
     let listener = TcpListener::bind("0.0.0.0:8002")
@@ -481,6 +485,7 @@ fn start_ws_server() -> Result<(), String> {
     Ok(())
 }
 
+#[allow(dead_code)]
 fn handle_ws_connection(mut ws: tungstenite::WebSocket<std::net::TcpStream>) {
     loop {
         match ws.read() {
