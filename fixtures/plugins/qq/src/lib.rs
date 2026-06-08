@@ -786,7 +786,7 @@ fn handle_qq_send(req: &NodeRequest) -> Result<NodeResponse, String> {
         ok: true,
         node_id: "qq_send".to_string(),
         messages: None,
-        message: msg_id.map(|mid| format!("message_id={mid}")),
+        message: Some(format!("sent [{}]: {}", target, message)),
         data: Some(data),
         error: None,
     })
