@@ -31,6 +31,8 @@ struct QqState {
     default_target: Option<String>,
     /// Groups allowed to trigger agent (grayscale whitelist)
     allow_groups: Vec<String>,
+    /// Groups blocked from triggering agent (blacklist, takes priority over allow_groups)
+    block_groups: Vec<String>,
     /// OneBot access token
     access_token: Option<String>,
     /// LLM API config
@@ -43,6 +45,7 @@ static STATE: Mutex<QqState> = Mutex::new(QqState {
     onebot_url: None,
     default_target: None,
     allow_groups: Vec::new(),
+    block_groups: Vec::new(),
     access_token: None,
     llm_api_url: None,
     llm_api_key: None,
@@ -252,6 +255,11 @@ fn handle_legacy(req: QqRequest) -> Result<QqResponse, String> {
         "send" => handle_send(req),
         "status" => handle_status(),
         "call" => handle_call(req),
+        "block" => handle_block(req),
+        "unblock" => handle_unblock(req),
+        "allow_group" => handle_allow_group(req),
+        "disallow_group" => handle_disallow_group(req),
+        "list_groups" => handle_list_groups(),
         other => Err(format!("unsupported action: {other}")),
     }
 }
@@ -260,12 +268,92 @@ fn handle_configure(req: QqRequest) -> Result<QqResponse, String> {
     let mut state = STATE.lock().map_err(|e| format!("lock: {e}"))?;
     if let Some(url) = req.url { state.onebot_url = Some(url); }
     if let Some(target) = req.target { parse_target(&target)?; state.default_target = Some(target); }
+    // Parse allow_groups from payload.
+    if let Some(ref payload) = req.payload {
+        if let Some(arr) = payload.get("allow_groups").and_then(|v| v.as_array()) {
+            state.allow_groups = arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect();
+        }
+        if let Some(arr) = payload.get("block_groups").and_then(|v| v.as_array()) {
+            state.block_groups = arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect();
+        }
+    }
     Ok(QqResponse {
         ok: true, action: "configure".to_string(),
         message: Some(format!(
-            "url={} target={}",
+            "url={} target={} allow={:?} block={:?}",
             state.onebot_url.as_deref().unwrap_or("(unchanged)"),
-            state.default_target.as_deref().unwrap_or("(unchanged)")
+            state.default_target.as_deref().unwrap_or("(unchanged)"),
+            state.allow_groups,
+            state.block_groups,
+        )),
+        data: None,
+    })
+}
+
+fn handle_block(req: QqRequest) -> Result<QqResponse, String> {
+    let target = req.target.as_deref().ok_or("block requires 'target' field (group:<id>)")?;
+    let (_kind, id) = parse_target(target)?;
+    let gid = id.to_string();
+    let mut state = STATE.lock().map_err(|e| format!("lock: {e}"))?;
+    if !state.block_groups.contains(&gid) {
+        state.block_groups.push(gid.clone());
+    }
+    Ok(QqResponse {
+        ok: true, action: "block".to_string(),
+        message: Some(format!("group {} blocked. block_groups={:?}", gid, state.block_groups)),
+        data: None,
+    })
+}
+
+fn handle_unblock(req: QqRequest) -> Result<QqResponse, String> {
+    let target = req.target.as_deref().ok_or("unblock requires 'target' field (group:<id>)")?;
+    let (_kind, id) = parse_target(target)?;
+    let gid = id.to_string();
+    let mut state = STATE.lock().map_err(|e| format!("lock: {e}"))?;
+    state.block_groups.retain(|g| g != &gid);
+    Ok(QqResponse {
+        ok: true, action: "unblock".to_string(),
+        message: Some(format!("group {} unblocked. block_groups={:?}", gid, state.block_groups)),
+        data: None,
+    })
+}
+
+fn handle_allow_group(req: QqRequest) -> Result<QqResponse, String> {
+    let target = req.target.as_deref().ok_or("allow_group requires 'target' field (group:<id>)")?;
+    let (_kind, id) = parse_target(target)?;
+    let gid = id.to_string();
+    let mut state = STATE.lock().map_err(|e| format!("lock: {e}"))?;
+    if !state.allow_groups.contains(&gid) {
+        state.allow_groups.push(gid.clone());
+    }
+    Ok(QqResponse {
+        ok: true, action: "allow_group".to_string(),
+        message: Some(format!("group {} added to allow list. allow_groups={:?}", gid, state.allow_groups)),
+        data: None,
+    })
+}
+
+fn handle_disallow_group(req: QqRequest) -> Result<QqResponse, String> {
+    let target = req.target.as_deref().ok_or("disallow_group requires 'target' field (group:<id>)")?;
+    let (_kind, id) = parse_target(target)?;
+    let gid = id.to_string();
+    let mut state = STATE.lock().map_err(|e| format!("lock: {e}"))?;
+    state.allow_groups.retain(|g| g != &gid);
+    Ok(QqResponse {
+        ok: true, action: "disallow_group".to_string(),
+        message: Some(format!("group {} removed from allow list. allow_groups={:?}", gid, state.allow_groups)),
+        data: None,
+    })
+}
+
+fn handle_list_groups() -> Result<QqResponse, String> {
+    let state = STATE.lock().map_err(|e| format!("lock: {e}"))?;
+    Ok(QqResponse {
+        ok: true, action: "list_groups".to_string(),
+        message: Some(format!(
+            "allow_groups={:?} block_groups={:?}",
+            state.allow_groups,
+            state.block_groups,
         )),
         data: None,
     })
@@ -463,6 +551,12 @@ fn handle_onebot_event(event: &OneBotEvent) {
             _ => return,
         };
 
+        // Blacklist check (takes priority over allow_groups).
+        let block = STATE.lock().ok().map(|s| s.block_groups.clone()).unwrap_or_default();
+        if block.contains(&gid_str) {
+            return;
+        }
+
         // Grayscale whitelist check.
         let allow = STATE.lock().ok().map(|s| s.allow_groups.clone()).unwrap_or_default();
         if !allow.is_empty() && !allow.contains(&gid_str) {
@@ -553,10 +647,17 @@ fn handle_qq_serve(req: &NodeRequest) -> Result<NodeResponse, String> {
         .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
         .unwrap_or_default();
 
+    let block_groups: Vec<String> = req.payload.as_ref()
+        .and_then(|p| p.get("block_groups"))
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+        .unwrap_or_default();
+
     // Store configuration.
     {
         let mut state = STATE.lock().map_err(|e| format!("lock: {e}"))?;
         state.allow_groups = allow_groups.clone();
+        state.block_groups = block_groups.clone();
         if let Some(url) = req.payload.as_ref().and_then(|p| p.get("onebot_url")).and_then(|v| v.as_str()) {
             state.onebot_url = Some(url.to_string());
         }
@@ -601,8 +702,8 @@ fn handle_qq_serve(req: &NodeRequest) -> Result<NodeResponse, String> {
         node_id: "qq_serve".to_string(),
         messages: None,
         message: Some(format!(
-            "HTTP server listening on port {port}, allow_groups={:?}",
-            allow_groups
+            "HTTP server listening on port {port}, allow_groups={:?}, block_groups={:?}",
+            allow_groups, block_groups
         )),
         data: None,
         error: None,
