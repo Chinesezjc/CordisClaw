@@ -1,7 +1,7 @@
 //! Web access plugin — search and fetch.
 //!
 //! Nodes:
-//! - `web_search`  — search Bing and return results
+//! - `web_search`  — search the web using Brave or Bing (auto-selects by available API key)
 //! - `web_fetch`   — fetch a URL and return plain-text content
 //!
 //! Safety: only http/https URLs are allowed; localhost, loopback, and private
@@ -67,7 +67,7 @@ struct SearchResult {
 // Web search — Bing API
 // ---------------------------------------------------------------------------
 
-fn web_search(query: &str, max_results: usize) -> Result<Vec<SearchResult>, String> {
+fn web_search_bing(query: &str, max_results: usize) -> Result<Vec<SearchResult>, String> {
     let api_key = std::env::var("BING_API_KEY")
         .map_err(|_| "BING_API_KEY environment variable not set".to_string())?;
 
@@ -110,6 +110,69 @@ fn web_search(query: &str, max_results: usize) -> Result<Vec<SearchResult>, Stri
     }
 
     Ok(items)
+}
+
+// ---------------------------------------------------------------------------
+// Web search — Brave API
+// ---------------------------------------------------------------------------
+
+fn web_search_brave(query: &str, max_results: usize) -> Result<Vec<SearchResult>, String> {
+    let api_key = std::env::var("BRAVE_API_KEY")
+        .map_err(|_| "BRAVE_API_KEY environment variable not set".to_string())?;
+
+    let client = Client::builder()
+        .timeout(Duration::from_secs(TIMEOUT_SECS))
+        .build()
+        .map_err(|e| format!("build HTTP client: {e}"))?;
+
+    let resp = client
+        .get("https://api.search.brave.com/res/v1/web/search")
+        .header("X-Subscription-Token", &api_key)
+        .header("Accept", "application/json")
+        .query(&[
+            ("q", query),
+            ("count", &max_results.min(20).to_string()),
+        ])
+        .send()
+        .map_err(|e| format!("HTTP request: {e}"))?;
+
+    let body = resp.text().map_err(|e| format!("read body: {e}"))?;
+    let json: Value = serde_json::from_str(&body).map_err(|e| format!("parse JSON: {e}"))?;
+
+    let web_results = json["web"]["results"]
+        .as_array()
+        .ok_or_else(|| "no search results found (check BRAVE_API_KEY)".to_string())?;
+
+    let items: Vec<SearchResult> = web_results
+        .iter()
+        .take(max_results)
+        .map(|item| SearchResult {
+            title: item["title"].as_str().unwrap_or("").to_string(),
+            url: item["url"].as_str().unwrap_or("").to_string(),
+            snippet: item["description"].as_str().unwrap_or("").to_string(),
+        })
+        .filter(|r| !r.title.is_empty() && !r.url.is_empty())
+        .collect();
+
+    if items.is_empty() {
+        return Err("no search results found".to_string());
+    }
+
+    Ok(items)
+}
+
+// ---------------------------------------------------------------------------
+// Web search — router (auto-select backend by available API key)
+// ---------------------------------------------------------------------------
+
+fn web_search(query: &str, max_results: usize) -> Result<(Vec<SearchResult>, &'static str), String> {
+    if std::env::var("BRAVE_API_KEY").is_ok() {
+        return web_search_brave(query, max_results).map(|r| (r, "brave"));
+    }
+    if std::env::var("BING_API_KEY").is_ok() {
+        return web_search_bing(query, max_results).map(|r| (r, "bing"));
+    }
+    Err("no search backend available: set BRAVE_API_KEY or BING_API_KEY".to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -190,7 +253,7 @@ fn handle(req: &WebRequest) -> Result<WebResponse, String> {
                 return Err("query is required for web_search".to_string());
             }
             let max = req.max_results.unwrap_or(5).min(20);
-            let results = web_search(query, max)?;
+            let (results, _backend) = web_search(query, max)?;
             Ok(WebResponse {
                 ok: true,
                 node_id: "web_search".to_string(),
@@ -241,7 +304,7 @@ fn docs_value() -> cordis_plugin_sdk::PluginDocs {
         vec![
             node_doc(
                 "web_search",
-                "Search the web using Bing API. Requires BING_API_KEY env var. Returns up to max_results items with title, url, and snippet.",
+                "Search the web using Brave or Bing API. Auto-selects backend by available API key: BRAVE_API_KEY preferred, falls back to BING_API_KEY. Returns up to max_results items with title, url, and snippet.",
                 json!({
                     "type": "object",
                     "required": ["node_id", "query"],
@@ -259,8 +322,8 @@ fn docs_value() -> cordis_plugin_sdk::PluginDocs {
                         "error": { "type": ["string", "null"] }
                     }
                 }),
-                &["makes HTTP request to Bing API"],
-                &["BING_API_KEY not set", "network unavailable", "rate limited", "no results found"],
+                &["makes HTTP request to Brave Search API or Bing API"],
+                &["BRAVE_API_KEY and BING_API_KEY not set", "network unavailable", "rate limited", "no results found"],
             ).with_agent_accessible(),
             node_doc(
                 "web_fetch",
@@ -294,7 +357,7 @@ fn abi_fingerprint_value() -> AbiFingerprint {
     AbiFingerprint {
         rustc_version: "1.85.1".to_string(),
         target_triple: "x86_64-unknown-linux-gnu".to_string(),
-        crate_hash: "crate_web_v1".to_string(),
+        crate_hash: "web_brave_v2".to_string(),
         api_hash: "api_v2".to_string(),
     }
 }
