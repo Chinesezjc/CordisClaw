@@ -36,7 +36,6 @@ struct ServeState {
 }
 
 static mut AGENT_TRIGGER_TX: Option<std::sync::mpsc::Sender<String>> = None;
-static mut AGENT_INBOX_QUEUE: Option<std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>> = None;
 
 #[no_mangle]
 pub extern "C" fn _cordis_agent_trigger(msg: *const std::ffi::c_char) {
@@ -46,9 +45,6 @@ pub extern "C" fn _cordis_agent_trigger(msg: *const std::ffi::c_char) {
     unsafe {
         if let Some(ref tx) = AGENT_TRIGGER_TX {
             let _ = tx.send(s.clone());
-        }
-        if let Some(ref q) = AGENT_INBOX_QUEUE {
-            q.lock().unwrap_or_else(|p| p.into_inner()).push_back(s);
         }
     }
 }
@@ -277,7 +273,6 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         let inject_queue = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::<String>::new()));
         unsafe {
             AGENT_TRIGGER_TX = Some(tx);
-            AGENT_INBOX_QUEUE = Some(std::sync::Arc::clone(&inject_queue));
         }
         cordis_runtime::agent::set_agent_inject_queue(inject_queue);
         let mut sessions: BTreeMap<String, String> = BTreeMap::new();
