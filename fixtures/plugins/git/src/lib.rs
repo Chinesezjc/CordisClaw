@@ -293,7 +293,7 @@ fn docs_value() -> cordis_plugin_sdk::PluginDocs {
                 }),
                 &["reads git working tree"],
                 &["not a git repository", "path escapes root"],
-            ),
+            ).with_agent_accessible(),
             node_doc(
                 "git_log",
                 "Show recent git commit history (oneline format).",
@@ -317,7 +317,7 @@ fn docs_value() -> cordis_plugin_sdk::PluginDocs {
                 }),
                 &["reads git history"],
                 &["not a git repository"],
-            ),
+            ).with_agent_accessible(),
             node_doc(
                 "git_status",
                 "Show git working tree status (short format).",
@@ -339,7 +339,7 @@ fn docs_value() -> cordis_plugin_sdk::PluginDocs {
                 }),
                 &["reads git working tree"],
                 &["not a git repository"],
-            ),
+            ).with_agent_accessible(),
             node_doc(
                 "git_commit",
                 "Stage and commit changes. Pass specific file paths or omit to commit all changes. Dangerous operations (push, force, amend) are blocked.",
@@ -364,7 +364,7 @@ fn docs_value() -> cordis_plugin_sdk::PluginDocs {
                 }),
                 &["modifies git history (local only)"],
                 &["commit message empty", "forbidden operation", "path escapes root", "not a git repository"],
-            ),
+            ).with_agent_accessible(),
         ],
     None
     )

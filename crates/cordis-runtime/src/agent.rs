@@ -201,6 +201,7 @@ impl AgentToolHost for RuntimeHost {
         node_id: &str,
         payload_json: Value,
     ) -> Result<Value, RuntimeError> {
+        self.check_agent_accessible(plugin_path, node_id)?;
         let payload_text =
             serde_json::to_string(&payload_json).map_err(|err| RuntimeError::Invariant {
                 message: format!("failed to serialize invoke payload for agent tool: {err}"),
@@ -218,6 +219,9 @@ impl AgentToolHost for RuntimeHost {
         node_fqn: &str,
         payload_json: Value,
     ) -> Result<Value, RuntimeError> {
+        if let Some((plugin_path, node_id)) = node_fqn.split_once("::") {
+            self.check_agent_accessible(plugin_path, node_id)?;
+        }
         let response = self.execute(node_fqn, payload_json)?;
         to_json_value("execution result", response)
     }
