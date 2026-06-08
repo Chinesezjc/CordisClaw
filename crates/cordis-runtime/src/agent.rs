@@ -44,6 +44,7 @@ const AGENT_TOOL_LIST_NODES: &str = "list_nodes";
 const AGENT_TOOL_GET_KERNEL_STATUS: &str = "get_kernel_status";
 const AGENT_TOOL_GET_KERNEL_ISSUES: &str = "get_kernel_issues";
 const AGENT_TOOL_RELOAD_RUNTIME: &str = "reload_runtime";
+const AGENT_TOOL_BUILD_PLUGINS: &str = "build_plugins";
 const AGENT_TOOL_INVOKE_PLUGIN: &str = "invoke_plugin";
 const AGENT_TOOL_EXECUTE_TARGET: &str = "execute_target";
 const AGENT_TOOL_READ_FILE: &str = "read_file";
@@ -62,6 +63,7 @@ pub trait AgentToolHost {
     fn agent_kernel_status(&self) -> Result<Value, RuntimeError>;
     fn agent_kernel_issues(&self) -> Result<Value, RuntimeError>;
     fn agent_reload_runtime(&self) -> Result<Value, RuntimeError>;
+    fn agent_build_plugins(&self, plugin_name: &str) -> Result<Value, RuntimeError>;
     /// Collect system_hint strings from all loaded plugins. The Agent's
     /// system prompt should include these so that plugin-specific usage
     /// conventions (e.g. chat mode vs suspend for a messaging plugin) are
@@ -161,6 +163,26 @@ impl AgentToolHost for RuntimeHost {
 
     fn agent_reload_runtime(&self) -> Result<Value, RuntimeError> {
         to_json_value("reload diagnostics", self.reload_with_diagnostics())
+    }
+
+    fn agent_build_plugins(&self, plugin_name: &str) -> Result<Value, RuntimeError> {
+        use std::process::Command;
+        let fixtures = self.fixtures_root();
+        let manifest = fixtures.join("plugins").join("Cargo.toml");
+        let mut cmd = Command::new("cargo");
+        cmd.arg("build").arg("--manifest-path").arg(&manifest);
+        if plugin_name != "all" {
+            cmd.arg("-p").arg(plugin_name);
+        }
+        let output = cmd.output().map_err(|e| RuntimeError::InvalidArgument {
+            message: format!("cargo build failed to start: {e}"),
+        })?;
+        Ok(json!({
+            "ok": output.status.success(),
+            "exit_code": output.status.code(),
+            "stdout": String::from_utf8_lossy(&output.stdout).to_string(),
+            "stderr": String::from_utf8_lossy(&output.stderr).to_string(),
+        }))
     }
 
     fn agent_plugin_hints(&self) -> Vec<String> {
@@ -1315,6 +1337,8 @@ struct ReplaceInFileArgs {
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
+struct BuildPluginsArgs { plugin_name: String }
+
 struct RunCommandArgs {
     command: String,
 }
@@ -1638,6 +1662,10 @@ impl<'a, H: AgentToolHost + ?Sized> AgentBackend for RuntimeShellAgentBackend<'a
                 parse_tool_value_arguments::<EmptyArgs>(arguments, name)?;
                 self.host.agent_reload_runtime()
             }
+            AGENT_TOOL_BUILD_PLUGINS => {
+                let args = parse_tool_value_arguments::<BuildPluginsArgs>(arguments, name)?;
+                self.host.agent_build_plugins(&args.plugin_name)
+            }
             AGENT_TOOL_INVOKE_PLUGIN => {
                 let args = parse_tool_value_arguments::<InvokePluginArgs>(arguments, name)?;
                 self.host
@@ -1756,6 +1784,18 @@ fn shell_agent_tools() -> Vec<AgentToolSpec> {
             parameters: json!({
                 "type": "object",
                 "properties": {},
+                "additionalProperties": false,
+            }),
+        },
+        AgentToolSpec {
+            name: AGENT_TOOL_BUILD_PLUGINS,
+            description: "Build a plugin crate. Specify plugin_name (e.g. 'qq') or 'all' to build everything. Returns stdout, stderr, and exit_code.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "plugin_name": { "type": "string", "description": "Plugin crate name or 'all'" },
+                },
+                "required": ["plugin_name"],
                 "additionalProperties": false,
             }),
         },
