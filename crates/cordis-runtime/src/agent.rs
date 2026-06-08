@@ -730,12 +730,27 @@ impl AgentSession {
                         output: event.output.clone(),
                         error: event.error.clone(),
                     });
+                    let tool_ok = event.ok;
+                    let tool_err = event.error.clone();
                     tool_events.push(event);
                     messages.push(json!({
                         "role": "tool",
                         "tool_call_id": tool_call.id,
                         "content": tool_output,
                     }));
+                    // Inject a prominent warning when tools fail so the Agent
+                    // cannot silently continue after an error.
+                    if !tool_ok {
+                        let err = tool_err.as_deref().unwrap_or("unknown error");
+                        messages.push(json!({
+                            "role": "user",
+                            "content": format!(
+                                "🔴 TOOL '{event_name}' FAILED: {err}\n\
+                                 Do NOT proceed as if it succeeded. Fix the cause \
+                                 and retry, or use a different approach."
+                            ),
+                        }));
+                    }
                     if let Some(reply_content) = terminal_reply {
                         if message
                             .tool_calls

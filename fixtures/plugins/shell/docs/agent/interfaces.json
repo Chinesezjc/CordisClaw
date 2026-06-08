@@ -72,7 +72,8 @@
         "invalid shell backend",
         "command not found"
       ],
-      "node_type": "router"
+      "node_type": "router",
+      "agent_accessible": false
     }
   ],
   "system_hint": null
