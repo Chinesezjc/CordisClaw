@@ -28,7 +28,8 @@
       "failure_modes": [
         "division by zero"
       ],
-      "node_type": "router"
+      "node_type": "router",
+      "agent_accessible": false
     }
   ],
   "system_hint": null

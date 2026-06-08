@@ -59,7 +59,8 @@
         "language pack missing",
         "no text in image"
       ],
-      "node_type": "task"
+      "node_type": "task",
+      "agent_accessible": false
     },
     {
       "id": "vision_describe",
@@ -122,7 +123,8 @@
         "API quota exceeded",
         "image too large"
       ],
-      "node_type": "task"
+      "node_type": "task",
+      "agent_accessible": false
     }
   ],
   "system_hint": null

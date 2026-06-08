@@ -36,7 +36,8 @@
         "invalid number",
         "unexpected token"
       ],
-      "node_type": "router"
+      "node_type": "router",
+      "agent_accessible": true
     }
   ],
   "system_hint": null

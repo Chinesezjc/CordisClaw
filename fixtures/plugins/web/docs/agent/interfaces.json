@@ -58,7 +58,8 @@
         "rate limited",
         "no results found"
       ],
-      "node_type": "router"
+      "node_type": "router",
+      "agent_accessible": true
     },
     {
       "id": "web_fetch",
@@ -111,7 +112,8 @@
         "network timeout",
         "localhost/private IP blocked"
       ],
-      "node_type": "router"
+      "node_type": "router",
+      "agent_accessible": true
     }
   ],
   "system_hint": null

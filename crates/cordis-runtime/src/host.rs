@@ -4353,6 +4353,7 @@ fn register_builtin_agent_node(
             side_effects: vec!["calls the LLM agent session".to_string()],
             failure_modes: vec!["agent session not started".to_string()],
             node_type: cordis_plugin_sdk::NodeType::Router,
+            agent_accessible: false,
         }],
         system_hint: None,
     };

@@ -34,7 +34,8 @@
       "failure_modes": [
         "factorial requires a non-negative integer"
       ],
-      "node_type": "router"
+      "node_type": "router",
+      "agent_accessible": false
     }
   ],
   "system_hint": null

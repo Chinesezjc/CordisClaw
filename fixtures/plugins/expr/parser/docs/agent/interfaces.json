@@ -29,7 +29,8 @@
         "missing right paren",
         "unexpected token"
       ],
-      "node_type": "router"
+      "node_type": "router",
+      "agent_accessible": false
     }
   ],
   "system_hint": null
