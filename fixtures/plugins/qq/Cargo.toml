@@ -1,44 +1,27 @@
+[package]
+name = "qq"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["rlib", "dylib"]
+
+[package.metadata.cordis]
+plugin_path = "qq"
+abi_kind = "rust"
+declared_nodes = ["qq_entry", "qq_serve", "qq_fetch_messages", "qq_send"]
+children = []
+
+[package.metadata.cordis.abi_fingerprint]
+rustc_version = "1.85.1"
+target_triple = "x86_64-unknown-linux-gnu"
+crate_hash = "crate_qq_v1"
+api_hash = "api_v2"
+
 [dependencies]
+cordis-plugin-sdk = { path = "../../../crates/cordis-plugin-sdk" }
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tiny_http = "0.12"
 tungstenite = "0.26"
 ureq = "2"
-
-[dependencies.cordis-plugin-sdk]
-path = "../../../crates/cordis-plugin-sdk"
-
-[dependencies.serde]
-features = ["derive"]
-version = "1"
-
-[lib]
-crate-type = [
-    "rlib",
-    "dylib",
-]
-
-[package]
-edition = "2021"
-name = "qq"
-version = "0.1.0"
-
-[package.metadata.cordis]
-abi_kind = "rust"
-declared_nodes = [
-    "qq_entry",
-    "qq_serve",
-    "qq_fetch_messages",
-    "qq_send",
-]
-plugin_path = "qq"
-
-[package.metadata.cordis.abi_fingerprint]
-api_hash = "api_v2"
-crate_hash = "crate_qq_v1"
-rustc_version = "1.85.1"
-target_triple = "x86_64-unknown-linux-gnu"
-
-[[package.metadata.cordis.children]]
-grants = []
-required = true
-source = "./cd"
