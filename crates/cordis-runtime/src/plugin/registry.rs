@@ -157,6 +157,28 @@ impl PluginRegistry {
         }
     }
 
+    /// Update an existing plugin entry after reloading its dylib.
+    pub fn reload_plugin_entry(
+        &self,
+        plugin_path: &str,
+        docs: PluginDocs,
+        abi_fingerprint: AbiFingerprint,
+    ) -> bool {
+        let mut guard = self
+            .plugins
+            .write()
+            .expect("plugin registry lock poisoned");
+        if let Some(plugin) = guard.get_mut(plugin_path) {
+            plugin.load_result = PluginLoadResult::Loaded;
+            plugin.docs = Some(docs);
+            plugin.abi_fingerprint = Some(abi_fingerprint);
+            plugin.fingerprint_diff = Vec::new();
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn get(&self, plugin_path: &str) -> Option<RegisteredPlugin> {
         self.plugins
             .read()

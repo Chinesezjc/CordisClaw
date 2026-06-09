@@ -473,7 +473,7 @@ fn handle_serve_command(
             println!("{}", serde_json::to_string(&host.status())?);
         }
         "reload" => {
-            let report = host.reload_with_diagnostics();
+            let report = host.reload_with_diagnostics("/");
             println!("{}", serde_json::to_string(&report)?);
         }
         "candidate status" => {
