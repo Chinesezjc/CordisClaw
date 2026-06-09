@@ -57,6 +57,7 @@ const AGENT_TOOL_REVERT_CHANGES: &str = "revert_changes";
 const AGENT_TOOL_DELETE_FILE: &str = "delete_file";
 const AGENT_TOOL_RENAME_FILE: &str = "rename_file";
 const AGENT_TOOL_MOVE_FILE: &str = "move_file";
+const AGENT_TOOL_COPY_FILE: &str = "copy_file";
 const LLM_DEBUG_ENV: &str = "CORDIS_LLM_DEBUG";
 
 pub trait AgentToolHost {
@@ -107,6 +108,7 @@ pub trait AgentToolHost {
     fn agent_delete_file(&self, path: &str) -> Result<Value, RuntimeError>;
     fn agent_rename_file(&self, path: &str, new_path: &str) -> Result<Value, RuntimeError>;
     fn agent_move_file(&self, path: &str, new_path: &str) -> Result<Value, RuntimeError>;
+    fn agent_copy_file(&self, path: &str, new_path: &str) -> Result<Value, RuntimeError>;
 }
 
 impl AgentToolHost for RuntimeHost {
@@ -183,12 +185,33 @@ impl AgentToolHost for RuntimeHost {
         let output = cmd.output().map_err(|e| RuntimeError::InvalidArgument {
             message: format!("cargo build failed to start: {e}"),
         })?;
-        Ok(json!({
-            "ok": output.status.success(),
+        let ok = output.status.success();
+        let mut result = json!({
+            "ok": ok,
             "exit_code": output.status.code(),
             "stdout": String::from_utf8_lossy(&output.stdout).to_string(),
             "stderr": String::from_utf8_lossy(&output.stderr).to_string(),
-        }))
+        });
+        // Auto-sync the built .so to artifacts/ so reload_runtime picks it up.
+        if ok && plugin_name != "all" {
+            let target_dir = fixtures.join("plugins").join("target").join("debug");
+            let src = target_dir.join(format!("lib{}.so", plugin_name.replace('-', "_")));
+            let artifacts_dir = fixtures.join("artifacts");
+            let _ = std::fs::create_dir_all(&artifacts_dir);
+            let dst = artifacts_dir.join(format!("{}.so", plugin_name));
+            match std::fs::copy(&src, &dst) {
+                Ok(bytes) => {
+                    result["synced_artifact"] = json!(format!("{} -> artifacts/{}.so ({} bytes)", src.display(), plugin_name, bytes));
+                    eprintln!("build_plugins: synced {} -> {}", src.display(), dst.display());
+                }
+                Err(e) => {
+                    // Not all plugins produce a .so (e.g. rlib-only); don't fail.
+                    eprintln!("build_plugins: artifact sync skipped for {plugin_name}: {e}");
+                    result["synced_artifact"] = json!(null);
+                }
+            }
+        }
+        Ok(result)
     }
 
     fn agent_plugin_hints(&self) -> Vec<String> {
@@ -501,6 +524,38 @@ impl AgentToolHost for RuntimeHost {
 
     fn agent_move_file(&self, path: &str, new_path: &str) -> Result<Value, RuntimeError> {
         self.agent_rename_file(path, new_path)
+    }
+
+    fn agent_copy_file(&self, path: &str, new_path: &str) -> Result<Value, RuntimeError> {
+        self.check_sensitive_path(path)?;
+        self.check_sensitive_path(new_path)?;
+        let resolved_src = self.resolve_sandboxed_path(path)?;
+        let resolved_dst = self.resolve_sandboxed_path(new_path)?;
+        // Backup destination original if it exists (for rollback).
+        let dst_original = std::fs::read(&resolved_dst).ok();
+        if let Some(parent) = resolved_dst.parent() {
+            std::fs::create_dir_all(parent).map_err(|err| RuntimeError::Io {
+                path: parent.to_path_buf(),
+                message: err.to_string(),
+            })?;
+        }
+        std::fs::copy(&resolved_src, &resolved_dst).map_err(|err| RuntimeError::Io {
+            path: resolved_src.clone(),
+            message: err.to_string(),
+        })?;
+        let mut rollback = self.interactive_rollback();
+        // Back up destination at new_path (the file we just overwrote or created).
+        let backup = crate::kernel::plugin_iteration::PluginEditRollback::single_backup(
+            self.fixtures_root(),
+            new_path,
+            dst_original,
+        );
+        rollback.absorb(backup)?;
+        Ok(json!({
+            "path": path,
+            "new_path": new_path,
+            "copied": true,
+        }))
     }
 }
 
@@ -1447,6 +1502,12 @@ struct MoveFileArgs {
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
+struct CopyFileArgs {
+    path: String,
+    new_path: String,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 struct BuildPluginsArgs { plugin_name: String }
 
 struct RunCommandArgs {
@@ -1828,6 +1889,11 @@ impl<'a, H: AgentToolHost + ?Sized> AgentBackend for RuntimeShellAgentBackend<'a
                 self.host
                     .agent_move_file(&args.path, &args.new_path)
             }
+            AGENT_TOOL_COPY_FILE => {
+                let args = parse_tool_value_arguments::<CopyFileArgs>(arguments, name)?;
+                self.host
+                    .agent_copy_file(&args.path, &args.new_path)
+            }
             other => Err(RuntimeError::InvalidArgument {
                 message: format!("runtime shell agent does not support tool {other}"),
             }),
@@ -2064,6 +2130,19 @@ fn shell_agent_tools() -> Vec<AgentToolSpec> {
                 "properties": {
                     "path": { "type": "string", "description": "Current relative path within the fixtures root." },
                     "new_path": { "type": "string", "description": "New relative path within the fixtures root. Parent directories are created automatically." }
+                },
+                "required": ["path", "new_path"],
+                "additionalProperties": false,
+            }),
+        },
+        AgentToolSpec {
+            name: AGENT_TOOL_COPY_FILE,
+            description: "Copy a file to a new location within the fixtures workspace. Creates parent directories for the destination if needed. If the destination exists it is overwritten and backed up for revert_changes.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Source relative path within the fixtures root." },
+                    "new_path": { "type": "string", "description": "Destination relative path within the fixtures root. Parent directories are created automatically." }
                 },
                 "required": ["path", "new_path"],
                 "additionalProperties": false,
@@ -2430,6 +2509,11 @@ mod tests {
         fn agent_move_file(&self, path: &str, new_path: &str) -> Result<Value, RuntimeError> {
             let _ = (path, new_path);
             Ok(json!({ "moved": true }))
+        }
+
+        fn agent_copy_file(&self, path: &str, new_path: &str) -> Result<Value, RuntimeError> {
+            let _ = (path, new_path);
+            Ok(json!({ "copied": true }))
         }
     }
 
