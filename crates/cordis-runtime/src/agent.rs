@@ -66,7 +66,7 @@ pub trait AgentToolHost {
     fn agent_list_nodes(&self) -> Result<Value, RuntimeError>;
     fn agent_kernel_status(&self) -> Result<Value, RuntimeError>;
     fn agent_kernel_issues(&self) -> Result<Value, RuntimeError>;
-    fn agent_reload_runtime(&self) -> Result<Value, RuntimeError>;
+    fn agent_reload_runtime(&self, plugin_path: &str) -> Result<Value, RuntimeError>;
     fn agent_build_plugins(&self, plugin_name: &str) -> Result<Value, RuntimeError>;
     /// Collect system_hint strings from all loaded plugins. The Agent's
     /// system prompt should include these so that plugin-specific usage
@@ -169,8 +169,8 @@ impl AgentToolHost for RuntimeHost {
         to_json_value("kernel issues", self.kernel().plugin_issues())
     }
 
-    fn agent_reload_runtime(&self) -> Result<Value, RuntimeError> {
-        to_json_value("reload diagnostics", self.reload_with_diagnostics())
+    fn agent_reload_runtime(&self, plugin_path: &str) -> Result<Value, RuntimeError> {
+        to_json_value("reload diagnostics", self.reload_with_diagnostics(plugin_path))
     }
 
     fn agent_build_plugins(&self, plugin_name: &str) -> Result<Value, RuntimeError> {
@@ -1510,6 +1510,9 @@ struct CopyFileArgs {
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 struct BuildPluginsArgs { plugin_name: String }
 
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+struct ReloadRuntimeArgs { plugin_path: String }
+
 struct RunCommandArgs {
     command: String,
 }
@@ -1830,8 +1833,8 @@ impl<'a, H: AgentToolHost + ?Sized> AgentBackend for RuntimeShellAgentBackend<'a
                 self.host.agent_kernel_issues()
             }
             AGENT_TOOL_RELOAD_RUNTIME => {
-                parse_tool_value_arguments::<EmptyArgs>(arguments, name)?;
-                self.host.agent_reload_runtime()
+                let args = parse_tool_value_arguments::<ReloadRuntimeArgs>(arguments, name)?;
+                self.host.agent_reload_runtime(&args.plugin_path)
             }
             AGENT_TOOL_BUILD_PLUGINS => {
                 let args = parse_tool_value_arguments::<BuildPluginsArgs>(arguments, name)?;
@@ -1970,10 +1973,13 @@ fn shell_agent_tools() -> Vec<AgentToolSpec> {
         },
         AgentToolSpec {
             name: AGENT_TOOL_RELOAD_RUNTIME,
-            description: "Reload the runtime snapshot and return the full reload diagnostics report.",
+            description: "Reload the runtime snapshot and return the full reload diagnostics report. Use '/' to reload all plugins, or '/<path>' to reload a specific subtree (e.g. '/qq', '/expr'). Task services are gracefully restarted.",
             parameters: json!({
                 "type": "object",
-                "properties": {},
+                "properties": {
+                    "plugin_path": { "type": "string", "description": "Plugin path: '/' for all, '/qq' for a specific plugin or subtree." }
+                },
+                "required": ["plugin_path"],
                 "additionalProperties": false,
             }),
         },
@@ -2185,7 +2191,7 @@ IMPORTANT — workspace layout:\n\
 - After a successful `cargo build`, the built .so files need to be synced to `artifacts/`\n\
   for the runtime to pick them up:\n\
   `cp plugins/target/debug/libexpr*.so artifacts/ 2>/dev/null; cp plugins/target/debug/*.so artifacts/ 2>/dev/null`\n\
-  Then use `reload_runtime` to load the changes into the live runtime.\n\
+  Then use `reload_runtime` with `plugin_path: \"/\"` to load the changes into the live runtime.\n\
 \n\
 When the user asks you to add a feature or fix a bug, follow this workflow:\n\
 1. Read the relevant source files to understand the codebase structure.\n\
@@ -2416,7 +2422,7 @@ mod tests {
             Ok(json!([]))
         }
 
-        fn agent_reload_runtime(&self) -> Result<Value, RuntimeError> {
+        fn agent_reload_runtime(&self, _plugin_path: &str) -> Result<Value, RuntimeError> {
             Ok(json!({ "ok": true }))
         }
 

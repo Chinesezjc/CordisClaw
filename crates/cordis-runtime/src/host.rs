@@ -5,7 +5,7 @@ use crate::agent::{
 use crate::config::{LlmApiConfig, PluginConfigFile, RuntimeConfig};
 use crate::context::RuntimeContext;
 use crate::core::error::RuntimeError;
-use crate::core::models::{GatePolicy, NodeOutcome, PluginLoadResult, PluginUnavailableReason};
+use crate::core::models::{AbiFingerprint, GatePolicy, NodeOutcome, PluginDocs, PluginLoadResult, PluginUnavailableReason};
 use cordis_plugin_sdk::NodeType;
 use crate::execution::engine::{
     execute_net, ExecutionConfig, ExecutionNetSpec, ExecutionOutput, ExecutionTransitionKind,
@@ -1562,8 +1562,13 @@ impl RuntimeHost {
         result
     }
 
-    pub fn reload(&self) -> Result<ReloadReport, RuntimeError> {
-        match self.reload_internal() {
+    pub fn reload(&self, plugin_path: &str) -> Result<ReloadReport, RuntimeError> {
+        let result = if plugin_path == "/" {
+            self.reload_internal()
+        } else {
+            self.reload_subtree(plugin_path)
+        };
+        match result {
             Ok((report, attempt)) => {
                 self.record_reload_attempt(attempt);
                 let snapshot = self.current_snapshot();
@@ -1580,8 +1585,13 @@ impl RuntimeHost {
         }
     }
 
-    pub fn reload_with_diagnostics(&self) -> ReloadAttemptReport {
-        match self.reload_internal() {
+    pub fn reload_with_diagnostics(&self, plugin_path: &str) -> ReloadAttemptReport {
+        let result = if plugin_path == "/" {
+            self.reload_internal()
+        } else {
+            self.reload_subtree(plugin_path)
+        };
+        match result {
             Ok((report, attempt)) => {
                 self.record_reload_attempt(attempt.clone());
                 let snapshot = self.current_snapshot();
@@ -1595,6 +1605,202 @@ impl RuntimeHost {
                 self.try_auto_iterate_observed_plugins();
                 attempt
             }
+        }
+    }
+
+    /// Reload a subtree of plugins whose path starts with `prefix`.
+    /// `prefix` is already normalized (e.g. "qq", "expr", "expr/evaluator").
+    fn reload_subtree(
+        &self,
+        prefix: &str,
+    ) -> Result<(ReloadReport, ReloadAttemptReport), (RuntimeError, ReloadAttemptReport)> {
+        let normalized = prefix.trim_start_matches('/');
+        let previous_snapshot = self.current_snapshot();
+        let started_at = Instant::now();
+
+        // Collect target plugins (match prefix).
+        let targets: Vec<String> = previous_snapshot
+            .plugin_registry()
+            .iter()
+            .map(|(p, _)| p)
+            .filter(|p| {
+                if normalized.is_empty() {
+                    true
+                } else {
+                    p.as_str() == normalized || p.starts_with(&format!("{}/", normalized))
+                }
+            })
+            .collect();
+
+        if targets.is_empty() {
+            let attempt = ReloadAttemptReport {
+                status: ReloadAttemptStatus::Reloaded,
+                from_snapshot_id: previous_snapshot.snapshot_id().to_string(),
+                to_snapshot_id: Some(previous_snapshot.snapshot_id().to_string()),
+                snapshot_root: self.snapshot_root.display().to_string(),
+                staged_artifact_root: String::new(),
+                elapsed_ms: started_at.elapsed().as_millis(),
+                plugin_count: None,
+                node_count: None,
+                added_plugins: Vec::new(),
+                removed_plugins: Vec::new(),
+                changed_plugins: Vec::new(),
+                changed_plugin_reasons: BTreeMap::new(),
+                failure_summary: None,
+            };
+            return Ok((
+                ReloadReport {
+                    from_snapshot_id: previous_snapshot.snapshot_id().to_string(),
+                    to_snapshot_id: previous_snapshot.snapshot_id().to_string(),
+                    snapshot_root: self.snapshot_root.display().to_string(),
+                    staged_artifact_root: String::new(),
+                    elapsed_ms: 0,
+                    added_plugins: Vec::new(),
+                    removed_plugins: Vec::new(),
+                    changed_plugins: Vec::new(),
+                    changed_plugin_reasons: BTreeMap::new(),
+                },
+                attempt,
+            ));
+        }
+
+        // Gracefully stop Task services for target plugins (reverse order).
+        {
+            for plugin_path in targets.iter().rev() {
+                eprintln!("reload_subtree: stopping services for {plugin_path}");
+                self.service_registry.stop_plugin_services(plugin_path);
+            }
+        }
+
+        let artifacts_dir = self.fixtures_root().join("artifacts");
+        let index_path = artifacts_dir.join("index.json");
+        let index = crate::plugin::artifact::load_artifact_index(&index_path)
+            .map_err(|e| {
+                let attempt = self.make_failed_attempt(&previous_snapshot, started_at, &e);
+                (e, attempt)
+            })?;
+        let index_map = crate::plugin::artifact::artifact_index_map(&index);
+
+        let mut changed_plugins: Vec<String> = Vec::new();
+        let mut changed_reasons: BTreeMap<String, Vec<String>> = BTreeMap::new();
+
+        {
+            let registry = previous_snapshot.plugin_registry();
+
+            for plugin_path in &targets {
+                let entry = match index_map.get(plugin_path) {
+                    Some(e) => e,
+                    None => {
+                        eprintln!("reload_subtree: {plugin_path} not in artifact index, skipping");
+                        continue;
+                    }
+                };
+                let resolved = crate::plugin::artifact::resolve_artifact_path(
+                    &index_path,
+                    &entry.artifact_path,
+                );
+                let dylib = match crate::plugin::dynamic::LoadedDylibApi::open(&resolved) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        eprintln!("reload_subtree: failed to load dylib for {plugin_path}: {e}");
+                        let attempt = self.make_failed_attempt(&previous_snapshot, started_at, &e);
+                        return Err((e, attempt));
+                    }
+                };
+                let api = dylib.api();
+                let docs = match serde_json::from_str::<PluginDocs>(&(api.docs)().payload) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        let err = RuntimeError::Invariant {
+                            message: format!("failed to parse docs for {plugin_path}: {e}"),
+                        };
+                        let attempt = self.make_failed_attempt(&previous_snapshot, started_at, &err);
+                        return Err((err, attempt));
+                    }
+                };
+                let actual_fingerprint: AbiFingerprint =
+                    match serde_json::from_str(&(api.abi_fingerprint)().payload) {
+                        Ok(fp) => fp,
+                        Err(e) => {
+                            let err = RuntimeError::Invariant {
+                                message: format!(
+                                    "failed to parse abi_fingerprint for {plugin_path}: {e}"
+                                ),
+                            };
+                            let attempt =
+                                self.make_failed_attempt(&previous_snapshot, started_at, &err);
+                            return Err((err, attempt));
+                        }
+                    };
+                        if actual_fingerprint.crate_hash != entry.abi_fingerprint.crate_hash
+                            || actual_fingerprint.api_hash != entry.abi_fingerprint.api_hash
+                        {
+                            eprintln!(
+                                "reload_subtree: {plugin_path} ABI mismatch (expected {:?}, got {:?})",
+                                entry.abi_fingerprint, actual_fingerprint
+                            );
+                        }
+                registry.reload_plugin_entry(plugin_path, docs, actual_fingerprint);
+                changed_plugins.push(plugin_path.clone());
+                changed_reasons
+                    .insert(plugin_path.clone(), vec!["subtree reload".to_string()]);
+                eprintln!("reload_subtree: reloaded {plugin_path}");
+                // Drop dylib — it stays loaded in memory (libloading ref).
+                std::mem::drop(dylib);
+            }
+        }
+
+        let report = ReloadReport {
+            from_snapshot_id: previous_snapshot.snapshot_id().to_string(),
+            to_snapshot_id: previous_snapshot.snapshot_id().to_string(),
+            snapshot_root: self.snapshot_root.display().to_string(),
+            staged_artifact_root: String::new(),
+            elapsed_ms: started_at.elapsed().as_millis(),
+            added_plugins: Vec::new(),
+            removed_plugins: Vec::new(),
+            changed_plugins: changed_plugins.clone(),
+            changed_plugin_reasons: changed_reasons,
+        };
+
+        let attempt = ReloadAttemptReport {
+            status: ReloadAttemptStatus::Reloaded,
+            from_snapshot_id: report.from_snapshot_id.clone(),
+            to_snapshot_id: Some(report.to_snapshot_id.clone()),
+            snapshot_root: report.snapshot_root.clone(),
+            staged_artifact_root: report.staged_artifact_root.clone(),
+            elapsed_ms: report.elapsed_ms,
+            plugin_count: Some(targets.len()),
+            node_count: None,
+            added_plugins: Vec::new(),
+            removed_plugins: Vec::new(),
+            changed_plugins,
+            changed_plugin_reasons: BTreeMap::new(),
+            failure_summary: None,
+        };
+
+        Ok((report, attempt))
+    }
+
+    fn make_failed_attempt(
+        &self,
+        previous_snapshot: &RuntimeSnapshot,
+        started_at: Instant,
+        err: &RuntimeError,
+    ) -> ReloadAttemptReport {
+        ReloadAttemptReport {
+            status: ReloadAttemptStatus::Failed,
+            from_snapshot_id: previous_snapshot.snapshot_id().to_string(),
+            to_snapshot_id: None,
+            snapshot_root: self.snapshot_root.display().to_string(),
+            staged_artifact_root: String::new(),
+            elapsed_ms: started_at.elapsed().as_millis(),
+            plugin_count: None,
+            node_count: None,
+            added_plugins: Vec::new(),
+            removed_plugins: Vec::new(),
+            changed_plugins: Vec::new(),
+            changed_plugin_reasons: BTreeMap::new(),
+            failure_summary: Some(err.to_string()),
         }
     }
 
