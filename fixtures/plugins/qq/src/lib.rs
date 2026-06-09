@@ -590,24 +590,15 @@ fn handle_onebot_event(event: &OneBotEvent) {
 fn extract_message_text(message: &Value, raw_message: Option<&str>) -> String {
     let mut parts: Vec<String> = Vec::new();
 
-    // Extract text from raw_message first (but don't discard image data).
-    if let Some(raw) = raw_message {
-        if !raw.is_empty() {
-            parts.push(raw.to_string());
-        }
-    }
-
-    // Also extract from array segments — captures image URLs, etc.
+    // Prefer structured segments array when available.
+    // Fall back to raw_message or plain string otherwise.
     if let Value::Array(segments) = message {
         for seg in segments {
             let seg_type = seg.get("type").and_then(|t| t.as_str()).unwrap_or("");
             match seg_type {
                 "text" => {
-                    // Only add text from segments if raw_message was empty (avoid duplicates).
-                    if parts.is_empty() {
-                        if let Some(t) = seg.get("data").and_then(|d| d.get("text")).and_then(|t| t.as_str()) {
-                            parts.push(t.to_string());
-                        }
+                    if let Some(t) = seg.get("data").and_then(|d| d.get("text")).and_then(|t| t.as_str()) {
+                        parts.push(t.to_string());
                     }
                 }
                 "image" => {
@@ -617,15 +608,22 @@ fn extract_message_text(message: &Value, raw_message: Option<&str>) -> String {
                         parts.push(format!("[image file: {file}]"));
                     }
                 }
+                "at" => {
+                    let qq = seg.get("data").and_then(|d| d.get("qq")).and_then(|q| q.as_str()).unwrap_or("unknown");
+                    // OneBot implementations may provide a "name" field (group card/nickname).
+                    // Fall back to qq number if not available.
+                    let name = seg.get("data").and_then(|d| d.get("name")).and_then(|n| n.as_str()).unwrap_or(qq);
+                    parts.push(format!("@[id={},name={}]", qq, name));
+                }
                 _ => {}
             }
         }
-    }
-
-    if parts.is_empty() {
-        if let Value::String(s) = message {
-            return s.clone();
+    } else if let Some(raw) = raw_message {
+        if !raw.is_empty() {
+            parts.push(raw.to_string());
         }
+    } else if let Value::String(s) = message {
+        parts.push(s.clone());
     }
 
     parts.join("\n")
@@ -755,6 +753,38 @@ fn load_runtime_config() -> Option<serde_json::Value> {
     serde_json::from_str(&data).ok()
 }
 
+fn handle_qq_get_group_members(req: &NodeRequest) -> Result<NodeResponse, String> {
+    let target = req.target.as_deref().unwrap_or("").trim();
+    if target.is_empty() { return Err("target is required for qq_get_group_members (group:<id>)".to_string()); }
+    let (kind, id) = parse_target(target)?;
+    if kind != TargetKind::Group { return Err("target must be group:<id> for qq_get_group_members".to_string()); }
+
+    let base_url = req.payload.as_ref()
+        .and_then(|p| p.get("onebot_url")).and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| STATE.lock().ok().and_then(|s| s.onebot_url.clone()))
+        .or_else(|| load_runtime_config().and_then(|c| c.get("onebot_url")?.as_str().map(|s| s.to_string())))
+        .ok_or("no OneBot URL configured")?;
+
+    let token = req.payload.as_ref()
+        .and_then(|p| p.get("access_token")).and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| STATE.lock().ok().and_then(|s| s.access_token.clone()))
+        .or_else(|| load_runtime_config().and_then(|c| c.get("access_token")?.as_str().map(|s| s.to_string())));
+
+    let params = json!({ "group_id": id });
+    let data = onebot_call(&base_url, "get_group_member_list", &params, token.as_deref())?;
+
+    Ok(NodeResponse {
+        ok: true,
+        node_id: "qq_get_group_members".to_string(),
+        messages: None,
+        message: Some(format!("group {} member list", id)),
+        data: Some(data),
+        error: None,
+    })
+}
+
 fn handle_qq_send(req: &NodeRequest) -> Result<NodeResponse, String> {
     let target = req.target.as_deref().unwrap_or("").trim();
     let message = req.message.as_deref().unwrap_or("").trim();
@@ -801,6 +831,7 @@ fn handle(req: &NodeRequest) -> Result<NodeResponse, String> {
         "qq_serve" => handle_qq_serve(req),
         "qq_fetch_messages" => handle_qq_fetch_messages(),
         "qq_send" => handle_qq_send(req),
+        "qq_get_group_members" => handle_qq_get_group_members(req),
         // For qq_entry, delegate to legacy handler.
         "qq_entry" => {
             let legacy = QqRequest {
