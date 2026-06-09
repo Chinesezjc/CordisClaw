@@ -1609,7 +1609,9 @@ impl RuntimeHost {
     }
 
     /// Reload a subtree of plugins whose path starts with `prefix`.
-    /// `prefix` is already normalized (e.g. "qq", "expr", "expr/evaluator").
+    /// Uses two-phase commit: Phase 1 pre-loads and validates all new dylibs
+    /// (no side effects); Phase 2 stops old services and swaps in the new
+    /// registry entries.
     fn reload_subtree(
         &self,
         prefix: &str,
@@ -1664,14 +1666,6 @@ impl RuntimeHost {
             ));
         }
 
-        // Gracefully stop Task services for target plugins (reverse order).
-        {
-            for plugin_path in targets.iter().rev() {
-                eprintln!("reload_subtree: stopping services for {plugin_path}");
-                self.service_registry.stop_plugin_services(plugin_path);
-            }
-        }
-
         let artifacts_dir = self.fixtures_root().join("artifacts");
         let index_path = artifacts_dir.join("index.json");
         let index = crate::plugin::artifact::load_artifact_index(&index_path)
@@ -1681,73 +1675,124 @@ impl RuntimeHost {
             })?;
         let index_map = crate::plugin::artifact::artifact_index_map(&index);
 
+        // ── Phase 1: pre-load and validate all new dylibs ─────────────
+        // No side effects — if anything fails, old plugins keep running.
+        struct Prepared {
+            plugin_path: String,
+            docs: PluginDocs,
+            abi_fingerprint: AbiFingerprint,
+            _dylib: crate::plugin::dynamic::LoadedDylibApi,
+        }
+        let mut prepared: Vec<Prepared> = Vec::new();
+
+        for plugin_path in &targets {
+            let entry = index_map.get(plugin_path).ok_or_else(|| {
+                let err = RuntimeError::PluginUnavailable {
+                    plugin_path: plugin_path.clone(),
+                    reason: PluginUnavailableReason::ArtifactMissing,
+                    required: false,
+                };
+                let attempt = self.make_failed_attempt(&previous_snapshot, started_at, &err);
+                (err, attempt)
+            })?;
+
+            let resolved =
+                crate::plugin::artifact::resolve_artifact_path(&index_path, &entry.artifact_path);
+            let dylib =
+                crate::plugin::dynamic::LoadedDylibApi::open(&resolved).map_err(|e| {
+                    let attempt = self.make_failed_attempt(&previous_snapshot, started_at, &e);
+                    (e, attempt)
+                })?;
+            let api = dylib.api();
+
+            // Strict docs comparison.
+            let new_docs: PluginDocs =
+                serde_json::from_str(&(api.docs)().payload).map_err(|e| {
+                    let err = RuntimeError::Invariant {
+                        message: format!("failed to parse docs for {plugin_path}: {e}"),
+                    };
+                    let attempt = self.make_failed_attempt(&previous_snapshot, started_at, &err);
+                    (err, attempt)
+                })?;
+            if new_docs.nodes != entry.docs.nodes {
+                let err = RuntimeError::AbiMismatch {
+                    plugin_path: plugin_path.clone(),
+                    expected: entry.abi_fingerprint.clone(),
+                    actual: entry.abi_fingerprint.clone(),
+                    fingerprint_diff: vec![format!(
+                        "docs mismatch: expected {} nodes, got {}",
+                        entry.docs.nodes.len(),
+                        new_docs.nodes.len()
+                    )],
+                };
+                let attempt = self.make_failed_attempt(&previous_snapshot, started_at, &err);
+                return Err((err, attempt));
+            }
+
+            // Strict ABI fingerprint comparison.
+            let actual_fingerprint: AbiFingerprint =
+                serde_json::from_str(&(api.abi_fingerprint)().payload).map_err(|e| {
+                    let err = RuntimeError::Invariant {
+                        message: format!("failed to parse abi_fingerprint for {plugin_path}: {e}"),
+                    };
+                    let attempt = self.make_failed_attempt(&previous_snapshot, started_at, &err);
+                    (err, attempt)
+                })?;
+            if actual_fingerprint.crate_hash != entry.abi_fingerprint.crate_hash
+                || actual_fingerprint.api_hash != entry.abi_fingerprint.api_hash
+            {
+                let diff = vec![format!(
+                    "expected crate={} api={}, got crate={} api={}",
+                    entry.abi_fingerprint.crate_hash,
+                    entry.abi_fingerprint.api_hash,
+                    actual_fingerprint.crate_hash,
+                    actual_fingerprint.api_hash,
+                )];
+                let err = RuntimeError::AbiMismatch {
+                    plugin_path: plugin_path.clone(),
+                    expected: entry.abi_fingerprint.clone(),
+                    actual: actual_fingerprint,
+                    fingerprint_diff: diff,
+                };
+                let attempt = self.make_failed_attempt(&previous_snapshot, started_at, &err);
+                return Err((err, attempt));
+            }
+
+            prepared.push(Prepared {
+                plugin_path: plugin_path.clone(),
+                docs: new_docs,
+                abi_fingerprint: actual_fingerprint,
+                _dylib: dylib,
+            });
+        }
+
+        // ── Phase 2: stop old services → update registry ───────────
+        let registry = previous_snapshot.plugin_registry();
         let mut changed_plugins: Vec<String> = Vec::new();
         let mut changed_reasons: BTreeMap<String, Vec<String>> = BTreeMap::new();
 
-        {
-            let registry = previous_snapshot.plugin_registry();
+        for p in prepared.iter().rev() {
+            eprintln!("reload_subtree: stopping services for {}", p.plugin_path);
+            self.service_registry
+                .stop_plugin_services_timed(&p.plugin_path);
+        }
+        for p in &prepared {
+            registry.reload_plugin_entry(
+                &p.plugin_path,
+                p.docs.clone(),
+                p.abi_fingerprint.clone(),
+            );
+            changed_plugins.push(p.plugin_path.clone());
+            changed_reasons.insert(p.plugin_path.clone(), vec!["subtree reload".to_string()]);
+            eprintln!("reload_subtree: reloaded {}", p.plugin_path);
+        }
 
-            for plugin_path in &targets {
-                let entry = match index_map.get(plugin_path) {
-                    Some(e) => e,
-                    None => {
-                        eprintln!("reload_subtree: {plugin_path} not in artifact index, skipping");
-                        continue;
-                    }
-                };
-                let resolved = crate::plugin::artifact::resolve_artifact_path(
-                    &index_path,
-                    &entry.artifact_path,
-                );
-                let dylib = match crate::plugin::dynamic::LoadedDylibApi::open(&resolved) {
-                    Ok(d) => d,
-                    Err(e) => {
-                        eprintln!("reload_subtree: failed to load dylib for {plugin_path}: {e}");
-                        let attempt = self.make_failed_attempt(&previous_snapshot, started_at, &e);
-                        return Err((e, attempt));
-                    }
-                };
-                let api = dylib.api();
-                let docs = match serde_json::from_str::<PluginDocs>(&(api.docs)().payload) {
-                    Ok(d) => d,
-                    Err(e) => {
-                        let err = RuntimeError::Invariant {
-                            message: format!("failed to parse docs for {plugin_path}: {e}"),
-                        };
-                        let attempt = self.make_failed_attempt(&previous_snapshot, started_at, &err);
-                        return Err((err, attempt));
-                    }
-                };
-                let actual_fingerprint: AbiFingerprint =
-                    match serde_json::from_str(&(api.abi_fingerprint)().payload) {
-                        Ok(fp) => fp,
-                        Err(e) => {
-                            let err = RuntimeError::Invariant {
-                                message: format!(
-                                    "failed to parse abi_fingerprint for {plugin_path}: {e}"
-                                ),
-                            };
-                            let attempt =
-                                self.make_failed_attempt(&previous_snapshot, started_at, &err);
-                            return Err((err, attempt));
-                        }
-                    };
-                        if actual_fingerprint.crate_hash != entry.abi_fingerprint.crate_hash
-                            || actual_fingerprint.api_hash != entry.abi_fingerprint.api_hash
-                        {
-                            eprintln!(
-                                "reload_subtree: {plugin_path} ABI mismatch (expected {:?}, got {:?})",
-                                entry.abi_fingerprint, actual_fingerprint
-                            );
-                        }
-                registry.reload_plugin_entry(plugin_path, docs, actual_fingerprint);
-                changed_plugins.push(plugin_path.clone());
-                changed_reasons
-                    .insert(plugin_path.clone(), vec!["subtree reload".to_string()]);
-                eprintln!("reload_subtree: reloaded {plugin_path}");
-                // Drop dylib — it stays loaded in memory (libloading ref).
-                std::mem::drop(dylib);
-            }
+        let zombie_count = self.service_registry.zombie_count();
+        if zombie_count > 0 {
+            eprintln!(
+                "reload_subtree: {} zombie service(s) remaining (use kill_zombie_services to clean up)",
+                zombie_count
+            );
         }
 
         let report = ReloadReport {

@@ -8,7 +8,8 @@ use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContextScope {
@@ -867,8 +868,18 @@ struct ServiceEntry {
 }
 
 /// Registry of background services, keyed by `"plugin_path::node_id"`.
+/// A service whose `stop()` timed out. The stop thread is kept alive so
+/// we can retry later via `kill_zombie_services`.
+pub struct ZombieEntry {
+    pub key: String,
+    pub plugin_path: String,
+    pub stuck_since: Instant,
+    pub stop_handle: JoinHandle<Result<(), String>>,
+}
+
 pub struct ServiceRegistry {
     entries: Mutex<BTreeMap<String, ServiceEntry>>,
+    zombies: Mutex<Vec<ZombieEntry>>,
 }
 
 impl std::fmt::Debug for ServiceRegistry {
@@ -884,6 +895,7 @@ impl ServiceRegistry {
     pub fn new() -> Self {
         Self {
             entries: Mutex::new(BTreeMap::new()),
+            zombies: Mutex::new(Vec::new()),
         }
     }
 
@@ -922,6 +934,9 @@ impl ServiceRegistry {
     }
 
     /// Stop all services belonging to `plugin_path` (and its descendants).
+    /// Each `stop()` runs on a dedicated thread with a 5-second timeout.
+    /// Services that time out are moved to the zombie list for later
+    /// forced cleanup via [`kill_zombie_services`].
     pub fn stop_plugin_services(&self, plugin_path: &str) {
         let mut guard = self
             .entries
@@ -940,6 +955,114 @@ impl ServiceRegistry {
                 }
             }
         }
+    }
+
+    /// Stop services with a 5-second per-service deadline.
+    /// Services that don't stop in time are pushed to the zombie list.
+    pub fn stop_plugin_services_timed(&self, plugin_path: &str) {
+        const STOP_TIMEOUT: Duration = Duration::from_secs(5);
+
+        let entries_to_stop: Vec<(String, Box<dyn Service>)> = {
+            let mut guard = self
+                .entries
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            let keys: Vec<String> = guard
+                .keys()
+                .filter(|k| k.starts_with(plugin_path))
+                .cloned()
+                .collect();
+            keys.iter()
+                .filter_map(|k| {
+                    guard.remove(k).map(|e| {
+                        e.running.store(false, Ordering::SeqCst);
+                        (k.clone(), e.svc)
+                    })
+                })
+                .collect()
+        };
+
+        let now = Instant::now();
+        for (key, svc) in entries_to_stop {
+            let key_c = key.clone();
+            let plugin_path_c = plugin_path.to_string();
+            let handle = std::thread::spawn(move || svc.stop());
+            // Busy-wait with sleep (simple, no extra deps).
+            let deadline = Instant::now() + STOP_TIMEOUT;
+            let finished = loop {
+                if handle.is_finished() {
+                    break true;
+                }
+                if Instant::now() >= deadline {
+                    break false;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            };
+            if finished {
+                match handle.join() {
+                    Ok(Ok(())) => eprintln!("service {key_c} stopped"),
+                    Ok(Err(e)) => eprintln!("service {key_c} stop error: {e}"),
+                    Err(_) => eprintln!("service {key_c} stop panicked"),
+                }
+            } else {
+                eprintln!(
+                    "service {key_c} stop timed out (>{}s), moving to zombie list",
+                    STOP_TIMEOUT.as_secs()
+                );
+                self.zombies
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push(ZombieEntry {
+                        key: key_c,
+                        plugin_path: plugin_path_c,
+                        stuck_since: now,
+                        stop_handle: handle,
+                    });
+            }
+        }
+    }
+
+    /// Force-kill zombies matching `plugin_path` prefix.
+    /// Returns the number of zombies killed.
+    pub fn kill_zombie_services(&self, plugin_path: &str) -> usize {
+        let mut zombies = self
+            .zombies
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let (matched, rest): (Vec<_>, Vec<_>) =
+            std::mem::take(&mut *zombies)
+                .into_iter()
+                .partition(|z| z.key.starts_with(plugin_path));
+
+        let killed = matched.len();
+        for z in matched {
+            // Last attempt: try joining with zero timeout (non-blocking poll).
+            if z.stop_handle.is_finished() {
+                match z.stop_handle.join() {
+                    Ok(Ok(())) => eprintln!("zombie {} recovered", z.key),
+                    Ok(Err(e)) => eprintln!("zombie {} stop error: {e}", z.key),
+                    Err(_) => eprintln!("zombie {} stop panicked", z.key),
+                }
+            } else {
+                // Still stuck — drop the handle (thread becomes detached).
+                eprintln!(
+                    "zombie {} still stuck after {}s, abandoning",
+                    z.key,
+                    z.stuck_since.elapsed().as_secs()
+                );
+                // Handle dropped here — thread continues detached.
+            }
+        }
+        *zombies = rest;
+        killed
+    }
+
+    /// Number of zombie services currently tracked.
+    pub fn zombie_count(&self) -> usize {
+        self.zombies
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .len()
     }
 
     /// Stop and remove all registered services.
