@@ -9,7 +9,7 @@ crate-type = ["rlib", "dylib"]
 [package.metadata.cordis]
 plugin_path = "qq"
 abi_kind = "rust"
-declared_nodes = ["qq_entry", "qq_serve", "qq_fetch_messages", "qq_send"]
+declared_nodes = ["qq_entry", "qq_serve", "qq_fetch_messages", "qq_send", "qq_get_group_members", "qq_get_group_info"]
 children = []
 
 [package.metadata.cordis.abi_fingerprint]
@@ -17,6 +17,9 @@ rustc_version = "1.85.1"
 target_triple = "x86_64-unknown-linux-gnu"
 crate_hash = "crate_qq_v1"
 api_hash = "api_v2"
+
+[build-dependencies]
+serde_json = "1"
 
 [dependencies]
 cordis-plugin-sdk = { path = "../../../crates/cordis-plugin-sdk" }
