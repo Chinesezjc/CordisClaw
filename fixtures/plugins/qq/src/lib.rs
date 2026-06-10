@@ -15,7 +15,7 @@ use cordis_plugin_sdk::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::sync::Mutex;
 use std::thread;
 extern "C" { fn _cordis_agent_trigger(msg: *const std::ffi::c_char); }
@@ -62,6 +62,10 @@ static SERVER_RUNNING: Mutex<bool> = Mutex::new(false);
 /// Stored agent session ID for message routing.
 static AGENT_SESSION_ID: Mutex<Option<String>> = Mutex::new(None);
 
+/// Dedup: recently processed message IDs (prevents double-processing from zombie pollers / duplicate events).
+static RECENT_MESSAGE_IDS: std::sync::LazyLock<Mutex<HashSet<String>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashSet::new()));
+
 // ---------------------------------------------------------------------------
 // Data types
 // ---------------------------------------------------------------------------
@@ -76,6 +80,12 @@ struct IncomingMessage {
     user_id: String,
     /// Message text
     message: String,
+    /// OneBot message_id for quoting/reply; None for message events missing it
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message_id: Option<i64>,
+    /// Quoted message_id if this message is a reply to another message
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reply_to_msg_id: Option<i64>,
     /// Raw OneBot event for debugging
     #[serde(skip_serializing_if = "Option::is_none")]
     raw_event: Option<Value>,
@@ -91,6 +101,8 @@ struct OneBotEvent {
     message_type: String,
     #[serde(default)]
     message: Value, // can be string or array
+    #[serde(default)]
+    message_id: Option<Value>, // number or string
     #[serde(default)]
     user_id: Value, // number or string
     #[serde(default)]
@@ -151,6 +163,8 @@ struct NodeRequest {
     target: Option<String>,
     #[serde(default)]
     message: Option<String>,
+    #[serde(default)]
+    reply_to: Option<i64>,
     #[serde(default)]
     payload: Option<Value>,
     #[serde(default)]
@@ -213,14 +227,36 @@ fn onebot_call(base_url: &str, endpoint: &str, params: &Value, token: Option<&st
     Ok(parsed)
 }
 
-fn onebot_send_private_msg(base_url: &str, user_id: i64, message: &str, token: Option<&str>) -> Result<Value, String> {
-    let params = json!({ "user_id": user_id, "message": message });
+fn onebot_send_private_msg(
+    base_url: &str,
+    user_id: i64,
+    message: &str,
+    reply_to: Option<i64>,
+    token: Option<&str>,
+) -> Result<Value, String> {
+    let full_message = build_reply_message(message, reply_to);
+    let params = json!({ "user_id": user_id, "message": full_message });
     onebot_call(base_url, "send_private_msg", &params, token)
 }
 
-fn onebot_send_group_msg(base_url: &str, group_id: i64, message: &str, token: Option<&str>) -> Result<Value, String> {
-    let params = json!({ "group_id": group_id, "message": message });
+fn onebot_send_group_msg(
+    base_url: &str,
+    group_id: i64,
+    message: &str,
+    reply_to: Option<i64>,
+    token: Option<&str>,
+) -> Result<Value, String> {
+    let full_message = build_reply_message(message, reply_to);
+    let params = json!({ "group_id": group_id, "message": full_message });
     onebot_call(base_url, "send_group_msg", &params, token)
+}
+
+/// Prepend a OneBot reply segment when reply_to is Some.
+fn build_reply_message(message: &str, reply_to: Option<i64>) -> String {
+    match reply_to {
+        Some(mid) => format!("[CQ:reply,id={}]{}", mid, message),
+        None => message.to_string(),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -374,8 +410,8 @@ fn handle_send(req: QqRequest) -> Result<QqResponse, String> {
         state.onebot_url.clone().ok_or("no OneBot URL configured; use 'configure' first")?
     };
     let data = match kind {
-        TargetKind::Group => onebot_send_group_msg(&base_url, id, &message, None)?,
-        TargetKind::Private => onebot_send_private_msg(&base_url, id, &message, None)?,
+        TargetKind::Group => onebot_send_group_msg(&base_url, id, &message, None, None)?,
+        TargetKind::Private => onebot_send_private_msg(&base_url, id, &message, None, None)?,
     };
     let msg_id = data.get("data").and_then(|d| d.get("message_id")).and_then(|v| v.as_i64());
     Ok(QqResponse {
@@ -495,6 +531,7 @@ fn handle_ws_connection(mut ws: tungstenite::WebSocket<std::net::TcpStream>) {
                             post_type: val.get("post_type").and_then(|v| v.as_str()).unwrap_or("").to_string(),
                             message_type: val.get("message_type").and_then(|v| v.as_str()).unwrap_or("").to_string(),
                             message: val.get("message").cloned().unwrap_or_default(),
+                            message_id: val.get("message_id").cloned(),
                             user_id: val.get("user_id").cloned().unwrap_or_default(),
                             group_id: val.get("group_id").cloned(),
                             sender: val.get("sender").and_then(|s| {
@@ -533,8 +570,8 @@ fn handle_onebot_event(event: &OneBotEvent) {
         return;
     }
 
-    // Extract message text (OneBot can send message as string or array of segments).
-    let message_text = extract_message_text(&event.message, event.raw_message.as_deref());
+    // Extract message text and reply context.
+    let (message_text, reply_to_msg_id) = extract_message_info(&event.message, event.raw_message.as_deref());
 
     // Extract user_id.
     let user_id = match &event.user_id {
@@ -572,13 +609,44 @@ fn handle_onebot_event(event: &OneBotEvent) {
         return;
     }
 
+    let message_id = event.message_id.as_ref().and_then(|v| match v {
+        Value::Number(n) => n.as_i64(),
+        Value::String(s) => s.parse::<i64>().ok(),
+        _ => None,
+    });
+
     let msg = IncomingMessage {
         message_type: msg_type,
         sender_id,
         user_id,
         message: message_text,
+        message_id,
+        reply_to_msg_id,
         raw_event: Some(serde_json::to_value(event).unwrap_or_default()),
     };
+
+    // ---- dedup at ingest: skip events we've already seen ----
+    let dedup_key = match msg.message_id {
+        Some(mid) => format!("msg:{}", mid),
+        None => format!(
+            "hash:{},{},{}",
+            msg.sender_id, msg.user_id, msg.message
+        ),
+    };
+    {
+        let mut seen = RECENT_MESSAGE_IDS.lock().unwrap_or_else(|p| p.into_inner());
+        if seen.contains(&dedup_key) {
+            return; // duplicate event
+        }
+        seen.insert(dedup_key);
+        if seen.len() > 200 {
+            let drain_count = seen.len() - 100;
+            let keys: Vec<String> = seen.iter().take(drain_count).cloned().collect();
+            for k in keys {
+                seen.remove(&k);
+            }
+        }
+    }
 
     if let Ok(mut queue) = MESSAGE_QUEUE.lock() {
         if queue.len() < 128 {
@@ -587,8 +655,10 @@ fn handle_onebot_event(event: &OneBotEvent) {
     }
 }
 
-fn extract_message_text(message: &Value, raw_message: Option<&str>) -> String {
+/// Returns (message_text, reply_to_msg_id) extracted from the OneBot message.
+fn extract_message_info(message: &Value, raw_message: Option<&str>) -> (String, Option<i64>) {
     let mut parts: Vec<String> = Vec::new();
+    let mut reply_to: Option<i64> = None;
 
     // Prefer structured segments array when available.
     // Fall back to raw_message or plain string otherwise.
@@ -596,6 +666,12 @@ fn extract_message_text(message: &Value, raw_message: Option<&str>) -> String {
         for seg in segments {
             let seg_type = seg.get("type").and_then(|t| t.as_str()).unwrap_or("");
             match seg_type {
+                "reply" => {
+                    // Extract the replied message id.
+                    if let Some(id_val) = seg.get("data").and_then(|d| d.get("id")) {
+                        reply_to = extract_i64(id_val);
+                    }
+                }
                 "text" => {
                     if let Some(t) = seg.get("data").and_then(|d| d.get("text")).and_then(|t| t.as_str()) {
                         parts.push(t.to_string());
@@ -626,7 +702,15 @@ fn extract_message_text(message: &Value, raw_message: Option<&str>) -> String {
         parts.push(s.clone());
     }
 
-    parts.join("\n")
+    (parts.join("\n"), reply_to)
+}
+
+fn extract_i64(val: &Value) -> Option<i64> {
+    match val {
+        Value::Number(n) => n.as_i64(),
+        Value::String(s) => s.parse::<i64>().ok(),
+        _ => None,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -724,7 +808,50 @@ fn start_agent_poller() {
             };
             for msg in msgs {
                 if !should_process(&msg.message) { continue; }
-                let prompt = format!("[QQ group from {} (user {})]: {}", msg.sender_id, msg.user_id, msg.message);
+
+                // ---- dedup: skip messages we've already processed ----
+                let dedup_key = match msg.message_id {
+                    Some(mid) => format!("msg:{}", mid),
+                    None => format!(
+                        "hash:{},{},{}",
+                        msg.sender_id, msg.user_id, msg.message
+                    ),
+                };
+                {
+                    let mut seen = RECENT_MESSAGE_IDS.lock().unwrap_or_else(|p| p.into_inner());
+                    if seen.contains(&dedup_key) {
+                        continue; // already processed by this or a zombie poller
+                    }
+                    seen.insert(dedup_key);
+                    // keep the set bounded
+                    if seen.len() > 200 {
+                        let drain_count = seen.len() - 100;
+                        let keys: Vec<String> = seen.iter().take(drain_count).cloned().collect();
+                        for k in keys {
+                            seen.remove(&k);
+                        }
+                    }
+                }
+
+                let mut extra = String::new();
+                if let Some(mid) = msg.message_id {
+                    extra.push_str(&format!("msg_id={}", mid));
+                }
+                if let Some(rid) = msg.reply_to_msg_id {
+                    if !extra.is_empty() { extra.push_str(", "); }
+                    extra.push_str(&format!("reply_to={}", rid));
+                }
+                let prompt = if extra.is_empty() {
+                    format!(
+                        "[QQ group from {} (user {})]: {}",
+                        msg.sender_id, msg.user_id, msg.message
+                    )
+                } else {
+                    format!(
+                        "[QQ group from {} (user {}), {}]: {}",
+                        msg.sender_id, msg.user_id, extra, msg.message
+                    )
+                };
                 cordis_plugin_sdk::agent_trigger(&prompt);
             }
             thread::sleep(std::time::Duration::from_secs(5));
@@ -785,9 +912,47 @@ fn handle_qq_get_group_members(req: &NodeRequest) -> Result<NodeResponse, String
     })
 }
 
+fn handle_qq_get_group_info(req: &NodeRequest) -> Result<NodeResponse, String> {
+    let target = req.target.as_deref().unwrap_or("").trim();
+    if target.is_empty() { return Err("target is required for qq_get_group_info (group:<id>)".to_string()); }
+    let (kind, id) = parse_target(target)?;
+    if kind != TargetKind::Group { return Err("target must be group:<id> for qq_get_group_info".to_string()); }
+
+    let base_url = req.payload.as_ref()
+        .and_then(|p| p.get("onebot_url")).and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| STATE.lock().ok().and_then(|s| s.onebot_url.clone()))
+        .or_else(|| load_runtime_config().and_then(|c| c.get("onebot_url")?.as_str().map(|s| s.to_string())))
+        .ok_or("no OneBot URL configured")?;
+
+    let token = req.payload.as_ref()
+        .and_then(|p| p.get("access_token")).and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| STATE.lock().ok().and_then(|s| s.access_token.clone()))
+        .or_else(|| load_runtime_config().and_then(|c| c.get("access_token")?.as_str().map(|s| s.to_string())));
+
+    let params = json!({ "group_id": id });
+    let data = onebot_call(&base_url, "get_group_info", &params, token.as_deref())?;
+
+    let group_name = data.get("data")
+        .and_then(|d| d.get("group_name"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+
+    Ok(NodeResponse {
+        ok: true,
+        node_id: "qq_get_group_info".to_string(),
+        messages: None,
+        message: Some(format!("group {}: {}", id, group_name)),
+        data: Some(data),
+        error: None,
+    })
+}
+
 fn handle_qq_send(req: &NodeRequest) -> Result<NodeResponse, String> {
     let target = req.target.as_deref().unwrap_or("").trim();
     let message = req.message.as_deref().unwrap_or("").trim();
+    let reply_to = req.reply_to;
 
     if target.is_empty() { return Err("target is required for qq_send".to_string()); }
     if message.is_empty() { return Err("message is required for qq_send".to_string()); }
@@ -807,16 +972,17 @@ fn handle_qq_send(req: &NodeRequest) -> Result<NodeResponse, String> {
 
     let (kind, id) = parse_target(target)?;
     let data = match kind {
-        TargetKind::Group => onebot_send_group_msg(&base_url, id, message, token.as_deref())?,
-        TargetKind::Private => onebot_send_private_msg(&base_url, id, message, token.as_deref())?,
+        TargetKind::Group => onebot_send_group_msg(&base_url, id, message, reply_to, token.as_deref())?,
+        TargetKind::Private => onebot_send_private_msg(&base_url, id, message, reply_to, token.as_deref())?,
     };
-    let msg_id = data.get("data").and_then(|d| d.get("message_id")).and_then(|v| v.as_i64());
+    let _msg_id = data.get("data").and_then(|d| d.get("message_id")).and_then(|v| v.as_i64());
+    let reply_note = reply_to.map(|mid| format!(" (reply to {})", mid)).unwrap_or_default();
 
     Ok(NodeResponse {
         ok: true,
         node_id: "qq_send".to_string(),
         messages: None,
-        message: Some(format!("sent [{}]: {}", target, message)),
+        message: Some(format!("sent [{}]: {}{}", target, message, reply_note)),
         data: Some(data),
         error: None,
     })
@@ -832,6 +998,7 @@ fn handle(req: &NodeRequest) -> Result<NodeResponse, String> {
         "qq_fetch_messages" => handle_qq_fetch_messages(),
         "qq_send" => handle_qq_send(req),
         "qq_get_group_members" => handle_qq_get_group_members(req),
+        "qq_get_group_info" => handle_qq_get_group_info(req),
         // For qq_entry, delegate to legacy handler.
         "qq_entry" => {
             let legacy = QqRequest {
@@ -951,13 +1118,14 @@ fn docs_value() -> cordis_plugin_sdk::PluginDocs {
             ),
             node_doc(
                 "qq_send",
-                "Send a message to a QQ group or private chat via OneBot v11 HTTP API.",
+                "Send a message to a QQ group or private chat via OneBot v11 HTTP API. Supports reply/quote via reply_to.",
                 json!({
                     "type": "object", "required": ["node_id", "target", "message"],
                     "properties": {
                         "node_id": { "type": "string", "const": "qq_send" },
                         "target": { "type": "string", "description": "group:<id> or private:<id>" },
-                        "message": { "type": "string", "description": "Message text to send" }
+                        "message": { "type": "string", "description": "Message text to send" },
+                        "reply_to": { "type": "integer", "description": "Optional message_id to reply/quote" }
                     }
                 }),
                 json!({
@@ -971,6 +1139,28 @@ fn docs_value() -> cordis_plugin_sdk::PluginDocs {
                 &["sends HTTP request to OneBot API"],
                 &["no OneBot URL configured", "invalid target format", "message is empty"],
     ).with_agent_accessible(),
+            node_doc(
+                "qq_get_group_info",
+                "Get group information (name, member count, etc.) via OneBot v11 get_group_info API.",
+                json!({
+                    "type": "object", "required": ["node_id", "target"],
+                    "properties": {
+                        "node_id": { "type": "string", "const": "qq_get_group_info" },
+                        "target": { "type": "string", "description": "group:<id>" }
+                    }
+                }),
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "ok": { "type": "boolean" },
+                        "message": { "type": ["string", "null"] },
+                        "data": { "type": "object", "description": "Raw OneBot get_group_info response" },
+                        "error": { "type": ["string", "null"] }
+                    }
+                }),
+                &["calls OneBot get_group_info API"],
+                &["no OneBot URL configured", "invalid target format", "group not found"],
+            ).with_agent_accessible(),
         ],
     Some("\
 QQ GROUP CHAT MODE — you are running in a QQ group. Messages may be casual chat NOT directed at you.\n\

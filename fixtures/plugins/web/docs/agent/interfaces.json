@@ -7,7 +7,7 @@
   "nodes": [
     {
       "id": "web_search",
-      "summary": "Search the web using Bing API. Requires BING_API_KEY env var. Returns up to max_results items with title, url, and snippet.",
+      "summary": "Search the web using Brave or Bing API. Auto-selects backend by available API key: BRAVE_API_KEY preferred, falls back to BING_API_KEY. Returns up to max_results items with title, url, and snippet.",
       "input_schema": {
         "properties": {
           "max_results": {
@@ -50,10 +50,10 @@
         "type": "object"
       },
       "side_effects": [
-        "makes HTTP request to Bing API"
+        "makes HTTP request to Brave Search API or Bing API"
       ],
       "failure_modes": [
-        "BING_API_KEY not set",
+        "BRAVE_API_KEY and BING_API_KEY not set",
         "network unavailable",
         "rate limited",
         "no results found"
