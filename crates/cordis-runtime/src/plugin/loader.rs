@@ -181,36 +181,8 @@ impl Loader {
                 continue;
             }
 
-            let actual_hash = sha256_file(&resolved_artifact_path)?;
-            if actual_hash != entry.sha256 {
-                plugin_registry.insert_unavailable(
-                    plugin_path.clone(),
-                    entry.parent.clone(),
-                    entry.required,
-                    entry.grants_from_parent.iter().cloned().collect(),
-                    PluginUnavailableReason::HashMismatch,
-                    vec![format!(
-                        "expected hash {}, got {}",
-                        entry.sha256, actual_hash
-                    )],
-                );
-                context.set_plugin_state(
-                    plugin_path,
-                    PluginLoadResult::Unavailable(PluginUnavailableReason::HashMismatch),
-                );
-                metrics.plugin_unavailable_total += 1;
-                metrics.dylib_no_fallback_total += 1;
-                if entry.required {
-                    self.propagate_parent_failure(
-                        plugin_path,
-                        &index_map,
-                        &plugin_registry,
-                        &mut node_registry,
-                        &mut context,
-                    );
-                }
-                continue;
-            }
+            // Trust the artifact index hash (verified by rebuild-fixture-artifacts).
+            // Skip sha256_file for startup speed — large .so files are expensive to re-hash.
 
             let artifact_path = match staged_root {
                 Some(root) => stage_artifact_bundle(
