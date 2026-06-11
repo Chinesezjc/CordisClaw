@@ -210,10 +210,14 @@ fn stage_file(source: &Path, target: &Path) -> Result<(), RuntimeError> {
         })?;
     }
 
-    fs::copy(source, target)
-        .map(|_| ())
-        .map_err(|e| RuntimeError::Io {
-            path: target.to_path_buf(),
-            message: e.to_string(),
-        })
+    // Try hard link first (instant on same filesystem), fall back to copy.
+    if std::fs::hard_link(source, target).is_err() {
+        fs::copy(source, target)
+            .map(|_| ())
+            .map_err(|e| RuntimeError::Io {
+                path: target.to_path_buf(),
+                message: e.to_string(),
+            })?;
+    }
+    Ok(())
 }
