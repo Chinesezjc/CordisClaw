@@ -453,12 +453,7 @@ fn handle_call(req: QqRequest) -> Result<QqResponse, String> {
 // HTTP Server — receives OneBot event POSTs
 // ---------------------------------------------------------------------------
 
-fn start_event_server(port: u16) -> Result<(), String> {
-    let server = tiny_http::Server::http(format!("0.0.0.0:{port}"))
-        .map_err(|e| format!("qq_serve: cannot bind port {port}: {e}"))?;
-
-    *SERVER_RUNNING.lock().map_err(|e| format!("lock: {e}"))? = true;
-
+fn run_event_loop(server: tiny_http::Server) {
     for mut request in server.incoming_requests() {
         if request.url() == "/onebot/event" && request.method() == &tiny_http::Method::Post {
             let mut body = String::new();
@@ -485,8 +480,6 @@ fn start_event_server(port: u16) -> Result<(), String> {
             );
         }
     }
-
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -757,29 +750,16 @@ fn handle_qq_serve(req: &NodeRequest) -> Result<NodeResponse, String> {
         *AGENT_SESSION_ID.lock().map_err(|e| format!("lock: {e}"))? = Some(sid.clone());
     }
 
-    // Start HTTP server in background thread, report result via channel.
+    // Start HTTP server in background thread.  Bind synchronously so we
+    // can report errors, then spawn the accept loop.
     {
         let mut running = SERVER_RUNNING.lock().map_err(|e| format!("lock: {e}"))?;
         if !*running {
             *running = true;
             drop(running);
-            let (tx, rx) = std::sync::mpsc::sync_channel::<Result<(), String>>(0);
-            thread::spawn(move || {
-                let result = start_event_server(port);
-                let _ = tx.send(result);
-            });
-            // Wait up to 2 seconds for the server to bind.
-            match rx.recv_timeout(std::time::Duration::from_secs(2)) {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
-                    *SERVER_RUNNING.lock().map_err(|e2| format!("lock: {e2}"))? = false;
-                    return Err(format!("qq_serve failed to start: {e}"));
-                }
-                Err(_timeout) => {
-                    // Channel hung up — server thread panicked.
-                    eprintln!("qq_serve: server thread exited unexpectedly");
-                }
-            }
+            let server = tiny_http::Server::http(format!("0.0.0.0:{port}"))
+                .map_err(|e| format!("qq_serve: cannot bind port {port}: {e}"))?;
+            thread::spawn(move || run_event_loop(server));
         }
     }
 
