@@ -34,7 +34,6 @@ fn drain_inject_queue() -> Vec<String> {
     }
 }
 
-const AGENT_HISTORY_MESSAGE_LIMIT: usize = 24;
 const AGENT_MAX_TOOL_TURNS: usize = 96;
 const AGENT_REQUEST_MAX_ATTEMPTS: usize = 3;
 const AGENT_REQUEST_RETRY_BACKOFF_MS: u64 = 500;
@@ -644,6 +643,8 @@ pub struct AgentSession {
     history: Vec<Value>,
     transcript: Vec<AgentTranscriptEntry>,
     completed_turns: usize,
+    /// Conservative estimate of total tokens in history (chars / 2).
+    estimated_tokens: usize,
 }
 
 pub type ShellAgentStatus = AgentSessionStatus;
@@ -652,6 +653,12 @@ pub type ShellAgentReply = AgentReply;
 #[derive(Debug, Clone)]
 pub struct ShellAgentSession {
     inner: AgentSession,
+}
+
+/// Conservative token estimate: 1 token per 2 characters (assumes mostly
+/// Chinese text which is more token-dense than English).
+fn estimate_tokens(s: &str) -> usize {
+    s.chars().count() / 2
 }
 
 impl AgentSession {
@@ -669,6 +676,7 @@ impl AgentSession {
             history: Vec::new(),
             transcript: Vec::new(),
             completed_turns: 0,
+            estimated_tokens: 0,
         })
     }
 
@@ -736,6 +744,8 @@ impl AgentSession {
                 provider: self.config.provider.clone(),
             });
         }
+
+        self.compress_history();
 
         let endpoint = format!(
             "{}/chat/completions",
@@ -898,7 +908,7 @@ impl AgentSession {
                             }
                             continue;
                         }
-                        self.remember_exchange(trimmed, &reply_content);
+                        self.remember_exchange(trimmed, &reply_content, message.reasoning_content.as_deref());
                         self.completed_turns += 1;
                         self.transcript.push(AgentTranscriptEntry::Assistant {
                             content: reply_content.clone(),
@@ -930,7 +940,7 @@ impl AgentSession {
                     }
                     continue; // re-enter loop with new messages
                 }
-                self.remember_exchange(trimmed, content);
+                self.remember_exchange(trimmed, content, message.reasoning_content.as_deref());
                 self.completed_turns += 1;
                 self.transcript.push(AgentTranscriptEntry::Assistant {
                     content: content.to_string(),
@@ -975,30 +985,100 @@ impl AgentSession {
         self.respond(&mut backend, user_input)
     }
 
-    fn remember_exchange(&mut self, user_input: &str, assistant_output: &str) {
+    fn compress_history(&mut self) {
+        const COMPRESS_THRESHOLD: usize = 800_000;
+        const KEEP_RECENT: usize = 4;
+
+        if self.estimated_tokens < COMPRESS_THRESHOLD {
+            return;
+        }
+        if self.history.len() <= KEEP_RECENT + 2 {
+            return;
+        }
+
+        let split_at = (self.history.len() - KEEP_RECENT) / 2;
+        let split_at = if split_at % 2 == 0 { split_at } else { split_at + 1 };
+        if split_at == 0 || split_at >= self.history.len() - KEEP_RECENT {
+            return;
+        }
+
+        let old_messages: Vec<_> = self.history.drain(0..split_at).collect();
+        let mut summary_lines: Vec<String> = Vec::new();
+        for msg in &old_messages {
+            let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("");
+            let content = msg.get("content").and_then(|v| v.as_str()).unwrap_or("");
+            if content.is_empty() { continue; }
+            let short = if content.len() > 200 {
+                format!("{}…", &content[..200])
+            } else {
+                content.to_string()
+            };
+            summary_lines.push(format!("[{role}]: {short}"));
+        }
+        let summary = summary_lines.join("\n");
+        let summary_tokens = estimate_tokens(&summary);
+
+        self.estimated_tokens = self
+            .history
+            .iter()
+            .map(|m| {
+                let c = m.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                let r = m.get("reasoning_content").and_then(|v| v.as_str()).unwrap_or("");
+                estimate_tokens(c) + estimate_tokens(r)
+            })
+            .sum();
+        self.estimated_tokens += summary_tokens;
+
+        self.history.insert(
+            0,
+            json!({
+                "role": "system",
+                "content": format!(
+                    "[Compressed history — {} earlier messages summarized below]\n{}",
+                    old_messages.len(),
+                    summary
+                ),
+            }),
+        );
+
+        eprintln!(
+            "agent: compressed {} old messages into summary (~{} tokens est.)",
+            old_messages.len(),
+            summary_tokens,
+        );
+    }
+
+    fn remember_exchange(
+        &mut self,
+        user_input: &str,
+        assistant_output: &str,
+        reasoning: Option<&str>,
+    ) {
+        let mut assistant_msg = json!({
+            "role": "assistant",
+            "content": assistant_output,
+        });
+        if let Some(r) = reasoning {
+            if !r.trim().is_empty() {
+                assistant_msg["reasoning_content"] = Value::String(r.to_string());
+            }
+        }
         self.history.push(json!({
             "role": "user",
             "content": user_input,
         }));
-        self.history.push(json!({
-            "role": "assistant",
-            "content": assistant_output,
-        }));
-        while self.history.len() > AGENT_HISTORY_MESSAGE_LIMIT {
-            let drain = self
-                .history
-                .len()
-                .saturating_sub(AGENT_HISTORY_MESSAGE_LIMIT);
-            let remove = if drain % 2 == 0 { drain } else { drain + 1 };
-            self.history.drain(0..remove.min(self.history.len()));
-        }
+        self.history.push(assistant_msg);
+        // Update token estimate.
+        self.estimated_tokens += estimate_tokens(user_input)
+            + estimate_tokens(assistant_output)
+            + reasoning.map(estimate_tokens).unwrap_or(0);
     }
 
     /// Inject a user→assistant exchange into the agent's history without
     /// triggering an LLM call. Used by `/` shortcuts so the agent stays
     /// aware of direct invocations.
     pub fn inject_exchange(&mut self, user_input: &str, assistant_output: &str) {
-        self.remember_exchange(user_input, assistant_output);
+        self.remember_exchange(user_input, assistant_output, None);
         self.transcript.push(AgentTranscriptEntry::User {
             content: user_input.to_string(),
         });
@@ -1191,7 +1271,7 @@ impl ShellAgentSession {
 
     #[cfg(test)]
     fn remember_exchange(&mut self, user_input: &str, assistant_output: &str) {
-        self.inner.remember_exchange(user_input, assistant_output);
+        self.inner.remember_exchange(user_input, assistant_output, None);
         self.inner.completed_turns += 1;
     }
 }

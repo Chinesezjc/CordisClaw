@@ -18,7 +18,6 @@ use serde_json::{json, Value};
 use std::collections::{HashSet, VecDeque};
 use std::sync::Mutex;
 use std::thread;
-extern "C" { fn _cordis_agent_trigger(msg: *const std::ffi::c_char); }
 // ---------------------------------------------------------------------------
 // Plugin state
 // ---------------------------------------------------------------------------
@@ -625,18 +624,14 @@ fn handle_onebot_event(event: &OneBotEvent) {
         raw_event: Some(serde_json::to_value(event).unwrap_or_default()),
     };
 
-    // ---- dedup at ingest: skip events we've already seen ----
-    let dedup_key = match msg.message_id {
-        Some(mid) => format!("msg:{}", mid),
-        None => format!(
-            "hash:{},{},{}",
-            msg.sender_id, msg.user_id, msg.message
-        ),
-    };
-    {
+    // ---- dedup at ingest: skip duplicate OneBot events (by message_id only) ----
+    // We only dedup by message_id here, not by content hash, because
+    // content-hash dedup happens at consumption time in qq_fetch_messages.
+    if let Some(mid) = msg.message_id {
+        let dedup_key = format!("msg:{}", mid);
         let mut seen = RECENT_MESSAGE_IDS.lock().unwrap_or_else(|p| p.into_inner());
         if seen.contains(&dedup_key) {
-            return; // duplicate event
+            return; // duplicate OneBot event
         }
         seen.insert(dedup_key);
         if seen.len() > 200 {
@@ -775,7 +770,6 @@ fn handle_qq_serve(req: &NodeRequest) -> Result<NodeResponse, String> {
             });
             // Give the server a moment to start.
             thread::sleep(std::time::Duration::from_millis(100));
-            start_agent_poller();
         }
     }
 
@@ -792,78 +786,37 @@ fn handle_qq_serve(req: &NodeRequest) -> Result<NodeResponse, String> {
     })
 }
 
-fn should_process(text: &str) -> bool {
-    if text.len() <= 2 { return false; }
-    if text.starts_with('/') || text.starts_with("[CQ:") { return false; }
-    true
-}
-
-fn start_agent_poller() {
-    thread::spawn(move || {
-        thread::sleep(std::time::Duration::from_secs(2));
-        loop {
-            let msgs: Vec<IncomingMessage> = {
-                let mut queue = MESSAGE_QUEUE.lock().unwrap_or_else(|p| p.into_inner());
-                queue.drain(..).collect()
-            };
-            for msg in msgs {
-                if !should_process(&msg.message) { continue; }
-
-                // ---- dedup: skip messages we've already processed ----
-                let dedup_key = match msg.message_id {
-                    Some(mid) => format!("msg:{}", mid),
-                    None => format!(
-                        "hash:{},{},{}",
-                        msg.sender_id, msg.user_id, msg.message
-                    ),
-                };
-                {
-                    let mut seen = RECENT_MESSAGE_IDS.lock().unwrap_or_else(|p| p.into_inner());
-                    if seen.contains(&dedup_key) {
-                        continue; // already processed by this or a zombie poller
-                    }
-                    seen.insert(dedup_key);
-                    // keep the set bounded
-                    if seen.len() > 200 {
-                        let drain_count = seen.len() - 100;
-                        let keys: Vec<String> = seen.iter().take(drain_count).cloned().collect();
-                        for k in keys {
-                            seen.remove(&k);
-                        }
-                    }
-                }
-
-                let mut extra = String::new();
-                if let Some(mid) = msg.message_id {
-                    extra.push_str(&format!("msg_id={}", mid));
-                }
-                if let Some(rid) = msg.reply_to_msg_id {
-                    if !extra.is_empty() { extra.push_str(", "); }
-                    extra.push_str(&format!("reply_to={}", rid));
-                }
-                let prompt = if extra.is_empty() {
-                    format!(
-                        "[QQ group from {} (user {})]: {}",
-                        msg.sender_id, msg.user_id, msg.message
-                    )
-                } else {
-                    format!(
-                        "[QQ group from {} (user {}), {}]: {}",
-                        msg.sender_id, msg.user_id, extra, msg.message
-                    )
-                };
-                cordis_plugin_sdk::agent_trigger(&prompt);
-            }
-            thread::sleep(std::time::Duration::from_secs(5));
-        }
-    });
-}
-
 fn handle_qq_fetch_messages() -> Result<NodeResponse, String> {
-    let messages: Vec<IncomingMessage> = {
+    let drained: Vec<IncomingMessage> = {
         let mut queue = MESSAGE_QUEUE.lock().map_err(|e| format!("lock: {e}"))?;
         queue.drain(..).collect()
     };
+
+    // Filter out messages already processed (dedup).
+    let mut messages = Vec::new();
+    for msg in drained {
+        let dedup_key = match msg.message_id {
+            Some(mid) => format!("msg:{}", mid),
+            None => format!(
+                "hash:{},{},{}",
+                msg.sender_id, msg.user_id, msg.message
+            ),
+        };
+        let mut seen = RECENT_MESSAGE_IDS.lock().unwrap_or_else(|p| p.into_inner());
+        if seen.contains(&dedup_key) {
+            continue; // already processed
+        }
+        seen.insert(dedup_key);
+        if seen.len() > 200 {
+            let drain_count = seen.len() - 100;
+            let keys: Vec<String> = seen.iter().take(drain_count).cloned().collect();
+            for k in keys {
+                seen.remove(&k);
+            }
+        }
+        messages.push(msg);
+    }
+
     Ok(NodeResponse {
         ok: true,
         node_id: "qq_fetch_messages".to_string(),
