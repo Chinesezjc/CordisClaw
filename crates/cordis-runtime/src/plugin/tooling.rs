@@ -883,7 +883,7 @@ fn read_plugin_build_spec(manifest_path: &Path) -> Result<PluginBuildSpec, Runti
         is_dylib: manifest
             .lib
             .as_ref()
-            .map(|lib| lib.crate_type.iter().any(|kind| kind == "dylib"))
+            .map(|lib| lib.crate_type.iter().any(|kind| kind == "dylib" || kind == "cdylib"))
             .unwrap_or(false),
         artifact: package
             .metadata
