@@ -15,3 +15,6 @@ exclude = [
   "expr/evaluator/factorial",
 ]
 resolver = "2"
+
+[profile.dev]
+strip = "debuginfo"
