@@ -757,19 +757,29 @@ fn handle_qq_serve(req: &NodeRequest) -> Result<NodeResponse, String> {
         *AGENT_SESSION_ID.lock().map_err(|e| format!("lock: {e}"))? = Some(sid.clone());
     }
 
-    // Start HTTP server + WebSocket server in background threads.
+    // Start HTTP server in background thread, report result via channel.
     {
         let mut running = SERVER_RUNNING.lock().map_err(|e| format!("lock: {e}"))?;
         if !*running {
             *running = true;
             drop(running);
+            let (tx, rx) = std::sync::mpsc::sync_channel::<Result<(), String>>(0);
             thread::spawn(move || {
-                if let Err(e) = start_event_server(port) {
-                    eprintln!("qq_serve HTTP server error: {e}");
-                }
+                let result = start_event_server(port);
+                let _ = tx.send(result);
             });
-            // Give the server a moment to start.
-            thread::sleep(std::time::Duration::from_millis(100));
+            // Wait up to 2 seconds for the server to bind.
+            match rx.recv_timeout(std::time::Duration::from_secs(2)) {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    *SERVER_RUNNING.lock().map_err(|e2| format!("lock: {e2}"))? = false;
+                    return Err(format!("qq_serve failed to start: {e}"));
+                }
+                Err(_timeout) => {
+                    // Channel hung up — server thread panicked.
+                    eprintln!("qq_serve: server thread exited unexpectedly");
+                }
+            }
         }
     }
 
