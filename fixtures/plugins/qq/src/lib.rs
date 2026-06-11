@@ -705,6 +705,30 @@ fn extract_i64(val: &Value) -> Option<i64> {
 // New node handlers
 // ---------------------------------------------------------------------------
 
+fn should_process(text: &str) -> bool {
+    if text.len() <= 2 { return false; }
+    if text.starts_with('/') || text.starts_with("[CQ:") { return false; }
+    true
+}
+
+fn start_agent_poller() {
+    thread::spawn(move || {
+        thread::sleep(std::time::Duration::from_secs(2));
+        loop {
+            let msgs: Vec<IncomingMessage> = {
+                let mut queue = MESSAGE_QUEUE.lock().unwrap_or_else(|p| p.into_inner());
+                queue.drain(..).collect()
+            };
+            for msg in msgs {
+                if !should_process(&msg.message) { continue; }
+                let prompt = format!("[QQ group from {} (user {})]: {}", msg.sender_id, msg.user_id, msg.message);
+                cordis_plugin_sdk::agent_trigger(&prompt);
+            }
+            thread::sleep(std::time::Duration::from_secs(5));
+        }
+    });
+}
+
 fn handle_qq_serve(req: &NodeRequest) -> Result<NodeResponse, String> {
     let port: u16 = req.payload.as_ref()
         .and_then(|p| p.get("port"))
@@ -760,6 +784,7 @@ fn handle_qq_serve(req: &NodeRequest) -> Result<NodeResponse, String> {
             let server = tiny_http::Server::http(format!("0.0.0.0:{port}"))
                 .map_err(|e| format!("qq_serve: cannot bind port {port}: {e}"))?;
             thread::spawn(move || run_event_loop(server));
+            start_agent_poller();
         }
     }
 
