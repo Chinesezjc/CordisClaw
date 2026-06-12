@@ -1573,6 +1573,7 @@ impl RuntimeHost {
                 self.record_reload_attempt(attempt);
                 let snapshot = self.current_snapshot();
                 self.observe_snapshot_plugin_issues(snapshot.as_ref(), &report, "reload");
+                self.notify_sessions_of_reload(&report);
                 self.try_auto_iterate_observed_plugins();
                 Ok(report)
             }
@@ -1596,6 +1597,7 @@ impl RuntimeHost {
                 self.record_reload_attempt(attempt.clone());
                 let snapshot = self.current_snapshot();
                 self.observe_snapshot_plugin_issues(snapshot.as_ref(), &report, "reload");
+                self.notify_sessions_of_reload(&report);
                 self.try_auto_iterate_observed_plugins();
                 attempt
             }
@@ -1846,6 +1848,32 @@ impl RuntimeHost {
             changed_plugins: Vec::new(),
             changed_plugin_reasons: BTreeMap::new(),
             failure_summary: Some(err.to_string()),
+        }
+    }
+
+    /// Notify all active agent sessions that a plugin reload happened.
+    fn notify_sessions_of_reload(&self, report: &ReloadReport) {
+        if report.changed_plugins.is_empty() {
+            return;
+        }
+        let changed = report.changed_plugins.join(", ");
+        let notice = format!(
+            "[system] Plugin reloaded: {}. Available nodes may have changed. Use list_plugins/list_nodes if unsure.",
+            changed
+        );
+        // Collect session IDs first to avoid deadlock with agent_inject.
+        let sids: Vec<String> = {
+            self.agent_sessions
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .keys()
+                .cloned()
+                .collect()
+        };
+        for sid in &sids {
+            if let Err(e) = self.agent_inject(sid, &notice, "Acknowledged.") {
+                eprintln!("reload: failed to notify session {sid}: {e}");
+            }
         }
     }
 

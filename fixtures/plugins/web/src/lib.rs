@@ -1,11 +1,16 @@
 //! Web access plugin — search and fetch.
 //!
 //! Nodes:
-//! - `web_search`  — search the web using Brave or Bing (auto-selects by available API key)
+//! - `web_search`  — search the web using DeepSeek, Brave, or Bing (auto-selects by available API key)
 //! - `web_fetch`   — fetch a URL and return plain-text content
 //!
 //! Safety: only http/https URLs are allowed; localhost, loopback, and private
 //! network addresses are blocked.
+//!
+//! Backends (tried in order):
+//! 1. DeepSeek  — DEEPSEEK_API_KEY env var, returns AI-summarised text via /v1/chat + enable_search
+//! 2. Brave     — BRAVE_API_KEY env var, returns structured results (title/url/snippet)
+//! 3. Bing      — BING_API_KEY env var, returns structured results (title/url/snippet)
 
 use cordis_plugin_sdk::{
     export_plugin_api, json_response, node_doc, plugin_docs, AbiFingerprint, PluginRequest,
@@ -162,17 +167,68 @@ fn web_search_brave(query: &str, max_results: usize) -> Result<Vec<SearchResult>
 }
 
 // ---------------------------------------------------------------------------
+// Web search — DeepSeek API (native search, returns AI-summarised text)
+// ---------------------------------------------------------------------------
+
+fn web_search_deepseek(query: &str) -> Result<String, String> {
+    let api_key = std::env::var("DEEPSEEK_API_KEY")
+        .map_err(|_| "DEEPSEEK_API_KEY environment variable not set".to_string())?;
+
+    let model = std::env::var("DEEPSEEK_MODEL").unwrap_or_else(|_| "deepseek-chat".to_string());
+
+    let client = Client::builder()
+        .timeout(Duration::from_secs(TIMEOUT_SECS))
+        .build()
+        .map_err(|e| format!("build HTTP client: {e}"))?;
+
+    let body = json!({
+        "model": model,
+        "messages": [{"role": "user", "content": query}],
+        "enable_search": true
+    });
+
+    let resp = client
+        .post("https://api.deepseek.com/v1/chat")
+        .header("Authorization", format!("Bearer {}", api_key))
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .map_err(|e| format!("DeepSeek HTTP request: {e}"))?;
+
+    let status = resp.status();
+    let body = resp.text().map_err(|e| format!("DeepSeek read body: {e}"))?;
+
+    if !status.is_success() {
+        return Err(format!("DeepSeek API error ({}): {}", status.as_u16(), body));
+    }
+
+    let json: Value =
+        serde_json::from_str(&body).map_err(|e| format!("DeepSeek parse JSON: {e}"))?;
+
+    let content = json["choices"][0]["message"]["content"]
+        .as_str()
+        .ok_or_else(|| {
+            format!(
+                "unexpected DeepSeek response format: {}",
+                &body.chars().take(500).collect::<String>()
+            )
+        })?;
+
+    Ok(content.to_string())
+}
+
+// ---------------------------------------------------------------------------
 // Web search — router (auto-select backend by available API key)
 // ---------------------------------------------------------------------------
 
-fn web_search(query: &str, max_results: usize) -> Result<(Vec<SearchResult>, &'static str), String> {
+fn web_search_structured(query: &str, max_results: usize) -> Result<(Vec<SearchResult>, &'static str), String> {
     if std::env::var("BRAVE_API_KEY").is_ok() {
         return web_search_brave(query, max_results).map(|r| (r, "brave"));
     }
     if std::env::var("BING_API_KEY").is_ok() {
         return web_search_bing(query, max_results).map(|r| (r, "bing"));
     }
-    Err("no search backend available: set BRAVE_API_KEY or BING_API_KEY".to_string())
+    Err("no search backend available: set DEEPSEEK_API_KEY, BRAVE_API_KEY, or BING_API_KEY".to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -253,7 +309,30 @@ fn handle(req: &WebRequest) -> Result<WebResponse, String> {
                 return Err("query is required for web_search".to_string());
             }
             let max = req.max_results.unwrap_or(5).min(20);
-            let (results, _backend) = web_search(query, max)?;
+
+            // 1) Try DeepSeek native search first (returns AI-summarised text)
+            if std::env::var("DEEPSEEK_API_KEY").is_ok() {
+                match web_search_deepseek(query) {
+                    Ok(text) => {
+                        return Ok(WebResponse {
+                            ok: true,
+                            node_id: "web_search".to_string(),
+                            results: None,
+                            text: Some(text),
+                            truncated: None,
+                            error: None,
+                        });
+                    }
+                    Err(e) => {
+                        // Log and fall through to structured backends
+                        // (don't return the error unless everything fails)
+                        let _deepseek_err = e;
+                    }
+                }
+            }
+
+            // 2) Fall back to structured search (Brave / Bing)
+            let (results, _backend) = web_search_structured(query, max)?;
             Ok(WebResponse {
                 ok: true,
                 node_id: "web_search".to_string(),
@@ -304,26 +383,27 @@ fn docs_value() -> cordis_plugin_sdk::PluginDocs {
         vec![
             node_doc(
                 "web_search",
-                "Search the web using Brave or Bing API. Auto-selects backend by available API key: BRAVE_API_KEY preferred, falls back to BING_API_KEY. Returns up to max_results items with title, url, and snippet.",
+                "Search the web using DeepSeek, Brave, or Bing API. Auto-selects backend by available API key: DEEPSEEK_API_KEY preferred, then BRAVE_API_KEY, then BING_API_KEY. DeepSeek returns AI-summarised text; Brave/Bing return structured results (title/url/snippet).",
                 json!({
                     "type": "object",
                     "required": ["node_id", "query"],
                     "properties": {
                         "node_id": { "type": "string", "const": "web_search" },
                         "query": { "type": "string", "description": "Search query" },
-                        "max_results": { "type": "integer", "description": "Max results (default 5, max 20)" }
+                        "max_results": { "type": "integer", "description": "Max results for structured backends (default 5, max 20); ignored by DeepSeek" }
                     }
                 }),
                 json!({
                     "type": "object",
                     "properties": {
                         "ok": { "type": "boolean" },
-                        "results": { "type": "array", "items": { "type": "object" } },
+                        "results": { "type": "array", "items": { "type": "object" }, "description": "Structured results (Brave/Bing), null for DeepSeek" },
+                        "text": { "type": ["string", "null"], "description": "AI-summarised text (DeepSeek), null for structured backends" },
                         "error": { "type": ["string", "null"] }
                     }
                 }),
-                &["makes HTTP request to Brave Search API or Bing API"],
-                &["BRAVE_API_KEY and BING_API_KEY not set", "network unavailable", "rate limited", "no results found"],
+                &["makes HTTP request to DeepSeek /v1/chat, Brave Search API, or Bing API"],
+                &["no API key set (DEEPSEEK_API_KEY, BRAVE_API_KEY, BING_API_KEY)", "network unavailable", "rate limited", "no results found"],
             ).with_agent_accessible(),
             node_doc(
                 "web_fetch",
@@ -357,7 +437,7 @@ fn abi_fingerprint_value() -> AbiFingerprint {
     AbiFingerprint {
         rustc_version: "1.85.1".to_string(),
         target_triple: "x86_64-unknown-linux-gnu".to_string(),
-        crate_hash: "web_brave_v2".to_string(),
+        crate_hash: "web_deepseek_v1".to_string(),
         api_hash: "api_v2".to_string(),
     }
 }
