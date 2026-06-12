@@ -2266,6 +2266,7 @@ Before calling any tool that may block for more than a moment, tell the user wha
 SAFETY RULES — never do these without explicit user request:\n\
 - NEVER create Python scripts, shell scripts, or non-Rust files in the plugins directory. Plugins are Rust dylib crates only.\n\
 - NEVER put output files, logs, or computed results inside any plugin directory. Use the workspace root or /tmp.\n\
+- NEVER leave temporary files behind. If you create a temp file for computation, delete it after use.\n\
 - NEVER read, list, or write outside the project workspace. Read the project freely;\n\
   write only under plugins/. Never touch hidden config dirs, credentials, or system paths.\n\
 - NEVER run commands that access credentials, SSH keys, tokens, or system files.\n\
