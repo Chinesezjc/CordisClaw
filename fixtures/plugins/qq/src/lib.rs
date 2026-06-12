@@ -4,7 +4,7 @@
 //! (e.g. go-cqhttp, NapCat, LLOneBot) via its HTTP API.
 //!
 //! Nodes:
-//! - `qq_entry`         — original multi-action entry (configure/send/status/call)
+//! - `qq_entry`         — original multi-action entry (configure/send/status/call/block/unblock)
 //! - `qq_serve`         — Task node: starts HTTP server to receive OneBot events
 //! - `qq_fetch_messages` — return queued incoming messages (agent polls this)
 //! - `qq_send`          — send a message to a group or private chat
@@ -1044,11 +1044,11 @@ fn docs_value() -> cordis_plugin_sdk::PluginDocs {
         vec![
             node_doc(
                 "qq_entry",
-                "QQ adapter using the NoneBot (OneBot v11) protocol. Connect to a OneBot-compatible QQ client for sending messages. Actions: configure, send, status, call.",
+                "QQ adapter using the NoneBot (OneBot v11) protocol. Connect to a OneBot-compatible QQ client for sending messages. Actions: configure, send, status, call, block, unblock, allow, disallow.",
                 json!({
                     "type": "object", "required": ["action"],
                     "properties": {
-                        "action": { "type": "string", "description": "configure | send | status | call" },
+                        "action": { "type": "string", "description": "configure | send | status | call | block | unblock | allow | disallow" },
                         "url": { "type": "string", "description": "OneBot HTTP API base URL (for configure)" },
                         "target": { "type": "string", "description": "group:<id> or private:<id>" },
                         "message": { "type": "string", "description": "Message text (for send)" },
