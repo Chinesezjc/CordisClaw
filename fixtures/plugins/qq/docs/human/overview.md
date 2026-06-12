@@ -75,3 +75,14 @@ Agent 通过 LLM 自行判断消息是否对它说的。以下情况会触发响
 - 群友之间的闲聊
 - 表情、贴纸、单字回复
 - 不涉及机器人的陈述
+
+## ⚠ 关键代码依赖
+
+以下组件构成消息生命周期，**修改时不可删除**：
+
+| 组件 | 作用 | 后果 |
+|------|------|------|
+| `MESSAGE_QUEUE` | 消息缓冲区 | 删除后无法入队 |
+| `handle_onebot_event()` | HTTP事件→消息入队 | 删除后收不到事件 |
+| `start_agent_poller()` | 每5秒 drain 队列→`agent_trigger`→inbox | **删除后消息永远积压** |
+| `handle_qq_serve` 中的 `start_agent_poller()` 调用 | 启动 poller | 删除后 poller 不启动 |
