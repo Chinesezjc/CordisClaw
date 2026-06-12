@@ -653,6 +653,86 @@ fn handle_onebot_event(event: &OneBotEvent) {
     }
 }
 
+/// Parse a CQ code string (e.g. "[CQ:at,qq=123456,name=bot]") into a human-readable form.
+/// Returns an iterator of (part_type, text) where part_type is "text", "at", "image", etc.
+fn parse_cq_codes(raw: &str) -> Vec<String> {
+    let mut parts: Vec<String> = Vec::new();
+    let mut remaining = raw;
+    while let Some(start) = remaining.find("[CQ:") {
+        // Push text before the CQ code.
+        if start > 0 {
+            parts.push(remaining[..start].to_string());
+        }
+        // Find the closing bracket.
+        if let Some(end) = remaining[start..].find(']') {
+            let cq = &remaining[start + 1..start + end]; // inside brackets, e.g. "CQ:at,qq=123"
+            let cq_body = cq.strip_prefix("CQ:").unwrap_or(cq);
+            let (cq_type, cq_data) = cq_body.split_once(',').unwrap_or((cq_body, ""));
+            
+            match cq_type {
+                "at" => {
+                    let qq = cq_data.split(',')
+                        .find(|kv| kv.starts_with("qq="))
+                        .and_then(|kv| kv.strip_prefix("qq="))
+                        .unwrap_or("unknown");
+                    let name = cq_data.split(',')
+                        .find(|kv| kv.starts_with("name="))
+                        .and_then(|kv| kv.strip_prefix("name="))
+                        .unwrap_or(qq);
+                    parts.push(format!("@[id={},name={}]", qq, name));
+                }
+                "image" => {
+                    let url = cq_data.split(',')
+                        .find(|kv| kv.starts_with("url="))
+                        .and_then(|kv| kv.strip_prefix("url="))
+                        .unwrap_or("");
+                    let file = cq_data.split(',')
+                        .find(|kv| kv.starts_with("file="))
+                        .and_then(|kv| kv.strip_prefix("file="))
+                        .unwrap_or("");
+                    if !url.is_empty() {
+                        parts.push(format!("[image: {}]", url));
+                    } else if !file.is_empty() {
+                        parts.push(format!("[image file: {}]", file));
+                    } else {
+                        parts.push("[image]".to_string());
+                    }
+                }
+                "reply" => {
+                    // reply CQ codes carry message_id; we can't extract reply_to here
+                    // (caller already handles reply segments). Skip silently.
+                }
+                "face" | "sticker" => {
+                    parts.push("[sticker]".to_string());
+                }
+                "record" | "audio" => {
+                    parts.push("[audio]".to_string());
+                }
+                "video" => {
+                    parts.push("[video]".to_string());
+                }
+                "file" => {
+                    parts.push("[file]".to_string());
+                }
+                _ => {
+                    // Unknown CQ code — keep as-is for debugging.
+                    parts.push(format!("[{cq_type}]"));
+                }
+            }
+            remaining = &remaining[start + end + 1..]; // skip past ']'
+        } else {
+            // No closing bracket found; push the rest as-is.
+            parts.push(remaining.to_string());
+            remaining = "";
+            break;
+        }
+    }
+    if !remaining.is_empty() {
+        parts.push(remaining.to_string());
+    }
+    parts
+}
+
 /// Returns (message_text, reply_to_msg_id) extracted from the OneBot message.
 fn extract_message_info(message: &Value, raw_message: Option<&str>) -> (String, Option<i64>) {
     let mut parts: Vec<String> = Vec::new();
@@ -689,21 +769,26 @@ fn extract_message_info(message: &Value, raw_message: Option<&str>) -> (String, 
                     let name = seg.get("data").and_then(|d| d.get("name")).and_then(|n| n.as_str()).unwrap_or(qq);
                     parts.push(format!("@[id={},name={}]", qq, name));
                 }
+                "face" | "sticker" => {
+                    parts.push("[sticker]".to_string());
+                }
                 _ => {}
             }
         }
     } else if let Some(raw) = raw_message {
         if !raw.is_empty() {
-            parts.push(raw.to_string());
+            // Parse CQ codes in raw_message to get human-readable text.
+            parts.extend(parse_cq_codes(raw));
         }
     }
     if parts.is_empty() {
         if let Value::String(s) = message {
-            parts.push(s.clone());
+            // Parse CQ codes in plain string message.
+            parts.extend(parse_cq_codes(s));
         }
     }
 
-    (parts.join("\n"), reply_to)
+    (parts.join(""), reply_to)
 }
 
 fn extract_i64(val: &Value) -> Option<i64> {
@@ -720,7 +805,7 @@ fn extract_i64(val: &Value) -> Option<i64> {
 
 fn should_process(text: &str) -> bool {
     if text.len() <= 2 { return false; }
-    if text.starts_with('/') || text.starts_with("[CQ:") { return false; }
+    if text.starts_with('/') { return false; }
     true
 }
 
