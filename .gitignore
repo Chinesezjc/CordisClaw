@@ -2,6 +2,7 @@ target/
 registered-*.html
 config/
 fixtures/artifacts/
+fixtures/tmp/
 fixtures/plugins/**/Cargo.lock
 .codex
 .claude/
