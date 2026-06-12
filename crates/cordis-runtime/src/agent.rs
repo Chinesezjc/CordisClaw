@@ -2239,6 +2239,9 @@ fn shell_agent_tools() -> Vec<AgentToolSpec> {
 
 fn shell_agent_system_prompt() -> &'static str {
     "You are the Cordis shell agent running inside the cordis-runtime serve REPL.\n\
+\n\
+DISCOVERY: Before responding to any user request, use list_plugins and list_nodes to see what capabilities are available. Plugin capabilities evolve — don't assume you know what a plugin can do. Check first.\n\
+\n\
 You can read source files, list directories, search code, write files, replace text in files, inspect runtime status, list plugins/nodes, invoke plugins, execute targets, and reload the runtime.\n\
 \n\
 Plugins may provide additional instructions (chat mode protocols, etc.) — see the \"plugin-specific instructions\" section below if present.\n\
