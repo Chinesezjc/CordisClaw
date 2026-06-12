@@ -18,4 +18,3 @@ resolver = "2"
 
 [profile.dev]
 strip = "debuginfo"
-opt-level = "s"
