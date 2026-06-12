@@ -63,25 +63,31 @@ struct WebResponse {
 // Web search — DeepSeek native API (/v1/chat + search_enable)
 // ---------------------------------------------------------------------------
 
-fn read_llm_config() -> Option<(String, String)> {
-    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../config/llm_api.yaml");
+fn read_llm_config() -> Option<(String, String, String)> {
+    let path = "config/llm_api.yaml";
     let text = std::fs::read_to_string(path).ok()?;
-    // Simple YAML: "api_key: value" and "model: value" lines
     let mut api_key = None;
     let mut model = None;
+    let mut base_url = None;
     for line in text.lines() {
         let trimmed = line.trim();
         if let Some(v) = trimmed.strip_prefix("api_key: ") {
             api_key = Some(v.trim().to_string());
         } else if let Some(v) = trimmed.strip_prefix("model: ") {
             model = Some(v.trim().to_string());
+        } else if let Some(v) = trimmed.strip_prefix("base_url: ") {
+            base_url = Some(v.trim().to_string());
         }
     }
-    Some((api_key?, model.unwrap_or_else(|| "deepseek-chat".to_string())))
+    Some((
+        api_key?,
+        model.unwrap_or_else(|| "deepseek-chat".to_string()),
+        base_url.unwrap_or_else(|| "https://api.deepseek.com".to_string()),
+    ))
 }
 
 fn web_search_deepseek(query: &str) -> Result<String, String> {
-    let (api_key, model) = read_llm_config()
+    let (api_key, model, base_url) = read_llm_config()
         .ok_or("no api_key found in config/llm_api.yaml".to_string())?;
 
     let client = Client::builder()
@@ -95,8 +101,9 @@ fn web_search_deepseek(query: &str) -> Result<String, String> {
         "search_enable": true
     });
 
+    let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
     let resp = client
-        .post("https://api.deepseek.com/v1/chat")
+        .post(&url)
         .header("Authorization", format!("Bearer {}", api_key))
         .header("Content-Type", "application/json")
         .json(&body)
