@@ -63,12 +63,26 @@ struct WebResponse {
 // Web search — DeepSeek native API (/v1/chat + search_enable)
 // ---------------------------------------------------------------------------
 
-fn web_search_deepseek(query: &str) -> Result<String, String> {
-    let api_key = std::env::var("DEEPSEEK_API_KEY")
-        .map_err(|_| "DEEPSEEK_API_KEY environment variable not set".to_string())?;
+fn read_llm_config() -> Option<(String, String)> {
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../config/llm_api.yaml");
+    let text = std::fs::read_to_string(path).ok()?;
+    // Simple YAML: "api_key: value" and "model: value" lines
+    let mut api_key = None;
+    let mut model = None;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if let Some(v) = trimmed.strip_prefix("api_key: ") {
+            api_key = Some(v.trim().to_string());
+        } else if let Some(v) = trimmed.strip_prefix("model: ") {
+            model = Some(v.trim().to_string());
+        }
+    }
+    Some((api_key?, model.unwrap_or_else(|| "deepseek-chat".to_string())))
+}
 
-    let model =
-        std::env::var("DEEPSEEK_MODEL").unwrap_or_else(|_| "deepseek-chat".to_string());
+fn web_search_deepseek(query: &str) -> Result<String, String> {
+    let (api_key, model) = read_llm_config()
+        .ok_or("no api_key found in config/llm_api.yaml".to_string())?;
 
     let client = Client::builder()
         .timeout(Duration::from_secs(TIMEOUT_SECS))
