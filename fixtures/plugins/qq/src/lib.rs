@@ -696,8 +696,11 @@ fn extract_message_info(message: &Value, raw_message: Option<&str>) -> (String, 
         if !raw.is_empty() {
             parts.push(raw.to_string());
         }
-    } else if let Value::String(s) = message {
-        parts.push(s.clone());
+    }
+    if parts.is_empty() {
+        if let Value::String(s) = message {
+            parts.push(s.clone());
+        }
     }
 
     (parts.join("\n"), reply_to)
