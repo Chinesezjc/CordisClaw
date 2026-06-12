@@ -15,7 +15,7 @@ children = []
 [package.metadata.cordis.abi_fingerprint]
 rustc_version = "1.85.1"
 target_triple = "x86_64-unknown-linux-gnu"
-crate_hash = "web_deepseek_v1"
+crate_hash = "web_deepseek_native"
 api_hash = "api_v2"
 
 [dependencies]
