@@ -83,5 +83,4 @@ cargo clippy                          # lint（关注新增的 warning）
 
 ## 提交格式
 
-- 提交信息使用中文，末尾加 `Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>`
 - 在切分支前确认当前在 `main`
