@@ -10,9 +10,7 @@ crate-type = ["rlib", "dylib"]
 plugin_path = "web"
 abi_kind = "rust"
 declared_nodes = ["web_search", "web_fetch"]
-children = [
-  { source = "./scraper", required = false, grants = [] }
-]
+children = []
 
 [package.metadata.cordis.abi_fingerprint]
 rustc_version = "1.85.1"

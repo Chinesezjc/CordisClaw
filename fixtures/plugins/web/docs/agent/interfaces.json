@@ -7,11 +7,11 @@
   "nodes": [
     {
       "id": "web_search",
-      "summary": "Search the web using Brave or Bing API. Auto-selects backend by available API key: BRAVE_API_KEY preferred, falls back to BING_API_KEY. Returns up to max_results items with title, url, and snippet.",
+      "summary": "Search the web using DeepSeek, Brave, or Bing API. Auto-selects backend by available API key: DEEPSEEK_API_KEY preferred, then BRAVE_API_KEY, then BING_API_KEY. DeepSeek returns AI-summarised text; Brave/Bing return structured results (title/url/snippet).",
       "input_schema": {
         "properties": {
           "max_results": {
-            "description": "Max results (default 5, max 20)",
+            "description": "Max results for structured backends (default 5, max 20); ignored by DeepSeek",
             "type": "integer"
           },
           "node_id": {
@@ -41,19 +41,27 @@
             "type": "boolean"
           },
           "results": {
+            "description": "Structured results (Brave/Bing), null for DeepSeek",
             "items": {
               "type": "object"
             },
             "type": "array"
+          },
+          "text": {
+            "description": "AI-summarised text (DeepSeek), null for structured backends",
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "type": "object"
       },
       "side_effects": [
-        "makes HTTP request to Brave Search API or Bing API"
+        "makes HTTP request to DeepSeek /v1/chat, Brave Search API, or Bing API"
       ],
       "failure_modes": [
-        "BRAVE_API_KEY and BING_API_KEY not set",
+        "no API key set (DEEPSEEK_API_KEY, BRAVE_API_KEY, BING_API_KEY)",
         "network unavailable",
         "rate limited",
         "no results found"
