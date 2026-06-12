@@ -1,5 +1,5 @@
 [package]
-name = "web"
+name = "web_scraper"
 version = "0.1.0"
 edition = "2021"
 
@@ -7,21 +7,19 @@ edition = "2021"
 crate-type = ["rlib", "dylib"]
 
 [package.metadata.cordis]
-plugin_path = "web"
+plugin_path = "web/scraper"
 abi_kind = "rust"
-declared_nodes = ["web_search", "web_fetch"]
-children = [
-  { source = "./scraper", required = false, grants = [] }
-]
+declared_nodes = ["web_scraper"]
+children = []
 
 [package.metadata.cordis.abi_fingerprint]
 rustc_version = "1.85.1"
 target_triple = "x86_64-unknown-linux-gnu"
-crate_hash = "web_deepseek_v1"
+crate_hash = "crate_web_scraper_v1"
 api_hash = "api_v2"
 
 [dependencies]
-cordis-plugin-sdk = { path = "../../../crates/cordis-plugin-sdk" }
+cordis-plugin-sdk = { path = "../../../../crates/cordis-plugin-sdk" }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
