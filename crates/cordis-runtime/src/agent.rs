@@ -215,12 +215,30 @@ impl AgentToolHost for RuntimeHost {
 
     fn agent_plugin_hints(&self) -> Vec<String> {
         let snapshot = self.current_snapshot();
-        snapshot
-            .plugin_registry()
-            .iter()
-            .filter_map(|(_, plugin)| plugin.docs)
-            .filter_map(|docs| docs.system_hint)
-            .collect()
+        // Build a concise catalog of available plugins and their nodes.
+        let mut catalog = String::from("Loaded plugins:\n");
+        for (path, plugin) in snapshot.plugin_registry().iter() {
+            if let Some(ref docs) = plugin.docs {
+                let agent_nodes: Vec<&str> = docs
+                    .nodes
+                    .iter()
+                    .filter(|n| n.agent_accessible)
+                    .map(|n| n.id.as_str())
+                    .collect();
+                if !agent_nodes.is_empty() {
+                    catalog.push_str(&format!("  {} → {}\n", path, agent_nodes.join(", ")));
+                }
+            }
+        }
+        let mut hints = vec![catalog];
+        hints.extend(
+            snapshot
+                .plugin_registry()
+                .iter()
+                .filter_map(|(_, plugin)| plugin.docs)
+                .filter_map(|docs| docs.system_hint),
+        );
+        hints
     }
 
     fn agent_invoke_plugin(
@@ -2239,9 +2257,6 @@ fn shell_agent_tools() -> Vec<AgentToolSpec> {
 
 fn shell_agent_system_prompt() -> &'static str {
     "You are the Cordis shell agent running inside the cordis-runtime serve REPL.\n\
-\n\
-DISCOVERY: Before responding to any user request, use list_plugins and list_nodes to see what capabilities are available. Plugin capabilities evolve — don't assume you know what a plugin can do. Check first.\n\
-\n\
 You can read source files, list directories, search code, write files, replace text in files, inspect runtime status, list plugins/nodes, invoke plugins, execute targets, and reload the runtime.\n\
 \n\
 Plugins may provide additional instructions (chat mode protocols, etc.) — see the \"plugin-specific instructions\" section below if present.\n\
