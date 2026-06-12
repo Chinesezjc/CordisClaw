@@ -333,6 +333,11 @@ fn handle_block(req: QqRequest) -> Result<QqResponse, String> {
     if !state.block_groups.contains(&gid) {
         state.block_groups.push(gid.clone());
     }
+    // Persist to runtime config.
+    if let Some(mut config) = load_runtime_config() {
+        config["block_groups"] = json!(state.block_groups);
+        save_runtime_config(&config);
+    }
     Ok(QqResponse {
         ok: true, action: "block".to_string(),
         message: Some(format!("group {} blocked. block_groups={:?}", gid, state.block_groups)),
@@ -346,6 +351,11 @@ fn handle_unblock(req: QqRequest) -> Result<QqResponse, String> {
     let gid = id.to_string();
     let mut state = STATE.lock().map_err(|e| format!("lock: {e}"))?;
     state.block_groups.retain(|g| g != &gid);
+    // Persist to runtime config.
+    if let Some(mut config) = load_runtime_config() {
+        config["block_groups"] = json!(state.block_groups);
+        save_runtime_config(&config);
+    }
     Ok(QqResponse {
         ok: true, action: "unblock".to_string(),
         message: Some(format!("group {} unblocked. block_groups={:?}", gid, state.block_groups)),
@@ -756,11 +766,16 @@ fn handle_qq_serve(req: &NodeRequest) -> Result<NodeResponse, String> {
         .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
         .unwrap_or_default();
 
-    // Store configuration.
+    // Store configuration. Merge with persisted values from runtime config.
     {
         let mut state = STATE.lock().map_err(|e| format!("lock: {e}"))?;
+        // Load persisted block_groups from runtime config as a base.
+        let persisted_block: Vec<String> = load_runtime_config()
+            .and_then(|c| c.get("block_groups")?.as_array().cloned())
+            .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+            .unwrap_or_default();
         state.allow_groups = allow_groups.clone();
-        state.block_groups = block_groups.clone();
+        state.block_groups = if block_groups.is_empty() { persisted_block } else { block_groups.clone() };
         if let Some(url) = req.payload.as_ref().and_then(|p| p.get("onebot_url")).and_then(|v| v.as_str()) {
             state.onebot_url = Some(url.to_string());
         }
@@ -855,6 +870,14 @@ fn load_runtime_config() -> Option<serde_json::Value> {
     let path = "/root/CordisClaw/fixtures/.cordis-drafts/qq_runtime_config.json";
     let data = std::fs::read_to_string(path).ok()?;
     serde_json::from_str(&data).ok()
+}
+
+fn save_runtime_config(config: &serde_json::Value) {
+    let path = "/root/CordisClaw/fixtures/.cordis-drafts/qq_runtime_config.json";
+    if let Some(parent) = std::path::Path::new(path).parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, serde_json::to_string_pretty(config).unwrap_or_default());
 }
 
 fn handle_qq_get_group_members(req: &NodeRequest) -> Result<NodeResponse, String> {
