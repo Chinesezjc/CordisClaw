@@ -51,8 +51,8 @@ static STATE: Mutex<QqState> = Mutex::new(QqState {
     llm_model: None,
 });
 
-/// Incoming message queue — populated by the HTTP server, drained by
-/// `qq_fetch_messages`.
+/// ⚠ CRITICAL — incoming message queue. Populated by handle_onebot_event,
+/// drained by start_agent_poller → agent_trigger → inbox loop.
 static MESSAGE_QUEUE: Mutex<VecDeque<IncomingMessage>> = Mutex::new(VecDeque::new());
 
 /// Server running flag.
@@ -711,6 +711,15 @@ fn should_process(text: &str) -> bool {
     true
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+// ⚠ CRITICAL — message pump.  Do NOT delete or refactor away.
+// The runtime inbox loop depends on this polling thread to drain
+// MESSAGE_QUEUE and push messages via agent_trigger().
+//
+// Must be started inside handle_qq_serve after SERVER_RUNNING flips true.
+// If this function is missing, QQ messages will silently accumulate in
+// MESSAGE_QUEUE and never reach the agent.
+// ═══════════════════════════════════════════════════════════════════════
 fn start_agent_poller() {
     thread::spawn(move || {
         thread::sleep(std::time::Duration::from_secs(2));
