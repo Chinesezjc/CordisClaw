@@ -781,7 +781,10 @@ impl AgentSession {
             });
         }
 
-        self.compact_history();
+        // If this message would push us over the threshold, compact first.
+        if self.estimated_tokens + estimate_tokens(trimmed) > 800_000 {
+            self.compact_history();
+        }
 
         let endpoint = format!(
             "{}/chat/completions",
@@ -1027,12 +1030,8 @@ impl AgentSession {
     }
 
     pub fn compact_history(&mut self) {
-        const COMPRESS_THRESHOLD: usize = 800_000;
         const KEEP_RECENT: usize = 12; // keep at least 6 user+assistant pairs
 
-        if self.estimated_tokens < COMPRESS_THRESHOLD {
-            return;
-        }
         if self.history.len() <= KEEP_RECENT + 2 {
             return;
         }
