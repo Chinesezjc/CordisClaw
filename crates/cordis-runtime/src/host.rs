@@ -1064,8 +1064,6 @@ impl RuntimeHost {
                 }
             }
         }
-        recover_plugin_iteration_workspace(&fixtures_root, &snapshot_root)?;
-
         let initial_snapshot = Arc::new(build_snapshot(&loader, &snapshot_root)?);
         let interactive_rollback = Mutex::new(PluginEditRollback::empty(&fixtures_root));
         let service_registry = Arc::new(crate::context::ServiceRegistry::new());
@@ -5088,14 +5086,6 @@ fn restore_plugin_iteration_workspace(
     }
 
     Ok(false)
-}
-
-fn recover_plugin_iteration_workspace(
-    fixtures_root: &Path,
-    snapshot_root: &Path,
-) -> Result<(), RuntimeError> {
-    let _ = restore_plugin_iteration_workspace(fixtures_root, snapshot_root, None)?;
-    Ok(())
 }
 
 fn default_snapshot_root(fixtures_root: &Path) -> PathBuf {

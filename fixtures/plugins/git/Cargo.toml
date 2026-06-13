@@ -9,7 +9,7 @@ crate-type = ["rlib", "dylib"]
 [package.metadata.cordis]
 plugin_path = "git"
 abi_kind = "rust"
-declared_nodes = ["git_diff", "git_log", "git_status", "git_commit"]
+declared_nodes = ["git_diff", "git_log", "git_status", "git_commit", "git_reset", "git_rebase", "git_amend", "git_cherry_pick"]
 children = []
 
 [package.metadata.cordis.abi_fingerprint]

@@ -171,7 +171,7 @@
     },
     {
       "id": "git_commit",
-      "summary": "Stage and commit changes. Pass specific file paths or omit to commit all changes. Dangerous operations (push, force, amend) are blocked.",
+      "summary": "Stage and commit changes. Pass specific file paths or omit to commit all changes. Push and force-push are blocked.",
       "input_schema": {
         "properties": {
           "fixtures_root": {
@@ -232,6 +232,265 @@
         "forbidden operation",
         "path escapes root",
         "not a git repository"
+      ],
+      "node_type": "router",
+      "agent_accessible": true
+    },
+    {
+      "id": "git_reset",
+      "summary": "Reset HEAD to a target commit. Mode: soft (keep changes staged), mixed (default, keep changes unstaged), hard (discard all changes). Only local targets allowed.",
+      "input_schema": {
+        "properties": {
+          "fixtures_root": {
+            "description": "Path to the git repository root",
+            "type": "string"
+          },
+          "mode": {
+            "description": "Reset mode: soft, mixed (default), or hard",
+            "type": "string"
+          },
+          "node_id": {
+            "const": "git_reset",
+            "type": "string"
+          },
+          "target": {
+            "description": "Commit-ish to reset to (default HEAD)",
+            "type": "string"
+          }
+        },
+        "required": [
+          "node_id",
+          "fixtures_root"
+        ],
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "head": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ok": {
+            "type": "boolean"
+          },
+          "reset": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "side_effects": [
+        "modifies git history (local only)",
+        "destroys uncommitted changes (hard)"
+      ],
+      "failure_modes": [
+        "invalid reset mode",
+        "remote target",
+        "not a git repository"
+      ],
+      "node_type": "router",
+      "agent_accessible": true
+    },
+    {
+      "id": "git_rebase",
+      "summary": "Rebase current branch onto another local branch. Only local targets allowed.",
+      "input_schema": {
+        "properties": {
+          "fixtures_root": {
+            "description": "Path to the git repository root",
+            "type": "string"
+          },
+          "node_id": {
+            "const": "git_rebase",
+            "type": "string"
+          },
+          "onto": {
+            "description": "Branch to rebase onto (local branch only)",
+            "type": "string"
+          }
+        },
+        "required": [
+          "node_id",
+          "fixtures_root",
+          "onto"
+        ],
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "head": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ok": {
+            "type": "boolean"
+          },
+          "rebased": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "side_effects": [
+        "rewrites git history (local only)",
+        "may cause conflicts"
+      ],
+      "failure_modes": [
+        "remote target",
+        "not a git repository",
+        "merge conflicts"
+      ],
+      "node_type": "router",
+      "agent_accessible": true
+    },
+    {
+      "id": "git_amend",
+      "summary": "Amend the most recent commit. Stages all pending changes and amends. Pass a new message or omit to keep the previous message.",
+      "input_schema": {
+        "properties": {
+          "fixtures_root": {
+            "description": "Path to the git repository root",
+            "type": "string"
+          },
+          "message": {
+            "description": "Optional: new commit message. Omit to keep previous message.",
+            "type": "string"
+          },
+          "node_id": {
+            "const": "git_amend",
+            "type": "string"
+          }
+        },
+        "required": [
+          "node_id",
+          "fixtures_root"
+        ],
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "amended": {
+            "type": "boolean"
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "head": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ok": {
+            "type": "boolean"
+          },
+          "output": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "side_effects": [
+        "rewrites git history (local only)"
+      ],
+      "failure_modes": [
+        "not a git repository",
+        "nothing to commit"
+      ],
+      "node_type": "router",
+      "agent_accessible": true
+    },
+    {
+      "id": "git_cherry_pick",
+      "summary": "Cherry-pick one or more commits onto the current branch. Provide commit hashes.",
+      "input_schema": {
+        "properties": {
+          "commits": {
+            "description": "Commit hashes to cherry-pick",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "fixtures_root": {
+            "description": "Path to the git repository root",
+            "type": "string"
+          },
+          "node_id": {
+            "const": "git_cherry_pick",
+            "type": "string"
+          }
+        },
+        "required": [
+          "node_id",
+          "fixtures_root",
+          "commits"
+        ],
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "cherry_picked": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "head": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ok": {
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      },
+      "side_effects": [
+        "adds commits to git history (local only)",
+        "may cause conflicts"
+      ],
+      "failure_modes": [
+        "empty commits array",
+        "invalid commit hash",
+        "not a git repository",
+        "merge conflicts"
       ],
       "node_type": "router",
       "agent_accessible": true
