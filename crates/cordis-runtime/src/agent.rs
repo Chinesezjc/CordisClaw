@@ -111,6 +111,7 @@ pub trait AgentToolHost {
     fn agent_move_file(&self, path: &str, new_path: &str) -> Result<Value, RuntimeError>;
     fn agent_copy_file(&self, path: &str, new_path: &str) -> Result<Value, RuntimeError>;
     fn agent_compact_context(&self, session_id: &str) -> Result<Value, RuntimeError>;
+    fn agent_send_warning_to_test_groups(&self, message: &str);
 }
 
 impl AgentToolHost for RuntimeHost {
@@ -592,6 +593,31 @@ impl AgentToolHost for RuntimeHost {
             "new_messages": new_len,
         }))
     }
+
+    fn agent_send_warning_to_test_groups(&self, message: &str) {
+        let test_groups = read_test_groups_from_config();
+        for gid in &test_groups {
+            let payload = serde_json::json!({
+                "node_id": "qq_send",
+                "target": format!("group:{gid}"),
+                "message": message,
+            });
+            if let Err(e) = self.invoke("qq", "qq_send", payload.to_string()) {
+                eprintln!("[warn] qq_send to {gid} failed: {e}");
+            }
+        }
+    }
+}
+
+fn read_test_groups_from_config() -> Vec<String> {
+    let path = "/root/CordisClaw/fixtures/.cordis-drafts/qq_runtime_config.json";
+    let Ok(text) = std::fs::read_to_string(path) else { return vec![] };
+    let Ok(config) = serde_json::from_str::<serde_json::Value>(&text) else { return vec![] };
+    config
+        .get("test_groups")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+        .unwrap_or_default()
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -660,9 +686,11 @@ pub struct AgentToolSpec {
 }
 
 pub trait AgentBackend {
+    type Host: AgentToolHost + ?Sized;
     fn system_prompt(&self) -> String;
     fn tool_specs(&self) -> Vec<AgentToolSpec>;
     fn execute_tool(&mut self, name: &str, arguments: Value) -> Result<Value, RuntimeError>;
+    fn host(&self) -> &Self::Host;
     fn terminal_tool_reply(&self, _name: &str, _output: &Value) -> Option<String> {
         None
     }
@@ -681,6 +709,8 @@ pub struct AgentSession {
     completed_turns: usize,
     /// Conservative estimate of total tokens in history (chars / 2).
     estimated_tokens: usize,
+    /// Consecutive reasoning-only responses (no content, no tool_calls).
+    reasoning_only_strikes: usize,
 }
 
 pub type ShellAgentStatus = AgentSessionStatus;
@@ -713,6 +743,7 @@ impl AgentSession {
             transcript: Vec::new(),
             completed_turns: 0,
             estimated_tokens: 0,
+            reasoning_only_strikes: 0,
         })
     }
 
@@ -992,15 +1023,26 @@ impl AgentSession {
                 });
             }
 
-            if matches!(finish_reason.as_deref(), Some("length"))
-                && message
-                    .reasoning_content
-                    .as_deref()
-                    .is_some_and(|value| !value.trim().is_empty())
+            if message
+                .reasoning_content
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
             {
                 messages.push(message.to_request_message());
+                self.reasoning_only_strikes += 1;
+                if self.reasoning_only_strikes >= 3 {
+                    let _ = backend.host().agent_send_warning_to_test_groups(
+                        "⚠ Agent produced 3 consecutive reasoning-only responses — may be stuck.",
+                    );
+                    self.reasoning_only_strikes = 0;
+                }
+                messages.push(json!({
+                    "role": "user",
+                    "content": "[system] You produced reasoning but no response. Please output your answer or call a tool.",
+                }));
                 continue;
             }
+            self.reasoning_only_strikes = 0;
 
             return Err(RuntimeError::LlmResponseInvalid {
                 message: "agent response had neither tool_calls nor final content".to_string(),
@@ -1803,15 +1845,14 @@ fn read_chat_stream(
                 saw_done = true;
                 break;
             }
-            // Stream new content to the user in real-time.
+            // Stream new reasoning — prefix every line with 💭.
             let new_reasoning = &accumulator.reasoning_content[flushed_reasoning_len..];
             if !new_reasoning.is_empty() {
-                // First reasoning delta: print the prefix.
                 if flushed_reasoning_len == 0 {
                     let _ = write!(std::io::stdout(), "\x1b[2m💭 ");
                 }
-                // Print reasoning continuously without newlines.
-                let _ = write!(std::io::stdout(), "{new_reasoning}");
+                let formatted = new_reasoning.replace('\n', "\n💭 ");
+                let _ = write!(std::io::stdout(), "{formatted}");
                 let _ = std::io::stdout().flush();
                 flushed_reasoning_len = accumulator.reasoning_content.len();
             }
@@ -1921,6 +1962,8 @@ struct RuntimeShellAgentBackend<'a, H: AgentToolHost + ?Sized> {
 }
 
 impl<'a, H: AgentToolHost + ?Sized> AgentBackend for RuntimeShellAgentBackend<'a, H> {
+    type Host = H;
+    fn host(&self) -> &H { self.host }
     fn system_prompt(&self) -> String {
         let mut prompt = shell_agent_system_prompt().to_string();
         let hints = self.host.agent_plugin_hints();
@@ -2506,6 +2549,8 @@ mod tests {
     }
 
     impl AgentBackend for TerminalTestBackend {
+        type Host = FakeHost;
+        fn host(&self) -> &FakeHost { &FakeHost }
         fn system_prompt(&self) -> String {
             "test backend".to_string()
         }
@@ -2670,6 +2715,8 @@ mod tests {
         fn agent_compact_context(&self, _session_id: &str) -> Result<Value, RuntimeError> {
             Ok(json!({ "compacted": true }))
         }
+
+        fn agent_send_warning_to_test_groups(&self, _message: &str) {}
     }
 
     #[test]
