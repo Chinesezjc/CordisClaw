@@ -53,7 +53,9 @@ fn read_test_groups() -> Vec<String> {
 
 pub fn start_health_loop(host: Arc<RuntimeHost>, interval_secs: u64) {
     std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_secs(10));
+        // First check after a full interval, not immediately.
+        // Prevents spam when the service is restarted multiple times.
+        std::thread::sleep(Duration::from_secs(interval_secs));
         loop {
             run_check(&host);
             std::thread::sleep(Duration::from_secs(interval_secs));
