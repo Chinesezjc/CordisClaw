@@ -58,6 +58,7 @@ const AGENT_TOOL_DELETE_FILE: &str = "delete_file";
 const AGENT_TOOL_RENAME_FILE: &str = "rename_file";
 const AGENT_TOOL_MOVE_FILE: &str = "move_file";
 const AGENT_TOOL_COPY_FILE: &str = "copy_file";
+const AGENT_TOOL_COMPACT_CONTEXT: &str = "compact_context";
 const LLM_DEBUG_ENV: &str = "CORDIS_LLM_DEBUG";
 
 pub trait AgentToolHost {
@@ -109,6 +110,7 @@ pub trait AgentToolHost {
     fn agent_rename_file(&self, path: &str, new_path: &str) -> Result<Value, RuntimeError>;
     fn agent_move_file(&self, path: &str, new_path: &str) -> Result<Value, RuntimeError>;
     fn agent_copy_file(&self, path: &str, new_path: &str) -> Result<Value, RuntimeError>;
+    fn agent_compact_context(&self, session_id: &str) -> Result<Value, RuntimeError>;
 }
 
 impl AgentToolHost for RuntimeHost {
@@ -575,6 +577,21 @@ impl AgentToolHost for RuntimeHost {
             "copied": true,
         }))
     }
+
+    fn agent_compact_context(&self, session_id: &str) -> Result<Value, RuntimeError> {
+        let mut guard = self.agent_sessions_mut();
+        let session = guard.get_mut(session_id).ok_or_else(|| {
+            RuntimeError::AgentSessionNotFound {
+                session_id: session_id.to_string(),
+            }
+        })?;
+        let (old_len, new_len) = session.compact_history();
+        Ok(json!({
+            "compacted": true,
+            "old_messages": old_len,
+            "new_messages": new_len,
+        }))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -764,7 +781,7 @@ impl AgentSession {
             });
         }
 
-        self.compress_history();
+        self.compact_history();
 
         let endpoint = format!(
             "{}/chat/completions",
@@ -998,13 +1015,18 @@ impl AgentSession {
     pub fn respond_with_runtime_host<H: AgentToolHost + ?Sized>(
         &mut self,
         host: &H,
+        session_id: &str,
         user_input: &str,
     ) -> Result<AgentReply, RuntimeError> {
-        let mut backend = RuntimeShellAgentBackend { host };
+        let mut backend = RuntimeShellAgentBackend { host, session_id };
         self.respond(&mut backend, user_input)
     }
 
-    fn compress_history(&mut self) {
+    pub fn history_len(&self) -> usize {
+        self.history.len()
+    }
+
+    pub fn compact_history(&mut self) {
         const COMPRESS_THRESHOLD: usize = 800_000;
         const KEEP_RECENT: usize = 12; // keep at least 6 user+assistant pairs
 
@@ -1289,9 +1311,10 @@ impl ShellAgentSession {
     pub fn respond<H: AgentToolHost + ?Sized>(
         &mut self,
         host: &H,
+        session_id: &str,
         user_input: &str,
     ) -> Result<ShellAgentReply, RuntimeError> {
-        self.inner.respond_with_runtime_host(host, user_input)
+        self.inner.respond_with_runtime_host(host, session_id, user_input)
     }
 
     #[cfg(test)]
@@ -1895,6 +1918,7 @@ fn process_stream_event(
 
 struct RuntimeShellAgentBackend<'a, H: AgentToolHost + ?Sized> {
     host: &'a H,
+    session_id: &'a str,
 }
 
 impl<'a, H: AgentToolHost + ?Sized> AgentBackend for RuntimeShellAgentBackend<'a, H> {
@@ -2001,6 +2025,10 @@ impl<'a, H: AgentToolHost + ?Sized> AgentBackend for RuntimeShellAgentBackend<'a
                 let args = parse_tool_value_arguments::<CopyFileArgs>(arguments, name)?;
                 self.host
                     .agent_copy_file(&args.path, &args.new_path)
+            }
+            AGENT_TOOL_COMPACT_CONTEXT => {
+                parse_tool_value_arguments::<EmptyArgs>(arguments, name)?;
+                self.host.agent_compact_context(self.session_id)
             }
             other => Err(RuntimeError::InvalidArgument {
                 message: format!("runtime shell agent does not support tool {other}"),
@@ -2256,6 +2284,15 @@ fn shell_agent_tools() -> Vec<AgentToolSpec> {
                     "new_path": { "type": "string", "description": "Destination relative path within the fixtures root. Parent directories are created automatically." }
                 },
                 "required": ["path", "new_path"],
+                "additionalProperties": false,
+            }),
+        },
+        AgentToolSpec {
+            name: AGENT_TOOL_COMPACT_CONTEXT,
+            description: "Compress the conversation history to save context space. Summarizes older messages, keeping the most recent exchanges intact. Use when the conversation is getting long to stay within the context window.",
+            parameters: json!({
+                "type": "object",
+                "properties": {},
                 "additionalProperties": false,
             }),
         },
@@ -2629,6 +2666,10 @@ mod tests {
         fn agent_copy_file(&self, path: &str, new_path: &str) -> Result<Value, RuntimeError> {
             let _ = (path, new_path);
             Ok(json!({ "copied": true }))
+        }
+
+        fn agent_compact_context(&self, _session_id: &str) -> Result<Value, RuntimeError> {
+            Ok(json!({ "compacted": true }))
         }
     }
 
