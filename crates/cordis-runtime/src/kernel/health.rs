@@ -43,8 +43,13 @@ pub fn start_health_loop(host: Arc<RuntimeHost>, interval_secs: u64) {
                 "   Healthy example: '✅ Self-check OK | 18 plugins | 0 issues | 0 zombies'\n",
                 "   Unhealthy example: '⚠ Self-check: 2 plugin errors, 1 zombie service'"
             );
-            if let Err(e) = host.agent_send(&core_sid, prompt) {
-                eprintln!("[health] agent_send failed: {e}");
+            match host.agent_send(&core_sid, prompt) {
+                Ok(reply) => eprintln!(
+                    "[health] check complete: {} chars, {} tool calls",
+                    reply.content.len(),
+                    reply.tool_events.len(),
+                ),
+                Err(e) => eprintln!("[health] agent_send failed: {e}"),
             }
             std::thread::sleep(Duration::from_secs(interval_secs));
         }
