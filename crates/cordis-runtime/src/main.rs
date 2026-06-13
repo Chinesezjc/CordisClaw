@@ -276,7 +276,7 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             AGENT_TRIGGER_TX = Some(tx);
         }
         cordis_runtime::agent::set_agent_inject_queue(inject_queue);
-        cordis_runtime::kernel::health::start_health_loop(std::sync::Arc::clone(&host), 3600);
+        let health_host = std::sync::Arc::clone(&host);
         let mut sessions: BTreeMap<String, String> = BTreeMap::new();
         std::thread::spawn(move || {
             loop {
@@ -372,6 +372,9 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         });
+        // Start health check loop after all services are ready.
+        cordis_runtime::kernel::health::start_health_loop(health_host, 3600);
+
         // Park — background threads keep running.
         loop {
             std::thread::park();
