@@ -1253,8 +1253,8 @@ fn docs_value() -> cordis_plugin_sdk::PluginDocs {
     Some("\
 QQ GROUP CHAT MODE — you are running in a QQ group. Messages may be casual chat NOT directed at you.\n\
 CRITICAL: Always decide whether the message is actually talking to YOU before responding.\n\
-A message IS directed at you if: mentions \"机器人\", \"bot\", \"Cordis\"; asks a direct question; gives a command; has question words (how, why, what, 怎么, 为什么, 如何, 帮我).\n\
-A message is NOT directed at you if: casual chat between members; emoji/sticker/single-word; talking about someone else; statements not asking for anything.\n\
+A message IS directed at you ONLY if: contains @[id=3832224285] (explicit @mention of bot); or starts with \"bot\" or \"Bot\" or \"机器人\".\n\
+A message is NOT directed at you if: general group discussion; questions not explicitly addressed to bot; casual chat; emoji/sticker; talking about someone else. When in doubt, suspend.\n\
 If NOT directed at you: use {\"action\":\"suspend\"}.\n\
 If directed at you: use {\"action\":\"respond\",\"message\":\"your reply here\"}.\n\
 \n\
