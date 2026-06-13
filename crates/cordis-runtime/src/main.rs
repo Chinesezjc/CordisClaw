@@ -183,8 +183,9 @@ fn run_loader(root: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
 fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let (root, runtime_only) = parse_root_and_runtime_only(args, "fixtures")?;
     prepare_fixtures_root(&root, runtime_only)?;
-    let host =
-        RuntimeHost::boot(&root).map_err(|err| runtime_mode_error(err, &root, runtime_only))?;
+    let host = std::sync::Arc::new(
+        RuntimeHost::boot(&root).map_err(|err| runtime_mode_error(err, &root, runtime_only))?,
+    );
     let agent_session = host.agent_start(AgentSessionKind::RuntimeShell)?;
     let session_id = agent_session.session_id.clone();
     let mut state = ServeState {
@@ -275,6 +276,7 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             AGENT_TRIGGER_TX = Some(tx);
         }
         cordis_runtime::agent::set_agent_inject_queue(inject_queue);
+        cordis_runtime::kernel::health::start_health_loop(std::sync::Arc::clone(&host), 3600);
         let mut sessions: BTreeMap<String, String> = BTreeMap::new();
         std::thread::spawn(move || {
             loop {
