@@ -19,16 +19,8 @@ fn run_check(host: &RuntimeHost) {
         status.plugin_count, status.node_count, zombies,
     );
 
-    let test_groups = read_test_groups();
-    for gid in &test_groups {
-        let payload = json!({
-            "node_id": "qq_send",
-            "target": format!("group:{gid}"),
-            "message": &msg,
-        });
-        if let Err(e) = host.invoke("qq", "qq_send", payload.to_string()) {
-            eprintln!("[health] qq_send to {gid} failed: {e}");
-        }
+    for gid in &read_test_groups() {
+        send_msg(host, gid, &msg);
     }
 }
 
@@ -51,11 +43,25 @@ fn read_test_groups() -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn send_msg(host: &RuntimeHost, gid: &str, msg: &str) {
+    let payload = json!({
+        "node_id": "qq_send",
+        "target": format!("group:{gid}"),
+        "message": msg,
+    });
+    if let Err(e) = host.invoke("qq", "qq_send", payload.to_string()) {
+        eprintln!("[health] qq_send to {gid} failed: {e}");
+    }
+}
+
 pub fn start_health_loop(host: Arc<RuntimeHost>, interval_secs: u64) {
     std::thread::spawn(move || {
-        // First check after a full interval, not immediately.
-        // Prevents spam when the service is restarted multiple times.
-        std::thread::sleep(Duration::from_secs(interval_secs));
+        std::thread::sleep(Duration::from_secs(10));
+        // Startup announcement.
+        let test_groups = read_test_groups();
+        for gid in &test_groups {
+            send_msg(&host, gid, "🟢 CordisClaw started");
+        }
         loop {
             run_check(&host);
             std::thread::sleep(Duration::from_secs(interval_secs));
