@@ -12,7 +12,7 @@ use crate::core::models::{
 };
 use crate::plugin::artifact::{
     artifact_index_map, load_artifact_index, load_plugin_artifact, resolve_artifact_path,
-    sha256_file, stage_artifact_bundle,
+    stage_artifact_bundle,
 };
 use crate::plugin::registry::{NodeRegistry, PluginRegistry};
 use crate::service::doc_registry::DocRegistry;
