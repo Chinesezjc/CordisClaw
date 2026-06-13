@@ -764,9 +764,7 @@ impl AgentSession {
             });
         }
 
-        // FIXME: compress_history can break tool-call sequences.
-        // Revisit after adding tool-call-aware truncation.
-        // self.compress_history();
+        self.compress_history();
 
         let endpoint = format!(
             "{}/chat/completions",
@@ -1008,7 +1006,7 @@ impl AgentSession {
 
     fn compress_history(&mut self) {
         const COMPRESS_THRESHOLD: usize = 800_000;
-        const KEEP_RECENT: usize = 4;
+        const KEEP_RECENT: usize = 12; // keep at least 6 user+assistant pairs
 
         if self.estimated_tokens < COMPRESS_THRESHOLD {
             return;
