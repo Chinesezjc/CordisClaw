@@ -595,29 +595,8 @@ impl AgentToolHost for RuntimeHost {
     }
 
     fn agent_send_warning_to_test_groups(&self, message: &str) {
-        let test_groups = read_test_groups_from_config();
-        for gid in &test_groups {
-            let payload = serde_json::json!({
-                "node_id": "qq_send",
-                "target": format!("group:{gid}"),
-                "message": message,
-            });
-            if let Err(e) = self.invoke("qq", "qq_send", payload.to_string()) {
-                eprintln!("[warn] qq_send to {gid} failed: {e}");
-            }
-        }
+        crate::kernel::notify::send(self, message);
     }
-}
-
-fn read_test_groups_from_config() -> Vec<String> {
-    let path = "/root/CordisClaw/fixtures/.cordis-drafts/qq_runtime_config.json";
-    let Ok(text) = std::fs::read_to_string(path) else { return vec![] };
-    let Ok(config) = serde_json::from_str::<serde_json::Value>(&text) else { return vec![] };
-    config
-        .get("test_groups")
-        .and_then(|v| v.as_array())
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
-        .unwrap_or_default()
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]

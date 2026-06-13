@@ -1000,6 +1000,39 @@ fn handle_qq_get_group_members(req: &NodeRequest) -> Result<NodeResponse, String
     })
 }
 
+/// System notification handler — called by the kernel NotificationBus.
+/// Sends a message to all configured test groups.
+fn handle_qq_system_notify(req: &NodeRequest) -> Result<NodeResponse, String> {
+    let msg = req.message.as_deref().unwrap_or("").trim();
+    if msg.is_empty() { return Err("message is required for qq_system_notify".to_string()); }
+
+    let test_groups: Vec<String> = load_runtime_config()
+        .and_then(|c| c.get("test_groups")?.as_array().cloned())
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+        .unwrap_or_default();
+
+    if test_groups.is_empty() { return Err("no test_groups configured".to_string()); }
+
+    let base_url = STATE.lock().ok().and_then(|s| s.onebot_url.clone())
+        .or_else(|| load_runtime_config().and_then(|c| c.get("onebot_url")?.as_str().map(|s| s.to_string())))
+        .ok_or("no OneBot URL configured")?;
+    let token = STATE.lock().ok().and_then(|s| s.access_token.clone())
+        .or_else(|| load_runtime_config().and_then(|c| c.get("access_token")?.as_str().map(|s| s.to_string())));
+
+    for gid in &test_groups {
+        let _ = onebot_send_group_msg(&base_url, gid.parse().unwrap_or(0), msg, None, token.as_deref());
+    }
+
+    Ok(NodeResponse {
+        ok: true,
+        node_id: "qq_system_notify".to_string(),
+        messages: None,
+        message: Some(format!("notified {} groups", test_groups.len())),
+        data: None,
+        error: None,
+    })
+}
+
 fn handle_qq_get_group_info(req: &NodeRequest) -> Result<NodeResponse, String> {
     let target = req.target.as_deref().unwrap_or("").trim();
     if target.is_empty() { return Err("target is required for qq_get_group_info (group:<id>)".to_string()); }
@@ -1086,6 +1119,7 @@ fn handle(req: &NodeRequest) -> Result<NodeResponse, String> {
         "qq_fetch_messages" => handle_qq_fetch_messages(),
         "qq_send" => handle_qq_send(req),
         "qq_get_group_members" => handle_qq_get_group_members(req),
+        "qq_system_notify" => handle_qq_system_notify(req),
         "qq_get_group_info" => handle_qq_get_group_info(req),
         // For qq_entry, delegate to legacy handler.
         "qq_entry" => {
@@ -1249,6 +1283,27 @@ fn docs_value() -> cordis_plugin_sdk::PluginDocs {
                 &["calls OneBot get_group_info API"],
                 &["no OneBot URL configured", "invalid target format", "group not found"],
             ).with_agent_accessible(),
+            node_doc(
+                "qq_system_notify",
+                "Kernel notification handler — receives system messages and forwards to configured test groups.",
+                json!({
+                    "type": "object", "required": ["node_id", "message"],
+                    "properties": {
+                        "node_id": { "type": "string", "const": "qq_system_notify" },
+                        "message": { "type": "string", "description": "Notification text" }
+                    }
+                }),
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "ok": { "type": "boolean" },
+                        "message": { "type": ["string", "null"] },
+                        "error": { "type": ["string", "null"] }
+                    }
+                }),
+                &["sends QQ message to all configured test_groups"],
+                &["no OneBot URL configured", "no test_groups configured"],
+            ),
         ],
     Some("\
 QQ GROUP CHAT MODE — you are running in a QQ group. Messages may be casual chat NOT directed at you.\n\
