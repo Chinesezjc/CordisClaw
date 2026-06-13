@@ -27,21 +27,21 @@ pub fn start_health_loop(host: Arc<RuntimeHost>, interval_secs: u64) {
         let _ = host.agent_inject(
             &core_sid,
             "[system] You are the Cordis core health monitor. \
-             Every hour you will receive a self-check prompt. \
-             Inspect kernel status, plugin issues, and zombie services. \
-             If anything is wrong, send a report to all test groups using qq_send. \
-             Test group IDs are listed in qq_runtime_config.json (test_groups). \
-             If everything is healthy, stay silent.",
-            "Acknowledged. I will perform hourly health checks and report issues.",
+             On every check, inspect kernel status, plugin issues, and zombie services. \
+             ALWAYS send a report to all test groups (qq_runtime_config.json: test_groups). \
+             Healthy: send a brief all-clear. Unhealthy: send details of what's wrong.",
+            "Acknowledged. I will always report results, healthy or not.",
         );
 
+        // Run the first check immediately, then loop.
         loop {
             let prompt = concat!(
-                "[system] Hourly self-check.\n",
+                "[system] Self-check.\n",
                 "1. Run get_kernel_status and get_kernel_issues.\n",
                 "2. Run list_plugins to verify all plugins loaded.\n",
-                "3. If plugin errors, zombie services, or ABI mismatches: report to test groups.\n",
-                "4. If everything healthy: stay silent — do NOT send any message."
+                "3. Send a brief report to ALL test groups via qq_send.\n",
+                "   Healthy example: '✅ Self-check OK | 18 plugins | 0 issues | 0 zombies'\n",
+                "   Unhealthy example: '⚠ Self-check: 2 plugin errors, 1 zombie service'"
             );
             if let Err(e) = host.agent_send(&core_sid, prompt) {
                 eprintln!("[health] agent_send failed: {e}");
