@@ -934,7 +934,7 @@ pub struct AgentSessionHandle {
 }
 
 #[derive(Debug)]
-struct ManagedAgentSession {
+pub(crate) struct ManagedAgentSession {
     #[allow(dead_code)]
     handle: AgentSessionHandle,
     session: AgentSession,
@@ -1330,6 +1330,14 @@ impl RuntimeHost {
 
     /// Inject a user→assistant exchange into the agent's history without
     /// triggering an LLM call. Used by `/` shortcuts.
+    pub(crate) fn agent_sessions_mut(
+        &self,
+    ) -> std::sync::MutexGuard<BTreeMap<String, ManagedAgentSession>> {
+        self.agent_sessions
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
     pub fn agent_inject(
         &self,
         session_id: &str,
@@ -3082,9 +3090,18 @@ struct RecordIterationSummaryArgs {
 }
 
 impl ManagedAgentSession {
+    pub(crate) fn compact_history(&mut self) -> (usize, usize) {
+        let old = self.session.history_len();
+        self.session.compact_history();
+        (old, self.session.history_len())
+    }
+
     fn respond(&mut self, host: &RuntimeHost, input: &str) -> Result<AgentReply, RuntimeError> {
         match &mut self.state {
-            ManagedAgentState::RuntimeShell => self.session.respond_with_runtime_host(host, input),
+            ManagedAgentState::RuntimeShell => {
+                self.session
+                    .respond_with_runtime_host(host, &self.handle.session_id, input)
+            }
             ManagedAgentState::PluginIteration(state) => {
                 let mut backend = PluginIterationAgentBackend { host, state };
                 self.session.respond(&mut backend, input)
