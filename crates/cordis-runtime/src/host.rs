@@ -3556,6 +3556,8 @@ impl<'a> PluginIterationAgentBackend<'a> {
 }
 
 impl<'a> AgentBackend for PluginIterationAgentBackend<'a> {
+    type Host = RuntimeHost;
+    fn host(&self) -> &RuntimeHost { self.host }
     fn system_prompt(&self) -> String {
         format!(
             "You are the Cordis plugin-iteration agent.\n\
