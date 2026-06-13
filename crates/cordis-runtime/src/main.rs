@@ -372,6 +372,13 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         });
+        // Load notification handlers from config.
+        if let Ok(handlers) = cordis_runtime::kernel::notify::load_handlers(&root) {
+            for (plugin_path, node_id) in &handlers {
+                cordis_runtime::kernel::notify::register(plugin_path, node_id);
+            }
+        }
+
         // Start health check loop after all services are ready.
         cordis_runtime::kernel::health::start_health_loop(health_host, 3600);
 
