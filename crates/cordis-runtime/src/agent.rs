@@ -34,6 +34,7 @@ fn drain_inject_queue() -> Vec<String> {
     }
 }
 
+const AGENT_HISTORY_MESSAGE_LIMIT: usize = 512;
 const AGENT_MAX_TOOL_TURNS: usize = 96;
 const AGENT_REQUEST_MAX_ATTEMPTS: usize = 3;
 const AGENT_REQUEST_RETRY_BACKOFF_MS: u64 = 500;
@@ -763,7 +764,9 @@ impl AgentSession {
             });
         }
 
-        self.compress_history();
+        // FIXME: compress_history can break tool-call sequences.
+        // Revisit after adding tool-call-aware truncation.
+        // self.compress_history();
 
         let endpoint = format!(
             "{}/chat/completions",
@@ -1090,6 +1093,12 @@ impl AgentSession {
         self.estimated_tokens += estimate_tokens(user_input)
             + estimate_tokens(assistant_output)
             + reasoning.map(estimate_tokens).unwrap_or(0);
+
+        // Drop oldest user+assistant pairs if we exceed the limit.
+        while self.history.len() > AGENT_HISTORY_MESSAGE_LIMIT {
+            // Always remove in pairs (user + assistant).
+            self.history.drain(0..2.min(self.history.len()));
+        }
     }
 
     /// Inject a user→assistant exchange into the agent's history without
