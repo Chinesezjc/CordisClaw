@@ -8,7 +8,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeSet, VecDeque};
 use std::env;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::sync::mpsc::{sync_channel, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -37,6 +38,7 @@ fn drain_inject_queue() -> Vec<String> {
 const AGENT_HISTORY_MESSAGE_LIMIT: usize = 512;
 const AGENT_MAX_TOOL_TURNS: usize = 96;
 const AGENT_REQUEST_MAX_ATTEMPTS: usize = 3;
+const UNKNOWN_TOOL_STRIKE_LIMIT: usize = 3;
 const AGENT_REQUEST_RETRY_BACKOFF_MS: u64 = 500;
 const AGENT_TOOL_GET_RUNTIME_STATUS: &str = "get_runtime_status";
 const AGENT_TOOL_LIST_PLUGINS: &str = "list_plugins";
@@ -690,6 +692,8 @@ pub struct AgentSession {
     estimated_tokens: usize,
     /// Consecutive reasoning-only responses (no content, no tool_calls).
     reasoning_only_strikes: usize,
+    /// Consecutive calls to tools that don't exist in this session (LLM hallucination guard).
+    unknown_tool_strikes: usize,
 }
 
 pub type ShellAgentStatus = AgentSessionStatus;
@@ -723,6 +727,7 @@ impl AgentSession {
             completed_turns: 0,
             estimated_tokens: 0,
             reasoning_only_strikes: 0,
+            unknown_tool_strikes: 0,
         })
     }
 
@@ -899,7 +904,7 @@ impl AgentSession {
                     );
                     let _ = std::io::stdout().flush();
                     let (event, tool_output) =
-                        execute_agent_tool_call(backend, &available_tools, &self.kind, tool_call);
+                        execute_agent_tool_call(backend, &available_tools, &self.kind, tool_call, &mut self.unknown_tool_strikes);
                     let event_name = event.name.clone();
                     let terminal_reply = event
                         .ok
@@ -916,6 +921,10 @@ impl AgentSession {
                     let tool_ok = event.ok;
                     let tool_err = event.error.clone();
                     tool_events.push(event);
+                    // Reset unknown-tool strikes when a legitimate tool succeeds.
+                    if tool_ok {
+                        self.unknown_tool_strikes = 0;
+                    }
                     messages.push(json!({
                         "role": "tool",
                         "tool_call_id": tool_call.id,
@@ -1254,7 +1263,8 @@ impl AgentSession {
                 return Err(RuntimeError::LlmRequestFailed { message });
             }
 
-            let streamed = match read_chat_stream(response, &request_summary, attempt) {
+            let stream_timeout = Duration::from_millis(self.config.timeout_ms);
+            let streamed = match read_chat_stream(response, &request_summary, attempt, stream_timeout) {
                 Ok(streamed) => streamed,
                 Err(ChatStreamReadError::Io(err)) => {
                     let message = format!(
@@ -1670,31 +1680,43 @@ fn execute_agent_tool_call<B: AgentBackend + ?Sized>(
     available_tools: &BTreeSet<String>,
     session_kind: &str,
     tool_call: &ToolCall,
+    unknown_tool_strikes: &mut usize,
 ) -> (AgentToolEvent, String) {
     let tool_name = tool_call.function.name.clone();
     if !available_tools.contains(&tool_name) {
+        *unknown_tool_strikes += 1;
+        let tool_list = available_tools.iter().cloned().collect::<Vec<_>>().join(", ");
         let error = json!({
             "ok": false,
             "error": format!(
-                "tool {tool_name} is not available in the current {} scope",
-                backend.tool_scope_label()
+                "tool {tool_name} is not available in the current {} scope (strike {}/{})",
+                backend.tool_scope_label(),
+                *unknown_tool_strikes,
+                UNKNOWN_TOOL_STRIKE_LIMIT,
             ),
             "session_kind": session_kind,
             "available_tools": available_tools.iter().cloned().collect::<Vec<_>>(),
         });
-        return (
-            AgentToolEvent {
-                name: tool_name,
-                arguments: json!({}),
-                ok: false,
-                output: None,
-                error: error
-                    .get("error")
-                    .and_then(Value::as_str)
-                    .map(ToString::to_string),
-            },
-            error.to_string(),
-        );
+        let event = AgentToolEvent {
+            name: tool_name,
+            arguments: json!({}),
+            ok: false,
+            output: None,
+            error: error
+                .get("error")
+                .and_then(Value::as_str)
+                .map(ToString::to_string),
+        };
+        let mut err_text = error.to_string();
+        if *unknown_tool_strikes >= UNKNOWN_TOOL_STRIKE_LIMIT {
+            err_text.push_str(&format!(
+                "\n\nSTOP — you have called {} unsupported tools. You are in a {} session. Your ONLY available tools are: {}. Do NOT call any other tool name. If you need a capability not listed, tell the user you cannot do it.",
+                *unknown_tool_strikes,
+                backend.tool_scope_label(),
+                tool_list,
+            ));
+        }
+        return (event, err_text);
     }
 
     let args_json = if tool_call.function.arguments.trim().is_empty() {
@@ -1774,25 +1796,125 @@ fn read_chat_stream(
     response: Response,
     request_summary: &str,
     attempt: usize,
+    timeout: Duration,
 ) -> Result<ChatStreamReadResult, ChatStreamReadError> {
-    let mut reader = BufReader::new(response);
+    // Channel capacity: 8 chunks of 8 KiB each — enough to smooth out
+    // network jitter without buffering the entire response in memory.
+    let (tx, rx) = sync_channel::<std::io::Result<Vec<u8>>>(8);
+
+    // Read the response body in a background thread so the main loop can
+    // enforce a per-read timeout via recv_timeout.  This prevents the
+    // agent from hanging indefinitely when the server stalls mid-stream.
+    let _reader_thread = thread::spawn(move || {
+        let mut reader = BufReader::new(response);
+        loop {
+            let mut buf = vec![0u8; 8192];
+            match reader.read(&mut buf) {
+                Ok(0) => {
+                    // EOF — send empty marker.
+                    let _ = tx.send(Ok(Vec::new()));
+                    break;
+                }
+                Ok(n) => {
+                    buf.truncate(n);
+                    if tx.send(Ok(buf)).is_err() {
+                        break; // receiver hung up (timeout / error)
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(e));
+                    break;
+                }
+            }
+        }
+    });
+
     let mut raw_bytes = 0usize;
     let mut event_count = 0usize;
     let mut saw_done = false;
     let mut finish_reason = None;
     let mut pending_data_lines = Vec::new();
     let mut accumulator = ChatMessageAccumulator::default();
-    // Track how much content has been flushed to stdout so we only print new text.
     let mut flushed_content_len = 0usize;
     let mut flushed_reasoning_len = 0usize;
 
+    // Line buffer: accumulated raw bytes that haven't yielded a complete line yet.
+    let mut line_buf: Vec<u8> = Vec::new();
+
+    /// Drain complete lines from `line_buf`, returning each terminated line
+    /// (including the `\n`) as a String.  Leftover bytes (incomplete line)
+    /// stay in `line_buf`.
+    fn drain_lines(line_buf: &mut Vec<u8>) -> Vec<String> {
+        let mut lines = Vec::new();
+        while let Some(pos) = line_buf.iter().position(|&b| b == b'\n') {
+            let line_bytes: Vec<u8> = line_buf.drain(..=pos).collect();
+            lines.push(String::from_utf8_lossy(&line_bytes).to_string());
+        }
+        lines
+    }
+
+    let stream_started = Instant::now();
+
     loop {
-        let mut line = String::new();
-        let bytes_read = reader
-            .read_line(&mut line)
-            .map_err(ChatStreamReadError::Io)?;
-        raw_bytes += bytes_read;
-        if bytes_read == 0 {
+        // Wait for the next chunk with a timeout.  Each chunk gets its own
+        // timeout window so we don't fail just because the total response
+        // takes longer than the budget — we only fail when the server goes
+        // silent for too long.
+        let chunk = match rx.recv_timeout(timeout) {
+            Ok(Ok(chunk)) => chunk,
+            Ok(Err(e)) => return Err(ChatStreamReadError::Io(e)),
+            Err(RecvTimeoutError::Timeout) => {
+                return Err(ChatStreamReadError::Io(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!(
+                        "stream read timed out after {:?} (received {} bytes, {} events so far, elapsed {:?})",
+                        timeout,
+                        raw_bytes,
+                        event_count,
+                        stream_started.elapsed(),
+                    ),
+                )));
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                // Reader thread exited — flush any remaining data then break.
+                if !line_buf.is_empty() {
+                    // Treat leftover bytes as a final (incomplete) line.
+                    let leftover: Vec<u8> = line_buf.drain(..).collect();
+                    let line = String::from_utf8_lossy(&leftover).to_string();
+                    raw_bytes += line.len();
+                    if !pending_data_lines.is_empty() {
+                        saw_done = process_stream_event(
+                            &pending_data_lines.join("\n"),
+                            &mut accumulator,
+                            &mut event_count,
+                            &mut finish_reason,
+                            request_summary,
+                            attempt,
+                        )?;
+                    }
+                    // Also try to process the leftover as its own event.
+                    if !line.trim().is_empty() {
+                        if let Some(data) = line.trim().strip_prefix("data:") {
+                            pending_data_lines.push(data.trim_start().to_string());
+                        }
+                    }
+                    if !pending_data_lines.is_empty() {
+                        saw_done = process_stream_event(
+                            &pending_data_lines.join("\n"),
+                            &mut accumulator,
+                            &mut event_count,
+                            &mut finish_reason,
+                            request_summary,
+                            attempt,
+                        )?;
+                    }
+                }
+                break;
+            }
+        };
+
+        if chunk.is_empty() {
+            // EOF from reader thread.
             if !pending_data_lines.is_empty() {
                 saw_done = process_stream_event(
                     &pending_data_lines.join("\n"),
@@ -1806,50 +1928,58 @@ fn read_chat_stream(
             break;
         }
 
-        let trimmed = line.trim_end_matches(['\r', '\n']);
-        if trimmed.is_empty() {
-            if pending_data_lines.is_empty() {
+        raw_bytes += chunk.len();
+        line_buf.extend_from_slice(&chunk);
+
+        for line in drain_lines(&mut line_buf) {
+            let trimmed = line.trim_end_matches(['\r', '\n']);
+            if trimmed.is_empty() {
+                if pending_data_lines.is_empty() {
+                    continue;
+                }
+                let event_payload = pending_data_lines.join("\n");
+                pending_data_lines.clear();
+                if process_stream_event(
+                    &event_payload,
+                    &mut accumulator,
+                    &mut event_count,
+                    &mut finish_reason,
+                    request_summary,
+                    attempt,
+                )? {
+                    saw_done = true;
+                    break;
+                }
+                // Stream new reasoning — prefix every line with 💭.
+                let new_reasoning = &accumulator.reasoning_content[flushed_reasoning_len..];
+                if !new_reasoning.is_empty() {
+                    if flushed_reasoning_len == 0 {
+                        let _ = write!(std::io::stdout(), "\x1b[2m💭 ");
+                    }
+                    let formatted = new_reasoning.replace('\n', "\n💭 ");
+                    let _ = write!(std::io::stdout(), "{formatted}");
+                    let _ = std::io::stdout().flush();
+                    flushed_reasoning_len = accumulator.reasoning_content.len();
+                }
+                let new_content = &accumulator.content[flushed_content_len..];
+                if !new_content.is_empty() {
+                    if flushed_reasoning_len > 0 && flushed_content_len == 0 {
+                        let _ = writeln!(std::io::stdout(), "\x1b[0m");
+                    }
+                    print!("{new_content}");
+                    let _ = std::io::stdout().flush();
+                    flushed_content_len = accumulator.content.len();
+                }
                 continue;
             }
-            let event_payload = pending_data_lines.join("\n");
-            pending_data_lines.clear();
-            if process_stream_event(
-                &event_payload,
-                &mut accumulator,
-                &mut event_count,
-                &mut finish_reason,
-                request_summary,
-                attempt,
-            )? {
-                saw_done = true;
-                break;
+
+            if let Some(data) = trimmed.strip_prefix("data:") {
+                pending_data_lines.push(data.trim_start().to_string());
             }
-            // Stream new reasoning — prefix every line with 💭.
-            let new_reasoning = &accumulator.reasoning_content[flushed_reasoning_len..];
-            if !new_reasoning.is_empty() {
-                if flushed_reasoning_len == 0 {
-                    let _ = write!(std::io::stdout(), "\x1b[2m💭 ");
-                }
-                let formatted = new_reasoning.replace('\n', "\n💭 ");
-                let _ = write!(std::io::stdout(), "{formatted}");
-                let _ = std::io::stdout().flush();
-                flushed_reasoning_len = accumulator.reasoning_content.len();
-            }
-            let new_content = &accumulator.content[flushed_content_len..];
-            if !new_content.is_empty() {
-                // First content after reasoning: close the dim span and add a blank line.
-                if flushed_reasoning_len > 0 && flushed_content_len == 0 {
-                    let _ = writeln!(std::io::stdout(), "\x1b[0m");
-                }
-                print!("{new_content}");
-                let _ = std::io::stdout().flush();
-                flushed_content_len = accumulator.content.len();
-            }
-            continue;
         }
 
-        if let Some(data) = trimmed.strip_prefix("data:") {
-            pending_data_lines.push(data.trim_start().to_string());
+        if saw_done {
+            break;
         }
     }
 
@@ -2374,7 +2504,17 @@ Do not invent runtime state or claim a command succeeded unless a tool confirmed
 \n\
 CRITICAL: Your final output must be {\"action\":\"suspend\"} (JSON, nothing else).\n\
 To send a reply, use the invoke_plugin tool to call qq_send instead of outputting text.\n\
-Never output plain text — it will be dropped. All communication goes through tools."
+Never output plain text — it will be dropped. All communication goes through tools.\n\
+\n\
+CRITICAL — YOUR AVAILABLE TOOLS (and ONLY these):\n\
+  get_runtime_status, list_plugins, list_nodes, get_kernel_status, get_kernel_issues,\n\
+  reload_runtime, build_plugins, invoke_plugin, execute_target, read_file, search_code,\n\
+  write_file, replace_in_file, delete_file, rename_file, move_file, copy_file,\n\
+  compact_context, list_directory, revert_changes\n\
+\n\
+You do NOT have: replace_files_exact, run_plugin_check, run_plugin_test,\n\
+rebuild_plugin_workspace, record_iteration_summary, or any other tool not listed above.\n\
+Calling an unsupported tool returns an error — do not retry it. Use what you have."
 }
 
 fn resolve_api_key(config: &LlmApiConfig) -> Result<String, RuntimeError> {
