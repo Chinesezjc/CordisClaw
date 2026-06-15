@@ -17,6 +17,10 @@
           "node_id": {
             "const": "time_now",
             "type": "string"
+          },
+          "tz_offset_hours": {
+            "description": "Optional timezone offset in hours, e.g. 8 for UTC+8. Defaults to 0 (UTC).",
+            "type": "integer"
           }
         },
         "required": [
