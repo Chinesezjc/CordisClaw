@@ -82,6 +82,7 @@ struct OpPlugins {
 fn evaluate_with_plugins(ast: &ExprAst, ops: &OpPlugins) -> Result<f64, EvalError> {
     match ast {
         ExprAst::Number(v) => Ok(*v),
+        ExprAst::Constant { value, .. } => Ok(*value),
         ExprAst::Unary { op, expr } => {
             let value = evaluate_with_plugins(expr, ops)?;
             match op {
