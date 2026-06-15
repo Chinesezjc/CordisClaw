@@ -263,21 +263,48 @@ load_session_snapshot
 
 具体职责分工见 [rs-files-responsibility.md](../rs-files-responsibility.md)。
 
-## 10. Kernel 规划与实施阶段
+## 10. Agent 与自迭代
 
-原始规划里，Kernel 的目标是形成：
+原始蓝图设想了一条固定的 Kernel 流水线：
 
 ```text
 observe -> diagnose -> plan -> apply -> verify -> score -> promote/rollback
 ```
 
-并建议分成三阶段：
+这个固定 9 阶段 Petri Net（`kernel/loop.rs` + `kernel/planner.rs`，~9200 行）**已被删除**。
+替换为 **open-ended agent loop**——由 LLM 自主决定每一步做什么。
 
-1. 只读诊断
-2. 受限自动修复
-3. 小流量自迭代
+### 10.1 双 Agent 模型
 
-同时，原始“架构设计阶段实施计划”把整体收敛为 Stage A-E：
+当前运行时有两种 Agent session，工具集完全隔离：
+
+| Agent | Backend | 用途 | 工具 |
+|---|---|---|---|
+| **RuntimeShell** | `RuntimeShellAgentBackend` (agent.rs) | QQ 群聊、REPL 交互 | `read_file`, `write_file`, `replace_in_file`, `build_plugins`, `invoke_plugin`, `reload_runtime` 等 15 个内核工具 |
+| **PluginIteration** | `PluginIterationAgentBackend` (host.rs:3113) | Kernel 自主改进插件 | `replace_files_exact`, `run_plugin_check`, `run_plugin_test`, `rebuild_plugin_workspace`, `record_iteration_summary` 等 |
+
+**隔离原则**：两个后端的 `tool_specs()` 和 `execute_tool()` 完全独立。
+RuntimeShell 调用 PluginIteration 工具会被 unknown-tool guard（agent.rs:1677）拦截并返回 error。
+
+### 10.2 自迭代流程
+
+当前 `iterate_plugins()` (host.rs:2045) 的工作流：
+
+1. **准备阶段**（`PreparedPluginIteration`）：
+   - 收集目标插件上下文（`collect_plugin_context_paths`）
+   - 加载安全策略（`PluginIterationPolicy`）——路径白名单、敏感路径、diff 上限、时间预算
+   - 如果已有预审批 edit plan，直接执行（跳过 agent session）
+2. **Agent 阶段**（`run_plugin_iteration_agent`）：
+   - 启动独立的 `PluginIterationAgent` session
+   - Agent 自主读代码、写补丁、跑检查、跑测试
+   - `record_iteration_summary` 记录最终结果
+3. **Finalization**（`finalize_iteration`）：
+   - rebuild → stage → verify → canary → promote/rollback
+   - 回退安全网：panic guard + commit journal + draft patch + workspace 恢复
+
+### 10.3 Stage A-E 架构冻结
+
+以下阶段已在当前实现中收敛：
 
 - Stage A：Package Contract Freeze
 - Stage B：Runtime Contract Freeze
@@ -285,11 +312,7 @@ observe -> diagnose -> plan -> apply -> verify -> score -> promote/rollback
 - Stage D：Artifact Design Freeze
 - Stage E：Context & Security Freeze
 
-这些阶段现在已经不再适合作为单独的根文档长期维护，而是应该分别落到当前文档集合里：
-
-- 设计基线：本文
-- 当前实现语义：见各架构主题文档
-- 当前完成度与未完成项：见 [status-and-open-items.md](./status-and-open-items.md)
+对应实现与当前边界见 [contracts-and-loading.md](./contracts-and-loading.md)、[runtime-semantics.md](./runtime-semantics.md)、[status-and-open-items.md](./status-and-open-items.md)。
 
 ## 11. 现在应该怎么使用这套文档
 
