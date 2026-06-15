@@ -61,6 +61,7 @@ const AGENT_TOOL_RENAME_FILE: &str = "rename_file";
 const AGENT_TOOL_MOVE_FILE: &str = "move_file";
 const AGENT_TOOL_COPY_FILE: &str = "copy_file";
 const AGENT_TOOL_COMPACT_CONTEXT: &str = "compact_context";
+const AGENT_TOOL_RUN_PLUGIN_TEST: &str = "run_plugin_test";
 const LLM_DEBUG_ENV: &str = "CORDIS_LLM_DEBUG";
 
 pub trait AgentToolHost {
@@ -113,6 +114,7 @@ pub trait AgentToolHost {
     fn agent_move_file(&self, path: &str, new_path: &str) -> Result<Value, RuntimeError>;
     fn agent_copy_file(&self, path: &str, new_path: &str) -> Result<Value, RuntimeError>;
     fn agent_compact_context(&self, session_id: &str) -> Result<Value, RuntimeError>;
+    fn agent_run_plugin_test(&self, command: Option<&str>) -> Result<Value, RuntimeError>;
     fn agent_send_warning_to_test_groups(&self, message: &str);
 }
 
@@ -593,6 +595,29 @@ impl AgentToolHost for RuntimeHost {
             "compacted": true,
             "old_messages": old_len,
             "new_messages": new_len,
+        }))
+    }
+
+    fn agent_run_plugin_test(&self, command: Option<&str>) -> Result<Value, RuntimeError> {
+        let cmd = command
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "cargo test --quiet --manifest-path plugins/Cargo.toml".to_string());
+        let output = std::process::Command::new("bash")
+            .arg("-lc")
+            .arg(&cmd)
+            .current_dir(self.fixtures_root())
+            .output()
+            .map_err(|err| RuntimeError::CommandFailed {
+                program: "bash".to_string(),
+                args: vec!["-lc".to_string(), cmd.clone()],
+                message: err.to_string(),
+            })?;
+        Ok(json!({
+            "command": cmd,
+            "success": output.status.success(),
+            "exit_code": output.status.code(),
+            "stdout": String::from_utf8_lossy(&output.stdout).to_string(),
+            "stderr": String::from_utf8_lossy(&output.stderr).to_string(),
         }))
     }
 
@@ -1668,6 +1693,12 @@ struct CopyFileArgs {
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 struct BuildPluginsArgs { plugin_name: String }
 
+#[derive(Debug, Clone, Deserialize)]
+struct RunPluginTestArgs {
+    #[serde(default)]
+    command: Option<String>,
+}
+
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 struct ReloadRuntimeArgs { plugin_path: String }
 
@@ -2181,6 +2212,10 @@ impl<'a, H: AgentToolHost + ?Sized> AgentBackend for RuntimeShellAgentBackend<'a
                 parse_tool_value_arguments::<EmptyArgs>(arguments, name)?;
                 self.host.agent_compact_context(self.session_id)
             }
+            AGENT_TOOL_RUN_PLUGIN_TEST => {
+                let args = parse_tool_value_arguments::<RunPluginTestArgs>(arguments, name)?;
+                self.host.agent_run_plugin_test(args.command.as_deref())
+            }
             other => Err(RuntimeError::InvalidArgument {
                 message: format!("runtime shell agent does not support tool {other}"),
             }),
@@ -2447,12 +2482,23 @@ fn shell_agent_tools() -> Vec<AgentToolSpec> {
                 "additionalProperties": false,
             }),
         },
+        AgentToolSpec {
+            name: AGENT_TOOL_RUN_PLUGIN_TEST,
+            description: "Run cargo test in the plugins workspace. Defaults to `cargo test --quiet --manifest-path plugins/Cargo.toml`. Pass a custom command to run a specific test (e.g. `cargo test -p gacha`). Use after making code edits to verify correctness.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "command": { "type": "string", "description": "Optional: custom cargo test command (default runs all plugin tests)" },
+                },
+                "additionalProperties": false,
+            }),
+        },
     ]
 }
 
 fn shell_agent_system_prompt() -> &'static str {
     "You are the Cordis shell agent running inside the cordis-runtime serve REPL.\n\
-You can read source files, list directories, search code, write files, replace text in files, inspect runtime status, list plugins/nodes, invoke plugins, execute targets, and reload the runtime.\n\
+You can read source files, list directories, search code, write files, replace text in files, inspect runtime status, list plugins/nodes, invoke plugins, execute targets, run plugin tests, and reload the runtime.\n\
 \n\
 Plugins may provide additional instructions (chat mode protocols, etc.) — see the \"plugin-specific instructions\" section below if present.\n\
 \n\
@@ -2534,13 +2580,10 @@ CRITICAL — YOUR TOOLS (only these exist; all others will fail immediately):\n\
   get_runtime_status, list_plugins, list_nodes, get_kernel_status, get_kernel_issues,\n\
   reload_runtime, build_plugins, invoke_plugin, execute_target, read_file, search_code,\n\
   write_file, replace_in_file, delete_file, rename_file, move_file, copy_file,\n\
-  compact_context, list_directory, revert_changes\n\
+  compact_context, list_directory, revert_changes, run_plugin_test\n\
 \n\
-You are in a runtime_shell session. You are NOT in a plugin-iteration session.\n\
-Tools like replace_files_exact, run_plugin_check, rebuild_plugin_workspace DO NOT EXIST here.\n\
-If you call a tool not listed above you will get an error on the FIRST attempt — stop and use what you have.\n\
-\n\
-For build/test: use build_plugins or run shell commands via a shell plugin if available.\n\
+For build: use build_plugins.  For testing: use run_plugin_test (defaults to all plugin tests;\n\
+pass a custom command for specific tests, e.g. `cargo test -p gacha`).\n\
 For plugin node calls: always use invoke_plugin(plugin_path, node_id, payload_json)."
 }
 
@@ -2860,6 +2903,10 @@ mod tests {
 
         fn agent_compact_context(&self, _session_id: &str) -> Result<Value, RuntimeError> {
             Ok(json!({ "compacted": true }))
+        }
+
+        fn agent_run_plugin_test(&self, _command: Option<&str>) -> Result<Value, RuntimeError> {
+            Ok(json!({ "success": true, "stdout": "", "stderr": "" }))
         }
 
         fn agent_send_warning_to_test_groups(&self, _message: &str) {}

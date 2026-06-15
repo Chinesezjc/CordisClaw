@@ -276,17 +276,17 @@ observe -> diagnose -> plan -> apply -> verify -> score -> promote/rollback
 
 ### 10.1 Agent 模型
 
-当前只有一个 Agent session 类型在生产中使用：**RuntimeShell**（`RuntimeShellAgentBackend`, agent.rs）。
-它拥有 15 个内核工具（文件读写、搜索、构建、插件调用等），负责 QQ 聊天和 REPL 交互。
+当前只有一个 Agent backend 在生产中使用：**RuntimeShell**（`RuntimeShellAgentBackend`, agent.rs）。
+它拥有 16 个内核工具：文件读写、搜索、构建（`build_plugins`）、测试（`run_plugin_test`）、插件调用等，
+负责 QQ 聊天和 REPL 交互。
 
-**PluginIteration**（`PluginIterationAgentBackend`, host.rs:3113）提供额外工具：
-`replace_files_exact`, `run_plugin_check`, `run_plugin_test`, `rebuild_plugin_workspace`, `record_iteration_summary`。
-这些是插件迭代**能力**，当前仅被 `iterate_plugins()`（通过 `llm-auto-update` CLI 或 Kernel 自动触发）
-使用的独立 session 调用，RuntimeShell 目前拿不到。
+之前的 **PluginIteration** backend（`host.rs:3113`）提供的专用工具（`replace_files_exact`, `run_plugin_check`,
+`rebuild_plugin_workspace`, `record_iteration_summary`）已废弃——其中 `run_plugin_check`/`rebuild_plugin_workspace`
+被 `build_plugins` 覆盖，`replace_files_exact` 被 `replace_in_file` 覆盖，`run_plugin_test` 已合并入 RuntimeShell。
+`record_iteration_summary` 仅 Kernel 自动迭代使用，不外露。
 
-**待解决的设计问题**：PluginIteration 工具应当在用户通过 RuntimeShell 请求时也可用。
-即：用户说"改进 gacha" → RuntimeShell agent 应当能调用 `run_plugin_check` 等迭代工具，
-而不是走一条完全分离的代码路径。这需要合并两个 backend 或让 RuntimeShell 能够访问 PluginIteration 工具集。
+`iterate_plugins()` (host.rs:2045) 仍使用独立的 PluginIteration session 执行 Kernel 自主迭代流水线，
+但用户通过 RuntimeShell 也能完成相同的插件修改+测试工作流。
 
 ### 10.2 自迭代流程
 
