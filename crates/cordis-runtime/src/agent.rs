@@ -1,6 +1,7 @@
 use crate::config::LlmApiConfig;
 use crate::core::error::RuntimeError;
 use crate::host::RuntimeHost;
+use chrono::Local;
 use reqwest::blocking::{Client, Response};
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use serde::de::DeserializeOwned;
@@ -62,6 +63,7 @@ const AGENT_TOOL_MOVE_FILE: &str = "move_file";
 const AGENT_TOOL_COPY_FILE: &str = "copy_file";
 const AGENT_TOOL_COMPACT_CONTEXT: &str = "compact_context";
 const AGENT_TOOL_RUN_PLUGIN_TEST: &str = "run_plugin_test";
+const AGENT_TOOL_APPEND_FILE: &str = "append_file";
 const LLM_DEBUG_ENV: &str = "CORDIS_LLM_DEBUG";
 
 pub trait AgentToolHost {
@@ -114,6 +116,7 @@ pub trait AgentToolHost {
     fn agent_move_file(&self, path: &str, new_path: &str) -> Result<Value, RuntimeError>;
     fn agent_copy_file(&self, path: &str, new_path: &str) -> Result<Value, RuntimeError>;
     fn agent_compact_context(&self, session_id: &str) -> Result<Value, RuntimeError>;
+    fn agent_append_file(&self, path: &str, content: &str) -> Result<Value, RuntimeError>;
     fn agent_run_plugin_test(&self, command: Option<&str>) -> Result<Value, RuntimeError>;
     fn agent_send_warning_to_test_groups(&self, message: &str);
 }
@@ -580,6 +583,44 @@ impl AgentToolHost for RuntimeHost {
             "path": path,
             "new_path": new_path,
             "copied": true,
+        }))
+    }
+
+    fn agent_append_file(&self, path: &str, content: &str) -> Result<Value, RuntimeError> {
+        self.check_sensitive_path(path)?;
+        let resolved = self.resolve_sandboxed_path(path)?;
+        // Backup original before appending.
+        let original = std::fs::read(&resolved).ok();
+        if let Some(parent) = resolved.parent() {
+            std::fs::create_dir_all(parent).map_err(|err| RuntimeError::Io {
+                path: parent.to_path_buf(),
+                message: err.to_string(),
+            })?;
+        }
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(&resolved)
+            .map_err(|err| RuntimeError::Io {
+                path: resolved.clone(),
+                message: err.to_string(),
+            })?;
+        file.write_all(content.as_bytes())
+            .map_err(|err| RuntimeError::Io {
+                path: resolved,
+                message: err.to_string(),
+            })?;
+        let mut rollback = self.interactive_rollback();
+        let backup = crate::kernel::plugin_iteration::PluginEditRollback::single_backup(
+            self.fixtures_root(),
+            path,
+            original,
+        );
+        rollback.absorb(backup)?;
+        Ok(json!({
+            "path": path,
+            "appended_bytes": content.len(),
         }))
     }
 
@@ -2142,7 +2183,7 @@ impl<'a, H: AgentToolHost + ?Sized> AgentBackend for RuntimeShellAgentBackend<'a
     type Host = H;
     fn host(&self) -> &H { self.host }
     fn system_prompt(&self) -> String {
-        let mut prompt = shell_agent_system_prompt().to_string();
+        let mut prompt = shell_agent_system_prompt();
         let hints = self.host.agent_plugin_hints();
         if !hints.is_empty() {
             prompt.push_str("\n\n--- Plugin-specific instructions ---\n\n");
@@ -2244,6 +2285,10 @@ impl<'a, H: AgentToolHost + ?Sized> AgentBackend for RuntimeShellAgentBackend<'a
                 let args = parse_tool_value_arguments::<CopyFileArgs>(arguments, name)?;
                 self.host
                     .agent_copy_file(&args.path, &args.new_path)
+            }
+            AGENT_TOOL_APPEND_FILE => {
+                let args = parse_tool_value_arguments::<WriteFileArgs>(arguments, name)?;
+                self.host.agent_append_file(&args.path, &args.content)
             }
             AGENT_TOOL_COMPACT_CONTEXT => {
                 parse_tool_value_arguments::<EmptyArgs>(arguments, name)?;
@@ -2511,6 +2556,19 @@ fn shell_agent_tools() -> Vec<AgentToolSpec> {
             }),
         },
         AgentToolSpec {
+            name: AGENT_TOOL_APPEND_FILE,
+            description: "Append content to the end of an existing file. Use when the file is too large to write in one call via write_file. Creates the file if it does not exist. The file is backed up for revert_changes.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Relative path within the fixtures root." },
+                    "content": { "type": "string", "description": "Content to append to the file." },
+                },
+                "required": ["path", "content"],
+                "additionalProperties": false,
+            }),
+        },
+        AgentToolSpec {
             name: AGENT_TOOL_COMPACT_CONTEXT,
             description: "Compress the conversation history to save context space. Summarizes older messages, keeping the most recent exchanges intact. Use when the conversation is getting long to stay within the context window.",
             parameters: json!({
@@ -2533,8 +2591,11 @@ fn shell_agent_tools() -> Vec<AgentToolSpec> {
     ]
 }
 
-fn shell_agent_system_prompt() -> &'static str {
-    "You are the Cordis shell agent running inside the cordis-runtime serve REPL.\n\
+fn shell_agent_system_prompt() -> String {
+    let today = Local::now().format("%Y-%m-%d").to_string();
+    let mut prompt = format!("Today's date is {today}.\n\n");
+    prompt.push_str("\
+You are the Cordis shell agent running inside the cordis-runtime serve REPL.\n\
 You can read source files, list directories, search code, write files, replace text in files, inspect runtime status, list plugins/nodes, invoke plugins, execute targets, run plugin tests, and reload the runtime.\n\
 \n\
 Plugins may provide additional instructions (chat mode protocols, etc.) — see the \"plugin-specific instructions\" section below if present.\n\
@@ -2616,12 +2677,14 @@ Never output plain text — it will be dropped. All communication goes through t
 CRITICAL — YOUR TOOLS (only these exist; all others will fail immediately):\n\
   get_runtime_status, list_plugins, list_nodes, get_kernel_status, get_kernel_issues,\n\
   reload_runtime, build_plugins, invoke_plugin, execute_target, read_file, search_code,\n\
-  write_file, replace_in_file, delete_file, rename_file, move_file, copy_file,\n\
+  write_file, append_file, replace_in_file, delete_file, rename_file, move_file, copy_file,\n\
   compact_context, list_directory, revert_changes, run_plugin_test\n\
 \n\
 For build: use build_plugins.  For testing: use run_plugin_test (defaults to all plugin tests;\n\
 pass a custom command for specific tests, e.g. `cargo test -p gacha`).\n\
 For plugin node calls: always use invoke_plugin(plugin_path, node_id, payload_json)."
+    );
+    prompt
 }
 
 fn resolve_api_key(config: &LlmApiConfig) -> Result<String, RuntimeError> {
@@ -2936,6 +2999,10 @@ mod tests {
         fn agent_copy_file(&self, path: &str, new_path: &str) -> Result<Value, RuntimeError> {
             let _ = (path, new_path);
             Ok(json!({ "copied": true }))
+        }
+
+        fn agent_append_file(&self, _path: &str, content: &str) -> Result<Value, RuntimeError> {
+            Ok(json!({ "appended_bytes": content.len() }))
         }
 
         fn agent_compact_context(&self, _session_id: &str) -> Result<Value, RuntimeError> {
