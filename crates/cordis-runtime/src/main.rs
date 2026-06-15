@@ -275,7 +275,7 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         unsafe {
             AGENT_TRIGGER_TX = Some(tx);
         }
-        cordis_runtime::agent::set_agent_inject_queue(inject_queue);
+        cordis_runtime::agent::set_agent_inject_queue(inject_queue.clone());
         let health_host = std::sync::Arc::clone(&host);
         let mut sessions: BTreeMap<String, String> = BTreeMap::new();
         std::thread::spawn(move || {
@@ -303,6 +303,12 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     if group_id.is_empty() || group_msgs.is_empty() { continue; }
                     let combined = group_msgs.join("\n");
                     eprintln!("inbox: [{group_id}] batch {} msgs", group_msgs.len());
+                    // Push any messages that arrived while we were busy
+                    // into the inject queue so the agent's respond() loop
+                    // can see them via drain_inject_queue() between turns.
+                    while let Ok(late) = rx.try_recv() {
+                        inject_queue.lock().unwrap_or_else(|p| p.into_inner()).push_back(late);
+                    }
                     let sid = sessions.entry(group_id.clone())
                         .or_insert_with(|| host.agent_start(AgentSessionKind::RuntimeShell)
                             .map(|s| s.session_id).unwrap_or_default());
