@@ -29,6 +29,10 @@ pub enum UnaryOp {
 #[serde(rename_all = "snake_case")]
 pub enum ExprAst {
     Number(f64),
+    Constant {
+        name: String,
+        value: f64,
+    },
     Unary {
         op: UnaryOp,
         expr: Box<ExprAst>,
@@ -209,6 +213,24 @@ impl<'a> Parser<'a> {
                 ExprAst::Unary {
                     op: UnaryOp::Minus,
                     expr: Box::new(inner),
+                }
+            }
+            TokenKind::Identifier(name) => {
+                self.bump();
+                match name.as_str() {
+                    "pi" => ExprAst::Constant {
+                        name: name.clone(),
+                        value: std::f64::consts::PI,
+                    },
+                    "e" => ExprAst::Constant {
+                        name: name.clone(),
+                        value: std::f64::consts::E,
+                    },
+                    _ => {
+                        return Err(ParseError::UnexpectedToken {
+                            position: token.position,
+                        })
+                    }
                 }
             }
             TokenKind::LParen => {

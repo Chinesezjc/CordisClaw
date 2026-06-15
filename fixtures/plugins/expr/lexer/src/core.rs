@@ -7,6 +7,7 @@ use thiserror::Error;
 #[serde(rename_all = "snake_case")]
 pub enum TokenKind {
     Number(f64),
+    Identifier(String),
     Plus,
     Minus,
     Star,
@@ -132,6 +133,23 @@ pub fn lex(src: &str) -> Result<Vec<Token>, LexError> {
                 })?;
                 Token {
                     kind: TokenKind::Number(value),
+                    position: start,
+                }
+            }
+            c if c.is_ascii_alphabetic() || c == '_' => {
+                let start = pos;
+                pos += 1;
+                while pos < chars.len() {
+                    let cur = chars[pos];
+                    if cur.is_ascii_alphanumeric() || cur == '_' {
+                        pos += 1;
+                        continue;
+                    }
+                    break;
+                }
+                let name = chars[start..pos].iter().collect::<String>();
+                Token {
+                    kind: TokenKind::Identifier(name),
                     position: start,
                 }
             }
