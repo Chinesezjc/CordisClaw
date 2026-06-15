@@ -375,8 +375,31 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                                         }
                                     }
                                 }
-                                Ok(_) => { eprintln!("inbox: unknown JSON action, dropping"); }
-                                Err(_) => { eprintln!("inbox: JSON parse failed, dropping"); }
+                                Ok(ref cmd) => {
+                                    let action = cmd.get("action").and_then(|v| v.as_str()).unwrap_or("?");
+                                    eprintln!(
+                                        "inbox: unknown JSON action={action}, dropping raw={}...",
+                                        raw.chars().take(200).collect::<String>().replace('\n', " ")
+                                    );
+                                    let _ = host.invoke("qq", "qq_send", serde_json::json!({
+                                        "node_id": "qq_send",
+                                        "target": format!("group:{}", group_id),
+                                        "message": format!("⚠️ 回复异常（未知动作: {action}），请重试。"),
+                                    }).to_string());
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                        "inbox: JSON parse failed: {e} — raw={}... preprocessed={}...",
+                                        raw.chars().take(200).collect::<String>().replace('\n', " "),
+                                        out.chars().take(200).collect::<String>().replace('\n', " "),
+                                    );
+                                    // Notify the group so silent failures are visible.
+                                    let _ = host.invoke("qq", "qq_send", serde_json::json!({
+                                        "node_id": "qq_send",
+                                        "target": format!("group:{}", group_id),
+                                        "message": format!("⚠️ 回复格式异常，请重试。（错误: {e}）"),
+                                    }).to_string());
+                                }
                             }
                         }
                         Err(e) => eprintln!("inbox: {e}"),
