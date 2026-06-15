@@ -7,7 +7,7 @@
   "nodes": [
     {
       "id": "web_search",
-      "summary": "Search the web using DeepSeek native API (/v1/chat + search_enable). Requires DEEPSEEK_API_KEY env var. Returns AI-summarised text with search results integrated.",
+      "summary": "Search the web using DeepSeek Anthropic-compatible API. Returns structured results (title + URL per result) plus an AI summary. Use web_fetch to verify specific pages.",
       "input_schema": {
         "properties": {
           "node_id": {
@@ -37,7 +37,7 @@
             "type": "boolean"
           },
           "text": {
-            "description": "AI-summarised search result text",
+            "description": "Structured search results (numbered list with titles + URLs) + AI summary",
             "type": [
               "string",
               "null"
@@ -47,10 +47,10 @@
         "type": "object"
       },
       "side_effects": [
-        "makes HTTP request to DeepSeek /v1/chat with search_enable: true"
+        "makes HTTP request to DeepSeek Anthropic-compatible endpoint with native web_search tool"
       ],
       "failure_modes": [
-        "DEEPSEEK_API_KEY not set",
+        "api key not configured",
         "network unavailable",
         "rate limited"
       ],
