@@ -904,14 +904,53 @@ impl AgentSession {
             ));
 
             if !message.tool_calls.is_empty() {
-                messages.push(message.to_request_message());
                 let available_tools = tool_specs
                     .iter()
                     .map(|tool| tool.name.to_string())
                     .collect::<BTreeSet<_>>();
+                // Separate valid and unknown tool calls.
+                // Unknown tools are NOT added to the tool_calls chain
+                // (avoids DeepSeek tool_call_id mismatch errors).
+                // Instead they're injected as user-message errors.
+                let (valid_calls, unknown_calls): (Vec<_>, Vec<_>) = message
+                    .tool_calls
+                    .iter()
+                    .partition(|tc| available_tools.contains(&tc.function.name));
+                // Push assistant message with only valid tool_calls (if any).
+                if !valid_calls.is_empty() {
+                    let filtered = ChatMessage {
+                        content: message.content.clone(),
+                        reasoning_content: message.reasoning_content.clone(),
+                        tool_calls: valid_calls.iter().map(|&tc| tc.clone()).collect(),
+                    };
+                    messages.push(filtered.to_request_message());
+                }
+                // Inject errors for unknown tools BEFORE any assistant message.
+                for tool_call in &unknown_calls {
+                    let tool_name = &tool_call.function.name;
+                    self.unknown_tool_strikes += 1;
+                    let tool_list = available_tools.iter().cloned().collect::<Vec<_>>().join(", ");
+                    let err_msg = if self.unknown_tool_strikes >= UNKNOWN_TOOL_STRIKE_LIMIT {
+                        format!(
+                            "STOP — tool '{tool_name}' does not exist. Strike {}/{}. You are in a {} session. Your ONLY tools: {}",
+                            self.unknown_tool_strikes, UNKNOWN_TOOL_STRIKE_LIMIT,
+                            backend.tool_scope_label(), tool_list,
+                        )
+                    } else {
+                        format!(
+                            "Tool '{tool_name}' does not exist (strike {}/{}). Available tools: {}",
+                            self.unknown_tool_strikes, UNKNOWN_TOOL_STRIKE_LIMIT, tool_list,
+                        )
+                    };
+                    let _ = writeln!(std::io::stdout(), "⚙ {} (rejected — unknown tool)", tool_name);
+                    let _ = std::io::stdout().flush();
+                    messages.push(json!({"role": "user", "content": err_msg}));
+                }
                 // One blank line before the tool call block.
-                let _ = writeln!(std::io::stdout());
-                for tool_call in &message.tool_calls {
+                if !valid_calls.is_empty() {
+                    let _ = writeln!(std::io::stdout());
+                }
+                for tool_call in &valid_calls {
                     // Announce tool execution in real-time.
                     let tool_args_preview: String = serde_json::from_str::<Value>(
                         &tool_call.function.arguments,
