@@ -409,7 +409,13 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                                 }
                             }
                         }
-                        Err(e) => eprintln!("inbox: {e}"),
+                        Err(e) => {
+                            eprintln!("inbox: {e}");
+                            cordis_runtime::kernel::notify::send(
+                                &host,
+                                &format!("[{group_id}] ⚠️ LLM 请求失败: {e}"),
+                            );
+                        }
                     }
                 }
             }
