@@ -1276,9 +1276,7 @@ impl AgentSession {
                         .unwrap_or_else(|| format!("status={} body={}", status, raw_body.trim())),
                     truncate_for_error(&raw_body, 400),
                 );
-                if attempt < AGENT_REQUEST_MAX_ATTEMPTS
-                    && (status.is_server_error() || status.as_u16() == 429)
-                {
+                if attempt < AGENT_REQUEST_MAX_ATTEMPTS {
                     emit_agent_diagnostic(format!(
                         "{message} retry_backoff_ms={AGENT_REQUEST_RETRY_BACKOFF_MS}"
                     ));
