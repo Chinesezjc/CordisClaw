@@ -321,16 +321,22 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                                 let ch = chars[i];
                                 if ch == '"' {
                                     if in_string {
-                                        // Peek ahead: if next non-whitespace is : , } or ]
-                                        // this is a JSON structure close, otherwise embedded quote.
-                                        let mut j = i + 1;
-                                        while j < chars.len() && chars[j] == ' ' { j += 1; }
-                                        let next = chars.get(j).copied();
-                                        if matches!(next, Some(':') | Some(',') | Some('}') | Some(']') | None) {
-                                            in_string = false;
+                                        // If preceded by backslash, already escaped — pass through.
+                                        let already_escaped = i > 0 && chars[i - 1] == '\\';
+                                        if already_escaped {
                                             out.push('"');
                                         } else {
-                                            out.push_str("\\\"");
+                                            // Peek ahead: if next non-whitespace is : , } or ]
+                                            // this is a JSON structure close, otherwise embedded quote.
+                                            let mut j = i + 1;
+                                            while j < chars.len() && chars[j] == ' ' { j += 1; }
+                                            let next = chars.get(j).copied();
+                                            if matches!(next, Some(':') | Some(',') | Some('}') | Some(']') | None) {
+                                                in_string = false;
+                                                out.push('"');
+                                            } else {
+                                                out.push_str("\\\"");
+                                            }
                                         }
                                     } else {
                                         in_string = true;
