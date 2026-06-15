@@ -38,7 +38,7 @@ fn drain_inject_queue() -> Vec<String> {
 const AGENT_HISTORY_MESSAGE_LIMIT: usize = 512;
 const AGENT_MAX_TOOL_TURNS: usize = 96;
 const AGENT_REQUEST_MAX_ATTEMPTS: usize = 3;
-const UNKNOWN_TOOL_STRIKE_LIMIT: usize = 3;
+const UNKNOWN_TOOL_STRIKE_LIMIT: usize = 1;
 const AGENT_REQUEST_RETRY_BACKOFF_MS: u64 = 500;
 const AGENT_TOOL_GET_RUNTIME_STATUS: &str = "get_runtime_status";
 const AGENT_TOOL_LIST_PLUGINS: &str = "list_plugins";
@@ -2530,15 +2530,18 @@ CRITICAL: Your final output must be {\"action\":\"suspend\"} (JSON, nothing else
 To send a reply, use the invoke_plugin tool to call qq_send instead of outputting text.\n\
 Never output plain text — it will be dropped. All communication goes through tools.\n\
 \n\
-CRITICAL — YOUR AVAILABLE TOOLS (and ONLY these):\n\
+CRITICAL — YOUR TOOLS (only these exist; all others will fail immediately):\n\
   get_runtime_status, list_plugins, list_nodes, get_kernel_status, get_kernel_issues,\n\
   reload_runtime, build_plugins, invoke_plugin, execute_target, read_file, search_code,\n\
   write_file, replace_in_file, delete_file, rename_file, move_file, copy_file,\n\
   compact_context, list_directory, revert_changes\n\
 \n\
-You do NOT have: replace_files_exact, run_plugin_check, run_plugin_test,\n\
-rebuild_plugin_workspace, record_iteration_summary, or any other tool not listed above.\n\
-Calling an unsupported tool returns an error — do not retry it. Use what you have."
+You are in a runtime_shell session. You are NOT in a plugin-iteration session.\n\
+Tools like replace_files_exact, run_plugin_check, rebuild_plugin_workspace DO NOT EXIST here.\n\
+If you call a tool not listed above you will get an error on the FIRST attempt — stop and use what you have.\n\
+\n\
+For build/test: use build_plugins or run shell commands via a shell plugin if available.\n\
+For plugin node calls: always use invoke_plugin(plugin_path, node_id, payload_json)."
 }
 
 fn resolve_api_key(config: &LlmApiConfig) -> Result<String, RuntimeError> {
