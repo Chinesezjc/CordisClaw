@@ -20,6 +20,8 @@ struct NodeRequest {
     node_id: String,
     #[serde(default)]
     format: Option<String>,
+    #[serde(default)]
+    tz_offset_hours: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -38,7 +40,7 @@ struct NodeResponse {
 // Handlers
 // ---------------------------------------------------------------------------
 
-fn handle_time_now(_format: Option<&str>) -> Result<NodeResponse, String> {
+fn handle_time_now(_format: Option<&str>, tz_offset_hours: Option<i64>) -> Result<NodeResponse, String> {
     let dur = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|e| format!("system time error: {e}"))?;
@@ -61,11 +63,19 @@ fn handle_time_now(_format: Option<&str>) -> Result<NodeResponse, String> {
     while m < 12 && d >= mdays[m] as i64 { d -= mdays[m] as i64; m += 1; }
     let day = d + 1;
     let month = m + 1;
-    let remaining = secs % 86400;
-    let h = remaining / 3600;
-    let mi = (remaining % 3600) / 60;
-    let s = remaining % 60;
-    let datetime = format!("{y:04}-{month:02}-{day:02} {h:02}:{mi:02}:{s:02} UTC");
+    let offset_hours = tz_offset_hours.unwrap_or(0);
+    let total_secs = secs + offset_hours * 3600;
+    // Recalculate h/m/s from total_secs, handling day wrap
+    let adj_secs = total_secs.rem_euclid(86400);
+    let h = adj_secs / 3600;
+    let mi = (adj_secs % 3600) / 60;
+    let s = adj_secs % 60;
+    let tz_label = if offset_hours >= 0 {
+        format!("UTC+{offset_hours}")
+    } else {
+        format!("UTC{offset_hours}")
+    };
+    let datetime = format!("{y:04}-{month:02}-{day:02} {h:02}:{mi:02}:{s:02} {tz_label}");
 
     Ok(NodeResponse {
         ok: true,
@@ -78,7 +88,7 @@ fn handle_time_now(_format: Option<&str>) -> Result<NodeResponse, String> {
 
 fn handle(req: &NodeRequest) -> Result<NodeResponse, String> {
     match req.node_id.as_str() {
-        "time_now" => handle_time_now(req.format.as_deref()),
+        "time_now" => handle_time_now(req.format.as_deref(), req.tz_offset_hours),
         other => Err(format!("unknown node_id: {other}")),
     }
 }
@@ -102,7 +112,8 @@ fn docs_value() -> cordis_plugin_sdk::PluginDocs {
                     "required": ["node_id"],
                     "properties": {
                         "node_id": { "type": "string", "const": "time_now" },
-                        "format": { "type": "string", "description": "Optional chrono strftime format string, e.g. %Y-%m-%d %H:%M:%S" }
+                        "format": { "type": "string", "description": "Optional chrono strftime format string, e.g. %Y-%m-%d %H:%M:%S" },
+                        "tz_offset_hours": { "type": "integer", "description": "Optional timezone offset in hours, e.g. 8 for UTC+8. Defaults to 0 (UTC)." }
                     }
                 }),
                 json!({
