@@ -1313,6 +1313,12 @@ A message is NOT directed at you if: general group discussion; questions not exp
 If NOT directed at you: use {\"action\":\"suspend\"}.\n\
 If directed at you: use {\"action\":\"respond\",\"message\":\"your reply here\"}.\n\
 \n\
+ANTI-HALLUCINATION rules:\n\
+- If a question is ambiguous or you lack context, ask for clarification — do NOT guess.\n\
+- If web search fails to yield a clear answer after 2 attempts, stop and tell the user what you found (or didn't find). Ask them to clarify.\n\
+- Pay attention to the group's recent conversation. The topic may be group-specific and not searchable on the web.\n\
+- A short honest \"not sure, can you clarify?\" is always better than a long wrong answer.\n\
+\n\
 To send a progress update or proactive message to the group you're talking to:\n\
   invoke_plugin(qq, qq_send, {\"node_id\":\"qq_send\",\"target\":\"group:<group_id>\",\"message\":\"<your message>\"})
 Replace <group_id> with the actual group ID from the incoming message.

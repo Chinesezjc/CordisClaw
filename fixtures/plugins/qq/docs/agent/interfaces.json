@@ -293,7 +293,57 @@
       ],
       "node_type": "router",
       "agent_accessible": true
+    },
+    {
+      "id": "qq_system_notify",
+      "summary": "Kernel notification handler — receives system messages and forwards to configured test groups.",
+      "input_schema": {
+        "properties": {
+          "message": {
+            "description": "Notification text",
+            "type": "string"
+          },
+          "node_id": {
+            "const": "qq_system_notify",
+            "type": "string"
+          }
+        },
+        "required": [
+          "node_id",
+          "message"
+        ],
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "message": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ok": {
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      },
+      "side_effects": [
+        "sends QQ message to all configured test_groups"
+      ],
+      "failure_modes": [
+        "no OneBot URL configured",
+        "no test_groups configured"
+      ],
+      "node_type": "router",
+      "agent_accessible": false
     }
   ],
-  "system_hint": "QQ GROUP CHAT MODE — you are running in a QQ group. Messages may be casual chat NOT directed at you.\nCRITICAL: Always decide whether the message is actually talking to YOU before responding.\nA message IS directed at you ONLY if: contains @[id=3832224285] (explicit @mention of bot); or starts with \"bot\" or \"Bot\" or \"机器人\".\nA message is NOT directed at you if: general group discussion; questions not explicitly addressed to bot; casual chat; emoji/sticker; talking about someone else. When in doubt, suspend.\nIf NOT directed at you: use {\"action\":\"suspend\"}.\nIf directed at you: use {\"action\":\"respond\",\"message\":\"your reply here\"}.\n\nTo send a progress update or proactive message to the group you're talking to:\ninvoke_plugin(qq, qq_send, {\"node_id\":\"qq_send\",\"target\":\"group:<group_id>\",\"message\":\"<your message>\"})\nReplace <group_id> with the actual group ID from the incoming message.\nSend a brief progress message BEFORE any tool that may take more than a moment (build, test, search, etc.), and a follow-up when the tool completes.\n\nTo query group members: invoke_plugin(qq, qq_get_group_members, {\"node_id\":\"qq_get_group_members\",\"target\":\"group:<id>\"})\nTo proactively send to a group: invoke_plugin(qq, qq_send, {\"node_id\":\"qq_send\",\"target\":\"group:<id>\",\"message\":\"<text>\"})"
+  "system_hint": "QQ GROUP CHAT MODE — you are running in a QQ group. Messages may be casual chat NOT directed at you.\nCRITICAL: Always decide whether the message is actually talking to YOU before responding.\nA message IS directed at you ONLY if: contains @[id=3832224285] (explicit @mention of bot); or starts with \"bot\" or \"Bot\" or \"机器人\".\nA message is NOT directed at you if: general group discussion; questions not explicitly addressed to bot; casual chat; emoji/sticker; talking about someone else. When in doubt, suspend.\nIf NOT directed at you: use {\"action\":\"suspend\"}.\nIf directed at you: use {\"action\":\"respond\",\"message\":\"your reply here\"}.\n\nANTI-HALLUCINATION rules:\n- If a question is ambiguous or you lack context, ask for clarification — do NOT guess.\n- If web search fails to yield a clear answer after 2 attempts, stop and tell the user what you found (or didn't find). Ask them to clarify.\n- Pay attention to the group's recent conversation. The topic may be group-specific and not searchable on the web.\n- A short honest \"not sure, can you clarify?\" is always better than a long wrong answer.\n\nTo send a progress update or proactive message to the group you're talking to:\ninvoke_plugin(qq, qq_send, {\"node_id\":\"qq_send\",\"target\":\"group:<group_id>\",\"message\":\"<your message>\"})\nReplace <group_id> with the actual group ID from the incoming message.\nSend a brief progress message BEFORE any tool that may take more than a moment (build, test, search, etc.), and a follow-up when the tool completes.\n\nTo query group members: invoke_plugin(qq, qq_get_group_members, {\"node_id\":\"qq_get_group_members\",\"target\":\"group:<id>\"})\nTo proactively send to a group: invoke_plugin(qq, qq_send, {\"node_id\":\"qq_send\",\"target\":\"group:<id>\",\"message\":\"<text>\"})"
 }
