@@ -381,11 +381,16 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                                         "inbox: unknown JSON action={action}, dropping raw={}...",
                                         raw.chars().take(200).collect::<String>().replace('\n', " ")
                                     );
+                                    // Feed back to agent so it can self-correct and retry.
                                     let _ = host.invoke("qq", "qq_send", serde_json::json!({
                                         "node_id": "qq_send",
                                         "target": format!("group:{}", group_id),
-                                        "message": format!("⚠️ 回复异常（未知动作: {action}），请重试。"),
+                                        "message": format!("⚠️ 回复异常（未知动作: {action}），正在重试..."),
                                     }).to_string());
+                                    let feedback = format!(
+                                        "SYSTEM: Your last output was valid JSON but had unknown action \"{action}\". Allowed actions: \"suspend\" or \"respond\". Please retry with a correct action.\n\nYour raw output was:\n{raw}",
+                                    );
+                                    let _ = host.agent_send(sid, &feedback);
                                 }
                                 Err(e) => {
                                     eprintln!(
@@ -393,12 +398,16 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                                         raw.chars().take(200).collect::<String>().replace('\n', " "),
                                         out.chars().take(200).collect::<String>().replace('\n', " "),
                                     );
-                                    // Notify the group so silent failures are visible.
+                                    // Feed back to agent so it can self-correct and retry.
                                     let _ = host.invoke("qq", "qq_send", serde_json::json!({
                                         "node_id": "qq_send",
                                         "target": format!("group:{}", group_id),
-                                        "message": format!("⚠️ 回复格式异常，请重试。（错误: {e}）"),
+                                        "message": "⚠️ 回复格式异常，正在重试...",
                                     }).to_string());
+                                    let feedback = format!(
+                                        "SYSTEM: Your last output was not valid JSON and was dropped. Parse error: {e}\n\nPlease fix the JSON formatting and retry. Remember: final output must be exactly {{\"action\":\"suspend\"}} or {{\"action\":\"respond\",\"message\":\"...\"}}. Escape any double-quotes inside the message with backslash.\n\nYour raw output was:\n{raw}",
+                                    );
+                                    let _ = host.agent_send(sid, &feedback);
                                 }
                             }
                         }
