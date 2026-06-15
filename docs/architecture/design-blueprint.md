@@ -274,17 +274,19 @@ observe -> diagnose -> plan -> apply -> verify -> score -> promote/rollback
 这个固定 9 阶段 Petri Net（`kernel/loop.rs` + `kernel/planner.rs`，~9200 行）**已被删除**。
 替换为 **open-ended agent loop**——由 LLM 自主决定每一步做什么。
 
-### 10.1 双 Agent 模型
+### 10.1 Agent 模型
 
-当前运行时有两种 Agent session，工具集完全隔离：
+当前只有一个 Agent session 类型在生产中使用：**RuntimeShell**（`RuntimeShellAgentBackend`, agent.rs）。
+它拥有 15 个内核工具（文件读写、搜索、构建、插件调用等），负责 QQ 聊天和 REPL 交互。
 
-| Agent | Backend | 用途 | 工具 |
-|---|---|---|---|
-| **RuntimeShell** | `RuntimeShellAgentBackend` (agent.rs) | QQ 群聊、REPL 交互 | `read_file`, `write_file`, `replace_in_file`, `build_plugins`, `invoke_plugin`, `reload_runtime` 等 15 个内核工具 |
-| **PluginIteration** | `PluginIterationAgentBackend` (host.rs:3113) | Kernel 自主改进插件 | `replace_files_exact`, `run_plugin_check`, `run_plugin_test`, `rebuild_plugin_workspace`, `record_iteration_summary` 等 |
+**PluginIteration**（`PluginIterationAgentBackend`, host.rs:3113）提供额外工具：
+`replace_files_exact`, `run_plugin_check`, `run_plugin_test`, `rebuild_plugin_workspace`, `record_iteration_summary`。
+这些是插件迭代**能力**，当前仅被 `iterate_plugins()`（通过 `llm-auto-update` CLI 或 Kernel 自动触发）
+使用的独立 session 调用，RuntimeShell 目前拿不到。
 
-**隔离原则**：两个后端的 `tool_specs()` 和 `execute_tool()` 完全独立。
-RuntimeShell 调用 PluginIteration 工具会被 unknown-tool guard（agent.rs:1677）拦截并返回 error。
+**待解决的设计问题**：PluginIteration 工具应当在用户通过 RuntimeShell 请求时也可用。
+即：用户说"改进 gacha" → RuntimeShell agent 应当能调用 `run_plugin_check` 等迭代工具，
+而不是走一条完全分离的代码路径。这需要合并两个 backend 或让 RuntimeShell 能够访问 PluginIteration 工具集。
 
 ### 10.2 自迭代流程
 
