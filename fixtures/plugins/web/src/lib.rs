@@ -1,16 +1,16 @@
 //! Web access plugin — search and fetch.
 //!
 //! Nodes:
-//! - `web_search`  — search the web using DeepSeek native API (/v1/chat + search_enable)
+//! - `web_search`  — search the web using DeepSeek Anthropic-compatible API
+//!                    (returns structured results: title + URL per result)
 //! - `web_fetch`   — fetch a URL and return plain-text content
 //!
 //! Safety: only http/https URLs are allowed; localhost, loopback, and private
 //! network addresses are blocked.
 //!
 //! Backend:
-//! DeepSeek native search — DEEPSEEK_API_KEY env var required.
-//! Uses /v1/chat endpoint with search_enable: true.
-//! Returns AI-summarised text with search results integrated.
+//! DeepSeek Anthropic-compatible endpoint with native web_search server tool.
+//! Returns structured search results the agent can verify with web_fetch.
 
 use cordis_plugin_sdk::{
     export_plugin_api, json_response, node_doc, plugin_docs, AbiFingerprint, PluginRequest,
@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::time::Duration;
 
-const TIMEOUT_SECS: u64 = 30;
+const TIMEOUT_SECS: u64 = 60;
 const MAX_FETCH_CHARS: usize = 8000;
 
 // ---------------------------------------------------------------------------
@@ -60,7 +60,7 @@ struct WebResponse {
 }
 
 // ---------------------------------------------------------------------------
-// Web search — DeepSeek native API (/v1/chat + search_enable)
+// Web search — DeepSeek Anthropic-compatible API (native web_search tool)
 // ---------------------------------------------------------------------------
 
 fn read_llm_config() -> Option<(String, String, String)> {
@@ -86,8 +86,8 @@ fn read_llm_config() -> Option<(String, String, String)> {
     ))
 }
 
-fn web_search_deepseek(query: &str) -> Result<String, String> {
-    let (api_key, model, base_url) = read_llm_config()
+fn web_search_anthropic(query: &str) -> Result<String, String> {
+    let (api_key, model, _base_url) = read_llm_config()
         .ok_or("no api_key found in config/llm_api.yaml".to_string())?;
 
     let client = Client::builder()
@@ -95,47 +95,83 @@ fn web_search_deepseek(query: &str) -> Result<String, String> {
         .build()
         .map_err(|e| format!("build HTTP client: {e}"))?;
 
+    // Use DeepSeek's Anthropic-compatible endpoint with web_search server tool.
     let body = json!({
         "model": model,
+        "max_tokens": 2048,
         "messages": [{"role": "user", "content": query}],
-        "search_enable": true
+        "tools": [{"type": "web_search_20250305", "name": "web_search"}]
     });
 
-    let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
+    let url = "https://api.deepseek.com/anthropic/messages";
     let resp = client
-        .post(&url)
-        .header("Authorization", format!("Bearer {}", api_key))
+        .post(url)
+        .header("x-api-key", &api_key)
+        .header("anthropic-version", "2023-06-01")
         .header("Content-Type", "application/json")
         .json(&body)
         .send()
-        .map_err(|e| format!("DeepSeek HTTP request: {e}"))?;
+        .map_err(|e| format!("Anthropic HTTP request: {e}"))?;
 
     let status = resp.status();
-    let body = resp
+    let resp_body = resp
         .text()
-        .map_err(|e| format!("DeepSeek read body: {e}"))?;
+        .map_err(|e| format!("Anthropic read body: {e}"))?;
 
     if !status.is_success() {
         return Err(format!(
-            "DeepSeek API error ({}): {}",
+            "Anthropic API error ({}): {}",
             status.as_u16(),
-            &body.chars().take(500).collect::<String>()
+            &resp_body.chars().take(500).collect::<String>()
         ));
     }
 
     let json: Value =
-        serde_json::from_str(&body).map_err(|e| format!("DeepSeek parse JSON: {e}"))?;
+        serde_json::from_str(&resp_body).map_err(|e| format!("Anthropic parse JSON: {e}"))?;
 
-    let content = json["choices"][0]["message"]["content"]
-        .as_str()
-        .ok_or_else(|| {
-            format!(
-                "unexpected DeepSeek response format: {}",
-                &body.chars().take(500).collect::<String>()
-            )
-        })?;
+    // Extract structured search results + model text from content blocks.
+    let content_blocks = json["content"]
+        .as_array()
+        .ok_or_else(|| format!("unexpected response format: {}", &resp_body.chars().take(500).collect::<String>()))?;
 
-    Ok(content.to_string())
+    let mut results: Vec<String> = Vec::new();
+    let mut model_text = String::new();
+
+    for block in content_blocks {
+        let block_type = block["type"].as_str().unwrap_or("");
+        match block_type {
+            "web_search_tool_result" => {
+                if let Some(items) = block["content"].as_array() {
+                    for (i, item) in items.iter().enumerate() {
+                        let title = item["title"].as_str().unwrap_or("(no title)");
+                        let item_url = item["url"].as_str().unwrap_or("");
+                        results.push(format!("{}. **{}**\n   {}", i + 1, title, item_url));
+                    }
+                }
+            }
+            "text" => {
+                if let Some(t) = block["text"].as_str() {
+                    model_text.push_str(t);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut out = String::new();
+    if !results.is_empty() {
+        out.push_str(&format!("## Search results ({})\n\n", results.len()));
+        out.push_str(&results.join("\n\n"));
+        out.push_str("\n\n---\n\n");
+    }
+    if !model_text.is_empty() {
+        out.push_str("**Summary:** ");
+        out.push_str(&model_text);
+    } else {
+        out.push_str("No results found.");
+    }
+
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -229,7 +265,7 @@ fn handle(req: &WebRequest) -> Result<WebResponse, String> {
             if query.is_empty() {
                 return Err("query is required for web_search".to_string());
             }
-            let text = web_search_deepseek(query)?;
+            let text = web_search_anthropic(query)?;
             Ok(WebResponse {
                 ok: true,
                 node_id: "web_search".to_string(),
@@ -277,7 +313,7 @@ fn docs_value() -> cordis_plugin_sdk::PluginDocs {
         vec![
             node_doc(
                 "web_search",
-                "Search the web using DeepSeek native API (/v1/chat + search_enable). Requires DEEPSEEK_API_KEY env var. Returns AI-summarised text with search results integrated.",
+                "Search the web using DeepSeek Anthropic-compatible API. Returns structured results (title + URL per result) plus an AI summary. Use web_fetch to verify specific pages.",
                 json!({
                     "type": "object",
                     "required": ["node_id", "query"],
@@ -290,12 +326,12 @@ fn docs_value() -> cordis_plugin_sdk::PluginDocs {
                     "type": "object",
                     "properties": {
                         "ok": { "type": "boolean" },
-                        "text": { "type": ["string", "null"], "description": "AI-summarised search result text" },
+                        "text": { "type": ["string", "null"], "description": "Structured search results (numbered list with titles + URLs) + AI summary" },
                         "error": { "type": ["string", "null"] }
                     }
                 }),
-                &["makes HTTP request to DeepSeek /v1/chat with search_enable: true"],
-                &["DEEPSEEK_API_KEY not set", "network unavailable", "rate limited"],
+                &["makes HTTP request to DeepSeek Anthropic-compatible endpoint with native web_search tool"],
+                &["api key not configured", "network unavailable", "rate limited"],
             ).with_agent_accessible(),
             node_doc(
                 "web_fetch",
@@ -329,7 +365,7 @@ fn abi_fingerprint_value() -> AbiFingerprint {
     AbiFingerprint {
         rustc_version: "1.85.1".to_string(),
         target_triple: "x86_64-unknown-linux-gnu".to_string(),
-        crate_hash: "web_deepseek_native".to_string(),
+        crate_hash: "web_anthropic_search".to_string(),
         api_hash: "api_v2".to_string(),
     }
 }
