@@ -1,7 +1,7 @@
 [workspace]
 members = [
   "time",
-  "filesystem", "expr", "shell", "qq", "web", "git", "vision"]
+  "filesystem", "expr", "shell", "qq", "web", "git", "vision", "gacha"]
 exclude = [
   "expr/lexer",
   "expr/parser",

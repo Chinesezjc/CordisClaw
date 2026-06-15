@@ -1,0 +1,122 @@
+{
+  "plugin_id": "gacha",
+  "plugin_path": "gacha",
+  "plugin_version": "0.1.0",
+  "abi_version": 2,
+  "command_name": "Gacha",
+  "nodes": [
+    {
+      "id": "gacha_entry",
+      "summary": "Genshin Impact wish simulator. Pull on character/weapon/standard banners with accurate pity and 50/50 mechanics.",
+      "input_schema": {
+        "properties": {
+          "banner": {
+            "description": "character(default) | weapon | standard",
+            "type": "string"
+          },
+          "cmd": {
+            "description": "pull | status",
+            "type": "string"
+          },
+          "count": {
+            "description": "1-100, default 1",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "cmd"
+        ],
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "action": {
+            "type": "string"
+          },
+          "guaranteed": {
+            "type": "boolean"
+          },
+          "message": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ok": {
+            "type": "boolean"
+          },
+          "pity_4": {
+            "type": "integer"
+          },
+          "pity_5": {
+            "type": "integer"
+          },
+          "results": {
+            "items": {
+              "type": "object"
+            },
+            "type": "array"
+          }
+        },
+        "type": "object"
+      },
+      "side_effects": [
+        "accurate Genshin pity model",
+        "soft pity starts at 73",
+        "50/50 system"
+      ],
+      "failure_modes": [
+        "invalid banner",
+        "count out of range"
+      ],
+      "node_type": "router",
+      "agent_accessible": true
+    },
+    {
+      "id": "gacha_status",
+      "summary": "Check current gacha pity counters and statistics.",
+      "input_schema": {
+        "properties": {
+          "cmd": {
+            "const": "status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "cmd"
+        ],
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "guaranteed": {
+            "type": "boolean"
+          },
+          "message": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ok": {
+            "type": "boolean"
+          },
+          "pity_4": {
+            "type": "integer"
+          },
+          "pity_5": {
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "side_effects": [
+        "reads current pity state"
+      ],
+      "failure_modes": [],
+      "node_type": "router",
+      "agent_accessible": true
+    }
+  ],
+  "system_hint": null
+}
