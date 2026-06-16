@@ -312,100 +312,74 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     let sid = sessions.entry(group_id.clone())
                         .or_insert_with(|| host.agent_start(AgentSessionKind::RuntimeShell)
                             .map(|s| s.session_id).unwrap_or_default());
+                    // Process agent output: parse JSON, dispatch action, send to QQ.
+                    // Returns Some(feedback) if the agent needs to retry with a corrected output.
+                    let mut process = |raw: String, label: &str| -> Option<String> {
+                        if raw.is_empty() { return None; }
+                        // Preprocess: escape newlines and embedded quotes inside JSON strings.
+                        let chars: Vec<char> = raw.chars().collect();
+                        let mut out = String::with_capacity(raw.len() + 64);
+                        let mut in_string = false;
+                        let mut i = 0;
+                        while i < chars.len() {
+                            let ch = chars[i];
+                            if ch == '"' {
+                                if in_string {
+                                    let already_escaped = i > 0 && chars[i - 1] == '\\';
+                                    if already_escaped { out.push('"'); }
+                                    else {
+                                        let mut j = i + 1;
+                                        while j < chars.len() && chars[j] == ' ' { j += 1; }
+                                        let next = chars.get(j).copied();
+                                        if matches!(next, Some(':') | Some(',') | Some('}') | Some(']') | None) {
+                                            in_string = false; out.push('"');
+                                        } else { out.push_str("\\\""); }
+                                    }
+                                } else { in_string = true; out.push('"'); }
+                            } else if ch == '\n' && in_string { out.push_str("\\n"); }
+                            else { out.push(ch); }
+                            i += 1;
+                        }
+                        match serde_json::from_str::<Value>(&out) {
+                            Ok(ref cmd) if cmd.get("action").and_then(|v| v.as_str()) == Some("suspend") => {
+                                eprintln!("inbox: session suspended ({label})");
+                                None
+                            }
+                            Ok(ref cmd) if cmd.get("action").and_then(|v| v.as_str()) == Some("respond") => {
+                                let msg = cmd.get("message").and_then(|v| v.as_str()).unwrap_or("");
+                                if !msg.is_empty() {
+                                    eprintln!("inbox: agent reply ({label}): {}...", msg.chars().take(100).collect::<String>());
+                                    let payload = serde_json::json!({
+                                        "node_id": "qq_send",
+                                        "target": format!("group:{}", group_id),
+                                        "message": msg,
+                                    });
+                                    match host.invoke("qq", "qq_send", payload.to_string()) {
+                                        Ok(_) => eprintln!("inbox: qq_send OK ({label})"),
+                                        Err(e) => eprintln!("inbox: qq_send failed ({label}): {e}"),
+                                    }
+                                }
+                                None
+                            }
+                            Ok(ref cmd) => {
+                                let action = cmd.get("action").and_then(|v| v.as_str()).unwrap_or("?");
+                                eprintln!("inbox: unknown JSON action={action}, dropping raw={}...", raw.chars().take(200).collect::<String>().replace('\n', " "));
+                                cordis_runtime::kernel::notify::send(&host, &format!("[{group_id}] ⚠️ 回复异常（未知动作: {action}），正在重试..."));
+                                Some(format!("SYSTEM: Your last output was valid JSON but had unknown action \"{action}\". Allowed actions: \"suspend\" or \"respond\". Please retry.\n\nYour raw output was:\n{raw}"))
+                            }
+                            Err(e) => {
+                                eprintln!("inbox: JSON parse failed: {e} — raw={}... preprocessed={}...", raw.chars().take(200).collect::<String>().replace('\n', " "), out.chars().take(200).collect::<String>().replace('\n', " "));
+                                cordis_runtime::kernel::notify::send(&host, &format!("[{group_id}] ⚠️ 回复格式异常，正在重试...（{e}）"));
+                                Some(format!("SYSTEM: Your last output was not valid JSON and was dropped. Parse error: {e}\n\nPlease fix the JSON formatting and retry. Final output must be exactly {{\"action\":\"suspend\"}} or {{\"action\":\"respond\",\"message\":\"...\"}}.\n\nYour raw output was:\n{raw}"))
+                            }
+                        }
+                    };
                     match host.agent_send(sid, &combined) {
                         Ok(reply) => {
-                            let raw = reply.content.trim().to_string();
-                            if raw.is_empty() { continue; }
-                            // Preprocess: escape newlines and embedded quotes inside JSON
-                            // strings so serde_json can parse even when the model outputs
-                            // literal line breaks or bare double-quotes in message values.
-                            let chars: Vec<char> = raw.chars().collect();
-                            let mut out = String::with_capacity(raw.len() + 64);
-                            let mut in_string = false;
-                            let mut i = 0;
-                            while i < chars.len() {
-                                let ch = chars[i];
-                                if ch == '"' {
-                                    if in_string {
-                                        // If preceded by backslash, already escaped — pass through.
-                                        let already_escaped = i > 0 && chars[i - 1] == '\\';
-                                        if already_escaped {
-                                            out.push('"');
-                                        } else {
-                                            // Peek ahead: if next non-whitespace is : , } or ]
-                                            // this is a JSON structure close, otherwise embedded quote.
-                                            let mut j = i + 1;
-                                            while j < chars.len() && chars[j] == ' ' { j += 1; }
-                                            let next = chars.get(j).copied();
-                                            if matches!(next, Some(':') | Some(',') | Some('}') | Some(']') | None) {
-                                                in_string = false;
-                                                out.push('"');
-                                            } else {
-                                                out.push_str("\\\"");
-                                            }
-                                        }
-                                    } else {
-                                        in_string = true;
-                                        out.push('"');
-                                    }
-                                } else if ch == '\n' && in_string {
-                                    out.push_str("\\n");
-                                } else {
-                                    out.push(ch);
-                                }
-                                i += 1;
-                            }
-                            match serde_json::from_str::<Value>(&out) {
-                                Ok(ref cmd) if cmd.get("action").and_then(|v| v.as_str()) == Some("suspend") => {
-                                    eprintln!("inbox: session suspended");
-                                }
-                                Ok(ref cmd) if cmd.get("action").and_then(|v| v.as_str()) == Some("respond") => {
-                                    let msg = cmd.get("message").and_then(|v| v.as_str()).unwrap_or("");
-                                    if !msg.is_empty() {
-                                        eprintln!("inbox: agent reply: {}...", msg.chars().take(100).collect::<String>());
-                                        let payload = serde_json::json!({
-                                            "node_id": "qq_send",
-                                            "target": format!("group:{}", group_id),
-                                            "message": msg,
-                                            "payload": {},
-                                        });
-                                        match host.invoke("qq", "qq_send", payload.to_string()) {
-                                            Ok(_) => eprintln!("inbox: qq_send OK"),
-                                            Err(e) => eprintln!("inbox: qq_send failed: {e}"),
-                                        }
-                                    }
-                                }
-                                Ok(ref cmd) => {
-                                    let action = cmd.get("action").and_then(|v| v.as_str()).unwrap_or("?");
-                                    eprintln!(
-                                        "inbox: unknown JSON action={action}, dropping raw={}...",
-                                        raw.chars().take(200).collect::<String>().replace('\n', " ")
-                                    );
-                                    // Feed back to agent so it can self-correct and retry.
-                                    cordis_runtime::kernel::notify::send(
-                                        &host,
-                                        &format!("[{group_id}] ⚠️ 回复异常（未知动作: {action}），正在重试..."),
-                                    );
-                                    let feedback = format!(
-                                        "SYSTEM: Your last output was valid JSON but had unknown action \"{action}\". Allowed actions: \"suspend\" or \"respond\". Please retry with a correct action.\n\nYour raw output was:\n{raw}",
-                                    );
-                                    let _ = host.agent_send(sid, &feedback);
-                                }
-                                Err(e) => {
-                                    eprintln!(
-                                        "inbox: JSON parse failed: {e} — raw={}... preprocessed={}...",
-                                        raw.chars().take(200).collect::<String>().replace('\n', " "),
-                                        out.chars().take(200).collect::<String>().replace('\n', " "),
-                                    );
-                                    // Feed back to agent so it can self-correct and retry.
-                                    cordis_runtime::kernel::notify::send(
-                                        &host,
-                                        &format!("[{group_id}] ⚠️ 回复格式异常，正在重试...（{e}）"),
-                                    );
-                                    let feedback = format!(
-                                        "SYSTEM: Your last output was not valid JSON and was dropped. Parse error: {e}\n\nPlease fix the JSON formatting and retry. Remember: final output must be exactly {{\"action\":\"suspend\"}} or {{\"action\":\"respond\",\"message\":\"...\"}}. Escape any double-quotes inside the message with backslash.\n\nYour raw output was:\n{raw}",
-                                    );
-                                    let _ = host.agent_send(sid, &feedback);
+                            let feedback = process(reply.content.trim().to_string(), "inbox");
+                            if let Some(fb) = feedback {
+                                if let Ok(reply2) = host.agent_send(sid, &fb) {
+                                    process(reply2.content.trim().to_string(), "retry");
                                 }
                             }
                         }
