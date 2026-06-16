@@ -1090,6 +1090,7 @@ impl RuntimeHost {
     }
 
     /// Write a shutdown memory snapshot to data/memory/shutdown.json.
+    /// Uses try_lock to avoid deadlocking with active agent sessions.
     pub fn write_shutdown_memory(&self) {
         let ws_root = self.fixtures_root.parent()
             .map(|p| p.to_path_buf())
@@ -1097,17 +1098,22 @@ impl RuntimeHost {
         let path = ws_root.join("data/memory/shutdown.json");
         let _ = std::fs::create_dir_all(path.parent().unwrap());
         let now = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%z").to_string();
-        let guard = self.agent_sessions_mut();
-        let sessions: Vec<serde_json::Value> = guard.iter().map(|(sid, s)| {
-            let st = s.session.status();
-            serde_json::json!({
-                "session_id": sid,
-                "kind": st.kind,
-                "completed_turns": st.completed_turns,
-                "model": st.model,
+        // Use try_lock to avoid deadlocking if an agent session is active.
+        let sessions: Vec<serde_json::Value> = self
+            .agent_sessions
+            .try_lock()
+            .map(|guard| {
+                guard.iter().map(|(sid, s)| {
+                    let st = s.session.status();
+                    serde_json::json!({
+                        "session_id": sid,
+                        "kind": st.kind,
+                        "completed_turns": st.completed_turns,
+                        "model": st.model,
+                    })
+                }).collect()
             })
-        }).collect();
-        drop(guard);
+            .unwrap_or_default();
         let snapshot = self.current_snapshot();
         let plugins: Vec<serde_json::Value> = snapshot.plugin_registry().iter().map(|(p, pl)| {
             serde_json::json!({
@@ -3691,7 +3697,7 @@ Do not attempt to modify runtime crates, repository root manifests, config, .git
                 ]);
             }
         }
-        if !self.state.operations.is_empty() && self.state.recorded_summary.is_none() {
+        if !self.state.operations.is_empty() {
             tools.extend([
                 AgentToolSpec {
                     name: PLUGIN_AGENT_TOOL_RUN_PLUGIN_CHECK,
