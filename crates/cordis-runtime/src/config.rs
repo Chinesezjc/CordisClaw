@@ -41,6 +41,10 @@ fn default_timeout_ms() -> u64 {
     60_000
 }
 
+fn default_stream_timeout_secs() -> u64 {
+    60
+}
+
 fn default_enabled() -> bool {
     true
 }
@@ -212,6 +216,8 @@ pub struct LlmApiConfig {
     pub max_tokens: u32,
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u64,
+    #[serde(default = "default_stream_timeout_secs")]
+    pub stream_timeout_secs: u64,
 }
 
 impl Default for LlmApiConfig {
@@ -227,6 +233,7 @@ impl Default for LlmApiConfig {
             temperature: default_temperature(),
             max_tokens: default_max_tokens(),
             timeout_ms: default_timeout_ms(),
+            stream_timeout_secs: default_stream_timeout_secs(),
         }
     }
 }
