@@ -198,10 +198,11 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     );
     io::stdout().flush()?;
 
-    // Ctrl+C handler: save draft + revert, then exit cleanly.
+    // Ctrl+C handler: save draft + revert + shutdown memory, then exit cleanly.
     // Second Ctrl+C does a hard exit in case cleanup hangs.
     let interrupted = Arc::new(AtomicBool::new(false));
     let fixtures_root = host.fixtures_root().to_path_buf();
+    let shutdown_host = Arc::clone(&host);
     {
         let interrupted = Arc::clone(&interrupted);
         ctrlc::set_handler(move || {
@@ -209,9 +210,10 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!("\nforced exit");
                 std::process::exit(1);
             }
-            eprint!("\n⏸ interrupted, saving draft...");
+            eprint!("\n⏸ interrupted, saving...");
             let _ = std::io::stderr().flush();
             save_draft_and_revert(&fixtures_root, "ctrl-c");
+            shutdown_host.write_shutdown_memory();
             std::process::exit(0);
         })
         .ok();

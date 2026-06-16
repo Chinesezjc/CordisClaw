@@ -921,6 +921,35 @@ impl AgentSession {
                 tool_specs.len(),
             ));
 
+            // Diagnostic: scan for tool_calls / tool message mismatches.
+            for (idx, msg) in messages.iter().enumerate() {
+                if msg.get("role").and_then(|v| v.as_str()) == Some("assistant") {
+                    if let Some(tc_arr) = msg.get("tool_calls").and_then(|v| v.as_array()) {
+                        let expected: Vec<&str> = tc_arr.iter()
+                            .filter_map(|tc| tc.get("id").and_then(|v| v.as_str()))
+                            .collect();
+                        let mut found: Vec<&str> = Vec::new();
+                        for next in messages.iter().skip(idx + 1) {
+                            match next.get("role").and_then(|v| v.as_str()) {
+                                Some("tool") => {
+                                    if let Some(tid) = next.get("tool_call_id").and_then(|v| v.as_str()) {
+                                        found.push(tid);
+                                    }
+                                }
+                                Some("assistant") | Some("user") => break,
+                                _ => {}
+                            }
+                        }
+                        if found.len() < expected.len() {
+                            eprintln!(
+                                "[tool_calls diag] turn={} msg_idx={} expected={:?} found={:?}",
+                                turn + 1, idx, expected, found,
+                            );
+                        }
+                    }
+                }
+            }
+
             let request_body = json!({
                 "model": self.config.model,
                 "messages": messages,
@@ -2629,10 +2658,12 @@ IMPORTANT — workspace layout:\n\
 - The fixtures root is `./`, but cargo needs `plugins/` as the working directory.\n\
 - When creating NEW files/directories under plugins/, use write_file or invoke_plugin\n\
   (e.g. `mkdir -p plugins/expr/evaluator/pow/src`) first — write_file may reject non-existent paths.\n\
-- After a successful `cargo build`, the built .so files need to be synced to `artifacts/`\n\
-  for the runtime to pick them up:\n\
-  `cp plugins/target/debug/libexpr*.so artifacts/ 2>/dev/null; cp plugins/target/debug/*.so artifacts/ 2>/dev/null`\n\
-  Then use `reload_runtime` with `plugin_path: \"/\"` to load the changes into the live runtime.\n\
+- After editing plugin code, use `build_plugins` with `plugin_name: \"<name>\"` (or `\"all\"`)\n\
+  to compile and sync the .so to artifacts/ automatically.\n\
+- Then use `reload_runtime` with `plugin_path: \"/<name>\"` (or `\"/\"` for all) to load\n\
+  changes into the live runtime.\n\
+- Use `run_plugin_test` to run cargo test (defaults to all plugins; pass a custom command\n\
+  like `cargo test -p gacha` for a specific plugin).\n\
 \n\
 CREATING A NEW PLUGIN — required files (every new plugin MUST have all of these):\n\
   plugins/<name>/Cargo.toml      — package name = plugin_path = directory name (normalised)\n\
@@ -2662,11 +2693,11 @@ When the user asks you to add a feature or fix a bug, follow this workflow:\n\
 1. Read the relevant source files to understand the codebase structure.\n\
 2. Plan the edits needed (which files to create/modify).\n\
 3. Make the edits using write_file and replace_in_file (or invoke_plugin for new files/dirs).\n\
-4. Run `cd plugins && cargo build 2>&1` to verify compilation.\n\
-5. Run `cd plugins && cargo test -p <name> 2>&1` to verify correctness.\n\
-6. Sync artifacts and reload for runtime changes (if needed).\n\
+4. Run `build_plugins` with the plugin name to compile and sync artifacts.\n\
+5. Run `run_plugin_test` to verify correctness (pass a custom command for specific tests).\n\
+6. Run `reload_runtime` to load changes into the live runtime.\n\
 7. If something goes wrong, use revert_changes to undo, then try a different approach.\n\
-Always verify edits compile before claiming success. If a command fails, read the error output and fix it.\n\
+Always verify edits compile before claiming success. If a build fails, read the stderr and fix it.\n\
 Prefer concise, operator-friendly replies. Mention important tool outcomes plainly.\n\
 Do not invent runtime state or claim a command succeeded unless a tool confirmed it.\n\
 \n\
