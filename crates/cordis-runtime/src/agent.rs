@@ -1366,7 +1366,7 @@ impl AgentSession {
                 return Err(RuntimeError::LlmRequestFailed { message });
             }
 
-            let stream_timeout = Duration::from_millis(self.config.timeout_ms);
+            let stream_timeout = Duration::from_secs(self.config.stream_timeout_secs);
             let streamed = match read_chat_stream(response, &request_summary, attempt, stream_timeout) {
                 Ok(streamed) => streamed,
                 Err(ChatStreamReadError::Io(err)) => {
