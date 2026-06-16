@@ -49,6 +49,10 @@ pub extern "C" fn _cordis_agent_trigger(msg: *const std::ffi::c_char) {
     }
 }
 
+extern "C" fn sigterm_to_sigint(_sig: libc::c_int) {
+    unsafe { libc::raise(libc::SIGINT); }
+}
+
 fn main() {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     if args.first().map(|x| x.as_str()) == Some("auto-update") {
@@ -198,8 +202,9 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     );
     io::stdout().flush()?;
 
-    // Ctrl+C handler: save draft + revert + shutdown memory, then exit cleanly.
-    // Second Ctrl+C does a hard exit in case cleanup hangs.
+    // Signal handler: save draft + revert + shutdown memory, then exit.
+    // ctrlc crate handles SIGINT; we convert SIGTERM to SIGINT so both
+    // paths go through the same graceful shutdown logic.
     let interrupted = Arc::new(AtomicBool::new(false));
     let fixtures_root = host.fixtures_root().to_path_buf();
     let shutdown_host = Arc::clone(&host);
@@ -212,11 +217,15 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             }
             eprint!("\n⏸ interrupted, saving...");
             let _ = std::io::stderr().flush();
-            save_draft_and_revert(&fixtures_root, "ctrl-c");
+            save_draft_and_revert(&fixtures_root, "signal");
             shutdown_host.write_shutdown_memory();
             std::process::exit(0);
         })
         .ok();
+    }
+    // SIGTERM → SIGINT so systemctl stop triggers graceful shutdown.
+    unsafe {
+        libc::signal(libc::SIGTERM, sigterm_to_sigint as usize);
     }
 
     // ── Startup invocations ──────────────────────────────────────────────
