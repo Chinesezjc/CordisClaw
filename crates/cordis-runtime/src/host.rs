@@ -3646,78 +3646,63 @@ Do not attempt to modify runtime crates, repository root manifests, config, .git
                 description: "Read multiple currently visible context files in one call. If a needed file is hidden behind the focus shortlist, expand first with list_context_files(scope=all).",
                 parameters: json!({"type":"object","properties":{"paths":{"type":"array","items":{"type":"string"}}},"required":["paths"],"additionalProperties":false}),
             },
-        ];
-        if self.state.context_scope_expanded {
-            tools.push(AgentToolSpec {
+            AgentToolSpec {
                 name: PLUGIN_AGENT_TOOL_INSPECT_PLUGIN_CATALOG,
                 description: "Inspect the currently loaded plugin subtree, including child plugins and node summaries.",
                 parameters: json!({"type":"object","properties":{},"additionalProperties":false}),
-            });
-        }
-        if self.state.recorded_summary.is_none() {
-            tools.extend([
-                AgentToolSpec {
-                    name: PLUGIN_AGENT_TOOL_SCAFFOLD_CHILD_PLUGIN,
-                    description: "Create a sibling child plugin scaffold under the selected subtree and register it in the parent manifest.",
-                    parameters: json!({"type":"object","properties":{"parent_plugin_path":{"type":"string"},"child_name":{"type":"string"},"template_plugin_path":{"type":"string"},"node_id":{"type":"string"},"summary":{"type":"string"}},"required":["parent_plugin_path","child_name"],"additionalProperties":false}),
-                },
-                AgentToolSpec {
-                    name: PLUGIN_AGENT_TOOL_REPLACE_FILE_EXACT,
-                    description: "Replace an exact string in one writable file. Prefer replace_files_exact unless this is truly a single-file follow-up.",
-                    parameters: json!({"type":"object","properties":{"path":{"type":"string"},"expected_old_string":{"type":"string"},"new_content":{"type":"string"}},"required":["path","expected_old_string","new_content"],"additionalProperties":false}),
-                },
-                AgentToolSpec {
-                    name: PLUGIN_AGENT_TOOL_REPLACE_FILES_EXACT,
-                    description: "Replace exact strings in one or more writable files in one call. Prefer this for nearly all source edits so related changes land in the same tool turn.",
-                    parameters: json!({"type":"object","properties":{"edits":{"type":"array","items":{"type":"object","properties":{"path":{"type":"string"},"expected_old_string":{"type":"string"},"new_content":{"type":"string"}},"required":["path","expected_old_string","new_content"],"additionalProperties":false},"minItems":1}},"required":["edits"],"additionalProperties":false}),
-                },
-            ]);
-            if self.state.context_scope_expanded {
-                tools.extend([
-                    AgentToolSpec {
-                        name: PLUGIN_AGENT_TOOL_CREATE_FILE,
-                        description: "Create a new writable file inside the selected plugin subtree.",
-                        parameters: json!({"type":"object","properties":{"path":{"type":"string"},"new_content":{"type":"string"}},"required":["path","new_content"],"additionalProperties":false}),
-                    },
-                    AgentToolSpec {
-                        name: PLUGIN_AGENT_TOOL_DELETE_FILE,
-                        description: "Delete a writable file when you know its expected sha256.",
-                        parameters: json!({"type":"object","properties":{"path":{"type":"string"},"expected_sha256":{"type":"string"}},"required":["path","expected_sha256"],"additionalProperties":false}),
-                    },
-                    AgentToolSpec {
-                        name: PLUGIN_AGENT_TOOL_TOML_SET,
-                        description: "Set one TOML dotted key inside a writable manifest using an expected sha256 guard.",
-                        parameters: json!({"type":"object","properties":{"path":{"type":"string"},"expected_sha256":{"type":"string"},"dotted_key":{"type":"string"},"value":{}},"required":["path","expected_sha256","dotted_key","value"],"additionalProperties":false}),
-                    },
-                    AgentToolSpec {
-                        name: PLUGIN_AGENT_TOOL_JSON_SET,
-                        description: "Set one JSON pointer inside a writable file using an expected sha256 guard.",
-                        parameters: json!({"type":"object","properties":{"path":{"type":"string"},"expected_sha256":{"type":"string"},"pointer":{"type":"string"},"value":{}},"required":["path","expected_sha256","pointer","value"],"additionalProperties":false}),
-                    },
-                ]);
-            }
-        }
-        if !self.state.operations.is_empty() {
-            tools.extend([
-                AgentToolSpec {
-                    name: PLUGIN_AGENT_TOOL_RUN_PLUGIN_CHECK,
-                    description: "Run a restricted cargo check for the plugin workspace and confirm the files you changed are warning-free. Omit command or pass `check` to use the default cargo check for plugins/Cargo.toml.",
-                    parameters: json!({"type":"object","properties":{"command":{"type":"string"}},"additionalProperties":false}),
-                },
-                AgentToolSpec {
-                    name: PLUGIN_AGENT_TOOL_RUN_PLUGIN_TEST,
-                    description: "Run a restricted cargo test for the plugin workspace and confirm the files you changed are warning-free. Omit command or pass `test` to use the default cargo test for plugins/Cargo.toml.",
-                    parameters: json!({"type":"object","properties":{"command":{"type":"string"}},"additionalProperties":false}),
-                },
-                AgentToolSpec {
-                    name: PLUGIN_AGENT_TOOL_REBUILD_PLUGIN_WORKSPACE,
-                    description: "Rebuild plugin artifacts and sync generated docs for the whole plugin workspace after code changes. This does not replace a warning-free check or test run.",
-                    parameters: json!({"type":"object","properties":{},"additionalProperties":false}),
-                },
-            ]);
-        }
-        if !self.state.operations.is_empty()
-            && self.state.verification_successes > 0
+            },
+            AgentToolSpec {
+                name: PLUGIN_AGENT_TOOL_SCAFFOLD_CHILD_PLUGIN,
+                description: "Create a sibling child plugin scaffold under the selected subtree and register it in the parent manifest.",
+                parameters: json!({"type":"object","properties":{"parent_plugin_path":{"type":"string"},"child_name":{"type":"string"},"template_plugin_path":{"type":"string"},"node_id":{"type":"string"},"summary":{"type":"string"}},"required":["parent_plugin_path","child_name"],"additionalProperties":false}),
+            },
+            AgentToolSpec {
+                name: PLUGIN_AGENT_TOOL_REPLACE_FILE_EXACT,
+                description: "Replace an exact string in one writable file. Prefer replace_files_exact unless this is truly a single-file follow-up.",
+                parameters: json!({"type":"object","properties":{"path":{"type":"string"},"expected_old_string":{"type":"string"},"new_content":{"type":"string"}},"required":["path","expected_old_string","new_content"],"additionalProperties":false}),
+            },
+            AgentToolSpec {
+                name: PLUGIN_AGENT_TOOL_REPLACE_FILES_EXACT,
+                description: "Replace exact strings in one or more writable files in one call. Prefer this for nearly all source edits so related changes land in the same tool turn.",
+                parameters: json!({"type":"object","properties":{"edits":{"type":"array","items":{"type":"object","properties":{"path":{"type":"string"},"expected_old_string":{"type":"string"},"new_content":{"type":"string"}},"required":["path","expected_old_string","new_content"],"additionalProperties":false},"minItems":1}},"required":["edits"],"additionalProperties":false}),
+            },
+            AgentToolSpec {
+                name: PLUGIN_AGENT_TOOL_CREATE_FILE,
+                description: "Create a new writable file inside the selected plugin subtree.",
+                parameters: json!({"type":"object","properties":{"path":{"type":"string"},"new_content":{"type":"string"}},"required":["path","new_content"],"additionalProperties":false}),
+            },
+            AgentToolSpec {
+                name: PLUGIN_AGENT_TOOL_DELETE_FILE,
+                description: "Delete a writable file when you know its expected sha256.",
+                parameters: json!({"type":"object","properties":{"path":{"type":"string"},"expected_sha256":{"type":"string"}},"required":["path","expected_sha256"],"additionalProperties":false}),
+            },
+            AgentToolSpec {
+                name: PLUGIN_AGENT_TOOL_TOML_SET,
+                description: "Set one TOML dotted key inside a writable manifest using an expected sha256 guard.",
+                parameters: json!({"type":"object","properties":{"path":{"type":"string"},"expected_sha256":{"type":"string"},"dotted_key":{"type":"string"},"value":{}},"required":["path","expected_sha256","dotted_key","value"],"additionalProperties":false}),
+            },
+            AgentToolSpec {
+                name: PLUGIN_AGENT_TOOL_JSON_SET,
+                description: "Set one JSON pointer inside a writable file using an expected sha256 guard.",
+                parameters: json!({"type":"object","properties":{"path":{"type":"string"},"expected_sha256":{"type":"string"},"pointer":{"type":"string"},"value":{}},"required":["path","expected_sha256","pointer","value"],"additionalProperties":false}),
+            },
+            AgentToolSpec {
+                name: PLUGIN_AGENT_TOOL_RUN_PLUGIN_CHECK,
+                description: "Run a restricted cargo check for the plugin workspace and confirm the files you changed are warning-free. Omit command or pass `check` to use the default cargo check for plugins/Cargo.toml.",
+                parameters: json!({"type":"object","properties":{"command":{"type":"string"}},"additionalProperties":false}),
+            },
+            AgentToolSpec {
+                name: PLUGIN_AGENT_TOOL_RUN_PLUGIN_TEST,
+                description: "Run a restricted cargo test for the plugin workspace and confirm the files you changed are warning-free. Omit command or pass `test` to use the default cargo test for plugins/Cargo.toml.",
+                parameters: json!({"type":"object","properties":{"command":{"type":"string"}},"additionalProperties":false}),
+            },
+            AgentToolSpec {
+                name: PLUGIN_AGENT_TOOL_REBUILD_PLUGIN_WORKSPACE,
+                description: "Rebuild plugin artifacts and sync generated docs for the whole plugin workspace after code changes. This does not replace a warning-free check or test run.",
+                parameters: json!({"type":"object","properties":{},"additionalProperties":false}),
+            },
+        ];
+        if self.state.verification_successes > 0
             && self.state.recorded_summary.is_none()
         {
             tools.push(AgentToolSpec {
