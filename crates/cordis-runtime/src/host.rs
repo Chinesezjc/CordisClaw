@@ -1089,6 +1089,43 @@ impl RuntimeHost {
         &self.fixtures_root
     }
 
+    /// Write a shutdown memory snapshot to data/memory/shutdown.json.
+    pub fn write_shutdown_memory(&self) {
+        let ws_root = self.fixtures_root.parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| self.fixtures_root.clone());
+        let path = ws_root.join("data/memory/shutdown.json");
+        let _ = std::fs::create_dir_all(path.parent().unwrap());
+        let now = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%z").to_string();
+        let guard = self.agent_sessions_mut();
+        let sessions: Vec<serde_json::Value> = guard.iter().map(|(sid, s)| {
+            let st = s.session.status();
+            serde_json::json!({
+                "session_id": sid,
+                "kind": st.kind,
+                "completed_turns": st.completed_turns,
+                "model": st.model,
+            })
+        }).collect();
+        drop(guard);
+        let snapshot = self.current_snapshot();
+        let plugins: Vec<serde_json::Value> = snapshot.plugin_registry().iter().map(|(p, pl)| {
+            serde_json::json!({
+                "plugin_path": p,
+                "load_result": format!("{:?}", pl.load_result),
+            })
+        }).collect();
+        let memory = serde_json::json!({
+            "shutdown_at": now,
+            "sessions": sessions,
+            "plugins": plugins,
+        });
+        if let Ok(json) = serde_json::to_string_pretty(&memory) {
+            let _ = std::fs::write(&path, json);
+            eprintln!("[shutdown] wrote memory to {}", path.display());
+        }
+    }
+
     /// Register and start a background service for a Task node.
     pub fn start_service(
         &self,
@@ -1172,14 +1209,23 @@ impl RuntimeHost {
                 message: format!("parent directory traversal (..) is not allowed: {rel}"),
             });
         }
-        let resolved = self.fixtures_root.join(rel_path);
+        // Paths under data/ resolve against the workspace root (parent of
+        // fixtures/) so the agent can persist data outside the sandbox.
+        let (base_root, canonical_root) = if rel.starts_with("data/") || rel == "data" {
+            let ws = self.fixtures_root.parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| self.fixtures_root.clone());
+            let canon = ws.canonicalize().unwrap_or_else(|_| ws.clone());
+            (ws, canon)
+        } else {
+            let fr = self.fixtures_root.to_path_buf();
+            let canon = fr.canonicalize().unwrap_or_else(|_| fr.clone());
+            (fr, canon)
+        };
+        let resolved = base_root.join(rel_path);
         // Verify containment.  Try canonical form first (catches symlink
         // escapes); when the path does not exist yet (canonicalize fails),
         // walk up to the nearest existing ancestor and canonicalize that.
-        let canonical_root = self
-            .fixtures_root
-            .canonicalize()
-            .unwrap_or_else(|_| self.fixtures_root.clone());
         let check = resolved
             .canonicalize()
             .or_else(|_| {
