@@ -222,7 +222,10 @@ impl AgentToolHost for RuntimeHost {
                     // Reload: old snapshot is dropped, new snapshot loads the new .so.
                     match self.agent_reload_runtime(&format!("/{plugin_name}")) {
                         Ok(reload) => { result["reload"] = reload; }
-                        Err(e) => { result["reload_error"] = json!(e.to_string()); }
+                        Err(e) => {
+                            eprintln!("build_plugins: reload failed for {plugin_name}: {e}");
+                            return Err(e);
+                        }
                     }
                 }
                 Err(e) => {
