@@ -202,22 +202,28 @@ impl AgentToolHost for RuntimeHost {
             "stdout": String::from_utf8_lossy(&output.stdout).to_string(),
             "stderr": String::from_utf8_lossy(&output.stderr).to_string(),
         });
-        // Auto-sync the built .so to artifacts/ and reload the plugin.
+        // Sync built .so to artifacts/ via a staging copy, then atomic reload.
+        // Writing directly over the loaded .so causes SIGSEGV; writing to a
+        // staging name and then atomically swapping via reload is safe.
         if ok && plugin_name != "all" {
             let target_dir = fixtures.join("plugins").join("target").join("debug");
             let src = target_dir.join(format!("lib{}.so", plugin_name.replace('-', "_")));
             let artifacts_dir = fixtures.join("artifacts");
             let _ = std::fs::create_dir_all(&artifacts_dir);
+            let staging = artifacts_dir.join(format!(".{}.staging.so", plugin_name));
             let dst = artifacts_dir.join(format!("{}.so", plugin_name));
-            // Unload old .so before overwriting to avoid SIGSEGV from
-            // memory-mapped code being replaced while still in use.
-            let _ = self.agent_reload_runtime(&format!("/{plugin_name}"));
-            match std::fs::copy(&src, &dst) {
+            // Copy to staging first so the live .so is never overwritten in-place.
+            match std::fs::copy(&src, &staging) {
                 Ok(bytes) => {
+                    // Atomically rename staging → live (same filesystem = atomic).
+                    let _ = std::fs::rename(&staging, &dst);
                     result["synced_artifact"] = json!(format!("{} -> artifacts/{}.so ({} bytes)", src.display(), plugin_name, bytes));
                     eprintln!("build_plugins: synced {} -> {}", src.display(), dst.display());
-                    // Reload to load the new .so.
-                    let _ = self.agent_reload_runtime(&format!("/{plugin_name}"));
+                    // Reload: old snapshot is dropped, new snapshot loads the new .so.
+                    match self.agent_reload_runtime(&format!("/{plugin_name}")) {
+                        Ok(reload) => { result["reload"] = reload; }
+                        Err(e) => { result["reload_error"] = json!(e.to_string()); }
+                    }
                 }
                 Err(e) => {
                     eprintln!("build_plugins: artifact sync skipped for {plugin_name}: {e}");
