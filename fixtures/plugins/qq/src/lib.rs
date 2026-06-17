@@ -745,9 +745,9 @@ fn extract_message_info(message: &Value, raw_message: Option<&str>) -> (String, 
             let seg_type = seg.get("type").and_then(|t| t.as_str()).unwrap_or("");
             match seg_type {
                 "reply" => {
-                    // Extract the replied message id.
                     if let Some(id_val) = seg.get("data").and_then(|d| d.get("id")) {
                         reply_to = extract_i64(id_val);
+                        parts.push(format!("[reply to msg_id={}]", reply_to.unwrap_or(0)));
                     }
                 }
                 "text" => {
@@ -762,10 +762,18 @@ fn extract_message_info(message: &Value, raw_message: Option<&str>) -> (String, 
                         parts.push(format!("[image file: {file}]"));
                     }
                 }
+                "json" => {
+                    if let Some(data) = seg.get("data").and_then(|d| d.get("data")).and_then(|d| d.as_str()) {
+                        parts.push(format!("[json: {data}]"));
+                    }
+                }
+                "forward" => {
+                    if let Some(id) = seg.get("data").and_then(|d| d.get("id")).and_then(|d| d.as_str()) {
+                        parts.push(format!("[chat history: id={id}]"));
+                    }
+                }
                 "at" => {
                     let qq = seg.get("data").and_then(|d| d.get("qq")).and_then(|q| q.as_str()).unwrap_or("unknown");
-                    // OneBot implementations may provide a "name" field (group card/nickname).
-                    // Fall back to qq number if not available.
                     let name = seg.get("data").and_then(|d| d.get("name")).and_then(|n| n.as_str()).unwrap_or(qq);
                     parts.push(format!("@[id={},name={}]", qq, name));
                 }
