@@ -40,6 +40,13 @@
 - `root` / `root/child`：JSON 工件样例，主要用于校验 metadata、exports 和 grants。
 - `shell`：Rust dylib 外部插件，提供内建 shell 与命令路由。
 - `expr`：Rust dylib 外部插件树，负责表达式解析与计算。
+- `qq`：OneBot v11 QQ 适配器，HTTP 事件接收 + 消息发送。
+- `gacha`：原神抽卡模拟器，保底概率模型 + JSON 文件持久化。
+- `web`：网页搜索（DeepSeek Anthropic API）+ 网页抓取。
+- `git`：Git 操作（diff/log/status/commit/amend）。
+- `vision`：图片识别（OCR + 描述）。
+- `filesystem`：文件系统操作。
+- `time`：时间查询。
 
 这意味着：
 
@@ -58,6 +65,7 @@ CordisClaw/
 │   └── cordis-runtime/         # runtime、loader、execution、kernel、service
 ├── config.example/             # 版本库内的 YAML 模板
 ├── config/                     # 本地 runtime/kernel/LLM/plugin YAML 配置（gitignored）
+├── data/                       # 运行时持久化数据（gitignored）：插件状态、退出快照
 ├── docs/                       # 架构与维护文档
 ├── fixtures/
 │   ├── plugins/                # 外部插件样例工程
