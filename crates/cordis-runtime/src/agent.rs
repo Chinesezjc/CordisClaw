@@ -36,7 +36,7 @@ fn drain_inject_queue() -> Vec<String> {
     }
 }
 
-const AGENT_HISTORY_MESSAGE_LIMIT: usize = 512;
+const AGENT_HISTORY_MESSAGE_LIMIT: usize = 8192;
 const AGENT_MAX_TOOL_TURNS: usize = 96;
 const AGENT_REQUEST_MAX_ATTEMPTS: usize = 3;
 const UNKNOWN_TOOL_STRIKE_LIMIT: usize = 1;
@@ -1250,8 +1250,47 @@ impl AgentSession {
     }
 
     pub fn compact_history(&mut self) {
-        // No-op: keep full history.  The 512 hard cap (AGENT_HISTORY_MESSAGE_LIMIT)
-        // is far below DeepSeek's 384K context window, so compaction is unnecessary.
+        // Trigger at ~800K tokens (DeepSeek has 1M context).
+        const COMPACT_AT_MSGS: usize = 4000;
+        const KEEP_RECENT: usize = 2000;
+
+        if self.history.len() <= COMPACT_AT_MSGS {
+            return;
+        }
+
+        let discard = self.history.len() - KEEP_RECENT;
+        let split_at = discard.next_multiple_of(2);
+        let split_at = split_at.min(self.history.len().saturating_sub(2));
+        if split_at == 0 { return; }
+
+        let old_messages: Vec<_> = self.history.drain(0..split_at).collect();
+        let mut summary_lines: Vec<String> = Vec::new();
+        for msg in &old_messages {
+            let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("");
+            let content = msg.get("content").and_then(|v| v.as_str()).unwrap_or("");
+            if content.is_empty() { continue; }
+            let short: String = content.chars().take(500).collect();
+            let suffix = if content.len() > 500 { "…" } else { "" };
+            summary_lines.push(format!("[{role}]: {short}{suffix}"));
+        }
+        let summary = summary_lines.join("\n");
+        self.history.insert(
+            0,
+            json!({
+                "role": "system",
+                "content": format!(
+                    "[Compressed history — {} earlier messages summarized below]\n{}",
+                    old_messages.len(),
+                    summary
+                ),
+            }),
+        );
+        eprintln!(
+            "agent: compacted {} old messages into summary ({} chars), keeping {} recent",
+            old_messages.len(),
+            summary.len(),
+            self.history.len() - 1
+        );
     }
 
     fn remember_exchange(
