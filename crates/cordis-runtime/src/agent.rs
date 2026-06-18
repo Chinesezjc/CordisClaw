@@ -1250,58 +1250,8 @@ impl AgentSession {
     }
 
     pub fn compact_history(&mut self) {
-        const KEEP_RECENT: usize = 200;
-
-        if self.history.len() <= KEEP_RECENT + 2 {
-            return;
-        }
-
-        let split_at = (self.history.len() - KEEP_RECENT) / 2;
-        let split_at = if split_at % 2 == 0 { split_at } else { split_at + 1 };
-        if split_at == 0 || split_at >= self.history.len() - KEEP_RECENT {
-            return;
-        }
-
-        let old_messages: Vec<_> = self.history.drain(0..split_at).collect();
-        let mut summary_lines: Vec<String> = Vec::new();
-        for msg in &old_messages {
-            let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("");
-            let content = msg.get("content").and_then(|v| v.as_str()).unwrap_or("");
-            if content.is_empty() { continue; }
-            let short = content.to_string();
-            summary_lines.push(format!("[{role}]: {short}"));
-        }
-        let summary = summary_lines.join("\n");
-        let summary_tokens = estimate_tokens(&summary);
-
-        self.estimated_tokens = self
-            .history
-            .iter()
-            .map(|m| {
-                let c = m.get("content").and_then(|v| v.as_str()).unwrap_or("");
-                let r = m.get("reasoning_content").and_then(|v| v.as_str()).unwrap_or("");
-                estimate_tokens(c) + estimate_tokens(r)
-            })
-            .sum();
-        self.estimated_tokens += summary_tokens;
-
-        self.history.insert(
-            0,
-            json!({
-                "role": "system",
-                "content": format!(
-                    "[Compressed history — {} earlier messages summarized below]\n{}",
-                    old_messages.len(),
-                    summary
-                ),
-            }),
-        );
-
-        eprintln!(
-            "agent: compressed {} old messages into summary (~{} tokens est.)",
-            old_messages.len(),
-            summary_tokens,
-        );
+        // No-op: keep full history.  The 512 hard cap (AGENT_HISTORY_MESSAGE_LIMIT)
+        // is far below DeepSeek's 384K context window, so compaction is unnecessary.
     }
 
     fn remember_exchange(
