@@ -934,7 +934,10 @@ impl AgentSession {
                 tool_specs.len(),
             ));
 
-            // Diagnostic: scan for tool_calls / tool message mismatches.
+            // Repair broken tool_calls chains: if an assistant message has
+            // tool_calls without matching tool results, filter the tool_calls
+            // array so the remaining chain is valid for DeepSeek.
+            let mut repair_indices: Vec<(usize, Vec<Value>)> = Vec::new();
             for (idx, msg) in messages.iter().enumerate() {
                 if msg.get("role").and_then(|v| v.as_str()) == Some("assistant") {
                     if let Some(tc_arr) = msg.get("tool_calls").and_then(|v| v.as_array()) {
@@ -955,9 +958,40 @@ impl AgentSession {
                         }
                         if found.len() < expected.len() {
                             eprintln!(
-                                "[tool_calls diag] turn={} msg_idx={} expected={:?} found={:?}",
+                                "[tool_calls repair] turn={} msg_idx={} expected={:?} found={:?}",
                                 turn + 1, idx, expected, found,
                             );
+                            // Keep only tool_calls that have matching tool messages.
+                            let repaired: Vec<Value> = tc_arr.iter()
+                                .filter(|tc| {
+                                    tc.get("id")
+                                        .and_then(|v| v.as_str())
+                                        .is_some_and(|id| found.contains(&id))
+                                })
+                                .cloned()
+                                .collect();
+                            if repaired.is_empty() {
+                                // No tool calls have results — remove the entire
+                                // assistant message from the array (we'll do this
+                                // after the scan).
+                                repair_indices.push((idx, repaired));
+                            } else if repaired.len() < tc_arr.len() {
+                                repair_indices.push((idx, repaired));
+                            }
+                        }
+                    }
+                }
+            }
+            // Apply repairs in reverse order so earlier indices stay valid.
+            for (idx, repaired) in repair_indices.into_iter().rev() {
+                if repaired.is_empty() {
+                    messages.remove(idx);
+                    eprintln!("[tool_calls repair] removed orphan assistant at index {idx}");
+                } else {
+                    if let Some(msg) = messages.get_mut(idx) {
+                        if let Some(obj) = msg.as_object_mut() {
+                            obj.insert("tool_calls".to_string(), Value::Array(repaired));
+                            eprintln!("[tool_calls repair] filtered tool_calls at index {idx}");
                         }
                     }
                 }
@@ -1443,13 +1477,15 @@ impl AgentSession {
             };
 
             emit_agent_diagnostic(format!(
-                "agent_request_success attempt={attempt}/{AGENT_REQUEST_MAX_ATTEMPTS} status={} elapsed_ms={} total_elapsed_ms={} response_bytes={} stream_events={} stream_done={} {}",
+                "agent_request_success attempt={attempt}/{AGENT_REQUEST_MAX_ATTEMPTS} status={} elapsed_ms={} total_elapsed_ms={} response_bytes={} stream_events={} stream_done={} content_chars={} finish_reason={} {}",
                 status.as_u16(),
                 attempt_started.elapsed().as_millis(),
                 overall_started.elapsed().as_millis(),
                 streamed.raw_bytes,
                 streamed.event_count,
                 streamed.saw_done,
+                streamed.message.content.as_ref().map(|c| c.len()).unwrap_or(0),
+                streamed.finish_reason.as_deref().unwrap_or("-"),
                 request_summary,
             ));
 
