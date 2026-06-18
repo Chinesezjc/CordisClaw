@@ -1632,13 +1632,11 @@ impl RuntimeHost {
                 let snapshot = self.current_snapshot();
                 self.observe_snapshot_plugin_issues(snapshot.as_ref(), &report, "reload");
                 self.notify_sessions_of_reload(&report);
-                self.try_auto_iterate_observed_plugins();
                 Ok(report)
             }
             Err((err, attempt)) => {
                 self.record_reload_attempt(attempt);
                 self.observe_reload_error("reload", &err);
-                self.try_auto_iterate_observed_plugins();
                 Err(err)
             }
         }
@@ -1656,13 +1654,11 @@ impl RuntimeHost {
                 let snapshot = self.current_snapshot();
                 self.observe_snapshot_plugin_issues(snapshot.as_ref(), &report, "reload");
                 self.notify_sessions_of_reload(&report);
-                self.try_auto_iterate_observed_plugins();
                 attempt
             }
             Err((err, attempt)) => {
                 self.record_reload_attempt(attempt.clone());
                 self.observe_reload_error("reload", &err);
-                self.try_auto_iterate_observed_plugins();
                 attempt
             }
         }
