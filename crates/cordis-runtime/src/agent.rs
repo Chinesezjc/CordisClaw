@@ -1250,7 +1250,7 @@ impl AgentSession {
     }
 
     pub fn compact_history(&mut self) {
-        const KEEP_RECENT: usize = 12; // keep at least 6 user+assistant pairs
+        const KEEP_RECENT: usize = 200;
 
         if self.history.len() <= KEEP_RECENT + 2 {
             return;
@@ -1268,11 +1268,7 @@ impl AgentSession {
             let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("");
             let content = msg.get("content").and_then(|v| v.as_str()).unwrap_or("");
             if content.is_empty() { continue; }
-            let short = if content.len() > 200 {
-                format!("{}…", &content[..200])
-            } else {
-                content.to_string()
-            };
+            let short = content.to_string();
             summary_lines.push(format!("[{role}]: {short}"));
         }
         let summary = summary_lines.join("\n");
