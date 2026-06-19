@@ -2630,26 +2630,6 @@ fn shell_agent_tools() -> Vec<AgentToolSpec> {
                 "additionalProperties": false,
             }),
         },
-        AgentToolSpec {
-            name: AGENT_TOOL_COMPACT_CONTEXT,
-            description: "Compress the conversation history to save context space. Summarizes older messages, keeping the most recent exchanges intact. Use when the conversation is getting long to stay within the context window.",
-            parameters: json!({
-                "type": "object",
-                "properties": {},
-                "additionalProperties": false,
-            }),
-        },
-        AgentToolSpec {
-            name: AGENT_TOOL_RUN_PLUGIN_TEST,
-            description: "Run cargo test in the plugins workspace. Defaults to `cargo test --quiet --manifest-path plugins/Cargo.toml`. Pass a custom command to run a specific test (e.g. `cargo test -p gacha`). Use after making code edits to verify correctness.",
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "command": { "type": "string", "description": "Optional: custom cargo test command (default runs all plugin tests)" },
-                },
-                "additionalProperties": false,
-            }),
-        },
     ]
 }
 
