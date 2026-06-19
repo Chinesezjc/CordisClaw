@@ -3143,6 +3143,8 @@ struct JsonSetArgs {
 struct RunPluginCommandArgs {
     #[serde(default)]
     command: Option<String>,
+    #[serde(default)]
+    plugin_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -3701,13 +3703,13 @@ Do not attempt to modify runtime crates, repository root manifests, config, .git
             },
             AgentToolSpec {
                 name: PLUGIN_AGENT_TOOL_RUN_PLUGIN_CHECK,
-                description: "Run a restricted cargo check for the plugin workspace and confirm the files you changed are warning-free. Omit command or pass `check` to use the default cargo check for plugins/Cargo.toml.",
-                parameters: json!({"type":"object","properties":{"command":{"type":"string"}},"additionalProperties":false}),
+                description: "Run cargo check. Pass plugin_path to check a single plugin; omit for full workspace. Pass a custom command to override the default.",
+                parameters: json!({"type":"object","properties":{"command":{"type":"string"},"plugin_path":{"type":"string"}},"additionalProperties":false}),
             },
             AgentToolSpec {
                 name: PLUGIN_AGENT_TOOL_RUN_PLUGIN_TEST,
-                description: "Run a restricted cargo test for the plugin workspace and confirm the files you changed are warning-free. Omit command or pass `test` to use the default cargo test for plugins/Cargo.toml.",
-                parameters: json!({"type":"object","properties":{"command":{"type":"string"}},"additionalProperties":false}),
+                description: "Run cargo test. Pass plugin_path to test a single plugin; omit for full workspace. Pass a custom command to override the default.",
+                parameters: json!({"type":"object","properties":{"command":{"type":"string"},"plugin_path":{"type":"string"}},"additionalProperties":false}),
             },
             AgentToolSpec {
                 name: PLUGIN_AGENT_TOOL_REBUILD_PLUGIN_WORKSPACE,
@@ -3831,19 +3833,25 @@ Do not attempt to modify runtime crates, repository root manifests, config, .git
             }
             PLUGIN_AGENT_TOOL_RUN_PLUGIN_CHECK => {
                 let args = parse_agent_args::<RunPluginCommandArgs>(arguments, name)?;
+                let default = args.plugin_path.as_ref().map(|p| {
+                    format!("cargo check --quiet --manifest-path plugins/Cargo.toml -p {p}")
+                });
                 let command = validated_verification_command(
                     normalize_optional_command(args.command),
-                    Some("cargo check --quiet --manifest-path plugins/Cargo.toml".to_string()),
+                    default,
                     "cargo check",
                 )?;
                 self.run_checked_command("check", command)
             }
             PLUGIN_AGENT_TOOL_RUN_PLUGIN_TEST => {
                 let args = parse_agent_args::<RunPluginCommandArgs>(arguments, name)?;
+                let default = args.plugin_path.as_ref().map(|p| {
+                    format!("cargo test --quiet --manifest-path plugins/Cargo.toml -p {p}")
+                });
                 let command = validated_verification_command(
                     normalize_optional_command(args.command)
                         .or_else(|| normalize_optional_command(self.state.prepared.tests_command.clone())),
-                    Some("cargo test --quiet --manifest-path plugins/Cargo.toml".to_string()),
+                    default,
                     "cargo test",
                 )?;
                 self.run_checked_command("test", command)
