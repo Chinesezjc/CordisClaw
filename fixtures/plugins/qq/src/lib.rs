@@ -17,6 +17,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashSet, VecDeque};
 use std::sync::Mutex;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
 use std::thread;
 // ---------------------------------------------------------------------------
 // Plugin state
@@ -57,6 +59,9 @@ static MESSAGE_QUEUE: Mutex<VecDeque<IncomingMessage>> = Mutex::new(VecDeque::ne
 
 /// Server running flag.
 static SERVER_RUNNING: Mutex<bool> = Mutex::new(false);
+
+static SERVER_SHUTDOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static EVENT_LOOP_HANDLE: Mutex<Option<std::thread::JoinHandle<()>>> = Mutex::new(None);
 
 /// Stored agent session ID for message routing.
 static AGENT_SESSION_ID: Mutex<Option<String>> = Mutex::new(None);
@@ -463,31 +468,51 @@ fn handle_call(req: QqRequest) -> Result<QqResponse, String> {
 // HTTP Server — receives OneBot event POSTs
 // ---------------------------------------------------------------------------
 
+fn stop_qq_serve() {
+    SERVER_SHUTDOWN.store(true, Ordering::SeqCst);
+    if let Ok(mut guard) = EVENT_LOOP_HANDLE.lock() {
+        if let Some(handle) = guard.take() {
+            let _ = handle.join();
+        }
+    }
+    SERVER_SHUTDOWN.store(false, Ordering::SeqCst);
+}
+
 fn run_event_loop(server: tiny_http::Server) {
-    for mut request in server.incoming_requests() {
-        if request.url() == "/onebot/event" && request.method() == &tiny_http::Method::Post {
-            let mut body = String::new();
-            if let Ok(_) = request.as_reader().read_to_string(&mut body) {
-                let _ = request.respond(tiny_http::Response::from_string(
-                    serde_json::to_string(&json!({"status":"ok"})).unwrap(),
-                ));
-                if let Ok(event) = serde_json::from_str::<OneBotEvent>(&body) {
-                    handle_onebot_event(&event);
+    loop {
+        if SERVER_SHUTDOWN.load(Ordering::SeqCst) { break; }
+        match server.recv_timeout(Duration::from_millis(500)) {
+            Ok(Some(mut request)) => {
+                if request.url() == "/onebot/event" && request.method() == &tiny_http::Method::Post {
+                    let mut body = String::new();
+                    if let Ok(_) = request.as_reader().read_to_string(&mut body) {
+                        let _ = request.respond(tiny_http::Response::from_string(
+                            serde_json::to_string(&json!({"status":"ok"})).unwrap(),
+                        ));
+                        if let Ok(event) = serde_json::from_str::<OneBotEvent>(&body) {
+                            handle_onebot_event(&event);
+                        }
+                    } else {
+                        let _ = request.respond(
+                            tiny_http::Response::from_string("bad request")
+                                .with_status_code(400),
+                        );
+                    }
+                } else if request.url() == "/health" {
+                    let _ = request.respond(tiny_http::Response::from_string(
+                        serde_json::to_string(&json!({"status":"ok"})).unwrap(),
+                    ));
+                } else {
+                    let _ = request.respond(
+                        tiny_http::Response::from_string("not found").with_status_code(404),
+                    );
                 }
-            } else {
-                let _ = request.respond(
-                    tiny_http::Response::from_string("bad request")
-                        .with_status_code(400),
-                );
             }
-        } else if request.url() == "/health" {
-            let _ = request.respond(tiny_http::Response::from_string(
-                serde_json::to_string(&json!({"status":"ok"})).unwrap(),
-            ));
-        } else {
-            let _ = request.respond(
-                tiny_http::Response::from_string("not found").with_status_code(404),
-            );
+            Ok(None) => {}
+            Err(e) => {
+                eprintln!("[qq] server recv error: {e}");
+                break;
+            }
         }
     }
 }
@@ -845,6 +870,11 @@ fn start_agent_poller() {
 }
 
 fn handle_qq_serve(req: &NodeRequest) -> Result<NodeResponse, String> {
+    if req.action.as_deref() == Some("stop") {
+        stop_qq_serve();
+        *SERVER_RUNNING.lock().map_err(|e| format!("lock: {e}"))? = false;
+        return Ok(NodeResponse { ok: true, node_id: "qq_serve".to_string(), message: Some("stopped".to_string()), messages: None, data: None, error: None });
+    }
     let port: u16 = req.payload.as_ref()
         .and_then(|p| p.get("port"))
         .and_then(|v| v.as_u64())
@@ -903,7 +933,10 @@ fn handle_qq_serve(req: &NodeRequest) -> Result<NodeResponse, String> {
             drop(running);
             let server = tiny_http::Server::http(format!("0.0.0.0:{port}"))
                 .map_err(|e| format!("qq_serve: cannot bind port {port}: {e}"))?;
-            thread::spawn(move || run_event_loop(server));
+            let handle = thread::spawn(move || run_event_loop(server));
+            if let Ok(mut guard) = EVENT_LOOP_HANDLE.lock() {
+                *guard = Some(handle);
+            }
             start_agent_poller();
         }
     }

@@ -1731,6 +1731,23 @@ impl RuntimeHost {
             })?;
         let index_map = crate::plugin::artifact::artifact_index_map(&index);
 
+        // Stop background services + Task node threads before .so is dlclose'd.
+        for plugin_path in &targets {
+            self.service_registry.stop_plugin_services(plugin_path);
+            // Also invoke stop action for Task nodes (plugins that don't
+            // implement the Service trait call stop via node invocation).
+            let snapshot = self.current_snapshot();
+            for fqn in snapshot.node_registry().task_node_fqns() {
+                if fqn.starts_with(&format!("{}::", plugin_path)) {
+                    let parts: Vec<&str> = fqn.splitn(2, "::").collect();
+                    if parts.len() == 2 {
+                        let payload = serde_json::json!({"action": "stop"}).to_string();
+                        let _ = self.invoke(parts[0], parts[1], payload);
+                    }
+                }
+            }
+        }
+
         // ── Phase 1: pre-load and validate all new dylibs ─────────────
         // No side effects — if anything fails, old plugins keep running.
         struct Prepared {
