@@ -1560,7 +1560,7 @@ impl RuntimeHost {
             }
         }
         self.cleanup_retired_snapshots();
-        self.try_auto_iterate_observed_plugins();
+        // auto-iteration deferred to kernel timer.
         response
     }
 
@@ -1603,7 +1603,7 @@ impl RuntimeHost {
             );
         }
         self.cleanup_retired_snapshots();
-        self.try_auto_iterate_observed_plugins();
+        // auto-iteration deferred to kernel timer.
         result
     }
 
@@ -1970,13 +1970,13 @@ impl RuntimeHost {
                         "candidate_reload",
                     );
                 }
-                self.try_auto_iterate_observed_plugins();
+                // auto-iteration deferred to kernel timer.
                 Ok(status)
             }
             Err((err, attempt)) => {
                 self.record_candidate_reload_attempt(attempt);
                 self.observe_reload_error("candidate_reload", &err);
-                self.try_auto_iterate_observed_plugins();
+                // auto-iteration deferred to kernel timer.
                 Err(err)
             }
         }
@@ -2004,13 +2004,13 @@ impl RuntimeHost {
                         "candidate_reload",
                     );
                 }
-                self.try_auto_iterate_observed_plugins();
+                // auto-iteration deferred to kernel timer.
                 attempt
             }
             Err((err, attempt)) => {
                 self.record_candidate_reload_attempt(attempt.clone());
                 self.observe_reload_error("candidate_reload", &err);
-                self.try_auto_iterate_observed_plugins();
+                // auto-iteration deferred to kernel timer.
                 attempt
             }
         }
