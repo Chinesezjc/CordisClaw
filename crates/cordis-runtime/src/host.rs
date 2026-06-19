@@ -2174,9 +2174,10 @@ impl RuntimeHost {
                 }
             }
 
-            // Step 3: Rebuild plugin workspace.
+            // Step 3: Rebuild the target plugin only.
             if state.stage_error.is_none() {
-                match rebuild_plugin_workspace(&self.fixtures_root, "/") {
+                let plugin_path = format!("/{}", state.prepared.root_plugin_path);
+                match rebuild_plugin_workspace(&self.fixtures_root, &plugin_path) {
                     Ok(rebuilt) => {
                         state.rebuilt_artifacts = rebuilt;
                     }
