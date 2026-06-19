@@ -2176,7 +2176,7 @@ impl RuntimeHost {
 
             // Step 3: Rebuild plugin workspace.
             if state.stage_error.is_none() {
-                match rebuild_plugin_workspace(&self.fixtures_root, None) {
+                match rebuild_plugin_workspace(&self.fixtures_root, "/") {
                     Ok(rebuilt) => {
                         state.rebuilt_artifacts = rebuilt;
                     }
@@ -3703,18 +3703,18 @@ Do not attempt to modify runtime crates, repository root manifests, config, .git
             },
             AgentToolSpec {
                 name: PLUGIN_AGENT_TOOL_RUN_PLUGIN_CHECK,
-                description: "Run cargo check. Pass plugin_path to check a single plugin; omit for full workspace. Pass a custom command to override the default.",
-                parameters: json!({"type":"object","properties":{"command":{"type":"string"},"plugin_path":{"type":"string"}},"additionalProperties":false}),
+                description: "Run cargo check. plugin_path: \"/\" for whole workspace, \"/qq\" for a single plugin. Pass a custom command to override.",
+                parameters: json!({"type":"object","properties":{"command":{"type":"string"},"plugin_path":{"type":"string","description":"\"/\" = all, \"/qq\" = single plugin"}},"required":["plugin_path"],"additionalProperties":false}),
             },
             AgentToolSpec {
                 name: PLUGIN_AGENT_TOOL_RUN_PLUGIN_TEST,
-                description: "Run cargo test. Pass plugin_path to test a single plugin; omit for full workspace. Pass a custom command to override the default.",
-                parameters: json!({"type":"object","properties":{"command":{"type":"string"},"plugin_path":{"type":"string"}},"additionalProperties":false}),
+                description: "Run cargo test. plugin_path: \"/\" for whole workspace, \"/qq\" for a single plugin. Pass a custom command to override.",
+                parameters: json!({"type":"object","properties":{"command":{"type":"string"},"plugin_path":{"type":"string","description":"\"/\" = all, \"/qq\" = single plugin"}},"required":["plugin_path"],"additionalProperties":false}),
             },
             AgentToolSpec {
                 name: PLUGIN_AGENT_TOOL_REBUILD_PLUGIN_WORKSPACE,
-                description: "Rebuild plugin artifacts and sync generated docs. Pass plugin_path to rebuild just one plugin; omit for a full workspace rebuild. This does not replace a warning-free check or test run.",
-                parameters: json!({"type":"object","properties":{"plugin_path":{"type":"string"}},"additionalProperties":false}),
+                description: "Rebuild plugin artifacts and sync generated docs. plugin_path: \"/\" for whole workspace, \"/qq\" for a single plugin.",
+                parameters: json!({"type":"object","properties":{"plugin_path":{"type":"string","description":"\"/\" = all, \"/qq\" = single plugin"}},"required":["plugin_path"],"additionalProperties":false}),
             },
         ];
         if self.state.verification_successes > 0
@@ -3833,25 +3833,33 @@ Do not attempt to modify runtime crates, repository root manifests, config, .git
             }
             PLUGIN_AGENT_TOOL_RUN_PLUGIN_CHECK => {
                 let args = parse_agent_args::<RunPluginCommandArgs>(arguments, name)?;
-                let default = args.plugin_path.as_ref().map(|p| {
-                    format!("cargo check --quiet --manifest-path plugins/Cargo.toml -p {p}")
-                });
+                let pp = args.plugin_path.as_deref().unwrap_or("/");
+                let pp_trimmed = pp.trim_start_matches('/');
+                let default = if pp_trimmed.is_empty() {
+                    "cargo check --quiet --manifest-path plugins/Cargo.toml".to_string()
+                } else {
+                    format!("cargo check --quiet --manifest-path plugins/Cargo.toml -p {pp_trimmed}")
+                };
                 let command = validated_verification_command(
                     normalize_optional_command(args.command),
-                    default,
+                    Some(default),
                     "cargo check",
                 )?;
                 self.run_checked_command("check", command)
             }
             PLUGIN_AGENT_TOOL_RUN_PLUGIN_TEST => {
                 let args = parse_agent_args::<RunPluginCommandArgs>(arguments, name)?;
-                let default = args.plugin_path.as_ref().map(|p| {
-                    format!("cargo test --quiet --manifest-path plugins/Cargo.toml -p {p}")
-                });
+                let pp = args.plugin_path.as_deref().unwrap_or("/");
+                let pp_trimmed = pp.trim_start_matches('/');
+                let default = if pp_trimmed.is_empty() {
+                    "cargo test --quiet --manifest-path plugins/Cargo.toml".to_string()
+                } else {
+                    format!("cargo test --quiet --manifest-path plugins/Cargo.toml -p {pp_trimmed}")
+                };
                 let command = validated_verification_command(
                     normalize_optional_command(args.command)
                         .or_else(|| normalize_optional_command(self.state.prepared.tests_command.clone())),
-                    default,
+                    Some(default),
                     "cargo test",
                 )?;
                 self.run_checked_command("test", command)
@@ -3859,8 +3867,8 @@ Do not attempt to modify runtime crates, repository root manifests, config, .git
             PLUGIN_AGENT_TOOL_REBUILD_PLUGIN_WORKSPACE => {
                 self.state.verification_attempts += 1;
                 let args: serde_json::Value = arguments;
-                let name = args.get("plugin_path").and_then(|v| v.as_str());
-                let rebuilt = rebuild_plugin_workspace(&self.host.fixtures_root, name)?;
+                let pp = args.get("plugin_path").and_then(|v| v.as_str()).unwrap_or("/");
+                let rebuilt = rebuild_plugin_workspace(&self.host.fixtures_root, pp)?;
                 Ok(json!({
                     "rebuilt_count": rebuilt.len(),
                     "rebuilt": rebuilt,
@@ -5153,14 +5161,14 @@ fn restore_plugin_iteration_workspace(
         &journal_path,
     )? {
         rollback.rollback()?;
-        rebuild_plugin_workspace(fixtures_root, None)?;
+        rebuild_plugin_workspace(fixtures_root, "/")?;
         crate::kernel::plugin_iteration::PluginEditRollback::clear_journal(&journal_path)?;
         return Ok(true);
     }
 
     if let Some(rollback) = in_memory_rollback {
         rollback.rollback()?;
-        rebuild_plugin_workspace(fixtures_root, None)?;
+        rebuild_plugin_workspace(fixtures_root, "/")?;
         return Ok(true);
     }
 

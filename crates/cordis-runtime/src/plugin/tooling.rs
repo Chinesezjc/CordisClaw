@@ -186,37 +186,36 @@ pub fn rebuild_fixture_artifacts(
 
 pub fn rebuild_plugin_workspace(
     workspace_root: &Path,
-    plugin_path: Option<&str>,
+    plugin_path: &str,
 ) -> Result<Vec<(String, String)>, RuntimeError> {
-    match plugin_path {
-        Some(name) => {
-            let mut cmd = std::process::Command::new("cargo");
-            cmd.arg("build")
-                .arg("--manifest-path")
-                .arg(workspace_root.join("plugins").join("Cargo.toml"))
-                .arg("-p").arg(name);
-            let output = cmd.output().map_err(|e| RuntimeError::InvalidArgument {
-                message: format!("cargo build failed to start: {e}"),
-            })?;
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                return Err(RuntimeError::InvalidArgument {
-                    message: format!("cargo build -p {name} failed: {stderr}"),
-                });
-            }
-            // Sync the .so.
-            let target_dir = workspace_root.join("plugins").join("target").join("debug");
-            let src = target_dir.join(format!("lib{}.so", name.replace('-', "_")));
-            let dst = workspace_root.join("artifacts").join(format!("{}.so", name));
-            let _ = std::fs::create_dir_all(dst.parent().unwrap());
-            std::fs::copy(&src, &dst).map_err(|e| RuntimeError::Io {
-                path: dst.clone(),
-                message: format!("{e}"),
-            })?;
-            Ok(vec![(name.to_string(), format!("{} -> {}", src.display(), dst.display()))])
-        }
-        None => rebuild_fixture_artifacts(workspace_root),
+    // "/" means all plugins; "/qq" means just qq.
+    let name = plugin_path.trim_start_matches('/');
+    if name.is_empty() {
+        return rebuild_fixture_artifacts(workspace_root);
     }
+    let mut cmd = std::process::Command::new("cargo");
+    cmd.arg("build")
+        .arg("--manifest-path")
+        .arg(workspace_root.join("plugins").join("Cargo.toml"))
+        .arg("-p").arg(name);
+    let output = cmd.output().map_err(|e| RuntimeError::InvalidArgument {
+        message: format!("cargo build failed to start: {e}"),
+    })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(RuntimeError::InvalidArgument {
+            message: format!("cargo build -p {name} failed: {stderr}"),
+        });
+    }
+    let target_dir = workspace_root.join("plugins").join("target").join("debug");
+    let src = target_dir.join(format!("lib{}.so", name.replace('-', "_")));
+    let dst = workspace_root.join("artifacts").join(format!("{}.so", name));
+    let _ = std::fs::create_dir_all(dst.parent().unwrap());
+    std::fs::copy(&src, &dst).map_err(|e| RuntimeError::Io {
+        path: dst.clone(),
+        message: format!("{e}"),
+    })?;
+    Ok(vec![(name.to_string(), format!("{} -> {}", src.display(), dst.display()))])
 }
 
 pub fn sync_plugin_docs(fixtures_root: &Path) -> Result<Vec<PathBuf>, RuntimeError> {
