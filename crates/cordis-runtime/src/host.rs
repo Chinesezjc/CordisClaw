@@ -2176,7 +2176,7 @@ impl RuntimeHost {
 
             // Step 3: Rebuild plugin workspace.
             if state.stage_error.is_none() {
-                match rebuild_plugin_workspace(&self.fixtures_root) {
+                match rebuild_plugin_workspace(&self.fixtures_root, None) {
                     Ok(rebuilt) => {
                         state.rebuilt_artifacts = rebuilt;
                     }
@@ -3711,8 +3711,8 @@ Do not attempt to modify runtime crates, repository root manifests, config, .git
             },
             AgentToolSpec {
                 name: PLUGIN_AGENT_TOOL_REBUILD_PLUGIN_WORKSPACE,
-                description: "Rebuild plugin artifacts and sync generated docs for the whole plugin workspace after code changes. This does not replace a warning-free check or test run.",
-                parameters: json!({"type":"object","properties":{},"additionalProperties":false}),
+                description: "Rebuild plugin artifacts and sync generated docs. Pass plugin_name to rebuild just one plugin; omit for a full workspace rebuild. This does not replace a warning-free check or test run.",
+                parameters: json!({"type":"object","properties":{"plugin_name":{"type":"string"}},"additionalProperties":false}),
             },
         ];
         if self.state.verification_successes > 0
@@ -3850,7 +3850,9 @@ Do not attempt to modify runtime crates, repository root manifests, config, .git
             }
             PLUGIN_AGENT_TOOL_REBUILD_PLUGIN_WORKSPACE => {
                 self.state.verification_attempts += 1;
-                let rebuilt = rebuild_plugin_workspace(&self.host.fixtures_root)?;
+                let args: serde_json::Value = arguments;
+                let name = args.get("plugin_name").and_then(|v| v.as_str());
+                let rebuilt = rebuild_plugin_workspace(&self.host.fixtures_root, name)?;
                 Ok(json!({
                     "rebuilt_count": rebuilt.len(),
                     "rebuilt": rebuilt,
@@ -5143,14 +5145,14 @@ fn restore_plugin_iteration_workspace(
         &journal_path,
     )? {
         rollback.rollback()?;
-        rebuild_plugin_workspace(fixtures_root)?;
+        rebuild_plugin_workspace(fixtures_root, None)?;
         crate::kernel::plugin_iteration::PluginEditRollback::clear_journal(&journal_path)?;
         return Ok(true);
     }
 
     if let Some(rollback) = in_memory_rollback {
         rollback.rollback()?;
-        rebuild_plugin_workspace(fixtures_root)?;
+        rebuild_plugin_workspace(fixtures_root, None)?;
         return Ok(true);
     }
 
