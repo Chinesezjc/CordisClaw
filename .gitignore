@@ -9,3 +9,4 @@ fixtures/plugins/**/Cargo.lock
 .cordis-drafts/
 fixtures/.artifacts-build.lock
 data/
+tmp/
