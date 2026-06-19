@@ -2035,8 +2035,21 @@ fn read_chat_stream(
     }
 
     let stream_started = Instant::now();
+    let overall_deadline = timeout * 5;
 
     loop {
+        // Overall deadline: if the stream takes way longer than expected,
+        // the server is hung — don't wait for per-chunk timeouts.
+        if stream_started.elapsed() > overall_deadline {
+            return Err(ChatStreamReadError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "stream overall deadline exceeded after {:?} (received {} bytes, {} events, timeout {:?})",
+                    overall_deadline, raw_bytes, event_count, timeout,
+                ),
+            )));
+        }
+
         // Wait for the next chunk with a timeout.  Each chunk gets its own
         // timeout window so we don't fail just because the total response
         // takes longer than the budget — we only fail when the server goes
