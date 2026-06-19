@@ -186,9 +186,9 @@ pub fn rebuild_fixture_artifacts(
 
 pub fn rebuild_plugin_workspace(
     workspace_root: &Path,
-    plugin_name: Option<&str>,
+    plugin_path: Option<&str>,
 ) -> Result<Vec<(String, String)>, RuntimeError> {
-    match plugin_name {
+    match plugin_path {
         Some(name) => {
             let mut cmd = std::process::Command::new("cargo");
             cmd.arg("build")

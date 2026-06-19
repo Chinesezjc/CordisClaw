@@ -3711,8 +3711,8 @@ Do not attempt to modify runtime crates, repository root manifests, config, .git
             },
             AgentToolSpec {
                 name: PLUGIN_AGENT_TOOL_REBUILD_PLUGIN_WORKSPACE,
-                description: "Rebuild plugin artifacts and sync generated docs. Pass plugin_name to rebuild just one plugin; omit for a full workspace rebuild. This does not replace a warning-free check or test run.",
-                parameters: json!({"type":"object","properties":{"plugin_name":{"type":"string"}},"additionalProperties":false}),
+                description: "Rebuild plugin artifacts and sync generated docs. Pass plugin_path to rebuild just one plugin; omit for a full workspace rebuild. This does not replace a warning-free check or test run.",
+                parameters: json!({"type":"object","properties":{"plugin_path":{"type":"string"}},"additionalProperties":false}),
             },
         ];
         if self.state.verification_successes > 0
@@ -3851,7 +3851,7 @@ Do not attempt to modify runtime crates, repository root manifests, config, .git
             PLUGIN_AGENT_TOOL_REBUILD_PLUGIN_WORKSPACE => {
                 self.state.verification_attempts += 1;
                 let args: serde_json::Value = arguments;
-                let name = args.get("plugin_name").and_then(|v| v.as_str());
+                let name = args.get("plugin_path").and_then(|v| v.as_str());
                 let rebuilt = rebuild_plugin_workspace(&self.host.fixtures_root, name)?;
                 Ok(json!({
                     "rebuilt_count": rebuilt.len(),
