@@ -63,7 +63,7 @@ const AGENT_TOOL_MOVE_FILE: &str = "move_file";
 const AGENT_TOOL_COPY_FILE: &str = "copy_file";
 const AGENT_TOOL_COMPACT_CONTEXT: &str = "compact_context";
 const AGENT_TOOL_RUN_PLUGIN_TEST: &str = "run_plugin_test";
-const AGENT_TOOL_APPEND_FILE: &str = "append_file";
+const AGENT_TOOL_REQUEST_ITERATION: &str = "request_iteration";
 const LLM_DEBUG_ENV: &str = "CORDIS_LLM_DEBUG";
 
 pub trait AgentToolHost {
@@ -118,6 +118,7 @@ pub trait AgentToolHost {
     fn agent_compact_context(&self, session_id: &str) -> Result<Value, RuntimeError>;
     fn agent_append_file(&self, path: &str, content: &str) -> Result<Value, RuntimeError>;
     fn agent_run_plugin_test(&self, command: Option<&str>) -> Result<Value, RuntimeError>;
+    fn agent_request_iteration(&self, plugin_path: &str, instruction: &str) -> Result<Value, RuntimeError>;
     fn agent_send_warning_to_test_groups(&self, message: &str);
 }
 
@@ -673,6 +674,37 @@ impl AgentToolHost for RuntimeHost {
             "stdout": String::from_utf8_lossy(&output.stdout).to_string(),
             "stderr": String::from_utf8_lossy(&output.stderr).to_string(),
         }))
+    }
+
+    fn agent_request_iteration(&self, plugin_path: &str, instruction: &str) -> Result<Value, RuntimeError> {
+        let pp = plugin_path.trim_start_matches('/');
+        if pp.is_empty() {
+            return Err(RuntimeError::InvalidArgument {
+                message: "plugin_path must be non-empty, use \"/web\" for example".to_string(),
+            });
+        }
+        let request = crate::kernel::plugin_iteration::KernelPluginIterationRequest {
+            issue_id: None,
+            target_plugin_paths: vec![pp.to_string()],
+            instruction: Some(instruction.to_string()),
+            edit_plan: None,
+            manual_approved: false,
+            tests_command: None,
+            safety_command: None,
+            verify_profile: None,
+            quality_score: None,
+        };
+        match self.iterate_plugins(request) {
+            Ok(result) => Ok(serde_json::json!({
+                "ok": true,
+                "summary": result.summary,
+                "verdict": format!("{:?}", result.verifier_verdict),
+            })),
+            Err(e) => Ok(serde_json::json!({
+                "ok": false,
+                "error": e.to_string(),
+            })),
+        }
     }
 
     fn agent_send_warning_to_test_groups(&self, message: &str) {
@@ -1849,6 +1881,12 @@ struct RunPluginTestArgs {
     command: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct RequestIterationArgs {
+    plugin_path: String,
+    instruction: String,
+}
+
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 struct ReloadRuntimeArgs { plugin_path: String }
 
@@ -2383,6 +2421,10 @@ impl<'a, H: AgentToolHost + ?Sized> AgentBackend for RuntimeShellAgentBackend<'a
                 let args = parse_tool_value_arguments::<RunPluginTestArgs>(arguments, name)?;
                 self.host.agent_run_plugin_test(args.command.as_deref())
             }
+            AGENT_TOOL_REQUEST_ITERATION => {
+                let args = parse_tool_value_arguments::<RequestIterationArgs>(arguments, name)?;
+                self.host.agent_request_iteration(&args.plugin_path, &args.instruction)
+            }
             other => Err(RuntimeError::InvalidArgument {
                 message: format!("runtime shell agent does not support tool {other}"),
             }),
@@ -2553,36 +2595,11 @@ fn shell_agent_tools() -> Vec<AgentToolSpec> {
                 "additionalProperties": false,
             }),
         },
+        // Code editing tools are removed from RuntimeShell.
+        // Plugin code changes must go through PluginIteration.
         AgentToolSpec {
-            name: AGENT_TOOL_WRITE_FILE,
-            description: "Create or overwrite a file in the fixtures workspace. The previous content is backed up and can be restored with revert_changes.",
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string", "description": "Relative path within the fixtures root." },
-                    "content": { "type": "string", "description": "Full file content to write." }
-                },
-                "required": ["path", "content"],
-                "additionalProperties": false,
-            }),
-        },
-        AgentToolSpec {
-            name: AGENT_TOOL_REPLACE_IN_FILE,
-            description: "Find and replace the first occurrence of a string in a file. The previous content is backed up and can be restored with revert_changes.",
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string", "description": "Relative path within the fixtures root." },
-                    "find": { "type": "string", "description": "Exact string to find (first occurrence only)." },
-                    "replace": { "type": "string", "description": "Replacement string." }
-                },
-                "required": ["path", "find", "replace"],
-                "additionalProperties": false,
-            }),
-        },
-        AgentToolSpec {
-            name: AGENT_TOOL_REVERT_CHANGES,
-            description: "Revert all file changes made by write_file, replace_in_file, delete_file, rename_file, and move_file in this session. Restores all touched files to their original content.",
+            name: AGENT_TOOL_COMPACT_CONTEXT,
+            description: "Compress the conversation history to save context space. Summarizes older messages, keeping the most recent exchanges intact. Use when the conversation is getting long to stay within the context window.",
             parameters: json!({
                 "type": "object",
                 "properties": {},
@@ -2590,66 +2607,26 @@ fn shell_agent_tools() -> Vec<AgentToolSpec> {
             }),
         },
         AgentToolSpec {
-            name: AGENT_TOOL_DELETE_FILE,
-            description: "Delete a file within the fixtures workspace. The file content is backed up and can be restored with revert_changes. Fails if the path is a directory.",
+            name: AGENT_TOOL_RUN_PLUGIN_TEST,
+            description: "Run cargo test in the plugins workspace. Defaults to `cargo test --quiet --manifest-path plugins/Cargo.toml`. Pass a custom command to run a specific test (e.g. `cargo test -p gacha`). Use after making code edits to verify correctness.",
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string", "description": "Relative path within the fixtures root." }
+                    "command": { "type": "string", "description": "Optional: custom cargo test command (default runs all plugin tests)" },
                 },
-                "required": ["path"],
                 "additionalProperties": false,
             }),
         },
         AgentToolSpec {
-            name: AGENT_TOOL_RENAME_FILE,
-            description: "Rename or move a file or directory within the fixtures workspace. Creates parent directories for the destination if needed. The original is backed up and can be restored with revert_changes.",
+            name: AGENT_TOOL_REQUEST_ITERATION,
+            description: "Start a PluginIteration session to safely modify plugin source code. Creates a backup snapshot before changes; on failure, auto-rollbacks to the snapshot. plugin_path: the plugin to modify (e.g. \"/web\"), instruction: what to change.",
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string", "description": "Current relative path within the fixtures root." },
-                    "new_path": { "type": "string", "description": "New relative path within the fixtures root. Parent directories are created automatically." }
+                    "plugin_path": { "type": "string", "description": "Target plugin path, e.g. \"/web\" or \"/qq\"." },
+                    "instruction": { "type": "string", "description": "What change to make in this iteration." },
                 },
-                "required": ["path", "new_path"],
-                "additionalProperties": false,
-            }),
-        },
-        AgentToolSpec {
-            name: AGENT_TOOL_MOVE_FILE,
-            description: "Move a file or directory to a new location within the fixtures workspace. Alias for rename_file. The original is backed up and can be restored with revert_changes.",
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string", "description": "Current relative path within the fixtures root." },
-                    "new_path": { "type": "string", "description": "New relative path within the fixtures root. Parent directories are created automatically." }
-                },
-                "required": ["path", "new_path"],
-                "additionalProperties": false,
-            }),
-        },
-        AgentToolSpec {
-            name: AGENT_TOOL_COPY_FILE,
-            description: "Copy a file to a new location within the fixtures workspace. Creates parent directories for the destination if needed. If the destination exists it is overwritten and backed up for revert_changes.",
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string", "description": "Source relative path within the fixtures root." },
-                    "new_path": { "type": "string", "description": "Destination relative path within the fixtures root. Parent directories are created automatically." }
-                },
-                "required": ["path", "new_path"],
-                "additionalProperties": false,
-            }),
-        },
-        AgentToolSpec {
-            name: AGENT_TOOL_APPEND_FILE,
-            description: "Append content to the end of an existing file. Use when the file is too large to write in one call via write_file. Creates the file if it does not exist. The file is backed up for revert_changes.",
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string", "description": "Relative path within the fixtures root." },
-                    "content": { "type": "string", "description": "Content to append to the file." },
-                },
-                "required": ["path", "content"],
+                "required": ["plugin_path", "instruction"],
                 "additionalProperties": false,
             }),
         },
@@ -2681,7 +2658,8 @@ fn shell_agent_system_prompt() -> String {
     let mut prompt = format!("Today's date is {today}.\n\n");
     prompt.push_str("\
 You are the Cordis shell agent running inside the cordis-runtime serve REPL.\n\
-You can read source files, list directories, search code, write files, replace text in files, inspect runtime status, list plugins/nodes, invoke plugins, execute targets, run plugin tests, and reload the runtime.\n\
+You can read source files, list directories, search code, inspect runtime status, list plugins/nodes, invoke plugins, execute targets, run plugin tests, and reload the runtime.\n\
+To modify plugin source code, use `request_iteration` to start a safe PluginIteration session (supports rollback).\n\
 \n\
 Plugins may provide additional instructions (chat mode protocols, etc.) — see the \"plugin-specific instructions\" section below if present.\n\
 \n\
@@ -2747,15 +2725,13 @@ Plugins workspace membership:\n\
   After everything compiles, run `build_plugins` with `plugin_name: \"all\"` to sync artifacts.\n\
   Then `reload_runtime` with `plugin_path: \"/\"` to load the new plugin.\n\
 \n\
-When the user asks you to add a feature or fix a bug, follow this workflow:\n\
+When the user asks you to add a feature or fix a bug in a plugin:\n\
 1. Read the relevant source files to understand the codebase structure.\n\
-2. Plan the edits needed (which files to create/modify).\n\
-3. Make the edits using write_file and replace_in_file (or invoke_plugin for new files/dirs).\n\
-4. Run `build_plugins` with the plugin name to compile and sync artifacts.\n\
-5. Run `run_plugin_test` to verify correctness (pass a custom command for specific tests).\n\
-6. Run `reload_runtime` to load changes into the live runtime.\n\
-7. If something goes wrong, use revert_changes to undo, then try a different approach.\n\
-Always verify edits compile before claiming success. If a build fails, read the stderr and fix it.\n\
+2. Call `request_iteration(plugin_path, instruction)` to start a PluginIteration session.\n\
+   This snapshots the plugin, scopes edits to the subtree, and enables rollback on failure.\n\
+3. Inside the iteration, edit, build, test, and reload using iteration tools.\n\
+4. The iteration auto-commits on success or rolls back on failure.\n\
+You cannot edit plugin code directly — always use request_iteration.\n\
 Prefer concise, operator-friendly replies. Mention important tool outcomes plainly.\n\
 Do not invent runtime state or claim a command succeeded unless a tool confirmed it.\n\
 \n\
@@ -2766,8 +2742,7 @@ Never output plain text — it will be dropped. All communication goes through t
 CRITICAL — YOUR TOOLS (only these exist; all others will fail immediately):\n\
   get_runtime_status, list_plugins, list_nodes, get_kernel_status, get_kernel_issues,\n\
   reload_runtime, build_plugins, invoke_plugin, execute_target, read_file, search_code,\n\
-  write_file, append_file, replace_in_file, delete_file, rename_file, move_file, copy_file,\n\
-  compact_context, list_directory, revert_changes, run_plugin_test\n\
+  compact_context, list_directory, run_plugin_test, request_iteration\n\
 \n\
 For build: use build_plugins.  For testing: use run_plugin_test (defaults to all plugin tests;\n\
 pass a custom command for specific tests, e.g. `cargo test -p gacha`).\n\
@@ -3100,6 +3075,10 @@ mod tests {
 
         fn agent_run_plugin_test(&self, _command: Option<&str>) -> Result<Value, RuntimeError> {
             Ok(json!({ "success": true, "stdout": "", "stderr": "" }))
+        }
+
+        fn agent_request_iteration(&self, _plugin_path: &str, _instruction: &str) -> Result<Value, RuntimeError> {
+            Ok(json!({ "ok": true, "summary": "mock iteration", "verdict": "SimulatedSuccess" }))
         }
 
         fn agent_send_warning_to_test_groups(&self, _message: &str) {}
