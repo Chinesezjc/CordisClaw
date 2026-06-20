@@ -258,7 +258,6 @@ impl Default for PluginIterationPolicy {
                 ".git/".to_string(),
                 "target/".to_string(),
                 "artifacts/".to_string(),
-                "plugins/Cargo.toml".to_string(),
             ],
             allow_plugin_manifest_edits: true,
         }
@@ -283,6 +282,11 @@ impl PluginIterationPolicy {
         path: &str,
     ) -> Result<(), RuntimeError> {
         let normalized = normalize_rel_path(path)?;
+        // The workspace manifest (plugins/Cargo.toml) needs to be editable
+        // so that new top-level plugins can be added to workspace members.
+        if normalized == "plugins/Cargo.toml" {
+            return Ok(());
+        }
         if self
             .forbidden_prefixes
             .iter()
