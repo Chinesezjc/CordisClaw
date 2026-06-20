@@ -288,6 +288,7 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         }
         cordis_runtime::agent::set_agent_inject_queue(inject_queue.clone());
         let health_host = std::sync::Arc::clone(&host);
+        let park_host = std::sync::Arc::clone(&host);
         let mut sessions: BTreeMap<String, String> = BTreeMap::new();
         std::thread::spawn(move || {
             loop {
@@ -416,8 +417,23 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         cordis_runtime::kernel::health::start_health_loop(health_host, 3600);
 
         // Park — background threads keep running.
+        // Periodically check whether stdin is still open: when the parent
+        // process dies (e.g. a test runner that spawned us), stdin gets
+        // a hangup.  Exiting cleanly prevents orphaned zombie processes
+        // with their own health-check loops from piling up.
         loop {
-            std::thread::park();
+            std::thread::sleep(std::time::Duration::from_secs(30));
+            let mut pfd = libc::pollfd {
+                fd: libc::STDIN_FILENO,
+                events: 0,
+                revents: 0,
+            };
+            let ret = unsafe { libc::poll(&mut pfd, 1, 0) };
+            if ret > 0 && (pfd.revents & libc::POLLHUP) != 0 {
+                eprintln!("runtime-only: stdin hangup (parent exited), shutting down");
+                park_host.write_shutdown_memory();
+                std::process::exit(0);
+            }
         }
     }
 
