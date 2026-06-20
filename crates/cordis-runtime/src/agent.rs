@@ -1932,6 +1932,7 @@ struct RunPluginTestArgs {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RequestIterationArgs {
     plugin_path: String,
     instruction: String,
