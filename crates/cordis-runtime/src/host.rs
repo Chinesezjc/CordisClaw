@@ -439,18 +439,24 @@ impl RuntimeKernel {
     }
 
     pub fn status(&self) -> KernelStatus {
-        let plugin_issues = self
+        // Lock each field individually and drop the guard immediately
+        // to prevent deadlocks with concurrent PluginIteration operations
+        // that may also need these locks.
+        let plugin_issue_count = self
             .plugin_issues
             .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        let blocked_iterations = self
+            .unwrap_or_else(|poison| poison.into_inner())
+            .len();
+        let blocked_iteration_count = self
             .blocked_iterations
             .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        let plugin_history = self
+            .unwrap_or_else(|poison| poison.into_inner())
+            .len();
+        let plugin_iteration_total = self
             .plugin_history
             .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+            .unwrap_or_else(|poison| poison.into_inner())
+            .len();
         let last_plugin_iteration = self
             .last_plugin_iteration
             .lock()
@@ -460,35 +466,40 @@ impl RuntimeKernel {
             .iteration_metrics
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        let status = KernelStatus {
+        let (iteration_total, iteration_promote_total, iteration_rollback_total) = (
+            metrics.iteration_total,
+            metrics.iteration_promote_total,
+            metrics.iteration_rollback_total,
+        );
+        drop(metrics);
+        // Single memory lock for both fields — avoids double-futex.
+        let (history_len, last_change) = {
+            let memory = self
+                .memory
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            let len = memory.len();
+            let last = memory.recent(1).into_iter().next();
+            (len, last)
+        };
+        KernelStatus {
             workspace_root: self.workspace_root.display().to_string(),
             config_dir: self.config_dir.display().to_string(),
             llm_provider: self.llm_api.provider.clone(),
             llm_model: self.llm_api.model.clone(),
             plugin_config_count: self.plugin_configs.len(),
-            iteration_total: metrics.iteration_total,
-            iteration_promote_total: metrics.iteration_promote_total,
-            iteration_rollback_total: metrics.iteration_rollback_total,
-            history_len: self
-                .memory
-                .lock()
-                .unwrap_or_else(|poison| poison.into_inner())
-                .len(),
-            last_change: self
-                .memory
-                .lock()
-                .unwrap_or_else(|poison| poison.into_inner())
-                .recent(1)
-                .into_iter()
-                .next(),
-            plugin_issue_count: plugin_issues.len(),
-            blocked_iteration_count: blocked_iterations.len(),
-            plugin_iteration_total: plugin_history.len(),
+            iteration_total,
+            iteration_promote_total,
+            iteration_rollback_total,
+            history_len,
+            last_change,
+            plugin_issue_count,
+            blocked_iteration_count,
+            plugin_iteration_total,
             last_plugin_iteration: last_plugin_iteration
                 .as_ref()
                 .map(plugin_iteration_status_from_result),
-        };
-        status
+        }
     }
 
     pub fn history(&self) -> Vec<ChangeRecord> {
