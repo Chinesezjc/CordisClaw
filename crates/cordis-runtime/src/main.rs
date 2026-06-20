@@ -314,7 +314,7 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 for (group_id, group_msgs) in &by_group {
                     if group_id.is_empty() || group_msgs.is_empty() { continue; }
                     let combined = group_msgs.join("\n");
-                    eprintln!("inbox: [{group_id}] batch {} msgs", group_msgs.len());
+                    eprintln!("inbox: [{group_id}] batch {} msgs: {}", group_msgs.len(), combined);
                     // Push any messages that arrived while we were busy
                     // into the inject queue so the agent's respond() loop
                     // can see them via drain_inject_queue() between turns.
