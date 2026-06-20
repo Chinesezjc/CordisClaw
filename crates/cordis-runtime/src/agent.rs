@@ -55,7 +55,6 @@ const AGENT_TOOL_LIST_DIRECTORY: &str = "list_directory";
 const AGENT_TOOL_SEARCH_CODE: &str = "search_code";
 const AGENT_TOOL_WRITE_FILE: &str = "write_file";
 const AGENT_TOOL_REPLACE_IN_FILE: &str = "replace_in_file";
-const AGENT_TOOL_RUN_COMMAND: &str = "run_command";
 const AGENT_TOOL_REVERT_CHANGES: &str = "revert_changes";
 const AGENT_TOOL_DELETE_FILE: &str = "delete_file";
 const AGENT_TOOL_RENAME_FILE: &str = "rename_file";
@@ -807,6 +806,21 @@ pub struct AgentSession {
     unknown_tool_strikes: usize,
 }
 
+/// Serializable snapshot of an AgentSession for crash recovery.
+/// Captures everything needed to reconstruct the session except the
+/// reqwest::Client, which is recreated from the stored config.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentSessionSnapshot {
+    pub kind: String,
+    pub config: LlmApiConfig,
+    pub history: Vec<Value>,
+    pub transcript: Vec<AgentTranscriptEntry>,
+    pub completed_turns: usize,
+    pub estimated_tokens: usize,
+    pub reasoning_only_strikes: usize,
+    pub unknown_tool_strikes: usize,
+}
+
 pub type ShellAgentStatus = AgentSessionStatus;
 pub type ShellAgentReply = AgentReply;
 
@@ -1520,6 +1534,42 @@ impl AgentSession {
             ),
         })
     }
+
+    /// Create a serializable snapshot of the current session state.
+    pub fn to_snapshot(&self) -> AgentSessionSnapshot {
+        AgentSessionSnapshot {
+            kind: self.kind.clone(),
+            config: self.config.clone(),
+            history: self.history.clone(),
+            transcript: self.transcript.clone(),
+            completed_turns: self.completed_turns,
+            estimated_tokens: self.estimated_tokens,
+            reasoning_only_strikes: self.reasoning_only_strikes,
+            unknown_tool_strikes: self.unknown_tool_strikes,
+        }
+    }
+
+    /// Reconstruct an AgentSession from a snapshot.
+    /// The reqwest::Client is freshly created from the stored config.
+    pub fn from_snapshot(snapshot: AgentSessionSnapshot) -> Result<Self, RuntimeError> {
+        let client = Client::builder()
+            .timeout(Duration::from_millis(snapshot.config.timeout_ms))
+            .build()
+            .map_err(|err| RuntimeError::LlmRequestFailed {
+                message: format!("failed to rebuild agent HTTP client from snapshot: {err}"),
+            })?;
+        Ok(Self {
+            kind: snapshot.kind,
+            config: snapshot.config,
+            client,
+            history: snapshot.history,
+            transcript: snapshot.transcript,
+            completed_turns: snapshot.completed_turns,
+            estimated_tokens: snapshot.estimated_tokens,
+            reasoning_only_strikes: snapshot.reasoning_only_strikes,
+            unknown_tool_strikes: snapshot.unknown_tool_strikes,
+        })
+    }
 }
 
 impl ShellAgentSession {
@@ -1889,10 +1939,6 @@ struct RequestIterationArgs {
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 struct ReloadRuntimeArgs { plugin_path: String }
-
-struct RunCommandArgs {
-    command: String,
-}
 
 fn execute_agent_tool_call<B: AgentBackend + ?Sized>(
     backend: &mut B,
@@ -2408,10 +2454,6 @@ impl<'a, H: AgentToolHost + ?Sized> AgentBackend for RuntimeShellAgentBackend<'a
                 let args = parse_tool_value_arguments::<CopyFileArgs>(arguments, name)?;
                 self.host
                     .agent_copy_file(&args.path, &args.new_path)
-            }
-            AGENT_TOOL_APPEND_FILE => {
-                let args = parse_tool_value_arguments::<WriteFileArgs>(arguments, name)?;
-                self.host.agent_append_file(&args.path, &args.content)
             }
             AGENT_TOOL_COMPACT_CONTEXT => {
                 parse_tool_value_arguments::<EmptyArgs>(arguments, name)?;
@@ -3062,6 +3104,14 @@ mod tests {
         }
 
         fn agent_send_warning_to_test_groups(&self, _message: &str) {}
+
+        fn agent_build_plugins(&self, _plugin_name: &str) -> Result<Value, RuntimeError> {
+            Ok(json!({ "ok": true, "exit_code": 0 }))
+        }
+
+        fn agent_plugin_hints(&self) -> Vec<String> {
+            Vec::new()
+        }
     }
 
     #[test]
@@ -3154,7 +3204,7 @@ mod tests {
         };
         let mut session = ShellAgentSession::new(config).expect("build session");
         let reply = session
-            .respond(&FakeHost, "What is the runtime status right now?")
+            .respond(&FakeHost, "test-session-1", "What is the runtime status right now?")
             .expect("agent reply");
 
         assert_eq!(reply.content, "Runtime is healthy and loaded.");

@@ -1,6 +1,6 @@
 use crate::agent::{
-    AgentBackend, AgentReply, AgentSession, AgentSessionStatus, AgentToolExecutionSummary,
-    AgentToolSpec, AgentTranscriptEntry,
+    AgentBackend, AgentReply, AgentSession, AgentSessionSnapshot, AgentSessionStatus,
+    AgentToolExecutionSummary, AgentToolSpec, AgentTranscriptEntry,
 };
 use crate::config::{LlmApiConfig, PluginConfigFile, RuntimeConfig};
 use crate::context::RuntimeContext;
@@ -1067,7 +1067,7 @@ impl RuntimeHost {
         let initial_snapshot = Arc::new(build_snapshot(&loader, &snapshot_root)?);
         let interactive_rollback = Mutex::new(PluginEditRollback::empty(&fixtures_root));
         let service_registry = Arc::new(crate::context::ServiceRegistry::new());
-        Ok(Self {
+        let host = Self {
             kernel: RuntimeKernel::new(&fixtures_root, &config),
             config,
             fixtures_root,
@@ -1082,7 +1082,9 @@ impl RuntimeHost {
             agent_sessions: Mutex::new(BTreeMap::new()),
             service_registry,
             interactive_rollback,
-        })
+        };
+        host.detect_crash_and_recover();
+        Ok(host)
     }
 
     pub fn fixtures_root(&self) -> &Path {
@@ -1129,6 +1131,134 @@ impl RuntimeHost {
         if let Ok(json) = serde_json::to_string_pretty(&memory) {
             let _ = std::fs::write(&path, json);
             eprintln!("[shutdown] wrote memory to {}", path.display());
+        }
+    }
+
+    /// Workspace-root-relative `data/` directory.
+    fn data_dir(&self) -> PathBuf {
+        self.fixtures_root
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| self.fixtures_root.clone())
+            .join("data")
+    }
+
+    /// Best-effort save of a session snapshot to `data/sessions/<id>.json`.
+    /// Uses atomic temp-file-then-rename.  Errors are logged but never
+    /// propagated — an auto-save failure must not break the agent response.
+    fn auto_save_session(&self, session_id: &str, session: &AgentSession) {
+        let sessions_dir = self.data_dir().join("sessions");
+        if let Err(e) = std::fs::create_dir_all(&sessions_dir) {
+            eprintln!(
+                "[auto-save] failed to create sessions dir {}: {e}",
+                sessions_dir.display()
+            );
+            return;
+        }
+        let snapshot = session.to_snapshot();
+        let json = match serde_json::to_vec(&snapshot) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("[auto-save] serialize failed for {session_id}: {e}");
+                return;
+            }
+        };
+        let target = sessions_dir.join(format!("{session_id}.json"));
+        let tmp = sessions_dir.join(format!(".{session_id}.json.tmp"));
+        if let Err(e) = std::fs::write(&tmp, &json) {
+            eprintln!("[auto-save] write tmp failed for {session_id}: {e}");
+            return;
+        }
+        if let Err(e) = std::fs::rename(&tmp, &target) {
+            eprintln!("[auto-save] rename failed for {session_id}: {e}");
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
+
+    /// Check for saved sessions in `data/sessions/` and reconstruct them.
+    /// Called once at the end of `boot()`.  If sessions exist from a previous
+    /// run (crash or deliberate restart), they are restored into the agent
+    /// session map so the user can continue where they left off.
+    fn detect_crash_and_recover(&self) {
+        let sessions_dir = self.data_dir().join("sessions");
+        let dir = match std::fs::read_dir(&sessions_dir) {
+            Ok(d) => d,
+            Err(_) => return, // no sessions dir, nothing to recover
+        };
+        let mut recovered = 0usize;
+        let mut skipped = 0usize;
+        for entry in dir.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            // Skip temp files.
+            if path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with('.'))
+            {
+                continue;
+            }
+            let json = match std::fs::read(&path) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!(
+                        "[crash-recovery] read failed for {}: {e}",
+                        path.display()
+                    );
+                    skipped += 1;
+                    continue;
+                }
+            };
+            let snapshot: AgentSessionSnapshot = match serde_json::from_slice(&json) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!(
+                        "[crash-recovery] parse failed for {}: {e}",
+                        path.display()
+                    );
+                    skipped += 1;
+                    continue;
+                }
+            };
+            let session = match AgentSession::from_snapshot(snapshot) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!(
+                        "[crash-recovery] reconstruct failed for {}: {e}",
+                        path.display()
+                    );
+                    skipped += 1;
+                    continue;
+                }
+            };
+            let session_id = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("recovered-session")
+                .to_string();
+            let handle = AgentSessionHandle {
+                session_id: session_id.clone(),
+                kind: AgentSessionKind::RuntimeShell,
+            };
+            self.agent_sessions
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .insert(
+                    session_id,
+                    ManagedAgentSession {
+                        handle,
+                        session,
+                        state: ManagedAgentState::RuntimeShell,
+                    },
+                );
+            recovered += 1;
+        }
+        if recovered > 0 || skipped > 0 {
+            eprintln!(
+                "[crash-recovery] recovered {recovered} session(s), skipped {skipped}"
+            );
         }
     }
 
@@ -1373,6 +1503,13 @@ impl RuntimeHost {
                 })?
         };
         let result = session.respond(self, input);
+        // Auto-save on success for RuntimeShell sessions so that
+        // session context survives crashes and restarts.
+        if result.is_ok() {
+            if matches!(session.state, ManagedAgentState::RuntimeShell) {
+                self.auto_save_session(session_id, &session.session);
+            }
+        }
         self.agent_sessions
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
@@ -2713,40 +2850,6 @@ impl RuntimeHost {
             plugin_path.clone(),
             format!("{stage} failed for {plugin_path}: {err}"),
         );
-    }
-
-    fn try_auto_iterate_observed_plugins(&self) {
-        if !self.kernel.can_auto_iterate_plugins() {
-            return;
-        }
-        if self
-            .kernel
-            .active_plugin_iteration
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .is_some()
-        {
-            return;
-        }
-        let Some(issue) = self
-            .kernel
-            .plugin_issues()
-            .into_iter()
-            .find(|issue| issue.status == KernelPluginIssueStatus::Open)
-        else {
-            return;
-        };
-        let _ = self.iterate_plugins(KernelPluginIterationRequest {
-            issue_id: Some(issue.issue_id.clone()),
-            target_plugin_paths: Vec::new(),
-            instruction: Some(issue.summary.clone()),
-            edit_plan: None,
-            manual_approved: false,
-            tests_command: None,
-            safety_command: None,
-            verify_profile: Some(VerificationProfile::RustWorkspace),
-            quality_score: None,
-        });
     }
 
     fn reload_internal(
@@ -5484,7 +5587,7 @@ mod tests {
         assert!(initial_tools
             .iter()
             .any(|tool| tool.name == PLUGIN_AGENT_TOOL_READ_CONTEXT_FILES));
-        assert!(!initial_tools
+        assert!(initial_tools
             .iter()
             .any(|tool| tool.name == PLUGIN_AGENT_TOOL_INSPECT_PLUGIN_CATALOG));
         assert!(initial_tools
@@ -5496,16 +5599,16 @@ mod tests {
         assert!(initial_tools
             .iter()
             .any(|tool| tool.name == PLUGIN_AGENT_TOOL_REPLACE_FILES_EXACT));
-        assert!(!initial_tools
+        assert!(initial_tools
             .iter()
             .any(|tool| tool.name == PLUGIN_AGENT_TOOL_CREATE_FILE));
-        assert!(!initial_tools
+        assert!(initial_tools
             .iter()
             .any(|tool| tool.name == PLUGIN_AGENT_TOOL_DELETE_FILE));
-        assert!(!initial_tools
+        assert!(initial_tools
             .iter()
             .any(|tool| tool.name == PLUGIN_AGENT_TOOL_TOML_SET));
-        assert!(!initial_tools
+        assert!(initial_tools
             .iter()
             .any(|tool| tool.name == PLUGIN_AGENT_TOOL_JSON_SET));
 

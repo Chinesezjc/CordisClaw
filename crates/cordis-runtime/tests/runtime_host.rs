@@ -569,7 +569,7 @@ fn runtime_host_reload_adds_top_level_plugin() {
     let host = RuntimeHost::boot(temp.path()).expect("host should boot");
 
     add_demo_process_plugin(temp.path(), "v1");
-    let report = host.reload().expect("reload with demo should succeed");
+    let report = host.reload("/").expect("reload with demo should succeed");
 
     assert!(report.added_plugins.iter().any(|plugin| plugin == "demo"));
     assert!(host
@@ -614,7 +614,7 @@ fn runtime_host_reload_removes_plugin_but_old_snapshot_stays_usable() {
         serde_json::to_string_pretty(&value).expect("serialize index"),
     )
     .expect("write updated index");
-    let report = host.reload().expect("reload without shell should succeed");
+    let report = host.reload("/").expect("reload without shell should succeed");
 
     assert!(report
         .removed_plugins
@@ -645,7 +645,7 @@ fn runtime_host_reload_failure_keeps_current_snapshot() {
 
     overwrite_index_hash(temp.path(), "shell", "deadbeef");
     let err = host
-        .reload()
+        .reload("/")
         .expect_err("reload should fail on hash mismatch");
     assert!(err.to_string().contains("HashMismatch") || err.to_string().contains("hash"));
 
@@ -668,7 +668,7 @@ fn runtime_host_reload_observes_docs_drift_issue() {
     let updated_summary = "Start the CordisClaw terminal with updated docs.";
 
     update_index_node_summary(temp.path(), "shell", "shell_entry", updated_summary);
-    let report = host.reload().expect("reload should succeed");
+    let report = host.reload("/").expect("reload should succeed");
 
     assert!(report
         .changed_plugin_reasons
@@ -695,7 +695,7 @@ fn runtime_host_snapshot_keeps_old_staged_process_artifact_after_reload() {
     write_demo_artifacts(temp.path(), "v2");
     sync_demo_index_entry(temp.path(), "v2");
     refresh_artifact_index(temp.path()).expect("refresh index after demo update");
-    host.reload()
+    host.reload("/")
         .expect("reload with updated demo should succeed");
 
     let old_response = old_snapshot
@@ -763,7 +763,7 @@ fn runtime_host_kernel_state_persists_across_reload() {
     assert!(!result.rolled_back);
 
     update_workspace_members(temp.path(), &["root", "expr"]);
-    host.reload().expect("reload should succeed");
+    host.reload("/").expect("reload should succeed");
 
     let status = host.kernel().status();
     assert_eq!(status.iteration_total, 1);
@@ -813,7 +813,7 @@ fn runtime_host_reload_with_diagnostics_reports_failure_summary() {
     let snapshot_id = host.current_snapshot().snapshot_id().to_string();
 
     overwrite_index_hash(temp.path(), "shell", "deadbeef");
-    let report = host.reload_with_diagnostics();
+    let report = host.reload_with_diagnostics("/");
 
     assert_eq!(report.status, ReloadAttemptStatus::Failed);
     assert_eq!(report.from_snapshot_id, snapshot_id);
