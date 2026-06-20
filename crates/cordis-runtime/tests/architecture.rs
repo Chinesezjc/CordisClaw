@@ -62,6 +62,7 @@ fn make_node_doc(id: &str, consumes: &[&str], produces: &[&str]) -> NodeDoc {
         side_effects: vec![],
         failure_modes: vec![],
         node_type: Default::default(),
+        agent_accessible: true,
     }
 }
 
