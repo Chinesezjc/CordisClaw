@@ -63,6 +63,7 @@ const AGENT_TOOL_COPY_FILE: &str = "copy_file";
 const AGENT_TOOL_COMPACT_CONTEXT: &str = "compact_context";
 const AGENT_TOOL_RUN_PLUGIN_TEST: &str = "run_plugin_test";
 const AGENT_TOOL_REQUEST_ITERATION: &str = "request_iteration";
+const AGENT_TOOL_CREATE_PLUGIN: &str = "create_plugin";
 const LLM_DEBUG_ENV: &str = "CORDIS_LLM_DEBUG";
 
 pub trait AgentToolHost {
@@ -118,6 +119,7 @@ pub trait AgentToolHost {
     fn agent_append_file(&self, path: &str, content: &str) -> Result<Value, RuntimeError>;
     fn agent_run_plugin_test(&self, command: Option<&str>) -> Result<Value, RuntimeError>;
     fn agent_request_iteration(&self, plugin_path: &str, instruction: &str) -> Result<Value, RuntimeError>;
+    fn agent_create_plugin(&self, name: &str, description: Option<&str>) -> Result<Value, RuntimeError>;
     fn agent_send_warning_to_test_groups(&self, message: &str);
 }
 
@@ -677,14 +679,16 @@ impl AgentToolHost for RuntimeHost {
 
     fn agent_request_iteration(&self, plugin_path: &str, instruction: &str) -> Result<Value, RuntimeError> {
         let pp = plugin_path.trim_start_matches('/');
-        if pp.is_empty() {
-            return Err(RuntimeError::InvalidArgument {
-                message: "plugin_path must be non-empty, use \"/web\" for example".to_string(),
-            });
-        }
+        // Empty plugin_path (from "/") means root workspace mode — the agent
+        // can create/edit files anywhere under plugins/, not just one subtree.
+        let target_plugin_paths: Vec<String> = if pp.is_empty() {
+            vec![]
+        } else {
+            vec![pp.to_string()]
+        };
         let request = crate::kernel::plugin_iteration::KernelPluginIterationRequest {
             issue_id: None,
-            target_plugin_paths: vec![pp.to_string()],
+            target_plugin_paths,
             instruction: Some(instruction.to_string()),
             edit_plan: None,
             manual_approved: false,
@@ -704,6 +708,10 @@ impl AgentToolHost for RuntimeHost {
                 "error": e.to_string(),
             })),
         }
+    }
+
+    fn agent_create_plugin(&self, name: &str, description: Option<&str>) -> Result<Value, RuntimeError> {
+        self.create_plugin(name, description)
     }
 
     fn agent_send_warning_to_test_groups(&self, message: &str) {
@@ -1938,6 +1946,14 @@ struct RequestIterationArgs {
     instruction: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CreatePluginArgs {
+    name: String,
+    #[serde(default)]
+    description: Option<String>,
+}
+
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 struct ReloadRuntimeArgs { plugin_path: String }
 
@@ -2468,6 +2484,10 @@ impl<'a, H: AgentToolHost + ?Sized> AgentBackend for RuntimeShellAgentBackend<'a
                 let args = parse_tool_value_arguments::<RequestIterationArgs>(arguments, name)?;
                 self.host.agent_request_iteration(&args.plugin_path, &args.instruction)
             }
+            AGENT_TOOL_CREATE_PLUGIN => {
+                let args = parse_tool_value_arguments::<CreatePluginArgs>(arguments, name)?;
+                self.host.agent_create_plugin(&args.name, args.description.as_deref())
+            }
             other => Err(RuntimeError::InvalidArgument {
                 message: format!("runtime shell agent does not support tool {other}"),
             }),
@@ -2662,14 +2682,27 @@ fn shell_agent_tools() -> Vec<AgentToolSpec> {
         },
         AgentToolSpec {
             name: AGENT_TOOL_REQUEST_ITERATION,
-            description: "Start a PluginIteration session to safely modify plugin source code. Creates a backup snapshot before changes; on failure, auto-rollbacks to the snapshot. plugin_path: the plugin to modify (e.g. \"/web\"), instruction: what to change.",
+            description: "Start a PluginIteration session to safely modify plugin source code. Creates a backup snapshot before changes; on failure, auto-rollbacks to the snapshot. plugin_path: the plugin to modify (e.g. \"/web\"), or \"/\" for root workspace (entire plugins/ directory). instruction: what to change.",
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "plugin_path": { "type": "string", "description": "Target plugin path, e.g. \"/web\" or \"/qq\"." },
+                    "plugin_path": { "type": "string", "description": "Target plugin path, e.g. \"/web\" or \"/qq\". Use \"/\" for root workspace to create new plugins or edit multiple plugins at once." },
                     "instruction": { "type": "string", "description": "What change to make in this iteration." },
                 },
                 "required": ["plugin_path", "instruction"],
+                "additionalProperties": false,
+            }),
+        },
+        AgentToolSpec {
+            name: AGENT_TOOL_CREATE_PLUGIN,
+            description: "Create a new top-level plugin directory under plugins/ with a skeleton Cargo.toml, src/lib.rs, and add it to the workspace members. Use this before request_iteration to scaffold a brand-new plugin. name: plugin name (alphanumeric + underscore only), description: optional short description.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "Plugin name. Must contain only letters, digits, and underscores (e.g. \"my_plugin\")." },
+                    "description": { "type": "string", "description": "Optional short description for the plugin (goes in lib.rs doc comment)." },
+                },
+                "required": ["name"],
                 "additionalProperties": false,
             }),
         },
@@ -3102,6 +3135,10 @@ mod tests {
 
         fn agent_request_iteration(&self, _plugin_path: &str, _instruction: &str) -> Result<Value, RuntimeError> {
             Ok(json!({ "ok": true, "summary": "mock iteration", "verdict": "SimulatedSuccess" }))
+        }
+
+        fn agent_create_plugin(&self, name: &str, _description: Option<&str>) -> Result<Value, RuntimeError> {
+            Ok(json!({ "ok": true, "plugin_path": format!("/{name}") }))
         }
 
         fn agent_send_warning_to_test_groups(&self, _message: &str) {}
