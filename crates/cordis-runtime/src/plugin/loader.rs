@@ -8,7 +8,8 @@
 use crate::context::{ContextRegistry, PluginHierarchy, RuntimeContext};
 use crate::core::error::RuntimeError;
 use crate::core::models::{
-    ArtifactIndexEntry, ArtifactKind, LoaderBudget, PluginLoadResult, PluginUnavailableReason,
+    ArtifactIndexEntry, ArtifactKind, LoaderBudget, PluginDocs, PluginLoadResult,
+    PluginUnavailableReason,
 };
 use crate::plugin::artifact::{
     artifact_index_map, load_artifact_index, load_plugin_artifact, resolve_artifact_path,
@@ -72,7 +73,7 @@ impl Loader {
     ) -> Result<LoadOutput, RuntimeError> {
         let started_at = Instant::now();
         let execution_id = make_execution_id();
-        let index = load_artifact_index(&self.config.artifact_index_path)?;
+        let mut index = load_artifact_index(&self.config.artifact_index_path)?;
         self.ensure_not_timed_out(started_at)?;
 
         let plugin_count = index.entries.len();
@@ -96,6 +97,7 @@ impl Loader {
         let plugin_registry = PluginRegistry::default();
         let mut node_registry = NodeRegistry::default();
         let mut metrics = LoaderMetrics::default();
+        let mut docs_drift: Vec<(String, PluginDocs)> = Vec::new();
 
         let hierarchy = PluginHierarchy {
             parent_of: index_map
@@ -194,6 +196,11 @@ impl Loader {
                 None => resolved_artifact_path,
             };
 
+            // Effective docs for this plugin — may be updated if drift is
+            // detected. Defaults to the cached index entry; replaced with
+            // fresh artifact docs on drift.
+            let mut effective_docs: Option<PluginDocs> = None;
+
             if matches!(entry.artifact_kind, ArtifactKind::Json) {
                 let artifact = load_plugin_artifact(&artifact_path)?;
                 if artifact.plugin_path != *plugin_path {
@@ -255,40 +262,34 @@ impl Loader {
                 }
 
                 if artifact.docs != entry.docs {
-                    plugin_registry.insert_unavailable(
-                        plugin_path.clone(),
-                        entry.parent.clone(),
-                        entry.required,
-                        entry.grants_from_parent.iter().cloned().collect(),
-                        PluginUnavailableReason::ContractViolation,
-                        vec!["artifact docs mismatch".to_string()],
-                    );
-                    context.set_plugin_state(
-                        plugin_path,
-                        PluginLoadResult::Unavailable(PluginUnavailableReason::ContractViolation),
-                    );
-                    metrics.plugin_unavailable_total += 1;
-                    metrics.dylib_no_fallback_total += 1;
-                    if entry.required {
-                        self.propagate_parent_failure(
-                            plugin_path,
-                            &index_map,
-                            &plugin_registry,
-                            &mut node_registry,
-                            &mut context,
-                        );
-                    }
-                    continue;
+                    // Docs drifted — auto-heal: take artifact docs as ground
+                    // truth, refresh cache + interfaces.json after load.
+                    docs_drift.push((plugin_path.clone(), artifact.docs.clone()));
+                    effective_docs = Some(artifact.docs);
                 }
             }
 
-            node_registry.register_from_docs(plugin_path, &entry.docs)?;
+            // For dylib artifacts, extract docs from the .so and compare
+            // against the cached index entry.
+            if !matches!(entry.artifact_kind, ArtifactKind::Json) {
+                if let Ok(dylib_docs) =
+                    crate::plugin::tooling::read_plugin_docs(&artifact_path)
+                {
+                    if dylib_docs != entry.docs {
+                        docs_drift.push((plugin_path.clone(), dylib_docs.clone()));
+                        effective_docs = Some(dylib_docs);
+                    }
+                }
+            }
+
+            let docs = effective_docs.as_ref().unwrap_or(&entry.docs);
+            node_registry.register_from_docs(plugin_path, docs)?;
             plugin_registry.insert_loaded(
                 plugin_path.clone(),
                 entry.parent.clone(),
                 entry.required,
                 entry.grants_from_parent.iter().cloned().collect(),
-                entry.docs.clone(),
+                docs.clone(),
                 artifact_path,
                 entry.artifact_kind.clone(),
                 entry.abi_fingerprint.clone(),
@@ -303,6 +304,89 @@ impl Loader {
                     export,
                     format!("service:{plugin_path}:{export}"),
                 )?;
+            }
+        }
+
+        // Auto-heal: write back updated docs to index.json and sync
+        // interfaces.json for any plugins whose docs drifted from cache.
+        if !docs_drift.is_empty() {
+            let plugins_root = &self.config.plugins_root;
+            for item in &docs_drift {
+                let plugin_path: &str = &item.0;
+                let new_docs: &PluginDocs = &item.1;
+                // Update the in-memory index entry.
+                for entry in &mut index.entries {
+                    if entry.plugin_path == plugin_path {
+                        entry.docs = new_docs.clone();
+                        break;
+                    }
+                }
+                // Sync interfaces.json on disk.
+                let docs_path = plugins_root
+                    .join(plugin_path.replace('/', std::path::MAIN_SEPARATOR_STR))
+                    .join("docs/agent/interfaces.json");
+                if let Some(parent) = docs_path.parent() {
+                    if let Err(e) = std::fs::create_dir_all(parent) {
+                        eprintln!(
+                            "[loader] docs-drift: failed to create dir {}: {e}",
+                            parent.display()
+                        );
+                        continue;
+                    }
+                }
+                match serde_json::to_string_pretty(new_docs) {
+                    Ok(json) => {
+                        let tmp = docs_path.with_extension("json.tmp");
+                        if let Err(e) = std::fs::write(&tmp, &json) {
+                            eprintln!(
+                                "[loader] docs-drift: failed to write tmp {}: {e}",
+                                tmp.display()
+                            );
+                            continue;
+                        }
+                        if let Err(e) = std::fs::rename(&tmp, &docs_path) {
+                            eprintln!(
+                                "[loader] docs-drift: failed to rename {} → {}: {e}",
+                                tmp.display(),
+                                docs_path.display()
+                            );
+                        } else {
+                            eprintln!(
+                                "[loader] docs-drift: auto-healed {plugin_path} — \
+                                 interfaces.json refreshed from artifact"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[loader] docs-drift: failed to serialize docs for {plugin_path}: {e}"
+                        );
+                    }
+                }
+            }
+            // Atomic write-back of the artifact index.
+            let index_path = &self.config.artifact_index_path;
+            match serde_json::to_string_pretty(&index) {
+                Ok(json) => {
+                    let tmp = index_path.with_extension("json.tmp");
+                    if let Err(e) = std::fs::write(&tmp, &json) {
+                        eprintln!(
+                            "[loader] docs-drift: failed to write index tmp {}: {e}",
+                            tmp.display()
+                        );
+                    } else if let Err(e) = std::fs::rename(&tmp, index_path) {
+                        eprintln!(
+                            "[loader] docs-drift: failed to rename index {} → {}: {e}",
+                            tmp.display(),
+                            index_path.display()
+                        );
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[loader] docs-drift: failed to serialize artifact index: {e}"
+                    );
+                }
             }
         }
 
