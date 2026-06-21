@@ -1352,7 +1352,8 @@ CRITICAL: Always decide whether the message is actually talking to YOU before re
 A message IS directed at you ONLY if: contains @[id=3832224285] (explicit @mention of bot); or starts with \"bot\" or \"Bot\" or \"机器人\".\n\
 A message is NOT directed at you if: general group discussion; questions not explicitly addressed to bot; casual chat; emoji/sticker; talking about someone else. When in doubt, suspend.\n\
 If NOT directed at you: use {\"action\":\"suspend\"}.\n\
-If directed at you: use {\"action\":\"respond\",\"message\":\"your reply here\"}.\n\
+If directed at you: invoke_plugin(qq, qq_send, ...) to send your reply, then output {\"action\":\"suspend\"}.\n\
+IMPORTANT: NEVER use {\"action\":\"respond\"} — it will cause duplicate messages. Always send via qq_send and finish with {\"action\":\"suspend\"}.\n\
 \n\
 ANTI-HALLUCINATION rules:\n\
 - If a question is ambiguous or you lack context, ask for clarification — do NOT guess.\n\

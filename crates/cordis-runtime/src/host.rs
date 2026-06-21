@@ -698,21 +698,38 @@ impl RuntimeKernel {
 
         let selected_issue = self.select_issue_for_request(request)?;
         let iteration_id = normalize_request_id(None, "plugin-iteration");
+
+        // Root workspace mode: empty target_plugin_paths means work across all
+        // plugins. This allows creating new top-level plugins and editing any
+        // existing one. The "" → "plugins" root in allowed_plugin_roots lets
+        // validate_path accept any path under plugins/.
+        let root_mode = request.target_plugin_paths.is_empty();
         let root_plugin_path = if let Some(issue) = &selected_issue {
             issue.root_plugin_path.clone()
+        } else if root_mode {
+            String::new()
         } else {
             determine_root_plugin_path(snapshot, &request.target_plugin_paths)?
         };
-        let target_plugin_paths = snapshot
-            .plugin_registry()
-            .iter()
-            .map(|(plugin_path, _)| plugin_path)
-            .filter(|plugin_path| {
-                plugin_path == &root_plugin_path
-                    || plugin_path.starts_with(&format!("{root_plugin_path}/"))
-            })
-            .collect::<Vec<_>>();
-        if target_plugin_paths.is_empty() {
+        let target_plugin_paths: Vec<String> = if root_mode {
+            snapshot
+                .plugin_registry()
+                .iter()
+                .map(|(plugin_path, _)| plugin_path.clone())
+                .collect()
+        } else {
+            snapshot
+                .plugin_registry()
+                .iter()
+                .map(|(plugin_path, _)| plugin_path)
+                .filter(|plugin_path| {
+                    plugin_path == &root_plugin_path
+                        || plugin_path.starts_with(&format!("{root_plugin_path}/"))
+                })
+                .map(|s| s.clone())
+                .collect()
+        };
+        if target_plugin_paths.is_empty() && !root_mode {
             return Err(RuntimeError::InvalidArgument {
                 message: format!("plugin subtree not found for {root_plugin_path}"),
             });
@@ -726,10 +743,15 @@ impl RuntimeKernel {
             .clone()
             .or_else(|| selected_issue.as_ref().map(|issue| issue.summary.clone()))
             .unwrap_or_else(|| format!("iterate plugin subtree {root_plugin_path}"));
-        let allowed_plugin_roots = target_plugin_paths
+        let mut allowed_plugin_roots: BTreeMap<String, String> = target_plugin_paths
             .iter()
-            .map(|plugin_path| (plugin_path.clone(), format!("plugins/{plugin_path}")))
-            .collect::<BTreeMap<_, _>>();
+            .map(|plugin_path: &String| (plugin_path.clone(), format!("plugins/{plugin_path}")))
+            .collect();
+        // In root mode, add a catch-all root so that paths under any plugin
+        // directory (including not-yet-created ones) pass subtree validation.
+        if root_mode {
+            allowed_plugin_roots.insert(String::new(), "plugins".to_string());
+        }
 
         if let Some(ref issue) = selected_issue {
             self.plugin_issues
@@ -1466,6 +1488,196 @@ impl RuntimeHost {
             .read()
             .unwrap_or_else(|poison| poison.into_inner())
             .clone()
+    }
+
+    pub fn create_plugin(&self, name: &str, description: Option<&str>) -> Result<Value, RuntimeError> {
+        // Validate name
+        if name.is_empty() {
+            return Err(RuntimeError::InvalidArgument {
+                message: "plugin name must not be empty".to_string(),
+            });
+        }
+        if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return Err(RuntimeError::InvalidArgument {
+                message: "plugin name must contain only [a-zA-Z0-9_]".to_string(),
+            });
+        }
+
+        let plugin_dir = self.fixtures_root.join("plugins").join(name);
+        if plugin_dir.exists() {
+            return Err(RuntimeError::InvalidArgument {
+                message: format!("plugin directory already exists: plugins/{name}"),
+            });
+        }
+
+        // Create directory structure
+        let src_dir = plugin_dir.join("src");
+        std::fs::create_dir_all(&src_dir).map_err(|e| RuntimeError::Io {
+            path: src_dir.clone(),
+            message: format!("failed to create plugin src dir: {e}"),
+        })?;
+
+        let desc = description.unwrap_or(name);
+        let crate_hash = format!("crate_{name}_v1");
+
+        // Write Cargo.toml skeleton
+        let cargo_toml = format!(
+            r#"[package]
+name = "{name}"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["rlib", "dylib"]
+
+[package.metadata.cordis]
+plugin_path = "{name}"
+abi_kind = "rust"
+declared_nodes = []
+children = []
+
+[package.metadata.cordis.abi_fingerprint]
+rustc_version = "1.85.1"
+target_triple = "x86_64-unknown-linux-gnu"
+crate_hash = "{crate_hash}"
+api_hash = "api_v2"
+
+[dependencies]
+cordis-plugin-sdk = {{ path = "../../../crates/cordis-plugin-sdk" }}
+serde = {{ version = "1", features = ["derive"] }}
+serde_json = "1"
+"#
+        );
+        std::fs::write(plugin_dir.join("Cargo.toml"), &cargo_toml).map_err(|e| {
+            RuntimeError::Io {
+                path: plugin_dir.join("Cargo.toml"),
+                message: format!("failed to write Cargo.toml: {e}"),
+            }
+        })?;
+
+        // Write src/lib.rs skeleton
+        let lib_rs = format!(
+            r#"//! {desc} plugin.
+
+use cordis_plugin_sdk::{{
+    export_plugin_api, json_response, node_doc, plugin_docs, AbiFingerprint,
+    PluginRequest, PluginResponse,
+}};
+use serde::{{Deserialize, Serialize}};
+use serde_json::json;
+
+// ---------------------------------------------------------------------------
+// Request / Response types
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct NodeRequest {{
+    node_id: String,
+}}
+
+#[derive(Debug, Serialize)]
+struct NodeResponse {{
+    ok: bool,
+    node_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}}
+
+// ---------------------------------------------------------------------------
+// Handlers
+// ---------------------------------------------------------------------------
+
+fn handle(req: &NodeRequest) -> Result<NodeResponse, String> {{
+    Err(format!("unknown node_id: {{}}", req.node_id))
+}}
+
+// ---------------------------------------------------------------------------
+// Plugin API exports
+// ---------------------------------------------------------------------------
+
+fn docs_value() -> cordis_plugin_sdk::PluginDocs {{
+    plugin_docs(
+        "{name}",
+        "{name}",
+        "0.1.0",
+        None,
+        vec![],
+        None,
+    )
+}}
+
+fn abi_fingerprint_value() -> AbiFingerprint {{
+    AbiFingerprint {{
+        rustc_version: "1.85.1".to_string(),
+        target_triple: "x86_64-unknown-linux-gnu".to_string(),
+        crate_hash: "{crate_hash}".to_string(),
+        api_hash: "api_v2".to_string(),
+    }}
+}}
+
+fn api_handle(req: PluginRequest) -> PluginResponse {{
+    match serde_json::from_str::<NodeRequest>(&req.payload)
+        .map_err(|e| format!("{name} plugin: {{e}}"))
+        .and_then(|r| handle(&r))
+    {{
+        Ok(resp) => json_response(&resp),
+        Err(e) => json_response(&NodeResponse {{
+            ok: false,
+            node_id: "error".to_string(),
+            error: Some(e),
+        }}),
+    }}
+}}
+
+export_plugin_api! {{
+    abi_fingerprint = abi_fingerprint_value(),
+    docs = docs_value(),
+    handle = api_handle,
+}}
+"#
+        );
+        std::fs::write(src_dir.join("lib.rs"), &lib_rs).map_err(|e| RuntimeError::Io {
+            path: src_dir.join("lib.rs"),
+            message: format!("failed to write lib.rs: {e}"),
+        })?;
+
+        // Add to workspace members
+        let workspace_manifest = self.fixtures_root.join("plugins").join("Cargo.toml");
+        let manifest_text = std::fs::read_to_string(&workspace_manifest).map_err(|e| {
+            RuntimeError::Io {
+                path: workspace_manifest.clone(),
+                message: format!("failed to read workspace manifest: {e}"),
+            }
+        })?;
+        let mut document: TomlValue =
+            toml::from_str(&manifest_text).map_err(|e| RuntimeError::InvalidArgument {
+                message: format!("failed to parse workspace manifest: {e}"),
+            })?;
+        let members = document
+            .get_mut("workspace")
+            .and_then(|w| w.get_mut("members"))
+            .and_then(|m| m.as_array_mut())
+            .ok_or_else(|| RuntimeError::InvalidArgument {
+                message: "workspace.members not found in plugins/Cargo.toml".to_string(),
+            })?;
+        let already_member = members.iter().any(|v| v.as_str() == Some(name));
+        if !already_member {
+            members.push(TomlValue::String(name.to_string()));
+        }
+        let new_manifest = toml::to_string_pretty(&document).map_err(|e| RuntimeError::Io {
+            path: workspace_manifest.clone(),
+            message: format!("failed to serialize workspace manifest: {e}"),
+        })?;
+        std::fs::write(&workspace_manifest, &new_manifest).map_err(|e| RuntimeError::Io {
+            path: workspace_manifest,
+            message: format!("failed to write workspace manifest: {e}"),
+        })?;
+
+        Ok(serde_json::json!({
+            "ok": true,
+            "plugin_path": format!("/{name}"),
+            "message": format!("Created plugin /{name} with skeleton. Use request_iteration with plugin_path=\"/{name}\" to add nodes."),
+        }))
     }
 
     pub fn agent_start(&self, kind: AgentSessionKind) -> Result<AgentSessionHandle, RuntimeError> {
