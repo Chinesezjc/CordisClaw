@@ -37,6 +37,14 @@ pub enum EvalError {
     ModuloByZero,
     #[error("factorial requires a non-negative integer")]
     FactorialDomainError,
+    #[error("factorial argument exceeds representable range (max 170)")]
+    FactorialOverflow,
+    /// P1-47: pow / evaluation produced a non-finite number (Inf or NaN).
+    /// Previously flowed back to the caller as JSON, but `serde_json`
+    /// refuses to serialize NaN, so the agent got an opaque error instead
+    /// of the correct diagnostic.
+    #[error("evaluation produced a non-finite number")]
+    NonFinite,
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -48,6 +56,10 @@ pub enum EvaluateExpressionError {
     ModuloByZero,
     #[error("factorial requires a non-negative integer")]
     FactorialDomainError,
+    #[error("factorial argument exceeds representable range (max 170)")]
+    FactorialOverflow,
+    #[error("evaluation produced a non-finite number")]
+    NonFinite,
     #[error("unexpected token at position {position}")]
     UnexpectedToken { position: usize },
     #[error("missing ')' at position {position}")]
@@ -56,6 +68,8 @@ pub enum EvaluateExpressionError {
     ExpectedNumber { position: usize },
     #[error("invalid number `{text}` at position {position}")]
     InvalidNumber { text: String, position: usize },
+    #[error("expression nested too deep (>{limit}) at position {position}")]
+    TooDeep { position: usize, limit: usize },
 }
 
 pub fn evaluate_expression(src: &str) -> Result<f64, EvaluateExpressionError> {
@@ -103,13 +117,25 @@ fn evaluate_with_plugins(ast: &ExprAst, ops: &OpPlugins) -> Result<f64, EvalErro
                 BinaryOp::Mod => ops.modulo.apply(left, right).map_err(|err| match err {
                     ModError::ModuloByZero => EvalError::ModuloByZero,
                 }),
-                BinaryOp::Pow => Ok(ops.pow.apply(left, right)),
+                BinaryOp::Pow => {
+                    // P1-47: reject non-finite results (Inf, NaN). f64::powf
+                    // silently produces those for e.g. 10^500 or (-1)^0.5;
+                    // we let the caller see a structured error rather than
+                    // an opaque serialization failure downstream.
+                    let value = ops.pow.apply(left, right);
+                    if value.is_finite() {
+                        Ok(value)
+                    } else {
+                        Err(EvalError::NonFinite)
+                    }
+                }
             }
         }
         ExprAst::Factorial { expr } => {
             let value = evaluate_with_plugins(expr, ops)?;
             ops.factorial.apply(value).map_err(|err| match err {
                 FactorialError::FactorialDomainError => EvalError::FactorialDomainError,
+                FactorialError::FactorialOverflow => EvalError::FactorialOverflow,
             })
         }
     }
@@ -129,6 +155,9 @@ fn map_parse_expression_error(err: ParseExpressionError) -> EvaluateExpressionEr
         ParseExpressionError::InvalidNumber { text, position } => {
             EvaluateExpressionError::InvalidNumber { text, position }
         }
+        ParseExpressionError::TooDeep { position, limit } => {
+            EvaluateExpressionError::TooDeep { position, limit }
+        }
     }
 }
 
@@ -137,5 +166,7 @@ fn map_eval_error(err: EvalError) -> EvaluateExpressionError {
         EvalError::DivisionByZero => EvaluateExpressionError::DivisionByZero,
         EvalError::ModuloByZero => EvaluateExpressionError::ModuloByZero,
         EvalError::FactorialDomainError => EvaluateExpressionError::FactorialDomainError,
+        EvalError::FactorialOverflow => EvaluateExpressionError::FactorialOverflow,
+        EvalError::NonFinite => EvaluateExpressionError::NonFinite,
     }
 }

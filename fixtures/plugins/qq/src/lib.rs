@@ -15,9 +15,9 @@ use cordis_plugin_sdk::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::{HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::sync::Mutex;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use std::thread;
 // ---------------------------------------------------------------------------
@@ -67,8 +67,18 @@ static EVENT_LOOP_HANDLE: Mutex<Option<std::thread::JoinHandle<()>>> = Mutex::ne
 static AGENT_SESSION_ID: Mutex<Option<String>> = Mutex::new(None);
 
 /// Dedup: recently processed message IDs (prevents double-processing from zombie pollers / duplicate events).
-static RECENT_MESSAGE_IDS: std::sync::LazyLock<Mutex<HashSet<String>>> =
-    std::sync::LazyLock::new(|| Mutex::new(HashSet::new()));
+/// P1-38: bounded FIFO dedup for message ids.  Was `HashSet<String>` whose
+/// iteration order is unspecified — "drain the oldest" was actually
+/// "drain 100 arbitrary entries", so the true-oldest ids could linger
+/// while recent ids got dropped. `VecDeque` gives us proper FIFO
+/// eviction; contains() is O(n) but n is capped at 200.
+static RECENT_MESSAGE_IDS: std::sync::LazyLock<Mutex<VecDeque<String>>> =
+    std::sync::LazyLock::new(|| Mutex::new(VecDeque::new()));
+
+/// P1-39: counter for silently-dropped messages when MESSAGE_QUEUE is
+/// full. Read + reset by qq_fetch_messages so the agent can see how
+/// many events it missed since the last poll.
+static MESSAGE_QUEUE_DROPPED: AtomicU64 = AtomicU64::new(0);
 
 // ---------------------------------------------------------------------------
 // Data types
@@ -556,81 +566,8 @@ fn run_event_loop(server: tiny_http::Server) {
         }
     }
 }
+// P1-40: WebSocket reverse-connection code removed (dead code, never wired).
 
-// ---------------------------------------------------------------------------
-// WebSocket Server — receives OneBot events via WS reverse connection
-// ---------------------------------------------------------------------------
-
-fn start_ws_server() -> Result<(), String> {
-    use std::net::TcpListener;
-    let listener = TcpListener::bind("0.0.0.0:8002")
-        .map_err(|e| format!("ws: cannot bind port 8000: {e}"))?;
-    listener.set_nonblocking(false)
-        .map_err(|e| format!("ws: set_nonblocking: {e}"))?;
-    eprintln!("[qq] WebSocket server listening on port 8002");
-    for stream in listener.incoming() {
-        let stream = match stream {
-            Ok(s) => s,
-            Err(e) => { eprintln!("[qq] ws accept: {e}"); continue; }
-        };
-        let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(3600)));
-        let ws = match tungstenite::accept(stream) {
-            Ok(w) => w,
-            Err(e) => { eprintln!("[qq] ws handshake: {e}"); continue; }
-        };
-        eprintln!("[qq] WebSocket client connected");
-        handle_ws_connection(ws);
-    }
-    Ok(())
-}
-
-fn handle_ws_connection(mut ws: tungstenite::WebSocket<std::net::TcpStream>) {
-    loop {
-        match ws.read() {
-            Ok(tungstenite::Message::Text(text)) => {
-                if let Ok(event) = serde_json::from_str::<OneBotEvent>(&text) {
-                    handle_onebot_event(&event);
-                } else {
-                    // OneBot WS protocol: events may be wrapped differently.
-                    // Try parsing as generic JSON and extract event fields.
-                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(&text) {
-                        let event = OneBotEvent {
-                            post_type: val.get("post_type").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                            message_type: val.get("message_type").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                            message: val.get("message").cloned().unwrap_or_default(),
-                            message_id: val.get("message_id").cloned(),
-                            user_id: val.get("user_id").cloned().unwrap_or_default(),
-                            group_id: val.get("group_id").cloned(),
-                            sender: val.get("sender").and_then(|s| {
-                                Some(OneBotSender {
-                                    nickname: s.get("nickname").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                                    user_id: s.get("user_id").cloned(),
-                                })
-                            }),
-                            raw_message: val.get("raw_message").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                        };
-                        handle_onebot_event(&event);
-                    }
-                }
-            }
-            Ok(tungstenite::Message::Ping(data)) => {
-                let _ = ws.send(tungstenite::Message::Pong(data));
-            }
-            Ok(tungstenite::Message::Close(_)) => {
-                eprintln!("[qq] WebSocket client disconnected");
-                break;
-            }
-            Err(tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed) => {
-                break;
-            }
-            Err(e) => {
-                eprintln!("[qq] ws read error: {e}");
-                break;
-            }
-            _ => {}
-        }
-    }
-}
 
 fn handle_onebot_event(event: &OneBotEvent) {
     if event.post_type != "message" {
@@ -698,22 +635,27 @@ fn handle_onebot_event(event: &OneBotEvent) {
     if let Some(mid) = msg.message_id {
         let dedup_key = format!("msg:{}", mid);
         let mut seen = RECENT_MESSAGE_IDS.lock().unwrap_or_else(|p| p.into_inner());
-        if seen.contains(&dedup_key) {
+        if seen.iter().any(|k| k == &dedup_key) {
             return; // duplicate OneBot event
         }
-        seen.insert(dedup_key);
-        if seen.len() > 200 {
-            let drain_count = seen.len() - 100;
-            let keys: Vec<String> = seen.iter().take(drain_count).cloned().collect();
-            for k in keys {
-                seen.remove(&k);
-            }
+        seen.push_back(dedup_key);
+        // FIFO eviction (P1-38).
+        while seen.len() > 200 {
+            seen.pop_front();
         }
     }
 
     if let Ok(mut queue) = MESSAGE_QUEUE.lock() {
         if queue.len() < 128 {
             queue.push_back(msg);
+        } else {
+            // P1-39: don't drop silently — surface the count.
+            let dropped = MESSAGE_QUEUE_DROPPED.fetch_add(1, Ordering::Relaxed) + 1;
+            if dropped.is_power_of_two() {
+                eprintln!(
+                    "[qq] MESSAGE_QUEUE full (>=128); dropped total = {dropped}"
+                );
+            }
         }
     }
 }
@@ -1011,16 +953,12 @@ fn handle_qq_fetch_messages() -> Result<NodeResponse, String> {
             ),
         };
         let mut seen = RECENT_MESSAGE_IDS.lock().unwrap_or_else(|p| p.into_inner());
-        if seen.contains(&dedup_key) {
+        if seen.iter().any(|k| k == &dedup_key) {
             continue; // already processed
         }
-        seen.insert(dedup_key);
-        if seen.len() > 200 {
-            let drain_count = seen.len() - 100;
-            let keys: Vec<String> = seen.iter().take(drain_count).cloned().collect();
-            for k in keys {
-                seen.remove(&k);
-            }
+        seen.push_back(dedup_key);
+        while seen.len() > 200 {
+            seen.pop_front();
         }
         messages.push(msg);
     }
@@ -1152,7 +1090,20 @@ fn handle_qq_system_notify(req: &NodeRequest) -> Result<NodeResponse, String> {
         .or_else(|| load_runtime_config().and_then(|c| c.get("access_token")?.as_str().map(|s| s.to_string())));
 
     for gid in &test_groups {
-        let _ = onebot_send_group_msg(&base_url, gid.parse().unwrap_or(0), msg, None, token.as_deref());
+        // P1-26: was `.parse().unwrap_or(0)` — a mis-typed / non-numeric
+        // group id in the config silently routed the system notify to
+        // group 0, which either drops or (worse) lands somewhere else in
+        // the real world. Skip bad entries with a warning instead.
+        match gid.parse::<i64>() {
+            Ok(id) if id > 0 => {
+                let _ = onebot_send_group_msg(&base_url, id, msg, None, token.as_deref());
+            }
+            _ => {
+                eprintln!(
+                    "[qq_system_notify] skipping invalid group id in test_groups: {gid}"
+                );
+            }
+        }
     }
 
     Ok(NodeResponse {

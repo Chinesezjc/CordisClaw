@@ -8,6 +8,13 @@ use thiserror::Error;
 pub enum FactorialError {
     #[error("factorial requires a non-negative integer")]
     FactorialDomainError,
+    /// P1-46: cap the input at 170. f64 can only represent 170! exactly-ish
+    /// (≈ 7.257e306); 171! overflows to +inf. Accepting values beyond that
+    /// used to iterate for CPU-forever without producing a useful answer
+    /// — e.g. `factorial(10000000000)` = 10¹⁰ loop iterations of wasted
+    /// work. Reject up front.
+    #[error("factorial argument exceeds representable range (max 170)")]
+    FactorialOverflow,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -20,6 +27,9 @@ impl FactorialPlugin {
         }
         if n.fract() != 0.0 {
             return Err(FactorialError::FactorialDomainError);
+        }
+        if n > 170.0 {
+            return Err(FactorialError::FactorialOverflow);
         }
         let n = n as u64;
         if n <= 1 {
