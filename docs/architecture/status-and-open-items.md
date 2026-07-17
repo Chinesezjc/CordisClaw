@@ -189,6 +189,14 @@ Agent 现在可以自主完成：读代码 → 理解结构 → 写/改文件 �
 - [x] **Verify/Promote TOCTOU**（P0-3）— `VerificationReport.source_tree_hash` 记录 verify 时的 sha256；`finalize_plugin_iteration` 在 `promote_candidate` 前重算并比对，不匹配则强制 rollback。
 - [x] **Plugin verifier 目标错位**（P0-4）— `verify_plugin_iteration` 传入 `VerifyOptions::candidate_invoker`，`plugin:` 命令走 staged candidate snapshot 而非 live registry。
 
+### 5.2.4 Kernel↔Plugin 边界收敛（2026-07-17 已闭合）
+
+- [x] **`agent_run_command` 去 shell**（P0-17）— 从 `sh -c command` 改为 `shell_words::split` + `Command::new(argv[0]).args(...)`；`;`、``` ` ```、`$(...)`、重定向、管道 全部丧失特殊语义，Agent 工具面不再暴露 shell-injection 面。
+- [x] **Git 插件 argv 硬化**（P0-18）— 新增 `is_safe_ref` / `is_safe_hash` 拒绝首字符 `-` 与非 `[A-Za-z0-9_./-]` 字符；`git_reset` / `git_rebase` 的 `target` / `onto`、`git_cherry_pick` 的 commit hash 全部经过该校验，`--exec=…` / `--pathspec-from-file=…` 等无法作为 flag 传入 git。`git_add` 在自定义 paths 分支加显式 `--` 分隔符，`-p` / `--interactive` 之类的 path 只能是 pathspec。`validate_commit_message` 删除误伤合法词的子串禁词，Message 是单个 argv 元素，git 从不解析其中的 `--force`。
+- [x] **Filesystem / Git 白名单不再静默降级**（P0-19）— `canonicalize` 失败时不再退回未规范化路径。新增 `canonicalise_for_whitelist` / `validate_path_in_root` 的深度 ancestor 解析：路径不存在时 canonicalize 最深的存在祖先再拼 tail；两侧都失败则 fail-closed。`../../etc/shadow` 之类的构造再无绕过。
+- [x] **Plugin iteration symlink 逃逸**（P0-20）— `PluginEditExecutor::execute` 在写入前调用新 helper `resolve_under_workspace`：canonicalize 结果必须仍在 workspace_root 下。plugins 内的 symlink 指向 `/etc/passwd` 之类无法被写入。
+- [x] **Verifier shell 拼接**（P0-21）— 已随 A 批 P0-1 修复。`discover_rust_workspace_manifest` 输出的字符串被 `shell_words` 解析成 argv，空格 / `$` / `;` 无法被解释。
+
 ### 5.2.3 Build / Load 硬化（第 1 批，2026-07-17 已闭合）
 
 - [x] **平台原生 dylib 后缀**（P0-9）— `rebuild_plugin_workspace` 用 `std::env::consts::{DLL_PREFIX, DLL_SUFFIX}` 而非硬编码 `.so`，macOS/Windows 上的 iteration 现在能跑。同时 `.so` 覆盖走新的 `stage_then_rename_file` helper：tmp + sync_all + rename，避免 live-mmap SIGSEGV。

@@ -543,10 +543,36 @@ impl PluginEditExecutor {
             backups: Vec::new(),
         };
         let mut changed_paths = BTreeSet::new();
+        // P0-20: canonicalise workspace_root once and then, per-operation,
+        // confirm the resolved path is still inside it. `normalize_rel_path`
+        // only rejects `..` and absolute paths — it cannot detect
+        // symlink-based escape (`plugins/demo/src/evil -> /etc/passwd` etc.).
+        // With the guard below, any operation whose canonical target lands
+        // outside workspace_root is rejected before touching disk.
+        let canonical_workspace_root =
+            self.workspace_root
+                .canonicalize()
+                .map_err(|err| RuntimeError::Io {
+                    path: self.workspace_root.clone(),
+                    message: format!("workspace root not accessible: {err}"),
+                })?;
         for operation in &plan.operations {
             let normalized = normalize_rel_path(&operation.path)?;
             policy.validate_path(allowed_plugin_roots, &normalized)?;
             let abs_path = self.workspace_root.join(&normalized);
+            // Resolve the final on-disk target, following symlinks along any
+            // existing prefix. Reject if it escapes the workspace.
+            let resolved_for_check = resolve_under_workspace(&abs_path)?;
+            if !resolved_for_check.starts_with(&canonical_workspace_root) {
+                return Err(RuntimeError::AutoUpdateInvalidPath {
+                    path: operation.path.clone(),
+                    reason: format!(
+                        "resolved path escapes workspace root ({} not under {})",
+                        resolved_for_check.display(),
+                        canonical_workspace_root.display()
+                    ),
+                });
+            }
             let original = fs::read(&abs_path).ok();
             let updated = apply_operation(&normalized, operation, &abs_path, original.as_deref())?;
 
@@ -1014,6 +1040,46 @@ pub fn file_sha256(path: &Path) -> Result<String, RuntimeError> {
     Ok(hex::encode(hasher.finalize()))
 }
 
+/// P0-20 helper: resolve `abs_path` to a canonical form that follows
+/// symlinks along any existing prefix, and re-attaches the yet-to-be-created
+/// tail. Used before writing to make sure the actual on-disk target sits
+/// under the workspace root — `normalize_rel_path` alone only catches
+/// `..` / absolute paths, not symlink-based escape.
+pub(crate) fn resolve_under_workspace(abs_path: &Path) -> Result<PathBuf, RuntimeError> {
+    if let Ok(canonical) = abs_path.canonicalize() {
+        return Ok(canonical);
+    }
+    let mut ancestors: Vec<&Path> = Vec::new();
+    let mut current = abs_path;
+    let existing = loop {
+        if current.exists() {
+            break current.canonicalize().map_err(|err| RuntimeError::Io {
+                path: current.to_path_buf(),
+                message: format!("canonicalise ancestor failed: {err}"),
+            })?;
+        }
+        match current.parent() {
+            Some(parent) => {
+                ancestors.push(current);
+                current = parent;
+            }
+            None => {
+                return Err(RuntimeError::AutoUpdateInvalidPath {
+                    path: abs_path.display().to_string(),
+                    reason: "no accessible ancestor exists".to_string(),
+                });
+            }
+        }
+    };
+    let mut resolved = existing;
+    for tail in ancestors.iter().rev() {
+        if let Some(name) = tail.file_name() {
+            resolved.push(name);
+        }
+    }
+    Ok(resolved)
+}
+
 pub fn normalize_rel_path(path: &str) -> Result<String, RuntimeError> {
     let rel_path = Path::new(path);
     if rel_path.is_absolute() {
@@ -1250,6 +1316,53 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_ne!(gen_id, gen_id_2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn edit_executor_rejects_symlink_escape_out_of_workspace() {
+        // P0-20: a symlink inside the whitelisted plugin surface must not
+        // give the agent a write handle to somewhere outside workspace_root.
+        // Concretely: plugins/demo/src/evil -> /tmp/pwned should reject.
+        let outside = TempDir::new().unwrap();
+        let outside_target = outside.path().join("pwned");
+        fs::write(&outside_target, b"outside").unwrap();
+
+        let workspace = TempDir::new().unwrap();
+        let plugin_src = workspace.path().join("plugins/demo/src");
+        fs::create_dir_all(&plugin_src).unwrap();
+        // Place a symlink inside the plugin surface pointing outside.
+        let symlink_at = plugin_src.join("evil");
+        std::os::unix::fs::symlink(&outside_target, &symlink_at).unwrap();
+
+        let mut allowed = BTreeMap::new();
+        allowed.insert("demo".to_string(), "plugins/demo".to_string());
+        let plan = PluginEditPlan {
+            issue_id: "issue-1".to_string(),
+            patch_id: "patch-1".to_string(),
+            summary: "escape".to_string(),
+            operations: vec![PluginEditOperation {
+                path: "plugins/demo/src/evil".to_string(),
+                kind: PluginEditOpKind::ReplaceExact,
+                expected_old_string: Some("outside".to_string()),
+                expected_sha256: None,
+                new_content: Some("pwned".to_string()),
+                pointer: None,
+                dotted_key: None,
+                value: None,
+            }],
+        };
+
+        let executor = PluginEditExecutor::new(workspace.path());
+        let err = executor
+            .execute(&PluginIterationPolicy::default(), &allowed, &plan)
+            .expect_err("symlink escape must be rejected");
+        assert!(
+            err.to_string().contains("escapes workspace root"),
+            "unexpected error: {err}"
+        );
+        // And the symlinked target must remain untouched.
+        assert_eq!(fs::read(&outside_target).unwrap(), b"outside");
     }
 
     #[test]
