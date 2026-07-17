@@ -202,7 +202,12 @@ pub struct LlmApiConfig {
     pub base_url: String,
     #[serde(default = "default_api_key_env")]
     pub api_key_env: String,
-    #[serde(default)]
+    /// Optional literal API key. Loaded from config file (deserialize) but
+    /// P0-25: never serialized back to disk, so session auto-save /
+    /// shutdown-memory snapshots don't leak the key in plaintext. Callers
+    /// that need the key at request time still read `resolve_api_key` which
+    /// falls back to `api_key_env`.
+    #[serde(default, skip_serializing)]
     pub api_key: Option<String>,
     #[serde(default = "default_model")]
     pub model: String,

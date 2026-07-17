@@ -14,11 +14,112 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::io::Read;
+use std::net::{IpAddr, ToSocketAddrs};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
 const TIMEOUT_SECS: u64 = 10;
 const MAX_IMAGE_BYTES: usize = 20 * 1024 * 1024; // 20 MB
+
+// ---------------------------------------------------------------------------
+// SSRF guard (P0-22)
+// ---------------------------------------------------------------------------
+//
+// Duplicated from `fixtures/plugins/web/src/lib.rs` — see P2-2 in the review
+// plan for the plan to extract this into a shared `cordis-plugin-net` util
+// crate. Keep the two in lock-step until the extraction lands.
+
+fn ip_is_forbidden(ip: IpAddr) -> Option<&'static str> {
+    match ip {
+        IpAddr::V4(v4) => {
+            let octets = v4.octets();
+            if v4.is_loopback() {
+                return Some("loopback address");
+            }
+            if v4.is_private() {
+                return Some("RFC1918 private address");
+            }
+            if v4.is_link_local() {
+                return Some("link-local address (cloud metadata surface)");
+            }
+            if v4.is_broadcast() || v4.is_unspecified() || v4.is_multicast() {
+                return Some("special-purpose address");
+            }
+            if octets[0] == 100 && (octets[1] & 0b1100_0000) == 0b0100_0000 {
+                return Some("CGNAT (100.64/10) address");
+            }
+            if octets[0] == 0 {
+                return Some("0.0.0.0/8 address");
+            }
+            None
+        }
+        IpAddr::V6(v6) => {
+            if v6.is_loopback() {
+                return Some("loopback address");
+            }
+            if v6.is_unspecified() || v6.is_multicast() {
+                return Some("special-purpose address");
+            }
+            let seg = v6.segments();
+            if seg[0] == 0
+                && seg[1] == 0
+                && seg[2] == 0
+                && seg[3] == 0
+                && seg[4] == 0
+                && seg[5] == 0xffff
+            {
+                let mapped = std::net::Ipv4Addr::new(
+                    (seg[6] >> 8) as u8,
+                    (seg[6] & 0xff) as u8,
+                    (seg[7] >> 8) as u8,
+                    (seg[7] & 0xff) as u8,
+                );
+                return ip_is_forbidden(IpAddr::V4(mapped));
+            }
+            if (seg[0] & 0xfe00) == 0xfc00 {
+                return Some("IPv6 ULA (fc00::/7)");
+            }
+            if (seg[0] & 0xffc0) == 0xfe80 {
+                return Some("IPv6 link-local (fe80::/10)");
+            }
+            None
+        }
+    }
+}
+
+fn check_url_safety(url_str: &str) -> Result<(), String> {
+    let parsed = url::Url::parse(url_str).map_err(|_| format!("invalid URL: {url_str}"))?;
+    let scheme = parsed.scheme();
+    if scheme != "http" && scheme != "https" {
+        return Err(format!("only http/https allowed, got: {scheme}"));
+    }
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| format!("URL missing host: {url_str}"))?;
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        if let Some(reason) = ip_is_forbidden(ip) {
+            return Err(format!("host {host} is forbidden ({reason})"));
+        }
+        return Ok(());
+    }
+    let addrs = (host, 0u16)
+        .to_socket_addrs()
+        .map_err(|e| format!("DNS resolution failed for {host}: {e}"))?;
+    let mut saw_any = false;
+    for sa in addrs {
+        saw_any = true;
+        if let Some(reason) = ip_is_forbidden(sa.ip()) {
+            return Err(format!(
+                "host {host} resolves to forbidden address {}: {reason}",
+                sa.ip()
+            ));
+        }
+    }
+    if !saw_any {
+        return Err(format!("host {host} did not resolve to any address"));
+    }
+    Ok(())
+}
 
 // ---------------------------------------------------------------------------
 // Request / Response
@@ -65,26 +166,14 @@ struct VisionResponse {
 // ---------------------------------------------------------------------------
 
 fn download_image(url_str: &str) -> Result<Vec<u8>, String> {
-    let parsed =
-        url::Url::parse(url_str).map_err(|_| format!("invalid URL: {url_str}"))?;
-    let scheme = parsed.scheme();
-    if scheme != "http" && scheme != "https" {
-        return Err(format!("only http/https allowed, got: {scheme}"));
-    }
-    if let Some(host) = parsed.host_str() {
-        if host == "localhost" || host == "127.0.0.1" || host == "::1" {
-            return Err("localhost is not allowed".to_string());
-        }
-        if host.starts_with("10.")
-            || host.starts_with("172.16.")
-            || host.starts_with("192.168.")
-        {
-            return Err("private network addresses are not allowed".to_string());
-        }
-    }
+    // P0-22: full SSRF check (see the module-level guard for coverage).
+    // Note: `ureq::AgentBuilder` here does not follow redirects by default
+    // for `.call()`, so a single check on `url_str` covers the wire path.
+    check_url_safety(url_str)?;
 
     let resp = ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(TIMEOUT_SECS))
+        .redirects(0) // block redirects; caller must re-issue if needed
         .build()
         .get(url_str)
         .call()
@@ -141,9 +230,23 @@ fn vision_ocr(url: &str, lang: &str) -> Result<String, String> {
     let data = download_image(url)?;
     let ext = guess_mime(&data);
 
-    // Write to temp file
+    // P0-27: previously `cordis_ocr_<pid>.<ext>` — concurrent callers within
+    // the same process clobber each other's file, so agent A reads agent B's
+    // image. Append a monotonic in-process counter + a nanosecond timestamp
+    // so every filename is unique.
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
     let tmp_dir = std::env::temp_dir();
-    let tmp_path = tmp_dir.join(format!("cordis_ocr_{}.{}", std::process::id(), ext));
+    let tmp_path = tmp_dir.join(format!(
+        "cordis_ocr_{}_{seq:x}_{nanos:x}.{ext}",
+        std::process::id()
+    ));
     std::fs::write(&tmp_path, &data)
         .map_err(|e| format!("write temp file: {e}"))?;
 

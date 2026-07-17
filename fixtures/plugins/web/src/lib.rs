@@ -19,10 +19,125 @@ use cordis_plugin_sdk::{
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::net::{IpAddr, ToSocketAddrs};
 use std::time::Duration;
 
 const TIMEOUT_SECS: u64 = 60;
 const MAX_FETCH_CHARS: usize = 8000;
+
+// ---------------------------------------------------------------------------
+// SSRF guard (P0-22)
+// ---------------------------------------------------------------------------
+
+/// Return an error if `ip` should never be reachable from a fetched URL.
+/// This is the single source of truth used by both the pre-flight URL check
+/// and the redirect-policy hook.
+fn ip_is_forbidden(ip: IpAddr) -> Option<&'static str> {
+    match ip {
+        IpAddr::V4(v4) => {
+            let octets = v4.octets();
+            if v4.is_loopback() {
+                return Some("loopback address");
+            }
+            if v4.is_private() {
+                return Some("RFC1918 private address");
+            }
+            if v4.is_link_local() {
+                return Some("link-local address (cloud metadata surface)");
+            }
+            if v4.is_broadcast() || v4.is_unspecified() || v4.is_multicast() {
+                return Some("special-purpose address");
+            }
+            // CGNAT 100.64.0.0/10 — not covered by is_private.
+            if octets[0] == 100 && (octets[1] & 0b1100_0000) == 0b0100_0000 {
+                return Some("CGNAT (100.64/10) address");
+            }
+            // 0.0.0.0/8 additional guard (is_unspecified is only 0.0.0.0).
+            if octets[0] == 0 {
+                return Some("0.0.0.0/8 address");
+            }
+            None
+        }
+        IpAddr::V6(v6) => {
+            if v6.is_loopback() {
+                return Some("loopback address");
+            }
+            if v6.is_unspecified() || v6.is_multicast() {
+                return Some("special-purpose address");
+            }
+            let seg = v6.segments();
+            // IPv4-mapped IPv6 (::ffff:0:0/96) — unwrap and re-check as v4.
+            if seg[0] == 0
+                && seg[1] == 0
+                && seg[2] == 0
+                && seg[3] == 0
+                && seg[4] == 0
+                && seg[5] == 0xffff
+            {
+                let mapped = std::net::Ipv4Addr::new(
+                    (seg[6] >> 8) as u8,
+                    (seg[6] & 0xff) as u8,
+                    (seg[7] >> 8) as u8,
+                    (seg[7] & 0xff) as u8,
+                );
+                return ip_is_forbidden(IpAddr::V4(mapped));
+            }
+            // ULA fc00::/7
+            if (seg[0] & 0xfe00) == 0xfc00 {
+                return Some("IPv6 ULA (fc00::/7)");
+            }
+            // Link-local fe80::/10
+            if (seg[0] & 0xffc0) == 0xfe80 {
+                return Some("IPv6 link-local (fe80::/10)");
+            }
+            None
+        }
+    }
+}
+
+/// Validate that a URL is safe to fetch: scheme is http(s), the parsed host
+/// literal (if any) is not in a forbidden range, and — for hostnames — DNS
+/// resolves to only allowed addresses. Called both before the initial
+/// request and on every redirect hop.
+fn check_url_safety(url_str: &str) -> Result<(), String> {
+    let parsed = reqwest::Url::parse(url_str)
+        .map_err(|_| format!("invalid URL: {url_str}"))?;
+    let scheme = parsed.scheme();
+    if scheme != "http" && scheme != "https" {
+        return Err(format!("only http/https allowed, got: {scheme}"));
+    }
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| format!("URL missing host: {url_str}"))?;
+
+    // If the host literal is an IP, judge it directly. Otherwise resolve
+    // DNS and reject if any resolved address is forbidden. Uses `ToSocketAddrs`
+    // so we don't need an extra dependency; the port doesn't matter for
+    // resolution.
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        if let Some(reason) = ip_is_forbidden(ip) {
+            return Err(format!("host {host} is forbidden ({reason})"));
+        }
+        return Ok(());
+    }
+    let addrs = (host, 0u16)
+        .to_socket_addrs()
+        .map_err(|e| format!("DNS resolution failed for {host}: {e}"))?;
+    let mut saw_any = false;
+    for sa in addrs {
+        saw_any = true;
+        if let Some(reason) = ip_is_forbidden(sa.ip()) {
+            return Err(format!(
+                "host {host} resolves to forbidden address {}: {reason}",
+                sa.ip()
+            ));
+        }
+    }
+    if !saw_any {
+        return Err(format!("host {host} did not resolve to any address"));
+    }
+    Ok(())
+}
 
 // ---------------------------------------------------------------------------
 // Request / Response
@@ -179,26 +294,31 @@ fn web_search_anthropic(query: &str) -> Result<String, String> {
 // ---------------------------------------------------------------------------
 
 fn web_fetch(url_str: &str) -> Result<(String, bool), String> {
-    let parsed =
-        reqwest::Url::parse(url_str).map_err(|_| format!("invalid URL: {url_str}"))?;
-    let scheme = parsed.scheme();
-    if scheme != "http" && scheme != "https" {
-        return Err(format!("only http/https allowed, got: {scheme}"));
-    }
-    if let Some(host) = parsed.host_str() {
-        if host == "localhost" || host == "127.0.0.1" || host == "::1" {
-            return Err("localhost is not allowed".to_string());
-        }
-        if host.starts_with("10.")
-            || host.starts_with("172.16.")
-            || host.starts_with("192.168.")
-        {
-            return Err("private network addresses are not allowed".to_string());
-        }
-    }
+    // P0-22: comprehensive SSRF guard. Applied at URL time and again after
+    // DNS resolution, and re-applied on every redirect hop via a custom
+    // redirect policy. Blocks:
+    //   - loopback / private RFC1918 / CGNAT (100.64/10)
+    //   - link-local + cloud metadata endpoint (169.254.169.254 lives here)
+    //   - "unspecified" (0.0.0.0/8)
+    //   - IPv6 ULA (fc00::/7), link-local (fe80::/10), loopback (::1),
+    //     IPv4-mapped IPv6 (::ffff:127.0.0.1 style)
+    //   - hosts whose DNS resolves to any of the above (DNS rebinding)
+    // The previous string-prefix filter missed 172.17.0.0/12 (Docker
+    // bridge), 169.254.169.254 (metadata), IPv6 ULA/link-local, and had no
+    // DNS-based check at all.
+    check_url_safety(url_str)?;
 
     let client = Client::builder()
         .timeout(Duration::from_secs(TIMEOUT_SECS))
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.previous().len() >= 10 {
+                return attempt.error("too many redirects");
+            }
+            if let Err(msg) = check_url_safety(attempt.url().as_str()) {
+                return attempt.error(msg);
+            }
+            attempt.follow()
+        }))
         .build()
         .map_err(|e| format!("build HTTP client: {e}"))?;
 
@@ -390,4 +510,45 @@ export_plugin_api! {
     abi_fingerprint = abi_fingerprint_value(),
     docs = docs_value(),
     handle = api_handle,
+}
+
+#[cfg(test)]
+mod ssrf_tests {
+    use super::{ip_is_forbidden, IpAddr};
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    #[test]
+    fn rfc1918_and_metadata_and_docker_bridges_are_blocked() {
+        assert!(ip_is_forbidden(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))).is_some());
+        assert!(ip_is_forbidden(IpAddr::V4(Ipv4Addr::new(10, 1, 2, 3))).is_some());
+        assert!(ip_is_forbidden(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1))).is_some());
+        // Docker default bridge — used to slip through 172.16 prefix filter.
+        assert!(ip_is_forbidden(IpAddr::V4(Ipv4Addr::new(172, 20, 0, 1))).is_some());
+        // Cloud metadata endpoint (169.254/16).
+        assert!(ip_is_forbidden(IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254))).is_some());
+        // 0.0.0.0/8.
+        assert!(ip_is_forbidden(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 1))).is_some());
+        // CGNAT 100.64/10.
+        assert!(ip_is_forbidden(IpAddr::V4(Ipv4Addr::new(100, 64, 1, 1))).is_some());
+    }
+
+    #[test]
+    fn ipv6_loopback_ula_linklocal_are_blocked() {
+        assert!(ip_is_forbidden(IpAddr::V6(Ipv6Addr::LOCALHOST)).is_some());
+        // ULA.
+        assert!(ip_is_forbidden(IpAddr::V6(Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 1))).is_some());
+        // Link-local.
+        assert!(ip_is_forbidden(IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1))).is_some());
+        // IPv4-mapped IPv6 pointing at loopback.
+        assert!(
+            ip_is_forbidden(IpAddr::V6("::ffff:127.0.0.1".parse().unwrap())).is_some(),
+            "IPv4-mapped loopback must round-trip through ip_is_forbidden"
+        );
+    }
+
+    #[test]
+    fn public_ips_are_allowed() {
+        assert!(ip_is_forbidden(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))).is_none());
+        assert!(ip_is_forbidden(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))).is_none());
+    }
 }

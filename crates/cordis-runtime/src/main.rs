@@ -889,9 +889,16 @@ fn emit_invoke_response(payload: &str) -> Result<(), Box<dyn std::error::Error>>
     Ok(())
 }
 
-/// Save the current git diff as a draft patch in `.cordis-drafts/`, then
-/// revert all modified and untracked files under `plugins/`.  Used both by
-/// agent-error recovery and by the Ctrl+C handler.
+/// Save the current git diff (tracked *and* untracked) as a draft patch in
+/// `.cordis-drafts/`, then revert modified files. Untracked files are moved
+/// into `.cordis-drafts/untracked-<ts>-<reason>/` rather than deleted (P0-26).
+///
+/// Previous behaviour ran `git clean -fd -- plugins/` unconditionally, which
+/// deleted every untracked file under `plugins/` on every agent-error path.
+/// Users editing a brand-new plugin file that hadn't been `git add`ed yet
+/// lost that work on the first error the agent produced. The new flow
+/// preserves untracked files under `.cordis-drafts/` and never runs
+/// `git clean` outright.
 fn save_draft_and_revert(fixtures_root: &Path, reason: &str) -> Option<String> {
     let draft_dir = fixtures_root.join(".cordis-drafts");
     let _ = std::fs::create_dir_all(&draft_dir);
@@ -900,31 +907,68 @@ fn save_draft_and_revert(fixtures_root: &Path, reason: &str) -> Option<String> {
         .unwrap_or_default()
         .as_secs();
     let draft_path = draft_dir.join(format!("draft-{ts}-{reason}.patch"));
-    let diff = std::process::Command::new("sh")
-        .arg("-c")
-        .arg("git diff -- plugins/ 2>/dev/null")
+
+    // 1. Snapshot tracked changes (git diff of tracked files).
+    let diff = std::process::Command::new("git")
+        .args(["diff", "--", "plugins/"])
         .current_dir(fixtures_root)
         .output()
         .ok()?;
-    let patch = String::from_utf8_lossy(&diff.stdout);
-    if patch.trim().is_empty() {
+    let patch = String::from_utf8_lossy(&diff.stdout).into_owned();
+
+    // 2. Snapshot untracked file *names* under plugins/ (so we can preserve them).
+    let untracked = std::process::Command::new("git")
+        .args([
+            "ls-files",
+            "--others",
+            "--exclude-standard",
+            "--",
+            "plugins/",
+        ])
+        .current_dir(fixtures_root)
+        .output()
+        .ok()?;
+    let untracked_paths: Vec<String> = String::from_utf8_lossy(&untracked.stdout)
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| l.to_string())
+        .collect();
+
+    if patch.trim().is_empty() && untracked_paths.is_empty() {
         return None;
     }
-    std::fs::write(&draft_path, patch.as_bytes()).ok()?;
-    // Revert modified files and remove untracked files.
-    let _ = std::process::Command::new("sh")
-        .arg("-c")
-        .arg("git checkout -- plugins/ 2>/dev/null")
+
+    // 3. Persist the tracked diff, if any.
+    if !patch.trim().is_empty() {
+        std::fs::write(&draft_path, patch.as_bytes()).ok()?;
+    }
+
+    // 4. Preserve untracked files by moving them (not deleting) into the
+    //    draft dir. If the move fails, LEAVE the file in place rather than
+    //    deleting it — losing user work is worse than a slightly noisy
+    //    working tree.
+    if !untracked_paths.is_empty() {
+        let stash_root = draft_dir.join(format!("untracked-{ts}-{reason}"));
+        let _ = std::fs::create_dir_all(&stash_root);
+        for rel in &untracked_paths {
+            let src = fixtures_root.join(rel);
+            let dest = stash_root.join(rel);
+            if let Some(parent) = dest.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::rename(&src, &dest);
+        }
+    }
+
+    // 5. Revert tracked modifications only. NEVER `git clean -fd` — that
+    //    would clobber untracked files (see above) and any directory the
+    //    user just created.
+    let _ = std::process::Command::new("git")
+        .args(["checkout", "--", "plugins/"])
         .current_dir(fixtures_root)
         .output();
-    let _ = std::process::Command::new("sh")
-        .arg("-c")
-        .arg("git clean -fd -- plugins/ 2>/dev/null")
-        .current_dir(fixtures_root)
-        .output();
-    Some(format!(
-        ".cordis-drafts/draft-{ts}-{reason}.patch"
-    ))
+
+    Some(format!(".cordis-drafts/draft-{ts}-{reason}.patch"))
 }
 
 /// Handle `/node_fqn args...` or `/ShellCommand args...` shortcuts in agent chat.
