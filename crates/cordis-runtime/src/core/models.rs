@@ -48,6 +48,14 @@ pub struct CordisMetadata {
     /// Optional declared nodes for contract-level checks.
     #[serde(default)]
     pub declared_nodes: Vec<String>,
+    /// P1-48: opt-in to allow the runtime to synthesise a docs stub when
+    /// `docs/agent/interfaces.json` is missing. Previously ANY dylib
+    /// plugin could skip the docs contract just by declaring
+    /// `crate-type=["dylib"]`. Now the plugin author must explicitly say
+    /// `allow_generated_docs = true` in `[package.metadata.cordis]` —
+    /// defaulting to false keeps drift discoverable.
+    #[serde(default)]
+    pub allow_generated_docs: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

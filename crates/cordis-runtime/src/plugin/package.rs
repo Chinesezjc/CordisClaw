@@ -146,6 +146,38 @@ impl PackageResolver {
             self.visit_plugin(&member_dir, None, true, BTreeSet::new(), &mut state)?;
         }
 
+        // P1-49: detect crate-name collisions caused by `normalize_crate_name`
+        // collapsing `-`, `/`, `.` to `_`. Two plugin paths like `foo-bar` and
+        // `foo_bar`, or `a/b` and `a-b`, would produce the same crate name;
+        // cargo would then fail with a hard-to-diagnose duplicate. Surface it
+        // early with a clear error listing the conflicting plugin paths.
+        {
+            let mut by_crate_name: HashMap<String, Vec<String>> = HashMap::new();
+            for plugin_path in state.plugins.keys() {
+                by_crate_name
+                    .entry(normalize_crate_name(plugin_path))
+                    .or_default()
+                    .push(plugin_path.clone());
+            }
+            let mut conflicts: Vec<(String, Vec<String>)> = by_crate_name
+                .into_iter()
+                .filter(|(_, paths)| paths.len() > 1)
+                .collect();
+            conflicts.sort_by(|a, b| a.0.cmp(&b.0));
+            if let Some((crate_name, paths)) = conflicts.into_iter().next() {
+                let mut sorted_paths = paths;
+                sorted_paths.sort();
+                return Err(RuntimeError::Invariant {
+                    message: format!(
+                        "plugin crate name collision: `{}` is produced by multiple plugin paths [{}]; \
+                         rename one of them so their normalised crate names differ",
+                        crate_name,
+                        sorted_paths.join(", ")
+                    ),
+                });
+            }
+        }
+
         Ok(ResolvedPluginGraph {
             plugins: state.plugins,
             children: state.children,
@@ -211,11 +243,17 @@ impl PackageResolver {
             });
         }
 
-        let generated_agent_docs_allowed = plugin_toml.lib.as_ref().is_some_and(|lib| {
-            lib.crate_type
-                .iter()
-                .any(|crate_type| crate_type == "dylib")
-        });
+        // P1-48: `crate-type=["dylib"]` alone no longer grants a docs
+        // bypass. The plugin author must explicitly opt in via
+        // `allow_generated_docs = true` in
+        // `[package.metadata.cordis]` — pairing an opt-in with the
+        // dylib-only surface keeps unintentional bypass detectable.
+        let generated_agent_docs_allowed = metadata.allow_generated_docs
+            && plugin_toml.lib.as_ref().is_some_and(|lib| {
+                lib.crate_type
+                    .iter()
+                    .any(|crate_type| crate_type == "dylib")
+            });
 
         // Hard scaffold checks keep plugin projects uniform for both humans and agents.
         self.validate_scaffold(&metadata.plugin_path, dir, generated_agent_docs_allowed)?;

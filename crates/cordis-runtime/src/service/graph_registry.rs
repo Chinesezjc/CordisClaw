@@ -476,12 +476,22 @@ fn topo_levels(
     if !unresolved.is_empty() {
         diagnostics.push(format!(
             "cycle-like dependencies detected among: {}",
-            unresolved.into_iter().collect::<Vec<_>>().join(", ")
+            unresolved.iter().cloned().collect::<Vec<_>>().join(", ")
         ));
     }
 
     for node_id in node_ids {
-        levels.entry(node_id).or_insert(0);
+        // P1-51: cycle-participants used to fall through to `or_insert(0)`,
+        // which made them indistinguishable from real roots in downstream
+        // consumers (HTML render, engine ordering). Give them a distinct
+        // sentinel — `usize::MAX` — so callers can filter or highlight
+        // them, and the sort in `build_execution_net` puts them last.
+        let default_level = if unresolved.contains(&node_id) {
+            usize::MAX
+        } else {
+            0
+        };
+        levels.entry(node_id).or_insert(default_level);
     }
 
     levels
