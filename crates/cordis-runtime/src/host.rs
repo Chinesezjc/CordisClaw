@@ -1117,6 +1117,22 @@ impl RuntimeHost {
             interactive_rollback,
         };
         host.detect_crash_and_recover();
+        // P0-6: recover from a crashed plugin-iteration by replaying the
+        // durable rollback journal. Done AFTER the initial snapshot is built
+        // but before any user request lands. Errors are logged and the
+        // orphan journal is left on disk for operator inspection rather than
+        // panicking `boot`.
+        if let Err(err) = restore_plugin_iteration_workspace(
+            &host.fixtures_root,
+            &host.snapshot_root,
+            None,
+        ) {
+            eprintln!(
+                "[plugin-iteration-recovery] boot-time restore failed: {err}; \
+                 journal preserved at {}",
+                plugin_iteration_journal_path(&host.snapshot_root).display()
+            );
+        }
         Ok(host)
     }
 
@@ -2537,13 +2553,53 @@ export_plugin_api! {{
             // Step 3: Rebuild the target plugin only.
             if state.stage_error.is_none() {
                 let plugin_path = format!("/{}", state.prepared.root_plugin_path);
-                match rebuild_plugin_workspace(&self.fixtures_root, &plugin_path) {
-                    Ok(rebuilt) => {
-                        state.rebuilt_artifacts = rebuilt;
+                // P0-8: capture the current `.so` before rebuild so rollback
+                // reverts BOTH source and compiled artifact. Otherwise
+                // source-code rollback runs but the new `.so` stays on disk,
+                // producing silent behaviour drift on the next run.
+                if let Some(rollback) = state.rollback.as_mut() {
+                    let artifact_backup = artifact_paths_to_backup(
+                        &self.fixtures_root,
+                        &state.prepared.root_plugin_path,
+                    );
+                    for (rel_path, abs_path) in &artifact_backup {
+                        let original = fs::read(abs_path).ok();
+                        let single =
+                            crate::kernel::plugin_iteration::PluginEditRollback::single_backup(
+                                self.fixtures_root.clone(),
+                                rel_path,
+                                original,
+                            );
+                        if let Err(err) = rollback.absorb(single) {
+                            self.observe_plugin_iteration_failure(&state.prepared, "rebuild", &err);
+                            state.stage_error = Some(err.to_string());
+                            break;
+                        }
                     }
-                    Err(err) => {
-                        self.observe_plugin_iteration_failure(&state.prepared, "rebuild", &err);
-                        state.stage_error = Some(err.to_string());
+                }
+                if state.stage_error.is_none() {
+                    // Re-persist the journal now that artifact backups landed
+                    // in the rollback; otherwise a crash after rebuild would
+                    // leave the artifact rollback-able only in memory.
+                    if let Some(rollback) = state.rollback.as_ref() {
+                        if let Err(err) = rollback.persist_journal(
+                            &plugin_iteration_journal_path(&self.snapshot_root),
+                            &state.prepared.iteration_id,
+                        ) {
+                            self.observe_plugin_iteration_failure(&state.prepared, "rebuild", &err);
+                            state.stage_error = Some(err.to_string());
+                        }
+                    }
+                }
+                if state.stage_error.is_none() {
+                    match rebuild_plugin_workspace(&self.fixtures_root, &plugin_path) {
+                        Ok(rebuilt) => {
+                            state.rebuilt_artifacts = rebuilt;
+                        }
+                        Err(err) => {
+                            self.observe_plugin_iteration_failure(&state.prepared, "rebuild", &err);
+                            state.stage_error = Some(err.to_string());
+                        }
                     }
                 }
             }
@@ -5530,10 +5586,34 @@ fn plugin_iteration_journal_path(snapshot_root: &Path) -> PathBuf {
     snapshot_root.join("plugin-iteration-edit-journal.json")
 }
 
+/// P0-8: compute the artifact `.so` paths that a rebuild for `plugin_path`
+/// would overwrite. Returned as (rel-to-fixtures-root, absolute) pairs so the
+/// rollback recorder can save the current bytes before rebuild replaces them.
+///
+/// Currently only the direct `artifacts/{name}.so` produced by
+/// `rebuild_plugin_workspace` is captured — nested-plugin rebuild is handled
+/// via a separate helper if/when that path lands.
+fn artifact_paths_to_backup(fixtures_root: &Path, root_plugin_path: &str) -> Vec<(String, PathBuf)> {
+    let name = root_plugin_path.trim_start_matches('/');
+    if name.is_empty() {
+        return Vec::new();
+    }
+    let rel = format!("artifacts/{}.so", name);
+    let abs = fixtures_root.join(&rel);
+    if !abs.exists() {
+        return Vec::new();
+    }
+    vec![(rel, abs)]
+}
+
 fn clear_plugin_iteration_journal(snapshot_root: &Path) -> Result<(), RuntimeError> {
     crate::kernel::plugin_iteration::PluginEditRollback::clear_journal(
         &plugin_iteration_journal_path(snapshot_root),
     )
+}
+
+fn plugin_iteration_applied_marker_path(snapshot_root: &Path) -> PathBuf {
+    snapshot_root.join("plugin-iteration-edit-journal.applied")
 }
 
 fn restore_plugin_iteration_workspace(
@@ -5542,13 +5622,49 @@ fn restore_plugin_iteration_workspace(
     in_memory_rollback: Option<&crate::kernel::plugin_iteration::PluginEditRollback>,
 ) -> Result<bool, RuntimeError> {
     let journal_path = plugin_iteration_journal_path(snapshot_root);
+    let applied_marker = plugin_iteration_applied_marker_path(snapshot_root);
+
+    // P0-7: if the journal was already applied in a previous call, skip.
+    // The applied-marker records the generation id we successfully restored;
+    // if the journal on disk still carries the same id, we've already done
+    // this work — replaying it would revert source that has since been
+    // legitimately touched (or fail loudly on a moved file).
+    if journal_path.exists() && applied_marker.exists() {
+        let journal_gen = crate::kernel::plugin_iteration::PluginEditRollback::journal_generation_id(&journal_path)?;
+        let applied_gen = fs::read_to_string(&applied_marker).ok();
+        if let (Some(j), Some(a)) = (journal_gen.as_deref(), applied_gen.as_deref()) {
+            if j.trim() == a.trim() {
+                // Already applied — treat as if there is nothing to restore.
+                let _ = fs::remove_file(&applied_marker);
+                crate::kernel::plugin_iteration::PluginEditRollback::clear_journal(&journal_path)?;
+                return Ok(false);
+            }
+        }
+    }
+
     if let Some(rollback) = crate::kernel::plugin_iteration::PluginEditRollback::load_journal(
         fixtures_root,
         &journal_path,
     )? {
+        let generation_id = crate::kernel::plugin_iteration::PluginEditRollback::journal_generation_id(&journal_path)?;
         rollback.rollback()?;
+        // Persist the applied marker BEFORE clearing the journal. If we crash
+        // between rollback and clear, next boot sees marker + journal with the
+        // same id → skips the replay.
+        if let Some(id) = generation_id {
+            if let Err(err) = crate::kernel::plugin_iteration::atomic_write(
+                &applied_marker,
+                id.as_bytes(),
+            ) {
+                eprintln!(
+                    "[plugin-iteration-recovery] failed to write applied marker at {}: {err}",
+                    applied_marker.display()
+                );
+            }
+        }
         rebuild_plugin_workspace(fixtures_root, "/")?;
         crate::kernel::plugin_iteration::PluginEditRollback::clear_journal(&journal_path)?;
+        let _ = fs::remove_file(&applied_marker);
         return Ok(true);
     }
 

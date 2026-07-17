@@ -189,6 +189,13 @@ Agent 现在可以自主完成：读代码 → 理解结构 → 写/改文件 �
 - [x] **Verify/Promote TOCTOU**（P0-3）— `VerificationReport.source_tree_hash` 记录 verify 时的 sha256；`finalize_plugin_iteration` 在 `promote_candidate` 前重算并比对，不匹配则强制 rollback。
 - [x] **Plugin verifier 目标错位**（P0-4）— `verify_plugin_iteration` 传入 `VerifyOptions::candidate_invoker`，`plugin:` 命令走 staged candidate snapshot 而非 live registry。
 
+### 5.2.2 Rollback / Journal 硬化（2026-07-17 已闭合）
+
+- [x] **写入前先备份**（P0-5）— `PluginEditExecutor::execute` 现在先把 `AppliedEditBackup` 推入 rollback，再调用 `atomic_write`；写入失败时本函数内立即 `rollback.rollback()` 并把错误上抛，工作树无残留。
+- [x] **Rollback journal 持久化**（P0-6）— `persist_journal` 走 `<path>.cordis-tmp` + `sync_all` + rename；`RuntimeHost::boot` 在初始 snapshot 构建后自动调 `restore_plugin_iteration_workspace` 扫描 `plugin-iteration-edit-journal.json`，重放尚未清理的 rollback。
+- [x] **Restore 幂等**（P0-7）— journal 头新增 `rollback_generation_id`；成功 restore 后写 sibling `.applied` marker（同样 atomic）。下次 boot 若 journal 与 marker 的 generation id 一致，跳过重放，避免二次 rollback 已恢复的源码。
+- [x] **Artifact 参与 rollback**（P0-8）— `iterate_plugins` 在 `rebuild_plugin_workspace` 之前把即将被覆盖的 `artifacts/{plugin}.so` 备份进 rollback，并 re-persist journal。发生 rollback 时源码与编译产物一并回退，避免"source 回退但新 `.so` 留在盘上"的行为漂移。
+
 ### 5.3 工作流运行时适配层
 
 - [ ] 实现 `WorkflowRuntime` trait，桥接到 `execute_net`、Router、Context 系统

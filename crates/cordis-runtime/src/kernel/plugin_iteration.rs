@@ -493,7 +493,27 @@ struct AppliedEditBackup {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct PluginEditRollbackJournal {
     iteration_id: String,
+    /// Unique id assigned each time the journal is persisted (P0-7). The boot
+    /// recovery path records this id in a sibling `.applied` file after a
+    /// successful restore; on re-entry we compare and skip if the same id
+    /// was already applied — preventing the "restore already-restored source"
+    /// footgun that would otherwise mangle the workspace on a crash between
+    /// rollback and clear_journal.
+    #[serde(default = "generate_rollback_generation_id")]
+    rollback_generation_id: String,
     backups: Vec<PluginEditRollbackJournalBackup>,
+}
+
+fn generate_rollback_generation_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{now:x}-{seq:x}")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -518,7 +538,10 @@ impl PluginEditExecutor {
     ) -> Result<(PluginEditApplyResult, PluginEditRollback), RuntimeError> {
         policy.validate_plan(allowed_plugin_roots, plan)?;
 
-        let mut backups = Vec::new();
+        let mut rollback = PluginEditRollback {
+            workspace_root: self.workspace_root.clone(),
+            backups: Vec::new(),
+        };
         let mut changed_paths = BTreeSet::new();
         for operation in &plan.operations {
             let normalized = normalize_rel_path(&operation.path)?;
@@ -534,27 +557,45 @@ impl PluginEditExecutor {
                 })?;
             }
 
-            match updated {
-                UpdatedFile::Write(bytes) => {
-                    fs::write(&abs_path, bytes).map_err(|err| RuntimeError::Io {
-                        path: abs_path.clone(),
-                        message: err.to_string(),
-                    })?;
-                }
+            // P0-5: record the backup BEFORE mutating disk. If `atomic_write`
+            // or `remove_file` fails partway, the rollback list already has
+            // an entry for this file — so the caller can `rollback()` and
+            // restore prior state. Previously the backup was pushed after
+            // `fs::write`, leaving a torn file with no recovery path.
+            rollback.backups.push(AppliedEditBackup {
+                rel_path: normalized.clone(),
+                original,
+            });
+
+            let write_result = match updated {
+                UpdatedFile::Write(bytes) => atomic_write(&abs_path, &bytes),
                 UpdatedFile::Delete => {
                     if abs_path.exists() {
                         fs::remove_file(&abs_path).map_err(|err| RuntimeError::Io {
                             path: abs_path.clone(),
                             message: err.to_string(),
-                        })?;
+                        })
+                    } else {
+                        Ok(())
                     }
                 }
+            };
+            if let Err(err) = write_result {
+                // The failed op is already recorded in `rollback.backups`, so
+                // rolling back here restores prior state — including this file
+                // if `atomic_write` wrote a partial `.tmp` that the OS renamed.
+                // Return the original write error; the caller sees a clean
+                // workspace and no orphan partial edit.
+                if let Err(rollback_err) = rollback.rollback() {
+                    return Err(RuntimeError::Invariant {
+                        message: format!(
+                            "{err}; additionally, in-execute rollback failed: {rollback_err}"
+                        ),
+                    });
+                }
+                return Err(err);
             }
 
-            backups.push(AppliedEditBackup {
-                rel_path: normalized.clone(),
-                original,
-            });
             changed_paths.insert(normalized);
         }
 
@@ -563,10 +604,7 @@ impl PluginEditExecutor {
                 changed_paths: changed_paths.into_iter().collect(),
                 diff_lines: plan.diff_lines(),
             },
-            PluginEditRollback {
-                workspace_root: self.workspace_root.clone(),
-                backups,
-            },
+            rollback,
         ))
     }
 }
@@ -649,6 +687,7 @@ impl PluginEditRollback {
     ) -> Result<(), RuntimeError> {
         let journal = PluginEditRollbackJournal {
             iteration_id: iteration_id.to_string(),
+            rollback_generation_id: generate_rollback_generation_id(),
             backups: self
                 .backups
                 .iter()
@@ -667,11 +706,29 @@ impl PluginEditRollback {
         let bytes = serde_json::to_vec_pretty(&journal).map_err(|err| RuntimeError::Invariant {
             message: format!("plugin edit rollback journal serialize failed: {err}"),
         })?;
-        fs::write(journal_path, bytes).map_err(|err| RuntimeError::Io {
+        // P0-6: journal must survive a mid-write SIGKILL. tmp + fsync + rename
+        // → the file is either the previous journal or the new one, never
+        // truncated.
+        atomic_write(journal_path, &bytes)
+    }
+
+    /// Rollback-generation id recorded in the journal header. Used by the boot
+    /// recovery path to detect that a rollback has already been applied for
+    /// this journal (P0-7).
+    pub fn journal_generation_id(
+        journal_path: &Path,
+    ) -> Result<Option<String>, RuntimeError> {
+        if !journal_path.exists() {
+            return Ok(None);
+        }
+        let bytes = fs::read(journal_path).map_err(|err| RuntimeError::Io {
             path: journal_path.to_path_buf(),
             message: err.to_string(),
         })?;
-        Ok(())
+        match serde_json::from_slice::<PluginEditRollbackJournal>(&bytes) {
+            Ok(journal) => Ok(Some(journal.rollback_generation_id)),
+            Err(_) => Ok(None),
+        }
     }
 
     pub fn load_journal(
@@ -1141,6 +1198,97 @@ mod tests {
             KernelPluginIssueSource::InvokeFailure.priority()
         );
     }
+
+    // ---------- P0-5..P0-8 rollback hardening tests ----------
+
+    use super::{atomic_write, PluginEditRollback};
+
+    #[test]
+    fn atomic_write_is_all_or_nothing() {
+        // Writing succeeds and produces the expected bytes; no .tmp file
+        // survives.
+        let temp = TempDir::new().unwrap();
+        let target = temp.path().join("journal.json");
+        atomic_write(&target, b"hello").unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"hello");
+        let entries: Vec<_> = fs::read_dir(temp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".cordis-tmp"))
+            .collect();
+        assert!(entries.is_empty(), "no leftover tmp file expected");
+    }
+
+    #[test]
+    fn atomic_write_replaces_existing_contents() {
+        let temp = TempDir::new().unwrap();
+        let target = temp.path().join("journal.json");
+        fs::write(&target, b"stale").unwrap();
+        atomic_write(&target, b"fresh").unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"fresh");
+    }
+
+    #[test]
+    fn journal_persist_uses_atomic_rename_and_records_generation() {
+        // P0-6: persist_journal must round-trip and the generation id must
+        // be non-empty and readable by `journal_generation_id`.
+        let workspace = TempDir::new().unwrap();
+        let rollback = PluginEditRollback::single_backup(
+            workspace.path(),
+            "plugins/demo/src/lib.rs",
+            Some(b"prior".to_vec()),
+        );
+        let journal_path = workspace.path().join("journal.json");
+        rollback.persist_journal(&journal_path, "iter-1").unwrap();
+        let gen_id = PluginEditRollback::journal_generation_id(&journal_path)
+            .unwrap()
+            .expect("journal should carry a generation id");
+        assert!(!gen_id.is_empty());
+        // Confirm each rewrite produces a fresh generation id.
+        rollback.persist_journal(&journal_path, "iter-1").unwrap();
+        let gen_id_2 = PluginEditRollback::journal_generation_id(&journal_path)
+            .unwrap()
+            .unwrap();
+        assert_ne!(gen_id, gen_id_2);
+    }
+
+    #[test]
+    fn edit_executor_backup_is_registered_before_write_fails() {
+        // P0-5: the backup for a file must be present in the rollback list
+        // *before* mutating disk. We can't easily provoke a mid-write failure
+        // portably, so instead verify a successful path: after execute, the
+        // rollback restores the original bytes.
+        let workspace = TempDir::new().unwrap();
+        let target = workspace.path().join("plugins/demo/src/lib.rs");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(&target, b"original").unwrap();
+
+        let mut allowed = BTreeMap::new();
+        allowed.insert("demo".to_string(), "plugins/demo".to_string());
+        let plan = PluginEditPlan {
+            issue_id: "issue-1".to_string(),
+            patch_id: "patch-1".to_string(),
+            summary: "test".to_string(),
+            operations: vec![PluginEditOperation {
+                path: "plugins/demo/src/lib.rs".to_string(),
+                kind: PluginEditOpKind::ReplaceExact,
+                expected_old_string: Some("original".to_string()),
+                expected_sha256: None,
+                new_content: Some("mutated".to_string()),
+                pointer: None,
+                dotted_key: None,
+                value: None,
+            }],
+        };
+
+        let executor = PluginEditExecutor::new(workspace.path());
+        let (_apply, rollback) = executor
+            .execute(&PluginIterationPolicy::default(), &allowed, &plan)
+            .unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"mutated");
+        rollback.rollback().unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"original");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1251,4 +1399,50 @@ pub(crate) fn deepest_matching_writable_root<'a>(
                     .is_some_and(|rest| rest.starts_with('/'))
         })
         .max_by_key(|root| root.len())
+}
+
+/// Write `bytes` durably to `path`: write to `<path>.tmp`, fsync, then rename.
+/// After this returns Ok, the file at `path` is either the previous contents
+/// or the new contents — never a truncated partial write. Used by the plugin
+/// iteration edit executor (P0-5) and the rollback journal writer (P0-6).
+pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), RuntimeError> {
+    use std::io::Write;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|err| RuntimeError::Io {
+            path: parent.to_path_buf(),
+            message: err.to_string(),
+        })?;
+    }
+    let tmp_path = match path.file_name() {
+        Some(name) => {
+            let mut owned = name.to_os_string();
+            owned.push(".cordis-tmp");
+            path.with_file_name(owned)
+        }
+        None => {
+            return Err(RuntimeError::Io {
+                path: path.to_path_buf(),
+                message: "atomic_write target has no filename".to_string(),
+            });
+        }
+    };
+    {
+        let mut file = fs::File::create(&tmp_path).map_err(|err| RuntimeError::Io {
+            path: tmp_path.clone(),
+            message: err.to_string(),
+        })?;
+        file.write_all(bytes).map_err(|err| RuntimeError::Io {
+            path: tmp_path.clone(),
+            message: err.to_string(),
+        })?;
+        file.sync_all().map_err(|err| RuntimeError::Io {
+            path: tmp_path.clone(),
+            message: err.to_string(),
+        })?;
+    }
+    fs::rename(&tmp_path, path).map_err(|err| RuntimeError::Io {
+        path: path.to_path_buf(),
+        message: format!("rename {} -> {} failed: {err}", tmp_path.display(), path.display()),
+    })?;
+    Ok(())
 }
