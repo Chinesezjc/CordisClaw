@@ -479,10 +479,26 @@ impl AgentToolHost for RuntimeHost {
 
     fn agent_run_command(&self, command: &str) -> Result<Value, RuntimeError> {
         self.check_sensitive_command(command)?;
+        // P0-17: previously `sh -c command` — the whole string went through a
+        // shell, so `; rm -rf ~`, `` `curl x|sh` ``, `$(...)`, redirections
+        // and pipes all executed. Tokenise via shell_words (POSIX quoting,
+        // no expansion) and dispatch argv[0] directly with `Command::new`.
+        // Anything shell-meta-y ends up as a literal argv element that the
+        // target program either doesn't recognise or treats as data.
         use std::process::Command;
-        let output = Command::new("sh")
-            .arg("-c")
-            .arg(command)
+        let argv = shell_words::split(command).map_err(|err| RuntimeError::InvalidArgument {
+            message: format!("run_command tokenisation failed: {err}"),
+        })?;
+        let (program, args) = argv.split_first().ok_or_else(|| RuntimeError::InvalidArgument {
+            message: "run_command received an empty command string".to_string(),
+        })?;
+        if program.is_empty() {
+            return Err(RuntimeError::InvalidArgument {
+                message: "run_command program was empty after tokenisation".to_string(),
+            });
+        }
+        let output = Command::new(program)
+            .args(args)
             .current_dir(self.fixtures_root())
             .output()
             .map_err(|err| RuntimeError::Io {

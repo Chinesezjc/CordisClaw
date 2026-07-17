@@ -41,22 +41,68 @@ fn write_root() -> PathBuf {
     base_dir().join("fixtures").join("plugins")
 }
 
+/// Canonicalise a candidate path for whitelist matching. If the path exists
+/// we canonicalise it directly (following symlinks). If it does not exist —
+/// which is normal for writes to fresh files — we canonicalise the deepest
+/// existing ancestor and re-attach the remaining components. Any failure
+/// yields None so callers fail closed rather than silently falling back to
+/// the un-normalised path (the P0-19 bug: `../../etc/shadow` on a
+/// non-existent target used to slip through `starts_with` because the raw
+/// joined path still started with the whitelist root).
+fn canonicalise_for_whitelist(path: &Path) -> Option<PathBuf> {
+    if let Ok(canonical) = path.canonicalize() {
+        return Some(canonical);
+    }
+    // Walk up to find the deepest existing ancestor.
+    let mut ancestors: Vec<&Path> = Vec::new();
+    let mut current = path;
+    loop {
+        if current.exists() {
+            break;
+        }
+        match current.parent() {
+            Some(parent) => {
+                ancestors.push(current);
+                current = parent;
+            }
+            None => return None,
+        }
+    }
+    let mut resolved = current.canonicalize().ok()?;
+    for tail in ancestors.iter().rev() {
+        if let Some(name) = tail.file_name() {
+            resolved.push(name);
+        }
+    }
+    Some(resolved)
+}
+
 fn is_allowed_read(path: &Path) -> bool {
-    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let Some(canonical) = canonicalise_for_whitelist(path) else {
+        return false;
+    };
     for root in &read_roots() {
-        let canon_root = root.canonicalize().unwrap_or_else(|_| root.clone());
+        let Ok(canon_root) = root.canonicalize() else {
+            continue;
+        };
         if canonical.starts_with(&canon_root) {
             return true;
         }
     }
     // Also allow paths relative to the fixtures root.
-    let base = base_dir().canonicalize().unwrap_or_else(|_| base_dir());
+    let Ok(base) = base_dir().canonicalize() else {
+        return false;
+    };
     canonical.starts_with(&base)
 }
 
 fn is_allowed_write(path: &Path) -> bool {
-    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    let canon_write = write_root().canonicalize().unwrap_or_else(|_| write_root());
+    let Some(canonical) = canonicalise_for_whitelist(path) else {
+        return false;
+    };
+    let Ok(canon_write) = write_root().canonicalize() else {
+        return false;
+    };
     canonical.starts_with(&canon_write)
 }
 
