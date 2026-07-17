@@ -172,12 +172,19 @@ fn stage_process_command(
         message: e.to_string(),
     })?;
 
-    let normalized_target = target_parent
-        .canonicalize()
-        .unwrap_or_else(|_| target_parent.to_path_buf());
-    let normalized_root = staged_root
-        .canonicalize()
-        .unwrap_or_else(|_| staged_root.to_path_buf());
+    // P2-22: canonicalise both sides symmetrically. If one side succeeds
+    // canonicalising (resolves symlinks) and the other doesn't, the
+    // `starts_with` check would false-positive (e.g. after symlink
+    // resolution `normalized_target` might drop a `..` segment that
+    // still exists in the un-resolved `staged_root`). If either side
+    // fails to canonicalise, fall through to the original path on
+    // *both* sides so the check compares like-with-like.
+    let normalized_target = target_parent.canonicalize();
+    let normalized_root = staged_root.canonicalize();
+    let (normalized_target, normalized_root) = match (normalized_target, normalized_root) {
+        (Ok(t), Ok(r)) => (t, r),
+        _ => (target_parent.to_path_buf(), staged_root.to_path_buf()),
+    };
     if !normalized_target.starts_with(&normalized_root) {
         return Err(RuntimeError::Invariant {
             message: format!(

@@ -206,6 +206,37 @@ Agent 现在可以自主完成：读代码 → 理解结构 → 写/改文件 �
 - [x] **Plugin iteration symlink 逃逸**（P0-20）— `PluginEditExecutor::execute` 在写入前调用新 helper `resolve_under_workspace`：canonicalize 结果必须仍在 workspace_root 下。plugins 内的 symlink 指向 `/etc/passwd` 之类无法被写入。
 - [x] **Verifier shell 拼接**（P0-21）— 已随 A 批 P0-1 修复。`discover_rust_workspace_manifest` 输出的字符串被 `shell_words` 解析成 argv，空格 / `$` / `;` 无法被解释。
 
+### 5.2.17 P2 剩余打磨（Q/R/S 批，2026-07-17 已闭合）
+
+**Q 批 (rollback / promote 语义):**
+
+- [x] **P2-22 stage_process_command 对称 canonicalize** — 两侧同时成功才用 canonical 路径，任一侧失败则同时 fallback，`starts_with` 比较像与像，不再 false-positive Invariant。
+- [x] **P2-23 absorb dedup** — `PluginEditRollback::absorb` 按 rel_path 去重（保留 first backup），rollback 反向仍到达 pre-edit 状态；journal 大小不再随长 iteration 循环爆炸。
+- [x] **P2-24 Blocked 语义说明** — Partial + !manual_approved 保留 candidate 供后续 approve 是 by design；加代码注释说明下次 iterate 会替换 candidate 的 UX hazard。
+- [x] **P2-25 promote 失败 rollback** — Pass/Pass 与 Pass/Partial+approved 分支的 `promote_candidate()?` 都换成 match，Err 时显式 rollback candidate + restore workspace，把 promote error 挂到 blocked_reason 后返回。之前 promote fail 让工作树 + journal 双残留。
+- [x] **P2-26 expect_substring 严格化** — 新增 `exact:` 与 `line:` 前缀，让 verifier plugin 输出可用精确匹配；无前缀保持 legacy contains 行为。
+
+**R 批 (tooling):**
+
+- [x] **P2-19 cleanup_fixture_lockfiles 加 opt-in** — 只在 `CORDIS_CLEAN_FIXTURE_LOCKFILES=1` 时才删；避免每次 build 后误删并发读者持有的 Cargo.lock，也不再影响可重现构建。
+- [x] **P2-28 modtime 失败取 now**（非 UNIX_EPOCH）— dirty-tracking 不再把无法读 mtime 的文件误判为"极老"；log stderr 提示。
+- [x] **P2-29 rebuild_plugin_workspace 加 strip_proxy_envs** — 与 `run_command` 对齐；企业代理下不再挂起。
+- [x] **P2-30 rebuild 加 build timeout** — 新 helper `run_command_with_timeout` (20min 默认，`CORDIS_BUILD_TIMEOUT_SECS` 覆盖) + poll-based kill+wait；死循环 build.rs 不再挂死 iteration 管道。
+- [x] **P2-12 QQ 硬编码路径**（部分修）— 新 `runtime_config_path()` 从 `$CORDIS_FIXTURES_ROOT` 派生；env 未设置时回退到历史 `/root/CordisClaw/...`。
+- [ ] **P2-13 fingerprint per-build** — 需要 SDK build.rs + fixture 全量重构（每个 plugin 用 const 而非硬编码字符串）；改动面太大，留待后续。
+
+**S 批 (fixture / naming / misc):**
+
+- [x] **P2-3 / P2-4 tool spec 命名冲突注释** — `run_plugin_check` / `run_plugin_test` / `rebuild_plugin_workspace` 在 RuntimeShell 和 PluginIteration 两个 backend 里同名不同 schema；加注释说明未来若统一 dispatch table 需要重命名。
+- [x] **P2-5 `#[repr(C)]` on String 结构体注释澄清** — 说明 outer layout stable、String 内部不稳定，跨 toolchain 只靠 `AbiFingerprint::rustc_version` 校验；真正 FFI 需要 `*mut c_char`。
+- [x] **P2-10 `fixtures/plugins/root/Cargo.toml` children 清空** — `./child` 已删；`children = []` 让 `PackageResolver` 不再报缺失依赖。
+
+**未做（大改动，非紧急）:**
+
+- **P2-1 Kernel↔Plugin 边界收敛（工具下沉）** — 产品级重构。
+- **P2-2 SSRF util 抽 `cordis-plugin-net` crate** — 需 workspace 布局调整。
+- **P2-9 / P2-11 Task/Gate/Terminal fixture + `vision-ocr` / `vision-describe` 空目录** — fixture 补齐。
+
 ### 5.2.16 P2 文档同步（P 批，2026-07-17 已闭合）
 
 - [x] **`rs-files-responsibility.md` 重写**（P2-14）— execution/kernel/agent/service 表全部更新为当前代码状态。删除 `actor.rs`、`run_deterministic` 死代码条目；加 `notify.rs`、`health.rs`、`html_render.rs`；标注每个模块里已应用的 P0/P1 修复号。

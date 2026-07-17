@@ -198,9 +198,20 @@ pub fn rebuild_plugin_workspace(
         .arg("--manifest-path")
         .arg(workspace_root.join("plugins").join("Cargo.toml"))
         .arg("-p").arg(name);
-    let output = cmd.output().map_err(|e| RuntimeError::InvalidArgument {
-        message: format!("cargo build failed to start: {e}"),
-    })?;
+    // P2-29: strip HTTP proxy env vars so cargo doesn't try to
+    // contact a corporate proxy for the offline / local-path deps that
+    // fixtures use. `run_command` (the other cargo path in this file)
+    // already does this; the imbalance was itself the bug.
+    strip_proxy_envs(&mut cmd);
+    // P2-30: enforce a build timeout so an infinite-loop `build.rs`
+    // can't hang the whole iteration pipeline. 20 minutes is generous
+    // for a from-cold fixture rebuild; anything longer is almost
+    // certainly a bug. Override via CORDIS_BUILD_TIMEOUT_SECS.
+    let timeout_secs = std::env::var("CORDIS_BUILD_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(20 * 60);
+    let output = run_command_with_timeout(cmd, std::time::Duration::from_secs(timeout_secs))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(RuntimeError::InvalidArgument {
@@ -922,9 +933,20 @@ fn build_input_probe(repo_root: &Path, files: &[PathBuf]) -> Result<InputProbe, 
             path: file.clone(),
             message: e.to_string(),
         })?;
-        let modified_at_ms = metadata
-            .modified()
-            .unwrap_or(UNIX_EPOCH)
+        // P2-28: modtime read failure -> fall back to `now` (treat as
+        // freshly modified) instead of `UNIX_EPOCH` (treat as ancient).
+        // The old behaviour would silently mark a file as "very old" on
+        // a filesystem that doesn't support mtime, biasing dirty-tracking
+        // in the wrong direction. Log the error so an operator can
+        // notice repeat cases.
+        let modified_time = metadata.modified().unwrap_or_else(|err| {
+            eprintln!(
+                "[tooling] failed to read mtime for {}: {err}; treating as freshly modified",
+                file.display()
+            );
+            SystemTime::now()
+        });
+        let modified_at_ms = modified_time
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis();
@@ -1090,6 +1112,68 @@ fn prepare_local_cargo_args(args: &[String]) -> Vec<String> {
 
 fn cargo_command_prefers_offline(args: &[String]) -> bool {
     matches!(args.first().map(String::as_str), Some("metadata"))
+}
+
+/// P2-30: run `command` with a wall-clock timeout. On expiry, kill + wait
+/// so we return promptly with an error rather than blocking indefinitely
+/// on `Command::output()`. Poll interval is 100ms; overhead is trivial
+/// compared to a cargo build.
+fn run_command_with_timeout(
+    mut command: Command,
+    timeout: std::time::Duration,
+) -> Result<std::process::Output, RuntimeError> {
+    use std::io::Read;
+    use std::process::Stdio;
+    use std::time::Instant;
+    command.stdin(Stdio::null());
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
+    let mut child = command.spawn().map_err(|e| RuntimeError::InvalidArgument {
+        message: format!("cargo spawn failed: {e}"),
+    })?;
+    let deadline = Instant::now() + timeout;
+    let mut timed_out = false;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    timed_out = true;
+                    break std::process::ExitStatus::default();
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(e) => {
+                return Err(RuntimeError::InvalidArgument {
+                    message: format!("cargo wait failed: {e}"),
+                });
+            }
+        }
+    };
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    if let Some(mut o) = child.stdout.take() {
+        let _ = o.read_to_end(&mut stdout);
+    }
+    if let Some(mut e) = child.stderr.take() {
+        let _ = e.read_to_end(&mut stderr);
+    }
+    if timed_out {
+        return Err(RuntimeError::InvalidArgument {
+            message: format!(
+                "cargo build exceeded timeout ({:?}); stderr={}",
+                timeout,
+                String::from_utf8_lossy(&stderr).trim()
+            ),
+        });
+    }
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
 }
 
 fn strip_proxy_envs(command: &mut Command) {
@@ -1308,7 +1392,17 @@ fn maybe_remove_stale_lock(path: &Path) -> Result<(), RuntimeError> {
             });
         }
     };
-    let modified = metadata.modified().unwrap_or(SystemTime::now());
+    // P2-28: `unwrap_or(SystemTime::now())` was already the right
+    // fallback — mtime read failure -> treat as "just modified" so the
+    // lock is considered live. Kept as-is; the comment makes the intent
+    // explicit so future refactors don't flip it to UNIX_EPOCH.
+    let modified = metadata.modified().unwrap_or_else(|err| {
+        eprintln!(
+            "[tooling] lock file mtime read failed for {}: {err}",
+            path.display()
+        );
+        SystemTime::now()
+    });
 
     if let Ok(text) = fs::read_to_string(path) {
         if let Ok(state) = serde_json::from_str::<ArtifactBuildLockState>(&text) {
@@ -1393,6 +1487,15 @@ fn current_epoch_ms() -> u128 {
 
 fn cleanup_fixture_lockfiles(plugins_root: &Path) -> Result<(), RuntimeError> {
     if !plugins_root.exists() {
+        return Ok(());
+    }
+    // P2-19: gate the cleanup behind an opt-in env var. Blindly deleting
+    // every `Cargo.lock` under `plugins/` on each successful build breaks
+    // concurrent readers (editor lock services, another cargo process)
+    // and prevents reproducible builds. The historical behaviour is kept
+    // for callers who really need it; the default is now to leave lock
+    // files alone.
+    if std::env::var("CORDIS_CLEAN_FIXTURE_LOCKFILES").ok().as_deref() != Some("1") {
         return Ok(());
     }
 

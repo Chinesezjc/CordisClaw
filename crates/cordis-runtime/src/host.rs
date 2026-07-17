@@ -3255,16 +3255,81 @@ export_plugin_api! {{
         let final_verdict = if effective_verifier == VerifierVerdict::Pass
             && canary_verdict == CanaryVerdict::Pass
         {
-                self.promote_candidate()?;
-                PluginIterationFinalVerdict::Promoted
+                // P2-25: promote failure used to `?` propagate straight
+                // out, leaving the workspace modified with journal on
+                // disk but no rollback trigger (catch_unwind doesn't fire
+                // for normal Err). Now: on promote failure, run rollback
+                // + restore explicitly before propagating the promote
+                // error so the workspace is clean.
+                match self.promote_candidate() {
+                    Ok(_) => PluginIterationFinalVerdict::Promoted,
+                    Err(err) => {
+                        let mut rollback_errors = Vec::new();
+                        if self.candidate_snapshot().is_some() {
+                            if let Err(e) = self.rollback_candidate() {
+                                rollback_errors.push(format!("candidate rollback: {e}"));
+                            }
+                        }
+                        if let Err(e) = restore_plugin_iteration_workspace(
+                            &self.fixtures_root,
+                            &self.snapshot_root,
+                            state.rollback.as_ref(),
+                        ) {
+                            rollback_errors.push(format!("workspace restore: {e}"));
+                        }
+                        state.blocked_reason = Some(if rollback_errors.is_empty() {
+                            format!("promote failed: {err}")
+                        } else {
+                            format!(
+                                "promote failed: {err}; rollback errors: [{}]",
+                                rollback_errors.join(", ")
+                            )
+                        });
+                        return Err(err);
+                    }
+                }
             } else if effective_verifier == VerifierVerdict::Pass
                 && canary_verdict == CanaryVerdict::Partial
                 && state.prepared.manual_approved
             {
                 // When the user explicitly approves, allow promotion without canary evidence.
-                self.promote_candidate()?;
-                PluginIterationFinalVerdict::Promoted
+                // Same rollback-on-promote-failure guard as above.
+                match self.promote_candidate() {
+                    Ok(_) => PluginIterationFinalVerdict::Promoted,
+                    Err(err) => {
+                        let mut rollback_errors = Vec::new();
+                        if self.candidate_snapshot().is_some() {
+                            if let Err(e) = self.rollback_candidate() {
+                                rollback_errors.push(format!("candidate rollback: {e}"));
+                            }
+                        }
+                        if let Err(e) = restore_plugin_iteration_workspace(
+                            &self.fixtures_root,
+                            &self.snapshot_root,
+                            state.rollback.as_ref(),
+                        ) {
+                            rollback_errors.push(format!("workspace restore: {e}"));
+                        }
+                        state.blocked_reason = Some(if rollback_errors.is_empty() {
+                            format!("promote (manual-approved) failed: {err}")
+                        } else {
+                            format!(
+                                "promote (manual-approved) failed: {err}; rollback errors: [{}]",
+                                rollback_errors.join(", ")
+                            )
+                        });
+                        return Err(err);
+                    }
+                }
             } else if canary_verdict == CanaryVerdict::Partial {
+                // P2-24: `Partial` without manual_approved → Blocked. We
+                // intentionally keep the candidate snapshot alive so the
+                // user can call `approve_blocked_iteration(...)` later;
+                // discarding here would forfeit that path. If a new
+                // `iterate_plugins` runs before approval it will replace
+                // this candidate (see `reload_candidate_internal`), so
+                // long-lived blocked candidates are not a memory leak —
+                // just a UX hazard callers should be aware of.
                 state.blocked_reason = Some(
                     state
                         .canary
@@ -3750,6 +3815,15 @@ const PLUGIN_AGENT_TOOL_CREATE_FILE: &str = "create_file";
 const PLUGIN_AGENT_TOOL_DELETE_FILE: &str = "delete_file";
 const PLUGIN_AGENT_TOOL_TOML_SET: &str = "toml_set";
 const PLUGIN_AGENT_TOOL_JSON_SET: &str = "json_set";
+// P2-3: `run_plugin_check` / `run_plugin_test` / `rebuild_plugin_workspace`
+// share names with tools of the same name in `agent.rs`
+// (`AGENT_TOOL_RUN_PLUGIN_TEST`, etc). The two backends never share a
+// dispatch table, but the schemas are DIFFERENT: PluginIteration
+// requires `plugin_path`, RuntimeShell makes it optional and defaults
+// to `/`. If a future refactor unifies dispatch, rename these to
+// `plugin_iteration.run_plugin_test` etc, or fold the two schemas into
+// one and accept the wider superset. Keeping the names identical for
+// now avoids gratuitous churn in agent prompts.
 const PLUGIN_AGENT_TOOL_RUN_PLUGIN_CHECK: &str = "run_plugin_check";
 const PLUGIN_AGENT_TOOL_RUN_PLUGIN_TEST: &str = "run_plugin_test";
 const PLUGIN_AGENT_TOOL_REBUILD_PLUGIN_WORKSPACE: &str = "rebuild_plugin_workspace";
