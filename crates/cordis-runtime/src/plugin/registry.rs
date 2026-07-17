@@ -74,7 +74,7 @@ impl PluginRegistry {
     ) {
         self.plugins
             .write()
-            .expect("plugin registry lock poisoned")
+            .unwrap_or_else(|poison| poison.into_inner())
             .insert(
                 plugin_path.clone(),
                 RegisteredPlugin {
@@ -104,7 +104,7 @@ impl PluginRegistry {
     ) {
         self.plugins
             .write()
-            .expect("plugin registry lock poisoned")
+            .unwrap_or_else(|poison| poison.into_inner())
             .insert(
                 plugin_path.clone(),
                 RegisteredPlugin {
@@ -127,7 +127,7 @@ impl PluginRegistry {
         if let Some(plugin) = self
             .plugins
             .write()
-            .expect("plugin registry lock poisoned")
+            .unwrap_or_else(|poison| poison.into_inner())
             .get_mut(plugin_path)
         {
             plugin.load_result = PluginLoadResult::Unavailable(reason);
@@ -149,7 +149,7 @@ impl PluginRegistry {
         if let Some(plugin) = self
             .plugins
             .write()
-            .expect("plugin registry lock poisoned")
+            .unwrap_or_else(|poison| poison.into_inner())
             .get_mut(plugin_path)
         {
             plugin.load_result = PluginLoadResult::Unavailable(reason);
@@ -167,7 +167,7 @@ impl PluginRegistry {
         let mut guard = self
             .plugins
             .write()
-            .expect("plugin registry lock poisoned");
+            .unwrap_or_else(|poison| poison.into_inner());
         if let Some(plugin) = guard.get_mut(plugin_path) {
             plugin.load_result = PluginLoadResult::Loaded;
             plugin.docs = Some(docs);
@@ -182,7 +182,7 @@ impl PluginRegistry {
     pub fn get(&self, plugin_path: &str) -> Option<RegisteredPlugin> {
         self.plugins
             .read()
-            .expect("plugin registry lock poisoned")
+            .unwrap_or_else(|poison| poison.into_inner())
             .get(plugin_path)
             .cloned()
     }
@@ -190,7 +190,7 @@ impl PluginRegistry {
     pub fn iter(&self) -> impl Iterator<Item = (String, RegisteredPlugin)> {
         self.plugins
             .read()
-            .expect("plugin registry lock poisoned")
+            .unwrap_or_else(|poison| poison.into_inner())
             .iter()
             .map(|(plugin_path, plugin)| (plugin_path.clone(), plugin.clone()))
             .collect::<Vec<_>>()
@@ -200,7 +200,7 @@ impl PluginRegistry {
     pub fn len(&self) -> usize {
         self.plugins
             .read()
-            .expect("plugin registry lock poisoned")
+            .unwrap_or_else(|poison| poison.into_inner())
             .len()
     }
 }

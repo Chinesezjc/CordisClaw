@@ -36,11 +36,31 @@ pub fn load_handlers(fixtures_root: &Path) -> Result<Vec<(String, String)>, Stri
 }
 
 /// Register a plugin node as a notification handler.
+/// P1-10: dedup so repeated calls (e.g. across reload) don't produce
+/// double-deliveries. If `(plugin_path, node_id)` is already registered,
+/// this is a no-op.
 pub fn register(plugin_path: &str, node_id: &str) {
-    HANDLERS
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .push((plugin_path.to_string(), node_id.to_string()));
+    let entry = (plugin_path.to_string(), node_id.to_string());
+    let mut handlers = HANDLERS.lock().unwrap_or_else(|p| p.into_inner());
+    if handlers.iter().any(|h| h == &entry) {
+        return;
+    }
+    handlers.push(entry);
+}
+
+/// Remove a previously-registered handler. Used by plugin reload to drop
+/// stale registrations before the new snapshot re-registers.
+pub fn unregister(plugin_path: &str, node_id: &str) {
+    let mut handlers = HANDLERS.lock().unwrap_or_else(|p| p.into_inner());
+    handlers.retain(|(p, n)| p != plugin_path || n != node_id);
+}
+
+/// Drop every handler owned by `plugin_path` (any node). Called by reload
+/// paths so a plugin that stops declaring a notify handler doesn't keep
+/// receiving events from a stale registration.
+pub fn unregister_plugin(plugin_path: &str) {
+    let mut handlers = HANDLERS.lock().unwrap_or_else(|p| p.into_inner());
+    handlers.retain(|(p, _)| p != plugin_path);
 }
 
 /// Send a message to all registered notification handlers.

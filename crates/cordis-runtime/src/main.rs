@@ -35,22 +35,40 @@ struct ServeState {
     mode: ServeMode,
 }
 
-static mut AGENT_TRIGGER_TX: Option<std::sync::mpsc::Sender<String>> = None;
+/// P1-12: `static mut` is a data race waiting to happen (unsynchronised
+/// concurrent access from the plugin thread that raises the trigger and
+/// the main-loop thread that reads the receiver end). `OnceLock` gives us
+/// initialise-once + safe concurrent read semantics without unsafe.
+static AGENT_TRIGGER_TX: std::sync::OnceLock<std::sync::mpsc::Sender<String>> =
+    std::sync::OnceLock::new();
 
 #[no_mangle]
 pub extern "C" fn _cordis_agent_trigger(msg: *const std::ffi::c_char) {
     if msg.is_null() { return; }
     let s = unsafe { std::ffi::CStr::from_ptr(msg).to_string_lossy().to_string() };
     let _ = std::fs::write("/tmp/trigger_called.txt", &s);
-    unsafe {
-        if let Some(ref tx) = AGENT_TRIGGER_TX {
-            let _ = tx.send(s.clone());
-        }
+    if let Some(tx) = AGENT_TRIGGER_TX.get() {
+        let _ = tx.send(s);
     }
 }
 
 extern "C" fn sigterm_to_sigint(_sig: libc::c_int) {
     unsafe { libc::raise(libc::SIGINT); }
+}
+
+/// P1-12: install SIGTERM → SIGINT forwarding using `sigaction(2)`, the
+/// modern POSIX signal API. The old `libc::signal(SIGTERM, handler)` uses
+/// the legacy System V / BSD-divergent `signal(2)`, whose interaction with
+/// multithreaded processes is implementation-defined. `sigaction` gives us
+/// a portable, well-specified install.
+fn install_sigterm_handler() {
+    unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = sigterm_to_sigint as usize;
+        libc::sigemptyset(&mut action.sa_mask);
+        action.sa_flags = libc::SA_RESTART;
+        let _ = libc::sigaction(libc::SIGTERM, &action, std::ptr::null_mut());
+    }
 }
 
 fn main() {
@@ -224,9 +242,7 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         .ok();
     }
     // SIGTERM → SIGINT so systemctl stop triggers graceful shutdown.
-    unsafe {
-        libc::signal(libc::SIGTERM, sigterm_to_sigint as usize);
-    }
+    install_sigterm_handler();
 
     // ── Startup invocations ──────────────────────────────────────────────
     // Read startup_invoke.json from fixtures root and execute each
@@ -283,9 +299,9 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("runtime-only: inbox started");
         let (tx, rx) = std::sync::mpsc::channel::<String>();
         let inject_queue = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::<String>::new()));
-        unsafe {
-            AGENT_TRIGGER_TX = Some(tx);
-        }
+        // OnceLock::set returns Err if already set; runtime-only branch is
+        // entered at most once so the first-set path always wins.
+        let _ = AGENT_TRIGGER_TX.set(tx);
         cordis_runtime::agent::set_agent_inject_queue(inject_queue.clone());
         let health_host = std::sync::Arc::clone(&host);
         let park_host = std::sync::Arc::clone(&host);
@@ -414,7 +430,15 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         }
 
         // Start health check loop after all services are ready.
-        cordis_runtime::kernel::health::start_health_loop(health_host, 3600);
+        // P1-11: handle is intentionally leaked into the process — this
+        // branch is the runtime-only long-running path and shutdown flows
+        // through process exit rather than a graceful stop of the handle.
+        // Leaking (via mem::forget) prevents Drop from firing at scope
+        // end, so the loop keeps ticking; a future shutdown-orchestration
+        // pass can replace this with `handle.stop()` at the exit sink.
+        let health_handle =
+            cordis_runtime::kernel::health::start_health_loop(health_host, 3600);
+        std::mem::forget(health_handle);
 
         // Park — background threads keep running.
         // Periodically check whether stdin is still open: when the parent
