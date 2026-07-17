@@ -189,6 +189,15 @@ Agent 现在可以自主完成：读代码 → 理解结构 → 写/改文件 �
 - [x] **Verify/Promote TOCTOU**（P0-3）— `VerificationReport.source_tree_hash` 记录 verify 时的 sha256；`finalize_plugin_iteration` 在 `promote_candidate` 前重算并比对，不匹配则强制 rollback。
 - [x] **Plugin verifier 目标错位**（P0-4）— `verify_plugin_iteration` 传入 `VerifyOptions::candidate_invoker`，`plugin:` 命令走 staged candidate snapshot 而非 live registry。
 
+### 5.2.3 Build / Load 硬化（第 1 批，2026-07-17 已闭合）
+
+- [x] **平台原生 dylib 后缀**（P0-9）— `rebuild_plugin_workspace` 用 `std::env::consts::{DLL_PREFIX, DLL_SUFFIX}` 而非硬编码 `.so`，macOS/Windows 上的 iteration 现在能跑。同时 `.so` 覆盖走新的 `stage_then_rename_file` helper：tmp + sync_all + rename，避免 live-mmap SIGSEGV。
+- [x] **`materialize_artifact_entry` 同款硬化**（P0-8 补丁）— 也走 `stage_then_rename_file`，同一模板 stage-swap；共同解决过去两条 rebuild 路径的行为不一致。
+- [x] **`lock_pid_is_live` 跨平台**（P0-10）— 从 `Path::new("/proc").join(pid).exists()` 改为 `libc::kill(pid, 0)` + errno 判定 (`ESRCH` = dead, `EPERM` = alive)。macOS/BSD 上不再把所有活锁误判为死锁。
+- [x] **Loader sha256 校验**（P0-13）— `Loader::load_with_staging_root` 现在对每个 artifact 调用 `sha256_file` 并与 index 记录比对，不匹配就走 `PluginUnavailableReason::HashMismatch`（此前始终不校验，`HashMismatch` variant 是死代码）。
+- [x] **`stage_file` 原子化**（P0-15）— 从 `remove + hard_link/copy` 双步改为 `stage <target>.cordis-staging.<pid>` + `rename`，两个并发 loader 不再互相 clobber 目标文件。
+- [x] **`TASK_LIBRARIES` 从 `Vec` 换 `HashMap<plugin_path, ...>`**（P0-16）— 重复 invoke 同一 Task 节点不再累积 dylib mapping；reload 路径新增 `unregister_task_library` 让旧 `.so` 能被 OS 卸载。`.lock().unwrap()` 也换成 tolerant lock，poison 不再让 invoke 热路径直接 crash。
+
 ### 5.2.2 Rollback / Journal 硬化（2026-07-17 已闭合）
 
 - [x] **写入前先备份**（P0-5）— `PluginEditExecutor::execute` 现在先把 `AppliedEditBackup` 推入 rollback，再调用 `atomic_write`；写入失败时本函数内立即 `rollback.rollback()` 并把错误上抛，工作树无残留。

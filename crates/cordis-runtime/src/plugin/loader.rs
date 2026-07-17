@@ -183,8 +183,81 @@ impl Loader {
                 continue;
             }
 
-            // Trust the artifact index hash (verified by rebuild-fixture-artifacts).
-            // Skip sha256_file for startup speed — large .so files are expensive to re-hash.
+            // P0-13: verify artifact bytes match the sha256 recorded in
+            // index.json. The old implementation trusted `entry.sha256`
+            // without ever computing the actual file hash, so a tampered
+            // `.so` (or a botched rebuild) loaded silently. We hash the file
+            // on-load and raise `HashMismatch` on divergence — the runtime
+            // then routes the plugin through the standard "unavailable"
+            // pathway rather than dlopen-ing a modified artifact.
+            match crate::plugin::artifact::sha256_file(&resolved_artifact_path) {
+                Ok(actual) => {
+                    if actual != entry.sha256 {
+                        plugin_registry.insert_unavailable(
+                            plugin_path.clone(),
+                            entry.parent.clone(),
+                            entry.required,
+                            entry.grants_from_parent.iter().cloned().collect(),
+                            PluginUnavailableReason::HashMismatch,
+                            vec![format!(
+                                "artifact sha256 mismatch for {}: expected {}, got {}",
+                                resolved_artifact_path.display(),
+                                entry.sha256,
+                                actual
+                            )],
+                        );
+                        context.set_plugin_state(
+                            plugin_path,
+                            PluginLoadResult::Unavailable(
+                                PluginUnavailableReason::HashMismatch,
+                            ),
+                        );
+                        metrics.plugin_unavailable_total += 1;
+                        metrics.dylib_no_fallback_total += 1;
+                        if entry.required {
+                            self.propagate_parent_failure(
+                                plugin_path,
+                                &index_map,
+                                &plugin_registry,
+                                &mut node_registry,
+                                &mut context,
+                            );
+                        }
+                        continue;
+                    }
+                }
+                Err(err) => {
+                    plugin_registry.insert_unavailable(
+                        plugin_path.clone(),
+                        entry.parent.clone(),
+                        entry.required,
+                        entry.grants_from_parent.iter().cloned().collect(),
+                        PluginUnavailableReason::HashMismatch,
+                        vec![format!(
+                            "artifact sha256 read failed for {}: {err}",
+                            resolved_artifact_path.display()
+                        )],
+                    );
+                    context.set_plugin_state(
+                        plugin_path,
+                        PluginLoadResult::Unavailable(
+                            PluginUnavailableReason::HashMismatch,
+                        ),
+                    );
+                    metrics.plugin_unavailable_total += 1;
+                    metrics.dylib_no_fallback_total += 1;
+                    if entry.required {
+                        self.propagate_parent_failure(
+                            plugin_path,
+                            &index_map,
+                            &plugin_registry,
+                            &mut node_registry,
+                            &mut context,
+                        );
+                    }
+                    continue;
+                }
+            }
 
             let artifact_path = match staged_root {
                 Some(root) => stage_artifact_bundle(

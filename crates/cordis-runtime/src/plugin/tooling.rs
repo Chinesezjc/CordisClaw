@@ -207,15 +207,95 @@ pub fn rebuild_plugin_workspace(
             message: format!("cargo build -p {name} failed: {stderr}"),
         });
     }
+    // P0-9: use platform-native dylib prefix/extension. Previously hardcoded
+    // `lib{name}.so` / `{name}.so` — always wrong on macOS (`.dylib`) and
+    // Windows (`.dll`), so `iterate_plugins` was un-runnable on any dev
+    // machine that isn't Linux. `std::env::consts` gives us the right
+    // affixes for the current target triple.
     let target_dir = workspace_root.join("plugins").join("target").join("debug");
-    let src = target_dir.join(format!("lib{}.so", name.replace('-', "_")));
-    let dst = workspace_root.join("artifacts").join(format!("{}.so", name));
-    let _ = std::fs::create_dir_all(dst.parent().unwrap());
-    std::fs::copy(&src, &dst).map_err(|e| RuntimeError::Io {
-        path: dst.clone(),
-        message: format!("{e}"),
-    })?;
+    let src_filename = format!(
+        "{}{}{}",
+        std::env::consts::DLL_PREFIX,
+        name.replace('-', "_"),
+        std::env::consts::DLL_SUFFIX
+    );
+    let dst_filename = format!("{}{}", name, std::env::consts::DLL_SUFFIX);
+    let src = target_dir.join(&src_filename);
+    let dst = workspace_root.join("artifacts").join(&dst_filename);
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| RuntimeError::Io {
+            path: parent.to_path_buf(),
+            message: format!("create artifacts dir: {e}"),
+        })?;
+    }
+    // Stage-then-swap: `fs::copy` over a live-mmap'd `.so` risks SIGSEGV on
+    // concurrent readers. Write to `<dst>.cordis-tmp`, fsync, rename over
+    // the target — the OS unlinks the old file while any existing mapping
+    // remains valid until unmap.
+    stage_then_rename_file(&src, &dst)?;
     Ok(vec![(name.to_string(), format!("{} -> {}", src.display(), dst.display()))])
+}
+
+/// Copy `src` -> `dst` atomically: write to `<dst>.cordis-tmp`, fsync,
+/// rename. On Unix this replaces the file inode; any pre-existing dylib
+/// mapping stays valid until munmap while new opens see the fresh bytes.
+///
+/// (C batch, P0-8 / P0-15 style helper — shared between rebuild_plugin_workspace
+/// and materialize_artifact_entry so both stage-swap identically.)
+pub(crate) fn stage_then_rename_file(src: &Path, dst: &Path) -> Result<(), RuntimeError> {
+    use std::io::Read;
+    use std::io::Write;
+    let mut src_file = std::fs::File::open(src).map_err(|e| RuntimeError::Io {
+        path: src.to_path_buf(),
+        message: format!("open source: {e}"),
+    })?;
+    let mut buf = Vec::new();
+    src_file.read_to_end(&mut buf).map_err(|e| RuntimeError::Io {
+        path: src.to_path_buf(),
+        message: format!("read source: {e}"),
+    })?;
+    let tmp = match dst.file_name() {
+        Some(name) => {
+            let mut owned = name.to_os_string();
+            owned.push(".cordis-tmp");
+            dst.with_file_name(owned)
+        }
+        None => {
+            return Err(RuntimeError::Io {
+                path: dst.to_path_buf(),
+                message: "artifact target has no filename".to_string(),
+            });
+        }
+    };
+    {
+        let mut tmp_file = std::fs::File::create(&tmp).map_err(|e| RuntimeError::Io {
+            path: tmp.clone(),
+            message: format!("create tmp: {e}"),
+        })?;
+        tmp_file.write_all(&buf).map_err(|e| RuntimeError::Io {
+            path: tmp.clone(),
+            message: format!("write tmp: {e}"),
+        })?;
+        tmp_file.sync_all().map_err(|e| RuntimeError::Io {
+            path: tmp.clone(),
+            message: format!("sync tmp: {e}"),
+        })?;
+        // Preserve executable permissions from the source (dylibs are +x on
+        // most platforms; without this the OS refuses to dlopen).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(meta) = src_file.metadata() {
+                let mode = meta.permissions().mode();
+                let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode));
+            }
+        }
+    }
+    std::fs::rename(&tmp, dst).map_err(|e| RuntimeError::Io {
+        path: dst.to_path_buf(),
+        message: format!("rename {} -> {} failed: {e}", tmp.display(), dst.display()),
+    })?;
+    Ok(())
 }
 
 pub fn sync_plugin_docs(fixtures_root: &Path) -> Result<Vec<PathBuf>, RuntimeError> {
@@ -505,10 +585,12 @@ fn materialize_artifact_entry(
                     &context.build_spec.package_name,
                 )?
             };
-        fs::copy(&built_path, &context.artifact_path).map_err(|e| RuntimeError::Io {
-            path: context.artifact_path.clone(),
-            message: format!("copy from {} failed: {e}", built_path.display()),
-        })?;
+        // P0-8/C-batch: stage-then-rename over `.so` so any pre-existing
+        // mapping (Task-node plugins hold dylibs indefinitely in
+        // TASK_LIBRARIES) stays valid until munmap; new opens see the fresh
+        // bytes. Previously `fs::copy` truncated + wrote in place, which is
+        // the historic SIGSEGV pattern.
+        stage_then_rename_file(&built_path, &context.artifact_path)?;
 
         let (docs, runtime_fingerprint) = inspect_dylib_contract(&context.artifact_path)?;
         if runtime_fingerprint != context.plugin.metadata.abi_fingerprint {
@@ -1070,6 +1152,48 @@ mod tests {
         assert!(!cargo_command_prefers_offline(&args));
         assert_eq!(prepare_local_cargo_args(&args), args);
     }
+
+    // ---------- C batch (P0-9 / P0-10) tests ----------
+
+    #[test]
+    fn stage_then_rename_replaces_existing_target_atomically() {
+        // P0-9 sibling: the shared stage-then-rename helper must overwrite an
+        // existing dst with the new source bytes; no leftover .cordis-tmp.
+        use super::stage_then_rename_file;
+        use tempfile::TempDir;
+        let temp = TempDir::new().unwrap();
+        let src = temp.path().join("plugin.so");
+        let dst = temp.path().join("target.so");
+        std::fs::write(&src, b"fresh").unwrap();
+        std::fs::write(&dst, b"stale").unwrap();
+        stage_then_rename_file(&src, &dst).expect("stage-then-rename ok");
+        assert_eq!(std::fs::read(&dst).unwrap(), b"fresh");
+        let leftovers: Vec<_> = std::fs::read_dir(temp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".cordis-tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "no leftover tmp file expected");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lock_pid_liveness_recognises_current_process_as_alive() {
+        // P0-10: previously used `/proc/{pid}` and returned false on macOS/BSD
+        // for every live pid. `kill(pid, 0)` is portable; the running process
+        // must always be observed as alive.
+        use super::lock_pid_is_live;
+        assert!(lock_pid_is_live(std::process::id()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lock_pid_liveness_reports_dead_pid_as_dead() {
+        use super::lock_pid_is_live;
+        // A pid we're extremely unlikely to have — u32::MAX is above the
+        // maximum kernel-allowed pid on all common systems.
+        assert!(!lock_pid_is_live(u32::MAX - 1));
+    }
 }
 
 fn write_pretty_json<T: serde::Serialize>(path: &Path, value: &T) -> Result<(), RuntimeError> {
@@ -1189,13 +1313,34 @@ fn maybe_remove_stale_lock(path: &Path) -> Result<(), RuntimeError> {
     Ok(())
 }
 
+/// P0-10: on macOS/BSD `/proc` does not exist, so the previous implementation
+/// always returned false → every live lock was declared dead the moment the
+/// staleness timer expired, letting two concurrent `prepare_artifacts` calls
+/// clobber each other. Fix: use `kill(pid, 0)`, which is portable across all
+/// Unix platforms and returns EPERM (still alive, other uid) or ESRCH (dead)
+/// without actually delivering a signal.
 #[cfg(unix)]
 fn lock_pid_is_live(pid: u32) -> bool {
-    Path::new("/proc").join(pid.to_string()).exists()
+    if pid == 0 {
+        return false;
+    }
+    // SAFETY: `kill(pid, 0)` is signal-safe and side-effect free; it only
+    // checks whether the caller *could* deliver a signal to `pid`.
+    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    if rc == 0 {
+        return true;
+    }
+    // errno is thread-local; if the syscall returned an error, distinguish
+    // "no such process" (ESRCH → dead) from "permission denied" (EPERM →
+    // alive, owned by another user).
+    let err = std::io::Error::last_os_error();
+    !matches!(err.raw_os_error(), Some(libc::ESRCH))
 }
 
 #[cfg(not(unix))]
 fn lock_pid_is_live(_pid: u32) -> bool {
+    // Non-Unix: no portable liveness probe, so be conservative and assume
+    // still alive; the staleness timer eventually reclaims true zombies.
     true
 }
 

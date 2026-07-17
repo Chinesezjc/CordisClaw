@@ -2122,6 +2122,10 @@ export_plugin_api! {{
                     }
                 }
             }
+            // P0-16: drop the keep-alive dylib handle for this plugin path
+            // so the OS can unmap the old .so once the new one is loaded.
+            // Without this, every reload leaks a mapping.
+            crate::plugin::invoke::unregister_task_library(plugin_path);
         }
 
         // ── Phase 1: pre-load and validate all new dylibs ─────────────
