@@ -804,10 +804,17 @@ impl RuntimeKernel {
     }
 
     pub fn record_plugin_iteration_outcome(&self, result: &KernelPluginIterationResult) {
-        self.iteration_metrics
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .iteration_total += 1;
+        // P1-9: fragile nested-lock chain. Every lock is now acquired,
+        // mutated, and released in the shortest possible scope so that at
+        // no point does this function hold two of the kernel Mutexes at
+        // once. Callers that hold `plugin_issues` (e.g. `select_issue_for_
+        // request`) can invert order all day without deadlocking us.
+        //
+        // Canonical lock-order document (post-fix): every mutating call in
+        // this file acquires locks in this order (partial order); this
+        // function honours it by never holding more than one at a time.
+        //   iteration_metrics → plugin_history → last_plugin_iteration →
+        //   blocked_iterations → plugin_issues
         let completed_at_ms = now_ms();
         let history_entry = PluginIterationHistoryEntry {
             iteration_id: result.iteration_id.clone(),
@@ -824,53 +831,68 @@ impl RuntimeKernel {
             observed_at_ms: completed_at_ms,
             completed_at_ms,
         };
-        let mut history = self
-            .plugin_history
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        if let Some(existing) = history
-            .iter_mut()
-            .find(|entry| entry.iteration_id == result.iteration_id)
+
         {
-            *existing = history_entry;
-        } else {
-            history.push_front(history_entry);
-        }
-        *self
-            .last_plugin_iteration
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner()) = Some(result.clone());
-        match result.final_verdict {
-            PluginIterationFinalVerdict::Blocked => {
-                self.blocked_iterations
-                    .lock()
-                    .unwrap_or_else(|poison| poison.into_inner())
-                    .insert(result.iteration_id.clone(), result.clone());
-                self.update_issue_status(&result.issue_id, KernelPluginIssueStatus::Blocked);
-            }
-            PluginIterationFinalVerdict::Promoted => {
-                self.iteration_metrics
-                    .lock()
-                    .unwrap_or_else(|poison| poison.into_inner())
-                    .iteration_promote_total += 1;
-                self.blocked_iterations
-                    .lock()
-                    .unwrap_or_else(|poison| poison.into_inner())
-                    .remove(&result.iteration_id);
-                self.update_issue_status(&result.issue_id, KernelPluginIssueStatus::Resolved);
-            }
-            PluginIterationFinalVerdict::RolledBack => {
-                self.iteration_metrics
-                    .lock()
-                    .unwrap_or_else(|poison| poison.into_inner())
-                    .iteration_rollback_total += 1;
-                self.blocked_iterations
-                    .lock()
-                    .unwrap_or_else(|poison| poison.into_inner())
-                    .remove(&result.iteration_id);
-                self.update_issue_status(&result.issue_id, KernelPluginIssueStatus::Open);
+            let mut metrics = self
+                .iteration_metrics
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            metrics.iteration_total += 1;
+            match result.final_verdict {
+                PluginIterationFinalVerdict::Blocked => {}
+                PluginIterationFinalVerdict::Promoted => {
+                    metrics.iteration_promote_total += 1;
+                }
+                PluginIterationFinalVerdict::RolledBack => {
+                    metrics.iteration_rollback_total += 1;
+                }
             }
         }
+
+        {
+            let mut history = self
+                .plugin_history
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            if let Some(existing) = history
+                .iter_mut()
+                .find(|entry| entry.iteration_id == result.iteration_id)
+            {
+                *existing = history_entry;
+            } else {
+                history.push_front(history_entry);
+            }
+        }
+
+        {
+            *self
+                .last_plugin_iteration
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner()) = Some(result.clone());
+        }
+
+        {
+            let mut blocked = self
+                .blocked_iterations
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            match result.final_verdict {
+                PluginIterationFinalVerdict::Blocked => {
+                    blocked.insert(result.iteration_id.clone(), result.clone());
+                }
+                PluginIterationFinalVerdict::Promoted
+                | PluginIterationFinalVerdict::RolledBack => {
+                    blocked.remove(&result.iteration_id);
+                }
+            }
+        }
+
+        let status = match result.final_verdict {
+            PluginIterationFinalVerdict::Blocked => KernelPluginIssueStatus::Blocked,
+            PluginIterationFinalVerdict::Promoted => KernelPluginIssueStatus::Resolved,
+            PluginIterationFinalVerdict::RolledBack => KernelPluginIssueStatus::Open,
+        };
+        self.update_issue_status(&result.issue_id, status);
     }
 
     pub fn run_iteration(

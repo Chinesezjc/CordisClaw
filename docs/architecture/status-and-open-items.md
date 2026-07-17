@@ -206,6 +206,16 @@ Agent 现在可以自主完成：读代码 → 理解结构 → 写/改文件 �
 - [x] **Plugin iteration symlink 逃逸**（P0-20）— `PluginEditExecutor::execute` 在写入前调用新 helper `resolve_under_workspace`：canonicalize 结果必须仍在 workspace_root 下。plugins 内的 symlink 指向 `/etc/passwd` 之类无法被写入。
 - [x] **Verifier shell 拼接**（P0-21）— 已随 A 批 P0-1 修复。`discover_rust_workspace_manifest` 输出的字符串被 `shell_words` 解析成 argv，空格 / `$` / `;` 无法被解释。
 
+### 5.2.8 Lock / 生命周期硬化（G 批，2026-07-17 已闭合）
+
+- [x] **`record_plugin_iteration_outcome` 单锁段**（P1-9）— 拆成"每个 Mutex 单独作用域"，函数在任意瞬间最多持有一把锁；与 `select_issue_for_request` 等 `plugin_issues → plugin_history` 反向路径不再冲突。文件内 canonical lock order 也补了注释。
+- [x] **`kernel::notify::register` 去重 + `unregister`**（P1-10）— 已注册的 `(plugin_path, node_id)` 重复 register 是 no-op；reload 时可用 `unregister` / `unregister_plugin` 移除。之前 push-only 让 reload 累积重复交付。
+- [x] **`kernel::health::start_health_loop` 支持停止**（P1-11）— 返回 `HealthLoopHandle`（内含 `AtomicBool` + `JoinHandle`）；`Drop` 或 `stop()` 都会 set flag + join 线程。sleep 拆成 500ms 分片，shutdown 延迟 ≤ 500ms。runtime-only 分支目前用 `mem::forget` 保留原语义，等 shutdown-orchestration 换成显式 stop。
+- [x] **`static mut AGENT_TRIGGER_TX` → `OnceLock<Sender>`**（P1-12）— 无 unsafe 的初始化-一次 + 并发安全 read。
+- [x] **`libc::signal(SIGTERM)` → `sigaction`**（P1-19/12）— 用 POSIX `sigaction(2)` + `SA_RESTART` 装 SIGTERM→SIGINT forwarder；老 `signal(2)` 在多线程进程下语义不定，现在显式定义。
+- [x] **`PluginRegistry` 8 处 `.expect(...)` → tolerant lock**（P1-13）— 全部换成 `.unwrap_or_else(|poison| poison.into_inner())`，与 `context/mod.rs` / `kernel/notify.rs` 保持一致。任何加载路径 panic 中毒后，registry 不再让每一个 reader 都 crash。
+- [x] **`TASK_LIBRARIES` 已随 P0-16 修**（P1-14）— tolerant lock，不再 `unwrap`。
+
 ### 5.2.7 并行执行引擎硬化（F 批，2026-07-17 已闭合）
 
 - [x] **`commit_session` CAS**（P1-1）— `session_version` 用 `compare_exchange` 单步领取版本；两个线程并发 commit 同一 expected_version 不再都通过检查后各自 `fetch_add`。冲突方走 `CommitConflict` 错误。
