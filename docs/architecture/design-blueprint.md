@@ -277,15 +277,16 @@ observe -> diagnose -> plan -> apply -> verify -> score -> promote/rollback
 ### 10.1 Agent 模型
 
 当前只有一个 Agent backend 在生产中使用：**RuntimeShell**（`RuntimeShellAgentBackend`, agent.rs）。
-它拥有 16 个内核工具：文件读写、搜索、构建（`build_plugins`）、测试（`run_plugin_test`）、插件调用等，
-负责 QQ 聊天和 REPL 交互。
+它拥有约 20 个内核工具：文件读写、搜索、构建（`build_plugins`）、测试（`run_plugin_test`）、插件调用等，
+负责 QQ 聊天和 REPL 交互。工具集是当前架构的过渡态——见 P2-1，file/shell/search 类工具计划下沉为独立插件（`filesystem` / `shell` / `web` / `git` 等已经存在为 fixtures），Kernel 只保留 5 个自省工具和 `invoke_plugin` / `execute_target` 入口。
 
-之前的 **PluginIteration** backend（`host.rs:3113`）提供的专用工具（`replace_files_exact`, `run_plugin_check`,
+之前的 **PluginIteration** backend（`host.rs::PluginIterationAgentBackend`）提供的专用工具（`replace_files_exact`, `run_plugin_check`,
 `rebuild_plugin_workspace`, `record_iteration_summary`）已废弃——其中 `run_plugin_check`/`rebuild_plugin_workspace`
 被 `build_plugins` 覆盖，`replace_files_exact` 被 `replace_in_file` 覆盖，`run_plugin_test` 已合并入 RuntimeShell。
 `record_iteration_summary` 仅 Kernel 自动迭代使用，不外露。
 
-`iterate_plugins()` (host.rs:2045) 仍使用独立的 PluginIteration session 执行 Kernel 自主迭代流水线，
+`iterate_plugins()`（`host.rs::iterate_plugins`, 约 2500 行附近；具体行号随代码演进变化）
+使用独立的 PluginIteration session 执行 Kernel 自主迭代流水线，
 但用户通过 RuntimeShell 也能完成相同的插件修改+测试工作流。
 
 ### 10.2 自迭代流程
