@@ -8,14 +8,40 @@ use crate::plugin::abi::{PluginRequest, PluginResponse};
 use crate::plugin::dynamic::{is_dylib_path, LoadedDylibApi};
 use crate::plugin::loader::{default_loader_config, Loader};
 use crate::plugin::registry::PluginRegistry;
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 /// Keep-alive storage for dylib Libraries of Task nodes.
-/// These libraries must not be dropped because the plugin's
-/// background threads (HTTP servers, pollers) run code from them.
-static TASK_LIBRARIES: Mutex<Vec<LoadedDylibApi>> = Mutex::new(Vec::new());
+///
+/// These libraries must stay resident because the plugin's background threads
+/// (HTTP servers, pollers) run code from them.
+///
+/// P0-16: was `Mutex<Vec<LoadedDylibApi>>` which pushed one fresh entry per
+/// invocation — a Task node called N times would keep N copies of its dylib
+/// mapped. Now keyed by plugin path so re-entrant invokes replace the
+/// existing handle in-place, and reloads drop the old one via
+/// `unregister_task_library`.
+static TASK_LIBRARIES: OnceLock<Mutex<HashMap<String, LoadedDylibApi>>> = OnceLock::new();
+
+/// Access the task-library map with a tolerant lock policy: a poisoned lock
+/// is recovered (the underlying data is invariant-free — it's a keep-alive
+/// registry). Previously we called `.lock().unwrap()`, which turned any
+/// poison in the invoke hot path into a hard runtime crash.
+fn task_libraries_lock() -> std::sync::MutexGuard<'static, HashMap<String, LoadedDylibApi>> {
+    TASK_LIBRARIES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+}
+
+/// Drop the keep-alive handle for a plugin. Called by the reload path when a
+/// Task-node plugin is being replaced — otherwise the dylib grows unbounded
+/// across reloads.
+pub fn unregister_task_library(plugin_path: &str) {
+    let _ = task_libraries_lock().remove(plugin_path);
+}
 use std::process::{Command, Stdio};
 
 #[derive(Debug, Clone)]
@@ -222,8 +248,9 @@ pub fn invoke_registered_plugin(
                 );
             }
         }
-        // Keep dylib alive — Task nodes spawn background threads.
-        TASK_LIBRARIES.lock().unwrap().push(dylib);
+        // Keep dylib alive — Task nodes spawn background threads. Keyed by
+        // plugin_path so repeated invocations don't leak fresh copies.
+        task_libraries_lock().insert(plugin_path.to_string(), dylib);
     }
 
     Ok(response)

@@ -203,21 +203,42 @@ fn stage_file(source: &Path, target: &Path) -> Result<(), RuntimeError> {
         message: e.to_string(),
     })?;
 
-    if target.exists() {
-        fs::remove_file(target).map_err(|e| RuntimeError::Io {
-            path: target.to_path_buf(),
-            message: e.to_string(),
-        })?;
-    }
+    // P0-15: previously did `remove_file(target)` then `hard_link/copy` —
+    // two concurrent stagers race on that window and one may find the file
+    // absent when they expected it, breaking a third invoker. Stage into a
+    // sibling `<target>.cordis-staging.<pid>` first, then atomically rename
+    // over `target`. The rename is the only writer visible from outside.
+    let staging_name = match target.file_name() {
+        Some(name) => {
+            let mut owned = name.to_os_string();
+            owned.push(format!(".cordis-staging.{}", std::process::id()));
+            target.with_file_name(owned)
+        }
+        None => {
+            return Err(RuntimeError::Invariant {
+                message: format!("stage_file target has no filename: {}", target.display()),
+            });
+        }
+    };
+    // Clean up any stale staging file from a prior crash of this same pid.
+    let _ = fs::remove_file(&staging_name);
 
     // Try hard link first (instant on same filesystem), fall back to copy.
-    if std::fs::hard_link(source, target).is_err() {
-        fs::copy(source, target)
+    if std::fs::hard_link(source, &staging_name).is_err() {
+        fs::copy(source, &staging_name)
             .map(|_| ())
             .map_err(|e| RuntimeError::Io {
-                path: target.to_path_buf(),
+                path: staging_name.clone(),
                 message: e.to_string(),
             })?;
     }
+    fs::rename(&staging_name, target).map_err(|e| {
+        // Clean up staging on rename failure.
+        let _ = fs::remove_file(&staging_name);
+        RuntimeError::Io {
+            path: target.to_path_buf(),
+            message: format!("rename staging -> target failed: {e}"),
+        }
+    })?;
     Ok(())
 }
