@@ -189,6 +189,15 @@ Agent 现在可以自主完成：读代码 → 理解结构 → 写/改文件 �
 - [x] **Verify/Promote TOCTOU**（P0-3）— `VerificationReport.source_tree_hash` 记录 verify 时的 sha256；`finalize_plugin_iteration` 在 `promote_candidate` 前重算并比对，不匹配则强制 rollback。
 - [x] **Plugin verifier 目标错位**（P0-4）— `verify_plugin_iteration` 传入 `VerifyOptions::candidate_invoker`，`plugin:` 命令走 staged candidate snapshot 而非 live registry。
 
+### 5.2.5 Web/SSRF/Session 硬化（2026-07-17 已闭合）
+
+- [x] **Web / Vision SSRF**（P0-22）— 抽出 `ip_is_forbidden` + `check_url_safety`，对每个 URL 做 scheme + host + DNS 双重检查；覆盖 loopback / RFC1918 / CGNAT (100.64/10) / link-local (169.254/16, 含 AWS metadata) / IPv6 ULA / IPv6 link-local / IPv4-mapped IPv6 / 0.0.0.0/8。web 用自定义 `reqwest::redirect::Policy` 每一跳都重新校验；vision 关闭 redirect (`redirects(0)`) 保守 fail。
+- [x] **QQ webhook X-Signature 校验**（P0-23）— `/onebot/event` 现在验证 OneBot v11 `X-Signature: sha1=<hex>` HMAC-SHA1；access_token 已配置时必过，缺 token 才 fall-back 警告接受。用 `subtle::ConstantTimeEq` 常量时间比较避免 timing side channel。
+- [x] **QQ token 落盘权限**（P0-24）— `save_runtime_config` 在 Unix 上用 `OpenOptions::mode(0o600)` 创建；不再有 world-readable 窗口。
+- [x] **API key 不落盘**（P0-25）— `LlmApiConfig.api_key` 加 `#[serde(skip_serializing)]`；session 快照 / shutdown memory 都不再写出这个字段。`auto_save_session` 建目录后 chmod 0o700。
+- [x] **`save_draft_and_revert` 保留 untracked**（P0-26）— 不再无条件 `git clean -fd -- plugins/`；untracked 文件被 `git mv` 到 `.cordis-drafts/untracked-<ts>-<reason>/` 保留；`git checkout` 只 revert tracked 修改。用户还没 add 的新文件不再被吞。
+- [x] **Vision OCR temp file 冲突**（P0-27）— 文件名从 `cordis_ocr_<pid>.<ext>` 改为 `cordis_ocr_<pid>_<seq>_<nanos>.<ext>`；同进程并发 OCR 不再互相覆盖。
+
 ### 5.2.4 Kernel↔Plugin 边界收敛（2026-07-17 已闭合）
 
 - [x] **`agent_run_command` 去 shell**（P0-17）— 从 `sh -c command` 改为 `shell_words::split` + `Command::new(argv[0]).args(...)`；`;`、``` ` ```、`$(...)`、重定向、管道 全部丧失特殊语义，Agent 工具面不再暴露 shell-injection 面。

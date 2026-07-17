@@ -1204,6 +1204,18 @@ impl RuntimeHost {
             );
             return;
         }
+        // P0-25: session snapshots may embed non-secret HTTP config (base_url,
+        // model, timeouts) — the api_key field is now `#[serde(skip_serializing)]`
+        // so it does NOT land on disk, but even so we tighten the dir to
+        // owner-only permissions.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(
+                &sessions_dir,
+                std::fs::Permissions::from_mode(0o700),
+            );
+        }
         let snapshot = session.to_snapshot();
         let json = match serde_json::to_vec(&snapshot) {
             Ok(v) => v,

@@ -484,10 +484,50 @@ fn run_event_loop(server: tiny_http::Server) {
         match server.recv_timeout(Duration::from_millis(500)) {
             Ok(Some(mut request)) => {
                 if request.url() == "/onebot/event" && request.method() == &tiny_http::Method::Post {
+                    // P0-23: OneBot v11 signs the request body with HMAC-SHA1
+                    // keyed by `access_token`, and passes it in the
+                    // `X-Signature: sha1=<hex>` header. If a token is
+                    // configured we MUST verify — otherwise anyone who can
+                    // reach the port could push arbitrary "user messages"
+                    // into the agent.  If no token is configured, log a
+                    // warning and accept (backwards-compat with dev setups);
+                    // production deployments should always set access_token.
+                    let signature_header = request
+                        .headers()
+                        .iter()
+                        .find(|h| h.field.equiv("X-Signature"))
+                        .map(|h| h.value.as_str().to_string());
                     let mut body = String::new();
                     if let Ok(_) = request.as_reader().read_to_string(&mut body) {
+                        let expected_token = STATE
+                            .lock()
+                            .ok()
+                            .and_then(|s| s.access_token.clone())
+                            .or_else(|| {
+                                load_runtime_config()
+                                    .and_then(|c| c.get("access_token")?.as_str().map(String::from))
+                            });
+                        if let Some(token) = expected_token.as_deref() {
+                            let ok = signature_header
+                                .as_deref()
+                                .map(|s| verify_onebot_signature(token, body.as_bytes(), s))
+                                .unwrap_or(false);
+                            if !ok {
+                                eprintln!("[qq] webhook signature check failed");
+                                let _ = request.respond(
+                                    tiny_http::Response::from_string("bad signature")
+                                        .with_status_code(401),
+                                );
+                                continue;
+                            }
+                        } else {
+                            eprintln!(
+                                "[qq] warning: /onebot/event received with no access_token \
+                                 configured; accepting without signature check"
+                            );
+                        }
                         let _ = request.respond(tiny_http::Response::from_string(
-                            serde_json::to_string(&json!({"status":"ok"})).unwrap(),
+                            serde_json::to_string(&json!({"status":"ok"})).unwrap_or_default(),
                         ));
                         if let Ok(event) = serde_json::from_str::<OneBotEvent>(&body) {
                             handle_onebot_event(&event);
@@ -1006,7 +1046,58 @@ fn save_runtime_config(config: &serde_json::Value) {
     if let Some(parent) = std::path::Path::new(path).parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let _ = std::fs::write(path, serde_json::to_string_pretty(config).unwrap_or_default());
+    // P0-24: this file contains the QQ access_token. Write it with 0o600 on
+    // Unix so other users on the box can't read the token. Use OpenOptions
+    // with a mode so the perms are set at create time (chmod after write
+    // leaves a race window during which the file is world-readable).
+    let bytes = serde_json::to_string_pretty(config).unwrap_or_default();
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+        {
+            Ok(mut f) => {
+                let _ = f.write_all(bytes.as_bytes());
+            }
+            Err(_) => {
+                let _ = std::fs::write(path, &bytes);
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = std::fs::write(path, &bytes);
+    }
+}
+
+/// P0-23: verify OneBot v11 `X-Signature: sha1=<hex>` against `body` using
+/// `access_token` as the HMAC-SHA1 key. Comparison is constant-time via
+/// `subtle::ConstantTimeEq` to avoid timing side channels.
+fn verify_onebot_signature(access_token: &str, body: &[u8], header_value: &str) -> bool {
+    use hmac::{Hmac, Mac};
+    use sha1::Sha1;
+    use subtle::ConstantTimeEq;
+    let hex_from_header = header_value.trim().strip_prefix("sha1=").unwrap_or(header_value.trim());
+    let expected_bytes = match hex::decode(hex_from_header) {
+        Ok(b) => b,
+        Err(_) => return false,
+    };
+    let mut mac = match Hmac::<Sha1>::new_from_slice(access_token.as_bytes()) {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+    mac.update(body);
+    let computed = mac.finalize().into_bytes();
+    if computed.len() != expected_bytes.len() {
+        return false;
+    }
+    computed.ct_eq(&expected_bytes).into()
 }
 
 fn handle_qq_get_group_members(req: &NodeRequest) -> Result<NodeResponse, String> {
@@ -1401,4 +1492,52 @@ export_plugin_api! {
     abi_fingerprint = abi_fingerprint_value(),
     docs = docs_value(),
     handle = api_handle,
+}
+
+#[cfg(test)]
+mod signature_tests {
+    use super::verify_onebot_signature;
+
+    #[test]
+    fn valid_signature_is_accepted() {
+        use hmac::{Hmac, Mac};
+        use sha1::Sha1;
+        let token = "example-token";
+        let body = b"{\"post_type\":\"message\"}";
+        let mut mac = Hmac::<Sha1>::new_from_slice(token.as_bytes()).unwrap();
+        mac.update(body);
+        let sig = mac.finalize().into_bytes();
+        let header = format!("sha1={}", hex::encode(sig));
+        assert!(verify_onebot_signature(token, body, &header));
+        // Also accept a bare hex form without the sha1= prefix (some proxies
+        // strip it).
+        let bare = hex::encode(sig);
+        assert!(verify_onebot_signature(token, body, &bare));
+    }
+
+    #[test]
+    fn wrong_signature_is_rejected() {
+        assert!(!verify_onebot_signature(
+            "example-token",
+            b"payload",
+            "sha1=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+        ));
+    }
+
+    #[test]
+    fn wrong_token_is_rejected() {
+        use hmac::{Hmac, Mac};
+        use sha1::Sha1;
+        let mut mac = Hmac::<Sha1>::new_from_slice(b"other").unwrap();
+        mac.update(b"payload");
+        let sig = mac.finalize().into_bytes();
+        let header = format!("sha1={}", hex::encode(sig));
+        assert!(!verify_onebot_signature("expected", b"payload", &header));
+    }
+
+    #[test]
+    fn malformed_header_is_rejected() {
+        assert!(!verify_onebot_signature("t", b"payload", "not-hex"));
+        assert!(!verify_onebot_signature("t", b"payload", "sha1=zzz"));
+    }
 }
