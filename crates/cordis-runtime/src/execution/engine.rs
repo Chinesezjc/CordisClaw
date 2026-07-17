@@ -182,6 +182,33 @@ where
             .map(|spec| (spec.transition.transition_id.clone(), spec))
             .collect::<BTreeMap<_, _>>();
 
+        // P1-6: reject KeyedPair transitions whose arity != 2 at the entry
+        // to `execute_net` instead of letting them silently never fire.
+        // Previously the readiness check `is_transition_ready` would
+        // demand exactly 2 non-empty input places for KeyedPair and — for
+        // any transition with 1 or ≥3 input places — return `false` on
+        // every batch, so the engine looked healthy but the transition
+        // never made progress. Now we surface it as an Invariant error.
+        for (transition_id, spec) in &specs {
+            if matches!(
+                spec.transition.join_policy,
+                crate::execution::net::JoinPolicy::KeyedPair
+            ) {
+                let arc_count = graph
+                    .input_arcs_by_transition
+                    .get(transition_id)
+                    .map(|arcs| arcs.len())
+                    .unwrap_or(0);
+                if arc_count != 2 {
+                    return Err(RuntimeError::Invariant {
+                        message: format!(
+                            "KeyedPair transition {transition_id} requires exactly 2 input places, got {arc_count}"
+                        ),
+                    });
+                }
+            }
+        }
+
         let mut state = EngineState::new(execution_id.clone(), specs, graph, metrics);
         state.enqueue_roots()?;
 
@@ -199,8 +226,13 @@ where
                 }
             } else {
                 // ---- parallel key-sharded path ----
-                // Group ready items by correlation key; pick the highest-priority
-                // item per key.
+                // P1-4: drain the ready queue but dedup by correlation key,
+                // then sort by `cmp_ready` (topo_level → priority → ids)
+                // before taking `max_concurrency`. The previous version used
+                // `BTreeMap::into_values().take(N)`, which returned items in
+                // correlation-key sort order regardless of priority — a
+                // higher-priority ready transition could be starved by a
+                // lower-priority one just because its key sorted later.
                 let mut key_items: BTreeMap<CorrelationKey, ReadyItem> = BTreeMap::new();
                 while let Some(item) = state.ready.pop_front() {
                     let key = item.key.clone();
@@ -209,9 +241,10 @@ where
                     key_items.entry(key).or_insert(item);
                 }
 
-                // Take up to max_concurrency items (one per key).
-                let batch: Vec<ReadyItem> = key_items
-                    .into_values()
+                let mut sorted_items: Vec<ReadyItem> = key_items.into_values().collect();
+                sorted_items.sort_by(cmp_ready);
+                let batch: Vec<ReadyItem> = sorted_items
+                    .into_iter()
                     .take(config.scheduler.max_concurrency)
                     .collect();
 
@@ -254,11 +287,24 @@ where
 
                     state.order.push(item.transition_id.clone());
 
-                    // Router transitions need &mut context — run them now.
-                    let router_run = if matches!(
-                        spec.kind,
-                        ExecutionTransitionKind::Router { .. }
-                    ) {
+                    // P1-3: compute `skip` from the single-thread rule first
+                    // (AllOf + any-non-success upstream = Skipped) — this
+                    // decision must be identical whether or not we happen to
+                    // dispatch through the parallel path. Only then, if the
+                    // job is NOT to be skipped, do we invoke a Router
+                    // transition (Router needs `&mut context` so it stays
+                    // serial). The previous code always pre-ran Router and
+                    // then forced `skip: skip && router_run.is_none()` —
+                    // effectively "Router is never skipped", which diverged
+                    // from the single-threaded path.
+                    let skip = spec.transition.join_policy == JoinPolicy::AllOf
+                        && trigger
+                            .inputs
+                            .iter()
+                            .any(|i| i.token.meta.outcome != NodeOutcome::Success);
+                    let router_run = if !skip
+                        && matches!(spec.kind, ExecutionTransitionKind::Router { .. })
+                    {
                         Some(run_transition_router(
                             &spec,
                             attempt,
@@ -271,18 +317,13 @@ where
                         None
                     };
 
-                    let skip = spec.transition.join_policy == JoinPolicy::AllOf
-                        && trigger
-                            .inputs
-                            .iter()
-                            .any(|i| i.token.meta.outcome != NodeOutcome::Success);
                     jobs.push(ParallelJob {
                         transition_id: item.transition_id,
                         key: item.key,
                         spec,
                         attempt,
                         trigger,
-                        skip: skip && router_run.is_none(),
+                        skip,
                         router_run,
                     });
                 }
@@ -314,9 +355,31 @@ where
                             }),
                         ));
                     }
+                    // P1-5: turn a runner-thread panic into a RuntimeError
+                    // instead of unwinding through the whole executor.
+                    // Previously `h.join().unwrap()` propagated the panic to
+                    // the main loop, losing every other job in the batch and
+                    // giving the caller no chance to retry.
                     handles
                         .into_iter()
-                        .map(|(idx, h)| (idx, h.join().unwrap()))
+                        .map(|(idx, h)| match h.join() {
+                            Ok(result) => (idx, result),
+                            Err(panic_payload) => {
+                                let message = if let Some(s) = panic_payload.downcast_ref::<&'static str>() {
+                                    (*s).to_string()
+                                } else if let Some(s) = panic_payload.downcast_ref::<String>() {
+                                    s.clone()
+                                } else {
+                                    "runner thread panicked".to_string()
+                                };
+                                (
+                                    idx,
+                                    Err(RuntimeError::Invariant {
+                                        message: format!("runner panic: {message}"),
+                                    }),
+                                )
+                            }
+                        })
                         .collect()
                 });
 

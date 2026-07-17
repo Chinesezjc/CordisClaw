@@ -41,7 +41,17 @@ where
     context.begin_subgraph(subgraph_id)?;
     let raw_outcome = run(&*context);
     let elapsed = started_at.elapsed();
-    let outcome = if timeout_ms > 0 && elapsed > std::time::Duration::from_millis(timeout_ms) {
+    // P1-7: only downgrade to Timeout when the run itself did NOT succeed.
+    // The previous behaviour overrode Success with Timeout whenever the
+    // elapsed time exceeded `timeout_ms` — a slow but correct run got
+    // rolled back the same as a genuine timeout. Now Success is preserved
+    // and only Failure/Cancelled/Skipped are re-classified as Timeout when
+    // the deadline was blown; the caller can still see slow-successes via
+    // metrics if it cares.
+    let outcome = if timeout_ms > 0
+        && elapsed > std::time::Duration::from_millis(timeout_ms)
+        && raw_outcome != NodeOutcome::Success
+    {
         NodeOutcome::Timeout
     } else {
         raw_outcome
@@ -78,4 +88,53 @@ where
     metrics.router_exec_ms += elapsed.as_millis();
 
     Ok(RouterRunResult { outcome })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::context::RuntimeContext;
+
+    #[test]
+    fn slow_success_is_not_downgraded_to_timeout() {
+        // P1-7 regression guard: a run that returns Success but happens to
+        // exceed `timeout_ms` used to be re-classified as Timeout and
+        // rolled back. Now Success is preserved.
+        let mut ctx = RuntimeContext::default();
+        let mut metrics = RouterMetrics::default();
+        let result = execute_router(
+            &mut ctx,
+            "slow-success",
+            &mut metrics,
+            |_ctx| {
+                std::thread::sleep(std::time::Duration::from_millis(30));
+                NodeOutcome::Success
+            },
+            10,
+        )
+        .expect("router should not error");
+        assert_eq!(result.outcome, NodeOutcome::Success);
+        assert_eq!(metrics.router_success_total, 1);
+        assert_eq!(metrics.router_timeout_total, 0);
+    }
+
+    #[test]
+    fn slow_failure_is_reclassified_as_timeout() {
+        // The Timeout override still applies to non-Success outcomes.
+        let mut ctx = RuntimeContext::default();
+        let mut metrics = RouterMetrics::default();
+        let result = execute_router(
+            &mut ctx,
+            "slow-failure",
+            &mut metrics,
+            |_ctx| {
+                std::thread::sleep(std::time::Duration::from_millis(30));
+                NodeOutcome::Failure
+            },
+            10,
+        )
+        .expect("router should not error");
+        assert_eq!(result.outcome, NodeOutcome::Timeout);
+        assert_eq!(metrics.router_timeout_total, 1);
+    }
 }

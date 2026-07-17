@@ -120,7 +120,6 @@ fn eval_first_success(
     completion_order: &[String],
 ) -> GateDecision {
     let upstream: BTreeSet<_> = upstream_nodes.iter().cloned().collect();
-    let mut completed_terminals = 0usize;
     let mut first_success: Option<String> = None;
 
     for node in completion_order {
@@ -128,9 +127,6 @@ fn eval_first_success(
             continue;
         }
         if let Some(outcome) = outcomes.get(node) {
-            if is_terminal(*outcome) {
-                completed_terminals += 1;
-            }
             if *outcome == NodeOutcome::Success {
                 first_success = Some(node.clone());
                 break;
@@ -153,7 +149,19 @@ fn eval_first_success(
         };
     }
 
-    if completed_terminals == upstream_nodes.len() && !upstream_nodes.is_empty() {
+    // P1-8: count terminal upstreams directly from `outcomes` (source of
+    // truth) rather than via `completion_order`. The previous counter only
+    // incremented when a node appeared in `completion_order` AND had an
+    // outcome recorded, so a terminal-but-not-yet-ordered upstream held the
+    // gate in Wait forever. Now: if every upstream has some terminal
+    // outcome and none of them are Success, we complete as failure.
+    let all_terminal_non_success = !upstream_nodes.is_empty()
+        && upstream_nodes.iter().all(|n| {
+            outcomes
+                .get(n)
+                .is_some_and(|o| is_terminal(*o))
+        });
+    if all_terminal_non_success {
         GateDecision::CompleteFailure
     } else {
         GateDecision::Wait
