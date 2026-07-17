@@ -712,27 +712,33 @@ impl AgentToolHost for RuntimeHost {
     }
 
     fn agent_compact_context(&self, session_id: &str) -> Result<Value, RuntimeError> {
-        // P1-25: during `agent_send` the session is `remove`d from the
-        // map for the duration of `respond`, so a tool-dispatch trying to
-        // look itself up here previously returned AgentSessionNotFound
-        // unconditionally. Detect that state and surface a more accurate
-        // error: the compact must be scheduled by the caller as an
-        // out-of-band operation (e.g. `record_summary` at end of turn) —
-        // it cannot run mid-turn against the session it belongs to.
-        // Turning this into a graceful no-op with a "deferred: true"
-        // response would silently drop the request, so we return an
-        // explicit error the agent can read and re-plan.
-        let mut guard = self.agent_sessions_mut();
-        let session = guard.get_mut(session_id).ok_or_else(|| {
-            RuntimeError::AgentSessionNotFound {
-                session_id: session_id.to_string(),
+        // P1-25: during `agent_send` the session is removed from the map
+        // for the duration of `respond`, so this lookup misses when the
+        // agent calls compact on itself mid-turn. Detect that case and
+        // queue a `PendingSessionAction::CompactHistory` on the host —
+        // it drains and applies before reinserting the session after the
+        // turn ends. Returns `{"deferred": true}` so the LLM knows the
+        // action is scheduled rather than failed.
+        {
+            let mut guard = self.agent_sessions_mut();
+            if let Some(session) = guard.get_mut(session_id) {
+                let (old_len, new_len) = session.compact_history();
+                return Ok(json!({
+                    "compacted": true,
+                    "old_messages": old_len,
+                    "new_messages": new_len,
+                }));
             }
-        })?;
-        let (old_len, new_len) = session.compact_history();
+        }
+        // Session is currently executing a turn — queue for post-turn.
+        self.queue_session_action(
+            session_id,
+            crate::host::PendingSessionAction::CompactHistory,
+        );
         Ok(json!({
-            "compacted": true,
-            "old_messages": old_len,
-            "new_messages": new_len,
+            "compacted": false,
+            "deferred": true,
+            "reason": "session is currently mid-turn; compact will run after this turn completes",
         }))
     }
 
