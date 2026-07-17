@@ -1200,8 +1200,18 @@ impl RuntimeHost {
             "plugins": plugins,
         });
         if let Ok(json) = serde_json::to_string_pretty(&memory) {
-            let _ = std::fs::write(&path, json);
-            eprintln!("[shutdown] wrote memory to {}", path.display());
+            // P1-15: previously `fs::write(&path, json)` — a crash mid-write
+            // (SIGKILL / power loss) left a truncated JSON on disk that the
+            // next boot would parse-fail on. All other runtime writers use
+            // tmp + rename; shutdown is now the same.
+            if let Err(err) = atomic_write_bytes(&path, json.as_bytes()) {
+                eprintln!(
+                    "[shutdown] failed to write memory to {}: {err}",
+                    path.display()
+                );
+            } else {
+                eprintln!("[shutdown] wrote memory to {}", path.display());
+            }
         }
     }
 
@@ -1691,8 +1701,18 @@ export_plugin_api! {{
             message: format!("failed to write lib.rs: {e}"),
         })?;
 
-        // Add to workspace members
+        // Add to workspace members.
+        //
+        // P1-16: previously plain `read → mutate → write`. Two concurrent
+        // `create_plugin` calls could interleave the read-modify-write and
+        // lose one member. Now:
+        //   - hold an advisory flock on `<manifest>.lock` for the whole
+        //     RMW, so callers cross-process see a serial order;
+        //   - write to `<manifest>.cordis-tmp.<pid>` + rename so a crash
+        //     mid-write leaves the previous manifest intact.
         let workspace_manifest = self.fixtures_root.join("plugins").join("Cargo.toml");
+        let lock_path = workspace_manifest.with_extension("toml.create-lock");
+        let _lock = workspace_manifest_lock::acquire(&lock_path);
         let manifest_text = std::fs::read_to_string(&workspace_manifest).map_err(|e| {
             RuntimeError::Io {
                 path: workspace_manifest.clone(),
@@ -1718,9 +1738,11 @@ export_plugin_api! {{
             path: workspace_manifest.clone(),
             message: format!("failed to serialize workspace manifest: {e}"),
         })?;
-        std::fs::write(&workspace_manifest, &new_manifest).map_err(|e| RuntimeError::Io {
-            path: workspace_manifest,
-            message: format!("failed to write workspace manifest: {e}"),
+        atomic_write_bytes(&workspace_manifest, new_manifest.as_bytes()).map_err(|e| {
+            RuntimeError::Io {
+                path: workspace_manifest,
+                message: format!("failed to write workspace manifest: {e}"),
+            }
         })?;
 
         Ok(serde_json::json!({
@@ -5631,6 +5653,105 @@ fn plugin_iteration_journal_path(snapshot_root: &Path) -> PathBuf {
 /// Currently only the direct `artifacts/{name}.so` produced by
 /// `rebuild_plugin_workspace` is captured — nested-plugin rebuild is handled
 /// via a separate helper if/when that path lands.
+/// P1-16 helper module: fcntl advisory file lock around workspace-manifest
+/// edits so two concurrent `create_plugin` invocations don't interleave
+/// their read/modify/write of `plugins/Cargo.toml`.
+mod workspace_manifest_lock {
+    use std::fs::{File, OpenOptions};
+    use std::path::Path;
+
+    pub struct Guard {
+        #[allow(dead_code)]
+        file: Option<File>,
+    }
+
+    pub fn acquire(path: &Path) -> Guard {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let file = match OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(path)
+        {
+            Ok(f) => f,
+            Err(err) => {
+                eprintln!(
+                    "[create_plugin] failed to open lock {}: {err}",
+                    path.display()
+                );
+                return Guard { file: None };
+            }
+        };
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            // SAFETY: fd owned by `file`, kept alive across the syscall.
+            let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+            if rc != 0 {
+                eprintln!(
+                    "[create_plugin] flock({}) failed: {}",
+                    path.display(),
+                    std::io::Error::last_os_error()
+                );
+            }
+        }
+        Guard { file: Some(file) }
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            #[cfg(unix)]
+            {
+                if let Some(file) = self.file.as_ref() {
+                    use std::os::unix::io::AsRawFd;
+                    let _ = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+                }
+            }
+        }
+    }
+}
+
+/// P1-15 shared helper: durable atomic write for JSON snapshots (session
+/// snapshots, shutdown memory, workspace-manifest edits). Same shape as
+/// `kernel::plugin_iteration::atomic_write` but returns `std::io::Error`
+/// so hot paths that don't care about the RuntimeError newtype can just
+/// swallow / log.
+fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp = match path.file_name() {
+        Some(name) => {
+            let mut owned = name.to_os_string();
+            owned.push(format!(
+                ".cordis-tmp.{}",
+                std::process::id()
+            ));
+            path.with_file_name(owned)
+        }
+        None => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "atomic_write_bytes target has no filename",
+            ));
+        }
+    };
+    {
+        let mut f = fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+    }
+    if let Err(err) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(err);
+    }
+    Ok(())
+}
+
 fn artifact_paths_to_backup(fixtures_root: &Path, root_plugin_path: &str) -> Vec<(String, PathBuf)> {
     let name = root_plugin_path.trim_start_matches('/');
     if name.is_empty() {
