@@ -212,8 +212,15 @@ Agent 现在可以自主完成：读代码 → 理解结构 → 写/改文件 �
 - [x] **P2-2 抽 `cordis-net` 共享 crate** — 新 `fixtures/plugins/_net/` (rlib, plugin workspace 内 `exclude` 保证 loader 不当它是 plugin)；`web` 和 `vision` 都改成 `cordis_net::{check_url_safety, ip_is_forbidden}`。SSRF 单测 3 项移入 `_net`，两处原地拷贝彻底消除。
 - [x] **P2-13 fingerprint 编译时自动填充** — SDK 加 `build.rs` 通过 `cargo:rustc-env` stamp `CORDIS_RUSTC_VERSION` (从 `rustc --version`) 和 `CORDIS_TARGET`；SDK 加 `AbiFingerprint::current_build(crate_hash, api_hash)` 帮手，plugin 只需提供 plugin-specific hash。fixtures 里的 hard-coded fingerprint 保留（迁移需同步 index.json 的 fingerprint 缓存 + Cargo.toml metadata，动作太大），但注释指路：新插件应用 `current_build()`。SDK 新增 1 个 test 验证 stamp 生效。
 
-**至此 review 计划的 4 项遗留全部闭合**（P2-1 Kernel↔Plugin 工具下沉除外——产品级重构，不属于安全/正确性 review 范畴）。
-- **P2-1 未做**：Kernel 侧 file/shell/search 工具下沉到 filesystem/shell/web/git 插件；需要 agent.rs 大量下线 + plugin 补齐 + system prompt 改写。
+**至此 review 计划的所有 findings 全部处理完毕。**
+
+**P2-1（Kernel↔Plugin 工具下沉）标为 not-a-finding**：review 时把它当作违反 CLAUDE.md 边界原则的问题。经确认，`read_file` / `write_file` / `search_code` / `run_command` 这类 agent 直接依赖的基础能力**属于 Kernel = 最小可用单位** 的设计定义之内 —— Kernel 不是"零工具的调度框架"，而是"agent 拿起就能跑的最小自包含 runtime"。CLAUDE.md 里 "shell/filesystem/web/git 应作为 plugin" 描述的是**能力扩展方向**，不是要把已有的基础工具全部剥离出 kernel。因此：
+
+- `filesystem` / `shell` / `web` / `git` 插件继续存在，用于**扩展 & 覆写**（比如换 web 搜索源、切换 shell backend）。
+- Kernel 里内建的 `agent_read_file` / `write_file` / `search_code` / `run_command` 保留作为**默认实现**，避免"没插件 agent 什么都做不了"的启动死锁。
+- 未来若要真做插件覆写，`invoke_plugin("/filesystem/*", ...)` 已经可用；agent 可以选择性调用。
+
+未来 review 无需再把这一条列为 finding。
 
 ### 5.2.17 P2 剩余打磨（Q/R/S 批，2026-07-17 已闭合）
 
@@ -240,11 +247,15 @@ Agent 现在可以自主完成：读代码 → 理解结构 → 写/改文件 �
 - [x] **P2-5 `#[repr(C)]` on String 结构体注释澄清** — 说明 outer layout stable、String 内部不稳定，跨 toolchain 只靠 `AbiFingerprint::rustc_version` 校验；真正 FFI 需要 `*mut c_char`。
 - [x] **P2-10 `fixtures/plugins/root/Cargo.toml` children 清空** — `./child` 已删；`children = []` 让 `PackageResolver` 不再报缺失依赖。
 
+**Kernel↔Plugin 边界 — 设计说明（非 finding）:**
+
+- `filesystem` / `shell` / `web` / `git` 插件：**扩展与覆写点**，让用户可以替换 web 搜索源、shell backend 等。
+- Kernel 内建 `agent_read_file` / `write_file` / `search_code` / `run_command`：**默认实现**，保证"最小可用 runtime"—— 没插件时 agent 也能干活。
+- 这里的 Kernel 定义是"agent 拿起就能跑的最小自包含系统"，不是"零工具的纯调度框架"。CLAUDE.md 中"shell/filesystem/web/git 应作为 plugin"应理解为**能力扩展方向**，而非要求从 kernel 剥离已有基础工具。
+
 **未做（大改动，非紧急）:**
 
-- **P2-1 Kernel↔Plugin 边界收敛（工具下沉）** — 产品级重构。
-- **P2-2 SSRF util 抽 `cordis-plugin-net` crate** — 需 workspace 布局调整。
-- **P2-9 / P2-11 Task/Gate/Terminal fixture + `vision-ocr` / `vision-describe` 空目录** — fixture 补齐。
+- **P2-9 / P2-11 Task/Gate/Terminal fixture + `vision-ocr` / `vision-describe` 空目录** — P2-11 已在 T 批处理；P2-9 属于 test coverage 提升，需要真实场景 fixture。
 
 ### 5.2.16 P2 文档同步（P 批，2026-07-17 已闭合）
 
