@@ -35,6 +35,11 @@ struct ShellPluginResponsePayload {
 
 #[derive(Debug, Clone)]
 struct ShellPlugin {
+    /// P2-36: currently always `None` because the plugin is
+    /// instantiated per request via `ShellPlugin::default()`. The
+    /// per-request `fixtures_root` in `ShellPluginRequest` supersedes
+    /// this field; the fallback branch below is effectively dead code
+    /// but kept as a future extension point (host-injected default).
     fixtures_root: Option<PathBuf>,
 }
 
@@ -209,6 +214,13 @@ impl BuiltinShell {
     }
 
     fn run_repl(&mut self) -> Result<i32, String> {
+        // P2-37: bail out early on non-TTY stdin so a headless host that
+        // instantiates this plugin doesn't hang forever waiting for
+        // input. `IsTerminal` is stable since Rust 1.70.
+        use std::io::IsTerminal;
+        if !io::stdin().is_terminal() {
+            return Err("shell REPL requires an interactive TTY on stdin".to_string());
+        }
         let stdin = io::stdin();
         loop {
             print!("CordisClaw@runtime:{}$ ", self.cwd.display());

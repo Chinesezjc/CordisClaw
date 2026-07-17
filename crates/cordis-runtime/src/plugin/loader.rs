@@ -344,13 +344,28 @@ impl Loader {
 
             // For dylib artifacts, extract docs from the .so and compare
             // against the cached index entry.
+            //
+            // P2-34: the previous `if let Ok(...)` silently swallowed
+            // errors — architecture-mismatched or missing-symbol dylibs
+            // would just fall through to the cached index docs, hiding
+            // the drift from operators. Now record any read failure as a
+            // stderr diagnostic so it shows up in logs (we deliberately
+            // don't propagate: the plugin registry entry stays "loaded"
+            // with the last-known docs, matching prior semantics).
             if !matches!(entry.artifact_kind, ArtifactKind::Json) {
-                if let Ok(dylib_docs) =
-                    crate::plugin::tooling::read_plugin_docs(&artifact_path)
-                {
-                    if dylib_docs != entry.docs {
-                        docs_drift.push((plugin_path.clone(), dylib_docs.clone()));
-                        effective_docs = Some(dylib_docs);
+                match crate::plugin::tooling::read_plugin_docs(&artifact_path) {
+                    Ok(dylib_docs) => {
+                        if dylib_docs != entry.docs {
+                            docs_drift.push((plugin_path.clone(), dylib_docs.clone()));
+                            effective_docs = Some(dylib_docs);
+                        }
+                    }
+                    Err(err) => {
+                        eprintln!(
+                            "[loader] docs-drift: read_plugin_docs({}) failed: {err}; \
+                             falling back to cached index docs",
+                            artifact_path.display()
+                        );
                     }
                 }
             }
@@ -547,11 +562,18 @@ pub fn default_loader_config(root: impl AsRef<Path>) -> LoaderConfig {
 }
 
 fn make_execution_id() -> String {
+    // P2-18: `duration_since(UNIX_EPOCH).unwrap_or(0)` used to collapse
+    // clock-goes-backwards or same-nanosecond boots to the same id. Add
+    // a process-local monotonic counter so ids stay unique regardless
+    // of wall clock behaviour.
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    format!("exec-{nanos}")
+    format!("exec-{nanos:x}-{seq:x}")
 }
 
 /// P0-14: produce a per-process unique tmp path for atomic write-then-rename.

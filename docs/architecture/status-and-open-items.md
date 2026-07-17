@@ -206,6 +206,23 @@ Agent 现在可以自主完成：读代码 → 理解结构 → 写/改文件 �
 - [x] **Plugin iteration symlink 逃逸**（P0-20）— `PluginEditExecutor::execute` 在写入前调用新 helper `resolve_under_workspace`：canonicalize 结果必须仍在 workspace_root 下。plugins 内的 symlink 指向 `/etc/passwd` 之类无法被写入。
 - [x] **Verifier shell 拼接**（P0-21）— 已随 A 批 P0-1 修复。`discover_rust_workspace_manifest` 输出的字符串被 `shell_words` 解析成 argv，空格 / `$` / `;` 无法被解释。
 
+### 5.2.15 P2 代码打磨（O 批，2026-07-17 已闭合）
+
+- [x] **`make_execution_id` unique**（P2-18）— 加进程本地 `AtomicU64` seq；纳秒 + seq 组合，时钟回拨或同纳秒 boot 不再撞 id。
+- [x] **`plugin/invoke.rs` NUL/JSON 严格化**（P2-20/21）— `CString::new(node_id)` 失败明确报错；`payload` 反序列失败也不再吞成 null。
+- [x] **`net.rs::ArcSpec.required` 注释更新**（P2-6）— 说明 required 已由 `is_transition_ready` 强制。
+- [x] **`scheduler.rs::run_deterministic` 死代码删除**（P2-7）— 连同 `ScheduledNode` / `ExecutionReport` / `ReadyItem` / 私有 `cmp_ready` 一并删除；保留 `SchedulerConfig`（`ExecutionConfig` 依赖它）。
+- [x] **`auto_update.rs` text patch 严格化**（P2-27）— `find` 命中数 !=1 直接报错（0 → 未找到；>1 → 需上下文），不再 `replacen(1)` 静默取首个。
+- [x] **`respond` err path 补 Assistant placeholder**（P2-31）— 分离 `respond` / `respond_inner`；Err 时若 `transcript` 里有 orphan User，插入 `[error] <msg>` Assistant 条目，retry 同 session 不再 double-record 用户输入。
+- [x] **`from_snapshot` api_key 澄清**（P2-33）— 加注释说明 `#[serde(skip_serializing)]` 让 api_key 恢复时为 `None`，`resolve_api_key` 从 env 补，避免"雷带毒配置"担忧。
+- [x] **`AGENT_INJECT_QUEUE` 已知局限文档化**（P2-32）— 加注释说明单 static + 多 session 的 mis-routing 风险为 latent（当前只跑一个 primary session），per-session queue 是未来工作。
+- [x] **`loader::read_plugin_docs` 显式记诊断**（P2-34）— `if let Ok` 换成 `match`，Err 分支写 stderr；架构不兼容/missing symbol 的 dylib drift 不再静默。
+- [x] **QQ `unwrap()` 换 `unwrap_or_default`**（P2-35）— `/health` 响应 JSON 编码失败不再让整个事件循环 panic。
+- [x] **Gacha state path**（P2-38）— 优先用 `$CORDIS_FIXTURES_ROOT/../data/gacha/state.json`，摆脱 cwd 依赖。
+- [x] **Gacha avg 5★ 公式**（P2-39）— 新增 `char_5_star_count` 字段并用于 avg 计算；旧公式 `total_pulls / pity_5_total` 实际 ≈ 1，一直是错的。
+- [x] **Shell `ShellPlugin::fixtures_root` 注释**（P2-36）— 说明当前始终 None，保留字段作为未来 host-injected default 的扩展点。
+- [x] **Shell `run_repl` isatty 检查**（P2-37）— 非 TTY 立即返回错误，headless host 不再 hang。
+
 ### 5.2.14 P1-25 收尾（2026-07-17 已闭合）
 
 - [x] **Session self-lookup 冲突**（P1-25）— 新增 `PendingSessionAction` 与 `RuntimeHost::pending_session_actions` 侧信道；`agent_compact_context` 先尝试 `get_mut(session_id)`，命中就立刻应用（例如从别的 session 调过来的），未命中则 `queue_session_action(session_id, CompactHistory)` 并返回 `{"deferred": true, ...}`。`agent_send` 在 respond 完成后 reinsert 前 drain 队列并应用；单一活跃 session 的 self-lookup 不再 `AgentSessionNotFound`。之前评估需要 `Arc<Mutex<Session>>` 大重构；这个方案只加了一个 side-channel Mutex，兼容现有 remove/insert 模式，代价是 compact 在 turn 结束时执行而非中途。

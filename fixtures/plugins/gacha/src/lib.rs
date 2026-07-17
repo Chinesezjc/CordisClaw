@@ -20,8 +20,17 @@ struct GachaState {
     char_pity_4: u32,
     char_guaranteed: bool,
     char_4_guaranteed: bool,
+    /// Cumulative sum of pity-5 counts at every 5★ trigger. Retained for
+    /// backwards compat; the correct-average denominator is
+    /// `char_5_star_count` (P2-39 adds it below).
     char_pity_5_total: u64,
     char_total_pulls: u64,
+    /// P2-39: number of 5★ pulls seen since last reset. The historical
+    /// "avg 5★" formula computed `total_pulls / char_pity_5_total`, which
+    /// is a ratio of counts-to-gap-sum ≈ 1 for balanced RNG — always wrong.
+    /// The correct denominator is the count of 5★ events, tracked here.
+    #[serde(default)]
+    char_5_star_count: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,6 +46,19 @@ struct Store {
 }
 
 fn store_path() -> PathBuf {
+    // P2-38: was a relative `data/gacha/state.json`, which resolved
+    // against whatever the process cwd happened to be — two launches
+    // from different directories saw different state files. Prefer
+    // `$CORDIS_FIXTURES_ROOT/../data/gacha/state.json` (relative to the
+    // workspace root above `fixtures/`); fall back to the historical
+    // relative path only when the env is unset.
+    if let Ok(root) = std::env::var("CORDIS_FIXTURES_ROOT") {
+        let ws = PathBuf::from(&root)
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from(&root));
+        return ws.join("data/gacha/state.json");
+    }
     PathBuf::from("data/gacha/state.json")
 }
 
@@ -120,6 +142,7 @@ impl Default for Store {
                 char_4_guaranteed: false,
                 char_pity_5_total: 0,
                 char_total_pulls: 0,
+                char_5_star_count: 0,
             },
             banner: BannerConfig {
                 featured_5: String::new(),
@@ -224,6 +247,7 @@ fn pull_char_banner(state: &mut GachaState, banner: &BannerConfig) -> GachaResul
     let rate_5 = char_5_star_rate(state.char_pity_5);
     if rand_f64() < rate_5 {
         state.char_pity_5_total += state.char_pity_5 as u64;
+        state.char_5_star_count += 1;
         // 50/50: featured limited or random standard
         let (name, is_feat) = if state.char_guaranteed || rand_f64() < 0.5 {
             state.char_guaranteed = false;
@@ -311,8 +335,9 @@ fn handle_status() -> Result<GachaResponse, String> {
             store.state.char_pity_5, store.state.char_pity_4,
             store.state.char_guaranteed, store.state.char_4_guaranteed,
             store.state.char_total_pulls,
-            if store.state.char_pity_5_total > 0 {
-                store.state.char_total_pulls as f64 / store.state.char_pity_5_total as f64
+            // P2-39: correct average is total_pulls / count_of_5star.
+            if store.state.char_5_star_count > 0 {
+                store.state.char_total_pulls as f64 / store.state.char_5_star_count as f64
             } else { 0.0 },
             banner_info,
         )),
@@ -429,7 +454,7 @@ fn handle_reset() -> Result<GachaResponse, String> {
     let mut store = load_store();
     store.state = GachaState {
         char_pity_5: 0, char_pity_4: 0, char_guaranteed: false, char_4_guaranteed: false,
-        char_pity_5_total: 0, char_total_pulls: 0,
+        char_pity_5_total: 0, char_total_pulls: 0, char_5_star_count: 0,
     };
     save_store(&store);
     Ok(GachaResponse {

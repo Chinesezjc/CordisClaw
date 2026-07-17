@@ -330,10 +330,24 @@ fn apply_text_patch(
     abs_path: &Path,
     original: &str,
 ) -> Result<String, RuntimeError> {
-    if !original.contains(&patch.find) {
+    // P2-27: require `find` to occur exactly once. `replacen(..., 1)`
+    // used to silently mis-target when the pattern appeared >1 time, so
+    // an ambiguous find string produced by an LLM would edit the first
+    // instance — often the wrong one. Force the caller to supply enough
+    // context to disambiguate.
+    let occurrences = original.matches(patch.find.as_str()).count();
+    if occurrences == 0 {
         return Err(RuntimeError::AutoUpdatePatternNotFound {
             path: abs_path.to_path_buf(),
             pattern: patch.find.clone(),
+        });
+    }
+    if occurrences > 1 {
+        return Err(RuntimeError::AutoUpdatePatchInvalid {
+            path: abs_path.display().to_string(),
+            reason: format!(
+                "text patch `find` appears {occurrences} times; supply more surrounding context so the target is unique"
+            ),
         });
     }
 

@@ -213,12 +213,19 @@ pub fn invoke_registered_plugin(
     }
 
     // Inject node_id into the payload so plugins don't need to duplicate it.
-    let mut payload_value: serde_json::Value = serde_json::from_str(&payload)
-        .unwrap_or(serde_json::Value::Null);
+    // P2-21: reject malformed payload instead of silently converting to
+    // `null` — a downstream node_id-injection would otherwise vanish and
+    // the plugin would see just `null` with no clue why.
+    let mut payload_value: serde_json::Value =
+        serde_json::from_str(&payload).map_err(|err| RuntimeError::InvalidArgument {
+            message: format!("plugin invoke payload was not valid JSON: {err}"),
+        })?;
     if let Some(obj) = payload_value.as_object_mut() {
         obj.entry("node_id").or_insert_with(|| serde_json::json!(node_id));
     }
-    let payload = serde_json::to_string(&payload_value).unwrap_or(payload);
+    let payload = serde_json::to_string(&payload_value).map_err(|err| RuntimeError::Invariant {
+        message: format!("plugin invoke payload re-serialize failed: {err}"),
+    })?;
 
     let response = (api.handle)(PluginRequest { payload });
 
@@ -228,8 +235,17 @@ pub fn invoke_registered_plugin(
         .iter()
         .any(|n| n.id == node_id && n.node_type == NodeType::Task);
     if is_task {
-        // Look up Service VTable from the plugin.
-        let c_node = std::ffi::CString::new(node_id).unwrap_or_default();
+        // P2-20: was `CString::new(node_id).unwrap_or_default()` — a
+        // node_id containing an interior NUL byte silently became empty
+        // and the plugin returned the wrong service vtable (or null).
+        // Fail closed with a clear error.
+        let c_node = std::ffi::CString::new(node_id).map_err(|err| {
+            RuntimeError::InvalidArgument {
+                message: format!(
+                    "plugin invoke node_id contains NUL byte: {err}"
+                ),
+            }
+        })?;
         let create_sym: Result<
             libloading::Symbol<
                 unsafe extern "C" fn(
