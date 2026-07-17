@@ -897,6 +897,13 @@ impl AgentSession {
         }
     }
 
+    /// P1-24(b): expose the session's own kind so crash-recovery can
+    /// re-wire it under the correct `AgentSessionKind` instead of
+    /// hardcoding RuntimeShell.
+    pub fn kind(&self) -> &str {
+        &self.kind
+    }
+
     pub fn transcript(&self) -> &[AgentTranscriptEntry] {
         &self.transcript
     }

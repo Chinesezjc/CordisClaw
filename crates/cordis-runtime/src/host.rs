@@ -850,6 +850,10 @@ impl RuntimeKernel {
         }
 
         {
+            // P1-23: cap `plugin_history` at a hard upper bound; without
+            // this the VecDeque grew forever on long-running hosts. Newest
+            // entries stay at the front, so we drop from the back.
+            const MAX_PLUGIN_HISTORY: usize = 1024;
             let mut history = self
                 .plugin_history
                 .lock()
@@ -861,6 +865,9 @@ impl RuntimeKernel {
                 *existing = history_entry;
             } else {
                 history.push_front(history_entry);
+                while history.len() > MAX_PLUGIN_HISTORY {
+                    history.pop_back();
+                }
             }
         }
 
@@ -1257,7 +1264,15 @@ impl RuntimeHost {
             }
         };
         let target = sessions_dir.join(format!("{session_id}.json"));
-        let tmp = sessions_dir.join(format!(".{session_id}.json.tmp"));
+        // P1-24(c): unique tmp filename per write so concurrent
+        // `agent_send` invocations for the same session id don't stomp on
+        // each other's staging file. Previously `.<id>.json.tmp` was
+        // shared, so a race would leave a truncated / mis-attributed
+        // snapshot.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let tmp = sessions_dir.join(format!(".{session_id}.json.tmp.{}", seq));
         if let Err(e) = std::fs::write(&tmp, &json) {
             eprintln!("[auto-save] write tmp failed for {session_id}: {e}");
             return;
@@ -1265,6 +1280,25 @@ impl RuntimeHost {
         if let Err(e) = std::fs::rename(&tmp, &target) {
             eprintln!("[auto-save] rename failed for {session_id}: {e}");
             let _ = std::fs::remove_file(&tmp);
+        }
+    }
+
+    /// P1-24(a): remove the on-disk snapshot for `session_id` so a
+    /// completed/reset session is not re-hydrated by the crash recovery
+    /// path on next boot. Best-effort — failures are logged.
+    pub fn delete_session_snapshot(&self, session_id: &str) {
+        let path = self
+            .data_dir()
+            .join("sessions")
+            .join(format!("{session_id}.json"));
+        if !path.exists() {
+            return;
+        }
+        if let Err(err) = std::fs::remove_file(&path) {
+            eprintln!(
+                "[auto-save] failed to delete session snapshot {}: {err}",
+                path.display()
+            );
         }
     }
 
@@ -1331,9 +1365,26 @@ impl RuntimeHost {
                 .and_then(|s| s.to_str())
                 .unwrap_or("recovered-session")
                 .to_string();
+            // P1-24(b): read the recovered session's own `kind` field
+            // instead of hardcoding RuntimeShell. Otherwise a
+            // PluginIteration session comes back as RuntimeShell, whose
+            // tool set disagrees with what the transcript expects.
+            let (session_kind, agent_state) = match session.kind() {
+                "plugin_iteration" => (
+                    AgentSessionKind::PluginIteration,
+                    // Recovery cannot reconstruct the in-progress iteration
+                    // state; hold the session in a neutral RuntimeShell-
+                    // state for now so it's inspectable. The plugin-
+                    // iteration transition itself is guarded by the
+                    // rollback journal (P0-6), so this is a UX
+                    // concession, not a correctness gap.
+                    ManagedAgentState::RuntimeShell,
+                ),
+                _ => (AgentSessionKind::RuntimeShell, ManagedAgentState::RuntimeShell),
+            };
             let handle = AgentSessionHandle {
                 session_id: session_id.clone(),
-                kind: AgentSessionKind::RuntimeShell,
+                kind: session_kind,
             };
             self.agent_sessions
                 .lock()
@@ -1343,7 +1394,7 @@ impl RuntimeHost {
                     ManagedAgentSession {
                         handle,
                         session,
-                        state: ManagedAgentState::RuntimeShell,
+                        state: agent_state,
                     },
                 );
             recovered += 1;
@@ -2168,13 +2219,36 @@ export_plugin_api! {{
             self.service_registry.stop_plugin_services(plugin_path);
             // Also invoke stop action for Task nodes (plugins that don't
             // implement the Service trait call stop via node invocation).
+            //
+            // P1-19: a plugin's stop handler runs inside the plugin's own
+            // dylib; a panic there would unwind across the FFI boundary
+            // (UB in the general case). Wrap each invocation in
+            // catch_unwind so a broken stop handler cannot crash the whole
+            // reload path.
             let snapshot = self.current_snapshot();
             for fqn in snapshot.node_registry().task_node_fqns() {
                 if fqn.starts_with(&format!("{}::", plugin_path)) {
                     let parts: Vec<&str> = fqn.splitn(2, "::").collect();
                     if parts.len() == 2 {
                         let payload = serde_json::json!({"action": "stop"}).to_string();
-                        let _ = self.invoke(parts[0], parts[1], payload);
+                        let plugin_id = parts[0].to_string();
+                        let node_id = parts[1].to_string();
+                        let this = &*self;
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            let _ = this.invoke(&plugin_id, &node_id, payload);
+                        }));
+                        if let Err(err) = result {
+                            let msg = if let Some(s) = err.downcast_ref::<&'static str>() {
+                                (*s).to_string()
+                            } else if let Some(s) = err.downcast_ref::<String>() {
+                                s.clone()
+                            } else {
+                                "unknown".to_string()
+                            };
+                            eprintln!(
+                                "[reload] stop handler for {plugin_id}::{node_id} panicked: {msg}"
+                            );
+                        }
                     }
                 }
             }
@@ -2186,6 +2260,15 @@ export_plugin_api! {{
 
         // ── Phase 1: pre-load and validate all new dylibs ─────────────
         // No side effects — if anything fails, old plugins keep running.
+        //
+        // P1-20: `_dylib` is held as a struct-owned by-value handle for the
+        // lifetime of `prepared` (drops at fn return, i.e. AFTER Phase 2
+        // has updated the registry). The invoke path opens the artifact
+        // fresh each time via `LoadedDylibApi::open`, so we don't hand any
+        // function pointer from Phase 1 across to the registry — no
+        // dangling reference to worry about. Keeping `_dylib` here still
+        // matters because it validates the fingerprint before we mutate
+        // the registry and gives us "old plugins keep running" on failure.
         struct Prepared {
             plugin_path: String,
             docs: PluginDocs,
@@ -2304,9 +2387,15 @@ export_plugin_api! {{
             );
         }
 
+        // P1-21: give the subtree reload a distinct snapshot id so
+        // invocation traces before and after the reload don't collide.
+        // The previous behaviour reused `previous_snapshot.snapshot_id()`
+        // for both `from` and `to`, making downstream analytics unable to
+        // distinguish invocations against the old vs new plugin set.
+        let new_snapshot_id = make_snapshot_dir_name();
         let report = ReloadReport {
             from_snapshot_id: previous_snapshot.snapshot_id().to_string(),
-            to_snapshot_id: previous_snapshot.snapshot_id().to_string(),
+            to_snapshot_id: new_snapshot_id,
             snapshot_root: self.snapshot_root.display().to_string(),
             staged_artifact_root: String::new(),
             elapsed_ms: started_at.elapsed().as_millis(),
@@ -3369,6 +3458,14 @@ export_plugin_api! {{
     }
 
     fn cleanup_retired_snapshots(&self) {
+        // P1-22: opportunistic removal of Weak-dead entries. Long-lived
+        // agent sessions may pin an Arc<RuntimeSnapshot> across many
+        // reloads, keeping the underlying `RetiredSnapshot` alive; without
+        // an upper bound the Vec grew unbounded. In addition to the
+        // Weak-liveness sweep we now cap the retained count at
+        // `MAX_RETIRED_SNAPSHOTS` and drop the oldest entries first, so a
+        // pathologically long-lived pin can only leak a bounded prefix.
+        const MAX_RETIRED_SNAPSHOTS: usize = 64;
         let mut retired = self
             .retired_snapshots
             .lock()
@@ -3380,6 +3477,10 @@ export_plugin_api! {{
             let _ = fs::remove_dir_all(&entry.staged_artifact_root);
             false
         });
+        while retired.len() > MAX_RETIRED_SNAPSHOTS {
+            let dropped = retired.remove(0);
+            let _ = fs::remove_dir_all(&dropped.staged_artifact_root);
+        }
     }
 
     fn reload_candidate_internal(
