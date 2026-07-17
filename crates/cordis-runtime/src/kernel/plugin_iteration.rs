@@ -673,7 +673,23 @@ impl PluginEditRollback {
                 ),
             });
         }
-        self.backups.append(&mut other.backups);
+        // P2-23: dedup by rel_path — keep only the first backup for each
+        // path so `absorb` chains don't blow up the journal size on
+        // repeated edits to the same file. Rollback runs in reverse
+        // insertion order, and reverting to the very first snapshot
+        // fully undoes the run — a mid-run intermediate is never useful
+        // for recovery. Existing entries win: whichever rollback saw the
+        // file first records the correct pre-edit bytes.
+        let mut existing: std::collections::HashSet<String> = self
+            .backups
+            .iter()
+            .map(|b| b.rel_path.clone())
+            .collect();
+        for backup in other.backups.drain(..) {
+            if existing.insert(backup.rel_path.clone()) {
+                self.backups.push(backup);
+            }
+        }
         Ok(())
     }
 

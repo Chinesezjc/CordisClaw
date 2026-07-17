@@ -7,9 +7,12 @@ edition = "2021"
 plugin_path = "root"
 abi_kind = "rust"
 declared_nodes = ["root_entry"]
-children = [
-  { source = "./child", required = true, grants = ["service.db"] }
-]
+# P2-10: `./child` was previously declared as a required child plugin, but
+# the `fixtures/plugins/root/child/` directory no longer exists in the
+# tree. Empty out `children` so `PackageResolver` doesn't error on a
+# missing dependency. If a nested root/child fixture is needed again,
+# reintroduce both the directory scaffold and this declaration.
+children = []
 
 [package.metadata.cordis.abi_fingerprint]
 rustc_version = "1.85.1"

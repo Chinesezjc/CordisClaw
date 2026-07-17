@@ -129,6 +129,16 @@ impl Default for NodeType {
     }
 }
 
+// P2-5: `#[repr(C)]` on structs containing `String` is misleading. The
+// outer struct layout (field offsets, sizes) is C-stable, but `String`'s
+// internal layout is NOT stable across rustc versions or crates. Passing
+// these across a real FFI boundary is only safe when the host and plugin
+// are compiled with the exact same rustc release (which the runtime
+// enforces via `AbiFingerprint::rustc_version`).
+//
+// If you're introducing a truly cross-toolchain plugin ABI, replace the
+// `String` field with `*mut c_char + len + free_fn` — do NOT rely on this
+// annotation alone.
 #[repr(C)]
 #[derive(Debug, Clone)]
 pub struct PluginRequest {

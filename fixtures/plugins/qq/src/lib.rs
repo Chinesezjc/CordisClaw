@@ -976,15 +976,30 @@ fn handle_qq_fetch_messages() -> Result<NodeResponse, String> {
     })
 }
 
+/// P2-12: resolve the QQ runtime-config path relative to
+/// `$CORDIS_FIXTURES_ROOT` (falling back to the historical hard-coded
+/// `/root/CordisClaw/fixtures/...` when the env is missing). The
+/// filesystem plugin already reads this env var; this makes QQ portable
+/// across environments and testing setups.
+fn runtime_config_path() -> std::path::PathBuf {
+    match std::env::var("CORDIS_FIXTURES_ROOT") {
+        Ok(root) => std::path::PathBuf::from(root)
+            .join(".cordis-drafts/qq_runtime_config.json"),
+        Err(_) => std::path::PathBuf::from(
+            "/root/CordisClaw/fixtures/.cordis-drafts/qq_runtime_config.json",
+        ),
+    }
+}
+
 fn load_runtime_config() -> Option<serde_json::Value> {
-    let path = "/root/CordisClaw/fixtures/.cordis-drafts/qq_runtime_config.json";
-    let data = std::fs::read_to_string(path).ok()?;
+    let path = runtime_config_path();
+    let data = std::fs::read_to_string(&path).ok()?;
     serde_json::from_str(&data).ok()
 }
 
 fn save_runtime_config(config: &serde_json::Value) {
-    let path = "/root/CordisClaw/fixtures/.cordis-drafts/qq_runtime_config.json";
-    if let Some(parent) = std::path::Path::new(path).parent() {
+    let path = runtime_config_path();
+    if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
     // P0-24: this file contains the QQ access_token. Write it with 0o600 on
@@ -1001,19 +1016,19 @@ fn save_runtime_config(config: &serde_json::Value) {
             .create(true)
             .truncate(true)
             .mode(0o600)
-            .open(path)
+            .open(&path)
         {
             Ok(mut f) => {
                 let _ = f.write_all(bytes.as_bytes());
             }
             Err(_) => {
-                let _ = std::fs::write(path, &bytes);
+                let _ = std::fs::write(&path, &bytes);
             }
         }
     }
     #[cfg(not(unix))]
     {
-        let _ = std::fs::write(path, &bytes);
+        let _ = std::fs::write(&path, &bytes);
     }
 }
 

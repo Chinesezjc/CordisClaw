@@ -407,7 +407,24 @@ fn run_plugin_command(
     let mut success = true;
     let mut stderr = String::new();
     if let Some(expected) = &spec.expect_substring {
-        if !response.payload.contains(expected) {
+        // P2-26: `contains` is intentionally a substring check — some
+        // plugins produce structured JSON where the caller wants
+        // `"value":7.0` to hit regardless of surrounding context. To
+        // avoid the historical false-positive (`"value":7.0X"` matches
+        // `"value":7.0`), support two disambiguation prefixes:
+        //   * `exact:` — the response payload must equal the substring
+        //     after the prefix verbatim.
+        //   * `line:`  — one of the payload's `\n`-separated lines must
+        //     equal the substring after the prefix verbatim.
+        // Any other value keeps legacy `contains` behaviour.
+        let ok = if let Some(needle) = expected.strip_prefix("exact:") {
+            response.payload.trim() == needle
+        } else if let Some(needle) = expected.strip_prefix("line:") {
+            response.payload.lines().any(|l| l.trim() == needle)
+        } else {
+            response.payload.contains(expected)
+        };
+        if !ok {
             success = false;
             stderr = format!("plugin output missing expected substring: {expected}");
         }
