@@ -206,6 +206,15 @@ Agent 现在可以自主完成：读代码 → 理解结构 → 写/改文件 �
 - [x] **Plugin iteration symlink 逃逸**（P0-20）— `PluginEditExecutor::execute` 在写入前调用新 helper `resolve_under_workspace`：canonicalize 结果必须仍在 workspace_root 下。plugins 内的 symlink 指向 `/etc/passwd` 之类无法被写入。
 - [x] **Verifier shell 拼接**（P0-21）— 已随 A 批 P0-1 修复。`discover_rust_workspace_manifest` 输出的字符串被 `shell_words` 解析成 argv，空格 / `$` / `;` 无法被解释。
 
+### 5.2.10 Reload / 生命周期硬化（I 批，2026-07-17 已闭合）
+
+- [x] **`reload_subtree` stop 走 FFI 加 `catch_unwind`**（P1-19）— 每次 Task stop 调用被 `panic::catch_unwind(AssertUnwindSafe(...))` 包裹；插件 stop 处理器 panic 不再跨 C ABI unwind（UB）也不再让整个 reload 崩。panic message 落到 stderr。
+- [x] **Phase-1 pre-loaded dylib 生命周期澄清**（P1-20）— 加显式注释：`_dylib` 是 struct-owned by-value handle，drop 于 fn return（Phase 2 之后）；invoke 路径每次自开 `LoadedDylibApi::open`，registry 不缓存函数指针，无 dangling reference。原 concern 事实上不构成 bug，但注释固化契约。
+- [x] **`reload_subtree` 新 snapshot_id**（P1-21）— `to_snapshot_id` 使用 `make_snapshot_dir_name()` 生成新 id；invocation trace 现在能区分 reload 前后。
+- [x] **`retired_snapshots` 加上限**（P1-22）— 除 Weak-dead 清理外，硬上限 `MAX_RETIRED_SNAPSHOTS = 64`，超出时按 FIFO 丢弃最旧的 `staged_artifact_root` + 目录；长活 agent session pin snapshot 也只能 leak 有限前缀。
+- [x] **`plugin_history` 加 eviction**（P1-23）— hard cap `MAX_PLUGIN_HISTORY = 1024`；每次 `push_front` 后 `pop_back` 到上限内。之前 unbounded VecDeque 长运行会 OOM。
+- [x] **Session 若干次要问题**（P1-24）— (a) 新 `delete_session_snapshot(session_id)` API，让 completed/reset 的 session 从磁盘摘除；(b) `detect_crash_and_recover` 用 `session.kind()` 决定 `AgentSessionKind`（`plugin_iteration` 走 PluginIteration 而不是硬编码 RuntimeShell）；(c) auto-save 的 tmp 文件名从共用 `.<id>.json.tmp` 换成 `.<id>.json.tmp.<seq>`（atomic 计数器），并发 `agent_send` 同一 session 不再互踩。
+
 ### 5.2.9 原子写入 / rollback（H 批，2026-07-17 已闭合）
 
 - [x] **`write_shutdown_memory` 原子写**（P1-15）— 新 helper `atomic_write_bytes`（tmp + sync_all + rename）；crash 中留 truncated JSON 的问题消失。
