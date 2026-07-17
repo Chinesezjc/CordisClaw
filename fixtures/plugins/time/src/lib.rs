@@ -135,6 +135,11 @@ fn docs_value() -> cordis_plugin_sdk::PluginDocs {
 }
 
 fn abi_fingerprint_value() -> AbiFingerprint {
+    // P2-13: legacy fixture kept hard-coded so on-disk index.json fingerprints
+    // still match without a workspace-wide rebuild. New plugins should call
+    // `AbiFingerprint::current_build("crate_<name>_v1", "api_v2")` — the
+    // rustc / target values then come from the SDK build.rs so cross-
+    // toolchain fingerprints are automatically distinguishable.
     AbiFingerprint {
         rustc_version: "1.85.1".to_string(),
         target_triple: "x86_64-unknown-linux-gnu".to_string(),

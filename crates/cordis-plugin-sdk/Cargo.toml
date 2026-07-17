@@ -2,6 +2,7 @@
 name = "cordis-plugin-sdk"
 version = "0.1.0"
 edition = "2021"
+build = "build.rs"
 
 [dependencies]
 libc = "0.2"

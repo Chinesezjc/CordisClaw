@@ -206,6 +206,15 @@ Agent 现在可以自主完成：读代码 → 理解结构 → 写/改文件 �
 - [x] **Plugin iteration symlink 逃逸**（P0-20）— `PluginEditExecutor::execute` 在写入前调用新 helper `resolve_under_workspace`：canonicalize 结果必须仍在 workspace_root 下。plugins 内的 symlink 指向 `/etc/passwd` 之类无法被写入。
 - [x] **Verifier shell 拼接**（P0-21）— 已随 A 批 P0-1 修复。`discover_rust_workspace_manifest` 输出的字符串被 `shell_words` 解析成 argv，空格 / `$` / `;` 无法被解释。
 
+### 5.2.18 P2 收尾（T 批，2026-07-17 已闭合）
+
+- [x] **P2-11 空 vision 子目录清理** — `fixtures/plugins/vision/vision-ocr/` 和 `vision-describe/` 只包含 docs 存根、无 Cargo.toml/src；已删除。vision plugin 的 `children = []` 保留，不再有"半吊子子插件"的目录。
+- [x] **P2-2 抽 `cordis-net` 共享 crate** — 新 `fixtures/plugins/_net/` (rlib, plugin workspace 内 `exclude` 保证 loader 不当它是 plugin)；`web` 和 `vision` 都改成 `cordis_net::{check_url_safety, ip_is_forbidden}`。SSRF 单测 3 项移入 `_net`，两处原地拷贝彻底消除。
+- [x] **P2-13 fingerprint 编译时自动填充** — SDK 加 `build.rs` 通过 `cargo:rustc-env` stamp `CORDIS_RUSTC_VERSION` (从 `rustc --version`) 和 `CORDIS_TARGET`；SDK 加 `AbiFingerprint::current_build(crate_hash, api_hash)` 帮手，plugin 只需提供 plugin-specific hash。fixtures 里的 hard-coded fingerprint 保留（迁移需同步 index.json 的 fingerprint 缓存 + Cargo.toml metadata，动作太大），但注释指路：新插件应用 `current_build()`。SDK 新增 1 个 test 验证 stamp 生效。
+
+**至此 review 计划的 4 项遗留全部闭合**（P2-1 Kernel↔Plugin 工具下沉除外——产品级重构，不属于安全/正确性 review 范畴）。
+- **P2-1 未做**：Kernel 侧 file/shell/search 工具下沉到 filesystem/shell/web/git 插件；需要 agent.rs 大量下线 + plugin 补齐 + system prompt 改写。
+
 ### 5.2.17 P2 剩余打磨（Q/R/S 批，2026-07-17 已闭合）
 
 **Q 批 (rollback / promote 语义):**

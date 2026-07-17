@@ -3,6 +3,10 @@ members = [
   "time",
   "filesystem", "expr", "shell", "qq", "web", "git", "vision", "gacha"]
 exclude = [
+  # `_net` is a utility rlib shared by `web` and `vision` for the SSRF
+  # guard (P2-2); it's not a runtime-loadable plugin. Depended on via
+  # `path = "../_net"` inside those crates.
+  "_net",
   "expr/lexer",
   "expr/parser",
   "expr/evaluator",

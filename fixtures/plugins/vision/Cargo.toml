@@ -20,6 +20,7 @@ api_hash = "api_v2"
 
 [dependencies]
 cordis-plugin-sdk = { path = "../../../crates/cordis-plugin-sdk" }
+cordis-net = { path = "../_net" }
 ureq = { version = "2.12", default-features = false, features = ["tls"] }
 url = "2"
 serde = { version = "1", features = ["derive"] }

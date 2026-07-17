@@ -1,0 +1,15 @@
+[package]
+name = "cordis-net"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+url = "2"
+
+# Make this crate an independent package (not a member of the outer
+# fixtures workspace and not the root repo workspace either). It's used
+# via `path = "../_net"` from `web` and `vision`.
+[workspace]
