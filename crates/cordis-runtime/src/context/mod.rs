@@ -583,44 +583,66 @@ impl ContextRead for RuntimeContext {
 
     fn list_by_ns(&self, namespace: &str) -> Vec<ContextKey> {
         self.metrics.inc_read();
+        // P1-2: canonical lock order — active → overlays → request → session
+        // → global (mirrors `lookup_slot_entry`). Previously this method
+        // acquired global→session→request→active→overlays; two parallel
+        // executor workers, one calling list_by_ns and one calling
+        // lookup_slot_entry, could deadlock on the reverse-order chain.
         let mut out = BTreeSet::new();
-        let global = self
-            .global_slots
+        let active = self
+            .active_subgraph
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        let session = self
-            .session_slots
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let active_id = active.clone();
+        drop(active);
+        let overlay_snapshot: Option<BTreeMap<ContextKey, Option<SlotEntry>>> = if let Some(id) = active_id.as_deref() {
+            let overlays = self
+                .subgraph_overlays
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            overlays.get(id).cloned()
+        } else {
+            None
+        };
+
         let request = self
             .request_slots
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        for key in global.keys().chain(session.keys()).chain(request.keys()) {
+        for key in request.keys() {
             if key.namespace == namespace {
                 out.insert(key.clone());
             }
         }
         drop(request);
-        drop(session);
-        drop(global);
-        let active = self
-            .active_subgraph
+        let session = self
+            .session_slots
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        if let Some(active_id) = active.as_ref() {
-            let overlays = self
-                .subgraph_overlays
-                .lock()
-                .unwrap_or_else(|poison| poison.into_inner());
-            if let Some(overlay) = overlays.get(active_id) {
-                for (key, delta) in overlay {
-                    if key.namespace == namespace {
-                        if delta.is_some() {
-                            out.insert(key.clone());
-                        } else {
-                            out.remove(key);
-                        }
+        for key in session.keys() {
+            if key.namespace == namespace {
+                out.insert(key.clone());
+            }
+        }
+        drop(session);
+        let global = self
+            .global_slots
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        for key in global.keys() {
+            if key.namespace == namespace {
+                out.insert(key.clone());
+            }
+        }
+        drop(global);
+
+        if let Some(overlay) = overlay_snapshot {
+            for (key, delta) in overlay {
+                if key.namespace == namespace {
+                    if delta.is_some() {
+                        out.insert(key.clone());
+                    } else {
+                        out.remove(&key);
                     }
                 }
             }
@@ -799,22 +821,36 @@ impl ContextTxn for RuntimeContext {
         session_id: &str,
         expected_version: u64,
     ) -> Result<(), RuntimeError> {
-        // session_version is not behind a Mutex — it's only accessed from
-        // the main thread in the engine.  For parallel safety, it should
-        // eventually be AtomicU64, but for now the single-threaded path
-        // is sufficient.
-        // Safety: this is a &self method; the caller must ensure external
-        // synchronization if called from multiple threads.
+        // P1-1: single-step CAS on session_version. Previously this method
+        // did `load` → work → `fetch_add`, so two threads at the same
+        // `expected_version` could both pass the equality check and both
+        // fetch-add — a lost-update bug that only showed up under the
+        // parallel executor. compare_exchange atomically claims the version
+        // slot; on failure the caller retries at the new version.
         let started_at = Instant::now();
-        let current_version = self.session_version.load(Ordering::SeqCst);
-        if current_version != expected_version {
+        if self
+            .session_version
+            .compare_exchange(
+                expected_version,
+                expected_version + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            let actual = self.session_version.load(Ordering::Acquire);
             self.metrics.inc_commit_conflict();
             return Err(RuntimeError::CommitConflict {
                 session_id: session_id.to_string(),
                 expected_version,
-                actual_version: current_version,
+                actual_version: actual,
             });
         }
+
+        // From here we own the version bump. Any error would have to be
+        // recovered by decrementing — but since the merge below is purely
+        // lock-based (no fallible IO), it either succeeds or panics; in the
+        // latter case the poisoned Mutex is fine to leave to the next caller.
         let request = self
             .request_slots
             .lock()
@@ -831,7 +867,6 @@ impl ContextTxn for RuntimeContext {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
             .clear();
-        self.session_version.fetch_add(1, Ordering::SeqCst);
         self.metrics.add_commit_latency_ms(
             started_at
                 .elapsed()

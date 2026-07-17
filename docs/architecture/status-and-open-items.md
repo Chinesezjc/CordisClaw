@@ -206,6 +206,17 @@ Agent 现在可以自主完成：读代码 → 理解结构 → 写/改文件 �
 - [x] **Plugin iteration symlink 逃逸**（P0-20）— `PluginEditExecutor::execute` 在写入前调用新 helper `resolve_under_workspace`：canonicalize 结果必须仍在 workspace_root 下。plugins 内的 symlink 指向 `/etc/passwd` 之类无法被写入。
 - [x] **Verifier shell 拼接**（P0-21）— 已随 A 批 P0-1 修复。`discover_rust_workspace_manifest` 输出的字符串被 `shell_words` 解析成 argv，空格 / `$` / `;` 无法被解释。
 
+### 5.2.7 并行执行引擎硬化（F 批，2026-07-17 已闭合）
+
+- [x] **`commit_session` CAS**（P1-1）— `session_version` 用 `compare_exchange` 单步领取版本；两个线程并发 commit 同一 expected_version 不再都通过检查后各自 `fetch_add`。冲突方走 `CommitConflict` 错误。
+- [x] **`list_by_ns` 与 `lookup_slot_entry` 锁序统一**（P1-2）— 都改成 active → overlays → request → session → global；`list_by_ns` 先 clone overlay snapshot 再顺序拿其它 lock，两条路径反向锁序造成的双工死锁被消除。
+- [x] **并行路径 Router skip 语义对称**（P1-3）— skip 计算移到 Router 判定之前；`skip: skip` 不再叠加 `router_run.is_none()`，Router 现在遵守单线程一致的 AllOf-skip 规则。
+- [x] **并行 batch 保留 priority 排序**（P1-4）— `BTreeMap<CorrelationKey, ReadyItem>` 去重后先 `sort_by(cmp_ready)`（topo_level → priority → ids）再 `take(N)`；高优先级 transition 不再因 correlation-key 字典序被低优先级挤掉。
+- [x] **并行 runner panic 不再毒化 executor**（P1-5）— `h.join()` 的 `Err(panic)` 被翻译成 `RuntimeError::Invariant`（附 panic message），本 batch 其它 job 的结果仍能被 merge。之前 `.unwrap()` 让整个 executor 崩掉。
+- [x] **`KeyedPair` arity 校验**（P1-6）— `execute_net` 入口对所有 KeyedPair transition 校验 input arc 数是否恰好 2；1 或 ≥3 直接 `RuntimeError::Invariant`，不再"静默永不 fire"。
+- [x] **Router Timeout 不再覆盖 Success**（P1-7）— `execute_router` 仅当 `raw_outcome != Success` 且超时时才把结果改成 Timeout；慢成功保留 Success 不再被回滚。
+- [x] **`eval_first_success` 不再永远 Wait**（P1-8）— completion counter 改用 `outcomes.iter().all(...)` 直接从状态源判定，某个 upstream 已 terminal 但未入 `completion_order` 时也能正确 CompleteFailure。
+
 ### 5.2.6 Build / Load 硬化（第 2 批，2026-07-17 已闭合）
 
 - [x] **`invoke_dylib` UAF**（P0-11）— `CatalogPlugin` 现在持有 `Arc<Mutex<Option<LoadedDylib>>>`。首次 invoke 时 dlopen 并缓存 `Library` + `api_ptr`；后续 invoke 直接复用。返回的 `PluginResponse.payload` 内存所属的 dylib 与 `CatalogPlugin` 同生命周期，不再存在 dlclose-after-return 的悬空 String 问题。
