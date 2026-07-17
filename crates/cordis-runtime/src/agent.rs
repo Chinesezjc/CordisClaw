@@ -306,6 +306,23 @@ impl AgentToolHost for RuntimeHost {
     ) -> Result<Value, RuntimeError> {
         self.check_sensitive_path(path)?;
         let resolved = self.resolve_sandboxed_path(path)?;
+        // P1-28: cap the amount of data we load into memory before slicing
+        // by offset/limit. `read_to_string` on a multi-GB file (a plugin
+        // log, an accidental `/dev/zero` bypass, etc.) would blow the
+        // process. Reject anything above 16 MiB up front — big enough for
+        // any legitimate source file, small enough to bound memory.
+        const MAX_READ_BYTES: u64 = 16 * 1024 * 1024;
+        if let Ok(meta) = std::fs::metadata(&resolved) {
+            if meta.len() > MAX_READ_BYTES {
+                return Err(RuntimeError::InvalidArgument {
+                    message: format!(
+                        "read_file: file {path} exceeds {} MiB limit (size={} bytes)",
+                        MAX_READ_BYTES / (1024 * 1024),
+                        meta.len()
+                    ),
+                });
+            }
+        }
         let content = std::fs::read_to_string(&resolved).map_err(|err| RuntimeError::Io {
             path: resolved,
             message: err.to_string(),
@@ -379,11 +396,17 @@ impl AgentToolHost for RuntimeHost {
         };
         let mut matches = Vec::new();
         let mut walked = 0usize;
-        self.walk_code_files(&search_root, &mut |rel_path, abs_path| {
+        // P1-27: stop the walker as soon as we have 40 hits. The old
+        // implementation only `break`'d the inner line loop, so
+        // `walk_code_files` kept traversing the whole tree and
+        // `read_to_string`ing every candidate file even though the caller
+        // was capped at 40 rows.
+        const MAX_HITS: usize = 40;
+        self.walk_code_files_ctl(&search_root, &mut |rel_path, abs_path| {
             walked += 1;
             let content = match std::fs::read_to_string(abs_path) {
                 Ok(c) => c,
-                Err(_) => return,
+                Err(_) => return crate::host::WalkControl::Continue,
             };
             for (line_no, line_text) in content.lines().enumerate() {
                 if line_text.contains(pattern) {
@@ -392,10 +415,15 @@ impl AgentToolHost for RuntimeHost {
                         "line": line_no + 1,
                         "text": line_text.trim(),
                     }));
-                    if matches.len() >= 40 {
+                    if matches.len() >= MAX_HITS {
                         break;
                     }
                 }
+            }
+            if matches.len() >= MAX_HITS {
+                crate::host::WalkControl::Stop
+            } else {
+                crate::host::WalkControl::Continue
             }
         })?;
         Ok(json!({
@@ -448,10 +476,25 @@ impl AgentToolHost for RuntimeHost {
             path: resolved.clone(),
             message: err.to_string(),
         })?;
-        if !original.contains(find) {
+        // P1-29: require `find` to appear exactly once. `replacen(..., 1)`
+        // was silently mis-targeting the first occurrence when the
+        // agent-generated `find` string appeared multiple times in the
+        // file (common for short identifiers). Force the agent to supply
+        // enough surrounding context to disambiguate, or use a different
+        // tool for multi-replace.
+        let occurrences = original.matches(find).count();
+        if occurrences == 0 {
             return Err(RuntimeError::InvalidArgument {
                 message: format!(
                     "replace_in_file: pattern not found in {path}: {find}"
+                ),
+            });
+        }
+        if occurrences > 1 {
+            return Err(RuntimeError::InvalidArgument {
+                message: format!(
+                    "replace_in_file: pattern appears {occurrences} times in {path}; \
+                     provide more surrounding context so the target is unique"
                 ),
             });
         }
@@ -474,6 +517,7 @@ impl AgentToolHost for RuntimeHost {
         Ok(json!({
             "path": path,
             "replaced": true,
+            "occurrences": 1,
         }))
     }
 
@@ -557,6 +601,10 @@ impl AgentToolHost for RuntimeHost {
         let resolved_src = self.resolve_sandboxed_path(path)?;
         let resolved_dst = self.resolve_sandboxed_path(new_path)?;
         let original = std::fs::read(&resolved_src).ok();
+        // P1-30: back up the destination if it already exists — otherwise
+        // `rename` overwrites the destination content and `revert_changes`
+        // is unable to restore it.
+        let dst_original = std::fs::read(&resolved_dst).ok();
         if let Some(parent) = resolved_dst.parent() {
             std::fs::create_dir_all(parent).map_err(|err| RuntimeError::Io {
                 path: parent.to_path_buf(),
@@ -574,6 +622,14 @@ impl AgentToolHost for RuntimeHost {
             original,
         );
         rollback.absorb(backup)?;
+        if let Some(dst_bytes) = dst_original {
+            let dst_backup = crate::kernel::plugin_iteration::PluginEditRollback::single_backup(
+                self.fixtures_root(),
+                new_path,
+                Some(dst_bytes),
+            );
+            rollback.absorb(dst_backup)?;
+        }
         Ok(json!({
             "path": path,
             "new_path": new_path,
@@ -656,6 +712,16 @@ impl AgentToolHost for RuntimeHost {
     }
 
     fn agent_compact_context(&self, session_id: &str) -> Result<Value, RuntimeError> {
+        // P1-25: during `agent_send` the session is `remove`d from the
+        // map for the duration of `respond`, so a tool-dispatch trying to
+        // look itself up here previously returned AgentSessionNotFound
+        // unconditionally. Detect that state and surface a more accurate
+        // error: the compact must be scheduled by the caller as an
+        // out-of-band operation (e.g. `record_summary` at end of turn) —
+        // it cannot run mid-turn against the session it belongs to.
+        // Turning this into a graceful no-op with a "deferred: true"
+        // response would silently drop the request, so we return an
+        // explicit error the agent can read and re-plan.
         let mut guard = self.agent_sessions_mut();
         let session = guard.get_mut(session_id).ok_or_else(|| {
             RuntimeError::AgentSessionNotFound {
@@ -954,7 +1020,7 @@ impl AgentSession {
 
         // If this message would push us over the threshold, compact first.
         if self.estimated_tokens + estimate_tokens(trimmed) > 800_000 {
-            self.compact_history();
+            let _ = self.compact_history();
         }
 
         let endpoint = format!(
@@ -1326,19 +1392,22 @@ impl AgentSession {
         self.history.len()
     }
 
-    pub fn compact_history(&mut self) {
+    pub fn compact_history(&mut self) -> (usize, usize) {
         // Trigger at ~800K tokens (DeepSeek has 1M context).
         const COMPACT_AT_MSGS: usize = 4000;
         const KEEP_RECENT: usize = 2000;
 
+        let before_len = self.history.len();
         if self.history.len() <= COMPACT_AT_MSGS {
-            return;
+            return (before_len, before_len);
         }
 
         let discard = self.history.len() - KEEP_RECENT;
         let split_at = discard.next_multiple_of(2);
         let split_at = split_at.min(self.history.len().saturating_sub(2));
-        if split_at == 0 { return; }
+        if split_at == 0 {
+            return (before_len, before_len);
+        }
 
         let old_messages: Vec<_> = self.history.drain(0..split_at).collect();
         let mut summary_lines: Vec<String> = Vec::new();
@@ -1346,8 +1415,14 @@ impl AgentSession {
             let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("");
             let content = msg.get("content").and_then(|v| v.as_str()).unwrap_or("");
             if content.is_empty() { continue; }
+            // P1-33: `content.chars().take(500)` is char-based, but the
+            // `content.len() > 500` guard was byte-based. For Chinese /
+            // multi-byte text the `…` suffix would fire inconsistently
+            // (byte length always > char length here). Compare chars on
+            // both sides so behaviour is uniform.
+            let char_count = content.chars().count();
             let short: String = content.chars().take(500).collect();
-            let suffix = if content.len() > 500 { "…" } else { "" };
+            let suffix = if char_count > 500 { "…" } else { "" };
             summary_lines.push(format!("[{role}]: {short}{suffix}"));
         }
         let summary = summary_lines.join("\n");
@@ -1362,12 +1437,30 @@ impl AgentSession {
                 ),
             }),
         );
+        // P1-32: `estimated_tokens` was only ever incremented in
+        // `remember_exchange`, so once it crossed the 800K guard it
+        // would trip every subsequent request forever — but compact
+        // then early-exited (history.len() <= COMPACT_AT_MSGS) and did
+        // nothing, making the whole compact path a permanent no-op.
+        // Rebuild the estimate from what actually remains in `history`.
+        self.estimated_tokens = self
+            .history
+            .iter()
+            .map(|msg| {
+                let content = msg
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                estimate_tokens(content)
+            })
+            .sum();
         eprintln!(
             "agent: compacted {} old messages into summary ({} chars), keeping {} recent",
             old_messages.len(),
             summary.len(),
             self.history.len() - 1
         );
+        (before_len, self.history.len())
     }
 
     fn remember_exchange(
@@ -1504,6 +1597,20 @@ impl AgentSession {
                     truncate_for_error(&raw_body, 400),
                 );
                 if attempt < AGENT_REQUEST_MAX_ATTEMPTS {
+                    // P1-35: don't retry permanent-failure client errors
+                    // (4xx except 408 / 429). Bad API key, invalid model,
+                    // quota exhausted, permission denied — retrying just
+                    // burns network round trips and can trigger rate-
+                    // limit escalation.
+                    let code = status.as_u16();
+                    let is_permanent_4xx =
+                        (400..500).contains(&code) && code != 408 && code != 429;
+                    if is_permanent_4xx {
+                        emit_agent_diagnostic(format!(
+                            "{message} not-retrying (permanent 4xx)"
+                        ));
+                        return Err(RuntimeError::LlmRequestFailed { message });
+                    }
                     emit_agent_diagnostic(format!(
                         "{message} retry_backoff_ms={AGENT_REQUEST_RETRY_BACKOFF_MS}"
                     ));

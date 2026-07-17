@@ -206,6 +206,19 @@ Agent 现在可以自主完成：读代码 → 理解结构 → 写/改文件 �
 - [x] **Plugin iteration symlink 逃逸**（P0-20）— `PluginEditExecutor::execute` 在写入前调用新 helper `resolve_under_workspace`：canonicalize 结果必须仍在 workspace_root 下。plugins 内的 symlink 指向 `/etc/passwd` 之类无法被写入。
 - [x] **Verifier shell 拼接**（P0-21）— 已随 A 批 P0-1 修复。`discover_rust_workspace_manifest` 输出的字符串被 `shell_words` 解析成 argv，空格 / `$` / `;` 无法被解释。
 
+### 5.2.11 Agent 层硬化（J 批，2026-07-17 已闭合）
+
+- [x] **`fs_search` 早停**（P1-27）— 新增 `walk_code_files_ctl` + `WalkControl::Stop`；`agent_search_code` 命中 40 后立即中止目录遍历，不再继续读文件 / 触发 IO。
+- [x] **`agent_read_file` 加 byte cap**（P1-28）— 读盘前 `metadata().len()` 检查，超过 16 MiB 直接拒；即使 sandbox 允许 `/dev/zero` 之外的大文件也不会 OOM。
+- [x] **`agent_replace_in_file` 拒绝多重匹配**（P1-29）— 命中数 !=1 报错（0 = pattern not found；>1 = 需要更多上下文）。旧行为 `replacen(..., 1)` 会静默改错位置。
+- [x] **`agent_rename_file` 备份 destination**（P1-30）— rename 前若 `new_path` 已存在，先把它的字节备份进 rollback；`revert_changes` 现在能还原被覆盖的目标。
+- [x] **`compact_history` 重算 estimated_tokens**（P1-32）— compact 后重新从 `history` 汇总，不再"只增不减"。之前 400K→800K 触发一次 compact 后每次请求都触发，且 compact early-exit no-op，导致 guard 永久失效。
+- [x] **`compact_history` UTF-8 char/byte 一致**（P1-33）— `content.len() > 500`（byte）改成 `content.chars().count() > 500`（char），中文/多字节文本的 `…` 标记不再一致触发。返回值改为 `(old_len, new_len)` 供 tool 使用。
+- [x] **`send_chat_request` 4xx 不重试**（P1-35）— 400-499（除 408 / 429）直接返回 `LlmRequestFailed`，不再对坏 API key / bad model / 权限拒绝重试 3 次。
+- [ ] **Session self-lookup 冲突**（P1-25）— 需要把 session 存 `Arc<Mutex<...>>` 共享，大重构，未做。当前 `agent_compact_context` 在 turn 内仍返回 AgentSessionNotFound。
+- [ ] **P1-26 QQ group id .parse().unwrap_or(0)** — 待 K 批。
+- [ ] **P1-31 96-turn overflow / P1-34 streaming reader / P1-36 unknown_tool double / P1-37 timeout 联动** — agent 层深修，未做。
+
 ### 5.2.10 Reload / 生命周期硬化（I 批，2026-07-17 已闭合）
 
 - [x] **`reload_subtree` stop 走 FFI 加 `catch_unwind`**（P1-19）— 每次 Task stop 调用被 `panic::catch_unwind(AssertUnwindSafe(...))` 包裹；插件 stop 处理器 panic 不再跨 C ABI unwind（UB）也不再让整个 reload 崩。panic message 落到 stderr。

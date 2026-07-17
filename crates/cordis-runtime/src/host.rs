@@ -1537,6 +1537,22 @@ impl RuntimeHost {
         root: &Path,
         f: &mut dyn FnMut(&str, &Path),
     ) -> Result<(), RuntimeError> {
+        self.walk_code_files_ctl(root, &mut |rel, abs| {
+            f(rel, abs);
+            WalkControl::Continue
+        })
+    }
+
+    /// P1-27 variant of `walk_code_files`: caller can return
+    /// `WalkControl::Stop` to abort the entire walk immediately, so a
+    /// search that already collected N hits doesn't keep reading and
+    /// grep'ing the rest of the tree. Returning `Continue` matches the
+    /// original semantics.
+    pub fn walk_code_files_ctl(
+        &self,
+        root: &Path,
+        f: &mut dyn FnMut(&str, &Path) -> WalkControl,
+    ) -> Result<(), RuntimeError> {
         if !root.is_dir() {
             return Ok(());
         }
@@ -1557,7 +1573,6 @@ impl RuntimeHost {
                 };
                 let name = entry.file_name();
                 let name_str = name.to_string_lossy();
-                // Skip well-known generated / VCS directories.
                 if ft.is_dir() {
                     if name_str == "target" || name_str == ".git" || name_str == "node_modules" {
                         continue;
@@ -1568,12 +1583,16 @@ impl RuntimeHost {
                 if !ft.is_file() {
                     continue;
                 }
-                // Only index source-like files.
                 if !is_source_like_file_name(&name_str) {
                     continue;
                 }
                 if let Ok(rel) = entry.path().strip_prefix(root) {
-                    f(rel.to_string_lossy().as_ref(), &entry.path());
+                    if matches!(
+                        f(rel.to_string_lossy().as_ref(), &entry.path()),
+                        WalkControl::Stop
+                    ) {
+                        return Ok(());
+                    }
                 }
             }
         }
@@ -6352,6 +6371,15 @@ mod tests {
         .expect("empty command should fall back to default");
         assert_eq!(empty, "cargo check --quiet --manifest-path plugins/Cargo.toml");
     }
+}
+
+/// P1-27: caller-controlled stop signal for `walk_code_files_ctl`.
+/// Returning `Stop` from the visitor callback aborts the walk
+/// immediately; returning `Continue` keeps traversing.
+#[derive(Debug, Clone, Copy)]
+pub enum WalkControl {
+    Continue,
+    Stop,
 }
 
 fn is_source_like_file_name(name: &str) -> bool {
