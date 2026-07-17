@@ -36,13 +36,14 @@
 
 | 文件 | 职责定位 | 关键入口 |
 |---|---|---|
-| `crates/cordis-runtime/src/execution/actor.rs` | Actor 执行原语：mailbox、批量派发、事件回传 | `ActorExecutor::dispatch_batch()` |
 | `crates/cordis-runtime/src/execution/net.rs` | CPN Net 模型与校验：Place/Transition/Arc、join policy、token/correlation key 载体 | `build_petri_net()` |
-| `crates/cordis-runtime/src/execution/gate.rs` | 运行策略配置（retry/backoff/timeout） | `RunPolicy`、`BackoffPolicy` |
-| `crates/cordis-runtime/src/execution/router.rs` | Router 子图事务边界：begin/commit/rollback + 指标 | `execute_router()` |
-| `crates/cordis-runtime/src/execution/scheduler.rs` | 确定性调度原型与 ready 队列规则 | `run_deterministic()` |
-| `crates/cordis-runtime/src/execution/engine.rs` | 集成执行引擎：调度 + actor + retry/backoff + cancel 传播 | `execute_net()` |
-| `crates/cordis-runtime/src/execution/mod.rs` | Execution 模块导出聚合 | `pub mod actor/net/...` |
+| `crates/cordis-runtime/src/execution/gate.rs` | GatePolicy 决策（first_success、at_least_k 等）+ 运行策略（RunPolicy / BackoffPolicy）载体 | `GatePolicy::eval`、`RunPolicy` |
+| `crates/cordis-runtime/src/execution/router.rs` | Router 子图事务边界：begin/commit/rollback + 指标；Timeout override 仅在非 Success 时生效 | `execute_router()` |
+| `crates/cordis-runtime/src/execution/scheduler.rs` | 仅剩 `SchedulerConfig` 载体（`max_parallelism` / `max_concurrency`）；原 `run_deterministic` 死代码已删除，实际调度在 `engine.rs` | `SchedulerConfig` |
+| `crates/cordis-runtime/src/execution/engine.rs` | 集成执行引擎：调度 + retry/backoff + cancel 传播 + Router pre-run + parallel key-shard（P1-1..8 系列修复） | `execute_net()`、`cmp_ready` |
+| `crates/cordis-runtime/src/execution/mod.rs` | Execution 模块导出聚合 | `pub mod engine/gate/net/router/scheduler` |
+
+> **已删除**: `execution/actor.rs`（历史上的 `ActorExecutor::dispatch_batch()` mailbox，5cc7c65 合并回 `engine.rs`）；`execution/scheduler.rs::run_deterministic` 及关联死代码（P2-7）。
 
 ## 5. Context 层 (`crates/cordis-runtime/src/context`)
 
@@ -57,10 +58,12 @@
 | `crates/cordis-runtime/src/kernel/policy.rs` | 自迭代策略边界：路径白名单、敏感路径人工确认、diff 预算 | `IterationPolicy` |
 | `crates/cordis-runtime/src/kernel/evaluator.rs` | 验证结果聚合与评分判定 | `EvalHarness::evaluate()` |
 | `crates/cordis-runtime/src/kernel/memory.rs` | 迭代历史记忆（问题-补丁-结果） | `ChangeMemory::record()` |
-| `crates/cordis-runtime/src/kernel/auto_update.rs` | 自动更新执行器：应用补丁、回调验证、失败回滚 | `AutoUpdater::execute()` |
-| `crates/cordis-runtime/src/kernel/plugin_iteration.rs` | 插件迭代：策略校验、编辑执行器、回滚日志、canary 判定 | `PluginEditExecutor`、`PluginEditRollback`、`CanaryReport` |
-| `crates/cordis-runtime/src/kernel/verifier.rs` | 验证 pipeline：static_check / tests / safety stage、shell/plugin verifier | `CommandVerifier`、`VerificationProfile` |
-| `crates/cordis-runtime/src/kernel/mod.rs` | Kernel 模块导出聚合 | `pub mod auto_update/plugin_iteration/verifier/...` |
+| `crates/cordis-runtime/src/kernel/auto_update.rs` | 自动更新执行器：应用补丁、回调验证、失败回滚（P2-27：find 命中数 !=1 报错；P1-18：per-patch 失败回滚已应用部分） | `AutoUpdater::execute()` |
+| `crates/cordis-runtime/src/kernel/plugin_iteration.rs` | 插件迭代：策略校验、编辑执行器（P0-5 备份先行）、回滚日志（P0-6 tmp+fsync+rename + generation_id）、canary 判定；symlink escape guard（P0-20） | `PluginEditExecutor`、`PluginEditRollback`、`CanaryReport`、`atomic_write` |
+| `crates/cordis-runtime/src/kernel/verifier.rs` | 验证 pipeline：static_check / tests / safety stage；argv-based shell runner（P0-1 命令注入修复）、每命令 wall-clock timeout；`plugin:` 命令走 candidate invoker（P0-4）；tree hash TOCTOU 检查（P0-3） | `CommandVerifier`、`VerificationProfile`、`VerifyOptions`、`hash_source_tree` |
+| `crates/cordis-runtime/src/kernel/notify.rs` | 通知总线：注册去重（P1-10）、发送、`unregister_plugin` | `notify::register`、`notify::send` |
+| `crates/cordis-runtime/src/kernel/health.rs` | 定期健康检查循环 + 可停止 handle（P1-11） | `start_health_loop`、`HealthLoopHandle` |
+| `crates/cordis-runtime/src/kernel/mod.rs` | Kernel 模块导出聚合 | `pub mod auto_update/plugin_iteration/verifier/notify/health/...` |
 
 > **已删除**: `kernel/loop.rs`（9 阶段 Petri Net 替换为 agent loop）、`kernel/planner.rs`（独立 LLM 路径合并到 AgentSession）
 
@@ -68,15 +71,16 @@
 
 | 职责定位 | 关键入口 |
 |---|---|
-| 统一的 LLM agent 会话：SSE 流解析、tool-calling loop（最多 96 轮）、重试/超时管理、消息历史；两个后端：`RuntimeShellAgentBackend`（15 个交互式工具）和 `PluginIterationAgentBackend`（14 个 plugin-editing 工具） | `AgentSession::respond()`、`ShellAgentSession`、`AgentToolHost` trait |
+| 统一的 LLM agent 会话：SSE 流解析、tool-calling loop（最多 96 轮，overflow 保留 partial history P1-31）、重试/超时管理（4xx 不重试 P1-35，budget 合并 P1-37）、消息历史（compact 后重算 estimated_tokens P1-32、UTF-8 char/byte 一致 P1-33）、orphan-User cleanup（P2-31）；两个后端：`RuntimeShellAgentBackend`（20 个交互式工具；P2-1 边界收敛待做）和 `PluginIterationAgentBackend`（scaffold/edit/verify 工具集） | `AgentSession::respond` / `respond_inner`、`ShellAgentSession`、`AgentToolHost` trait、`PendingSessionAction`（P1-25 self-lookup 侧信道） |
 
 ## 7. Service 层 (`crates/cordis-runtime/src/service`)
 
 | 文件 | 职责定位 | 关键入口 |
 |---|---|---|
 | `crates/cordis-runtime/src/service/doc_registry.rs` | docs 注册与查询（含 GET 路径解析） | `DocRegistry::handle_get()` |
-| `crates/cordis-runtime/src/service/graph_registry.rs` | 已注册插件/节点图与推导 net 服务：输出 JSON 图模型与自包含 HTML 可视化 | `GraphRegistry::render_registered_nodes_html()`、`GraphRegistry::render_registered_net_html()` |
-| `crates/cordis-runtime/src/service/mod.rs` | Service 模块导出聚合 | `pub mod doc_registry/graph_registry` |
+| `crates/cordis-runtime/src/service/graph_registry.rs` | 已注册插件/节点图与推导 net 服务：输出 JSON 图模型与自包含 HTML 可视化；多 producer 排序稳定（P1-50）、cycle 节点 topo_level=usize::MAX（P1-51） | `GraphRegistry::render_registered_nodes_html()`、`GraphRegistry::render_registered_net_html()` |
+| `crates/cordis-runtime/src/service/html_render.rs` | HTML 转义与嵌套元素渲染 helper | `escape_html`、`text`、`raw` |
+| `crates/cordis-runtime/src/service/mod.rs` | Service 模块导出聚合 | `pub mod doc_registry/graph_registry/html_render` |
 
 ## 8. Crate 根与 CLI
 

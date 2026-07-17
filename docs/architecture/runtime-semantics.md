@@ -72,12 +72,11 @@ Local(当前插件 -> 祖先插件中被 grants 明确允许的服务)
 
 这让子图可以有类似事务边界的上下文语义。
 
-### 2.3 Actor 与调度器
+### 2.3 调度器
 
-- [execution/actor.rs](../../crates/cordis-runtime/src/execution/actor.rs) 提供 mailbox 风格批量分发。
-- [execution/scheduler.rs](../../crates/cordis-runtime/src/execution/scheduler.rs) 提供调度配置。
+- [execution/scheduler.rs](../../crates/cordis-runtime/src/execution/scheduler.rs) 仅承载 `SchedulerConfig` 载体（`max_parallelism` / `max_concurrency`）。历史上的 `execution/actor.rs` mailbox 已合并回 `engine.rs`（5cc7c65），`run_deterministic` 死代码已在 P2-7 清理；实际调度、批处理和 parallel key-shard 逻辑都在 [execution/engine.rs](../../crates/cordis-runtime/src/execution/engine.rs) 内。
 
-当前引擎默认吞吐优先调度，并保留 `SchedulerMode::Deterministic` 供测试/排障复现。
+当前引擎默认单线程；`SchedulerConfig::max_concurrency > 1` 启用 parallel key-shard 分批（P1-3/4/5/6/7/8 系列修复覆盖了 Router skip 对称、优先级排序、runner panic 转 Err、KeyedPair arity 校验、Router Timeout override 语义、eval_first_success 及时收敛）。
 
 ### 2.4 `execute_net()`
 
@@ -120,7 +119,8 @@ Local(当前插件 -> 祖先插件中被 grants 明确允许的服务)
 - `reload()`：重建整图并在成功后原子切换
 - `kernel().status()`：查看当前 kernel / LLM 配置摘要和迭代计数
 - `kernel().history()`：读取历史变更记录
-- `kernel().run_iteration()`：执行一次受限 auto-update 事务
+- `kernel().run_iteration()`：legacy 单文本-patch 的 `AutoUpdater` 事务（见 3.3）
+- `iterate_plugins()`：**主入口**，运行 agent-loop 驱动的自迭代（agent + edit + rebuild + stage + verify + canary + promote/rollback），支持 hard rollback + journal 恢复
 
 ### 3.2 策略边界
 
@@ -134,14 +134,18 @@ Local(当前插件 -> 祖先插件中被 grants 明确允许的服务)
 
 默认策略下，`core/`、`plugin/`、`kernel/` 等敏感目录需要人工批准。
 
-### 3.3 AutoUpdater
+### 3.3 AutoUpdater (legacy)
 
-[kernel/auto_update.rs](../../crates/cordis-runtime/src/kernel/auto_update.rs) 提供一个最小可运行更新器：
+[kernel/auto_update.rs](../../crates/cordis-runtime/src/kernel/auto_update.rs) 是 open-ended agent loop 之前的最小更新器，仍保留供简单单文本 patch 使用：
 
 - 仅支持文本级 `find -> replace` 补丁。
 - 所有路径必须是 workspace 内的相对路径。
 - 禁止绝对路径和 `..` 路径穿越。
+- P2-27: `find` 命中数 != 1 直接报错，不再 replacen(1) 静默取首个。
+- P1-18: 中途 per-patch 失败，已应用的补丁一并回滚，不留脏工作树。
 - 如果验证失败或 verdict 是 `Rollback`，会按备份顺序回滚。
+
+自迭代的主入口现在是 `RuntimeHost::iterate_plugins()`（agent-loop + hard rollback + journal 持久化），见 [design-blueprint.md](./design-blueprint.md) 10 节。
 
 这说明当前 auto-update 仍是“安全边界验证原型”，不是完整代码修改系统。
 

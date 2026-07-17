@@ -206,6 +206,15 @@ Agent 现在可以自主完成：读代码 → 理解结构 → 写/改文件 �
 - [x] **Plugin iteration symlink 逃逸**（P0-20）— `PluginEditExecutor::execute` 在写入前调用新 helper `resolve_under_workspace`：canonicalize 结果必须仍在 workspace_root 下。plugins 内的 symlink 指向 `/etc/passwd` 之类无法被写入。
 - [x] **Verifier shell 拼接**（P0-21）— 已随 A 批 P0-1 修复。`discover_rust_workspace_manifest` 输出的字符串被 `shell_words` 解析成 argv，空格 / `$` / `;` 无法被解释。
 
+### 5.2.16 P2 文档同步（P 批，2026-07-17 已闭合）
+
+- [x] **`rs-files-responsibility.md` 重写**（P2-14）— execution/kernel/agent/service 表全部更新为当前代码状态。删除 `actor.rs`、`run_deterministic` 死代码条目；加 `notify.rs`、`health.rs`、`html_render.rs`；标注每个模块里已应用的 P0/P1 修复号。
+- [x] **`runtime-semantics.md` self-iteration 章节**（P2-16）— 2.3 Actor 段去掉；3.1 `RuntimeHost` API 明确 `iterate_plugins()` 是主入口，`run_iteration()` 是 legacy；3.3 AutoUpdater 标 legacy 并列出 P1-18 / P2-27 修复。
+- [x] **`design-blueprint.md` 行号 / 工具数**（P2-17）— "16 个内核工具" 更新为"约 20 个"并标注 P2-1（file/shell 类工具下沉计划）；`host.rs:2045` 换为函数名引用（源码行号随时变化）。
+- [ ] **P2-1 Kernel↔Plugin 边界收敛（工具下沉）** — Kernel 侧 file/shell/search 工具仍在 `agent.rs`，未真正下沉到 `filesystem`/`shell`/`web`/`git` 插件（agent 端提示词也未改）。属于产品级重构，不在本轮 review 范围。
+- [ ] **P2-2 SSRF util 抽 `cordis-plugin-net`** — web / vision 依然复制粘贴同一份 `ip_is_forbidden`；抽 crate 需要 workspace 布局调整，留到后续。
+- [ ] **P2-15 status-and-open-items 日期与内容落后** — 已随本轮更新；本文件即"最新状态"。
+
 ### 5.2.15 P2 代码打磨（O 批，2026-07-17 已闭合）
 
 - [x] **`make_execution_id` unique**（P2-18）— 加进程本地 `AtomicU64` seq；纳秒 + seq 组合，时钟回拨或同纳秒 boot 不再撞 id。
