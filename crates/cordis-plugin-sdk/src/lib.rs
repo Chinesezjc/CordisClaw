@@ -34,6 +34,28 @@ pub struct AbiFingerprint {
 }
 
 impl AbiFingerprint {
+    /// P2-13: construct an `AbiFingerprint` whose `rustc_version` and
+    /// `target_triple` come from the compiler that built this SDK crate.
+    /// Plugins call this in their `abi_fingerprint_value()` and supply
+    /// only the plugin-specific `crate_hash` / `api_hash`, e.g.:
+    ///
+    /// ```ignore
+    /// fn abi_fingerprint_value() -> AbiFingerprint {
+    ///     AbiFingerprint::current_build("crate_my_plugin_v1", "api_v2")
+    /// }
+    /// ```
+    ///
+    /// Values are baked in by `build.rs`; two builds on different
+    /// toolchains produce different fingerprints automatically.
+    pub fn current_build(crate_hash: impl Into<String>, api_hash: impl Into<String>) -> Self {
+        Self {
+            rustc_version: env!("CORDIS_RUSTC_VERSION").to_string(),
+            target_triple: env!("CORDIS_TARGET").to_string(),
+            crate_hash: crate_hash.into(),
+            api_hash: api_hash.into(),
+        }
+    }
+
     pub fn diff(&self, other: &Self) -> Vec<String> {
         let mut out = Vec::new();
         if self.rustc_version != other.rustc_version {
@@ -298,4 +320,22 @@ extern "C" {
 #[no_mangle]
 pub extern "C" fn _cordis_create_service(_node_id: *const std::ffi::c_char) -> *const ServiceVTable {
     std::ptr::null()
+}
+
+#[cfg(test)]
+mod fingerprint_tests {
+    use super::*;
+
+    #[test]
+    fn current_build_populates_rustc_and_target() {
+        // P2-13: the two env values are stamped by build.rs from cargo's
+        // `RUSTC` and `TARGET`. Both should be non-empty; rustc_version
+        // should start with the word "rustc".
+        let fp = AbiFingerprint::current_build("crate_test_v1", "api_v2");
+        assert!(!fp.rustc_version.is_empty(), "rustc_version stamped");
+        assert!(fp.rustc_version.starts_with("rustc"), "looks like rustc --version output: {}", fp.rustc_version);
+        assert!(!fp.target_triple.is_empty(), "target_triple stamped");
+        assert_eq!(fp.crate_hash, "crate_test_v1");
+        assert_eq!(fp.api_hash, "api_v2");
+    }
 }
