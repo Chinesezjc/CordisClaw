@@ -2,14 +2,21 @@
 
 use crate::core::error::RuntimeError;
 use crate::kernel::evaluator::VerificationInput;
+use crate::plugin::abi::PluginResponse;
 use crate::plugin::invoke::PluginInvoker;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
+use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 const DEFAULT_QUALITY_SCORE: u32 = 90;
 const PLUGIN_COMMAND_PREFIX: &str = "plugin:";
+const DEFAULT_COMMAND_TIMEOUT_SECS: u64 = 600;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
@@ -83,6 +90,9 @@ pub struct VerificationReport {
     pub input: VerificationInput,
     pub tests: Option<CommandCheckResult>,
     pub safety: Option<CommandCheckResult>,
+    /// Sha256 of the source tree at verification time. Used by the caller to
+    /// detect concurrent mutation between verify and promote (P0-3 TOCTOU).
+    pub source_tree_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -95,6 +105,25 @@ struct PluginCommandSpec {
     payload_json: Value,
     #[serde(default)]
     expect_substring: Option<String>,
+}
+
+/// Delegate that dispatches a plugin invocation to the *staged candidate*
+/// registry rather than the live one. When provided (P0-4), `plugin:`
+/// verifier commands go through this closure so the verifier actually
+/// exercises the code being promoted.
+pub type CandidateInvoker<'a> =
+    &'a (dyn Fn(&str, &str, String) -> Result<PluginResponse, RuntimeError> + Send + Sync);
+
+/// Options passed to [`CommandVerifier::verify_with_options`] that control
+/// safety-critical behaviour of the verification run.
+#[derive(Default)]
+pub struct VerifyOptions<'a> {
+    /// If set, `plugin:` commands dispatch through this closure — pointing at
+    /// the staged candidate snapshot — instead of loading a fresh
+    /// [`PluginInvoker`] from the live fixtures directory.
+    pub candidate_invoker: Option<CandidateInvoker<'a>>,
+    /// Timeout for each shell/plugin command. `None` = default 600s.
+    pub command_timeout: Option<Duration>,
 }
 
 pub struct CommandVerifier;
@@ -113,9 +142,14 @@ impl CommandVerifier {
                     let relative = manifest
                         .strip_prefix(workspace_root)
                         .unwrap_or(&manifest)
-                        .display()
-                        .to_string();
-                    format!("cargo check --quiet --manifest-path {relative}")
+                        .to_string_lossy()
+                        .into_owned();
+                    // Encoded as a shell-words parseable string; the runner
+                    // splits it back into argv without invoking a shell.
+                    format!(
+                        "cargo check --quiet --manifest-path {}",
+                        shell_quote(&relative)
+                    )
                 }),
         };
 
@@ -134,7 +168,28 @@ impl CommandVerifier {
         safety_command: Option<&str>,
         quality_score_override: Option<u32>,
     ) -> Result<VerificationReport, RuntimeError> {
+        Self::verify_with_options(
+            workspace_root,
+            profile,
+            tests_command,
+            safety_command,
+            quality_score_override,
+            &VerifyOptions::default(),
+        )
+    }
+
+    pub fn verify_with_options(
+        workspace_root: &Path,
+        profile: VerificationProfile,
+        tests_command: Option<&str>,
+        safety_command: Option<&str>,
+        quality_score_override: Option<u32>,
+        options: &VerifyOptions<'_>,
+    ) -> Result<VerificationReport, RuntimeError> {
         let plan = Self::resolve_plan(workspace_root, profile, tests_command, safety_command);
+        let timeout = options
+            .command_timeout
+            .unwrap_or_else(|| Duration::from_secs(DEFAULT_COMMAND_TIMEOUT_SECS));
         let mut stages = Vec::new();
 
         let static_check = run_optional_stage(
@@ -142,33 +197,50 @@ impl CommandVerifier {
             true,
             plan.static_check_command.as_deref(),
             workspace_root,
+            options,
+            timeout,
         )?;
         let tests = run_optional_stage(
             VerificationStageKind::Tests,
             true,
             plan.tests_command.as_deref(),
             workspace_root,
+            options,
+            timeout,
         )?;
         let safety = run_optional_stage(
             VerificationStageKind::Safety,
             true,
             plan.safety_command.as_deref(),
             workspace_root,
+            options,
+            timeout,
         )?;
+
+        // P0-2: at least one stage must have really executed (not Skipped).
+        // If every stage was skipped, treat as verifier failure — a plan
+        // without any command is a rubber stamp.
+        let any_executed = matches!(static_check.stage.status, VerificationStageStatus::Passed | VerificationStageStatus::Failed)
+            || matches!(tests.stage.status, VerificationStageStatus::Passed | VerificationStageStatus::Failed)
+            || matches!(safety.stage.status, VerificationStageStatus::Passed | VerificationStageStatus::Failed);
 
         stages.push(static_check.stage);
         stages.push(tests.stage);
         stages.push(safety.stage);
 
-        let tests_passed = static_check.success && tests.success;
-        let safety_checks_passed = safety.success;
-        let quality_score = quality_score_override.unwrap_or_else(|| {
+        let tests_passed = any_executed && static_check.success && tests.success;
+        let safety_checks_passed = any_executed && safety.success;
+        let quality_score = quality_score_override.unwrap_or({
             if tests_passed && safety_checks_passed {
                 DEFAULT_QUALITY_SCORE
             } else {
                 0
             }
         });
+
+        // P0-3: hash the source tree AFTER commands ran; caller compares this
+        // against a re-hash right before promote to detect mid-flight edits.
+        let source_tree_hash = hash_source_tree(workspace_root).ok();
 
         Ok(VerificationReport {
             plan,
@@ -180,6 +252,7 @@ impl CommandVerifier {
             },
             tests: tests.check,
             safety: safety.check,
+            source_tree_hash,
         })
     }
 }
@@ -225,6 +298,8 @@ fn run_optional_stage(
     required: bool,
     command: Option<&str>,
     current_dir: &Path,
+    options: &VerifyOptions<'_>,
+    timeout: Duration,
 ) -> Result<StageExecution, RuntimeError> {
     let Some(command) = command else {
         return Ok(StageExecution {
@@ -239,7 +314,7 @@ fn run_optional_stage(
         });
     };
 
-    let check = run_check_command(command, current_dir)?;
+    let check = run_check_command(command, current_dir, options, timeout)?;
     let status = if check.success {
         VerificationStageStatus::Passed
     } else {
@@ -260,51 +335,72 @@ fn run_optional_stage(
 fn run_check_command(
     command: &str,
     current_dir: &Path,
+    options: &VerifyOptions<'_>,
+    timeout: Duration,
 ) -> Result<CommandCheckResult, RuntimeError> {
     if let Some(spec_json) = command.strip_prefix(PLUGIN_COMMAND_PREFIX) {
-        return run_plugin_command(command, spec_json, current_dir);
+        return run_plugin_command(command, spec_json, current_dir, options);
     }
-    run_shell_command(command, current_dir)
+    run_shell_command(command, current_dir, timeout)
 }
 
 fn run_plugin_command(
     original_command: &str,
     spec_json: &str,
     current_dir: &Path,
+    options: &VerifyOptions<'_>,
 ) -> Result<CommandCheckResult, RuntimeError> {
     let spec: PluginCommandSpec =
         serde_json::from_str(spec_json).map_err(|err| RuntimeError::InvalidArgument {
             message: format!("invalid plugin verifier spec: {err}"),
         })?;
-    let fixtures_root = resolve_plugin_fixtures_root(current_dir, spec.fixtures_root.as_deref());
     let payload =
         serde_json::to_string(&spec.payload_json).map_err(|err| RuntimeError::InvalidArgument {
             message: format!("plugin payload_json was not serializable: {err}"),
         })?;
 
-    let invoker = match PluginInvoker::load(&fixtures_root) {
-        Ok(invoker) => invoker,
-        Err(err) => {
-            return Ok(CommandCheckResult {
-                command: original_command.to_string(),
-                runner: VerificationRunner::Plugin,
-                success: false,
-                stdout: String::new(),
-                stderr: err.to_string(),
-            });
+    // P0-4: route through the caller-supplied candidate invoker when present.
+    // Falling back to `PluginInvoker::load` would verify the currently-running
+    // plugins — the exact bug this option exists to fix.
+    let response = if let Some(invoker) = options.candidate_invoker {
+        match invoker(&spec.plugin_path, &spec.node_id, payload) {
+            Ok(response) => response,
+            Err(err) => {
+                return Ok(CommandCheckResult {
+                    command: original_command.to_string(),
+                    runner: VerificationRunner::Plugin,
+                    success: false,
+                    stdout: String::new(),
+                    stderr: err.to_string(),
+                });
+            }
         }
-    };
-
-    let response = match invoker.invoke(&spec.plugin_path, &spec.node_id, payload) {
-        Ok(response) => response,
-        Err(err) => {
-            return Ok(CommandCheckResult {
-                command: original_command.to_string(),
-                runner: VerificationRunner::Plugin,
-                success: false,
-                stdout: String::new(),
-                stderr: err.to_string(),
-            });
+    } else {
+        let fixtures_root =
+            resolve_plugin_fixtures_root(current_dir, spec.fixtures_root.as_deref());
+        let invoker = match PluginInvoker::load(&fixtures_root) {
+            Ok(invoker) => invoker,
+            Err(err) => {
+                return Ok(CommandCheckResult {
+                    command: original_command.to_string(),
+                    runner: VerificationRunner::Plugin,
+                    success: false,
+                    stdout: String::new(),
+                    stderr: err.to_string(),
+                });
+            }
+        };
+        match invoker.invoke(&spec.plugin_path, &spec.node_id, payload) {
+            Ok(response) => response,
+            Err(err) => {
+                return Ok(CommandCheckResult {
+                    command: original_command.to_string(),
+                    runner: VerificationRunner::Plugin,
+                    success: false,
+                    stdout: String::new(),
+                    stderr: err.to_string(),
+                });
+            }
         }
     };
 
@@ -357,90 +453,231 @@ fn resolve_plugin_fixtures_root(current_dir: &Path, requested_root: Option<&str>
     current_dir.to_path_buf()
 }
 
+/// P0-1: run the command as a real argv, NEVER through `bash -lc`.
+/// The command string is split via `shell_words` (POSIX-shell tokenisation
+/// with quoting, no expansion of `$VAR` / backticks / `$()`), then dispatched
+/// to `Command::new(argv[0])` directly. Any attempt to inject a subshell,
+/// command substitution, redirect, or backtick therefore lands in argv as a
+/// literal string and does nothing.
+///
+/// The child is monitored with a wall-clock timeout. On expiry it is killed
+/// and reaped so a hung `cargo test` cannot stall the whole iteration.
 fn run_shell_command(
     command: &str,
     current_dir: &Path,
+    timeout: Duration,
 ) -> Result<CommandCheckResult, RuntimeError> {
-    #[cfg(windows)]
-    let output = Command::new("cmd")
-        .args(["/C", command])
-        .current_dir(current_dir)
-        .output();
+    let argv = match shell_words::split(command) {
+        Ok(a) => a,
+        Err(err) => {
+            return Ok(CommandCheckResult {
+                command: command.to_string(),
+                runner: VerificationRunner::Shell,
+                success: false,
+                stdout: String::new(),
+                stderr: format!("command tokenisation failed: {err}"),
+            });
+        }
+    };
+    let Some((program, args)) = argv.split_first() else {
+        return Ok(CommandCheckResult {
+            command: command.to_string(),
+            runner: VerificationRunner::Shell,
+            success: false,
+            stdout: String::new(),
+            stderr: "command was empty after tokenisation".to_string(),
+        });
+    };
+    if program.is_empty() {
+        return Ok(CommandCheckResult {
+            command: command.to_string(),
+            runner: VerificationRunner::Shell,
+            success: false,
+            stdout: String::new(),
+            stderr: "command program was empty".to_string(),
+        });
+    }
 
-    #[cfg(not(windows))]
-    let output = Command::new("bash")
-        .args(["-lc", command])
+    let mut child = Command::new(program)
+        .args(args)
         .current_dir(current_dir)
-        .output();
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| RuntimeError::CommandFailed {
+            program: program.clone(),
+            args: args.to_vec(),
+            message: err.to_string(),
+        })?;
 
-    let output = output.map_err(|err| RuntimeError::CommandFailed {
-        program: shell_program().to_string(),
-        args: shell_args(command),
-        message: err.to_string(),
-    })?;
+    // Poll for exit up to `timeout`. On expiry, kill + reap.
+    let deadline = Instant::now() + timeout;
+    let mut timed_out = false;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    timed_out = true;
+                    break std::process::ExitStatus::default();
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err(err) => {
+                return Err(RuntimeError::CommandFailed {
+                    program: program.clone(),
+                    args: args.to_vec(),
+                    message: format!("wait failed: {err}"),
+                });
+            }
+        }
+    };
+
+    let mut stdout_buf = Vec::new();
+    let mut stderr_buf = Vec::new();
+    if let Some(mut out) = child.stdout.take() {
+        use std::io::Read;
+        let _ = out.read_to_end(&mut stdout_buf);
+    }
+    if let Some(mut err) = child.stderr.take() {
+        use std::io::Read;
+        let _ = err.read_to_end(&mut stderr_buf);
+    }
+
+    let success = !timed_out && status.success();
+    let stderr = if timed_out {
+        let base = String::from_utf8_lossy(&stderr_buf).trim().to_string();
+        if base.is_empty() {
+            format!("command timed out after {:?}", timeout)
+        } else {
+            format!("command timed out after {:?}; stderr: {base}", timeout)
+        }
+    } else {
+        String::from_utf8_lossy(&stderr_buf).trim().to_string()
+    };
 
     Ok(CommandCheckResult {
         command: command.to_string(),
         runner: VerificationRunner::Shell,
-        success: output.status.success(),
-        stdout: String::from_utf8_lossy(&output.stdout).trim().to_string(),
-        stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        success,
+        stdout: String::from_utf8_lossy(&stdout_buf).trim().to_string(),
+        stderr,
     })
 }
 
-#[cfg(windows)]
-fn shell_program() -> &'static str {
-    "cmd"
+/// Quote a single argument for later `shell_words::split` — since we control
+/// both sides we only need enough escaping that round-tripping is stable.
+fn shell_quote(s: &str) -> String {
+    if !s.is_empty()
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'/' | b'='))
+    {
+        s.to_string()
+    } else {
+        let escaped = s.replace('\\', "\\\\").replace('\'', "'\\''");
+        format!("'{}'", escaped)
+    }
 }
 
-#[cfg(not(windows))]
-fn shell_program() -> &'static str {
-    "bash"
+/// P0-3: compute a stable digest of every regular file inside `root` (skipping
+/// `target/` and hidden dirs). Returned as a lowercase hex string. Caller
+/// compares before/after verify to detect concurrent mutation.
+///
+/// The hash is deterministic: we sort files by relative path, then feed
+/// `path\0len\0bytes` into a single sha256. Symlinks are followed (they must
+/// resolve to a file). Missing / unreadable entries surface as an Err so the
+/// caller can decide policy.
+pub fn hash_source_tree(root: &Path) -> Result<String, RuntimeError> {
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let mut entries: BTreeMap<String, PathBuf> = BTreeMap::new();
+    collect_source_tree(&root, &root, &mut entries).map_err(|err| RuntimeError::Io {
+        path: root.clone(),
+        message: format!("hash_source_tree walk failed: {err}"),
+    })?;
+
+    let mut hasher = Sha256::new();
+    for (rel, abs) in &entries {
+        let bytes = fs::read(abs).map_err(|err| RuntimeError::Io {
+            path: abs.clone(),
+            message: format!("hash_source_tree read failed: {err}"),
+        })?;
+        hasher.update(rel.as_bytes());
+        hasher.update([0u8]);
+        hasher.update((bytes.len() as u64).to_le_bytes());
+        hasher.update([0u8]);
+        hasher.update(&bytes);
+    }
+    Ok(hex::encode(hasher.finalize()))
 }
 
-#[cfg(windows)]
-fn shell_args(command: &str) -> Vec<String> {
-    vec!["/C".to_string(), command.to_string()]
-}
-
-#[cfg(not(windows))]
-fn shell_args(command: &str) -> Vec<String> {
-    vec!["-lc".to_string(), command.to_string()]
+fn collect_source_tree(
+    root: &Path,
+    current: &Path,
+    entries: &mut BTreeMap<String, PathBuf>,
+) -> std::io::Result<()> {
+    for entry in fs::read_dir(current)? {
+        let entry = entry?;
+        let path = entry.path();
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if name_str.starts_with('.') {
+            continue;
+        }
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            if matches!(
+                name_str.as_ref(),
+                "target" | "node_modules" | ".cordis-drafts"
+            ) {
+                continue;
+            }
+            collect_source_tree(root, &path, entries)?;
+        } else if file_type.is_file() || file_type.is_symlink() {
+            if let Ok(rel) = path.strip_prefix(root) {
+                let rel_str = rel.to_string_lossy().replace('\\', "/");
+                entries.insert(rel_str, path);
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        resolve_plugin_fixtures_root, CommandVerifier, VerificationProfile, VerificationRunner,
-        VerificationStageKind, VerificationStageStatus,
+        hash_source_tree, resolve_plugin_fixtures_root, run_shell_command, CommandVerifier,
+        VerificationProfile, VerificationRunner, VerificationStageKind, VerificationStageStatus,
     };
     use serde_json::json;
     use std::fs;
     use std::path::Path;
+    use std::time::Duration;
     use tempfile::TempDir;
 
     #[test]
-    fn verify_defaults_to_success_without_commands() {
+    fn verify_without_any_command_now_fails() {
+        // P0-2: no test/safety command → verifier used to rubber-stamp Pass.
+        // Now it must report tests_passed=false.
         let report = CommandVerifier::verify(
-            std::path::Path::new("."),
+            Path::new("."),
             VerificationProfile::Default,
             None,
             None,
             None,
         )
-        .expect("verify should succeed");
-        assert!(report.input.tests_passed);
-        assert!(report.input.safety_checks_passed);
-        assert_eq!(report.input.quality_score, 90);
-        assert_eq!(report.stages.len(), 3);
-        assert_eq!(report.stages[0].kind, VerificationStageKind::StaticCheck);
-        assert_eq!(report.stages[0].status, VerificationStageStatus::Skipped);
+        .expect("verify should return report");
+        assert!(!report.input.tests_passed);
+        assert!(!report.input.safety_checks_passed);
+        assert_eq!(report.input.quality_score, 0);
     }
 
     #[test]
     fn verify_marks_failed_command() {
         let report = CommandVerifier::verify(
-            std::path::Path::new("."),
+            Path::new("."),
             VerificationProfile::Default,
             Some("cargo --badflag"),
             None,
@@ -453,6 +690,41 @@ mod tests {
             report.tests.as_ref().map(|check| check.runner),
             Some(VerificationRunner::Shell)
         );
+    }
+
+    #[test]
+    fn shell_injection_via_tests_command_is_blocked() {
+        // P0-1: `; touch <marker>` used to be evaluated by bash -lc. Now the
+        // whole string tokenises to argv, and `echo` runs literally with those
+        // characters — no subshell.
+        let temp = TempDir::new().expect("tempdir");
+        let marker = temp.path().join("pwned");
+        let payload = format!("echo hello ; touch {}", marker.display());
+        let report = CommandVerifier::verify(
+            temp.path(),
+            VerificationProfile::Default,
+            Some(&payload),
+            None,
+            None,
+        )
+        .expect("verify should return report");
+        // The runner may treat `;` as an argument or fail; the only invariant
+        // that matters is that no shell interpreted it.
+        assert!(!marker.exists(), "shell metachars must not spawn a subshell");
+        let _ = report;
+    }
+
+    #[test]
+    fn shell_command_honors_timeout() {
+        let temp = TempDir::new().expect("tempdir");
+        let result = run_shell_command(
+            "sleep 5",
+            temp.path(),
+            Duration::from_millis(200),
+        )
+        .expect("timeout path should not panic");
+        assert!(!result.success);
+        assert!(result.stderr.contains("timed out"), "stderr: {}", result.stderr);
     }
 
     #[test]
@@ -522,5 +794,38 @@ mod tests {
             .expect("static check")
             .command
             .contains("cargo check --quiet --manifest-path Cargo.toml"));
+    }
+
+    #[test]
+    fn hash_source_tree_is_stable_and_detects_change() {
+        let temp = TempDir::new().expect("tempdir");
+        fs::create_dir_all(temp.path().join("src")).unwrap();
+        fs::write(temp.path().join("src/lib.rs"), "fn a() {}\n").unwrap();
+
+        let h1 = hash_source_tree(temp.path()).unwrap();
+        let h2 = hash_source_tree(temp.path()).unwrap();
+        assert_eq!(h1, h2);
+
+        fs::write(temp.path().join("src/lib.rs"), "fn b() {}\n").unwrap();
+        let h3 = hash_source_tree(temp.path()).unwrap();
+        assert_ne!(h1, h3);
+    }
+
+    // Preserve legacy assertion: an explicit `true` tests command *does* pass.
+    #[test]
+    fn verify_passes_when_all_stages_execute_and_succeed() {
+        let report = CommandVerifier::verify(
+            Path::new("."),
+            VerificationProfile::Default,
+            Some("true"),
+            Some("true"),
+            None,
+        )
+        .expect("verify should return report");
+        assert!(report.input.tests_passed);
+        assert!(report.input.safety_checks_passed);
+        assert_eq!(report.input.quality_score, 90);
+        assert_eq!(report.stages[1].kind, VerificationStageKind::Tests);
+        assert_eq!(report.stages[1].status, VerificationStageStatus::Passed);
     }
 }

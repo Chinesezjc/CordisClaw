@@ -28,7 +28,7 @@ use crate::kernel::plugin_iteration::{
     PluginIterationPolicy, PluginIterationStatus, VerifierVerdict,
 };
 use crate::kernel::verifier::{
-    CommandVerifier, VerificationProfile, VerificationReport,
+    hash_source_tree, CommandVerifier, VerificationProfile, VerificationReport, VerifyOptions,
 };
 use crate::plugin::abi::PluginResponse;
 use crate::plugin::invoke::invoke_registered_plugin;
@@ -2775,12 +2775,26 @@ export_plugin_api! {{
             .safety_command
             .clone()
             .or_else(|| state.prepared.safety_command.clone());
-        let report = CommandVerifier::verify(
+        // P0-4: `plugin:` commands must exercise the staged candidate. Wire an
+        // invoker closure that dispatches into the candidate snapshot rather
+        // than loading a fresh live invoker inside the verifier.
+        let candidate_invoker = |plugin_path: &str,
+                                 node_id: &str,
+                                 payload: String|
+         -> Result<PluginResponse, RuntimeError> {
+            self.invoke_candidate(plugin_path, node_id, payload)
+        };
+        let options = VerifyOptions {
+            candidate_invoker: Some(&candidate_invoker),
+            command_timeout: None,
+        };
+        let report = CommandVerifier::verify_with_options(
             &self.fixtures_root,
             state.prepared.verify_profile,
             tests_command.as_deref(),
             safety_command.as_deref(),
             state.prepared.quality_score,
+            &options,
         )?;
         Ok(report)
     }
@@ -2915,11 +2929,53 @@ export_plugin_api! {{
             .as_ref()
             .map(|report| report.verdict)
             .unwrap_or(CanaryVerdict::Partial);
-        let final_verdict =
-            if verifier_verdict == VerifierVerdict::Pass && canary_verdict == CanaryVerdict::Pass {
+
+        // P0-3: guard against concurrent source-tree mutation between verify
+        // and promote. The verifier hashes the tree; here we rehash and
+        // compare. Any drift → downgrade the verdict to a rollback so we
+        // don't promote code we never verified.
+        let mut effective_verifier = verifier_verdict;
+        let mut source_drift_reason: Option<String> = None;
+        if verifier_verdict == VerifierVerdict::Pass {
+            if let Some(expected) = state
+                .verification
+                .as_ref()
+                .and_then(|r| r.source_tree_hash.as_deref())
+            {
+                match hash_source_tree(&self.fixtures_root) {
+                    Ok(actual) if actual == expected => {}
+                    Ok(actual) => {
+                        source_drift_reason = Some(format!(
+                            "source tree mutated between verify and promote (expected {expected}, got {actual})"
+                        ));
+                        effective_verifier = VerifierVerdict::Fail;
+                    }
+                    Err(err) => {
+                        source_drift_reason = Some(format!(
+                            "unable to re-hash source tree before promote: {err}"
+                        ));
+                        effective_verifier = VerifierVerdict::Fail;
+                    }
+                }
+            }
+        }
+        if let Some(reason) = source_drift_reason.as_deref() {
+            self.kernel.observe_plugin_issue(
+                KernelPluginIssueSource::VerifierFailure,
+                state.prepared.root_plugin_path.clone(),
+                format!(
+                    "plugin verifier TOCTOU guard tripped for {}: {}",
+                    state.prepared.root_plugin_path, reason
+                ),
+            );
+        }
+
+        let final_verdict = if effective_verifier == VerifierVerdict::Pass
+            && canary_verdict == CanaryVerdict::Pass
+        {
                 self.promote_candidate()?;
                 PluginIterationFinalVerdict::Promoted
-            } else if verifier_verdict == VerifierVerdict::Pass
+            } else if effective_verifier == VerifierVerdict::Pass
                 && canary_verdict == CanaryVerdict::Partial
                 && state.prepared.manual_approved
             {
@@ -2936,6 +2992,9 @@ export_plugin_api! {{
                 );
                 PluginIterationFinalVerdict::Blocked
             } else {
+                if let Some(reason) = source_drift_reason.as_ref() {
+                    state.blocked_reason = Some(reason.clone());
+                }
                 let mut rollback_errors = Vec::new();
                 if self.candidate_snapshot().is_some() {
                     if let Err(err) = self.rollback_candidate() {

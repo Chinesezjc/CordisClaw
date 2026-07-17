@@ -2,7 +2,7 @@
 
 ## 1. 判定口径
 
-- 本文基于当前仓库现状整理，最近更新：2026-06-17。
+- 本文基于当前仓库现状整理，最近更新：2026-07-17。
 - 历史规划蓝图已经吸收进 [design-blueprint.md](./design-blueprint.md)，因此本文结论来自三类证据的交叉比对：
   - 设计蓝图：[design-blueprint.md](./design-blueprint.md)
   - 架构文档：[system-overview.md](./system-overview.md)、[contracts-and-loading.md](./contracts-and-loading.md)、[runtime-semantics.md](./runtime-semantics.md)、[maintenance-guide.md](./maintenance-guide.md)
@@ -180,6 +180,14 @@ Agent 现在可以自主完成：读代码 → 理解结构 → 写/改文件 �
 - [x] **`NodeType::Gate` 映射到执行模型** — `build_execution_net` 使用声明的 `node_type` 设置 `ExecutionTransitionKind`
 - [x] **`Terminal` 节点实现结束语义** — Terminal 变迁后停止引擎，标记未完成变迁为 Cancelled
 - [x] **`ActorExecutor` 已移除** — 死代码清理完成
+
+### 5.2.1 Verifier 安全硬化（2026-07-17 已闭合）
+
+- [x] **命令注入**（P0-1）— `bash -lc` 被换成 `shell_words::split` + `Command::new(argv[0])`；`;`、``` ` ```、`$(...)`、重定向等 shell 元字符不再被解释为语法。`kernel/verifier.rs::run_shell_command`。
+- [x] **命令超时**（P0-1）— 每条 verifier 命令有 10 分钟默认 wall-clock 超时；到点 kill + wait。防止恶意 `sleep infinity` 或死锁 `cargo test` 卡住 iteration 管道。
+- [x] **无命令等于 rubber-stamp**（P0-2）— 全部 stage 均 `Skipped` 时 `tests_passed = false` 且 `quality_score = 0`。至少要有一个 stage 真的 execute 才可能 Pass。
+- [x] **Verify/Promote TOCTOU**（P0-3）— `VerificationReport.source_tree_hash` 记录 verify 时的 sha256；`finalize_plugin_iteration` 在 `promote_candidate` 前重算并比对，不匹配则强制 rollback。
+- [x] **Plugin verifier 目标错位**（P0-4）— `verify_plugin_iteration` 传入 `VerifyOptions::candidate_invoker`，`plugin:` 命令走 staged candidate snapshot 而非 live registry。
 
 ### 5.3 工作流运行时适配层
 
