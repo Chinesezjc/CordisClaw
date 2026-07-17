@@ -334,10 +334,8 @@ pub fn sync_plugin_docs(fixtures_root: &Path) -> Result<Vec<PathBuf>, RuntimeErr
             path: docs_dir.to_path_buf(),
             message: e.to_string(),
         })?;
-        fs::write(&docs_path, pretty_json(&entry.docs)).map_err(|e| RuntimeError::Io {
-            path: docs_path.clone(),
-            message: e.to_string(),
-        })?;
+        // P1-17: durable atomic write for interfaces.json.
+        write_pretty_json(&docs_path, &entry.docs)?;
         written.push(docs_path);
     }
 
@@ -358,10 +356,9 @@ pub fn refresh_artifact_index(fixtures_root: &Path) -> Result<Vec<(String, Strin
     }
     index.generated_at = current_build_marker();
 
-    fs::write(&artifact_index_path, pretty_json(&index)).map_err(|e| RuntimeError::Io {
-        path: artifact_index_path,
-        message: e.to_string(),
-    })?;
+    // P1-17: durable atomic write. A torn artifact index blocks the next
+    // verify pass entirely.
+    write_pretty_json(&artifact_index_path, &index)?;
 
     Ok(refreshed)
 }
@@ -480,10 +477,8 @@ fn prepare_artifacts_locked(
         topo_order: graph.topo_order.clone(),
         entries: next_entries,
     };
-    fs::write(&artifact_index_path, pretty_json(&next_index)).map_err(|e| RuntimeError::Io {
-        path: artifact_index_path,
-        message: e.to_string(),
-    })?;
+    // P1-17: durable atomic write.
+    write_pretty_json(&artifact_index_path, &next_index)?;
     cleanup_fixture_lockfiles(&plugins_root)?;
     Ok(report)
 }
@@ -1204,10 +1199,49 @@ fn write_pretty_json<T: serde::Serialize>(path: &Path, value: &T) -> Result<(), 
         path: parent.to_path_buf(),
         message: e.to_string(),
     })?;
-    fs::write(path, pretty_json(value)).map_err(|e| RuntimeError::Io {
-        path: path.to_path_buf(),
-        message: e.to_string(),
-    })
+    // P1-17: durable JSON write. Was `fs::write` — a crash mid-write left a
+    // torn JSON. `artifact/index.json` is consumed by `PluginInvoker::load`
+    // on the very next verify pass; a torn index bricked the runtime.
+    // Now: staging tmp + sync_all + rename. Covers `write_pretty_json`'s
+    // callers (docs/interfaces.json and artifact/index.json) at 337, 361,
+    // 483, 1207.
+    use std::io::Write as _;
+    let bytes = pretty_json(value);
+    let tmp = match path.file_name() {
+        Some(name) => {
+            let mut owned = name.to_os_string();
+            owned.push(format!(".cordis-tmp.{}", std::process::id()));
+            path.with_file_name(owned)
+        }
+        None => {
+            return Err(RuntimeError::Invariant {
+                message: format!("path has no filename: {}", path.display()),
+            });
+        }
+    };
+    {
+        let mut file = fs::File::create(&tmp).map_err(|e| RuntimeError::Io {
+            path: tmp.clone(),
+            message: format!("create tmp: {e}"),
+        })?;
+        file.write_all(bytes.as_bytes())
+            .map_err(|e| RuntimeError::Io {
+                path: tmp.clone(),
+                message: format!("write tmp: {e}"),
+            })?;
+        file.sync_all().map_err(|e| RuntimeError::Io {
+            path: tmp.clone(),
+            message: format!("sync tmp: {e}"),
+        })?;
+    }
+    if let Err(e) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(RuntimeError::Io {
+            path: path.to_path_buf(),
+            message: format!("rename tmp -> target: {e}"),
+        });
+    }
+    Ok(())
 }
 
 impl ArtifactBuildLock {
@@ -1231,6 +1265,12 @@ impl ArtifactBuildLock {
                         message: err.to_string(),
                     })?;
                     file.flush().map_err(|err| RuntimeError::Io {
+                        path: path.clone(),
+                        message: err.to_string(),
+                    })?;
+                    // P1-17: fsync the lock file so a power loss doesn't
+                    // leave a 0-byte file that lock_pid_is_live can't parse.
+                    file.sync_all().map_err(|err| RuntimeError::Io {
                         path: path.clone(),
                         message: err.to_string(),
                     })?;

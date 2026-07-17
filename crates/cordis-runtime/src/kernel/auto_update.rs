@@ -215,26 +215,52 @@ impl AutoUpdater {
         let mut backups = Vec::new();
         let mut changed_paths = BTreeSet::new();
 
-        for patch in &plan.patches {
-            patch.validate_shape()?;
-            let abs_path = self.resolve_patch_path(&patch.path)?;
-            let original = fs::read_to_string(&abs_path).map_err(|e| RuntimeError::Io {
-                path: abs_path.clone(),
-                message: e.to_string(),
-            })?;
-
-            let updated = match patch.kind {
-                FilePatchKind::Text => apply_text_patch(patch, &abs_path, &original)?,
-                FilePatchKind::JsonValue => apply_json_patch(patch, &abs_path, &original)?,
-                FilePatchKind::TomlValue => apply_toml_patch(patch, &abs_path, &original)?,
+        // P1-18: helper closure that runs one patch. On any per-patch error
+        // we roll back what has been applied so far before propagating. The
+        // previous implementation used `?` in this loop, leaving files
+        // modified with no rollback trigger and no way for the caller to
+        // restore prior state.
+        let apply_one =
+            |patch: &crate::kernel::auto_update::FilePatch,
+             backups: &mut Vec<AppliedBackup>,
+             changed_paths: &mut BTreeSet<String>|
+             -> Result<(), RuntimeError> {
+                patch.validate_shape()?;
+                let abs_path = self.resolve_patch_path(&patch.path)?;
+                let original = fs::read_to_string(&abs_path).map_err(|e| RuntimeError::Io {
+                    path: abs_path.clone(),
+                    message: e.to_string(),
+                })?;
+                let updated = match patch.kind {
+                    FilePatchKind::Text => apply_text_patch(patch, &abs_path, &original)?,
+                    FilePatchKind::JsonValue => apply_json_patch(patch, &abs_path, &original)?,
+                    FilePatchKind::TomlValue => apply_toml_patch(patch, &abs_path, &original)?,
+                };
+                // Record the backup BEFORE mutating disk so a failed write
+                // is still recoverable (mirrors the P0-5 rollback pattern).
+                backups.push(AppliedBackup {
+                    abs_path: abs_path.clone(),
+                    original,
+                });
+                fs::write(&abs_path, updated).map_err(|e| RuntimeError::Io {
+                    path: abs_path.clone(),
+                    message: e.to_string(),
+                })?;
+                changed_paths.insert(patch.path.clone());
+                Ok(())
             };
-            fs::write(&abs_path, updated).map_err(|e| RuntimeError::Io {
-                path: abs_path.clone(),
-                message: e.to_string(),
-            })?;
 
-            backups.push(AppliedBackup { abs_path, original });
-            changed_paths.insert(patch.path.clone());
+        for patch in &plan.patches {
+            if let Err(err) = apply_one(patch, &mut backups, &mut changed_paths) {
+                if let Err(rollback_err) = self.rollback(&backups) {
+                    return Err(RuntimeError::Invariant {
+                        message: format!(
+                            "{err}; additionally, patch rollback failed: {rollback_err}"
+                        ),
+                    });
+                }
+                return Err(err);
+            }
         }
 
         let verification = match verify(&self.workspace_root) {

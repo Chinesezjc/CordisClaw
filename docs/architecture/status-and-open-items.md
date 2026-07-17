@@ -206,6 +206,13 @@ Agent 现在可以自主完成：读代码 → 理解结构 → 写/改文件 �
 - [x] **Plugin iteration symlink 逃逸**（P0-20）— `PluginEditExecutor::execute` 在写入前调用新 helper `resolve_under_workspace`：canonicalize 结果必须仍在 workspace_root 下。plugins 内的 symlink 指向 `/etc/passwd` 之类无法被写入。
 - [x] **Verifier shell 拼接**（P0-21）— 已随 A 批 P0-1 修复。`discover_rust_workspace_manifest` 输出的字符串被 `shell_words` 解析成 argv，空格 / `$` / `;` 无法被解释。
 
+### 5.2.9 原子写入 / rollback（H 批，2026-07-17 已闭合）
+
+- [x] **`write_shutdown_memory` 原子写**（P1-15）— 新 helper `atomic_write_bytes`（tmp + sync_all + rename）；crash 中留 truncated JSON 的问题消失。
+- [x] **`create_plugin` workspace 清单加 flock**（P1-16）— `plugins/Cargo.toml.create-lock` 上 fcntl LOCK_EX；两个并发 `create_plugin` 不再互相踩 members。写入本身走 `atomic_write_bytes`。
+- [x] **`write_pretty_json` 通用 durable 写入**（P1-17）— `write_pretty_json`（docs interfaces.json / artifact index.json 的写盘入口）改成 tmp + sync_all + rename。`refresh_artifact_index` / `prepare_artifacts_locked` 转用它。lock file 也补了 `sync_all`。
+- [x] **`kernel/auto_update.rs::execute` 全路径 rollback**（P1-18）— 逐 patch 应用改成 `apply_one` 闭包 + Err 分支主动 `self.rollback(&backups)`；任何一 patch 失败都会把已经写完的前几个 patch 全部还原，不再半途留下工作树脏。
+
 ### 5.2.8 Lock / 生命周期硬化（G 批，2026-07-17 已闭合）
 
 - [x] **`record_plugin_iteration_outcome` 单锁段**（P1-9）— 拆成"每个 Mutex 单独作用域"，函数在任意瞬间最多持有一把锁；与 `select_issue_for_request` 等 `plugin_issues → plugin_history` 反向路径不再冲突。文件内 canonical lock order 也补了注释。
