@@ -550,7 +550,10 @@ fn run_event_loop(server: tiny_http::Server) {
                     }
                 } else if request.url() == "/health" {
                     let _ = request.respond(tiny_http::Response::from_string(
-                        serde_json::to_string(&json!({"status":"ok"})).unwrap(),
+                        // P2-35: unwrap_or_default keeps the response body
+                        // empty on a JSON-encode failure rather than panic
+                        // the whole event loop.
+                        serde_json::to_string(&json!({"status":"ok"})).unwrap_or_default(),
                     ));
                 } else {
                     let _ = request.respond(

@@ -18,6 +18,15 @@ use std::time::{Duration, Instant};
 /// Shared queue for Agent message injection.  The inbox thread pushes new
 /// incoming messages here, and the Agent's respond loop drains them
 /// between LLM turns so that late-arriving messages are seen.
+///
+/// P2-32 known limitation: this is a single process-wide queue. When more
+/// than one session runs concurrently (e.g. `RuntimeShell` + a
+/// `PluginIteration` agent driven in parallel from another thread), an
+/// injected message lands in whichever session's `respond` loop happens
+/// to drain first. Per-session queues would require the caller
+/// (`main.rs::run_serve`) to route messages by session id — that
+/// refactor is tracked separately; today's setup runs one primary
+/// session at a time so the mis-routing hazard is latent, not active.
 static AGENT_INJECT_QUEUE: Mutex<Option<Arc<Mutex<VecDeque<String>>>>> = Mutex::new(None);
 
 /// Set the injection queue from the main binary.  Must be called once
@@ -1010,6 +1019,41 @@ impl AgentSession {
         backend: &mut B,
         user_input: &str,
     ) -> Result<AgentReply, RuntimeError> {
+        let transcript_len_before = self.transcript.len();
+        let result = self.respond_inner(backend, user_input);
+        // P2-31: on error path, if we pushed a User transcript entry but
+        // never got to push a matching Assistant entry, insert an
+        // Assistant placeholder describing the error. Otherwise a retry
+        // with the same session id sees an orphan User (and the LLM
+        // double-records the prompt on the next round).
+        if result.is_err() {
+            let has_user_without_assistant = self
+                .transcript
+                .iter()
+                .skip(transcript_len_before)
+                .any(|e| matches!(e, AgentTranscriptEntry::User { .. }))
+                && !self
+                    .transcript
+                    .iter()
+                    .skip(transcript_len_before)
+                    .any(|e| matches!(e, AgentTranscriptEntry::Assistant { .. }));
+            if has_user_without_assistant {
+                if let Err(err) = &result {
+                    self.transcript.push(AgentTranscriptEntry::Assistant {
+                        content: format!("[error] {}", err),
+                        response_id: None,
+                    });
+                }
+            }
+        }
+        result
+    }
+
+    fn respond_inner<B: AgentBackend + ?Sized>(
+        &mut self,
+        backend: &mut B,
+        user_input: &str,
+    ) -> Result<AgentReply, RuntimeError> {
         let trimmed = user_input.trim();
         if trimmed.is_empty() {
             return Err(RuntimeError::InvalidArgument {
@@ -1733,6 +1777,12 @@ impl AgentSession {
     /// Reconstruct an AgentSession from a snapshot.
     /// The reqwest::Client is freshly created from the stored config.
     pub fn from_snapshot(snapshot: AgentSessionSnapshot) -> Result<Self, RuntimeError> {
+        // P2-33 + P0-25: `api_key` is `#[serde(skip_serializing)]`, so a
+        // recovered snapshot arrives with `config.api_key = None`. Leave
+        // it None here — `resolve_api_key` (send path) reads
+        // `config.api_key_env` from the environment at request time, so
+        // the recovered session picks up whatever key the operator has
+        // configured on this boot, not one baked into the on-disk file.
         let client = Client::builder()
             .timeout(Duration::from_millis(snapshot.config.timeout_ms))
             .build()
