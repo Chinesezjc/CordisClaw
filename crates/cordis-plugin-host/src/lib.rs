@@ -1,5 +1,6 @@
 use cordis_plugin_sdk::{
-    PluginDocs, PluginRequest, PluginResponse, RustPluginApiV2, RUST_PLUGIN_ENTRY_SYMBOL,
+    AbiFingerprint, PluginDocs, PluginRequest, PluginResponse, RustPluginApiV2,
+    RUST_PLUGIN_ENTRY_SYMBOL,
 };
 use libloading::Library;
 use serde::Deserialize;
@@ -10,7 +11,7 @@ use std::io::Write;
 use std::os::raw::c_char;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 use thiserror::Error;
 
 // ── Message Handler Registry ──────────────────────────────────────────────
@@ -71,14 +72,61 @@ pub enum PluginHostError {
         plugin_path: String,
         artifact_path: PathBuf,
     },
+
+    #[error("plugin ABI mismatch for {plugin_path}: expected {expected:?}, actual {actual:?}")]
+    AbiFingerprintMismatch {
+        plugin_path: String,
+        expected: AbiFingerprint,
+        actual: AbiFingerprint,
+    },
 }
 
-#[derive(Debug, Clone)]
+/// Cached, keep-alive dylib handle. Sits alongside `CatalogPlugin` inside an
+/// `Arc<Mutex>` so multiple invocations reuse the same mapping — this is the
+/// P0-11 fix. Previously `invoke_dylib` called `Library::new` on every
+/// invocation and dropped it on return, which unmaps the dylib while the
+/// `PluginResponse.payload` heap allocation (owned by the plugin's
+/// allocator) is still live in the caller. On any platform where dlclose
+/// actually unmaps (musl, custom allocators), that is a use-after-free.
+struct LoadedDylib {
+    library: Library,
+    /// Non-null `*const RustPluginApiV2` inside the (now-resident) dylib.
+    /// Safe to dereference while `library` is alive.
+    api_ptr: *const RustPluginApiV2,
+    /// Whether we've already run the P0-12 fingerprint check for this handle.
+    fingerprint_verified: bool,
+}
+
+// SAFETY: `Library` is not `Send + Sync` in libloading's type system, but the
+// underlying dlopen'd module is process-global; concurrent use through
+// separate `&Library` references is fine, and we serialise every access via
+// the `Mutex<LoadedDylib>` wrapper.
+unsafe impl Send for LoadedDylib {}
+unsafe impl Sync for LoadedDylib {}
+
+#[derive(Clone)]
 pub struct CatalogPlugin {
     pub plugin_path: String,
     pub docs: PluginDocs,
     artifact_path: PathBuf,
     execution: Option<PluginExecution>,
+    /// Expected ABI fingerprint from `index.json`. Optional to keep older
+    /// index files loadable; when present it's cross-checked against the
+    /// dylib's own `abi_fingerprint()` on first invoke (P0-12).
+    expected_abi_fingerprint: Option<AbiFingerprint>,
+    /// Lazily loaded dylib handle. `None` for JSON/process artifacts.
+    library: Arc<Mutex<Option<LoadedDylib>>>,
+}
+
+impl std::fmt::Debug for CatalogPlugin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CatalogPlugin")
+            .field("plugin_path", &self.plugin_path)
+            .field("artifact_path", &self.artifact_path)
+            .field("execution", &self.execution)
+            .field("expected_abi_fingerprint", &self.expected_abi_fingerprint)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -99,6 +147,11 @@ struct ArtifactIndexEntry {
     artifact_path: String,
     docs: PluginDocs,
     execution: Option<PluginExecution>,
+    /// Present for entries produced by the current runtime; absent in older
+    /// or JSON-only artifact indices. When present, host verifies the loaded
+    /// dylib reports the same fingerprint on first invoke (P0-12).
+    #[serde(default)]
+    abi_fingerprint: Option<AbiFingerprint>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -134,6 +187,8 @@ impl PluginCatalog {
                     docs: entry.docs,
                     artifact_path,
                     execution: entry.execution,
+                    expected_abi_fingerprint: entry.abi_fingerprint,
+                    library: Arc::new(Mutex::new(None)),
                 },
             );
         }
@@ -224,28 +279,72 @@ fn invoke_dylib(
     plugin: &CatalogPlugin,
     payload: String,
 ) -> Result<PluginResponse, PluginHostError> {
-    let lib =
-        unsafe { Library::new(&plugin.artifact_path) }.map_err(|err| PluginHostError::Io {
-            path: plugin.artifact_path.clone(),
-            message: format!("load dylib failed: {err}"),
-        })?;
-    let symbol_name = format!("{RUST_PLUGIN_ENTRY_SYMBOL}\0");
-    let symbol =
-        unsafe { lib.get::<*const RustPluginApiV2>(symbol_name.as_bytes()) }.map_err(|err| {
+    // P0-11: cache the `Library` for the lifetime of `CatalogPlugin` so any
+    // heap allocation the plugin returns (its `PluginResponse.payload`
+    // `String`) still points at mapped memory after this function returns.
+    // The previous implementation dlopen'd + dlclose'd on every invocation,
+    // creating a use-after-free window when the returned String owned heap
+    // memory from the (now-unmapped) plugin allocator.
+    //
+    // P0-12: the first time we open the dylib we call its `abi_fingerprint`
+    // and compare against the fingerprint the catalog was constructed from
+    // (`expected_abi_fingerprint`, populated from `index.json`). On mismatch
+    // we return `AbiFingerprintMismatch` and refuse the invocation.
+    let mut guard = plugin
+        .library
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    if guard.is_none() {
+        let lib = unsafe { Library::new(&plugin.artifact_path) }.map_err(|err| {
             PluginHostError::Io {
                 path: plugin.artifact_path.clone(),
-                message: format!("symbol lookup failed ({RUST_PLUGIN_ENTRY_SYMBOL}): {err}"),
+                message: format!("load dylib failed: {err}"),
             }
         })?;
-    let api_ptr = *symbol;
-    if api_ptr.is_null() {
-        return Err(PluginHostError::Io {
-            path: plugin.artifact_path.clone(),
-            message: "symbol resolved to null pointer".to_string(),
+        let symbol_name = format!("{RUST_PLUGIN_ENTRY_SYMBOL}\0");
+        let symbol = unsafe { lib.get::<*const RustPluginApiV2>(symbol_name.as_bytes()) }
+            .map_err(|err| PluginHostError::Io {
+                path: plugin.artifact_path.clone(),
+                message: format!("symbol lookup failed ({RUST_PLUGIN_ENTRY_SYMBOL}): {err}"),
+            })?;
+        let api_ptr = *symbol;
+        if api_ptr.is_null() {
+            return Err(PluginHostError::Io {
+                path: plugin.artifact_path.clone(),
+                message: "symbol resolved to null pointer".to_string(),
+            });
+        }
+        // Detach the symbol from the borrow of `lib` — the returned raw ptr
+        // remains valid because `lib` is stored below and never dropped.
+        drop(symbol);
+        *guard = Some(LoadedDylib {
+            library: lib,
+            api_ptr,
+            fingerprint_verified: false,
         });
     }
-
-    let api = unsafe { &*api_ptr };
+    let loaded = guard.as_mut().expect("just populated");
+    if !loaded.fingerprint_verified {
+        if let Some(expected) = plugin.expected_abi_fingerprint.as_ref() {
+            let api = unsafe { &*loaded.api_ptr };
+            let raw = (api.abi_fingerprint)();
+            let actual: AbiFingerprint = serde_json::from_str(&raw.payload).map_err(|err| {
+                PluginHostError::PluginInvocationFailed {
+                    plugin_path: plugin.plugin_path.clone(),
+                    message: format!("abi_fingerprint response was not parseable: {err}"),
+                }
+            })?;
+            if &actual != expected {
+                return Err(PluginHostError::AbiFingerprintMismatch {
+                    plugin_path: plugin.plugin_path.clone(),
+                    expected: expected.clone(),
+                    actual,
+                });
+            }
+        }
+        loaded.fingerprint_verified = true;
+    }
+    let api = unsafe { &*loaded.api_ptr };
     Ok((api.handle)(PluginRequest { payload }))
 }
 

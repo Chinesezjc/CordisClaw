@@ -382,8 +382,21 @@ impl Loader {
 
         // Auto-heal: write back updated docs to index.json and sync
         // interfaces.json for any plugins whose docs drifted from cache.
+        //
+        // P0-14: two concurrent loaders (primary + candidate) used to race
+        // here on a shared `.tmp` filename, causing torn / mis-attributed
+        // interfaces.json / index.json writes. We now:
+        //  - hold a POSIX file lock on `<snapshot_root>/docs-heal.lock` for
+        //    the duration of the auto-heal block (fcntl F_SETLK, released
+        //    on drop) so at most one loader writes at a time;
+        //  - use per-invocation staging filenames (pid + seq + nanos) so
+        //    two loaders on different mount points can't clobber each other
+        //    even without the lock.
         if !docs_drift.is_empty() {
             let plugins_root = &self.config.plugins_root;
+            let index_path = &self.config.artifact_index_path;
+            let lock_path = index_path.with_extension("json.heal-lock");
+            let _lock = auto_heal_file_lock::acquire(&lock_path);
             for item in &docs_drift {
                 let plugin_path: &str = &item.0;
                 let new_docs: &PluginDocs = &item.1;
@@ -409,7 +422,7 @@ impl Loader {
                 }
                 match serde_json::to_string_pretty(new_docs) {
                     Ok(json) => {
-                        let tmp = docs_path.with_extension("json.tmp");
+                        let tmp = unique_staging_path(&docs_path);
                         if let Err(e) = std::fs::write(&tmp, &json) {
                             eprintln!(
                                 "[loader] docs-drift: failed to write tmp {}: {e}",
@@ -423,6 +436,7 @@ impl Loader {
                                 tmp.display(),
                                 docs_path.display()
                             );
+                            let _ = std::fs::remove_file(&tmp);
                         } else {
                             eprintln!(
                                 "[loader] docs-drift: auto-healed {plugin_path} — \
@@ -438,10 +452,9 @@ impl Loader {
                 }
             }
             // Atomic write-back of the artifact index.
-            let index_path = &self.config.artifact_index_path;
             match serde_json::to_string_pretty(&index) {
                 Ok(json) => {
-                    let tmp = index_path.with_extension("json.tmp");
+                    let tmp = unique_staging_path(index_path);
                     if let Err(e) = std::fs::write(&tmp, &json) {
                         eprintln!(
                             "[loader] docs-drift: failed to write index tmp {}: {e}",
@@ -453,6 +466,7 @@ impl Loader {
                             tmp.display(),
                             index_path.display()
                         );
+                        let _ = std::fs::remove_file(&tmp);
                     }
                 }
                 Err(e) => {
@@ -538,4 +552,112 @@ fn make_execution_id() -> String {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     format!("exec-{nanos}")
+}
+
+/// P0-14: produce a per-process unique tmp path for atomic write-then-rename.
+/// The old code shared `<file>.tmp` between loaders, so two concurrent auto-
+/// heals raced on the same tmp file.  `<file>.cordis-tmp.<pid>-<seq>-<nanos>`
+/// is unique per invocation.
+fn unique_staging_path(target: &Path) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let pid = std::process::id();
+    match target.file_name() {
+        Some(name) => {
+            let mut owned = name.to_os_string();
+            owned.push(format!(".cordis-tmp.{pid}-{seq:x}-{nanos:x}"));
+            target.with_file_name(owned)
+        }
+        None => target.with_extension(format!("cordis-tmp.{pid}-{seq:x}-{nanos:x}")),
+    }
+}
+
+#[cfg(test)]
+mod loader_helper_tests {
+    use super::unique_staging_path;
+    use std::path::Path;
+
+    #[test]
+    fn unique_staging_path_never_collides_within_process() {
+        let base = Path::new("/tmp/cordis/artifacts/index.json");
+        let a = unique_staging_path(base);
+        let b = unique_staging_path(base);
+        assert_ne!(a, b);
+        assert!(a.file_name().unwrap().to_string_lossy().contains(".cordis-tmp."));
+        assert!(a.file_name().unwrap().to_string_lossy().starts_with("index.json.cordis-tmp."));
+    }
+
+    #[test]
+    fn unique_staging_path_stays_in_same_dir() {
+        let base = Path::new("/tmp/cordis/artifacts/index.json");
+        let tmp = unique_staging_path(base);
+        assert_eq!(tmp.parent(), base.parent());
+    }
+}
+
+/// POSIX file lock helper used to serialise the docs-drift auto-heal write
+/// across multiple runtime processes and multiple loaders within one process.
+/// Uses `fcntl(F_SETLK, ...)` on Unix; a no-op stub on other platforms.
+mod auto_heal_file_lock {
+    use std::fs::{File, OpenOptions};
+    use std::path::Path;
+
+    pub struct Guard {
+        #[allow(dead_code)]
+        file: Option<File>,
+    }
+
+    pub fn acquire(path: &Path) -> Guard {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let file = match OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(path)
+        {
+            Ok(f) => f,
+            Err(err) => {
+                eprintln!(
+                    "[loader] docs-drift: failed to open lock {}: {err}",
+                    path.display()
+                );
+                return Guard { file: None };
+            }
+        };
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            let fd = file.as_raw_fd();
+            // SAFETY: fd is owned by `file`, kept alive across the syscall.
+            let rc = unsafe { libc::flock(fd, libc::LOCK_EX) };
+            if rc != 0 {
+                let err = std::io::Error::last_os_error();
+                eprintln!(
+                    "[loader] docs-drift: flock({}) failed: {err}",
+                    path.display()
+                );
+            }
+        }
+        Guard { file: Some(file) }
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            #[cfg(unix)]
+            {
+                if let Some(file) = self.file.as_ref() {
+                    use std::os::unix::io::AsRawFd;
+                    let _ = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+                }
+            }
+        }
+    }
 }

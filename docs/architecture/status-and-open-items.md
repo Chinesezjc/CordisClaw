@@ -206,6 +206,12 @@ Agent 现在可以自主完成：读代码 → 理解结构 → 写/改文件 �
 - [x] **Plugin iteration symlink 逃逸**（P0-20）— `PluginEditExecutor::execute` 在写入前调用新 helper `resolve_under_workspace`：canonicalize 结果必须仍在 workspace_root 下。plugins 内的 symlink 指向 `/etc/passwd` 之类无法被写入。
 - [x] **Verifier shell 拼接**（P0-21）— 已随 A 批 P0-1 修复。`discover_rust_workspace_manifest` 输出的字符串被 `shell_words` 解析成 argv，空格 / `$` / `;` 无法被解释。
 
+### 5.2.6 Build / Load 硬化（第 2 批，2026-07-17 已闭合）
+
+- [x] **`invoke_dylib` UAF**（P0-11）— `CatalogPlugin` 现在持有 `Arc<Mutex<Option<LoadedDylib>>>`。首次 invoke 时 dlopen 并缓存 `Library` + `api_ptr`；后续 invoke 直接复用。返回的 `PluginResponse.payload` 内存所属的 dylib 与 `CatalogPlugin` 同生命周期，不再存在 dlclose-after-return 的悬空 String 问题。
+- [x] **ABI fingerprint 校验**（P0-12）— `ArtifactIndexEntry` 新加 `abi_fingerprint` 字段（可选，兼容老 index）；host 首次加载 dylib 时调用 `(api.abi_fingerprint)()` 并与 index 记录比对，不匹配返回 `PluginHostError::AbiFingerprintMismatch` 拒绝 invoke。之前该字段完全是死代码。
+- [x] **Loader docs-drift TOCTOU**（P0-14）— 每处 tmp 文件从共用 `<file>.tmp` 换成 `<file>.cordis-tmp.<pid>-<seq>-<nanos>` (`unique_staging_path`)，两个并发 loader 不再互相 clobber。整个 auto-heal 段用 fcntl `flock(LOCK_EX)` 拿排他锁 (`<snapshot_root>/artifacts/index.json.heal-lock`) 保护，跨进程互斥。
+
 ### 5.2.3 Build / Load 硬化（第 1 批，2026-07-17 已闭合）
 
 - [x] **平台原生 dylib 后缀**（P0-9）— `rebuild_plugin_workspace` 用 `std::env::consts::{DLL_PREFIX, DLL_SUFFIX}` 而非硬编码 `.so`，macOS/Windows 上的 iteration 现在能跑。同时 `.so` 覆盖走新的 `stage_then_rename_file` helper：tmp + sync_all + rename，避免 live-mmap SIGSEGV。
