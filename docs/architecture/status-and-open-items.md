@@ -206,6 +206,10 @@ Agent 现在可以自主完成：读代码 → 理解结构 → 写/改文件 �
 - [x] **Plugin iteration symlink 逃逸**（P0-20）— `PluginEditExecutor::execute` 在写入前调用新 helper `resolve_under_workspace`：canonicalize 结果必须仍在 workspace_root 下。plugins 内的 symlink 指向 `/etc/passwd` 之类无法被写入。
 - [x] **Verifier shell 拼接**（P0-21）— 已随 A 批 P0-1 修复。`discover_rust_workspace_manifest` 输出的字符串被 `shell_words` 解析成 argv，空格 / `$` / `;` 无法被解释。
 
+### 5.2.14 P1-25 收尾（2026-07-17 已闭合）
+
+- [x] **Session self-lookup 冲突**（P1-25）— 新增 `PendingSessionAction` 与 `RuntimeHost::pending_session_actions` 侧信道；`agent_compact_context` 先尝试 `get_mut(session_id)`，命中就立刻应用（例如从别的 session 调过来的），未命中则 `queue_session_action(session_id, CompactHistory)` 并返回 `{"deferred": true, ...}`。`agent_send` 在 respond 完成后 reinsert 前 drain 队列并应用；单一活跃 session 的 self-lookup 不再 `AgentSessionNotFound`。之前评估需要 `Arc<Mutex<Session>>` 大重构；这个方案只加了一个 side-channel Mutex，兼容现有 remove/insert 模式，代价是 compact 在 turn 结束时执行而非中途。
+
 ### 5.2.13 P1 收尾（L/M/N 批，2026-07-17 已闭合）
 
 **L 批 — Agent 深修 (P1-31, 34, 36, 37):**

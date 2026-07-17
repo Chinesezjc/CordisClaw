@@ -963,6 +963,13 @@ pub struct RuntimeHost {
     last_reload_attempt: Mutex<Option<ReloadAttemptReport>>,
     last_candidate_reload_attempt: Mutex<Option<ReloadAttemptReport>>,
     agent_sessions: Mutex<BTreeMap<String, ManagedAgentSession>>,
+    /// P1-25: side-channel for tool calls that need to mutate their own
+    /// active `AgentSession`. During `agent_send` the session is removed
+    /// from `agent_sessions` for the duration of `respond`; tools like
+    /// `compact_context` can't `get_mut` the session because it's not in
+    /// the map. Instead they push a `PendingSessionAction` here; the
+    /// `agent_send` prologue drains and applies them before reinsert.
+    pending_session_actions: Mutex<BTreeMap<String, Vec<PendingSessionAction>>>,
     /// Registry of background services (Task nodes).
     pub service_registry: Arc<crate::context::ServiceRegistry>,
     /// Accumulated rollback for interactive agent file edits.
@@ -987,6 +994,17 @@ struct StagedCandidateSnapshot {
 pub enum AgentSessionKind {
     RuntimeShell,
     PluginIteration,
+}
+
+/// P1-25: actions a tool can request against its own currently-running
+/// `AgentSession`. The tool queues one of these instead of blocking
+/// waiting for the session lock (which is held by `agent_send`
+/// throughout `respond`); `agent_send` drains and applies before
+/// reinserting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PendingSessionAction {
+    /// Run `session.compact_history()` after the current turn.
+    CompactHistory,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1142,6 +1160,7 @@ impl RuntimeHost {
             last_reload_attempt: Mutex::new(None),
             last_candidate_reload_attempt: Mutex::new(None),
             agent_sessions: Mutex::new(BTreeMap::new()),
+            pending_session_actions: Mutex::new(BTreeMap::new()),
             service_registry,
             interactive_rollback,
         };
@@ -1868,6 +1887,30 @@ export_plugin_api! {{
                 })?
         };
         let result = session.respond(self, input);
+        // P1-25: drain any pending actions queued by tools that couldn't
+        // reach the session during `respond` (compact_context et al) and
+        // apply them here, before reinserting into the map. Errors are
+        // logged, not propagated, because the underlying tool call has
+        // already returned "deferred" to the LLM.
+        {
+            let pending = {
+                let mut guard = self
+                    .pending_session_actions
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner());
+                guard.remove(session_id).unwrap_or_default()
+            };
+            for action in pending {
+                match action {
+                    PendingSessionAction::CompactHistory => {
+                        let (old, new) = session.session.compact_history();
+                        eprintln!(
+                            "[pending-action] compact_history for session {session_id}: {old} -> {new}"
+                        );
+                    }
+                }
+            }
+        }
         // Auto-save on success for RuntimeShell sessions so that
         // session context survives crashes and restarts.
         if result.is_ok() {
@@ -1880,6 +1923,21 @@ export_plugin_api! {{
             .unwrap_or_else(|poison| poison.into_inner())
             .insert(session_id.to_string(), session);
         result
+    }
+
+    /// P1-25: queue a `PendingSessionAction` for `session_id`; the next
+    /// `agent_send` prologue drains and applies. Public because tool
+    /// implementations in `agent.rs` may need to call it via the
+    /// `AgentToolHost` interface (see `queue_session_compact` below).
+    pub(crate) fn queue_session_action(&self, session_id: &str, action: PendingSessionAction) {
+        let mut guard = self
+            .pending_session_actions
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        guard
+            .entry(session_id.to_string())
+            .or_default()
+            .push(action);
     }
 
     /// Inject a user→assistant exchange into the agent's history without
