@@ -331,11 +331,34 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     if group_id.is_empty() || group_msgs.is_empty() { continue; }
                     let combined = group_msgs.join("\n");
                     eprintln!("inbox: [{group_id}] batch {} msgs: {}", group_msgs.len(), combined);
-                    // Push any messages that arrived while we were busy
-                    // into the inject queue so the agent's respond() loop
-                    // can see them via drain_inject_queue() between turns.
-                    while let Ok(late) = rx.try_recv() {
-                        inject_queue.lock().unwrap_or_else(|p| p.into_inner()).push_back(late);
+                    // P1-53: previously this drained `rx.try_recv()` into
+                    // `inject_queue` unconditionally — but messages on the
+                    // channel are from ALL groups, not this one. The result
+                    // was that group B's messages leaked into group A's
+                    // agent turn. Don't drain here; the next iteration of
+                    // the outer `loop { match rx.recv() ... }` will read
+                    // them and by_group-shard correctly. (An
+                    // agent-per-group inject queue would be cleaner and is
+                    // tracked separately.)
+                    // P1-52: evict oldest before we possibly insert a
+                    // new session below. Cap group→session map at
+                    // MAX_SESSIONS; the evicted group re-creates on next
+                    // message via `agent_start`.
+                    const MAX_SESSIONS: usize = 512;
+                    if !sessions.contains_key(group_id) && sessions.len() >= MAX_SESSIONS {
+                        if let Some(evict_key) = sessions
+                            .keys()
+                            .next()
+                            .cloned()
+                        {
+                            if let Some(evicted_sid) = sessions.remove(&evict_key) {
+                                eprintln!(
+                                    "inbox: evicting oldest session for group {} (session {})",
+                                    evict_key, evicted_sid
+                                );
+                                host.delete_session_snapshot(&evicted_sid);
+                            }
+                        }
                     }
                     let sid = sessions.entry(group_id.clone())
                         .or_insert_with(|| host.agent_start(AgentSessionKind::RuntimeShell)

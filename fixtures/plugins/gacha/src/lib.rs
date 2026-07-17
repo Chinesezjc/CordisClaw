@@ -43,22 +43,70 @@ fn store_path() -> PathBuf {
 fn load_store() -> Store {
     let path = store_path();
     if path.exists() {
-        std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default()
+        // P1-44: `.ok()` used to silently swallow deserialize failures
+        // and reset state to default (nuking user progress). Log the
+        // parse error to stderr and preserve default only when the file
+        // is genuinely absent.
+        match std::fs::read_to_string(&path) {
+            Ok(text) => match serde_json::from_str::<Store>(&text) {
+                Ok(store) => store,
+                Err(err) => {
+                    eprintln!(
+                        "[gacha] state file at {} failed to parse ({err}); \
+                         refusing to overwrite — please repair or delete it",
+                        path.display()
+                    );
+                    // Return a poison sentinel: an in-memory default so
+                    // reads don't crash, but any subsequent save is
+                    // blocked below by SAVE_BLOCKED.
+                    SAVE_BLOCKED.store(true, std::sync::atomic::Ordering::SeqCst);
+                    Store::default()
+                }
+            },
+            Err(err) => {
+                eprintln!("[gacha] state file read failed: {err}");
+                Store::default()
+            }
+        }
     } else {
         Store::default()
     }
 }
 
+/// P1-44: sticky flag set when a load failure would otherwise be masked;
+/// prevents save_store from clobbering the on-disk file until an operator
+/// intervenes.
+static SAVE_BLOCKED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// P1-44: process-wide lock around read-modify-write of the gacha state.
+/// Concurrent pull invocations used to interleave `load → mutate → save`,
+/// losing pity increments. This is a coarse mutex (whole state), which is
+/// fine because gacha is one small file.
+static STATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn save_store(store: &Store) {
+    if SAVE_BLOCKED.load(std::sync::atomic::Ordering::SeqCst) {
+        eprintln!("[gacha] save blocked because prior load failed to parse");
+        return;
+    }
     let path = store_path();
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
     if let Ok(json) = serde_json::to_string(store) {
-        let _ = std::fs::write(&path, json);
+        // P1-44: atomic tmp + rename so a crash mid-write doesn't leave
+        // a truncated state file (which would then trip the load-poison
+        // path on next boot).
+        let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
+        if let Err(err) = std::fs::write(&tmp, &json) {
+            eprintln!("[gacha] save tmp write failed: {err}");
+            return;
+        }
+        if let Err(err) = std::fs::rename(&tmp, &path) {
+            eprintln!("[gacha] save rename failed: {err}");
+            let _ = std::fs::remove_file(&tmp);
+        }
     }
 }
 
@@ -222,6 +270,9 @@ fn pull_char_banner(state: &mut GachaState, banner: &BannerConfig) -> GachaResul
 fn handle_pull(count: u32) -> Result<GachaResponse, String> {
     if count == 0 || count > 100 { return Err("count must be 1-100".into()); }
 
+    // P1-44: hold STATE_LOCK across the whole read-modify-write so
+    // concurrent pulls don't lose pity or duplicate results.
+    let _guard = STATE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let mut store = load_store();
     let mut results = Vec::new();
     for _ in 0..count {
@@ -346,6 +397,7 @@ fn handle_setbanner(args: &[String]) -> Result<GachaResponse, String> {
         .ok_or_else(|| format!("未知4星角色: {f4_2_raw}。用 list 查看可用角色"))?
         .to_string();
 
+    let _guard = STATE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let mut store = load_store();
     store.banner.featured_5 = f5.clone();
     store.banner.featured_4 = [f4_0.clone(), f4_1.clone(), f4_2.clone()];
@@ -373,6 +425,7 @@ fn handle_list() -> Result<GachaResponse, String> {
 }
 
 fn handle_reset() -> Result<GachaResponse, String> {
+    let _guard = STATE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let mut store = load_store();
     store.state = GachaState {
         char_pity_5: 0, char_pity_4: 0, char_guaranteed: false, char_4_guaranteed: false,

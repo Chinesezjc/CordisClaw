@@ -116,6 +116,9 @@ struct BuiltinShell {
     // plugin so users can talk to the agent here directly, while runtime only
     // exposes the backend/tooling surface.
     cwd: PathBuf,
+    /// P1-41: absolute canonical path of the sandbox root. `cd` refuses
+    /// any target that would resolve outside this prefix.
+    sandbox_root: PathBuf,
     env: BTreeMap<String, String>,
     plugin_catalog: Option<PluginCatalog>,
     plugin_catalog_error: Option<String>,
@@ -129,9 +132,28 @@ enum CommandOutcome {
 
 impl BuiltinShell {
     fn new(cwd: Option<String>, fixtures_root: PathBuf) -> Result<Self, String> {
+        // P1-41: canonicalise the sandbox root; every subsequent `cd`
+        // resolves against it so `cd /etc` or `cd ../..` cannot escape.
+        let sandbox_root = fixtures_root
+            .canonicalize()
+            .unwrap_or_else(|_| fixtures_root.clone());
         let cwd = match cwd {
-            Some(path) => PathBuf::from(path),
-            None => std::env::current_dir().map_err(|e| format!("I/O at .: {e}"))?,
+            Some(path) => {
+                let p = PathBuf::from(path);
+                let resolved = if p.is_absolute() { p } else { sandbox_root.join(p) };
+                let canonical = resolved
+                    .canonicalize()
+                    .unwrap_or_else(|_| resolved.clone());
+                if !canonical.starts_with(&sandbox_root) {
+                    return Err(format!(
+                        "shell cwd escapes sandbox root ({} not under {})",
+                        canonical.display(),
+                        sandbox_root.display()
+                    ));
+                }
+                canonical
+            }
+            None => sandbox_root.clone(),
         };
 
         let mut env = BTreeMap::new();
@@ -139,13 +161,14 @@ impl BuiltinShell {
         env.insert("LOGNAME".to_string(), "CordisClaw".to_string());
         env.insert("USERNAME".to_string(), "CordisClaw".to_string());
 
-        let (plugin_catalog, plugin_catalog_error) = match PluginCatalog::load(&fixtures_root) {
+        let (plugin_catalog, plugin_catalog_error) = match PluginCatalog::load(&sandbox_root) {
             Ok(catalog) => (Some(catalog), None),
             Err(err) => (None, Some(err.to_string())),
         };
 
         Ok(Self {
             cwd,
+            sandbox_root,
             env,
             plugin_catalog,
             plugin_catalog_error,
@@ -217,7 +240,15 @@ impl BuiltinShell {
     }
 
     fn run_single(&mut self, line: &str) -> CommandOutcome {
-        let tokens = split_tokens(line);
+        let tokens = match split_tokens(line) {
+            Ok(t) => t,
+            Err(err) => {
+                return CommandOutcome::Continue {
+                    exit_code: 2,
+                    output: format!("shell: {err}"),
+                };
+            }
+        };
         if tokens.is_empty() {
             return CommandOutcome::Continue {
                 exit_code: 0,
@@ -249,8 +280,32 @@ impl BuiltinShell {
                         self.cwd.join(p)
                     }
                 };
-                if target.is_dir() {
-                    self.cwd = target;
+                // P1-41: canonicalise + verify still inside sandbox_root
+                // before accepting. `cd /etc` and `cd ../../..` both fail
+                // here even though the OS would let them through.
+                let canonical = match target.canonicalize() {
+                    Ok(c) => c,
+                    Err(_) => {
+                        return CommandOutcome::Continue {
+                            exit_code: 1,
+                            output: format!(
+                                "cd: no such directory: {}",
+                                target.display()
+                            ),
+                        };
+                    }
+                };
+                if !canonical.starts_with(&self.sandbox_root) {
+                    return CommandOutcome::Continue {
+                        exit_code: 1,
+                        output: format!(
+                            "cd: refused (escapes sandbox root {})",
+                            self.sandbox_root.display()
+                        ),
+                    };
+                }
+                if canonical.is_dir() {
+                    self.cwd = canonical;
                     CommandOutcome::Continue {
                         exit_code: 0,
                         output: String::new(),
@@ -258,7 +313,7 @@ impl BuiltinShell {
                 } else {
                     CommandOutcome::Continue {
                         exit_code: 1,
-                        output: format!("cd: no such directory: {}", target.display()),
+                        output: format!("cd: not a directory: {}", canonical.display()),
                     }
                 }
             }
@@ -520,46 +575,40 @@ fn format_plugin_response(command: &str, output_schema: &Value, payload: &str) -
 }
 
 fn split_script_commands(script: &str) -> Vec<&str> {
-    let mut out = Vec::new();
-    for line in script.lines() {
-        for part in line.split(';') {
-            out.push(part);
+    // P1-42: the previous impl split naively on `;` without respecting
+    // quotes, so `echo "a;b"` became two commands (`echo "a` and `b"`).
+    // We now walk the script byte-by-byte tracking single/double quote
+    // state and only split on top-level `;` and newlines. Returns
+    // byte-slice views to keep the same &str API.
+    let bytes = script.as_bytes();
+    let mut parts: Vec<&str> = Vec::new();
+    let mut start = 0usize;
+    let mut i = 0usize;
+    let mut quote: Option<u8> = None;
+    while i < bytes.len() {
+        let b = bytes[i];
+        match quote {
+            Some(q) if b == q => quote = None,
+            None if b == b'\'' || b == b'"' => quote = Some(b),
+            None if b == b';' || b == b'\n' => {
+                parts.push(&script[start..i]);
+                start = i + 1;
+            }
+            _ => {}
         }
+        i += 1;
     }
-    out
+    if start <= bytes.len() {
+        parts.push(&script[start..]);
+    }
+    parts
 }
 
-fn split_tokens(line: &str) -> Vec<String> {
-    let mut tokens = Vec::new();
-    let mut current = String::new();
-    let mut quote: Option<char> = None;
-    for ch in line.chars() {
-        match quote {
-            Some(q) => {
-                if ch == q {
-                    quote = None;
-                } else {
-                    current.push(ch);
-                }
-            }
-            None => match ch {
-                '\'' | '"' => {
-                    quote = Some(ch);
-                }
-                c if c.is_whitespace() => {
-                    if !current.is_empty() {
-                        tokens.push(current.clone());
-                        current.clear();
-                    }
-                }
-                _ => current.push(ch),
-            },
-        }
-    }
-    if !current.is_empty() {
-        tokens.push(current);
-    }
-    tokens
+fn split_tokens(line: &str) -> Result<Vec<String>, String> {
+    // P1-42: reject unterminated quotes instead of silently eating to
+    // EOL. `shell_words::split` implements POSIX quoting exactly and
+    // returns Err on unbalanced quotes.
+    shell_words::split(line).map_err(|e| format!("shell tokenize failed: {e}"))
 }
 
 fn schema_property_names(schema: &Value) -> Vec<String> {

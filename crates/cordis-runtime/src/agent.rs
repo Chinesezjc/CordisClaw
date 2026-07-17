@@ -1045,13 +1045,28 @@ impl AgentSession {
         let mut tool_events = Vec::new();
 
         for turn in 0..AGENT_MAX_TOOL_TURNS {
-            if turn_started.elapsed() >= Duration::from_millis(self.config.timeout_ms) {
+            // P1-37: unify the two timeout budgets. `timeout_ms` (per
+            // HTTP request) and `stream_timeout_secs * 5` (per-stream
+            // overall) were checked independently — a session where
+            // `stream_timeout_secs` was set generously would keep
+            // running past what `timeout_ms` implied and vice versa.
+            // The effective budget here is
+            //   max(timeout_ms, stream_timeout_secs * 1000 * 5)
+            // × AGENT_MAX_TOOL_TURNS, but since turns share the wall
+            // clock we cap at the larger of the two; the outer caller
+            // still bounds via AGENT_MAX_TOOL_TURNS itself.
+            let per_request_ms = self.config.timeout_ms;
+            let stream_budget_ms = self.config.stream_timeout_secs.saturating_mul(1000 * 5);
+            let effective_budget_ms = per_request_ms.max(stream_budget_ms);
+            if turn_started.elapsed() >= Duration::from_millis(effective_budget_ms) {
                 return Err(RuntimeError::LlmResponseInvalid {
                     message: format!(
-                        "agent exceeded total response budget after {} tool turns; elapsed_ms={} timeout_ms={}",
+                        "agent exceeded total response budget after {} tool turns; elapsed_ms={} effective_budget_ms={} (timeout_ms={} stream_secs={})",
                         turn,
                         turn_started.elapsed().as_millis(),
+                        effective_budget_ms,
                         self.config.timeout_ms,
+                        self.config.stream_timeout_secs,
                     ),
                 });
             }
@@ -1370,6 +1385,28 @@ impl AgentSession {
             });
         }
 
+        // P1-31: on turn overflow, preserve what was accumulated across
+        // the aborted respond() so a retry with the same session id has
+        // context. The 1-slot skip accounts for the leading system prompt
+        // that `messages` starts with; `self.history` doesn't include it.
+        let system_prompt_offset = 1;
+        if messages.len() > self.history.len() + system_prompt_offset {
+            let recovered: Vec<_> = messages
+                .iter()
+                .skip(system_prompt_offset)
+                .skip(self.history.len())
+                .cloned()
+                .collect();
+            for msg in &recovered {
+                let content_est = msg
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .map(estimate_tokens)
+                    .unwrap_or(0);
+                self.estimated_tokens = self.estimated_tokens.saturating_add(content_est);
+            }
+            self.history.extend(recovered);
+        }
         Err(RuntimeError::LlmResponseInvalid {
             message: format!(
                 "agent exceeded safety turn limit {} without producing a final response",
@@ -2096,7 +2133,17 @@ fn execute_agent_tool_call<B: AgentBackend + ?Sized>(
 ) -> (AgentToolEvent, String) {
     let tool_name = tool_call.function.name.clone();
     if !available_tools.contains(&tool_name) {
-        *unknown_tool_strikes += 1;
+        // P1-36: this branch is dead in practice — `respond()` filters
+        // unknown tools into `unknown_calls` before ever calling into
+        // `execute_agent_tool_call`, and the strike counter is
+        // incremented there. Keep the branch as a defensive fallback but
+        // do NOT double-increment the counter here; a future refactor
+        // that skips the outer filter would otherwise trip the strike
+        // limit twice as fast as intended.
+        debug_assert!(
+            false,
+            "execute_agent_tool_call reached with unknown tool {tool_name}; caller should filter"
+        );
         let tool_list = available_tools.iter().cloned().collect::<Vec<_>>().join(", ");
         let error = json!({
             "ok": false,
@@ -2217,6 +2264,17 @@ fn read_chat_stream(
     // Read the response body in a background thread so the main loop can
     // enforce a per-read timeout via recv_timeout.  This prevents the
     // agent from hanging indefinitely when the server stalls mid-stream.
+    //
+    // P1-34: `reader.read()` blocks on the underlying TCP socket, and the
+    // reader-thread has no explicit stop signal — if the main loop
+    // returns early (e.g. InvalidResponse), the thread would only exit
+    // when the next `read()` completes. That is bounded by the
+    // reqwest::Client `timeout(...)` set at construction (see
+    // `AgentSession::new` / `from_snapshot`), which caps the total time
+    // a `read()` can block. When the client timeout eventually fires,
+    // the thread hits an Io error, sees `tx.send(Err(e))` fail (rx has
+    // been dropped) and exits. Not zero-cost — one temporarily-alive
+    // reader thread per failed attempt — but bounded and self-cleaning.
     let _reader_thread = thread::spawn(move || {
         let mut reader = BufReader::new(response);
         loop {

@@ -206,6 +206,29 @@ Agent 现在可以自主完成：读代码 → 理解结构 → 写/改文件 �
 - [x] **Plugin iteration symlink 逃逸**（P0-20）— `PluginEditExecutor::execute` 在写入前调用新 helper `resolve_under_workspace`：canonicalize 结果必须仍在 workspace_root 下。plugins 内的 symlink 指向 `/etc/passwd` 之类无法被写入。
 - [x] **Verifier shell 拼接**（P0-21）— 已随 A 批 P0-1 修复。`discover_rust_workspace_manifest` 输出的字符串被 `shell_words` 解析成 argv，空格 / `$` / `;` 无法被解释。
 
+### 5.2.13 P1 收尾（L/M/N 批，2026-07-17 已闭合）
+
+**L 批 — Agent 深修 (P1-31, 34, 36, 37):**
+
+- [x] **96-turn overflow 保留 partial history**（P1-31）— err path 前把 `messages` 里超出 `self.history` 的部分抄回 `history` 并累加 `estimated_tokens`；retry 同 session 不再从零 replan。
+- [x] **Streaming reader 生命周期文档化**（P1-34）— 加显式注释说明 reader thread 通过 `reqwest::Client::timeout` bound 停止；未做零成本 abort（需要底层 TCP-level cancel）。
+- [x] **`execute_agent_tool_call` unknown-tool 防双计**（P1-36）— 增加 `debug_assert!` 保证外层 filter 起作用；不再自增 `unknown_tool_strikes`（respond 已加过一次）。
+- [x] **Timeout 联动**（P1-37）— `respond` 里的 turn budget 用 `max(timeout_ms, stream_timeout_secs * 5s)`，两套配置合并为 effective_budget_ms。
+
+**M 批 — Shell / Gacha / package.rs (P1-41, 42, 44, 48, 49):**
+
+- [x] **Shell cwd escape**（P1-41）— `BuiltinShell` 加 `sandbox_root: PathBuf`，`cd` canonicalize 后必须 `starts_with(sandbox_root)`；`cd /etc` / `cd ../../..` 被拒。
+- [x] **Shell 引号 + 未闭合报错**（P1-42）— `split_script_commands` 重写按引号感知切分 `;`/`\n`；`split_tokens` 换用 `shell_words::split` 并对未闭合引号返回 Err，caller 显式处理。
+- [x] **Gacha 并发保护 + 反序列化不 clobber**（P1-44）— 新增 `STATE_LOCK: Mutex<()>` 包住 read-modify-write；load 失败不 default-reset，改设 `SAVE_BLOCKED` 阻止后续写；save 走 tmp + rename。
+- [x] **`generated_agent_docs_allowed` 需显式 opt-in**（P1-48）— `CordisMetadata::allow_generated_docs` 默认 `false`；只 `crate-type=["dylib"]` 不再自动豁免 docs 契约。
+- [x] **`normalize_crate_name` 冲突检测**（P1-49）— `PackageResolver::resolve` 收尾扫所有 plugin 路径的规范化 crate name，出现冲突立即 `RuntimeError::Invariant` 报告冲突组，不再等 cargo 阶段拿到晦涩错误。
+
+**N 批 — main.rs + graph (P1-51, 52, 53):**
+
+- [x] **Graph cycle 与真根区分**（P1-51）— cycle 参与节点 topo_level = `usize::MAX` 而非 `0`；HTML render / execution ordering 现在可以按 level 排序时把 cycle 排最后。
+- [x] **main.rs sessions LRU eviction**（P1-52）— `MAX_SESSIONS = 512` 硬上限；超出时淘汰最早 group 并 `delete_session_snapshot` 清理磁盘。
+- [x] **main.rs message misrouting**（P1-53）— 移除 group 循环里 `while let Ok(late) = rx.try_recv() { inject_queue.push_back(late) }`——那段代码把任意 group 消息灌到当前 group 的 inject 队列。由外层 `loop { rx.recv() }` 保证按 group 分片。
+
 ### 5.2.12 插件业务硬化（K 批，2026-07-17 已闭合）
 
 - [x] **QQ system_notify 拒绝 bad group id**（P1-26）— `.parse().unwrap_or(0)` 换成 `parse::<i64>` + `id > 0` 校验；非法 id 跳过 + stderr 警告，不再静默发送到 group 0。
