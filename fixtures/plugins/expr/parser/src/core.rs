@@ -56,6 +56,11 @@ pub enum ParseError {
     MissingRightParen { position: usize },
     #[error("expected number at position {position}")]
     ExpectedNumber { position: usize },
+    /// P1-45: recursive-descent parser gave the caller a stack overflow
+    /// on deeply nested expressions (`(((...)))` or right-recursive
+    /// `1^1^1^...`). Now bounded by MAX_PARSE_DEPTH.
+    #[error("expression nested too deep (>{limit}) at position {position}")]
+    TooDeep { position: usize, limit: usize },
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -69,6 +74,9 @@ pub enum ParseExpressionError {
     ExpectedNumber { position: usize },
     #[error("invalid number `{text}` at position {position}")]
     InvalidNumber { text: String, position: usize },
+    /// P1-45: bubble up TooDeep to the public error shape.
+    #[error("expression nested too deep (>{limit}) at position {position}")]
+    TooDeep { position: usize, limit: usize },
 }
 
 pub fn parse_expression(src: &str) -> Result<ExprAst, ParseExpressionError> {
@@ -103,17 +111,48 @@ fn map_parse_error(err: ParseError) -> ParseExpressionError {
             ParseExpressionError::MissingRightParen { position }
         }
         ParseError::ExpectedNumber { position } => ParseExpressionError::ExpectedNumber { position },
+        ParseError::TooDeep { position, limit } => ParseExpressionError::TooDeep { position, limit },
     }
 }
 
 struct Parser<'a> {
     tokens: &'a [Token],
     pos: usize,
+    /// P1-45: current recursion depth of the parse_expr / parse_term /
+    /// parse_power / parse_factor tower. Every entry checks against
+    /// `MAX_PARSE_DEPTH` and returns `TooDeep` before recursing.
+    depth: usize,
 }
+
+/// P1-45: 512 covers any realistic user expression while leaving plenty of
+/// stack headroom on the default 8 MiB Rust stack (~16 KiB per parser frame
+/// pessimistically = 8 MiB).
+const MAX_PARSE_DEPTH: usize = 512;
 
 impl<'a> Parser<'a> {
     fn new(tokens: &'a [Token]) -> Self {
-        Self { tokens, pos: 0 }
+        Self {
+            tokens,
+            pos: 0,
+            depth: 0,
+        }
+    }
+
+    #[inline]
+    fn enter_scope(&mut self) -> Result<(), ParseError> {
+        if self.depth >= MAX_PARSE_DEPTH {
+            return Err(ParseError::TooDeep {
+                position: self.current_position(),
+                limit: MAX_PARSE_DEPTH,
+            });
+        }
+        self.depth += 1;
+        Ok(())
+    }
+
+    #[inline]
+    fn exit_scope(&mut self) {
+        self.depth = self.depth.saturating_sub(1);
     }
 
     fn peek(&self) -> Option<&'a Token> {
@@ -134,6 +173,13 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_expr(&mut self) -> Result<ExprAst, ParseError> {
+        self.enter_scope()?;
+        let result = self.parse_expr_body();
+        self.exit_scope();
+        result
+    }
+
+    fn parse_expr_body(&mut self) -> Result<ExprAst, ParseError> {
         let mut lhs = self.parse_term()?;
         loop {
             let op = match self.peek().map(|t| &t.kind) {
@@ -153,6 +199,13 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_term(&mut self) -> Result<ExprAst, ParseError> {
+        self.enter_scope()?;
+        let result = self.parse_term_body();
+        self.exit_scope();
+        result
+    }
+
+    fn parse_term_body(&mut self) -> Result<ExprAst, ParseError> {
         let mut lhs = self.parse_power()?;
         loop {
             let op = match self.peek().map(|t| &t.kind) {
@@ -173,6 +226,13 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_power(&mut self) -> Result<ExprAst, ParseError> {
+        self.enter_scope()?;
+        let result = self.parse_power_body();
+        self.exit_scope();
+        result
+    }
+
+    fn parse_power_body(&mut self) -> Result<ExprAst, ParseError> {
         let lhs = self.parse_factor()?;
         if let Some(TokenKind::Caret) = self.peek().map(|t| &t.kind) {
             self.bump();
@@ -188,6 +248,13 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_factor(&mut self) -> Result<ExprAst, ParseError> {
+        self.enter_scope()?;
+        let result = self.parse_factor_body();
+        self.exit_scope();
+        result
+    }
+
+    fn parse_factor_body(&mut self) -> Result<ExprAst, ParseError> {
         let Some(token) = self.peek() else {
             return Err(ParseError::ExpectedNumber {
                 position: self.current_position(),
@@ -266,3 +333,8 @@ impl<'a> Parser<'a> {
         Ok(expr)
     }
 }
+
+// P1-45 DepthGuard removed; parser now uses paired
+// enter_scope/exit_scope helper calls at the top/bottom of each
+// parse_* method, avoiding the &mut aliasing problem an RAII guard
+// would introduce inside the recursive-descent tower.

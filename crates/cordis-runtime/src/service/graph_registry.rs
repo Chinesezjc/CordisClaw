@@ -338,9 +338,18 @@ fn build_registered_net(
                 continue;
             }
             if candidates.len() > 1 {
+                // P1-50: multi-producer edges silently picked candidates[0]
+                // (alphabetical order) before, which meant the runtime
+                // rendered a graph structurally different from what any
+                // author expected. Sort so the choice is at least
+                // deterministic across builds, and emit the pick verbatim
+                // as a diagnostic — callers (kernel status, HTML render)
+                // surface these upstream.
+                candidates.sort();
                 diagnostics.push(format!(
-                    "input {input} for {consumer_fqn} has multiple producers: {} (choosing first)",
-                    candidates.join(", ")
+                    "registered-net multi-producer for input `{input}` of {consumer_fqn}: candidates=[{}] chosen={} (sort-stable)",
+                    candidates.join(", "),
+                    candidates[0],
                 ));
             }
 

@@ -206,6 +206,24 @@ Agent 现在可以自主完成：读代码 → 理解结构 → 写/改文件 �
 - [x] **Plugin iteration symlink 逃逸**（P0-20）— `PluginEditExecutor::execute` 在写入前调用新 helper `resolve_under_workspace`：canonicalize 结果必须仍在 workspace_root 下。plugins 内的 symlink 指向 `/etc/passwd` 之类无法被写入。
 - [x] **Verifier shell 拼接**（P0-21）— 已随 A 批 P0-1 修复。`discover_rust_workspace_manifest` 输出的字符串被 `shell_words` 解析成 argv，空格 / `$` / `;` 无法被解释。
 
+### 5.2.12 插件业务硬化（K 批，2026-07-17 已闭合）
+
+- [x] **QQ system_notify 拒绝 bad group id**（P1-26）— `.parse().unwrap_or(0)` 换成 `parse::<i64>` + `id > 0` 校验；非法 id 跳过 + stderr 警告，不再静默发送到 group 0。
+- [x] **QQ dedup FIFO**（P1-38）— `HashSet<String>` 换成 `VecDeque<String>`，`push_back` + `pop_front` 保证正确 FIFO 驱逐，"驱逐最旧" 不再是随机集合序。
+- [x] **QQ 队列上限计数**（P1-39）— 新增 `MESSAGE_QUEUE_DROPPED: AtomicU64`，队列 >= 128 时递增；每 2^n 次到 stderr。之前静默丢弃。
+- [x] **QQ WebSocket 死代码删除**（P1-40）— `start_ws_server` / `handle_ws_connection` (73 行) + `tungstenite` Cargo 依赖移除。
+- [x] **Gacha node_id 白名单**（P1-43）— `GachaRequest` 加 `node_id` 字段；`gacha_status` 只允许 `cmd=status`，其他节点走原命令集。之前 agent 用 `gacha_status` 节点发 `cmd=reset` 就能清 pity。
+- [x] **Expr parser 深度限制**（P1-45）— `Parser` 加 `depth` 计数器 + `MAX_PARSE_DEPTH=512` + 每个 parse_* 方法 `enter_scope`/`exit_scope` 包裹。`1^1^1^...` 与深嵌套括号不再栈溢出，返回 `TooDeep`。
+- [x] **Expr factorial 上限**（P1-46）— 输入 > 170 直接返回 `FactorialOverflow`；`10000000000!` 之类的 CPU DoS 不再可行。
+- [x] **Expr NonFinite 显式错**（P1-47）— `Pow` 结果非 finite 返回 `EvalError::NonFinite`；`10^500`、`(-1)^0.5` 不再触发 serde_json NaN 序列化崩溃。
+- [x] **graph_registry 多 producer 确定性 + 显式诊断**（P1-50）— `candidates.sort()` 保证选择跨构建一致；诊断信息改为 `candidates=[...] chosen=X (sort-stable)` 便于 kernel status 与 HTML render 上报。
+
+未做（在 K 剩余项，非紧急）:
+- P1-41 shell cwd escape / P1-42 shell script quote / P1-44 gacha lock+atomic /
+  P1-48 package.rs generated docs / P1-49 normalize_crate_name conflict /
+  P1-51 cycle topo_level=0 / P1-52 main.rs sessions eviction /
+  P1-53 main.rs message misrouting.
+
 ### 5.2.11 Agent 层硬化（J 批，2026-07-17 已闭合）
 
 - [x] **`fs_search` 早停**（P1-27）— 新增 `walk_code_files_ctl` + `WalkControl::Stop`；`agent_search_code` 命中 40 后立即中止目录遍历，不再继续读文件 / 触发 IO。

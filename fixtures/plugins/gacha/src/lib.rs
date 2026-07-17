@@ -129,6 +129,13 @@ fn pick<T: Copy>(arr: &[T]) -> T {
 
 #[derive(Debug, Deserialize)]
 struct GachaRequest {
+    /// P1-43: `node_id` restricts what `cmd` values are legal for this
+    /// invocation. The `gacha_status` node advertises `cmd:"status"` in
+    /// its schema; without an explicit check the plugin used to accept
+    /// `{cmd:"reset"}` here and happily wipe pity. Route each node to a
+    /// whitelist of commands so schema drift stays honest.
+    #[serde(default)]
+    node_id: Option<String>,
     cmd: String,
     #[serde(default)]
     count: Option<u32>,
@@ -380,6 +387,24 @@ fn handle_reset() -> Result<GachaResponse, String> {
 }
 
 fn handle(req: GachaRequest) -> Result<GachaResponse, String> {
+    // P1-43: enforce per-node command whitelist. gacha_status must only
+    // ever return status; gacha_entry accepts the full command set.
+    if let Some(node) = req.node_id.as_deref() {
+        match node {
+            "gacha_status" => {
+                if req.cmd.as_str() != "status" {
+                    return Err(format!(
+                        "gacha_status only supports cmd=status; got cmd={}",
+                        req.cmd
+                    ));
+                }
+            }
+            "gacha_entry" | "" => {}
+            other => {
+                return Err(format!("unknown gacha node_id: {other}"));
+            }
+        }
+    }
     match req.cmd.as_str() {
         "pull" => handle_pull(req.count.unwrap_or(1)),
         "status" => handle_status(),
