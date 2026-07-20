@@ -1170,16 +1170,32 @@ impl RuntimeHost {
         // but before any user request lands. Errors are logged and the
         // orphan journal is left on disk for operator inspection rather than
         // panicking `boot`.
-        if let Err(err) = restore_plugin_iteration_workspace(
+        match restore_plugin_iteration_workspace(
             &host.fixtures_root,
             &host.snapshot_root,
             None,
         ) {
-            eprintln!(
-                "[plugin-iteration-recovery] boot-time restore failed: {err}; \
-                 journal preserved at {}",
-                plugin_iteration_journal_path(&host.snapshot_root).display()
-            );
+            Err(err) => {
+                eprintln!(
+                    "[plugin-iteration-recovery] boot-time restore failed: {err}; \
+                     journal preserved at {}",
+                    plugin_iteration_journal_path(&host.snapshot_root).display()
+                );
+            }
+            Ok(true) => {
+                // The initial snapshot above was built from the PRE-restore
+                // artifacts (the crashed iteration's half-promoted state).
+                // After the journal replay rewrote sources and rebuilt the
+                // artifacts, reload so the live registry reflects the
+                // restored tree — otherwise docs/nodes from the rolled-back
+                // candidate leak into the recovered snapshot.
+                if let Err(err) = host.reload("/") {
+                    eprintln!(
+                        "[plugin-iteration-recovery] post-restore reload failed: {err}"
+                    );
+                }
+            }
+            Ok(false) => {}
         }
         Ok(host)
     }
@@ -2776,9 +2792,25 @@ export_plugin_api! {{
                 }
             }
 
-            // Step 3: Rebuild the target plugin only.
+            // Step 3: Rebuild the target plugin only — UNLESS the iteration
+            // touched any Cargo.toml. A manifest change is structural: a
+            // scaffolded child plugin (new crate + parent children entry)
+            // exists neither in the cargo build graph of `-p <target>` nor
+            // in artifacts/index.json, so a target-only rebuild would
+            // silently drop it and the subsequent candidate load could
+            // never register it (the `45febba` regression). Manifest-touching
+            // iterations take the full `rebuild_fixture_artifacts` path,
+            // which re-resolves the plugin graph and regenerates the index.
             if state.stage_error.is_none() {
-                let plugin_path = format!("/{}", state.prepared.root_plugin_path);
+                let manifest_changed = state
+                    .changed_paths
+                    .iter()
+                    .any(|path| path.ends_with("Cargo.toml"));
+                let plugin_path = if manifest_changed {
+                    "/".to_string()
+                } else {
+                    format!("/{}", state.prepared.root_plugin_path)
+                };
                 // P0-8: capture the current `.so` before rebuild so rollback
                 // reverts BOTH source and compiled artifact. Otherwise
                 // source-code rollback runs but the new `.so` stays on disk,
@@ -4930,7 +4962,7 @@ fn sha256_text(content: &str) -> String {
 
 fn render_child_plugin_manifest(crate_name: &str, plugin_path: &str, node_id: &str) -> String {
     format!(
-        "[package]\nname = \"{crate_name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\ncrate-type = [\"rlib\", \"dylib\"]\n\n[package.metadata.cordis]\nplugin_path = \"{plugin_path}\"\nabi_kind = \"rust\"\ndeclared_nodes = [\"{node_id}\"]\nchildren = []\n\n[package.metadata.cordis.abi_fingerprint]\nrustc_version = \"1.85.1\"\ntarget_triple = \"x86_64-unknown-linux-gnu\"\ncrate_hash = \"crate_{crate_name}_v1\"\napi_hash = \"api_v2\"\n\n[dependencies]\ncordis-plugin-sdk = {{ path = \"../../../../../crates/cordis-plugin-sdk\" }}\nserde = {{ version = \"1\", features = [\"derive\"] }}\nserde_json = \"1\"\nthiserror = \"2\"\n\n[workspace]\n",
+        "[package]\nname = \"{crate_name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\ncrate-type = [\"rlib\", \"dylib\"]\n\n[package.metadata.cordis]\nplugin_path = \"{plugin_path}\"\nabi_kind = \"rust\"\ndeclared_nodes = [\"{node_id}\"]\nchildren = []\n# The scaffold ships no docs/agent/interfaces.json — docs are read from\n# the built dylib. P1-48 made this bypass an explicit opt-in.\nallow_generated_docs = true\n\n[package.metadata.cordis.abi_fingerprint]\nrustc_version = \"1.85.1\"\ntarget_triple = \"x86_64-unknown-linux-gnu\"\ncrate_hash = \"crate_{crate_name}_v1\"\napi_hash = \"api_v2\"\n\n[dependencies]\ncordis-plugin-sdk = {{ path = \"../../../../../crates/cordis-plugin-sdk\" }}\nserde = {{ version = \"1\", features = [\"derive\"] }}\nserde_json = \"1\"\nthiserror = \"2\"\n\n[workspace]\n",
         crate_name = crate_name.replace('-', "_"),
         plugin_path = plugin_path,
         node_id = node_id,
@@ -4944,7 +4976,7 @@ fn render_child_plugin_lib(
     summary: &str,
 ) -> String {
     format!(
-        "mod core;\n\npub use core::*;\n\nuse cordis_plugin_sdk::{{\n    export_plugin_api, json_response, node_doc, plugin_docs, AbiFingerprint, PluginRequest,\n    PluginResponse,\n}};\nuse serde::{{Deserialize, Serialize}};\nuse serde_json::json;\n\n#[derive(Debug, Deserialize)]\nstruct BinaryOpRequest {{\n    lhs: f64,\n    rhs: f64,\n}}\n\n#[derive(Debug, Serialize)]\nstruct BinaryOpResponse {{\n    #[serde(skip_serializing_if = \"Option::is_none\")]\n    value: Option<f64>,\n    #[serde(skip_serializing_if = \"Option::is_none\")]\n    error: Option<String>,\n}}\n\nfn docs_value() -> cordis_plugin_sdk::PluginDocs {{\n    plugin_docs(\n        \"{crate_name}\",\n        \"{plugin_path}\",\n        \"0.1.0\",\n        None,\n        vec![node_doc(\n            \"{node_id}\",\n            \"{summary}\",\n            json!({{\"type\":\"object\",\"required\":[\"lhs\",\"rhs\"],\"properties\":{{\"lhs\":{{\"type\":\"number\"}},\"rhs\":{{\"type\":\"number\"}}}}}}),\n            json!({{\"type\":\"object\",\"properties\":{{\"value\":{{\"type\":\"number\"}},\"error\":{{\"type\":\"string\"}}}}}}),\n            &[],\n            &[\"not implemented\"],\n        )],\n    )\n}}\n\nfn abi_fingerprint_value() -> AbiFingerprint {{\n    AbiFingerprint {{\n        rustc_version: \"1.85.1\".to_string(),\n        target_triple: \"x86_64-unknown-linux-gnu\".to_string(),\n        crate_hash: \"crate_{crate_name}_v1\".to_string(),\n        api_hash: \"api_v2\".to_string(),\n    }}\n}}\n\nfn api_handle(req: PluginRequest) -> PluginResponse {{\n    let response = match serde_json::from_str::<BinaryOpRequest>(&req.payload) {{\n        Ok(request) => match apply(request.lhs, request.rhs) {{\n            Ok(value) => BinaryOpResponse {{ value: Some(value), error: None }},\n            Err(err) => BinaryOpResponse {{ value: None, error: Some(err.to_string()) }},\n        }},\n        Err(err) => BinaryOpResponse {{ value: None, error: Some(format!(\"invalid request: {{err}}\")) }},\n    }};\n    json_response(&response)\n}}\n\nexport_plugin_api! {{\n    abi_fingerprint = abi_fingerprint_value(),\n    docs = docs_value(),\n    handle = api_handle,\n}}\n",
+        "mod core;\n\npub use core::*;\n\nuse cordis_plugin_sdk::{{\n    export_plugin_api, json_response, node_doc, plugin_docs, AbiFingerprint, PluginRequest,\n    PluginResponse,\n}};\nuse serde::{{Deserialize, Serialize}};\nuse serde_json::json;\n\n#[derive(Debug, Deserialize)]\nstruct BinaryOpRequest {{\n    lhs: f64,\n    rhs: f64,\n}}\n\n#[derive(Debug, Serialize)]\nstruct BinaryOpResponse {{\n    #[serde(skip_serializing_if = \"Option::is_none\")]\n    value: Option<f64>,\n    #[serde(skip_serializing_if = \"Option::is_none\")]\n    error: Option<String>,\n}}\n\nfn docs_value() -> cordis_plugin_sdk::PluginDocs {{\n    plugin_docs(\n        \"{crate_name}\",\n        \"{plugin_path}\",\n        \"0.1.0\",\n        None,\n        vec![node_doc(\n            \"{node_id}\",\n            \"{summary}\",\n            json!({{\"type\":\"object\",\"required\":[\"lhs\",\"rhs\"],\"properties\":{{\"lhs\":{{\"type\":\"number\"}},\"rhs\":{{\"type\":\"number\"}}}}}}),\n            json!({{\"type\":\"object\",\"properties\":{{\"value\":{{\"type\":\"number\"}},\"error\":{{\"type\":\"string\"}}}}}}),\n            &[],\n            &[\"not implemented\"],\n        )],\n        None,\n    )\n}}\n\nfn abi_fingerprint_value() -> AbiFingerprint {{\n    AbiFingerprint {{\n        rustc_version: \"1.85.1\".to_string(),\n        target_triple: \"x86_64-unknown-linux-gnu\".to_string(),\n        crate_hash: \"crate_{crate_name}_v1\".to_string(),\n        api_hash: \"api_v2\".to_string(),\n    }}\n}}\n\nfn api_handle(req: PluginRequest) -> PluginResponse {{\n    let response = match serde_json::from_str::<BinaryOpRequest>(&req.payload) {{\n        Ok(request) => match apply(request.lhs, request.rhs) {{\n            Ok(value) => BinaryOpResponse {{ value: Some(value), error: None }},\n            Err(err) => BinaryOpResponse {{ value: None, error: Some(err.to_string()) }},\n        }},\n        Err(err) => BinaryOpResponse {{ value: None, error: Some(format!(\"invalid request: {{err}}\")) }},\n    }};\n    json_response(&response)\n}}\n\nexport_plugin_api! {{\n    abi_fingerprint = abi_fingerprint_value(),\n    docs = docs_value(),\n    handle = api_handle,\n}}\n",
         crate_name = crate_name,
         plugin_path = plugin_path,
         node_id = node_id,

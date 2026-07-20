@@ -148,16 +148,23 @@ fn assistant_response(response_id: &str, content: &str) -> Vec<(u64, String)> {
     ])
 }
 
-fn generated_mod_scaffold_core() -> &'static str {
-    "use serde::{Deserialize, Serialize};\nuse thiserror::Error;\n\n#[derive(Debug, Error, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]\n#[serde(rename_all = \"snake_case\")]\npub enum ModError {\n    #[error(\"not implemented\")]\n    NotImplemented,\n}\n\n#[derive(Debug, Default, Clone, Copy)]\npub struct ModPlugin;\n\nimpl ModPlugin {\n    pub fn apply(&self, _lhs: f64, _rhs: f64) -> Result<f64, ModError> {\n        Err(ModError::NotImplemented)\n    }\n}\n\n#[allow(dead_code)]\npub fn apply(lhs: f64, rhs: f64) -> Result<f64, ModError> {\n    ModPlugin.apply(lhs, rhs)\n}\n"
+// 5.2.27-1: these fixtures previously scripted the agent adding a `%`
+// (modulo) operator — but the real expr fixture gained modulo in
+// `2eb0ff4` (2026-06-02), so the scripted `replace_once` anchors began
+// asserting "content unchanged" and the tests rotted. The scripted
+// feature is now a `~` (absolute-difference "dist") operator, which the
+// fixture does NOT have; same shape (new token + parser arm + evaluator
+// child plugin), same promote/retry flows.
+fn generated_dist_scaffold_core() -> &'static str {
+    "use serde::{Deserialize, Serialize};\nuse thiserror::Error;\n\n#[derive(Debug, Error, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]\n#[serde(rename_all = \"snake_case\")]\npub enum DistError {\n    #[error(\"not implemented\")]\n    NotImplemented,\n}\n\n#[derive(Debug, Default, Clone, Copy)]\npub struct DistPlugin;\n\nimpl DistPlugin {\n    pub fn apply(&self, _lhs: f64, _rhs: f64) -> Result<f64, DistError> {\n        Err(DistError::NotImplemented)\n    }\n}\n\n#[allow(dead_code)]\npub fn apply(lhs: f64, rhs: f64) -> Result<f64, DistError> {\n    DistPlugin.apply(lhs, rhs)\n}\n"
 }
 
-fn implemented_mod_core() -> &'static str {
-    "use serde::{Deserialize, Serialize};\nuse thiserror::Error;\n\n#[derive(Debug, Error, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]\n#[serde(rename_all = \"snake_case\")]\npub enum ModError {\n    #[error(\"division by zero\")]\n    DivisionByZero,\n}\n\n#[derive(Debug, Default, Clone, Copy)]\npub struct ModPlugin;\n\nimpl ModPlugin {\n    pub fn apply(&self, lhs: f64, rhs: f64) -> Result<f64, ModError> {\n        if rhs == 0.0 {\n            return Err(ModError::DivisionByZero);\n        }\n        Ok(lhs % rhs)\n    }\n}\n\n#[allow(dead_code)]\npub fn apply(lhs: f64, rhs: f64) -> Result<f64, ModError> {\n    ModPlugin.apply(lhs, rhs)\n}\n"
+fn implemented_dist_core() -> &'static str {
+    "use serde::{Deserialize, Serialize};\nuse thiserror::Error;\n\n#[derive(Debug, Error, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]\n#[serde(rename_all = \"snake_case\")]\npub enum DistError {\n    #[error(\"not implemented\")]\n    NotImplemented,\n}\n\n#[derive(Debug, Default, Clone, Copy)]\npub struct DistPlugin;\n\nimpl DistPlugin {\n    pub fn apply(&self, lhs: f64, rhs: f64) -> Result<f64, DistError> {\n        Ok((lhs - rhs).abs())\n    }\n}\n\n#[allow(dead_code)]\npub fn apply(lhs: f64, rhs: f64) -> Result<f64, DistError> {\n    DistPlugin.apply(lhs, rhs)\n}\n"
 }
 
-fn implemented_mod_core_with_warning() -> &'static str {
-    "use serde::{Deserialize, Serialize};\nuse std::fmt;\nuse thiserror::Error;\n\n#[derive(Debug, Error, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]\n#[serde(rename_all = \"snake_case\")]\npub enum ModError {\n    #[error(\"division by zero\")]\n    DivisionByZero,\n}\n\n#[derive(Debug, Default, Clone, Copy)]\npub struct ModPlugin;\n\nimpl ModPlugin {\n    pub fn apply(&self, lhs: f64, rhs: f64) -> Result<f64, ModError> {\n        if rhs == 0.0 {\n            return Err(ModError::DivisionByZero);\n        }\n        Ok(lhs % rhs)\n    }\n}\n\n#[allow(dead_code)]\npub fn apply(lhs: f64, rhs: f64) -> Result<f64, ModError> {\n    ModPlugin.apply(lhs, rhs)\n}\n"
+fn implemented_dist_core_with_warning() -> &'static str {
+    "use serde::{Deserialize, Serialize};\nuse std::fmt;\nuse thiserror::Error;\n\n#[derive(Debug, Error, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]\n#[serde(rename_all = \"snake_case\")]\npub enum DistError {\n    #[error(\"not implemented\")]\n    NotImplemented,\n}\n\n#[derive(Debug, Default, Clone, Copy)]\npub struct DistPlugin;\n\nimpl DistPlugin {\n    pub fn apply(&self, lhs: f64, rhs: f64) -> Result<f64, DistError> {\n        Ok((lhs - rhs).abs())\n    }\n}\n\n#[allow(dead_code)]\npub fn apply(lhs: f64, rhs: f64) -> Result<f64, DistError> {\n    DistPlugin.apply(lhs, rhs)\n}\n"
 }
 
 fn plugin_node_summary(snapshot: &RuntimeSnapshot, plugin_path: &str, node_id: &str) -> String {
@@ -663,25 +670,33 @@ fn runtime_host_reload_failure_keeps_current_snapshot() {
 
 #[test]
 fn runtime_host_reload_observes_docs_drift_issue() {
+    // 5.2.27: semantics updated for the P0-14/P2-34 docs auto-heal. The
+    // dylib's embedded docs are ground truth; tampering with the cached
+    // copy in index.json no longer propagates a "docs_changed" snapshot
+    // diff — instead the loader detects the drift and heals the cache
+    // BACK from the artifact. Assert the heal, not the old propagation.
     let temp = setup_fixture_copy();
     let host = RuntimeHost::boot(temp.path()).expect("host should boot");
-    let updated_summary = "Start the CordisClaw terminal with updated docs.";
+    let original_summary =
+        plugin_node_summary(host.current_snapshot().as_ref(), "shell", "shell_entry");
+    let tampered_summary = "Start the CordisClaw terminal with updated docs.";
 
-    update_index_node_summary(temp.path(), "shell", "shell_entry", updated_summary);
-    let report = host.reload("/").expect("reload should succeed");
+    update_index_node_summary(temp.path(), "shell", "shell_entry", tampered_summary);
+    host.reload("/").expect("reload should succeed");
 
-    assert!(report
-        .changed_plugin_reasons
-        .get("shell")
-        .map(|reasons| reasons.iter().any(|reason| reason == "docs_changed"))
-        .unwrap_or(false));
+    // Auto-heal wins: the live snapshot serves the artifact's original
+    // summary, not the tampered cache entry.
     assert_eq!(
         plugin_node_summary(host.current_snapshot().as_ref(), "shell", "shell_entry"),
-        updated_summary
+        original_summary
     );
-    assert!(host.kernel().plugin_issues().iter().any(|issue| {
-        issue.root_plugin_path == "shell" && issue.source == KernelPluginIssueSource::DocsDrift
-    }));
+    // And the on-disk cache is healed back too.
+    let index_text = fs::read_to_string(temp.path().join("artifacts/index.json"))
+        .expect("read healed index");
+    assert!(
+        !index_text.contains(tampered_summary),
+        "tampered summary must be healed out of index.json"
+    );
 }
 
 #[test]
@@ -1064,55 +1079,55 @@ fn runtime_host_iterate_plugins_promotes_after_canary_replay() {
 
 #[serial]
 #[test]
-fn runtime_host_iterate_plugins_agent_adds_modulo_child_plugin_and_promotes() {
+fn runtime_host_iterate_plugins_agent_adds_dist_child_plugin_and_promotes() {
     let temp = setup_fixture_workspace_copy();
     let fixtures = temp.path().join("fixtures");
 
     let lexer_before = read_rel(&fixtures, "plugins/expr/lexer/src/core.rs");
     let lexer_after = replace_once(
         &lexer_before,
-        "    Slash,\n    LParen,\n",
-        "    Slash,\n    Percent,\n    LParen,\n",
+        "    Exclamation,\n    LParen,\n",
+        "    Exclamation,\n    Tilde,\n    LParen,\n",
     );
     let lexer_after = replace_once(
         &lexer_after,
-        "            '/' => {\n                pos += 1;\n                Token {\n                    kind: TokenKind::Slash,\n                    position: pos - 1,\n                }\n            }\n            '(' => {\n",
-        "            '/' => {\n                pos += 1;\n                Token {\n                    kind: TokenKind::Slash,\n                    position: pos - 1,\n                }\n            }\n            '%' => {\n                pos += 1;\n                Token {\n                    kind: TokenKind::Percent,\n                    position: pos - 1,\n                }\n            }\n            '(' => {\n",
+        "            '!' => {\n                pos += 1;\n                Token {\n                    kind: TokenKind::Exclamation,\n                    position: pos - 1,\n                }\n            }\n            '(' => {\n",
+        "            '!' => {\n                pos += 1;\n                Token {\n                    kind: TokenKind::Exclamation,\n                    position: pos - 1,\n                }\n            }\n            '~' => {\n                pos += 1;\n                Token {\n                    kind: TokenKind::Tilde,\n                    position: pos - 1,\n                }\n            }\n            '(' => {\n",
     );
 
     let parser_before = read_rel(&fixtures, "plugins/expr/parser/src/core.rs");
-    let parser_after = replace_once(&parser_before, "    Div,\n}\n", "    Div,\n    Mod,\n}\n");
+    let parser_after = replace_once(&parser_before, "    Pow,\n}\n", "    Pow,\n    Dist,\n}\n");
     let parser_after = replace_once(
         &parser_after,
-        "                Some(TokenKind::Star) => BinaryOp::Mul,\n                Some(TokenKind::Slash) => BinaryOp::Div,\n                _ => break,\n",
-        "                Some(TokenKind::Star) => BinaryOp::Mul,\n                Some(TokenKind::Slash) => BinaryOp::Div,\n                Some(TokenKind::Percent) => BinaryOp::Mod,\n                _ => break,\n",
+        "                Some(TokenKind::Percent) => BinaryOp::Mod,\n                _ => break,\n",
+        "                Some(TokenKind::Percent) => BinaryOp::Mod,\n                Some(TokenKind::Tilde) => BinaryOp::Dist,\n                _ => break,\n",
     );
 
     let evaluator_before = read_rel(&fixtures, "plugins/expr/evaluator/src/core.rs");
     let evaluator_after = replace_once(
         &evaluator_before,
         "#[path = \"../div/src/core.rs\"]\npub mod div_core;\n",
-        "#[path = \"../div/src/core.rs\"]\npub mod div_core;\n#[path = \"../mod/src/core.rs\"]\npub mod mod_core;\n",
+        "#[path = \"../div/src/core.rs\"]\npub mod div_core;\n#[path = \"../dist/src/core.rs\"]\npub mod dist_core;\n",
     );
     let evaluator_after = replace_once(
         &evaluator_after,
         "pub use div_core::{DivError, DivPlugin};\n",
-        "pub use div_core::{DivError, DivPlugin};\npub use mod_core::{ModError, ModPlugin};\n",
+        "pub use div_core::{DivError, DivPlugin};\npub use dist_core::{DistError, DistPlugin};\n",
     );
     let evaluator_after = replace_once(
         &evaluator_after,
         "    div: DivPlugin,\n",
-        "    div: DivPlugin,\n    modulo: ModPlugin,\n",
+        "    div: DivPlugin,\n    dist: DistPlugin,\n",
     );
     let evaluator_after = replace_once(
         &evaluator_after,
         "                BinaryOp::Div => ops.div.apply(left, right).map_err(|err| match err {\n                    DivError::DivisionByZero => EvalError::DivisionByZero,\n                }),\n",
-        "                BinaryOp::Div => ops.div.apply(left, right).map_err(|err| match err {\n                    DivError::DivisionByZero => EvalError::DivisionByZero,\n                }),\n                BinaryOp::Mod => ops.modulo.apply(left, right).map_err(|err| match err {\n                    ModError::DivisionByZero => EvalError::DivisionByZero,\n                }),\n",
+        "                BinaryOp::Div => ops.div.apply(left, right).map_err(|err| match err {\n                    DivError::DivisionByZero => EvalError::DivisionByZero,\n                }),\n                BinaryOp::Dist => ops.dist.apply(left, right).map_err(|err| match err {\n                    DistError::NotImplemented => EvalError::NonFinite,\n                }),\n",
     );
 
     let eval_tests_before = read_rel(&fixtures, "plugins/expr/tests/eval.rs");
     let eval_tests_after = format!(
-        "{eval_tests_before}\n#[test]\nfn evaluates_modulo_expression() {{\n    let value = evaluate_expression(\"7 % 4 + 1\").expect(\"must evaluate\");\n    assert_eq!(value, 4.0);\n}}\n"
+        "{eval_tests_before}\n#[test]\nfn evaluates_dist_expression() {{\n    let value = evaluate_expression(\"7 ~ 4 + 1\").expect(\"must evaluate\");\n    assert_eq!(value, 4.0);\n}}\n"
     );
 
     let responses = vec![
@@ -1123,9 +1138,9 @@ fn runtime_host_iterate_plugins_agent_adds_modulo_child_plugin_and_promotes() {
                 "scaffold_child_plugin",
                 json!({
                     "parent_plugin_path": "expr/evaluator",
-                    "child_name": "mod",
-                    "node_id": "expr_mod",
-                    "summary": "Compute lhs modulo rhs."
+                    "child_name": "dist",
+                    "node_id": "expr_dist",
+                    "summary": "Compute absolute difference of lhs and rhs."
                 }),
             )],
         ),
@@ -1163,9 +1178,9 @@ fn runtime_host_iterate_plugins_agent_adds_modulo_child_plugin_and_promotes() {
                     "call_replace_mod_core",
                     "replace_file_exact",
                     json!({
-                        "path": "plugins/expr/evaluator/mod/src/core.rs",
-                        "expected_old_string": generated_mod_scaffold_core(),
-                        "new_content": implemented_mod_core(),
+                        "path": "plugins/expr/evaluator/dist/src/core.rs",
+                        "expected_old_string": generated_dist_scaffold_core(),
+                        "new_content": implemented_dist_core(),
                     }),
                 ),
                 (
@@ -1195,7 +1210,7 @@ fn runtime_host_iterate_plugins_agent_adds_modulo_child_plugin_and_promotes() {
                 "call_record_summary",
                 "record_iteration_summary",
                 json!({
-                    "summary": "Add modulo child plugin support under expr/evaluator/mod and wire lexer/parser/evaluator dispatch.",
+                    "summary": "Add dist child plugin support under expr/evaluator/dist and wire lexer/parser/evaluator dispatch.",
                     "tests_command": "cargo test --quiet --manifest-path plugins/expr/Cargo.toml"
                 }),
             )],
@@ -1220,7 +1235,7 @@ fn runtime_host_iterate_plugins_agent_adds_modulo_child_plugin_and_promotes() {
         .iterate_plugins(KernelPluginIterationRequest {
             issue_id: None,
             target_plugin_paths: vec!["expr".to_string()],
-            instruction: Some("Add modulo operator support with a sibling evaluator child plugin at expr/evaluator/mod.".to_string()),
+            instruction: Some("Add absolute-difference (~) operator support with a sibling evaluator child plugin at expr/evaluator/dist.".to_string()),
             edit_plan: None,
             manual_approved: false,
             tests_command: None,
@@ -1238,7 +1253,14 @@ fn runtime_host_iterate_plugins_agent_adds_modulo_child_plugin_and_promotes() {
         4,
         "record_iteration_summary should end the session"
     );
-    assert_eq!(result.final_verdict, PluginIterationFinalVerdict::Promoted);
+    assert_eq!(
+        result.final_verdict,
+        PluginIterationFinalVerdict::Promoted,
+        "blocked_reason={:?} verifier={:?} canary={:?}",
+        result.blocked_reason,
+        result.verifier_verdict,
+        result.canary.as_ref().map(|r| (&r.verdict, &r.message)),
+    );
     assert_eq!(result.verifier_verdict, Some(VerifierVerdict::Pass));
     assert_eq!(
         result.canary.as_ref().map(|report| report.verdict),
@@ -1247,7 +1269,7 @@ fn runtime_host_iterate_plugins_agent_adds_modulo_child_plugin_and_promotes() {
     assert!(result
         .changed_paths
         .iter()
-        .any(|path| path == "plugins/expr/evaluator/mod/Cargo.toml"));
+        .any(|path| path == "plugins/expr/evaluator/dist/Cargo.toml"));
     assert!(result
         .changed_paths
         .iter()
@@ -1259,24 +1281,25 @@ fn runtime_host_iterate_plugins_agent_adds_modulo_child_plugin_and_promotes() {
     assert!(host
         .current_snapshot()
         .plugin_registry()
-        .get("expr/evaluator/mod")
+        .get("expr/evaluator/dist")
         .is_some());
 
-    let modulo_response = host
+    let dist_response = host
         .invoke(
             "expr",
             "expr_entry",
-            json!({ "expression": "7 % 4 + 1" }).to_string(),
+            json!({ "expression": "7 ~ 4 + 1" }).to_string(),
         )
-        .expect("promoted expr plugin should support modulo");
-    let modulo_value: Value =
-        serde_json::from_str(&modulo_response.payload).expect("modulo response json");
+        .expect("promoted expr plugin should support dist");
+    let dist_value: Value =
+        serde_json::from_str(&dist_response.payload).expect("dist response json");
     assert_eq!(
-        modulo_value.get("value").and_then(|v| v.as_f64()),
+        dist_value.get("value").and_then(|v| v.as_f64()),
         Some(4.0)
     );
 }
 
+#[serial]
 #[test]
 fn runtime_host_iterate_plugins_agent_retries_on_warning_and_promotes() {
     let temp = setup_fixture_workspace_copy();
@@ -1285,48 +1308,48 @@ fn runtime_host_iterate_plugins_agent_retries_on_warning_and_promotes() {
     let lexer_before = read_rel(&fixtures, "plugins/expr/lexer/src/core.rs");
     let lexer_after = replace_once(
         &lexer_before,
-        "    Slash,\n    LParen,\n",
-        "    Slash,\n    Percent,\n    LParen,\n",
+        "    Exclamation,\n    LParen,\n",
+        "    Exclamation,\n    Tilde,\n    LParen,\n",
     );
     let lexer_after = replace_once(
         &lexer_after,
-        "            '/' => {\n                pos += 1;\n                Token {\n                    kind: TokenKind::Slash,\n                    position: pos - 1,\n                }\n            }\n            '(' => {\n",
-        "            '/' => {\n                pos += 1;\n                Token {\n                    kind: TokenKind::Slash,\n                    position: pos - 1,\n                }\n            }\n            '%' => {\n                pos += 1;\n                Token {\n                    kind: TokenKind::Percent,\n                    position: pos - 1,\n                }\n            }\n            '(' => {\n",
+        "            '!' => {\n                pos += 1;\n                Token {\n                    kind: TokenKind::Exclamation,\n                    position: pos - 1,\n                }\n            }\n            '(' => {\n",
+        "            '!' => {\n                pos += 1;\n                Token {\n                    kind: TokenKind::Exclamation,\n                    position: pos - 1,\n                }\n            }\n            '~' => {\n                pos += 1;\n                Token {\n                    kind: TokenKind::Tilde,\n                    position: pos - 1,\n                }\n            }\n            '(' => {\n",
     );
 
     let parser_before = read_rel(&fixtures, "plugins/expr/parser/src/core.rs");
-    let parser_after = replace_once(&parser_before, "    Div,\n}\n", "    Div,\n    Mod,\n}\n");
+    let parser_after = replace_once(&parser_before, "    Pow,\n}\n", "    Pow,\n    Dist,\n}\n");
     let parser_after = replace_once(
         &parser_after,
-        "                Some(TokenKind::Star) => BinaryOp::Mul,\n                Some(TokenKind::Slash) => BinaryOp::Div,\n                _ => break,\n",
-        "                Some(TokenKind::Star) => BinaryOp::Mul,\n                Some(TokenKind::Slash) => BinaryOp::Div,\n                Some(TokenKind::Percent) => BinaryOp::Mod,\n                _ => break,\n",
+        "                Some(TokenKind::Percent) => BinaryOp::Mod,\n                _ => break,\n",
+        "                Some(TokenKind::Percent) => BinaryOp::Mod,\n                Some(TokenKind::Tilde) => BinaryOp::Dist,\n                _ => break,\n",
     );
 
     let evaluator_before = read_rel(&fixtures, "plugins/expr/evaluator/src/core.rs");
     let evaluator_after = replace_once(
         &evaluator_before,
         "#[path = \"../div/src/core.rs\"]\npub mod div_core;\n",
-        "#[path = \"../div/src/core.rs\"]\npub mod div_core;\n#[path = \"../mod/src/core.rs\"]\npub mod mod_core;\n",
+        "#[path = \"../div/src/core.rs\"]\npub mod div_core;\n#[path = \"../dist/src/core.rs\"]\npub mod dist_core;\n",
     );
     let evaluator_after = replace_once(
         &evaluator_after,
         "pub use div_core::{DivError, DivPlugin};\n",
-        "pub use div_core::{DivError, DivPlugin};\npub use mod_core::{ModError, ModPlugin};\n",
+        "pub use div_core::{DivError, DivPlugin};\npub use dist_core::{DistError, DistPlugin};\n",
     );
     let evaluator_after = replace_once(
         &evaluator_after,
         "    div: DivPlugin,\n",
-        "    div: DivPlugin,\n    modulo: ModPlugin,\n",
+        "    div: DivPlugin,\n    dist: DistPlugin,\n",
     );
     let evaluator_after = replace_once(
         &evaluator_after,
         "                BinaryOp::Div => ops.div.apply(left, right).map_err(|err| match err {\n                    DivError::DivisionByZero => EvalError::DivisionByZero,\n                }),\n",
-        "                BinaryOp::Div => ops.div.apply(left, right).map_err(|err| match err {\n                    DivError::DivisionByZero => EvalError::DivisionByZero,\n                }),\n                BinaryOp::Mod => ops.modulo.apply(left, right).map_err(|err| match err {\n                    ModError::DivisionByZero => EvalError::DivisionByZero,\n                }),\n",
+        "                BinaryOp::Div => ops.div.apply(left, right).map_err(|err| match err {\n                    DivError::DivisionByZero => EvalError::DivisionByZero,\n                }),\n                BinaryOp::Dist => ops.dist.apply(left, right).map_err(|err| match err {\n                    DistError::NotImplemented => EvalError::NonFinite,\n                }),\n",
     );
 
     let eval_tests_before = read_rel(&fixtures, "plugins/expr/tests/eval.rs");
     let eval_tests_after = format!(
-        "{eval_tests_before}\n#[test]\nfn evaluates_modulo_expression() {{\n    let value = evaluate_expression(\"7 % 4 + 1\").expect(\"must evaluate\");\n    assert_eq!(value, 4.0);\n}}\n"
+        "{eval_tests_before}\n#[test]\nfn evaluates_dist_expression() {{\n    let value = evaluate_expression(\"7 ~ 4 + 1\").expect(\"must evaluate\");\n    assert_eq!(value, 4.0);\n}}\n"
     );
 
     let responses = vec![
@@ -1337,9 +1360,9 @@ fn runtime_host_iterate_plugins_agent_retries_on_warning_and_promotes() {
                 "scaffold_child_plugin",
                 json!({
                     "parent_plugin_path": "expr/evaluator",
-                    "child_name": "mod",
-                    "node_id": "expr_mod",
-                    "summary": "Compute lhs modulo rhs."
+                    "child_name": "dist",
+                    "node_id": "expr_dist",
+                    "summary": "Compute absolute difference of lhs and rhs."
                 }),
             )],
         ),
@@ -1377,9 +1400,9 @@ fn runtime_host_iterate_plugins_agent_retries_on_warning_and_promotes() {
                     "call_replace_mod_core_warning",
                     "replace_file_exact",
                     json!({
-                        "path": "plugins/expr/evaluator/mod/src/core.rs",
-                        "expected_old_string": generated_mod_scaffold_core(),
-                        "new_content": implemented_mod_core_with_warning(),
+                        "path": "plugins/expr/evaluator/dist/src/core.rs",
+                        "expected_old_string": generated_dist_scaffold_core(),
+                        "new_content": implemented_dist_core_with_warning(),
                     }),
                 ),
                 (
@@ -1409,9 +1432,9 @@ fn runtime_host_iterate_plugins_agent_retries_on_warning_and_promotes() {
                 "call_fix_mod_warning",
                 "replace_file_exact",
                 json!({
-                    "path": "plugins/expr/evaluator/mod/src/core.rs",
-                    "expected_old_string": implemented_mod_core_with_warning(),
-                    "new_content": implemented_mod_core(),
+                    "path": "plugins/expr/evaluator/dist/src/core.rs",
+                    "expected_old_string": implemented_dist_core_with_warning(),
+                    "new_content": implemented_dist_core(),
                 }),
             )],
         ),
@@ -1431,7 +1454,7 @@ fn runtime_host_iterate_plugins_agent_retries_on_warning_and_promotes() {
                 "call_record_summary",
                 "record_iteration_summary",
                 json!({
-                    "summary": "Add modulo child plugin support under expr/evaluator/mod and clean warnings before promotion.",
+                    "summary": "Add dist child plugin support under expr/evaluator/dist and clean warnings before promotion.",
                     "tests_command": "cargo test --quiet --manifest-path plugins/expr/Cargo.toml"
                 }),
             )],
@@ -1456,7 +1479,7 @@ fn runtime_host_iterate_plugins_agent_retries_on_warning_and_promotes() {
         .iterate_plugins(KernelPluginIterationRequest {
             issue_id: None,
             target_plugin_paths: vec!["expr".to_string()],
-            instruction: Some("Add modulo operator support with a sibling evaluator child plugin at expr/evaluator/mod.".to_string()),
+            instruction: Some("Add absolute-difference (~) operator support with a sibling evaluator child plugin at expr/evaluator/dist.".to_string()),
             edit_plan: None,
             manual_approved: false,
             tests_command: None,
@@ -1478,15 +1501,16 @@ fn runtime_host_iterate_plugins_agent_retries_on_warning_and_promotes() {
         .any(|request| request.contains("unused import: `std::fmt`")));
     assert_eq!(result.final_verdict, PluginIterationFinalVerdict::Promoted);
 
-    let core_after = read_rel(&fixtures, "plugins/expr/evaluator/mod/src/core.rs");
-    assert_eq!(core_after, implemented_mod_core());
+    let core_after = read_rel(&fixtures, "plugins/expr/evaluator/dist/src/core.rs");
+    assert_eq!(core_after, implemented_dist_core());
     assert!(host
         .current_snapshot()
         .plugin_registry()
-        .get("expr/evaluator/mod")
+        .get("expr/evaluator/dist")
         .is_some());
 }
 
+#[serial]
 #[test]
 fn runtime_host_iterate_plugins_agent_retries_on_raw_mod_identifier_and_rolls_back() {
     let temp = setup_fixture_workspace_copy();
@@ -1535,7 +1559,7 @@ fn runtime_host_iterate_plugins_agent_retries_on_raw_mod_identifier_and_rolls_ba
         .iterate_plugins(KernelPluginIterationRequest {
             issue_id: None,
             target_plugin_paths: vec!["expr".to_string()],
-            instruction: Some("Add modulo operator support with a sibling evaluator child plugin at expr/evaluator/mod.".to_string()),
+            instruction: Some("Add absolute-difference (~) operator support with a sibling evaluator child plugin at expr/evaluator/dist.".to_string()),
             edit_plan: None,
             manual_approved: false,
             tests_command: None,
@@ -1714,22 +1738,27 @@ fn runtime_host_iterate_plugins_rolls_back_invalid_plugin_manifest_and_keeps_run
     let fixtures = temp.path().join("fixtures");
     let host = RuntimeHost::boot(&fixtures).expect("host should boot");
     let journal_path = plugin_iteration_journal_path(&host.status().snapshot_root);
-    let manifest_path = fixtures.join("plugins/root/Cargo.toml");
-    let original_manifest = fs::read_to_string(&manifest_path).expect("read root manifest");
+    // 5.2.27: previously targeted the `root` fixture's `./child` declaration,
+    // but P2-10 removed root/child (root now has `children = []` and is not
+    // even a workspace member). Break the expr tree's `./lexer` child source
+    // instead — same semantics: an edit that corrupts a parent manifest must
+    // roll back and leave the runtime alive.
+    let manifest_path = fixtures.join("plugins/expr/Cargo.toml");
+    let original_manifest = fs::read_to_string(&manifest_path).expect("read expr manifest");
 
     let result = host
         .iterate_plugins(KernelPluginIterationRequest {
             issue_id: None,
-            target_plugin_paths: vec!["root".to_string()],
-            instruction: Some("break root child source".to_string()),
+            target_plugin_paths: vec!["expr".to_string()],
+            instruction: Some("break expr child source".to_string()),
             edit_plan: Some(PluginEditPlan {
-                issue_id: "issue-root-manifest".to_string(),
-                patch_id: "patch-root-manifest".to_string(),
-                summary: "break root child source".to_string(),
+                issue_id: "issue-expr-manifest".to_string(),
+                patch_id: "patch-expr-manifest".to_string(),
+                summary: "break expr child source".to_string(),
                 operations: vec![PluginEditOperation {
-                    path: "plugins/root/Cargo.toml".to_string(),
+                    path: "plugins/expr/Cargo.toml".to_string(),
                     kind: PluginEditOpKind::ReplaceExact,
-                    expected_old_string: Some("./child".to_string()),
+                    expected_old_string: Some("./lexer".to_string()),
                     expected_sha256: None,
                     new_content: Some("./missing-child".to_string()),
                     pointer: None,
@@ -1756,7 +1785,7 @@ fn runtime_host_iterate_plugins_rolls_back_invalid_plugin_manifest_and_keeps_run
         original_manifest
     );
     assert!(host.kernel().plugin_issues().iter().any(|issue| {
-        issue.root_plugin_path == "root" && issue.source == KernelPluginIssueSource::LoadFailure
+        issue.root_plugin_path == "expr" && issue.source == KernelPluginIssueSource::LoadFailure
     }));
 
     let response = host
@@ -1900,16 +1929,14 @@ fn runtime_host_boot_recovers_plugin_iteration_journal() {
     );
 }
 
+#[serial]
 #[test]
 fn serve_mode_supports_plugins_reload_and_kernel_status() {
-    let temp = setup_fixture_copy();
+    let temp = setup_fixture_workspace_copy();
+    let fixtures = temp.path().join("fixtures");
     let bin = env!("CARGO_BIN_EXE_cordis-runtime");
     let mut child = Command::new(bin)
-        .args([
-            "serve",
-            temp.path().to_str().expect("temp path utf-8"),
-            "--runtime-only",
-        ])
+        .args(["serve", fixtures.to_str().expect("temp path utf-8")])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1941,18 +1968,21 @@ fn serve_mode_supports_plugins_reload_and_kernel_status() {
     assert!(stdout.contains("\"status\":\"reloaded\""));
 }
 
+// 5.2.27-2 后续：原测试用手工拼进 index.json 的 demo process 插件做
+// candidate invoke，依赖 --runtime-only 跳过 prepare_artifacts 的旧行为。
+// 去掉 --runtime-only 后 serve 启动会跑 prepare 重建 index，手工 demo
+// 条目的 `execution` 字段在重建中丢失 → "plugin execution unsupported"。
+// 测试目的（candidate 控制面命令：status/reload/invoke/promote 的往返）
+// 与 process 插件无关，改用真实 expr dylib 插件走一遍。
+#[serial]
 #[test]
 fn serve_mode_supports_candidate_control_plane() {
-    let temp = setup_fixture_copy();
-    add_demo_process_plugin(temp.path(), "v1");
+    let temp = setup_fixture_workspace_copy();
+    let fixtures = temp.path().join("fixtures");
 
     let bin = env!("CARGO_BIN_EXE_cordis-runtime");
     let mut child = Command::new(bin)
-        .args([
-            "serve",
-            temp.path().to_str().expect("temp path utf-8"),
-            "--runtime-only",
-        ])
+        .args(["serve", fixtures.to_str().expect("temp path utf-8")])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1963,7 +1993,7 @@ fn serve_mode_supports_candidate_control_plane() {
     use std::io::Write as _;
     stdin
         .write_all(
-            b"candidate status\ncandidate reload\ncandidate status\ncandidate invoke demo demo_entry {\"message\":\"hello\"}\ncandidate promote\nstatus\ncandidate status\nexit\n",
+            b"candidate status\ncandidate reload\ncandidate status\ncandidate invoke expr expr_entry {\"expression\":\"2 + 3\"}\ncandidate promote\nstatus\ncandidate status\nexit\n",
         )
         .expect("write serve candidate commands");
 
@@ -1975,11 +2005,11 @@ fn serve_mode_supports_candidate_control_plane() {
     );
 
     let stdout = String::from_utf8(output.stdout).expect("stdout utf-8");
-    assert!(stdout.contains("serve ready snapshot_id="));
-    assert!(stdout.contains("null"));
-    assert!(stdout.contains("\"status\":\"staged\""));
-    assert!(stdout.contains("\"candidate_snapshot_id\""));
-    assert!(stdout.contains("{\"version\":\"v1\"}"));
-    assert!(stdout.contains("\"current_snapshot_id\""));
-    assert!(stdout.contains("\"candidate_snapshot\":null"));
+    assert!(stdout.contains("serve ready snapshot_id="), "stdout: {stdout}");
+    assert!(stdout.contains("null"), "stdout: {stdout}");
+    assert!(stdout.contains("\"status\":\"staged\""), "stdout: {stdout}");
+    assert!(stdout.contains("\"candidate_snapshot_id\""), "stdout: {stdout}");
+    assert!(stdout.contains("\"value\":5.0"), "stdout: {stdout}");
+    assert!(stdout.contains("\"current_snapshot_id\""), "stdout: {stdout}");
+    assert!(stdout.contains("\"candidate_snapshot\":null"), "stdout: {stdout}");
 }
