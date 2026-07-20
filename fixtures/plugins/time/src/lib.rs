@@ -164,6 +164,15 @@ fn api_handle(req: PluginRequest) -> PluginResponse {
     }
 }
 
+/// Test hook for `tests/sanity.rs` (P0-2 verifier demo). Not part of the
+/// plugin ABI — integration tests can't dlopen the dylib without a
+/// full host, so this exposes the same pure path with a stable Rust
+/// signature.
+#[doc(hidden)]
+pub fn __test_call_handle(payload: String) -> String {
+    api_handle(PluginRequest { payload }).payload
+}
+
 export_plugin_api! {
     abi_fingerprint = abi_fingerprint_value(),
     docs = docs_value(),
