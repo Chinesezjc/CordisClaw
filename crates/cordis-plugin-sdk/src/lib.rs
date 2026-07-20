@@ -309,6 +309,87 @@ pub struct ServiceVTable {
 unsafe impl Send for ServiceVTable {}
 unsafe impl Sync for ServiceVTable {}
 
+/// Panic firewall for service `start`/`stop` calls.
+///
+/// `ServiceVTable::{start,stop}` are `extern "C" fn`.  Modern rustc inserts an
+/// implicit `abort()` when a Rust panic tries to unwind *through* a C ABI
+/// frame, so a `catch_unwind` on the runtime (host) side is futile — the
+/// process is already gone by the time control would return.  The isolation
+/// therefore has to happen **inside** the plugin, on Rust frames, before the
+/// unwind ever reaches the `extern "C"` boundary.
+///
+/// This helper runs the user's (panic-prone) service body under
+/// `catch_unwind`.  On a caught panic it prints a contextual diagnostic and
+/// returns `-1`, so the surrounding `extern "C"` shim returns an ordinary
+/// error code instead of unwinding.  Use it via [`service_vtable!`] rather
+/// than hand-writing `extern "C" fn`s.
+pub fn guard_service_call(
+    op: &str,
+    data: *mut std::ffi::c_void,
+    body: fn(*mut std::ffi::c_void) -> i32,
+) -> i32 {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(data))) {
+        Ok(code) => code,
+        Err(payload) => {
+            let msg = if let Some(s) = payload.downcast_ref::<&str>() {
+                (*s).to_string()
+            } else if let Some(s) = payload.downcast_ref::<String>() {
+                s.clone()
+            } else {
+                "<non-string panic payload>".to_string()
+            };
+            eprintln!(
+                "cordis-plugin-sdk: service {op} panicked, isolated before C ABI boundary (returning -1): {msg}"
+            );
+            -1
+        }
+    }
+}
+
+/// Build a [`ServiceVTable`] whose `start`/`stop` entry points are wrapped in a
+/// panic firewall ([`guard_service_call`]).
+///
+/// Plugins supply ordinary safe Rust `fn(*mut c_void) -> i32` bodies (which are
+/// *allowed to panic*); the macro generates the `extern "C"` shims and routes
+/// them through `catch_unwind`, so a panicking service can never abort the
+/// host process.  Return `0` for success, non-zero for a handled error; a
+/// panic is reported as `-1`.
+///
+/// ```ignore
+/// #[no_mangle]
+/// pub extern "C" fn _cordis_create_service(
+///     node_id: *const std::ffi::c_char,
+/// ) -> *const cordis_plugin_sdk::ServiceVTable {
+///     // ... match node_id, build `data` ...
+///     let vtable = cordis_plugin_sdk::service_vtable! {
+///         data = my_data_ptr,
+///         start = my_start,   // fn(*mut c_void) -> i32, may panic
+///         stop = my_stop,     // fn(*mut c_void) -> i32, may panic
+///     };
+///     Box::into_raw(Box::new(vtable))
+/// }
+/// ```
+#[macro_export]
+macro_rules! service_vtable {
+    (
+        data = $data:expr,
+        start = $start:path,
+        stop = $stop:path $(,)?
+    ) => {{
+        extern "C" fn __cordis_service_start(data: *mut ::std::ffi::c_void) -> i32 {
+            $crate::guard_service_call("start", data, $start)
+        }
+        extern "C" fn __cordis_service_stop(data: *mut ::std::ffi::c_void) -> i32 {
+            $crate::guard_service_call("stop", data, $stop)
+        }
+        $crate::ServiceVTable {
+            data: $data,
+            start: __cordis_service_start,
+            stop: __cordis_service_stop,
+        }
+    }};
+}
+
 #[cfg(not(test))]
 extern "C" {
     /// Plugin exports this.  Called with a node_id; returns a ServiceVTable
@@ -337,5 +418,70 @@ mod fingerprint_tests {
         assert!(!fp.target_triple.is_empty(), "target_triple stamped");
         assert_eq!(fp.crate_hash, "crate_test_v1");
         assert_eq!(fp.api_hash, "api_v2");
+    }
+}
+
+#[cfg(test)]
+mod service_panic_isolation_tests {
+    use super::*;
+    use std::ffi::c_void;
+
+    // A service `start` body that panics.  Under `guard_service_call` (and thus
+    // through the `service_vtable!`-generated `extern "C"` shim) this must be
+    // caught on Rust frames and reported as -1 — the process must NOT abort.
+    fn panicking_start(_data: *mut c_void) -> i32 {
+        panic!("boom from service start");
+    }
+
+    fn panicking_stop(_data: *mut c_void) -> i32 {
+        panic!("boom from service stop");
+    }
+
+    // A well-behaved body: reads a flag out of the data pointer and returns it.
+    fn ok_start(data: *mut c_void) -> i32 {
+        if data.is_null() {
+            return 7;
+        }
+        unsafe { *(data as *mut i32) }
+    }
+
+    fn ok_stop(_data: *mut c_void) -> i32 {
+        0
+    }
+
+    #[test]
+    fn guarded_panicking_start_returns_minus_one_without_abort() {
+        // Directly exercise the firewall.  If the panic escaped, the test
+        // binary would abort and this assert would never run.
+        let code = guard_service_call("start", std::ptr::null_mut(), panicking_start);
+        assert_eq!(code, -1, "panicking start must be isolated as -1");
+    }
+
+    #[test]
+    fn service_vtable_macro_isolates_start_panic() {
+        // Build a real vtable via the public macro and call it exactly the way
+        // the runtime does: `(vtable.start)(vtable.data)`.
+        let vtable = service_vtable! {
+            data = std::ptr::null_mut(),
+            start = panicking_start,
+            stop = panicking_stop,
+        };
+        let code = (vtable.start)(vtable.data);
+        assert_eq!(code, -1, "extern C start shim must catch the panic and return -1");
+        // The stop path must be equally protected.
+        let stop_code = (vtable.stop)(vtable.data);
+        assert_eq!(stop_code, -1, "extern C stop shim must catch the panic and return -1");
+    }
+
+    #[test]
+    fn service_vtable_macro_passes_through_success_code() {
+        let mut flag: i32 = 0;
+        let vtable = service_vtable! {
+            data = (&mut flag as *mut i32) as *mut c_void,
+            start = ok_start,
+            stop = ok_stop,
+        };
+        assert_eq!((vtable.start)(vtable.data), 0, "non-panicking start returns its own code");
+        assert_eq!((vtable.stop)(vtable.data), 0, "non-panicking stop returns 0");
     }
 }
