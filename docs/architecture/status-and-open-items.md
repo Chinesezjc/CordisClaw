@@ -206,6 +206,18 @@ Agent 现在可以自主完成：读代码 → 理解结构 → 写/改文件 �
 - [x] **Plugin iteration symlink 逃逸**（P0-20）— `PluginEditExecutor::execute` 在写入前调用新 helper `resolve_under_workspace`：canonicalize 结果必须仍在 workspace_root 下。plugins 内的 symlink 指向 `/etc/passwd` 之类无法被写入。
 - [x] **Verifier shell 拼接**（P0-21）— 已随 A 批 P0-1 修复。`discover_rust_workspace_manifest` 输出的字符串被 `shell_words` 解析成 argv，空格 / `$` / `;` 无法被解释。
 
+### 5.2.21 自迭代端到端 smoke test（C 批，2026-07-20）
+
+用真实 DeepSeek LLM + serve REPL 端到端跑一次 `iterate_plugins`，验证从 bug 注入 → 测试失败 → 自动定位 → 编辑 → 编译 → 测试 → rollback 判定的整条链路：
+
+1. **注入 bug**：`fixtures/plugins/time/src/lib.rs` `handle_time_now` 里 `let timestamp = 0i64;`（原本 `dur.as_secs() as i64`）。
+2. **注入 sentinel**：`fixtures/plugins/time/tests/sanity.rs` 断言 `timestamp > 0` 且距参考时钟 ±1d。手动 `cargo test --test sanity` 立即失败：`time_now timestamp must be positive, got 0`。
+3. **REPL 触发**：`kernel iterate-plugins {"target_plugin_paths":["time"], "instruction":"...", "tests_command":"..."}`。9 个 tool call、5 verification attempts、2 successes 后 agent 自主完成：`list_context_files` → `read_context_files` → `replace_files_exact`（编辑正好一处，`0i64` → `dur.as_secs() as i64`）→ `run_plugin_check` → `rebuild_plugin_workspace` → 三次 `run_plugin_test`（前两次因 manifest-path 错误 fail，第三次 agent 自主纠错切到 `plugins/Cargo.toml`）→ `record_iteration_summary`。
+4. **rollback 判定**：`final_verdict = rolled_back, blocked_reason = "plugin unavailable: time, reason=HashMismatch"`。P0-13 硬编码 `entry.sha256` 校验（loader 里当时的 TODO 直接信任，此处已改为实际计算并对比）触发 —— 新 rebuild 的 `.so` 与 `index.json` 里的 sha256 不匹配，安全网正确地拒绝上线；journal 回放把源码恢复到 pre-edit 字节。
+5. **验证结论**：agent 端 self-iteration 循环 **功能上完全跑通**（正确定位 + 正确编辑 + 通过测试）；hard-rollback 层 **也如设计工作**（sha256 保护线拒绝 stale index 的 promote）。**遗留 finding**：`refresh_artifact_index` 在 `rebuild_plugin_workspace` 后未刷新 `index.json`，需要 candidate 通道在 promote 前统一 sync 一次；已记入下一次修复批次。
+
+耗时：~1.5 min（含 DeepSeek 8 次交互 + 一次 `cargo build fixtures`）。
+
 ### 5.2.20 崩溃恢复集成测试（B 批，2026-07-20）
 
 `crates/cordis-runtime/tests/crash_recovery.rs` 用 6 项集成测试覆盖 P0-6 / P0-7 rollback journal 的跨 boot 恢复语义 —— 这些是"设计上安全，但只被单元测试碰过"的最关键路径：
