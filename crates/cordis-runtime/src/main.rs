@@ -1,13 +1,15 @@
 use cordis_runtime::agent::ShellAgentReply;
 use cordis_runtime::context::ContextRegistry;
 use cordis_runtime::host::{
-    AgentSessionKind, KernelApplyRequest, RuntimeHost,
+    AgentSessionKind, KernelApplyRequest, KernelPluginIterationResult, RuntimeHost,
 };
 use cordis_runtime::kernel::auto_update::{
     AutoUpdatePlan, AutoUpdater, FilePatch, VerificationEnvelope,
 };
 use cordis_runtime::kernel::evaluator::VerificationInput;
-use cordis_runtime::kernel::plugin_iteration::KernelPluginIterationRequest;
+use cordis_runtime::kernel::plugin_iteration::{
+    KernelPluginIterationRequest, PluginIterationFinalVerdict,
+};
 use cordis_runtime::kernel::verifier::VerificationProfile;
 use cordis_runtime::plugin::invoke::PluginInvoker;
 use cordis_runtime::plugin::loader::{default_loader_config, Loader};
@@ -518,16 +520,28 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             ServeMode::Command => handle_serve_command(&host, &mut state, line),
         };
 
-        match handled {
-            Ok(true) => {}
-            Ok(false) => break,
+        let keep_going = match handled {
+            Ok(true) => true,
+            Ok(false) => false,
             Err(err) => {
                 println!("serve error: {err}");
-                io::stdout().flush()?;
+                true
             }
-        }
+        };
+        // Flush stdout AFTER the command fully finished and BEFORE the next
+        // queued stdin line is consumed. In batch mode (`cat cmds | serve`)
+        // a trailing `quit` used to break the loop while the previous
+        // command's output was still buffered — truncating large results
+        // such as the `kernel iterate-plugins` JSON. Flushing here on EVERY
+        // path (including the quit/exit path, which returns Ok(false) before
+        // reaching the per-command flush) guarantees complete output no
+        // matter how the loop exits.
+        io::stdout().flush()?;
         // Persist history after every command.
         let _ = rl.save_history(&history_path);
+        if !keep_going {
+            break;
+        }
     }
 
     let _ = rl.save_history(&history_path);
@@ -669,11 +683,11 @@ fn handle_serve_command(
             } else if let Some(json) = command.strip_prefix("kernel plan-apply ") {
                 let request: KernelPluginIterationRequest = serde_json::from_str(json)?;
                 let result = host.iterate_plugins(request)?;
-                println!("{}", serde_json::to_string(&result)?);
+                emit_plugin_iteration_result(&result)?;
             } else if let Some(json) = command.strip_prefix("kernel iterate-plugins ") {
                 let request: KernelPluginIterationRequest = serde_json::from_str(json)?;
                 let result = host.iterate_plugins(request)?;
-                println!("{}", serde_json::to_string(&result)?);
+                emit_plugin_iteration_result(&result)?;
             } else if let Some(iteration_id) = command.strip_prefix("kernel iteration-status ") {
                 let result = host.kernel().plugin_iteration_status(iteration_id.trim())?;
                 println!("{}", serde_json::to_string(&result)?);
@@ -1101,6 +1115,31 @@ fn emit_agent_reply(reply: &ShellAgentReply) -> Result<(), Box<dyn std::error::E
         // input prompt starts on a fresh line.
         println!();
     }
+    Ok(())
+}
+
+/// Emit a plugin-iteration result: a human-readable one-line summary first
+/// (final_verdict + changed_paths + blocked_reason), then the full JSON on
+/// the LAST line so `tail -1 | jq` still parses a complete object. Reading a
+/// 450-line JSON blob by eye to find the verdict was the motivating pain.
+fn emit_plugin_iteration_result(
+    result: &KernelPluginIterationResult,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let verdict = match result.final_verdict {
+        PluginIterationFinalVerdict::Promoted => "promoted",
+        PluginIterationFinalVerdict::RolledBack => "rolled_back",
+        PluginIterationFinalVerdict::Blocked => "blocked",
+    };
+    let changed = if result.changed_paths.is_empty() {
+        "-".to_string()
+    } else {
+        result.changed_paths.join(", ")
+    };
+    let blocked = result.blocked_reason.as_deref().unwrap_or("-");
+    println!(
+        "iterate-plugins: final_verdict={verdict} changed_paths=[{changed}] blocked_reason={blocked}"
+    );
+    println!("{}", serde_json::to_string(result)?);
     Ok(())
 }
 

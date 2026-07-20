@@ -206,6 +206,19 @@ Agent 现在可以自主完成：读代码 → 理解结构 → 写/改文件 �
 - [x] **Plugin iteration symlink 逃逸**（P0-20）— `PluginEditExecutor::execute` 在写入前调用新 helper `resolve_under_workspace`：canonicalize 结果必须仍在 workspace_root 下。plugins 内的 symlink 指向 `/etc/passwd` 之类无法被写入。
 - [x] **Verifier shell 拼接**（P0-21）— 已随 A 批 P0-1 修复。`discover_rust_workspace_manifest` 输出的字符串被 `shell_words` 解析成 argv，空格 / `$` / `;` 无法被解释。
 
+### 5.2.23 REPL / serve 收尾正确性（E 批任务 C，2026-07-20）
+
+批处理式 `cat cmds | cordis-runtime serve fixtures` 时，`kernel iterate-plugins` 的最终结果 JSON 会被后面排队的 `quit` 打断（5.2.22 E2E 二轮复验里 run log 停在第二次 reload 的 `[snapshot] detected`，`final_verdict` 缺失）。改动仅限 [crates/cordis-runtime/src/main.rs](../../crates/cordis-runtime/src/main.rs)：
+
+- **根因**：serve 主循环里，每条命令的 stdout flush 只发生在 `handle_serve_command` 内部末尾（`io::stdout().flush()`）与主循环的 `Err` 分支；而 `quit`/`exit` 走 `Ok(false) => return Ok(false)`，在到达那个 flush **之前**就 `break` 出循环。批处理模式下 stdout 连到 pipe（全缓冲，非行缓冲），`iterate-plugins` 那一坨大 JSON 还躺在用户态缓冲区里没落地，`quit` 一 break、`run_serve` 返回、进程退出，缓冲区内容随之丢失 → 输出截断。（并非 stdin 并发消费，也非内部 reload 调 `process::exit`——排查过 `iterate_plugins` 全链路：rebuild 子进程用 `Stdio::null()` 接 stdin，两次 reload 与 promote/rollback 都不碰 `process::exit`。）
+- **修法**：把主循环尾部改成"先算 `keep_going`，**无条件 `io::stdout().flush()?`，再决定是否 break**"。这样退出路径（`Ok(false)`）与正常路径、错误路径统一都在读下一条 stdin 前 flush 完；命令处理中途不允许 `process::exit`（现状本就没有）。
+- **顺带**：新增 `emit_plugin_iteration_result()`，`kernel iterate-plugins` 与 `kernel plan-apply` 两个入口共用。先打印一行人类可读摘要 `iterate-plugins: final_verdict=... changed_paths=[...] blocked_reason=...`，完整 JSON 仍在其后**最后一行**，`tail -1 | jq` 照旧可解析。
+
+**验证**：
+- 快速失败路径（policy-blocked 的 `create_file` 到非法子树路径，`iterate_plugins` 立即返回 `rolled_back`，不触碰 rebuild/DeepSeek）：`printf '<req>\nquit\n' | serve fixtures 2>/dev/null | tail -1 | jq -r .final_verdict` → `rolled_back`，`jq 'keys|length'` → 19（结果结构体全字段齐全，无截断）；摘要行 `grep` 命中。
+- 慢路径（manual edit_plan：给 `time` 插件新建一个 trivial 通过测试，走完 rebuild + 两次 reload + verify + canary + promote）跑通一次：`final_verdict=promoted`，last line 10769 bytes 完整 JSON。
+- `cargo build -p cordis-runtime` 零新增 warning（bin 仍是既有 3 条：SIGTERM 函数指针 cast、`session_id` unused、闭包 `mut`）；`cargo test -p cordis-runtime --lib` 89 passed / 0 failed。
+
 ### 5.2.22 sha256 同步 + handle panic 隔离（D 批，2026-07-20）
 
 紧跟 5.2.21 E2E smoke 的两条 finding，一次修完：
