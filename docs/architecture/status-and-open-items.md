@@ -206,7 +206,7 @@ Agent 现在可以自主完成：读代码 → 理解结构 → 写/改文件 �
 - [x] **Plugin iteration symlink 逃逸**（P0-20）— `PluginEditExecutor::execute` 在写入前调用新 helper `resolve_under_workspace`：canonicalize 结果必须仍在 workspace_root 下。plugins 内的 symlink 指向 `/etc/passwd` 之类无法被写入。
 - [x] **Verifier shell 拼接**（P0-21）— 已随 A 批 P0-1 修复。`discover_rust_workspace_manifest` 输出的字符串被 `shell_words` 解析成 argv，空格 / `$` / `;` 无法被解释。
 
-### 5.2.23 REPL / serve 收尾正确性（E 批任务 C，2026-07-20）
+### 5.2.24 REPL / serve 收尾正确性（E 批任务 C，2026-07-20）
 
 批处理式 `cat cmds | cordis-runtime serve fixtures` 时，`kernel iterate-plugins` 的最终结果 JSON 会被后面排队的 `quit` 打断（5.2.22 E2E 二轮复验里 run log 停在第二次 reload 的 `[snapshot] detected`，`final_verdict` 缺失）。改动仅限 [crates/cordis-runtime/src/main.rs](../../crates/cordis-runtime/src/main.rs)：
 
@@ -218,6 +218,80 @@ Agent 现在可以自主完成：读代码 → 理解结构 → 写/改文件 �
 - 快速失败路径（policy-blocked 的 `create_file` 到非法子树路径，`iterate_plugins` 立即返回 `rolled_back`，不触碰 rebuild/DeepSeek）：`printf '<req>\nquit\n' | serve fixtures 2>/dev/null | tail -1 | jq -r .final_verdict` → `rolled_back`，`jq 'keys|length'` → 19（结果结构体全字段齐全，无截断）；摘要行 `grep` 命中。
 - 慢路径（manual edit_plan：给 `time` 插件新建一个 trivial 通过测试，走完 rebuild + 两次 reload + verify + canary + promote）跑通一次：`final_verdict=promoted`，last line 10769 bytes 完整 JSON。
 - `cargo build -p cordis-runtime` 零新增 warning（bin 仍是既有 3 条：SIGTERM 函数指针 cast、`session_id` unused、闭包 `mut`）；`cargo test -p cordis-runtime --lib` 89 passed / 0 failed。
+### 5.2.25 QQ 对话链路端到端验证（E 批任务 D，2026-07-20）
+
+首次对 **QQ 消息进来 → agent 处理 → 回复发出去** 的完整链路做端到端验证（此前只有 P0-23 签名单测，整条链从未拉通跑过）。产品面，runtime 侧只读不改。
+
+**链路图**（token 消耗点已标注）：
+
+```
+① OneBot 客户端 / curl
+      │  POST /onebot/event  (body + X-Signature: sha1=<hmac-sha1(body, access_token)>)
+      ▼
+② qq_serve HTTP 事件循环  run_event_loop  (lib.rs:491)
+      │  verify_onebot_signature 校验签名 (lib.rs:1038)：配了 token → 必校验，失败 401
+      │  先回 200 {"status":"ok"}，再解析事件
+      ▼
+③ handle_onebot_event  (lib.rs:575)
+      │  post_type != "message" → 丢弃
+      │  黑名单(block_groups) > 灰度白名单(allow_groups) 过滤
+      │  extract_message_info 抽取文本 / reply / CQ code
+      │  按 message_id 去重 (RECENT_MESSAGE_IDS, FIFO≤200)
+      ▼
+④ MESSAGE_QUEUE  (VecDeque, 上限 128；满则计数丢弃 MESSAGE_QUEUE_DROPPED)
+      ▼
+⑤ start_agent_poller 轮询线程  (lib.rs:839, 每 5s 排空)
+      │  should_process 过滤（≤2 字符 / 斜杠命令跳过）
+      │  拼 prompt: "[QQ group from <gid> (user <uid>)]: <text>"
+      │  cordis_plugin_sdk::agent_trigger(prompt)  → dlsym _cordis_agent_trigger
+      ▼
+⑥ runtime: _cordis_agent_trigger  (main.rs:46) → AGENT_TRIGGER_TX.send
+      ▼
+⑦ runtime inbox 循环  (main.rs:309, 仅 --runtime-only 模式)
+      │  strip_prefix "[QQ group from " 解析 group_id → by_group 分片（防跨群串台 P1-53）
+      │  group_id → session 映射 (agent_start，上限 512，LRU 驱逐)
+      │  host.agent_send(sid, combined)   ★消耗 DeepSeek token★
+      │  解析 agent 输出 JSON: suspend / respond
+      ▼
+⑧ 若 respond: host.invoke("qq","qq_send",{target:"group:<gid>",message})  (main.rs:408)
+      ▼
+⑨ qq_send  (lib.rs:1174) → onebot_send_group_msg → HTTP POST 到 onebot_url/send_group_msg
+      ▼
+⑩ OneBot 客户端发到 QQ 群
+```
+
+**注意**：agent 触发有两条并存路径 —— (a) `start_agent_poller` 主动 `agent_trigger`（上图 ⑤→⑥）；(b) agent 主动 `qq_fetch_messages` 拉取。本次验证走 (a) 主动推送路径。另外 inbox 里 agent 的 system hint 要求 agent 自己调 `qq_send` 后 `suspend`，而 main.rs:399 的 `respond` 分支也会兜底发一次——本次实测 agent 走的是 hint 指定的「自己调 qq_send + suspend」路径，sink 收到的正是 agent 主动发的那条。
+
+**分段验证结果**：
+
+| 段 | 内容 | 验证手段 | 结果 |
+|----|------|----------|------|
+| ② webhook 接收 | /health 就绪 + 事件 POST 返回 200 | `scripts/qq_e2e_verify.sh` A/B 段 | PASS |
+| ② 签名校验 | 合法 sig→200，错误 sig→401，无 sig(配token)→401 | `qq_e2e_verify.sh` B/C/D 段 | PASS |
+| ③ 事件解析/CQ | segments + raw_message + CQ code 抽取 | 单测 `extract_message_info_*` | PASS |
+| ③ 灰度/黑名单 | 白名单只放行白名单群；黑名单优先 | 单测 `webhook_ingest_dedup_whitelist_blocklist_chain` | PASS |
+| ④ 去重/队列 | 相同 message_id 只入队一次 | 单测（同上）+ `qq_e2e_verify.sh` E 段 | PASS |
+| ⑤ prompt 格式 | poller 拼的 prompt 能被 inbox 反解出 group_id | 单测 `agent_prompt_format_is_parseable_by_session_router` | PASS |
+| ⑤→⑦ trigger→路由 | agent_trigger 到达 inbox 并正确分组 | 探针脚本 serve 日志 `inbox: [123456] batch 1 msgs` | PASS |
+| ⑦ agent 处理 | DeepSeek 真实调用，agent 回复 | `scripts/qq_e2e_send_probe.sh`（消耗 token，跑 1 次） | PASS |
+| ⑧⑨ qq_send 出口 | 回复动作构造正确并到达 HTTP 出口 | mock sink 落盘 | PASS |
+
+出口段实证（mock OneBot sink 捕获）：发「bot 请只回复两个字：收到」，sink 收到
+`{"endpoint":"send_group_msg","params":{"group_id":123456,"message":"收到"},"authorization":"Bearer <token>"}`
+—— target/message/token 三者构造正确，`group:123456` 被正确解析为 `send_group_msg` + `group_id`。
+
+**脚本**（`scripts/`，均可重复执行）：
+- `mock_onebot_sink.py` — mock OneBot v11 HTTP API，拦 send_group_msg/send_private_msg 落盘。
+- `send_onebot_event.sh` — 用 openssl 算 HMAC-SHA1 X-Signature，构造并 POST OneBot v11 群消息事件；支持 `--bad-sig`/`--no-sig`/自定义 message_id，便于断言签名与去重。
+- `qq_e2e_verify.sh` — 不消耗 token 的分段编排（A~E 段），起 sink + serve，跑签名/去重段，输出 PASS/FAIL。
+- `qq_e2e_send_probe.sh` — 消耗 token 的出口段探针（需 `CONFIRM_TOKEN_SPEND=1`），真实 DeepSeek 触发 → 断言 sink 收到 send_group_msg。
+
+**新增测试**：`fixtures/plugins/qq/src/lib.rs` 内 `chain_tests` 模块 +6（webhook 入队/去重/灰度/黑名单、非消息忽略、prompt 格式契约、segments/CQ 抽取、should_process 过滤）。`cargo test -p qq` 由 5 → 11 全绿。
+
+**移交 runtime 的问题（本次只记录，未改）**：
+1. **测试隔离依赖 `config/` 同级目录**：`discover_config_dir`（config.rs:266）用 `fixtures_root.parent()/config` 定位 `llm_api.yaml`。用临时 fixtures 目录跑 `--runtime-only` 时找不到 config，inbox 报「LLM API key missing」。且 `config/` 被 `.gitignore`，git worktree 里默认不存在，需手动 symlink 才能跑通 agent 段。建议：支持 `CORDIS_CONFIG_DIR` 环境变量显式指定，或让 `--runtime-only` 也接受 `CORDIS_FIXTURES_ROOT` 联动定位 config。
+2. **agent 触发路径无背压/无确认**：`start_agent_poller` 每 5s 排空 MESSAGE_QUEUE 并逐条 `agent_trigger`，但 trigger 只是 `tx.send` 到 inbox channel，poller 不感知 agent 是否处理完；若 DeepSeek 慢，channel 会堆积（inbox 侧靠 `by_group` 合并缓解，但无上限背压）。属 runtime inbox 设计，记录待评估。
+3. **`_cordis_agent_trigger` 副作用写死路径**：main.rs:49 每次 trigger 都 `std::fs::write("/tmp/trigger_called.txt", ...)`，疑似调试残留，生产环境下多实例会互相覆盖。建议移除或改为可配置。
 
 ### 5.2.22 sha256 同步 + handle panic 隔离（D 批，2026-07-20）
 
