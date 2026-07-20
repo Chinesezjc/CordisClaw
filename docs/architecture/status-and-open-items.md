@@ -206,6 +206,14 @@ Agent 现在可以自主完成：读代码 → 理解结构 → 写/改文件 �
 - [x] **Plugin iteration symlink 逃逸**（P0-20）— `PluginEditExecutor::execute` 在写入前调用新 helper `resolve_under_workspace`：canonicalize 结果必须仍在 workspace_root 下。plugins 内的 symlink 指向 `/etc/passwd` 之类无法被写入。
 - [x] **Verifier shell 拼接**（P0-21）— 已随 A 批 P0-1 修复。`discover_rust_workspace_manifest` 输出的字符串被 `shell_words` 解析成 argv，空格 / `$` / `;` 无法被解释。
 
+### 5.2.27 已知存量债务：tests/runtime_host.rs 三类失效（2026-07-20 记录，未修）
+
+E 批任务 A 完成后全量跑 `cargo test -p cordis-runtime` 发现 `tests/runtime_host.rs` 有 8~16 项失败（数量随机器负载浮动），全部为**存量腐化**，与 E 批改动无关（该文件自 `2054be6` 后未动过）：
+
+1. **modulo 自迭代系列（3 项）**：`runtime_host_iterate_plugins_agent_adds_modulo_child_plugin_and_promotes` 等。测试模拟 agent 给 expr 加 `%` 算子，但 fixture 在 2026-06-02（`2eb0ff4`）已实现 Percent/Mod，`replace_once` 的 assert_ne 必然失败。**修法方向**：换一个 fixture 尚不存在的算子（如位运算），或改成先删再加。
+2. **serve_mode 系列（2 项）**：`serve_mode_supports_candidate_control_plane` / `serve_mode_supports_plugins_reload_and_kernel_status`。测试用 `--runtime-only` 启动并向 stdin 写 REPL 命令，但 `--runtime-only` 语义已在 QQ 集成（`5f4ad00`）时改为 inbox 驻留模式，完全不消费 stdin 命令。**修法方向**：去掉 `--runtime-only` 参数（用普通 serve REPL 模式），或者给 runtime-only 保留一个控制面命令通道。
+3. **LoadTimeout flake（其余）**：`host should boot: LoadTimeout { limit_ms: 30000 }`。单跑全过（16s 内 boot），并行 25 个测试同时全量加载 fixtures 时超 30s 上限。**修法方向**：测试内调大 load_timeout、或对重型 host 测试标 `#[serial]` / 单独二进制。
+
 ### 5.2.26 architecture.rs 失效测试修复（E 批任务 A，2026-07-20）
 
 D 批修掉 `tests/architecture.rs` 的编译错误后暴露的 11 项运行失败，根因是测试写于 `root/child` 嵌套 fixture 时代（P2-10 已拆除）。全部改造完成，`cargo test --test architecture` 17/17 全绿。处置方式：
