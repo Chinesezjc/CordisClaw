@@ -345,7 +345,25 @@ fn invoke_dylib(
         loaded.fingerprint_verified = true;
     }
     let api = unsafe { &*loaded.api_ptr };
-    Ok((api.handle)(PluginRequest { payload }))
+    let handle = api.handle;
+    let plugin_path_for_msg = plugin.plugin_path.clone();
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handle(PluginRequest { payload }))) {
+        Ok(resp) => Ok(resp),
+        Err(payload) => {
+            let msg = if let Some(s) = payload.downcast_ref::<&'static str>() {
+                (*s).to_string()
+            } else if let Some(s) = payload.downcast_ref::<String>() {
+                s.clone()
+            } else {
+                "<non-string panic payload>".to_string()
+            };
+            eprintln!("plugin {plugin_path_for_msg} panicked in handle: {msg}");
+            Err(PluginHostError::PluginInvocationFailed {
+                plugin_path: plugin_path_for_msg,
+                message: format!("plugin handle panicked: {msg}"),
+            })
+        }
+    }
 }
 
 fn invoke_json_artifact(

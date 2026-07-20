@@ -227,7 +227,7 @@ pub fn invoke_registered_plugin(
         message: format!("plugin invoke payload re-serialize failed: {err}"),
     })?;
 
-    let response = (api.handle)(PluginRequest { payload });
+    let response = call_handle_catch_unwind(plugin_path, api.handle, PluginRequest { payload })?;
 
     // For Task nodes: keep the dylib alive and look up the Service VTable.
     let is_task = docs
@@ -258,6 +258,15 @@ pub fn invoke_registered_plugin(
             let vtable = unsafe { create(c_node.as_ptr()) };
             if !vtable.is_null() {
                 let vtable = unsafe { &*vtable };
+                // NOTE: `vtable.start` is `extern "C" fn` — modern rustc
+                // *auto-aborts* if a Rust panic tries to unwind through
+                // a C ABI boundary (see `-C panic=abort` for extern "C"
+                // in rustc reference). A `catch_unwind` on this side of
+                // the boundary is therefore FUTILE: the panic hits the
+                // extern-fn frame, LLVM inserts `abort()`, we never
+                // return. The isolation for services must live inside
+                // the plugin's own SDK-provided wrapper (defense in
+                // depth is deferred to a future SDK change).
                 eprintln!(
                     "service: {plugin_path}::{node_id} registered (start={})",
                     (vtable.start)(vtable.data) == 0
@@ -348,5 +357,83 @@ fn resolve_exec_path(artifact_path: &Path, command: &str) -> PathBuf {
             .parent()
             .unwrap_or_else(|| Path::new("."))
             .join(command_path)
+    }
+}
+
+/// Guard a plugin `handle` call with `catch_unwind` so a panic inside a
+/// plugin's dylib can't unwind across into the runtime call stack and
+/// tear down the host process. The panic is converted into a
+/// `RuntimeError` tagged with the plugin path.
+///
+/// This only works because `handle` is `fn(...)` (not `extern "C" fn`).
+/// For `extern "C"` service entrypoints (start/stop), modern rustc
+/// auto-inserts `abort()` on any panic that would unwind through the
+/// C ABI, so catch_unwind on the runtime side is defeated. Panic
+/// isolation for services must be added inside the plugin SDK's own
+/// service wrapper — deferred.
+fn call_handle_catch_unwind(
+    plugin_path: &str,
+    handle: fn(PluginRequest) -> PluginResponse,
+    request: PluginRequest,
+) -> Result<PluginResponse, RuntimeError> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handle(request))) {
+        Ok(resp) => Ok(resp),
+        Err(payload) => {
+            let msg = panic_message(&payload);
+            eprintln!("plugin {plugin_path} panicked during handle: {msg}");
+            Err(RuntimeError::InvalidArgument {
+                message: format!("plugin {plugin_path} panicked in handle: {msg}"),
+            })
+        }
+    }
+}
+
+fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "<non-string panic payload>".to_string()
+    }
+}
+
+#[cfg(test)]
+mod panic_isolation_tests {
+    use super::*;
+
+    #[test]
+    fn handle_panic_is_caught_and_reported() {
+        fn boom(_: PluginRequest) -> PluginResponse {
+            panic!("deliberate test panic")
+        }
+        let err = call_handle_catch_unwind(
+            "test/panicker",
+            boom,
+            PluginRequest { payload: "{}".to_string() },
+        )
+        .expect_err("panic must convert to Err");
+        match err {
+            RuntimeError::InvalidArgument { message } => {
+                assert!(message.contains("panicked in handle"), "msg={message}");
+                assert!(message.contains("deliberate test panic"), "msg={message}");
+                assert!(message.contains("test/panicker"), "msg={message}");
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn handle_ok_passes_through() {
+        fn happy(_: PluginRequest) -> PluginResponse {
+            PluginResponse { payload: r#"{"ok":true}"#.to_string() }
+        }
+        let resp = call_handle_catch_unwind(
+            "test/happy",
+            happy,
+            PluginRequest { payload: "{}".to_string() },
+        )
+        .expect("no panic");
+        assert_eq!(resp.payload, r#"{"ok":true}"#);
     }
 }

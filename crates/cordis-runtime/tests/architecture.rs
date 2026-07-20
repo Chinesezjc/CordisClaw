@@ -3,7 +3,7 @@ use cordis_runtime::core::error::RuntimeError;
 use cordis_runtime::core::models::{
     ArtifactKind, NodeOutcome, PluginLoadResult, PluginUnavailableReason,
 };
-use cordis_runtime::execution::scheduler::{run_deterministic, ScheduledNode, SchedulerConfig};
+use cordis_runtime::execution::scheduler::SchedulerConfig;
 use cordis_runtime::plugin::invoke::PluginInvoker;
 use cordis_runtime::plugin::loader::{default_loader_config, Loader};
 use cordis_runtime::plugin::registry::{NodeRegistry, PluginRegistry};
@@ -561,50 +561,11 @@ fn inject_on_unavailable_plugin_returns_unavailable_error() {
 
 #[test]
 fn scheduler_is_deterministic_across_runs() {
-    let nodes = vec![
-        ScheduledNode {
-            id: "a".to_string(),
-            topo_level: 0,
-            priority: 1,
-            deps: vec![],
-            max_retries: 1,
-        },
-        ScheduledNode {
-            id: "b".to_string(),
-            topo_level: 1,
-            priority: 10,
-            deps: vec!["a".to_string()],
-            max_retries: 0,
-        },
-        ScheduledNode {
-            id: "c".to_string(),
-            topo_level: 1,
-            priority: 5,
-            deps: vec!["a".to_string()],
-            max_retries: 0,
-        },
-    ];
-
-    let run_once = || {
-        run_deterministic(
-            SchedulerConfig { max_parallelism: 1, max_concurrency: 1 },
-            nodes.clone(),
-            |node, attempt| {
-                if node.id == "a" && attempt == 0 {
-                    NodeOutcome::Failure
-                } else {
-                    NodeOutcome::Success
-                }
-            },
-        )
-    };
-
-    let first = run_once();
-    let second = run_once();
-
-    assert_eq!(first.order, second.order);
-    assert_eq!(first.outcomes, second.outcomes);
-    assert_eq!(first.order, vec!["a", "a", "b", "c"]);
+    // P2-7: the standalone `run_deterministic` scheduler was removed as
+    // dead code; ordering guarantees now live in
+    // `execution::engine::cmp_ready` and its unit tests. Kept as a
+    // no-op placeholder so the test-name history is preserved without
+    // resurrecting the removed API.
 }
 
 // ---------------------------------------------------------------------------

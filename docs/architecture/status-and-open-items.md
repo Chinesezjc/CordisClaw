@@ -206,6 +206,19 @@ Agent 现在可以自主完成：读代码 → 理解结构 → 写/改文件 �
 - [x] **Plugin iteration symlink 逃逸**（P0-20）— `PluginEditExecutor::execute` 在写入前调用新 helper `resolve_under_workspace`：canonicalize 结果必须仍在 workspace_root 下。plugins 内的 symlink 指向 `/etc/passwd` 之类无法被写入。
 - [x] **Verifier shell 拼接**（P0-21）— 已随 A 批 P0-1 修复。`discover_rust_workspace_manifest` 输出的字符串被 `shell_words` 解析成 argv，空格 / `$` / `;` 无法被解释。
 
+### 5.2.22 sha256 同步 + handle panic 隔离（D 批，2026-07-20）
+
+紧跟 5.2.21 E2E smoke 的两条 finding，一次修完：
+
+- **`rebuild_plugin_workspace` 后同步 `index.json` 里 `entry.sha256`**（[plugin/tooling.rs:246-278](../../crates/cordis-runtime/src/plugin/tooling.rs#L246-L278)）：stage-swap 完 `.so` 后，直接读回新文件 sha256，只更新受本次 rebuild 影响的 entry（避免对未 build 的 entry 也刷新，从而误 unlock 一些"stale 但 required"的检测）。原子写回 `index.json`。这条修复消除了 5.2.21 里 verifier 判 `HashMismatch → rolled_back` 的假失败。
+- **插件 `handle` panic 隔离**（[plugin/invoke.rs:230, 350-425](../../crates/cordis-runtime/src/plugin/invoke.rs#L230)、[cordis-plugin-host/src/lib.rs:347-370](../../crates/cordis-plugin-host/src/lib.rs#L347-L370)）：`api.handle` 是普通 `fn`（不是 `extern "C"`），Rust 允许 panic 跨帧 unwind，直接把 runtime 撕成 corrupted 状态。两处调用点都包 `catch_unwind(AssertUnwindSafe(...))`，捕获后转 `RuntimeError::InvalidArgument` / `PluginHostError::PluginInvocationFailed`，plugin_path 一并带出。**Service `start`/`stop`（`extern "C" fn`）不在此覆盖范围**：modern rustc 会在任何 panic 尝试 unwind 过 C ABI 时自动 `abort()`，runtime 侧的 `catch_unwind` 拦不住；后续要做 SDK 侧的服务包装。lib.rs 里 code comment 已注明这条边界。
+
+新增单测：`plugin::invoke::panic_isolation_tests` +2（handle panic 转 Err、正常 handle 透传）。lib 测试 87 → 89，全 pass。
+
+**顺带**：`tests/architecture.rs` 里 `scheduler_is_deterministic_across_runs` 引用了 P2-7 已删除的 `run_deterministic` / `ScheduledNode`，本次一并 stub 掉（保留 test 名 + 一段 comment，避免误再引入）。此前 `tests/architecture.rs` 本身另有 11 项因 `root/child` fixture 早年被拆解（P2-10）而失效，非本批范围，记 5.7 待清理。
+
+**E2E 复验**：注入相同 bug 二次跑 `iterate_plugins` — final JSON 因 REPL `quit` 打断没打完，但落盘验证：源码保留 fix 未 rollback；`index.json` sha256 与 `.so` bytes 一致。安全网从"误触发"变为"正确沉默"，agent 的 fix 得以持久化。
+
 ### 5.2.21 自迭代端到端 smoke test（C 批，2026-07-20）
 
 用真实 DeepSeek LLM + serve REPL 端到端跑一次 `iterate_plugins`，验证从 bug 注入 → 测试失败 → 自动定位 → 编辑 → 编译 → 测试 → rollback 判定的整条链路：

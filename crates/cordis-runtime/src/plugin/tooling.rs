@@ -244,6 +244,38 @@ pub fn rebuild_plugin_workspace(
     // the target — the OS unlinks the old file while any existing mapping
     // remains valid until unmap.
     stage_then_rename_file(&src, &dst)?;
+
+    // Post-rebuild: refresh `index.json` sha256 for the freshly-staged artifact
+    // (and, if present, `LoadedDylibApi::open`-derived docs so the same rebuild
+    // won't be flagged as `HashMismatch` by the loader on next verify pass).
+    // Without this, the E2E `iterate_plugins` path builds a candidate `.so`
+    // whose bytes have moved but whose sha256 in `index.json` still reflects
+    // the *previous* build; the loader's P0-13 sha check then rejects the
+    // fresh artifact as unavailable, forcing a hard rollback of code that
+    // actually passed tests. See docs/architecture/status-and-open-items.md
+    // section 5.2.21 for the observation from the E2E smoke.
+    let artifact_index_path = workspace_root.join("artifacts").join("index.json");
+    if artifact_index_path.exists() {
+        let mut index = load_artifact_index(&artifact_index_path)?;
+        let entry_name = name.to_string();
+        let mut updated = false;
+        for entry in &mut index.entries {
+            if entry.plugin_path == entry_name {
+                let resolved = resolve_artifact_path(&artifact_index_path, &entry.artifact_path);
+                let new_hash = sha256_file(&resolved)?;
+                if entry.sha256 != new_hash {
+                    entry.sha256 = new_hash;
+                    updated = true;
+                }
+                break;
+            }
+        }
+        if updated {
+            index.generated_at = current_build_marker();
+            write_pretty_json(&artifact_index_path, &index)?;
+        }
+    }
+
     Ok(vec![(name.to_string(), format!("{} -> {}", src.display(), dst.display()))])
 }
 
