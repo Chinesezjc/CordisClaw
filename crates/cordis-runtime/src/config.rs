@@ -264,6 +264,16 @@ impl Default for PluginConfigFile {
 }
 
 pub fn discover_config_dir(fixtures_root: &Path) -> PathBuf {
+    // Explicit override first. The sibling-directory heuristic below breaks
+    // whenever fixtures are copied to a temp dir (tests, git worktrees where
+    // `config/` is gitignored) — `CORDIS_CONFIG_DIR` lets those environments
+    // point at a real config without symlink games.
+    if let Some(dir) = std::env::var_os("CORDIS_CONFIG_DIR") {
+        let dir = PathBuf::from(dir);
+        if !dir.as_os_str().is_empty() {
+            return dir;
+        }
+    }
     let sibling = fixtures_root
         .parent()
         .unwrap_or_else(|| Path::new("."))

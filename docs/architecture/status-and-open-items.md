@@ -206,6 +206,16 @@ Agent 现在可以自主完成：读代码 → 理解结构 → 写/改文件 �
 - [x] **Plugin iteration symlink 逃逸**（P0-20）— `PluginEditExecutor::execute` 在写入前调用新 helper `resolve_under_workspace`：canonicalize 结果必须仍在 workspace_root 下。plugins 内的 symlink 指向 `/etc/passwd` 之类无法被写入。
 - [x] **Verifier shell 拼接**（P0-21）— 已随 A 批 P0-1 修复。`discover_rust_workspace_manifest` 输出的字符串被 `shell_words` 解析成 argv，空格 / `$` / `;` 无法被解释。
 
+### 5.2.29 QQ 链路移交的三个 runtime 问题（G 批，2026-07-20）
+
+D 批（QQ 对话链路 E2E 验证，5.2.25）记录、移交给 runtime 的三个问题，全部修完：
+
+1. **`CORDIS_CONFIG_DIR` 显式覆盖**（[config.rs `discover_config_dir`](../../crates/cordis-runtime/src/config.rs)）：原逻辑靠 `fixtures_root.parent()/config` 的兄弟目录启发式定位 `llm_api.yaml`，但 fixtures 被拷到临时目录（测试、`config/` 被 gitignore 的 git worktree）时失效。新增环境变量优先级最高，空值忽略。已验证 `CORDIS_CONFIG_DIR=/tmp/altconfig` 下 invoke 正常。
+2. **inbox 背压**（[main.rs `AGENT_TRIGGER_TX`](../../crates/cordis-runtime/src/main.rs)）：inbox 消费者阻塞在 LLM 往返上，原 unbounded `mpsc::channel` 在 DeepSeek 慢于消息速率时无限增长。改为 `sync_channel(256)` 有界通道；溢出时 `try_send` 失败，丢**最新**消息并计数（qq 插件上游已去重+批处理，持续过载下有界丢失优于无限内存增长）；前 5 次 + 之后每 50 次打一条 stderr。
+3. **`_cordis_agent_trigger` 调试残留移除**（[main.rs](../../crates/cordis-runtime/src/main.rs)）：每次 trigger 都 `fs::write("/tmp/trigger_called.txt", ...)`，多实例互相覆盖、生产环境无意义。直接删除。
+
+`cargo build` + lib 89 测试全绿；runtime-only serve 冒烟正常。
+
 ### 5.2.28 runtime_host.rs 三类存量失效全部闭合（F 批，2026-07-20）
 
 5.2.27 记录的三类债务 + 排查中暴露的四个连带问题，全部修完。`cargo test --test runtime_host` **25/25 全绿**（此前 17/25）。
@@ -316,10 +326,10 @@ D 批修掉 `tests/architecture.rs` 的编译错误后暴露的 11 项运行失�
 
 **新增测试**：`fixtures/plugins/qq/src/lib.rs` 内 `chain_tests` 模块 +6（webhook 入队/去重/灰度/黑名单、非消息忽略、prompt 格式契约、segments/CQ 抽取、should_process 过滤）。`cargo test -p qq` 由 5 → 11 全绿。
 
-**移交 runtime 的问题（本次只记录，未改）**：
-1. **测试隔离依赖 `config/` 同级目录**：`discover_config_dir`（config.rs:266）用 `fixtures_root.parent()/config` 定位 `llm_api.yaml`。用临时 fixtures 目录跑 `--runtime-only` 时找不到 config，inbox 报「LLM API key missing」。且 `config/` 被 `.gitignore`，git worktree 里默认不存在，需手动 symlink 才能跑通 agent 段。建议：支持 `CORDIS_CONFIG_DIR` 环境变量显式指定，或让 `--runtime-only` 也接受 `CORDIS_FIXTURES_ROOT` 联动定位 config。
-2. **agent 触发路径无背压/无确认**：`start_agent_poller` 每 5s 排空 MESSAGE_QUEUE 并逐条 `agent_trigger`，但 trigger 只是 `tx.send` 到 inbox channel，poller 不感知 agent 是否处理完；若 DeepSeek 慢，channel 会堆积（inbox 侧靠 `by_group` 合并缓解，但无上限背压）。属 runtime inbox 设计，记录待评估。
-3. **`_cordis_agent_trigger` 副作用写死路径**：main.rs:49 每次 trigger 都 `std::fs::write("/tmp/trigger_called.txt", ...)`，疑似调试残留，生产环境下多实例会互相覆盖。建议移除或改为可配置。
+**移交 runtime 的问题（三项已在 G 批 5.2.29 全部闭合）**：
+1. ~~测试隔离依赖 `config/` 同级目录~~ → G 批加 `CORDIS_CONFIG_DIR` 覆盖。
+2. ~~agent 触发路径无背压~~ → G 批改 `sync_channel(256)` 有界通道 + 溢出计数。
+3. ~~`_cordis_agent_trigger` 副作用写死路径~~ → G 批移除 `/tmp/trigger_called.txt` 写入。
 
 ### 5.2.22 sha256 同步 + handle panic 隔离（D 批，2026-07-20）
 

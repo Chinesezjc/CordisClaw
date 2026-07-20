@@ -41,16 +41,37 @@ struct ServeState {
 /// concurrent access from the plugin thread that raises the trigger and
 /// the main-loop thread that reads the receiver end). `OnceLock` gives us
 /// initialise-once + safe concurrent read semantics without unsafe.
-static AGENT_TRIGGER_TX: std::sync::OnceLock<std::sync::mpsc::Sender<String>> =
+///
+/// Bounded (`SyncSender`, capacity below): the inbox consumer blocks on
+/// LLM round-trips, so an unbounded channel would grow without limit
+/// whenever DeepSeek is slower than the QQ message rate. On overflow we
+/// drop the NEWEST message (try_send fails) and count it — the qq plugin
+/// already deduplicates and batches upstream, and a bounded loss under
+/// sustained overload beats unbounded memory growth.
+static AGENT_TRIGGER_TX: std::sync::OnceLock<std::sync::mpsc::SyncSender<String>> =
     std::sync::OnceLock::new();
+const AGENT_TRIGGER_CAPACITY: usize = 256;
+static AGENT_TRIGGER_DROPPED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 #[no_mangle]
 pub extern "C" fn _cordis_agent_trigger(msg: *const std::ffi::c_char) {
     if msg.is_null() { return; }
     let s = unsafe { std::ffi::CStr::from_ptr(msg).to_string_lossy().to_string() };
-    let _ = std::fs::write("/tmp/trigger_called.txt", &s);
     if let Some(tx) = AGENT_TRIGGER_TX.get() {
-        let _ = tx.send(s);
+        if tx.try_send(s).is_err() {
+            let dropped = AGENT_TRIGGER_DROPPED
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                + 1;
+            // Log every drop at first, then only every 50th so a sustained
+            // flood doesn't turn stderr into its own overload problem.
+            if dropped <= 5 || dropped % 50 == 0 {
+                eprintln!(
+                    "agent-trigger: inbox full ({AGENT_TRIGGER_CAPACITY}), \
+                     dropped {dropped} message(s) total"
+                );
+            }
+        }
     }
 }
 
@@ -299,7 +320,7 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     // they were spawned as detached threads during startup invocations.
     if runtime_only {
         eprintln!("runtime-only: inbox started");
-        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        let (tx, rx) = std::sync::mpsc::sync_channel::<String>(AGENT_TRIGGER_CAPACITY);
         let inject_queue = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::<String>::new()));
         // OnceLock::set returns Err if already set; runtime-only branch is
         // entered at most once so the first-set path always wins.
