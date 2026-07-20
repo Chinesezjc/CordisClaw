@@ -556,7 +556,12 @@ pub fn default_loader_config(root: impl AsRef<Path>) -> LoaderConfig {
         budget: LoaderBudget {
             max_total_plugins: 256,
             max_total_nodes: 4096,
-            load_timeout_ms: 30_000,
+            // 120s: normal boot is 1-16s even on loaded machines; the old
+            // 30s ceiling was routinely breached when ~25 integration
+            // tests each booted a full fixture host in parallel (CPU
+            // starvation, not a hang). 120s still catches genuine
+            // deadlocks while surviving parallel-test contention.
+            load_timeout_ms: 120_000,
         },
     }
 }

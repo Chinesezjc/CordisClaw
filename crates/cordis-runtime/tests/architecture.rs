@@ -1,9 +1,8 @@
 use cordis_runtime::context::ContextRegistry;
 use cordis_runtime::core::error::RuntimeError;
 use cordis_runtime::core::models::{
-    ArtifactKind, NodeOutcome, PluginLoadResult, PluginUnavailableReason,
+    ArtifactKind, PluginLoadResult, PluginUnavailableReason,
 };
-use cordis_runtime::execution::scheduler::SchedulerConfig;
 use cordis_runtime::plugin::invoke::PluginInvoker;
 use cordis_runtime::plugin::loader::{default_loader_config, Loader};
 use cordis_runtime::plugin::registry::{NodeRegistry, PluginRegistry};

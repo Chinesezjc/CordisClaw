@@ -230,15 +230,19 @@ fn stage_file(source: &Path, target: &Path) -> Result<(), RuntimeError> {
     // Clean up any stale staging file from a prior crash of this same pid.
     let _ = fs::remove_file(&staging_name);
 
-    // Try hard link first (instant on same filesystem), fall back to copy.
-    if std::fs::hard_link(source, &staging_name).is_err() {
-        fs::copy(source, &staging_name)
-            .map(|_| ())
-            .map_err(|e| RuntimeError::Io {
-                path: staging_name.clone(),
-                message: e.to_string(),
-            })?;
-    }
+    // Always COPY, never hard-link. A hard link shares the inode with the
+    // source: any writer that later mutates the source IN PLACE (fs::write,
+    // truncate — e.g. an external tool or a test fixture) silently rewrites
+    // the staged snapshot copy too, breaking the "old snapshot stays
+    // immutable" guarantee. Our own writers use tmp+rename (new inode) so
+    // they happened not to trigger this, but snapshot isolation must not
+    // depend on every writer being well-behaved.
+    fs::copy(source, &staging_name)
+        .map(|_| ())
+        .map_err(|e| RuntimeError::Io {
+            path: staging_name.clone(),
+            message: e.to_string(),
+        })?;
     fs::rename(&staging_name, target).map_err(|e| {
         // Clean up staging on rename failure.
         let _ = fs::remove_file(&staging_name);

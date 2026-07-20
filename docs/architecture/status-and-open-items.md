@@ -206,13 +206,23 @@ Agent 现在可以自主完成：读代码 → 理解结构 → 写/改文件 �
 - [x] **Plugin iteration symlink 逃逸**（P0-20）— `PluginEditExecutor::execute` 在写入前调用新 helper `resolve_under_workspace`：canonicalize 结果必须仍在 workspace_root 下。plugins 内的 symlink 指向 `/etc/passwd` 之类无法被写入。
 - [x] **Verifier shell 拼接**（P0-21）— 已随 A 批 P0-1 修复。`discover_rust_workspace_manifest` 输出的字符串被 `shell_words` 解析成 argv，空格 / `$` / `;` 无法被解释。
 
-### 5.2.27 已知存量债务：tests/runtime_host.rs 三类失效（2026-07-20 记录，未修）
+### 5.2.28 runtime_host.rs 三类存量失效全部闭合（F 批，2026-07-20）
 
-E 批任务 A 完成后全量跑 `cargo test -p cordis-runtime` 发现 `tests/runtime_host.rs` 有 8~16 项失败（数量随机器负载浮动），全部为**存量腐化**，与 E 批改动无关（该文件自 `2054be6` 后未动过）：
+5.2.27 记录的三类债务 + 排查中暴露的四个连带问题，全部修完。`cargo test --test runtime_host` **25/25 全绿**（此前 17/25）。
 
-1. **modulo 自迭代系列（3 项）**：`runtime_host_iterate_plugins_agent_adds_modulo_child_plugin_and_promotes` 等。测试模拟 agent 给 expr 加 `%` 算子，但 fixture 在 2026-06-02（`2eb0ff4`）已实现 Percent/Mod，`replace_once` 的 assert_ne 必然失败。**修法方向**：换一个 fixture 尚不存在的算子（如位运算），或改成先删再加。
-2. **serve_mode 系列（2 项）**：`serve_mode_supports_candidate_control_plane` / `serve_mode_supports_plugins_reload_and_kernel_status`。测试用 `--runtime-only` 启动并向 stdin 写 REPL 命令，但 `--runtime-only` 语义已在 QQ 集成（`5f4ad00`）时改为 inbox 驻留模式，完全不消费 stdin 命令。**修法方向**：去掉 `--runtime-only` 参数（用普通 serve REPL 模式），或者给 runtime-only 保留一个控制面命令通道。
-3. **LoadTimeout flake（其余）**：`host should boot: LoadTimeout { limit_ms: 30000 }`。单跑全过（16s 内 boot），并行 25 个测试同时全量加载 fixtures 时超 30s 上限。**修法方向**：测试内调大 load_timeout、或对重型 host 测试标 `#[serial]` / 单独二进制。
+**测试侧修复**：
+1. **modulo → dist（`~` 绝对差算子）**：三个脚本化 agent 测试原剧本是"给 expr 加 `%`"，但 fixture 在 `2eb0ff4`（2026-06-02）已实现 modulo，`replace_once` 锚点断言"内容未变"必炸。剧本换成 fixture 没有的 `~` (dist) 算子，同样走 scaffold 子插件 + lexer/parser/evaluator 三层接线 + promote/retry 流程，测试语义完整保留。
+2. **serve_mode 去掉 `--runtime-only`**：该 flag 语义已在 QQ 集成（`5f4ad00`）变为 inbox 驻留模式、不再消费 stdin REPL 命令。两测试改走普通 serve 模式 + `setup_fixture_workspace_copy`（prepare_artifacts 需要能解析 SDK path 依赖）；candidate 控制面测试的 demo process 插件换成真实 expr dylib（手工拼的 index 条目会被 prepare 重建抹掉 `execution` 字段）。
+3. **LoadTimeout flake**：`default_loader_config` 的 `load_timeout_ms` 30s → 120s（单跑 1-16s，25 测试并行时 CPU 饥饿常态超 30s；120s 仍能兜住真死锁）。四个重型脚本化测试加 `#[serial]`。
+4. **docs_drift 测试语义修正**：P0-14/P2-34 之后 dylib 内嵌 docs 是 ground truth，篡改 index.json 缓存不再产生 "docs_changed" 快照 diff，而是被 loader 反向 auto-heal。断言改为验证 heal（live snapshot 保持原 summary + index.json 被治愈）。
+
+**排查中发现并修复的 runtime 真 bug（三个）**：
+1. **boot 恢复后快照未刷新**（[host.rs:1167-1199](../../crates/cordis-runtime/src/host.rs#L1167)）：boot 时 journal replay 发生在初始快照构建**之后**，恢复了源码和 artifact 但 live registry 仍是崩溃前候选的 docs/nodes。修复：replay 返回 `true` 时补一次 `host.reload("/")`。
+2. **scaffold 子插件被 target-only rebuild 丢弃**（[host.rs:2796](../../crates/cordis-runtime/src/host.rs#L2796)）：`45febba` 把 iteration rebuild 从全量收窄到 `-p <target>`，但 scaffold 出的新 crate 既不在 target 的 build graph 也不在 index.json，导致"agent 新增子插件"的 promote 永远失败（`missing plugin scaffold` / 插件注册不上）。修复：changed_paths 含任何 Cargo.toml（结构性变更）时走全量 `rebuild_fixture_artifacts` 重新解析插件图 + 重建 index。
+3. **stage_file 硬链接破坏快照隔离**（[plugin/artifact.rs](../../crates/cordis-runtime/src/plugin/artifact.rs)）：staged snapshot 用 `hard_link` 优化，但硬链接共享 inode——任何对源文件的就地写（`fs::write`）同时改写已冻结的快照副本，"旧快照不可变"保证失守。修复：一律 copy。
+4. **scaffold 模板两处腐化**（host.rs 模板函数）：生成的 lib.rs 调 `plugin_docs(5 args)` 而 SDK 已是 6 参（缺 `command_name`），编译必炸；生成的 Cargo.toml 缺 `allow_generated_docs = true`，P1-48 收紧后 scaffold 无 interfaces.json 必被 resolver 拒绝。两处模板同步修正。
+
+**顺带**：`fixtures/plugins/root/` 补齐 tests/docs scaffold（此前只有 Cargo.toml + src，任何全量 prepare 都报 missing scaffold）。
 
 ### 5.2.26 architecture.rs 失效测试修复（E 批任务 A，2026-07-20）
 
