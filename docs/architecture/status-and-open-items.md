@@ -2,7 +2,7 @@
 
 ## 1. 判定口径
 
-- 本文基于当前仓库现状整理，最近更新：2026-07-17。
+- 本文基于当前仓库现状整理，最近更新：2026-07-20。
 - 历史规划蓝图已经吸收进 [design-blueprint.md](./design-blueprint.md)，因此本文结论来自三类证据的交叉比对：
   - 设计蓝图：[design-blueprint.md](./design-blueprint.md)
   - 架构文档：[system-overview.md](./system-overview.md)、[contracts-and-loading.md](./contracts-and-loading.md)、[runtime-semantics.md](./runtime-semantics.md)、[maintenance-guide.md](./maintenance-guide.md)
@@ -205,6 +205,47 @@ Agent 现在可以自主完成：读代码 → 理解结构 → 写/改文件 �
 - [x] **Filesystem / Git 白名单不再静默降级**（P0-19）— `canonicalize` 失败时不再退回未规范化路径。新增 `canonicalise_for_whitelist` / `validate_path_in_root` 的深度 ancestor 解析：路径不存在时 canonicalize 最深的存在祖先再拼 tail；两侧都失败则 fail-closed。`../../etc/shadow` 之类的构造再无绕过。
 - [x] **Plugin iteration symlink 逃逸**（P0-20）— `PluginEditExecutor::execute` 在写入前调用新 helper `resolve_under_workspace`：canonicalize 结果必须仍在 workspace_root 下。plugins 内的 symlink 指向 `/etc/passwd` 之类无法被写入。
 - [x] **Verifier shell 拼接**（P0-21）— 已随 A 批 P0-1 修复。`discover_rust_workspace_manifest` 输出的字符串被 `shell_words` 解析成 argv，空格 / `$` / `;` 无法被解释。
+
+### 5.2.19 回归测试大规模补齐（U/V/W/Y 批，2026-07-20）
+
+第二轮 review 把之前遗漏的 P0/P1/P2 修复补上单测。原则：**测试跟被测代码在同一 crate**——runtime crate 修的 bug 用 runtime 单测，plugin 内部的行为放到 plugin 自己的 `#[cfg(test)]` 里，避免 runtime 测试知道 plugin 实现细节。
+
+**Runtime 层（`crates/cordis-runtime/src/**`）新增 36 项，从 51 → 87：**
+
+- **context/mod.rs** +2：P1-1 CAS 独占语义（8 线程并发 commit 仅 1 成功）；P1-2 反向锁序双工无死锁。
+- **execution/gate.rs** +5：P1-8 `eval_first_success` 在 completion_order 不完整时也能收敛；AllOf / AtLeast 语义、cancel_pending 分支。
+- **execution/engine.rs** +3：P1-6 `KeyedPair` arity=1/=3 拒绝、AllOf 单入口接受、`cmp_ready` 排序（P1-4）。
+- **kernel/plugin_iteration.rs** +7：journal generation_id 唯一性（P0-6）、`load_journal` round-trip、`clear_journal` 幂等、P2-23 `absorb` dedup 保留 first backup、混合 create+delete 的 rollback 语义。
+- **kernel/auto_update.rs** +5：P2-27 find≠1 拒绝（0 / 多重）、P1-18 per-patch 失败回滚已应用部分、verify 失败回滚。
+- **kernel/notify.rs** +3：P1-10 register dedup、`unregister` 按 (plugin,node) 单点、`unregister_plugin` 只影响 target。
+- **kernel/health.rs** +2：P1-11 `sleep_interruptible` 早退（500ms 内响应停止）、自然完成路径。
+- **plugin/package.rs** +2：P1-49 `normalize_crate_name` 冲突（foo-bar / foo_bar / a/b / a-b 归一同名）。
+- **plugin/tooling.rs** +2：P1-17 `write_pretty_json` tmp+rename 无 leftover、`stage_then_rename_file` 保留 exec 位。
+- **agent.rs** +3：P1-32/33 `compact_history` 阈值下 no-op、阈值上 shrink+重算 estimated_tokens、`estimate_tokens` 长度线性。
+
+**Plugin 层（`fixtures/plugins/**`）新增 30 项：**
+
+- **git/src/lib.rs** +7：P0-18 `is_safe_ref` 拒 leading-dash / shell metachars / 空、`is_safe_hash` 拒 slash、`validate_commit_message` 只拒空（不再子串禁词）、接受含 `--force` 字面的正常 commit message。
+- **filesystem/src/lib.rs** +3：P0-19 `canonicalise_for_whitelist` 已存在路径 / 不存在 leaf 走 ancestor / 不可能路径要么返回 None 要么仍是绝对路径。
+- **shell/src/lib.rs** +7：P1-42 `split_script_commands` 尊重双/单引号内 `;`、按 `\n` 或 `;` 顶层分、`split_tokens` 用 shell_words 拒未闭合引号 / 处理带空格的引用参数 / 空输入。
+- **gacha/src/lib.rs** +5：P1-43 `gacha_status` 节点拒 `reset` / `pull`、`gacha_entry` 节点接受全命令集、未知 node_id 拒、缺 node_id 走 entry 语义。
+- **expr/parser/src/core.rs** +3：P1-45 深嵌套括号 / 右递归 `1^1^1...` 触发 `TooDeep`、正常输入通过。
+- **expr/evaluator/src/core.rs** +5：P1-47 pow → Inf / NaN 都触发 `NonFinite`、finite 结果通过、`DivisionByZero` 语义不被 NonFinite 吞、P1-46 factorial overflow 冒泡到 EvaluateExpressionError。
+- **expr/evaluator/factorial/src/core.rs** +5：P1-46 n>170 拒绝、170! 仍 finite、大 n 快速拒（<50ms）、domain error 语义、`0!=1!=1`。
+
+**测试组织约定**：runtime 层测试放 runtime crate；插件内部行为放插件自己的 `#[cfg(test)] mod tests`；跨插件共享的 SSRF 单测集中在 `fixtures/plugins/_net/` crate；SDK 层的 `AbiFingerprint::current_build` 单测在 SDK crate。
+
+**运行方式**：
+```
+cargo test --lib                                    # SDK 3 + runtime 87 = 90
+cargo test --manifest-path fixtures/plugins/Cargo.toml --lib
+                                                    # git+fs+shell+gacha 22 + expr 组合 13 + net 3
+cd fixtures/plugins/expr/parser && cargo test --lib # 3 (excluded from plugin workspace)
+cd fixtures/plugins/expr/evaluator/factorial && cargo test --lib # 5 (同上)
+cd fixtures/plugins/expr/lexer && cargo test --lib  # excluded, external tests only
+```
+
+至此测试面从 51 (runtime lib only) 扩展到 **runtime 87 + SDK 3 + net 3 + plugins 30 = 123 单测**。
 
 ### 5.2.18 P2 收尾（T 批，2026-07-17 已闭合）
 

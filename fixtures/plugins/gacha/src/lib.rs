@@ -566,3 +566,69 @@ export_plugin_api! {
     docs = docs_value(),
     handle = api_handle,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{handle, GachaRequest};
+
+    fn req(node_id: Option<&str>, cmd: &str) -> GachaRequest {
+        GachaRequest {
+            node_id: node_id.map(|s| s.to_string()),
+            cmd: cmd.to_string(),
+            count: None,
+            args: None,
+        }
+    }
+
+    /// P1-43: `gacha_status` node must reject any command other than
+    /// `status`. Without the whitelist an agent using `gacha_status`
+    /// could send `{cmd:"reset"}` and wipe pity state — a real
+    /// regression demonstrated in the review.
+    #[test]
+    fn gacha_status_node_rejects_reset() {
+        let err = handle(req(Some("gacha_status"), "reset")).unwrap_err();
+        assert!(err.contains("gacha_status"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn gacha_status_node_rejects_pull() {
+        let err = handle(req(Some("gacha_status"), "pull")).unwrap_err();
+        assert!(err.contains("gacha_status"));
+    }
+
+    #[test]
+    fn gacha_entry_node_accepts_all_commands() {
+        // Just verify the whitelist gate doesn't reject at the entry
+        // node — the underlying handle may still fail for other reasons
+        // (state file, etc.) but the P1-43 guard must not fire.
+        for cmd in &["status", "banner", "list"] {
+            let r = handle(req(Some("gacha_entry"), cmd));
+            // status/banner/list are read-only; they shouldn't hit the
+            // node-id whitelist error path even if the state file
+            // isn't present (they default state).
+            if let Err(e) = &r {
+                assert!(
+                    !e.contains("gacha_status only supports"),
+                    "cmd={cmd}: {e}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_node_id_is_rejected() {
+        let err = handle(req(Some("gacha_evil"), "status")).unwrap_err();
+        assert!(err.contains("unknown gacha node_id"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn missing_node_id_defaults_to_entry_behavior() {
+        // Backwards compat: no node_id → treat as entry (accept all).
+        let r = handle(req(None, "status"));
+        // Might still fail for state-file reasons, but not for
+        // node_id whitelist.
+        if let Err(e) = &r {
+            assert!(!e.contains("only supports"), "unexpected: {e}");
+        }
+    }
+}

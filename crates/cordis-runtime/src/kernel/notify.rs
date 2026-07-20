@@ -63,6 +63,19 @@ pub fn unregister_plugin(plugin_path: &str) {
     handlers.retain(|(p, _)| p != plugin_path);
 }
 
+/// P1-10 test helper: number of registered handlers whose plugin_path
+/// matches `plugin_path`. Not part of the public API — but crate-private
+/// to let the notify unit tests avoid touching HANDLERS directly.
+#[cfg(test)]
+pub(crate) fn handler_count_for(plugin_path: &str) -> usize {
+    HANDLERS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .filter(|(p, _)| p == plugin_path)
+        .count()
+}
+
 /// Send a message to all registered notification handlers.
 pub fn send(host: &RuntimeHost, message: &str) {
     let handlers = HANDLERS
@@ -79,5 +92,61 @@ pub fn send(host: &RuntimeHost, message: &str) {
                 "[notify] {plugin_path}::{node_id} failed: {e}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // P1-10 regression: register/unregister must be idempotent and
+    // plugin-scoped. Tests use unique plugin paths per test to avoid
+    // stepping on the process-global HANDLERS state that other tests
+    // may touch.
+
+    #[test]
+    fn register_is_idempotent() {
+        let p = "notify_test_p1_dedup";
+        // Clean up in case a prior test left something around.
+        unregister_plugin(p);
+        assert_eq!(handler_count_for(p), 0);
+        register(p, "n1");
+        register(p, "n1");
+        register(p, "n1");
+        assert_eq!(handler_count_for(p), 1, "duplicate register must be no-op");
+        // Different node id is a distinct entry.
+        register(p, "n2");
+        assert_eq!(handler_count_for(p), 2);
+        unregister_plugin(p);
+        assert_eq!(handler_count_for(p), 0);
+    }
+
+    #[test]
+    fn unregister_specific_node_leaves_others() {
+        let p = "notify_test_p1_scoped_unreg";
+        unregister_plugin(p);
+        register(p, "n1");
+        register(p, "n2");
+        assert_eq!(handler_count_for(p), 2);
+        unregister(p, "n1");
+        assert_eq!(handler_count_for(p), 1);
+        unregister_plugin(p);
+    }
+
+    #[test]
+    fn unregister_plugin_only_affects_target() {
+        let p = "notify_test_p1_scoped_unreg_plugin";
+        let other = "notify_test_p1_scoped_other";
+        unregister_plugin(p);
+        unregister_plugin(other);
+        register(p, "a");
+        register(p, "b");
+        register(other, "a");
+        assert_eq!(handler_count_for(p), 2);
+        assert_eq!(handler_count_for(other), 1);
+        unregister_plugin(p);
+        assert_eq!(handler_count_for(p), 0);
+        assert_eq!(handler_count_for(other), 1, "other plugin's handlers stay");
+        unregister_plugin(other);
     }
 }

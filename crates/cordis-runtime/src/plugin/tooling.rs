@@ -1273,6 +1273,54 @@ mod tests {
         // maximum kernel-allowed pid on all common systems.
         assert!(!lock_pid_is_live(u32::MAX - 1));
     }
+
+    /// P1-17: `write_pretty_json` is the durable writer for
+    /// interfaces.json / artifact/index.json / lock files. Verify tmp
+    /// + rename semantics: no stray `.cordis-tmp.<pid>` after a
+    /// success.
+    #[test]
+    fn write_pretty_json_is_atomic_and_leaves_no_tmp() {
+        use super::write_pretty_json;
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("index.json");
+        write_pretty_json(&target, &serde_json::json!({"k": 1})).unwrap();
+        assert!(target.exists());
+        // No leftover tmp file.
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".cordis-tmp."))
+            .collect();
+        assert!(leftovers.is_empty(), "no tmp leftover expected");
+        // Overwrite preserves prior success semantics: file has new bytes.
+        write_pretty_json(&target, &serde_json::json!({"k": 2})).unwrap();
+        let text = std::fs::read_to_string(&target).unwrap();
+        assert!(text.contains("\"k\""));
+        assert!(text.contains("2"));
+    }
+
+    /// P0-9 sibling: `stage_then_rename_file` preserves the source's
+    /// executable bit on Unix (dlopen requires +x on the dylib).
+    #[cfg(unix)]
+    #[test]
+    fn stage_then_rename_preserves_exec_bit() {
+        use super::stage_then_rename_file;
+        use std::os::unix::fs::PermissionsExt;
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        let src = dir.path().join("plug.so");
+        let dst = dir.path().join("target.so");
+        std::fs::write(&src, b"bytes").unwrap();
+        std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o755)).unwrap();
+        stage_then_rename_file(&src, &dst).unwrap();
+        let mode = std::fs::metadata(&dst).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o755,
+            "exec bits should be preserved, got {mode:o}"
+        );
+    }
 }
 
 fn write_pretty_json<T: serde::Serialize>(path: &Path, value: &T) -> Result<(), RuntimeError> {

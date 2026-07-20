@@ -1418,6 +1418,155 @@ mod tests {
         rollback.rollback().unwrap();
         assert_eq!(fs::read(&target).unwrap(), b"original");
     }
+
+    /// P0-6/7: journal generation_id round-trips; two persists yield
+    /// distinct ids.
+    #[test]
+    fn journal_generation_id_round_trip_and_distinctness() {
+        let workspace = TempDir::new().unwrap();
+        let rb = PluginEditRollback::single_backup(
+            workspace.path(),
+            "plugins/demo/src/lib.rs",
+            Some(b"orig".to_vec()),
+        );
+        let jp = workspace.path().join("j.json");
+        rb.persist_journal(&jp, "iter").unwrap();
+        let id1 = PluginEditRollback::journal_generation_id(&jp)
+            .unwrap()
+            .unwrap();
+        assert!(!id1.is_empty());
+        rb.persist_journal(&jp, "iter").unwrap();
+        let id2 = PluginEditRollback::journal_generation_id(&jp)
+            .unwrap()
+            .unwrap();
+        assert_ne!(id1, id2);
+    }
+
+    #[test]
+    fn journal_generation_id_returns_none_when_absent() {
+        let workspace = TempDir::new().unwrap();
+        let jp = workspace.path().join("nonexistent.json");
+        assert!(PluginEditRollback::journal_generation_id(&jp)
+            .unwrap()
+            .is_none());
+    }
+
+    /// P0-6 durability: load_journal round-trips backups via hex.
+    #[test]
+    fn load_journal_round_trip_preserves_backup_bytes() {
+        let workspace = TempDir::new().unwrap();
+        let rb = PluginEditRollback::single_backup(
+            workspace.path(),
+            "plugins/demo/src/lib.rs",
+            Some(b"pre-edit\n\x00\xffbytes".to_vec()),
+        );
+        let jp = workspace.path().join("j.json");
+        rb.persist_journal(&jp, "iter-a").unwrap();
+        let loaded = PluginEditRollback::load_journal(workspace.path(), &jp)
+            .unwrap()
+            .expect("journal exists");
+        assert_eq!(loaded.len(), 1);
+    }
+
+    #[test]
+    fn clear_journal_removes_file() {
+        let workspace = TempDir::new().unwrap();
+        let rb = PluginEditRollback::empty(workspace.path());
+        let jp = workspace.path().join("j.json");
+        rb.persist_journal(&jp, "iter").unwrap();
+        assert!(jp.exists());
+        PluginEditRollback::clear_journal(&jp).unwrap();
+        assert!(!jp.exists());
+        // Idempotent: clearing an absent journal is fine.
+        PluginEditRollback::clear_journal(&jp).unwrap();
+    }
+
+    /// P2-23: `absorb` dedups by `rel_path`, keeping the first backup so
+    /// rollback restores the earliest known bytes (not later mid-run
+    /// snapshots).
+    #[test]
+    fn rollback_absorb_dedups_by_rel_path_preserving_first() {
+        let workspace = TempDir::new().unwrap();
+        let target = workspace.path().join("plugins/demo/src/lib.rs");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(&target, b"orig").unwrap();
+
+        let mut acc = PluginEditRollback::single_backup(
+            workspace.path(),
+            "plugins/demo/src/lib.rs",
+            Some(b"orig".to_vec()),
+        );
+        // A second backup for the same file with different bytes MUST be
+        // discarded by absorb.
+        let second = PluginEditRollback::single_backup(
+            workspace.path(),
+            "plugins/demo/src/lib.rs",
+            Some(b"mid-run".to_vec()),
+        );
+        acc.absorb(second).unwrap();
+        assert_eq!(acc.len(), 1);
+        // Mutate the file, then rollback: bytes must go back to the FIRST
+        // backup (b"orig"), not the second (b"mid-run").
+        fs::write(&target, b"mutated").unwrap();
+        acc.rollback().unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"orig");
+    }
+
+    #[test]
+    fn rollback_absorb_preserves_distinct_paths() {
+        let workspace = TempDir::new().unwrap();
+        fs::create_dir_all(workspace.path().join("plugins/demo/src")).unwrap();
+        fs::write(workspace.path().join("plugins/demo/src/a.rs"), b"a-orig").unwrap();
+        fs::write(workspace.path().join("plugins/demo/src/b.rs"), b"b-orig").unwrap();
+
+        let mut acc = PluginEditRollback::single_backup(
+            workspace.path(),
+            "plugins/demo/src/a.rs",
+            Some(b"a-orig".to_vec()),
+        );
+        let second = PluginEditRollback::single_backup(
+            workspace.path(),
+            "plugins/demo/src/b.rs",
+            Some(b"b-orig".to_vec()),
+        );
+        acc.absorb(second).unwrap();
+        assert_eq!(acc.len(), 2);
+    }
+
+    /// P1-29 spirit / P0-5 spirit: an edit that deletes a file records
+    /// a `None` original (i.e. "file did not exist") vs. a `Some(...)`
+    /// original (i.e. "restore these bytes"). Rollback preserves both
+    /// semantics.
+    #[test]
+    fn rollback_recreates_deleted_file_and_removes_created_file() {
+        let workspace = TempDir::new().unwrap();
+        let existing = workspace.path().join("plugins/demo/src/existing.rs");
+        fs::create_dir_all(existing.parent().unwrap()).unwrap();
+        fs::write(&existing, b"before").unwrap();
+
+        // Simulate: delete the existing file, then create a new one.
+        let mut rb = PluginEditRollback::empty(workspace.path());
+        let del_backup = PluginEditRollback::single_backup(
+            workspace.path(),
+            "plugins/demo/src/existing.rs",
+            Some(b"before".to_vec()),
+        );
+        rb.absorb(del_backup).unwrap();
+        fs::remove_file(&existing).unwrap();
+
+        let create_backup = PluginEditRollback::single_backup(
+            workspace.path(),
+            "plugins/demo/src/fresh.rs",
+            None, // did not exist before
+        );
+        rb.absorb(create_backup).unwrap();
+        let fresh = workspace.path().join("plugins/demo/src/fresh.rs");
+        fs::write(&fresh, b"new").unwrap();
+
+        rb.rollback().unwrap();
+        assert_eq!(fs::read(&existing).unwrap(), b"before");
+        assert!(!fresh.exists(), "created file should be removed on rollback");
+    }
 }
 
 // ---------------------------------------------------------------------------

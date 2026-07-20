@@ -3686,4 +3686,65 @@ mod tests {
         chunks.push((0, "data: [DONE]\n\n".to_string()));
         chunks
     }
+
+    fn test_config() -> LlmApiConfig {
+        LlmApiConfig {
+            provider: "deepseek".to_string(),
+            base_url: "http://127.0.0.1:12345/v1".to_string(),
+            api_key: Some("test-key".to_string()),
+            model: "deepseek-reasoner".to_string(),
+            ..LlmApiConfig::default()
+        }
+    }
+
+    /// P1-32: compact_history must be a no-op below COMPACT_AT_MSGS
+    /// and return (before_len, before_len).
+    #[test]
+    fn compact_history_is_noop_below_threshold() {
+        let mut session = AgentSession::new(test_config(), "runtime_shell").unwrap();
+        // Add far fewer than COMPACT_AT_MSGS (4000).
+        for i in 0..10 {
+            session.remember_exchange(&format!("u{i}"), &format!("a{i}"), None);
+        }
+        let before = session.status().stored_messages;
+        let (old_len, new_len) = session.compact_history();
+        assert_eq!(old_len, before);
+        assert_eq!(new_len, before);
+    }
+
+    /// P1-32 + P1-33: after crossing threshold, compact returns
+    /// (before > after) and resets `estimated_tokens` to sum of what
+    /// remains. Also verifies char-based truncation for multi-byte
+    /// text.
+    #[test]
+    fn compact_history_shrinks_and_resets_estimated_tokens() {
+        let mut session = AgentSession::new(test_config(), "runtime_shell").unwrap();
+        // 4000+ msgs to cross COMPACT_AT_MSGS; include some Chinese
+        // text so the char/byte guard (P1-33) is exercised.
+        for i in 0..2200 {
+            session.remember_exchange(&format!("请求{i}"), &format!("回复{i}"), None);
+        }
+        let before = session.status().stored_messages;
+        assert!(before > 4000, "sanity: {before} messages");
+        let (old_len, new_len) = session.compact_history();
+        assert_eq!(old_len, before);
+        assert!(new_len < old_len);
+        assert!(new_len > 0);
+        // estimated_tokens should be non-zero but bounded by the
+        // remaining history — no runaway accumulation.
+        let est = session.to_snapshot().estimated_tokens;
+        assert!(
+            est < old_len * 200, // upper-bound sanity check
+            "estimated_tokens={est}, expected < {}",
+            old_len * 200
+        );
+    }
+
+    #[test]
+    fn estimate_tokens_scales_with_length() {
+        assert_eq!(estimate_tokens(""), 0);
+        let small = estimate_tokens("hello world");
+        let large = estimate_tokens(&"hello world ".repeat(100));
+        assert!(large > small * 50, "large={large} small={small}");
+    }
 }

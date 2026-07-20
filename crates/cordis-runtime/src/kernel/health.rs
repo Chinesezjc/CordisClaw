@@ -89,3 +89,44 @@ fn sleep_interruptible(total: Duration, stop_flag: &AtomicBool) -> bool {
     }
     !stop_flag.load(Ordering::SeqCst)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// P1-11: `sleep_interruptible` must observe the stop flag inside a
+    /// long total sleep and return early. Ensures shutdown latency is
+    /// bounded by the poll interval (500ms) regardless of health-loop
+    /// interval (may be an hour).
+    #[test]
+    fn sleep_interruptible_returns_early_on_stop_flag() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let flag_clone = flag.clone();
+        let handle = std::thread::spawn(move || {
+            let started = Instant::now();
+            // Ask for a very long sleep; the stop flag should short-
+            // circuit it.
+            let completed = sleep_interruptible(Duration::from_secs(60), &flag_clone);
+            (completed, started.elapsed())
+        });
+        // Give the sleeper time to enter the loop, then flip the flag.
+        std::thread::sleep(Duration::from_millis(50));
+        flag.store(true, Ordering::SeqCst);
+        let (completed, elapsed) = handle.join().unwrap();
+        assert!(!completed, "sleep should return false when stop was set");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "should exit within one poll window (~500ms), got {elapsed:?}"
+        );
+    }
+
+    /// Sleep runs to completion when the flag is never set.
+    #[test]
+    fn sleep_interruptible_completes_naturally_without_stop() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let started = Instant::now();
+        let completed = sleep_interruptible(Duration::from_millis(150), &flag);
+        assert!(completed);
+        assert!(started.elapsed() >= Duration::from_millis(140));
+    }
+}

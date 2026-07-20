@@ -447,3 +447,116 @@ fn apply_toml_patch(
         reason: "toml dotted key must not be empty".to_string(),
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kernel::evaluator::VerificationInput;
+    use std::fs;
+    use tempfile::TempDir;
+
+    fn plan(patches: Vec<FilePatch>) -> AutoUpdatePlan {
+        AutoUpdatePlan {
+            issue_id: "issue".to_string(),
+            patch_id: "patch".to_string(),
+            manual_approved: false,
+            diff_lines: 0,
+            patches,
+        }
+    }
+
+    fn verify_ok(_: &Path) -> Result<VerificationEnvelope, RuntimeError> {
+        Ok(VerificationEnvelope::from(VerificationInput {
+            tests_passed: true,
+            safety_checks_passed: true,
+            quality_score: 100,
+        }))
+    }
+
+    /// P2-27: `find` must appear exactly once. Zero → not-found; >1 →
+    /// ambiguous, refuse to touch the file.
+    #[test]
+    fn text_patch_rejects_when_find_appears_zero_times() {
+        let ws = TempDir::new().unwrap();
+        fs::write(ws.path().join("f.txt"), "unrelated").unwrap();
+        let updater = AutoUpdater::new(ws.path());
+        let err = updater
+            .execute(plan(vec![FilePatch::text("f.txt", "nope", "yes")]), verify_ok)
+            .unwrap_err();
+        assert!(matches!(err, RuntimeError::AutoUpdatePatternNotFound { .. }));
+    }
+
+    #[test]
+    fn text_patch_rejects_when_find_is_ambiguous() {
+        let ws = TempDir::new().unwrap();
+        fs::write(ws.path().join("f.txt"), "hello hello").unwrap();
+        let updater = AutoUpdater::new(ws.path());
+        let err = updater
+            .execute(plan(vec![FilePatch::text("f.txt", "hello", "world")]), verify_ok)
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("appears") && msg.contains("2"), "unexpected: {msg}");
+        // File must be unchanged.
+        assert_eq!(
+            fs::read_to_string(ws.path().join("f.txt")).unwrap(),
+            "hello hello"
+        );
+    }
+
+    #[test]
+    fn text_patch_applies_when_unique_and_verify_ok() {
+        let ws = TempDir::new().unwrap();
+        fs::write(ws.path().join("a.txt"), "foo bar").unwrap();
+        let updater = AutoUpdater::new(ws.path());
+        let result = updater
+            .execute(plan(vec![FilePatch::text("a.txt", "foo", "FOO")]), verify_ok)
+            .unwrap();
+        assert!(!result.rolled_back);
+        assert_eq!(fs::read_to_string(ws.path().join("a.txt")).unwrap(), "FOO bar");
+    }
+
+    /// P1-18: if patch N fails, patches 1..N-1 must be rolled back —
+    /// the earlier ones are otherwise silently left on disk.
+    #[test]
+    fn per_patch_failure_rolls_back_preceding_writes() {
+        let ws = TempDir::new().unwrap();
+        fs::write(ws.path().join("a.txt"), "before").unwrap();
+        fs::write(ws.path().join("b.txt"), "no-match-here").unwrap();
+        let updater = AutoUpdater::new(ws.path());
+        // First patch succeeds (writes "after"), second patch fails
+        // (pattern not found). Expected: after error, a.txt back to
+        // "before".
+        let err = updater
+            .execute(
+                plan(vec![
+                    FilePatch::text("a.txt", "before", "after"),
+                    FilePatch::text("b.txt", "nope", "yes"),
+                ]),
+                verify_ok,
+            )
+            .unwrap_err();
+        assert!(matches!(err, RuntimeError::AutoUpdatePatternNotFound { .. }));
+        assert_eq!(
+            fs::read_to_string(ws.path().join("a.txt")).unwrap(),
+            "before",
+            "first patch must be rolled back on later failure"
+        );
+    }
+
+    #[test]
+    fn verify_failure_rolls_back_applied_patches() {
+        let ws = TempDir::new().unwrap();
+        fs::write(ws.path().join("a.txt"), "x").unwrap();
+        let updater = AutoUpdater::new(ws.path());
+        let verify_fail = |_: &Path| -> Result<VerificationEnvelope, RuntimeError> {
+            Err(RuntimeError::Invariant {
+                message: "verify said no".to_string(),
+            })
+        };
+        let err = updater
+            .execute(plan(vec![FilePatch::text("a.txt", "x", "y")]), verify_fail)
+            .unwrap_err();
+        assert!(matches!(err, RuntimeError::AutoUpdateVerifyFailed { .. }));
+        assert_eq!(fs::read_to_string(ws.path().join("a.txt")).unwrap(), "x");
+    }
+}

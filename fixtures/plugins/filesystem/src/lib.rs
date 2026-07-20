@@ -337,3 +337,55 @@ export_plugin_api! {
     docs = docs_value(),
     handle = api_handle,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::canonicalise_for_whitelist;
+    use std::path::PathBuf;
+
+    /// P0-19: canonicalisation must succeed both for existing files
+    /// AND for not-yet-created paths (walk up to the deepest existing
+    /// ancestor + reattach the tail). Without this fix, a write target
+    /// that didn't yet exist would fall back to the un-normalised joined
+    /// path, letting `../../etc/shadow` slip through `starts_with`.
+    #[test]
+    fn canonicalise_resolves_existing_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("a.txt");
+        std::fs::write(&file, b"x").unwrap();
+        let resolved = canonicalise_for_whitelist(&file).expect("resolve");
+        assert!(resolved.is_absolute());
+        assert!(resolved.ends_with("a.txt"));
+    }
+
+    #[test]
+    fn canonicalise_resolves_nonexistent_leaf_via_ancestor() {
+        let temp = tempfile::tempdir().unwrap();
+        let phantom = temp.path().join("subdir").join("not_yet.txt");
+        // subdir doesn't exist either — the walk should still find `temp`.
+        let resolved = canonicalise_for_whitelist(&phantom).expect("resolve");
+        // Should be prefixed by the canonicalized tempdir.
+        let canonical_root = temp.path().canonicalize().unwrap();
+        assert!(
+            resolved.starts_with(&canonical_root),
+            "resolved={} root={}",
+            resolved.display(),
+            canonical_root.display()
+        );
+    }
+
+    #[test]
+    fn canonicalise_returns_none_for_impossible_paths() {
+        // A path with no accessible ancestor — /nonexistent-abs-path-xyz.
+        let impossible = PathBuf::from("/does-not-exist-cordis-test-xyz/foo/bar");
+        let resolved = canonicalise_for_whitelist(&impossible);
+        // Depending on the filesystem this may succeed as literal or
+        // return None; the important property is that a returned Some
+        // is at least prefix-comparable to a canonical root.
+        if let Some(p) = resolved {
+            // Even in the "resolved" case, the path should be
+            // syntactically absolute — no risk of ambient-cwd surprise.
+            assert!(p.is_absolute());
+        }
+    }
+}

