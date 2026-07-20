@@ -1510,3 +1510,129 @@ mod signature_tests {
         assert!(!verify_onebot_signature("t", b"payload", "sha1=zzz"));
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════
+// Task D (E 批): 端到端链路分段验证 — 不消耗 token 的各段。
+// 覆盖：webhook 事件解析 → 去重 → 灰度白名单/黑名单 → 队列入列，
+// 以及 poller 产出的 agent 触发 prompt 是否能被 runtime 侧 session
+// 路由（main.rs:322 附近的 strip_prefix 逻辑）正确解析出 group_id。
+// agent 触发（消耗 DeepSeek token）不在单测内验证，见 scripts/ 下脚本。
+// ═══════════════════════════════════════════════════════════════════════
+#[cfg(test)]
+mod chain_tests {
+    use super::*;
+
+    fn clear_globals() {
+        MESSAGE_QUEUE.lock().unwrap().clear();
+        RECENT_MESSAGE_IDS.lock().unwrap_or_else(|p| p.into_inner()).clear();
+        let mut s = STATE.lock().unwrap();
+        s.allow_groups.clear();
+        s.block_groups.clear();
+    }
+
+    fn group_event(mid: i64, gid: i64, text: &str) -> OneBotEvent {
+        let v = json!({
+            "post_type": "message",
+            "message_type": "group",
+            "message": [{"type": "text", "data": {"text": text}}],
+            "message_id": mid,
+            "user_id": 111,
+            "group_id": gid
+        });
+        serde_json::from_value(v).unwrap()
+    }
+
+    fn queue_len() -> usize {
+        MESSAGE_QUEUE.lock().unwrap().len()
+    }
+
+    // 单测串行化：所有触碰全局静态（MESSAGE_QUEUE / STATE / RECENT_MESSAGE_IDS）
+    // 的断言集中在这一个 test 内，避免 cargo 并行跑 test 时的全局态污染。
+    #[test]
+    fn webhook_ingest_dedup_whitelist_blocklist_chain() {
+        clear_globals();
+
+        // ── 段1 webhook 收到 → 入队 ──────────────────────────────
+        handle_onebot_event(&group_event(2001, 222, "hello world"));
+        assert_eq!(queue_len(), 1, "群消息应进入 MESSAGE_QUEUE");
+
+        // ── 段2 去重：相同 message_id 再来一次被丢弃 ──────────────
+        handle_onebot_event(&group_event(2001, 222, "hello world"));
+        assert_eq!(queue_len(), 1, "重复 message_id 不应二次入队");
+        MESSAGE_QUEUE.lock().unwrap().clear();
+
+        // ── 段3 灰度白名单：设置 allow_groups 后只放行白名单群 ─────
+        STATE.lock().unwrap().allow_groups = vec!["222".to_string()];
+        handle_onebot_event(&group_event(2002, 999, "not allowed"));
+        assert_eq!(queue_len(), 0, "非白名单群应被丢弃");
+        handle_onebot_event(&group_event(2003, 222, "allowed"));
+        assert_eq!(queue_len(), 1, "白名单群应放行");
+        MESSAGE_QUEUE.lock().unwrap().clear();
+
+        // ── 段4 黑名单优先级高于白名单 ────────────────────────────
+        STATE.lock().unwrap().block_groups = vec!["222".to_string()];
+        handle_onebot_event(&group_event(2004, 222, "blocked"));
+        assert_eq!(queue_len(), 0, "黑名单群即使在白名单里也应被丢弃");
+
+        clear_globals();
+    }
+
+    // 非消息事件（心跳/通知）不应入队。
+    #[test]
+    fn non_message_event_is_ignored() {
+        clear_globals();
+        let ev: OneBotEvent = serde_json::from_value(json!({
+            "post_type": "meta_event",
+            "user_id": 0
+        })).unwrap();
+        handle_onebot_event(&ev);
+        assert_eq!(MESSAGE_QUEUE.lock().unwrap().len(), 0, "非 message 事件应被忽略");
+        clear_globals();
+    }
+
+    // poller 产出的 prompt 必须能被 runtime session 路由解析出 group_id。
+    // 复刻 main.rs:322 的 strip 逻辑，验证格式契约（这是链路契约校验，
+    // 不是测 runtime 代码）。
+    #[test]
+    fn agent_prompt_format_is_parseable_by_session_router() {
+        let sender_id = "222";
+        let user_id = "111";
+        let prompt = format!("[QQ group from {} (user {})]: {}", sender_id, user_id, "在吗");
+        let gid = prompt
+            .strip_prefix("[QQ group from ")
+            .and_then(|rest| rest.find("]: ").map(|end| &rest[..end]))
+            .map(|prefix| prefix.split_once(" (user ").map(|(g, _)| g).unwrap_or(prefix).to_string());
+        assert_eq!(gid.as_deref(), Some("222"), "runtime 应能从 prompt 还原 group_id");
+    }
+
+    // 消息文本抽取：结构化 segments（text/at/image/reply）。
+    #[test]
+    fn extract_message_info_handles_segments() {
+        let msg = json!([
+            {"type": "reply", "data": {"id": "555"}},
+            {"type": "at", "data": {"qq": "3832224285", "name": "bot"}},
+            {"type": "text", "data": {"text": " hello"}}
+        ]);
+        let (text, reply_to) = extract_message_info(&msg, None);
+        assert_eq!(reply_to, Some(555));
+        assert!(text.contains("@[id=3832224285,name=bot]"));
+        assert!(text.contains("hello"));
+    }
+
+    // 消息文本抽取：raw_message 中的 CQ code。
+    #[test]
+    fn extract_message_info_handles_cq_codes() {
+        let msg = json!("");
+        let (text, _) = extract_message_info(&msg, Some("[CQ:at,qq=123]你好"));
+        assert!(text.contains("@[id=123"));
+        assert!(text.contains("你好"));
+    }
+
+    // should_process 过滤：过短 / 斜杠命令不触发 agent。
+    #[test]
+    fn should_process_filters_short_and_slash() {
+        assert!(!should_process("ok"), "过短消息不触发");
+        assert!(!should_process("/help"), "斜杠命令不触发");
+        assert!(should_process("这是一条正常消息"), "正常消息触发");
+    }
+}
