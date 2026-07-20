@@ -120,22 +120,43 @@ where
     fs::write(&index_path, patched).expect("write patched index");
 }
 
+/// P2-10 后 `root/child` 嵌套 fixture 已拆除；改用现存的 expr 插件树
+/// （expr → lexer/parser/evaluator）验证父子加载。grants 链路通过
+/// patch_index 注入 exports / grants_from_parent 覆盖（fixture 本身
+/// 不再自带 grants 声明）。
 #[test]
 fn load_success_and_grants_enforced() {
     let temp = setup_fixture_copy();
+    patch_index(&temp, |index| {
+        let entries = index
+            .get_mut("entries")
+            .and_then(|x| x.as_array_mut())
+            .expect("entries array");
+        for entry in entries.iter_mut() {
+            match entry.get("plugin_path").and_then(|v| v.as_str()) {
+                Some("expr") => {
+                    entry["exports"] = json!(["service.db", "service.cache"]);
+                }
+                Some("expr/lexer") => {
+                    entry["grants_from_parent"] = json!(["service.db"]);
+                }
+                _ => {}
+            }
+        }
+    });
     let config = default_loader_config(temp.path());
     let loader = Loader::new(config);
 
     let output = loader.load().expect("load should pass");
 
     assert!(matches!(
-        output.plugin_registry.get("root").unwrap().load_result,
+        output.plugin_registry.get("expr").unwrap().load_result,
         PluginLoadResult::Loaded
     ));
     assert!(matches!(
         output
             .plugin_registry
-            .get("root/child")
+            .get("expr/lexer")
             .unwrap()
             .load_result,
         PluginLoadResult::Loaded
@@ -144,40 +165,40 @@ fn load_success_and_grants_enforced() {
         output.plugin_registry.get("shell").unwrap().load_result,
         PluginLoadResult::Loaded
     ));
-    assert!(output.node_registry.contains("root::root_entry"));
-    assert!(output.node_registry.contains("root/child::child_entry"));
+    assert!(output.node_registry.contains("expr::expr_entry"));
+    assert!(output.node_registry.contains("expr/lexer::expr_lexer"));
     assert!(output.node_registry.contains("shell::shell_entry"));
 
     let plugin_docs = output
         .doc_registry
-        .get_plugin_docs("root")
-        .expect("root docs should exist");
-    assert_eq!(plugin_docs.plugin_path, "root");
+        .get_plugin_docs("expr")
+        .expect("expr docs should exist");
+    assert_eq!(plugin_docs.plugin_path, "expr");
 
     let node_docs = output
         .doc_registry
-        .get_node_docs("root/child", "child_entry")
-        .expect("child node docs should exist");
-    assert_eq!(node_docs.id, "child_entry");
+        .get_node_docs("expr/lexer", "expr_lexer")
+        .expect("lexer node docs should exist");
+    assert_eq!(node_docs.id, "expr_lexer");
 
     let route_value = output
         .doc_registry
-        .handle_get("/plugins/root/child/nodes/child_entry/docs")
+        .handle_get("/plugins/expr/lexer/nodes/expr_lexer/docs")
         .expect("route query should succeed");
     assert_eq!(
         route_value.get("id").and_then(|x| x.as_str()),
-        Some("child_entry")
+        Some("expr_lexer")
     );
 
     let allowed = output
         .context
-        .inject::<String>("root/child", "service.db")
+        .inject::<String>("expr/lexer", "service.db")
         .expect("service.db should be granted");
-    assert!(allowed.contains("service:root:service.db"));
+    assert!(allowed.contains("service:expr:service.db"));
 
     let denied = output
         .context
-        .inject::<String>("root/child", "service.cache");
+        .inject::<String>("expr/lexer", "service.cache");
     assert!(matches!(denied, Err(RuntimeError::PermissionDenied { .. })));
 }
 
@@ -218,7 +239,7 @@ fn registered_graph_json_and_html_are_available() {
     assert!(html.contains("<!doctype html>"));
     assert!(html.contains("Registered Nodes Graph"));
     assert!(html.contains("expr::expr_entry"));
-    assert!(html.contains("root/child::child_entry"));
+    assert!(html.contains("time::time_now"));
     assert!(html.contains("shell::shell_entry"));
 }
 
@@ -256,7 +277,7 @@ fn registered_net_json_and_html_are_available() {
     );
     assert!(
         nodes.iter().any(|node| {
-            node.get("node_fqn").and_then(|v| v.as_str()) == Some("expr/evaluator::expr_evaluator")
+            node.get("node_fqn").and_then(|v| v.as_str()) == Some("expr/evaluator::expr_eval")
         }),
         "evaluator node should appear in net"
     );
@@ -270,7 +291,7 @@ fn registered_net_json_and_html_are_available() {
     assert!(
         edges.iter().any(|edge| {
             edge.get("from").and_then(|v| v.as_str()) == Some("expr/parser::expr_parser")
-                && edge.get("to").and_then(|v| v.as_str()) == Some("expr/evaluator::expr_evaluator")
+                && edge.get("to").and_then(|v| v.as_str()) == Some("expr/evaluator::expr_eval")
         }),
         "parser -> evaluator edge should be inferred"
     );
@@ -282,7 +303,7 @@ fn registered_net_json_and_html_are_available() {
     assert!(html.contains("<!doctype html>"));
     assert!(html.contains("Registered Net"));
     assert!(html.contains("expr/lexer::expr_lexer"));
-    assert!(html.contains("expr/evaluator::expr_evaluator"));
+    assert!(html.contains("expr/evaluator::expr_eval"));
 }
 
 #[test]
@@ -313,7 +334,7 @@ fn expr_dylib_subplugins_are_invokable() {
     let evaluator = invoker
         .invoke(
             "expr/evaluator",
-            "expr_evaluator",
+            "expr_eval",
             json!({ "ast": ast }).to_string(),
         )
         .expect("evaluator should be invokable");
@@ -394,10 +415,10 @@ api_hash = "api_v2"
 #[test]
 fn child_path_escape_fails_fast() {
     let temp = setup_fixture_copy();
-    let root_manifest = temp.path().join("plugins/root/Cargo.toml");
-    let content = fs::read_to_string(&root_manifest).expect("read root manifest");
-    let patched = content.replace("./child", "../child");
-    fs::write(&root_manifest, patched).expect("write root manifest");
+    let expr_manifest = temp.path().join("plugins/expr/Cargo.toml");
+    let content = fs::read_to_string(&expr_manifest).expect("read expr manifest");
+    let patched = content.replace("./lexer", "../lexer");
+    fs::write(&expr_manifest, patched).expect("write expr manifest");
 
     let err = prepare_artifacts(temp.path(), PrepareMode::Incremental)
         .expect_err("must fail due to path escape");
@@ -407,33 +428,43 @@ fn child_path_escape_fails_fast() {
 #[test]
 fn plugin_path_mismatch_fails_fast() {
     let temp = setup_fixture_copy();
-    let child_manifest = temp.path().join("plugins/root/child/Cargo.toml");
-    let content = fs::read_to_string(&child_manifest).expect("read child manifest");
-    let patched = content.replace("plugin_path = \"root/child\"", "plugin_path = \"root/bad\"");
-    fs::write(&child_manifest, patched).expect("write child manifest");
+    let child_manifest = temp.path().join("plugins/expr/lexer/Cargo.toml");
+    let content = fs::read_to_string(&child_manifest).expect("read lexer manifest");
+    let patched = content.replace("plugin_path = \"expr/lexer\"", "plugin_path = \"expr/bad\"");
+    assert_ne!(content, patched, "expected plugin_path line to be replaced");
+    fs::write(&child_manifest, patched).expect("write lexer manifest");
 
     let err = prepare_artifacts(temp.path(), PrepareMode::Incremental)
         .expect_err("must fail due to plugin_path mismatch");
     assert!(matches!(err, RuntimeError::PluginPathMismatch { .. }));
 }
 
-#[test]
-fn optional_child_unavailable_does_not_block_parent() {
-    let temp = setup_fixture_copy();
-
-    let index_path = temp.path().join("artifacts/index.json");
-    let index_content = fs::read_to_string(&index_path).expect("read index");
-    let broken = index_content.replace("crate_child_v1", "crate_child_wrong");
-    fs::write(&index_path, broken).expect("write broken index");
-    patch_index(&temp, |index| {
+/// 把 index.json 里 `plugin_path` 对应 entry 的字段 patch 成给定值。
+/// P2-10 后父子链路测试统一用 expr 树（expr → expr/lexer 等）。
+fn patch_child_entry(temp: &TempDir, plugin_path: &str, patch: impl FnOnce(&mut Value)) {
+    patch_index(temp, |index| {
         let entries = index
             .get_mut("entries")
             .and_then(|x| x.as_array_mut())
             .expect("entries array");
         let child = entries
             .iter_mut()
-            .find(|x| x.get("plugin_path").and_then(|v| v.as_str()) == Some("root/child"))
+            .find(|x| x.get("plugin_path").and_then(|v| v.as_str()) == Some(plugin_path))
             .expect("child entry");
+        patch(child);
+    });
+}
+
+/// 注：AbiMismatch 只在 `ArtifactKind::Json` 分支由 loader 判定；dylib 的
+/// fingerprint 校验延后到 invoke 时由 plugin-host 执行（P0-12）。现存
+/// fixtures 全部是 dylib，所以这里用 dylib 加载路径上真实存在的两种
+/// 失效方式：sha256 篡改（HashMismatch）与 artifact 缺失（ArtifactMissing）。
+#[test]
+fn optional_child_unavailable_does_not_block_parent() {
+    let temp = setup_fixture_copy();
+
+    patch_child_entry(&temp, "expr/lexer", |child| {
+        child["sha256"] = Value::String("deadbeef".to_string());
         child["required"] = Value::Bool(false);
     });
 
@@ -444,16 +475,16 @@ fn optional_child_unavailable_does_not_block_parent() {
         .expect("optional child failure should not abort");
 
     assert!(matches!(
-        output.plugin_registry.get("root").unwrap().load_result,
+        output.plugin_registry.get("expr").unwrap().load_result,
         PluginLoadResult::Loaded
     ));
     assert!(matches!(
         output
             .plugin_registry
-            .get("root/child")
+            .get("expr/lexer")
             .unwrap()
             .load_result,
-        PluginLoadResult::Unavailable(PluginUnavailableReason::AbiMismatch)
+        PluginLoadResult::Unavailable(PluginUnavailableReason::HashMismatch)
     ));
     assert!(output.metrics.dylib_no_fallback_total >= 1);
 }
@@ -462,17 +493,11 @@ fn optional_child_unavailable_does_not_block_parent() {
 fn required_child_unavailable_blocks_parent_chain() {
     let temp = setup_fixture_copy();
 
-    patch_index(&temp, |index| {
-        let entries = index
-            .get_mut("entries")
-            .and_then(|x| x.as_array_mut())
-            .expect("entries array");
-        let child = entries
-            .iter_mut()
-            .find(|x| x.get("plugin_path").and_then(|v| v.as_str()) == Some("root/child"))
-            .expect("child entry");
-        child["abi_fingerprint"]["crate_hash"] = Value::String("crate_child_wrong".to_string());
-    });
+    // Remove the child artifact from disk — loader marks the child
+    // ArtifactMissing and (required=true) propagates InitFailed upward.
+    let artifact = temp.path().join("artifacts/expr_lexer.so");
+    assert!(artifact.exists(), "expected lexer artifact at {artifact:?}");
+    fs::remove_file(&artifact).expect("remove lexer artifact");
 
     let config = default_loader_config(temp.path());
     let loader = Loader::new(config);
@@ -483,13 +508,13 @@ fn required_child_unavailable_blocks_parent_chain() {
     assert!(matches!(
         output
             .plugin_registry
-            .get("root/child")
+            .get("expr/lexer")
             .unwrap()
             .load_result,
-        PluginLoadResult::Unavailable(PluginUnavailableReason::AbiMismatch)
+        PluginLoadResult::Unavailable(PluginUnavailableReason::ArtifactMissing)
     ));
     assert!(matches!(
-        output.plugin_registry.get("root").unwrap().load_result,
+        output.plugin_registry.get("expr").unwrap().load_result,
         PluginLoadResult::Unavailable(PluginUnavailableReason::InitFailed)
     ));
 }
@@ -498,15 +523,7 @@ fn required_child_unavailable_blocks_parent_chain() {
 fn hash_mismatch_marks_child_unavailable_and_no_fallback() {
     let temp = setup_fixture_copy();
 
-    patch_index(&temp, |index| {
-        let entries = index
-            .get_mut("entries")
-            .and_then(|x| x.as_array_mut())
-            .expect("entries array");
-        let child = entries
-            .iter_mut()
-            .find(|x| x.get("plugin_path").and_then(|v| v.as_str()) == Some("root/child"))
-            .expect("child entry");
+    patch_child_entry(&temp, "expr/lexer", |child| {
         child["sha256"] = Value::String("deadbeef".to_string());
     });
 
@@ -519,13 +536,13 @@ fn hash_mismatch_marks_child_unavailable_and_no_fallback() {
     assert!(matches!(
         output
             .plugin_registry
-            .get("root/child")
+            .get("expr/lexer")
             .unwrap()
             .load_result,
         PluginLoadResult::Unavailable(PluginUnavailableReason::HashMismatch)
     ));
     assert!(matches!(
-        output.plugin_registry.get("root").unwrap().load_result,
+        output.plugin_registry.get("expr").unwrap().load_result,
         PluginLoadResult::Unavailable(PluginUnavailableReason::InitFailed)
     ));
     assert!(output.metrics.dylib_no_fallback_total >= 1);
@@ -535,16 +552,8 @@ fn hash_mismatch_marks_child_unavailable_and_no_fallback() {
 fn inject_on_unavailable_plugin_returns_unavailable_error() {
     let temp = setup_fixture_copy();
 
-    patch_index(&temp, |index| {
-        let entries = index
-            .get_mut("entries")
-            .and_then(|x| x.as_array_mut())
-            .expect("entries array");
-        let child = entries
-            .iter_mut()
-            .find(|x| x.get("plugin_path").and_then(|v| v.as_str()) == Some("root/child"))
-            .expect("child entry");
-        child["abi_fingerprint"]["crate_hash"] = Value::String("crate_child_wrong".to_string());
+    patch_child_entry(&temp, "expr/lexer", |child| {
+        child["sha256"] = Value::String("deadbeef".to_string());
     });
 
     let config = default_loader_config(temp.path());
@@ -554,7 +563,7 @@ fn inject_on_unavailable_plugin_returns_unavailable_error() {
         .expect("loader should continue with unavailable state");
 
     assert!(matches!(
-        output.context.inject::<String>("root/child", "service.db"),
+        output.context.inject::<String>("expr/lexer", "service.db"),
         Err(RuntimeError::ContextPluginUnavailable { .. })
     ));
 }
@@ -625,11 +634,13 @@ fn multi_producer_input_generates_warning() {
         .collect();
     assert_eq!(consumer_edges.len(), 1);
 
-    // A diagnostic about multiple producers should be emitted.
+    // A diagnostic about multiple producers should be emitted (P1-50 把
+    // 文案改成了 "registered-net multi-producer for input `<x>` ..."，
+    // 并附带 candidates 与 sort-stable 选择结果)。
     let has_multi = net
         .diagnostics
         .iter()
-        .any(|d| d.contains("multiple producers") && d.contains("result"));
+        .any(|d| d.contains("multi-producer") && d.contains("result"));
     assert!(has_multi, "expected multi-producer diagnostic, got: {net:?}");
 }
 
