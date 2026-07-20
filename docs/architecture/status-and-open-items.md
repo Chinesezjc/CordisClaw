@@ -232,6 +232,22 @@ Agent 现在可以自主完成：读代码 → 理解结构 → 写/改文件 �
 
 **E2E 复验**：注入相同 bug 二次跑 `iterate_plugins` — final JSON 因 REPL `quit` 打断没打完，但落盘验证：源码保留 fix 未 rollback；`index.json` sha256 与 `.so` bytes 一致。安全网从"误触发"变为"正确沉默"，agent 的 fix 得以持久化。
 
+### 5.2.23 SDK 侧 service panic 隔离（E 批任务 B，2026-07-20）
+
+紧接 5.2.22 留下的边界：`ServiceVTable::{start,stop}` 是 `extern "C" fn`（[cordis-plugin-sdk/src/lib.rs:302-304](../../crates/cordis-plugin-sdk/src/lib.rs#L302-L304)），modern rustc 在 panic 试图 unwind 穿越 C ABI 帧时自动 `abort()`，runtime 侧（[plugin/invoke.rs:270-273](../../crates/cordis-runtime/src/plugin/invoke.rs#L270-L273) 的 `(vtable.start)(vtable.data)`）的 `catch_unwind` 拦不住（实测 SIGABRT）。隔离必须做在插件侧、在 Rust 帧上、在跨 ABI **之前**。
+
+- **`guard_service_call(op, data, body)`**（SDK）：把用户的 `fn(*mut c_void) -> i32` 服务体包进 `catch_unwind(AssertUnwindSafe(...))`。捕获 panic 后 `eprintln!` 带 `op`（start/stop）与 panic message，返回 `-1`；正常路径透传用户返回码。unwind 在到达任何 `extern "C"` 帧之前就被吃掉，进程不 abort。
+- **`service_vtable!{ data=, start=, stop= }` 宏**（SDK，`#[macro_export]`）：生成两个 `extern "C" fn` shim，各自 body 只调 `guard_service_call`，再组装成 `ServiceVTable`。插件只写会 panic 的安全 Rust `fn`，宏保证 catch 在 ABI 内侧。这是 5.2.22 里 "后续要做的 SDK 侧服务包装" 的落地。
+
+**插件迁移情况**：现存唯一真实 service `qq_serve` 目前**不经过** `ServiceVTable` 路径——它跑在普通 `handle` fn 分支（已由 D 批 5.2.22 的 runtime 侧 `catch_unwind` 覆盖，因为 `handle` 是普通 `fn`）。`_cordis_create_service` / `ServiceVTable` 是前瞻性路径，当前无任何插件导出它。因此本任务只落地 SDK 包装层，无需迁移插件；未来任何真正用 `ServiceVTable` 的插件都应通过 `service_vtable!` 构造，天然获得隔离。
+
+**新增单测**（SDK crate，`service_panic_isolation_tests` +3，SDK lib 测试 3 → 6 全 pass）：
+- `guarded_panicking_start_returns_minus_one_without_abort` — 直接调 `guard_service_call`，panicky start 返回 -1，进程不 abort。
+- `service_vtable_macro_isolates_start_panic` — 用公开宏建 vtable，按 runtime 的方式 `(vtable.start)(vtable.data)` / `(vtable.stop)(vtable.data)` 调用，两者都返回 -1（证明 catch 在 `extern "C"` shim 内侧生效）。
+- `service_vtable_macro_passes_through_success_code` — 正常 start/stop 透传返回码（0），不误伤。
+
+**验证**：`cargo test -p cordis-plugin-sdk` 6 pass；`cargo build` 通过（SDK crate 零 warning；main.rs 的 3 条 warning 为既有、非本改动）；`cargo test -p cordis-runtime --lib` 89 pass（fresh worktree 需先补 `fixtures/artifacts/`，该目录为 build 产物非 git-tracked，与本改动无关）。
+
 ### 5.2.21 自迭代端到端 smoke test（C 批，2026-07-20）
 
 用真实 DeepSeek LLM + serve REPL 端到端跑一次 `iterate_plugins`，验证从 bug 注入 → 测试失败 → 自动定位 → 编辑 → 编译 → 测试 → rollback 判定的整条链路：
