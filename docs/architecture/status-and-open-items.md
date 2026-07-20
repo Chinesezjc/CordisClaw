@@ -206,6 +206,19 @@ Agent 现在可以自主完成：读代码 → 理解结构 → 写/改文件 �
 - [x] **Plugin iteration symlink 逃逸**（P0-20）— `PluginEditExecutor::execute` 在写入前调用新 helper `resolve_under_workspace`：canonicalize 结果必须仍在 workspace_root 下。plugins 内的 symlink 指向 `/etc/passwd` 之类无法被写入。
 - [x] **Verifier shell 拼接**（P0-21）— 已随 A 批 P0-1 修复。`discover_rust_workspace_manifest` 输出的字符串被 `shell_words` 解析成 argv，空格 / `$` / `;` 无法被解释。
 
+### 5.2.20 崩溃恢复集成测试（B 批，2026-07-20）
+
+`crates/cordis-runtime/tests/crash_recovery.rs` 用 6 项集成测试覆盖 P0-6 / P0-7 rollback journal 的跨 boot 恢复语义 —— 这些是"设计上安全，但只被单元测试碰过"的最关键路径：
+
+- **`recovery_restores_edited_file_after_simulated_crash`** — persist_journal → 手动 mutate 文件 → drop rollback（模拟 SIGKILL 未 clear_journal）→ 新 boot 调用 recovery → 验证：文件回到 pre-edit 字节，journal 已清理。
+- **`double_boot_after_recovery_is_a_noop`** — recovery 完成后用户合法 edit → 第二次 boot 不再有 journal → recovery 是 no-op → 用户 edit 不被 clobber。
+- **`recovery_is_idempotent_when_crash_between_rollback_and_clear`** — P0-7 核心场景。手动构造"rollback 完但 clear_journal 前崩溃"状态（journal 存在 + marker 存在 + 用户已 edit）→ 第二次 boot 见到 marker.id == journal.id → 立即短路，不再 rollback → 用户 edit 保留。
+- **`stale_marker_does_not_block_a_new_journal`** — 旧 iteration 的 marker 残留 + 新 iteration 的 journal（不同 generation_id）→ recovery 仍然执行新 journal 的 replay。marker 只保护"同一 journal 不重复应用"，不阻塞其它 iteration。
+- **`journal_generation_id_is_stable_across_reload`** — journal 落盘 → load_journal 重建 → re-persist 生成新 generation_id。保证 P0-6 durability + P0-7 identity 双属性。
+- **`in_memory_rollback_path_applies_when_no_journal`** — 同进程失败恢复分支：没 on-disk journal 但传入 `PluginEditRollback` 时，应用 in-memory rollback。
+
+**关键设计**：`restore_plugin_iteration_workspace` 拆成 `apply_plugin_iteration_journal`（纯 journal 层）+ 后置的 `rebuild_plugin_workspace`。集成测试只调 journal 层，避免依赖真实 cargo build 环境（fixtures 完整性、network 状态、macOS 平台）。前者标 `#[doc(hidden)] pub` 明示是 test hook。
+
 ### 5.2.19 回归测试大规模补齐（U/V/W/Y 批，2026-07-20）
 
 第二轮 review 把之前遗漏的 P0/P1/P2 修复补上单测。原则：**测试跟被测代码在同一 crate**——runtime crate 修的 bug 用 runtime 单测，plugin 内部的行为放到 plugin 自己的 `#[cfg(test)]` 里，避免 runtime 测试知道 plugin 实现细节。

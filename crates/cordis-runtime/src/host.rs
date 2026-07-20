@@ -6032,6 +6032,35 @@ fn restore_plugin_iteration_workspace(
     snapshot_root: &Path,
     in_memory_rollback: Option<&crate::kernel::plugin_iteration::PluginEditRollback>,
 ) -> Result<bool, RuntimeError> {
+    // Split into two phases so integration tests can exercise the
+    // journal + rollback semantics without needing a real
+    // `cargo build`-capable fixtures tree.
+    let restored = apply_plugin_iteration_journal(
+        fixtures_root,
+        snapshot_root,
+        in_memory_rollback,
+    )?;
+    if restored {
+        rebuild_plugin_workspace(fixtures_root, "/")?;
+    }
+    Ok(restored)
+}
+
+/// P0-6/7 recovery core: replay the on-disk rollback journal (or an
+/// in-memory rollback if no journal) against the workspace. Returns
+/// `true` iff a restore happened. Does NOT call `rebuild_plugin_workspace`
+/// — callers that need artifact refresh do so themselves (production
+/// path in `restore_plugin_iteration_workspace`), while integration
+/// tests can stop here.
+///
+/// This is `pub` **only for the crash-recovery integration test**;
+/// treat it as a test hook, not part of the runtime API.
+#[doc(hidden)]
+pub fn apply_plugin_iteration_journal(
+    fixtures_root: &Path,
+    snapshot_root: &Path,
+    in_memory_rollback: Option<&crate::kernel::plugin_iteration::PluginEditRollback>,
+) -> Result<bool, RuntimeError> {
     let journal_path = plugin_iteration_journal_path(snapshot_root);
     let applied_marker = plugin_iteration_applied_marker_path(snapshot_root);
 
@@ -6073,7 +6102,6 @@ fn restore_plugin_iteration_workspace(
                 );
             }
         }
-        rebuild_plugin_workspace(fixtures_root, "/")?;
         crate::kernel::plugin_iteration::PluginEditRollback::clear_journal(&journal_path)?;
         let _ = fs::remove_file(&applied_marker);
         return Ok(true);
@@ -6081,7 +6109,6 @@ fn restore_plugin_iteration_workspace(
 
     if let Some(rollback) = in_memory_rollback {
         rollback.rollback()?;
-        rebuild_plugin_workspace(fixtures_root, "/")?;
         return Ok(true);
     }
 
