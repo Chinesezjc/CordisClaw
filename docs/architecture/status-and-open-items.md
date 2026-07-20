@@ -206,6 +206,16 @@ Agent 现在可以自主完成：读代码 → 理解结构 → 写/改文件 �
 - [x] **Plugin iteration symlink 逃逸**（P0-20）— `PluginEditExecutor::execute` 在写入前调用新 helper `resolve_under_workspace`：canonicalize 结果必须仍在 workspace_root 下。plugins 内的 symlink 指向 `/etc/passwd` 之类无法被写入。
 - [x] **Verifier shell 拼接**（P0-21）— 已随 A 批 P0-1 修复。`discover_rust_workspace_manifest` 输出的字符串被 `shell_words` 解析成 argv，空格 / `$` / `;` 无法被解释。
 
+### 5.2.26 architecture.rs 失效测试修复（E 批任务 A，2026-07-20）
+
+D 批修掉 `tests/architecture.rs` 的编译错误后暴露的 11 项运行失败，根因是测试写于 `root/child` 嵌套 fixture 时代（P2-10 已拆除）。全部改造完成，`cargo test --test architecture` 17/17 全绿。处置方式：
+
+- **父子链路 6 项 → 迁移到现存 expr 插件树**（expr → lexer/parser/evaluator）。`load_success_and_grants_enforced` 用 `patch_index` 注入 exports / grants_from_parent 覆盖来验证 grants 链（fixture 本身不带 grants）；`optional_child` / `inject_on_unavailable` 用 sha256 篡改（HashMismatch），`required_child` 用删除 artifact（ArtifactMissing）触发父链 InitFailed 传播。新增共享 helper `patch_child_entry`。
+- **一个语义修正**：原 `optional/required_child` 测试断言 AbiMismatch，但 loader 的 fingerprint 判定只在 `ArtifactKind::Json` 分支执行；dylib 的 fingerprint 校验延后到 invoke 时由 plugin-host 做（P0-12）。现存 fixtures 全是 dylib，所以旧断言即使在 root/child 时代能过，也只是因为当时 child 是 Json artifact。改用 dylib 路径上真实存在的失效方式，测试语义反而更贴近生产。
+- **图导出 2 项 + expr invoke 1 项 → 修断言目标**：`root/child::child_entry` → `time::time_now`；节点 id `expr_evaluator` → 实际的 `expr_eval`（docs 里从来就是 expr_eval，旧断言从未对过 dylib 实物）。
+- **multi_producer 1 项 → 跟进 P1-50 文案**：诊断字符串已从 "multiple producers" 改为 "registered-net multi-producer for input ..."，断言同步。
+- **path escape / path mismatch 2 项 → 换目标**：`root` 的 `./child` 声明 → `expr` 的 `./lexer`，并加 `assert_ne!` 防 replace 静默失配。
+
 ### 5.2.24 REPL / serve 收尾正确性（E 批任务 C，2026-07-20）
 
 批处理式 `cat cmds | cordis-runtime serve fixtures` 时，`kernel iterate-plugins` 的最终结果 JSON 会被后面排队的 `quit` 打断（5.2.22 E2E 二轮复验里 run log 停在第二次 reload 的 `[snapshot] detected`，`final_verdict` 缺失）。改动仅限 [crates/cordis-runtime/src/main.rs](../../crates/cordis-runtime/src/main.rs)：
