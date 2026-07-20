@@ -751,3 +751,65 @@ export_plugin_api! {
     docs = docs_value(),
     handle = api_handle,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{split_script_commands, split_tokens};
+
+    // P1-42: script splitting must respect quoted regions. `echo "a;b"`
+    // is ONE command; the naive split-on-`;` implementation broke it
+    // into two.
+
+    #[test]
+    fn split_script_preserves_semicolon_inside_double_quotes() {
+        let parts = split_script_commands("echo \"a;b\"");
+        assert_eq!(parts, vec!["echo \"a;b\""]);
+    }
+
+    #[test]
+    fn split_script_preserves_semicolon_inside_single_quotes() {
+        let parts = split_script_commands("echo 'x;y' ; ls");
+        assert_eq!(parts.len(), 2, "got {parts:?}");
+        assert_eq!(parts[0].trim(), "echo 'x;y'");
+        assert_eq!(parts[1].trim(), "ls");
+    }
+
+    #[test]
+    fn split_script_splits_on_newline_and_semicolon() {
+        let parts = split_script_commands("cmd1\ncmd2; cmd3");
+        assert_eq!(parts.len(), 3);
+    }
+
+    #[test]
+    fn split_script_leaves_single_line_intact() {
+        assert_eq!(split_script_commands("echo hi"), vec!["echo hi"]);
+    }
+
+    // P1-42: split_tokens uses shell_words; unterminated quotes must
+    // return Err rather than silently eating to EOL.
+    #[test]
+    fn split_tokens_rejects_unterminated_quote() {
+        let err = split_tokens("echo \"unclosed").unwrap_err();
+        assert!(err.contains("tokenize failed"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn split_tokens_handles_quoted_args() {
+        let tokens = split_tokens("echo hello \"a b c\" --flag").unwrap();
+        assert_eq!(
+            tokens,
+            vec![
+                "echo".to_string(),
+                "hello".to_string(),
+                "a b c".to_string(),
+                "--flag".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn split_tokens_returns_empty_on_empty_input() {
+        assert_eq!(split_tokens("").unwrap(), Vec::<String>::new());
+        assert_eq!(split_tokens("   ").unwrap(), Vec::<String>::new());
+    }
+}

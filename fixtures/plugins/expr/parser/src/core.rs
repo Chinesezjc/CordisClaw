@@ -338,3 +338,50 @@ impl<'a> Parser<'a> {
 // enter_scope/exit_scope helper calls at the top/bottom of each
 // parse_* method, avoiding the &mut aliasing problem an RAII guard
 // would introduce inside the recursive-descent tower.
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_expression, ParseExpressionError, MAX_PARSE_DEPTH};
+
+    /// P1-45: deeply nested parentheses must bounce off the depth
+    /// counter with `TooDeep` rather than exhausting the stack.
+    #[test]
+    fn deeply_nested_parens_hit_too_deep() {
+        // MAX_PARSE_DEPTH+1 levels of nesting.
+        let mut src = String::new();
+        let depth = MAX_PARSE_DEPTH + 50;
+        for _ in 0..depth {
+            src.push('(');
+        }
+        src.push('1');
+        for _ in 0..depth {
+            src.push(')');
+        }
+        let err = parse_expression(&src).unwrap_err();
+        assert!(
+            matches!(err, ParseExpressionError::TooDeep { .. }),
+            "expected TooDeep, got {err:?}"
+        );
+    }
+
+    /// P1-45: right-recursive `1^1^1^...` also hits TooDeep — this is
+    /// the pattern that would otherwise blow the stack because
+    /// `parse_power` recurses on itself.
+    #[test]
+    fn right_recursive_power_hits_too_deep() {
+        // Build 1^1^1^...^1 with (MAX_PARSE_DEPTH * 2) operands.
+        let src: String = std::iter::repeat_n("1^", MAX_PARSE_DEPTH * 2)
+            .chain(std::iter::once("1"))
+            .collect();
+        let err = parse_expression(&src).unwrap_err();
+        assert!(matches!(err, ParseExpressionError::TooDeep { .. }));
+    }
+
+    /// Normal shallow inputs still parse fine.
+    #[test]
+    fn shallow_input_parses_normally() {
+        assert!(parse_expression("1 + 2 * (3 - 4)").is_ok());
+        assert!(parse_expression("2 ^ 3 ^ 2").is_ok());
+        assert!(parse_expression("5!").is_ok());
+    }
+}

@@ -47,3 +47,56 @@ impl FactorialPlugin {
 pub fn apply(n: f64) -> Result<f64, FactorialError> {
     FactorialPlugin.apply(n)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// P1-46: `n > 170` must return `FactorialOverflow` immediately —
+    /// otherwise `10000000000!` would spin for 10¹⁰ iterations before
+    /// even overflowing. Also protects the callers from a NaN/Inf that
+    /// serde_json can't serialise.
+    #[test]
+    fn factorial_over_170_is_rejected() {
+        let err = FactorialPlugin.apply(200.0).unwrap_err();
+        assert!(matches!(err, FactorialError::FactorialOverflow));
+    }
+
+    #[test]
+    fn factorial_at_170_still_finite() {
+        let v = FactorialPlugin.apply(170.0).unwrap();
+        assert!(v.is_finite(), "170! must fit in f64 (got {v})");
+    }
+
+    #[test]
+    fn factorial_over_170_avoids_dos_no_infinite_loop() {
+        // The point of the cap: reject FAST. If this hangs, the guard
+        // regressed.
+        let start = std::time::Instant::now();
+        let err = FactorialPlugin.apply(1_000_000_000.0).unwrap_err();
+        assert!(matches!(err, FactorialError::FactorialOverflow));
+        assert!(
+            start.elapsed() < std::time::Duration::from_millis(50),
+            "factorial(1e9) must reject fast, took {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn factorial_domain_errors_still_apply() {
+        assert!(matches!(
+            FactorialPlugin.apply(-1.0),
+            Err(FactorialError::FactorialDomainError)
+        ));
+        assert!(matches!(
+            FactorialPlugin.apply(3.5),
+            Err(FactorialError::FactorialDomainError)
+        ));
+    }
+
+    #[test]
+    fn factorial_zero_and_one_return_one() {
+        assert_eq!(FactorialPlugin.apply(0.0).unwrap(), 1.0);
+        assert_eq!(FactorialPlugin.apply(1.0).unwrap(), 1.0);
+    }
+}

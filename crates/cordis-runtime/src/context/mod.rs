@@ -1205,4 +1205,100 @@ mod tests {
             .expect_err("should reject");
         assert!(err.to_string().contains("dup"));
     }
+
+    // ---------- P1-1 / P1-2 concurrency regressions ----------
+
+    /// P1-1: two concurrent `commit_session` calls at the same expected
+    /// version must NOT both succeed. `compare_exchange` gives exactly
+    /// one caller the version bump; the other sees `CommitConflict`.
+    #[test]
+    fn commit_session_cas_is_exclusive_under_race() {
+        let ctx = std::sync::Arc::new(RuntimeContext::default());
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let ctx = ctx.clone();
+            let barrier = barrier.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                ctx.commit_session("s", 0)
+            }));
+        }
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let ok = results.iter().filter(|r| r.is_ok()).count();
+        let conflict = results
+            .iter()
+            .filter(|r| matches!(r, Err(RuntimeError::CommitConflict { .. })))
+            .count();
+        assert_eq!(ok, 1, "exactly one commit_session should succeed");
+        assert_eq!(conflict, 7, "other 7 must see CommitConflict");
+    }
+
+    #[test]
+    fn commit_session_increments_version_monotonically() {
+        let ctx = RuntimeContext::default();
+        ctx.commit_session("s", 0).unwrap();
+        ctx.commit_session("s", 1).unwrap();
+        ctx.commit_session("s", 2).unwrap();
+        // Wrong expected version rejected.
+        let err = ctx.commit_session("s", 2).unwrap_err();
+        assert!(matches!(err, RuntimeError::CommitConflict { .. }));
+    }
+
+    /// P1-2: `list_by_ns` and `lookup_slot_entry` used to acquire
+    /// context locks in opposite orders; two workers doing one each
+    /// could deadlock. After the fix both go active → overlays →
+    /// request → session → global. This test spawns two workers hitting
+    /// each path in a tight loop; without the fix it would hang.
+    #[test]
+    fn list_by_ns_and_lookup_do_not_deadlock() {
+        let ctx = std::sync::Arc::new(RuntimeContext::default());
+        let meta = SlotMeta {
+            required: false,
+            ttl_ms: None,
+            sensitivity: Sensitivity::Low,
+            owner: "test".to_string(),
+        };
+        // Seed a couple of entries in different namespaces.
+        for i in 0..5 {
+            let key = ContextKey {
+                namespace: format!("ns-{}", i % 2),
+                name: format!("k{i}"),
+                version: 1,
+            };
+            ctx.put(key, serde_json::json!({ "n": i }), meta.clone())
+                .unwrap();
+        }
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_a = stop.clone();
+        let ctx_a = ctx.clone();
+        let a = std::thread::spawn(move || {
+            let mut count = 0usize;
+            while !stop_a.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = ctx_a.list_by_ns("ns-0");
+                count += 1;
+            }
+            count
+        });
+        let stop_b = stop.clone();
+        let ctx_b = ctx.clone();
+        let b = std::thread::spawn(move || {
+            let mut count = 0usize;
+            let key = ContextKey {
+                namespace: "ns-1".to_string(),
+                name: "k1".to_string(),
+                version: 1,
+            };
+            while !stop_b.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = ctx_b.contains(&key);
+                count += 1;
+            }
+            count
+        });
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let ca = a.join().unwrap();
+        let cb = b.join().unwrap();
+        assert!(ca > 0 && cb > 0, "workers should progress, got {ca} / {cb}");
+    }
 }

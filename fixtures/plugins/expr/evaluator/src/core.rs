@@ -170,3 +170,46 @@ fn map_eval_error(err: EvalError) -> EvaluateExpressionError {
         EvalError::NonFinite => EvaluateExpressionError::NonFinite,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// P1-47: Pow yields Inf or NaN → the evaluator surfaces
+    /// `NonFinite`, not a numeric result that would break downstream
+    /// serde_json.
+    #[test]
+    fn pow_producing_infinity_returns_non_finite() {
+        let err = evaluate_expression("10^500").unwrap_err();
+        assert!(matches!(err, EvaluateExpressionError::NonFinite));
+    }
+
+    #[test]
+    fn pow_producing_nan_returns_non_finite() {
+        // (-1)^0.5 = NaN in real f64.
+        let err = evaluate_expression("(-1)^0.5").unwrap_err();
+        assert!(matches!(err, EvaluateExpressionError::NonFinite));
+    }
+
+    /// Finite pow results pass through normally.
+    #[test]
+    fn pow_finite_result_passes_through() {
+        assert_eq!(evaluate_expression("2^10").unwrap(), 1024.0);
+    }
+
+    #[test]
+    fn division_by_zero_still_specific_error() {
+        // Sanity: NonFinite guard doesn't swallow more specific errors.
+        assert!(matches!(
+            evaluate_expression("1 / 0"),
+            Err(EvaluateExpressionError::DivisionByZero)
+        ));
+    }
+
+    #[test]
+    fn factorial_overflow_bubbles_up() {
+        // P1-46 wired through the evaluator error mapping.
+        let err = evaluate_expression("200!").unwrap_err();
+        assert!(matches!(err, EvaluateExpressionError::FactorialOverflow));
+    }
+}

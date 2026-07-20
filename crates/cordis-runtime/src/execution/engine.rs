@@ -1128,3 +1128,173 @@ fn retry_backoff_delay_ms(policy: &RunPolicy, next_attempt: u32) -> u64 {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::context::RuntimeContext;
+    use crate::execution::gate::RunPolicy;
+    use crate::execution::net::{ArcDirection, JoinPolicy};
+
+    fn make_transition(
+        id: &str,
+        kind: ExecutionTransitionKind,
+        join: JoinPolicy,
+    ) -> ExecutionTransitionSpec {
+        ExecutionTransitionSpec {
+            transition: TransitionSpec {
+                transition_id: id.to_string(),
+                priority: 0,
+                join_policy: join,
+            },
+            run_policy: RunPolicy::default(),
+            kind,
+            logical_group: None,
+            topo_level: 0,
+            node_type: None,
+        }
+    }
+
+    fn place(id: &str) -> PlaceSpec {
+        PlaceSpec {
+            place_id: id.to_string(),
+        }
+    }
+
+    fn arc_in(arc_id: &str, place: &str, transition: &str) -> ArcSpec {
+        ArcSpec {
+            arc_id: arc_id.to_string(),
+            place_id: place.to_string(),
+            transition_id: transition.to_string(),
+            direction: ArcDirection::PlaceToTransition,
+            label: None,
+            required: false,
+        }
+    }
+
+    /// P1-6: `KeyedPair` demands exactly two input places. The engine
+    /// used to silently never fire on arity != 2; now it must reject at
+    /// `execute_net` entry with `RuntimeError::Invariant`.
+    #[test]
+    fn keyed_pair_arity_one_is_rejected() {
+        let net = ExecutionNetSpec {
+            places: vec![place("p1")],
+            transitions: vec![make_transition(
+                "t",
+                ExecutionTransitionKind::Task,
+                JoinPolicy::KeyedPair,
+            )],
+            arcs: vec![arc_in("a1", "p1", "t")],
+        };
+        let mut ctx = RuntimeContext::default();
+        let err = execute_net(
+            ExecutionConfig::default(),
+            net,
+            &mut ctx,
+            |_spec, _attempt, _trigger, _ctx| {
+                TransitionRunResult::from_outcome(NodeOutcome::Success)
+            },
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("KeyedPair"), "unexpected error: {msg}");
+        assert!(msg.contains("2"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn keyed_pair_arity_three_is_rejected() {
+        let net = ExecutionNetSpec {
+            places: vec![place("p1"), place("p2"), place("p3")],
+            transitions: vec![make_transition(
+                "t",
+                ExecutionTransitionKind::Task,
+                JoinPolicy::KeyedPair,
+            )],
+            arcs: vec![
+                arc_in("a1", "p1", "t"),
+                arc_in("a2", "p2", "t"),
+                arc_in("a3", "p3", "t"),
+            ],
+        };
+        let mut ctx = RuntimeContext::default();
+        let err = execute_net(
+            ExecutionConfig::default(),
+            net,
+            &mut ctx,
+            |_spec, _attempt, _trigger, _ctx| {
+                TransitionRunResult::from_outcome(NodeOutcome::Success)
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("KeyedPair"));
+    }
+
+    /// AllOf arity is unrestricted — a single-arity AllOf must be accepted.
+    #[test]
+    fn all_of_single_arity_is_accepted() {
+        let net = ExecutionNetSpec {
+            places: vec![place("p1")],
+            transitions: vec![make_transition(
+                "t",
+                ExecutionTransitionKind::Terminal,
+                JoinPolicy::AllOf,
+            )],
+            arcs: vec![arc_in("a1", "p1", "t")],
+        };
+        let mut ctx = RuntimeContext::default();
+        let output = execute_net(
+            ExecutionConfig::default(),
+            net,
+            &mut ctx,
+            |_spec, _attempt, _trigger, _ctx| {
+                TransitionRunResult::from_outcome(NodeOutcome::Success)
+            },
+        )
+        .expect("AllOf with 1 input should not be rejected");
+        assert!(output.order.is_empty(), "no seeded tokens -> nothing fires");
+    }
+
+    /// P1-4 regression guard: `cmp_ready` orders ready items primarily
+    /// by `topo_level` ascending, then by `priority` descending.
+    #[test]
+    fn cmp_ready_orders_by_topo_level_then_priority() {
+        use crate::execution::net::CorrelationKey;
+        let a = ReadyItem {
+            transition_id: "a".to_string(),
+            key: CorrelationKey(String::new()),
+            topo_level: 0,
+            priority: 1,
+            retry: false,
+        };
+        let b = ReadyItem {
+            transition_id: "b".to_string(),
+            key: CorrelationKey(String::new()),
+            topo_level: 1,
+            priority: 100,
+            retry: false,
+        };
+        assert!(
+            cmp_ready(&a, &b).is_lt(),
+            "lower topo_level should sort first even with lower priority"
+        );
+
+        let c = ReadyItem {
+            transition_id: "c".to_string(),
+            key: CorrelationKey(String::new()),
+            topo_level: 5,
+            priority: 10,
+            retry: false,
+        };
+        let d = ReadyItem {
+            transition_id: "d".to_string(),
+            key: CorrelationKey(String::new()),
+            topo_level: 5,
+            priority: 5,
+            retry: false,
+        };
+        assert!(
+            cmp_ready(&c, &d).is_lt(),
+            "at same topo_level, higher priority sorts first"
+        );
+    }
+}
