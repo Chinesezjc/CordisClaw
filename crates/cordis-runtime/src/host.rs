@@ -2211,7 +2211,7 @@ export_plugin_api! {{
                 Ok(report)
             }
             Err((err, attempt)) => {
-                self.record_reload_attempt(attempt);
+                self.record_reload_attempt(*attempt);
                 self.observe_reload_error("reload", &err);
                 Err(err)
             }
@@ -2233,6 +2233,7 @@ export_plugin_api! {{
                 attempt
             }
             Err((err, attempt)) => {
+                let attempt = *attempt;
                 self.record_reload_attempt(attempt.clone());
                 self.observe_reload_error("reload", &err);
                 attempt
@@ -2247,7 +2248,7 @@ export_plugin_api! {{
     fn reload_subtree(
         &self,
         prefix: &str,
-    ) -> Result<(ReloadReport, ReloadAttemptReport), (RuntimeError, ReloadAttemptReport)> {
+    ) -> Result<(ReloadReport, ReloadAttemptReport), (RuntimeError, Box<ReloadAttemptReport>)> {
         let normalized = prefix.trim_start_matches('/');
         let previous_snapshot = self.current_snapshot();
         let started_at = Instant::now();
@@ -2303,7 +2304,7 @@ export_plugin_api! {{
         let index = crate::plugin::artifact::load_artifact_index(&index_path)
             .map_err(|e| {
                 let attempt = self.make_failed_attempt(&previous_snapshot, started_at, &e);
-                (e, attempt)
+                (e, Box::new(attempt))
             })?;
         let index_map = crate::plugin::artifact::artifact_index_map(&index);
 
@@ -2378,7 +2379,7 @@ export_plugin_api! {{
                     required: false,
                 };
                 let attempt = self.make_failed_attempt(&previous_snapshot, started_at, &err);
-                (err, attempt)
+                (err, Box::new(attempt))
             })?;
 
             let resolved =
@@ -2386,7 +2387,7 @@ export_plugin_api! {{
             let dylib =
                 crate::plugin::dynamic::LoadedDylibApi::open(&resolved).map_err(|e| {
                     let attempt = self.make_failed_attempt(&previous_snapshot, started_at, &e);
-                    (e, attempt)
+                    (e, Box::new(attempt))
                 })?;
             let api = dylib.api();
 
@@ -2397,7 +2398,7 @@ export_plugin_api! {{
                         message: format!("failed to parse docs for {plugin_path}: {e}"),
                     };
                     let attempt = self.make_failed_attempt(&previous_snapshot, started_at, &err);
-                    (err, attempt)
+                    (err, Box::new(attempt))
                 })?;
             if new_docs.nodes != entry.docs.nodes {
                 let err = RuntimeError::AbiMismatch {
@@ -2411,7 +2412,7 @@ export_plugin_api! {{
                     )],
                 };
                 let attempt = self.make_failed_attempt(&previous_snapshot, started_at, &err);
-                return Err((err, attempt));
+                return Err((err, Box::new(attempt)));
             }
 
             // Strict ABI fingerprint comparison.
@@ -2421,7 +2422,7 @@ export_plugin_api! {{
                         message: format!("failed to parse abi_fingerprint for {plugin_path}: {e}"),
                     };
                     let attempt = self.make_failed_attempt(&previous_snapshot, started_at, &err);
-                    (err, attempt)
+                    (err, Box::new(attempt))
                 })?;
             if actual_fingerprint.crate_hash != entry.abi_fingerprint.crate_hash
                 || actual_fingerprint.api_hash != entry.abi_fingerprint.api_hash
@@ -2440,7 +2441,7 @@ export_plugin_api! {{
                     fingerprint_diff: diff,
                 };
                 let attempt = self.make_failed_attempt(&previous_snapshot, started_at, &err);
-                return Err((err, attempt));
+                return Err((err, Box::new(attempt)));
             }
 
             prepared.push(Prepared {
@@ -2592,7 +2593,7 @@ export_plugin_api! {{
                 Ok(status)
             }
             Err((err, attempt)) => {
-                self.record_candidate_reload_attempt(attempt);
+                self.record_candidate_reload_attempt(*attempt);
                 self.observe_reload_error("candidate_reload", &err);
                 // auto-iteration deferred to kernel timer.
                 Err(err)
@@ -2626,6 +2627,7 @@ export_plugin_api! {{
                 attempt
             }
             Err((err, attempt)) => {
+                let attempt = *attempt;
                 self.record_candidate_reload_attempt(attempt.clone());
                 self.observe_reload_error("candidate_reload", &err);
                 // auto-iteration deferred to kernel timer.
@@ -3515,7 +3517,7 @@ export_plugin_api! {{
 
     fn reload_internal(
         &self,
-    ) -> Result<(ReloadReport, ReloadAttemptReport), (RuntimeError, ReloadAttemptReport)> {
+    ) -> Result<(ReloadReport, ReloadAttemptReport), (RuntimeError, Box<ReloadAttemptReport>)> {
         let previous_snapshot = self.current_snapshot();
         let staged_artifact_root = next_staged_artifact_root(&self.snapshot_root);
         let started_at = Instant::now();
@@ -3539,7 +3541,7 @@ export_plugin_api! {{
                         changed_plugin_reasons: BTreeMap::new(),
                         failure_summary: Some(err.to_string()),
                     };
-                    return Err((err, attempt));
+                    return Err((err, Box::new(attempt)));
                 }
             };
 
@@ -3659,7 +3661,7 @@ export_plugin_api! {{
 
     fn reload_candidate_internal(
         &self,
-    ) -> Result<(CandidateSnapshotStatus, ReloadAttemptReport), (RuntimeError, ReloadAttemptReport)>
+    ) -> Result<(CandidateSnapshotStatus, ReloadAttemptReport), (RuntimeError, Box<ReloadAttemptReport>)>
     {
         let previous_snapshot = self.current_snapshot();
         let staged_artifact_root = next_staged_artifact_root(&self.snapshot_root);
@@ -3684,7 +3686,7 @@ export_plugin_api! {{
                         changed_plugin_reasons: BTreeMap::new(),
                         failure_summary: Some(err.to_string()),
                     };
-                    return Err((err, attempt));
+                    return Err((err, Box::new(attempt)));
                 }
             };
 
