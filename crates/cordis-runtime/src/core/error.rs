@@ -91,8 +91,13 @@ pub enum RuntimeError {
     )]
     AbiMismatch {
         plugin_path: String,
-        expected: AbiFingerprint,
-        actual: AbiFingerprint,
+        // Boxed: two inline `AbiFingerprint`s (4 Strings each, ~96B apiece)
+        // made this the largest variant and inflated every
+        // `Result<_, RuntimeError>` on its success path (clippy
+        // result_large_err). Boxing keeps the enum small; ABI mismatches
+        // are cold-path so the extra allocation is irrelevant.
+        expected: Box<AbiFingerprint>,
+        actual: Box<AbiFingerprint>,
         fingerprint_diff: Vec<String>,
     },
 

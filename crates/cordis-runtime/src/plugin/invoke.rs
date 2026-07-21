@@ -188,8 +188,8 @@ pub fn invoke_registered_plugin(
         );
         return Err(RuntimeError::AbiMismatch {
             plugin_path: plugin_path.to_string(),
-            expected: expected_fingerprint,
-            actual: runtime_fingerprint,
+            expected: Box::new(expected_fingerprint),
+            actual: Box::new(runtime_fingerprint),
             fingerprint_diff: diff,
         });
     }

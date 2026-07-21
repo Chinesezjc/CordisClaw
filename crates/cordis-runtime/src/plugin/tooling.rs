@@ -634,8 +634,8 @@ fn materialize_artifact_entry(
         if runtime_fingerprint != context.plugin.metadata.abi_fingerprint {
             return Err(RuntimeError::AbiMismatch {
                 plugin_path: context.plugin.plugin_path.clone(),
-                expected: context.plugin.metadata.abi_fingerprint.clone(),
-                actual: runtime_fingerprint.clone(),
+                expected: Box::new(context.plugin.metadata.abi_fingerprint.clone()),
+                actual: Box::new(runtime_fingerprint.clone()),
                 fingerprint_diff: context
                     .plugin
                     .metadata
