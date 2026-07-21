@@ -967,6 +967,21 @@ impl AgentSession {
         self.completed_turns = 0;
     }
 
+    /// Swap the LLM config (profile fallback switching). Rebuilds the
+    /// HTTP client for the new timeout; history/transcript are untouched
+    /// so the conversation continues seamlessly on the other endpoint.
+    pub fn swap_config(&mut self, config: LlmApiConfig) -> Result<(), RuntimeError> {
+        let client = Client::builder()
+            .timeout(Duration::from_millis(config.timeout_ms))
+            .build()
+            .map_err(|err| RuntimeError::LlmRequestFailed {
+                message: format!("failed to build agent HTTP client: {err}"),
+            })?;
+        self.config = config;
+        self.client = client;
+        Ok(())
+    }
+
     pub fn status(&self) -> AgentSessionStatus {
         AgentSessionStatus {
             kind: self.kind.clone(),

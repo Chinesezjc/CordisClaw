@@ -2013,3 +2013,118 @@ fn serve_mode_supports_candidate_control_plane() {
     assert!(stdout.contains("\"current_snapshot_id\""), "stdout: {stdout}");
     assert!(stdout.contains("\"candidate_snapshot\":null"), "stdout: {stdout}");
 }
+
+// L批: LLM profile fallback 状态机。default 指向死端口 → 自动切 fallback
+// 'fast'（mock server）并记录 kernel issue；default 恢复后乐观探测切回。
+fn write_llm_profiles_config(root: &Path, default_url: &str, fast_url: &str) {
+    let config_dir = root.join("config");
+    fs::create_dir_all(&config_dir).expect("create config dir");
+    fs::write(
+        config_dir.join("llm_api.yaml"),
+        format!(
+            "profiles:\n  default:\n    provider: deepseek\n    base_url: {default_url}\n    api_key: test-key\n    model: deepseek-reasoner\n    timeout_ms: 10000\n    fallback: fast\n  fast:\n    provider: deepseek\n    base_url: {fast_url}\n    api_key: test-key\n    model: deepseek-chat\n    timeout_ms: 10000\n"
+        ),
+    )
+    .expect("write llm profiles config");
+}
+
+/// Serve exactly one SSE chat completion on an already-bound listener.
+fn serve_one_sse(
+    listener: std::net::TcpListener,
+    chunks: Vec<(u64, String)>,
+) -> std::thread::JoinHandle<usize> {
+    std::thread::spawn(move || {
+        use std::io::{BufRead, BufReader, Read as _, Write as _};
+        let (mut stream, _) = listener.accept().expect("accept probe request");
+        let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+        let mut line = String::new();
+        reader.read_line(&mut line).expect("request line");
+        let mut content_length = 0usize;
+        loop {
+            let mut header = String::new();
+            reader.read_line(&mut header).expect("header line");
+            if header == "\r\n" {
+                break;
+            }
+            if let Some(v) = header.to_ascii_lowercase().strip_prefix("content-length:") {
+                content_length = v.trim().parse().expect("content length");
+            }
+        }
+        let mut body = vec![0u8; content_length];
+        reader.read_exact(&mut body).expect("request body");
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+        )
+        .expect("headers");
+        for (delay_ms, chunk) in &chunks {
+            std::thread::sleep(std::time::Duration::from_millis(*delay_ms));
+            write!(stream, "{:X}\r\n{}\r\n", chunk.len(), chunk).expect("chunk");
+        }
+        write!(stream, "0\r\n\r\n").expect("chunked end");
+        stream.flush().expect("flush");
+        1
+    })
+}
+
+#[test]
+#[serial]
+fn llm_profile_fallback_degrades_and_recovers() {
+    use cordis_runtime::host::{AgentSessionKind, AgentStartOptions};
+
+    let temp = setup_fixture_workspace_copy();
+    let fixtures = temp.path().join("fixtures");
+
+    // Reserve a port for "default" then free it so the first send fails.
+    let placeholder = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve port");
+    let default_addr = placeholder.local_addr().expect("addr");
+    drop(placeholder);
+    let default_url = format!("http://{default_addr}/v1");
+
+    let (fast_url, fast_requests_rx, fast_handle) =
+        spawn_chunked_mock_llm_server_sequence(vec![assistant_response(
+            "fallback_reply",
+            "served by fast",
+        )]);
+    write_llm_profiles_config(temp.path(), &default_url, &fast_url);
+
+    let host = RuntimeHost::boot(&fixtures).expect("host should boot");
+    let handle = host
+        .agent_start_with(
+            AgentSessionKind::RuntimeShell,
+            AgentStartOptions { profile: Some("default".to_string()) },
+        )
+        .expect("agent start");
+    let sid = handle.session_id.as_str();
+
+    // 1) default dead → degrade to fast, reply still succeeds.
+    let reply = host
+        .agent_send_with_fallback(sid, "hello")
+        .expect("fallback should rescue the request");
+    assert!(reply.content.contains("served by fast"), "content: {}", reply.content);
+    let issues = host.kernel().plugin_issues();
+    assert!(
+        issues.iter().any(|i| i.root_plugin_path == "/llm-profile"
+            && i.summary.contains("degraded to fallback 'fast'")),
+        "issues: {issues:?}"
+    );
+    let fast_requests = fast_requests_rx.recv().expect("fast requests");
+    fast_handle.join().expect("join fast mock");
+    assert_eq!(fast_requests.len(), 1);
+
+    // 2) default comes back → optimistic probe switches back on next send.
+    let revived = std::net::TcpListener::bind(default_addr).expect("rebind default port");
+    let probe_handle = serve_one_sse(
+        revived,
+        assistant_response("recovered_reply", "served by default"),
+    );
+    let reply = host
+        .agent_send_with_fallback(sid, "are you back?")
+        .expect("recovered profile should serve");
+    assert!(
+        reply.content.contains("served by default"),
+        "content: {}",
+        reply.content
+    );
+    assert_eq!(probe_handle.join().expect("join probe server"), 1);
+}
