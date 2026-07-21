@@ -1,0 +1,6 @@
+# soul_store: SQLite soul 存储插件。加载后其 soul_get/soul_set 能力
+# 节点覆写 kernel 的文件默认实现（data/souls/*.json → data/souls.db）。
+# 禁用/卸载后自动回落文件存储，不影响冷启动。
+plugin: soul_store
+enabled: true
+settings: {}

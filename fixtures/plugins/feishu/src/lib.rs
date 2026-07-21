@@ -1192,16 +1192,15 @@ fn post_loading_card(msg: &IncomingMessage) {
     }
 }
 
-/// Skip trivial / command-style inputs (mirrors qq's should_process).
+/// Skip trivial inputs. `/`-prefixed commands ARE forwarded (N批): the
+/// runtime's command router handles them without the LLM, which keeps
+/// /status etc. usable during a model outage.
 fn should_process(text: &str) -> bool {
     let t = text.trim();
-    if t.chars().count() <= 1 {
-        return false;
-    }
     if t.starts_with('/') {
-        return false;
+        return t.chars().count() > 1;
     }
-    true
+    t.chars().count() > 1
 }
 
 /// Build the runtime routing envelope for a message.

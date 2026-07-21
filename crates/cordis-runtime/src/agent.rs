@@ -73,6 +73,7 @@ const AGENT_TOOL_COMPACT_CONTEXT: &str = "compact_context";
 const AGENT_TOOL_RUN_PLUGIN_TEST: &str = "run_plugin_test";
 const AGENT_TOOL_REQUEST_ITERATION: &str = "request_iteration";
 const AGENT_TOOL_CREATE_PLUGIN: &str = "create_plugin";
+const AGENT_TOOL_SET_SOUL: &str = "set_soul";
 const LLM_DEBUG_ENV: &str = "CORDIS_LLM_DEBUG";
 
 pub trait AgentToolHost {
@@ -130,6 +131,24 @@ pub trait AgentToolHost {
     fn agent_request_iteration(&self, plugin_path: &str, instruction: &str) -> Result<Value, RuntimeError>;
     fn agent_create_plugin(&self, name: &str, description: Option<&str>) -> Result<Value, RuntimeError>;
     fn agent_send_warning_to_test_groups(&self, message: &str);
+    /// O批: persona overlay text for the given soul scope, if any.
+    /// Default None keeps non-runtime hosts (tests) working unchanged.
+    fn agent_soul_overlay(&self, _soul_key: &str) -> Option<String> {
+        None
+    }
+    /// O批: update the soul for a scope key. The KEY IS NOT LLM-SUPPLIED —
+    /// callers must pass the current session's own soul_key so one user
+    /// can never edit another user's persona.
+    fn agent_set_soul(
+        &self,
+        _soul_key: &str,
+        _persona: Option<&str>,
+        _profile: Option<&str>,
+    ) -> Result<Value, RuntimeError> {
+        Err(RuntimeError::InvalidArgument {
+            message: "soul storage is not available on this host".to_string(),
+        })
+    }
 }
 
 impl AgentToolHost for RuntimeHost {
@@ -814,6 +833,63 @@ impl AgentToolHost for RuntimeHost {
     fn agent_send_warning_to_test_groups(&self, message: &str) {
         crate::kernel::notify::send(self, message);
     }
+
+    fn agent_soul_overlay(&self, soul_key: &str) -> Option<String> {
+        match self.get_soul(soul_key) {
+            Ok(Some(soul)) if !soul.persona.trim().is_empty() => Some(soul.persona),
+            Ok(_) => None,
+            Err(err) => {
+                eprintln!("[soul] overlay lookup failed for {soul_key}: {err}");
+                None
+            }
+        }
+    }
+
+    fn agent_set_soul(
+        &self,
+        soul_key: &str,
+        persona: Option<&str>,
+        profile: Option<&str>,
+    ) -> Result<Value, RuntimeError> {
+        if soul_key.is_empty() {
+            return Err(RuntimeError::InvalidArgument {
+                message: "this session has no user identity; soul editing requires a \
+                          channel session (Feishu/QQ) with sender info"
+                    .to_string(),
+            });
+        }
+        // Merge onto the existing record so setting only the profile
+        // doesn't wipe the persona (and vice versa).
+        let mut soul = self.get_soul(soul_key)?.unwrap_or_default();
+        if let Some(p) = persona {
+            soul.persona = p.to_string();
+        }
+        if let Some(p) = profile {
+            let trimmed = p.trim();
+            soul.profile = if trimmed.is_empty() { None } else { Some(trimmed.to_string()) };
+            if let Some(name) = &soul.profile {
+                let profiles = &self.config().llm_profiles.profiles;
+                if !profiles.contains_key(name) {
+                    return Err(RuntimeError::InvalidArgument {
+                        message: format!(
+                            "unknown LLM profile '{name}'; available: {}",
+                            profiles.keys().cloned().collect::<Vec<_>>().join(", ")
+                        ),
+                    });
+                }
+            }
+        }
+        soul.updated_at_ms = crate::kernel::plugin_iteration::now_ms() as u64;
+        soul.updated_by = "agent".to_string();
+        self.set_soul(soul_key, &soul)?;
+        Ok(json!({
+            "ok": true,
+            "soul_key": soul_key,
+            "persona_chars": soul.persona.chars().count(),
+            "profile": soul.profile.clone().unwrap_or_else(|| "default".to_string()),
+            "note": "changes apply to NEW sessions (after /reset); the current conversation keeps its prompt",
+        }))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -909,6 +985,9 @@ pub struct AgentSession {
     reasoning_only_strikes: usize,
     /// Consecutive calls to tools that don't exist in this session (LLM hallucination guard).
     unknown_tool_strikes: usize,
+    /// O批: soul scope key ({sender_id}#{conversation_kind}) this session
+    /// serves. Empty = no per-user soul (REPL, legacy callers).
+    soul_key: String,
 }
 
 /// Serializable snapshot of an AgentSession for crash recovery.
@@ -924,6 +1003,9 @@ pub struct AgentSessionSnapshot {
     pub estimated_tokens: usize,
     pub reasoning_only_strikes: usize,
     pub unknown_tool_strikes: usize,
+    /// `#[serde(default)]` keeps pre-O批 snapshots deserializable.
+    #[serde(default)]
+    pub soul_key: String,
 }
 
 pub type ShellAgentStatus = AgentSessionStatus;
@@ -958,7 +1040,18 @@ impl AgentSession {
             estimated_tokens: 0,
             reasoning_only_strikes: 0,
             unknown_tool_strikes: 0,
+            soul_key: String::new(),
         })
+    }
+
+    /// O批: bind this session to a soul scope key. Set once at
+    /// agent_start; the backend reads it to fetch the persona overlay.
+    pub fn set_soul_key(&mut self, soul_key: impl Into<String>) {
+        self.soul_key = soul_key.into();
+    }
+
+    pub fn soul_key(&self) -> &str {
+        &self.soul_key
     }
 
     pub fn reset(&mut self) {
@@ -1486,7 +1579,8 @@ impl AgentSession {
         session_id: &str,
         user_input: &str,
     ) -> Result<AgentReply, RuntimeError> {
-        let mut backend = RuntimeShellAgentBackend { host, session_id };
+        let soul_key = self.soul_key.clone();
+        let mut backend = RuntimeShellAgentBackend { host, session_id, soul_key };
         self.respond(&mut backend, user_input)
     }
 
@@ -1786,6 +1880,7 @@ impl AgentSession {
             estimated_tokens: self.estimated_tokens,
             reasoning_only_strikes: self.reasoning_only_strikes,
             unknown_tool_strikes: self.unknown_tool_strikes,
+            soul_key: self.soul_key.clone(),
         }
     }
 
@@ -1814,6 +1909,7 @@ impl AgentSession {
             estimated_tokens: snapshot.estimated_tokens,
             reasoning_only_strikes: snapshot.reasoning_only_strikes,
             unknown_tool_strikes: snapshot.unknown_tool_strikes,
+            soul_key: snapshot.soul_key,
         })
     }
 }
@@ -2190,6 +2286,17 @@ struct CreatePluginArgs {
     name: String,
     #[serde(default)]
     description: Option<String>,
+}
+
+/// O批: set_soul deliberately has NO soul_key parameter — the scope is
+/// injected from the session, so the LLM can't target another user.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SetSoulArgs {
+    #[serde(default)]
+    persona: Option<String>,
+    #[serde(default)]
+    profile: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -2622,13 +2729,27 @@ fn process_stream_event(
 struct RuntimeShellAgentBackend<'a, H: AgentToolHost + ?Sized> {
     host: &'a H,
     session_id: &'a str,
+    /// O批: soul scope of the owning session ("" = none).
+    soul_key: String,
 }
 
 impl<'a, H: AgentToolHost + ?Sized> AgentBackend for RuntimeShellAgentBackend<'a, H> {
     type Host = H;
     fn host(&self) -> &H { self.host }
+    /// O批: three-part prompt — base, soul overlay, plugin hints. The
+    /// overlay sits between them so a persona can adjust tone/behaviour
+    /// while plugin usage contracts still land last (highest recency).
     fn system_prompt(&self) -> String {
         let mut prompt = shell_agent_system_prompt();
+        if !self.soul_key.is_empty() {
+            if let Some(persona) = self.host.agent_soul_overlay(&self.soul_key) {
+                if !persona.trim().is_empty() {
+                    prompt.push_str("\n\n--- Persona (per-user soul) ---\n\n");
+                    prompt.push_str(persona.trim());
+                    prompt.push('\n');
+                }
+            }
+        }
         let hints = self.host.agent_plugin_hints();
         if !hints.is_empty() {
             prompt.push_str("\n\n--- Plugin-specific instructions ---\n\n");
@@ -2746,6 +2867,14 @@ impl<'a, H: AgentToolHost + ?Sized> AgentBackend for RuntimeShellAgentBackend<'a
             AGENT_TOOL_CREATE_PLUGIN => {
                 let args = parse_tool_value_arguments::<CreatePluginArgs>(arguments, name)?;
                 self.host.agent_create_plugin(&args.name, args.description.as_deref())
+            }
+            AGENT_TOOL_SET_SOUL => {
+                let args = parse_tool_value_arguments::<SetSoulArgs>(arguments, name)?;
+                self.host.agent_set_soul(
+                    &self.soul_key,
+                    args.persona.as_deref(),
+                    args.profile.as_deref(),
+                )
             }
             other => Err(RuntimeError::InvalidArgument {
                 message: format!("runtime shell agent does not support tool {other}"),
@@ -2962,6 +3091,18 @@ fn shell_agent_tools() -> Vec<AgentToolSpec> {
                     "description": { "type": "string", "description": "Optional short description for the plugin (goes in lib.rs doc comment)." },
                 },
                 "required": ["name"],
+                "additionalProperties": false,
+            }),
+        },
+        AgentToolSpec {
+            name: AGENT_TOOL_SET_SOUL,
+            description: "Update the persona (soul) and/or LLM profile for the CURRENT user's current conversation scope. Use when the user asks to change your personality, tone, role, or which model profile serves them. persona: full replacement persona text (omit to keep). profile: named LLM profile like \"default\" or \"fast\" (omit to keep; empty string clears back to default). Changes take effect in NEW sessions (after /reset). You can never edit another user's soul — the scope is bound to this session.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "persona": { "type": "string", "description": "New persona overlay text for the system prompt. Replaces the existing persona entirely." },
+                    "profile": { "type": "string", "description": "Named LLM profile for this user (must exist in llm_api.yaml profiles). Empty string resets to default." },
+                },
                 "additionalProperties": false,
             }),
         },

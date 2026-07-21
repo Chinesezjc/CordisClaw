@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod command_router;
 pub mod config;
 pub mod context;
 pub mod core;
@@ -7,3 +8,4 @@ pub mod host;
 pub mod kernel;
 pub mod plugin;
 pub mod service;
+pub mod soul;

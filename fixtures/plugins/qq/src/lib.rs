@@ -836,10 +836,11 @@ fn extract_i64(val: &Value) -> Option<i64> {
 // New node handlers
 // ---------------------------------------------------------------------------
 
+/// `/`-prefixed commands ARE forwarded (N批): the runtime's command
+/// router executes them without the LLM (usable during model outages).
 fn should_process(text: &str) -> bool {
-    if text.len() <= 2 { return false; }
-    if text.starts_with('/') { return false; }
-    true
+    if text.starts_with('/') { return text.len() > 1; }
+    text.len() > 2
 }
 
 /// Build the runtime routing envelope (mirrors feishu's build_envelope).
@@ -1667,11 +1668,13 @@ mod chain_tests {
         assert!(text.contains("你好"));
     }
 
-    // should_process 过滤：过短 / 斜杠命令不触发 agent。
+    // should_process 过滤：过短消息不转发；斜杠指令放行（N批：kernel
+    // 指令路由器接管，不经 LLM）。
     #[test]
-    fn should_process_filters_short_and_slash() {
+    fn should_process_filters_short_and_forwards_slash() {
         assert!(!should_process("ok"), "过短消息不触发");
-        assert!(!should_process("/help"), "斜杠命令不触发");
+        assert!(should_process("/help"), "斜杠指令放行给指令路由器");
+        assert!(!should_process("/"), "裸斜杠不触发");
         assert!(should_process("这是一条正常消息"), "正常消息触发");
     }
 

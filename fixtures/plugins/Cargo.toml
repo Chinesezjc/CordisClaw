@@ -1,7 +1,8 @@
 [workspace]
 members = [
   "time",
-  "filesystem", "expr", "shell", "qq", "feishu", "web", "git", "vision", "gacha"]
+  "filesystem", "expr", "shell", "qq", "feishu", "web", "git", "vision", "gacha",
+  "soul_store"]
 exclude = [
   # `_net` is a utility rlib shared by `web` and `vision` for the SSRF
   # guard (P2-2); it's not a runtime-loadable plugin. Depended on via

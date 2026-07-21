@@ -172,3 +172,24 @@ required 子插件失败后，`Loader::propagate_parent_failure()` 会沿着 req
   - 也可导出 JSON 和自包含 HTML
 
 注意这里的 net 是“文档推导的注册 net”，不是执行引擎真实运行时传入的任意 net。当前推导规则比较保守，主要基于 schema 属性名匹配。
+
+## 4. 约定能力节点（capability-node）覆写契约（O/P 批，2026-07-21）
+
+节点 FQN 冲突是 fail-fast 的（无同名覆写机制），因此"插件覆写 kernel 默认实现"走**约定 node_id** 模式：kernel 在取用某能力时扫描 registry，找到声明了约定节点的已加载插件就 invoke 它，否则用内建默认。每次取用时解析，reload 自动切换。
+
+当前已定义的能力契约：
+
+### 4.1 Soul 存储（`soul_get` + `soul_set`，成对出现才生效）
+
+- `soul_get`
+  - 入参 payload：`{ soul_key: string, data_dir: string }`（`data_dir` 由 kernel 注入，插件应优先使用它定位存储，勿依赖 cwd/env）
+  - 出参：`{ ok: bool, soul: {persona, profile, updated_at_ms, updated_by} | null }`
+- `soul_set`
+  - 入参 payload：`{ soul_key: string, soul: {…}, data_dir: string }`
+  - 出参：`{ ok: bool }`
+
+kernel 默认实现：`FileSoulProvider`（`data/souls/{sanitized_key}.json`）。覆写样例：`fixtures/plugins/soul_store`（rusqlite bundled，`data/souls.db`）。
+
+### 4.2 指令入口（`command_name` + `command_entry`）
+
+插件 docs 声明 `command_name` 且暴露 `command_entry` 节点时，`/{command_name} <args>` 由指令路由器（不经 LLM）分发到该节点，payload：`{ args, session_key, sender_id, conversation_kind }`；回复取响应 JSON 的 `message` 字段（缺失则用原始 payload 文本）。

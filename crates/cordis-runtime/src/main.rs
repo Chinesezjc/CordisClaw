@@ -520,6 +520,54 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                         "inbox: [{session_key}] (soul {}) batch {} msgs: {}",
                         route.soul_key(), envs.len(), combined
                     );
+                    // Fixed-template reply through the envelope route — the
+                    // no-LLM send path shared by commands and receipts.
+                    let send_direct = |message: &str| {
+                        if !route.can_reply() {
+                            eprintln!("inbox: no reply route for {session_key}, direct reply dropped");
+                            return;
+                        }
+                        let payload = serde_json::json!({
+                            "node_id": route.reply_node,
+                            "target": route.reply_target,
+                            "message": message,
+                        });
+                        if let Err(e) = host.invoke(&route.source_plugin, &route.reply_node, payload.to_string()) {
+                            eprintln!("inbox: direct reply failed: {e}");
+                        }
+                    };
+                    // N批: `/`-prefixed messages bypass the LLM entirely.
+                    // The user text is extracted from the display's trailing
+                    // "]: " marker when present (channel plugins prefix a
+                    // source tag); raw text is used as-is otherwise.
+                    let user_text = route
+                        .display
+                        .rsplit_once("]: ")
+                        .map(|(_, t)| t)
+                        .unwrap_or(route.display.as_str())
+                        .trim();
+                    if user_text.starts_with('/') {
+                        let ctx = cordis_runtime::command_router::CommandContext {
+                            session_key: session_key.clone(),
+                            sender_id: route.sender_id.clone(),
+                            conversation_kind: route.conversation_kind.clone(),
+                            soul_key: route.soul_key(),
+                        };
+                        match cordis_runtime::command_router::dispatch(&host, &ctx, user_text) {
+                            cordis_runtime::command_router::CommandOutcome::Reply(text) => {
+                                send_direct(&text);
+                            }
+                            cordis_runtime::command_router::CommandOutcome::ResetSession(text) => {
+                                if let Some(old_sid) = sessions.remove(session_key) {
+                                    host.delete_session_snapshot(&old_sid);
+                                    eprintln!("inbox: [{session_key}] session {old_sid} reset by /reset");
+                                }
+                                pending::clear(&data_dir, session_key);
+                                send_direct(&text);
+                            }
+                        }
+                        continue;
+                    }
                     // P1-53: don't drain rx.try_recv() here — messages on the
                     // channel are from ALL sessions; the outer loop shards
                     // them correctly next iteration.
@@ -542,9 +590,21 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
                     }
+                    // O批: resolve the soul BEFORE creating the session so
+                    // its profile reference picks the LLM config and its
+                    // persona overlays the system prompt. Unknown profile
+                    // names fall back to default inside resolve().
+                    let soul_key = route.soul_key();
                     let sid = sessions.entry(session_key.clone())
-                        .or_insert_with(|| host.agent_start(AgentSessionKind::RuntimeShell)
-                            .map(|s| s.session_id).unwrap_or_default());
+                        .or_insert_with(|| {
+                            let soul = host.get_soul(&soul_key).ok().flatten();
+                            let options = cordis_runtime::host::AgentStartOptions {
+                                profile: soul.as_ref().and_then(|s| s.profile.clone()),
+                                soul_key: soul_key.clone(),
+                            };
+                            host.agent_start_with(AgentSessionKind::RuntimeShell, options)
+                                .map(|s| s.session_id).unwrap_or_default()
+                        });
                     // Process agent output: parse JSON, dispatch action, send
                     // the reply back to the ORIGINATING plugin (route). Returns
                     // Some(feedback) if the agent needs to retry.

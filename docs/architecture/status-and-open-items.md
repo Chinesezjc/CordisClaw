@@ -206,6 +206,32 @@ Agent 现在可以自主完成：读代码 → 理解结构 → 写/改文件 �
 - [x] **Plugin iteration symlink 逃逸**（P0-20）— `PluginEditExecutor::execute` 在写入前调用新 helper `resolve_under_workspace`：canonicalize 结果必须仍在 workspace_root 下。plugins 内的 symlink 指向 `/etc/passwd` 之类无法被写入。
 - [x] **Verifier shell 拼接**（P0-21）— 已随 A 批 P0-1 修复。`discover_rust_workspace_manifest` 输出的字符串被 `shell_words` 解析成 argv，空格 / `$` / `;` 无法被解释。
 
+### 5.2.32 Soul / LLM Profile / 指令路由 / 消息可靠性（J-P 批，2026-07-21）
+
+多用户化 + 无 LLM 韧性一期，五项能力，全部遵循 kernel=槽+默认实现、plugin=覆写的边界：
+
+**J批 — envelope 身份字段**：`AgentEnvelope` 新增 `sender_id`（如 `feishu:ou_x`）/ `conversation_kind`（private|group），全部 `serde(default)` 向后兼容；`soul_key = {sender_id}#{conversation_kind}`（无身份回落 session_key）。feishu 填充身份；**qq 从纯文本 trigger 升级为完整 envelope**（获得回复路由能力），`qq_send` 的 `reply_to` 接受 i64/字符串双类型。
+
+**K批 — LLM profile 表**（config.rs）：`llm_api.yaml` 支持 `profiles: {name: {...}}` 具名表（`LlmProfile` = flatten 的 `LlmApiConfig` + `fallback` 指针）；旧单份格式自动包装为 default；`LlmProfileRegistry::resolve` 未知名回落 default、缺 default 自动补齐、自指/悬空 fallback 无效化。`agent_start_with(AgentStartOptions{profile, soul_key})` 按名选配置。凭据仍走 env/config，绝不进任何 per-user 存储。
+
+**L批 — profile 自动 fallback**（host.rs `agent_send_with_fallback`）：请求打穿（send_chat_request 内 3 次重试耗尽）→ 机械切 `fallback` profile 重试一次；降级期间每次 send 先乐观探测原 profile，成功即切回。每次切换/恢复记 kernel issue（`/llm-profile`）+ notify 用户可见通知，**绝不静默换模型**。`AgentSession::swap_config` 换端点保留历史。
+
+**M批 — 消息可靠性**（main.rs `mod pending`）：LLM+fallback 全挂时消息落盘 `data/pending/{key}.json`（合并式 spill，原子写），同 session 下条消息到来时前置重放，成功后清除；渠道立即收到固定模板回执（不经 LLM）。用户体验从"消息被吞"变为"回复迟到"。
+
+**N批 — 指令路由器**（`command_router.rs`）：`/` 前缀消息在 inbox 拦截，**完全不经 LLM**，经 envelope 现有回复通路直接回。内建 `/status` `/help` `/reset` `/soul`；插件经 docs `command_name` + 约定节点 `command_entry` 注册指令；未知指令回提示。这同时是 LLM 全挂时的管理面（/status 在模型宕机时照常工作）。权限一期 = 渠道 policy；/reset、/soul 只作用于调用者自己的会话/soul。feishu/qq 的 `should_process` 从丢弃 `/` 改为放行。
+
+**O批 — Soul 槽**（`soul.rs`）：`Soul{persona, profile, updated_at_ms, updated_by}` + `SoulProvider` trait + kernel 内建 `FileSoulProvider`（`data/souls/{key}.json`，0600/0700，无插件无 DB 也可用）。system prompt 三段化：base + soul overlay + plugin hints。插件覆写走**约定能力节点**：加载中的插件同时声明 `soul_get`+`soul_set` 节点即接管存取（每次取用时解析，reload 自动生效）。写路径 = agent 工具 `set_soul`（merge 语义；**不暴露 soul_key 参数**，host 绑定当前 session，杜绝越权改他人人格；profile 名校验白名单）。soul.profile 引用在 inbox 建会话时决定 LLM profile；变更只影响新会话（/reset 后生效）。`AgentSessionSnapshot` 新增 `soul_key`（serde default 兼容旧快照）。
+
+**P批 — soul_store 插件**（`fixtures/plugins/soul_store/`）：rusqlite（bundled）SQLite 存储，`data/souls.db`，`soul_get`/`soul_set` 两节点验证覆写路径端到端；不加载时回落文件。
+
+**验证**：envelope 3 单测 + profile 4 单测 + pending 2 单测 + soul 3 单测 + router 1 单测 + soul_store 3 单测 + qq/feishu 更新单测；集成测试 `llm_profile_fallback_degrades_and_recovers`（双 mock server 降级/恢复 + issue 断言）、`soul_roundtrip_profile_reference_and_scope_guard`、`soul_store_plugin_overrides_file_provider`。
+
+**待办（二期候选）**：
+- 指令 admin 白名单层（当前 = 渠道 policy）。
+- fallback 探测冷却（当前每次 send 都探测，降级期吞吐减半）。
+- 用户自助 soul 编辑指令（当前走 agent 工具，涉及提示词注入面需单独评估）。
+- pending spill 的容量上限与过期清理。
+
 ### 5.2.31 飞书 WSS 长连接 + openclaw 风格策略面 + 卡片两段式（I 批，2026-07-21）
 
 H 批的 feishu 插件源码曾因 sshfs 静默丢失事故从 checkout 消失（仅剩 `.so`），本批先从 `save_draft_and_revert` 保留的 `.cordis-drafts/untracked-*` 快照恢复源码并**提交进 git**（`51f5951`），再做三项扩展（接口面参考 openclaw 的飞书通道）：

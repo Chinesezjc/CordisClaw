@@ -162,19 +162,27 @@ Local(当前插件 -> 祖先插件中被 grants 明确允许的服务)
   - `snapshot_root`
   - `kernel.change_history_limit`
   - `kernel.min_quality_score`
-- `config/llm_api.yaml`
-  - `provider`
-  - `base_url`
-  - `api_key_env`
-  - `api_key`
-  - `model`
-  - `temperature`
-  - `max_tokens`
-  - `timeout_ms`
+- `config/llm_api.yaml` — 两种格式（K批）：
+  - **具名 profile 表（推荐）**：顶层 `profiles: {name: {...}}`，每个 profile 是完整的 API 配置（provider/base_url/api_key_env/api_key/model/temperature/max_tokens/timeout_ms）外加可选 `fallback: <另一 profile 名>`（请求打穿后机械切换目标，L批）。`default` 必在（缺失自动补齐）；未知名引用回落 default。
+  - **旧单份格式（兼容）**：整份文件是一个 API 配置，加载时自动包装为 `default` profile。
 - `config/plugins/*.yaml`
   - 为各插件预留 `enabled + settings` 配置位
 
 仓库把模板放在 `config.example/`，本地运行时目录仍是 `config/`。
+
+### 3.5 多用户消息链路语义（J-P 批，2026-07-21）
+
+`--runtime-only` 模式下，渠道插件（feishu/qq）经 `agent_trigger` FFI 投递 JSON envelope，单 inbox 线程串行消费。envelope 携带回复路由（source_plugin/reply_node/reply_target）与**身份**（`sender_id`、`conversation_kind`）；soul 作用域键 = `{sender_id}#{conversation_kind}`（无身份的 legacy 调用回落 session_key）。
+
+一条消息的处理顺序：
+
+1. **pending 重放**（M批）：`data/pending/{key}.json` 存在则前置拼接（LLM 恢复后旧消息不丢）。
+2. **指令拦截**（N批）：正文以 `/` 开头 → `command_router::dispatch`，不经 LLM，经 envelope 回复通路直接返回。`/status /help /reset /soul` 内建；插件经 docs `command_name` + `command_entry` 节点注册。这是 LLM 全挂时仍可用的管理面。
+3. **会话创建**（O批）：首条消息按 soul 记录的 `profile` 名选 LLM 配置（`agent_start_with`），soul 的 `persona` 作为 system prompt 第二段（base + soul overlay + plugin hints 三段式）。soul 变更只影响新会话（/reset 后生效）。
+4. **发送与降级**（L批）：`agent_send_with_fallback` — 打穿后切 profile 声明的 `fallback` 重试一次；降级期每次先乐观探测原 profile；切换/恢复记 kernel issue + notify，绝不静默。
+5. **彻底失败**（M批）：消息落盘 pending、渠道收到固定模板回执（不经 LLM）、notify 告警。
+
+soul 存储：kernel 内建 `FileSoulProvider`（`data/souls/`），插件同时声明 `soul_get`+`soul_set` 节点即覆写（样例 `fixtures/plugins/soul_store`，SQLite）。写路径是 agent 工具 `set_soul`（soul_key 由 host 绑定当前会话，不可越权）。
 
 这批配置当前主要服务于：
 

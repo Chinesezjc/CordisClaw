@@ -1022,6 +1022,8 @@ pub struct AgentSessionHandle {
 #[derive(Debug, Clone, Default)]
 pub struct AgentStartOptions {
     pub profile: Option<String>,
+    /// Soul scope key for the persona overlay; "" = no per-user soul.
+    pub soul_key: String,
 }
 
 /// Per-session profile fallback state. `desired` is the profile the
@@ -1031,6 +1033,53 @@ pub struct AgentStartOptions {
 struct ProfileFallbackEntry {
     desired: String,
     degraded: bool,
+}
+
+/// O批: soul provider backed by a storage plugin's `soul_get`/`soul_set`
+/// capability nodes (see `crate::soul` for the payload contract).
+struct PluginSoulProvider<'a> {
+    host: &'a RuntimeHost,
+    plugin_path: String,
+}
+
+impl crate::soul::SoulProvider for PluginSoulProvider<'_> {
+    fn get(&self, soul_key: &str) -> Result<Option<crate::soul::Soul>, RuntimeError> {
+        let payload = serde_json::json!({
+            "node_id": "soul_get",
+            // data_dir travels in the payload so the plugin never has to
+            // guess the workspace root from env/cwd.
+            "payload": {
+                "soul_key": soul_key,
+                "data_dir": self.host.data_dir().display().to_string(),
+            },
+        });
+        let response = self.host.invoke(&self.plugin_path, "soul_get", payload.to_string())?;
+        let value: serde_json::Value =
+            serde_json::from_str(&response.payload).map_err(|e| RuntimeError::InvalidArgument {
+                message: format!("soul_get reply from {} is not JSON: {e}", self.plugin_path),
+            })?;
+        match value.get("soul") {
+            None | Some(serde_json::Value::Null) => Ok(None),
+            Some(soul) => serde_json::from_value(soul.clone()).map(Some).map_err(|e| {
+                RuntimeError::InvalidArgument {
+                    message: format!("soul_get reply from {} malformed: {e}", self.plugin_path),
+                }
+            }),
+        }
+    }
+
+    fn set(&self, soul_key: &str, soul: &crate::soul::Soul) -> Result<(), RuntimeError> {
+        let payload = serde_json::json!({
+            "node_id": "soul_set",
+            "payload": {
+                "soul_key": soul_key,
+                "soul": soul,
+                "data_dir": self.host.data_dir().display().to_string(),
+            },
+        });
+        self.host.invoke(&self.plugin_path, "soul_set", payload.to_string())?;
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -1276,6 +1325,42 @@ impl RuntimeHost {
                 eprintln!("[shutdown] wrote memory to {}", path.display());
             }
         }
+    }
+
+    /// O批: resolve the active soul provider. A loaded plugin exposing
+    /// BOTH `soul_get` and `soul_set` nodes overrides the kernel's file
+    /// default (capability-node convention — resolved per call so a
+    /// reload picks up / drops the override automatically).
+    fn soul_provider(&self) -> Box<dyn crate::soul::SoulProvider + '_> {
+        let snapshot = self.current_snapshot();
+        for (plugin_path, plugin) in snapshot.plugin_registry().iter() {
+            let Some(docs) = &plugin.docs else { continue };
+            if !matches!(plugin.load_result, crate::core::models::PluginLoadResult::Loaded) {
+                continue;
+            }
+            let has_get = docs.nodes.iter().any(|n| n.id == "soul_get");
+            let has_set = docs.nodes.iter().any(|n| n.id == "soul_set");
+            if has_get && has_set {
+                return Box::new(PluginSoulProvider { host: self, plugin_path });
+            }
+        }
+        Box::new(crate::soul::FileSoulProvider::new(&self.data_dir()))
+    }
+
+    pub fn get_soul(&self, soul_key: &str) -> Result<Option<crate::soul::Soul>, RuntimeError> {
+        if soul_key.is_empty() {
+            return Ok(None);
+        }
+        self.soul_provider().get(soul_key)
+    }
+
+    pub fn set_soul(&self, soul_key: &str, soul: &crate::soul::Soul) -> Result<(), RuntimeError> {
+        if soul_key.is_empty() {
+            return Err(RuntimeError::InvalidArgument {
+                message: "cannot store a soul without a scope key".to_string(),
+            });
+        }
+        self.soul_provider().set(soul_key, soul)
     }
 
     /// Workspace-root-relative `data/` directory. Public because the
@@ -1910,7 +1995,8 @@ export_plugin_api! {{
         };
         let profile_name = options.profile.as_deref().unwrap_or("default");
         let api = self.config.llm_profiles.resolve(profile_name).api.clone();
-        let session = AgentSession::new(api, session_kind_label)?;
+        let mut session = AgentSession::new(api, session_kind_label)?;
+        session.set_soul_key(options.soul_key.clone());
         self.profile_fallback
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
