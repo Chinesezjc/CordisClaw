@@ -2402,8 +2402,8 @@ export_plugin_api! {{
             if new_docs.nodes != entry.docs.nodes {
                 let err = RuntimeError::AbiMismatch {
                     plugin_path: plugin_path.clone(),
-                    expected: entry.abi_fingerprint.clone(),
-                    actual: entry.abi_fingerprint.clone(),
+                    expected: Box::new(entry.abi_fingerprint.clone()),
+                    actual: Box::new(entry.abi_fingerprint.clone()),
                     fingerprint_diff: vec![format!(
                         "docs mismatch: expected {} nodes, got {}",
                         entry.docs.nodes.len(),
@@ -2435,8 +2435,8 @@ export_plugin_api! {{
                 )];
                 let err = RuntimeError::AbiMismatch {
                     plugin_path: plugin_path.clone(),
-                    expected: entry.abi_fingerprint.clone(),
-                    actual: actual_fingerprint,
+                    expected: Box::new(entry.abi_fingerprint.clone()),
+                    actual: Box::new(actual_fingerprint),
                     fingerprint_diff: diff,
                 };
                 let attempt = self.make_failed_attempt(&previous_snapshot, started_at, &err);

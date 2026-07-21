@@ -76,8 +76,11 @@ pub enum PluginHostError {
     #[error("plugin ABI mismatch for {plugin_path}: expected {expected:?}, actual {actual:?}")]
     AbiFingerprintMismatch {
         plugin_path: String,
-        expected: AbiFingerprint,
-        actual: AbiFingerprint,
+        // Boxed to keep the enum small: two inline fingerprints made this
+        // the large variant driving clippy::result_large_err across every
+        // `Result<_, PluginHostError>`. ABI mismatch is a cold path.
+        expected: Box<AbiFingerprint>,
+        actual: Box<AbiFingerprint>,
     },
 }
 
@@ -341,8 +344,8 @@ fn invoke_dylib(
             if &actual != expected {
                 return Err(PluginHostError::AbiFingerprintMismatch {
                     plugin_path: plugin.plugin_path.clone(),
-                    expected: expected.clone(),
-                    actual,
+                    expected: Box::new(expected.clone()),
+                    actual: Box::new(actual),
                 });
             }
         }
