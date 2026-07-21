@@ -87,7 +87,7 @@ extern "C" fn sigterm_to_sigint(_sig: libc::c_int) {
 fn install_sigterm_handler() {
     unsafe {
         let mut action: libc::sigaction = std::mem::zeroed();
-        action.sa_sigaction = sigterm_to_sigint as usize;
+        action.sa_sigaction = sigterm_to_sigint as *const () as usize;
         libc::sigemptyset(&mut action.sa_mask);
         action.sa_flags = libc::SA_RESTART;
         let _ = libc::sigaction(libc::SIGTERM, &action, std::ptr::null_mut());
@@ -232,7 +232,6 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         RuntimeHost::boot(&root).map_err(|err| runtime_mode_error(err, &root, runtime_only))?,
     );
     let agent_session = host.agent_start(AgentSessionKind::RuntimeShell)?;
-    let session_id = agent_session.session_id.clone();
     let mut state = ServeState {
         agent_session_id: agent_session.session_id,
         mode: ServeMode::Command,
@@ -388,7 +387,7 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                             .map(|s| s.session_id).unwrap_or_default());
                     // Process agent output: parse JSON, dispatch action, send to QQ.
                     // Returns Some(feedback) if the agent needs to retry with a corrected output.
-                    let mut process = |raw: String, label: &str| -> Option<String> {
+                    let process = |raw: String, label: &str| -> Option<String> {
                         if raw.is_empty() { return None; }
                         // Preprocess: escape newlines and embedded quotes inside JSON strings.
                         let chars: Vec<char> = raw.chars().collect();

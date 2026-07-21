@@ -346,7 +346,7 @@ fn join_policy_any_of_and_quorum_fire() {
 
 #[test]
 fn context_txn_commit_and_rollback_work() {
-    let mut ctx = RuntimeContext::default();
+    let ctx = RuntimeContext::default();
 
     let base_key = ContextKey {
         namespace: "ns".to_string(),
@@ -383,7 +383,7 @@ fn context_txn_commit_and_rollback_work() {
 
 #[test]
 fn context_session_commit_uses_cas() {
-    let mut ctx = RuntimeContext::default();
+    let ctx = RuntimeContext::default();
     let key = ContextKey {
         namespace: "session".to_string(),
         name: "counter".to_string(),

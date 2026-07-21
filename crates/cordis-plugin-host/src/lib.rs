@@ -89,6 +89,10 @@ pub enum PluginHostError {
 /// allocator) is still live in the caller. On any platform where dlclose
 /// actually unmaps (musl, custom allocators), that is a use-after-free.
 struct LoadedDylib {
+    /// Never read directly — held solely to keep the dylib mapped for as
+    /// long as `api_ptr` (and any `PluginResponse.payload` allocated by the
+    /// plugin) is live. Dropping this field unmaps the module (P0-11).
+    #[allow(dead_code)]
     library: Library,
     /// Non-null `*const RustPluginApiV2` inside the (now-resident) dylib.
     /// Safe to dereference while `library` is alive.
