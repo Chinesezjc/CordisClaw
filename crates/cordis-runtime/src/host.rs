@@ -970,6 +970,9 @@ pub struct RuntimeHost {
     /// the map. Instead they push a `PendingSessionAction` here; the
     /// `agent_send` prologue drains and applies them before reinsert.
     pending_session_actions: Mutex<BTreeMap<String, Vec<PendingSessionAction>>>,
+    /// Per-session LLM profile fallback state. Single inbox thread means
+    /// no real contention; the Mutex is for interior mutability only.
+    profile_fallback: Mutex<BTreeMap<String, ProfileFallbackEntry>>,
     /// Registry of background services (Task nodes).
     pub service_registry: Arc<crate::context::ServiceRegistry>,
     /// Accumulated rollback for interactive agent file edits.
@@ -1011,6 +1014,23 @@ pub enum PendingSessionAction {
 pub struct AgentSessionHandle {
     pub session_id: String,
     pub kind: AgentSessionKind,
+}
+
+/// Options for `agent_start_with`. `profile` selects a named entry from
+/// `llm_profiles` (None/unknown → default). Kept as a struct so the soul
+/// scope key and future per-session knobs extend without churning callers.
+#[derive(Debug, Clone, Default)]
+pub struct AgentStartOptions {
+    pub profile: Option<String>,
+}
+
+/// Per-session profile fallback state. `desired` is the profile the
+/// session was started with; `degraded` is true while requests are being
+/// served by that profile's fallback instead.
+#[derive(Debug, Clone)]
+struct ProfileFallbackEntry {
+    desired: String,
+    degraded: bool,
 }
 
 #[derive(Debug)]
@@ -1161,6 +1181,7 @@ impl RuntimeHost {
             last_candidate_reload_attempt: Mutex::new(None),
             agent_sessions: Mutex::new(BTreeMap::new()),
             pending_session_actions: Mutex::new(BTreeMap::new()),
+            profile_fallback: Mutex::new(BTreeMap::new()),
             service_registry,
             interactive_rollback,
         };
@@ -1257,8 +1278,9 @@ impl RuntimeHost {
         }
     }
 
-    /// Workspace-root-relative `data/` directory.
-    fn data_dir(&self) -> PathBuf {
+    /// Workspace-root-relative `data/` directory. Public because the
+    /// inbox loop (pending-message spill) and soul storage share it.
+    pub fn data_dir(&self) -> PathBuf {
         self.fixtures_root
             .parent()
             .map(|p| p.to_path_buf())
@@ -1858,6 +1880,17 @@ export_plugin_api! {{
     }
 
     pub fn agent_start(&self, kind: AgentSessionKind) -> Result<AgentSessionHandle, RuntimeError> {
+        self.agent_start_with(kind, AgentStartOptions::default())
+    }
+
+    /// Start an agent session with an explicit LLM profile and soul scope.
+    /// `profile` names an entry in `llm_profiles` (unknown/None → default);
+    /// `soul_key` scopes the persona overlay ("" → no per-user soul).
+    pub fn agent_start_with(
+        &self,
+        kind: AgentSessionKind,
+        options: AgentStartOptions,
+    ) -> Result<AgentSessionHandle, RuntimeError> {
         let handle = AgentSessionHandle {
             session_id: normalize_request_id(None, "agent-session"),
             kind,
@@ -1875,7 +1908,16 @@ export_plugin_api! {{
                 });
             }
         };
-        let session = AgentSession::new(self.config.llm_api.clone(), session_kind_label)?;
+        let profile_name = options.profile.as_deref().unwrap_or("default");
+        let api = self.config.llm_profiles.resolve(profile_name).api.clone();
+        let session = AgentSession::new(api, session_kind_label)?;
+        self.profile_fallback
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .insert(
+                handle.session_id.clone(),
+                ProfileFallbackEntry { desired: profile_name.to_string(), degraded: false },
+            );
         self.agent_sessions
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
@@ -1939,6 +1981,119 @@ export_plugin_api! {{
             .unwrap_or_else(|poison| poison.into_inner())
             .insert(session_id.to_string(), session);
         result
+    }
+
+    /// `agent_send` with mechanical LLM-profile fallback. Policy:
+    /// - Requests normally go through the session's desired profile.
+    /// - On failure (retries already exhausted inside `send_chat_request`),
+    ///   switch to the profile's declared `fallback` and retry once.
+    /// - While degraded, each new send optimistically probes the desired
+    ///   profile first; success switches back, failure re-degrades.
+    /// Every switch is explicit: a kernel issue is recorded and a notify
+    /// message is emitted — never a silent model change.
+    pub fn agent_send_with_fallback(
+        &self,
+        session_id: &str,
+        input: &str,
+    ) -> Result<AgentReply, RuntimeError> {
+        let entry = {
+            let guard = self
+                .profile_fallback
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            guard.get(session_id).cloned()
+        };
+        let Some(entry) = entry else {
+            // Sessions started via plain agent_start (REPL, tests) have no
+            // fallback entry under a non-default registry only if created
+            // before this map existed; treat as plain send.
+            return self.agent_send(session_id, input);
+        };
+
+        // Recovery probe: while degraded, put the desired profile back
+        // before this attempt. If it is still down we fall through to the
+        // normal failure path below and re-degrade.
+        if entry.degraded {
+            self.swap_session_profile(session_id, &entry.desired)?;
+        }
+
+        match self.agent_send(session_id, input) {
+            Ok(reply) => {
+                if entry.degraded {
+                    self.set_degraded(session_id, false);
+                    let msg = format!(
+                        "LLM profile '{}' recovered; session {} switched back",
+                        entry.desired, session_id
+                    );
+                    eprintln!("[llm-profile] {msg}");
+                    crate::kernel::notify::send(self, &format!("⚙️ {msg}"));
+                }
+                Ok(reply)
+            }
+            Err(primary_err) => {
+                let Some(fallback) = self.config.llm_profiles.fallback_of(&entry.desired) else {
+                    return Err(primary_err);
+                };
+                let fallback = fallback.to_string();
+                self.swap_session_profile(session_id, &fallback)?;
+                match self.agent_send(session_id, input) {
+                    Ok(reply) => {
+                        self.set_degraded(session_id, true);
+                        let msg = format!(
+                            "LLM profile '{}' failing ({}); session {} degraded to fallback '{}'",
+                            entry.desired, primary_err, session_id, fallback
+                        );
+                        eprintln!("[llm-profile] {msg}");
+                        self.kernel.observe_plugin_issue(
+                            KernelPluginIssueSource::InvokeFailure,
+                            "/llm-profile",
+                            msg.clone(),
+                        );
+                        crate::kernel::notify::send(self, &format!("⚙️ {msg}"));
+                        Ok(reply)
+                    }
+                    Err(fallback_err) => {
+                        // Both profiles down. Restore the desired profile so
+                        // the next attempt probes it first, and surface the
+                        // original error (more representative).
+                        let _ = self.swap_session_profile(session_id, &entry.desired);
+                        self.set_degraded(session_id, false);
+                        eprintln!(
+                            "[llm-profile] fallback '{fallback}' also failed: {fallback_err}"
+                        );
+                        Err(primary_err)
+                    }
+                }
+            }
+        }
+    }
+
+    /// Swap the live LLM config of a resting session (must not be inside
+    /// `respond`) to the named profile.
+    fn swap_session_profile(
+        &self,
+        session_id: &str,
+        profile_name: &str,
+    ) -> Result<(), RuntimeError> {
+        let api = self.config.llm_profiles.resolve(profile_name).api.clone();
+        let mut guard = self
+            .agent_sessions
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let managed = guard.get_mut(session_id).ok_or_else(|| {
+            RuntimeError::AgentSessionNotFound { session_id: session_id.to_string() }
+        })?;
+        managed.session.swap_config(api)
+    }
+
+    fn set_degraded(&self, session_id: &str, degraded: bool) {
+        let mut guard = self
+            .profile_fallback
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if let Some(entry) = guard.get_mut(session_id) {
+            entry.degraded = degraded;
+        }
     }
 
     /// P1-25: queue a `PendingSessionAction` for `session_id`; the next

@@ -166,6 +166,19 @@ struct QqResponse {
 // Request / Response (new nodes)
 // ---------------------------------------------------------------------------
 
+/// reply_to arrives as i64 from legacy callers and as a string from the
+/// runtime inbox (envelope reply_to is stringly-typed). Accept both;
+/// unparseable strings degrade to None (send without quote) rather than
+/// failing the whole request.
+fn de_reply_to<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<i64>, D::Error> {
+    let v = Option::<Value>::deserialize(d)?;
+    Ok(match v {
+        Some(Value::Number(n)) => n.as_i64(),
+        Some(Value::String(s)) => s.trim().parse::<i64>().ok(),
+        _ => None,
+    })
+}
+
 #[derive(Debug, Deserialize)]
 struct NodeRequest {
     node_id: String,
@@ -177,7 +190,9 @@ struct NodeRequest {
     target: Option<String>,
     #[serde(default)]
     message: Option<String>,
-    #[serde(default)]
+    /// Accepts both i64 (legacy direct invoke) and string (runtime inbox
+    /// reply routing serialises envelope reply_to as a string).
+    #[serde(default, deserialize_with = "de_reply_to")]
     reply_to: Option<i64>,
     #[serde(default)]
     payload: Option<Value>,
@@ -827,6 +842,31 @@ fn should_process(text: &str) -> bool {
     true
 }
 
+/// Build the runtime routing envelope (mirrors feishu's build_envelope).
+/// sender_id is "group:<gid>" or "private:<uid>"; the actual person is
+/// user_id, so identity is "qq:<user_id>".
+fn build_envelope(msg: &IncomingMessage) -> String {
+    let reply_target = format!("{}:{}", msg.message_type, msg.sender_id);
+    let session_key = format!("qq:{reply_target}");
+    let display = format!(
+        "[QQ {} from {} (user {})]: {}",
+        msg.message_type, msg.sender_id, msg.user_id, msg.message
+    );
+    let mut env = json!({
+        "source_plugin": "qq",
+        "reply_node": "qq_send",
+        "session_key": session_key,
+        "display": display,
+        "reply_target": reply_target,
+        "sender_id": format!("qq:{}", msg.user_id),
+        "conversation_kind": msg.message_type,
+    });
+    if let Some(mid) = msg.message_id {
+        env["reply_to"] = json!(mid.to_string());
+    }
+    env.to_string()
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // ⚠ CRITICAL — message pump.  Do NOT delete or refactor away.
 // The runtime inbox loop depends on this polling thread to drain
@@ -846,8 +886,7 @@ fn start_agent_poller() {
             };
             for msg in msgs {
                 if !should_process(&msg.message) { continue; }
-                let prompt = format!("[QQ group from {} (user {})]: {}", msg.sender_id, msg.user_id, msg.message);
-                cordis_plugin_sdk::agent_trigger(&prompt);
+                cordis_plugin_sdk::agent_trigger(&build_envelope(&msg));
             }
             thread::sleep(std::time::Duration::from_secs(5));
         }
@@ -1634,5 +1673,41 @@ mod chain_tests {
         assert!(!should_process("ok"), "过短消息不触发");
         assert!(!should_process("/help"), "斜杠命令不触发");
         assert!(should_process("这是一条正常消息"), "正常消息触发");
+    }
+
+    // envelope 必须携带路由 + 身份字段（J批：qq 从纯文本升级为 envelope）。
+    #[test]
+    fn build_envelope_carries_route_and_identity() {
+        let msg = IncomingMessage {
+            message_type: "group".to_string(),
+            sender_id: "123456".to_string(),
+            user_id: "789".to_string(),
+            message: "hello".to_string(),
+            message_id: Some(42),
+            reply_to_msg_id: None,
+            raw_event: None,
+        };
+        let env: Value = serde_json::from_str(&build_envelope(&msg)).unwrap();
+        assert_eq!(env["source_plugin"], "qq");
+        assert_eq!(env["reply_node"], "qq_send");
+        assert_eq!(env["session_key"], "qq:group:123456");
+        assert_eq!(env["reply_target"], "group:123456");
+        assert_eq!(env["sender_id"], "qq:789");
+        assert_eq!(env["conversation_kind"], "group");
+        assert_eq!(env["reply_to"], "42");
+    }
+
+    // reply_to 双类型解析：i64（legacy）与字符串（inbox 路由）都接受。
+    #[test]
+    fn node_request_reply_to_accepts_both_types() {
+        let req: NodeRequest =
+            serde_json::from_str(r#"{"node_id":"qq_send","reply_to":42}"#).unwrap();
+        assert_eq!(req.reply_to, Some(42));
+        let req: NodeRequest =
+            serde_json::from_str(r#"{"node_id":"qq_send","reply_to":"42"}"#).unwrap();
+        assert_eq!(req.reply_to, Some(42));
+        let req: NodeRequest =
+            serde_json::from_str(r#"{"node_id":"qq_send","reply_to":"om_x"}"#).unwrap();
+        assert_eq!(req.reply_to, None, "不可解析字符串降级为无引用");
     }
 }

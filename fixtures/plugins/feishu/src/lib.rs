@@ -1219,6 +1219,8 @@ fn build_envelope(msg: &IncomingMessage) -> String {
         "session_key": session_key,
         "display": display,
         "reply_target": reply_target,
+        "sender_id": format!("feishu:{}", msg.open_id),
+        "conversation_kind": scope,
     });
     // Prefer threaded reply if the message is in a thread.
     if let Some(root) = &msg.root_id {
@@ -1492,6 +1494,18 @@ mod tests {
             root_id: None,
             mentioned,
         }
+    }
+
+    // envelope 必须携带身份字段（soul 作用域依赖）。
+    #[test]
+    fn build_envelope_carries_identity() {
+        let env: Value =
+            serde_json::from_str(&build_envelope(&msg("p2p", "oc_1", "ou_abc", false))).unwrap();
+        assert_eq!(env["sender_id"], "feishu:ou_abc");
+        assert_eq!(env["conversation_kind"], "private");
+        let env: Value =
+            serde_json::from_str(&build_envelope(&msg("group", "oc_2", "ou_abc", true))).unwrap();
+        assert_eq!(env["conversation_kind"], "group");
     }
 
     #[test]

@@ -56,6 +56,13 @@ struct AgentEnvelope {
     /// Optional original message id for quote-reply.
     #[serde(default)]
     reply_to: Option<String>,
+    /// Stable sender identity, e.g. "feishu:ou_xxx". Empty = unknown
+    /// (legacy caller) — soul scoping falls back to `session_key`.
+    #[serde(default)]
+    sender_id: String,
+    /// Conversation dimension: "private" | "group". Empty = unknown.
+    #[serde(default)]
+    conversation_kind: String,
 }
 
 impl AgentEnvelope {
@@ -72,12 +79,93 @@ impl AgentEnvelope {
                 display: raw.to_string(),
                 reply_target: String::new(),
                 reply_to: None,
+                sender_id: String::new(),
+                conversation_kind: String::new(),
             },
         }
     }
 
     fn can_reply(&self) -> bool {
         !self.source_plugin.is_empty() && !self.reply_node.is_empty()
+    }
+
+    /// Soul scope key: `{sender_id}#{conversation_kind}` so the same user
+    /// can carry different personas in private vs group chats. Envelopes
+    /// without identity (legacy callers) scope by session_key instead.
+    fn soul_key(&self) -> String {
+        if self.sender_id.is_empty() {
+            self.session_key.clone()
+        } else {
+            format!("{}#{}", self.sender_id, self.conversation_kind)
+        }
+    }
+}
+
+/// M批: pending-message spill. When the LLM request exhausts every retry
+/// AND the profile fallback, the user's message must not vanish — it is
+/// written to `data/pending/<hash>.json` and replayed (prepended) on the
+/// next message for the same session. Pure mechanical path: no LLM.
+mod pending {
+    use serde::{Deserialize, Serialize};
+    use std::path::{Path, PathBuf};
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct PendingMessage {
+        pub session_key: String,
+        /// The combined user text that failed to get a response.
+        pub combined: String,
+        pub enqueued_at_ms: u64,
+    }
+
+    fn sanitize(key: &str) -> String {
+        key.chars()
+            .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+            .collect()
+    }
+
+    pub fn path_for(data_dir: &Path, session_key: &str) -> PathBuf {
+        data_dir.join("pending").join(format!("{}.json", sanitize(session_key)))
+    }
+
+    pub fn save(data_dir: &Path, msg: &PendingMessage) {
+        let path = path_for(data_dir, &msg.session_key);
+        if let Some(dir) = path.parent() {
+            if let Err(e) = std::fs::create_dir_all(dir) {
+                eprintln!("pending: create dir failed: {e}");
+                return;
+            }
+        }
+        // Merge with an already-pending message so consecutive failures
+        // accumulate instead of overwriting the older text.
+        let merged = match load(data_dir, &msg.session_key) {
+            Some(prev) => PendingMessage {
+                session_key: msg.session_key.clone(),
+                combined: format!("{}\n{}", prev.combined, msg.combined),
+                enqueued_at_ms: prev.enqueued_at_ms,
+            },
+            None => msg.clone(),
+        };
+        // Atomic tmp+rename, same discipline as session auto-save.
+        let tmp = path.with_extension("json.tmp");
+        let bytes = match serde_json::to_vec(&merged) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("pending: serialize failed: {e}");
+                return;
+            }
+        };
+        if let Err(e) = std::fs::write(&tmp, &bytes).and_then(|_| std::fs::rename(&tmp, &path)) {
+            eprintln!("pending: write failed: {e}");
+        }
+    }
+
+    pub fn load(data_dir: &Path, session_key: &str) -> Option<PendingMessage> {
+        let text = std::fs::read_to_string(path_for(data_dir, session_key)).ok()?;
+        serde_json::from_str(&text).ok()
+    }
+
+    pub fn clear(data_dir: &Path, session_key: &str) {
+        let _ = std::fs::remove_file(path_for(data_dir, session_key));
     }
 }
 
@@ -408,15 +496,30 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 }
                 for (session_key, envs) in &by_session {
                     if session_key.is_empty() || envs.is_empty() { continue; }
-                    let combined = envs
+                    let mut combined = envs
                         .iter()
                         .map(|e| e.display.as_str())
                         .collect::<Vec<_>>()
                         .join("\n");
+                    // M批: replay any message that failed during an earlier
+                    // LLM outage by prepending it to this batch. Cleared
+                    // only after a successful send below.
+                    let data_dir = host.data_dir();
+                    let replaying = pending::load(&data_dir, session_key);
+                    if let Some(p) = &replaying {
+                        eprintln!(
+                            "inbox: [{session_key}] replaying pending message from outage ({} chars)",
+                            p.combined.chars().count()
+                        );
+                        combined = format!("{}\n{}", p.combined, combined);
+                    }
                     // Reply routing comes from the LAST envelope in the batch
                     // (all share session_key, so same source/target).
                     let route = envs.last().cloned().unwrap();
-                    eprintln!("inbox: [{session_key}] batch {} msgs: {}", envs.len(), combined);
+                    eprintln!(
+                        "inbox: [{session_key}] (soul {}) batch {} msgs: {}",
+                        route.soul_key(), envs.len(), combined
+                    );
                     // P1-53: don't drain rx.try_recv() here — messages on the
                     // channel are from ALL sessions; the outer loop shards
                     // them correctly next iteration.
@@ -512,20 +615,52 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
                     };
-                    match host.agent_send(sid, &combined) {
+                    match host.agent_send_with_fallback(sid, &combined) {
                         Ok(reply) => {
+                            pending::clear(&data_dir, session_key);
                             let feedback = process(reply.content.trim().to_string(), "inbox");
                             if let Some(fb) = feedback {
-                                if let Ok(reply2) = host.agent_send(sid, &fb) {
+                                if let Ok(reply2) = host.agent_send_with_fallback(sid, &fb) {
                                     process(reply2.content.trim().to_string(), "retry");
                                 }
                             }
                         }
                         Err(e) => {
                             eprintln!("inbox: {e}");
+                            // M批: the message must survive the outage. Spill
+                            // it to disk (replayed on the next inbound batch)
+                            // and tell the user via a FIXED template — this
+                            // receipt path must never depend on the LLM.
+                            let batch_only = envs
+                                .iter()
+                                .map(|e| e.display.as_str())
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            pending::save(&data_dir, &pending::PendingMessage {
+                                session_key: session_key.clone(),
+                                combined: batch_only,
+                                enqueued_at_ms: std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_millis() as u64)
+                                    .unwrap_or(0),
+                            });
+                            if route.can_reply() {
+                                let payload = serde_json::json!({
+                                    "node_id": route.reply_node,
+                                    "target": route.reply_target,
+                                    "message": "我暂时无法思考（模型服务不可用），你的消息已收到，恢复后会回复你。",
+                                });
+                                if let Err(re) = host.invoke(
+                                    &route.source_plugin,
+                                    &route.reply_node,
+                                    payload.to_string(),
+                                ) {
+                                    eprintln!("inbox: outage receipt failed: {re}");
+                                }
+                            }
                             cordis_runtime::kernel::notify::send(
                                 &host,
-                                &format!("[{session_key}] ⚠️ LLM 请求失败: {e}"),
+                                &format!("[{session_key}] ⚠️ LLM 请求失败（消息已暂存待重放）: {e}"),
                             );
                         }
                     }
@@ -1735,4 +1870,75 @@ fn agent_chat_usage() -> &'static str {
   /status  show the current shared agent session status
   /reset   start a fresh shared agent session
   /exit    leave agent chat mode and return to serve commands"
+}
+
+#[cfg(test)]
+mod envelope_tests {
+    use super::AgentEnvelope;
+
+    // 旧 envelope（无身份字段）必须照常解析，soul_key 回落 session_key。
+    #[test]
+    fn envelope_parse_backfills_identity() {
+        let raw = r#"{"source_plugin":"feishu","reply_node":"feishu_send","session_key":"feishu:chat:oc_x","display":"hi","reply_target":"chat:oc_x"}"#;
+        let env = AgentEnvelope::parse(raw);
+        assert_eq!(env.sender_id, "");
+        assert_eq!(env.conversation_kind, "");
+        assert_eq!(env.soul_key(), "feishu:chat:oc_x");
+    }
+
+    #[test]
+    fn envelope_parse_reads_identity() {
+        let raw = r#"{"session_key":"feishu:chat:oc_x","display":"hi","sender_id":"feishu:ou_abc","conversation_kind":"private"}"#;
+        let env = AgentEnvelope::parse(raw);
+        assert_eq!(env.sender_id, "feishu:ou_abc");
+        assert_eq!(env.soul_key(), "feishu:ou_abc#private");
+    }
+
+    // 非 JSON 的 legacy 纯文本仍能进 agent（无路由、soul_key = 原文）。
+    #[test]
+    fn envelope_parse_plain_text_fallback() {
+        let env = AgentEnvelope::parse("plain text trigger");
+        assert_eq!(env.display, "plain text trigger");
+        assert!(!env.can_reply());
+        assert_eq!(env.soul_key(), "plain text trigger");
+    }
+}
+
+#[cfg(test)]
+mod pending_tests {
+    use super::pending;
+
+    // spill → load → clear 往返；连续失败合并不覆盖。
+    #[test]
+    fn pending_roundtrip_and_merge() {
+        let temp = std::env::temp_dir().join(format!("cordis-pending-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        let key = "feishu:chat:oc_x";
+        assert!(pending::load(&temp, key).is_none());
+        pending::save(&temp, &pending::PendingMessage {
+            session_key: key.to_string(),
+            combined: "第一条".to_string(),
+            enqueued_at_ms: 100,
+        });
+        pending::save(&temp, &pending::PendingMessage {
+            session_key: key.to_string(),
+            combined: "第二条".to_string(),
+            enqueued_at_ms: 200,
+        });
+        let loaded = pending::load(&temp, key).expect("pending should exist");
+        assert_eq!(loaded.combined, "第一条\n第二条");
+        assert_eq!(loaded.enqueued_at_ms, 100, "保留最早时间戳");
+        pending::clear(&temp, key);
+        assert!(pending::load(&temp, key).is_none());
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    // session_key 含特殊字符不能逃出 pending 目录。
+    #[test]
+    fn pending_path_sanitizes_key() {
+        let dir = std::path::Path::new("/data");
+        let p = pending::path_for(dir, "../../etc/passwd");
+        assert!(p.starts_with("/data/pending/"), "path: {}", p.display());
+        assert!(!p.to_string_lossy().contains(".."), "path: {}", p.display());
+    }
 }

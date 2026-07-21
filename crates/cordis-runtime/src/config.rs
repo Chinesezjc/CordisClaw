@@ -55,8 +55,16 @@ pub struct RuntimeConfig {
     pub runtime: RuntimeSettings,
     #[serde(default)]
     pub kernel: KernelConfig,
+    /// The "default" profile's API config. Kept as a direct field so the
+    /// many existing `config.llm_api` call sites keep working; it is
+    /// always synchronised with `llm_profiles.profiles["default"].api`.
     #[serde(default)]
     pub llm_api: LlmApiConfig,
+    /// Named LLM profiles (default/fast/…). Users select by name (via
+    /// soul records); credentials stay in env vars referenced by
+    /// `api_key_env` — never in any per-user store.
+    #[serde(default)]
+    pub llm_profiles: LlmProfileRegistry,
     #[serde(default)]
     pub plugin_configs: BTreeMap<String, PluginConfigFile>,
     #[serde(skip)]
@@ -69,6 +77,7 @@ impl Default for RuntimeConfig {
             runtime: RuntimeSettings::default(),
             kernel: KernelConfig::default(),
             llm_api: LlmApiConfig::default(),
+            llm_profiles: LlmProfileRegistry::default(),
             plugin_configs: BTreeMap::new(),
             config_dir: PathBuf::from("config"),
         }
@@ -100,7 +109,15 @@ impl RuntimeConfig {
 
         let llm_api_path = config_dir.join("llm_api.yaml");
         if llm_api_path.exists() {
-            config.llm_api = read_yaml_file(&llm_api_path)?;
+            let raw: serde_yaml::Value = read_yaml_file(&llm_api_path)?;
+            config.llm_profiles =
+                LlmProfileRegistry::from_yaml_value(raw).map_err(|message| {
+                    RuntimeError::ConfigParse {
+                        path: llm_api_path.clone(),
+                        message,
+                    }
+                })?;
+            config.llm_api = config.llm_profiles.default_profile().api.clone();
         }
 
         let plugin_dir = config_dir.join("plugins");
@@ -243,6 +260,80 @@ impl Default for LlmApiConfig {
     }
 }
 
+/// A named LLM configuration plus an optional fallback pointer. The
+/// fallback names another profile the runtime mechanically switches to
+/// when requests through this profile exhaust their retries.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LlmProfile {
+    #[serde(flatten)]
+    pub api: LlmApiConfig,
+    #[serde(default)]
+    pub fallback: Option<String>,
+}
+
+/// Named LLM profile table parsed from `llm_api.yaml`. Two accepted
+/// formats: the new `profiles: {name: {...}}` table, and the legacy
+/// single-config document which is wrapped as the `default` profile.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LlmProfileRegistry {
+    #[serde(default)]
+    pub profiles: BTreeMap<String, LlmProfile>,
+}
+
+impl Default for LlmProfileRegistry {
+    fn default() -> Self {
+        let mut profiles = BTreeMap::new();
+        profiles.insert(
+            "default".to_string(),
+            LlmProfile { api: LlmApiConfig::default(), fallback: None },
+        );
+        Self { profiles }
+    }
+}
+
+impl LlmProfileRegistry {
+    /// Parse either yaml format. Errors only on malformed profile bodies;
+    /// a missing `default` entry is backfilled from `LlmApiConfig::default()`
+    /// so `resolve` always has a landing spot.
+    pub fn from_yaml_value(raw: serde_yaml::Value) -> Result<Self, String> {
+        let mut registry = if raw.get("profiles").is_some() {
+            serde_yaml::from_value::<LlmProfileRegistry>(raw).map_err(|e| e.to_string())?
+        } else {
+            let api = serde_yaml::from_value::<LlmApiConfig>(raw).map_err(|e| e.to_string())?;
+            let mut profiles = BTreeMap::new();
+            profiles.insert("default".to_string(), LlmProfile { api, fallback: None });
+            Self { profiles }
+        };
+        registry
+            .profiles
+            .entry("default".to_string())
+            .or_insert_with(|| LlmProfile { api: LlmApiConfig::default(), fallback: None });
+        Ok(registry)
+    }
+
+    /// Look up a profile by name; unknown or empty names fall back to
+    /// `default` (guaranteed present by construction).
+    pub fn resolve(&self, name: &str) -> &LlmProfile {
+        self.profiles.get(name).unwrap_or_else(|| self.default_profile())
+    }
+
+    pub fn default_profile(&self) -> &LlmProfile {
+        self.profiles
+            .get("default")
+            .expect("LlmProfileRegistry always contains a default profile")
+    }
+
+    /// The fallback target for `name`, if it declares one that exists and
+    /// differs from itself (self-loops would make the switch a no-op).
+    pub fn fallback_of(&self, name: &str) -> Option<&str> {
+        let target = self.resolve(name).fallback.as_deref()?;
+        if target == name || !self.profiles.contains_key(target) {
+            return None;
+        }
+        Some(target)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PluginConfigFile {
     #[serde(default)]
@@ -298,4 +389,61 @@ where
         path: path.to_path_buf(),
         message: e.to_string(),
     })
+}
+
+#[cfg(test)]
+mod llm_profile_tests {
+    use super::*;
+
+    // 旧格式（单份 LlmApiConfig 文档）必须被包装为 default profile。
+    #[test]
+    fn parse_legacy_single_profile() {
+        let raw: serde_yaml::Value = serde_yaml::from_str(
+            "provider: deepseek\nbase_url: https://api.deepseek.com/v1\nmodel: deepseek-chat\n",
+        )
+        .unwrap();
+        let reg = LlmProfileRegistry::from_yaml_value(raw).unwrap();
+        assert_eq!(reg.profiles.len(), 1);
+        let def = reg.default_profile();
+        assert_eq!(def.api.provider, "deepseek");
+        assert_eq!(def.api.model, "deepseek-chat");
+        assert!(def.fallback.is_none());
+    }
+
+    #[test]
+    fn parse_profile_table() {
+        let raw: serde_yaml::Value = serde_yaml::from_str(
+            "profiles:\n  default:\n    provider: deepseek\n    model: deepseek-chat\n    fallback: fast\n  fast:\n    provider: openai\n    model: gpt-4o-mini\n",
+        )
+        .unwrap();
+        let reg = LlmProfileRegistry::from_yaml_value(raw).unwrap();
+        assert_eq!(reg.profiles.len(), 2);
+        assert_eq!(reg.resolve("fast").api.model, "gpt-4o-mini");
+        assert_eq!(reg.fallback_of("default"), Some("fast"));
+        assert_eq!(reg.fallback_of("fast"), None);
+    }
+
+    #[test]
+    fn resolve_unknown_falls_back_default() {
+        let reg = LlmProfileRegistry::default();
+        assert_eq!(reg.resolve("nonexistent").api.provider, reg.default_profile().api.provider);
+    }
+
+    // profiles 表缺 default 时自动补齐；fallback 指向不存在/自身时失效。
+    #[test]
+    fn missing_default_backfilled_and_bad_fallbacks_ignored() {
+        let raw: serde_yaml::Value = serde_yaml::from_str(
+            "profiles:\n  fast:\n    provider: openai\n    model: gpt-4o-mini\n    fallback: fast\n",
+        )
+        .unwrap();
+        let reg = LlmProfileRegistry::from_yaml_value(raw).unwrap();
+        assert!(reg.profiles.contains_key("default"), "default 自动补齐");
+        assert_eq!(reg.fallback_of("fast"), None, "自指 fallback 无效");
+        let raw: serde_yaml::Value = serde_yaml::from_str(
+            "profiles:\n  default:\n    provider: openai\n    fallback: ghost\n",
+        )
+        .unwrap();
+        let reg = LlmProfileRegistry::from_yaml_value(raw).unwrap();
+        assert_eq!(reg.fallback_of("default"), None, "不存在的 fallback 目标无效");
+    }
 }
