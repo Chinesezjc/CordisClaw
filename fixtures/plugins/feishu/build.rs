@@ -7,7 +7,7 @@ fn main() {
     let index_path = "/root/CordisClaw/fixtures/artifacts/index.json";
 
     // Copy the .so file
-    let status = Command::new("cp").args(&[src, dst]).status();
+    let status = Command::new("cp").args([src, dst]).status();
     match status {
         Ok(s) if s.success() => println!("cargo:warning=Copied libfeishu.so to artifacts/"),
         Ok(s) => println!("cargo:warning=cp exited with {}", s),

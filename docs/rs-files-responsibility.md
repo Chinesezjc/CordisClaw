@@ -167,6 +167,14 @@
 | `fixtures/plugins/qq/src/lib.rs` | QQ 适配器 dylib：OneBot v11 协议 HTTP 客户端，支持 configure/send/status/call | `onebot_call()`、`parse_target()` |
 | `fixtures/plugins/qq/tests/test_parse.rs` | QQ 适配器测试：target 字符串解析 | `test_parse_target` |
 
+## 13.1 Feishu Adapter 插件 (`fixtures/plugins/feishu`)
+
+| 文件 | 职责定位 | 关键入口 |
+|---|---|---|
+| `fixtures/plugins/feishu/src/lib.rs` | 飞书适配器 dylib：事件解析（challenge/AES/schema 2.0）、openclaw 风格访问策略（dm_policy/group_policy/pairing）、出站消息/卡片（tenant_access_token 缓存、卡片两段式 PATCH 更新） | `interpret_inbound()`、`policy_gate()`、`handle_feishu_send()` |
+| `fixtures/plugins/feishu/src/ws.rs` | 飞书长连接（WSS）事件模式：bootstrap 换 wss URL、手写 proto2 Frame 编解码、心跳/合包/帧内 ACK/断线重连 | `run_ws_loop()`、`Frame::encode/decode` |
+| `fixtures/plugins/feishu/tests/scaffold.rs` | 占位（实质单测内嵌于 lib.rs/ws.rs 的 `mod tests`） | `scaffold()` |
+
 ## 14. 插件样例工程 (`fixtures/plugins`)
 
 | 文件 | 职责定位 | 关键入口 |

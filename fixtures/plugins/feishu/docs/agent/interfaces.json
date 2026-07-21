@@ -7,7 +7,7 @@
   "nodes": [
     {
       "id": "feishu_serve",
-      "summary": "Start the Feishu event-subscription HTTP server (webhook). Receives im.message.receive_v1 events + card actions, handles the url_verification challenge, verifies token, decrypts (if encrypt_key set), gates group messages on @bot, dedups, and forwards to the agent.",
+      "summary": "Start Feishu event intake. mode='ws' (default): long connection — dials out to Feishu (/callback/ws/endpoint), no public URL needed. mode='webhook': HTTP server receiving event callbacks at POST /feishu/event (url_verification challenge, token check, optional AES decryption). Both modes apply the access policy (dm_policy/group_policy/require_mention/pairing), dedup, and forward accepted messages to the agent.",
       "input_schema": {
         "properties": {
           "action": {
@@ -21,6 +21,13 @@
           },
           "payload": {
             "properties": {
+              "mode": {
+                "enum": [
+                  "ws",
+                  "webhook"
+                ],
+                "type": "string"
+              },
               "port": {
                 "type": "integer"
               }
@@ -42,17 +49,19 @@
         "type": "object"
       },
       "side_effects": [
-        "network:listen"
+        "network:listen",
+        "network:feishu-api"
       ],
       "failure_modes": [
-        "port bind failure"
+        "port bind failure",
+        "bootstrap auth failure"
       ],
       "node_type": "task",
       "agent_accessible": false
     },
     {
       "id": "feishu_send",
-      "summary": "Send a message to a Feishu chat or user. target is 'chat:<chat_id>' or 'user:<open_id>'. Provide either `message` (text) or `card` (interactive card JSON). Optional `reply_to` quote-replies to a message_id.",
+      "summary": "Send a message to a Feishu chat or user. target is 'chat:<chat_id>' or 'user:<open_id>'. Provide either `message` (text) or `card` (interactive card JSON). Optional `reply_to` quote-replies to a message_id. If a pending 'thinking…' card exists for the target (two-stage replies) the content PATCHes that card; payload.update_message_id forces updating a specific message.",
       "input_schema": {
         "properties": {
           "card": {
@@ -63,6 +72,14 @@
           },
           "node_id": {
             "const": "feishu_send"
+          },
+          "payload": {
+            "properties": {
+              "update_message_id": {
+                "type": "string"
+              }
+            },
+            "type": "object"
           },
           "reply_to": {
             "type": "string"
@@ -100,13 +117,15 @@
     },
     {
       "id": "feishu_entry",
-      "summary": "Configure the Feishu plugin (app_id/app_secret/verification_token/encrypt_key/bot_open_id) or query status. action='configure' with payload, or action='status'.",
+      "summary": "Configure the Feishu plugin or manage access. action='configure' with payload (app_id/app_secret/bot_open_id/api_base/verification_token/encrypt_key + policies: dm_policy open|allowlist|pairing, dm_allow_from[], group_policy open|allowlist|disabled, group_allow_from[], require_mention, card_replies). action='status' for a summary. action='approve_pairing' with payload.code approves a pending DM pairing. action='list_pending' lists pending pairings.",
       "input_schema": {
         "properties": {
           "action": {
             "enum": [
               "configure",
-              "status"
+              "status",
+              "approve_pairing",
+              "list_pending"
             ],
             "type": "string"
           },

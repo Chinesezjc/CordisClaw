@@ -2,14 +2,23 @@
 //! platform, structurally analogous to the `qq` plugin.
 //!
 //! Nodes:
-//! - `feishu_serve` (Task) — HTTP server on :8100 receiving Feishu event
-//!   subscription callbacks at `POST /feishu/event`. Handles the
-//!   url_verification challenge, (optional) AES decryption, token check,
-//!   dedup, @-mention gating, then enqueues messages and a poller emits
+//! - `feishu_serve` (Task) — event intake in one of two modes:
+//!   * `mode:"ws"` (default, openclaw-style): long connection — dial out to
+//!     Feishu via `/callback/ws/endpoint`, receive events over WSS (see
+//!     `ws.rs`). No public URL / verification_token / encrypt_key needed.
+//!   * `mode:"webhook"`: HTTP server on :8100 receiving event-subscription
+//!     callbacks at `POST /feishu/event` (url_verification challenge,
+//!     optional AES decryption, token check).
+//!
+//!   Both modes share: dedup, openclaw-style access policy (dm_policy /
+//!   group_policy / require_mention / pairing), then a poller emits
 //!   structured envelopes to the runtime agent via `agent_trigger`.
+//!
 //! - `feishu_send` (Router) — outbound: send text / interactive card,
-//!   optionally as a quote-reply, using a cached tenant_access_token.
-//! - `feishu_entry` (Router) — configure (persist app_id/secret/tokens).
+//!   quote-reply, or PATCH-update a previously sent card (two-stage
+//!   "thinking… → final" replies), using a cached tenant_access_token.
+//! - `feishu_entry` (Router) — configure (persist app_id/secret/policies),
+//!   approve_pairing / list_pending, status.
 
 use cordis_plugin_sdk::{
     export_plugin_api, json_response, node_doc, plugin_docs, task_node_doc, AbiFingerprint,
@@ -17,12 +26,14 @@ use cordis_plugin_sdk::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
+
+mod ws;
 
 // ---------------------------------------------------------------------------
 // Global state
@@ -40,6 +51,14 @@ struct FeishuState {
     bot_open_id: Option<String>,
     /// Feishu API base, overridable for tests (default open.feishu.cn).
     api_base: Option<String>,
+    /// openclaw-style access policy overrides (None/empty = defaults).
+    dm_policy: Option<String>,
+    dm_allow_from: Vec<String>,
+    group_policy: Option<String>,
+    group_allow_from: Vec<String>,
+    require_mention: Option<bool>,
+    /// Two-stage card replies ("thinking… → final"); default on.
+    card_replies: Option<bool>,
 }
 
 static STATE: Mutex<FeishuState> = Mutex::new(FeishuState {
@@ -49,7 +68,64 @@ static STATE: Mutex<FeishuState> = Mutex::new(FeishuState {
     encrypt_key: None,
     bot_open_id: None,
     api_base: None,
+    dm_policy: None,
+    dm_allow_from: Vec::new(),
+    group_policy: None,
+    group_allow_from: Vec::new(),
+    require_mention: None,
+    card_replies: None,
 });
+
+// ---------------------------------------------------------------------------
+// Access policy (openclaw-compatible: dmPolicy / groupPolicy / requireMention)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub(crate) struct AccessPolicy {
+    /// "open" | "allowlist" | "pairing" (default: pairing — unknown DM users
+    /// get a pairing code an admin must approve).
+    pub dm_policy: String,
+    pub dm_allow_from: Vec<String>,
+    /// "open" | "allowlist" | "disabled" (default: allowlist).
+    pub group_policy: String,
+    pub group_allow_from: Vec<String>,
+    /// None → derived: mention required unless group_policy == "open".
+    pub require_mention: Option<bool>,
+}
+
+impl Default for AccessPolicy {
+    fn default() -> Self {
+        AccessPolicy {
+            dm_policy: "pairing".to_string(),
+            dm_allow_from: Vec::new(),
+            group_policy: "allowlist".to_string(),
+            group_allow_from: Vec::new(),
+            require_mention: None,
+        }
+    }
+}
+
+impl AccessPolicy {
+    fn require_mention_effective(&self) -> bool {
+        self.require_mention.unwrap_or(self.group_policy != "open")
+    }
+}
+
+/// Snapshot the effective policy from STATE (falling back to defaults).
+pub(crate) fn current_policy() -> AccessPolicy {
+    let s = STATE.lock().unwrap_or_else(|p| p.into_inner());
+    let mut p = AccessPolicy::default();
+    if let Some(v) = &s.dm_policy {
+        p.dm_policy = v.clone();
+    }
+    p.dm_allow_from = s.dm_allow_from.clone();
+    if let Some(v) = &s.group_policy {
+        p.group_policy = v.clone();
+    }
+    p.group_allow_from = s.group_allow_from.clone();
+    p.require_mention = s.require_mention;
+    p
+}
 
 /// Cached tenant_access_token: (token, expires_at). Refreshed 60s early.
 static TENANT_TOKEN: Mutex<Option<(String, Instant)>> = Mutex::new(None);
@@ -90,6 +166,9 @@ struct IncomingMessage {
     message_id: String,
     /// thread root for threaded replies (root_id), if any.
     root_id: Option<String>,
+    /// Whether the bot was @-mentioned (group chats; parse-time fact,
+    /// policy decides what to do with it).
+    mentioned: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -220,13 +299,16 @@ fn decrypt_feishu(encrypt_key: &str, b64_cipher: &str) -> Result<String, String>
 }
 
 /// Result of interpreting an inbound HTTP body.
-enum InboundOutcome {
+pub(crate) enum InboundOutcome {
     /// url_verification handshake — respond with this exact JSON body.
     Challenge(String),
     /// A message to enqueue.
     Message(IncomingMessage),
     /// A card button action — treated as a fresh inbound message.
     CardAction(IncomingMessage),
+    /// dm_policy=pairing and the sender is unknown: reply with a pairing
+    /// code instead of forwarding to the agent. (open_id, code)
+    Pairing(String, String),
     /// Valid but not actionable (non-message event, wrong token, etc.).
     Ignore(String),
     /// Token/verification rejected — respond 401.
@@ -234,12 +316,14 @@ enum InboundOutcome {
 }
 
 /// Parse a raw HTTP body into an outcome. `verification_token`/`encrypt_key`
-/// come from config; `bot_open_id` gates group @-mentions.
-fn interpret_inbound(
+/// come from config (webhook mode; pass None in ws mode); `bot_open_id`
+/// resolves @-mentions; `policy` gates who may talk to the agent.
+pub(crate) fn interpret_inbound(
     raw_body: &str,
     verification_token: Option<&str>,
     encrypt_key: Option<&str>,
     bot_open_id: Option<&str>,
+    policy: &AccessPolicy,
 ) -> InboundOutcome {
     // If encrypted, the outer body is {"encrypt": "..."} — decrypt first.
     let body: String = match serde_json::from_str::<Value>(raw_body) {
@@ -312,18 +396,65 @@ fn interpret_inbound(
     }
 
     match parse_message_event(&v, bot_open_id) {
-        Some(Ok(im)) => InboundOutcome::Message(im),
-        Some(Err(reason)) => InboundOutcome::Ignore(reason),
+        Some(im) => policy_gate(im, policy),
         None => InboundOutcome::Ignore("malformed message event".into()),
     }
 }
 
-/// Parse an `im.message.receive_v1` event. Returns:
-/// - Some(Ok(msg)) when actionable,
-/// - Some(Err(reason)) when a valid message we deliberately skip (e.g. group
-///   message that doesn't @ the bot),
-/// - None when structurally malformed.
-fn parse_message_event(v: &Value, bot_open_id: Option<&str>) -> Option<Result<IncomingMessage, String>> {
+/// Apply the openclaw-style access policy to a parsed message.
+fn policy_gate(im: IncomingMessage, policy: &AccessPolicy) -> InboundOutcome {
+    if im.chat_type == "p2p" {
+        return match policy.dm_policy.as_str() {
+            "open" => InboundOutcome::Message(im),
+            "allowlist" => {
+                if policy.dm_allow_from.iter().any(|a| a == &im.open_id) {
+                    InboundOutcome::Message(im)
+                } else {
+                    InboundOutcome::Ignore(format!(
+                        "dm from {} not in allowlist; skipped",
+                        im.open_id
+                    ))
+                }
+            }
+            // Default & explicit "pairing": known users pass, unknown users
+            // get a pairing code an admin must approve via feishu_entry.
+            _ => {
+                if policy.dm_allow_from.iter().any(|a| a == &im.open_id) {
+                    InboundOutcome::Message(im)
+                } else {
+                    let code = pairing_code_for(&im.open_id);
+                    InboundOutcome::Pairing(im.open_id.clone(), code)
+                }
+            }
+        };
+    }
+
+    // Group chats.
+    match policy.group_policy.as_str() {
+        "disabled" => {
+            return InboundOutcome::Ignore("group_policy=disabled; skipped".to_string())
+        }
+        "open" => {}
+        // Default & explicit "allowlist".
+        _ => {
+            if !policy.group_allow_from.iter().any(|a| a == &im.chat_id) {
+                return InboundOutcome::Ignore(format!(
+                    "group {} not in allowlist; skipped",
+                    im.chat_id
+                ));
+            }
+        }
+    }
+    if policy.require_mention_effective() && !im.mentioned {
+        return InboundOutcome::Ignore("group message without @bot; skipped".to_string());
+    }
+    InboundOutcome::Message(im)
+}
+
+/// Parse an `im.message.receive_v1` event structurally (no policy).
+/// Returns None when malformed. Mention state is recorded on the message;
+/// `policy_gate` decides whether it matters.
+fn parse_message_event(v: &Value, bot_open_id: Option<&str>) -> Option<IncomingMessage> {
     let event = v.get("event")?;
     let message = event.get("message")?;
     let chat_id = message.get("chat_id")?.as_str()?.to_string();
@@ -347,43 +478,88 @@ fn parse_message_event(v: &Value, bot_open_id: Option<&str>) -> Option<Result<In
         .unwrap_or("")
         .to_string();
 
-    // @-mention gating for group chats. p2p (direct) is always actionable.
-    if chat_type == "group" {
-        let mentioned = message
-            .get("mentions")
-            .and_then(|m| m.as_array())
-            .map(|arr| {
-                arr.iter().any(|m| {
-                    let mid = m
-                        .get("id")
-                        .and_then(|i| i.get("open_id"))
-                        .and_then(|o| o.as_str());
-                    match (mid, bot_open_id) {
-                        // If we know our open_id, require an exact match.
-                        (Some(mid), Some(bot)) => mid == bot,
-                        // If bot_open_id unknown, any @ counts (best-effort).
-                        (Some(_), None) => true,
-                        _ => false,
-                    }
-                })
+    // Record whether the bot was @-mentioned; policy_gate decides relevance.
+    let mentioned = message
+        .get("mentions")
+        .and_then(|m| m.as_array())
+        .map(|arr| {
+            arr.iter().any(|m| {
+                let mid = m
+                    .get("id")
+                    .and_then(|i| i.get("open_id"))
+                    .and_then(|o| o.as_str());
+                match (mid, bot_open_id) {
+                    // If we know our open_id, require an exact match.
+                    (Some(mid), Some(bot)) => mid == bot,
+                    // If bot_open_id unknown, any @ counts (best-effort).
+                    (Some(_), None) => true,
+                    _ => false,
+                }
             })
-            .unwrap_or(false);
-        if !mentioned {
-            return Some(Err("group message without @bot; skipped".to_string()));
-        }
-    }
+        })
+        .unwrap_or(false);
 
     // Strip @-mention placeholder text like "@_user_1 " that Feishu leaves.
     let cleaned = strip_mention_tokens(&text);
 
-    Some(Ok(IncomingMessage {
+    Some(IncomingMessage {
         chat_type,
         chat_id,
         open_id,
         text: cleaned,
         message_id,
         root_id,
-    }))
+        mentioned,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Pairing (dm_policy = "pairing", openclaw-style)
+// ---------------------------------------------------------------------------
+
+/// Pending pairing requests: code → open_id.
+static PENDING_PAIRINGS: LazyLock<Mutex<HashMap<String, String>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Deterministic 6-digit pairing code per open_id (stable across retries so
+/// the user always sees the same code until approved).
+fn pairing_code_for(open_id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(open_id.as_bytes());
+    let n = u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]]) % 1_000_000;
+    let code = format!("{n:06}");
+    let mut pending = PENDING_PAIRINGS.lock().unwrap_or_else(|p| p.into_inner());
+    pending.insert(code.clone(), open_id.to_string());
+    code
+}
+
+/// Approve a pairing code: moves the open_id into dm_allow_from (persisted).
+fn approve_pairing(code: &str) -> Result<String, String> {
+    let open_id = {
+        let mut pending = PENDING_PAIRINGS.lock().unwrap_or_else(|p| p.into_inner());
+        pending
+            .remove(code.trim())
+            .ok_or_else(|| format!("no pending pairing with code {code}"))?
+    };
+    let mut config = load_runtime_config().unwrap_or_else(|| json!({}));
+    let mut allow: Vec<String> = config
+        .get("dm_allow_from")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    if !allow.iter().any(|a| a == &open_id) {
+        allow.push(open_id.clone());
+    }
+    config["dm_allow_from"] = json!(allow);
+    save_runtime_config(&config)?;
+    if let Ok(mut s) = STATE.lock() {
+        apply_config_to_state(&mut s, &config);
+    }
+    Ok(open_id)
 }
 
 /// Feishu leaves "@_user_N" placeholders in text where mentions were; drop them.
@@ -426,6 +602,8 @@ fn parse_card_action(v: &Value) -> Option<IncomingMessage> {
         text,
         message_id: format!("cardaction:{}", value.get("text").and_then(|t| t.as_str()).unwrap_or("")),
         root_id: None,
+        // A button click is always an explicit interaction with the bot.
+        mentioned: true,
     })
 }
 
@@ -474,6 +652,49 @@ fn tenant_access_token(app_id: &str, app_secret: &str) -> Result<String, String>
         *cache = Some((token.clone(), refresh_at));
     }
     Ok(token)
+}
+
+/// Two-stage card replies: reply_target → message_id of the "thinking…"
+/// card we posted when the message was accepted. The agent's reply then
+/// PATCHes that card instead of sending a new message.
+static PENDING_CARDS: LazyLock<Mutex<HashMap<String, String>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn loading_card() -> Value {
+    json!({
+        "config": { "wide_screen_mode": true },
+        "elements": [
+            { "tag": "div", "text": { "tag": "lark_md", "content": "⏳ 思考中…" } }
+        ]
+    })
+}
+
+fn final_card(text: &str) -> Value {
+    json!({
+        "config": { "wide_screen_mode": true },
+        "elements": [
+            { "tag": "markdown", "content": text }
+        ]
+    })
+}
+
+/// PATCH an existing interactive-card message with new content.
+fn feishu_update_card(token: &str, message_id: &str, card: &Value) -> Result<Value, String> {
+    let url = format!("{}/open-apis/im/v1/messages/{message_id}", api_base());
+    let resp = ureq::request("PATCH", &url)
+        .set("Authorization", &format!("Bearer {token}"))
+        .set("Content-Type", "application/json; charset=utf-8")
+        .send_json(json!({ "content": card.to_string() }))
+        .map_err(|e| format!("feishu card update failed: {e}"))?;
+    let parsed: Value = resp.into_json().map_err(|e| format!("feishu card update parse: {e}"))?;
+    let code = parsed.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
+    if code != 0 {
+        return Err(format!(
+            "feishu card update error code={code}: {}",
+            parsed.get("msg").and_then(|m| m.as_str()).unwrap_or("")
+        ));
+    }
+    Ok(parsed)
 }
 
 /// "chat:oc_xxx" / "user:ou_xxx" → (receive_id_type, receive_id).
@@ -537,8 +758,47 @@ fn handle_feishu_send(req: &NodeRequest) -> Result<NodeResponse, String> {
     let app_secret = config_str(req.payload.as_ref(), "app_secret", |s| s.app_secret.clone())
         .ok_or("no app_secret configured")?;
     let token = tenant_access_token(&app_id, &app_secret)?;
-    let (recv_type, recv_id) = parse_target(target)?;
 
+    // Two-stage card flow: if we posted a "thinking…" card for this target,
+    // PATCH it into the final content instead of sending a new message.
+    // (Explicit `update_message_id` in the payload takes precedence.)
+    let update_mid = req
+        .payload
+        .as_ref()
+        .and_then(|p| p.get("update_message_id"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| {
+            let mut pending = PENDING_CARDS.lock().unwrap_or_else(|p| p.into_inner());
+            pending.remove(target)
+        });
+    if let Some(mid) = update_mid {
+        let card = if let Some(card) = &req.card {
+            card.clone()
+        } else {
+            let message = req.message.as_deref().unwrap_or("").trim();
+            if message.is_empty() {
+                return Err("message or card is required for feishu_send".to_string());
+            }
+            final_card(message)
+        };
+        match feishu_update_card(&token, &mid, &card) {
+            Ok(data) => {
+                return Ok(NodeResponse {
+                    ok: true,
+                    node_id: "feishu_send".to_string(),
+                    message: Some("updated".to_string()),
+                    data: Some(data),
+                    error: None,
+                })
+            }
+            // Card update can fail (e.g. card expired); fall through to a
+            // plain send so the reply is never lost.
+            Err(e) => eprintln!("[feishu] card update failed, sending fresh message: {e}"),
+        }
+    }
+
+    let (recv_type, recv_id) = parse_target(target)?;
     let (msg_type, content) = if let Some(card) = &req.card {
         ("interactive", card.to_string())
     } else {
@@ -566,8 +826,21 @@ fn handle_feishu_entry(req: &NodeRequest) -> Result<NodeResponse, String> {
             let payload = req.payload.clone().unwrap_or(Value::Null);
             // Merge into existing config so partial updates work.
             let mut config = load_runtime_config().unwrap_or_else(|| json!({}));
-            for key in ["app_id", "app_secret", "verification_token", "encrypt_key", "bot_open_id", "api_base"] {
+            for key in [
+                "app_id", "app_secret", "verification_token", "encrypt_key",
+                "bot_open_id", "api_base", "dm_policy", "group_policy",
+            ] {
                 if let Some(val) = payload.get(key).and_then(|v| v.as_str()) {
+                    config[key] = json!(val);
+                }
+            }
+            for key in ["dm_allow_from", "group_allow_from"] {
+                if let Some(val) = payload.get(key).and_then(|v| v.as_array()) {
+                    config[key] = json!(val);
+                }
+            }
+            for key in ["require_mention", "card_replies"] {
+                if let Some(val) = payload.get(key).and_then(|v| v.as_bool()) {
                     config[key] = json!(val);
                 }
             }
@@ -579,6 +852,7 @@ fn handle_feishu_entry(req: &NodeRequest) -> Result<NodeResponse, String> {
             Ok(NodeResponse { ok: true, node_id: "feishu_entry".to_string(), message: Some("configured".to_string()), data: None, error: None })
         }
         Some("status") => {
+            let policy = current_policy();
             let s = STATE.lock().map_err(|e| format!("lock: {e}"))?;
             let data = json!({
                 "app_id_set": s.app_id.is_some(),
@@ -587,21 +861,74 @@ fn handle_feishu_entry(req: &NodeRequest) -> Result<NodeResponse, String> {
                 "bot_open_id_set": s.bot_open_id.is_some(),
                 "server_running": SERVER_RUNNING.lock().map(|g| *g).unwrap_or(false),
                 "queue_dropped": MESSAGE_QUEUE_DROPPED.load(Ordering::Relaxed),
+                "dm_policy": policy.dm_policy,
+                "group_policy": policy.group_policy,
+                "require_mention": policy.require_mention_effective(),
+                "dm_allow_count": policy.dm_allow_from.len(),
+                "group_allow_count": policy.group_allow_from.len(),
+                "pending_pairings": PENDING_PAIRINGS.lock().map(|g| g.len()).unwrap_or(0),
             });
             Ok(NodeResponse { ok: true, node_id: "feishu_entry".to_string(), message: None, data: Some(data), error: None })
+        }
+        Some("approve_pairing") => {
+            let code = req
+                .payload
+                .as_ref()
+                .and_then(|p| p.get("code"))
+                .and_then(|c| c.as_str())
+                .ok_or("approve_pairing requires payload.code")?;
+            let open_id = approve_pairing(code)?;
+            Ok(NodeResponse {
+                ok: true,
+                node_id: "feishu_entry".to_string(),
+                message: Some(format!("paired {open_id}")),
+                data: Some(json!({ "open_id": open_id })),
+                error: None,
+            })
+        }
+        Some("list_pending") => {
+            let pending = PENDING_PAIRINGS.lock().unwrap_or_else(|p| p.into_inner());
+            let items: Vec<Value> = pending
+                .iter()
+                .map(|(code, oid)| json!({ "code": code, "open_id": oid }))
+                .collect();
+            Ok(NodeResponse {
+                ok: true,
+                node_id: "feishu_entry".to_string(),
+                message: None,
+                data: Some(json!({ "pending": items })),
+                error: None,
+            })
         }
         other => Err(format!("unknown feishu_entry action: {other:?}")),
     }
 }
 
-fn apply_config_to_state(s: &mut FeishuState, config: &Value) {
+pub(crate) fn apply_config_to_state(s: &mut FeishuState, config: &Value) {
     let g = |k: &str| config.get(k).and_then(|v| v.as_str()).map(|v| v.to_string());
+    let list = |k: &str| -> Vec<String> {
+        config
+            .get(k)
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
     s.app_id = g("app_id");
     s.app_secret = g("app_secret");
     s.verification_token = g("verification_token");
     s.encrypt_key = g("encrypt_key");
     s.bot_open_id = g("bot_open_id");
     s.api_base = g("api_base");
+    s.dm_policy = g("dm_policy");
+    s.dm_allow_from = list("dm_allow_from");
+    s.group_policy = g("group_policy");
+    s.group_allow_from = list("group_allow_from");
+    s.require_mention = config.get("require_mention").and_then(|v| v.as_bool());
+    s.card_replies = config.get("card_replies").and_then(|v| v.as_bool());
 }
 
 // ---------------------------------------------------------------------------
@@ -622,34 +949,54 @@ fn handle_feishu_serve(req: &NodeRequest) -> Result<NodeResponse, String> {
         }
     }
 
-    let port: u16 = req
+    let mode = req
         .payload
         .as_ref()
-        .and_then(|p| p.get("port"))
-        .and_then(|v| v.as_u64())
-        .map(|v| v as u16)
-        .unwrap_or(DEFAULT_PORT);
+        .and_then(|p| p.get("mode"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("ws")
+        .to_string();
 
     let mut running = SERVER_RUNNING.lock().map_err(|e| format!("lock: {e}"))?;
     if *running {
-        return Ok(NodeResponse { ok: true, node_id: "feishu_serve".to_string(), message: Some(format!("already running on {port}")), data: None, error: None });
+        return Ok(NodeResponse { ok: true, node_id: "feishu_serve".to_string(), message: Some(format!("already running (mode={mode})")), data: None, error: None });
     }
-    let server = tiny_http::Server::http(format!("0.0.0.0:{port}"))
-        .map_err(|e| format!("feishu_serve: cannot bind port {port}: {e}"))?;
+
+    let message = if mode == "webhook" {
+        let port: u16 = req
+            .payload
+            .as_ref()
+            .and_then(|p| p.get("port"))
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u16)
+            .unwrap_or(DEFAULT_PORT);
+        let server = tiny_http::Server::http(format!("0.0.0.0:{port}"))
+            .map_err(|e| format!("feishu_serve: cannot bind port {port}: {e}"))?;
+        SERVER_SHUTDOWN.store(false, Ordering::SeqCst);
+        let handle = thread::spawn(move || run_event_loop(server));
+        if let Ok(mut guard) = EVENT_LOOP_HANDLE.lock() {
+            *guard = Some(handle);
+        }
+        format!("HTTP server listening on port {port}, path /feishu/event")
+    } else {
+        // Long-connection (openclaw-style default): dial out to Feishu.
+        // Credentials may be configured later; the loop waits for them.
+        SERVER_SHUTDOWN.store(false, Ordering::SeqCst);
+        let handle = thread::spawn(ws::run_ws_loop);
+        if let Ok(mut guard) = EVENT_LOOP_HANDLE.lock() {
+            *guard = Some(handle);
+        }
+        "long-connection (wss) event loop started".to_string()
+    };
+
     *running = true;
     drop(running);
-    SERVER_SHUTDOWN.store(false, Ordering::SeqCst);
-
-    let handle = thread::spawn(move || run_event_loop(server));
-    if let Ok(mut guard) = EVENT_LOOP_HANDLE.lock() {
-        *guard = Some(handle);
-    }
     start_agent_poller();
 
     Ok(NodeResponse {
         ok: true,
         node_id: "feishu_serve".to_string(),
-        message: Some(format!("HTTP server listening on port {port}, path /feishu/event")),
+        message: Some(message),
         data: None,
         error: None,
     })
@@ -688,30 +1035,66 @@ fn run_event_loop(server: tiny_http::Server) {
             let s = STATE.lock().unwrap_or_else(|p| p.into_inner());
             (s.verification_token.clone(), s.encrypt_key.clone(), s.bot_open_id.clone())
         };
+        let policy = current_policy();
 
-        match interpret_inbound(&body, vtoken.as_deref(), ekey.as_deref(), bot.as_deref()) {
+        match interpret_inbound(&body, vtoken.as_deref(), ekey.as_deref(), bot.as_deref(), &policy) {
             InboundOutcome::Challenge(resp) => {
                 let _ = request.respond(
                     tiny_http::Response::from_string(resp)
                         .with_header("Content-Type: application/json".parse::<tiny_http::Header>().unwrap()),
                 );
             }
-            InboundOutcome::Message(im) | InboundOutcome::CardAction(im) => {
-                // Always 200 first so Feishu doesn't retry.
-                let _ = request.respond(tiny_http::Response::from_string(r#"{"code":0}"#));
-                enqueue_message(im);
-            }
-            InboundOutcome::Ignore(reason) => {
-                eprintln!("[feishu] ignore: {reason}");
-                let _ = request.respond(tiny_http::Response::from_string(r#"{"code":0}"#));
-            }
             InboundOutcome::Rejected(reason) => {
                 eprintln!("[feishu] rejected: {reason}");
                 let _ = request.respond(tiny_http::Response::from_string("unauthorized").with_status_code(401));
             }
+            outcome => {
+                // Always 200 first so Feishu doesn't retry.
+                let _ = request.respond(tiny_http::Response::from_string(r#"{"code":0}"#));
+                process_outcome(outcome);
+            }
         }
     }
     eprintln!("[feishu] event loop stopped");
+}
+
+/// Shared post-parse handling for both webhook and ws modes: enqueue
+/// messages, answer pairing requests, log ignores.
+pub(crate) fn process_outcome(outcome: InboundOutcome) {
+    match outcome {
+        InboundOutcome::Message(im) | InboundOutcome::CardAction(im) => enqueue_message(im),
+        InboundOutcome::Pairing(open_id, code) => {
+            eprintln!("[feishu] pairing request from {open_id}: code {code}");
+            // Best-effort: tell the user their pairing code. Failure is
+            // non-fatal (e.g. credentials not yet configured).
+            if let Err(e) = send_text_to(&format!("user:{open_id}"), &format!(
+                "你还未获得使用授权。配对码：{code}\n请联系管理员执行 approve_pairing 批准。"
+            )) {
+                eprintln!("[feishu] pairing reply failed: {e}");
+            }
+        }
+        InboundOutcome::Ignore(reason) => eprintln!("[feishu] ignore: {reason}"),
+        // Challenge/Rejected are transport-level; handled by the caller.
+        _ => {}
+    }
+}
+
+/// Minimal internal text send (used for pairing replies).
+fn send_text_to(target: &str, message: &str) -> Result<(), String> {
+    let app_id = config_str(None, "app_id", |s| s.app_id.clone()).ok_or("no app_id configured")?;
+    let app_secret =
+        config_str(None, "app_secret", |s| s.app_secret.clone()).ok_or("no app_secret configured")?;
+    let token = tenant_access_token(&app_id, &app_secret)?;
+    let (recv_type, recv_id) = parse_target(target)?;
+    feishu_send_message(
+        &token,
+        recv_type,
+        &recv_id,
+        "text",
+        &json!({ "text": message }).to_string(),
+        None,
+    )
+    .map(|_| ())
 }
 
 fn enqueue_message(im: IncomingMessage) {
@@ -754,12 +1137,59 @@ fn start_agent_poller() {
                 if !should_process(&msg.text) {
                     continue;
                 }
+                // Two-stage card reply: post a "thinking…" card now; the
+                // agent's reply will PATCH it into the final card.
+                if card_replies_enabled() {
+                    post_loading_card(&msg);
+                }
                 let envelope = build_envelope(&msg);
                 cordis_plugin_sdk::agent_trigger(&envelope);
             }
             thread::sleep(Duration::from_secs(5));
         }
     });
+}
+
+fn card_replies_enabled() -> bool {
+    STATE
+        .lock()
+        .ok()
+        .and_then(|s| s.card_replies)
+        .unwrap_or(true)
+}
+
+/// Post the "thinking…" loading card and remember its message_id keyed by
+/// reply_target, so the agent's reply PATCHes it instead of double-posting.
+fn post_loading_card(msg: &IncomingMessage) {
+    let target = format!("chat:{}", msg.chat_id);
+    let post = || -> Result<String, String> {
+        let app_id =
+            config_str(None, "app_id", |s| s.app_id.clone()).ok_or("no app_id configured")?;
+        let app_secret = config_str(None, "app_secret", |s| s.app_secret.clone())
+            .ok_or("no app_secret configured")?;
+        let token = tenant_access_token(&app_id, &app_secret)?;
+        let (recv_type, recv_id) = parse_target(&target)?;
+        let data = feishu_send_message(
+            &token,
+            recv_type,
+            &recv_id,
+            "interactive",
+            &loading_card().to_string(),
+            None,
+        )?;
+        data.get("data")
+            .and_then(|d| d.get("message_id"))
+            .and_then(|m| m.as_str())
+            .map(|s| s.to_string())
+            .ok_or("no message_id in send response".to_string())
+    };
+    match post() {
+        Ok(mid) => {
+            let mut pending = PENDING_CARDS.lock().unwrap_or_else(|p| p.into_inner());
+            pending.insert(target, mid);
+        }
+        Err(e) => eprintln!("[feishu] loading card failed (falling back to plain reply): {e}"),
+    }
 }
 
 /// Skip trivial / command-style inputs (mirrors qq's should_process).
@@ -831,24 +1261,24 @@ fn docs_value() -> cordis_plugin_sdk::PluginDocs {
         vec![
             task_node_doc(
                 "feishu_serve",
-                "Start the Feishu event-subscription HTTP server (webhook). Receives im.message.receive_v1 events + card actions, handles the url_verification challenge, verifies token, decrypts (if encrypt_key set), gates group messages on @bot, dedups, and forwards to the agent.",
-                json!({"type":"object","properties":{"node_id":{"const":"feishu_serve"},"action":{"type":"string","enum":["stop"]},"payload":{"type":"object","properties":{"port":{"type":"integer"}}}}}),
+                "Start Feishu event intake. mode='ws' (default): long connection — dials out to Feishu (/callback/ws/endpoint), no public URL needed. mode='webhook': HTTP server receiving event callbacks at POST /feishu/event (url_verification challenge, token check, optional AES decryption). Both modes apply the access policy (dm_policy/group_policy/require_mention/pairing), dedup, and forward accepted messages to the agent.",
+                json!({"type":"object","properties":{"node_id":{"const":"feishu_serve"},"action":{"type":"string","enum":["stop"]},"payload":{"type":"object","properties":{"mode":{"type":"string","enum":["ws","webhook"]},"port":{"type":"integer"}}}}}),
                 json!({"type":"object","properties":{"ok":{"type":"boolean"},"message":{"type":"string"}}}),
-                &["network:listen"],
-                &["port bind failure"],
+                &["network:listen","network:feishu-api"],
+                &["port bind failure","bootstrap auth failure"],
             ),
             node_doc(
                 "feishu_send",
-                "Send a message to a Feishu chat or user. target is 'chat:<chat_id>' or 'user:<open_id>'. Provide either `message` (text) or `card` (interactive card JSON). Optional `reply_to` quote-replies to a message_id.",
-                json!({"type":"object","required":["node_id","target"],"properties":{"node_id":{"const":"feishu_send"},"target":{"type":"string"},"message":{"type":"string"},"card":{"type":"object"},"reply_to":{"type":"string"}}}),
+                "Send a message to a Feishu chat or user. target is 'chat:<chat_id>' or 'user:<open_id>'. Provide either `message` (text) or `card` (interactive card JSON). Optional `reply_to` quote-replies to a message_id. If a pending 'thinking…' card exists for the target (two-stage replies) the content PATCHes that card; payload.update_message_id forces updating a specific message.",
+                json!({"type":"object","required":["node_id","target"],"properties":{"node_id":{"const":"feishu_send"},"target":{"type":"string"},"message":{"type":"string"},"card":{"type":"object"},"reply_to":{"type":"string"},"payload":{"type":"object","properties":{"update_message_id":{"type":"string"}}}}}),
                 json!({"type":"object","properties":{"ok":{"type":"boolean"},"data":{"type":"object"}}}),
                 &["network:feishu-api"],
                 &["auth failure","invalid target"],
             ).with_agent_accessible(),
             node_doc(
                 "feishu_entry",
-                "Configure the Feishu plugin (app_id/app_secret/verification_token/encrypt_key/bot_open_id) or query status. action='configure' with payload, or action='status'.",
-                json!({"type":"object","required":["node_id"],"properties":{"node_id":{"const":"feishu_entry"},"action":{"type":"string","enum":["configure","status"]},"payload":{"type":"object"}}}),
+                "Configure the Feishu plugin or manage access. action='configure' with payload (app_id/app_secret/bot_open_id/api_base/verification_token/encrypt_key + policies: dm_policy open|allowlist|pairing, dm_allow_from[], group_policy open|allowlist|disabled, group_allow_from[], require_mention, card_replies). action='status' for a summary. action='approve_pairing' with payload.code approves a pending DM pairing. action='list_pending' lists pending pairings.",
+                json!({"type":"object","required":["node_id"],"properties":{"node_id":{"const":"feishu_entry"},"action":{"type":"string","enum":["configure","status","approve_pairing","list_pending"]},"payload":{"type":"object"}}}),
                 json!({"type":"object","properties":{"ok":{"type":"boolean"}}}),
                 &["config write"],
                 &["missing fields"],
@@ -889,10 +1319,22 @@ export_plugin_api! {
 mod tests {
     use super::*;
 
+    /// Fully-open policy: what the pre-policy tests assumed (any DM, any
+    /// group, mention still required via explicit require_mention).
+    fn open_policy() -> AccessPolicy {
+        AccessPolicy {
+            dm_policy: "open".to_string(),
+            dm_allow_from: Vec::new(),
+            group_policy: "open".to_string(),
+            group_allow_from: Vec::new(),
+            require_mention: Some(true),
+        }
+    }
+
     #[test]
     fn challenge_handshake_echoes_challenge() {
         let body = json!({"type":"url_verification","challenge":"abc123","token":"vtok"}).to_string();
-        match interpret_inbound(&body, Some("vtok"), None, None) {
+        match interpret_inbound(&body, Some("vtok"), None, None, &open_policy()) {
             InboundOutcome::Challenge(resp) => {
                 let v: Value = serde_json::from_str(&resp).unwrap();
                 assert_eq!(v.get("challenge").unwrap().as_str().unwrap(), "abc123");
@@ -905,7 +1347,7 @@ mod tests {
     fn challenge_wrong_token_rejected() {
         let body = json!({"type":"url_verification","challenge":"x","token":"WRONG"}).to_string();
         assert!(matches!(
-            interpret_inbound(&body, Some("vtok"), None, None),
+            interpret_inbound(&body, Some("vtok"), None, None, &open_policy()),
             InboundOutcome::Rejected(_)
         ));
     }
@@ -917,7 +1359,7 @@ mod tests {
             "event": {}
         }).to_string();
         assert!(matches!(
-            interpret_inbound(&body, Some("vtok"), None, None),
+            interpret_inbound(&body, Some("vtok"), None, None, &open_policy()),
             InboundOutcome::Rejected(_)
         ));
     }
@@ -925,7 +1367,7 @@ mod tests {
     #[test]
     fn p2p_message_is_actionable() {
         let body = message_event("p2p", "oc_1", "om_1", "hello there", &[]).to_string();
-        match interpret_inbound(&body, Some("vtok"), None, Some("ou_bot")) {
+        match interpret_inbound(&body, Some("vtok"), None, Some("ou_bot"), &open_policy()) {
             InboundOutcome::Message(im) => {
                 assert_eq!(im.chat_id, "oc_1");
                 assert_eq!(im.text, "hello there");
@@ -938,7 +1380,7 @@ mod tests {
     fn group_message_without_at_is_skipped() {
         let body = message_event("group", "oc_2", "om_2", "just chatting", &[]).to_string();
         assert!(matches!(
-            interpret_inbound(&body, Some("vtok"), None, Some("ou_bot")),
+            interpret_inbound(&body, Some("vtok"), None, Some("ou_bot"), &open_policy()),
             InboundOutcome::Ignore(_)
         ));
     }
@@ -946,7 +1388,7 @@ mod tests {
     #[test]
     fn group_message_with_at_bot_is_actionable() {
         let body = message_event("group", "oc_3", "om_3", "@_user_1 hi bot", &["ou_bot"]).to_string();
-        match interpret_inbound(&body, Some("vtok"), None, Some("ou_bot")) {
+        match interpret_inbound(&body, Some("vtok"), None, Some("ou_bot"), &open_policy()) {
             InboundOutcome::Message(im) => {
                 assert_eq!(im.chat_id, "oc_3");
                 // mention placeholder stripped
@@ -960,7 +1402,7 @@ mod tests {
     fn group_at_someone_else_is_skipped() {
         let body = message_event("group", "oc_4", "om_4", "@_user_1 hi", &["ou_someone"]).to_string();
         assert!(matches!(
-            interpret_inbound(&body, Some("vtok"), None, Some("ou_bot")),
+            interpret_inbound(&body, Some("vtok"), None, Some("ou_bot"), &open_policy()),
             InboundOutcome::Ignore(_)
         ));
     }
@@ -981,6 +1423,7 @@ mod tests {
             text: "hello".to_string(),
             message_id: "om_5".to_string(),
             root_id: None,
+            mentioned: true,
         };
         let env: Value = serde_json::from_str(&build_envelope(&im)).unwrap();
         assert_eq!(env["source_plugin"], "feishu");
@@ -1028,13 +1471,155 @@ mod tests {
                 "operator": {"open_id":"ou_op"}
             }
         }).to_string();
-        match interpret_inbound(&body, Some("vtok"), None, None) {
+        match interpret_inbound(&body, Some("vtok"), None, None, &open_policy()) {
             InboundOutcome::CardAction(im) => {
                 assert_eq!(im.chat_id, "oc_card");
                 assert_eq!(im.text, "button clicked");
             }
             _ => panic!("expected CardAction"),
         }
+    }
+
+    // ---- Access-policy matrix -------------------------------------------
+
+    fn msg(chat_type: &str, chat_id: &str, open_id: &str, mentioned: bool) -> IncomingMessage {
+        IncomingMessage {
+            chat_type: chat_type.to_string(),
+            chat_id: chat_id.to_string(),
+            open_id: open_id.to_string(),
+            text: "hi".to_string(),
+            message_id: "om_t".to_string(),
+            root_id: None,
+            mentioned,
+        }
+    }
+
+    #[test]
+    fn dm_open_allows_anyone() {
+        let p = AccessPolicy { dm_policy: "open".into(), ..AccessPolicy::default() };
+        assert!(matches!(
+            policy_gate(msg("p2p", "oc", "ou_stranger", false), &p),
+            InboundOutcome::Message(_)
+        ));
+    }
+
+    #[test]
+    fn dm_allowlist_gates_unknown_users() {
+        let p = AccessPolicy {
+            dm_policy: "allowlist".into(),
+            dm_allow_from: vec!["ou_friend".into()],
+            ..AccessPolicy::default()
+        };
+        assert!(matches!(
+            policy_gate(msg("p2p", "oc", "ou_friend", false), &p),
+            InboundOutcome::Message(_)
+        ));
+        assert!(matches!(
+            policy_gate(msg("p2p", "oc", "ou_stranger", false), &p),
+            InboundOutcome::Ignore(_)
+        ));
+    }
+
+    #[test]
+    fn dm_pairing_issues_code_for_unknown_then_allows_after_approve() {
+        let p = AccessPolicy::default(); // dm_policy = pairing
+        let outcome = policy_gate(msg("p2p", "oc", "ou_new", false), &p);
+        let code = match outcome {
+            InboundOutcome::Pairing(oid, code) => {
+                assert_eq!(oid, "ou_new");
+                assert_eq!(code.len(), 6);
+                code
+            }
+            _ => panic!("expected Pairing"),
+        };
+        // Same user retries → same code (deterministic).
+        match policy_gate(msg("p2p", "oc", "ou_new", false), &p) {
+            InboundOutcome::Pairing(_, code2) => assert_eq!(code2, code),
+            _ => panic!("expected Pairing again"),
+        }
+        // Known users pass without pairing.
+        let p_known = AccessPolicy {
+            dm_allow_from: vec!["ou_new".into()],
+            ..AccessPolicy::default()
+        };
+        assert!(matches!(
+            policy_gate(msg("p2p", "oc", "ou_new", false), &p_known),
+            InboundOutcome::Message(_)
+        ));
+    }
+
+    #[test]
+    fn group_disabled_ignores_everything() {
+        let p = AccessPolicy { group_policy: "disabled".into(), ..AccessPolicy::default() };
+        assert!(matches!(
+            policy_gate(msg("group", "oc_g", "ou", true), &p),
+            InboundOutcome::Ignore(_)
+        ));
+    }
+
+    #[test]
+    fn group_allowlist_gates_unknown_groups() {
+        let p = AccessPolicy {
+            group_policy: "allowlist".into(),
+            group_allow_from: vec!["oc_ok".into()],
+            ..AccessPolicy::default()
+        };
+        assert!(matches!(
+            policy_gate(msg("group", "oc_ok", "ou", true), &p),
+            InboundOutcome::Message(_)
+        ));
+        assert!(matches!(
+            policy_gate(msg("group", "oc_other", "ou", true), &p),
+            InboundOutcome::Ignore(_)
+        ));
+    }
+
+    #[test]
+    fn group_open_waives_mention_by_default() {
+        let p = AccessPolicy {
+            group_policy: "open".into(),
+            require_mention: None,
+            ..AccessPolicy::default()
+        };
+        // openclaw: requireMention defaults false when policy is open.
+        assert!(matches!(
+            policy_gate(msg("group", "oc_any", "ou", false), &p),
+            InboundOutcome::Message(_)
+        ));
+        // Explicit require_mention=true still gates.
+        let p2 = AccessPolicy { require_mention: Some(true), ..p };
+        assert!(matches!(
+            policy_gate(msg("group", "oc_any", "ou", false), &p2),
+            InboundOutcome::Ignore(_)
+        ));
+    }
+
+    #[test]
+    fn group_allowlist_requires_mention_by_default() {
+        let p = AccessPolicy {
+            group_policy: "allowlist".into(),
+            group_allow_from: vec!["oc_ok".into()],
+            require_mention: None,
+            ..AccessPolicy::default()
+        };
+        assert!(matches!(
+            policy_gate(msg("group", "oc_ok", "ou", false), &p),
+            InboundOutcome::Ignore(_)
+        ));
+    }
+
+    #[test]
+    fn approve_pairing_unknown_code_errors() {
+        assert!(approve_pairing("999999xxx").is_err());
+    }
+
+    #[test]
+    fn cards_have_expected_shape() {
+        let lc = loading_card();
+        assert!(lc["elements"][0]["text"]["content"].as_str().unwrap().contains("思考中"));
+        let fc = final_card("**done**");
+        assert_eq!(fc["elements"][0]["tag"], "markdown");
+        assert_eq!(fc["elements"][0]["content"], "**done**");
     }
 
     // Build an im.message.receive_v1 event with optional @mention open_ids.
