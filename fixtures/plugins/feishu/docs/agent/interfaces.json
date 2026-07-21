@@ -1,0 +1,144 @@
+{
+  "plugin_id": "feishu",
+  "plugin_path": "feishu",
+  "plugin_version": "0.1.0",
+  "abi_version": 2,
+  "command_name": "Feishu",
+  "nodes": [
+    {
+      "id": "feishu_serve",
+      "summary": "Start the Feishu event-subscription HTTP server (webhook). Receives im.message.receive_v1 events + card actions, handles the url_verification challenge, verifies token, decrypts (if encrypt_key set), gates group messages on @bot, dedups, and forwards to the agent.",
+      "input_schema": {
+        "properties": {
+          "action": {
+            "enum": [
+              "stop"
+            ],
+            "type": "string"
+          },
+          "node_id": {
+            "const": "feishu_serve"
+          },
+          "payload": {
+            "properties": {
+              "port": {
+                "type": "integer"
+              }
+            },
+            "type": "object"
+          }
+        },
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "message": {
+            "type": "string"
+          },
+          "ok": {
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      },
+      "side_effects": [
+        "network:listen"
+      ],
+      "failure_modes": [
+        "port bind failure"
+      ],
+      "node_type": "task",
+      "agent_accessible": false
+    },
+    {
+      "id": "feishu_send",
+      "summary": "Send a message to a Feishu chat or user. target is 'chat:<chat_id>' or 'user:<open_id>'. Provide either `message` (text) or `card` (interactive card JSON). Optional `reply_to` quote-replies to a message_id.",
+      "input_schema": {
+        "properties": {
+          "card": {
+            "type": "object"
+          },
+          "message": {
+            "type": "string"
+          },
+          "node_id": {
+            "const": "feishu_send"
+          },
+          "reply_to": {
+            "type": "string"
+          },
+          "target": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "node_id",
+          "target"
+        ],
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "data": {
+            "type": "object"
+          },
+          "ok": {
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      },
+      "side_effects": [
+        "network:feishu-api"
+      ],
+      "failure_modes": [
+        "auth failure",
+        "invalid target"
+      ],
+      "node_type": "router",
+      "agent_accessible": true
+    },
+    {
+      "id": "feishu_entry",
+      "summary": "Configure the Feishu plugin (app_id/app_secret/verification_token/encrypt_key/bot_open_id) or query status. action='configure' with payload, or action='status'.",
+      "input_schema": {
+        "properties": {
+          "action": {
+            "enum": [
+              "configure",
+              "status"
+            ],
+            "type": "string"
+          },
+          "node_id": {
+            "const": "feishu_entry"
+          },
+          "payload": {
+            "type": "object"
+          }
+        },
+        "required": [
+          "node_id"
+        ],
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "ok": {
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      },
+      "side_effects": [
+        "config write"
+      ],
+      "failure_modes": [
+        "missing fields"
+      ],
+      "node_type": "router",
+      "agent_accessible": false
+    }
+  ],
+  "system_hint": "You are chatting in Feishu (Lark). Each incoming message is prefixed with its source, e.g. \"[Feishu group from <chat_id> (user <open_id>)]: <text>\".\nYour FINAL output each turn MUST be exactly one JSON object:\n{\"action\":\"respond\",\"message\":\"<reply text>\"}  — to reply to the chat, OR\n{\"action\":\"suspend\"}  — when no reply is warranted.\nThe runtime routes your \"respond\" back to the originating Feishu chat automatically; do NOT call feishu_send yourself for the direct reply.\nTo proactively send an extra message (e.g. a progress update) to a chat: invoke_plugin(feishu, feishu_send, {\"node_id\":\"feishu_send\",\"target\":\"chat:<chat_id>\",\"message\":\"<text>\"}).\nKeep replies concise and helpful; a short honest \"not sure\" beats a long wrong answer."
+}
