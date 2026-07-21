@@ -206,6 +206,30 @@ Agent 现在可以自主完成：读代码 → 理解结构 → 写/改文件 �
 - [x] **Plugin iteration symlink 逃逸**（P0-20）— `PluginEditExecutor::execute` 在写入前调用新 helper `resolve_under_workspace`：canonicalize 结果必须仍在 workspace_root 下。plugins 内的 symlink 指向 `/etc/passwd` 之类无法被写入。
 - [x] **Verifier shell 拼接**（P0-21）— 已随 A 批 P0-1 修复。`discover_rust_workspace_manifest` 输出的字符串被 `shell_words` 解析成 argv，空格 / `$` / `;` 无法被解释。
 
+### 5.2.31 飞书 WSS 长连接 + openclaw 风格策略面 + 卡片两段式（I 批，2026-07-21）
+
+H 批的 feishu 插件源码曾因 sshfs 静默丢失事故从 checkout 消失（仅剩 `.so`），本批先从 `save_draft_and_revert` 保留的 `.cordis-drafts/untracked-*` 快照恢复源码并**提交进 git**（`51f5951`），再做三项扩展（接口面参考 openclaw 的飞书通道）：
+
+**WSS 长连接模式（`fixtures/plugins/feishu/src/ws.rs`，默认）**：
+- `feishu_serve` payload 新增 `mode: "ws" | "webhook"`（默认 ws）。ws 模式无需公网回调 URL / verification_token / encrypt_key：`POST /callback/ws/endpoint`（AppID/AppSecret）换取一次性 wss URL，事件经 protobuf `Frame`（proto2，手写 varint 编解码，不引入 prost）到达，帧内 ACK（`{"code":200}` 写回原帧回发）。
+- 心跳 ping/pong（服务端可经 pong payload 下发 ClientConfig 动态调参）、sum/seq 分片合包（5s 窗口）、断线重连（抖动 + 重 bootstrap，403 凭证错误退避 10min）。凭证未配置时挂起等待 `feishu_entry` configure。
+- webhook 模式完整保留（本地测试 / 有公网场景）。协议参考 larksuite/oapi-sdk-go v3 `ws/` 模块。依赖新增 `tungstenite`（rustls）。
+
+**openclaw 风格访问控制**（配置项与 openclaw 飞书通道对齐）：
+- `dm_policy: open|allowlist|pairing`（默认 pairing：未知用户私聊收到 6 位确定性配对码，管理员经 `feishu_entry action=approve_pairing` 批准后写入 `dm_allow_from` 持久化；`list_pending` 列待批）。
+- `group_policy: open|allowlist|disabled`（默认 allowlist）+ `group_allow_from`；`require_mention` 缺省派生：group_policy=open 时不要求 @，否则要求。
+- 原 parse 阶段的 @ 门控拆为 `parse_message_event`（纯结构解析，记录 `mentioned`）+ `policy_gate`（策略判定），webhook/ws 双模共用 `process_outcome`。
+
+**卡片两段式回复**（token 级流式的近似，见待办）：
+- 收到消息受理后立即发"⏳ 思考中…" interactive 卡片（`card_replies` 配置可关，默认开），message_id 记入 pending map（key=reply_target）。
+- agent 回复经 envelope 回调 `feishu_send` 时，若该 target 有 pending 卡片则 `PATCH /open-apis/im/v1/messages/{id}` 更新为 markdown 终稿卡片；PATCH 失败回退发新消息（回复永不丢失）。`update_message_id` payload 可显式指定更新目标。
+
+**验证**：feishu 26 单测（原 11 + Frame roundtrip/varint/合包/service_id 解析/未知字段跳过 + 策略矩阵 8 项 + pairing 流程 + 卡片形状）+ scaffold 全绿；clippy 零实质 warning；runtime lib 89 / architecture 17 回归全绿。`startup_invoke.json` feishu 条目改为 `mode:"ws"`。
+
+**待办**：
+- 真机部署：飞书开发者后台建自建应用（事件订阅选"长连接"、订阅 `im.message.receive_v1`、开 `im:message` 权限族），`feishu_entry` configure 写入 app_id/app_secret/bot_open_id。
+- token 级流式卡片（openclaw `streaming: partial`）需要 kernel `agent_send` 暴露 chunk 回调，涉及 agent.rs 流式读取层外露，另立批次。
+
 ### 5.2.30 消息路由解耦 + 飞书插件（H 批，2026-07-21）
 
 在飞书上真机部署插件的需求,暴露出 runtime `main.rs` inbox loop 硬编码了 QQ 专属逻辑,违反 Kernel/Plugin 边界。本批做了**解耦 + 新插件**两件事。

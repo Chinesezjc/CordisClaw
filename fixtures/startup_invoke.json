@@ -18,7 +18,7 @@
     "payload": {
       "node_id": "feishu_serve",
       "payload": {
-        "port": 8100
+        "mode": "ws"
       }
     }
   }
