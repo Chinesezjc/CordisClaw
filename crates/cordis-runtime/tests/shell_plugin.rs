@@ -104,7 +104,14 @@ fn shell_plugin_rejects_external_shell_backend() {
 }
 
 #[test]
-fn invoke_cli_runs_interactive_shell_session() {
+fn invoke_cli_shell_repl_refuses_non_tty_stdin() {
+    // P2-37: `shell_run_repl` now requires an interactive TTY on stdin so a
+    // headless host can't hang waiting on a REPL that will never receive
+    // keystrokes. This test drives `invoke shell shell_entry` with a PIPED
+    // stdin (never a TTY under `cargo test`), so the plugin must fail fast
+    // with a clear diagnostic rather than block or pretend to run a session.
+    // (Was `invoke_cli_runs_interactive_shell_session`, which asserted the
+    // pre-P2-37 behaviour of driving the REPL over a pipe — impossible now.)
     let bin = env!("CARGO_BIN_EXE_cordis-runtime");
     let mut child = Command::new(bin)
         .args([
@@ -126,13 +133,12 @@ fn invoke_cli_runs_interactive_shell_session() {
 
     let output = child.wait_with_output().expect("wait for invoke cli");
     assert!(
-        output.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
+        !output.status.success(),
+        "non-TTY stdin must make `invoke shell` exit non-zero"
     );
-
-    let stdout = String::from_utf8(output.stdout).expect("stdout utf-8");
-    assert!(stdout.contains("CordisClaw@runtime:"));
-    assert!(stdout.contains("CordisClaw"));
-    assert!(stdout.contains("invoke ok=true"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("requires an interactive TTY"),
+        "expected TTY-refusal diagnostic, got stderr: {stderr}"
+    );
 }
