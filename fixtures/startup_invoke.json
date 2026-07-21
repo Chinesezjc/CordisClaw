@@ -11,5 +11,15 @@
         "allow_groups": []
       }
     }
+  },
+  {
+    "plugin_path": "feishu",
+    "node_id": "feishu_serve",
+    "payload": {
+      "node_id": "feishu_serve",
+      "payload": {
+        "port": 8100
+      }
+    }
   }
 ]

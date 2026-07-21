@@ -2,7 +2,7 @@
 
 ## 1. 判定口径
 
-- 本文基于当前仓库现状整理，最近更新：2026-07-20。
+- 本文基于当前仓库现状整理，最近更新：2026-07-21。
 - 历史规划蓝图已经吸收进 [design-blueprint.md](./design-blueprint.md)，因此本文结论来自三类证据的交叉比对：
   - 设计蓝图：[design-blueprint.md](./design-blueprint.md)
   - 架构文档：[system-overview.md](./system-overview.md)、[contracts-and-loading.md](./contracts-and-loading.md)、[runtime-semantics.md](./runtime-semantics.md)、[maintenance-guide.md](./maintenance-guide.md)
@@ -205,6 +205,26 @@ Agent 现在可以自主完成：读代码 → 理解结构 → 写/改文件 �
 - [x] **Filesystem / Git 白名单不再静默降级**（P0-19）— `canonicalize` 失败时不再退回未规范化路径。新增 `canonicalise_for_whitelist` / `validate_path_in_root` 的深度 ancestor 解析：路径不存在时 canonicalize 最深的存在祖先再拼 tail；两侧都失败则 fail-closed。`../../etc/shadow` 之类的构造再无绕过。
 - [x] **Plugin iteration symlink 逃逸**（P0-20）— `PluginEditExecutor::execute` 在写入前调用新 helper `resolve_under_workspace`：canonicalize 结果必须仍在 workspace_root 下。plugins 内的 symlink 指向 `/etc/passwd` 之类无法被写入。
 - [x] **Verifier shell 拼接**（P0-21）— 已随 A 批 P0-1 修复。`discover_rust_workspace_manifest` 输出的字符串被 `shell_words` 解析成 argv，空格 / `$` / `;` 无法被解释。
+
+### 5.2.30 消息路由解耦 + 飞书插件（H 批，2026-07-21）
+
+在飞书上真机部署插件的需求,暴露出 runtime `main.rs` inbox loop 硬编码了 QQ 专属逻辑,违反 Kernel/Plugin 边界。本批做了**解耦 + 新插件**两件事。
+
+**消息路由解耦(核心)**:
+- 原 inbox loop 用 `strip_prefix("[QQ group from ")` 从裸 prompt 解析 group_id 分 session,`respond` 时写死 `host.invoke("qq","qq_send",{target:"group:{gid}"})`。runtime 认识 "qq"/"qq_send",协议耦合。
+- 改为**结构化 envelope 路由**:`agent_trigger` 传 JSON envelope(`source_plugin`/`reply_node`/`session_key`/`display`/`reply_target`/`reply_to`)。runtime 新增 `AgentEnvelope`(`main.rs`),按 `session_key` 分 session、`respond` 时 `host.invoke(env.source_plugin, env.reply_node, ...)` 动态回调来源插件。解析容错:非 envelope 的裸字符串回退为 display+session_key(兼容未迁移调用者)。
+- **qq 迁移**:poller 从拼前缀字符串改为构造 envelope(`source_plugin:"qq"`/`session_key:"qq:group:{id}"`/`reply_target:"group:{id}"`)。`NodeRequest.reply_to` 加 `de_opt_i64_flexible`(runtime 透传的是字符串,直接调用者可能传 int,两者都接)。旧契约测试 `agent_prompt_format_is_parseable` 改为 `agent_envelope_carries_routing_fields`。qq E2E 5/5 全绿,迁移无回归。
+
+**飞书插件**(`fixtures/plugins/feishu/`,与 qq 同构):
+- `feishu_serve`(Task,:8100,`POST /feishu/event`)、`feishu_send`(text/card/reply)、`feishu_entry`(configure/status)。
+- 飞书特有:url_verification challenge 握手 + `verification_token` 校验 + 可选 AES-256-CBC 解密(key=SHA256(encrypt_key),IV=密文前16字节);event schema 2.0(`im.message.receive_v1`);群聊 @机器人门控(`mentions` 含 bot open_id 才处理,单聊无条件);出站用 `tenant_access_token`(带 60s 提前刷新的缓存)POST `open.feishu.cn/open-apis/im/v1/messages`;引用回复走 `/messages/{id}/reply`;卡片按钮 `card.action.trigger` 回调转为合成消息。
+- 11 单测(challenge/token/AES 往返/@门控/target/envelope/卡片)全绿。`ureq` 开 `tls` feature(qq 只发本地 http 没开)。
+
+**验证**:build/build --tests 零 warning;feishu 11 + qq 10 单测;runtime lib 89 + architecture 17 + crash_recovery 6 + semantics 15 + auto_update 5 + shell_plugin 8 全绿;qq E2E 5/5;本地 serve + curl 端到端:challenge 应答、群@消息、单聊消息三条链路全通,两条消息(群 oc_final / 单聊 oc_p2p)各自分 session、agent 回复经 envelope 正确回调 `feishu_send`,证明解耦生效(runtime 不认识具体协议)。
+
+**待办**:真机部署等用户在飞书开发者后台建自建应用取凭证(App ID/Secret/Verification Token/可选 Encrypt Key),经 `feishu_entry` configure 写入,公网回调 `https://<域名>/feishu/event`。
+
+**过程教训**:MomoiAiri 的 sshfs 挂载写入不可靠——经挂载用工具新建的文件会静默丢失(编译期短暂可见但未 writeback)。改用 ssh heredoc / base64 直写 + grep 确认。
 
 ### 5.2.29 QQ 链路移交的三个 runtime 问题（G 批，2026-07-20）
 

@@ -25,6 +25,62 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+/// Structured message envelope carried over `agent_trigger`.
+///
+/// Kernel/Plugin boundary: the runtime inbox must NOT know about any
+/// specific protocol (QQ, Feishu, …). Source plugins encode routing
+/// metadata here so the inbox can (a) shard sessions by `session_key`
+/// and (b) dispatch the agent's reply back to the ORIGINATING plugin's
+/// send node — without the runtime hard-coding `qq_send` or `group:`.
+///
+/// Parsing is tolerant: a plain (non-JSON) string from a legacy caller
+/// is wrapped as `{ display = <string>, session_key = <string> }` with
+/// no reply routing, so it still reaches the agent (just can't reply).
+#[derive(Debug, Clone, serde::Deserialize)]
+struct AgentEnvelope {
+    /// Plugin to invoke for the reply, e.g. "feishu". Empty = no reply.
+    #[serde(default)]
+    source_plugin: String,
+    /// Reply node on that plugin, e.g. "feishu_send". Empty = no reply.
+    #[serde(default)]
+    reply_node: String,
+    /// Session sharding key, unique across sources, e.g. "feishu:chat:oc_x".
+    #[serde(default)]
+    session_key: String,
+    /// Human-readable text fed to the agent.
+    #[serde(default)]
+    display: String,
+    /// `target` passed to the reply node; plugin self-parses (e.g. "chat:oc_x").
+    #[serde(default)]
+    reply_target: String,
+    /// Optional original message id for quote-reply.
+    #[serde(default)]
+    reply_to: Option<String>,
+}
+
+impl AgentEnvelope {
+    /// Parse a trigger payload. Falls back to treating the whole string
+    /// as `display` + `session_key` when it isn't a valid envelope, so
+    /// un-migrated callers still function (without reply routing).
+    fn parse(raw: &str) -> Self {
+        match serde_json::from_str::<AgentEnvelope>(raw) {
+            Ok(env) if !env.session_key.is_empty() || !env.display.is_empty() => env,
+            _ => AgentEnvelope {
+                source_plugin: String::new(),
+                reply_node: String::new(),
+                session_key: raw.to_string(),
+                display: raw.to_string(),
+                reply_target: String::new(),
+                reply_to: None,
+            },
+        }
+    }
+
+    fn can_reply(&self) -> bool {
+        !self.source_plugin.is_empty() && !self.reply_node.is_empty()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ServeMode {
     Command,
@@ -338,36 +394,37 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 while let Ok(m) = rx.try_recv() {
                     msgs.push(m);
                 }
-                // Group by group_id so replies never leak across groups.
-                let mut by_group: BTreeMap<String, Vec<String>> = BTreeMap::new();
+                // Parse each trigger payload into an envelope and shard by
+                // session_key so replies never leak across sources/chats.
+                // The envelope also carries reply routing (which plugin +
+                // node + target to invoke for the agent's response) — the
+                // runtime stays protocol-agnostic (no hard-coded qq_send).
+                let mut by_session: BTreeMap<String, Vec<AgentEnvelope>> = BTreeMap::new();
                 for msg in msgs {
-                    let gid = msg.strip_prefix("[QQ group from ")
-                        .and_then(|rest| rest.find("]: ").map(|end| &rest[..end]))
-                        .map(|prefix| prefix.split_once(" (user ").map(|(g, _)| g).unwrap_or(prefix).to_string())
-                        .unwrap_or_default();
-                    if !gid.is_empty() {
-                        by_group.entry(gid).or_default().push(msg);
+                    let env = AgentEnvelope::parse(&msg);
+                    if !env.session_key.is_empty() {
+                        by_session.entry(env.session_key.clone()).or_default().push(env);
                     }
                 }
-                for (group_id, group_msgs) in &by_group {
-                    if group_id.is_empty() || group_msgs.is_empty() { continue; }
-                    let combined = group_msgs.join("\n");
-                    eprintln!("inbox: [{group_id}] batch {} msgs: {}", group_msgs.len(), combined);
-                    // P1-53: previously this drained `rx.try_recv()` into
-                    // `inject_queue` unconditionally — but messages on the
-                    // channel are from ALL groups, not this one. The result
-                    // was that group B's messages leaked into group A's
-                    // agent turn. Don't drain here; the next iteration of
-                    // the outer `loop { match rx.recv() ... }` will read
-                    // them and by_group-shard correctly. (An
-                    // agent-per-group inject queue would be cleaner and is
-                    // tracked separately.)
-                    // P1-52: evict oldest before we possibly insert a
-                    // new session below. Cap group→session map at
-                    // MAX_SESSIONS; the evicted group re-creates on next
-                    // message via `agent_start`.
+                for (session_key, envs) in &by_session {
+                    if session_key.is_empty() || envs.is_empty() { continue; }
+                    let combined = envs
+                        .iter()
+                        .map(|e| e.display.as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    // Reply routing comes from the LAST envelope in the batch
+                    // (all share session_key, so same source/target).
+                    let route = envs.last().cloned().unwrap();
+                    eprintln!("inbox: [{session_key}] batch {} msgs: {}", envs.len(), combined);
+                    // P1-53: don't drain rx.try_recv() here — messages on the
+                    // channel are from ALL sessions; the outer loop shards
+                    // them correctly next iteration.
+                    // P1-52: evict oldest before inserting a new session. Cap
+                    // session map at MAX_SESSIONS; evicted key re-creates on
+                    // next message via agent_start.
                     const MAX_SESSIONS: usize = 512;
-                    if !sessions.contains_key(group_id) && sessions.len() >= MAX_SESSIONS {
+                    if !sessions.contains_key(session_key) && sessions.len() >= MAX_SESSIONS {
                         if let Some(evict_key) = sessions
                             .keys()
                             .next()
@@ -375,18 +432,19 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                         {
                             if let Some(evicted_sid) = sessions.remove(&evict_key) {
                                 eprintln!(
-                                    "inbox: evicting oldest session for group {} (session {})",
+                                    "inbox: evicting oldest session for {} (session {})",
                                     evict_key, evicted_sid
                                 );
                                 host.delete_session_snapshot(&evicted_sid);
                             }
                         }
                     }
-                    let sid = sessions.entry(group_id.clone())
+                    let sid = sessions.entry(session_key.clone())
                         .or_insert_with(|| host.agent_start(AgentSessionKind::RuntimeShell)
                             .map(|s| s.session_id).unwrap_or_default());
-                    // Process agent output: parse JSON, dispatch action, send to QQ.
-                    // Returns Some(feedback) if the agent needs to retry with a corrected output.
+                    // Process agent output: parse JSON, dispatch action, send
+                    // the reply back to the ORIGINATING plugin (route). Returns
+                    // Some(feedback) if the agent needs to retry.
                     let process = |raw: String, label: &str| -> Option<String> {
                         if raw.is_empty() { return None; }
                         // Preprocess: escape newlines and embedded quotes inside JSON strings.
@@ -422,14 +480,21 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                                 let msg = cmd.get("message").and_then(|v| v.as_str()).unwrap_or("");
                                 if !msg.is_empty() {
                                     eprintln!("inbox: agent reply ({label}): {}...", msg.chars().take(100).collect::<String>());
-                                    let payload = serde_json::json!({
-                                        "node_id": "qq_send",
-                                        "target": format!("group:{}", group_id),
-                                        "message": msg,
-                                    });
-                                    match host.invoke("qq", "qq_send", payload.to_string()) {
-                                        Ok(_) => eprintln!("inbox: qq_send OK ({label})"),
-                                        Err(e) => eprintln!("inbox: qq_send failed ({label}): {e}"),
+                                    if route.can_reply() {
+                                        let mut payload = serde_json::json!({
+                                            "node_id": route.reply_node,
+                                            "target": route.reply_target,
+                                            "message": msg,
+                                        });
+                                        if let Some(rt) = &route.reply_to {
+                                            payload["reply_to"] = serde_json::json!(rt);
+                                        }
+                                        match host.invoke(&route.source_plugin, &route.reply_node, payload.to_string()) {
+                                            Ok(_) => eprintln!("inbox: {}::{} OK ({label})", route.source_plugin, route.reply_node),
+                                            Err(e) => eprintln!("inbox: {}::{} failed ({label}): {e}", route.source_plugin, route.reply_node),
+                                        }
+                                    } else {
+                                        eprintln!("inbox: no reply route for session {session_key}, dropping reply ({label})");
                                     }
                                 }
                                 None
@@ -437,12 +502,12 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                             Ok(ref cmd) => {
                                 let action = cmd.get("action").and_then(|v| v.as_str()).unwrap_or("?");
                                 eprintln!("inbox: unknown JSON action={action}, dropping raw={}...", raw.chars().take(200).collect::<String>().replace('\n', " "));
-                                cordis_runtime::kernel::notify::send(&host, &format!("[{group_id}] ⚠️ 回复异常（未知动作: {action}），正在重试..."));
+                                cordis_runtime::kernel::notify::send(&host, &format!("[{session_key}] ⚠️ 回复异常（未知动作: {action}），正在重试..."));
                                 Some(format!("SYSTEM: Your last output was valid JSON but had unknown action \"{action}\". Allowed actions: \"suspend\" or \"respond\". Please retry.\n\nYour raw output was:\n{raw}"))
                             }
                             Err(e) => {
                                 eprintln!("inbox: JSON parse failed: {e} — raw={}... preprocessed={}...", raw.chars().take(200).collect::<String>().replace('\n', " "), out.chars().take(200).collect::<String>().replace('\n', " "));
-                                cordis_runtime::kernel::notify::send(&host, &format!("[{group_id}] ⚠️ 回复格式异常，正在重试...（{e}）"));
+                                cordis_runtime::kernel::notify::send(&host, &format!("[{session_key}] ⚠️ 回复格式异常，正在重试...（{e}）"));
                                 Some(format!("SYSTEM: Your last output was not valid JSON and was dropped. Parse error: {e}\n\nPlease fix the JSON formatting and retry. Final output must be exactly {{\"action\":\"suspend\"}} or {{\"action\":\"respond\",\"message\":\"...\"}}.\n\nYour raw output was:\n{raw}"))
                             }
                         }
@@ -460,7 +525,7 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                             eprintln!("inbox: {e}");
                             cordis_runtime::kernel::notify::send(
                                 &host,
-                                &format!("[{group_id}] ⚠️ LLM 请求失败: {e}"),
+                                &format!("[{session_key}] ⚠️ LLM 请求失败: {e}"),
                             );
                         }
                     }
