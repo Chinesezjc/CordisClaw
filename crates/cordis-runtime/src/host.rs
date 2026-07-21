@@ -1960,7 +1960,7 @@ export_plugin_api! {{
     /// triggering an LLM call. Used by `/` shortcuts.
     pub(crate) fn agent_sessions_mut(
         &self,
-    ) -> std::sync::MutexGuard<BTreeMap<String, ManagedAgentSession>> {
+    ) -> std::sync::MutexGuard<'_, BTreeMap<String, ManagedAgentSession>> {
         self.agent_sessions
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
@@ -5474,7 +5474,7 @@ fn register_builtin_agent_node(
     plugin_registry: &PluginRegistry,
     node_registry: &mut NodeRegistry,
 ) {
-    use crate::core::models::{PluginDocs, PluginLoadResult};
+    use crate::core::models::PluginDocs;
     use cordis_plugin_sdk::NodeDoc;
 
     let docs = PluginDocs {
