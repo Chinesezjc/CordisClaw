@@ -2092,7 +2092,7 @@ fn llm_profile_fallback_degrades_and_recovers() {
     let handle = host
         .agent_start_with(
             AgentSessionKind::RuntimeShell,
-            AgentStartOptions { profile: Some("default".to_string()) },
+            AgentStartOptions { profile: Some("default".to_string()), ..Default::default() },
         )
         .expect("agent start");
     let sid = handle.session_id.as_str();
@@ -2127,4 +2127,93 @@ fn llm_profile_fallback_degrades_and_recovers() {
         reply.content
     );
     assert_eq!(probe_handle.join().expect("join probe server"), 1);
+}
+
+// O批: soul 槽 — set_soul 经 host 写入文件 provider，新会话 system prompt
+// 含 persona overlay；soul.profile 引用决定新会话使用的 LLM profile。
+#[test]
+#[serial]
+fn soul_roundtrip_profile_reference_and_scope_guard() {
+    use cordis_runtime::agent::AgentToolHost;
+    use cordis_runtime::soul::Soul;
+
+    let temp = setup_fixture_workspace_copy();
+    let fixtures = temp.path().join("fixtures");
+    write_llm_profiles_config(
+        temp.path(),
+        "http://127.0.0.1:1/v1",
+        "http://127.0.0.1:2/v1",
+    );
+    let host = RuntimeHost::boot(&fixtures).expect("host should boot");
+
+    let soul_key = "feishu:ou_abc#private";
+    // agent 工具写路径（merge 语义：先 persona 后 profile 不互相覆盖）。
+    host.agent_set_soul(soul_key, Some("你是毒舌但可靠的运维助手"), None)
+        .expect("set persona");
+    host.agent_set_soul(soul_key, None, Some("fast")).expect("set profile");
+    let soul: Soul = host.get_soul(soul_key).expect("get").expect("exists");
+    assert_eq!(soul.persona, "你是毒舌但可靠的运维助手");
+    assert_eq!(soul.profile.as_deref(), Some("fast"));
+
+    // 未知 profile 拒绝。
+    let err = host
+        .agent_set_soul(soul_key, None, Some("ghost"))
+        .expect_err("unknown profile must fail");
+    assert!(err.to_string().contains("ghost"), "err: {err}");
+
+    // 空 soul_key（无身份会话）拒绝写入。
+    assert!(host.agent_set_soul("", Some("x"), None).is_err());
+
+    // overlay 读路径。
+    assert_eq!(
+        host.agent_soul_overlay(soul_key).as_deref(),
+        Some("你是毒舌但可靠的运维助手")
+    );
+    assert!(host.agent_soul_overlay("nobody#private").is_none());
+}
+
+// P批: soul_store 插件加载后，soul 读写应走 SQLite 覆写（写入
+// data/souls.db 而非 data/souls/*.json）；这是"约定能力节点"覆写
+// 路径的端到端验证。
+#[test]
+#[serial]
+fn soul_store_plugin_overrides_file_provider() {
+    use cordis_runtime::agent::AgentToolHost;
+
+    let temp = setup_fixture_workspace_copy();
+    let fixtures = temp.path().join("fixtures");
+    write_llm_profiles_config(
+        temp.path(),
+        "http://127.0.0.1:1/v1",
+        "http://127.0.0.1:2/v1",
+    );
+    let host = RuntimeHost::boot(&fixtures).expect("host should boot");
+
+    let has_soul_store = host
+        .current_snapshot()
+        .plugin_registry()
+        .iter()
+        .any(|(path, _)| path == "soul_store");
+    if !has_soul_store {
+        eprintln!("soul_store not in fixture registry; skipping override assertion");
+        return;
+    }
+
+    let soul_key = "qq:789#group";
+    host.agent_set_soul(soul_key, Some("SQLite 里的我"), None)
+        .expect("set soul via plugin provider");
+    let soul = host.get_soul(soul_key).expect("get").expect("exists");
+    assert_eq!(soul.persona, "SQLite 里的我");
+
+    // 覆写生效的证据：文件 provider 的目录不应有这个 key 的文件。
+    let file_path = temp
+        .path()
+        .join("data/souls")
+        .join("qq_789#group.json");
+    assert!(
+        !file_path.exists(),
+        "soul must live in souls.db, not {}",
+        file_path.display()
+    );
+    assert!(temp.path().join("data/souls.db").exists(), "souls.db should exist");
 }

@@ -1,0 +1,105 @@
+{
+  "plugin_id": "soul_store",
+  "plugin_path": "soul_store",
+  "plugin_version": "0.1.0",
+  "abi_version": 2,
+  "command_name": null,
+  "nodes": [
+    {
+      "id": "soul_get",
+      "summary": "Fetch the stored soul (persona + LLM profile reference) for a scope key. Capability node: its presence (with soul_set) overrides the kernel's file-based soul storage.",
+      "input_schema": {
+        "properties": {
+          "node_id": {
+            "const": "soul_get"
+          },
+          "payload": {
+            "properties": {
+              "soul_key": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "soul_key"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "node_id"
+        ],
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "ok": {
+            "type": "boolean"
+          },
+          "soul": {
+            "type": [
+              "object",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "side_effects": [
+        "reads data/souls.db"
+      ],
+      "failure_modes": [
+        "missing soul_key"
+      ],
+      "node_type": "router",
+      "agent_accessible": false
+    },
+    {
+      "id": "soul_set",
+      "summary": "Upsert the soul for a scope key. Capability node paired with soul_get.",
+      "input_schema": {
+        "properties": {
+          "node_id": {
+            "const": "soul_set"
+          },
+          "payload": {
+            "properties": {
+              "soul": {
+                "type": "object"
+              },
+              "soul_key": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "soul_key",
+              "soul"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "node_id"
+        ],
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "ok": {
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      },
+      "side_effects": [
+        "writes data/souls.db"
+      ],
+      "failure_modes": [
+        "missing soul_key",
+        "malformed soul"
+      ],
+      "node_type": "router",
+      "agent_accessible": false
+    }
+  ],
+  "system_hint": null
+}

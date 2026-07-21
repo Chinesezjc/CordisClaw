@@ -1,12 +1,30 @@
-# Set provider: deepseek, base_url: https://api.deepseek.com/v1,
-# api_key_env: DEEPSEEK_API_KEY, and model: deepseek-chat for DeepSeek.
-provider: openai
-base_url: https://api.openai.com/v1
-api_key_env: OPENAI_API_KEY
-api_key: null
-model: gpt-4.1-mini
-organization: null
-project: null
-temperature: 0.2
-max_tokens: 4096
-timeout_ms: 60000
+# LLM API 配置：两种格式都支持。
+#
+# 格式 A（推荐，K批）：具名 profile 表。soul 记录以名字引用 profile
+# （不同用户可用不同 profile）；`fallback` 声明请求打穿后机械切换的
+# 备用 profile（L批，切换会记 kernel issue + 通知，不静默）。
+# 凭据建议只写 api_key_env（从环境变量读），不落明文。
+profiles:
+  default:
+    provider: openai
+    base_url: https://api.openai.com/v1
+    api_key_env: OPENAI_API_KEY
+    model: gpt-4.1-mini
+    temperature: 0.2
+    max_tokens: 4096
+    timeout_ms: 60000
+    fallback: fast
+  fast:
+    provider: openai
+    base_url: https://api.openai.com/v1
+    api_key_env: OPENAI_API_KEY
+    model: gpt-4o-mini
+    temperature: 0.2
+    max_tokens: 4096
+    timeout_ms: 30000
+
+# 格式 B（旧格式，仍兼容）：整份文件是单个配置，自动包装为 default。
+# provider: deepseek
+# base_url: https://api.deepseek.com/v1
+# api_key_env: DEEPSEEK_API_KEY
+# model: deepseek-chat

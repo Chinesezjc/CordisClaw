@@ -73,6 +73,13 @@
 |---|---|
 | 统一的 LLM agent 会话：SSE 流解析、tool-calling loop（最多 96 轮，overflow 保留 partial history P1-31）、重试/超时管理（4xx 不重试 P1-35，budget 合并 P1-37）、消息历史（compact 后重算 estimated_tokens P1-32、UTF-8 char/byte 一致 P1-33）、orphan-User cleanup（P2-31）；两个后端：`RuntimeShellAgentBackend`（20 个交互式工具；P2-1 边界收敛待做）和 `PluginIterationAgentBackend`（scaffold/edit/verify 工具集） | `AgentSession::respond` / `respond_inner`、`ShellAgentSession`、`AgentToolHost` trait、`PendingSessionAction`（P1-25 self-lookup 侧信道） |
 
+## 6c. Soul 与指令路由（`crates/cordis-runtime/src/soul.rs`、`command_router.rs`）
+
+| 文件 | 职责定位 | 关键入口 |
+|---|---|---|
+| `crates/cordis-runtime/src/soul.rs` | per-用户人格（soul）存储槽：`Soul` 数据模型（persona + LLM profile 引用）、`SoulProvider` trait、kernel 内建 `FileSoulProvider`（`data/souls/*.json`，0600）。插件同时声明 `soul_get`+`soul_set` 节点即覆写（host 侧 `PluginSoulProvider`） | `SoulProvider::get/set`、`FileSoulProvider::new`、`sanitize_soul_key` |
+| `crates/cordis-runtime/src/command_router.rs` | bypass-LLM 指令路由：`/` 前缀消息不经 LLM 直接执行，经 envelope 回复通路返回；内建 /status /help /reset /soul，插件经 `command_name`+`command_entry` 节点注册；LLM 全挂时的管理面 | `dispatch`、`CommandContext`、`CommandOutcome` |
+
 ## 7. Service 层 (`crates/cordis-runtime/src/service`)
 
 | 文件 | 职责定位 | 关键入口 |
