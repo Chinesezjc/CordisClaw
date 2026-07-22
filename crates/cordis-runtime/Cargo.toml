@@ -21,5 +21,6 @@ rustyline = "15"
 shell-words = "1"
 
 [dev-dependencies]
+cordis-plugin-sdk = { path = "../cordis-plugin-sdk" }
 serial_test = "3"
 tempfile = "3"

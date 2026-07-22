@@ -6658,6 +6658,10 @@ mod tests {
 
     #[test]
     fn plugin_iteration_tool_surface_and_context_reads_expand_from_focus_to_all() {
+        if cordis_plugin_sdk::CORDIS_TARGET != "x86_64-unknown-linux-gnu" {
+            eprintln!("[skip] fixture dylibs are x86_64-linux only; skipping on this host");
+            return;
+        }
         let fixtures_root = repo_fixtures_root();
         let host = RuntimeHost::boot(&fixtures_root).expect("host should boot");
         let snapshot = host.current_snapshot();

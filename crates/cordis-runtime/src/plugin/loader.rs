@@ -2,8 +2,9 @@
 //! Flow:
 //! 1) read artifact index
 //! 2) verify artifact hash + availability
-//! 3) register plugins/nodes/context from index docs
-//! 4) defer dylib ABI/docs guard to first invoke
+//! 3) for dylibs: check target triple against host, read docs from the
+//!    artifact (failure = unavailable); full ABI guard stays at invoke
+//! 4) register plugins/nodes/context from index docs
 
 use crate::context::{ContextRegistry, PluginHierarchy, RuntimeContext};
 use crate::core::error::RuntimeError;
@@ -259,6 +260,46 @@ impl Loader {
                 }
             }
 
+            // Dylib artifacts are platform-specific: dlopen-ing a binary
+            // built for another target triple can never succeed. Check the
+            // recorded triple against the host before staging or opening,
+            // so a cross-platform checkout (e.g. linux-built fixtures on a
+            // macOS host) surfaces as `AbiMismatch` instead of a runtime
+            // failure at first invoke.
+            if !matches!(entry.artifact_kind, ArtifactKind::Json)
+                && entry.abi_fingerprint.target_triple != cordis_plugin_sdk::CORDIS_TARGET
+            {
+                plugin_registry.insert_unavailable(
+                    plugin_path.clone(),
+                    entry.parent.clone(),
+                    entry.required,
+                    entry.grants_from_parent.iter().cloned().collect(),
+                    PluginUnavailableReason::AbiMismatch,
+                    vec![format!(
+                        "dylib target triple mismatch: artifact={}, host={}",
+                        entry.abi_fingerprint.target_triple,
+                        cordis_plugin_sdk::CORDIS_TARGET
+                    )],
+                );
+                context.set_plugin_state(
+                    plugin_path,
+                    PluginLoadResult::Unavailable(PluginUnavailableReason::AbiMismatch),
+                );
+                metrics.plugin_unavailable_total += 1;
+                metrics.dylib_abi_mismatch_total += 1;
+                metrics.dylib_no_fallback_total += 1;
+                if entry.required {
+                    self.propagate_parent_failure(
+                        plugin_path,
+                        &index_map,
+                        &plugin_registry,
+                        &mut node_registry,
+                        &mut context,
+                    );
+                }
+                continue;
+            }
+
             let artifact_path = match staged_root {
                 Some(root) => stage_artifact_bundle(
                     plugin_path,
@@ -345,13 +386,14 @@ impl Loader {
             // For dylib artifacts, extract docs from the .so and compare
             // against the cached index entry.
             //
-            // P2-34: the previous `if let Ok(...)` silently swallowed
-            // errors — architecture-mismatched or missing-symbol dylibs
-            // would just fall through to the cached index docs, hiding
-            // the drift from operators. Now record any read failure as a
-            // stderr diagnostic so it shows up in logs (we deliberately
-            // don't propagate: the plugin registry entry stays "loaded"
-            // with the last-known docs, matching prior semantics).
+            // P2-34 follow-up: the target-triple precheck above already
+            // rejected architecture-mismatched dylibs, so a failure here —
+            // dlopen error, missing symbol, or unparseable docs payload —
+            // is a genuine artifact fault. Marking the plugin "loaded"
+            // anyway (the previous fallback-to-cached-docs behavior) hid
+            // broken artifacts until first invoke; mark it unavailable
+            // instead. The Ok path keeps the docs-drift auto-heal: a
+            // readable dylib's docs are ground truth over the cache.
             if !matches!(entry.artifact_kind, ArtifactKind::Json) {
                 match crate::plugin::tooling::read_plugin_docs(&artifact_path) {
                     Ok(dylib_docs) => {
@@ -361,11 +403,35 @@ impl Loader {
                         }
                     }
                     Err(err) => {
-                        eprintln!(
-                            "[loader] docs-drift: read_plugin_docs({}) failed: {err}; \
-                             falling back to cached index docs",
-                            artifact_path.display()
+                        plugin_registry.insert_unavailable(
+                            plugin_path.clone(),
+                            entry.parent.clone(),
+                            entry.required,
+                            entry.grants_from_parent.iter().cloned().collect(),
+                            PluginUnavailableReason::SymbolMissing,
+                            vec![format!(
+                                "read_plugin_docs({}) failed: {err}",
+                                artifact_path.display()
+                            )],
                         );
+                        context.set_plugin_state(
+                            plugin_path,
+                            PluginLoadResult::Unavailable(
+                                PluginUnavailableReason::SymbolMissing,
+                            ),
+                        );
+                        metrics.plugin_unavailable_total += 1;
+                        metrics.dylib_no_fallback_total += 1;
+                        if entry.required {
+                            self.propagate_parent_failure(
+                                plugin_path,
+                                &index_map,
+                                &plugin_registry,
+                                &mut node_registry,
+                                &mut context,
+                            );
+                        }
+                        continue;
                     }
                 }
             }

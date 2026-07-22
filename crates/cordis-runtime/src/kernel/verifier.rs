@@ -746,6 +746,10 @@ mod tests {
 
     #[test]
     fn verify_supports_plugin_command_specs() {
+        if cordis_plugin_sdk::CORDIS_TARGET != "x86_64-unknown-linux-gnu" {
+            eprintln!("[skip] fixture dylibs are x86_64-linux only; skipping on this host");
+            return;
+        }
         let spec = format!(
             "plugin:{}",
             json!({

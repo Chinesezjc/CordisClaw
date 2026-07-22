@@ -10,6 +10,23 @@ use std::time::Duration;
 
 static FIXTURES_ROOT: OnceLock<PathBuf> = OnceLock::new();
 
+/// The pre-built `.so` artifacts under `fixtures/artifacts/` are all
+/// `x86_64-unknown-linux-gnu` ELF binaries (their target triple is recorded
+/// in `index.json`). On any other host the loader marks them
+/// `Unavailable(AbiMismatch)` and `RuntimeHost::boot` fails, so tests that
+/// need real dylib loading must skip declaratively:
+///
+/// ```ignore
+/// if !support::linux_dylib_artifacts_available() {
+///     eprintln!("[skip] fixture dylibs are x86_64-linux only; skipping on this host");
+///     return;
+/// }
+/// ```
+#[allow(dead_code)]
+pub fn linux_dylib_artifacts_available() -> bool {
+    cordis_plugin_sdk::CORDIS_TARGET == "x86_64-unknown-linux-gnu"
+}
+
 pub fn fixtures_root() -> PathBuf {
     FIXTURES_ROOT
         .get_or_init(|| {

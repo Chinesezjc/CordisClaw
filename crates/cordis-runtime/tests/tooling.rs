@@ -200,6 +200,10 @@ fn modulo_returns_remainder() {
 
 #[test]
 fn sync_plugin_docs_rewrites_dylib_interfaces_json() {
+    if !support::linux_dylib_artifacts_available() {
+        eprintln!("[skip] fixture dylibs are x86_64-linux only; skipping on this host");
+        return;
+    }
     let temp = setup_fixture_copy();
     let expr_docs = temp.path().join("plugins/expr/docs/agent/interfaces.json");
     fs::write(&expr_docs, "{}\n").expect("write broken docs");
@@ -221,6 +225,10 @@ fn sync_plugin_docs_rewrites_dylib_interfaces_json() {
 
 #[test]
 fn refresh_artifact_index_recomputes_hashes() {
+    if !support::linux_dylib_artifacts_available() {
+        eprintln!("[skip] fixture dylibs are x86_64-linux only; skipping on this host");
+        return;
+    }
     let temp = setup_fixture_copy();
     let index_path = temp.path().join("artifacts/index.json");
     let mut value: Value =
@@ -269,6 +277,10 @@ fn refresh_artifact_index_recomputes_hashes() {
 
 #[test]
 fn package_resolver_allows_new_dylib_child_without_generated_agent_docs() {
+    if !support::linux_dylib_artifacts_available() {
+        eprintln!("[skip] fixture dylibs are x86_64-linux only; skipping on this host");
+        return;
+    }
     let temp = setup_fixture_copy();
     append_expr_evaluator_child(temp.path(), "mod");
     write_expr_mod_child_without_generated_docs(temp.path());
