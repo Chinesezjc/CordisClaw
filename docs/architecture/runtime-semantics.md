@@ -184,6 +184,18 @@ Local(当前插件 -> 祖先插件中被 grants 明确允许的服务)
 
 soul 存储：kernel 内建 `FileSoulProvider`（`data/souls/`），插件同时声明 `soul_get`+`soul_set` 节点即覆写（样例 `fixtures/plugins/soul_store`，SQLite）。写路径是 agent 工具 `set_soul`（soul_key 由 host 绑定当前会话，不可越权）。
 
+#### 3.5.1 批处理与群聊身份语义（5.2.34 修正，2026-07-22）
+
+inbox 一次可取到一批消息（同一渠道多条堆积）。批处理不是"整批走同一条路"，而是**逐条划分**：
+
+- **命令 vs 普通消息逐条切分**：批内每条按正文是否 `/` 前缀分类。命令**逐条 dispatch**，各自用**自己 envelope 的 ctx**（身份 = 各自发送者，不是整批统一身份）；普通消息重组成一个 batch 送 agent。命令先于普通消息处理。
+- **`/reset` 的同批语义**：`/reset` 走 `drop_session`（清 `agent_sessions` / `pending_session_actions` / `profile_fallback` 三张 map + 删磁盘快照，幂等）。同一批里 `/reset` 之后到来的普通消息进入**新 session**。
+- **soul 随最近发言者刷新**：群聊里一条 session 服务多个发言者。每批 send 前，inbox 把 session 的 `soul_key` 刷成**最近发言者**的（`refresh_session_soul`），persona overlay 每轮从 `session.soul_key` 重建，因此发言者切换后 system prompt 立即换成对应的人格。**profile（LLM 端点）保持 session 起点不随刷新变**——换 profile 需 `/reset` 起新会话。
+- **多 sender 批的妥协**：一批里若有多个发言者，persona 取**最后一个发言者**（last）的；该批内非 last 成员的 `set_soul` 意图也会落到 last 的 soul。这是"一 session 多用户"下的已知取舍，phase 2 若需按发言者分裂 session 再议。
+- **纯命令批不碰 pending**：整批都是命令时不触发 pending spill / 重放（命令本就不经 LLM，无"打穿"可言）。
+
+soul_key 越权防护：H2 的 `drop_session` 幂等，重复 drop 不 panic；`command_router` 的 `/soul` 在 `ctx.soul_key` 为空（无身份会话）时回"无身份"提示而非泄漏任何其他作用域的 persona。
+
 这批配置当前主要服务于：
 
 - RuntimeHost staging 根目录

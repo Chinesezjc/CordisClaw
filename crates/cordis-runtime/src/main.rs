@@ -169,6 +169,39 @@ mod pending {
     }
 }
 
+/// Strip a channel-plugin source tag (e.g. `[feishu (user 张三)]: `) from a
+/// display line, returning the trimmed user text. Falls back to the trimmed
+/// original when no `]: ` marker is present (raw / legacy callers).
+fn extract_user_text(display: &str) -> &str {
+    display
+        .rsplit_once("]: ")
+        .map(|(_, t)| t)
+        .unwrap_or(display)
+        .trim()
+}
+
+/// A batch envelope classified by whether its user text is a `/command`.
+/// Commands bypass the LLM; normals are combined and sent to the agent.
+enum BatchItem {
+    Command(AgentEnvelope),
+    Normal(AgentEnvelope),
+}
+
+/// Classify each envelope in a batch (order preserved): `/`-prefixed user
+/// text becomes a `Command`, everything else a `Normal`. M2 fix — a command
+/// anywhere in a mixed batch no longer discards the batch's normal messages.
+fn partition_batch(envs: Vec<AgentEnvelope>) -> Vec<BatchItem> {
+    envs.into_iter()
+        .map(|env| {
+            if extract_user_text(&env.display).starts_with('/') {
+                BatchItem::Command(env)
+            } else {
+                BatchItem::Normal(env)
+            }
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ServeMode {
     Command,
@@ -198,8 +231,16 @@ const AGENT_TRIGGER_CAPACITY: usize = 256;
 static AGENT_TRIGGER_DROPPED: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// C ABI entry point plugins call to push a message into the agent inbox.
+///
+/// # Safety
+///
+/// The caller must pass either a null pointer (handled here as a no-op) or a
+/// pointer to a valid, NUL-terminated C string that stays live for the
+/// duration of this call. Passing a dangling, misaligned, or non-NUL-terminated
+/// pointer is undefined behaviour.
 #[no_mangle]
-pub extern "C" fn _cordis_agent_trigger(msg: *const std::ffi::c_char) {
+pub unsafe extern "C" fn _cordis_agent_trigger(msg: *const std::ffi::c_char) {
     if msg.is_null() { return; }
     let s = unsafe { std::ffi::CStr::from_ptr(msg).to_string_lossy().to_string() };
     if let Some(tx) = AGENT_TRIGGER_TX.get() {
@@ -209,7 +250,7 @@ pub extern "C" fn _cordis_agent_trigger(msg: *const std::ffi::c_char) {
                 + 1;
             // Log every drop at first, then only every 50th so a sustained
             // flood doesn't turn stderr into its own overload problem.
-            if dropped <= 5 || dropped % 50 == 0 {
+            if dropped <= 5 || dropped.is_multiple_of(50) {
                 eprintln!(
                     "agent-trigger: inbox full ({AGENT_TRIGGER_CAPACITY}), \
                      dropped {dropped} message(s) total"
@@ -496,7 +537,65 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 }
                 for (session_key, envs) in &by_session {
                     if session_key.is_empty() || envs.is_empty() { continue; }
-                    let mut combined = envs
+                    let data_dir = host.data_dir();
+                    // Fixed-template reply through a GIVEN envelope's route —
+                    // the no-LLM send path shared by command replies and
+                    // outage receipts. Parameterised by env so each command
+                    // in a mixed batch answers its own sender/target.
+                    let send_via = |env: &AgentEnvelope, message: &str| {
+                        if !env.can_reply() {
+                            eprintln!("inbox: no reply route for {session_key}, direct reply dropped");
+                            return;
+                        }
+                        let payload = serde_json::json!({
+                            "node_id": env.reply_node,
+                            "target": env.reply_target,
+                            "message": message,
+                        });
+                        if let Err(e) = host.invoke(&env.source_plugin, &env.reply_node, payload.to_string()) {
+                            eprintln!("inbox: direct reply failed: {e}");
+                        }
+                    };
+                    // M2: classify the batch so a `/command` anywhere no
+                    // longer discards the batch's normal messages. Commands
+                    // (N批 bypass-LLM) run FIRST, each with its own envelope
+                    // for identity + reply routing; normals then go to the LLM.
+                    let mut normals: Vec<AgentEnvelope> = Vec::new();
+                    for item in partition_batch(envs.clone()) {
+                        match item {
+                            BatchItem::Command(env) => {
+                                let user_text = extract_user_text(&env.display);
+                                let ctx = cordis_runtime::command_router::CommandContext {
+                                    session_key: session_key.clone(),
+                                    sender_id: env.sender_id.clone(),
+                                    conversation_kind: env.conversation_kind.clone(),
+                                    soul_key: env.soul_key(),
+                                };
+                                match cordis_runtime::command_router::dispatch(&host, &ctx, user_text) {
+                                    cordis_runtime::command_router::CommandOutcome::Reply(text) => {
+                                        send_via(&env, &text);
+                                    }
+                                    cordis_runtime::command_router::CommandOutcome::ResetSession(text) => {
+                                        if let Some(old_sid) = sessions.remove(session_key) {
+                                            host.drop_session(&old_sid);
+                                            eprintln!("inbox: [{session_key}] session {old_sid} reset by /reset");
+                                        }
+                                        pending::clear(&data_dir, session_key);
+                                        send_via(&env, &text);
+                                    }
+                                }
+                            }
+                            BatchItem::Normal(env) => normals.push(env),
+                        }
+                    }
+                    // Pure-command batch: nothing for the LLM, and pending is
+                    // left untouched (a command must not consume a spill).
+                    if normals.is_empty() {
+                        continue;
+                    }
+                    // Combine only the NORMAL messages; each display keeps its
+                    // source-tag prefix (e.g. "[feishu (user X)]: ...").
+                    let mut combined = normals
                         .iter()
                         .map(|e| e.display.as_str())
                         .collect::<Vec<_>>()
@@ -504,7 +603,6 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     // M批: replay any message that failed during an earlier
                     // LLM outage by prepending it to this batch. Cleared
                     // only after a successful send below.
-                    let data_dir = host.data_dir();
                     let replaying = pending::load(&data_dir, session_key);
                     if let Some(p) = &replaying {
                         eprintln!(
@@ -513,61 +611,13 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                         );
                         combined = format!("{}\n{}", p.combined, combined);
                     }
-                    // Reply routing comes from the LAST envelope in the batch
+                    // Reply routing / soul come from the LAST NORMAL envelope
                     // (all share session_key, so same source/target).
-                    let route = envs.last().cloned().unwrap();
+                    let route = normals.last().cloned().unwrap();
                     eprintln!(
                         "inbox: [{session_key}] (soul {}) batch {} msgs: {}",
-                        route.soul_key(), envs.len(), combined
+                        route.soul_key(), normals.len(), combined
                     );
-                    // Fixed-template reply through the envelope route — the
-                    // no-LLM send path shared by commands and receipts.
-                    let send_direct = |message: &str| {
-                        if !route.can_reply() {
-                            eprintln!("inbox: no reply route for {session_key}, direct reply dropped");
-                            return;
-                        }
-                        let payload = serde_json::json!({
-                            "node_id": route.reply_node,
-                            "target": route.reply_target,
-                            "message": message,
-                        });
-                        if let Err(e) = host.invoke(&route.source_plugin, &route.reply_node, payload.to_string()) {
-                            eprintln!("inbox: direct reply failed: {e}");
-                        }
-                    };
-                    // N批: `/`-prefixed messages bypass the LLM entirely.
-                    // The user text is extracted from the display's trailing
-                    // "]: " marker when present (channel plugins prefix a
-                    // source tag); raw text is used as-is otherwise.
-                    let user_text = route
-                        .display
-                        .rsplit_once("]: ")
-                        .map(|(_, t)| t)
-                        .unwrap_or(route.display.as_str())
-                        .trim();
-                    if user_text.starts_with('/') {
-                        let ctx = cordis_runtime::command_router::CommandContext {
-                            session_key: session_key.clone(),
-                            sender_id: route.sender_id.clone(),
-                            conversation_kind: route.conversation_kind.clone(),
-                            soul_key: route.soul_key(),
-                        };
-                        match cordis_runtime::command_router::dispatch(&host, &ctx, user_text) {
-                            cordis_runtime::command_router::CommandOutcome::Reply(text) => {
-                                send_direct(&text);
-                            }
-                            cordis_runtime::command_router::CommandOutcome::ResetSession(text) => {
-                                if let Some(old_sid) = sessions.remove(session_key) {
-                                    host.delete_session_snapshot(&old_sid);
-                                    eprintln!("inbox: [{session_key}] session {old_sid} reset by /reset");
-                                }
-                                pending::clear(&data_dir, session_key);
-                                send_direct(&text);
-                            }
-                        }
-                        continue;
-                    }
                     // P1-53: don't drain rx.try_recv() here — messages on the
                     // channel are from ALL sessions; the outer loop shards
                     // them correctly next iteration.
@@ -586,7 +636,7 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                                     "inbox: evicting oldest session for {} (session {})",
                                     evict_key, evicted_sid
                                 );
-                                host.delete_session_snapshot(&evicted_sid);
+                                host.drop_session(&evicted_sid);
                             }
                         }
                     }
@@ -605,6 +655,11 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                             host.agent_start_with(AgentSessionKind::RuntimeShell, options)
                                 .map(|s| s.session_id).unwrap_or_default()
                         });
+                    // H1: re-scope the soul to THIS batch's speaker before
+                    // sending. Idempotent — a cheap no-op when unchanged, and
+                    // also covers the just-created session. Errors ignored
+                    // (a missing session surfaces on agent_send instead).
+                    let _ = host.refresh_session_soul(sid, &route.soul_key());
                     // Process agent output: parse JSON, dispatch action, send
                     // the reply back to the ORIGINATING plugin (route). Returns
                     // Some(feedback) if the agent needs to retry.
@@ -691,7 +746,9 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                             // it to disk (replayed on the next inbound batch)
                             // and tell the user via a FIXED template — this
                             // receipt path must never depend on the LLM.
-                            let batch_only = envs
+                            // Only the NORMAL messages are spilled: commands
+                            // were already handled above the LLM call.
+                            let batch_only = normals
                                 .iter()
                                 .map(|e| e.display.as_str())
                                 .collect::<Vec<_>>()
@@ -1362,7 +1419,7 @@ fn invoke_shortcut(host: &RuntimeHost, input: &str) -> Result<String, Box<dyn st
 
     let response = host.execute(&node_fqn, payload)?;
     let mut lines = Vec::new();
-    for (_key, trace) in &response.traces {
+    for trace in response.traces.values() {
         let outcome = match trace.outcome {
             Some(cordis_runtime::core::models::NodeOutcome::Success) => "ok",
             Some(_) => "fail",
@@ -2000,5 +2057,107 @@ mod pending_tests {
         let p = pending::path_for(dir, "../../etc/passwd");
         assert!(p.starts_with("/data/pending/"), "path: {}", p.display());
         assert!(!p.to_string_lossy().contains(".."), "path: {}", p.display());
+    }
+}
+
+#[cfg(test)]
+mod batch_tests {
+    use super::{extract_user_text, partition_batch, AgentEnvelope, BatchItem};
+
+    // Build an envelope with a given display + sender via the JSON parser
+    // (no public struct literal outside the module).
+    fn env(display: &str, sender_id: &str) -> AgentEnvelope {
+        let raw = serde_json::json!({
+            "session_key": "feishu:chat:oc_x",
+            "display": display,
+            "sender_id": sender_id,
+            "conversation_kind": "group",
+        })
+        .to_string();
+        AgentEnvelope::parse(&raw)
+    }
+
+    // 混合批（普通A / 命令B / 普通C，不同 sender）→ 2 Normal + 1 Command，
+    // 顺序保持，Command env 的 sender_id 是 B 的。
+    #[test]
+    fn partition_batch_splits_commands_and_normals() {
+        let batch = vec![
+            env("[feishu (user A)]: 你好", "A"),
+            env("[feishu (user B)]: /status", "B"),
+            env("[feishu (user C)]: 在吗", "C"),
+        ];
+        let items = partition_batch(batch);
+        assert_eq!(items.len(), 3);
+        // First and last are Normal (A then C), middle is Command (B).
+        match &items[0] {
+            BatchItem::Normal(e) => assert_eq!(e.sender_id, "A"),
+            _ => panic!("item 0 should be Normal"),
+        }
+        match &items[1] {
+            BatchItem::Command(e) => assert_eq!(e.sender_id, "B"),
+            _ => panic!("item 1 should be Command"),
+        }
+        match &items[2] {
+            BatchItem::Normal(e) => assert_eq!(e.sender_id, "C"),
+            _ => panic!("item 2 should be Normal"),
+        }
+        let normals = items
+            .iter()
+            .filter(|i| matches!(i, BatchItem::Normal(_)))
+            .count();
+        let commands = items
+            .iter()
+            .filter(|i| matches!(i, BatchItem::Command(_)))
+            .count();
+        assert_eq!(normals, 2);
+        assert_eq!(commands, 1);
+    }
+
+    // 全命令批 → 0 Normal。
+    #[test]
+    fn partition_batch_all_commands_no_normal() {
+        let batch = vec![
+            env("[feishu (user A)]: /status", "A"),
+            env("[feishu (user B)]: /reset", "B"),
+        ];
+        let items = partition_batch(batch);
+        let normals = items
+            .iter()
+            .filter(|i| matches!(i, BatchItem::Normal(_)))
+            .count();
+        assert_eq!(normals, 0);
+        assert!(items.iter().all(|i| matches!(i, BatchItem::Command(_))));
+    }
+
+    // 带 `]: ` 前缀提取、无前缀回落原文、两侧 trim。
+    #[test]
+    fn extract_user_text_variants() {
+        assert_eq!(extract_user_text("[feishu (user 张三)]: /status"), "/status");
+        assert_eq!(extract_user_text("[qq (user 42)]:   在吗  "), "在吗");
+        // No "]: " marker → whole string, trimmed.
+        assert_eq!(extract_user_text("  plain text  "), "plain text");
+        assert_eq!(extract_user_text("/help"), "/help");
+    }
+
+    // 混合批过滤 Normal 后 last 的 soul_key() 是最后一条普通消息发送者的
+    // （直接对 partition 结果断言，不经 host）。
+    #[test]
+    fn batch_route_is_last_normal_sender() {
+        let batch = vec![
+            env("[feishu (user A)]: 你好", "A"),
+            env("[feishu (user C)]: 在吗", "C"),
+            env("[feishu (user B)]: /status", "B"),
+        ];
+        let normals: Vec<AgentEnvelope> = partition_batch(batch)
+            .into_iter()
+            .filter_map(|i| match i {
+                BatchItem::Normal(e) => Some(e),
+                BatchItem::Command(_) => None,
+            })
+            .collect();
+        let route = normals.last().expect("at least one normal");
+        // Last normal is C (the command B trails but is filtered out).
+        assert_eq!(route.sender_id, "C");
+        assert_eq!(route.soul_key(), "C#group");
     }
 }

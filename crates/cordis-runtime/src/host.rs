@@ -726,7 +726,6 @@ impl RuntimeKernel {
                     plugin_path == &root_plugin_path
                         || plugin_path.starts_with(&format!("{root_plugin_path}/"))
                 })
-                .map(|s| s.clone())
                 .collect()
         };
         if target_plugin_paths.is_empty() && !root_mode {
@@ -1093,7 +1092,7 @@ pub(crate) struct ManagedAgentSession {
 #[derive(Debug)]
 enum ManagedAgentState {
     RuntimeShell,
-    PluginIteration(PluginIterationAgentState),
+    PluginIteration(Box<PluginIterationAgentState>),
 }
 
 #[derive(Debug, Clone)]
@@ -1442,6 +1441,51 @@ impl RuntimeHost {
                 path.display()
             );
         }
+    }
+
+    /// H2: session-termination cleanup entry point. Removes the session from
+    /// all three per-session maps (`agent_sessions`, `pending_session_actions`,
+    /// `profile_fallback`) and deletes its on-disk snapshot. Call this whenever
+    /// a session ends: `/reset`, LRU eviction, or `plugin_iteration` completion.
+    /// Idempotent — dropping an unknown session id is a no-op (no panic, no
+    /// error).
+    pub fn drop_session(&self, session_id: &str) {
+        self.agent_sessions
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .remove(session_id);
+        self.pending_session_actions
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .remove(session_id);
+        self.profile_fallback
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .remove(session_id);
+        self.delete_session_snapshot(session_id);
+    }
+
+    /// Test/debug helper: current entry counts of the three per-session maps,
+    /// as `(agent_sessions, pending_session_actions, profile_fallback)`. Lock
+    /// order matches the rest of this impl to avoid deadlock.
+    #[doc(hidden)]
+    pub fn debug_session_map_sizes(&self) -> (usize, usize, usize) {
+        let agent_sessions = self
+            .agent_sessions
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .len();
+        let pending = self
+            .pending_session_actions
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .len();
+        let fallback = self
+            .profile_fallback
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .len();
+        (agent_sessions, pending, fallback)
     }
 
     /// Check for saved sessions in `data/sessions/` and reconstruct them.
@@ -2057,10 +2101,8 @@ export_plugin_api! {{
         }
         // Auto-save on success for RuntimeShell sessions so that
         // session context survives crashes and restarts.
-        if result.is_ok() {
-            if matches!(session.state, ManagedAgentState::RuntimeShell) {
-                self.auto_save_session(session_id, &session.session);
-            }
+        if result.is_ok() && matches!(session.state, ManagedAgentState::RuntimeShell) {
+            self.auto_save_session(session_id, &session.session);
         }
         self.agent_sessions
             .lock()
@@ -2075,8 +2117,8 @@ export_plugin_api! {{
     ///   switch to the profile's declared `fallback` and retry once.
     /// - While degraded, each new send optimistically probes the desired
     ///   profile first; success switches back, failure re-degrades.
-    /// Every switch is explicit: a kernel issue is recorded and a notify
-    /// message is emitted — never a silent model change.
+    ///   Every switch is explicit: a kernel issue is recorded and a notify
+    ///   message is emitted — never a silent model change.
     pub fn agent_send_with_fallback(
         &self,
         session_id: &str,
@@ -2170,6 +2212,26 @@ export_plugin_api! {{
             RuntimeError::AgentSessionNotFound { session_id: session_id.to_string() }
         })?;
         managed.session.swap_config(api)
+    }
+
+    /// H1: rebind an existing session's soul scope key. Unlike `agent_start`
+    /// (which sets `soul_key` once at creation), group chats route several
+    /// senders through one session and must re-scope the persona overlay per
+    /// turn. Returns `AgentSessionNotFound` if the session is gone.
+    pub fn refresh_session_soul(
+        &self,
+        session_id: &str,
+        soul_key: &str,
+    ) -> Result<(), RuntimeError> {
+        let mut guard = self
+            .agent_sessions
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let managed = guard.get_mut(session_id).ok_or_else(|| {
+            RuntimeError::AgentSessionNotFound { session_id: session_id.to_string() }
+        })?;
+        managed.session.set_soul_key(soul_key.to_string());
+        Ok(())
     }
 
     fn set_degraded(&self, session_id: &str, degraded: bool) {
@@ -2277,10 +2339,12 @@ export_plugin_api! {{
                         kind: AgentSessionKind::PluginIteration,
                     },
                     session,
-                    state: ManagedAgentState::PluginIteration(PluginIterationAgentState::new(
-                        prepared,
-                        context_paths,
-                        &self.fixtures_root,
+                    state: ManagedAgentState::PluginIteration(Box::new(
+                        PluginIterationAgentState::new(
+                            prepared,
+                            context_paths,
+                            &self.fixtures_root,
+                        ),
                     )),
                 },
             );
@@ -2568,7 +2632,7 @@ export_plugin_api! {{
                         let payload = serde_json::json!({"action": "stop"}).to_string();
                         let plugin_id = parts[0].to_string();
                         let node_id = parts[1].to_string();
-                        let this = &*self;
+                        let this = self;
                         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                             let _ = this.invoke(&plugin_id, &node_id, payload);
                         }));
@@ -3294,6 +3358,9 @@ export_plugin_api! {{
                     .get(&session_id)
                     .map(|managed| managed.session.tool_execution_summary())
             });
+            // H2: excerpt/tool_summary captured above; terminate the failed
+            // session and reclaim its map entries before returning the error.
+            self.drop_session(&session_id);
             return Err(enrich_plugin_iteration_agent_error(
                 err,
                 &session_id,
@@ -3311,6 +3378,9 @@ export_plugin_api! {{
                 .get(&session_id)
                 .map(|managed| managed.session.tool_execution_summary())
         });
+        // H2: transcript/snapshot are fully read above; terminate the session
+        // and reclaim its map entries before returning success.
+        self.drop_session(&session_id);
         Ok(PluginIterationAgentRun {
             session_id: Some(session_id),
             tool_summary,
@@ -4199,7 +4269,10 @@ impl ManagedAgentSession {
                     .respond_with_runtime_host(host, &self.handle.session_id, input)
             }
             ManagedAgentState::PluginIteration(state) => {
-                let mut backend = PluginIterationAgentBackend { host, state };
+                let mut backend = PluginIterationAgentBackend {
+                    host,
+                    state: state.as_mut(),
+                };
                 self.session.respond(&mut backend, input)
             }
         }
@@ -4461,7 +4534,7 @@ impl<'a> PluginIterationAgentBackend<'a> {
             .node_id
             .clone()
             .unwrap_or_else(|| format!("{}_entry", child_segment.replace('-', "_")));
-        let crate_name = child_plugin_path.replace('/', "_").replace('-', "_");
+        let crate_name = child_plugin_path.replace(['/', '-'], "_");
         let summary = args
             .summary
             .clone()
@@ -6148,11 +6221,19 @@ fn normalize_request_id(raw: Option<String>, prefix: &str) -> String {
     match raw {
         Some(value) if !value.trim().is_empty() => value,
         _ => {
+            // Same hazard as P2-18's make_execution_id: two calls within the
+            // same millisecond produced identical ids, so a second
+            // agent_start_with silently overwrote the first session's map
+            // entries. A process-local counter keeps ids unique regardless
+            // of wall-clock granularity.
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static SEQ: AtomicU64 = AtomicU64::new(0);
+            let seq = SEQ.fetch_add(1, Ordering::Relaxed);
             let now_ms = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis();
-            format!("{prefix}-{now_ms}")
+            format!("{prefix}-{now_ms}-{seq:x}")
         }
     }
 }
@@ -6407,14 +6488,16 @@ mod tests {
         collect_plugin_context_paths, ensure_scaffold_integration_edits, extract_warning_blocks,
         render_child_plugin_core, render_child_plugin_test, sanitize_child_plugin_segment,
         sort_plugin_context_paths, warning_diagnostics_for_changed_paths, AgentBackend,
-        ContextFilesScope, PluginIterationAgentBackend, PluginIterationAgentState, RuntimeHost,
-        ScaffoldedChildRegistration, PLUGIN_AGENT_TOOL_CREATE_FILE, PLUGIN_AGENT_TOOL_DELETE_FILE,
+        AgentSessionKind, AgentStartOptions, ContextFilesScope, PluginIterationAgentBackend,
+        PluginIterationAgentState, RuntimeHost, ScaffoldedChildRegistration,
+        PLUGIN_AGENT_TOOL_CREATE_FILE, PLUGIN_AGENT_TOOL_DELETE_FILE,
         PLUGIN_AGENT_TOOL_INSPECT_PLUGIN_CATALOG, PLUGIN_AGENT_TOOL_JSON_SET,
         PLUGIN_AGENT_TOOL_LIST_CONTEXT_FILES, PLUGIN_AGENT_TOOL_READ_CONTEXT_FILES,
         PLUGIN_AGENT_TOOL_REPLACE_FILE_EXACT, PLUGIN_AGENT_TOOL_REPLACE_FILES_EXACT,
         PLUGIN_AGENT_TOOL_SCAFFOLD_CHILD_PLUGIN,
         PLUGIN_AGENT_TOOL_TOML_SET,
     };
+    use crate::core::error::RuntimeError;
     use crate::kernel::plugin_iteration::{
         KernelPluginIterationRequest, PluginEditOpKind, PluginEditOperation,
     };
@@ -6808,6 +6891,61 @@ mod tests {
         )
         .expect("empty command should fall back to default");
         assert_eq!(empty, "cargo check --quiet --manifest-path plugins/Cargo.toml");
+    }
+
+    #[test]
+    fn drop_session_clears_all_maps() {
+        if cordis_plugin_sdk::CORDIS_TARGET != "x86_64-unknown-linux-gnu" {
+            eprintln!("[skip] fixture dylibs are x86_64-linux only; skipping on this host");
+            return;
+        }
+        let fixtures_root = repo_fixtures_root();
+        let host = RuntimeHost::boot(&fixtures_root).expect("host should boot");
+        // Boot may hydrate leftover session snapshots from data/sessions
+        // (crash recovery), so assert deltas against the post-boot baseline
+        // instead of absolute sizes.
+        let (a0, p0, f0) = host.debug_session_map_sizes();
+        let handle = host
+            .agent_start_with(AgentSessionKind::RuntimeShell, AgentStartOptions::default())
+            .expect("agent should start");
+        let session_id = handle.session_id;
+        // agent_start populates agent_sessions + profile_fallback; the
+        // pending_session_actions entry is created lazily.
+        assert_eq!(host.debug_session_map_sizes(), (a0 + 1, p0, f0 + 1));
+        host.drop_session(&session_id);
+        assert_eq!(host.debug_session_map_sizes(), (a0, p0, f0));
+    }
+
+    #[test]
+    fn drop_session_idempotent_on_missing() {
+        if cordis_plugin_sdk::CORDIS_TARGET != "x86_64-unknown-linux-gnu" {
+            eprintln!("[skip] fixture dylibs are x86_64-linux only; skipping on this host");
+            return;
+        }
+        let fixtures_root = repo_fixtures_root();
+        let host = RuntimeHost::boot(&fixtures_root).expect("host should boot");
+        // Boot may hydrate leftover snapshots (crash recovery); baseline
+        // against whatever is there rather than assuming empty maps.
+        let baseline = host.debug_session_map_sizes();
+        // Dropping an unknown session id twice must not panic or error, and
+        // must leave the maps untouched.
+        host.drop_session("no-such-session");
+        host.drop_session("no-such-session");
+        assert_eq!(host.debug_session_map_sizes(), baseline);
+    }
+
+    #[test]
+    fn refresh_session_soul_unknown_sid_errors() {
+        if cordis_plugin_sdk::CORDIS_TARGET != "x86_64-unknown-linux-gnu" {
+            eprintln!("[skip] fixture dylibs are x86_64-linux only; skipping on this host");
+            return;
+        }
+        let fixtures_root = repo_fixtures_root();
+        let host = RuntimeHost::boot(&fixtures_root).expect("host should boot");
+        let err = host
+            .refresh_session_soul("no-such-session", "user:42")
+            .expect_err("unknown session should error");
+        assert!(matches!(err, RuntimeError::AgentSessionNotFound { .. }));
     }
 }
 
