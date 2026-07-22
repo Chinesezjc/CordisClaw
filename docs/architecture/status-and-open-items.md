@@ -214,6 +214,7 @@ Review 交叉验证发现 loader 对 dylib 工件的两处静默失效，本批�
 - [x] **read_plugin_docs 吞错闭合**（P2-34 根因）— 见 5.2.15 P2-34 条目更新；triple 预检兜住架构不符后，走到 docs 读取仍失败的 dylib 是真实故障，标 `Unavailable(SymbolMissing)`，不再回落 cached docs 假装 Loaded。Ok 分支的 docs-drift 自愈（dylib docs 为 ground truth）保持不变。
 - [x] **测试跨平台策略** — fixtures 的 21 个 `.so` 全部是 `x86_64-unknown-linux-gnu` 预构建工件（in-repo 提交，index.json 记录 triple）。既有语义:`RuntimeHost::boot` 只要任一插件 Unavailable 即整体失败（host.rs `build_snapshot_with_staged_root`），因此非 Linux 宿主上所有依赖真实 fixtures 的测试改为经 `support::linux_dylib_artifacts_available()` 声明式 skip（打印 `[skip]` 日志）;Linux CI 上门控恒真、全部实际执行。**权威测试判定在 Linux 侧**;macOS 本机 `cargo test` 现在全绿（真实执行纯内存/语义测试，声明式跳过 dylib 测试）。
 - [x] **soul_store 测试软跳过删除** — `soul_store_plugin_overrides_file_provider` 原有的 registry 成员资格 guard（恒真、失效）删除;Linux 上该测试从此硬断言 souls.db/souls/*.json，soul_store 加载回归不再静默绿。
+- [x] **tooling.rs 存量失效闭合** — `package_resolver_allows_new_dylib_child_without_generated_agent_docs` 自 P1-48 起在 Linux 上一直失败（测试构造的临时插件缺 P1-48 要求的 `allow_generated_docs = true` 显式 opt-in），本批补上;Linux 远端全量 `cargo test` 恢复全绿。
 
 ### 5.2.32 Soul / LLM Profile / 指令路由 / 消息可靠性（J-P 批，2026-07-21）
 

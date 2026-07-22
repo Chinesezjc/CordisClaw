@@ -68,6 +68,9 @@ plugin_path = "expr/evaluator/mod"
 abi_kind = "rust"
 declared_nodes = ["expr_mod"]
 children = []
+# P1-48: dylib alone no longer bypasses the generated-docs scaffold check;
+# the resolver requires this explicit opt-in (paired with crate-type dylib).
+allow_generated_docs = true
 
 [package.metadata.cordis.abi_fingerprint]
 rustc_version = "1.85.1"
