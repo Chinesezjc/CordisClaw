@@ -451,7 +451,7 @@ where
                     if is_terminal {
                         state.ready.clear();
                         state.ready_set.clear();
-                        for (tid, _) in &state.specs {
+                        for tid in state.specs.keys() {
                             if !state.outcomes.contains_key(tid) {
                                 state.outcomes.insert(
                                     tid.clone(),
@@ -570,7 +570,7 @@ where
     if is_terminal {
         state.ready.clear();
         state.ready_set.clear();
-        for (tid, _) in &state.specs {
+        for tid in state.specs.keys() {
             if !state.outcomes.contains_key(tid) {
                 state.outcomes
                     .insert(tid.clone(), NodeOutcome::Cancelled);
@@ -908,15 +908,14 @@ impl EngineState {
         }
 
         let ready = evaluate_join_policy(spec.transition.join_policy, &tokens_per_place);
-        if !ready {
-            if tokens_per_place
+        if !ready
+            && tokens_per_place
                 .iter()
                 .any(|(_, values)| !values.is_empty())
-            {
-                self.join_wait_started
-                    .entry((transition_id.to_string(), key.clone()))
-                    .or_insert_with(Instant::now);
-            }
+        {
+            self.join_wait_started
+                .entry((transition_id.to_string(), key.clone()))
+                .or_insert_with(Instant::now);
         }
         Ok(ready)
     }

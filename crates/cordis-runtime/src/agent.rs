@@ -1406,7 +1406,7 @@ impl AgentSession {
                     let terminal_reply = event
                         .ok
                         .then_some(())
-                        .and_then(|_| event.output.as_ref())
+                        .and(event.output.as_ref())
                         .and_then(|output| backend.terminal_tool_reply(&event.name, output));
                     self.transcript.push(AgentTranscriptEntry::Tool {
                         name: event.name.clone(),
@@ -1525,7 +1525,7 @@ impl AgentSession {
                 messages.push(message.to_request_message());
                 self.reasoning_only_strikes += 1;
                 if self.reasoning_only_strikes >= 3 {
-                    let _ = backend.host().agent_send_warning_to_test_groups(
+                    backend.host().agent_send_warning_to_test_groups(
                         "⚠ Agent produced 3 consecutive reasoning-only responses — may be stuck.",
                     );
                     self.reasoning_only_strikes = 0;
@@ -2540,7 +2540,7 @@ fn read_chat_stream(
                 // Reader thread exited — flush any remaining data then break.
                 if !line_buf.is_empty() {
                     // Treat leftover bytes as a final (incomplete) line.
-                    let leftover: Vec<u8> = line_buf.drain(..).collect();
+                    let leftover = std::mem::take(&mut line_buf);
                     let line = String::from_utf8_lossy(&leftover).to_string();
                     raw_bytes += line.len();
                     if !pending_data_lines.is_empty() {
@@ -3312,9 +3312,7 @@ fn normalize_streamed_optional_text(value: String) -> Option<String> {
 }
 
 fn merge_stream_field(target: &mut String, delta: &str, append: bool) {
-    if append {
-        target.push_str(delta);
-    } else if target.is_empty() {
+    if append || target.is_empty() {
         target.push_str(delta);
     }
 }

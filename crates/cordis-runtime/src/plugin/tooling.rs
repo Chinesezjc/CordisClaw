@@ -474,7 +474,7 @@ fn prepare_artifacts_locked(
         full_rebuild = true;
     } else if contexts
         .iter()
-        .any(|context| existing_map.get(&context.plugin.plugin_path).is_none() || context.dirty)
+        .any(|context| !existing_map.contains_key(&context.plugin.plugin_path) || context.dirty)
     {
         full_rebuild = false;
     }
@@ -1230,131 +1230,6 @@ fn expected_artifact_name(plugin_path: &str, is_dylib: bool) -> String {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{cargo_command_prefers_offline, prepare_local_cargo_args};
-
-    #[test]
-    fn metadata_commands_run_offline_for_local_fixture_tooling() {
-        let args = vec![
-            "metadata".to_string(),
-            "--format-version".to_string(),
-            "1".to_string(),
-        ];
-        assert!(cargo_command_prefers_offline(&args));
-        assert_eq!(
-            prepare_local_cargo_args(&args),
-            vec![
-                "metadata".to_string(),
-                "--format-version".to_string(),
-                "1".to_string(),
-                "--offline".to_string(),
-            ]
-        );
-    }
-
-    #[test]
-    fn non_metadata_commands_keep_original_cargo_args() {
-        let args = vec![
-            "build".to_string(),
-            "--manifest-path".to_string(),
-            "fixtures/plugins/Cargo.toml".to_string(),
-        ];
-        assert!(!cargo_command_prefers_offline(&args));
-        assert_eq!(prepare_local_cargo_args(&args), args);
-    }
-
-    // ---------- C batch (P0-9 / P0-10) tests ----------
-
-    #[test]
-    fn stage_then_rename_replaces_existing_target_atomically() {
-        // P0-9 sibling: the shared stage-then-rename helper must overwrite an
-        // existing dst with the new source bytes; no leftover .cordis-tmp.
-        use super::stage_then_rename_file;
-        use tempfile::TempDir;
-        let temp = TempDir::new().unwrap();
-        let src = temp.path().join("plugin.so");
-        let dst = temp.path().join("target.so");
-        std::fs::write(&src, b"fresh").unwrap();
-        std::fs::write(&dst, b"stale").unwrap();
-        stage_then_rename_file(&src, &dst).expect("stage-then-rename ok");
-        assert_eq!(std::fs::read(&dst).unwrap(), b"fresh");
-        let leftovers: Vec<_> = std::fs::read_dir(temp.path())
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_name().to_string_lossy().ends_with(".cordis-tmp"))
-            .collect();
-        assert!(leftovers.is_empty(), "no leftover tmp file expected");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn lock_pid_liveness_recognises_current_process_as_alive() {
-        // P0-10: previously used `/proc/{pid}` and returned false on macOS/BSD
-        // for every live pid. `kill(pid, 0)` is portable; the running process
-        // must always be observed as alive.
-        use super::lock_pid_is_live;
-        assert!(lock_pid_is_live(std::process::id()));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn lock_pid_liveness_reports_dead_pid_as_dead() {
-        use super::lock_pid_is_live;
-        // A pid we're extremely unlikely to have — u32::MAX is above the
-        // maximum kernel-allowed pid on all common systems.
-        assert!(!lock_pid_is_live(u32::MAX - 1));
-    }
-
-    /// P1-17: `write_pretty_json` is the durable writer for
-    /// interfaces.json / artifact/index.json / lock files. Verify tmp
-    /// + rename semantics: no stray `.cordis-tmp.<pid>` after a
-    /// success.
-    #[test]
-    fn write_pretty_json_is_atomic_and_leaves_no_tmp() {
-        use super::write_pretty_json;
-        use tempfile::TempDir;
-        let dir = TempDir::new().unwrap();
-        let target = dir.path().join("index.json");
-        write_pretty_json(&target, &serde_json::json!({"k": 1})).unwrap();
-        assert!(target.exists());
-        // No leftover tmp file.
-        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_name().to_string_lossy().contains(".cordis-tmp."))
-            .collect();
-        assert!(leftovers.is_empty(), "no tmp leftover expected");
-        // Overwrite preserves prior success semantics: file has new bytes.
-        write_pretty_json(&target, &serde_json::json!({"k": 2})).unwrap();
-        let text = std::fs::read_to_string(&target).unwrap();
-        assert!(text.contains("\"k\""));
-        assert!(text.contains("2"));
-    }
-
-    /// P0-9 sibling: `stage_then_rename_file` preserves the source's
-    /// executable bit on Unix (dlopen requires +x on the dylib).
-    #[cfg(unix)]
-    #[test]
-    fn stage_then_rename_preserves_exec_bit() {
-        use super::stage_then_rename_file;
-        use std::os::unix::fs::PermissionsExt;
-        use tempfile::TempDir;
-        let dir = TempDir::new().unwrap();
-        let src = dir.path().join("plug.so");
-        let dst = dir.path().join("target.so");
-        std::fs::write(&src, b"bytes").unwrap();
-        std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o755)).unwrap();
-        stage_then_rename_file(&src, &dst).unwrap();
-        let mode = std::fs::metadata(&dst).unwrap().permissions().mode();
-        assert_eq!(
-            mode & 0o777,
-            0o755,
-            "exec bits should be preserved, got {mode:o}"
-        );
-    }
-}
-
 fn write_pretty_json<T: serde::Serialize>(path: &Path, value: &T) -> Result<(), RuntimeError> {
     let parent = path.parent().ok_or_else(|| RuntimeError::Invariant {
         message: format!("json path missing parent: {}", path.display()),
@@ -1643,4 +1518,129 @@ fn absolute_path(path: &Path) -> Result<PathBuf, RuntimeError> {
             path: path.to_path_buf(),
             message: e.to_string(),
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{cargo_command_prefers_offline, prepare_local_cargo_args};
+
+    #[test]
+    fn metadata_commands_run_offline_for_local_fixture_tooling() {
+        let args = vec![
+            "metadata".to_string(),
+            "--format-version".to_string(),
+            "1".to_string(),
+        ];
+        assert!(cargo_command_prefers_offline(&args));
+        assert_eq!(
+            prepare_local_cargo_args(&args),
+            vec![
+                "metadata".to_string(),
+                "--format-version".to_string(),
+                "1".to_string(),
+                "--offline".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn non_metadata_commands_keep_original_cargo_args() {
+        let args = vec![
+            "build".to_string(),
+            "--manifest-path".to_string(),
+            "fixtures/plugins/Cargo.toml".to_string(),
+        ];
+        assert!(!cargo_command_prefers_offline(&args));
+        assert_eq!(prepare_local_cargo_args(&args), args);
+    }
+
+    // ---------- C batch (P0-9 / P0-10) tests ----------
+
+    #[test]
+    fn stage_then_rename_replaces_existing_target_atomically() {
+        // P0-9 sibling: the shared stage-then-rename helper must overwrite an
+        // existing dst with the new source bytes; no leftover .cordis-tmp.
+        use super::stage_then_rename_file;
+        use tempfile::TempDir;
+        let temp = TempDir::new().unwrap();
+        let src = temp.path().join("plugin.so");
+        let dst = temp.path().join("target.so");
+        std::fs::write(&src, b"fresh").unwrap();
+        std::fs::write(&dst, b"stale").unwrap();
+        stage_then_rename_file(&src, &dst).expect("stage-then-rename ok");
+        assert_eq!(std::fs::read(&dst).unwrap(), b"fresh");
+        let leftovers: Vec<_> = std::fs::read_dir(temp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".cordis-tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "no leftover tmp file expected");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lock_pid_liveness_recognises_current_process_as_alive() {
+        // P0-10: previously used `/proc/{pid}` and returned false on macOS/BSD
+        // for every live pid. `kill(pid, 0)` is portable; the running process
+        // must always be observed as alive.
+        use super::lock_pid_is_live;
+        assert!(lock_pid_is_live(std::process::id()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lock_pid_liveness_reports_dead_pid_as_dead() {
+        use super::lock_pid_is_live;
+        // A pid we're extremely unlikely to have — u32::MAX is above the
+        // maximum kernel-allowed pid on all common systems.
+        assert!(!lock_pid_is_live(u32::MAX - 1));
+    }
+
+    /// P1-17: `write_pretty_json` is the durable writer for
+    /// interfaces.json / artifact/index.json / lock files. Verify tmp
+    /// + rename semantics: no stray `.cordis-tmp.<pid>` after a
+    ///   success.
+    #[test]
+    fn write_pretty_json_is_atomic_and_leaves_no_tmp() {
+        use super::write_pretty_json;
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("index.json");
+        write_pretty_json(&target, &serde_json::json!({"k": 1})).unwrap();
+        assert!(target.exists());
+        // No leftover tmp file.
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".cordis-tmp."))
+            .collect();
+        assert!(leftovers.is_empty(), "no tmp leftover expected");
+        // Overwrite preserves prior success semantics: file has new bytes.
+        write_pretty_json(&target, &serde_json::json!({"k": 2})).unwrap();
+        let text = std::fs::read_to_string(&target).unwrap();
+        assert!(text.contains("\"k\""));
+        assert!(text.contains("2"));
+    }
+
+    /// P0-9 sibling: `stage_then_rename_file` preserves the source's
+    /// executable bit on Unix (dlopen requires +x on the dylib).
+    #[cfg(unix)]
+    #[test]
+    fn stage_then_rename_preserves_exec_bit() {
+        use super::stage_then_rename_file;
+        use std::os::unix::fs::PermissionsExt;
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        let src = dir.path().join("plug.so");
+        let dst = dir.path().join("target.so");
+        std::fs::write(&src, b"bytes").unwrap();
+        std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o755)).unwrap();
+        stage_then_rename_file(&src, &dst).unwrap();
+        let mode = std::fs::metadata(&dst).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o755,
+            "exec bits should be preserved, got {mode:o}"
+        );
+    }
 }

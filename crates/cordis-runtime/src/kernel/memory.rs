@@ -46,6 +46,8 @@ impl ChangeMemory {
     }
 
     /// Append one iteration result; oldest item is evicted when over limit.
+    // 记录一次修复事件的全部维度；拆参数结构体会让唯一调用点更啰嗦，收益为负。
+    #[expect(clippy::too_many_arguments)]
     pub fn record(
         &mut self,
         issue_id: impl Into<String>,

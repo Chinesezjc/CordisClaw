@@ -15,10 +15,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use thiserror::Error;
 
 // ── Message Handler Registry ──────────────────────────────────────────────
-/// Plugins register a handler function that transforms raw messages into
-/// tagged routing items.  The host calls this handler for each message
-/// fetched from the plugin's output queue.
-
+// Plugins register a handler function that transforms raw messages into
+// tagged routing items.  The host calls this handler for each message
+// fetched from the plugin's output queue.
 type HandlerFn = extern "C" fn(*const c_char) -> *mut c_char;
 static HANDLER: OnceLock<HandlerFn> = OnceLock::new();
 
@@ -323,7 +322,7 @@ fn invoke_dylib(
         }
         // Detach the symbol from the borrow of `lib` — the returned raw ptr
         // remains valid because `lib` is stored below and never dropped.
-        drop(symbol);
+        let _ = symbol;
         *guard = Some(LoadedDylib {
             library: lib,
             api_ptr,
