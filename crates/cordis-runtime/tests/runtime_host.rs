@@ -2323,3 +2323,271 @@ fn soul_store_plugin_overrides_file_provider() {
     );
     assert!(temp.path().join("data/souls.db").exists(), "souls.db should exist");
 }
+
+// H1: 群聊 soul 错位修复。session 的 soul_key 由 inbox 随最近发言者刷新
+// (refresh_session_soul);persona overlay 每轮从 session.soul_key 重建,
+// 刷新后 system prompt 立刻对齐新的人。
+#[test]
+#[serial]
+fn refresh_session_soul_switches_persona_scope() {
+    if !support::linux_dylib_artifacts_available() {
+        eprintln!("[skip] fixture dylibs are x86_64-linux only; skipping on this host");
+        return;
+    }
+    use cordis_runtime::agent::AgentToolHost;
+    use cordis_runtime::host::{AgentSessionKind, AgentStartOptions};
+
+    let temp = setup_fixture_workspace_copy();
+    let fixtures = temp.path().join("fixtures");
+
+    // Two turns served by the same "default" mock server; the persona in
+    // each request body is what we assert on.
+    let (default_url, requests_rx, handle) = spawn_chunked_mock_llm_server_sequence(vec![
+        assistant_response("soul_switch_1", "回复给 A"),
+        assistant_response("soul_switch_2", "回复给 B"),
+    ]);
+    // fast profile is a dead port; unused here (no fallback path exercised).
+    write_llm_profiles_config(temp.path(), &default_url, "http://127.0.0.1:2/v1");
+
+    let host = RuntimeHost::boot(&fixtures).expect("host should boot");
+
+    // Two distinct souls in the same group scope.
+    host.agent_set_soul("userA#group", Some("A 的人格"), None)
+        .expect("set soul A");
+    host.agent_set_soul("userB#group", Some("B 的人格"), None)
+        .expect("set soul B");
+
+    // Session starts bound to A's soul scope.
+    let handle_session = host
+        .agent_start_with(
+            AgentSessionKind::RuntimeShell,
+            AgentStartOptions {
+                profile: None,
+                soul_key: "userA#group".to_string(),
+            },
+        )
+        .expect("agent start");
+    let sid = handle_session.session_id.clone();
+
+    // Turn 1: persona overlay should be A's.
+    host.agent_send(&sid, "hi from A").expect("first send");
+
+    // Inbox refreshes the session soul to the latest speaker (B).
+    host.refresh_session_soul(&sid, "userB#group")
+        .expect("refresh to B");
+
+    // Turn 2: persona overlay rebuilt from the new soul_key → B's.
+    host.agent_send(&sid, "hi from B").expect("second send");
+
+    let requests = requests_rx.recv().expect("captured requests");
+    handle.join().expect("join mock server");
+
+    assert_eq!(requests.len(), 2, "expected exactly two turns");
+    assert!(
+        requests[0].contains("A 的人格"),
+        "first turn should carry A's persona: {}",
+        requests[0]
+    );
+    assert!(
+        requests[1].contains("B 的人格"),
+        "second turn should carry B's persona after refresh: {}",
+        requests[1]
+    );
+    assert!(
+        !requests[1].contains("A 的人格"),
+        "persona overlay is rebuilt each turn; A must be gone after refresh: {}",
+        requests[1]
+    );
+
+    // Unknown session id must error, not silently no-op.
+    assert!(
+        host.refresh_session_soul("no-such-sid", "userA#group")
+            .is_err(),
+        "refresh on unknown session must be an error"
+    );
+}
+
+// H2: session 内存/磁盘终结清理。drop_session 清 agent_sessions /
+// pending_session_actions / profile_fallback 三张 map + 删除磁盘快照,
+// 且幂等。debug_session_map_sizes 暴露三张 map 的大小用于断言。
+#[test]
+#[serial]
+fn drop_session_evicts_memory_and_disk() {
+    if !support::linux_dylib_artifacts_available() {
+        eprintln!("[skip] fixture dylibs are x86_64-linux only; skipping on this host");
+        return;
+    }
+    use cordis_runtime::host::{AgentSessionKind, AgentStartOptions};
+
+    let temp = setup_fixture_workspace_copy();
+    let fixtures = temp.path().join("fixtures");
+
+    // Both sessions send one turn each so a disk snapshot exists (auto_save
+    // fires on successful send, not at start).
+    let (default_url, requests_rx, handle) = spawn_chunked_mock_llm_server_sequence(vec![
+        assistant_response("drop_1", "ok one"),
+        assistant_response("drop_2", "ok two"),
+    ]);
+    write_llm_profiles_config(temp.path(), &default_url, "http://127.0.0.1:2/v1");
+
+    let host = RuntimeHost::boot(&fixtures).expect("host should boot");
+
+    let s1 = host
+        .agent_start_with(
+            AgentSessionKind::RuntimeShell,
+            AgentStartOptions::default(),
+        )
+        .expect("start s1")
+        .session_id;
+    let s2 = host
+        .agent_start_with(
+            AgentSessionKind::RuntimeShell,
+            AgentStartOptions::default(),
+        )
+        .expect("start s2")
+        .session_id;
+
+    // Send one turn each so each session lands a disk snapshot.
+    host.agent_send(&s1, "hello one").expect("send s1");
+    host.agent_send(&s2, "hello two").expect("send s2");
+    let _ = requests_rx.recv().expect("captured requests");
+    handle.join().expect("join mock server");
+
+    // agent_sessions=2, pending_session_actions=0, profile_fallback=2.
+    assert_eq!(
+        host.debug_session_map_sizes(),
+        (2, 0, 2),
+        "two live sessions across the tracked maps"
+    );
+
+    let s1_snapshot = temp
+        .path()
+        .join("data/sessions")
+        .join(format!("{s1}.json"));
+    assert!(s1_snapshot.exists(), "s1 snapshot should exist after send");
+
+    // Drop the first session: memory maps shrink and disk snapshot removed.
+    host.drop_session(&s1);
+    assert_eq!(
+        host.debug_session_map_sizes(),
+        (1, 0, 1),
+        "dropping one session frees exactly one slot in each populated map"
+    );
+    assert!(
+        !s1_snapshot.exists(),
+        "drop_session must delete the on-disk snapshot"
+    );
+
+    // A dropped session id is gone from the query surface.
+    assert!(
+        matches!(
+            host.agent_status(&s1),
+            Err(cordis_runtime::core::error::RuntimeError::AgentSessionNotFound { .. })
+        ),
+        "agent_status on dropped session must be AgentSessionNotFound"
+    );
+    assert!(
+        matches!(
+            host.agent_transcript(&s1),
+            Err(cordis_runtime::core::error::RuntimeError::AgentSessionNotFound { .. })
+        ),
+        "agent_transcript on dropped session must be AgentSessionNotFound"
+    );
+
+    // The surviving session is untouched.
+    assert!(host.agent_status(&s2).is_ok(), "s2 should still be live");
+
+    // Idempotent: dropping again is a no-op, not a panic or double-free.
+    host.drop_session(&s1);
+    assert_eq!(
+        host.debug_session_map_sizes(),
+        (1, 0, 1),
+        "dropping the same session twice is idempotent"
+    );
+}
+
+// review 欠账: command_router::dispatch 表驱动覆盖。bypass-LLM 指令路由的
+// 各分支(内建 + 未知)在真实 boot 的运行时上逐一验证。
+#[test]
+#[serial]
+fn command_router_dispatch_table() {
+    if !support::linux_dylib_artifacts_available() {
+        eprintln!("[skip] fixture dylibs are x86_64-linux only; skipping on this host");
+        return;
+    }
+    use cordis_runtime::agent::AgentToolHost;
+    use cordis_runtime::command_router::{dispatch, CommandContext, CommandOutcome};
+
+    let temp = setup_fixture_workspace_copy();
+    let fixtures = temp.path().join("fixtures");
+    write_llm_profiles_config(
+        temp.path(),
+        "http://127.0.0.1:1/v1",
+        "http://127.0.0.1:2/v1",
+    );
+    let host = RuntimeHost::boot(&fixtures).expect("host should boot");
+
+    // Seed a soul so /soul reads back a concrete persona for this scope.
+    let soul_key = "feishu:ou_cmd#private";
+    host.agent_set_soul(soul_key, Some("表驱动测试人格"), None)
+        .expect("seed soul for /soul");
+
+    let ctx = CommandContext {
+        session_key: "sess-cmd".to_string(),
+        sender_id: "ou_cmd".to_string(),
+        conversation_kind: "private".to_string(),
+        soul_key: soul_key.to_string(),
+    };
+
+    // (input, predicate on the Reply text) for the Reply-returning cases.
+    type ReplyPredicate = Box<dyn Fn(&str) -> bool>;
+    let reply_cases: Vec<(&str, ReplyPredicate)> = vec![
+        (
+            "/status",
+            Box::new(|t: &str| t.contains("运行时状态") && t.contains("snapshot")),
+        ),
+        (
+            "/help",
+            Box::new(|t: &str| t.contains("可用指令") && t.contains("/status") && t.contains("/soul")),
+        ),
+        (
+            "/soul",
+            Box::new(move |t: &str| t.contains("表驱动测试人格") && t.contains(soul_key)),
+        ),
+        (
+            "/nonexistent",
+            Box::new(|t: &str| t.contains("未知指令") && t.contains("/nonexistent")),
+        ),
+    ];
+    for (input, ok) in reply_cases {
+        match dispatch(&host, &ctx, input) {
+            CommandOutcome::Reply(text) => {
+                assert!(ok(&text), "dispatch({input}) reply mismatch: {text}");
+            }
+            other => panic!("dispatch({input}) expected Reply, got {other:?}"),
+        }
+    }
+
+    // /reset is the one non-Reply outcome.
+    assert!(
+        matches!(dispatch(&host, &ctx, "/reset"), CommandOutcome::ResetSession(_)),
+        "/reset must yield ResetSession"
+    );
+
+    // /soul with an empty soul_key (identity-less session) falls back to the
+    // "no identity" message instead of leaking another user's persona.
+    let anon = CommandContext::default();
+    match dispatch(&host, &anon, "/soul") {
+        CommandOutcome::Reply(text) => {
+            assert!(
+                text.contains("没有身份") || text.contains("无法定位"),
+                "/soul without soul_key should explain the missing identity: {text}"
+            );
+            assert!(
+                !text.contains("表驱动测试人格"),
+                "/soul without soul_key must not leak another scope's persona"
+            );
+        }
+        other => panic!("/soul (anon) expected Reply, got {other:?}"),
+    }
+}

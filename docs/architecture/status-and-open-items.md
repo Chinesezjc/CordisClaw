@@ -206,6 +206,16 @@ Agent 现在可以自主完成：读代码 → 理解结构 → 写/改文件 �
 - [x] **Plugin iteration symlink 逃逸**（P0-20）— `PluginEditExecutor::execute` 在写入前调用新 helper `resolve_under_workspace`：canonicalize 结果必须仍在 workspace_root 下。plugins 内的 symlink 指向 `/etc/passwd` 之类无法被写入。
 - [x] **Verifier shell 拼接**（P0-21）— 已随 A 批 P0-1 修复。`discover_rust_workspace_manifest` 输出的字符串被 `shell_words` 解析成 argv，空格 / `$` / `;` 无法被解释。
 
+### 5.2.34 群聊身份修复 + session 内存终结清理（2026-07-22）
+
+Review 交叉验证在 J-P 批（5.2.32）落地后发现三处 runtime bug，本批闭合：
+
+- [x] **H1 群聊 soul 错位**（host.rs `refresh_session_soul` + inbox）— 群聊里一条 session 服务多个发言者，此前 session 的 `soul_key` 在建会话时冻结成首个发言者的身份，后续别人发言仍套着第一个人的 persona。修复：新增 `refresh_session_soul(&self, session_id: &str, soul_key: &str) -> Result<(), RuntimeError>`（`get_mut` session → `set_soul_key`；未知 sid 返回 `AgentSessionNotFound`）；inbox 每批 send 前把 session 的 `soul_key` 刷成**最近发言者**的。persona overlay（system prompt 的 `--- Persona ---` 段）每轮从 `session.soul_key` 重建，`set_soul` 工具也读同一个 key，刷新后两者同时对齐。**残余取舍**：一批内非 last 成员的 `set_soul` 意图会落到 last 发言者的 soul；`profile`（LLM 端点）仍保持 session 起点不随刷新变，改 profile 需 `/reset`（与 5.2.32 O 批"profile 变更 /reset 后生效"一致，此处只精修 persona 随发言者刷新）。
+- [x] **H2 session 内存/磁盘泄漏**（host.rs `drop_session`）— 会话结束/淘汰时只清了 `agent_sessions`，`pending_session_actions`、`profile_fallback` 两张 map 与磁盘快照残留。修复：新增 `drop_session(&self, session_id: &str)` 一把清三张 map（`agent_sessions` / `pending_session_actions` / `profile_fallback`）+ `delete_session_snapshot`，**幂等**；`/reset`、LRU 淘汰、`plugin_iteration` 收尾全部改走 `drop_session`。配套 `#[doc(hidden)] debug_session_map_sizes() -> (usize, usize, usize)`（顺序 = agent_sessions, pending_session_actions, profile_fallback）供测试断言。
+- [x] **M2 命令/普通消息混批**（inbox）— 一批消息此前整批走同一条路径，`/`命令与普通消息混在一起、命令的 ctx 身份取整批而非各自发送者。修复：inbox 逐条划分命令/普通消息，命令**逐条 dispatch**（各自 envelope 的 ctx，身份修正为各自发送者），普通消息重组 batch 送 agent；**纯命令批不碰 pending**（不触发 spill/重放）。
+
+**验证**：集成测试 `refresh_session_soul_switches_persona_scope`（双轮 mock server + request body 断言 persona 切换、未知 sid 报错）、`drop_session_evicts_memory_and_disk`（`debug_session_map_sizes` (2,0,2)→(1,0,1) + 磁盘快照删除 + `AgentSessionNotFound` + 幂等）、`command_router_dispatch_table`（表驱动覆盖 /status /help /soul /reset /未知 + 空 soul_key 不泄漏他人 persona）。
+
 ### 5.2.33 Loader dylib 平台门控 + 测试跨平台策略（2026-07-22）
 
 Review 交叉验证发现 loader 对 dylib 工件的两处静默失效，本批闭合：
@@ -230,7 +240,7 @@ Review 交叉验证发现 loader 对 dylib 工件的两处静默失效，本批�
 
 **N批 — 指令路由器**（`command_router.rs`）：`/` 前缀消息在 inbox 拦截，**完全不经 LLM**，经 envelope 现有回复通路直接回。内建 `/status` `/help` `/reset` `/soul`；插件经 docs `command_name` + 约定节点 `command_entry` 注册指令；未知指令回提示。这同时是 LLM 全挂时的管理面（/status 在模型宕机时照常工作）。权限一期 = 渠道 policy；/reset、/soul 只作用于调用者自己的会话/soul。feishu/qq 的 `should_process` 从丢弃 `/` 改为放行。
 
-**O批 — Soul 槽**（`soul.rs`）：`Soul{persona, profile, updated_at_ms, updated_by}` + `SoulProvider` trait + kernel 内建 `FileSoulProvider`（`data/souls/{key}.json`，0600/0700，无插件无 DB 也可用）。system prompt 三段化：base + soul overlay + plugin hints。插件覆写走**约定能力节点**：加载中的插件同时声明 `soul_get`+`soul_set` 节点即接管存取（每次取用时解析，reload 自动生效）。写路径 = agent 工具 `set_soul`（merge 语义；**不暴露 soul_key 参数**，host 绑定当前 session，杜绝越权改他人人格；profile 名校验白名单）。soul.profile 引用在 inbox 建会话时决定 LLM profile；变更只影响新会话（/reset 后生效）。`AgentSessionSnapshot` 新增 `soul_key`（serde default 兼容旧快照）。
+**O批 — Soul 槽**（`soul.rs`）：`Soul{persona, profile, updated_at_ms, updated_by}` + `SoulProvider` trait + kernel 内建 `FileSoulProvider`（`data/souls/{key}.json`，0600/0700，无插件无 DB 也可用）。system prompt 三段化：base + soul overlay + plugin hints。插件覆写走**约定能力节点**：加载中的插件同时声明 `soul_get`+`soul_set` 节点即接管存取（每次取用时解析，reload 自动生效）。写路径 = agent 工具 `set_soul`（merge 语义；**不暴露 soul_key 参数**，host 绑定当前 session，杜绝越权改他人人格；profile 名校验白名单）。soul.profile 引用在 inbox 建会话时决定 LLM profile；变更只影响新会话（/reset 后生效）。`AgentSessionSnapshot` 新增 `soul_key`（serde default 兼容旧快照）。**（后续修正）** 本批的 session `soul_key` 建会话时冻结在群聊里会导致 persona 错位，5.2.34 H1 改为 persona 随最近发言者刷新（profile 仍保持 session 起点）。
 
 **P批 — soul_store 插件**（`fixtures/plugins/soul_store/`）：rusqlite（bundled）SQLite 存储，`data/souls.db`，`soul_get`/`soul_set` 两节点验证覆写路径端到端；不加载时回落文件。
 
