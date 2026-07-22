@@ -117,7 +117,8 @@ loader 会把插件状态归一为：
   - index entry 存在性校验
   - metadata 与 index 的 ABI 指纹比对
   - artifact 文件存在性与 `sha256` 校验
-  - dylib 固定符号加载或 JSON artifact 反序列化
+  - dylib：`target_triple` 与宿主平台预检（不匹配 → `AbiMismatch`，不尝试 dlopen）
+  - dylib 固定符号加载（失败 → `SymbolMissing`，不回落 cached docs）或 JSON artifact 反序列化
   - runtime 导出的 docs / 指纹再次校验
 - 把结果写入 `PluginRegistry`、`NodeRegistry` 和 `RuntimeContext`
 

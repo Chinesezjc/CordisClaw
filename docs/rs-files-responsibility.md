@@ -26,7 +26,7 @@
 | `crates/cordis-runtime/src/plugin/artifact.rs` | 预构建工件索引读取与哈希计算 | `load_artifact_index()`、`sha256_file()` |
 | `crates/cordis-runtime/src/plugin/dynamic.rs` | 动态库加载与固定符号解析 | `LoadedDylibApi::open()` |
 | `crates/cordis-runtime/src/plugin/package.rs` | Phase A：按 direct-children metadata 递归发现并做 fail-fast 校验 | `PackageResolver::resolve()` |
-| `crates/cordis-runtime/src/plugin/loader.rs` | Phase B：实例化、注册、required/optional 传播与禁回退策略；shell 与整棵 expr 子树现在都走 dylib 路径 | `Loader::load()` |
+| `crates/cordis-runtime/src/plugin/loader.rs` | Phase B：实例化、注册、required/optional 传播与禁回退策略；dylib 在 dlopen 前做宿主 target_triple 预检（不匹配 → AbiMismatch），docs 读取失败 → SymbolMissing 不回落；shell 与整棵 expr 子树现在都走 dylib 路径 | `Loader::load()` |
 | `crates/cordis-runtime/src/plugin/invoke.rs` | 运行时插件调用桥：按统一入口执行 dylib 或外部进程插件 | `PluginInvoker::invoke()` |
 | `crates/cordis-runtime/src/plugin/tooling.rs` | 工具化命令：从 dylib `docs()` 回写 `interfaces.json`，并刷新 artifact index 的哈希 | `sync_plugin_docs()`、`refresh_artifact_index()` |
 | `crates/cordis-runtime/src/plugin/registry.rs` | 插件/节点注册中心，维护唯一性与状态 | `PluginRegistry`、`NodeRegistry` |

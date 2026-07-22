@@ -35,6 +35,10 @@ fn invoke_shell(payload: &str) -> ShellResponse {
 
 #[test]
 fn shell_plugin_is_loaded_externally() {
+    if !support::linux_dylib_artifacts_available() {
+        eprintln!("[skip] fixture dylibs are x86_64-linux only; skipping on this host");
+        return;
+    }
     let invoker = PluginInvoker::load(fixtures_root()).expect("fixtures should load");
     let plugin = invoker
         .plugin_registry()
@@ -46,6 +50,10 @@ fn shell_plugin_is_loaded_externally() {
 
 #[test]
 fn shell_plugin_start_terminal_success() {
+    if !support::linux_dylib_artifacts_available() {
+        eprintln!("[skip] fixture dylibs are x86_64-linux only; skipping on this host");
+        return;
+    }
     let parsed = invoke_shell(r#"{"action":"start_terminal","command":"echo hello"}"#);
     assert!(parsed.ok);
     assert_eq!(parsed.action, "start_terminal");
@@ -56,6 +64,10 @@ fn shell_plugin_start_terminal_success() {
 
 #[test]
 fn shell_plugin_expr_command_outputs_value() {
+    if !support::linux_dylib_artifacts_available() {
+        eprintln!("[skip] fixture dylibs are x86_64-linux only; skipping on this host");
+        return;
+    }
     let parsed = invoke_shell(r#"{"action":"start_terminal","command":"Expr 1 + 2 * 3"}"#);
     assert!(parsed.ok);
     assert_eq!(parsed.exit_code, Some(0));
@@ -64,6 +76,10 @@ fn shell_plugin_expr_command_outputs_value() {
 
 #[test]
 fn shell_plugin_start_terminal_non_zero_exit() {
+    if !support::linux_dylib_artifacts_available() {
+        eprintln!("[skip] fixture dylibs are x86_64-linux only; skipping on this host");
+        return;
+    }
     let parsed = invoke_shell(r#"{"action":"start_terminal","command":"no_such_command"}"#);
     assert!(!parsed.ok);
     assert_eq!(parsed.action, "start_terminal");
@@ -77,6 +93,10 @@ fn shell_plugin_start_terminal_non_zero_exit() {
 
 #[test]
 fn shell_plugin_rejects_unknown_action() {
+    if !support::linux_dylib_artifacts_available() {
+        eprintln!("[skip] fixture dylibs are x86_64-linux only; skipping on this host");
+        return;
+    }
     let parsed = invoke_shell(r#"{"action":"unknown_action"}"#);
     assert!(!parsed.ok);
     assert_eq!(parsed.action, "error");
@@ -85,6 +105,10 @@ fn shell_plugin_rejects_unknown_action() {
 
 #[test]
 fn shell_plugin_sets_username_to_cordisclaw() {
+    if !support::linux_dylib_artifacts_available() {
+        eprintln!("[skip] fixture dylibs are x86_64-linux only; skipping on this host");
+        return;
+    }
     let parsed = invoke_shell(r#"{"action":"start_terminal","command":"whoami"}"#);
     assert!(
         parsed.ok,
@@ -96,6 +120,10 @@ fn shell_plugin_sets_username_to_cordisclaw() {
 
 #[test]
 fn shell_plugin_rejects_external_shell_backend() {
+    if !support::linux_dylib_artifacts_available() {
+        eprintln!("[skip] fixture dylibs are x86_64-linux only; skipping on this host");
+        return;
+    }
     let parsed =
         invoke_shell(r#"{"action":"start_terminal","shell":"/bin/bash","command":"echo hi"}"#);
     assert!(!parsed.ok);
@@ -105,6 +133,10 @@ fn shell_plugin_rejects_external_shell_backend() {
 
 #[test]
 fn invoke_cli_shell_repl_refuses_non_tty_stdin() {
+    if !support::linux_dylib_artifacts_available() {
+        eprintln!("[skip] fixture dylibs are x86_64-linux only; skipping on this host");
+        return;
+    }
     // P2-37: `shell_run_repl` now requires an interactive TTY on stdin so a
     // headless host can't hang waiting on a REPL that will never receive
     // keystrokes. This test drives `invoke shell shell_entry` with a PIPED

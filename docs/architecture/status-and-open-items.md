@@ -2,7 +2,7 @@
 
 ## 1. 判定口径
 
-- 本文基于当前仓库现状整理，最近更新：2026-07-21。
+- 本文基于当前仓库现状整理，最近更新：2026-07-22。
 - 历史规划蓝图已经吸收进 [design-blueprint.md](./design-blueprint.md)，因此本文结论来自三类证据的交叉比对：
   - 设计蓝图：[design-blueprint.md](./design-blueprint.md)
   - 架构文档：[system-overview.md](./system-overview.md)、[contracts-and-loading.md](./contracts-and-loading.md)、[runtime-semantics.md](./runtime-semantics.md)、[maintenance-guide.md](./maintenance-guide.md)
@@ -205,6 +205,15 @@ Agent 现在可以自主完成：读代码 → 理解结构 → 写/改文件 �
 - [x] **Filesystem / Git 白名单不再静默降级**（P0-19）— `canonicalize` 失败时不再退回未规范化路径。新增 `canonicalise_for_whitelist` / `validate_path_in_root` 的深度 ancestor 解析：路径不存在时 canonicalize 最深的存在祖先再拼 tail；两侧都失败则 fail-closed。`../../etc/shadow` 之类的构造再无绕过。
 - [x] **Plugin iteration symlink 逃逸**（P0-20）— `PluginEditExecutor::execute` 在写入前调用新 helper `resolve_under_workspace`：canonicalize 结果必须仍在 workspace_root 下。plugins 内的 symlink 指向 `/etc/passwd` 之类无法被写入。
 - [x] **Verifier shell 拼接**（P0-21）— 已随 A 批 P0-1 修复。`discover_rust_workspace_manifest` 输出的字符串被 `shell_words` 解析成 argv，空格 / `$` / `;` 无法被解释。
+
+### 5.2.33 Loader dylib 平台门控 + 测试跨平台策略（2026-07-22）
+
+Review 交叉验证发现 loader 对 dylib 工件的两处静默失效，本批闭合：
+
+- [x] **dylib target_triple 预检**（loader.rs）— dylib 条目在 staging/dlopen 之前比对 `entry.abi_fingerprint.target_triple` 与宿主 triple（`cordis_plugin_sdk::CORDIS_TARGET`，SDK build.rs 注入的编译期常量），不匹配 → `Unavailable(AbiMismatch)` + required 传播。此前 target 比对只在 Json 分支存在，跨平台 checkout（macOS 上的 linux .so）会被误标 Loaded、首次 invoke 才炸。
+- [x] **read_plugin_docs 吞错闭合**（P2-34 根因）— 见 5.2.15 P2-34 条目更新；triple 预检兜住架构不符后，走到 docs 读取仍失败的 dylib 是真实故障，标 `Unavailable(SymbolMissing)`，不再回落 cached docs 假装 Loaded。Ok 分支的 docs-drift 自愈（dylib docs 为 ground truth）保持不变。
+- [x] **测试跨平台策略** — fixtures 的 21 个 `.so` 全部是 `x86_64-unknown-linux-gnu` 预构建工件（in-repo 提交，index.json 记录 triple）。既有语义:`RuntimeHost::boot` 只要任一插件 Unavailable 即整体失败（host.rs `build_snapshot_with_staged_root`），因此非 Linux 宿主上所有依赖真实 fixtures 的测试改为经 `support::linux_dylib_artifacts_available()` 声明式 skip（打印 `[skip]` 日志）;Linux CI 上门控恒真、全部实际执行。**权威测试判定在 Linux 侧**;macOS 本机 `cargo test` 现在全绿（真实执行纯内存/语义测试，声明式跳过 dylib 测试）。
+- [x] **soul_store 测试软跳过删除** — `soul_store_plugin_overrides_file_provider` 原有的 registry 成员资格 guard（恒真、失效）删除;Linux 上该测试从此硬断言 souls.db/souls/*.json，soul_store 加载回归不再静默绿。
 
 ### 5.2.32 Soul / LLM Profile / 指令路由 / 消息可靠性（J-P 批，2026-07-21）
 
@@ -566,7 +575,7 @@ cd fixtures/plugins/expr/lexer && cargo test --lib  # excluded, external tests o
 - [x] **`respond` err path 补 Assistant placeholder**（P2-31）— 分离 `respond` / `respond_inner`；Err 时若 `transcript` 里有 orphan User，插入 `[error] <msg>` Assistant 条目，retry 同 session 不再 double-record 用户输入。
 - [x] **`from_snapshot` api_key 澄清**（P2-33）— 加注释说明 `#[serde(skip_serializing)]` 让 api_key 恢复时为 `None`，`resolve_api_key` 从 env 补，避免"雷带毒配置"担忧。
 - [x] **`AGENT_INJECT_QUEUE` 已知局限文档化**（P2-32）— 加注释说明单 static + 多 session 的 mis-routing 风险为 latent（当前只跑一个 primary session），per-session queue 是未来工作。
-- [x] **`loader::read_plugin_docs` 显式记诊断**（P2-34）— `if let Ok` 换成 `match`，Err 分支写 stderr；架构不兼容/missing symbol 的 dylib drift 不再静默。
+- [x] **`loader::read_plugin_docs` 显式记诊断**（P2-34）— `if let Ok` 换成 `match`，Err 分支写 stderr；架构不兼容/missing symbol 的 dylib drift 不再静默。**2026-07-22 根因闭合**：Err 分支不再 fall back 到 cached docs + `insert_loaded`，改为 `insert_unavailable(SymbolMissing)` + required 传播——dlopen 失败的 dylib 从此在 load 时就标 Unavailable，不再等到首次 invoke 才暴露。
 - [x] **QQ `unwrap()` 换 `unwrap_or_default`**（P2-35）— `/health` 响应 JSON 编码失败不再让整个事件循环 panic。
 - [x] **Gacha state path**（P2-38）— 优先用 `$CORDIS_FIXTURES_ROOT/../data/gacha/state.json`，摆脱 cwd 依赖。
 - [x] **Gacha avg 5★ 公式**（P2-39）— 新增 `char_5_star_count` 字段并用于 avg 计算；旧公式 `total_pulls / pity_5_total` 实际 ≈ 1，一直是错的。

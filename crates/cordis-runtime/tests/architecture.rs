@@ -125,6 +125,10 @@ where
 /// 不再自带 grants 声明）。
 #[test]
 fn load_success_and_grants_enforced() {
+    if !support::linux_dylib_artifacts_available() {
+        eprintln!("[skip] fixture dylibs are x86_64-linux only; skipping on this host");
+        return;
+    }
     let temp = setup_fixture_copy();
     patch_index(&temp, |index| {
         let entries = index
@@ -203,6 +207,10 @@ fn load_success_and_grants_enforced() {
 
 #[test]
 fn registered_graph_json_and_html_are_available() {
+    if !support::linux_dylib_artifacts_available() {
+        eprintln!("[skip] fixture dylibs are x86_64-linux only; skipping on this host");
+        return;
+    }
     let temp = setup_fixture_copy();
     let config = default_loader_config(temp.path());
     let loader = Loader::new(config);
@@ -244,6 +252,10 @@ fn registered_graph_json_and_html_are_available() {
 
 #[test]
 fn registered_net_json_and_html_are_available() {
+    if !support::linux_dylib_artifacts_available() {
+        eprintln!("[skip] fixture dylibs are x86_64-linux only; skipping on this host");
+        return;
+    }
     let temp = setup_fixture_copy();
     let config = default_loader_config(temp.path());
     let loader = Loader::new(config);
@@ -307,6 +319,10 @@ fn registered_net_json_and_html_are_available() {
 
 #[test]
 fn expr_dylib_subplugins_are_invokable() {
+    if !support::linux_dylib_artifacts_available() {
+        eprintln!("[skip] fixture dylibs are x86_64-linux only; skipping on this host");
+        return;
+    }
     let temp = setup_fixture_copy();
     let invoker = PluginInvoker::load(temp.path()).expect("fixtures should load");
 
@@ -369,6 +385,10 @@ fn expr_dylib_subplugins_are_invokable() {
 
 #[test]
 fn undeclared_grandchild_is_not_discovered() {
+    if !support::linux_dylib_artifacts_available() {
+        eprintln!("[skip] fixture dylibs are x86_64-linux only; skipping on this host");
+        return;
+    }
     let temp = setup_fixture_copy();
 
     let ghost_dir = temp.path().join("plugins/root/ghost");
@@ -413,6 +433,10 @@ api_hash = "api_v2"
 
 #[test]
 fn child_path_escape_fails_fast() {
+    if !support::linux_dylib_artifacts_available() {
+        eprintln!("[skip] fixture dylibs are x86_64-linux only; skipping on this host");
+        return;
+    }
     let temp = setup_fixture_copy();
     let expr_manifest = temp.path().join("plugins/expr/Cargo.toml");
     let content = fs::read_to_string(&expr_manifest).expect("read expr manifest");
@@ -426,6 +450,10 @@ fn child_path_escape_fails_fast() {
 
 #[test]
 fn plugin_path_mismatch_fails_fast() {
+    if !support::linux_dylib_artifacts_available() {
+        eprintln!("[skip] fixture dylibs are x86_64-linux only; skipping on this host");
+        return;
+    }
     let temp = setup_fixture_copy();
     let child_manifest = temp.path().join("plugins/expr/lexer/Cargo.toml");
     let content = fs::read_to_string(&child_manifest).expect("read lexer manifest");
@@ -460,6 +488,10 @@ fn patch_child_entry(temp: &TempDir, plugin_path: &str, patch: impl FnOnce(&mut 
 /// 失效方式：sha256 篡改（HashMismatch）与 artifact 缺失（ArtifactMissing）。
 #[test]
 fn optional_child_unavailable_does_not_block_parent() {
+    if !support::linux_dylib_artifacts_available() {
+        eprintln!("[skip] fixture dylibs are x86_64-linux only; skipping on this host");
+        return;
+    }
     let temp = setup_fixture_copy();
 
     patch_child_entry(&temp, "expr/lexer", |child| {
@@ -490,6 +522,10 @@ fn optional_child_unavailable_does_not_block_parent() {
 
 #[test]
 fn required_child_unavailable_blocks_parent_chain() {
+    if !support::linux_dylib_artifacts_available() {
+        eprintln!("[skip] fixture dylibs are x86_64-linux only; skipping on this host");
+        return;
+    }
     let temp = setup_fixture_copy();
 
     // Remove the child artifact from disk — loader marks the child
@@ -520,6 +556,10 @@ fn required_child_unavailable_blocks_parent_chain() {
 
 #[test]
 fn hash_mismatch_marks_child_unavailable_and_no_fallback() {
+    if !support::linux_dylib_artifacts_available() {
+        eprintln!("[skip] fixture dylibs are x86_64-linux only; skipping on this host");
+        return;
+    }
     let temp = setup_fixture_copy();
 
     patch_child_entry(&temp, "expr/lexer", |child| {
@@ -549,6 +589,10 @@ fn hash_mismatch_marks_child_unavailable_and_no_fallback() {
 
 #[test]
 fn inject_on_unavailable_plugin_returns_unavailable_error() {
+    if !support::linux_dylib_artifacts_available() {
+        eprintln!("[skip] fixture dylibs are x86_64-linux only; skipping on this host");
+        return;
+    }
     let temp = setup_fixture_copy();
 
     patch_child_entry(&temp, "expr/lexer", |child| {

@@ -33,6 +33,11 @@ pub struct AbiFingerprint {
     pub api_hash: String,
 }
 
+/// Target triple of the toolchain that compiled this SDK crate (and, by
+/// extension, any binary linking it). Loaders compare this against a dylib
+/// artifact's recorded `target_triple` before attempting to dlopen it.
+pub const CORDIS_TARGET: &str = env!("CORDIS_TARGET");
+
 impl AbiFingerprint {
     /// P2-13: construct an `AbiFingerprint` whose `rustc_version` and
     /// `target_triple` come from the compiler that built this SDK crate.

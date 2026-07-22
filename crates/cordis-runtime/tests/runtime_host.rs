@@ -514,6 +514,10 @@ fn update_index_node_summary(root: &Path, plugin_path: &str, node_id: &str, summ
 
 #[test]
 fn runtime_host_loads_yaml_config_and_uses_custom_snapshot_root() {
+    if !support::linux_dylib_artifacts_available() {
+        eprintln!("[skip] fixture dylibs are x86_64-linux only; skipping on this host");
+        return;
+    }
     let temp = setup_fixture_copy();
     let config_dir = temp.path().join("config");
     let plugin_config_dir = config_dir.join("plugins");
@@ -552,6 +556,10 @@ fn runtime_host_loads_yaml_config_and_uses_custom_snapshot_root() {
 
 #[test]
 fn runtime_host_boots_and_invokes_loaded_plugins() {
+    if !support::linux_dylib_artifacts_available() {
+        eprintln!("[skip] fixture dylibs are x86_64-linux only; skipping on this host");
+        return;
+    }
     let temp = setup_fixture_copy();
     let host = RuntimeHost::boot(temp.path()).expect("host should boot");
 
@@ -572,6 +580,10 @@ fn runtime_host_boots_and_invokes_loaded_plugins() {
 
 #[test]
 fn runtime_host_reload_adds_top_level_plugin() {
+    if !support::linux_dylib_artifacts_available() {
+        eprintln!("[skip] fixture dylibs are x86_64-linux only; skipping on this host");
+        return;
+    }
     let temp = setup_fixture_copy();
     let host = RuntimeHost::boot(temp.path()).expect("host should boot");
 
@@ -598,6 +610,10 @@ fn runtime_host_reload_adds_top_level_plugin() {
 
 #[test]
 fn runtime_host_reload_removes_plugin_but_old_snapshot_stays_usable() {
+    if !support::linux_dylib_artifacts_available() {
+        eprintln!("[skip] fixture dylibs are x86_64-linux only; skipping on this host");
+        return;
+    }
     let temp = setup_fixture_copy();
     let host = RuntimeHost::boot(temp.path()).expect("host should boot");
     let old_snapshot = host.current_snapshot();
@@ -646,6 +662,10 @@ fn runtime_host_reload_removes_plugin_but_old_snapshot_stays_usable() {
 
 #[test]
 fn runtime_host_reload_failure_keeps_current_snapshot() {
+    if !support::linux_dylib_artifacts_available() {
+        eprintln!("[skip] fixture dylibs are x86_64-linux only; skipping on this host");
+        return;
+    }
     let temp = setup_fixture_copy();
     let host = RuntimeHost::boot(temp.path()).expect("host should boot");
     let snapshot_id = host.current_snapshot().snapshot_id().to_string();
@@ -670,6 +690,10 @@ fn runtime_host_reload_failure_keeps_current_snapshot() {
 
 #[test]
 fn runtime_host_reload_observes_docs_drift_issue() {
+    if !support::linux_dylib_artifacts_available() {
+        eprintln!("[skip] fixture dylibs are x86_64-linux only; skipping on this host");
+        return;
+    }
     // 5.2.27: semantics updated for the P0-14/P2-34 docs auto-heal. The
     // dylib's embedded docs are ground truth; tampering with the cached
     // copy in index.json no longer propagates a "docs_changed" snapshot
@@ -701,6 +725,10 @@ fn runtime_host_reload_observes_docs_drift_issue() {
 
 #[test]
 fn runtime_host_snapshot_keeps_old_staged_process_artifact_after_reload() {
+    if !support::linux_dylib_artifacts_available() {
+        eprintln!("[skip] fixture dylibs are x86_64-linux only; skipping on this host");
+        return;
+    }
     let temp = setup_fixture_copy();
     add_demo_process_plugin(temp.path(), "v1");
     let host = RuntimeHost::boot(temp.path()).expect("host should boot with demo");
@@ -753,6 +781,10 @@ fn runtime_host_snapshot_keeps_old_staged_process_artifact_after_reload() {
 
 #[test]
 fn runtime_host_kernel_state_persists_across_reload() {
+    if !support::linux_dylib_artifacts_available() {
+        eprintln!("[skip] fixture dylibs are x86_64-linux only; skipping on this host");
+        return;
+    }
     let temp = setup_fixture_copy();
     let host = RuntimeHost::boot(temp.path()).expect("host should boot");
     let patch_target = temp.path().join("notes.txt");
@@ -792,6 +824,10 @@ fn runtime_host_kernel_state_persists_across_reload() {
 
 #[test]
 fn runtime_host_execute_runs_registered_target_through_execution_engine() {
+    if !support::linux_dylib_artifacts_available() {
+        eprintln!("[skip] fixture dylibs are x86_64-linux only; skipping on this host");
+        return;
+    }
     let host = RuntimeHost::boot(fixtures_root()).expect("host should boot");
     let result = host
         .execute("expr::expr_entry", json!({ "expression": "1 + 2 * 3" }))
@@ -823,6 +859,10 @@ fn runtime_host_execute_runs_registered_target_through_execution_engine() {
 
 #[test]
 fn runtime_host_reload_with_diagnostics_reports_failure_summary() {
+    if !support::linux_dylib_artifacts_available() {
+        eprintln!("[skip] fixture dylibs are x86_64-linux only; skipping on this host");
+        return;
+    }
     let temp = setup_fixture_copy();
     let host = RuntimeHost::boot(temp.path()).expect("host should boot");
     let snapshot_id = host.current_snapshot().snapshot_id().to_string();
@@ -847,6 +887,10 @@ fn runtime_host_reload_with_diagnostics_reports_failure_summary() {
 
 #[test]
 fn runtime_host_candidate_reload_stages_snapshot_without_switching_current() {
+    if !support::linux_dylib_artifacts_available() {
+        eprintln!("[skip] fixture dylibs are x86_64-linux only; skipping on this host");
+        return;
+    }
     let temp = setup_fixture_copy();
     let host = RuntimeHost::boot(temp.path()).expect("host should boot");
     let current_snapshot_id = host.current_snapshot().snapshot_id().to_string();
@@ -885,6 +929,10 @@ fn runtime_host_candidate_reload_stages_snapshot_without_switching_current() {
 
 #[test]
 fn runtime_host_candidate_reload_observes_load_failure_issue() {
+    if !support::linux_dylib_artifacts_available() {
+        eprintln!("[skip] fixture dylibs are x86_64-linux only; skipping on this host");
+        return;
+    }
     let temp = setup_fixture_copy();
     let host = RuntimeHost::boot(temp.path()).expect("host should boot");
 
@@ -901,6 +949,10 @@ fn runtime_host_candidate_reload_observes_load_failure_issue() {
 
 #[test]
 fn runtime_host_promote_candidate_switches_current_and_keeps_old_snapshot_usable() {
+    if !support::linux_dylib_artifacts_available() {
+        eprintln!("[skip] fixture dylibs are x86_64-linux only; skipping on this host");
+        return;
+    }
     let temp = setup_fixture_copy();
     let host = RuntimeHost::boot(temp.path()).expect("host should boot");
     let old_snapshot = host.current_snapshot();
@@ -956,6 +1008,10 @@ fn runtime_host_promote_candidate_switches_current_and_keeps_old_snapshot_usable
 
 #[test]
 fn runtime_host_rollback_candidate_discards_staged_snapshot() {
+    if !support::linux_dylib_artifacts_available() {
+        eprintln!("[skip] fixture dylibs are x86_64-linux only; skipping on this host");
+        return;
+    }
     let temp = setup_fixture_copy();
     let host = RuntimeHost::boot(temp.path()).expect("host should boot");
 
@@ -988,6 +1044,10 @@ fn runtime_host_rollback_candidate_discards_staged_snapshot() {
 
 #[test]
 fn runtime_host_iterate_plugins_promotes_after_canary_replay() {
+    if !support::linux_dylib_artifacts_available() {
+        eprintln!("[skip] fixture dylibs are x86_64-linux only; skipping on this host");
+        return;
+    }
     let temp = setup_fixture_workspace_copy();
     let fixtures = temp.path().join("fixtures");
     let host = RuntimeHost::boot(&fixtures).expect("host should boot");
@@ -1080,6 +1140,10 @@ fn runtime_host_iterate_plugins_promotes_after_canary_replay() {
 #[serial]
 #[test]
 fn runtime_host_iterate_plugins_agent_adds_dist_child_plugin_and_promotes() {
+    if !support::linux_dylib_artifacts_available() {
+        eprintln!("[skip] fixture dylibs are x86_64-linux only; skipping on this host");
+        return;
+    }
     let temp = setup_fixture_workspace_copy();
     let fixtures = temp.path().join("fixtures");
 
@@ -1302,6 +1366,10 @@ fn runtime_host_iterate_plugins_agent_adds_dist_child_plugin_and_promotes() {
 #[serial]
 #[test]
 fn runtime_host_iterate_plugins_agent_retries_on_warning_and_promotes() {
+    if !support::linux_dylib_artifacts_available() {
+        eprintln!("[skip] fixture dylibs are x86_64-linux only; skipping on this host");
+        return;
+    }
     let temp = setup_fixture_workspace_copy();
     let fixtures = temp.path().join("fixtures");
 
@@ -1513,6 +1581,10 @@ fn runtime_host_iterate_plugins_agent_retries_on_warning_and_promotes() {
 #[serial]
 #[test]
 fn runtime_host_iterate_plugins_agent_retries_on_raw_mod_identifier_and_rolls_back() {
+    if !support::linux_dylib_artifacts_available() {
+        eprintln!("[skip] fixture dylibs are x86_64-linux only; skipping on this host");
+        return;
+    }
     let temp = setup_fixture_workspace_copy();
     let fixtures = temp.path().join("fixtures");
     let evaluator_before = read_rel(&fixtures, "plugins/expr/evaluator/src/core.rs");
@@ -1592,6 +1664,10 @@ fn runtime_host_iterate_plugins_agent_retries_on_raw_mod_identifier_and_rolls_ba
 
 #[test]
 fn runtime_host_iterate_plugins_blocks_without_canary_evidence_and_approve_promotes() {
+    if !support::linux_dylib_artifacts_available() {
+        eprintln!("[skip] fixture dylibs are x86_64-linux only; skipping on this host");
+        return;
+    }
     let temp = setup_fixture_workspace_copy();
     let fixtures = temp.path().join("fixtures");
     let host = RuntimeHost::boot(&fixtures).expect("host should boot");
@@ -1681,6 +1757,10 @@ fn runtime_host_iterate_plugins_blocks_without_canary_evidence_and_approve_promo
 
 #[test]
 fn runtime_host_iterate_plugins_policy_blocks_runtime_paths() {
+    if !support::linux_dylib_artifacts_available() {
+        eprintln!("[skip] fixture dylibs are x86_64-linux only; skipping on this host");
+        return;
+    }
     let temp = setup_fixture_workspace_copy();
     let fixtures = temp.path().join("fixtures");
     let host = RuntimeHost::boot(&fixtures).expect("host should boot");
@@ -1734,6 +1814,10 @@ fn runtime_host_iterate_plugins_policy_blocks_runtime_paths() {
 
 #[test]
 fn runtime_host_iterate_plugins_rolls_back_invalid_plugin_manifest_and_keeps_runtime_alive() {
+    if !support::linux_dylib_artifacts_available() {
+        eprintln!("[skip] fixture dylibs are x86_64-linux only; skipping on this host");
+        return;
+    }
     let temp = setup_fixture_workspace_copy();
     let fixtures = temp.path().join("fixtures");
     let host = RuntimeHost::boot(&fixtures).expect("host should boot");
@@ -1801,6 +1885,10 @@ fn runtime_host_iterate_plugins_rolls_back_invalid_plugin_manifest_and_keeps_run
 
 #[test]
 fn runtime_host_rollback_candidate_restores_plugin_sources_and_clears_journal() {
+    if !support::linux_dylib_artifacts_available() {
+        eprintln!("[skip] fixture dylibs are x86_64-linux only; skipping on this host");
+        return;
+    }
     let temp = setup_fixture_workspace_copy();
     let fixtures = temp.path().join("fixtures");
     let host = RuntimeHost::boot(&fixtures).expect("host should boot");
@@ -1864,6 +1952,10 @@ fn runtime_host_rollback_candidate_restores_plugin_sources_and_clears_journal() 
 
 #[test]
 fn runtime_host_boot_recovers_plugin_iteration_journal() {
+    if !support::linux_dylib_artifacts_available() {
+        eprintln!("[skip] fixture dylibs are x86_64-linux only; skipping on this host");
+        return;
+    }
     let temp = setup_fixture_workspace_copy();
     let fixtures = temp.path().join("fixtures");
     let host = RuntimeHost::boot(&fixtures).expect("host should boot");
@@ -1932,6 +2024,10 @@ fn runtime_host_boot_recovers_plugin_iteration_journal() {
 #[serial]
 #[test]
 fn serve_mode_supports_plugins_reload_and_kernel_status() {
+    if !support::linux_dylib_artifacts_available() {
+        eprintln!("[skip] fixture dylibs are x86_64-linux only; skipping on this host");
+        return;
+    }
     let temp = setup_fixture_workspace_copy();
     let fixtures = temp.path().join("fixtures");
     let bin = env!("CARGO_BIN_EXE_cordis-runtime");
@@ -1977,6 +2073,10 @@ fn serve_mode_supports_plugins_reload_and_kernel_status() {
 #[serial]
 #[test]
 fn serve_mode_supports_candidate_control_plane() {
+    if !support::linux_dylib_artifacts_available() {
+        eprintln!("[skip] fixture dylibs are x86_64-linux only; skipping on this host");
+        return;
+    }
     let temp = setup_fixture_workspace_copy();
     let fixtures = temp.path().join("fixtures");
 
@@ -2070,6 +2170,10 @@ fn serve_one_sse(
 #[test]
 #[serial]
 fn llm_profile_fallback_degrades_and_recovers() {
+    if !support::linux_dylib_artifacts_available() {
+        eprintln!("[skip] fixture dylibs are x86_64-linux only; skipping on this host");
+        return;
+    }
     use cordis_runtime::host::{AgentSessionKind, AgentStartOptions};
 
     let temp = setup_fixture_workspace_copy();
@@ -2134,6 +2238,10 @@ fn llm_profile_fallback_degrades_and_recovers() {
 #[test]
 #[serial]
 fn soul_roundtrip_profile_reference_and_scope_guard() {
+    if !support::linux_dylib_artifacts_available() {
+        eprintln!("[skip] fixture dylibs are x86_64-linux only; skipping on this host");
+        return;
+    }
     use cordis_runtime::agent::AgentToolHost;
     use cordis_runtime::soul::Soul;
 
@@ -2178,6 +2286,10 @@ fn soul_roundtrip_profile_reference_and_scope_guard() {
 #[test]
 #[serial]
 fn soul_store_plugin_overrides_file_provider() {
+    if !support::linux_dylib_artifacts_available() {
+        eprintln!("[skip] fixture dylibs are x86_64-linux only; skipping on this host");
+        return;
+    }
     use cordis_runtime::agent::AgentToolHost;
 
     let temp = setup_fixture_workspace_copy();
@@ -2189,16 +2301,10 @@ fn soul_store_plugin_overrides_file_provider() {
     );
     let host = RuntimeHost::boot(&fixtures).expect("host should boot");
 
-    let has_soul_store = host
-        .current_snapshot()
-        .plugin_registry()
-        .iter()
-        .any(|(path, _)| path == "soul_store");
-    if !has_soul_store {
-        eprintln!("soul_store not in fixture registry; skipping override assertion");
-        return;
-    }
-
+    // No load-status guard here on purpose: soul_store is a required,
+    // committed fixture. If it ever fails to load, the assertions below
+    // must go red (a silent fallback to FileSoulProvider would create
+    // souls/*.json instead of souls.db), not skip.
     let soul_key = "qq:789#group";
     host.agent_set_soul(soul_key, Some("SQLite 里的我"), None)
         .expect("set soul via plugin provider");
