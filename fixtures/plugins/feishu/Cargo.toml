@@ -16,8 +16,6 @@ children = []
 allow_generated_docs = true
 
 [package.metadata.cordis.abi_fingerprint]
-rustc_version = "1.85.1"
-target_triple = "x86_64-unknown-linux-gnu"
 crate_hash = "crate_feishu_v1"
 api_hash = "api_v2"
 

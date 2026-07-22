@@ -1853,8 +1853,6 @@ declared_nodes = []
 children = []
 
 [package.metadata.cordis.abi_fingerprint]
-rustc_version = "1.85.1"
-target_triple = "x86_64-unknown-linux-gnu"
 crate_hash = "{crate_hash}"
 api_hash = "api_v2"
 
@@ -1923,12 +1921,7 @@ fn docs_value() -> cordis_plugin_sdk::PluginDocs {{
 }}
 
 fn abi_fingerprint_value() -> AbiFingerprint {{
-    AbiFingerprint {{
-        rustc_version: "1.85.1".to_string(),
-        target_triple: "x86_64-unknown-linux-gnu".to_string(),
-        crate_hash: "{crate_hash}".to_string(),
-        api_hash: "api_v2".to_string(),
-    }}
+    AbiFingerprint::current_build("{crate_hash}", "api_v2")
 }}
 
 fn api_handle(req: PluginRequest) -> PluginResponse {{
@@ -5278,7 +5271,7 @@ fn sha256_text(content: &str) -> String {
 
 fn render_child_plugin_manifest(crate_name: &str, plugin_path: &str, node_id: &str) -> String {
     format!(
-        "[package]\nname = \"{crate_name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\ncrate-type = [\"rlib\", \"dylib\"]\n\n[package.metadata.cordis]\nplugin_path = \"{plugin_path}\"\nabi_kind = \"rust\"\ndeclared_nodes = [\"{node_id}\"]\nchildren = []\n# The scaffold ships no docs/agent/interfaces.json — docs are read from\n# the built dylib. P1-48 made this bypass an explicit opt-in.\nallow_generated_docs = true\n\n[package.metadata.cordis.abi_fingerprint]\nrustc_version = \"1.85.1\"\ntarget_triple = \"x86_64-unknown-linux-gnu\"\ncrate_hash = \"crate_{crate_name}_v1\"\napi_hash = \"api_v2\"\n\n[dependencies]\ncordis-plugin-sdk = {{ path = \"../../../../../crates/cordis-plugin-sdk\" }}\nserde = {{ version = \"1\", features = [\"derive\"] }}\nserde_json = \"1\"\nthiserror = \"2\"\n\n[workspace]\n",
+        "[package]\nname = \"{crate_name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\ncrate-type = [\"rlib\", \"dylib\"]\n\n[package.metadata.cordis]\nplugin_path = \"{plugin_path}\"\nabi_kind = \"rust\"\ndeclared_nodes = [\"{node_id}\"]\nchildren = []\n# The scaffold ships no docs/agent/interfaces.json — docs are read from\n# the built dylib. P1-48 made this bypass an explicit opt-in.\nallow_generated_docs = true\n\n[package.metadata.cordis.abi_fingerprint]\ncrate_hash = \"crate_{crate_name}_v1\"\napi_hash = \"api_v2\"\n\n[dependencies]\ncordis-plugin-sdk = {{ path = \"../../../../../crates/cordis-plugin-sdk\" }}\nserde = {{ version = \"1\", features = [\"derive\"] }}\nserde_json = \"1\"\nthiserror = \"2\"\n\n[workspace]\n",
         crate_name = crate_name.replace('-', "_"),
         plugin_path = plugin_path,
         node_id = node_id,
@@ -5292,7 +5285,7 @@ fn render_child_plugin_lib(
     summary: &str,
 ) -> String {
     format!(
-        "mod core;\n\npub use core::*;\n\nuse cordis_plugin_sdk::{{\n    export_plugin_api, json_response, node_doc, plugin_docs, AbiFingerprint, PluginRequest,\n    PluginResponse,\n}};\nuse serde::{{Deserialize, Serialize}};\nuse serde_json::json;\n\n#[derive(Debug, Deserialize)]\nstruct BinaryOpRequest {{\n    lhs: f64,\n    rhs: f64,\n}}\n\n#[derive(Debug, Serialize)]\nstruct BinaryOpResponse {{\n    #[serde(skip_serializing_if = \"Option::is_none\")]\n    value: Option<f64>,\n    #[serde(skip_serializing_if = \"Option::is_none\")]\n    error: Option<String>,\n}}\n\nfn docs_value() -> cordis_plugin_sdk::PluginDocs {{\n    plugin_docs(\n        \"{crate_name}\",\n        \"{plugin_path}\",\n        \"0.1.0\",\n        None,\n        vec![node_doc(\n            \"{node_id}\",\n            \"{summary}\",\n            json!({{\"type\":\"object\",\"required\":[\"lhs\",\"rhs\"],\"properties\":{{\"lhs\":{{\"type\":\"number\"}},\"rhs\":{{\"type\":\"number\"}}}}}}),\n            json!({{\"type\":\"object\",\"properties\":{{\"value\":{{\"type\":\"number\"}},\"error\":{{\"type\":\"string\"}}}}}}),\n            &[],\n            &[\"not implemented\"],\n        )],\n        None,\n    )\n}}\n\nfn abi_fingerprint_value() -> AbiFingerprint {{\n    AbiFingerprint {{\n        rustc_version: \"1.85.1\".to_string(),\n        target_triple: \"x86_64-unknown-linux-gnu\".to_string(),\n        crate_hash: \"crate_{crate_name}_v1\".to_string(),\n        api_hash: \"api_v2\".to_string(),\n    }}\n}}\n\nfn api_handle(req: PluginRequest) -> PluginResponse {{\n    let response = match serde_json::from_str::<BinaryOpRequest>(&req.payload) {{\n        Ok(request) => match apply(request.lhs, request.rhs) {{\n            Ok(value) => BinaryOpResponse {{ value: Some(value), error: None }},\n            Err(err) => BinaryOpResponse {{ value: None, error: Some(err.to_string()) }},\n        }},\n        Err(err) => BinaryOpResponse {{ value: None, error: Some(format!(\"invalid request: {{err}}\")) }},\n    }};\n    json_response(&response)\n}}\n\nexport_plugin_api! {{\n    abi_fingerprint = abi_fingerprint_value(),\n    docs = docs_value(),\n    handle = api_handle,\n}}\n",
+        "mod core;\n\npub use core::*;\n\nuse cordis_plugin_sdk::{{\n    export_plugin_api, json_response, node_doc, plugin_docs, AbiFingerprint, PluginRequest,\n    PluginResponse,\n}};\nuse serde::{{Deserialize, Serialize}};\nuse serde_json::json;\n\n#[derive(Debug, Deserialize)]\nstruct BinaryOpRequest {{\n    lhs: f64,\n    rhs: f64,\n}}\n\n#[derive(Debug, Serialize)]\nstruct BinaryOpResponse {{\n    #[serde(skip_serializing_if = \"Option::is_none\")]\n    value: Option<f64>,\n    #[serde(skip_serializing_if = \"Option::is_none\")]\n    error: Option<String>,\n}}\n\nfn docs_value() -> cordis_plugin_sdk::PluginDocs {{\n    plugin_docs(\n        \"{crate_name}\",\n        \"{plugin_path}\",\n        \"0.1.0\",\n        None,\n        vec![node_doc(\n            \"{node_id}\",\n            \"{summary}\",\n            json!({{\"type\":\"object\",\"required\":[\"lhs\",\"rhs\"],\"properties\":{{\"lhs\":{{\"type\":\"number\"}},\"rhs\":{{\"type\":\"number\"}}}}}}),\n            json!({{\"type\":\"object\",\"properties\":{{\"value\":{{\"type\":\"number\"}},\"error\":{{\"type\":\"string\"}}}}}}),\n            &[],\n            &[\"not implemented\"],\n        )],\n        None,\n    )\n}}\n\nfn abi_fingerprint_value() -> AbiFingerprint {{\n    AbiFingerprint::current_build(\"crate_{crate_name}_v1\", \"api_v2\")\n}}\n\nfn api_handle(req: PluginRequest) -> PluginResponse {{\n    let response = match serde_json::from_str::<BinaryOpRequest>(&req.payload) {{\n        Ok(request) => match apply(request.lhs, request.rhs) {{\n            Ok(value) => BinaryOpResponse {{ value: Some(value), error: None }},\n            Err(err) => BinaryOpResponse {{ value: None, error: Some(err.to_string()) }},\n        }},\n        Err(err) => BinaryOpResponse {{ value: None, error: Some(format!(\"invalid request: {{err}}\")) }},\n    }};\n    json_response(&response)\n}}\n\nexport_plugin_api! {{\n    abi_fingerprint = abi_fingerprint_value(),\n    docs = docs_value(),\n    handle = api_handle,\n}}\n",
         crate_name = crate_name,
         plugin_path = plugin_path,
         node_id = node_id,

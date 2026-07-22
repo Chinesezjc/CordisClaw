@@ -12,8 +12,6 @@ abi_kind = "rust"
 declared_nodes = ["gacha_entry", "gacha_status"]
 
 [package.metadata.cordis.abi_fingerprint]
-rustc_version = "1.85.1"
-target_triple = "x86_64-unknown-linux-gnu"
 crate_hash = "crate_gacha_v1"
 api_hash = "api_v2"
 

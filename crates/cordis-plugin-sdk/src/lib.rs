@@ -22,10 +22,24 @@ pub enum DylibAbiKind {
 #[repr(C)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct AbiFingerprint {
+    /// Toolchain facts default to the environment that compiled this SDK
+    /// crate, so declarations (e.g. `[package.metadata.cordis.abi_fingerprint]`
+    /// in a plugin's Cargo.toml) may omit them and stay portable across
+    /// machines; hardcoding them pins the artifact to one toolchain/host.
+    #[serde(default = "default_rustc_version")]
     pub rustc_version: String,
+    #[serde(default = "default_target_triple")]
     pub target_triple: String,
     pub crate_hash: String,
     pub api_hash: String,
+}
+
+fn default_rustc_version() -> String {
+    env!("CORDIS_RUSTC_VERSION").to_string()
+}
+
+fn default_target_triple() -> String {
+    env!("CORDIS_TARGET").to_string()
 }
 
 /// Target triple of the toolchain that compiled this SDK crate (and, by
@@ -415,6 +429,25 @@ mod fingerprint_tests {
         assert!(!fp.target_triple.is_empty(), "target_triple stamped");
         assert_eq!(fp.crate_hash, "crate_test_v1");
         assert_eq!(fp.api_hash, "api_v2");
+    }
+
+    #[test]
+    fn fingerprint_toolchain_fields_default_to_current_build() {
+        // Declarations may omit rustc_version/target_triple (e.g. the
+        // `[package.metadata.cordis.abi_fingerprint]` table); they must
+        // fill in from the toolchain that built this SDK so contracts
+        // stay portable across host machines.
+        let fp: AbiFingerprint =
+            serde_json::from_str(r#"{"crate_hash":"crate_x_v1","api_hash":"api_v2"}"#).unwrap();
+        let built = AbiFingerprint::current_build("crate_x_v1", "api_v2");
+        assert_eq!(fp, built);
+        // Explicit values still win over the defaults.
+        let pinned: AbiFingerprint = serde_json::from_str(
+            r#"{"rustc_version":"rustc 0.0.0","target_triple":"t","crate_hash":"c","api_hash":"a"}"#,
+        )
+        .unwrap();
+        assert_eq!(pinned.rustc_version, "rustc 0.0.0");
+        assert_eq!(pinned.target_triple, "t");
     }
 
     #[test]
