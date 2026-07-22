@@ -4,17 +4,12 @@
 use crate::core::models::{GatePolicy, NodeOutcome};
 use std::collections::{BTreeMap, BTreeSet};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum BackoffPolicy {
+    #[default]
     None,
     Fixed { delay_ms: u64 },
     Exponential { base_ms: u64, max_ms: u64 },
-}
-
-impl Default for BackoffPolicy {
-    fn default() -> Self {
-        Self::None
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -354,5 +349,10 @@ mod tests {
             evaluate_gate(GatePolicy::AtLeast(2), &up, &one_ok_two_fail, &empty),
             GateDecision::CompleteFailure
         );
+    }
+
+    #[test]
+    fn backoff_policy_default_is_none() {
+        assert_eq!(BackoffPolicy::default(), BackoffPolicy::None);
     }
 }

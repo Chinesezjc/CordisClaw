@@ -49,10 +49,10 @@ impl LoadedDylibApi {
 }
 
 pub fn is_dylib_path(path: &Path) -> bool {
-    match path.extension().and_then(|x| x.to_str()) {
-        Some("so") | Some("dylib") | Some("dll") => true,
-        _ => false,
-    }
+    matches!(
+        path.extension().and_then(|x| x.to_str()),
+        Some("so" | "dylib" | "dll")
+    )
 }
 
 pub fn sidecar_json_path(path: &Path) -> PathBuf {

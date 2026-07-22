@@ -60,6 +60,8 @@ pub struct NodeRegistry {
 }
 
 impl PluginRegistry {
+    // 装载登记的全部字段一次性写入；拆结构体只是把 10 个参数换成 10 个字段赋值，不减少调用点耦合。
+    #[expect(clippy::too_many_arguments)]
     pub fn insert_loaded(
         &self,
         plugin_path: String,
@@ -203,6 +205,10 @@ impl PluginRegistry {
             .unwrap_or_else(|poison| poison.into_inner())
             .len()
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 impl NodeRegistry {
@@ -241,6 +247,10 @@ impl NodeRegistry {
         self.nodes.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     pub fn remove_by_plugin(&mut self, plugin_path: &str) {
         self.nodes
             .retain(|_, node| node.plugin_path.as_str() != plugin_path);
@@ -261,5 +271,58 @@ impl NodeRegistry {
             .filter(|(_, node)| node.node_type == NodeType::Task)
             .map(|(fqn, _)| fqn.clone())
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cordis_plugin_sdk::{NodeDoc, PluginDocs};
+
+    fn sample_docs(plugin_path: &str) -> PluginDocs {
+        PluginDocs {
+            plugin_id: plugin_path.replace('/', "_"),
+            plugin_path: plugin_path.to_string(),
+            plugin_version: "0.1.0".to_string(),
+            abi_version: 1,
+            command_name: None,
+            nodes: vec![NodeDoc {
+                id: "n0".to_string(),
+                summary: "test node".to_string(),
+                input_schema: serde_json::json!({"type": "object"}),
+                output_schema: serde_json::json!({"type": "object"}),
+                side_effects: vec![],
+                failure_modes: vec![],
+                node_type: NodeType::Router,
+                agent_accessible: true,
+            }],
+            system_hint: None,
+        }
+    }
+
+    #[test]
+    fn plugin_registry_is_empty_reflects_len() {
+        let registry = PluginRegistry::default();
+        assert!(registry.is_empty());
+        registry.insert_unavailable(
+            "sample/plugin".to_string(),
+            None,
+            true,
+            BTreeSet::new(),
+            PluginUnavailableReason::ArtifactMissing,
+            Vec::new(),
+        );
+        assert!(!registry.is_empty());
+    }
+
+    #[test]
+    fn node_registry_is_empty_reflects_len() {
+        let mut registry = NodeRegistry::default();
+        assert!(registry.is_empty());
+        let docs = sample_docs("sample/plugin");
+        registry
+            .register_from_docs("sample/plugin", &docs)
+            .expect("register nodes");
+        assert!(!registry.is_empty());
     }
 }

@@ -12,16 +12,11 @@ pub const RUST_PLUGIN_ENTRY_SYMBOL: &str = "cordis_plugin_api_rust_v2";
 pub const DEFAULT_ABI_VERSION: u32 = 2;
 
 #[repr(u8)]
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum DylibAbiKind {
+    #[default]
     Rust,
-}
-
-impl Default for DylibAbiKind {
-    fn default() -> Self {
-        Self::Rust
-    }
 }
 
 #[repr(C)]
@@ -137,23 +132,18 @@ impl NodeDoc {
 
 /// Class of execution semantics for a plugin node.
 #[repr(C)]
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum NodeType {
     /// Long-running background service with lifecycle (start/stop).
     Task,
     /// Conditionally routes execution to one of several downstream nodes.
+    #[default]
     Router,
     /// Guards a subgraph behind a policy check.
     Gate,
     /// Terminal node — produces a final output and ends the execution.
     Terminal,
-}
-
-impl Default for NodeType {
-    fn default() -> Self {
-        NodeType::Router
-    }
 }
 
 // P2-5: `#[repr(C)]` on structs containing `String` is misleading. The
@@ -195,14 +185,16 @@ pub fn json_response<T: Serialize>(value: &T) -> PluginResponse {
 pub fn agent_trigger(msg: &str) {
     // Resolve at runtime via dlsym so plugins don't get a hard
     // undefined-symbol dependency on the host binary.
-    type TriggerFn = extern "C" fn(*const std::ffi::c_char);
+    type TriggerFn = unsafe extern "C" fn(*const std::ffi::c_char);
     let ptr = unsafe {
-        libc::dlsym(libc::RTLD_DEFAULT, b"_cordis_agent_trigger\0".as_ptr() as *const _)
+        libc::dlsym(libc::RTLD_DEFAULT, c"_cordis_agent_trigger".as_ptr())
     };
     if !ptr.is_null() {
-        let trigger: TriggerFn = unsafe { std::mem::transmute(ptr) };
         let c_str = std::ffi::CString::new(msg).unwrap();
-        trigger(c_str.as_ptr());
+        unsafe {
+            let trigger: TriggerFn = std::mem::transmute(ptr);
+            trigger(c_str.as_ptr());
+        }
     }
 }
 
@@ -423,6 +415,21 @@ mod fingerprint_tests {
         assert!(!fp.target_triple.is_empty(), "target_triple stamped");
         assert_eq!(fp.crate_hash, "crate_test_v1");
         assert_eq!(fp.api_hash, "api_v2");
+    }
+
+    #[test]
+    fn default_dylib_abi_kind_is_rust() {
+        // Derived `#[default]` on the `Rust` variant must preserve the
+        // previous hand-written `impl Default` behaviour.
+        assert!(matches!(DylibAbiKind::default(), DylibAbiKind::Rust));
+    }
+
+    #[test]
+    fn default_node_type_is_router() {
+        // Derived `#[default]` on the `Router` variant must preserve the
+        // previous hand-written `impl Default` behaviour (used by
+        // `#[serde(default)]` on `NodeDoc::node_type`).
+        assert!(matches!(NodeType::default(), NodeType::Router));
     }
 }
 

@@ -6,6 +6,12 @@ CordisClaw — 基于有色 Petri 网 (CPN) 的契约驱动插件树运行时。
 
 **任何代码修改必须先写 plan，用户批准后再实施。** 不要直接改代码。
 
+**任何代码修改必须补完整的测试。** 新功能配新测试（单测 + 涉及跨模块链路时的集成测试），改行为改断言，修 bug 先补能复现的用例；不允许"测试另立批次"式欠账。
+
+**默认起 10 个命名 teammate 并行工作。** 实施批准后的 plan 时，默认将任务拆给 10 个命名 agent 并行推进（任务本身粒度不足 10 份时按实际拆分）。要求：任务边界切干净；并行改文件时用 worktree 隔离；汇合后由主会话统一验证（cargo build/test/clippy）再落盘。
+
+**任何提交必须保持 `cargo clippy --all-targets -- -D warnings` 通过（零 warning 规范）。** 确需豁免时用带理由注释的 `#[expect(lint)]`，禁止裸 `#[allow]`。
+
 ## 关键文档
 
 修改代码前后应参考：
@@ -78,9 +84,10 @@ cargo build                           # 编译（零 warning）
 cargo test                            # 全部测试
 cargo test --test semantics           # 引擎语义测试
 cargo test --test architecture        # 架构集成测试
-cargo clippy                          # lint（关注新增的 warning）
+cargo clippy --all-targets -- -D warnings  # lint：必须零 warning（warning 即失败）
 ```
 
 ## 提交格式
 
 - 在切分支前确认当前在 `main`
+- 提交信息不带 Co-Authored-By 等 coauthor 尾注

@@ -374,12 +374,9 @@ fn plugin_subtree_surface_kind(path: &str, subtree_root: &str) -> Option<PluginS
         }
     }
 
-    let Some(surface_idx) = segments
+    let surface_idx = segments
         .iter()
-        .position(|segment| matches!(*segment, "src" | "tests" | "docs"))
-    else {
-        return None;
-    };
+        .position(|segment| matches!(*segment, "src" | "tests" | "docs"))?;
     if segments[..surface_idx]
         .iter()
         .any(|segment| matches!(*segment, "src" | "tests" | "docs"))
@@ -661,6 +658,11 @@ impl PluginEditRollback {
     /// Number of backed-up files in this rollback.
     pub fn len(&self) -> usize {
         self.backups.len()
+    }
+
+    /// Whether this rollback holds no file backups.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     pub fn absorb(&mut self, mut other: Self) -> Result<(), RuntimeError> {
@@ -1132,6 +1134,162 @@ pub fn now_ms() -> u128 {
         .unwrap_or(0)
 }
 
+// ---------------------------------------------------------------------------
+// Reserved keyword validation (moved from kernel/planner)
+// ---------------------------------------------------------------------------
+
+pub(crate) fn validate_reserved_child_keyword_identifiers(
+    operations: &[PluginEditOperation],
+    writable_roots: &BTreeSet<String>,
+) -> Result<(), RuntimeError> {
+    let reserved_child_keywords = operations
+        .iter()
+        .filter(|operation| operation.kind == PluginEditOpKind::CreateFile)
+        .filter_map(|operation| normalize_rel_path(&operation.path).ok())
+        .filter(|path| path.ends_with("/Cargo.toml"))
+        .filter_map(|path| {
+            let root = deepest_matching_writable_root(&path, writable_roots)?;
+            let relative = path
+                .strip_prefix(root)?
+                .strip_prefix('/')
+                .and_then(|value| value.strip_suffix("/Cargo.toml"))?;
+            let child_name = relative.rsplit('/').next()?;
+            matches!(child_name, "mod").then_some(child_name.to_string())
+        })
+        .collect::<BTreeSet<_>>();
+
+    if reserved_child_keywords.is_empty() {
+        return Ok(());
+    }
+
+    for operation in operations {
+        if !operation.path.ends_with(".rs") {
+            continue;
+        }
+        let Some(content) = operation.new_content.as_deref() else {
+            continue;
+        };
+        for keyword in &reserved_child_keywords {
+            if contains_raw_reserved_identifier_usage(content, keyword) {
+                return Err(reserved_child_keyword_identifier_error(
+                    &operation.path,
+                    keyword,
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn contains_raw_reserved_identifier_usage(content: &str, keyword: &str) -> bool {
+    let direct_patterns = [
+        format!(" {keyword}:"),
+        format!("({keyword}:"),
+        format!(", {keyword}:"),
+        format!("let {keyword} "),
+        format!("let mut {keyword} "),
+        format!("for {keyword} in "),
+        format!("as {keyword};"),
+        format!("as {keyword},"),
+        format!("as {keyword}\n"),
+        format!("fn {keyword}("),
+        format!("type {keyword} "),
+        format!("const {keyword}:"),
+        format!("static {keyword}:"),
+        format!(" {keyword} ="),
+        format!(" {keyword} @"),
+    ];
+    direct_patterns
+        .iter()
+        .any(|pattern| content.contains(pattern))
+        || contains_raw_member_access(content, keyword)
+}
+
+fn contains_raw_member_access(content: &str, keyword: &str) -> bool {
+    let needle = format!(".{keyword}");
+    let mut haystack = content;
+    while let Some(idx) = haystack.find(&needle) {
+        let suffix = &haystack[idx + needle.len()..];
+        let next = suffix.chars().next();
+        if next.is_none_or(|ch| !(ch.is_ascii_alphanumeric() || ch == '_')) {
+            return true;
+        }
+        haystack = suffix;
+    }
+    false
+}
+
+fn reserved_child_keyword_identifier_error(path: &str, keyword: &str) -> RuntimeError {
+    RuntimeError::LlmResponseInvalid {
+        message: format!(
+            "child plugin path component `{keyword}` is allowed in filesystem paths like `expr/evaluator/{keyword}`, but raw Rust identifier `{keyword}` is invalid in source code; keep the path as `expr/evaluator/{keyword}`, keep PascalCase type names like `ModPlugin` or `ModError` if needed, and rename only the lower-case Rust identifier in {path} to something like `modulo` or `mod_plugin` before retrying"
+        ),
+    }
+}
+
+pub(crate) fn deepest_matching_writable_root<'a>(
+    path: &str,
+    writable_roots: &'a BTreeSet<String>,
+) -> Option<&'a str> {
+    writable_roots
+        .iter()
+        .map(String::as_str)
+        .filter(|root| {
+            path == *root
+                || path
+                    .strip_prefix(root)
+                    .is_some_and(|rest| rest.starts_with('/'))
+        })
+        .max_by_key(|root| root.len())
+}
+
+/// Write `bytes` durably to `path`: write to `<path>.tmp`, fsync, then rename.
+/// After this returns Ok, the file at `path` is either the previous contents
+/// or the new contents — never a truncated partial write. Used by the plugin
+/// iteration edit executor (P0-5) and the rollback journal writer (P0-6).
+pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), RuntimeError> {
+    use std::io::Write;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|err| RuntimeError::Io {
+            path: parent.to_path_buf(),
+            message: err.to_string(),
+        })?;
+    }
+    let tmp_path = match path.file_name() {
+        Some(name) => {
+            let mut owned = name.to_os_string();
+            owned.push(".cordis-tmp");
+            path.with_file_name(owned)
+        }
+        None => {
+            return Err(RuntimeError::Io {
+                path: path.to_path_buf(),
+                message: "atomic_write target has no filename".to_string(),
+            });
+        }
+    };
+    {
+        let mut file = fs::File::create(&tmp_path).map_err(|err| RuntimeError::Io {
+            path: tmp_path.clone(),
+            message: err.to_string(),
+        })?;
+        file.write_all(bytes).map_err(|err| RuntimeError::Io {
+            path: tmp_path.clone(),
+            message: err.to_string(),
+        })?;
+        file.sync_all().map_err(|err| RuntimeError::Io {
+            path: tmp_path.clone(),
+            message: err.to_string(),
+        })?;
+    }
+    fs::rename(&tmp_path, path).map_err(|err| RuntimeError::Io {
+        path: path.to_path_buf(),
+        message: format!("rename {} -> {} failed: {err}", tmp_path.display(), path.display()),
+    })?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1533,6 +1691,19 @@ mod tests {
         assert_eq!(acc.len(), 2);
     }
 
+    #[test]
+    fn rollback_is_empty_reflects_backup_count() {
+        let workspace = TempDir::new().unwrap();
+        let empty = PluginEditRollback::empty(workspace.path());
+        assert!(empty.is_empty());
+        let one = PluginEditRollback::single_backup(
+            workspace.path(),
+            "plugins/demo/src/lib.rs",
+            Some(b"orig".to_vec()),
+        );
+        assert!(!one.is_empty());
+    }
+
     /// P1-29 spirit / P0-5 spirit: an edit that deletes a file records
     /// a `None` original (i.e. "file did not exist") vs. a `Some(...)`
     /// original (i.e. "restore these bytes"). Rollback preserves both
@@ -1567,160 +1738,4 @@ mod tests {
         assert_eq!(fs::read(&existing).unwrap(), b"before");
         assert!(!fresh.exists(), "created file should be removed on rollback");
     }
-}
-
-// ---------------------------------------------------------------------------
-// Reserved keyword validation (moved from kernel/planner)
-// ---------------------------------------------------------------------------
-
-pub(crate) fn validate_reserved_child_keyword_identifiers(
-    operations: &[PluginEditOperation],
-    writable_roots: &BTreeSet<String>,
-) -> Result<(), RuntimeError> {
-    let reserved_child_keywords = operations
-        .iter()
-        .filter(|operation| operation.kind == PluginEditOpKind::CreateFile)
-        .filter_map(|operation| normalize_rel_path(&operation.path).ok())
-        .filter(|path| path.ends_with("/Cargo.toml"))
-        .filter_map(|path| {
-            let root = deepest_matching_writable_root(&path, writable_roots)?;
-            let relative = path
-                .strip_prefix(root)?
-                .strip_prefix('/')
-                .and_then(|value| value.strip_suffix("/Cargo.toml"))?;
-            let child_name = relative.rsplit('/').next()?;
-            matches!(child_name, "mod").then_some(child_name.to_string())
-        })
-        .collect::<BTreeSet<_>>();
-
-    if reserved_child_keywords.is_empty() {
-        return Ok(());
-    }
-
-    for operation in operations {
-        if !operation.path.ends_with(".rs") {
-            continue;
-        }
-        let Some(content) = operation.new_content.as_deref() else {
-            continue;
-        };
-        for keyword in &reserved_child_keywords {
-            if contains_raw_reserved_identifier_usage(content, keyword) {
-                return Err(reserved_child_keyword_identifier_error(
-                    &operation.path,
-                    keyword,
-                ));
-            }
-        }
-    }
-
-    Ok(())
-}
-
-fn contains_raw_reserved_identifier_usage(content: &str, keyword: &str) -> bool {
-    let direct_patterns = [
-        format!(" {keyword}:"),
-        format!("({keyword}:"),
-        format!(", {keyword}:"),
-        format!("let {keyword} "),
-        format!("let mut {keyword} "),
-        format!("for {keyword} in "),
-        format!("as {keyword};"),
-        format!("as {keyword},"),
-        format!("as {keyword}\n"),
-        format!("fn {keyword}("),
-        format!("type {keyword} "),
-        format!("const {keyword}:"),
-        format!("static {keyword}:"),
-        format!(" {keyword} ="),
-        format!(" {keyword} @"),
-    ];
-    direct_patterns
-        .iter()
-        .any(|pattern| content.contains(pattern))
-        || contains_raw_member_access(content, keyword)
-}
-
-fn contains_raw_member_access(content: &str, keyword: &str) -> bool {
-    let needle = format!(".{keyword}");
-    let mut haystack = content;
-    while let Some(idx) = haystack.find(&needle) {
-        let suffix = &haystack[idx + needle.len()..];
-        let next = suffix.chars().next();
-        if next.is_none_or(|ch| !(ch.is_ascii_alphanumeric() || ch == '_')) {
-            return true;
-        }
-        haystack = suffix;
-    }
-    false
-}
-
-fn reserved_child_keyword_identifier_error(path: &str, keyword: &str) -> RuntimeError {
-    RuntimeError::LlmResponseInvalid {
-        message: format!(
-            "child plugin path component `{keyword}` is allowed in filesystem paths like `expr/evaluator/{keyword}`, but raw Rust identifier `{keyword}` is invalid in source code; keep the path as `expr/evaluator/{keyword}`, keep PascalCase type names like `ModPlugin` or `ModError` if needed, and rename only the lower-case Rust identifier in {path} to something like `modulo` or `mod_plugin` before retrying"
-        ),
-    }
-}
-
-pub(crate) fn deepest_matching_writable_root<'a>(
-    path: &str,
-    writable_roots: &'a BTreeSet<String>,
-) -> Option<&'a str> {
-    writable_roots
-        .iter()
-        .map(String::as_str)
-        .filter(|root| {
-            path == *root
-                || path
-                    .strip_prefix(root)
-                    .is_some_and(|rest| rest.starts_with('/'))
-        })
-        .max_by_key(|root| root.len())
-}
-
-/// Write `bytes` durably to `path`: write to `<path>.tmp`, fsync, then rename.
-/// After this returns Ok, the file at `path` is either the previous contents
-/// or the new contents — never a truncated partial write. Used by the plugin
-/// iteration edit executor (P0-5) and the rollback journal writer (P0-6).
-pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), RuntimeError> {
-    use std::io::Write;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|err| RuntimeError::Io {
-            path: parent.to_path_buf(),
-            message: err.to_string(),
-        })?;
-    }
-    let tmp_path = match path.file_name() {
-        Some(name) => {
-            let mut owned = name.to_os_string();
-            owned.push(".cordis-tmp");
-            path.with_file_name(owned)
-        }
-        None => {
-            return Err(RuntimeError::Io {
-                path: path.to_path_buf(),
-                message: "atomic_write target has no filename".to_string(),
-            });
-        }
-    };
-    {
-        let mut file = fs::File::create(&tmp_path).map_err(|err| RuntimeError::Io {
-            path: tmp_path.clone(),
-            message: err.to_string(),
-        })?;
-        file.write_all(bytes).map_err(|err| RuntimeError::Io {
-            path: tmp_path.clone(),
-            message: err.to_string(),
-        })?;
-        file.sync_all().map_err(|err| RuntimeError::Io {
-            path: tmp_path.clone(),
-            message: err.to_string(),
-        })?;
-    }
-    fs::rename(&tmp_path, path).map_err(|err| RuntimeError::Io {
-        path: path.to_path_buf(),
-        message: format!("rename {} -> {} failed: {err}", tmp_path.display(), path.display()),
-    })?;
-    Ok(())
 }

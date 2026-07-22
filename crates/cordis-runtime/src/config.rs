@@ -123,13 +123,13 @@ impl RuntimeConfig {
         let plugin_dir = config_dir.join("plugins");
         if plugin_dir.exists() {
             let mut plugin_configs = BTreeMap::new();
-            let mut entries = fs::read_dir(&plugin_dir).map_err(|e| RuntimeError::Io {
+            let entries = fs::read_dir(&plugin_dir).map_err(|e| RuntimeError::Io {
                 path: plugin_dir.clone(),
                 message: e.to_string(),
             })?;
 
             let mut paths = Vec::new();
-            while let Some(entry) = entries.next() {
+            for entry in entries {
                 let entry = entry.map_err(|e| RuntimeError::Io {
                     path: plugin_dir.clone(),
                     message: e.to_string(),

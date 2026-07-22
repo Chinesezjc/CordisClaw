@@ -926,6 +926,12 @@ impl std::fmt::Debug for ServiceRegistry {
     }
 }
 
+impl Default for ServiceRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ServiceRegistry {
     pub fn new() -> Self {
         Self {
@@ -1122,6 +1128,10 @@ impl ServiceRegistry {
             .unwrap_or_else(|poison| poison.into_inner())
             .len()
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 impl Drop for ServiceRegistry {
@@ -1192,6 +1202,16 @@ mod tests {
         // Stopping "root" should stop root and root/child, but not "other".
         registry.stop_plugin_services("root");
         assert_eq!(registry.len(), 1);
+    }
+
+    #[test]
+    fn registry_is_empty_reflects_len() {
+        let registry = ServiceRegistry::default();
+        assert!(registry.is_empty());
+        registry
+            .start_service("root", "svc", Box::new(CounterService::new()))
+            .expect("start");
+        assert!(!registry.is_empty());
     }
 
     #[test]
