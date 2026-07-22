@@ -56,12 +56,7 @@ fn docs_value() -> cordis_plugin_sdk::PluginDocs {
 }
 
 fn abi_fingerprint_value() -> AbiFingerprint {
-    AbiFingerprint {
-        rustc_version: "1.85.1".to_string(),
-        target_triple: "x86_64-unknown-linux-gnu".to_string(),
-        crate_hash: "crate_expr_factorial_v1".to_string(),
-        api_hash: "api_v2".to_string(),
-    }
+    AbiFingerprint::current_build("crate_expr_factorial_v1", "api_v2")
 }
 
 fn api_handle(req: PluginRequest) -> PluginResponse {

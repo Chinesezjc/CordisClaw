@@ -520,7 +520,7 @@ cd fixtures/plugins/expr/lexer && cargo test --lib  # excluded, external tests o
 
 - [x] **P2-11 空 vision 子目录清理** — `fixtures/plugins/vision/vision-ocr/` 和 `vision-describe/` 只包含 docs 存根、无 Cargo.toml/src；已删除。vision plugin 的 `children = []` 保留，不再有"半吊子子插件"的目录。
 - [x] **P2-2 抽 `cordis-net` 共享 crate** — 新 `fixtures/plugins/_net/` (rlib, plugin workspace 内 `exclude` 保证 loader 不当它是 plugin)；`web` 和 `vision` 都改成 `cordis_net::{check_url_safety, ip_is_forbidden}`。SSRF 单测 3 项移入 `_net`，两处原地拷贝彻底消除。
-- [x] **P2-13 fingerprint 编译时自动填充** — SDK 加 `build.rs` 通过 `cargo:rustc-env` stamp `CORDIS_RUSTC_VERSION` (从 `rustc --version`) 和 `CORDIS_TARGET`；SDK 加 `AbiFingerprint::current_build(crate_hash, api_hash)` 帮手，plugin 只需提供 plugin-specific hash。fixtures 里的 hard-coded fingerprint 保留（迁移需同步 index.json 的 fingerprint 缓存 + Cargo.toml metadata，动作太大），但注释指路：新插件应用 `current_build()`。SDK 新增 1 个 test 验证 stamp 生效。
+- [x] **P2-13 fingerprint 编译时自动填充** — SDK 加 `build.rs` 通过 `cargo:rustc-env` stamp `CORDIS_RUSTC_VERSION` (从 `rustc --version`) 和 `CORDIS_TARGET`；SDK 加 `AbiFingerprint::current_build(crate_hash, api_hash)` 帮手，plugin 只需提供 plugin-specific hash。SDK 新增 1 个 test 验证 stamp 生效。（fixtures 的硬编码指纹当时保留，后续已全量迁移 —— 见下方 P2-13 fixture 迁移条目。）
 
 **至此 review 计划的所有 findings 全部处理完毕。**
 
@@ -549,7 +549,7 @@ cd fixtures/plugins/expr/lexer && cargo test --lib  # excluded, external tests o
 - [x] **P2-29 rebuild_plugin_workspace 加 strip_proxy_envs** — 与 `run_command` 对齐；企业代理下不再挂起。
 - [x] **P2-30 rebuild 加 build timeout** — 新 helper `run_command_with_timeout` (20min 默认，`CORDIS_BUILD_TIMEOUT_SECS` 覆盖) + poll-based kill+wait；死循环 build.rs 不再挂死 iteration 管道。
 - [x] **P2-12 QQ 硬编码路径**（部分修）— 新 `runtime_config_path()` 从 `$CORDIS_FIXTURES_ROOT` 派生；env 未设置时回退到历史 `/root/CordisClaw/...`。
-- [ ] **P2-13 fingerprint per-build** — 需要 SDK build.rs + fixture 全量重构（每个 plugin 用 const 而非硬编码字符串）；改动面太大，留待后续。
+- [x] **P2-13 fingerprint per-build**（fixture 迁移完成）— 21 个 fixture 插件的 `abi_fingerprint_value()` 全部从硬编码 `AbiFingerprint { rustc_version: "1.85.1", target_triple: "x86_64-unknown-linux-gnu", ... }` 迁移到 `AbiFingerprint::current_build(crate_hash, api_hash)`；Cargo.toml 的 `[package.metadata.cordis.abi_fingerprint]` 删除 rustc_version/target_triple 两行（SDK 的 `AbiFingerprint` 加 serde default，缺省时填当前工具链值，显式声明仍生效）；host.rs 两处插件脚手架模板与 agent.rs 的插件创建 prompt 同步。修复动机：硬编码 linux triple 导致 macOS 等非 linux-x86 宿主上所有 dylib 插件被 target_triple 预检拒载（`Unavailable(AbiMismatch)`），serve 无法冷启动。SDK 补 serde-default 单测；macOS (aarch64-apple-darwin) 实机 serve + invoke 验证通过。
 
 **S 批 (fixture / naming / misc):**
 

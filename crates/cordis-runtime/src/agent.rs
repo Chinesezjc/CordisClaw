@@ -3171,10 +3171,10 @@ Cargo.toml MUST include these sections:\n\
     declared_nodes = [...]        — list every node_id your plugin exports\n\
     children = []                 — (unless the plugin has child plugins)\n\
   [package.metadata.cordis.abi_fingerprint]\n\
-    rustc_version = \"1.85.1\"\n\
-    target_triple = \"x86_64-unknown-linux-gnu\"\n\
     crate_hash = \"crate_<name>_v1\"\n\
     api_hash = \"api_v2\"           — MUST be \"api_v2\" (same as all other plugins)\n\
+    (do NOT declare rustc_version/target_triple — they default to the\n\
+     current toolchain; in code use AbiFingerprint::current_build)\n\
 \n\
 Plugins workspace membership:\n\
   After creating a new plugin, add \"<name>\" to the `members` list in plugins/Cargo.toml.\n\
