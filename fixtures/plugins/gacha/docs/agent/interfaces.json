@@ -7,19 +7,22 @@
   "nodes": [
     {
       "id": "gacha_entry",
-      "summary": "Genshin Impact wish simulator. Pull on character/weapon/standard banners with accurate pity and 50/50 mechanics.",
+      "summary": "原神抽卡模拟器。支持自定义UP池，完整角色库，精准保底与50/50机制。\n命令: pull [N] | status | banner | setbanner <5星> <4星> <4星> <4星> | list | reset",
       "input_schema": {
         "properties": {
-          "banner": {
-            "description": "character(default) | weapon | standard",
-            "type": "string"
+          "args": {
+            "description": "setbanner参数: [5星, 4星1, 4星2, 4星3]",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
           },
           "cmd": {
-            "description": "pull | status",
+            "description": "pull | status | banner | setbanner | list | reset",
             "type": "string"
           },
           "count": {
-            "description": "1-100, default 1",
+            "description": "抽数 1-100, 默认1",
             "type": "integer"
           }
         },
@@ -63,18 +66,20 @@
       "side_effects": [
         "accurate Genshin pity model",
         "soft pity starts at 73",
-        "50/50 system"
+        "50/50 system",
+        "custom banner support",
+        "complete character roster"
       ],
       "failure_modes": [
-        "invalid banner",
-        "count out of range"
+        "invalid count",
+        "unknown character name"
       ],
       "node_type": "router",
       "agent_accessible": true
     },
     {
       "id": "gacha_status",
-      "summary": "Check current gacha pity counters and statistics.",
+      "summary": "查看当前保底计数、UP池信息及抽卡统计。",
       "input_schema": {
         "properties": {
           "cmd": {
@@ -111,7 +116,7 @@
         "type": "object"
       },
       "side_effects": [
-        "reads current pity state"
+        "reads current pity + banner state"
       ],
       "failure_modes": [],
       "node_type": "router",
