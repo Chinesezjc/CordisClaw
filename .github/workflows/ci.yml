@@ -68,4 +68,10 @@ jobs:
       # （已在 x86_64-linux 实测复现 "rename staging -> target failed"）。
       # 代码级修复（按测试隔离 snapshot root）待办，闭合后可去掉此串行开关。
       - name: test
-        run: cargo test --locked -- --test-threads=1
+        run: |
+          set -o pipefail
+          cargo test --locked -- --test-threads=1 2>&1 | tee /tmp/test.log || {
+            echo "::error::failed tests: $(grep -E '^test .* FAILED' /tmp/test.log | head -c 600 | tr '\n' ' ')"
+            echo "::error::first panic: $(grep -m1 -A2 'panicked at' /tmp/test.log | tr '\n' ' ' | head -c 900)"
+            exit 1
+          }
