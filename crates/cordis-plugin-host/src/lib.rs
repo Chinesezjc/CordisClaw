@@ -514,8 +514,10 @@ mod tests {
     }
 
     /// Absolute path to a real, dlopen-able artifact shipped in the repo.
+    /// prepare-artifacts 按宿主平台命名产物（Linux `time.so` / macOS
+    /// `time.dylib`），必须用 DLL_SUFFIX 拼接。
     fn time_dylib_path() -> PathBuf {
-        real_fixtures_root().join("artifacts/time.dylib")
+        real_fixtures_root().join(format!("artifacts/time{}", std::env::consts::DLL_SUFFIX))
     }
 
     /// Minimal PluginDocs JSON exposing a single node id.
