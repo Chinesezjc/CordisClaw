@@ -440,4 +440,48 @@ mod panic_isolation_tests {
         .expect("no panic");
         assert_eq!(resp.payload, r#"{"ok":true}"#);
     }
+
+    // panic_message: a `String` payload (as produced by `panic!("{}", s)`
+    // with a runtime-formatted argument) must be surfaced verbatim. This
+    // hits the `downcast_ref::<String>()` arm, distinct from the
+    // `&'static str` arm covered by `handle_panic_is_caught_and_reported`.
+    #[test]
+    fn panic_message_extracts_owned_string() {
+        let payload: Box<dyn std::any::Any + Send> = Box::new(String::from("owned panic text"));
+        assert_eq!(panic_message(&payload), "owned panic text");
+    }
+
+    // panic_message: a payload that is neither `&'static str` nor `String`
+    // must fall through to the placeholder rather than panic. Hits the
+    // final `else` arm.
+    #[test]
+    fn panic_message_handles_non_string_payload() {
+        let payload: Box<dyn std::any::Any + Send> = Box::new(42u32);
+        assert_eq!(panic_message(&payload), "<non-string panic payload>");
+    }
+
+    // A `String`-payload panic routed through the full guard must still be
+    // caught and tagged with the plugin path and message text.
+    #[test]
+    fn handle_string_panic_is_caught() {
+        fn boom(_: PluginRequest) -> PluginResponse {
+            let detail = "dynamic".to_string();
+            panic!("{detail} panic value")
+        }
+        let err = call_handle_catch_unwind(
+            "test/stringpanic",
+            boom,
+            PluginRequest {
+                payload: "{}".to_string(),
+            },
+        )
+        .expect_err("panic must convert to Err");
+        match err {
+            RuntimeError::InvalidArgument { message } => {
+                assert!(message.contains("dynamic panic value"), "msg={message}");
+                assert!(message.contains("test/stringpanic"), "msg={message}");
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
 }

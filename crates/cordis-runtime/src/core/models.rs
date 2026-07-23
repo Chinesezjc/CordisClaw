@@ -194,3 +194,86 @@ pub enum GatePolicy {
     FirstCompleted,
     AtLeast(usize),
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Exercises `default_required` via serde: `required` omitted must
+    // deserialize to `true`, and `grants` omitted to an empty vec.
+    #[test]
+    fn child_plugin_spec_defaults_required_true_and_empty_grants() {
+        let spec: ChildPluginSpec =
+            serde_json::from_str(r#"{"source": "child"}"#).expect("deserialize ChildPluginSpec");
+        assert_eq!(spec.source, "child");
+        assert!(spec.required, "default_required must yield true");
+        assert!(spec.grants.is_empty(), "grants must default to empty");
+    }
+
+    // Explicit `required: false` must override the default.
+    #[test]
+    fn child_plugin_spec_required_can_be_overridden() {
+        let spec: ChildPluginSpec =
+            serde_json::from_str(r#"{"source": "child", "required": false}"#)
+                .expect("deserialize ChildPluginSpec");
+        assert!(!spec.required);
+    }
+
+    // Exercises `default_artifact_index_schema_version`: omitting
+    // `schema_version` must yield `ARTIFACT_INDEX_SCHEMA_VERSION`.
+    #[test]
+    fn artifact_index_defaults_schema_version() {
+        let index: ArtifactIndex = serde_json::from_str(
+            r#"{"generated_at": "now", "entries": []}"#,
+        )
+        .expect("deserialize ArtifactIndex");
+        assert_eq!(index.schema_version, ARTIFACT_INDEX_SCHEMA_VERSION);
+        assert_eq!(index.schema_version, 2);
+        assert!(index.topo_order.is_empty());
+    }
+
+    // A supplied `schema_version` must be preserved (default fn not called).
+    #[test]
+    fn artifact_index_preserves_explicit_schema_version() {
+        let index: ArtifactIndex = serde_json::from_str(
+            r#"{"schema_version": 9, "generated_at": "now", "entries": []}"#,
+        )
+        .expect("deserialize ArtifactIndex");
+        assert_eq!(index.schema_version, 9);
+    }
+
+    // Exercises `default_artifact_kind`: omitting `artifact_kind` on an
+    // entry must yield `ArtifactKind::Json`, and omitting `required`
+    // must yield `true`.
+    #[test]
+    fn artifact_index_entry_defaults_artifact_kind_json_and_required_true() {
+        let entry: ArtifactIndexEntry = serde_json::from_str(
+            r#"{
+                "plugin_path": "p",
+                "version": "0.1.0",
+                "abi_fingerprint": {
+                    "rustc_version": "rustc",
+                    "target_triple": "triple",
+                    "crate_hash": "c",
+                    "api_hash": "api_v2"
+                },
+                "artifact_path": "p.json",
+                "sha256": "deadbeef",
+                "built_at": "now",
+                "docs": {
+                    "plugin_id": "p",
+                    "plugin_path": "p",
+                    "plugin_version": "0.1.0",
+                    "abi_version": 2,
+                    "nodes": []
+                },
+                "build_fingerprint": "bf"
+            }"#,
+        )
+        .expect("deserialize ArtifactIndexEntry");
+        assert_eq!(entry.artifact_kind, ArtifactKind::Json);
+        assert!(entry.required, "default_required must yield true for entry");
+        assert!(entry.parent.is_none());
+        assert!(entry.exports.is_empty());
+    }
+}

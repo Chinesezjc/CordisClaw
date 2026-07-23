@@ -277,6 +277,7 @@ impl NodeRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::models::AbiFingerprint;
     use cordis_plugin_sdk::{NodeDoc, PluginDocs};
 
     fn sample_docs(plugin_path: &str) -> PluginDocs {
@@ -300,6 +301,55 @@ mod tests {
         }
     }
 
+    // Docs carrying a mix of node types, for exercising `task_node_fqns`
+    // and multi-node registration.
+    fn docs_with_nodes(plugin_path: &str, nodes: &[(&str, NodeType)]) -> PluginDocs {
+        PluginDocs {
+            plugin_id: plugin_path.replace('/', "_"),
+            plugin_path: plugin_path.to_string(),
+            plugin_version: "0.1.0".to_string(),
+            abi_version: 1,
+            command_name: None,
+            nodes: nodes
+                .iter()
+                .map(|(id, node_type)| NodeDoc {
+                    id: (*id).to_string(),
+                    summary: "n".to_string(),
+                    input_schema: serde_json::json!({"type": "object"}),
+                    output_schema: serde_json::json!({"type": "object"}),
+                    side_effects: vec![],
+                    failure_modes: vec![],
+                    node_type: *node_type,
+                    agent_accessible: true,
+                })
+                .collect(),
+            system_hint: None,
+        }
+    }
+
+    fn sample_fingerprint() -> AbiFingerprint {
+        AbiFingerprint {
+            rustc_version: "rustc-test".to_string(),
+            target_triple: "test-triple".to_string(),
+            crate_hash: "crate_test_v1".to_string(),
+            api_hash: "api_v2".to_string(),
+        }
+    }
+
+    fn insert_sample_loaded(registry: &PluginRegistry, plugin_path: &str) {
+        registry.insert_loaded(
+            plugin_path.to_string(),
+            None,
+            true,
+            BTreeSet::new(),
+            sample_docs(plugin_path),
+            PathBuf::from(format!("/tmp/{}.dylib", plugin_path.replace('/', "_"))),
+            ArtifactKind::Dylib,
+            sample_fingerprint(),
+            None,
+        );
+    }
+
     #[test]
     fn plugin_registry_is_empty_reflects_len() {
         let registry = PluginRegistry::default();
@@ -315,6 +365,131 @@ mod tests {
         assert!(!registry.is_empty());
     }
 
+    // insert_loaded stores a fully-populated Loaded entry; get returns a clone
+    // whose fields round-trip. iter reflects the same set; len counts entries.
+    #[test]
+    fn insert_loaded_populates_entry_and_iter() {
+        let registry = PluginRegistry::default();
+        insert_sample_loaded(&registry, "loaded/one");
+        insert_sample_loaded(&registry, "loaded/two");
+
+        assert_eq!(registry.len(), 2);
+        let plugin = registry.get("loaded/one").expect("entry present");
+        assert!(matches!(plugin.load_result, PluginLoadResult::Loaded));
+        assert!(plugin.docs.is_some());
+        assert_eq!(plugin.artifact_kind, Some(ArtifactKind::Dylib));
+        assert!(plugin.abi_fingerprint.is_some());
+        assert!(plugin.fingerprint_diff.is_empty());
+
+        let paths: Vec<String> = registry.iter().map(|(path, _)| path).collect();
+        assert_eq!(paths, vec!["loaded/one", "loaded/two"]);
+        assert!(registry.get("missing").is_none());
+    }
+
+    // mark_unavailable flips a Loaded entry to Unavailable and clears all the
+    // artifact-derived fields (docs / path / kind / fingerprint / diff).
+    #[test]
+    fn mark_unavailable_clears_artifact_fields() {
+        let registry = PluginRegistry::default();
+        insert_sample_loaded(&registry, "flip/me");
+
+        registry.mark_unavailable("flip/me", PluginUnavailableReason::InitFailed);
+
+        let plugin = registry.get("flip/me").expect("still present");
+        assert!(matches!(
+            plugin.load_result,
+            PluginLoadResult::Unavailable(PluginUnavailableReason::InitFailed)
+        ));
+        assert!(plugin.docs.is_none());
+        assert!(plugin.artifact_path.is_none());
+        assert!(plugin.artifact_kind.is_none());
+        assert!(plugin.abi_fingerprint.is_none());
+        assert!(plugin.execution.is_none());
+        assert!(plugin.fingerprint_diff.is_empty());
+    }
+
+    // mark_unavailable on an unknown path is a no-op (the `if let` guard must
+    // not insert anything).
+    #[test]
+    fn mark_unavailable_on_unknown_is_noop() {
+        let registry = PluginRegistry::default();
+        registry.mark_unavailable("nope", PluginUnavailableReason::InitFailed);
+        assert!(registry.is_empty());
+    }
+
+    // mark_runtime_unavailable sets the reason and records the fingerprint
+    // diff while (unlike mark_unavailable) leaving other fields untouched.
+    #[test]
+    fn mark_runtime_unavailable_records_diff() {
+        let registry = PluginRegistry::default();
+        insert_sample_loaded(&registry, "runtime/bad");
+
+        registry.mark_runtime_unavailable(
+            "runtime/bad",
+            PluginUnavailableReason::AbiMismatch,
+            vec!["api_hash:api_v2!=api_v3".to_string()],
+        );
+
+        let plugin = registry.get("runtime/bad").expect("present");
+        assert!(matches!(
+            plugin.load_result,
+            PluginLoadResult::Unavailable(PluginUnavailableReason::AbiMismatch)
+        ));
+        assert_eq!(plugin.fingerprint_diff, vec!["api_hash:api_v2!=api_v3"]);
+    }
+
+    #[test]
+    fn mark_runtime_unavailable_on_unknown_is_noop() {
+        let registry = PluginRegistry::default();
+        registry.mark_runtime_unavailable(
+            "nope",
+            PluginUnavailableReason::AbiMismatch,
+            vec!["x".to_string()],
+        );
+        assert!(registry.is_empty());
+    }
+
+    // reload_plugin_entry returns true and re-marks a previously-unavailable
+    // entry as Loaded, refreshing docs / fingerprint and clearing the diff.
+    #[test]
+    fn reload_plugin_entry_updates_existing_returns_true() {
+        let registry = PluginRegistry::default();
+        registry.insert_unavailable(
+            "reload/me".to_string(),
+            None,
+            true,
+            BTreeSet::new(),
+            PluginUnavailableReason::SymbolMissing,
+            vec!["stale-diff".to_string()],
+        );
+
+        let ok = registry.reload_plugin_entry(
+            "reload/me",
+            sample_docs("reload/me"),
+            sample_fingerprint(),
+        );
+        assert!(ok, "reload of existing entry must return true");
+
+        let plugin = registry.get("reload/me").expect("present");
+        assert!(matches!(plugin.load_result, PluginLoadResult::Loaded));
+        assert!(plugin.docs.is_some());
+        assert_eq!(plugin.abi_fingerprint, Some(sample_fingerprint()));
+        assert!(plugin.fingerprint_diff.is_empty());
+    }
+
+    // reload_plugin_entry returns false for a path that was never registered.
+    #[test]
+    fn reload_plugin_entry_missing_returns_false() {
+        let registry = PluginRegistry::default();
+        let ok = registry.reload_plugin_entry(
+            "never/registered",
+            sample_docs("never/registered"),
+            sample_fingerprint(),
+        );
+        assert!(!ok);
+        assert!(registry.is_empty());
+    }
+
     #[test]
     fn node_registry_is_empty_reflects_len() {
         let mut registry = NodeRegistry::default();
@@ -324,5 +499,109 @@ mod tests {
             .register_from_docs("sample/plugin", &docs)
             .expect("register nodes");
         assert!(!registry.is_empty());
+    }
+
+    // register_from_docs builds fqns as "{plugin_path}::{node_id}"; get and
+    // contains locate them; len counts each declared node.
+    #[test]
+    fn node_registry_get_and_contains() {
+        let mut registry = NodeRegistry::default();
+        let docs = docs_with_nodes(
+            "svc/plug",
+            &[("a", NodeType::Router), ("b", NodeType::Task)],
+        );
+        registry
+            .register_from_docs("svc/plug", &docs)
+            .expect("register");
+
+        assert_eq!(registry.len(), 2);
+        assert!(registry.contains("svc/plug::a"));
+        assert!(!registry.contains("svc/plug::missing"));
+
+        let node = registry.get("svc/plug::b").expect("node present");
+        assert_eq!(node.plugin_path, "svc/plug");
+        assert_eq!(node.node_id, "b");
+        assert_eq!(node.node_type, NodeType::Task);
+        assert_eq!(node.node_fqn, "svc/plug::b");
+        assert!(registry.get("svc/plug::missing").is_none());
+
+        // iter yields all registered nodes.
+        let count = registry.iter().count();
+        assert_eq!(count, 2);
+    }
+
+    // Two plugins declaring the same fqn must surface NodeFqnConflict with
+    // both offending plugin paths.
+    #[test]
+    fn register_from_docs_detects_fqn_conflict() {
+        let mut registry = NodeRegistry::default();
+        // Both plugins are keyed as "shared" so their node fqns collide.
+        let first = docs_with_nodes("shared", &[("dup", NodeType::Router)]);
+        registry
+            .register_from_docs("shared", &first)
+            .expect("first registration ok");
+
+        let second = docs_with_nodes("shared", &[("dup", NodeType::Router)]);
+        let err = registry
+            .register_from_docs("shared", &second)
+            .expect_err("duplicate fqn must conflict");
+        match err {
+            RuntimeError::NodeFqnConflict {
+                node_fqn,
+                first,
+                second,
+            } => {
+                assert_eq!(node_fqn, "shared::dup");
+                assert_eq!(first, "shared");
+                assert_eq!(second, "shared");
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    // remove_by_plugin drops exactly the nodes owned by the given plugin and
+    // leaves other plugins' nodes intact.
+    #[test]
+    fn remove_by_plugin_drops_only_matching_nodes() {
+        let mut registry = NodeRegistry::default();
+        registry
+            .register_from_docs("keep", &docs_with_nodes("keep", &[("k", NodeType::Router)]))
+            .expect("register keep");
+        registry
+            .register_from_docs(
+                "drop",
+                &docs_with_nodes("drop", &[("d1", NodeType::Router), ("d2", NodeType::Task)]),
+            )
+            .expect("register drop");
+        assert_eq!(registry.len(), 3);
+
+        registry.remove_by_plugin("drop");
+
+        assert_eq!(registry.len(), 1);
+        assert!(registry.contains("keep::k"));
+        assert!(!registry.contains("drop::d1"));
+        assert!(!registry.contains("drop::d2"));
+    }
+
+    // task_node_fqns returns fqns of Task nodes only, across all plugins.
+    #[test]
+    fn task_node_fqns_filters_task_type() {
+        let mut registry = NodeRegistry::default();
+        registry
+            .register_from_docs(
+                "p1",
+                &docs_with_nodes(
+                    "p1",
+                    &[("r", NodeType::Router), ("t1", NodeType::Task)],
+                ),
+            )
+            .expect("register p1");
+        registry
+            .register_from_docs("p2", &docs_with_nodes("p2", &[("t2", NodeType::Task)]))
+            .expect("register p2");
+
+        let mut fqns = registry.task_node_fqns();
+        fqns.sort();
+        assert_eq!(fqns, vec!["p1::t1".to_string(), "p2::t2".to_string()]);
     }
 }
