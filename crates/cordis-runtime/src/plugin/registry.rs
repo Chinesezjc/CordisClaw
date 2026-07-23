@@ -590,10 +590,7 @@ mod tests {
         registry
             .register_from_docs(
                 "p1",
-                &docs_with_nodes(
-                    "p1",
-                    &[("r", NodeType::Router), ("t1", NodeType::Task)],
-                ),
+                &docs_with_nodes("p1", &[("r", NodeType::Router), ("t1", NodeType::Task)]),
             )
             .expect("register p1");
         registry

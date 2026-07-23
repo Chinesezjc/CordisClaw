@@ -223,10 +223,9 @@ mod tests {
     // `schema_version` must yield `ARTIFACT_INDEX_SCHEMA_VERSION`.
     #[test]
     fn artifact_index_defaults_schema_version() {
-        let index: ArtifactIndex = serde_json::from_str(
-            r#"{"generated_at": "now", "entries": []}"#,
-        )
-        .expect("deserialize ArtifactIndex");
+        let index: ArtifactIndex =
+            serde_json::from_str(r#"{"generated_at": "now", "entries": []}"#)
+                .expect("deserialize ArtifactIndex");
         assert_eq!(index.schema_version, ARTIFACT_INDEX_SCHEMA_VERSION);
         assert_eq!(index.schema_version, 2);
         assert!(index.topo_order.is_empty());
@@ -235,10 +234,9 @@ mod tests {
     // A supplied `schema_version` must be preserved (default fn not called).
     #[test]
     fn artifact_index_preserves_explicit_schema_version() {
-        let index: ArtifactIndex = serde_json::from_str(
-            r#"{"schema_version": 9, "generated_at": "now", "entries": []}"#,
-        )
-        .expect("deserialize ArtifactIndex");
+        let index: ArtifactIndex =
+            serde_json::from_str(r#"{"schema_version": 9, "generated_at": "now", "entries": []}"#)
+                .expect("deserialize ArtifactIndex");
         assert_eq!(index.schema_version, 9);
     }
 
