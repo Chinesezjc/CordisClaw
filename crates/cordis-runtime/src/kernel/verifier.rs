@@ -672,12 +672,15 @@ fn collect_source_tree(
 #[cfg(test)]
 mod tests {
     use super::{
-        hash_source_tree, resolve_plugin_fixtures_root, run_shell_command, CommandVerifier,
-        VerificationProfile, VerificationRunner, VerificationStageKind, VerificationStageStatus,
+        collect_source_tree, discover_rust_workspace_manifest, hash_source_tree,
+        normalize_optional_command, resolve_plugin_fixtures_root, run_shell_command, shell_quote,
+        CommandVerifier, PluginResponse, RuntimeError, VerificationProfile, VerificationRunner,
+        VerificationStageKind, VerificationStageStatus, VerifyOptions,
     };
     use serde_json::json;
+    use std::collections::BTreeMap;
     use std::fs;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::time::Duration;
     use tempfile::TempDir;
 
@@ -858,5 +861,481 @@ mod tests {
         assert_eq!(report.input.quality_score, 90);
         assert_eq!(report.stages[1].kind, VerificationStageKind::Tests);
         assert_eq!(report.stages[1].status, VerificationStageStatus::Passed);
+    }
+
+    #[test]
+    fn verification_profile_as_str_maps_both_variants() {
+        assert_eq!(VerificationProfile::Default.as_str(), "default");
+        assert_eq!(
+            VerificationProfile::RustWorkspace.as_str(),
+            "rust_workspace"
+        );
+        // Default derive resolves to the Default variant.
+        assert_eq!(VerificationProfile::default(), VerificationProfile::Default);
+    }
+
+    #[test]
+    fn normalize_optional_command_trims_and_drops_blank() {
+        assert_eq!(normalize_optional_command(None), None);
+        assert_eq!(normalize_optional_command(Some("   ")), None);
+        assert_eq!(normalize_optional_command(Some("")), None);
+        assert_eq!(
+            normalize_optional_command(Some("  /bin/echo hi  ")),
+            Some("/bin/echo hi".to_string())
+        );
+    }
+
+    #[test]
+    fn shell_quote_passes_safe_tokens_and_escapes_specials() {
+        // Alphanumeric plus the safe punctuation set is returned verbatim.
+        assert_eq!(shell_quote("Cargo.toml"), "Cargo.toml");
+        assert_eq!(shell_quote("a/b-c_d.=e"), "a/b-c_d.=e");
+        // Empty string is not "safe" (guarded by `!s.is_empty()`) → quoted.
+        assert_eq!(shell_quote(""), "''");
+        // Spaces force single-quoting.
+        assert_eq!(shell_quote("a b"), "'a b'");
+        // Embedded single-quote uses the '\'' escape and round-trips through
+        // shell_words::split back to the original token.
+        let quoted = shell_quote("it's a $VAR");
+        let split = shell_words::split(&quoted).expect("quoted token must re-split");
+        assert_eq!(split, vec!["it's a $VAR".to_string()]);
+        // Backslash forces quoting and is doubled inside the single-quoted
+        // form. (Backslash round-trip fidelity is not a contract of this
+        // helper; it only quotes safe manifest paths.)
+        assert_eq!(shell_quote("a\\b"), "'a\\\\b'");
+    }
+
+    #[test]
+    fn discover_rust_workspace_manifest_prefers_direct_then_nested_then_none() {
+        // No manifest anywhere → None.
+        let empty = TempDir::new().expect("tempdir");
+        assert_eq!(discover_rust_workspace_manifest(empty.path()), None);
+
+        // Nested plugins/Cargo.toml is discovered when the direct one is absent.
+        let nested = TempDir::new().expect("tempdir");
+        fs::create_dir_all(nested.path().join("plugins")).expect("plugins dir");
+        fs::write(nested.path().join("plugins/Cargo.toml"), "[workspace]\n").expect("nested toml");
+        assert_eq!(
+            discover_rust_workspace_manifest(nested.path()),
+            Some(nested.path().join("plugins/Cargo.toml"))
+        );
+
+        // A direct Cargo.toml wins over the nested one.
+        let direct = TempDir::new().expect("tempdir");
+        fs::write(direct.path().join("Cargo.toml"), "[workspace]\n").expect("direct toml");
+        fs::create_dir_all(direct.path().join("plugins")).expect("plugins dir");
+        fs::write(direct.path().join("plugins/Cargo.toml"), "[workspace]\n").expect("nested toml");
+        assert_eq!(
+            discover_rust_workspace_manifest(direct.path()),
+            Some(direct.path().join("Cargo.toml"))
+        );
+    }
+
+    #[test]
+    fn resolve_plan_default_profile_has_no_static_check() {
+        let temp = TempDir::new().expect("tempdir");
+        let plan = CommandVerifier::resolve_plan(
+            temp.path(),
+            VerificationProfile::Default,
+            Some("  echo t  "),
+            None,
+        );
+        assert_eq!(plan.profile, VerificationProfile::Default);
+        assert_eq!(plan.static_check_command, None);
+        // tests_command is normalized (trimmed); empty safety stays None.
+        assert_eq!(plan.tests_command.as_deref(), Some("echo t"));
+        assert_eq!(plan.safety_command, None);
+    }
+
+    #[test]
+    fn resolve_plan_rust_workspace_encodes_relative_manifest() {
+        let temp = TempDir::new().expect("tempdir");
+        fs::write(temp.path().join("Cargo.toml"), "[workspace]\n").expect("cargo toml");
+        let plan = CommandVerifier::resolve_plan(
+            temp.path(),
+            VerificationProfile::RustWorkspace,
+            None,
+            None,
+        );
+        assert_eq!(
+            plan.static_check_command.as_deref(),
+            Some("cargo check --quiet --manifest-path Cargo.toml")
+        );
+    }
+
+    #[test]
+    fn run_shell_command_reports_empty_after_tokenisation() {
+        let temp = TempDir::new().expect("tempdir");
+        let result = run_shell_command("   ", temp.path(), Duration::from_secs(5))
+            .expect("empty command should not panic");
+        assert!(!result.success);
+        assert!(
+            result.stderr.contains("empty after tokenisation"),
+            "stderr: {}",
+            result.stderr
+        );
+        assert_eq!(result.runner, VerificationRunner::Shell);
+    }
+
+    #[test]
+    fn run_shell_command_reports_tokenisation_failure() {
+        let temp = TempDir::new().expect("tempdir");
+        // Unbalanced quote — shell_words::split returns Err.
+        let result = run_shell_command("echo 'unterminated", temp.path(), Duration::from_secs(5))
+            .expect("tokenisation failure should not panic");
+        assert!(!result.success);
+        assert!(
+            result.stderr.contains("tokenisation failed"),
+            "stderr: {}",
+            result.stderr
+        );
+    }
+
+    #[test]
+    fn run_shell_command_captures_success_stdout() {
+        let temp = TempDir::new().expect("tempdir");
+        let result =
+            run_shell_command("/bin/echo hello world", temp.path(), Duration::from_secs(5))
+                .expect("echo should run");
+        assert!(result.success);
+        assert_eq!(result.stdout, "hello world");
+        assert!(result.stderr.is_empty());
+        assert_eq!(result.runner, VerificationRunner::Shell);
+    }
+
+    #[test]
+    fn run_shell_command_reports_failure_exit_code() {
+        let temp = TempDir::new().expect("tempdir");
+        // `false` exits non-zero with no output.
+        let result =
+            run_shell_command("false", temp.path(), Duration::from_secs(5)).expect("false runs");
+        assert!(!result.success);
+    }
+
+    #[test]
+    fn run_shell_command_spawn_error_surfaces_as_err() {
+        let temp = TempDir::new().expect("tempdir");
+        let err = run_shell_command(
+            "/nonexistent/definitely/not/here arg",
+            temp.path(),
+            Duration::from_secs(5),
+        )
+        .expect_err("missing program must surface a spawn error");
+        assert!(matches!(err, RuntimeError::CommandFailed { .. }));
+    }
+
+    #[test]
+    fn plugin_command_uses_candidate_invoker_and_exact_prefix() {
+        // exact: prefix requires verbatim equality of the trimmed payload.
+        let invoker = |_plugin: &str, _node: &str, _payload: String| {
+            Ok(PluginResponse {
+                payload: "  42  ".to_string(),
+            })
+        };
+        let options = VerifyOptions {
+            candidate_invoker: Some(&invoker),
+            command_timeout: None,
+        };
+        let spec = format!(
+            "plugin:{}",
+            json!({
+                "plugin_path": "p",
+                "node_id": "n",
+                "expect_substring": "exact:42"
+            })
+        );
+        let report = CommandVerifier::verify_with_options(
+            Path::new("."),
+            VerificationProfile::Default,
+            Some(&spec),
+            None,
+            None,
+            &options,
+        )
+        .expect("verify should return a report");
+        assert!(report.input.tests_passed);
+        let check = report.tests.as_ref().expect("tests check present");
+        assert_eq!(check.runner, VerificationRunner::Plugin);
+        assert_eq!(check.stdout, "  42  ");
+    }
+
+    #[test]
+    fn plugin_command_exact_prefix_mismatch_fails_with_reason() {
+        let invoker = |_p: &str, _n: &str, _pl: String| {
+            Ok(PluginResponse {
+                payload: "43".to_string(),
+            })
+        };
+        let options = VerifyOptions {
+            candidate_invoker: Some(&invoker),
+            command_timeout: None,
+        };
+        let spec = format!(
+            "plugin:{}",
+            json!({"plugin_path": "p", "node_id": "n", "expect_substring": "exact:42"})
+        );
+        let report = CommandVerifier::verify_with_options(
+            Path::new("."),
+            VerificationProfile::Default,
+            Some(&spec),
+            None,
+            None,
+            &options,
+        )
+        .expect("report");
+        assert!(!report.input.tests_passed);
+        let check = report.tests.as_ref().expect("check");
+        assert!(!check.success);
+        assert!(check.stderr.contains("missing expected substring"));
+    }
+
+    #[test]
+    fn plugin_command_line_prefix_matches_one_line() {
+        let invoker = |_p: &str, _n: &str, _pl: String| {
+            Ok(PluginResponse {
+                payload: "alpha\n  target  \nbeta".to_string(),
+            })
+        };
+        let options = VerifyOptions {
+            candidate_invoker: Some(&invoker),
+            command_timeout: None,
+        };
+        let spec = format!(
+            "plugin:{}",
+            json!({"plugin_path": "p", "node_id": "n", "expect_substring": "line:target"})
+        );
+        let report = CommandVerifier::verify_with_options(
+            Path::new("."),
+            VerificationProfile::Default,
+            Some(&spec),
+            None,
+            None,
+            &options,
+        )
+        .expect("report");
+        assert!(report.input.tests_passed, "report: {report:?}");
+    }
+
+    #[test]
+    fn plugin_command_contains_prefix_is_default_substring() {
+        let invoker = |_p: &str, _n: &str, _pl: String| {
+            Ok(PluginResponse {
+                payload: "prefix-NEEDLE-suffix".to_string(),
+            })
+        };
+        let options = VerifyOptions {
+            candidate_invoker: Some(&invoker),
+            command_timeout: None,
+        };
+        let spec = format!(
+            "plugin:{}",
+            json!({"plugin_path": "p", "node_id": "n", "expect_substring": "NEEDLE"})
+        );
+        let report = CommandVerifier::verify_with_options(
+            Path::new("."),
+            VerificationProfile::Default,
+            Some(&spec),
+            None,
+            None,
+            &options,
+        )
+        .expect("report");
+        assert!(report.input.tests_passed);
+    }
+
+    #[test]
+    fn plugin_command_no_expect_substring_always_succeeds() {
+        let invoker = |_p: &str, _n: &str, payload: String| {
+            // The default payload_json is an empty object.
+            assert_eq!(payload, "{}");
+            Ok(PluginResponse {
+                payload: "anything".to_string(),
+            })
+        };
+        let options = VerifyOptions {
+            candidate_invoker: Some(&invoker),
+            command_timeout: None,
+        };
+        let spec = format!("plugin:{}", json!({"plugin_path": "p", "node_id": "n"}));
+        let report = CommandVerifier::verify_with_options(
+            Path::new("."),
+            VerificationProfile::Default,
+            Some(&spec),
+            None,
+            None,
+            &options,
+        )
+        .expect("report");
+        assert!(report.input.tests_passed);
+    }
+
+    #[test]
+    fn plugin_command_invoker_error_becomes_failed_check() {
+        let invoker = |_p: &str, _n: &str, _pl: String| {
+            Err(RuntimeError::Invariant {
+                message: "candidate blew up".to_string(),
+            })
+        };
+        let options = VerifyOptions {
+            candidate_invoker: Some(&invoker),
+            command_timeout: None,
+        };
+        let spec = format!("plugin:{}", json!({"plugin_path": "p", "node_id": "n"}));
+        let report = CommandVerifier::verify_with_options(
+            Path::new("."),
+            VerificationProfile::Default,
+            Some(&spec),
+            None,
+            None,
+            &options,
+        )
+        .expect("report");
+        assert!(!report.input.tests_passed);
+        let check = report.tests.as_ref().expect("check");
+        assert!(!check.success);
+        assert!(check.stderr.contains("candidate blew up"));
+        assert_eq!(check.runner, VerificationRunner::Plugin);
+    }
+
+    #[test]
+    fn plugin_command_invalid_spec_json_is_invalid_argument() {
+        let options = VerifyOptions::default();
+        let report = super::run_check_command(
+            "plugin:{not valid json",
+            Path::new("."),
+            &options,
+            Duration::from_secs(5),
+        );
+        let err = report.expect_err("bad spec json must be an error");
+        assert!(matches!(err, RuntimeError::InvalidArgument { .. }));
+    }
+
+    #[test]
+    fn plugin_command_without_candidate_loads_invoker_and_reports_failure() {
+        // No candidate_invoker → the fallback path builds a real
+        // PluginInvoker from the resolved fixtures root. Point it at an empty
+        // artifact index so the load succeeds but the invoke of an unknown
+        // plugin fails, surfacing as a failed (not errored) check.
+        let temp = TempDir::new().expect("tempdir");
+        let artifacts = temp.path().join("artifacts");
+        fs::create_dir_all(&artifacts).expect("artifacts dir");
+        fs::write(
+            artifacts.join("index.json"),
+            r#"{"generated_at":"1970-01-01T00:00:00Z","topo_order":[],"entries":[]}"#,
+        )
+        .expect("write empty index");
+
+        let options = VerifyOptions::default();
+        let spec = format!("plugin:{}", json!({"plugin_path": "ghost", "node_id": "n"}));
+        let report = CommandVerifier::verify_with_options(
+            temp.path(),
+            VerificationProfile::Default,
+            Some(&spec),
+            None,
+            None,
+            &options,
+        )
+        .expect("report");
+        let check = report.tests.as_ref().expect("tests check present");
+        assert_eq!(check.runner, VerificationRunner::Plugin);
+        assert!(!check.success, "unknown plugin invoke should fail");
+        assert!(!check.stderr.is_empty());
+    }
+
+    #[test]
+    fn resolve_plugin_fixtures_root_absolute_requested_returned_as_is() {
+        let abs = if cfg!(windows) {
+            PathBuf::from("C:/abs/root")
+        } else {
+            PathBuf::from("/abs/root")
+        };
+        let resolved =
+            resolve_plugin_fixtures_root(Path::new("current"), Some(&abs.to_string_lossy()));
+        assert_eq!(resolved, abs);
+    }
+
+    #[test]
+    fn resolve_plugin_fixtures_root_sibling_with_plugins_wins() {
+        // parent/<requested>/plugins exists → sibling path selected.
+        let temp = TempDir::new().expect("tempdir");
+        let parent = temp.path();
+        fs::create_dir_all(parent.join("shared/plugins")).expect("sibling plugins");
+        let current = parent.join("workdir");
+        fs::create_dir_all(&current).expect("current dir");
+        let resolved = resolve_plugin_fixtures_root(&current, Some("shared"));
+        assert_eq!(resolved, parent.join("shared"));
+    }
+
+    #[test]
+    fn resolve_plugin_fixtures_root_falls_back_to_current_join_when_no_sibling() {
+        let temp = TempDir::new().expect("tempdir");
+        let current = temp.path().join("workdir");
+        fs::create_dir_all(&current).expect("current dir");
+        // No sibling `shared/plugins` exists, so it joins under current.
+        let resolved = resolve_plugin_fixtures_root(&current, Some("shared"));
+        assert_eq!(resolved, current.join("shared"));
+    }
+
+    #[test]
+    fn resolve_plugin_fixtures_root_none_prefers_current_plugins_dir() {
+        let temp = TempDir::new().expect("tempdir");
+        fs::create_dir_all(temp.path().join("plugins")).expect("plugins");
+        let resolved = resolve_plugin_fixtures_root(temp.path(), None);
+        assert_eq!(resolved, temp.path());
+    }
+
+    #[test]
+    fn resolve_plugin_fixtures_root_none_falls_back_to_nested_fixtures() {
+        let temp = TempDir::new().expect("tempdir");
+        fs::create_dir_all(temp.path().join("fixtures/plugins")).expect("nested fixtures");
+        let resolved = resolve_plugin_fixtures_root(temp.path(), None);
+        assert_eq!(resolved, temp.path().join("fixtures"));
+    }
+
+    #[test]
+    fn resolve_plugin_fixtures_root_none_defaults_to_current_dir() {
+        let temp = TempDir::new().expect("tempdir");
+        // Neither plugins/ nor fixtures/plugins present → current dir.
+        let resolved = resolve_plugin_fixtures_root(temp.path(), None);
+        assert_eq!(resolved, temp.path());
+    }
+
+    #[test]
+    fn collect_source_tree_skips_hidden_and_ignored_dirs() {
+        let temp = TempDir::new().expect("tempdir");
+        let root = temp.path();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), "fn a() {}").unwrap();
+        fs::write(root.join("top.txt"), "hi").unwrap();
+        // These must all be skipped by the walker.
+        fs::create_dir_all(root.join("target")).unwrap();
+        fs::write(root.join("target/artifact"), "x").unwrap();
+        fs::create_dir_all(root.join("node_modules")).unwrap();
+        fs::write(root.join("node_modules/dep"), "x").unwrap();
+        fs::create_dir_all(root.join(".cordis-drafts")).unwrap();
+        fs::write(root.join(".cordis-drafts/j"), "x").unwrap();
+        fs::create_dir_all(root.join(".hidden")).unwrap();
+        fs::write(root.join(".hidden/secret"), "x").unwrap();
+
+        let mut entries: BTreeMap<String, PathBuf> = BTreeMap::new();
+        collect_source_tree(root, root, &mut entries).expect("walk should succeed");
+        let keys: Vec<&str> = entries.keys().map(|s| s.as_str()).collect();
+        assert!(keys.contains(&"src/lib.rs"));
+        assert!(keys.contains(&"top.txt"));
+        assert!(
+            keys.iter().all(|k| !k.contains("target")
+                && !k.contains("node_modules")
+                && !k.contains(".cordis-drafts")
+                && !k.contains(".hidden")),
+            "ignored dirs leaked: {keys:?}"
+        );
+    }
+
+    #[test]
+    fn hash_source_tree_errors_when_root_missing() {
+        let temp = TempDir::new().expect("tempdir");
+        let missing = temp.path().join("does-not-exist");
+        let err = hash_source_tree(&missing).expect_err("missing root must error");
+        assert!(matches!(err, RuntimeError::Io { .. }));
     }
 }

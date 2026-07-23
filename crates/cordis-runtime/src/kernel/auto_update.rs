@@ -579,4 +579,322 @@ mod tests {
         assert!(matches!(err, RuntimeError::AutoUpdateVerifyFailed { .. }));
         assert_eq!(fs::read_to_string(ws.path().join("a.txt")).unwrap(), "x");
     }
+
+    #[test]
+    fn default_file_patch_kind_is_text() {
+        assert_eq!(super::default_file_patch_kind(), FilePatchKind::Text);
+    }
+
+    #[test]
+    fn file_patch_constructors_and_kind_names() {
+        let text = FilePatch::text("a", "f", "r");
+        assert_eq!(text.kind, FilePatchKind::Text);
+        assert_eq!(text.patch_kind_name(), "text");
+        assert_eq!(text.find, "f");
+        assert_eq!(text.replace, "r");
+
+        let jv = FilePatch::json_value("a.json", "/x/y", serde_json::json!(5));
+        assert_eq!(jv.kind, FilePatchKind::JsonValue);
+        assert_eq!(jv.patch_kind_name(), "json_value");
+        assert_eq!(jv.pointer.as_deref(), Some("/x/y"));
+        assert_eq!(jv.value, Some(serde_json::json!(5)));
+
+        let tv = FilePatch::toml_value("a.toml", "pkg.name", serde_json::json!("demo"));
+        assert_eq!(tv.kind, FilePatchKind::TomlValue);
+        assert_eq!(tv.patch_kind_name(), "toml_value");
+        assert_eq!(tv.dotted_key.as_deref(), Some("pkg.name"));
+    }
+
+    #[test]
+    fn diff_line_estimate_counts_lines_for_text_and_one_for_structured() {
+        // Text: max(find lines, replace lines), min 1.
+        let single = FilePatch::text("a", "one", "two");
+        assert_eq!(single.diff_line_estimate(), 1);
+        let multi = FilePatch::text("a", "l1\nl2", "r1\nr2\nr3");
+        assert_eq!(multi.diff_line_estimate(), 3);
+        // Structured kinds are always 1.
+        assert_eq!(
+            FilePatch::json_value("a", "/p", serde_json::json!(1)).diff_line_estimate(),
+            1
+        );
+        assert_eq!(
+            FilePatch::toml_value("a", "k", serde_json::json!(1)).diff_line_estimate(),
+            1
+        );
+    }
+
+    #[test]
+    fn validate_shape_text_requires_find() {
+        let mut p = FilePatch::text("a", "", "r");
+        let err = p.validate_shape().unwrap_err();
+        assert!(matches!(err, RuntimeError::LlmResponseInvalid { .. }));
+        p.find = "x".to_string();
+        assert!(p.validate_shape().is_ok());
+    }
+
+    #[test]
+    fn validate_shape_json_requires_pointer_and_value() {
+        // Missing pointer.
+        let mut p = FilePatch::json_value("a", "", serde_json::json!(1));
+        assert!(matches!(
+            p.validate_shape().unwrap_err(),
+            RuntimeError::LlmResponseInvalid { .. }
+        ));
+        // Pointer present but value None.
+        p.pointer = Some("/x".to_string());
+        p.value = None;
+        assert!(matches!(
+            p.validate_shape().unwrap_err(),
+            RuntimeError::LlmResponseInvalid { .. }
+        ));
+        p.value = Some(serde_json::json!(1));
+        assert!(p.validate_shape().is_ok());
+    }
+
+    #[test]
+    fn validate_shape_toml_requires_dotted_key_and_value() {
+        let mut p = FilePatch::toml_value("a", "", serde_json::json!(1));
+        assert!(matches!(
+            p.validate_shape().unwrap_err(),
+            RuntimeError::LlmResponseInvalid { .. }
+        ));
+        p.dotted_key = Some("k".to_string());
+        p.value = None;
+        assert!(matches!(
+            p.validate_shape().unwrap_err(),
+            RuntimeError::LlmResponseInvalid { .. }
+        ));
+        p.value = Some(serde_json::json!(1));
+        assert!(p.validate_shape().is_ok());
+    }
+
+    #[test]
+    fn verification_envelope_from_input_has_no_profile() {
+        let env = VerificationEnvelope::from(VerificationInput {
+            tests_passed: true,
+            safety_checks_passed: false,
+            quality_score: 10,
+        });
+        assert_eq!(env.verification_profile, None);
+        assert!(env.input.tests_passed);
+        assert!(!env.input.safety_checks_passed);
+    }
+
+    #[test]
+    fn resolve_patch_path_rejects_absolute() {
+        let ws = TempDir::new().unwrap();
+        let updater = AutoUpdater::new(ws.path());
+        let abs = if cfg!(windows) { "C:/x" } else { "/etc/passwd" };
+        let err = updater.resolve_patch_path(abs).unwrap_err();
+        assert!(matches!(err, RuntimeError::AutoUpdateInvalidPath { .. }));
+    }
+
+    #[test]
+    fn resolve_patch_path_rejects_parent_traversal() {
+        let ws = TempDir::new().unwrap();
+        let updater = AutoUpdater::new(ws.path());
+        let err = updater.resolve_patch_path("../escape.txt").unwrap_err();
+        match err {
+            RuntimeError::AutoUpdateInvalidPath { reason, .. } => {
+                assert!(reason.contains("parent directory"), "reason: {reason}");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_patch_path_accepts_relative() {
+        let ws = TempDir::new().unwrap();
+        let updater = AutoUpdater::new(ws.path());
+        let resolved = updater.resolve_patch_path("sub/dir/file.txt").unwrap();
+        assert_eq!(resolved, ws.path().join("sub/dir/file.txt"));
+    }
+
+    #[test]
+    fn json_value_patch_applies_and_promotes() {
+        let ws = TempDir::new().unwrap();
+        fs::write(ws.path().join("c.json"), r#"{"a":{"b":1}}"#).unwrap();
+        let updater = AutoUpdater::new(ws.path());
+        let result = updater
+            .execute(
+                plan(vec![FilePatch::json_value(
+                    "c.json",
+                    "/a/b",
+                    serde_json::json!(42),
+                )]),
+                verify_ok,
+            )
+            .unwrap();
+        assert!(!result.rolled_back);
+        assert_eq!(result.verdict, "promote");
+        let doc: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(ws.path().join("c.json")).unwrap()).unwrap();
+        assert_eq!(doc.pointer("/a/b"), Some(&serde_json::json!(42)));
+    }
+
+    #[test]
+    fn json_value_patch_bad_pointer_rolls_back() {
+        let ws = TempDir::new().unwrap();
+        fs::write(ws.path().join("c.json"), r#"{"a":1}"#).unwrap();
+        let updater = AutoUpdater::new(ws.path());
+        let err = updater
+            .execute(
+                plan(vec![FilePatch::json_value(
+                    "c.json",
+                    "/missing",
+                    serde_json::json!(1),
+                )]),
+                verify_ok,
+            )
+            .unwrap_err();
+        assert!(matches!(err, RuntimeError::AutoUpdatePatchInvalid { .. }));
+        // Unchanged after rollback.
+        assert_eq!(
+            fs::read_to_string(ws.path().join("c.json")).unwrap(),
+            r#"{"a":1}"#
+        );
+    }
+
+    #[test]
+    fn json_value_patch_invalid_json_document_errors() {
+        let ws = TempDir::new().unwrap();
+        fs::write(ws.path().join("c.json"), "not json").unwrap();
+        let updater = AutoUpdater::new(ws.path());
+        let err = updater
+            .execute(
+                plan(vec![FilePatch::json_value(
+                    "c.json",
+                    "/a",
+                    serde_json::json!(1),
+                )]),
+                verify_ok,
+            )
+            .unwrap_err();
+        match err {
+            RuntimeError::AutoUpdatePatchInvalid { reason, .. } => {
+                assert!(reason.contains("json parse failed"), "reason: {reason}");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn toml_value_patch_applies_nested_key() {
+        let ws = TempDir::new().unwrap();
+        fs::write(
+            ws.path().join("Cargo.toml"),
+            "[package]\nname = \"old\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        let updater = AutoUpdater::new(ws.path());
+        let result = updater
+            .execute(
+                plan(vec![FilePatch::toml_value(
+                    "Cargo.toml",
+                    "package.name",
+                    serde_json::json!("new"),
+                )]),
+                verify_ok,
+            )
+            .unwrap();
+        assert!(!result.rolled_back);
+        let doc: toml::Value =
+            toml::from_str(&fs::read_to_string(ws.path().join("Cargo.toml")).unwrap()).unwrap();
+        assert_eq!(
+            doc.get("package")
+                .and_then(|p| p.get("name"))
+                .and_then(|n| n.as_str()),
+            Some("new")
+        );
+    }
+
+    #[test]
+    fn toml_value_patch_missing_key_rolls_back() {
+        let ws = TempDir::new().unwrap();
+        fs::write(ws.path().join("t.toml"), "[package]\nname = \"x\"\n").unwrap();
+        let updater = AutoUpdater::new(ws.path());
+        let err = updater
+            .execute(
+                plan(vec![FilePatch::toml_value(
+                    "t.toml",
+                    "package.missing",
+                    serde_json::json!("v"),
+                )]),
+                verify_ok,
+            )
+            .unwrap_err();
+        assert!(matches!(err, RuntimeError::AutoUpdatePatchInvalid { .. }));
+    }
+
+    #[test]
+    fn toml_value_patch_non_table_segment_errors() {
+        let ws = TempDir::new().unwrap();
+        // `name` is a string, so descending into `name.deeper` hits the
+        // "not a table" branch.
+        fs::write(ws.path().join("t.toml"), "[package]\nname = \"x\"\n").unwrap();
+        let updater = AutoUpdater::new(ws.path());
+        let err = updater
+            .execute(
+                plan(vec![FilePatch::toml_value(
+                    "t.toml",
+                    "package.name.deeper",
+                    serde_json::json!("v"),
+                )]),
+                verify_ok,
+            )
+            .unwrap_err();
+        match err {
+            RuntimeError::AutoUpdatePatchInvalid { reason, .. } => {
+                assert!(reason.contains("not a table"), "reason: {reason}");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn quality_failure_verdict_is_rollback() {
+        let ws = TempDir::new().unwrap();
+        fs::write(ws.path().join("a.txt"), "keep").unwrap();
+        let updater = AutoUpdater::new(ws.path());
+        // verify succeeds structurally but reports tests_passed=false, so
+        // the result must be rolled back with verdict "rollback".
+        let verify_reject = |_: &Path| {
+            Ok(VerificationEnvelope::from(VerificationInput {
+                tests_passed: false,
+                safety_checks_passed: true,
+                quality_score: 0,
+            }))
+        };
+        let result = updater
+            .execute(
+                plan(vec![FilePatch::text("a.txt", "keep", "changed")]),
+                verify_reject,
+            )
+            .unwrap();
+        assert!(result.rolled_back);
+        assert_eq!(result.verdict, "rollback");
+        assert!(!result.tests_passed);
+        // File restored.
+        assert_eq!(fs::read_to_string(ws.path().join("a.txt")).unwrap(), "keep");
+    }
+
+    #[test]
+    fn missing_target_file_rolls_back_prior_patches() {
+        let ws = TempDir::new().unwrap();
+        fs::write(ws.path().join("a.txt"), "one").unwrap();
+        // missing.txt does not exist → read_to_string fails inside apply_one,
+        // which triggers rollback of the a.txt write.
+        let updater = AutoUpdater::new(ws.path());
+        let err = updater
+            .execute(
+                plan(vec![
+                    FilePatch::text("a.txt", "one", "ONE"),
+                    FilePatch::text("missing.txt", "x", "y"),
+                ]),
+                verify_ok,
+            )
+            .unwrap_err();
+        assert!(matches!(err, RuntimeError::Io { .. }));
+        assert_eq!(fs::read_to_string(ws.path().join("a.txt")).unwrap(), "one");
+    }
 }

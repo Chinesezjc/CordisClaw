@@ -542,4 +542,293 @@ mod tests {
         static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake_by_ref, drop);
         RawWaker::new(std::ptr::null(), &VTABLE)
     }
+
+    // ── Spec builders ──────────────────────────────────────────────────
+
+    #[test]
+    fn call_spec_try_new_and_timeout() {
+        let spec = CallSpec::try_new("p", "n", serde_json::json!({"k": 1}))
+            .expect("spec")
+            .with_timeout_ms(1500);
+        assert_eq!(spec.plugin_path, "p");
+        assert_eq!(spec.node_id, "n");
+        assert_eq!(spec.timeout_ms, Some(1500));
+        assert_eq!(spec.payload["k"], 1);
+    }
+
+    #[test]
+    fn call_spec_try_new_encode_error() {
+        // A map with a tuple key cannot be serialized to JSON (JSON object
+        // keys must be strings) -> EncodePayload error.
+        let mut bad = BTreeMap::new();
+        bad.insert((1_i32, 2_i32), 3_i32);
+        let err = CallSpec::try_new("p", "n", bad).expect_err("tuple-key map must fail");
+        assert_eq!(err.kind, WorkflowErrorKind::EncodePayload);
+        assert!(err.message.contains("serialization failed"));
+    }
+
+    #[test]
+    fn join_spec_new_and_timeout() {
+        let calls = vec![CallSpec::try_new("p", "n", serde_json::json!({})).unwrap()];
+        let spec = JoinSpec::new(JoinPolicy::AtLeast(2), calls).with_timeout_ms(200);
+        assert_eq!(spec.policy, JoinPolicy::AtLeast(2));
+        assert_eq!(spec.calls.len(), 1);
+        assert_eq!(spec.timeout_ms, Some(200));
+    }
+
+    #[test]
+    fn race_spec_new_and_timeout() {
+        let calls = vec![CallSpec::try_new("p", "n", serde_json::json!({})).unwrap()];
+        let spec = RaceSpec::new(RacePolicy::FirstSuccess, calls).with_timeout_ms(300);
+        assert_eq!(spec.policy, RacePolicy::FirstSuccess);
+        assert_eq!(spec.timeout_ms, Some(300));
+    }
+
+    #[test]
+    fn event_spec_builder_chain() {
+        let spec = EventSpec::new("topic").with_key("k").with_timeout_ms(50);
+        assert_eq!(spec.topic, "topic");
+        assert_eq!(spec.key.as_deref(), Some("k"));
+        assert_eq!(spec.timeout_ms, Some(50));
+        // default builder leaves key/timeout unset.
+        let bare = EventSpec::new("t");
+        assert!(bare.key.is_none());
+        assert!(bare.timeout_ms.is_none());
+    }
+
+    #[test]
+    fn sleep_spec_new() {
+        let spec = SleepSpec::new(1234);
+        assert_eq!(spec.duration_ms, 1234);
+    }
+
+    #[test]
+    fn ask_user_spec_builder_and_context_error() {
+        let spec = AskUserSpec::new("prompt?")
+            .with_context_field("a", 1)
+            .unwrap()
+            .with_context_field("b", "text")
+            .unwrap()
+            .with_timeout_ms(999);
+        assert_eq!(spec.prompt, "prompt?");
+        assert_eq!(spec.context.len(), 2);
+        assert_eq!(spec.context["a"], 1);
+        assert_eq!(spec.timeout_ms, Some(999));
+        // A tuple-key map cannot serialize to a JSON value -> EncodePayload.
+        let mut bad = BTreeMap::new();
+        bad.insert((1_i32, 2_i32), 3_i32);
+        let err = AskUserSpec::new("p")
+            .with_context_field("bad", bad)
+            .expect_err("non-serializable context must fail");
+        assert_eq!(err.kind, WorkflowErrorKind::EncodePayload);
+    }
+
+    #[test]
+    fn wait_spec_kind_covers_all_variants() {
+        let call = CallSpec::try_new("p", "n", serde_json::json!({})).unwrap();
+        assert_eq!(WaitSpec::Call(call.clone()).kind(), WaitKind::Call);
+        assert_eq!(
+            WaitSpec::Join(JoinSpec::new(JoinPolicy::All, vec![call.clone()])).kind(),
+            WaitKind::Join
+        );
+        assert_eq!(
+            WaitSpec::Race(RaceSpec::new(RacePolicy::FirstCompleted, vec![call])).kind(),
+            WaitKind::Race
+        );
+        assert_eq!(WaitSpec::Event(EventSpec::new("t")).kind(), WaitKind::Event);
+        assert_eq!(WaitSpec::Sleep(SleepSpec::new(1)).kind(), WaitKind::Sleep);
+        assert_eq!(
+            WaitSpec::AskUser(AskUserSpec::new("p")).kind(),
+            WaitKind::AskUser
+        );
+    }
+
+    #[test]
+    fn workflow_error_display_includes_kind_and_message() {
+        let err = WorkflowError::new(WorkflowErrorKind::Runtime, "boom");
+        let text = format!("{err}");
+        assert!(text.contains("Runtime"));
+        assert!(text.contains("boom"));
+        // std::error::Error is implemented (source defaults to None).
+        let dyn_err: &dyn std::error::Error = &err;
+        assert!(dyn_err.source().is_none());
+    }
+
+    // ── Outcome decode paths ────────────────────────────────────────────
+
+    #[test]
+    fn error_outcome_becomes_runtime_error() {
+        let mut runtime = ReadyRuntime::new(WaitOutcome::Error {
+            message: "downstream failed".to_string(),
+        });
+        let err = {
+            let mut wf = session(&mut runtime);
+            let spec = CallSpec::try_new("p", "n", serde_json::json!({})).unwrap();
+            let mut fut = wf.call::<NumberValue>(spec);
+            poll_once(&mut fut).expect_err("error outcome")
+        };
+        assert_eq!(err.kind, WorkflowErrorKind::Runtime);
+        assert_eq!(err.message, "downstream failed");
+    }
+
+    #[test]
+    fn cancelled_outcome_becomes_cancelled_error() {
+        let mut runtime = ReadyRuntime::new(WaitOutcome::Cancelled {
+            reason: "user aborted".to_string(),
+        });
+        let err = {
+            let mut wf = session(&mut runtime);
+            let spec = CallSpec::try_new("p", "n", serde_json::json!({})).unwrap();
+            let mut fut = wf.call::<NumberValue>(spec);
+            poll_once(&mut fut).expect_err("cancelled outcome")
+        };
+        assert_eq!(err.kind, WorkflowErrorKind::Cancelled);
+        assert_eq!(err.message, "user aborted");
+    }
+
+    #[test]
+    fn zombie_outcome_becomes_zombie_error() {
+        let mut runtime = ReadyRuntime::new(WaitOutcome::Zombie {
+            reason: "orphaned".to_string(),
+        });
+        let err = {
+            let mut wf = session(&mut runtime);
+            let spec = CallSpec::try_new("p", "n", serde_json::json!({})).unwrap();
+            let mut fut = wf.call::<NumberValue>(spec);
+            poll_once(&mut fut).expect_err("zombie outcome")
+        };
+        assert_eq!(err.kind, WorkflowErrorKind::Zombie);
+        assert_eq!(err.message, "orphaned");
+    }
+
+    #[test]
+    fn timed_out_without_ms_uses_generic_message() {
+        let mut runtime = ReadyRuntime::new(WaitOutcome::TimedOut { timeout_ms: None });
+        let err = {
+            let mut wf = session(&mut runtime);
+            let spec = CallSpec::try_new("p", "n", serde_json::json!({})).unwrap();
+            let mut fut = wf.call::<NumberValue>(spec);
+            poll_once(&mut fut).expect_err("timeout outcome")
+        };
+        assert_eq!(err.kind, WorkflowErrorKind::Timeout);
+        assert_eq!(err.message, "wait timed out");
+    }
+
+    #[test]
+    fn value_decode_type_mismatch_becomes_decode_error() {
+        // payload is a string but NumberValue expects an object with `value`.
+        let mut runtime = ReadyRuntime::new(WaitOutcome::Value {
+            payload: serde_json::json!("not an object"),
+        });
+        let err = {
+            let mut wf = session(&mut runtime);
+            let spec = CallSpec::try_new("p", "n", serde_json::json!({})).unwrap();
+            let mut fut = wf.call::<NumberValue>(spec);
+            poll_once(&mut fut).expect_err("decode mismatch")
+        };
+        assert_eq!(err.kind, WorkflowErrorKind::DecodeOutput);
+    }
+
+    // ── Session method coverage ─────────────────────────────────────────
+
+    #[test]
+    fn session_methods_submit_expected_wait_kinds() {
+        let ok = || WaitOutcome::Value {
+            payload: serde_json::json!({ "value": 1.0 }),
+        };
+
+        let mut runtime = ReadyRuntime::new(ok());
+        {
+            let mut wf = session(&mut runtime);
+            let call = CallSpec::try_new("p", "n", serde_json::json!({})).unwrap();
+            let mut fut = wf.join::<NumberValue>(JoinSpec::new(JoinPolicy::All, vec![call]));
+            poll_once(&mut fut).unwrap();
+        }
+        assert_eq!(runtime.submitted.last().unwrap().kind(), WaitKind::Join);
+
+        {
+            let mut wf = session(&mut runtime);
+            let call = CallSpec::try_new("p", "n", serde_json::json!({})).unwrap();
+            let mut fut =
+                wf.race::<NumberValue>(RaceSpec::new(RacePolicy::FirstCompleted, vec![call]));
+            poll_once(&mut fut).unwrap();
+        }
+        assert_eq!(runtime.submitted.last().unwrap().kind(), WaitKind::Race);
+
+        {
+            let mut wf = session(&mut runtime);
+            let mut fut = wf.wait_event::<NumberValue>(EventSpec::new("t"));
+            poll_once(&mut fut).unwrap();
+        }
+        assert_eq!(runtime.submitted.last().unwrap().kind(), WaitKind::Event);
+
+        {
+            let mut wf = session(&mut runtime);
+            let mut fut = wf.ask_user::<NumberValue>(AskUserSpec::new("p?"));
+            poll_once(&mut fut).unwrap();
+        }
+        assert_eq!(runtime.submitted.last().unwrap().kind(), WaitKind::AskUser);
+    }
+
+    #[test]
+    fn sleep_future_decodes_unit() {
+        let mut runtime = ReadyRuntime::new(WaitOutcome::Value {
+            payload: serde_json::Value::Null,
+        });
+        {
+            let mut wf = session(&mut runtime);
+            let mut fut = wf.sleep(10);
+            poll_once(&mut fut).expect("unit decode");
+        }
+        assert_eq!(runtime.submitted.last().unwrap().kind(), WaitKind::Sleep);
+    }
+
+    // ── Drop-cancel path ────────────────────────────────────────────────
+
+    #[derive(Debug)]
+    struct PendingRuntime {
+        cancel_count: usize,
+        next_sequence: u64,
+    }
+
+    impl WorkflowRuntime for PendingRuntime {
+        fn submit_wait(&mut self, spec: WaitSpec) -> WaitHandle {
+            self.next_sequence += 1;
+            WaitHandle {
+                workflow_id: "wf".to_string(),
+                sequence: self.next_sequence,
+                generation: 1,
+                kind: spec.kind(),
+            }
+        }
+        fn poll_wait(&mut self, _handle: &WaitHandle, _cx: &mut Context<'_>) -> Poll<WaitOutcome> {
+            Poll::Pending
+        }
+        fn cancel_wait(&mut self, _handle: &WaitHandle) -> Result<(), WorkflowError> {
+            self.cancel_count += 1;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn dropping_pending_future_cancels_wait() {
+        let mut runtime = PendingRuntime {
+            cancel_count: 0,
+            next_sequence: 0,
+        };
+        {
+            let mut wf = session(&mut runtime);
+            let spec = CallSpec::try_new("p", "n", serde_json::json!({})).unwrap();
+            let mut fut = wf.call::<NumberValue>(spec);
+            // Poll once: submits and stays Pending (handle now set).
+            let waker = noop_waker();
+            let mut cx = Context::from_waker(&waker);
+            assert!(matches!(Pin::new(&mut fut).poll(&mut cx), Poll::Pending));
+            // fut dropped here while holding a live handle -> cancel_wait.
+        }
+        assert_eq!(
+            runtime.cancel_count, 1,
+            "pending future must cancel on drop"
+        );
+    }
 }

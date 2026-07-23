@@ -170,4 +170,75 @@ mod tests {
         assert_eq!(soul.persona, "x");
         assert!(soul.profile.is_none());
     }
+
+    // get() 读到损坏 JSON → Io 解析错误（非 NotFound 分支）。
+    #[test]
+    fn get_malformed_json_is_parse_error() {
+        let dir = temp_dir();
+        let provider = FileSoulProvider::new(&dir);
+        let key = "corrupt#private";
+        // Write a file at the exact path the provider will read, with
+        // contents that are not valid Soul JSON.
+        std::fs::create_dir_all(dir.join("souls")).unwrap();
+        std::fs::write(provider.path_for(key), b"{ this is not json").unwrap();
+        let err = provider.get(key).unwrap_err();
+        match err {
+            RuntimeError::Io { message, .. } => {
+                assert!(message.contains("soul parse"), "message: {message}");
+            }
+            other => panic!("expected Io parse error, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // get() 遇到非 NotFound 的 I/O 错误（路径是目录）应向上抛。
+    #[test]
+    fn get_when_path_is_directory_is_io_error() {
+        let dir = temp_dir();
+        let provider = FileSoulProvider::new(&dir);
+        let key = "dirlike#private";
+        // Create a directory where the soul file would be; read_to_string
+        // then fails with a non-NotFound I/O error.
+        let p = provider.path_for(key);
+        std::fs::create_dir_all(&p).unwrap();
+        assert!(matches!(provider.get(key), Err(RuntimeError::Io { .. })));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // set() 无法建立 souls 目录（父路径被文件占用）→ Io 错误。
+    #[test]
+    fn set_when_root_parent_is_file_is_io_error() {
+        let dir = temp_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        // Make `data_dir` itself a FILE, so joining `souls` and calling
+        // create_dir_all fails (a component of the path is not a directory).
+        let data_file = dir.join("as_file");
+        std::fs::write(&data_file, b"x").unwrap();
+        let provider = FileSoulProvider::new(&data_file);
+        let soul = Soul::default();
+        assert!(matches!(
+            provider.set("k#private", &soul),
+            Err(RuntimeError::Io { .. })
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // set() 的 tmp→rename 失败分支：目标路径是一个已存在的目录，
+    // rename 无法覆盖 → Io 错误。
+    #[test]
+    fn set_rename_over_directory_is_io_error() {
+        let dir = temp_dir();
+        let provider = FileSoulProvider::new(&dir);
+        let key = "renamefail#private";
+        // souls dir exists; the destination filename is occupied by a
+        // non-empty directory, so the atomic tmp→rename step fails.
+        let dest = provider.path_for(key);
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::write(dest.join("blocker"), b"x").unwrap();
+        assert!(matches!(
+            provider.set(key, &Soul::default()),
+            Err(RuntimeError::Io { .. })
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

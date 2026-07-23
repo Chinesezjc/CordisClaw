@@ -414,6 +414,233 @@ pub extern "C" fn _cordis_create_service(
 }
 
 #[cfg(test)]
+mod constructor_and_helper_tests {
+    use super::*;
+
+    #[test]
+    fn fingerprint_diff_reports_each_changed_field() {
+        let base = AbiFingerprint {
+            rustc_version: "rustc 1".to_string(),
+            target_triple: "t1".to_string(),
+            crate_hash: "c1".to_string(),
+            api_hash: "a1".to_string(),
+        };
+        // Identical fingerprints diff to empty.
+        assert!(base.diff(&base).is_empty());
+        // Every field differs -> four diff entries in field order.
+        let other = AbiFingerprint {
+            rustc_version: "rustc 2".to_string(),
+            target_triple: "t2".to_string(),
+            crate_hash: "c2".to_string(),
+            api_hash: "a2".to_string(),
+        };
+        let diff = base.diff(&other);
+        assert_eq!(diff.len(), 4);
+        assert!(diff[0].starts_with("rustc_version:"));
+        assert!(diff[1].starts_with("target_triple:"));
+        assert!(diff[2].starts_with("crate_hash:"));
+        assert!(diff[3].starts_with("api_hash:"));
+        assert!(diff[2].contains("c1!=c2"));
+    }
+
+    #[test]
+    fn plugin_docs_constructor_maps_optionals() {
+        let docs = plugin_docs(
+            "id",
+            "root/p",
+            "0.2.0",
+            Some("cmd"),
+            vec![node_doc(
+                "n0",
+                "summary",
+                serde_json::json!({}),
+                serde_json::json!({}),
+                &["writes"],
+                &["boom"],
+            )],
+            Some("hint text"),
+        );
+        assert_eq!(docs.plugin_id, "id");
+        assert_eq!(docs.plugin_path, "root/p");
+        assert_eq!(docs.plugin_version, "0.2.0");
+        assert_eq!(docs.abi_version, DEFAULT_ABI_VERSION);
+        assert_eq!(docs.command_name.as_deref(), Some("cmd"));
+        assert_eq!(docs.system_hint.as_deref(), Some("hint text"));
+        assert_eq!(docs.nodes.len(), 1);
+        // None variants pass through as None.
+        let bare = plugin_docs("id", "p", "0.1.0", None, vec![], None);
+        assert!(bare.command_name.is_none());
+        assert!(bare.system_hint.is_none());
+    }
+
+    #[test]
+    fn node_doc_constructor_defaults_to_router() {
+        let doc = node_doc(
+            "n0",
+            "sum",
+            serde_json::json!({"a": 1}),
+            serde_json::json!({"b": 2}),
+            &["se1", "se2"],
+            &["fm1"],
+        );
+        assert_eq!(doc.id, "n0");
+        assert_eq!(doc.summary, "sum");
+        assert_eq!(doc.side_effects, vec!["se1", "se2"]);
+        assert_eq!(doc.failure_modes, vec!["fm1"]);
+        assert!(matches!(doc.node_type, NodeType::Router));
+        assert!(!doc.agent_accessible);
+    }
+
+    #[test]
+    fn task_node_doc_sets_task_type() {
+        let doc = task_node_doc(
+            "svc",
+            "background",
+            serde_json::json!({}),
+            serde_json::json!({}),
+            &[],
+            &[],
+        );
+        assert!(matches!(doc.node_type, NodeType::Task));
+        assert!(!doc.agent_accessible);
+    }
+
+    #[test]
+    fn with_agent_accessible_flips_flag() {
+        let doc = node_doc(
+            "n",
+            "s",
+            serde_json::json!({}),
+            serde_json::json!({}),
+            &[],
+            &[],
+        )
+        .with_agent_accessible();
+        assert!(doc.agent_accessible);
+    }
+
+    #[test]
+    fn json_response_serializes_payload() {
+        let doc = node_doc(
+            "n",
+            "s",
+            serde_json::json!({}),
+            serde_json::json!({}),
+            &[],
+            &[],
+        );
+        let resp = json_response(&doc);
+        let round: NodeDoc = serde_json::from_str(&resp.payload).expect("valid json");
+        assert_eq!(round.id, "n");
+    }
+
+    #[test]
+    fn pretty_json_is_multiline() {
+        let value = serde_json::json!({ "a": 1, "b": 2 });
+        let text = pretty_json(&value);
+        assert!(text.contains('\n'), "pretty output should be indented");
+    }
+
+    #[test]
+    fn agent_trigger_null_symbol_path_is_noop() {
+        // In the test process the host symbol `_cordis_agent_trigger` is not
+        // exported, so dlsym returns null and agent_trigger must return
+        // without invoking anything (exercises the null-branch).
+        agent_trigger("no host present");
+    }
+
+    #[test]
+    fn create_service_returns_null_in_test_build() {
+        // The `#[cfg(test)]` stub always returns null.
+        let ptr = _cordis_create_service(std::ptr::null());
+        assert!(ptr.is_null());
+    }
+
+    #[test]
+    fn guard_service_call_string_panic_payload_reported() {
+        // Panic with a `String` payload (not `&str`) exercises the
+        // downcast_ref::<String>() branch in guard_service_call.
+        fn panic_string(_data: *mut std::ffi::c_void) -> i32 {
+            std::panic::panic_any(String::from("string payload boom"));
+        }
+        let code = guard_service_call("start", std::ptr::null_mut(), panic_string);
+        assert_eq!(code, -1);
+    }
+
+    #[test]
+    fn guard_service_call_non_string_panic_payload_reported() {
+        // Panic with a payload that is neither &str nor String exercises the
+        // final `else` branch ("<non-string panic payload>").
+        fn panic_int(_data: *mut std::ffi::c_void) -> i32 {
+            std::panic::panic_any(42_u64);
+        }
+        let code = guard_service_call("stop", std::ptr::null_mut(), panic_int);
+        assert_eq!(code, -1);
+    }
+
+    #[test]
+    fn guard_service_call_null_data_success_branch() {
+        // A well-behaved body returning early on null data (return 7).
+        fn null_ok(data: *mut std::ffi::c_void) -> i32 {
+            if data.is_null() {
+                return 7;
+            }
+            0
+        }
+        assert_eq!(
+            guard_service_call("start", std::ptr::null_mut(), null_ok),
+            7
+        );
+    }
+
+    // Exercise the `export_plugin_api!` macro expansion: the generated
+    // `__cordis_sdk_*` functions and the static vtable must be callable.
+    mod exported {
+        use super::super::*;
+
+        fn fingerprint() -> AbiFingerprint {
+            AbiFingerprint::current_build("crate_macro", "api_macro")
+        }
+        fn docs() -> PluginDocs {
+            plugin_docs("macro_id", "root/macro", "0.1.0", None, vec![], None)
+        }
+        fn handle(req: PluginRequest) -> PluginResponse {
+            PluginResponse {
+                payload: format!("echo:{}", req.payload),
+            }
+        }
+
+        export_plugin_api! {
+            abi_fingerprint = fingerprint(),
+            docs = docs(),
+            handle = handle,
+        }
+
+        #[test]
+        fn macro_generated_vtable_dispatches() {
+            assert!(matches!(
+                cordis_plugin_api_rust_v2.abi_kind,
+                DylibAbiKind::Rust
+            ));
+            // abi_fingerprint entry serializes the current-build fingerprint.
+            let fp_resp = (cordis_plugin_api_rust_v2.abi_fingerprint)();
+            let fp: AbiFingerprint =
+                serde_json::from_str(&fp_resp.payload).expect("fingerprint json");
+            assert_eq!(fp.crate_hash, "crate_macro");
+            // docs entry serializes plugin docs.
+            let docs_resp = (cordis_plugin_api_rust_v2.docs)();
+            let parsed: PluginDocs = serde_json::from_str(&docs_resp.payload).expect("docs json");
+            assert_eq!(parsed.plugin_path, "root/macro");
+            // handle entry dispatches to our body.
+            let resp = (cordis_plugin_api_rust_v2.handle)(PluginRequest {
+                payload: "ping".to_string(),
+            });
+            assert_eq!(resp.payload, "echo:ping");
+        }
+    }
+}
+
+#[cfg(test)]
 mod fingerprint_tests {
     use super::*;
 

@@ -94,3 +94,101 @@ impl ChangeMemory {
             .collect::<Vec<_>>()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{ChangeMemory, ChangeVerdict};
+
+    fn push(memory: &mut ChangeMemory, issue: &str, verdict: ChangeVerdict) {
+        memory.record(
+            issue,
+            format!("{issue}-patch"),
+            "replace_exact",
+            Some("rust_workspace".to_string()),
+            verdict,
+            88,
+            vec!["ok".to_string()],
+        );
+    }
+
+    #[test]
+    fn default_starts_empty() {
+        let memory = ChangeMemory::default();
+        assert_eq!(memory.len(), 0);
+        assert!(memory.is_empty());
+        assert!(memory.recent(10).is_empty());
+    }
+
+    #[test]
+    fn record_stores_all_dimensions() {
+        let mut memory = ChangeMemory::default();
+        memory.record(
+            "issue-1",
+            "patch-1",
+            "create_file",
+            None,
+            ChangeVerdict::Promote,
+            95,
+            vec!["tests_passed".to_string(), "safety_ok".to_string()],
+        );
+        assert_eq!(memory.len(), 1);
+        assert!(!memory.is_empty());
+        let recent = memory.recent(1);
+        let record = &recent[0];
+        assert_eq!(record.issue_id, "issue-1");
+        assert_eq!(record.patch_id, "patch-1");
+        assert_eq!(record.patch_kind, "create_file");
+        assert_eq!(record.verification_profile, None);
+        assert_eq!(record.verdict, ChangeVerdict::Promote);
+        assert_eq!(record.quality_score, 95);
+        assert_eq!(record.reasons, vec!["tests_passed", "safety_ok"]);
+        // observed_at_ms is populated from the system clock (non-zero on any
+        // real host past the epoch).
+        assert!(record.observed_at_ms > 0);
+    }
+
+    #[test]
+    fn with_limit_floors_at_one() {
+        // limit.max(1): a requested limit of 0 must still keep at least one.
+        let mut memory = ChangeMemory::with_limit(0);
+        push(&mut memory, "a", ChangeVerdict::Promote);
+        push(&mut memory, "b", ChangeVerdict::Rollback);
+        assert_eq!(memory.len(), 1);
+        // Only the newest survives eviction.
+        assert_eq!(memory.recent(1)[0].issue_id, "b");
+    }
+
+    #[test]
+    fn record_evicts_oldest_when_over_limit() {
+        let mut memory = ChangeMemory::with_limit(2);
+        push(&mut memory, "first", ChangeVerdict::Promote);
+        push(&mut memory, "second", ChangeVerdict::Promote);
+        push(&mut memory, "third", ChangeVerdict::Rollback);
+        assert_eq!(memory.len(), 2);
+        let recent = memory.recent(5);
+        // recent() is newest-first; "first" was evicted.
+        assert_eq!(recent[0].issue_id, "third");
+        assert_eq!(recent[1].issue_id, "second");
+    }
+
+    #[test]
+    fn recent_limits_and_reverses_order() {
+        let mut memory = ChangeMemory::with_limit(10);
+        for name in ["x", "y", "z"] {
+            push(&mut memory, name, ChangeVerdict::Promote);
+        }
+        let recent = memory.recent(2);
+        assert_eq!(recent.len(), 2);
+        assert_eq!(recent[0].issue_id, "z");
+        assert_eq!(recent[1].issue_id, "y");
+    }
+
+    #[test]
+    fn verdict_serde_round_trips() {
+        for verdict in [ChangeVerdict::Promote, ChangeVerdict::Rollback] {
+            let json = serde_json::to_string(&verdict).unwrap();
+            let back: ChangeVerdict = serde_json::from_str(&json).unwrap();
+            assert_eq!(verdict, back);
+        }
+    }
+}

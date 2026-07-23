@@ -144,4 +144,91 @@ mod tests {
         assert_eq!(handler_count_for(other), 1, "other plugin's handlers stay");
         unregister_plugin(other);
     }
+
+    #[test]
+    fn load_handlers_parses_valid_config() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        std::fs::write(
+            dir.path().join("notify_handlers.json"),
+            r#"[{"plugin_path":"qq","node_id":"send"},{"plugin_path":"slack","node_id":"post"}]"#,
+        )
+        .expect("write config");
+        let handlers = load_handlers(dir.path()).expect("valid config parses");
+        assert_eq!(
+            handlers,
+            vec![
+                ("qq".to_string(), "send".to_string()),
+                ("slack".to_string(), "post".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn load_handlers_missing_file_is_read_error() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let err = load_handlers(dir.path()).expect_err("missing file must error");
+        assert!(err.starts_with("read:"), "err: {err}");
+    }
+
+    #[test]
+    fn load_handlers_invalid_json_is_parse_error() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        std::fs::write(dir.path().join("notify_handlers.json"), "{not an array")
+            .expect("write config");
+        let err = load_handlers(dir.path()).expect_err("bad json must error");
+        assert!(err.starts_with("parse:"), "err: {err}");
+    }
+
+    #[test]
+    fn load_handlers_missing_plugin_path_field_errors() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        std::fs::write(
+            dir.path().join("notify_handlers.json"),
+            r#"[{"node_id":"send"}]"#,
+        )
+        .expect("write config");
+        let err = load_handlers(dir.path()).expect_err("missing plugin_path must error");
+        assert_eq!(err, "missing plugin_path");
+    }
+
+    #[test]
+    fn load_handlers_missing_node_id_field_errors() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        std::fs::write(
+            dir.path().join("notify_handlers.json"),
+            r#"[{"plugin_path":"qq"}]"#,
+        )
+        .expect("write config");
+        let err = load_handlers(dir.path()).expect_err("missing node_id must error");
+        assert_eq!(err, "missing node_id");
+    }
+
+    /// `send` fans out to every registered handler and swallows per-handler
+    /// invoke errors (they only log). With a handler pointing at a plugin the
+    /// host does not know about, `host.invoke` errors and `send` must still
+    /// return without panicking.
+    #[test]
+    fn send_delivers_to_registered_handlers_and_tolerates_invoke_errors() {
+        use crate::host::RuntimeHost;
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let artifacts = dir.path().join("artifacts");
+        std::fs::create_dir_all(&artifacts).expect("artifacts dir");
+        std::fs::write(
+            artifacts.join("index.json"),
+            r#"{"generated_at":"1970-01-01T00:00:00Z","topo_order":[],"entries":[]}"#,
+        )
+        .expect("write empty index");
+        let host = RuntimeHost::boot(dir.path()).expect("empty host should boot");
+
+        let p = "notify_test_send_unknown_plugin";
+        unregister_plugin(p);
+        // No such plugin is loaded, so invoke returns Err → the eprintln
+        // branch runs. send must not propagate or panic.
+        register(p, "handler_node");
+        send(&host, "hello world");
+        // A send with zero matching handlers is also a no-op.
+        unregister_plugin(p);
+        send(&host, "no handlers now");
+        assert_eq!(handler_count_for(p), 0);
+    }
 }

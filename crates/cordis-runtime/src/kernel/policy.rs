@@ -75,3 +75,80 @@ impl IterationPolicy {
         elapsed_ms <= u128::from(self.time_budget_ms)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::IterationPolicy;
+
+    fn paths(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn default_has_expected_bounds() {
+        let policy = IterationPolicy::default();
+        assert_eq!(policy.max_diff_lines, 500);
+        assert_eq!(policy.time_budget_ms, 60_000);
+        assert!(policy.require_manual_approval_for_sensitive);
+        assert!(policy.path_allowlist.contains(&"crates/".to_string()));
+    }
+
+    #[test]
+    fn paths_allowed_requires_every_path_in_allowlist() {
+        let policy = IterationPolicy::default();
+        assert!(policy.paths_allowed(&paths(&["crates/a.rs", "docs/b.md", "tests/c.rs"])));
+        // Any single out-of-list path fails the whole set.
+        assert!(!policy.paths_allowed(&paths(&["crates/a.rs", "config/secret.toml"])));
+        // Empty set is vacuously allowed.
+        assert!(policy.paths_allowed(&[]));
+    }
+
+    #[test]
+    fn diff_allowed_boundary() {
+        let policy = IterationPolicy::default();
+        assert!(policy.diff_allowed(0));
+        assert!(policy.diff_allowed(500));
+        assert!(!policy.diff_allowed(501));
+    }
+
+    #[test]
+    fn touches_sensitive_paths_detects_prefix() {
+        let policy = IterationPolicy::default();
+        assert!(policy.touches_sensitive_paths(&paths(&[
+            "crates/other/a.rs",
+            "crates/cordis-runtime/src/kernel/policy.rs",
+        ])));
+        assert!(!policy.touches_sensitive_paths(&paths(&["crates/other/a.rs", "docs/x.md"])));
+        assert!(!policy.touches_sensitive_paths(&[]));
+    }
+
+    #[test]
+    fn manual_gate_requires_approval_only_for_sensitive() {
+        let policy = IterationPolicy::default();
+        let sensitive = paths(&["crates/cordis-runtime/src/core/models.rs"]);
+        let benign = paths(&["docs/readme.md"]);
+        // Non-sensitive paths pass regardless of approval.
+        assert!(policy.manual_gate_passed(&benign, false));
+        // Sensitive paths need explicit approval.
+        assert!(!policy.manual_gate_passed(&sensitive, false));
+        assert!(policy.manual_gate_passed(&sensitive, true));
+    }
+
+    #[test]
+    fn manual_gate_bypassed_when_flag_disabled() {
+        let policy = IterationPolicy {
+            require_manual_approval_for_sensitive: false,
+            ..IterationPolicy::default()
+        };
+        let sensitive = paths(&["crates/cordis-runtime/src/kernel/x.rs"]);
+        assert!(policy.manual_gate_passed(&sensitive, false));
+    }
+
+    #[test]
+    fn time_allowed_boundary() {
+        let policy = IterationPolicy::default();
+        assert!(policy.time_allowed(0));
+        assert!(policy.time_allowed(60_000));
+        assert!(!policy.time_allowed(60_001));
+    }
+}

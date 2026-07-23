@@ -517,3 +517,318 @@ fn join_or_dash(items: &[String]) -> String {
         items.join(", ")
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::models::ArtifactKind;
+    use crate::plugin::registry::{NodeRegistry, PluginRegistry};
+    use cordis_plugin_sdk::{node_doc, plugin_docs, AbiFingerprint, NodeDoc, PluginDocs};
+    use std::collections::BTreeSet;
+    use std::path::PathBuf;
+
+    fn doc_with_schema(id: &str, inputs: &[&str], outputs: &[&str]) -> NodeDoc {
+        let props = |names: &[&str]| {
+            let mut map = serde_json::Map::new();
+            for name in names {
+                map.insert((*name).to_string(), serde_json::json!({"type": "string"}));
+            }
+            serde_json::json!({ "type": "object", "properties": map })
+        };
+        node_doc(id, "n", props(inputs), props(outputs), &[], &[])
+    }
+
+    fn insert_plugin(
+        registry: &PluginRegistry,
+        plugin_path: &str,
+        parent: Option<&str>,
+        docs: PluginDocs,
+    ) {
+        registry.insert_loaded(
+            plugin_path.to_string(),
+            parent.map(ToString::to_string),
+            true,
+            BTreeSet::new(),
+            docs,
+            PathBuf::from("/tmp/a.json"),
+            ArtifactKind::Json,
+            AbiFingerprint::current_build("crate", "api"),
+            None,
+        );
+    }
+
+    // Build a linear chain: producer node emits `x`, consumer node reads `x`.
+    fn chain_registries() -> (PluginRegistry, NodeRegistry) {
+        let plugins = PluginRegistry::default();
+        let docs = plugin_docs(
+            "p",
+            "root/p",
+            "0.1.0",
+            None,
+            vec![
+                doc_with_schema("producer", &[], &["x"]),
+                doc_with_schema("consumer", &["x"], &[]),
+            ],
+            None,
+        );
+        insert_plugin(&plugins, "root/p", None, docs.clone());
+        let mut nodes = NodeRegistry::default();
+        nodes.register_from_docs("root/p", &docs).expect("register");
+        (plugins, nodes)
+    }
+
+    #[test]
+    fn accessors_expose_built_graphs() {
+        let (plugins, nodes) = chain_registries();
+        let reg = GraphRegistry::from_registries(&plugins, &nodes);
+        // registration graph: 1 plugin, 2 nodes.
+        assert_eq!(reg.graph().plugins.len(), 1);
+        assert_eq!(reg.graph().nodes.len(), 2);
+        // one plugin->node edge per node, no plugin-child edge (no parent).
+        assert_eq!(reg.graph().edges.len(), 2);
+        // net graph: 2 nodes, 1 data edge producer->consumer.
+        assert_eq!(reg.net().nodes.len(), 2);
+        assert_eq!(reg.net().edges.len(), 1);
+        let edge = &reg.net().edges[0];
+        assert_eq!(edge.from, "root/p::producer");
+        assert_eq!(edge.to, "root/p::consumer");
+        assert_eq!(edge.label.as_deref(), Some("x"));
+        assert!(matches!(edge.kind, RegisteredNetEdgeKind::Data));
+        // topo levels: producer at 0, consumer at 1.
+        let consumer = reg
+            .net()
+            .nodes
+            .iter()
+            .find(|n| n.node_fqn == "root/p::consumer")
+            .unwrap();
+        assert_eq!(consumer.topo_level, 1);
+    }
+
+    #[test]
+    fn plugin_child_edge_recorded_when_parent_present() {
+        let plugins = PluginRegistry::default();
+        insert_plugin(
+            &plugins,
+            "root",
+            None,
+            plugin_docs("r", "root", "0.1.0", None, vec![], None),
+        );
+        insert_plugin(
+            &plugins,
+            "root/child",
+            Some("root"),
+            plugin_docs(
+                "c",
+                "root/child",
+                "0.1.0",
+                None,
+                vec![doc_with_schema("n0", &[], &[])],
+                None,
+            ),
+        );
+        let mut nodes = NodeRegistry::default();
+        let child_docs = plugins.get("root/child").unwrap().docs.unwrap();
+        nodes.register_from_docs("root/child", &child_docs).unwrap();
+        let reg = GraphRegistry::from_registries(&plugins, &nodes);
+        assert!(reg.graph().edges.iter().any(|e| matches!(
+            e.kind,
+            RegisteredGraphEdgeKind::PluginChild
+        ) && e.from == "root"
+            && e.to == "root/child"));
+    }
+
+    #[test]
+    fn handle_get_json_routes() {
+        let (plugins, nodes) = chain_registries();
+        let reg = GraphRegistry::from_registries(&plugins, &nodes);
+        let v = reg.handle_get_json("/graphs/registered-nodes").unwrap();
+        assert!(v["plugins"].is_array());
+        let v = reg.handle_get_json("/graphs/registered-net").unwrap();
+        assert!(v["nodes"].is_array());
+        assert!(matches!(
+            reg.handle_get_json("/graphs/unknown"),
+            Err(RuntimeError::InvalidDocsRoute { .. })
+        ));
+    }
+
+    #[test]
+    fn handle_get_html_routes() {
+        let (plugins, nodes) = chain_registries();
+        let reg = GraphRegistry::from_registries(&plugins, &nodes);
+        let html = reg
+            .handle_get_html("/graphs/registered-nodes.html")
+            .unwrap();
+        assert!(html.contains("Registered Nodes Graph"));
+        assert!(html.contains("root/p::producer"));
+        let html = reg.handle_get_html("/graphs/registered-net.html").unwrap();
+        assert!(html.contains("Registered Net"));
+        assert!(html.contains(" -> ")); // edge arrow written via raw()
+        assert!(html.contains("label="));
+        assert!(matches!(
+            reg.handle_get_html("/graphs/unknown.html"),
+            Err(RuntimeError::InvalidDocsRoute { .. })
+        ));
+    }
+
+    #[test]
+    fn render_net_html_shows_dash_for_empty_consumes_and_produces() {
+        // Single isolated node with no inputs/outputs -> consumes/produces "-".
+        let plugins = PluginRegistry::default();
+        let docs = plugin_docs(
+            "p",
+            "root/p",
+            "0.1.0",
+            None,
+            vec![doc_with_schema("lonely", &[], &[])],
+            None,
+        );
+        insert_plugin(&plugins, "root/p", None, docs.clone());
+        let mut nodes = NodeRegistry::default();
+        nodes.register_from_docs("root/p", &docs).unwrap();
+        let reg = GraphRegistry::from_registries(&plugins, &nodes);
+        let html = reg.render_registered_net_html();
+        assert!(html.contains("consumes=[-]"));
+        assert!(html.contains("produces=[-]"));
+    }
+
+    #[test]
+    fn multi_producer_emits_diagnostic() {
+        // Two producers of `x`, one consumer of `x`.
+        let plugins = PluginRegistry::default();
+        let docs = plugin_docs(
+            "p",
+            "root/p",
+            "0.1.0",
+            None,
+            vec![
+                doc_with_schema("prod_a", &[], &["x"]),
+                doc_with_schema("prod_b", &[], &["x"]),
+                doc_with_schema("consumer", &["x"], &[]),
+            ],
+            None,
+        );
+        insert_plugin(&plugins, "root/p", None, docs.clone());
+        let mut nodes = NodeRegistry::default();
+        nodes.register_from_docs("root/p", &docs).unwrap();
+        let reg = GraphRegistry::from_registries(&plugins, &nodes);
+        assert!(
+            reg.net()
+                .diagnostics
+                .iter()
+                .any(|d| d.contains("multi-producer") && d.contains("`x`")),
+            "diagnostics: {:?}",
+            reg.net().diagnostics
+        );
+        // Deterministic pick: alphabetically first producer (prod_a).
+        let edge = reg
+            .net()
+            .edges
+            .iter()
+            .find(|e| e.to == "root/p::consumer")
+            .unwrap();
+        assert_eq!(edge.from, "root/p::prod_a");
+        // Diagnostics surface in the net HTML.
+        let html = reg.render_registered_net_html();
+        assert!(html.contains("Net diagnostics"));
+    }
+
+    #[test]
+    fn cycle_dependency_detected_and_marked() {
+        // a consumes y (produced by b); b consumes x (produced by a) -> cycle.
+        let plugins = PluginRegistry::default();
+        let docs = plugin_docs(
+            "p",
+            "root/p",
+            "0.1.0",
+            None,
+            vec![
+                doc_with_schema("a", &["y"], &["x"]),
+                doc_with_schema("b", &["x"], &["y"]),
+            ],
+            None,
+        );
+        insert_plugin(&plugins, "root/p", None, docs.clone());
+        let mut nodes = NodeRegistry::default();
+        nodes.register_from_docs("root/p", &docs).unwrap();
+        let reg = GraphRegistry::from_registries(&plugins, &nodes);
+        assert!(
+            reg.net()
+                .diagnostics
+                .iter()
+                .any(|d| d.contains("cycle-like")),
+            "diagnostics: {:?}",
+            reg.net().diagnostics
+        );
+        // Cycle participants get the usize::MAX sentinel level.
+        assert!(reg.net().nodes.iter().all(|n| n.topo_level == usize::MAX));
+    }
+
+    #[test]
+    fn empty_registries_produce_default_net() {
+        let plugins = PluginRegistry::default();
+        let nodes = NodeRegistry::default();
+        let reg = GraphRegistry::from_registries(&plugins, &nodes);
+        assert!(reg.net().nodes.is_empty());
+        assert!(reg.net().edges.is_empty());
+        assert!(reg.net().diagnostics.is_empty());
+    }
+
+    #[test]
+    fn node_without_docs_entry_is_skipped_in_net() {
+        // Node registered whose id is absent from the plugin docs nodes list.
+        // build_registered_net skips it (no matching node_doc).
+        let plugins = PluginRegistry::default();
+        // docs only declare `known`; we register an extra `ghost` node manually.
+        let docs = plugin_docs(
+            "p",
+            "root/p",
+            "0.1.0",
+            None,
+            vec![doc_with_schema("known", &[], &[])],
+            None,
+        );
+        insert_plugin(&plugins, "root/p", None, docs.clone());
+        let mut nodes = NodeRegistry::default();
+        nodes.register_from_docs("root/p", &docs).unwrap();
+        // Register a second plugin path that has NO entry in plugin_registry,
+        // so the `plugin_registry.get(...)` else-branch (continue) is hit.
+        let orphan_docs = plugin_docs(
+            "o",
+            "orphan",
+            "0.1.0",
+            None,
+            vec![doc_with_schema("g", &[], &[])],
+            None,
+        );
+        nodes.register_from_docs("orphan", &orphan_docs).unwrap();
+        let reg = GraphRegistry::from_registries(&plugins, &nodes);
+        // Only the `known` node survives into the net.
+        assert_eq!(reg.net().nodes.len(), 1);
+        assert_eq!(reg.net().nodes[0].node_fqn, "root/p::known");
+    }
+
+    #[test]
+    fn error_output_property_is_not_treated_as_produced() {
+        // infer_outputs filters out the reserved `error` property.
+        let plugins = PluginRegistry::default();
+        let docs = plugin_docs(
+            "p",
+            "root/p",
+            "0.1.0",
+            None,
+            vec![doc_with_schema("n", &[], &["error"])],
+            None,
+        );
+        insert_plugin(&plugins, "root/p", None, docs.clone());
+        let mut nodes = NodeRegistry::default();
+        nodes.register_from_docs("root/p", &docs).unwrap();
+        let reg = GraphRegistry::from_registries(&plugins, &nodes);
+        assert!(reg.net().nodes[0].produces.is_empty());
+    }
+
+    #[test]
+    fn join_or_dash_behaviour() {
+        assert_eq!(join_or_dash(&[]), "-");
+        assert_eq!(join_or_dash(&["a".to_string(), "b".to_string()]), "a, b");
+    }
+}

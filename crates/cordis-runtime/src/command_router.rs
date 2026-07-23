@@ -182,6 +182,7 @@ fn soul_text(host: &RuntimeHost, ctx: &CommandContext) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::soul::Soul;
 
     #[test]
     fn split_command_variants() {
@@ -192,5 +193,163 @@ mod tests {
         );
         assert_eq!(split_command("/STATUS"), ("status".into(), String::new()));
         assert_eq!(split_command("/"), ("".into(), String::new()));
+    }
+
+    /// Boot a real `RuntimeHost` against an empty fixtures workspace (no
+    /// dylibs, so it works on every host — unlike the fixture-backed
+    /// integration test which is x86_64-linux only). Only the built-in
+    /// kernel plugin is present, which is all the builtin commands need.
+    fn boot_minimal() -> (tempfile::TempDir, RuntimeHost) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let fixtures = tmp.path().join("fixtures");
+        std::fs::create_dir_all(fixtures.join("artifacts")).unwrap();
+        std::fs::write(
+            fixtures.join("artifacts/index.json"),
+            r#"{"generated_at":"0","entries":[]}"#,
+        )
+        .unwrap();
+        let host = RuntimeHost::boot(&fixtures).expect("boot minimal host");
+        (tmp, host)
+    }
+
+    fn ctx_with_soul(key: &str) -> CommandContext {
+        CommandContext {
+            session_key: "sess".to_string(),
+            sender_id: "sender".to_string(),
+            conversation_kind: "private".to_string(),
+            soul_key: key.to_string(),
+        }
+    }
+
+    #[test]
+    fn dispatch_status_reports_runtime_state() {
+        let (_t, host) = boot_minimal();
+        match dispatch(&host, &CommandContext::default(), "/status") {
+            CommandOutcome::Reply(text) => {
+                assert!(text.contains("运行时状态"), "text: {text}");
+                assert!(text.contains("snapshot"), "text: {text}");
+                assert!(text.contains("plugins"), "text: {text}");
+                assert!(text.contains("不经 LLM"), "text: {text}");
+            }
+            other => panic!("expected Reply, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dispatch_help_lists_builtins() {
+        let (_t, host) = boot_minimal();
+        // "/help" and the empty-command fallback both yield the help text.
+        for input in ["/help", "/"] {
+            match dispatch(&host, &CommandContext::default(), input) {
+                CommandOutcome::Reply(text) => {
+                    assert!(text.contains("可用指令"), "text: {text}");
+                    assert!(text.contains("/status"), "text: {text}");
+                    assert!(text.contains("/reset"), "text: {text}");
+                    assert!(text.contains("/soul"), "text: {text}");
+                    assert!(text.contains("/help"), "text: {text}");
+                }
+                other => panic!("expected Reply for {input}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn dispatch_reset_yields_reset_session() {
+        let (_t, host) = boot_minimal();
+        match dispatch(&host, &CommandContext::default(), "/reset") {
+            CommandOutcome::ResetSession(text) => {
+                assert!(text.contains("会话已重置"), "text: {text}");
+            }
+            other => panic!("expected ResetSession, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dispatch_unknown_command_is_reply() {
+        let (_t, host) = boot_minimal();
+        match dispatch(&host, &CommandContext::default(), "/frobnicate now") {
+            CommandOutcome::Reply(text) => {
+                assert!(text.contains("未知指令"), "text: {text}");
+                assert!(text.contains("/frobnicate"), "text: {text}");
+                assert!(text.contains("/help"), "text: {text}");
+            }
+            other => panic!("expected Reply, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dispatch_soul_without_identity_explains_missing() {
+        let (_t, host) = boot_minimal();
+        // Empty soul_key → identity-less session branch.
+        match dispatch(&host, &CommandContext::default(), "/soul") {
+            CommandOutcome::Reply(text) => {
+                assert!(
+                    text.contains("没有身份") || text.contains("无法定位"),
+                    "text: {text}"
+                );
+            }
+            other => panic!("expected Reply, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dispatch_soul_unset_scope_reports_default() {
+        let (_t, host) = boot_minimal();
+        let ctx = ctx_with_soul("scope_never_set#private");
+        match dispatch(&host, &ctx, "/soul") {
+            CommandOutcome::Reply(text) => {
+                assert!(text.contains("尚未设置"), "text: {text}");
+                assert!(text.contains("默认人格"), "text: {text}");
+            }
+            other => panic!("expected Reply, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dispatch_soul_reads_persona_and_profile() {
+        let (_t, host) = boot_minimal();
+        let key = "scope_with_soul#private";
+        host.set_soul(
+            key,
+            &Soul {
+                persona: "运维值班助手".to_string(),
+                profile: Some("fast".to_string()),
+                updated_at_ms: 1,
+                updated_by: "test".to_string(),
+            },
+        )
+        .unwrap();
+        match dispatch(&host, &ctx_with_soul(key), "/soul") {
+            CommandOutcome::Reply(text) => {
+                assert!(text.contains("运维值班助手"), "text: {text}");
+                assert!(text.contains("fast"), "text: {text}");
+                assert!(text.contains(key), "text: {text}");
+            }
+            other => panic!("expected Reply, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dispatch_soul_empty_persona_shows_placeholder() {
+        let (_t, host) = boot_minimal();
+        let key = "scope_empty_persona#private";
+        // Stored soul exists but persona is blank → "(未设置)" placeholder,
+        // and profile None falls back to "default".
+        host.set_soul(key, &Soul::default()).unwrap();
+        match dispatch(&host, &ctx_with_soul(key), "/soul") {
+            CommandOutcome::Reply(text) => {
+                assert!(text.contains("(未设置)"), "text: {text}");
+                assert!(text.contains("default"), "text: {text}");
+            }
+            other => panic!("expected Reply, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plugin_commands_empty_without_declared_commands() {
+        let (_t, host) = boot_minimal();
+        // No fixture plugins loaded → no plugin-declared commands, and
+        // /help therefore lists only the builtins.
+        assert!(plugin_commands(&host).is_empty());
     }
 }

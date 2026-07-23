@@ -126,4 +126,20 @@ mod tests {
             "<!doctype html><html><title>My Title</title></html>"
         );
     }
+
+    #[test]
+    fn void_tag_emits_open_only() {
+        let mut w = HtmlWriter::new();
+        w.void_tag("br");
+        w.void_tag("hr");
+        assert_eq!(w.into_string(), "<br><hr>");
+    }
+
+    #[test]
+    fn raw_element_wraps_trusted_content() {
+        let mut w = HtmlWriter::new();
+        // raw content is trusted / pre-escaped: `<b>` must pass through verbatim.
+        w.raw_element("p", "<b>bold</b>");
+        assert_eq!(w.into_string(), "<p><b>bold</b></p>");
+    }
 }

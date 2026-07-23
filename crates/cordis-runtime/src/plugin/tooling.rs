@@ -1657,4 +1657,737 @@ mod tests {
             "exec bits should be preserved, got {mode:o}"
         );
     }
+
+    // ---------- path / name helpers ----------
+
+    #[test]
+    fn relative_display_strips_base_and_normalises_separators() {
+        use super::relative_display;
+        use std::path::Path;
+        let base = Path::new("/repo/root");
+        assert_eq!(
+            relative_display(base, Path::new("/repo/root/plugins/qq/src/lib.rs")),
+            "plugins/qq/src/lib.rs"
+        );
+        // Path outside base falls back to the lossy absolute rendering.
+        assert_eq!(
+            relative_display(base, Path::new("/other/place.rs")),
+            "/other/place.rs"
+        );
+    }
+
+    #[test]
+    fn grants_vec_preserves_sorted_order() {
+        use super::grants_vec;
+        use std::collections::BTreeSet;
+        let mut set = BTreeSet::new();
+        set.insert("write".to_string());
+        set.insert("read".to_string());
+        // BTreeSet is ordered, so the Vec comes out sorted.
+        assert_eq!(
+            grants_vec(&set),
+            vec!["read".to_string(), "write".to_string()]
+        );
+        assert!(grants_vec(&BTreeSet::new()).is_empty());
+    }
+
+    #[test]
+    fn expected_artifact_name_uses_extension_by_kind() {
+        use super::expected_artifact_name;
+        use std::env::consts::DLL_EXTENSION;
+        assert_eq!(
+            expected_artifact_name("expr/evaluator", false),
+            "expr_evaluator.json"
+        );
+        assert_eq!(
+            expected_artifact_name("expr/evaluator", true),
+            format!("expr_evaluator.{DLL_EXTENSION}")
+        );
+    }
+
+    #[test]
+    fn can_prepare_requires_plugins_manifest() {
+        use super::can_prepare_fixture_artifacts;
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        assert!(!can_prepare_fixture_artifacts(dir.path()));
+        std::fs::create_dir_all(dir.path().join("plugins")).unwrap();
+        std::fs::write(dir.path().join("plugins/Cargo.toml"), "[workspace]\n").unwrap();
+        assert!(can_prepare_fixture_artifacts(dir.path()));
+    }
+
+    #[test]
+    fn build_markers_are_numeric_strings() {
+        use super::{current_build_marker, current_epoch_ms};
+        let marker = current_build_marker();
+        assert!(
+            marker.parse::<u64>().is_ok(),
+            "marker should be secs: {marker}"
+        );
+        assert!(current_epoch_ms() > 0);
+    }
+
+    #[test]
+    fn absolute_path_passes_through_absolute_and_joins_relative() {
+        use super::absolute_path;
+        use std::path::{Path, PathBuf};
+        let abs = Path::new("/tmp/some/where");
+        assert_eq!(
+            absolute_path(abs).unwrap(),
+            PathBuf::from("/tmp/some/where")
+        );
+        let rel = absolute_path(Path::new("rel/child")).unwrap();
+        assert!(rel.is_absolute());
+        assert!(rel.ends_with("rel/child"));
+    }
+
+    // ---------- manifest parsing ----------
+
+    #[test]
+    fn read_plugin_build_spec_parses_dylib_and_artifact_config() {
+        use super::read_plugin_build_spec;
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        let manifest = dir.path().join("Cargo.toml");
+        std::fs::write(
+            &manifest,
+            r#"[package]
+name = "demo_plugin"
+version = "1.2.3"
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[package.metadata.cordis.artifact]
+exports = ["svc_a", "svc_b"]
+"#,
+        )
+        .unwrap();
+        let spec = read_plugin_build_spec(&manifest).unwrap();
+        assert_eq!(spec.package_name, "demo_plugin");
+        assert_eq!(spec.version, "1.2.3");
+        assert!(spec.is_dylib);
+        assert_eq!(spec.artifact.exports, vec!["svc_a", "svc_b"]);
+    }
+
+    #[test]
+    fn read_plugin_build_spec_defaults_to_json_when_no_dylib_crate_type() {
+        use super::read_plugin_build_spec;
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        let manifest = dir.path().join("Cargo.toml");
+        std::fs::write(
+            &manifest,
+            "[package]\nname = \"jsonp\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        let spec = read_plugin_build_spec(&manifest).unwrap();
+        assert!(!spec.is_dylib);
+        assert!(spec.artifact.exports.is_empty());
+    }
+
+    #[test]
+    fn read_plugin_build_spec_rejects_missing_package_and_bad_toml() {
+        use super::read_plugin_build_spec;
+        use crate::core::error::RuntimeError;
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+
+        // Missing file -> Io error.
+        let missing = dir.path().join("nope/Cargo.toml");
+        assert!(matches!(
+            read_plugin_build_spec(&missing),
+            Err(RuntimeError::Io { .. })
+        ));
+
+        // Malformed TOML -> CargoParse.
+        let bad = dir.path().join("bad.toml");
+        std::fs::write(&bad, "this is = = not toml").unwrap();
+        assert!(matches!(
+            read_plugin_build_spec(&bad),
+            Err(RuntimeError::CargoParse { .. })
+        ));
+
+        // Valid TOML but no [package] -> InvalidWorkspace.
+        let no_pkg = dir.path().join("nopkg.toml");
+        std::fs::write(&no_pkg, "[lib]\ncrate-type=[\"dylib\"]\n").unwrap();
+        assert!(matches!(
+            read_plugin_build_spec(&no_pkg),
+            Err(RuntimeError::InvalidWorkspace { .. })
+        ));
+    }
+
+    // ---------- input collection / probe / fingerprint ----------
+
+    fn scaffold_crate(root: &std::path::Path) {
+        use std::fs;
+        fs::create_dir_all(root.join("src/inner")).unwrap();
+        fs::create_dir_all(root.join("docs/agent")).unwrap();
+        fs::create_dir_all(root.join("target/debug")).unwrap();
+        fs::write(root.join("Cargo.toml"), "[package]\nname=\"c\"\n").unwrap();
+        fs::write(root.join("build.rs"), "fn main() {}").unwrap();
+        fs::write(root.join("src/lib.rs"), "// lib").unwrap();
+        fs::write(root.join("src/inner/mod.rs"), "// inner").unwrap();
+        fs::write(root.join("docs/agent/interfaces.json"), "{}").unwrap();
+        // Should be excluded by the `target` skip.
+        fs::write(root.join("target/debug/artifact.bin"), "x").unwrap();
+    }
+
+    #[test]
+    fn collect_crate_inputs_gathers_sources_and_skips_target() {
+        use super::collect_crate_inputs;
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        scaffold_crate(dir.path());
+
+        let files = collect_crate_inputs(dir.path(), true).unwrap();
+        let names: Vec<String> = files
+            .iter()
+            .map(|p| {
+                p.strip_prefix(dir.path())
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+        assert!(names.contains(&"Cargo.toml".to_string()));
+        assert!(names.contains(&"build.rs".to_string()));
+        assert!(names.contains(&"src/lib.rs".to_string()));
+        assert!(names.contains(&"src/inner/mod.rs".to_string()));
+        assert!(names.contains(&"docs/agent/interfaces.json".to_string()));
+        assert!(
+            !names.iter().any(|n| n.contains("target/")),
+            "target/ must be excluded, got {names:?}"
+        );
+
+        // include_docs=false drops the interfaces.json.
+        let no_docs = collect_crate_inputs(dir.path(), false).unwrap();
+        assert!(!no_docs
+            .iter()
+            .any(|p| p.ends_with("docs/agent/interfaces.json")));
+    }
+
+    #[test]
+    fn collect_plugin_inputs_merges_local_deps_deduped_sorted() {
+        use super::collect_plugin_inputs;
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        let plugin = dir.path().join("plugin");
+        let dep = dir.path().join("dep");
+        scaffold_crate(&plugin);
+        scaffold_crate(&dep);
+
+        let files = collect_plugin_inputs(&plugin, std::slice::from_ref(&dep)).unwrap();
+        // Sorted + deduped.
+        let mut sorted = files.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(files, sorted);
+        // Contains files from both crates.
+        assert!(files.iter().any(|p| p.starts_with(&plugin)));
+        assert!(files.iter().any(|p| p.starts_with(&dep)));
+        // Dep contributes no interfaces.json (include_docs=false for deps).
+        let dep_docs = dep.join("docs/agent/interfaces.json");
+        assert!(!files.contains(&dep_docs));
+    }
+
+    #[test]
+    fn build_input_probe_records_relative_path_and_size() {
+        use super::build_input_probe;
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("plugins/qq/src/lib.rs");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, b"hello world").unwrap();
+
+        let probe = build_input_probe(dir.path(), std::slice::from_ref(&file)).unwrap();
+        assert_eq!(probe.files.len(), 1);
+        assert_eq!(probe.files[0].path, "plugins/qq/src/lib.rs");
+        assert_eq!(probe.files[0].size, 11);
+    }
+
+    #[test]
+    fn build_input_probe_errors_on_missing_file() {
+        use super::build_input_probe;
+        use crate::core::error::RuntimeError;
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        let missing = dir.path().join("ghost.rs");
+        assert!(matches!(
+            build_input_probe(dir.path(), &[missing]),
+            Err(RuntimeError::Io { .. })
+        ));
+    }
+
+    #[test]
+    fn compute_build_fingerprint_is_content_sensitive_and_deterministic() {
+        use super::compute_build_fingerprint;
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("a.rs");
+        std::fs::write(&file, b"one").unwrap();
+
+        let fp1 = compute_build_fingerprint(dir.path(), std::slice::from_ref(&file)).unwrap();
+        let fp2 = compute_build_fingerprint(dir.path(), std::slice::from_ref(&file)).unwrap();
+        assert_eq!(fp1, fp2, "same content -> same fingerprint");
+
+        std::fs::write(&file, b"two").unwrap();
+        let fp3 = compute_build_fingerprint(dir.path(), std::slice::from_ref(&file)).unwrap();
+        assert_ne!(fp1, fp3, "content change -> new fingerprint");
+    }
+
+    #[test]
+    fn compute_build_fingerprint_errors_on_missing_file() {
+        use super::compute_build_fingerprint;
+        use crate::core::error::RuntimeError;
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        assert!(matches!(
+            compute_build_fingerprint(dir.path(), &[dir.path().join("nope.rs")]),
+            Err(RuntimeError::Io { .. })
+        ));
+    }
+
+    // ---------- compute_dirty_state ----------
+
+    fn sample_abi() -> crate::core::models::AbiFingerprint {
+        crate::core::models::AbiFingerprint {
+            rustc_version: "rustc".to_string(),
+            target_triple: "triple".to_string(),
+            crate_hash: "crate_v1".to_string(),
+            api_hash: "api_v1".to_string(),
+        }
+    }
+
+    fn sample_context(artifact_path: std::path::PathBuf) -> super::PluginBuildContext {
+        use super::{PluginBuildContext, PluginBuildSpec, SourceArtifactConfig};
+        use crate::core::models::{ArtifactKind, CordisMetadata, InputProbe};
+        use crate::plugin::package::ResolvedPlugin;
+        use cordis_plugin_sdk::plugin_docs;
+        use std::collections::BTreeSet;
+        let plugin = ResolvedPlugin {
+            plugin_path: "foo".to_string(),
+            crate_name: "foo".to_string(),
+            dir: std::path::PathBuf::from("/repo/plugins/foo"),
+            metadata: CordisMetadata {
+                plugin_path: "foo".to_string(),
+                abi_kind: Default::default(),
+                abi_fingerprint: sample_abi(),
+                children: Vec::new(),
+                declared_nodes: Vec::new(),
+                allow_generated_docs: false,
+            },
+            docs: plugin_docs("foo", "foo", "0.1.0", None, Vec::new(), None),
+            parent: None,
+            required: true,
+            grants_from_parent: BTreeSet::new(),
+        };
+        PluginBuildContext {
+            plugin,
+            build_spec: PluginBuildSpec {
+                package_name: "foo".to_string(),
+                version: "0.1.0".to_string(),
+                is_dylib: false,
+                artifact: SourceArtifactConfig::default(),
+            },
+            artifact_name: "foo.json".to_string(),
+            artifact_path,
+            artifact_kind: ArtifactKind::Json,
+            local_path_deps: Vec::new(),
+            input_files: Vec::new(),
+            input_probe: InputProbe::default(),
+            build_fingerprint: None,
+            dirty: false,
+        }
+    }
+
+    fn entry_matching(ctx: &super::PluginBuildContext) -> crate::core::models::ArtifactIndexEntry {
+        crate::core::models::ArtifactIndexEntry {
+            plugin_path: ctx.plugin.plugin_path.clone(),
+            version: ctx.build_spec.version.clone(),
+            abi_fingerprint: ctx.plugin.metadata.abi_fingerprint.clone(),
+            artifact_path: ctx.artifact_name.clone(),
+            sha256: "abc".to_string(),
+            built_at: "0".to_string(),
+            parent: ctx.plugin.parent.clone(),
+            required: ctx.plugin.required,
+            grants_from_parent: Vec::new(),
+            docs: ctx.plugin.docs.clone(),
+            exports: Vec::new(),
+            execution: None,
+            artifact_kind: ctx.artifact_kind.clone(),
+            build_fingerprint: "fp".to_string(),
+            input_probe: ctx.input_probe.clone(),
+            local_path_deps: ctx.local_path_deps.clone(),
+        }
+    }
+
+    #[test]
+    fn compute_dirty_state_true_when_no_existing_entry() {
+        use super::compute_dirty_state;
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        let artifact = dir.path().join("foo.json");
+        std::fs::write(&artifact, "{}").unwrap();
+        let ctx = sample_context(artifact);
+        assert!(compute_dirty_state(dir.path(), &ctx, None).unwrap());
+    }
+
+    #[test]
+    fn compute_dirty_state_true_when_artifact_missing() {
+        use super::compute_dirty_state;
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        let artifact = dir.path().join("absent.json");
+        let ctx = sample_context(artifact);
+        let existing = entry_matching(&ctx);
+        assert!(compute_dirty_state(dir.path(), &ctx, Some(&existing)).unwrap());
+    }
+
+    #[test]
+    fn compute_dirty_state_true_on_metadata_drift() {
+        use super::compute_dirty_state;
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        let artifact = dir.path().join("foo.json");
+        std::fs::write(&artifact, "{}").unwrap();
+        let ctx = sample_context(artifact);
+        let mut existing = entry_matching(&ctx);
+        existing.version = "9.9.9".to_string();
+        assert!(compute_dirty_state(dir.path(), &ctx, Some(&existing)).unwrap());
+    }
+
+    #[test]
+    fn compute_dirty_state_false_when_probe_matches() {
+        use super::compute_dirty_state;
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        let artifact = dir.path().join("foo.json");
+        std::fs::write(&artifact, "{}").unwrap();
+        let ctx = sample_context(artifact);
+        let existing = entry_matching(&ctx);
+        // probe equal (both default) -> clean.
+        assert!(!compute_dirty_state(dir.path(), &ctx, Some(&existing)).unwrap());
+    }
+
+    #[test]
+    fn compute_dirty_state_uses_fingerprint_when_probe_differs() {
+        use super::{compute_build_fingerprint, compute_dirty_state};
+        use crate::core::models::{InputProbe, InputProbeFile};
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        let artifact = dir.path().join("foo.json");
+        std::fs::write(&artifact, "{}").unwrap();
+        let ctx = sample_context(artifact);
+        // ctx.input_files is empty, so the fingerprint is stable.
+        let real_fp = compute_build_fingerprint(dir.path(), &ctx.input_files).unwrap();
+
+        let differing_probe = InputProbe {
+            files: vec![InputProbeFile {
+                path: "x".to_string(),
+                size: 1,
+                modified_at_ms: 42,
+            }],
+        };
+
+        // Probe differs but the recomputed fingerprint matches -> clean.
+        let mut same_fp = entry_matching(&ctx);
+        same_fp.input_probe = differing_probe.clone();
+        same_fp.build_fingerprint = real_fp;
+        assert!(!compute_dirty_state(dir.path(), &ctx, Some(&same_fp)).unwrap());
+
+        // Probe differs and stored fingerprint differs -> dirty.
+        let mut diff_fp = entry_matching(&ctx);
+        diff_fp.input_probe = differing_probe;
+        diff_fp.build_fingerprint = "stale-fingerprint".to_string();
+        assert!(compute_dirty_state(dir.path(), &ctx, Some(&diff_fp)).unwrap());
+    }
+
+    // ---------- read_plugin_docs (JSON artifact path) ----------
+
+    #[test]
+    fn read_plugin_docs_reads_json_artifact() {
+        use super::read_plugin_docs;
+        use crate::core::models::PluginArtifact;
+        use cordis_plugin_sdk::{plugin_docs, pretty_json};
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("plug.json");
+        let artifact = PluginArtifact {
+            plugin_path: "foo".to_string(),
+            abi_fingerprint: sample_abi(),
+            docs: plugin_docs("foo", "foo", "0.1.0", Some("Foo"), Vec::new(), None),
+            exports: Vec::new(),
+            execution: None,
+        };
+        std::fs::write(&path, pretty_json(&artifact)).unwrap();
+
+        let docs = read_plugin_docs(&path).unwrap();
+        assert_eq!(docs.plugin_path, "foo");
+        assert_eq!(docs.command_name.as_deref(), Some("Foo"));
+    }
+
+    #[test]
+    fn read_plugin_docs_errors_on_bad_json_artifact() {
+        use super::read_plugin_docs;
+        use crate::core::error::RuntimeError;
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("plug.json");
+        std::fs::write(&path, "{ not valid").unwrap();
+        assert!(matches!(
+            read_plugin_docs(&path),
+            Err(RuntimeError::ArtifactIndexParse { .. })
+        ));
+    }
+
+    // ---------- write_pretty_json error branch ----------
+
+    #[test]
+    fn write_pretty_json_errors_when_path_has_no_parent() {
+        use super::write_pretty_json;
+        use crate::core::error::RuntimeError;
+        use std::path::Path;
+        // Root path has no parent directory.
+        let err = write_pretty_json(Path::new("/"), &serde_json::json!({"k": 1}));
+        assert!(matches!(err, Err(RuntimeError::Invariant { .. })));
+    }
+
+    // ---------- stage_then_rename_file error branch ----------
+
+    #[test]
+    fn stage_then_rename_errors_when_source_missing() {
+        use super::stage_then_rename_file;
+        use crate::core::error::RuntimeError;
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        let src = dir.path().join("nope.so");
+        let dst = dir.path().join("out.so");
+        assert!(matches!(
+            stage_then_rename_file(&src, &dst),
+            Err(RuntimeError::Io { .. })
+        ));
+    }
+
+    // ---------- run_command ----------
+
+    #[test]
+    fn run_command_returns_stdout_on_success() {
+        use super::run_command;
+        let out = run_command("echo", &["hello".to_string()], None).unwrap();
+        assert_eq!(String::from_utf8_lossy(&out).trim(), "hello");
+    }
+
+    #[test]
+    fn run_command_maps_nonzero_exit_to_command_failed() {
+        use super::run_command;
+        use crate::core::error::RuntimeError;
+        assert!(matches!(
+            run_command("false", &[], None),
+            Err(RuntimeError::CommandFailed { .. })
+        ));
+    }
+
+    #[test]
+    fn run_command_maps_spawn_failure_to_command_failed() {
+        use super::run_command;
+        use crate::core::error::RuntimeError;
+        let err = run_command("cordis-no-such-program-xyz", &[], None);
+        assert!(matches!(err, Err(RuntimeError::CommandFailed { .. })));
+    }
+
+    // ---------- run_command_with_timeout ----------
+
+    #[test]
+    fn run_command_with_timeout_returns_quickly_for_fast_command() {
+        use super::run_command_with_timeout;
+        use std::process::Command;
+        let mut cmd = Command::new("echo");
+        cmd.arg("done");
+        let output = run_command_with_timeout(cmd, std::time::Duration::from_secs(5)).unwrap();
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "done");
+    }
+
+    #[test]
+    fn run_command_with_timeout_kills_and_errors_on_expiry() {
+        use super::run_command_with_timeout;
+        use crate::core::error::RuntimeError;
+        use std::process::Command;
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30");
+        let err = run_command_with_timeout(cmd, std::time::Duration::from_millis(150));
+        match err {
+            Err(RuntimeError::InvalidArgument { message }) => {
+                assert!(message.contains("timeout"), "unexpected message: {message}");
+            }
+            other => panic!("expected timeout error, got {other:?}"),
+        }
+    }
+
+    // ---------- lock lifecycle ----------
+
+    #[test]
+    fn artifact_build_lock_writes_state_and_drops_file() {
+        use super::{ArtifactBuildLock, ArtifactBuildLockState, BUILD_LOCK_FILE};
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        let lock_path = dir.path().join(BUILD_LOCK_FILE);
+        {
+            let _lock = ArtifactBuildLock::acquire(dir.path()).unwrap();
+            assert!(lock_path.exists(), "lock file should exist while held");
+            let text = std::fs::read_to_string(&lock_path).unwrap();
+            let state: ArtifactBuildLockState = serde_json::from_str(&text).unwrap();
+            assert_eq!(state.pid, std::process::id());
+        }
+        // Drop released the lock file.
+        assert!(!lock_path.exists(), "lock file should be removed on drop");
+    }
+
+    #[test]
+    fn artifact_build_lock_reclaims_dead_pid_lock() {
+        use super::current_epoch_ms;
+        use super::{ArtifactBuildLock, ArtifactBuildLockState, BUILD_LOCK_FILE};
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        let lock_path = dir.path().join(BUILD_LOCK_FILE);
+        // Plant a lock owned by a dead pid.
+        let stale = ArtifactBuildLockState {
+            pid: u32::MAX - 1,
+            created_at_ms: current_epoch_ms(),
+        };
+        std::fs::write(&lock_path, serde_json::to_vec(&stale).unwrap()).unwrap();
+        // Acquire should reclaim it promptly rather than time out.
+        let _lock = ArtifactBuildLock::acquire(dir.path()).unwrap();
+        let text = std::fs::read_to_string(&lock_path).unwrap();
+        let state: ArtifactBuildLockState = serde_json::from_str(&text).unwrap();
+        assert_eq!(state.pid, std::process::id());
+    }
+
+    #[test]
+    fn maybe_remove_stale_lock_noop_when_missing() {
+        use super::maybe_remove_stale_lock;
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        // No file -> Ok, no error.
+        maybe_remove_stale_lock(&dir.path().join("absent.lock")).unwrap();
+    }
+
+    #[test]
+    fn maybe_remove_stale_lock_keeps_live_pid_lock() {
+        use super::current_epoch_ms;
+        use super::{maybe_remove_stale_lock, ArtifactBuildLockState};
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("live.lock");
+        let live = ArtifactBuildLockState {
+            pid: std::process::id(),
+            created_at_ms: current_epoch_ms(),
+        };
+        std::fs::write(&path, serde_json::to_vec(&live).unwrap()).unwrap();
+        maybe_remove_stale_lock(&path).unwrap();
+        assert!(path.exists(), "a live-pid, fresh lock must be preserved");
+    }
+
+    #[test]
+    fn maybe_remove_stale_lock_removes_dead_pid_lock() {
+        use super::current_epoch_ms;
+        use super::{maybe_remove_stale_lock, ArtifactBuildLockState};
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("dead.lock");
+        let dead = ArtifactBuildLockState {
+            pid: u32::MAX - 1,
+            created_at_ms: current_epoch_ms(),
+        };
+        std::fs::write(&path, serde_json::to_vec(&dead).unwrap()).unwrap();
+        maybe_remove_stale_lock(&path).unwrap();
+        assert!(!path.exists(), "a dead-pid lock must be reclaimed");
+    }
+
+    #[test]
+    fn maybe_remove_stale_lock_removes_legacy_old_nonjson_file() {
+        use super::maybe_remove_stale_lock;
+        use std::time::{Duration, SystemTime};
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("legacy.lock");
+        std::fs::write(&path, "not json at all").unwrap();
+        // Backdate mtime well past LEGACY_STALE_LOCK_TIMEOUT (30s) via std's
+        // File::set_modified (no external crate needed).
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_modified(SystemTime::now() - Duration::from_secs(120))
+            .unwrap();
+        drop(file);
+        maybe_remove_stale_lock(&path).unwrap();
+        assert!(!path.exists(), "an ancient non-JSON lock must be reclaimed");
+    }
+
+    #[test]
+    fn maybe_remove_stale_lock_keeps_fresh_legacy_file() {
+        use super::maybe_remove_stale_lock;
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("legacy_fresh.lock");
+        std::fs::write(&path, "not json at all").unwrap();
+        // Just-created mtime is within the legacy timeout -> kept.
+        maybe_remove_stale_lock(&path).unwrap();
+        assert!(path.exists(), "a fresh non-JSON lock must be preserved");
+    }
+
+    // ---------- fixture lockfile cleanup ----------
+
+    #[test]
+    fn remove_lockfiles_recursively_deletes_cargo_lock_but_skips_target() {
+        use super::remove_lockfiles_recursively;
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("qq");
+        std::fs::create_dir_all(root.join("child")).unwrap();
+        std::fs::create_dir_all(root.join("target")).unwrap();
+        std::fs::write(root.join("Cargo.lock"), "l").unwrap();
+        std::fs::write(root.join("child/Cargo.lock"), "l").unwrap();
+        std::fs::write(root.join("target/Cargo.lock"), "l").unwrap();
+        std::fs::write(root.join("keep.txt"), "k").unwrap();
+
+        remove_lockfiles_recursively(&root).unwrap();
+
+        assert!(!root.join("Cargo.lock").exists());
+        assert!(!root.join("child/Cargo.lock").exists());
+        assert!(
+            root.join("target/Cargo.lock").exists(),
+            "target/ is skipped"
+        );
+        assert!(root.join("keep.txt").exists());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn cleanup_fixture_lockfiles_is_gated_by_env() {
+        use super::cleanup_fixture_lockfiles;
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        let plugins_root = dir.path().join("plugins");
+        std::fs::create_dir_all(plugins_root.join("qq")).unwrap();
+        std::fs::write(plugins_root.join("qq/Cargo.lock"), "l").unwrap();
+
+        // Without the opt-in env var, lock files are left alone.
+        std::env::remove_var("CORDIS_CLEAN_FIXTURE_LOCKFILES");
+        cleanup_fixture_lockfiles(&plugins_root).unwrap();
+        assert!(plugins_root.join("qq/Cargo.lock").exists());
+
+        // With the opt-in, they are removed.
+        std::env::set_var("CORDIS_CLEAN_FIXTURE_LOCKFILES", "1");
+        cleanup_fixture_lockfiles(&plugins_root).unwrap();
+        std::env::remove_var("CORDIS_CLEAN_FIXTURE_LOCKFILES");
+        assert!(!plugins_root.join("qq/Cargo.lock").exists());
+    }
+
+    #[test]
+    fn cleanup_fixture_lockfiles_noop_for_missing_root() {
+        use super::cleanup_fixture_lockfiles;
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        cleanup_fixture_lockfiles(&dir.path().join("does-not-exist")).unwrap();
+    }
 }

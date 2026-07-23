@@ -693,6 +693,812 @@ mod loader_helper_tests {
     }
 }
 
+#[cfg(test)]
+mod loader_flow_tests {
+    use super::*;
+    use crate::core::models::{
+        AbiFingerprint, ArtifactIndex, ArtifactIndexEntry, ArtifactKind, PluginArtifact,
+        PluginDocs, ARTIFACT_INDEX_SCHEMA_VERSION,
+    };
+    use cordis_plugin_sdk::CORDIS_TARGET;
+    use std::fs;
+    use tempfile::TempDir;
+
+    // --- fixture builders ----------------------------------------------------
+
+    fn abi_host(crate_hash: &str, api_hash: &str) -> AbiFingerprint {
+        AbiFingerprint {
+            rustc_version: "test-rustc".to_string(),
+            target_triple: CORDIS_TARGET.to_string(),
+            crate_hash: crate_hash.to_string(),
+            api_hash: api_hash.to_string(),
+        }
+    }
+
+    fn docs(plugin_path: &str) -> PluginDocs {
+        PluginDocs {
+            plugin_id: plugin_path.replace('/', "_"),
+            plugin_path: plugin_path.to_string(),
+            plugin_version: "0.1.0".to_string(),
+            abi_version: 2,
+            command_name: None,
+            nodes: Vec::new(),
+            system_hint: None,
+        }
+    }
+
+    /// Build a JSON plugin artifact file and return (relative_ref, sha256).
+    fn write_json_artifact(
+        artifacts_dir: &Path,
+        rel_name: &str,
+        artifact: &PluginArtifact,
+    ) -> (String, String) {
+        let path = artifacts_dir.join(rel_name);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(&path, serde_json::to_string_pretty(artifact).unwrap()).unwrap();
+        let sha = crate::plugin::artifact::sha256_file(&path).unwrap();
+        (rel_name.to_string(), sha)
+    }
+
+    fn json_entry(
+        plugin_path: &str,
+        rel_name: &str,
+        sha256: &str,
+        abi: AbiFingerprint,
+        docs: PluginDocs,
+    ) -> ArtifactIndexEntry {
+        ArtifactIndexEntry {
+            plugin_path: plugin_path.to_string(),
+            version: "0.1.0".to_string(),
+            abi_fingerprint: abi,
+            artifact_path: rel_name.to_string(),
+            sha256: sha256.to_string(),
+            built_at: "0".to_string(),
+            parent: None,
+            required: true,
+            grants_from_parent: Vec::new(),
+            docs,
+            exports: Vec::new(),
+            execution: None,
+            artifact_kind: ArtifactKind::Json,
+            build_fingerprint: "bf".to_string(),
+            input_probe: Default::default(),
+            local_path_deps: Vec::new(),
+        }
+    }
+
+    fn write_index(root: &Path, index: &ArtifactIndex) -> LoaderConfig {
+        let artifacts_dir = root.join("artifacts");
+        fs::create_dir_all(&artifacts_dir).unwrap();
+        let index_path = artifacts_dir.join("index.json");
+        fs::write(&index_path, serde_json::to_string_pretty(index).unwrap()).unwrap();
+        LoaderConfig {
+            plugins_root: root.join("plugins"),
+            artifact_index_path: index_path,
+            budget: LoaderBudget {
+                max_total_plugins: 256,
+                max_total_nodes: 4096,
+                load_timeout_ms: 120_000,
+            },
+        }
+    }
+
+    /// Convenience: build a single JSON plugin whose artifact contents match
+    /// its index entry (happy path), return the finished LoaderConfig.
+    fn single_json_plugin(root: &Path, plugin_path: &str) -> LoaderConfig {
+        let artifacts_dir = root.join("artifacts");
+        fs::create_dir_all(&artifacts_dir).unwrap();
+        let abi = abi_host("crate_v1", "api_v2");
+        let d = docs(plugin_path);
+        let artifact = PluginArtifact {
+            plugin_path: plugin_path.to_string(),
+            abi_fingerprint: abi.clone(),
+            docs: d.clone(),
+            exports: Vec::new(),
+            execution: None,
+        };
+        let rel = format!("{}.json", plugin_path.replace('/', "_"));
+        let (rel, sha) = write_json_artifact(&artifacts_dir, &rel, &artifact);
+        let entry = json_entry(plugin_path, &rel, &sha, abi, d);
+        let index = ArtifactIndex {
+            schema_version: ARTIFACT_INDEX_SCHEMA_VERSION,
+            generated_at: "now".to_string(),
+            topo_order: vec![plugin_path.to_string()],
+            entries: vec![entry],
+        };
+        write_index(root, &index)
+    }
+
+    // --- happy path ----------------------------------------------------------
+
+    #[test]
+    fn load_single_json_plugin_loaded() {
+        let tmp = TempDir::new().unwrap();
+        let config = single_json_plugin(tmp.path(), "alpha");
+        let out = Loader::new(config).load().unwrap();
+        assert!(matches!(
+            out.plugin_registry.get("alpha").unwrap().load_result,
+            PluginLoadResult::Loaded
+        ));
+        assert!(out.execution_id.starts_with("exec-"));
+        assert_eq!(out.metrics.plugin_unavailable_total, 0);
+    }
+
+    #[test]
+    fn load_json_plugin_with_exports_provides_services() {
+        let tmp = TempDir::new().unwrap();
+        let artifacts_dir = tmp.path().join("artifacts");
+        fs::create_dir_all(&artifacts_dir).unwrap();
+        let abi = abi_host("crate_v1", "api_v2");
+        let d = docs("alpha");
+        let artifact = PluginArtifact {
+            plugin_path: "alpha".to_string(),
+            abi_fingerprint: abi.clone(),
+            docs: d.clone(),
+            exports: vec!["svc.db".to_string()],
+            execution: None,
+        };
+        let (rel, sha) = write_json_artifact(&artifacts_dir, "alpha.json", &artifact);
+        let mut entry = json_entry("alpha", &rel, &sha, abi, d);
+        entry.exports = vec!["svc.db".to_string()];
+        let index = ArtifactIndex {
+            schema_version: ARTIFACT_INDEX_SCHEMA_VERSION,
+            generated_at: "now".to_string(),
+            topo_order: vec!["alpha".to_string()],
+            entries: vec![entry],
+        };
+        let config = write_index(tmp.path(), &index);
+        let out = Loader::new(config).load().unwrap();
+        assert!(matches!(
+            out.plugin_registry.get("alpha").unwrap().load_result,
+            PluginLoadResult::Loaded
+        ));
+    }
+
+    #[test]
+    fn load_with_staging_root_copies_artifact() {
+        // load_with_staging_root(Some) drives stage_artifact_bundle before the
+        // JSON artifact is parsed, so the staged copy must load Loaded.
+        let tmp = TempDir::new().unwrap();
+        let config = single_json_plugin(tmp.path(), "alpha");
+        let staged = tmp.path().join("staged");
+        fs::create_dir_all(&staged).unwrap();
+        let out = Loader::new(config)
+            .load_with_staging_root(Some(&staged))
+            .unwrap();
+        assert!(matches!(
+            out.plugin_registry.get("alpha").unwrap().load_result,
+            PluginLoadResult::Loaded
+        ));
+        // The artifact was staged under the staging root.
+        assert!(staged.join("alpha.json").exists());
+    }
+
+    // --- budget --------------------------------------------------------------
+
+    #[test]
+    fn load_budget_exceeded_plugins() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = single_json_plugin(tmp.path(), "alpha");
+        config.budget.max_total_plugins = 0;
+        let err = Loader::new(config).load().unwrap_err();
+        assert!(matches!(err, RuntimeError::BudgetExceeded { .. }));
+    }
+
+    #[test]
+    fn load_budget_exceeded_nodes() {
+        let tmp = TempDir::new().unwrap();
+        // Give the plugin one declared node so max_total_nodes=0 trips.
+        let artifacts_dir = tmp.path().join("artifacts");
+        fs::create_dir_all(&artifacts_dir).unwrap();
+        let abi = abi_host("crate_v1", "api_v2");
+        let mut d = docs("alpha");
+        d.nodes.push(cordis_plugin_sdk::NodeDoc {
+            id: "n1".to_string(),
+            summary: "n".to_string(),
+            input_schema: serde_json::json!({}),
+            output_schema: serde_json::json!({}),
+            side_effects: Vec::new(),
+            failure_modes: Vec::new(),
+            node_type: Default::default(),
+            agent_accessible: true,
+        });
+        let artifact = PluginArtifact {
+            plugin_path: "alpha".to_string(),
+            abi_fingerprint: abi.clone(),
+            docs: d.clone(),
+            exports: Vec::new(),
+            execution: None,
+        };
+        let (rel, sha) = write_json_artifact(&artifacts_dir, "alpha.json", &artifact);
+        let entry = json_entry("alpha", &rel, &sha, abi, d);
+        let index = ArtifactIndex {
+            schema_version: ARTIFACT_INDEX_SCHEMA_VERSION,
+            generated_at: "now".to_string(),
+            topo_order: vec!["alpha".to_string()],
+            entries: vec![entry],
+        };
+        let mut config = write_index(tmp.path(), &index);
+        config.budget.max_total_nodes = 0;
+        let err = Loader::new(config).load().unwrap_err();
+        assert!(matches!(err, RuntimeError::BudgetExceeded { .. }));
+    }
+
+    // --- artifact missing ----------------------------------------------------
+
+    #[test]
+    fn load_artifact_missing_marks_unavailable() {
+        let tmp = TempDir::new().unwrap();
+        let abi = abi_host("crate_v1", "api_v2");
+        let d = docs("alpha");
+        // Index references a file that was never written.
+        let entry = json_entry("alpha", "ghost.json", &"0".repeat(64), abi, d);
+        let index = ArtifactIndex {
+            schema_version: ARTIFACT_INDEX_SCHEMA_VERSION,
+            generated_at: "now".to_string(),
+            topo_order: vec!["alpha".to_string()],
+            entries: vec![entry],
+        };
+        let config = write_index(tmp.path(), &index);
+        let out = Loader::new(config).load().unwrap();
+        assert!(matches!(
+            out.plugin_registry.get("alpha").unwrap().load_result,
+            PluginLoadResult::Unavailable(PluginUnavailableReason::ArtifactMissing)
+        ));
+        assert_eq!(out.metrics.plugin_unavailable_total, 1);
+    }
+
+    // --- hash mismatch -------------------------------------------------------
+
+    #[test]
+    fn load_hash_mismatch_marks_unavailable() {
+        let tmp = TempDir::new().unwrap();
+        let artifacts_dir = tmp.path().join("artifacts");
+        fs::create_dir_all(&artifacts_dir).unwrap();
+        let abi = abi_host("crate_v1", "api_v2");
+        let d = docs("alpha");
+        let artifact = PluginArtifact {
+            plugin_path: "alpha".to_string(),
+            abi_fingerprint: abi.clone(),
+            docs: d.clone(),
+            exports: Vec::new(),
+            execution: None,
+        };
+        let (rel, _sha) = write_json_artifact(&artifacts_dir, "alpha.json", &artifact);
+        // Deliberately record the WRONG sha256.
+        let entry = json_entry("alpha", &rel, &"a".repeat(64), abi, d);
+        let index = ArtifactIndex {
+            schema_version: ARTIFACT_INDEX_SCHEMA_VERSION,
+            generated_at: "now".to_string(),
+            topo_order: vec!["alpha".to_string()],
+            entries: vec![entry],
+        };
+        let config = write_index(tmp.path(), &index);
+        let out = Loader::new(config).load().unwrap();
+        assert!(matches!(
+            out.plugin_registry.get("alpha").unwrap().load_result,
+            PluginLoadResult::Unavailable(PluginUnavailableReason::HashMismatch)
+        ));
+    }
+
+    // --- dylib triple precheck (AbiMismatch) ---------------------------------
+
+    #[test]
+    fn load_dylib_wrong_triple_precheck_abi_mismatch() {
+        let tmp = TempDir::new().unwrap();
+        let artifacts_dir = tmp.path().join("artifacts");
+        fs::create_dir_all(&artifacts_dir).unwrap();
+        // Any bytes will do — the triple precheck fires before staging/dlopen.
+        let so_path = artifacts_dir.join("alpha.so");
+        fs::write(&so_path, b"not-a-real-dylib").unwrap();
+        let sha = crate::plugin::artifact::sha256_file(&so_path).unwrap();
+        // Record a triple that is guaranteed != host.
+        let bad_triple = if CORDIS_TARGET == "x86_64-unknown-linux-gnu" {
+            "aarch64-apple-darwin"
+        } else {
+            "x86_64-unknown-linux-gnu"
+        };
+        let abi = AbiFingerprint {
+            rustc_version: "test".to_string(),
+            target_triple: bad_triple.to_string(),
+            crate_hash: "c".to_string(),
+            api_hash: "a".to_string(),
+        };
+        let mut entry = json_entry("alpha", "alpha.so", &sha, abi, docs("alpha"));
+        entry.artifact_kind = ArtifactKind::Dylib;
+        let index = ArtifactIndex {
+            schema_version: ARTIFACT_INDEX_SCHEMA_VERSION,
+            generated_at: "now".to_string(),
+            topo_order: vec!["alpha".to_string()],
+            entries: vec![entry],
+        };
+        let config = write_index(tmp.path(), &index);
+        let out = Loader::new(config).load().unwrap();
+        assert!(matches!(
+            out.plugin_registry.get("alpha").unwrap().load_result,
+            PluginLoadResult::Unavailable(PluginUnavailableReason::AbiMismatch)
+        ));
+        assert_eq!(out.metrics.dylib_abi_mismatch_total, 1);
+    }
+
+    // --- JSON artifact contract violations -----------------------------------
+
+    #[test]
+    fn load_json_plugin_path_mismatch_contract_violation() {
+        let tmp = TempDir::new().unwrap();
+        let artifacts_dir = tmp.path().join("artifacts");
+        fs::create_dir_all(&artifacts_dir).unwrap();
+        let abi = abi_host("crate_v1", "api_v2");
+        // Artifact claims a different plugin_path than the index entry.
+        let artifact = PluginArtifact {
+            plugin_path: "other".to_string(),
+            abi_fingerprint: abi.clone(),
+            docs: docs("other"),
+            exports: Vec::new(),
+            execution: None,
+        };
+        let (rel, sha) = write_json_artifact(&artifacts_dir, "alpha.json", &artifact);
+        let entry = json_entry("alpha", &rel, &sha, abi, docs("alpha"));
+        let index = ArtifactIndex {
+            schema_version: ARTIFACT_INDEX_SCHEMA_VERSION,
+            generated_at: "now".to_string(),
+            topo_order: vec!["alpha".to_string()],
+            entries: vec![entry],
+        };
+        let config = write_index(tmp.path(), &index);
+        let out = Loader::new(config).load().unwrap();
+        assert!(matches!(
+            out.plugin_registry.get("alpha").unwrap().load_result,
+            PluginLoadResult::Unavailable(PluginUnavailableReason::ContractViolation)
+        ));
+    }
+
+    #[test]
+    fn load_json_abi_fingerprint_mismatch() {
+        let tmp = TempDir::new().unwrap();
+        let artifacts_dir = tmp.path().join("artifacts");
+        fs::create_dir_all(&artifacts_dir).unwrap();
+        let index_abi = abi_host("crate_v1", "api_v2");
+        let artifact_abi = abi_host("crate_DIFFERENT", "api_v2");
+        let artifact = PluginArtifact {
+            plugin_path: "alpha".to_string(),
+            abi_fingerprint: artifact_abi,
+            docs: docs("alpha"),
+            exports: Vec::new(),
+            execution: None,
+        };
+        let (rel, sha) = write_json_artifact(&artifacts_dir, "alpha.json", &artifact);
+        let entry = json_entry("alpha", &rel, &sha, index_abi, docs("alpha"));
+        let index = ArtifactIndex {
+            schema_version: ARTIFACT_INDEX_SCHEMA_VERSION,
+            generated_at: "now".to_string(),
+            topo_order: vec!["alpha".to_string()],
+            entries: vec![entry],
+        };
+        let config = write_index(tmp.path(), &index);
+        let out = Loader::new(config).load().unwrap();
+        assert!(matches!(
+            out.plugin_registry.get("alpha").unwrap().load_result,
+            PluginLoadResult::Unavailable(PluginUnavailableReason::AbiMismatch)
+        ));
+        assert_eq!(out.metrics.dylib_abi_mismatch_total, 1);
+    }
+
+    // --- docs drift auto-heal (JSON) -----------------------------------------
+
+    #[test]
+    fn load_json_docs_drift_autoheals_and_rewrites_index() {
+        let tmp = TempDir::new().unwrap();
+        let artifacts_dir = tmp.path().join("artifacts");
+        fs::create_dir_all(&artifacts_dir).unwrap();
+        let abi = abi_host("crate_v1", "api_v2");
+        // Artifact docs carry a system_hint the index entry lacks → drift.
+        let mut artifact_docs = docs("alpha");
+        artifact_docs.system_hint = Some("fresh hint".to_string());
+        let artifact = PluginArtifact {
+            plugin_path: "alpha".to_string(),
+            abi_fingerprint: abi.clone(),
+            docs: artifact_docs.clone(),
+            exports: Vec::new(),
+            execution: None,
+        };
+        let (rel, sha) = write_json_artifact(&artifacts_dir, "alpha.json", &artifact);
+        let entry = json_entry("alpha", &rel, &sha, abi, docs("alpha"));
+        let index = ArtifactIndex {
+            schema_version: ARTIFACT_INDEX_SCHEMA_VERSION,
+            generated_at: "now".to_string(),
+            topo_order: vec!["alpha".to_string()],
+            entries: vec![entry],
+        };
+        let config = write_index(tmp.path(), &index);
+        let index_path = config.artifact_index_path.clone();
+        let out = Loader::new(config).load().unwrap();
+        // Plugin loads with the healed docs (system_hint present).
+        let state = out.plugin_registry.get("alpha").unwrap();
+        assert!(matches!(state.load_result, PluginLoadResult::Loaded));
+        assert_eq!(
+            state.docs.as_ref().unwrap().system_hint.as_deref(),
+            Some("fresh hint")
+        );
+        // Index file on disk was rewritten with the healed docs.
+        let rewritten = load_artifact_index(&index_path).unwrap();
+        assert_eq!(
+            rewritten.entries[0].docs.system_hint.as_deref(),
+            Some("fresh hint")
+        );
+        // interfaces.json was synced under plugins_root.
+        let synced = tmp.path().join("plugins/alpha/docs/agent/interfaces.json");
+        assert!(synced.exists());
+    }
+
+    // --- required parent-failure propagation ---------------------------------
+
+    #[test]
+    fn load_required_child_failure_propagates_to_parent() {
+        let tmp = TempDir::new().unwrap();
+        let artifacts_dir = tmp.path().join("artifacts");
+        fs::create_dir_all(&artifacts_dir).unwrap();
+        let abi = abi_host("crate_v1", "api_v2");
+
+        // Parent loads fine.
+        let parent_artifact = PluginArtifact {
+            plugin_path: "parent".to_string(),
+            abi_fingerprint: abi.clone(),
+            docs: docs("parent"),
+            exports: Vec::new(),
+            execution: None,
+        };
+        let (prel, psha) = write_json_artifact(&artifacts_dir, "parent.json", &parent_artifact);
+        let parent_entry = json_entry("parent", &prel, &psha, abi.clone(), docs("parent"));
+
+        // Child is required and its artifact is MISSING → failure propagates
+        // upward and marks the parent InitFailed.
+        let mut child_entry = json_entry(
+            "parent/child",
+            "ghost.json",
+            &"0".repeat(64),
+            abi,
+            docs("parent/child"),
+        );
+        child_entry.parent = Some("parent".to_string());
+        child_entry.required = true;
+
+        let index = ArtifactIndex {
+            schema_version: ARTIFACT_INDEX_SCHEMA_VERSION,
+            generated_at: "now".to_string(),
+            topo_order: vec!["parent".to_string(), "parent/child".to_string()],
+            entries: vec![parent_entry, child_entry],
+        };
+        let config = write_index(tmp.path(), &index);
+        let out = Loader::new(config).load().unwrap();
+        // Child unavailable (artifact missing).
+        assert!(matches!(
+            out.plugin_registry.get("parent/child").unwrap().load_result,
+            PluginLoadResult::Unavailable(PluginUnavailableReason::ArtifactMissing)
+        ));
+        // Parent dragged to InitFailed by required-propagation.
+        assert!(matches!(
+            out.plugin_registry.get("parent").unwrap().load_result,
+            PluginLoadResult::Unavailable(PluginUnavailableReason::InitFailed)
+        ));
+    }
+
+    #[test]
+    fn load_child_skipped_when_parent_not_loaded() {
+        let tmp = TempDir::new().unwrap();
+        let artifacts_dir = tmp.path().join("artifacts");
+        fs::create_dir_all(&artifacts_dir).unwrap();
+        let abi = abi_host("crate_v1", "api_v2");
+
+        // Parent artifact missing → parent unavailable, but NOT required so no
+        // upward propagation.
+        let mut parent_entry = json_entry(
+            "parent",
+            "ghost.json",
+            &"0".repeat(64),
+            abi.clone(),
+            docs("parent"),
+        );
+        parent_entry.required = false;
+
+        // Child's artifact exists and is valid, but its parent failed to load →
+        // child is short-circuited to InitFailed before any hash check.
+        let child_artifact = PluginArtifact {
+            plugin_path: "parent/child".to_string(),
+            abi_fingerprint: abi.clone(),
+            docs: docs("parent/child"),
+            exports: Vec::new(),
+            execution: None,
+        };
+        let (crel, csha) = write_json_artifact(&artifacts_dir, "child.json", &child_artifact);
+        let mut child_entry = json_entry("parent/child", &crel, &csha, abi, docs("parent/child"));
+        child_entry.parent = Some("parent".to_string());
+        child_entry.required = false;
+
+        let index = ArtifactIndex {
+            schema_version: ARTIFACT_INDEX_SCHEMA_VERSION,
+            generated_at: "now".to_string(),
+            topo_order: vec!["parent".to_string(), "parent/child".to_string()],
+            entries: vec![parent_entry, child_entry],
+        };
+        let config = write_index(tmp.path(), &index);
+        let out = Loader::new(config).load().unwrap();
+        assert!(matches!(
+            out.plugin_registry.get("parent/child").unwrap().load_result,
+            PluginLoadResult::Unavailable(PluginUnavailableReason::InitFailed)
+        ));
+    }
+
+    // --- topo_order references a missing entry -------------------------------
+
+    #[test]
+    fn load_topo_order_missing_entry_errors() {
+        let tmp = TempDir::new().unwrap();
+        let config = single_json_plugin(tmp.path(), "alpha");
+        // Rewrite the index adding a topo_order id that has no entry.
+        let mut index = load_artifact_index(&config.artifact_index_path).unwrap();
+        index.topo_order.push("ghost".to_string());
+        fs::write(
+            &config.artifact_index_path,
+            serde_json::to_string_pretty(&index).unwrap(),
+        )
+        .unwrap();
+        let err = Loader::new(config).load().unwrap_err();
+        assert!(matches!(err, RuntimeError::ArtifactIndexMissing { .. }));
+    }
+
+    // --- load_timeout budget -------------------------------------------------
+
+    #[test]
+    fn load_timeout_zero_budget_trips() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = single_json_plugin(tmp.path(), "alpha");
+        config.budget.load_timeout_ms = 0;
+        // With a 0ms budget the first ensure_not_timed_out after index load
+        // will almost always exceed it; if the machine is impossibly fast the
+        // per-plugin check will. Assert either the timeout or a clean load.
+        match Loader::new(config).load() {
+            Err(RuntimeError::LoadTimeout { limit_ms, .. }) => assert_eq!(limit_ms, 0),
+            Ok(out) => {
+                // Extremely fast path: accept a successful load.
+                assert!(out.plugin_registry.get("alpha").is_some());
+            }
+            Err(other) => panic!("unexpected error {other:?}"),
+        }
+    }
+
+    // --- default_loader_config -----------------------------------------------
+
+    #[test]
+    fn default_loader_config_paths() {
+        let cfg = default_loader_config("/some/root");
+        assert_eq!(cfg.plugins_root, PathBuf::from("/some/root/plugins"));
+        assert_eq!(
+            cfg.artifact_index_path,
+            PathBuf::from("/some/root/artifacts/index.json")
+        );
+        assert_eq!(cfg.budget.max_total_plugins, 256);
+        assert_eq!(cfg.budget.max_total_nodes, 4096);
+        assert_eq!(cfg.budget.load_timeout_ms, 120_000);
+    }
+
+    #[test]
+    fn make_execution_id_is_unique_and_prefixed() {
+        let a = make_execution_id();
+        let b = make_execution_id();
+        assert_ne!(a, b);
+        assert!(a.starts_with("exec-"));
+    }
+
+    // --- dylib real-load happy path + docs read ------------------------------
+
+    fn host_native_fixture(name: &str) -> Option<(PathBuf, ArtifactKind)> {
+        let ext = if cfg!(target_os = "macos") {
+            "dylib"
+        } else if cfg!(target_os = "linux") {
+            "so"
+        } else {
+            return None;
+        };
+        let p = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/artifacts")
+            .join(format!("{name}.{ext}"));
+        p.exists().then_some((p, ArtifactKind::Dylib))
+    }
+
+    #[test]
+    fn load_real_dylib_reads_docs_and_registers() {
+        // Uses the arm64 fixture dylib on macOS; skip when unavailable or the
+        // triple doesn't match the host (loader precheck would reject it).
+        let Some((src, _)) = host_native_fixture("expr") else {
+            eprintln!("[skip] no host-native fixture dylib");
+            return;
+        };
+        // Read the plugin's real docs so the index entry matches (no drift, no
+        // symbol errors) — this drives the dylib Ok branch end-to-end.
+        let real_docs = match crate::plugin::tooling::read_plugin_docs(&src) {
+            Ok(d) => d,
+            Err(err) => {
+                eprintln!("[skip] fixture dylib not loadable here: {err:?}");
+                return;
+            }
+        };
+        let tmp = TempDir::new().unwrap();
+        let artifacts_dir = tmp.path().join("artifacts");
+        fs::create_dir_all(&artifacts_dir).unwrap();
+        let dst = artifacts_dir.join("expr.dylib");
+        fs::copy(&src, &dst).unwrap();
+        let sha = crate::plugin::artifact::sha256_file(&dst).unwrap();
+        let plugin_path = real_docs.plugin_path.clone();
+        let abi = AbiFingerprint {
+            rustc_version: "test".to_string(),
+            target_triple: CORDIS_TARGET.to_string(),
+            crate_hash: "c".to_string(),
+            api_hash: "a".to_string(),
+        };
+        let mut entry = json_entry(&plugin_path, "expr.dylib", &sha, abi, real_docs);
+        entry.artifact_kind = ArtifactKind::Dylib;
+        let index = ArtifactIndex {
+            schema_version: ARTIFACT_INDEX_SCHEMA_VERSION,
+            generated_at: "now".to_string(),
+            topo_order: vec![plugin_path.clone()],
+            entries: vec![entry],
+        };
+        let config = write_index(tmp.path(), &index);
+        let out = Loader::new(config).load().unwrap();
+        assert!(matches!(
+            out.plugin_registry.get(&plugin_path).unwrap().load_result,
+            PluginLoadResult::Loaded
+        ));
+    }
+
+    #[test]
+    fn load_sha256_read_failure_marks_hash_mismatch() {
+        // A directory at the artifact path passes exists() but sha256_file's
+        // read loop errors (EISDIR on Unix), driving the sha256 Err branch
+        // (distinct from the plain mismatch branch).
+        let tmp = TempDir::new().unwrap();
+        let artifacts_dir = tmp.path().join("artifacts");
+        fs::create_dir_all(&artifacts_dir).unwrap();
+        // Create a directory named like the artifact.
+        fs::create_dir_all(artifacts_dir.join("alpha.json")).unwrap();
+        let abi = abi_host("c", "a");
+        let entry = json_entry("alpha", "alpha.json", &"0".repeat(64), abi, docs("alpha"));
+        let index = ArtifactIndex {
+            schema_version: ARTIFACT_INDEX_SCHEMA_VERSION,
+            generated_at: "now".to_string(),
+            topo_order: vec!["alpha".to_string()],
+            entries: vec![entry],
+        };
+        let config = write_index(tmp.path(), &index);
+        let out = Loader::new(config).load().unwrap();
+        assert!(matches!(
+            out.plugin_registry.get("alpha").unwrap().load_result,
+            PluginLoadResult::Unavailable(PluginUnavailableReason::HashMismatch)
+        ));
+    }
+
+    #[test]
+    fn load_real_dylib_docs_drift_autoheals() {
+        // Index entry docs differ from the dylib's real docs → the dylib Ok
+        // branch pushes a docs-drift entry and auto-heals. Requires a
+        // host-native fixture dylib.
+        let Some((src, _)) = host_native_fixture("expr") else {
+            eprintln!("[skip] no host-native fixture dylib");
+            return;
+        };
+        let real_docs = match crate::plugin::tooling::read_plugin_docs(&src) {
+            Ok(d) => d,
+            Err(err) => {
+                eprintln!("[skip] fixture dylib not loadable: {err:?}");
+                return;
+            }
+        };
+        let tmp = TempDir::new().unwrap();
+        let artifacts_dir = tmp.path().join("artifacts");
+        fs::create_dir_all(&artifacts_dir).unwrap();
+        let dst = artifacts_dir.join("expr.dylib");
+        fs::copy(&src, &dst).unwrap();
+        let sha = crate::plugin::artifact::sha256_file(&dst).unwrap();
+        let plugin_path = real_docs.plugin_path.clone();
+        let abi = AbiFingerprint {
+            rustc_version: "test".to_string(),
+            target_triple: CORDIS_TARGET.to_string(),
+            crate_hash: "c".to_string(),
+            api_hash: "a".to_string(),
+        };
+        // Stale index docs: strip system_hint / mutate version so they differ
+        // from the artifact's real docs, forcing drift.
+        let mut stale = real_docs.clone();
+        stale.system_hint = Some("STALE-HINT-WILL-BE-HEALED".to_string());
+        let mut entry = json_entry(&plugin_path, "expr.dylib", &sha, abi, stale);
+        entry.artifact_kind = ArtifactKind::Dylib;
+        let index = ArtifactIndex {
+            schema_version: ARTIFACT_INDEX_SCHEMA_VERSION,
+            generated_at: "now".to_string(),
+            topo_order: vec![plugin_path.clone()],
+            entries: vec![entry],
+        };
+        let config = write_index(tmp.path(), &index);
+        let index_path = config.artifact_index_path.clone();
+        let out = Loader::new(config).load().unwrap();
+        let state = out.plugin_registry.get(&plugin_path).unwrap();
+        assert!(matches!(state.load_result, PluginLoadResult::Loaded));
+        // Effective docs are the dylib's real docs (drift healed).
+        assert_eq!(
+            state.docs.as_ref().unwrap().system_hint,
+            real_docs.system_hint
+        );
+        // Index on disk rewritten to the healed docs.
+        let rewritten = load_artifact_index(&index_path).unwrap();
+        assert_eq!(rewritten.entries[0].docs.system_hint, real_docs.system_hint);
+    }
+
+    #[test]
+    fn load_dylib_docs_read_failure_symbol_missing() {
+        // A file with the host target triple (so it passes the triple
+        // precheck) but invalid dylib bytes fails `read_plugin_docs`'s dlopen
+        // deterministically → SymbolMissing branch. The plugin is `required`
+        // with a parent so the parent-failure propagation path also runs.
+        let tmp = TempDir::new().unwrap();
+        let artifacts_dir = tmp.path().join("artifacts");
+        fs::create_dir_all(&artifacts_dir).unwrap();
+        let abi = AbiFingerprint {
+            rustc_version: "test".to_string(),
+            target_triple: CORDIS_TARGET.to_string(),
+            crate_hash: "c".to_string(),
+            api_hash: "a".to_string(),
+        };
+
+        // A valid JSON parent so the child's propagation has a real target.
+        let parent_artifact = PluginArtifact {
+            plugin_path: "parent".to_string(),
+            abi_fingerprint: abi.clone(),
+            docs: docs("parent"),
+            exports: Vec::new(),
+            execution: None,
+        };
+        let (prel, psha) = write_json_artifact(&artifacts_dir, "parent.json", &parent_artifact);
+        let parent_entry = json_entry("parent", &prel, &psha, abi.clone(), docs("parent"));
+
+        // Broken dylib child.
+        let broken = artifacts_dir.join("broken.dylib");
+        fs::write(&broken, b"this is not a valid mach-o or elf dylib").unwrap();
+        let sha = crate::plugin::artifact::sha256_file(&broken).unwrap();
+        let mut child = json_entry(
+            "parent/child",
+            "broken.dylib",
+            &sha,
+            abi,
+            docs("parent/child"),
+        );
+        child.artifact_kind = ArtifactKind::Dylib;
+        child.parent = Some("parent".to_string());
+        child.required = true;
+
+        let index = ArtifactIndex {
+            schema_version: ARTIFACT_INDEX_SCHEMA_VERSION,
+            generated_at: "now".to_string(),
+            topo_order: vec!["parent".to_string(), "parent/child".to_string()],
+            entries: vec![parent_entry, child],
+        };
+        let config = write_index(tmp.path(), &index);
+        let out = Loader::new(config).load().unwrap();
+        assert!(matches!(
+            out.plugin_registry.get("parent/child").unwrap().load_result,
+            PluginLoadResult::Unavailable(PluginUnavailableReason::SymbolMissing)
+        ));
+        // required child failure propagates the parent to InitFailed.
+        assert!(matches!(
+            out.plugin_registry.get("parent").unwrap().load_result,
+            PluginLoadResult::Unavailable(PluginUnavailableReason::InitFailed)
+        ));
+        assert_eq!(out.metrics.dylib_no_fallback_total, 1);
+    }
+}
+
 /// POSIX file lock helper used to serialise the docs-drift auto-heal write
 /// across multiple runtime processes and multiple loaders within one process.
 /// Uses `fcntl(F_SETLK, ...)` on Unix; a no-op stub on other platforms.
