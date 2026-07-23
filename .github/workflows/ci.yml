@@ -50,7 +50,8 @@ jobs:
         run: |
           set -o pipefail
           cargo run --locked -p cordis-runtime -- prepare-artifacts fixtures 2>&1 | tee /tmp/prepare.log || {
-            echo "::error::prepare-artifacts failed: $(tail -c 700 /tmp/prepare.log | tr '\n' ' ')"
+            echo "::error::$(grep -m1 'prepare-artifacts failed' /tmp/prepare.log | head -c 900)"
+            echo "::error::context: $(grep -B2 -m1 'prepare-artifacts failed' /tmp/prepare.log | tr '\n' ' ' | head -c 900)"
             exit 1
           }
 
