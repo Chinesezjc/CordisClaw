@@ -44,6 +44,13 @@ jobs:
       # fixtures/artifacts/ 不入库；host.rs / verifier.rs 的 lib 单测直接
       # RuntimeHost::boot，不走集成测试 support::fixtures_root() 的
       # ensure_fixture_artifacts()，所以必须在 test 之前显式预构建。
+      # prepare-artifacts 内部对 fixtures/plugins 跑 `cargo metadata
+      # --offline`（tooling.rs 对 metadata 子命令强制 offline），冷 runner
+      # 的 registry 没有 fixtures 依赖包时报 "no matching package named
+      # `hmac` found"。先在线 fetch 填充 registry；rust-cache 会缓存。
+      - name: fetch fixtures/plugins dependencies
+        run: cargo fetch --manifest-path fixtures/plugins/Cargo.toml
+
       # 失败时把输出尾部写成 ::error:: 注解，便于从 check-runs API 读取
       # 失败原因（GitHub 的原始日志接口需要认证）。
       - name: prepare fixture artifacts
