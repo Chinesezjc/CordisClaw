@@ -9,7 +9,7 @@ crate-type = ["rlib", "dylib"]
 [package.metadata.cordis]
 plugin_path = "feishu"
 abi_kind = "rust"
-declared_nodes = ["feishu_serve", "feishu_send", "feishu_entry"]
+declared_nodes = ["feishu_serve", "feishu_send", "feishu_entry", "feishu_fetch_resource", "feishu_fetch_image", "feishu_send_image", "feishu_get_message", "feishu_get_chat_info", "feishu_list_chats"]
 children = []
 # Docs come from the built dylib's docs_value(); no hand-written
 # docs/agent/interfaces.json (P1-48 opt-in).

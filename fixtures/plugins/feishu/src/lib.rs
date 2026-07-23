@@ -169,6 +169,13 @@ struct IncomingMessage {
     /// Whether the bot was @-mentioned (group chats; parse-time fact,
     /// policy decides what to do with it).
     mentioned: bool,
+    /// Feishu message_type ("text" | "image" | "post" | "file" | "audio" |
+    /// "media" | "sticker" | ...). Defaults to "text" when absent.
+    message_type: String,
+    /// True when the extracted text contains a media placeholder (image /
+    /// file / audio / video / sticker / unsupported), so the message is
+    /// forwarded even though its literal text may be short.
+    has_media: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -451,6 +458,87 @@ fn policy_gate(im: IncomingMessage, policy: &AccessPolicy) -> InboundOutcome {
     InboundOutcome::Message(im)
 }
 
+/// Extract a plain-text rendering of a message `content` value given its
+/// `message_type`. Returns `(text, has_media)`. Media messages become a
+/// bracketed placeholder carrying the resource key, so the agent can fetch
+/// the resource via `feishu_fetch_resource`. Malformed content (missing
+/// keys) degrades to empty-string placeholders and never panics.
+fn extract_content(message_type: &str, content: &Value) -> (String, bool) {
+    let s = |key: &str| content.get(key).and_then(|v| v.as_str()).unwrap_or("");
+    match message_type {
+        "text" => (s("text").to_string(), false),
+        "image" => (format!("[image file_key={}]", s("image_key")), true),
+        "post" => render_post(content),
+        "file" => (
+            format!("[file file_key={} name=\"{}\"]", s("file_key"), s("file_name")),
+            true,
+        ),
+        "audio" => {
+            let duration = content
+                .get("duration")
+                .and_then(|d| d.as_i64())
+                .map(|d| d.to_string())
+                .unwrap_or_else(|| s("duration").to_string());
+            (format!("[audio file_key={} duration={duration}ms]", s("file_key")), true)
+        }
+        "media" => (
+            format!("[video file_key={} name=\"{}\"]", s("file_key"), s("file_name")),
+            true,
+        ),
+        "sticker" => (format!("[sticker file_key={}]", s("file_key")), true),
+        other => (format!("[unsupported message_type={other}]"), true),
+    }
+}
+
+/// Render a Feishu rich-text (post) `content` into plain text. A non-empty
+/// title becomes a leading line. Each paragraph is a row of runs; runs are
+/// concatenated directly and paragraphs are joined with "\n". `img` runs
+/// become an image placeholder (setting has_media); `at` runs render as
+/// "@<name>"; `text`/`a` runs contribute their `text` field.
+fn render_post(content: &Value) -> (String, bool) {
+    let mut has_media = false;
+    let mut lines: Vec<String> = Vec::new();
+
+    if let Some(title) = content.get("title").and_then(|t| t.as_str()) {
+        if !title.is_empty() {
+            lines.push(title.to_string());
+        }
+    }
+
+    if let Some(paragraphs) = content.get("content").and_then(|c| c.as_array()) {
+        for paragraph in paragraphs {
+            let Some(runs) = paragraph.as_array() else { continue };
+            let mut line = String::new();
+            for run in runs {
+                let tag = run.get("tag").and_then(|t| t.as_str()).unwrap_or("");
+                match tag {
+                    "text" | "a" => {
+                        line.push_str(run.get("text").and_then(|t| t.as_str()).unwrap_or(""));
+                    }
+                    "at" => {
+                        let name = run
+                            .get("user_name")
+                            .and_then(|n| n.as_str())
+                            .or_else(|| run.get("user_id").and_then(|n| n.as_str()))
+                            .unwrap_or("");
+                        line.push('@');
+                        line.push_str(name);
+                    }
+                    "img" => {
+                        let key = run.get("image_key").and_then(|k| k.as_str()).unwrap_or("");
+                        line.push_str(&format!("[image file_key={key}]"));
+                        has_media = true;
+                    }
+                    _ => {}
+                }
+            }
+            lines.push(line);
+        }
+    }
+
+    (lines.join("\n"), has_media)
+}
+
 /// Parse an `im.message.receive_v1` event structurally (no policy).
 /// Returns None when malformed. Mention state is recorded on the message;
 /// `policy_gate` decides whether it matters.
@@ -469,14 +557,15 @@ fn parse_message_event(v: &Value, bot_open_id: Option<&str>) -> Option<IncomingM
         .unwrap_or("")
         .to_string();
 
-    // content is a JSON string; text messages carry {"text":"..."}.
+    // content is a JSON string; its shape depends on message_type.
+    let message_type = message
+        .get("message_type")
+        .and_then(|t| t.as_str())
+        .unwrap_or("text")
+        .to_string();
     let content_raw = message.get("content").and_then(|c| c.as_str()).unwrap_or("{}");
     let content: Value = serde_json::from_str(content_raw).unwrap_or(Value::Null);
-    let text = content
-        .get("text")
-        .and_then(|t| t.as_str())
-        .unwrap_or("")
-        .to_string();
+    let (text, has_media) = extract_content(&message_type, &content);
 
     // Record whether the bot was @-mentioned; policy_gate decides relevance.
     let mentioned = message
@@ -500,7 +589,13 @@ fn parse_message_event(v: &Value, bot_open_id: Option<&str>) -> Option<IncomingM
         .unwrap_or(false);
 
     // Strip @-mention placeholder text like "@_user_1 " that Feishu leaves.
-    let cleaned = strip_mention_tokens(&text);
+    // Only text and post carry such placeholders; media placeholders (with
+    // quoted file names / spaced tokens) are kept verbatim so they survive.
+    let cleaned = if message_type == "text" || message_type == "post" {
+        strip_mention_tokens(&text)
+    } else {
+        text
+    };
 
     Some(IncomingMessage {
         chat_type,
@@ -510,6 +605,8 @@ fn parse_message_event(v: &Value, bot_open_id: Option<&str>) -> Option<IncomingM
         message_id,
         root_id,
         mentioned,
+        message_type,
+        has_media,
     })
 }
 
@@ -604,6 +701,8 @@ fn parse_card_action(v: &Value) -> Option<IncomingMessage> {
         root_id: None,
         // A button click is always an explicit interaction with the bot.
         mentioned: true,
+        message_type: "text".to_string(),
+        has_media: false,
     })
 }
 
@@ -745,6 +844,200 @@ fn feishu_send_message(
 }
 
 // ---------------------------------------------------------------------------
+// Media resource helpers (download / upload / get / chats)
+// ---------------------------------------------------------------------------
+
+/// Cap for any resource we download or upload (Feishu message resources).
+const MAX_RESOURCE_BYTES: usize = 20 * 1024 * 1024;
+
+/// Monotonic counter for temp resource filenames (unique across concurrent
+/// callers within the process; see the vision plugin's P0-27 fix).
+static RESOURCE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Sniff a small set of image magic bytes; returns an extension without the
+/// dot. Falls back to "bin" for anything unrecognized.
+fn guess_ext(bytes: &[u8]) -> &'static str {
+    if bytes.len() >= 4 && &bytes[..4] == b"\x89PNG" {
+        "png"
+    } else if bytes.len() >= 3 && &bytes[..3] == b"\xFF\xD8\xFF" {
+        "jpg"
+    } else if bytes.len() >= 3 && &bytes[..3] == b"GIF" {
+        "gif"
+    } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        "webp"
+    } else {
+        "bin"
+    }
+}
+
+/// A unique temp path for a downloaded resource: pid + in-process counter +
+/// nanosecond timestamp, so concurrent callers never clobber each other.
+fn temp_resource_path(ext: &str) -> PathBuf {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let seq = RESOURCE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    std::env::temp_dir().join(format!(
+        "cordis_feishu_{}_{seq:x}_{nanos:x}.{ext}",
+        std::process::id()
+    ))
+}
+
+/// Download a message resource (image or file). `kind` selects the API
+/// `type` query param: "image" for image_key resources (image messages and
+/// post `img` runs), "file" for file_key resources (file/audio/media/
+/// sticker). Rejects synthetic card-action message ids (no real resource),
+/// enforces the 20MB cap, and surfaces Feishu error JSON as an Err.
+fn feishu_download_resource(
+    api_base: &str,
+    token: &str,
+    message_id: &str,
+    file_key: &str,
+    kind: &str,
+) -> Result<Vec<u8>, String> {
+    if message_id.starts_with("cardaction:") {
+        return Err("synthetic cardaction message_id has no downloadable resource".to_string());
+    }
+    let url = format!(
+        "{api_base}/open-apis/im/v1/messages/{message_id}/resources/{file_key}?type={kind}"
+    );
+    let resp = ureq::get(&url)
+        .set("Authorization", &format!("Bearer {token}"))
+        .call()
+        .map_err(|e| format!("feishu resource download failed: {e}"))?;
+    let content_type = resp.content_type().to_string();
+    let reader = resp.into_reader();
+    let mut bytes = Vec::new();
+    use std::io::Read;
+    reader
+        .take((MAX_RESOURCE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("feishu resource read: {e}"))?;
+    if bytes.len() > MAX_RESOURCE_BYTES {
+        return Err(format!("resource exceeds {MAX_RESOURCE_BYTES} bytes"));
+    }
+    // A JSON body on this endpoint is always an error payload, never a
+    // resource — parse it and surface code/msg instead of writing garbage.
+    let looks_json = content_type.contains("application/json")
+        || bytes.first().is_some_and(|b| *b == b'{');
+    if looks_json {
+        if let Ok(v) = serde_json::from_slice::<Value>(&bytes) {
+            let code = v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
+            let msg = v.get("msg").and_then(|m| m.as_str()).unwrap_or("");
+            return Err(format!("feishu resource error code={code}: {msg}"));
+        }
+    }
+    Ok(bytes)
+}
+
+/// GET a Feishu API endpoint with Bearer auth, parse JSON, require code==0,
+/// return the `data` object (or Null when absent).
+fn feishu_get_json(api_base: &str, token: &str, path: &str) -> Result<Value, String> {
+    let url = format!("{api_base}{path}");
+    let resp = ureq::get(&url)
+        .set("Authorization", &format!("Bearer {token}"))
+        .call()
+        .map_err(|e| format!("feishu GET {path} failed: {e}"))?;
+    let parsed: Value = resp.into_json().map_err(|e| format!("feishu GET {path} parse: {e}"))?;
+    let code = parsed.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
+    if code != 0 {
+        return Err(format!(
+            "feishu GET {path} error code={code}: {}",
+            parsed.get("msg").and_then(|m| m.as_str()).unwrap_or("")
+        ));
+    }
+    Ok(parsed.get("data").cloned().unwrap_or(Value::Null))
+}
+
+fn feishu_get_message_api(api_base: &str, token: &str, message_id: &str) -> Result<Value, String> {
+    if message_id.starts_with("cardaction:") {
+        return Err("synthetic cardaction message_id cannot be fetched".to_string());
+    }
+    feishu_get_json(api_base, token, &format!("/open-apis/im/v1/messages/{message_id}"))
+}
+
+fn feishu_get_chat_api(api_base: &str, token: &str, chat_id: &str) -> Result<Value, String> {
+    feishu_get_json(api_base, token, &format!("/open-apis/im/v1/chats/{chat_id}"))
+}
+
+fn feishu_list_chats_api(
+    api_base: &str,
+    token: &str,
+    page_size: Option<i64>,
+    page_token: Option<&str>,
+) -> Result<Value, String> {
+    let mut query = String::new();
+    if let Some(size) = page_size {
+        query.push_str(&format!("page_size={size}"));
+    }
+    if let Some(tok) = page_token {
+        if !query.is_empty() {
+            query.push('&');
+        }
+        query.push_str(&format!("page_token={tok}"));
+    }
+    let path = if query.is_empty() {
+        "/open-apis/im/v1/chats".to_string()
+    } else {
+        format!("/open-apis/im/v1/chats?{query}")
+    };
+    feishu_get_json(api_base, token, &path)
+}
+
+/// Build a multipart/form-data body for the image upload endpoint: an
+/// `image_type=message` field plus an `image` file part carrying the bytes.
+/// Kept pure (no I/O) so it can be unit-tested.
+fn build_multipart_image_body(boundary: &str, bytes: &[u8], ext: &str) -> Vec<u8> {
+    let mut body = Vec::new();
+    let mut push = |s: &str| body.extend_from_slice(s.as_bytes());
+    push(&format!("--{boundary}\r\n"));
+    push("Content-Disposition: form-data; name=\"image_type\"\r\n\r\n");
+    push("message\r\n");
+    push(&format!("--{boundary}\r\n"));
+    push(&format!(
+        "Content-Disposition: form-data; name=\"image\"; filename=\"image.{ext}\"\r\n"
+    ));
+    push("Content-Type: application/octet-stream\r\n\r\n");
+    body.extend_from_slice(bytes);
+    body.extend_from_slice(b"\r\n");
+    body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+    body
+}
+
+/// Upload an image to Feishu, returning the resulting image_key for use in
+/// an `image` message.
+fn feishu_upload_image(api_base: &str, token: &str, bytes: &[u8]) -> Result<String, String> {
+    if bytes.len() > MAX_RESOURCE_BYTES {
+        return Err(format!("image exceeds {MAX_RESOURCE_BYTES} bytes"));
+    }
+    let ext = guess_ext(bytes);
+    let boundary = format!("cordisfeishu{:x}", RESOURCE_SEQ.fetch_add(1, Ordering::Relaxed));
+    let body = build_multipart_image_body(&boundary, bytes, ext);
+    let url = format!("{api_base}/open-apis/im/v1/images");
+    let resp = ureq::post(&url)
+        .set("Authorization", &format!("Bearer {token}"))
+        .set("Content-Type", &format!("multipart/form-data; boundary={boundary}"))
+        .send_bytes(&body)
+        .map_err(|e| format!("feishu image upload failed: {e}"))?;
+    let parsed: Value = resp.into_json().map_err(|e| format!("feishu image upload parse: {e}"))?;
+    let code = parsed.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
+    if code != 0 {
+        return Err(format!(
+            "feishu image upload error code={code}: {}",
+            parsed.get("msg").and_then(|m| m.as_str()).unwrap_or("")
+        ));
+    }
+    parsed
+        .get("data")
+        .and_then(|d| d.get("image_key"))
+        .and_then(|k| k.as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| "no image_key in upload response".to_string())
+}
+
+// ---------------------------------------------------------------------------
 // Node handlers
 // ---------------------------------------------------------------------------
 
@@ -818,6 +1111,173 @@ fn handle_feishu_send(req: &NodeRequest) -> Result<NodeResponse, String> {
         req.reply_to.as_deref(),
     )?;
     Ok(NodeResponse { ok: true, node_id: "feishu_send".to_string(), message: Some("sent".to_string()), data: Some(data), error: None })
+}
+
+/// Resolve app credentials from payload/STATE/config and mint a token.
+fn resolve_token(payload: Option<&Value>) -> Result<String, String> {
+    let app_id = config_str(payload, "app_id", |s| s.app_id.clone()).ok_or("no app_id configured")?;
+    let app_secret =
+        config_str(payload, "app_secret", |s| s.app_secret.clone()).ok_or("no app_secret configured")?;
+    tenant_access_token(&app_id, &app_secret)
+}
+
+/// Shared core for feishu_fetch_resource / feishu_fetch_image. Downloads a
+/// resource to a temp file (kept on disk so downstream nodes like vision can
+/// read it by path) and returns metadata. `forced_type` pins the resource
+/// kind ("image" for feishu_fetch_image); when None the payload `type`
+/// (default "image") is used.
+fn fetch_resource_core(payload: &Value, forced_type: Option<&str>) -> Result<Value, String> {
+    let message_id = payload
+        .get("message_id")
+        .and_then(|v| v.as_str())
+        .ok_or("message_id is required")?;
+    let file_key = payload
+        .get("file_key")
+        .and_then(|v| v.as_str())
+        .ok_or("file_key is required")?;
+    let kind = forced_type.unwrap_or_else(|| {
+        payload.get("type").and_then(|v| v.as_str()).unwrap_or("image")
+    });
+    if kind != "image" && kind != "file" {
+        return Err(format!("type must be 'image' or 'file', got {kind}"));
+    }
+    let as_base64 = payload.get("as_base64").and_then(|v| v.as_bool()).unwrap_or(false);
+
+    let token = resolve_token(Some(payload))?;
+    let base = api_base();
+    let bytes = feishu_download_resource(&base, &token, message_id, file_key, kind)?;
+    let ext = guess_ext(&bytes);
+    let path = temp_resource_path(ext);
+    std::fs::write(&path, &bytes).map_err(|e| format!("write temp resource: {e}"))?;
+
+    let mut data = json!({
+        "path": path.to_string_lossy(),
+        "size": bytes.len(),
+        "mime": ext,
+    });
+    // Inline base64 only for small resources, to avoid bloating the response.
+    if as_base64 && bytes.len() <= 1024 * 1024 {
+        use base64::Engine;
+        data["base64"] = json!(base64::engine::general_purpose::STANDARD.encode(&bytes));
+    }
+    Ok(data)
+}
+
+fn handle_feishu_fetch_resource(req: &NodeRequest, forced_type: Option<&str>) -> Result<NodeResponse, String> {
+    let payload = req.payload.as_ref().ok_or("payload is required")?;
+    let data = fetch_resource_core(payload, forced_type)?;
+    let node_id = req.node_id.clone();
+    Ok(NodeResponse { ok: true, node_id, message: None, data: Some(data), error: None })
+}
+
+fn handle_feishu_send_image(req: &NodeRequest) -> Result<NodeResponse, String> {
+    let payload = req.payload.clone().unwrap_or(Value::Null);
+    let target = req
+        .target
+        .as_deref()
+        .or_else(|| payload.get("target").and_then(|v| v.as_str()))
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if target.is_empty() {
+        return Err("target is required for feishu_send_image (chat:<id> or user:<id>)".to_string());
+    }
+    let reply_to = req
+        .reply_to
+        .clone()
+        .or_else(|| payload.get("reply_to").and_then(|v| v.as_str()).map(|s| s.to_string()));
+
+    let token = resolve_token(req.payload.as_ref())?;
+    let base = api_base();
+
+    // An explicit image_key skips upload; otherwise a local temp path must be
+    // read and uploaded first.
+    let image_key = if let Some(key) = payload.get("image_key").and_then(|v| v.as_str()) {
+        key.to_string()
+    } else {
+        let path = payload
+            .get("path")
+            .and_then(|v| v.as_str())
+            .ok_or("either image_key or path is required")?;
+        // Confine reads to the temp dir: the resource must canonicalize to a
+        // location under the (canonicalized) system temp dir.
+        let canon = std::fs::canonicalize(path).map_err(|e| format!("canonicalize path: {e}"))?;
+        let tmp_root = std::fs::canonicalize(std::env::temp_dir())
+            .map_err(|e| format!("canonicalize temp dir: {e}"))?;
+        if !canon.starts_with(&tmp_root) {
+            return Err("path must be located under the system temp directory".to_string());
+        }
+        let bytes = std::fs::read(&canon).map_err(|e| format!("read image: {e}"))?;
+        if bytes.len() > MAX_RESOURCE_BYTES {
+            return Err(format!("image exceeds {MAX_RESOURCE_BYTES} bytes"));
+        }
+        feishu_upload_image(&base, &token, &bytes)?
+    };
+
+    let (recv_type, recv_id) = parse_target(&target)?;
+    let content = json!({ "image_key": image_key }).to_string();
+    let sent = feishu_send_message(&token, recv_type, &recv_id, "image", &content, reply_to.as_deref())?;
+    let message_id = sent
+        .get("data")
+        .and_then(|d| d.get("message_id"))
+        .and_then(|m| m.as_str())
+        .map(|s| s.to_string());
+    Ok(NodeResponse {
+        ok: true,
+        node_id: "feishu_send_image".to_string(),
+        message: Some("sent".to_string()),
+        data: Some(json!({ "image_key": image_key, "message_id": message_id })),
+        error: None,
+    })
+}
+
+fn handle_feishu_get_message(req: &NodeRequest) -> Result<NodeResponse, String> {
+    let payload = req.payload.as_ref().ok_or("payload is required")?;
+    let message_id = payload
+        .get("message_id")
+        .and_then(|v| v.as_str())
+        .ok_or("message_id is required")?;
+    let token = resolve_token(req.payload.as_ref())?;
+    let data = feishu_get_message_api(&api_base(), &token, message_id)?;
+    Ok(NodeResponse {
+        ok: true,
+        node_id: "feishu_get_message".to_string(),
+        message: None,
+        data: Some(data),
+        error: None,
+    })
+}
+
+fn handle_feishu_get_chat_info(req: &NodeRequest) -> Result<NodeResponse, String> {
+    let payload = req.payload.as_ref().ok_or("payload is required")?;
+    let chat_id = payload
+        .get("chat_id")
+        .and_then(|v| v.as_str())
+        .ok_or("chat_id is required")?;
+    let token = resolve_token(req.payload.as_ref())?;
+    let data = feishu_get_chat_api(&api_base(), &token, chat_id)?;
+    Ok(NodeResponse {
+        ok: true,
+        node_id: "feishu_get_chat_info".to_string(),
+        message: None,
+        data: Some(data),
+        error: None,
+    })
+}
+
+fn handle_feishu_list_chats(req: &NodeRequest) -> Result<NodeResponse, String> {
+    let payload = req.payload.clone().unwrap_or(Value::Null);
+    let page_size = payload.get("page_size").and_then(|v| v.as_i64());
+    let page_token = payload.get("page_token").and_then(|v| v.as_str());
+    let token = resolve_token(req.payload.as_ref())?;
+    let data = feishu_list_chats_api(&api_base(), &token, page_size, page_token)?;
+    Ok(NodeResponse {
+        ok: true,
+        node_id: "feishu_list_chats".to_string(),
+        message: None,
+        data: Some(data),
+        error: None,
+    })
 }
 
 fn handle_feishu_entry(req: &NodeRequest) -> Result<NodeResponse, String> {
@@ -1134,7 +1594,7 @@ fn start_agent_poller() {
                 queue.drain(..).collect()
             };
             for msg in msgs {
-                if !should_process(&msg.text) {
+                if !should_process(&msg) {
                     continue;
                 }
                 // Two-stage card reply: post a "thinking…" card now; the
@@ -1194,13 +1654,14 @@ fn post_loading_card(msg: &IncomingMessage) {
 
 /// Skip trivial inputs. `/`-prefixed commands ARE forwarded (N批): the
 /// runtime's command router handles them without the LLM, which keeps
-/// /status etc. usable during a model outage.
-fn should_process(text: &str) -> bool {
-    let t = text.trim();
+/// /status etc. usable during a model outage. Media messages are always
+/// forwarded regardless of literal text length.
+fn should_process(msg: &IncomingMessage) -> bool {
+    let t = msg.text.trim();
     if t.starts_with('/') {
         return t.chars().count() > 1;
     }
-    t.chars().count() > 1
+    t.chars().count() > 1 || msg.has_media
 }
 
 /// Build the runtime routing envelope for a message.
@@ -1208,10 +1669,20 @@ fn build_envelope(msg: &IncomingMessage) -> String {
     let reply_target = format!("chat:{}", msg.chat_id);
     let session_key = format!("feishu:{}", reply_target);
     let scope = if msg.chat_type == "p2p" { "private" } else { "group" };
-    let display = format!(
-        "[Feishu {} from {} (user {})]: {}",
-        scope, msg.chat_id, msg.open_id, msg.text
-    );
+    // Media messages carry a msg=<message_id> in the display prefix so the
+    // agent can pass it to feishu_fetch_resource alongside the file_key from
+    // the placeholder. Synthetic card-action ids are not real messages.
+    let display = if msg.has_media && !msg.message_id.starts_with("cardaction:") {
+        format!(
+            "[Feishu {} from {} (user {}) msg={}]: {}",
+            scope, msg.chat_id, msg.open_id, msg.message_id, msg.text
+        )
+    } else {
+        format!(
+            "[Feishu {} from {} (user {})]: {}",
+            scope, msg.chat_id, msg.open_id, msg.text
+        )
+    };
     let mut env = json!({
         "source_plugin": "feishu",
         "reply_node": "feishu_send",
@@ -1220,6 +1691,8 @@ fn build_envelope(msg: &IncomingMessage) -> String {
         "reply_target": reply_target,
         "sender_id": format!("feishu:{}", msg.open_id),
         "conversation_kind": scope,
+        "message_type": msg.message_type,
+        "has_media": msg.has_media,
     });
     // Prefer threaded reply if the message is in a thread.
     if let Some(root) = &msg.root_id {
@@ -1239,6 +1712,12 @@ fn handle(req: &NodeRequest) -> Result<NodeResponse, String> {
         "feishu_serve" => handle_feishu_serve(req),
         "feishu_send" => handle_feishu_send(req),
         "feishu_entry" => handle_feishu_entry(req),
+        "feishu_fetch_resource" => handle_feishu_fetch_resource(req, None),
+        "feishu_fetch_image" => handle_feishu_fetch_resource(req, Some("image")),
+        "feishu_send_image" => handle_feishu_send_image(req),
+        "feishu_get_message" => handle_feishu_get_message(req),
+        "feishu_get_chat_info" => handle_feishu_get_chat_info(req),
+        "feishu_list_chats" => handle_feishu_list_chats(req),
         other => Err(format!("unknown node_id: {other}")),
     }
 }
@@ -1284,6 +1763,54 @@ fn docs_value() -> cordis_plugin_sdk::PluginDocs {
                 &["config write"],
                 &["missing fields"],
             ),
+            node_doc(
+                "feishu_fetch_resource",
+                "Download a Feishu message resource (image or file) to a local temp file and return its path. Use the file_key from an inbound placeholder, and take message_id from the display prefix's msg=<id>. type='image' for image messages and post img runs (image_key); type='file' for file/audio/video/sticker messages (file_key). Optional as_base64=true inlines base64 for resources <=1MB.",
+                json!({"type":"object","required":["node_id","payload"],"properties":{"node_id":{"const":"feishu_fetch_resource"},"payload":{"type":"object","required":["message_id","file_key"],"properties":{"message_id":{"type":"string"},"file_key":{"type":"string"},"type":{"type":"string","enum":["image","file"]},"as_base64":{"type":"boolean"}}}}}),
+                json!({"type":"object","properties":{"ok":{"type":"boolean"},"data":{"type":"object","properties":{"path":{"type":"string"},"size":{"type":"integer"},"mime":{"type":"string"},"base64":{"type":"string"}}}}}),
+                &["network:feishu-api","file write (temp)"],
+                &["auth failure","resource not found","synthetic cardaction message_id","resource too large (>20MB)"],
+            ).with_agent_accessible(),
+            node_doc(
+                "feishu_fetch_image",
+                "Download an image resource (type is forced to 'image') to a local temp file and return its path. Same as feishu_fetch_resource with type='image'; use the file_key from an '[image file_key=...]' placeholder and message_id from the display prefix's msg=<id>.",
+                json!({"type":"object","required":["node_id","payload"],"properties":{"node_id":{"const":"feishu_fetch_image"},"payload":{"type":"object","required":["message_id","file_key"],"properties":{"message_id":{"type":"string"},"file_key":{"type":"string"},"as_base64":{"type":"boolean"}}}}}),
+                json!({"type":"object","properties":{"ok":{"type":"boolean"},"data":{"type":"object","properties":{"path":{"type":"string"},"size":{"type":"integer"},"mime":{"type":"string"}}}}}),
+                &["network:feishu-api","file write (temp)"],
+                &["auth failure","resource not found","synthetic cardaction message_id","resource too large (>20MB)"],
+            ).with_agent_accessible(),
+            node_doc(
+                "feishu_send_image",
+                "Send an image to a Feishu chat or user. target is 'chat:<chat_id>' or 'user:<open_id>'. Provide either image_key (already uploaded) or path (a local file under the system temp directory, uploaded first). Optional reply_to quote-replies. URLs are not supported.",
+                json!({"type":"object","required":["node_id","target"],"properties":{"node_id":{"const":"feishu_send_image"},"target":{"type":"string"},"reply_to":{"type":"string"},"payload":{"type":"object","properties":{"image_key":{"type":"string"},"path":{"type":"string"},"target":{"type":"string"},"reply_to":{"type":"string"}}}}}),
+                json!({"type":"object","properties":{"ok":{"type":"boolean"},"data":{"type":"object","properties":{"image_key":{"type":"string"},"message_id":{"type":"string"}}}}}),
+                &["network:feishu-api"],
+                &["auth failure","invalid target","resource too large (>20MB)","path outside temp directory"],
+            ).with_agent_accessible(),
+            node_doc(
+                "feishu_get_message",
+                "Fetch a message by message_id (im/v1/messages/{message_id}). Synthetic cardaction ids are rejected.",
+                json!({"type":"object","required":["node_id","payload"],"properties":{"node_id":{"const":"feishu_get_message"},"payload":{"type":"object","required":["message_id"],"properties":{"message_id":{"type":"string"}}}}}),
+                json!({"type":"object","properties":{"ok":{"type":"boolean"},"data":{"type":"object"}}}),
+                &["network:feishu-api"],
+                &["auth failure","resource not found","synthetic cardaction message_id"],
+            ).with_agent_accessible(),
+            node_doc(
+                "feishu_get_chat_info",
+                "Fetch chat/group info by chat_id (im/v1/chats/{chat_id}).",
+                json!({"type":"object","required":["node_id","payload"],"properties":{"node_id":{"const":"feishu_get_chat_info"},"payload":{"type":"object","required":["chat_id"],"properties":{"chat_id":{"type":"string"}}}}}),
+                json!({"type":"object","properties":{"ok":{"type":"boolean"},"data":{"type":"object"}}}),
+                &["network:feishu-api"],
+                &["auth failure","resource not found"],
+            ).with_agent_accessible(),
+            node_doc(
+                "feishu_list_chats",
+                "List chats the bot belongs to (im/v1/chats). Optional page_size and page_token for pagination.",
+                json!({"type":"object","required":["node_id"],"properties":{"node_id":{"const":"feishu_list_chats"},"payload":{"type":"object","properties":{"page_size":{"type":"integer"},"page_token":{"type":"string"}}}}}),
+                json!({"type":"object","properties":{"ok":{"type":"boolean"},"data":{"type":"object"}}}),
+                &["network:feishu-api"],
+                &["auth failure"],
+            ).with_agent_accessible(),
         ],
         Some(
             "You are chatting in Feishu (Lark). Each incoming message is prefixed with its source, e.g. \"[Feishu group from <chat_id> (user <open_id>)]: <text>\".\n\
@@ -1292,6 +1819,7 @@ Your FINAL output each turn MUST be exactly one JSON object:\n\
   {\"action\":\"suspend\"}  — when no reply is warranted.\n\
 The runtime routes your \"respond\" back to the originating Feishu chat automatically; do NOT call feishu_send yourself for the direct reply.\n\
 To proactively send an extra message (e.g. a progress update) to a chat: invoke_plugin(feishu, feishu_send, {\"node_id\":\"feishu_send\",\"target\":\"chat:<chat_id>\",\"message\":\"<text>\"}).\n\
+When you receive a media placeholder like \"[image file_key=...]\", \"[file file_key=... name=...]\", \"[audio ...]\", \"[video ...]\" or \"[sticker ...]\", the resource is not inlined: read the message_id from the display prefix's msg=<message_id>, then call invoke_plugin(feishu, feishu_fetch_resource, {\"node_id\":\"feishu_fetch_resource\",\"payload\":{\"message_id\":\"<id>\",\"file_key\":\"<key>\",\"type\":\"image|file\"}}) to get a local {path}. Use type=image for image placeholders (image messages and post img runs) and type=file for file/audio/video/sticker. Then pass that path to vision_ocr / vision_describe for images.\n\
 Keep replies concise and helpful; a short honest \"not sure\" beats a long wrong answer.",
         ),
     )
@@ -1420,6 +1948,8 @@ mod tests {
             message_id: "om_5".to_string(),
             root_id: None,
             mentioned: true,
+            message_type: "text".to_string(),
+            has_media: false,
         };
         let env: Value = serde_json::from_str(&build_envelope(&im)).unwrap();
         assert_eq!(env["source_plugin"], "feishu");
@@ -1487,6 +2017,8 @@ mod tests {
             message_id: "om_t".to_string(),
             root_id: None,
             mentioned,
+            message_type: "text".to_string(),
+            has_media: false,
         }
     }
 
@@ -1649,5 +2181,218 @@ mod tests {
                 }
             }
         })
+    }
+
+    // Build a media im.message.receive_v1 event with an explicit
+    // message_type and a content object (serialized to the JSON string that
+    // Feishu delivers).
+    fn media_event(
+        chat_type: &str,
+        chat_id: &str,
+        msg_id: &str,
+        message_type: &str,
+        content_json: Value,
+    ) -> Value {
+        json!({
+            "header": {"event_type":"im.message.receive_v1","token":"vtok"},
+            "event": {
+                "sender": {"sender_id": {"open_id":"ou_sender"}},
+                "message": {
+                    "chat_id": chat_id,
+                    "chat_type": chat_type,
+                    "message_id": msg_id,
+                    "message_type": message_type,
+                    "content": content_json.to_string()
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn image_message_becomes_placeholder_and_is_actionable() {
+        let body = media_event(
+            "p2p",
+            "oc_img",
+            "om_img",
+            "image",
+            json!({"image_key": "img_key_1"}),
+        )
+        .to_string();
+        match interpret_inbound(&body, Some("vtok"), None, Some("ou_bot"), &open_policy()) {
+            InboundOutcome::Message(im) => {
+                assert_eq!(im.text, "[image file_key=img_key_1]");
+                assert!(im.has_media);
+                assert_eq!(im.message_type, "image");
+            }
+            _ => panic!("expected Message"),
+        }
+    }
+
+    #[test]
+    fn image_message_passes_should_process() {
+        let (text, has_media) = extract_content("image", &json!({"image_key": "k"}));
+        let im = IncomingMessage {
+            chat_type: "p2p".into(),
+            chat_id: "oc".into(),
+            open_id: "ou".into(),
+            text,
+            message_id: "om_x".into(),
+            root_id: None,
+            mentioned: false,
+            message_type: "image".into(),
+            has_media,
+        };
+        assert!(should_process(&im));
+    }
+
+    #[test]
+    fn post_message_renders_text_at_and_image() {
+        let content = json!({
+            "title": "标题",
+            "content": [
+                [
+                    {"tag":"text","text":"hello "},
+                    {"tag":"at","user_name":"Alice","user_id":"ou_a"},
+                    {"tag":"text","text":" see "},
+                    {"tag":"img","image_key":"img_in_post"}
+                ]
+            ]
+        });
+        let (text, has_media) = extract_content("post", &content);
+        assert!(has_media);
+        assert_eq!(text, "标题\nhello @Alice see [image file_key=img_in_post]");
+    }
+
+    #[test]
+    fn post_at_falls_back_to_user_id() {
+        let content = json!({
+            "content": [[{"tag":"at","user_id":"ou_only"}]]
+        });
+        let (text, has_media) = extract_content("post", &content);
+        assert!(!has_media);
+        assert_eq!(text, "@ou_only");
+    }
+
+    #[test]
+    fn file_audio_media_sticker_placeholders() {
+        let (t, m) = extract_content("file", &json!({"file_key":"fk","file_name":"a.pdf"}));
+        assert!(m);
+        assert_eq!(t, "[file file_key=fk name=\"a.pdf\"]");
+        let (t, m) = extract_content("audio", &json!({"file_key":"ak","duration":1200}));
+        assert!(m);
+        assert_eq!(t, "[audio file_key=ak duration=1200ms]");
+        let (t, m) = extract_content("media", &json!({"file_key":"vk","file_name":"v.mp4"}));
+        assert!(m);
+        assert_eq!(t, "[video file_key=vk name=\"v.mp4\"]");
+        let (t, m) = extract_content("sticker", &json!({"file_key":"sk"}));
+        assert!(m);
+        assert_eq!(t, "[sticker file_key=sk]");
+    }
+
+    #[test]
+    fn unknown_message_type_is_forwarded_as_unsupported() {
+        let body = media_event("p2p", "oc_u", "om_u", "share_chat", json!({"chat_id":"x"}))
+            .to_string();
+        match interpret_inbound(&body, Some("vtok"), None, Some("ou_bot"), &open_policy()) {
+            InboundOutcome::Message(im) => {
+                assert_eq!(im.text, "[unsupported message_type=share_chat]");
+                assert!(im.has_media);
+            }
+            _ => panic!("expected Message"),
+        }
+    }
+
+    #[test]
+    fn extract_content_malformed_does_not_panic() {
+        // Missing keys degrade to empty placeholders.
+        assert_eq!(extract_content("image", &Value::Null), ("[image file_key=]".to_string(), true));
+        assert_eq!(
+            extract_content("file", &json!({})),
+            ("[file file_key= name=\"\"]".to_string(), true)
+        );
+        assert_eq!(extract_content("text", &Value::Null), (String::new(), false));
+        // A post with no content array is just an empty string.
+        assert_eq!(extract_content("post", &json!({})), (String::new(), false));
+    }
+
+    #[test]
+    fn media_message_envelope_carries_msg_id() {
+        let im = IncomingMessage {
+            chat_type: "group".into(),
+            chat_id: "oc_m".into(),
+            open_id: "ou_m".into(),
+            text: "[image file_key=k]".into(),
+            message_id: "om_media".into(),
+            root_id: None,
+            mentioned: true,
+            message_type: "image".into(),
+            has_media: true,
+        };
+        let env: Value = serde_json::from_str(&build_envelope(&im)).unwrap();
+        assert!(env["display"].as_str().unwrap().contains("msg=om_media"));
+    }
+
+    #[test]
+    fn text_message_envelope_has_no_msg_prefix() {
+        let im = IncomingMessage {
+            chat_type: "group".into(),
+            chat_id: "oc_t".into(),
+            open_id: "ou_t".into(),
+            text: "hello".into(),
+            message_id: "om_t2".into(),
+            root_id: None,
+            mentioned: true,
+            message_type: "text".into(),
+            has_media: false,
+        };
+        let env: Value = serde_json::from_str(&build_envelope(&im)).unwrap();
+        assert!(!env["display"].as_str().unwrap().contains("msg="));
+    }
+
+    #[test]
+    fn download_rejects_cardaction_id_without_network() {
+        // The cardaction guard is the first check, so no network is touched.
+        let err = feishu_download_resource("http://127.0.0.1:0", "tok", "cardaction:foo", "k", "image")
+            .unwrap_err();
+        assert!(err.contains("cardaction"));
+        let err = feishu_get_message_api("http://127.0.0.1:0", "tok", "cardaction:foo").unwrap_err();
+        assert!(err.contains("cardaction"));
+    }
+
+    #[test]
+    fn guess_ext_sniffs_known_magics() {
+        assert_eq!(guess_ext(b"\x89PNG\r\n\x1a\n"), "png");
+        assert_eq!(guess_ext(b"\xFF\xD8\xFF\xE0"), "jpg");
+        assert_eq!(guess_ext(b"GIF89a"), "gif");
+        let mut webp = b"RIFF".to_vec();
+        webp.extend_from_slice(&[0, 0, 0, 0]);
+        webp.extend_from_slice(b"WEBP");
+        assert_eq!(guess_ext(&webp), "webp");
+        assert_eq!(guess_ext(b"\x00\x01\x02\x03"), "bin");
+    }
+
+    #[test]
+    fn temp_resource_path_is_unique_per_call() {
+        let a = temp_resource_path("png");
+        let b = temp_resource_path("png");
+        assert_ne!(a, b);
+        assert!(a.starts_with(std::env::temp_dir()));
+    }
+
+    #[test]
+    fn multipart_image_body_shape() {
+        let boundary = "BOUND123";
+        let bytes = b"\x89PNGdata";
+        let body = build_multipart_image_body(boundary, bytes, "png");
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("--BOUND123\r\n"));
+        assert!(text.contains("name=\"image_type\""));
+        assert!(text.contains("\r\n\r\nmessage\r\n"));
+        assert!(text.contains("name=\"image\"; filename=\"image.png\""));
+        assert!(text.contains("Content-Type: application/octet-stream"));
+        assert!(text.ends_with("--BOUND123--\r\n"));
+        // The raw bytes are embedded verbatim.
+        let needle = b"\r\n\r\n\x89PNGdata\r\n";
+        assert!(body.windows(needle.len()).any(|w| w == needle));
     }
 }
