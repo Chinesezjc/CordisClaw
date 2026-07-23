@@ -1,14 +1,17 @@
-use cordis_plugin_sdk::{plugin_docs, pretty_json, AbiFingerprint};
+use cordis_plugin_sdk::{node_doc, plugin_docs, pretty_json, AbiFingerprint};
 use cordis_runtime::core::error::RuntimeError;
 use cordis_runtime::core::models::{
     ArtifactIndex, ArtifactIndexEntry, ArtifactKind, InputProbe, PluginArtifact,
     ARTIFACT_INDEX_SCHEMA_VERSION,
 };
 use cordis_runtime::plugin::package::PackageResolver;
-use cordis_runtime::plugin::tooling::{read_plugin_docs, refresh_artifact_index, sync_plugin_docs};
+use cordis_runtime::plugin::tooling::{
+    prepare_artifacts, read_plugin_docs, rebuild_fixture_artifacts, rebuild_plugin_workspace,
+    refresh_artifact_index, sync_plugin_docs, PrepareMode,
+};
 use serde_json::Value;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
 mod support;
@@ -516,4 +519,512 @@ fn read_plugin_docs_from_json_artifact_roundtrips() {
     let docs = read_plugin_docs(&artifact).expect("read docs ok");
     assert_eq!(docs.plugin_path, "alpha");
     assert_eq!(docs.command_name.as_deref(), Some("Cmd"));
+}
+
+// ---------------------------------------------------------------------------
+// Build-orchestration chain — drives `prepare_artifacts` /
+// `rebuild_fixture_artifacts` / `rebuild_plugin_workspace` against a minimal,
+// freshly-built dylib plugin workspace under a TempDir. These exercise the
+// private orchestration surface (prepare_artifacts_locked, build_plugin_contexts,
+// DependencySnapshot::load / load_workspace_metadata / collect_local_dependency_dirs,
+// build_dirty_dylib_plugins, materialize_artifact_entry, inspect_dylib_contract,
+// build_plugin_artifact, built_dylib_path) end-to-end.
+//
+// They require a working `cargo` toolchain and compile a real dylib against the
+// in-repo `cordis-plugin-sdk`, so the produced artifact matches the host arch
+// (dlopen-able). The compile is bounded to a single tiny crate; CARGO_TARGET_DIR
+// is redirected into the TempDir so cold/warm builds stay isolated and cheap.
+// ---------------------------------------------------------------------------
+
+/// Absolute path to the in-repo plugin SDK crate, used as the `path`
+/// dependency for the synthetic plugins so they link the same ABI symbol
+/// table the loader expects.
+fn sdk_crate_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../cordis-plugin-sdk")
+        .canonicalize()
+        .expect("plugin sdk crate must exist")
+}
+
+/// Write a minimal but *complete* dylib plugin crate at `dir`:
+/// - `Cargo.toml` (dylib crate-type, cordis metadata, path dep on the SDK)
+/// - `src/lib.rs` exporting the v2 ABI (real `abi_fingerprint` / `docs` / `handle`)
+/// - scaffold dirs (`tests/`, `docs/human/overview.md`) the resolver requires
+/// - `docs/agent/interfaces.json` matching the exported docs
+///
+/// `abi_fingerprint` uses `AbiFingerprint::current_build`, so the recorded
+/// fingerprint matches the built dylib's runtime fingerprint (materialize's
+/// AbiMismatch guard passes). `extra_cordis` injects e.g. a `children = [...]`
+/// line or a nested `[workspace]` marker.
+fn write_dylib_plugin(dir: &Path, crate_name: &str, plugin_path: &str, extra_cordis: &str) {
+    fs::create_dir_all(dir.join("src")).unwrap();
+    fs::create_dir_all(dir.join("tests")).unwrap();
+    fs::create_dir_all(dir.join("docs/human")).unwrap();
+    fs::create_dir_all(dir.join("docs/agent")).unwrap();
+
+    let sdk = sdk_crate_dir();
+    fs::write(
+        dir.join("Cargo.toml"),
+        format!(
+            r#"[package]
+name = "{crate_name}"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["rlib", "dylib"]
+
+[package.metadata.cordis]
+plugin_path = "{plugin_path}"
+abi_kind = "rust"
+declared_nodes = ["nd"]
+{extra_cordis}
+
+[package.metadata.cordis.abi_fingerprint]
+crate_hash = "crate_{crate_name}_v1"
+api_hash = "api_v2"
+
+[dependencies]
+cordis-plugin-sdk = {{ path = "{sdk}" }}
+serde = {{ version = "1", features = ["derive"] }}
+serde_json = "1"
+"#,
+            sdk = sdk.display(),
+        ),
+    )
+    .unwrap();
+
+    fs::write(
+        dir.join("src/lib.rs"),
+        format!(
+            r#"use cordis_plugin_sdk::{{
+    export_plugin_api, json_response, node_doc, plugin_docs, AbiFingerprint, PluginDocs,
+    PluginRequest, PluginResponse,
+}};
+use serde_json::json;
+
+fn docs_value() -> PluginDocs {{
+    plugin_docs(
+        "{crate_name}",
+        "{plugin_path}",
+        "0.1.0",
+        Some("Cmd"),
+        vec![node_doc(
+            "nd",
+            "demo node",
+            json!({{"type": "object"}}),
+            json!({{"type": "object"}}),
+            &[],
+            &[],
+        )],
+        None,
+    )
+}}
+
+fn abi() -> AbiFingerprint {{
+    AbiFingerprint::current_build("crate_{crate_name}_v1", "api_v2")
+}}
+
+fn handle(_req: PluginRequest) -> PluginResponse {{
+    json_response(&json!({{"ok": true}}))
+}}
+
+export_plugin_api! {{
+    abi_fingerprint = abi(),
+    docs = docs_value(),
+    handle = handle,
+}}
+"#,
+        ),
+    )
+    .unwrap();
+
+    fs::write(dir.join("tests/smoke.rs"), "fn main() {}\n").unwrap();
+    fs::write(
+        dir.join("docs/human/overview.md"),
+        format!("# {plugin_path}\n"),
+    )
+    .unwrap();
+
+    // interfaces.json must match the dylib's runtime `docs_value()` byte-for-byte:
+    // materialize_artifact_entry rewrites this file from the runtime docs, and
+    // it is itself a build input. If it drifts, the next incremental pass sees a
+    // changed fingerprint and rebuilds. Mirroring the exported docs (same node)
+    // keeps the rewrite a no-op so `reuse` is observable.
+    let docs = plugin_docs(
+        crate_name,
+        plugin_path,
+        "0.1.0",
+        Some("Cmd"),
+        vec![node_doc(
+            "nd",
+            "demo node",
+            serde_json::json!({"type": "object"}),
+            serde_json::json!({"type": "object"}),
+            &[],
+            &[],
+        )],
+        None,
+    );
+    fs::write(dir.join("docs/agent/interfaces.json"), pretty_json(&docs)).unwrap();
+}
+
+/// Build a synthetic fixtures root whose `plugins/` is a single-crate cargo
+/// workspace containing one dylib plugin. Returns the TempDir; the fixtures
+/// root is `temp.path()`.
+fn dylib_plugin_fixtures(crate_name: &str, plugin_path: &str) -> TempDir {
+    let temp = TempDir::new().expect("tempdir");
+    let plugins = temp.path().join("plugins");
+    fs::create_dir_all(&plugins).unwrap();
+    fs::write(
+        plugins.join("Cargo.toml"),
+        format!("[workspace]\nmembers = [\"{crate_name}\"]\nresolver = \"2\"\n"),
+    )
+    .unwrap();
+    write_dylib_plugin(
+        &plugins.join(crate_name),
+        crate_name,
+        plugin_path,
+        "children = []",
+    );
+    temp
+}
+
+/// Redirect cargo's target dir to `<fixtures>/plugins/target` — the TempDir's
+/// own workspace target. This keeps builds self-contained per test *and* matches
+/// `rebuild_plugin_workspace`'s hardcoded `plugins/target/debug` source path, so
+/// the metadata-driven (`prepare_artifacts`) and hardcoded (`rebuild_plugin_workspace`)
+/// paths both resolve the freshly built dylib.
+fn scoped_target_dir(temp: &TempDir) -> PathBuf {
+    let dir = temp.path().join("plugins/target");
+    fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// Guard that sets `CARGO_TARGET_DIR` for the duration of a build and restores
+/// the previous value on drop. `prepare_artifacts` shells out to `cargo build`
+/// without an explicit target dir, so we steer it via the env var.
+struct TargetDirGuard {
+    previous: Option<std::ffi::OsString>,
+}
+
+impl TargetDirGuard {
+    fn set(path: &Path) -> Self {
+        let previous = std::env::var_os("CARGO_TARGET_DIR");
+        std::env::set_var("CARGO_TARGET_DIR", path);
+        Self { previous }
+    }
+}
+
+impl Drop for TargetDirGuard {
+    fn drop(&mut self) {
+        match &self.previous {
+            Some(value) => std::env::set_var("CARGO_TARGET_DIR", value),
+            None => std::env::remove_var("CARGO_TARGET_DIR"),
+        }
+    }
+}
+
+fn read_index(fixtures_root: &Path) -> Value {
+    let index_path = fixtures_root.join("artifacts/index.json");
+    serde_json::from_str(&fs::read_to_string(&index_path).expect("read index"))
+        .expect("parse index")
+}
+
+#[test]
+#[serial_test::serial]
+fn prepare_artifacts_full_builds_dylib_and_writes_index_entry() {
+    let temp = dylib_plugin_fixtures("demo", "demo");
+    let target = scoped_target_dir(&temp);
+    let _guard = TargetDirGuard::set(&target);
+
+    // Full mode: no prior index -> build_plugin_contexts + DependencySnapshot::load
+    // (cargo metadata) + build_dirty_dylib_plugins (cargo build workspace member)
+    // + materialize_artifact_entry (stage-then-rename + inspect_dylib_contract).
+    let report =
+        prepare_artifacts(temp.path(), PrepareMode::Full).expect("full prepare should succeed");
+    assert!(report.full_rebuild, "full mode reports full_rebuild");
+    assert_eq!(
+        report.rebuilt.len(),
+        1,
+        "the single dylib plugin should be (re)built, got {:?}",
+        report.rebuilt
+    );
+    assert_eq!(report.rebuilt[0].0, "demo");
+    assert!(report.reused.is_empty(), "nothing to reuse on a cold build");
+
+    // The staged artifact exists and is a real dylib the loader can dlopen.
+    let artifact = temp
+        .path()
+        .join("artifacts")
+        .join(format!("demo.{}", std::env::consts::DLL_EXTENSION));
+    assert!(artifact.exists(), "dylib artifact should be staged");
+
+    // Index entry records the dylib kind, a 64-char sha256, and the runtime docs.
+    let index = read_index(temp.path());
+    let entries = index.get("entries").and_then(|v| v.as_array()).unwrap();
+    assert_eq!(entries.len(), 1);
+    let entry = &entries[0];
+    assert_eq!(entry["plugin_path"], "demo");
+    assert_eq!(entry["artifact_kind"], "dylib");
+    assert_eq!(
+        entry["sha256"].as_str().map(str::len),
+        Some(64),
+        "sha256 hashed from the freshly staged dylib"
+    );
+    // materialize_artifact_entry wrote the runtime docs back to the plugin.
+    let written_docs = temp.path().join("plugins/demo/docs/agent/interfaces.json");
+    let docs: Value = serde_json::from_str(&fs::read_to_string(&written_docs).unwrap()).unwrap();
+    assert_eq!(docs["plugin_path"], "demo");
+    assert_eq!(docs["command_name"], "Cmd");
+
+    // read_plugin_docs over the real dylib exercises inspect's sibling path
+    // (LoadedDylibApi::open + runtime docs parse).
+    let runtime_docs = read_plugin_docs(&artifact).expect("read docs from dylib");
+    assert_eq!(runtime_docs.plugin_path, "demo");
+}
+
+#[test]
+#[serial_test::serial]
+fn prepare_artifacts_incremental_reuses_clean_entry() {
+    let temp = dylib_plugin_fixtures("demo", "demo");
+    let target = scoped_target_dir(&temp);
+    let _guard = TargetDirGuard::set(&target);
+
+    // First pass builds; second incremental pass finds nothing dirty and
+    // reuses the existing entry (compute_dirty_state -> false branch).
+    prepare_artifacts(temp.path(), PrepareMode::Full).expect("initial build");
+    let report = prepare_artifacts(temp.path(), PrepareMode::Incremental)
+        .expect("incremental prepare should succeed");
+    assert!(!report.full_rebuild);
+    assert!(
+        report.rebuilt.is_empty(),
+        "clean incremental pass rebuilds nothing, got {:?}",
+        report.rebuilt
+    );
+    assert_eq!(report.reused, vec!["demo".to_string()]);
+}
+
+#[test]
+#[serial_test::serial]
+fn prepare_artifacts_incremental_rebuilds_after_source_edit() {
+    let temp = dylib_plugin_fixtures("demo", "demo");
+    let target = scoped_target_dir(&temp);
+    let _guard = TargetDirGuard::set(&target);
+
+    prepare_artifacts(temp.path(), PrepareMode::Full).expect("initial build");
+
+    // Touch the plugin source so its input probe + fingerprint drift, forcing
+    // compute_dirty_state -> true and a rebuild via build_dirty_dylib_plugins.
+    let lib = temp.path().join("plugins/demo/src/lib.rs");
+    let mut src = fs::read_to_string(&lib).unwrap();
+    src.push_str("\n// touch to invalidate fingerprint\n");
+    fs::write(&lib, src).unwrap();
+
+    let report = prepare_artifacts(temp.path(), PrepareMode::Incremental)
+        .expect("incremental prepare after edit");
+    assert_eq!(
+        report.rebuilt.len(),
+        1,
+        "edited plugin should rebuild, got {:?}",
+        report.rebuilt
+    );
+    assert_eq!(report.rebuilt[0].0, "demo");
+}
+
+#[test]
+#[serial_test::serial]
+fn rebuild_fixture_artifacts_returns_built_plugin() {
+    let temp = dylib_plugin_fixtures("demo", "demo");
+    let target = scoped_target_dir(&temp);
+    let _guard = TargetDirGuard::set(&target);
+
+    // Thin wrapper over prepare_artifacts(Full) that returns only the rebuilt list.
+    let rebuilt = rebuild_fixture_artifacts(temp.path()).expect("rebuild fixtures");
+    assert_eq!(rebuilt.len(), 1);
+    assert_eq!(rebuilt[0].0, "demo");
+    assert_eq!(rebuilt[0].1.len(), 64, "second tuple field is the sha256");
+}
+
+#[test]
+#[serial_test::serial]
+fn prepare_artifacts_full_requires_repo_sources() {
+    // Full mode against a directory without plugins/Cargo.toml must error
+    // (can_prepare_fixture_artifacts == false + Full -> Invariant).
+    let temp = TempDir::new().unwrap();
+    let err = prepare_artifacts(temp.path(), PrepareMode::Full);
+    assert!(matches!(err, Err(RuntimeError::Invariant { .. })));
+}
+
+#[test]
+fn prepare_artifacts_incremental_noop_without_repo_sources() {
+    // Incremental mode is a documented no-op when there's no plugins workspace.
+    let temp = TempDir::new().unwrap();
+    let report = prepare_artifacts(temp.path(), PrepareMode::Incremental)
+        .expect("incremental noop should succeed");
+    assert!(report.rebuilt.is_empty());
+    assert!(report.reused.is_empty());
+    assert!(!report.full_rebuild);
+}
+
+#[test]
+#[serial_test::serial]
+fn rebuild_plugin_workspace_named_plugin_builds_and_refreshes_index() {
+    let temp = dylib_plugin_fixtures("demo", "demo");
+    let target = scoped_target_dir(&temp);
+    let _guard = TargetDirGuard::set(&target);
+
+    // Seed a full index first so the named-rebuild path has an index to refresh.
+    prepare_artifacts(temp.path(), PrepareMode::Full).expect("seed index");
+
+    // Corrupt the recorded sha256 so we can prove rebuild_plugin_workspace
+    // refreshes it after staging the freshly built dylib.
+    let index_path = temp.path().join("artifacts/index.json");
+    let mut index: Value = serde_json::from_str(&fs::read_to_string(&index_path).unwrap()).unwrap();
+    index["entries"][0]["sha256"] = Value::String("deadbeef".to_string());
+    fs::write(&index_path, serde_json::to_string_pretty(&index).unwrap()).unwrap();
+
+    // "/demo" -> build just the `demo` package, stage lib{demo}.dylib into
+    // artifacts/, and refresh index.json's sha256.
+    let built = rebuild_plugin_workspace(temp.path(), "/demo").expect("named rebuild");
+    assert_eq!(built.len(), 1);
+    assert_eq!(built[0].0, "demo");
+    assert!(
+        built[0].1.contains("->"),
+        "detail records src -> dst, got {}",
+        built[0].1
+    );
+
+    let updated = read_index(temp.path());
+    let sha = updated["entries"][0]["sha256"].as_str().unwrap();
+    assert_ne!(sha, "deadbeef", "index sha256 should be refreshed");
+    assert_eq!(sha.len(), 64);
+}
+
+#[test]
+#[serial_test::serial]
+fn rebuild_plugin_workspace_root_slash_rebuilds_everything() {
+    let temp = dylib_plugin_fixtures("demo", "demo");
+    let target = scoped_target_dir(&temp);
+    let _guard = TargetDirGuard::set(&target);
+
+    // "/" delegates to rebuild_fixture_artifacts (full rebuild of all plugins).
+    let rebuilt = rebuild_plugin_workspace(temp.path(), "/").expect("root rebuild");
+    assert_eq!(rebuilt.len(), 1);
+    assert_eq!(rebuilt[0].0, "demo");
+}
+
+#[test]
+#[serial_test::serial]
+fn rebuild_plugin_workspace_unknown_plugin_errors() {
+    let temp = dylib_plugin_fixtures("demo", "demo");
+    let target = scoped_target_dir(&temp);
+    let _guard = TargetDirGuard::set(&target);
+
+    // A package name cargo doesn't know about -> `cargo build -p ...` fails,
+    // surfaced as InvalidArgument.
+    let err = rebuild_plugin_workspace(temp.path(), "/no_such_plugin");
+    assert!(matches!(err, Err(RuntimeError::InvalidArgument { .. })));
+}
+
+/// Fixtures with a workspace-member parent dylib plugin and a *non*-member
+/// child dylib plugin (the child carries its own `[workspace]` marker, so
+/// `DependencySnapshot::is_workspace_member` returns false for it). This routes
+/// the child through the `build_plugin_artifact` + `built_dylib_path` branch
+/// of `build_dirty_dylib_plugins` / `materialize_artifact_entry`, which the
+/// workspace-member fast path never touches.
+fn parent_child_fixtures() -> TempDir {
+    let temp = TempDir::new().expect("tempdir");
+    let plugins = temp.path().join("plugins");
+    fs::create_dir_all(&plugins).unwrap();
+    fs::write(
+        plugins.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"parent\"]\nexclude = [\"parent/child\"]\nresolver = \"2\"\n",
+    )
+    .unwrap();
+    // Parent is a workspace member; declares the nested child as required.
+    write_dylib_plugin(
+        &plugins.join("parent"),
+        "parent",
+        "parent",
+        "children = [{ source = \"./child\", required = true, grants = [] }]",
+    );
+    // Child crate name must equal normalize_crate_name("parent/child").
+    // Its own `[workspace]` line makes it a standalone workspace, so the parent
+    // metadata excludes it and prepare_artifacts builds it via its own manifest.
+    write_dylib_plugin(
+        &plugins.join("parent/child"),
+        "parent_child",
+        "parent/child",
+        "children = []\n[workspace]",
+    );
+    temp
+}
+
+#[test]
+#[serial_test::serial]
+fn prepare_artifacts_builds_non_workspace_member_child_via_own_manifest() {
+    let temp = parent_child_fixtures();
+    let target = scoped_target_dir(&temp);
+    let _guard = TargetDirGuard::set(&target);
+
+    let report =
+        prepare_artifacts(temp.path(), PrepareMode::Full).expect("full prepare with nested child");
+
+    // Both plugins built: parent through the workspace path, child through
+    // build_plugin_artifact + built_dylib_path (its own manifest metadata).
+    let mut built: Vec<String> = report.rebuilt.iter().map(|(p, _)| p.clone()).collect();
+    built.sort();
+    assert_eq!(
+        built,
+        vec!["parent".to_string(), "parent/child".to_string()]
+    );
+
+    // Both dylibs staged, both index entries dylib-kind with real hashes.
+    let ext = std::env::consts::DLL_EXTENSION;
+    assert!(temp.path().join(format!("artifacts/parent.{ext}")).exists());
+    assert!(temp
+        .path()
+        .join(format!("artifacts/parent_child.{ext}"))
+        .exists());
+
+    let index = read_index(temp.path());
+    let entries = index.get("entries").and_then(|v| v.as_array()).unwrap();
+    assert_eq!(entries.len(), 2);
+    for entry in entries {
+        assert_eq!(entry["artifact_kind"], "dylib");
+        assert_eq!(entry["sha256"].as_str().map(str::len), Some(64));
+    }
+}
+
+#[test]
+#[serial_test::serial]
+fn prepare_artifacts_detects_abi_fingerprint_mismatch() {
+    // The manifest's declared crate_hash and the dylib's runtime crate_hash
+    // (baked in by `abi()`) must agree. Rewrite the manifest so its declared
+    // crate_hash diverges from what the built dylib exports; materialize's
+    // AbiMismatch guard should reject it.
+    let temp = dylib_plugin_fixtures("demo", "demo");
+    let target = scoped_target_dir(&temp);
+    let _guard = TargetDirGuard::set(&target);
+
+    let manifest = temp.path().join("plugins/demo/Cargo.toml");
+    let text = fs::read_to_string(&manifest).unwrap();
+    let patched = text.replace(
+        "crate_hash = \"crate_demo_v1\"",
+        "crate_hash = \"crate_demo_DECLARED_MISMATCH\"",
+    );
+    assert_ne!(
+        patched, text,
+        "manifest crate_hash line should be rewritten"
+    );
+    fs::write(&manifest, patched).unwrap();
+
+    let err = prepare_artifacts(temp.path(), PrepareMode::Full);
+    match err {
+        Err(RuntimeError::AbiMismatch { plugin_path, .. }) => {
+            assert_eq!(plugin_path, "demo");
+        }
+        other => panic!("expected AbiMismatch, got {other:?}"),
+    }
 }

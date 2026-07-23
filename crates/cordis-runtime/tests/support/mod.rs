@@ -8,6 +8,7 @@ use std::sync::OnceLock;
 use std::thread;
 use std::time::Duration;
 
+#[allow(dead_code)]
 static FIXTURES_ROOT: OnceLock<PathBuf> = OnceLock::new();
 
 /// The pre-built `.so` artifacts under `fixtures/artifacts/` are all
@@ -27,6 +28,7 @@ pub fn linux_dylib_artifacts_available() -> bool {
     cordis_plugin_sdk::CORDIS_TARGET == "x86_64-unknown-linux-gnu"
 }
 
+#[allow(dead_code)]
 pub fn fixtures_root() -> PathBuf {
     FIXTURES_ROOT
         .get_or_init(|| {

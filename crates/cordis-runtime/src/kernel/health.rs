@@ -187,4 +187,35 @@ mod tests {
         std::thread::sleep(Duration::from_millis(30));
         drop(handle); // Drop impl sets the flag and joins.
     }
+
+    /// Exercise the periodic loop body that only runs *after* the fixed 10s
+    /// startup delay: the "started" notification, the `while` guard, at least
+    /// one `run_check`, and the interruptible periodic sleep that returns early
+    /// when the stop flag is set. Uses a 1s interval so a periodic check fires
+    /// shortly after startup; then stops mid-sleep. This is the only path that
+    /// covers the post-startup branch (lines 63-68), so it necessarily pays the
+    /// 10s startup delay.
+    #[test]
+    fn periodic_loop_runs_check_after_startup_then_stops() {
+        let host = boot_empty_host();
+        let started = Instant::now();
+        let handle = start_health_loop(host, 1);
+        // Wait past the 10s startup delay plus one periodic tick so the worker
+        // has sent the "started" notice and executed >=1 run_check, and is now
+        // inside a periodic sleep.
+        std::thread::sleep(Duration::from_millis(11_500));
+        handle.stop();
+        // The loop must have gotten past the startup delay (proving the
+        // post-delay branch executed) and shut down promptly once stopped.
+        assert!(
+            started.elapsed() >= Duration::from_secs(10),
+            "startup delay should have elapsed, got {:?}",
+            started.elapsed()
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(14),
+            "stop() should join within one poll window after the wait, got {:?}",
+            started.elapsed()
+        );
+    }
 }

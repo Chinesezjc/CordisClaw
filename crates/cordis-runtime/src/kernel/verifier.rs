@@ -1338,4 +1338,124 @@ mod tests {
         let err = hash_source_tree(&missing).expect_err("missing root must error");
         assert!(matches!(err, RuntimeError::Io { .. }));
     }
+
+    // ---------- residual branch coverage ----------
+
+    #[test]
+    fn verify_propagates_shell_spawn_error() {
+        // A tests_command whose program does not exist makes run_shell_command
+        // return Err(CommandFailed); run_optional_stage propagates it with `?`,
+        // so verify_with_options returns Err rather than a report. Covers the
+        // `?`-propagation on the stage results.
+        let temp = TempDir::new().expect("tempdir");
+        let err = CommandVerifier::verify(
+            temp.path(),
+            VerificationProfile::Default,
+            Some("/nonexistent/definitely/not/here run"),
+            None,
+            None,
+        )
+        .expect_err("missing program must surface as verify error");
+        assert!(matches!(err, RuntimeError::CommandFailed { .. }));
+    }
+
+    #[test]
+    fn resolve_plugin_fixtures_root_root_dir_without_parent_joins() {
+        // current_dir "/" has no parent and does not end_with the relative
+        // request, so the final `else` joins under current_dir.
+        let root = Path::new("/");
+        if root.parent().is_some() {
+            eprintln!("[skip] platform root has a parent; branch not applicable");
+            return;
+        }
+        let resolved = resolve_plugin_fixtures_root(root, Some("shared"));
+        assert_eq!(resolved, root.join("shared"));
+    }
+
+    #[test]
+    fn run_shell_command_captures_stderr_on_success() {
+        // `sh -c 'echo err >&2'` runs sh as a real program (argv, no injection)
+        // and writes to stderr while exiting 0 — covers the stderr read path.
+        let temp = TempDir::new().expect("tempdir");
+        let result = run_shell_command(
+            "sh -c 'echo boom 1>&2'",
+            temp.path(),
+            Duration::from_secs(5),
+        )
+        .expect("sh should run");
+        assert!(result.success);
+        assert!(result.stderr.contains("boom"), "stderr: {}", result.stderr);
+    }
+
+    #[test]
+    fn shell_command_timeout_includes_captured_stderr() {
+        // Child writes to stderr, then hangs past the timeout. The timeout
+        // branch must fold the captured stderr into the message.
+        let temp = TempDir::new().expect("tempdir");
+        let result = run_shell_command(
+            "sh -c 'echo pre-timeout 1>&2; sleep 5'",
+            temp.path(),
+            Duration::from_millis(300),
+        )
+        .expect("timeout path should not panic");
+        assert!(!result.success);
+        assert!(
+            result.stderr.contains("timed out"),
+            "stderr: {}",
+            result.stderr
+        );
+        assert!(
+            result.stderr.contains("pre-timeout"),
+            "captured stderr should be folded in: {}",
+            result.stderr
+        );
+    }
+
+    #[test]
+    fn plugin_command_fallback_load_failure_reports_failed_check() {
+        // No candidate_invoker and a fixtures root that has no artifact index
+        // → PluginInvoker::load itself fails (not the invoke), covering the
+        // load-error arm that returns a failed (not errored) check.
+        let temp = TempDir::new().expect("tempdir");
+        // current_dir with neither plugins/ nor fixtures/plugins → resolves to
+        // itself, and load finds no artifacts/index.json.
+        let options = VerifyOptions::default();
+        let spec = format!("plugin:{}", json!({"plugin_path": "p", "node_id": "n"}));
+        let report = CommandVerifier::verify_with_options(
+            temp.path(),
+            VerificationProfile::Default,
+            Some(&spec),
+            None,
+            None,
+            &options,
+        )
+        .expect("report");
+        let check = report.tests.as_ref().expect("tests check present");
+        assert_eq!(check.runner, VerificationRunner::Plugin);
+        assert!(
+            !check.success,
+            "missing artifact index should fail the load"
+        );
+        assert!(!check.stderr.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hash_source_tree_read_failure_surfaces_io() {
+        use std::os::unix::fs::PermissionsExt;
+        // Root ignores file-mode permissions, so an unreadable file still reads.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("[skip] running as root; unreadable file would still read");
+            return;
+        }
+        let temp = TempDir::new().expect("tempdir");
+        let secret = temp.path().join("secret.txt");
+        fs::write(&secret, "top secret").unwrap();
+        let mut perms = fs::metadata(&secret).unwrap().permissions();
+        perms.set_mode(0o000);
+        fs::set_permissions(&secret, perms).unwrap();
+        // The walk lists the file, but the read inside hash_source_tree fails.
+        let err = hash_source_tree(temp.path()).expect_err("unreadable file must error");
+        assert!(matches!(err, RuntimeError::Io { .. }), "got: {err:?}");
+    }
 }

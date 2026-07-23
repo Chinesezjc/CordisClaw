@@ -897,4 +897,155 @@ mod tests {
         assert!(matches!(err, RuntimeError::Io { .. }));
         assert_eq!(fs::read_to_string(ws.path().join("a.txt")).unwrap(), "one");
     }
+
+    // ---------- direct helper error-branch coverage ----------
+
+    #[test]
+    fn apply_json_patch_missing_value_errors() {
+        // value = None reaches the ok_or_else "missing replacement value".
+        let patch = FilePatch {
+            path: "c.json".to_string(),
+            kind: FilePatchKind::JsonValue,
+            find: String::new(),
+            replace: String::new(),
+            pointer: Some("/k".to_string()),
+            dotted_key: None,
+            value: None,
+        };
+        let err = apply_json_patch(&patch, Path::new("/tmp/c.json"), r#"{"k":1}"#).unwrap_err();
+        match err {
+            RuntimeError::AutoUpdatePatchInvalid { reason, .. } => {
+                assert!(
+                    reason.contains("missing replacement value"),
+                    "reason: {reason}"
+                );
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apply_toml_patch_missing_value_errors() {
+        let patch = FilePatch {
+            path: "c.toml".to_string(),
+            kind: FilePatchKind::TomlValue,
+            find: String::new(),
+            replace: String::new(),
+            pointer: None,
+            dotted_key: Some("k".to_string()),
+            value: None,
+        };
+        let err = apply_toml_patch(&patch, Path::new("/tmp/c.toml"), "k = 1\n").unwrap_err();
+        match err {
+            RuntimeError::AutoUpdatePatchInvalid { reason, .. } => {
+                assert!(
+                    reason.contains("missing replacement value"),
+                    "reason: {reason}"
+                );
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apply_toml_patch_value_conversion_fails() {
+        // serde_json null has no TOML representation → try_from errors.
+        let patch = FilePatch::toml_value("c.toml", "k", serde_json::Value::Null);
+        let err = apply_toml_patch(&patch, Path::new("/tmp/c.toml"), "k = 1\n").unwrap_err();
+        match err {
+            RuntimeError::AutoUpdatePatchInvalid { reason, .. } => {
+                assert!(
+                    reason.contains("toml value conversion failed"),
+                    "reason: {reason}"
+                );
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apply_toml_patch_parse_failure() {
+        let patch = FilePatch::toml_value("c.toml", "k", serde_json::json!(2));
+        // Not valid TOML.
+        let err = apply_toml_patch(&patch, Path::new("/tmp/c.toml"), "this is : not = toml [[[")
+            .unwrap_err();
+        match err {
+            RuntimeError::AutoUpdatePatchInvalid { reason, .. } => {
+                assert!(reason.contains("toml parse failed"), "reason: {reason}");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apply_toml_patch_intermediate_key_missing() {
+        // dotted_key "a.b": first segment "a" is absent at a non-final position,
+        // hitting the intermediate get_mut None branch.
+        let patch = FilePatch::toml_value("c.toml", "a.b", serde_json::json!(2));
+        let err =
+            apply_toml_patch(&patch, Path::new("/tmp/c.toml"), "[other]\nx = 1\n").unwrap_err();
+        match err {
+            RuntimeError::AutoUpdatePatchInvalid { reason, .. } => {
+                assert!(reason.contains("dotted key not found"), "reason: {reason}");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rollback_write_failure_surfaces_io() {
+        // A backup whose abs_path is an existing directory makes fs::write fail
+        // with an Io error, covering the rollback write-error closure.
+        let ws = TempDir::new().unwrap();
+        let dir_as_target = ws.path().join("iamdir");
+        fs::create_dir(&dir_as_target).unwrap();
+        let updater = AutoUpdater::new(ws.path());
+        let backups = vec![AppliedBackup {
+            abs_path: dir_as_target,
+            original: "restore".to_string(),
+        }];
+        let err = updater.rollback(&backups).unwrap_err();
+        assert!(matches!(err, RuntimeError::Io { .. }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn text_patch_write_failure_then_rollback_failure_surfaces_invariant() {
+        use std::os::unix::fs::PermissionsExt;
+        // Running as root bypasses file-mode permission checks, so skip.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("[skip] running as root; read-only write would not fail");
+            return;
+        }
+        // A read-only target: read_to_string succeeds, but the fs::write inside
+        // apply_one fails (covers the write error map). Rollback then tries to
+        // write the original back to the same read-only file and *also* fails,
+        // covering both the rollback write-error map and the
+        // "additionally, patch rollback failed" Invariant path.
+        let ws = TempDir::new().unwrap();
+        let target = ws.path().join("ro.txt");
+        fs::write(&target, "foo bar").unwrap();
+        let mut perms = fs::metadata(&target).unwrap().permissions();
+        perms.set_mode(0o444);
+        fs::set_permissions(&target, perms).unwrap();
+
+        let updater = AutoUpdater::new(ws.path());
+        let err = updater
+            .execute(
+                plan(vec![FilePatch::text("ro.txt", "foo", "FOO")]),
+                verify_ok,
+            )
+            .unwrap_err();
+        match err {
+            RuntimeError::Invariant { message } => {
+                assert!(message.contains("rollback failed"), "message: {message}");
+            }
+            other => panic!("expected Invariant, got: {other:?}"),
+        }
+
+        // Restore perms for TempDir cleanup.
+        let mut perms = fs::metadata(&target).unwrap().permissions();
+        perms.set_mode(0o644);
+        fs::set_permissions(&target, perms).unwrap();
+    }
 }

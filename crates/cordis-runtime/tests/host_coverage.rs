@@ -9,7 +9,8 @@
 //! reads `artifacts/`; the snapshot root lives in the OS temp dir), while any
 //! path that mutates the fixtures tree runs against a throwaway copy.
 
-use cordis_runtime::agent::AgentToolHost;
+use cordis_runtime::agent::{AgentSession, AgentToolHost};
+use cordis_runtime::config::RuntimeConfig;
 use cordis_runtime::core::error::RuntimeError;
 use cordis_runtime::core::models::NodeOutcome;
 use cordis_runtime::host::{
@@ -18,6 +19,7 @@ use cordis_runtime::host::{
 };
 use cordis_runtime::kernel::auto_update::{AutoUpdatePlan, FilePatch};
 use cordis_runtime::kernel::evaluator::VerificationInput;
+use cordis_runtime::kernel::plugin_iteration::PluginEditRollback;
 use cordis_runtime::kernel::plugin_iteration::{
     KernelPluginIssueSource, KernelPluginIterationRequest, PluginEditOpKind, PluginEditOperation,
     PluginEditPlan, PluginIterationFinalVerdict,
@@ -27,8 +29,9 @@ use cordis_runtime::soul::Soul;
 use serde_json::{json, Value};
 use serial_test::serial;
 use std::fs;
-use std::path::Path;
-use std::sync::OnceLock;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use tempfile::TempDir;
 
 mod support;
@@ -46,7 +49,18 @@ use support::fixtures_root;
 static SHARED_HOST: OnceLock<RuntimeHost> = OnceLock::new();
 
 fn shared_host() -> &'static RuntimeHost {
-    SHARED_HOST.get_or_init(|| RuntimeHost::boot(fixtures_root()).expect("host should boot"))
+    SHARED_HOST.get_or_init(|| {
+        let root = fixtures_root();
+        // Flaky-guard: other tests in a full serial run rebuild the fixture
+        // dylibs mid-suite, which makes `artifacts/index.json`'s recorded
+        // sha256 stale relative to the on-disk `.so`. A subsequent boot then
+        // fails with `PluginUnavailable { HashMismatch }`. Re-hash every
+        // staged artifact and rewrite the index right before booting so the
+        // shared host always sees a consistent index.
+        cordis_runtime::plugin::tooling::refresh_artifact_index(&root)
+            .expect("refresh artifact index before shared boot");
+        RuntimeHost::boot(root).expect("host should boot")
+    })
 }
 
 fn copy_dir_all(src: &Path, dst: &Path) {
@@ -704,4 +718,443 @@ fn host_iterate_plugins_policy_blocks_runtime_paths() {
     assert!(host.kernel().plugin_issues().iter().any(|issue| {
         issue.root_plugin_path == "expr" && issue.source == KernelPluginIssueSource::PolicyBlocked
     }));
+}
+
+// ===========================================================================
+// Group D — plugin-iteration journal recovery core.
+//
+// `apply_plugin_iteration_journal` is the recovery primitive that boot() calls
+// (via `restore_plugin_iteration_workspace`). It replays an on-disk rollback
+// journal WITHOUT rebuilding artifacts, so these tests are fully hermetic:
+// they run against throwaway temp dirs and need neither the fixtures mount nor
+// the platform dylibs. This exercises the boot journal-recovery branches
+// (already-applied skip, real replay, no-op) that a plain fixtures boot never
+// reaches because no journal is normally present.
+// ===========================================================================
+
+fn journal_path(snapshot_root: &Path) -> PathBuf {
+    snapshot_root.join("plugin-iteration-edit-journal.json")
+}
+
+fn applied_marker_path(snapshot_root: &Path) -> PathBuf {
+    snapshot_root.join("plugin-iteration-edit-journal.applied")
+}
+
+#[test]
+fn apply_journal_no_journal_is_noop() {
+    let workspace = TempDir::new().expect("workspace");
+    let snapshot_root = TempDir::new().expect("snapshot root");
+    // No journal on disk and no in-memory rollback → returns false, no work.
+    let restored = cordis_runtime::host::apply_plugin_iteration_journal(
+        workspace.path(),
+        snapshot_root.path(),
+        None,
+    )
+    .expect("apply should succeed");
+    assert!(!restored, "absent journal must be a no-op");
+    assert!(!applied_marker_path(snapshot_root.path()).exists());
+}
+
+#[test]
+fn apply_journal_in_memory_rollback_restores_file() {
+    let workspace = TempDir::new().expect("workspace");
+    let snapshot_root = TempDir::new().expect("snapshot root");
+    let target_rel = "plugins/demo/src/lib.rs";
+    let target_abs = workspace.path().join(target_rel);
+    fs::create_dir_all(target_abs.parent().unwrap()).expect("mkdir");
+    // Simulate a half-applied edit sitting on disk.
+    fs::write(&target_abs, b"edited-bytes").expect("write edited");
+
+    // In-memory rollback carrying the pre-edit bytes; no journal file present
+    // so the in-memory branch is taken.
+    let rollback = PluginEditRollback::single_backup(
+        workspace.path().to_path_buf(),
+        target_rel,
+        Some(b"original-bytes".to_vec()),
+    );
+    let restored = cordis_runtime::host::apply_plugin_iteration_journal(
+        workspace.path(),
+        snapshot_root.path(),
+        Some(&rollback),
+    )
+    .expect("apply should succeed");
+    assert!(restored, "in-memory rollback should report a restore");
+    assert_eq!(
+        fs::read_to_string(&target_abs).expect("read restored"),
+        "original-bytes"
+    );
+}
+
+#[test]
+fn apply_journal_on_disk_replays_and_clears() {
+    let workspace = TempDir::new().expect("workspace");
+    let snapshot_root = TempDir::new().expect("snapshot root");
+    let target_rel = "plugins/demo/src/core.rs";
+    let target_abs = workspace.path().join(target_rel);
+    fs::create_dir_all(target_abs.parent().unwrap()).expect("mkdir");
+    fs::write(&target_abs, b"corrupted-half-write").expect("write edited");
+
+    // Persist a real rollback journal (the shape boot() replays).
+    let rollback = PluginEditRollback::single_backup(
+        workspace.path().to_path_buf(),
+        target_rel,
+        Some(b"pristine-source".to_vec()),
+    );
+    let jp = journal_path(snapshot_root.path());
+    rollback
+        .persist_journal(&jp, "iteration-under-test")
+        .expect("persist journal");
+    assert!(jp.exists());
+
+    let restored = cordis_runtime::host::apply_plugin_iteration_journal(
+        workspace.path(),
+        snapshot_root.path(),
+        None,
+    )
+    .expect("apply should succeed");
+    assert!(restored, "on-disk journal should replay");
+    assert_eq!(
+        fs::read_to_string(&target_abs).expect("read restored"),
+        "pristine-source"
+    );
+    // Journal is cleared and the applied marker removed after a clean replay.
+    assert!(!jp.exists(), "journal cleared after replay");
+    assert!(!applied_marker_path(snapshot_root.path()).exists());
+
+    // A second apply is a no-op — nothing left to replay.
+    let again = cordis_runtime::host::apply_plugin_iteration_journal(
+        workspace.path(),
+        snapshot_root.path(),
+        None,
+    )
+    .expect("second apply should succeed");
+    assert!(!again, "cleared journal is a no-op on the next boot");
+}
+
+#[test]
+fn apply_journal_skips_when_already_applied_marker_matches() {
+    let workspace = TempDir::new().expect("workspace");
+    let snapshot_root = TempDir::new().expect("snapshot root");
+    let target_rel = "plugins/demo/src/lib.rs";
+    let target_abs = workspace.path().join(target_rel);
+    fs::create_dir_all(target_abs.parent().unwrap()).expect("mkdir");
+    // Content that legitimately post-dates the recorded rollback. If the
+    // already-applied guard fails, replay would clobber this back to the
+    // journal's backup bytes.
+    fs::write(&target_abs, b"legitimately-newer-source").expect("write current");
+
+    let rollback = PluginEditRollback::single_backup(
+        workspace.path().to_path_buf(),
+        target_rel,
+        Some(b"stale-backup".to_vec()),
+    );
+    let jp = journal_path(snapshot_root.path());
+    rollback
+        .persist_journal(&jp, "iteration-already-applied")
+        .expect("persist journal");
+
+    // Record the applied marker with the journal's own generation id so the
+    // guard recognizes this journal as already replayed.
+    let gen_id = PluginEditRollback::journal_generation_id(&jp)
+        .expect("read gen id")
+        .expect("gen id present");
+    fs::write(applied_marker_path(snapshot_root.path()), gen_id.as_bytes())
+        .expect("write applied marker");
+
+    let restored = cordis_runtime::host::apply_plugin_iteration_journal(
+        workspace.path(),
+        snapshot_root.path(),
+        None,
+    )
+    .expect("apply should succeed");
+    assert!(!restored, "already-applied journal must be skipped");
+    // The current (newer) source is preserved — not reverted to the backup.
+    assert_eq!(
+        fs::read_to_string(&target_abs).expect("read current"),
+        "legitimately-newer-source"
+    );
+    // The guard clears both marker and journal so they don't linger.
+    assert!(!jp.exists(), "already-applied journal is cleared");
+    assert!(!applied_marker_path(snapshot_root.path()).exists());
+}
+
+// ===========================================================================
+// Group E — background service lifecycle via start_service.
+// ===========================================================================
+
+#[derive(Default)]
+struct CountingService {
+    started: Arc<AtomicBool>,
+    stopped: Arc<AtomicBool>,
+    fail_start: bool,
+}
+
+impl cordis_runtime::context::Service for CountingService {
+    fn start(&self) -> Result<(), String> {
+        if self.fail_start {
+            return Err("intentional start failure".to_string());
+        }
+        self.started.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn stop(&self) -> Result<(), String> {
+        self.stopped.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+#[test]
+#[serial]
+fn host_start_service_registers_and_rejects_duplicates_and_failures() {
+    let host = shared_host();
+    let started = Arc::new(AtomicBool::new(false));
+    let svc = CountingService {
+        started: started.clone(),
+        stopped: Arc::new(AtomicBool::new(false)),
+        fail_start: false,
+    };
+    // Unique node id per run so repeated serial executions don't collide on a
+    // leftover registry entry from a previous invocation of the shared host.
+    let node_id = format!("cov_svc_{}", std::process::id());
+    host.start_service("time", &node_id, Box::new(svc))
+        .expect("service should start");
+    assert!(started.load(Ordering::SeqCst), "start() was invoked");
+
+    // Duplicate registration under the same key is rejected.
+    let dup = CountingService::default();
+    let err = host
+        .start_service("time", &node_id, Box::new(dup))
+        .expect_err("duplicate service should fail");
+    assert!(matches!(err, RuntimeError::DuplicateService { .. }));
+
+    // A service whose start() fails surfaces as an Invariant error and is not
+    // registered (so a different node id can be reused).
+    let failing = CountingService {
+        fail_start: true,
+        ..Default::default()
+    };
+    let fail_node = format!("cov_svc_fail_{}", std::process::id());
+    let err = host
+        .start_service("time", &fail_node, Box::new(failing))
+        .expect_err("failing service should error");
+    assert!(matches!(err, RuntimeError::Invariant { .. }));
+}
+
+// ===========================================================================
+// Group F — session management + persistence branches.
+// ===========================================================================
+
+#[test]
+#[serial]
+fn host_auto_save_and_delete_session_snapshot_roundtrip() {
+    let host = shared_host();
+    let handle = host
+        .agent_start_with(AgentSessionKind::RuntimeShell, AgentStartOptions::default())
+        .expect("agent should start");
+    let sid = handle.session_id.clone();
+
+    // delete on a session that never got persisted is a silent no-op.
+    let snap_path = host.data_dir().join("sessions").join(format!("{sid}.json"));
+    host.delete_session_snapshot(&sid);
+    assert!(!snap_path.exists());
+
+    host.drop_session(&sid);
+}
+
+#[test]
+#[serial]
+fn host_agent_start_with_profile_and_soul_option() {
+    let host = shared_host();
+    // Unknown profile name falls back to the default profile without error.
+    let handle = host
+        .agent_start_with(
+            AgentSessionKind::RuntimeShell,
+            AgentStartOptions {
+                profile: Some("definitely-not-a-real-profile".to_string()),
+                soul_key: "host-coverage:profile-opt#private".to_string(),
+            },
+        )
+        .expect("agent should start with unknown profile via default fallback");
+    let sid = handle.session_id.clone();
+    let status = host.agent_status(&sid).expect("status queryable");
+    assert_eq!(status.kind, "runtime_shell");
+    // The soul_key option is wired to the persona overlay lookup path.
+    host.refresh_session_soul(&sid, "host-coverage:profile-opt-refreshed#private")
+        .expect("refresh soul");
+    host.drop_session(&sid);
+}
+
+// ===========================================================================
+// Group G — candidate/reload diagnostic + rollback branches.
+// ===========================================================================
+
+#[test]
+#[serial]
+fn host_reload_candidate_with_diagnostics_stages_and_rolls_back() {
+    let host = shared_host();
+    // Ensure no stale candidate from a prior test.
+    if host.candidate_snapshot().is_some() {
+        host.rollback_candidate().expect("clear prior candidate");
+    }
+    let attempt = host.reload_candidate_with_diagnostics();
+    assert_eq!(attempt.status, ReloadAttemptStatus::Staged);
+    assert!(host.candidate_snapshot().is_some());
+    // execute against the candidate snapshot (execute_candidate branch).
+    let result = host
+        .execute_candidate("expr::expr_entry", json!({ "expression": "8 - 5" }))
+        .expect("candidate execute should succeed");
+    assert_eq!(result.target_node_fqn, "expr::expr_entry");
+    host.rollback_candidate().expect("rollback candidate");
+    assert!(host.candidate_snapshot().is_none());
+    // execute_candidate after rollback errors with CandidateSnapshotMissing.
+    let err = host
+        .execute_candidate("expr::expr_entry", json!({ "expression": "1" }))
+        .expect_err("execute_candidate without candidate should fail");
+    assert!(matches!(err, RuntimeError::CandidateSnapshotMissing));
+}
+
+#[test]
+#[serial]
+fn host_rollback_candidate_without_candidate_errors() {
+    let host = shared_host();
+    if host.candidate_snapshot().is_some() {
+        host.rollback_candidate().expect("clear prior candidate");
+    }
+    let err = host
+        .rollback_candidate()
+        .expect_err("rollback without candidate should fail");
+    assert!(matches!(err, RuntimeError::CandidateSnapshotMissing));
+}
+
+// ===========================================================================
+// Group H — write_shutdown_memory + detect_crash_and_recover.
+//
+// These need `data/` to live inside a throwaway dir, so the fixtures root is
+// nested one level down (`<temp>/fixtures`): the host derives `data_dir()` as
+// the parent of the fixtures root, i.e. `<temp>/data`. Only the artifacts tree
+// is copied, which is all a read-only boot consumes.
+// ===========================================================================
+
+fn setup_nested_artifacts_workspace() -> TempDir {
+    let temp = TempDir::new().expect("tempdir");
+    let fixtures = temp.path().join("fixtures");
+    let root = fixtures_root();
+    copy_dir_all(&root.join("artifacts"), &fixtures.join("artifacts"));
+    for name in ["notify_handlers.json", "startup_invoke.json"] {
+        let src = root.join(name);
+        if src.exists() {
+            fs::copy(&src, fixtures.join(name)).expect("copy top-level fixture file");
+        }
+    }
+    temp
+}
+
+#[test]
+#[serial]
+fn host_write_shutdown_memory_produces_atomic_snapshot() {
+    let temp = setup_nested_artifacts_workspace();
+    let fixtures = temp.path().join("fixtures");
+    let host = RuntimeHost::boot(&fixtures).expect("host should boot");
+
+    // A live session should be reflected in the shutdown snapshot.
+    let handle = host
+        .agent_start_with(AgentSessionKind::RuntimeShell, AgentStartOptions::default())
+        .expect("agent should start");
+    let sid = handle.session_id.clone();
+
+    host.write_shutdown_memory();
+
+    let memory_path = temp.path().join("data/memory/shutdown.json");
+    assert!(memory_path.exists(), "shutdown memory file written");
+    let value: Value =
+        serde_json::from_str(&fs::read_to_string(&memory_path).expect("read memory"))
+            .expect("valid json");
+    assert!(value.get("shutdown_at").and_then(Value::as_str).is_some());
+    assert!(value.get("plugins").and_then(Value::as_array).is_some());
+    let sessions = value
+        .get("sessions")
+        .and_then(Value::as_array)
+        .expect("sessions array");
+    assert!(
+        sessions
+            .iter()
+            .any(|s| s.get("session_id").and_then(Value::as_str) == Some(sid.as_str())),
+        "live session should appear in the shutdown memory"
+    );
+
+    // No temp staging file is left behind by the atomic writer.
+    let leftovers: Vec<_> = fs::read_dir(temp.path().join("data/memory"))
+        .expect("read memory dir")
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().contains("cordis-tmp"))
+        .collect();
+    assert!(leftovers.is_empty(), "no atomic-write temp file lingers");
+
+    host.drop_session(&sid);
+}
+
+#[test]
+#[serial]
+fn host_boot_recovers_saved_sessions_from_disk() {
+    let temp = setup_nested_artifacts_workspace();
+    let fixtures = temp.path().join("fixtures");
+
+    // Pre-seed data/sessions with one recoverable RuntimeShell snapshot, one
+    // PluginIteration snapshot (recovered under its own kind), plus decoy
+    // files that must be skipped: a temp file, a non-JSON file, and a corrupt
+    // JSON body.
+    let sessions_dir = temp.path().join("data/sessions");
+    fs::create_dir_all(&sessions_dir).expect("mkdir sessions");
+
+    let config = RuntimeConfig::default();
+    let make_snapshot = |kind: &str| -> String {
+        let session = AgentSession::new(config.llm_api.clone(), kind).expect("session");
+        serde_json::to_string(&session.to_snapshot()).expect("serialize snapshot")
+    };
+    fs::write(
+        sessions_dir.join("recover-shell.json"),
+        make_snapshot("runtime_shell"),
+    )
+    .expect("write shell snapshot");
+    fs::write(
+        sessions_dir.join("recover-iter.json"),
+        make_snapshot("plugin_iteration"),
+    )
+    .expect("write iter snapshot");
+    // Decoys — none should be hydrated.
+    fs::write(sessions_dir.join(".staging.json.tmp.7"), "{}").expect("write temp decoy");
+    fs::write(sessions_dir.join("notes.txt"), "not a session").expect("write non-json decoy");
+    fs::write(sessions_dir.join("corrupt.json"), "{ this is not json")
+        .expect("write corrupt decoy");
+
+    let host = RuntimeHost::boot(&fixtures).expect("host should boot and recover");
+
+    // Both valid sessions are hydrated; the three decoys are skipped.
+    let shell = host
+        .agent_status("recover-shell")
+        .expect("shell session recovered");
+    assert_eq!(shell.kind, "runtime_shell");
+    let iter = host
+        .agent_status("recover-iter")
+        .expect("iter session recovered");
+    assert_eq!(iter.kind, "plugin_iteration");
+
+    // The dotted temp file's stem must not have been treated as a session id.
+    assert!(host.agent_status(".staging.json").is_err());
+    assert!(host.agent_status("notes").is_err());
+    assert!(host.agent_status("corrupt").is_err());
+}
+
+#[test]
+#[serial]
+fn host_reload_with_diagnostics_noop_reports_reloaded() {
+    let host = shared_host();
+    let attempt = host.reload_with_diagnostics("/");
+    assert_eq!(attempt.status, ReloadAttemptStatus::Reloaded);
+    assert!(attempt.to_snapshot_id.is_some());
+    // A subtree reload for a real leaf plugin also succeeds (reload_subtree
+    // branch rather than reload_internal).
+    let attempt = host.reload_with_diagnostics("expr");
+    assert_eq!(attempt.status, ReloadAttemptStatus::Reloaded);
 }

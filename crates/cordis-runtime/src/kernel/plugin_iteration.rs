@@ -2443,4 +2443,228 @@ mod tests {
             .unwrap()
             .is_none());
     }
+
+    // ---------- executor / rollback / journal fs-injection coverage ----------
+
+    fn demo_allowed() -> BTreeMap<String, String> {
+        let mut allowed = BTreeMap::new();
+        allowed.insert("demo".to_string(), "plugins/demo".to_string());
+        allowed
+    }
+
+    fn single_replace_plan() -> PluginEditPlan {
+        PluginEditPlan {
+            issue_id: "i".to_string(),
+            patch_id: "p".to_string(),
+            summary: "s".to_string(),
+            operations: vec![PluginEditOperation {
+                path: "plugins/demo/src/lib.rs".to_string(),
+                kind: PluginEditOpKind::ReplaceExact,
+                expected_old_string: Some("foo".to_string()),
+                expected_sha256: None,
+                new_content: Some("FOO".to_string()),
+                pointer: None,
+                dotted_key: None,
+                value: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn execute_errors_when_workspace_root_not_accessible() {
+        // validate_plan passes (pure), then canonicalise(workspace_root) fails
+        // because the directory does not exist → Io error (lines 549-555).
+        let temp = TempDir::new().unwrap();
+        let missing = temp.path().join("no-such-workspace");
+        let executor = PluginEditExecutor::new(&missing);
+        let err = executor
+            .execute(
+                &PluginIterationPolicy::default(),
+                &demo_allowed(),
+                &single_replace_plan(),
+            )
+            .expect_err("inaccessible workspace root must error");
+        assert!(matches!(err, RuntimeError::Io { .. }), "got: {err:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn execute_write_failure_rolls_back_in_place() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("[skip] running as root; read-only write would not fail");
+            return;
+        }
+        // A read-only existing target makes atomic_write fail (create tmp under
+        // a writable dir succeeds, but the final rename over a file inside a
+        // read-only *directory* fails). To make the write itself fail, mark the
+        // containing directory read-only so tmp creation fails.
+        let temp = TempDir::new().unwrap();
+        let ws = temp.path();
+        let src_dir = ws.join("plugins/demo/src");
+        fs::create_dir_all(&src_dir).unwrap();
+        let target = src_dir.join("lib.rs");
+        fs::write(&target, b"foo").unwrap();
+        // Make the src dir read-only so atomic_write's tmp create fails.
+        let mut perms = fs::metadata(&src_dir).unwrap().permissions();
+        perms.set_mode(0o555);
+        fs::set_permissions(&src_dir, perms).unwrap();
+
+        let executor = PluginEditExecutor::new(ws);
+        let err = executor
+            .execute(
+                &PluginIterationPolicy::default(),
+                &demo_allowed(),
+                &single_replace_plan(),
+            )
+            .expect_err("write into read-only dir must fail");
+        assert!(matches!(err, RuntimeError::Io { .. }), "got: {err:?}");
+
+        // Restore perms so TempDir cleanup can proceed. The original file must
+        // still hold its pre-edit bytes (in-execute rollback restored it).
+        let mut perms = fs::metadata(&src_dir).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&src_dir, perms).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"foo");
+    }
+
+    #[test]
+    fn rollback_write_failure_when_target_is_directory() {
+        // A backup with Some(original) whose abs_path is an existing directory
+        // makes fs::write fail (lines 706-709).
+        let temp = TempDir::new().unwrap();
+        fs::create_dir_all(temp.path().join("adir")).unwrap();
+        let rb = PluginEditRollback::single_backup(temp.path(), "adir", Some(b"bytes".to_vec()));
+        let err = rb.rollback().expect_err("write over a dir must fail");
+        assert!(matches!(err, RuntimeError::Io { .. }), "got: {err:?}");
+    }
+
+    #[test]
+    fn rollback_create_dir_all_failure_when_parent_is_a_file() {
+        // Restoring "afile/child.rs" needs create_dir_all(ws/afile), but
+        // ws/afile is a regular file → create_dir_all fails (lines 701-705).
+        let temp = TempDir::new().unwrap();
+        fs::write(temp.path().join("afile"), b"x").unwrap();
+        let rb = PluginEditRollback::single_backup(
+            temp.path(),
+            "afile/child.rs",
+            Some(b"bytes".to_vec()),
+        );
+        let err = rb
+            .rollback()
+            .expect_err("create_dir_all over a file must fail");
+        assert!(matches!(err, RuntimeError::Io { .. }), "got: {err:?}");
+    }
+
+    #[test]
+    fn rollback_remove_failure_when_target_is_nonempty_dir() {
+        // A backup with None original (file "did not exist") whose abs_path is
+        // a non-empty directory makes remove_file fail (lines 712-717).
+        let temp = TempDir::new().unwrap();
+        let dir = temp.path().join("busy");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("inner"), b"x").unwrap();
+        let rb = PluginEditRollback::single_backup(temp.path(), "busy", None);
+        let err = rb
+            .rollback()
+            .expect_err("remove_file on a non-empty dir must fail");
+        assert!(matches!(err, RuntimeError::Io { .. }), "got: {err:?}");
+    }
+
+    #[test]
+    fn persist_journal_parent_create_failure_when_parent_is_a_file() {
+        // journal_path "afile/j.json" whose parent "afile" is a regular file
+        // → create_dir_all fails (lines 742-746).
+        let temp = TempDir::new().unwrap();
+        fs::write(temp.path().join("afile"), b"x").unwrap();
+        let rb = PluginEditRollback::empty(temp.path());
+        let jp = temp.path().join("afile/j.json");
+        let err = rb
+            .persist_journal(&jp, "iter")
+            .expect_err("bad journal parent must error");
+        assert!(matches!(err, RuntimeError::Io { .. }), "got: {err:?}");
+    }
+
+    #[test]
+    fn clear_journal_remove_failure_when_path_is_nonempty_dir() {
+        // clear_journal on a non-empty directory path → remove_file fails
+        // (lines 817-820).
+        let temp = TempDir::new().unwrap();
+        let dir = temp.path().join("j-as-dir");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("inner"), b"x").unwrap();
+        let err = PluginEditRollback::clear_journal(&dir)
+            .expect_err("remove_file on a non-empty dir must fail");
+        assert!(matches!(err, RuntimeError::Io { .. }), "got: {err:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journal_read_failures_surface_when_unreadable() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("[skip] running as root; unreadable file would still read");
+            return;
+        }
+        let temp = TempDir::new().unwrap();
+        let rb = PluginEditRollback::single_backup(
+            temp.path(),
+            "plugins/demo/src/lib.rs",
+            Some(b"orig".to_vec()),
+        );
+        let jp = temp.path().join("j.json");
+        rb.persist_journal(&jp, "iter").unwrap();
+        // Make the journal unreadable so the fs::read inside both accessors
+        // fails with Io (lines 763-766 and 780-783).
+        let mut perms = fs::metadata(&jp).unwrap().permissions();
+        perms.set_mode(0o000);
+        fs::set_permissions(&jp, perms).unwrap();
+
+        let gen_err = PluginEditRollback::journal_generation_id(&jp)
+            .expect_err("unreadable journal must error");
+        assert!(
+            matches!(gen_err, RuntimeError::Io { .. }),
+            "got: {gen_err:?}"
+        );
+        let load_err = PluginEditRollback::load_journal(temp.path(), &jp)
+            .expect_err("unreadable journal must error");
+        assert!(
+            matches!(load_err, RuntimeError::Io { .. }),
+            "got: {load_err:?}"
+        );
+    }
+
+    #[test]
+    fn load_journal_rejects_bad_hex_backup_bytes() {
+        // A journal whose original_hex is not valid hex hits the hex::decode
+        // error map in load_journal (lines 795-800).
+        let temp = TempDir::new().unwrap();
+        let jp = temp.path().join("j.json");
+        let bad = serde_json::json!({
+            "iteration_id": "iter",
+            "rollback_generation_id": "gen",
+            "backups": [
+                { "rel_path": "plugins/demo/src/lib.rs", "original_hex": "zzzz" }
+            ]
+        });
+        fs::write(&jp, serde_json::to_vec_pretty(&bad).unwrap()).unwrap();
+        let err =
+            PluginEditRollback::load_journal(temp.path(), &jp).expect_err("bad hex must error");
+        assert!(
+            matches!(err, RuntimeError::Invariant { .. }),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn subtree_surface_kind_src_manifest_is_not_treated_as_child_manifest() {
+        // "plugins/demo/src/Cargo.toml": last segment is Cargo.toml but the
+        // plugin_segments contain "src", so the child-manifest branch is
+        // skipped and it falls through to the src surface → WritableOther
+        // (covers the manifest-branch not-taken path, lines 366-373).
+        assert_eq!(
+            plugin_subtree_surface_kind("plugins/demo/src/Cargo.toml", "plugins/demo"),
+            Some(PluginSubtreeSurfaceKind::WritableOther)
+        );
+    }
 }
