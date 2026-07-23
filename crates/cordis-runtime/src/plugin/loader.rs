@@ -665,7 +665,7 @@ fn unique_staging_path(target: &Path) -> PathBuf {
 #[cfg(test)]
 mod loader_helper_tests {
     use super::unique_staging_path;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn unique_staging_path_never_collides_within_process() {
@@ -690,6 +690,16 @@ mod loader_helper_tests {
         let base = Path::new("/tmp/cordis/artifacts/index.json");
         let tmp = unique_staging_path(base);
         assert_eq!(tmp.parent(), base.parent());
+    }
+
+    // A target with no file_name (`/`) exercises the `None` arm, which falls
+    // back to `with_extension`. `with_extension` on a path with no file name is
+    // a no-op, so the returned path equals the input — the point is that the
+    // fallback arm is taken without panicking.
+    #[test]
+    fn unique_staging_path_no_filename_takes_extension_fallback() {
+        let out = unique_staging_path(Path::new("/"));
+        assert_eq!(out, PathBuf::from("/"));
     }
 }
 
@@ -855,6 +865,41 @@ mod loader_flow_tests {
             out.plugin_registry.get("alpha").unwrap().load_result,
             PluginLoadResult::Loaded
         ));
+    }
+
+    // A single plugin declaring the SAME export twice makes the second
+    // `context.provide(Local, ...)` return `DuplicateService`, which the
+    // export loop propagates via `?` straight out of `load` (line ~454).
+    #[test]
+    fn load_duplicate_export_propagates_duplicate_service() {
+        let tmp = TempDir::new().unwrap();
+        let artifacts_dir = tmp.path().join("artifacts");
+        fs::create_dir_all(&artifacts_dir).unwrap();
+        let abi = abi_host("crate_v1", "api_v2");
+        let d = docs("alpha");
+        let artifact = PluginArtifact {
+            plugin_path: "alpha".to_string(),
+            abi_fingerprint: abi.clone(),
+            docs: d.clone(),
+            exports: vec!["svc.db".to_string(), "svc.db".to_string()],
+            execution: None,
+        };
+        let (rel, sha) = write_json_artifact(&artifacts_dir, "alpha.json", &artifact);
+        let mut entry = json_entry("alpha", &rel, &sha, abi, d);
+        // Duplicate export id in the same local scope → DuplicateService.
+        entry.exports = vec!["svc.db".to_string(), "svc.db".to_string()];
+        let index = ArtifactIndex {
+            schema_version: ARTIFACT_INDEX_SCHEMA_VERSION,
+            generated_at: "now".to_string(),
+            topo_order: vec!["alpha".to_string()],
+            entries: vec![entry],
+        };
+        let config = write_index(tmp.path(), &index);
+        let err = Loader::new(config).load().unwrap_err();
+        assert!(
+            matches!(err, RuntimeError::DuplicateService { .. }),
+            "err={err:?}"
+        );
     }
 
     #[test]
@@ -1183,6 +1228,225 @@ mod loader_flow_tests {
             out.plugin_registry.get("parent").unwrap().load_result,
             PluginLoadResult::Unavailable(PluginUnavailableReason::InitFailed)
         ));
+    }
+
+    // --- staging error propagation (line ~305) -------------------------------
+
+    // `load_with_staging_root(Some(root))` runs `stage_artifact_bundle` before
+    // the artifact is parsed. If the staging destination cannot be created
+    // (a path component is a regular file), `stage_file`'s `create_dir_all`
+    // fails and the `?` propagates the Io error straight out of `load`.
+    #[test]
+    fn load_with_staging_root_staging_failure_propagates() {
+        let tmp = TempDir::new().unwrap();
+        let config = single_json_plugin(tmp.path(), "alpha");
+        // A regular file where the staging root's parent directory must be, so
+        // create_dir_all(<file>/alpha ...) fails with NotADirectory.
+        let blocker = tmp.path().join("blocker");
+        fs::write(&blocker, b"x").unwrap();
+        let staged_root = blocker.join("staged");
+        let err = Loader::new(config)
+            .load_with_staging_root(Some(&staged_root))
+            .unwrap_err();
+        assert!(matches!(err, RuntimeError::Io { .. }), "err={err:?}");
+    }
+
+    // --- docs-drift auto-heal: interfaces.json FS failure arms ---------------
+
+    /// Build a single JSON plugin that WILL drift (artifact docs carry a
+    /// system_hint the index entry lacks) and return the finished config with
+    /// `plugins_root` overridden. The drift makes the loader attempt to sync
+    /// interfaces.json under `plugins_root`.
+    fn drifting_json_plugin_with_plugins_root(
+        root: &Path,
+        override_plugins_root: PathBuf,
+    ) -> LoaderConfig {
+        let artifacts_dir = root.join("artifacts");
+        fs::create_dir_all(&artifacts_dir).unwrap();
+        let abi = abi_host("crate_v1", "api_v2");
+        let mut artifact_docs = docs("alpha");
+        artifact_docs.system_hint = Some("fresh".to_string());
+        let artifact = PluginArtifact {
+            plugin_path: "alpha".to_string(),
+            abi_fingerprint: abi.clone(),
+            docs: artifact_docs,
+            exports: Vec::new(),
+            execution: None,
+        };
+        let (rel, sha) = write_json_artifact(&artifacts_dir, "alpha.json", &artifact);
+        let entry = json_entry("alpha", &rel, &sha, abi, docs("alpha"));
+        let index = ArtifactIndex {
+            schema_version: ARTIFACT_INDEX_SCHEMA_VERSION,
+            generated_at: "now".to_string(),
+            topo_order: vec!["alpha".to_string()],
+            entries: vec![entry],
+        };
+        let index_path = artifacts_dir.join("index.json");
+        fs::write(&index_path, serde_json::to_string_pretty(&index).unwrap()).unwrap();
+        LoaderConfig {
+            plugins_root: override_plugins_root,
+            artifact_index_path: index_path,
+            budget: LoaderBudget {
+                max_total_plugins: 256,
+                max_total_nodes: 4096,
+                load_timeout_ms: 120_000,
+            },
+        }
+    }
+
+    // The interfaces.json parent directory cannot be created because a path
+    // component under plugins_root is a regular file. The auto-heal logs and
+    // `continue`s (create_dir_all error arm); the plugin still loads with the
+    // healed docs and the index is still rewritten.
+    #[test]
+    fn load_docs_drift_interfaces_dir_create_failure_is_logged_and_skipped() {
+        let tmp = TempDir::new().unwrap();
+        // plugins_root sits under a regular file → create_dir_all fails.
+        let blocker = tmp.path().join("blocker");
+        fs::write(&blocker, b"x").unwrap();
+        let config = drifting_json_plugin_with_plugins_root(tmp.path(), blocker.join("plugins"));
+        let index_path = config.artifact_index_path.clone();
+        // Load must still succeed: interface sync failure is non-fatal.
+        let out = Loader::new(config).load().unwrap();
+        let state = out.plugin_registry.get("alpha").unwrap();
+        assert!(matches!(state.load_result, PluginLoadResult::Loaded));
+        assert_eq!(
+            state.docs.as_ref().unwrap().system_hint.as_deref(),
+            Some("fresh")
+        );
+        // Index on disk WAS still rewritten with the healed docs.
+        let rewritten = load_artifact_index(&index_path).unwrap();
+        assert_eq!(
+            rewritten.entries[0].docs.system_hint.as_deref(),
+            Some("fresh")
+        );
+    }
+
+    // The interfaces.json rename fails because the destination path already
+    // exists as a DIRECTORY. create_dir_all(parent) and the tmp write both
+    // succeed, but rename(tmp -> interfaces.json/) is EISDIR → the rename error
+    // arm runs, logs, and removes the tmp file. Load still succeeds.
+    #[test]
+    fn load_docs_drift_interfaces_rename_failure_is_logged_and_cleaned() {
+        let tmp = TempDir::new().unwrap();
+        let plugins_root = tmp.path().join("plugins");
+        // Pre-create interfaces.json AS A DIRECTORY so rename onto it fails.
+        let iface_as_dir = plugins_root.join("alpha/docs/agent/interfaces.json");
+        fs::create_dir_all(&iface_as_dir).unwrap();
+        let config = drifting_json_plugin_with_plugins_root(tmp.path(), plugins_root.clone());
+        let out = Loader::new(config).load().unwrap();
+        assert!(matches!(
+            out.plugin_registry.get("alpha").unwrap().load_result,
+            PluginLoadResult::Loaded
+        ));
+        // interfaces.json is still the directory (rename never replaced it) and
+        // no stray tmp staging file was left behind next to it.
+        assert!(iface_as_dir.is_dir());
+        let agent_dir = plugins_root.join("alpha/docs/agent");
+        let leftover: Vec<_> = fs::read_dir(&agent_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".cordis-tmp."))
+            .collect();
+        assert!(leftover.is_empty(), "tmp staging file was not cleaned up");
+    }
+
+    // --- propagate_parent_failure break arms ---------------------------------
+
+    // A required child whose parent edge is NOT required: propagation marks the
+    // (non-required) parent unavailable, then stops at the `else { break }` arm
+    // rather than climbing further. A grandparent above the non-required parent
+    // must therefore stay Loaded.
+    #[test]
+    fn propagate_stops_at_non_required_parent() {
+        let tmp = TempDir::new().unwrap();
+        let artifacts_dir = tmp.path().join("artifacts");
+        fs::create_dir_all(&artifacts_dir).unwrap();
+        let abi = abi_host("crate_v1", "api_v2");
+
+        // Grandparent "gp" loads fine and is required.
+        let gp_art = PluginArtifact {
+            plugin_path: "gp".to_string(),
+            abi_fingerprint: abi.clone(),
+            docs: docs("gp"),
+            exports: Vec::new(),
+            execution: None,
+        };
+        let (grel, gsha) = write_json_artifact(&artifacts_dir, "gp.json", &gp_art);
+        let gp_entry = json_entry("gp", &grel, &gsha, abi.clone(), docs("gp"));
+
+        // Parent "gp/p" loads fine but its edge to gp is NOT required.
+        let p_art = PluginArtifact {
+            plugin_path: "gp/p".to_string(),
+            abi_fingerprint: abi.clone(),
+            docs: docs("gp/p"),
+            exports: Vec::new(),
+            execution: None,
+        };
+        let (prel, psha) = write_json_artifact(&artifacts_dir, "p.json", &p_art);
+        let mut p_entry = json_entry("gp/p", &prel, &psha, abi.clone(), docs("gp/p"));
+        p_entry.parent = Some("gp".to_string());
+        p_entry.required = false;
+
+        // Child "gp/p/c" is required and its artifact is missing → failure
+        // propagates to parent "gp/p", which is non-required → break.
+        let mut c_entry = json_entry("gp/p/c", "ghost.json", &"0".repeat(64), abi, docs("gp/p/c"));
+        c_entry.parent = Some("gp/p".to_string());
+        c_entry.required = true;
+
+        let index = ArtifactIndex {
+            schema_version: ARTIFACT_INDEX_SCHEMA_VERSION,
+            generated_at: "now".to_string(),
+            topo_order: vec!["gp".to_string(), "gp/p".to_string(), "gp/p/c".to_string()],
+            entries: vec![gp_entry, p_entry, c_entry],
+        };
+        let config = write_index(tmp.path(), &index);
+        let out = Loader::new(config).load().unwrap();
+        // Child failed, parent dragged to InitFailed...
+        assert!(matches!(
+            out.plugin_registry.get("gp/p/c").unwrap().load_result,
+            PluginLoadResult::Unavailable(PluginUnavailableReason::ArtifactMissing)
+        ));
+        assert!(matches!(
+            out.plugin_registry.get("gp/p").unwrap().load_result,
+            PluginLoadResult::Unavailable(PluginUnavailableReason::InitFailed)
+        ));
+        // ...but grandparent stays Loaded because propagation broke at the
+        // non-required parent.
+        assert!(matches!(
+            out.plugin_registry.get("gp").unwrap().load_result,
+            PluginLoadResult::Loaded
+        ));
+    }
+
+    // A required plugin whose declared parent is NOT present in the index:
+    // propagation calls `mark_unavailable` (a no-op for the unknown parent)
+    // then hits the `let Some(parent) = entries.get(...) else { break }` arm.
+    // The load still completes.
+    #[test]
+    fn propagate_breaks_on_dangling_parent() {
+        let tmp = TempDir::new().unwrap();
+        let abi = abi_host("crate_v1", "api_v2");
+        // Required plugin with a missing artifact AND a parent that has no
+        // index entry ("ghost_parent").
+        let mut entry = json_entry("orphan", "ghost.json", &"0".repeat(64), abi, docs("orphan"));
+        entry.parent = Some("ghost_parent".to_string());
+        entry.required = true;
+        let index = ArtifactIndex {
+            schema_version: ARTIFACT_INDEX_SCHEMA_VERSION,
+            generated_at: "now".to_string(),
+            // Only "orphan" is in topo_order/entries; "ghost_parent" is not.
+            topo_order: vec!["orphan".to_string()],
+            entries: vec![entry],
+        };
+        let config = write_index(tmp.path(), &index);
+        let out = Loader::new(config).load().unwrap();
+        assert!(matches!(
+            out.plugin_registry.get("orphan").unwrap().load_result,
+            PluginLoadResult::Unavailable(PluginUnavailableReason::ArtifactMissing)
+        ));
+        // The dangling parent was never registered.
+        assert!(out.plugin_registry.get("ghost_parent").is_none());
     }
 
     #[test]

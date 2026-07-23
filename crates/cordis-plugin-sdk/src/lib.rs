@@ -493,16 +493,20 @@ mod constructor_and_helper_tests {
 
     #[test]
     fn task_node_doc_sets_task_type() {
+        // Non-empty side_effects / failure_modes so the mapping closures that
+        // copy each &str into an owned String are exercised.
         let doc = task_node_doc(
             "svc",
             "background",
             serde_json::json!({}),
             serde_json::json!({}),
-            &[],
-            &[],
+            &["writes-log"],
+            &["service-crash"],
         );
         assert!(matches!(doc.node_type, NodeType::Task));
         assert!(!doc.agent_accessible);
+        assert_eq!(doc.side_effects, vec!["writes-log"]);
+        assert_eq!(doc.failure_modes, vec!["service-crash"]);
     }
 
     #[test]
@@ -546,7 +550,88 @@ mod constructor_and_helper_tests {
         // In the test process the host symbol `_cordis_agent_trigger` is not
         // exported, so dlsym returns null and agent_trigger must return
         // without invoking anything (exercises the null-branch).
+        //
+        // NB: this only holds while no other test has dlopen'd a provider of
+        // that symbol with RTLD_GLOBAL. `agent_trigger_success_branch_via_...`
+        // does exactly that, but it makes no assertion about which branch this
+        // test takes — the contract here is simply "must not panic".
         agent_trigger("no host present");
+    }
+
+    #[test]
+    fn agent_trigger_success_branch_via_dlopened_provider() {
+        // Exercise the non-null branch of `agent_trigger`: the dlsym lookup
+        // must resolve `_cordis_agent_trigger` and the transmuted fn must be
+        // invoked. Test binaries on macOS do not export their own symbols to
+        // `dlsym(RTLD_DEFAULT)`, so we compile a tiny, dependency-free helper
+        // cdylib that exports `_cordis_agent_trigger` (writing its argument to
+        // a file named by `$COV_TRIG_OUT`) and dlopen it with RTLD_GLOBAL so
+        // its symbols join the global scope RTLD_DEFAULT searches.
+        let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
+
+        let dir = std::env::temp_dir().join(format!(
+            "cordis-sdk-trig-{}-{:p}",
+            std::process::id(),
+            &rustc as *const _
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let src = dir.join("helper.rs");
+        let out_marker = dir.join("trigger.out");
+        let dylib = dir.join("libcordis_trig_helper.dylib");
+
+        std::fs::write(
+            &src,
+            r#"
+use std::os::raw::c_char;
+#[no_mangle]
+pub extern "C" fn _cordis_agent_trigger(msg: *const c_char) {
+    let s = unsafe { std::ffi::CStr::from_ptr(msg) }.to_string_lossy().into_owned();
+    if let Ok(path) = std::env::var("COV_TRIG_OUT") {
+        let _ = std::fs::write(path, format!("triggered:{s}"));
+    }
+}
+"#,
+        )
+        .expect("write helper source");
+
+        let status = std::process::Command::new(&rustc)
+            .args(["--crate-type", "cdylib", "--edition", "2021", "-o"])
+            .arg(&dylib)
+            .arg(&src)
+            .status();
+
+        // If rustc is unavailable in this environment, skip rather than fail.
+        let Ok(status) = status else {
+            eprintln!("skipping: rustc not runnable ({rustc})");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        };
+        if !status.success() || !dylib.exists() {
+            eprintln!("skipping: helper cdylib did not build");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+
+        // The helper reads COV_TRIG_OUT when called. Setting it in-process is
+        // fine because the call happens synchronously below.
+        std::env::set_var("COV_TRIG_OUT", &out_marker);
+        let _ = std::fs::remove_file(&out_marker);
+
+        // dlopen RTLD_NOW | RTLD_GLOBAL so the export is visible to
+        // dlsym(RTLD_DEFAULT). Leak the handle: the symbol must stay resident
+        // for the (synchronous) trigger call; unloading is unnecessary in a
+        // short-lived test process.
+        let c_path = std::ffi::CString::new(dylib.to_string_lossy().as_bytes()).unwrap();
+        let handle = unsafe { libc::dlopen(c_path.as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL) };
+        assert!(!handle.is_null(), "dlopen of helper cdylib failed");
+
+        agent_trigger("hello from success branch");
+
+        let written = std::fs::read_to_string(&out_marker).expect("trigger must write marker file");
+        assert_eq!(written, "triggered:hello from success branch");
+
+        std::env::remove_var("COV_TRIG_OUT");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -1142,10 +1142,11 @@ fn runtime_host_iterate_plugins_promotes_after_canary_replay() {
 #[serial]
 #[test]
 fn runtime_host_iterate_plugins_agent_adds_dist_child_plugin_and_promotes() {
-    if !support::linux_dylib_artifacts_available() {
-        eprintln!("[skip] fixture dylibs are x86_64-linux only; skipping on this host");
-        return;
-    }
+    // LLM-network coverage: drives the mock SSE server through a full
+    // agent-driven iteration, exercising `PluginIterationAgentBackend::
+    // execute_tool` arms scaffold_child_plugin / replace_files_exact /
+    // run_plugin_test / record_iteration_summary. No longer linux-gated:
+    // `ensure_fixture_artifacts` rebuilds fixture dylibs for the local target.
     let temp = setup_fixture_workspace_copy();
     let fixtures = temp.path().join("fixtures");
 
@@ -1365,10 +1366,9 @@ fn runtime_host_iterate_plugins_agent_adds_dist_child_plugin_and_promotes() {
 #[serial]
 #[test]
 fn runtime_host_iterate_plugins_agent_retries_on_warning_and_promotes() {
-    if !support::linux_dylib_artifacts_available() {
-        eprintln!("[skip] fixture dylibs are x86_64-linux only; skipping on this host");
-        return;
-    }
+    // LLM-network coverage: multi-round agent iteration (warning-driven retry
+    // loop) over the mock SSE server, exercising `execute_tool` including the
+    // warning-recovery re-edit path. No longer linux-gated.
     let temp = setup_fixture_workspace_copy();
     let fixtures = temp.path().join("fixtures");
 
@@ -1580,10 +1580,12 @@ fn runtime_host_iterate_plugins_agent_retries_on_warning_and_promotes() {
 #[serial]
 #[test]
 fn runtime_host_iterate_plugins_agent_retries_on_raw_mod_identifier_and_rolls_back() {
-    if !support::linux_dylib_artifacts_available() {
-        eprintln!("[skip] fixture dylibs are x86_64-linux only; skipping on this host");
-        return;
-    }
+    // LLM-network coverage: this agent-driven iteration exercises the mock
+    // SSE server and `PluginIterationAgentBackend::execute_tool` dispatch
+    // (scaffold_child_plugin, replace_file_exact). It no longer skips on
+    // non-linux hosts: `ensure_fixture_artifacts` (via setup_fixture_*_copy)
+    // rebuilds the fixture dylibs for the local target, so a real boot +
+    // agent loop succeeds on arm64 macOS too.
     let temp = setup_fixture_workspace_copy();
     let fixtures = temp.path().join("fixtures");
     let evaluator_before = read_rel(&fixtures, "plugins/expr/evaluator/src/core.rs");

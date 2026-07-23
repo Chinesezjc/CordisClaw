@@ -831,4 +831,95 @@ mod tests {
         assert_eq!(join_or_dash(&[]), "-");
         assert_eq!(join_or_dash(&["a".to_string(), "b".to_string()]), "a, b");
     }
+
+    #[test]
+    fn node_whose_plugin_has_no_docs_is_skipped_in_net() {
+        // Register a node from docs, then overwrite the plugin entry with an
+        // *unavailable* record whose `docs` is None. build_registered_net then
+        // hits the `let Some(docs) = &plugin.docs else { continue }` skip.
+        let plugins = PluginRegistry::default();
+        let docs = plugin_docs(
+            "p",
+            "root/p",
+            "0.1.0",
+            None,
+            vec![doc_with_schema("n0", &[], &[])],
+            None,
+        );
+        let mut nodes = NodeRegistry::default();
+        nodes.register_from_docs("root/p", &docs).unwrap();
+        // Overwrite "root/p" with a docs-less unavailable entry.
+        plugins.insert_unavailable(
+            "root/p".to_string(),
+            None,
+            true,
+            BTreeSet::new(),
+            crate::core::models::PluginUnavailableReason::ArtifactMissing,
+            Vec::new(),
+        );
+        assert!(plugins.get("root/p").unwrap().docs.is_none());
+        let reg = GraphRegistry::from_registries(&plugins, &nodes);
+        // The node's plugin has no docs -> node dropped from the net.
+        assert!(reg.net().nodes.is_empty());
+    }
+
+    #[test]
+    fn node_absent_from_plugin_docs_is_skipped_in_net() {
+        // Register node "ghost" from an initial docs set, then re-insert the
+        // plugin with docs that only declare "known". The net builder looks up
+        // each registered node in the (now-changed) plugin docs; "ghost" is
+        // absent, exercising the `find(...) else { continue }` skip on the
+        // node-doc lookup.
+        let plugins = PluginRegistry::default();
+        let docs_with_ghost = plugin_docs(
+            "p",
+            "root/p",
+            "0.1.0",
+            None,
+            vec![doc_with_schema("ghost", &[], &[])],
+            None,
+        );
+        let mut nodes = NodeRegistry::default();
+        nodes
+            .register_from_docs("root/p", &docs_with_ghost)
+            .unwrap();
+        // Re-insert the plugin with different docs that lack "ghost".
+        let docs_known_only = plugin_docs(
+            "p",
+            "root/p",
+            "0.1.0",
+            None,
+            vec![doc_with_schema("known", &[], &[])],
+            None,
+        );
+        insert_plugin(&plugins, "root/p", None, docs_known_only);
+        let reg = GraphRegistry::from_registries(&plugins, &nodes);
+        // "ghost" is registered as a node but absent from the plugin docs, so
+        // build_registered_net skips it -> empty net.
+        assert!(reg.net().nodes.is_empty());
+    }
+
+    #[test]
+    fn schema_without_properties_key_yields_no_names() {
+        // A node whose input/output schema is not an object-with-properties
+        // (here a bare `{"type":"string"}`) makes `schema_property_names` take
+        // its early-return `Vec::new()` path: no consumes / produces inferred.
+        let plugins = PluginRegistry::default();
+        let bare = node_doc(
+            "scalar",
+            "n",
+            serde_json::json!({ "type": "string" }),
+            serde_json::json!({ "type": "string" }),
+            &[],
+            &[],
+        );
+        let docs = plugin_docs("p", "root/p", "0.1.0", None, vec![bare], None);
+        insert_plugin(&plugins, "root/p", None, docs.clone());
+        let mut nodes = NodeRegistry::default();
+        nodes.register_from_docs("root/p", &docs).unwrap();
+        let reg = GraphRegistry::from_registries(&plugins, &nodes);
+        assert_eq!(reg.net().nodes.len(), 1);
+        assert!(reg.net().nodes[0].consumes.is_empty());
+        assert!(reg.net().nodes[0].produces.is_empty());
+    }
 }

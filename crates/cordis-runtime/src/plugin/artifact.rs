@@ -648,4 +648,182 @@ mod tests {
         stage_file(&path, &path).unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"hello");
     }
+
+    // --- stage_file error branches (direct calls) ----------------------------
+
+    // target has no parent (`/`) → the `target.parent().ok_or_else` guard fires
+    // with an Invariant before any filesystem write is attempted.
+    #[test]
+    fn stage_file_target_without_parent_is_invariant() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("src.bin");
+        fs::write(&src, b"x").unwrap();
+        // `/` has no parent component.
+        let err = stage_file(&src, Path::new("/")).unwrap_err();
+        match err {
+            RuntimeError::Invariant { message } => {
+                assert!(message.contains("missing parent"), "{message}");
+            }
+            other => panic!("expected Invariant, got {other:?}"),
+        }
+    }
+
+    // create_dir_all(target_parent) fails when a path component is a regular
+    // file (NotADirectory on Unix) → the create_dir_all error arm.
+    #[test]
+    fn stage_file_create_dir_all_failure_is_io() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("src.bin");
+        fs::write(&src, b"x").unwrap();
+        // A regular file where a parent directory would need to be.
+        let file_as_dir = tmp.path().join("blocker");
+        fs::write(&file_as_dir, b"blocker").unwrap();
+        // target_parent == <file>/sub, which create_dir_all cannot make.
+        let target = file_as_dir.join("sub/out.bin");
+        let err = stage_file(&src, &target).unwrap_err();
+        assert!(matches!(err, RuntimeError::Io { .. }), "err={err:?}");
+    }
+
+    // target has a parent but no file_name (ends in `..`) → the staging-name
+    // computation hits the `None` arm and returns an Invariant.
+    #[test]
+    fn stage_file_target_without_filename_is_invariant() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("src.bin");
+        fs::write(&src, b"x").unwrap();
+        let real_dir = tmp.path().join("realdir");
+        fs::create_dir_all(&real_dir).unwrap();
+        // "<realdir>/.." : parent() is Some(realdir) but file_name() is None.
+        let target = real_dir.join("..");
+        let err = stage_file(&src, &target).unwrap_err();
+        match err {
+            RuntimeError::Invariant { message } => {
+                assert!(message.contains("no filename"), "{message}");
+            }
+            other => panic!("expected Invariant, got {other:?}"),
+        }
+    }
+
+    // The copy step fails when the source does not exist → Io tagged with the
+    // staging path.
+    #[test]
+    fn stage_file_copy_failure_is_io() {
+        let tmp = TempDir::new().unwrap();
+        let missing_src = tmp.path().join("nope.bin");
+        let target = tmp.path().join("out/dst.bin");
+        let err = stage_file(&missing_src, &target).unwrap_err();
+        assert!(matches!(err, RuntimeError::Io { .. }), "err={err:?}");
+        // The staging file was cleaned up (copy failed before it existed / left
+        // nothing behind), and the target was never created.
+        assert!(!target.exists());
+    }
+
+    // The rename step fails when the target is an existing directory (renaming
+    // the staging file onto a directory is EISDIR) → the rename error arm,
+    // which cleans up the staging file and returns an Io error.
+    #[test]
+    fn stage_file_rename_failure_cleans_up_and_is_io() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("src.bin");
+        fs::write(&src, b"payload").unwrap();
+        // Pre-create the target AS A DIRECTORY so rename(staging -> target)
+        // fails.
+        let target = tmp.path().join("target_is_dir");
+        fs::create_dir_all(&target).unwrap();
+        let err = stage_file(&src, &target).unwrap_err();
+        match err {
+            RuntimeError::Io { message, .. } => {
+                assert!(message.contains("rename staging -> target"), "{message}");
+            }
+            other => panic!("expected Io rename failure, got {other:?}"),
+        }
+        // The staging sibling file must have been removed on failure.
+        let leftover: Vec<_> = fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".cordis-staging."))
+            .collect();
+        assert!(leftover.is_empty(), "staging file was not cleaned up");
+    }
+
+    // --- resolve_artifact_path: index path without a parent ------------------
+
+    // When the index path has no parent component (`/`), the relative artifact
+    // path is joined against `.` (the `unwrap_or_else(|| Path::new("."))` arm).
+    #[test]
+    fn resolve_artifact_path_root_index_uses_cwd_dot() {
+        let resolved = resolve_artifact_path(Path::new("/"), "rel/a.so");
+        assert_eq!(resolved, PathBuf::from("./rel/a.so"));
+    }
+
+    // --- staged_artifact_path: absolute ref + artifact path with no filename -
+
+    // An absolute artifact_reference forces the code to take the artifact
+    // path's file_name; if that path has none (ends in `..`), the Invariant
+    // guard fires.
+    #[test]
+    fn staged_artifact_path_absolute_ref_missing_filename_is_invariant() {
+        let staged_root = Path::new("/tmp/staged-root");
+        let err = staged_artifact_path(
+            "plug/here",
+            "/abs/reference.so",
+            Path::new("some/dir/.."),
+            staged_root,
+        )
+        .unwrap_err();
+        match err {
+            RuntimeError::Invariant { message } => {
+                assert!(message.contains("missing file name"), "{message}");
+            }
+            other => panic!("expected Invariant, got {other:?}"),
+        }
+    }
+
+    // --- stage_process_command: create_dir_all failure -----------------------
+
+    // The staged process command's target parent cannot be created because a
+    // path component is a regular file → Io error from create_dir_all.
+    #[test]
+    fn stage_process_command_create_dir_all_failure_is_io() {
+        let tmp = TempDir::new().unwrap();
+        let original = tmp.path().join("artifacts/a.json");
+        fs::create_dir_all(original.parent().unwrap()).unwrap();
+        // The staged artifact sits "under" a regular file, so its bin/ subdir
+        // cannot be created.
+        let blocker = tmp.path().join("blocker");
+        fs::write(&blocker, b"x").unwrap();
+        let staged_artifact = blocker.join("a.json");
+        let staged_root = tmp.path().join("staged");
+        fs::create_dir_all(&staged_root).unwrap();
+        let err = stage_process_command(&original, &staged_artifact, "bin/run.sh", &staged_root)
+            .unwrap_err();
+        assert!(matches!(err, RuntimeError::Io { .. }), "err={err:?}");
+    }
+
+    // --- stage_process_command: canonicalize fallback + escape ---------------
+
+    // When `staged_root` does not exist, `canonicalize` fails on that side and
+    // the code falls through to the unresolved paths on BOTH sides (the `_`
+    // arm). With a non-existent root the containment check then rejects the
+    // command as escaping the snapshot root.
+    #[test]
+    fn stage_process_command_uncanonicalizable_root_falls_back_and_rejects() {
+        let tmp = TempDir::new().unwrap();
+        let original = tmp.path().join("artifacts/a.json");
+        fs::create_dir_all(original.parent().unwrap()).unwrap();
+        // staged artifact lives under a real, canonicalizable temp dir...
+        let staged_artifact = tmp.path().join("real/a.json");
+        fs::create_dir_all(staged_artifact.parent().unwrap()).unwrap();
+        // ...but staged_root points somewhere that does not exist, so
+        // canonicalize(staged_root) errors and the `_` fallback arm runs.
+        let staged_root = tmp.path().join("does/not/exist");
+        let err = stage_process_command(&original, &staged_artifact, "bin/run.sh", &staged_root)
+            .unwrap_err();
+        match err {
+            RuntimeError::Invariant { message } => {
+                assert!(message.contains("escapes snapshot root"), "{message}");
+            }
+            other => panic!("expected escape Invariant, got {other:?}"),
+        }
+    }
 }

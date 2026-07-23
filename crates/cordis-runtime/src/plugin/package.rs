@@ -814,6 +814,21 @@ mod resolver_tests {
         assert!(matches!(err, RuntimeError::InvalidWorkspace { .. }));
     }
 
+    // A member whose Cargo.toml exists but is a DIRECTORY: `cargo_path.exists()`
+    // is true (so the ChildNotFound guard passes), but `read_to_string` errors
+    // with IsADirectory → the per-member Io read-error branch (lines 205-208).
+    #[test]
+    fn resolve_member_cargo_toml_is_directory_is_io() {
+        let tmp = TempDir::new().unwrap();
+        write_workspace(tmp.path(), &["alpha"]);
+        let dir = tmp.path().join("alpha");
+        fs::create_dir_all(&dir).unwrap();
+        // Cargo.toml as a directory rather than a file.
+        fs::create_dir_all(dir.join("Cargo.toml")).unwrap();
+        let err = PackageResolver::new(tmp.path()).resolve().unwrap_err();
+        assert!(matches!(err, RuntimeError::Io { .. }), "err={err:?}");
+    }
+
     #[test]
     fn resolve_member_malformed_cargo_toml_is_cargo_parse() {
         let tmp = TempDir::new().unwrap();

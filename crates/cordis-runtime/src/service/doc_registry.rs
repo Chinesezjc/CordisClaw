@@ -242,6 +242,42 @@ mod tests {
     }
 
     #[test]
+    fn get_node_docs_missing_plugin_propagates_plugin_not_found() {
+        // When the plugin itself is absent, `get_node_docs` must surface the
+        // `?`-propagated `PluginDocsNotFound` from `get_plugin_docs` rather
+        // than a `NodeDocsNotFound`.
+        let docs = DocRegistry::from_plugin_registry(&registry_with("root/plugin"));
+        match docs.get_node_docs("root/absent", "n0") {
+            Err(RuntimeError::PluginDocsNotFound { plugin_path }) => {
+                assert_eq!(plugin_path, "root/absent");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn handle_get_node_docs_route_missing_plugin_propagates_not_found() {
+        // The node-docs route propagates the plugin-not-found error from the
+        // nested `get_node_docs` call.
+        let docs = DocRegistry::from_plugin_registry(&registry_with("root/plugin"));
+        assert!(matches!(
+            docs.handle_get("/plugins/absent/nodes/n0/docs"),
+            Err(RuntimeError::PluginDocsNotFound { .. })
+        ));
+    }
+
+    #[test]
+    fn handle_get_node_docs_route_missing_node_propagates_not_found() {
+        // Plugin exists but the node id does not -> NodeDocsNotFound
+        // propagates through the node-docs route.
+        let docs = DocRegistry::from_plugin_registry(&registry_with("root/plugin"));
+        assert!(matches!(
+            docs.handle_get("/plugins/root/plugin/nodes/absent/docs"),
+            Err(RuntimeError::NodeDocsNotFound { .. })
+        ));
+    }
+
+    #[test]
     fn parse_plugin_docs_path_variants() {
         assert_eq!(
             parse_plugin_docs_path("/plugins/root/child/docs"),
