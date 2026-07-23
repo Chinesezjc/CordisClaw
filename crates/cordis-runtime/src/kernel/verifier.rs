@@ -977,6 +977,24 @@ mod tests {
         assert_eq!(result.runner, VerificationRunner::Shell);
     }
 
+    // A quoted empty token (`''`) tokenises to a single empty-string argv
+    // element — `split_first` succeeds (non-empty argv) but the program name
+    // itself is empty, exercising the `program.is_empty()` guard, distinct
+    // from the empty-argv "after tokenisation" branch above.
+    #[test]
+    fn run_shell_command_reports_empty_program_name() {
+        let temp = TempDir::new().expect("tempdir");
+        let result = run_shell_command("''", temp.path(), Duration::from_secs(5))
+            .expect("empty program should not panic");
+        assert!(!result.success);
+        assert!(
+            result.stderr.contains("command program was empty"),
+            "stderr: {}",
+            result.stderr
+        );
+        assert_eq!(result.runner, VerificationRunner::Shell);
+    }
+
     #[test]
     fn run_shell_command_reports_tokenisation_failure() {
         let temp = TempDir::new().expect("tempdir");

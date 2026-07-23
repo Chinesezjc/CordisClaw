@@ -922,4 +922,114 @@ mod tests {
         assert!(reg.net().nodes[0].consumes.is_empty());
         assert!(reg.net().nodes[0].produces.is_empty());
     }
+
+    // A consumer whose declared input has no producer anywhere in the net
+    // takes the `candidates.is_empty()` early-`continue` in
+    // `build_registered_net`: no edge is synthesised for that input.
+    #[test]
+    fn consumer_input_without_producer_yields_no_edge() {
+        let plugins = PluginRegistry::default();
+        let docs = plugin_docs(
+            "p",
+            "root/p",
+            "0.1.0",
+            None,
+            // `orphan` consumes `never_produced`; nobody produces it.
+            vec![doc_with_schema("orphan", &["never_produced"], &[])],
+            None,
+        );
+        insert_plugin(&plugins, "root/p", None, docs.clone());
+        let mut nodes = NodeRegistry::default();
+        nodes.register_from_docs("root/p", &docs).unwrap();
+        let reg = GraphRegistry::from_registries(&plugins, &nodes);
+        // The node is present, but no data edge feeds its unproduced input.
+        assert_eq!(reg.net().nodes.len(), 1);
+        assert!(
+            reg.net().edges.is_empty(),
+            "no producer means no edge: {:?}",
+            reg.net().edges
+        );
+    }
+
+    fn edge(from: &str, to: &str, kind: RegisteredNetEdgeKind) -> RegisteredNetEdge {
+        RegisteredNetEdge {
+            from: from.to_string(),
+            to: to.to_string(),
+            kind,
+            label: None,
+        }
+    }
+
+    // `topo_levels` accepts both Data and Control edges as real dependencies,
+    // and silently skips edges whose endpoints are not among the known node
+    // ids (a dangling edge left over from a partial graph). Called directly
+    // because `build_registered_net` only ever emits Data edges between known
+    // nodes, so these guard branches are unreachable through the public path.
+    #[test]
+    fn topo_levels_honors_control_edges_and_skips_dangling() {
+        let node_ids = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let edges = vec![
+            // Control edge a->b is a real ordering dependency: b sits below a.
+            edge("a", "b", RegisteredNetEdgeKind::Control),
+            // Data edge b->c: c sits below b.
+            edge("b", "c", RegisteredNetEdgeKind::Data),
+            // Dangling edges referencing unknown nodes must be ignored, not
+            // panic or inflate indegree.
+            edge("a", "ghost", RegisteredNetEdgeKind::Data),
+            edge("ghost", "c", RegisteredNetEdgeKind::Control),
+        ];
+        let mut diagnostics = Vec::new();
+        let levels = topo_levels(node_ids, &edges, &mut diagnostics);
+        assert_eq!(levels.get("a"), Some(&0));
+        assert_eq!(levels.get("b"), Some(&1));
+        assert_eq!(levels.get("c"), Some(&2));
+        // No cycle among the real nodes → no cycle diagnostic.
+        assert!(
+            !diagnostics.iter().any(|d| d.contains("cycle")),
+            "diagnostics: {diagnostics:?}"
+        );
+    }
+
+    // Two edges sharing the same `from` (one producer, two distinct inputs to
+    // the same consumer) force `build_registered_net`'s `edges.dedup_by`
+    // closure to evaluate past its first `from == from` term into the `to` /
+    // `label` comparisons — the only public path that reaches those terms,
+    // since every other scenario yields at most one edge per (consumer,input)
+    // pair and the closure would short-circuit on `from`.
+    #[test]
+    fn dedup_by_evaluates_to_and_label_for_shared_producer_edges() {
+        // Producer P emits both x and y; consumer C consumes both. Result:
+        // two edges P->C with labels x and y (adjacent after the sort, same
+        // from, same to, differing label).
+        let plugins = PluginRegistry::default();
+        let docs = plugin_docs(
+            "p",
+            "root/p",
+            "0.1.0",
+            None,
+            vec![
+                doc_with_schema("prod", &[], &["x", "y"]),
+                doc_with_schema("cons", &["x", "y"], &[]),
+            ],
+            None,
+        );
+        insert_plugin(&plugins, "root/p", None, docs.clone());
+        let mut nodes = NodeRegistry::default();
+        nodes.register_from_docs("root/p", &docs).unwrap();
+        let reg = GraphRegistry::from_registries(&plugins, &nodes);
+
+        // Both distinct-label edges survive dedup (label differs), so the
+        // consumer has two incoming edges from the same producer.
+        let incoming: Vec<_> = reg
+            .net()
+            .edges
+            .iter()
+            .filter(|e| e.to == "root/p::cons")
+            .collect();
+        assert_eq!(incoming.len(), 2, "edges: {:?}", reg.net().edges);
+        assert!(incoming.iter().all(|e| e.from == "root/p::prod"));
+        let mut labels: Vec<_> = incoming.iter().filter_map(|e| e.label.clone()).collect();
+        labels.sort();
+        assert_eq!(labels, vec!["x".to_string(), "y".to_string()]);
+    }
 }

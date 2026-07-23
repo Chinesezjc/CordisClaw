@@ -1792,6 +1792,33 @@ mod tests {
         assert!(matches!(err, RuntimeError::CommitConflict { .. }));
     }
 
+    // `commit_session` with a NON-empty request map promotes each entry into
+    // session scope (the `for (key, value)` merge loop, line 840). Afterwards
+    // the value is served from the session slot — `lookup_slot_entry`'s
+    // session-scope hit (line 358) — since the request scope was cleared by
+    // the commit. `list_by_ns` must then surface the key from session scope,
+    // and `session_version` reflects the bump.
+    #[test]
+    fn commit_session_promotes_request_to_session_scope() {
+        let ctx = RuntimeContext::default();
+        assert_eq!(ctx.session_version(), 0);
+        let k = key("sess_ns", "promoted", 1);
+        ctx.put(k.clone(), serde_json::json!("keep"), slot_meta())
+            .unwrap();
+        // Before commit the value lives in request scope.
+        ctx.commit_session("s", 0).unwrap();
+        assert_eq!(ctx.session_version(), 1);
+        // Request scope was cleared; the value is now served from session
+        // scope on read-back.
+        let got: serde_json::Value = ctx.get(&k).unwrap().unwrap();
+        assert_eq!(got, serde_json::json!("keep"));
+        // Still visible; contains() also routes through the session-scope hit.
+        assert!(ctx.contains(&k));
+        // list_by_ns enumerates the session-scope key.
+        let listed = ctx.list_by_ns("sess_ns");
+        assert!(listed.contains(&k), "listed: {listed:?}");
+    }
+
     /// P1-2: `list_by_ns` and `lookup_slot_entry` used to acquire
     /// context locks in opposite orders; two workers doing one each
     /// could deadlock. After the fix both go active → overlays →

@@ -24,3 +24,5 @@ shell-words = "1"
 cordis-plugin-sdk = { path = "../cordis-plugin-sdk" }
 serial_test = "3"
 tempfile = "3"
+sha2.workspace = true
+hex.workspace = true
