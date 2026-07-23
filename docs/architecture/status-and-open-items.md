@@ -26,7 +26,7 @@
 | 插件封装形态蓝图 | 部分完成 | `dylib` + JSON artifact + process 已落地；`cdylib` / `WASM` 未实现 |
 | 更真实的运行入口与服务化边界 | 部分完成 | `RuntimeHost`、`serve` REPL、agent chat、shell console 可用；尚未稳定化为外部服务边界 |
 | YAML 配置入口 | 已完成 | runtime / kernel / llm_api / plugins 配置模型完整 |
-| CI | 已完成 | GitHub Actions（`.github/workflows/ci.yml`）：push main + PR 触发，ubuntu-latest 上执行 fmt / clippy `-D warnings` / build / test；x86_64-linux 门控恒真，dylib 集成测试全量执行，fixture 插件在 CI 现场构建并经 rust-cache 缓存 |
+| CI | 已完成 | GitHub Actions（`.github/workflows/ci.yml`）：push main + PR 触发，ubuntu-latest 上执行 fmt / clippy `-D warnings` / prepare-artifacts / build / test；x86_64-linux 门控恒真，dylib 集成测试全量执行，fixture 插件经 `prepare-artifacts` 预构建并由 rust-cache 缓存。test 带 `--test-threads=1`：host.rs 等 lib 单测共享 `default_snapshot_root(repo fixtures)`，boot 时清理全部 `snapshot-*`，并行 boot 互删对方 in-flight staging（x86_64-linux 实测复现）；按测试隔离 snapshot root 的代码级修复在 TODO |
 
 ## 3. 已完成
 
@@ -172,6 +172,10 @@ Agent 现在可以自主完成：读代码 → 理解结构 → 写/改文件 �
 - [x] Plugin load 时遍历 `docs.nodes`，对 `node_type: Task` 的节点输出诊断日志（`NodeRegistry::task_node_fqns()`）
 - [x] Plugin reload 时调用 `stop_plugin_services()` 停止被移除/变更插件的 services
 - [ ] Plugin boot 时自动 `start_service()` 需要 service factory 注册机制（当前手动调用 `host.start_service()`）
+
+### 5.1.1 lib 单测 snapshot root 共享导致并行互踩（2026-07-23 发现）
+
+- [ ] host.rs / verifier.rs 的 lib 单测直接 `RuntimeHost::boot(repo fixtures)`，snapshot root 均为 `default_snapshot_root(repo fixtures)`（fixtures 路径哈希派生，因此全部相同）；boot 时会删除该目录下所有 `snapshot-*`，多个测试并行 boot 时互删对方 in-flight snapshot staging，报 `rename staging -> target failed`（x86_64-linux `cargo test` 并行模式实测复现，5 例失败）。当前 CI 用 `--test-threads=1` 规避；代码级修复方向：测试内 boot 走 per-test 临时 snapshot root（`RuntimeConfig.snapshot_root` 已支持配置），或 boot 的 stale 清理改为只删属于已死 pid 的 snapshot。
 
 ### 5.2 执行引擎缺口闭合（2026-06-05 大部分已闭合）
 
