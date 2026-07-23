@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      # fixtures/plugins 是独立 workspace：集成测试首次运行时会在
+      # CI 上现场 cargo build 各 fixture 插件（fixtures/artifacts/
+      # 不入库），因此其 target 目录也要缓存。
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            fixtures/plugins
+
+      - name: rustfmt
+        run: cargo fmt --all --check
+
+      - name: clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: build
+        run: cargo build --all-targets --locked
+
+      - name: test
+        run: cargo test --locked

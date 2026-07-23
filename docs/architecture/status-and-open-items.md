@@ -26,6 +26,7 @@
 | 插件封装形态蓝图 | 部分完成 | `dylib` + JSON artifact + process 已落地；`cdylib` / `WASM` 未实现 |
 | 更真实的运行入口与服务化边界 | 部分完成 | `RuntimeHost`、`serve` REPL、agent chat、shell console 可用；尚未稳定化为外部服务边界 |
 | YAML 配置入口 | 已完成 | runtime / kernel / llm_api / plugins 配置模型完整 |
+| CI | 已完成 | GitHub Actions（`.github/workflows/ci.yml`）：push main + PR 触发，ubuntu-latest 上执行 fmt / clippy `-D warnings` / build / test；x86_64-linux 门控恒真，dylib 集成测试全量执行，fixture 插件在 CI 现场构建并经 rust-cache 缓存 |
 
 ## 3. 已完成
 
@@ -562,6 +563,7 @@ cd fixtures/plugins/expr/lexer && cargo test --lib  # excluded, external tests o
 - [x] **P2-29 rebuild_plugin_workspace 加 strip_proxy_envs** — 与 `run_command` 对齐；企业代理下不再挂起。
 - [x] **P2-30 rebuild 加 build timeout** — 新 helper `run_command_with_timeout` (20min 默认，`CORDIS_BUILD_TIMEOUT_SECS` 覆盖) + poll-based kill+wait；死循环 build.rs 不再挂死 iteration 管道。
 - [x] **P2-12 QQ 硬编码路径**（部分修）— 新 `runtime_config_path()` 从 `$CORDIS_FIXTURES_ROOT` 派生；env 未设置时回退到历史 `/root/CordisClaw/...`。
+- [x] **serve 加 `--no-startup-invoke`（本地测试劫持线上流量修复，2026-07-22）** — serve 启动段原先无条件执行 `startup_invoke.json`（起 qq HTTP 8099 + 连真实飞书 WSS）；本地落地测试实例与线上 bot 共用渠道凭证，测试期间飞书把用户消息推给测试实例，实例发出"思考中"两段式占位卡片后被测试脚本 exit 杀掉，内存 `PENDING_CARDS` 丢失，用户侧卡片永久停留（已实际发生）。新增 `--no-startup-invoke` flag + `CORDIS_NO_STARTUP_INVOKE` 环境变量：跳过启动段全部自动 invoke 并打印明确日志，插件加载 / invoke / execute / REPL 不受影响。`parse_root_and_runtime_only` 重构为 `parse_serve_args`（env 读取在外壳，内层纯函数可测），main.rs 补 4 个参数解析单测。约定：本地落地测试一律带该开关。
 - [x] **P2-13 fingerprint per-build**（fixture 迁移完成）— 21 个 fixture 插件的 `abi_fingerprint_value()` 全部从硬编码 `AbiFingerprint { rustc_version: "1.85.1", target_triple: "x86_64-unknown-linux-gnu", ... }` 迁移到 `AbiFingerprint::current_build(crate_hash, api_hash)`；Cargo.toml 的 `[package.metadata.cordis.abi_fingerprint]` 删除 rustc_version/target_triple 两行（SDK 的 `AbiFingerprint` 加 serde default，缺省时填当前工具链值，显式声明仍生效）；host.rs 两处插件脚手架模板与 agent.rs 的插件创建 prompt 同步。修复动机：硬编码 linux triple 导致 macOS 等非 linux-x86 宿主上所有 dylib 插件被 target_triple 预检拒载（`Unavailable(AbiMismatch)`），serve 无法冷启动。SDK 补 serde-default 单测；macOS (aarch64-apple-darwin) 实机 serve + invoke 验证通过。
 
 **S 批 (fixture / naming / misc):**
