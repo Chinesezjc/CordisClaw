@@ -42,6 +42,11 @@ struct VisionRequest {
     #[serde(default)]
     url: Option<String>,
 
+    /// Local image file path. Must resolve to a location inside the system
+    /// temp directory. Mutually exclusive with `url`.
+    #[serde(default)]
+    path: Option<String>,
+
     /// For vision_describe: optional prompt override (default: "Describe this image in detail")
     #[serde(default)]
     prompt: Option<String>,
@@ -115,6 +120,59 @@ fn download_image(url_str: &str) -> Result<Vec<u8>, String> {
 }
 
 // ---------------------------------------------------------------------------
+// Local file source (P2: consume feishu_fetch_resource temp files)
+// ---------------------------------------------------------------------------
+
+/// Read a local image file. Access is restricted to the system temp directory
+/// so callers can only hand off files that a trusted producer (e.g. the feishu
+/// plugin's `feishu_fetch_resource`) placed under `std::env::temp_dir()`.
+///
+/// On macOS both `/tmp` and `/var/folders/...` are symlinks, so the requested
+/// path and the temp-dir prefix are each canonicalized before comparison.
+fn read_local_image(path: &str) -> Result<Vec<u8>, String> {
+    let real = std::fs::canonicalize(path)
+        .map_err(|e| format!("resolve path {path}: {e}"))?;
+
+    let temp_root = std::fs::canonicalize(std::env::temp_dir())
+        .map_err(|e| format!("resolve temp dir: {e}"))?;
+
+    if !real.starts_with(&temp_root) {
+        return Err(format!(
+            "path outside temp dir: {} (must be under {})",
+            real.display(),
+            temp_root.display()
+        ));
+    }
+
+    let meta = std::fs::metadata(&real)
+        .map_err(|e| format!("stat {}: {e}", real.display()))?;
+    if meta.len() > MAX_IMAGE_BYTES as u64 {
+        return Err(format!(
+            "image too large: {} bytes (max {MAX_IMAGE_BYTES})",
+            meta.len()
+        ));
+    }
+
+    std::fs::read(&real).map_err(|e| format!("read {}: {e}", real.display()))
+}
+
+/// Load image bytes from exactly one of `url` or `path`. Supplying both is an
+/// error; supplying neither is an error. `path` reads a local temp-dir file,
+/// `url` goes through the SSRF-guarded HTTP download.
+fn load_source(url: Option<&str>, path: Option<&str>) -> Result<Vec<u8>, String> {
+    let url = url.map(str::trim).filter(|s| !s.is_empty());
+    let path = path.map(str::trim).filter(|s| !s.is_empty());
+    match (url, path) {
+        (Some(_), Some(_)) => {
+            Err("provide either url or path, not both".to_string())
+        }
+        (Some(u), None) => download_image(u),
+        (None, Some(p)) => read_local_image(p),
+        (None, None) => Err("either url or path is required".to_string()),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // vision_ocr — tesseract
 // ---------------------------------------------------------------------------
 
@@ -134,8 +192,8 @@ fn guess_mime(data: &[u8]) -> &'static str {
     }
 }
 
-fn vision_ocr(url: &str, lang: &str) -> Result<String, String> {
-    let data = download_image(url)?;
+fn vision_ocr(url: Option<&str>, path: Option<&str>, lang: &str) -> Result<String, String> {
+    let data = load_source(url, path)?;
     let ext = guess_mime(&data);
 
     // P0-27: previously `cordis_ocr_<pid>.<ext>` — concurrent callers within
@@ -196,7 +254,11 @@ fn vision_ocr(url: &str, lang: &str) -> Result<String, String> {
 // vision_describe — OpenAI-compatible vision API
 // ---------------------------------------------------------------------------
 
-fn vision_describe(url: &str, prompt: &str) -> Result<(String, String), String> {
+fn vision_describe(
+    url: Option<&str>,
+    path: Option<&str>,
+    prompt: &str,
+) -> Result<(String, String), String> {
     let api_key = std::env::var("OPENAI_API_KEY")
         .or_else(|_| std::env::var("VISION_API_KEY"))
         .map_err(|_| {
@@ -210,7 +272,7 @@ fn vision_describe(url: &str, prompt: &str) -> Result<(String, String), String> 
     let model = std::env::var("VISION_MODEL")
         .unwrap_or_else(|_| "gpt-4o-mini".to_string());
 
-    let data = download_image(url)?;
+    let data = load_source(url, path)?;
     let mime = guess_mime(&data);
     let data_url = format!(
         "data:image/{};base64,{}",
@@ -281,12 +343,8 @@ fn vision_describe(url: &str, prompt: &str) -> Result<(String, String), String> 
 fn handle(req: &VisionRequest) -> Result<VisionResponse, String> {
     match req.node_id.as_str() {
         "vision_ocr" => {
-            let url = req.url.as_deref().unwrap_or("").trim();
-            if url.is_empty() {
-                return Err("url is required for vision_ocr".to_string());
-            }
             let lang = req.lang.as_deref().unwrap_or("chi_sim+eng");
-            match vision_ocr(url, lang) {
+            match vision_ocr(req.url.as_deref(), req.path.as_deref(), lang) {
                 Ok(text) => Ok(VisionResponse {
                     ok: true,
                     node_id: "vision_ocr".to_string(),
@@ -306,15 +364,11 @@ fn handle(req: &VisionRequest) -> Result<VisionResponse, String> {
             }
         }
         "vision_describe" => {
-            let url = req.url.as_deref().unwrap_or("").trim();
-            if url.is_empty() {
-                return Err("url is required for vision_describe".to_string());
-            }
             let prompt = req
                 .prompt
                 .as_deref()
                 .unwrap_or("Describe this image in detail. What do you see? Reply in Chinese if the image contains Chinese text or context.");
-            match vision_describe(url, prompt) {
+            match vision_describe(req.url.as_deref(), req.path.as_deref(), prompt) {
                 Ok((text, model)) => Ok(VisionResponse {
                     ok: true,
                     node_id: "vision_describe".to_string(),
@@ -350,13 +404,14 @@ fn docs_value() -> cordis_plugin_sdk::PluginDocs {
         vec![
             task_node_doc(
                 "vision_ocr",
-                "Download an image from URL and run tesseract OCR to extract text. Requires tesseract installed on the system. Default language: chi_sim+eng.",
+                "Run tesseract OCR on an image to extract text. Supply the image with either `url` (downloaded over HTTP) or `path` (a local file under the system temp directory); provide exactly one of them. Requires tesseract installed on the system. Default language: chi_sim+eng.",
                 json!({
                     "type": "object",
-                    "required": ["node_id", "url"],
+                    "required": ["node_id"],
                     "properties": {
                         "node_id": { "type": "string", "const": "vision_ocr" },
-                        "url": { "type": "string", "description": "Image URL to OCR" },
+                        "url": { "type": "string", "description": "Image URL to OCR (provide url or path, not both)" },
+                        "path": { "type": "string", "description": "Absolute path to a local image file. Must be located under the system temp directory. Provide url or path, not both." },
                         "lang": { "type": "string", "description": "Tesseract language code (default: chi_sim+eng)" }
                     }
                 }),
@@ -368,18 +423,19 @@ fn docs_value() -> cordis_plugin_sdk::PluginDocs {
                         "error": { "type": ["string", "null"] }
                     }
                 }),
-                &["downloads image from URL", "runs tesseract OCR"],
-                &["tesseract not installed", "network error", "language pack missing", "no text in image"],
+                &["reads image from url or local temp path", "runs tesseract OCR"],
+                &["tesseract not installed", "network error", "language pack missing", "no text in image", "path outside temp dir"],
             ),
             task_node_doc(
                 "vision_describe",
-                "Download an image from URL and send to an OpenAI-compatible vision API (default: gpt-4o-mini) for AI-powered description. Requires OPENAI_API_KEY (or VISION_API_KEY) env var. Supports OPENAI_BASE_URL for custom endpoints.",
+                "Send an image to an OpenAI-compatible vision API (default: gpt-4o-mini) for AI-powered description. Supply the image with either `url` (downloaded over HTTP) or `path` (a local file under the system temp directory); provide exactly one of them. Requires OPENAI_API_KEY (or VISION_API_KEY) env var. Supports OPENAI_BASE_URL for custom endpoints.",
                 json!({
                     "type": "object",
-                    "required": ["node_id", "url"],
+                    "required": ["node_id"],
                     "properties": {
                         "node_id": { "type": "string", "const": "vision_describe" },
-                        "url": { "type": "string", "description": "Image URL to analyze" },
+                        "url": { "type": "string", "description": "Image URL to analyze (provide url or path, not both)" },
+                        "path": { "type": "string", "description": "Absolute path to a local image file. Must be located under the system temp directory. Provide url or path, not both." },
                         "prompt": { "type": "string", "description": "Custom prompt for the vision model" }
                     }
                 }),
@@ -392,8 +448,8 @@ fn docs_value() -> cordis_plugin_sdk::PluginDocs {
                         "error": { "type": ["string", "null"] }
                     }
                 }),
-                &["downloads image from URL", "sends to OpenAI-compatible vision API"],
-                &["API key not set", "network error", "rate limited", "API quota exceeded", "image too large"],
+                &["reads image from url or local temp path", "sends to OpenAI-compatible vision API"],
+                &["API key not set", "network error", "rate limited", "API quota exceeded", "image too large", "path outside temp dir"],
             ),
         ],
     None
@@ -425,4 +481,87 @@ export_plugin_api! {
     abi_fingerprint = abi_fingerprint_value(),
     docs = docs_value(),
     handle = api_handle,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Build a unique path inside the temp dir without touching the filesystem.
+    fn unique_temp_path(tag: &str) -> std::path::PathBuf {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!(
+            "cordis_vision_test_{tag}_{}_{seq:x}_{nanos:x}.bin",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn read_local_image_rejects_path_outside_temp_dir() {
+        // Cargo.toml lives in the crate directory, not the temp dir.
+        let outside = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml");
+        let err = read_local_image(outside).unwrap_err();
+        assert!(
+            err.contains("path outside temp dir"),
+            "expected temp-dir rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn read_local_image_reads_temp_file() {
+        let path = unique_temp_path("read");
+        let payload: &[u8] = b"\x89PNG\r\n\x1a\nfake image bytes";
+        std::fs::write(&path, payload).expect("write temp file");
+
+        let result = read_local_image(path.to_str().unwrap());
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(result.expect("read back"), payload);
+    }
+
+    #[test]
+    fn read_local_image_errors_on_missing_path() {
+        let path = unique_temp_path("missing");
+        // Never created — canonicalize must fail.
+        let err = read_local_image(path.to_str().unwrap()).unwrap_err();
+        assert!(
+            err.contains("resolve path"),
+            "expected resolve failure, got: {err}"
+        );
+    }
+
+    #[test]
+    fn load_source_rejects_both_url_and_path() {
+        let err = load_source(Some("https://example.com/a.png"), Some("/tmp/x.png"))
+            .unwrap_err();
+        assert_eq!(err, "provide either url or path, not both");
+    }
+
+    #[test]
+    fn load_source_rejects_neither_url_nor_path() {
+        let err = load_source(None, None).unwrap_err();
+        assert_eq!(err, "either url or path is required");
+
+        // Empty / whitespace strings are treated as absent.
+        let err = load_source(Some("   "), Some("")).unwrap_err();
+        assert_eq!(err, "either url or path is required");
+    }
+
+    #[test]
+    fn load_source_path_branch_reads_temp_file() {
+        let path = unique_temp_path("load");
+        let payload: &[u8] = b"local via load_source";
+        std::fs::write(&path, payload).expect("write temp file");
+
+        let result = load_source(None, Some(path.to_str().unwrap()));
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(result.expect("load_source path branch"), payload);
+    }
 }
