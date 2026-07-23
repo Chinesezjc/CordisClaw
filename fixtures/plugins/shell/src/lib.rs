@@ -33,7 +33,7 @@ struct ShellPluginResponsePayload {
     output: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 struct ShellPlugin {
     /// P2-36: currently always `None` because the plugin is
     /// instantiated per request via `ShellPlugin::default()`. The
@@ -41,12 +41,6 @@ struct ShellPlugin {
     /// this field; the fallback branch below is effectively dead code
     /// but kept as a future extension point (host-injected default).
     fixtures_root: Option<PathBuf>,
-}
-
-impl Default for ShellPlugin {
-    fn default() -> Self {
-        Self { fixtures_root: None }
-    }
 }
 
 impl ShellPlugin {

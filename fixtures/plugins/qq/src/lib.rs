@@ -523,7 +523,7 @@ fn run_event_loop(server: tiny_http::Server) {
                         .find(|h| h.field.equiv("X-Signature"))
                         .map(|h| h.value.as_str().to_string());
                     let mut body = String::new();
-                    if let Ok(_) = request.as_reader().read_to_string(&mut body) {
+                    if request.as_reader().read_to_string(&mut body).is_ok() {
                         let expected_token = STATE
                             .lock()
                             .ok()

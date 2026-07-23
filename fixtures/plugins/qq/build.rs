@@ -8,7 +8,7 @@ fn main() {
 
     // Copy the .so file
     let status = Command::new("cp")
-        .args(&[src, dst])
+        .args([src, dst])
         .status();
     match status {
         Ok(s) if s.success() => println!("cargo:warning=Copied libqq.so to artifacts/"),
