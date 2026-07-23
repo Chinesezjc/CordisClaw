@@ -1271,4 +1271,224 @@ mod tests {
             "at same topo_level, higher priority sorts first"
         );
     }
+
+    use crate::execution::net::CorrelationKey;
+
+    fn empty_trigger() -> TransitionTrigger {
+        TransitionTrigger {
+            key: CorrelationKey(String::new()),
+            inputs: Vec::new(),
+        }
+    }
+
+    /// `run_transition` is the non-Router dispatcher; called on a Router
+    /// spec it must refuse with an Invariant error naming the transition
+    /// (the Router-must-go-through-run_transition_router guard).
+    #[test]
+    fn run_transition_rejects_router_kind() {
+        let spec = make_transition(
+            "r",
+            ExecutionTransitionKind::Router {
+                subgraph_id: "sg".to_string(),
+            },
+            JoinPolicy::AllOf,
+        );
+        let ctx = RuntimeContext::default();
+        let err = run_transition(&spec, 0, &empty_trigger(), &ctx, &|_, _, _, _| {
+            TransitionRunResult::from_outcome(NodeOutcome::Success)
+        })
+        .unwrap_err();
+        match err {
+            RuntimeError::Invariant { message } => {
+                assert!(message.contains("run_transition_router"), "msg: {message}");
+                assert!(message.contains('r'), "msg: {message}");
+            }
+            other => panic!("expected Invariant, got {other:?}"),
+        }
+    }
+
+    /// The Task-kind timeout override: when the runner takes longer than
+    /// `timeout_ms`, `run_transition` re-classifies the outcome as Timeout
+    /// even though the runner reported Success.
+    #[test]
+    fn run_transition_task_timeout_override() {
+        let mut spec = make_transition("t", ExecutionTransitionKind::Task, JoinPolicy::AllOf);
+        spec.run_policy = RunPolicy {
+            timeout_ms: 1,
+            max_retries: 0,
+            backoff: BackoffPolicy::None,
+        };
+        let ctx = RuntimeContext::default();
+        let result = run_transition(&spec, 0, &empty_trigger(), &ctx, &|_, _, _, _| {
+            sleep(Duration::from_millis(15));
+            TransitionRunResult::from_outcome(NodeOutcome::Success)
+        })
+        .expect("run should not error");
+        assert_eq!(result.outcome, NodeOutcome::Timeout);
+    }
+
+    /// A Gate-kind transition ignores the runner and always yields Success.
+    #[test]
+    fn run_transition_gate_kind_is_success() {
+        let spec = make_transition(
+            "g",
+            ExecutionTransitionKind::Gate {
+                policy: GatePolicy::AllOf,
+            },
+            JoinPolicy::AllOf,
+        );
+        let ctx = RuntimeContext::default();
+        let result = run_transition(&spec, 0, &empty_trigger(), &ctx, &|_, _, _, _| {
+            TransitionRunResult::from_outcome(NodeOutcome::Failure)
+        })
+        .expect("run should not error");
+        assert_eq!(result.outcome, NodeOutcome::Success);
+    }
+
+    /// `run_transition_router` on a non-Router spec must refuse with an
+    /// Invariant error (mirror guard of `run_transition`).
+    #[test]
+    fn run_transition_router_rejects_non_router_kind() {
+        let spec = make_transition("task", ExecutionTransitionKind::Task, JoinPolicy::AllOf);
+        let mut ctx = RuntimeContext::default();
+        let mut metrics = ExecutionMetrics::default();
+        let err = run_transition_router(
+            &spec,
+            0,
+            &empty_trigger(),
+            &mut metrics,
+            &mut ctx,
+            &|_, _, _, _| TransitionRunResult::from_outcome(NodeOutcome::Success),
+        )
+        .unwrap_err();
+        match err {
+            RuntimeError::Invariant { message } => {
+                assert!(message.contains("non-Router"), "msg: {message}");
+            }
+            other => panic!("expected Invariant, got {other:?}"),
+        }
+    }
+
+    /// `retry_backoff_delay_ms` branch table: None→0, Fixed→delay,
+    /// Exponential with next_attempt==0 short-circuits to 0, and the normal
+    /// exponential ramp is clamped by `max_ms`.
+    #[test]
+    fn retry_backoff_delay_all_branches() {
+        let none = RunPolicy {
+            timeout_ms: 0,
+            max_retries: 0,
+            backoff: BackoffPolicy::None,
+        };
+        assert_eq!(retry_backoff_delay_ms(&none, 1), 0);
+
+        let fixed = RunPolicy {
+            timeout_ms: 0,
+            max_retries: 0,
+            backoff: BackoffPolicy::Fixed { delay_ms: 42 },
+        };
+        assert_eq!(retry_backoff_delay_ms(&fixed, 3), 42);
+
+        let exp = RunPolicy {
+            timeout_ms: 0,
+            max_retries: 0,
+            backoff: BackoffPolicy::Exponential {
+                base_ms: 10,
+                max_ms: 1_000,
+            },
+        };
+        // next_attempt == 0 short-circuits to 0.
+        assert_eq!(retry_backoff_delay_ms(&exp, 0), 0);
+        // attempt 1 => 10 << 0 = 10; attempt 2 => 10 << 1 = 20.
+        assert_eq!(retry_backoff_delay_ms(&exp, 1), 10);
+        assert_eq!(retry_backoff_delay_ms(&exp, 2), 20);
+        // A huge attempt is clamped by max_ms.
+        assert_eq!(retry_backoff_delay_ms(&exp, 30), 1_000);
+    }
+
+    fn token(outcome: NodeOutcome) -> Token {
+        Token {
+            key: CorrelationKey(String::new()),
+            payload: Value::Null,
+            meta: TokenMeta {
+                execution_id: "e".to_string(),
+                transition_id: "t".to_string(),
+                logical_group: "g".to_string(),
+                sequence: 0,
+                outcome,
+            },
+        }
+    }
+
+    /// `evaluate_join_policy` FirstSuccess: a present Success token releases
+    /// immediately; with only terminal-non-success tokens on every place it
+    /// still releases (failure-branch completion); a genuinely empty place
+    /// holds the join.
+    #[test]
+    fn evaluate_join_policy_first_success_branches() {
+        // Success present anywhere → ready.
+        let with_success = vec![
+            ("p1".to_string(), vec![token(NodeOutcome::Failure)]),
+            ("p2".to_string(), vec![token(NodeOutcome::Success)]),
+        ];
+        assert!(evaluate_join_policy(
+            JoinPolicy::FirstSuccess,
+            &with_success
+        ));
+
+        // No success, but every place has a terminal token → still ready.
+        let all_terminal = vec![
+            ("p1".to_string(), vec![token(NodeOutcome::Failure)]),
+            ("p2".to_string(), vec![token(NodeOutcome::Timeout)]),
+        ];
+        assert!(evaluate_join_policy(
+            JoinPolicy::FirstSuccess,
+            &all_terminal
+        ));
+
+        // No success and one place empty → not ready.
+        let one_empty = vec![
+            ("p1".to_string(), vec![token(NodeOutcome::Failure)]),
+            ("p2".to_string(), Vec::new()),
+        ];
+        assert!(!evaluate_join_policy(JoinPolicy::FirstSuccess, &one_empty));
+    }
+
+    /// The parallel path (max_concurrency > 1) surfaces a runner panic whose
+    /// payload is a `String` (not `&'static str`) through the String
+    /// downcast arm, yielding a "runner panic" ExecutionFailed.
+    #[test]
+    fn parallel_runner_string_panic_is_surfaced() {
+        let net = ExecutionNetSpec {
+            places: vec![],
+            transitions: vec![make_transition(
+                "boom",
+                ExecutionTransitionKind::Task,
+                JoinPolicy::AllOf,
+            )],
+            arcs: vec![],
+        };
+        let mut ctx = RuntimeContext::default();
+        let err = execute_net(
+            ExecutionConfig {
+                scheduler: SchedulerConfig {
+                    max_parallelism: 1,
+                    max_concurrency: 4,
+                },
+                scheduler_mode: SchedulerMode::Deterministic,
+            },
+            net,
+            &mut ctx,
+            // A formatted (owned String) panic payload exercises the
+            // `downcast_ref::<String>()` arm rather than the &str arm.
+            |_, _, _, _| panic!("{}", String::from("string boom")),
+        )
+        .unwrap_err();
+        match err {
+            RuntimeError::ExecutionFailed { message, .. } => {
+                assert!(message.contains("runner panic"), "msg: {message}");
+                assert!(message.contains("string boom"), "msg: {message}");
+            }
+            other => panic!("expected ExecutionFailed, got {other:?}"),
+        }
+    }
 }
