@@ -2,7 +2,7 @@
 //!
 //! Nodes:
 //! - `web_search`  — search the web using DeepSeek Anthropic-compatible API
-//!                    (returns structured results: title + URL per result)
+//!   (returns structured results: title + URL per result)
 //! - `web_fetch`   — fetch a URL and return plain-text content
 //!
 //! Safety: only http/https URLs are allowed; localhost, loopback, and private
@@ -132,7 +132,7 @@ fn web_search_anthropic(query: &str) -> Result<String, String> {
         return Err(format!(
             "Anthropic API error ({}): {}",
             status.as_u16(),
-            &resp_body.chars().take(500).collect::<String>()
+            resp_body.chars().take(500).collect::<String>()
         ));
     }
 
@@ -142,7 +142,7 @@ fn web_search_anthropic(query: &str) -> Result<String, String> {
     // Extract structured search results + model text from content blocks.
     let content_blocks = json["content"]
         .as_array()
-        .ok_or_else(|| format!("unexpected response format: {}", &resp_body.chars().take(500).collect::<String>()))?;
+        .ok_or_else(|| format!("unexpected response format: {}", resp_body.chars().take(500).collect::<String>()))?;
 
     let mut results: Vec<String> = Vec::new();
     let mut model_text = String::new();

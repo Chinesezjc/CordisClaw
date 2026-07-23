@@ -2,7 +2,7 @@
 
 ## 1. 判定口径
 
-- 本文基于当前仓库现状整理，最近更新：2026-07-22。
+- 本文基于当前仓库现状整理，最近更新：2026-07-23。
 - 历史规划蓝图已经吸收进 [design-blueprint.md](./design-blueprint.md)，因此本文结论来自三类证据的交叉比对：
   - 设计蓝图：[design-blueprint.md](./design-blueprint.md)
   - 架构文档：[system-overview.md](./system-overview.md)、[contracts-and-loading.md](./contracts-and-loading.md)、[runtime-semantics.md](./runtime-semantics.md)、[maintenance-guide.md](./maintenance-guide.md)
@@ -205,6 +205,19 @@ Agent 现在可以自主完成：读代码 → 理解结构 → 写/改文件 �
 - [x] **Filesystem / Git 白名单不再静默降级**（P0-19）— `canonicalize` 失败时不再退回未规范化路径。新增 `canonicalise_for_whitelist` / `validate_path_in_root` 的深度 ancestor 解析：路径不存在时 canonicalize 最深的存在祖先再拼 tail；两侧都失败则 fail-closed。`../../etc/shadow` 之类的构造再无绕过。
 - [x] **Plugin iteration symlink 逃逸**（P0-20）— `PluginEditExecutor::execute` 在写入前调用新 helper `resolve_under_workspace`：canonicalize 结果必须仍在 workspace_root 下。plugins 内的 symlink 指向 `/etc/passwd` 之类无法被写入。
 - [x] **Verifier shell 拼接**（P0-21）— 已随 A 批 P0-1 修复。`discover_rust_workspace_manifest` 输出的字符串被 `shell_words` 解析成 argv，空格 / `$` / `;` 无法被解释。
+
+### 5.2.35 飞书媒体消息 + 资源节点扩展 + vision 本地 path（2026-07-23）
+
+此前飞书插件只解析 text 消息：`parse_message_event` 只读 `content["text"]`，image/post/file/audio/media/sticker 消息解析出空文本后被 `should_process` 过滤，静默丢弃（QQ 插件同期已有 `[image: url]` 占位符）。且飞书资源不是公开 URL（下载需 `GET /im/v1/messages/{message_id}/resources/{file_key}` + tenant token），vision 的 `download_image` 不带 auth header，无法直接接力。本批闭合：
+
+- [x] **入站媒体解析**（feishu lib.rs）— `IncomingMessage` 新增 `message_type` / `has_media`；`extract_content(message_type, content)` 纯函数按类型生成占位符：`[image file_key=...]`、`[file file_key=... name="..."]`、`[audio file_key=... duration=...ms]`、`[video file_key=... name="..."]`、`[sticker file_key=...]`；post 富文本经 `render_post` 抽取 title/text/a/at 文本 + 内嵌 img 占位符；未知类型转发 `[unsupported message_type=...]` 不再丢弃。`should_process` 改收 `&IncomingMessage`（文本规则 || has_media）。媒体消息的 envelope display 前缀注入 `msg=<message_id>`（纯文本与 cardaction 合成 id 不注入），envelope JSON 增带 `message_type`/`has_media`。
+- [x] **6 个新 agent 可见节点** — `feishu_fetch_resource`（下载资源到 temp 文件，返回 path/size/mime，可选 ≤1MB base64；image 类 `type=image`，file/audio/video/sticker `type=file`）、`feishu_fetch_image`（强制 type=image 的别名）、`feishu_send_image`（path 上传经 canonicalize 限制 temp 目录内，或直接 image_key；multipart 上传 `POST /im/v1/images` 后发 `msg_type=image`）、`feishu_get_message`、`feishu_get_chat_info`、`feishu_list_chats`。统一 20MB 上限（`MAX_RESOURCE_BYTES`）；下载成功体为原始字节，仅对 JSON 错误体（content-type / 首字节 `{`）解析报错；`cardaction:` 合成 id 前置拒绝。`declared_nodes` 3→9。
+- [x] **vision 本地 path 入参** — `vision_ocr`/`vision_describe` 新增 `path`（与 `url` 严格二选一），`read_local_image` canonicalize 两侧（macOS /tmp、/var/folders symlink）后要求位于系统 temp 目录下，先 `metadata().len()` 检查 20MB 再读。链路：占位符 → `feishu_fetch_resource` 得 path → `vision_ocr`/`vision_describe(path)`；说明写入 feishu `system_hint`。
+- [x] **clippy 1.97 存量新 lint 清零** — gacha/qq build.rs `&[..]`→`[..]`、filesystem question_mark/unnecessary closure、shell derive Default、web doc 缩进/format 冗余引用、qq redundant pattern matching。
+
+**验证**：feishu 40 单测（原 25 + 新 15：各类型占位符/post 渲染/should_process 放行/envelope msg= 注入与纯文本回归/extract_content 畸形容错/cardaction 拒绝/guess_ext/temp 路径唯一性/multipart body）+ vision 6 单测（temp 外路径拒绝/正常读回/缺失与互斥分支）；两 workspace `cargo build`/`test`/`clippy --all-targets -- -D warnings` 全绿；`prepare-artifacts`（7 个工件重建）+ `sync-plugin-docs` 再生 interfaces.json。
+
+**待办**：真机验证飞书图片收发（需真实凭证）；音频/视频下载后的理解链路（现只有 OCR/describe 两个图片消费端）。
 
 ### 5.2.34 群聊身份修复 + session 内存终结清理（2026-07-22）
 

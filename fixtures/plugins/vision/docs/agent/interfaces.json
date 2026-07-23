@@ -7,7 +7,7 @@
   "nodes": [
     {
       "id": "vision_ocr",
-      "summary": "Download an image from URL and run tesseract OCR to extract text. Requires tesseract installed on the system. Default language: chi_sim+eng.",
+      "summary": "Run tesseract OCR on an image to extract text. Supply the image with either `url` (downloaded over HTTP) or `path` (a local file under the system temp directory); provide exactly one of them. Requires tesseract installed on the system. Default language: chi_sim+eng.",
       "input_schema": {
         "properties": {
           "lang": {
@@ -18,14 +18,17 @@
             "const": "vision_ocr",
             "type": "string"
           },
+          "path": {
+            "description": "Absolute path to a local image file. Must be located under the system temp directory. Provide url or path, not both.",
+            "type": "string"
+          },
           "url": {
-            "description": "Image URL to OCR",
+            "description": "Image URL to OCR (provide url or path, not both)",
             "type": "string"
           }
         },
         "required": [
-          "node_id",
-          "url"
+          "node_id"
         ],
         "type": "object"
       },
@@ -50,25 +53,30 @@
         "type": "object"
       },
       "side_effects": [
-        "downloads image from URL",
+        "reads image from url or local temp path",
         "runs tesseract OCR"
       ],
       "failure_modes": [
         "tesseract not installed",
         "network error",
         "language pack missing",
-        "no text in image"
+        "no text in image",
+        "path outside temp dir"
       ],
       "node_type": "task",
       "agent_accessible": false
     },
     {
       "id": "vision_describe",
-      "summary": "Download an image from URL and send to an OpenAI-compatible vision API (default: gpt-4o-mini) for AI-powered description. Requires OPENAI_API_KEY (or VISION_API_KEY) env var. Supports OPENAI_BASE_URL for custom endpoints.",
+      "summary": "Send an image to an OpenAI-compatible vision API (default: gpt-4o-mini) for AI-powered description. Supply the image with either `url` (downloaded over HTTP) or `path` (a local file under the system temp directory); provide exactly one of them. Requires OPENAI_API_KEY (or VISION_API_KEY) env var. Supports OPENAI_BASE_URL for custom endpoints.",
       "input_schema": {
         "properties": {
           "node_id": {
             "const": "vision_describe",
+            "type": "string"
+          },
+          "path": {
+            "description": "Absolute path to a local image file. Must be located under the system temp directory. Provide url or path, not both.",
             "type": "string"
           },
           "prompt": {
@@ -76,13 +84,12 @@
             "type": "string"
           },
           "url": {
-            "description": "Image URL to analyze",
+            "description": "Image URL to analyze (provide url or path, not both)",
             "type": "string"
           }
         },
         "required": [
-          "node_id",
-          "url"
+          "node_id"
         ],
         "type": "object"
       },
@@ -113,7 +120,7 @@
         "type": "object"
       },
       "side_effects": [
-        "downloads image from URL",
+        "reads image from url or local temp path",
         "sends to OpenAI-compatible vision API"
       ],
       "failure_modes": [
@@ -121,7 +128,8 @@
         "network error",
         "rate limited",
         "API quota exceeded",
-        "image too large"
+        "image too large",
+        "path outside temp dir"
       ],
       "node_type": "task",
       "agent_accessible": false

@@ -60,13 +60,9 @@ fn canonicalise_for_whitelist(path: &Path) -> Option<PathBuf> {
         if current.exists() {
             break;
         }
-        match current.parent() {
-            Some(parent) => {
-                ancestors.push(current);
-                current = parent;
-            }
-            None => return None,
-        }
+        let parent = current.parent()?;
+        ancestors.push(current);
+        current = parent;
     }
     let mut resolved = current.canonicalize().ok()?;
     for tail in ancestors.iter().rev() {
@@ -263,7 +259,7 @@ fn handle_fs_search(req: &FsRequest) -> Result<FsResponse, String> {
                 if count >= max_results { break; }
                 if line.contains(pattern) {
                     matches.push(json!({
-                        "file": fpath.strip_prefix(&path).unwrap_or_else(|_| fpath.as_path()).to_string_lossy().into_owned(),
+                        "file": fpath.strip_prefix(&path).unwrap_or(fpath.as_path()).to_string_lossy().into_owned(),
                         "line": lineno + 1,
                         "text": line,
                     }));

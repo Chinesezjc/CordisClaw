@@ -178,7 +178,7 @@
 
 | 文件 | 职责定位 | 关键入口 |
 |---|---|---|
-| `fixtures/plugins/feishu/src/lib.rs` | 飞书适配器 dylib：事件解析（challenge/AES/schema 2.0）、openclaw 风格访问策略（dm_policy/group_policy/pairing）、出站消息/卡片（tenant_access_token 缓存、卡片两段式 PATCH 更新） | `interpret_inbound()`、`policy_gate()`、`handle_feishu_send()` |
+| `fixtures/plugins/feishu/src/lib.rs` | 飞书适配器 dylib：事件解析（challenge/AES/schema 2.0、媒体消息占位符 image/post/file/audio/media/sticker）、openclaw 风格访问策略（dm_policy/group_policy/pairing）、出站消息/卡片（tenant_access_token 缓存、卡片两段式 PATCH 更新）、消息资源节点（fetch_resource/fetch_image 带鉴权下载到 temp、send_image multipart 上传、get_message/get_chat_info/list_chats） | `interpret_inbound()`、`extract_content()`、`policy_gate()`、`handle_feishu_send()`、`fetch_resource_core()` |
 | `fixtures/plugins/feishu/src/ws.rs` | 飞书长连接（WSS）事件模式：bootstrap 换 wss URL、手写 proto2 Frame 编解码、心跳/合包/帧内 ACK/断线重连 | `run_ws_loop()`、`Frame::encode/decode` |
 | `fixtures/plugins/feishu/tests/scaffold.rs` | 占位（实质单测内嵌于 lib.rs/ws.rs 的 `mod tests`） | `scaffold()` |
 

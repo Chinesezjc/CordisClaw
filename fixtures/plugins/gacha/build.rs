@@ -6,7 +6,7 @@ fn main() {
     let dst = "/root/CordisClaw/fixtures/artifacts/gacha.so";
     let index_path = "/root/CordisClaw/fixtures/artifacts/index.json";
 
-    let _ = Command::new("cp").args(&[src, dst]).status();
+    let _ = Command::new("cp").args([src, dst]).status();
 
     let hash = if let Ok(o) = Command::new("sha256sum").arg(dst).output() {
         if o.status.success() {
