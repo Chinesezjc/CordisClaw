@@ -421,7 +421,7 @@ fn run_loader(root: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    let (root, runtime_only) = parse_root_and_runtime_only(args, "fixtures")?;
+    let (root, runtime_only, no_startup_invoke) = parse_serve_args(args, "fixtures")?;
     prepare_fixtures_root(&root, runtime_only)?;
     let host = std::sync::Arc::new(
         RuntimeHost::boot(&root).map_err(|err| runtime_mode_error(err, &root, runtime_only))?,
@@ -466,7 +466,9 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     // invocation before entering the REPL.  This is used to start
     // background services (e.g. qq_serve HTTP server).
     let startup_file = root.join("startup_invoke.json");
-    if startup_file.exists() {
+    if no_startup_invoke {
+        eprintln!("[startup] startup_invoke.json skipped (--no-startup-invoke)");
+    } else if startup_file.exists() {
         match fs::read_to_string(&startup_file) {
             Ok(text) => match serde_json::from_str::<Value>(&text) {
                 Ok(Value::Array(items)) => {
@@ -1958,17 +1960,38 @@ fn parse_optional_root_arg(
     }
 }
 
-fn parse_root_and_runtime_only(
+// 本地测试与线上实例共用外部协议凭证：startup_invoke.json 会连真实
+// 飞书 WSS / 起 qq HTTP，测试实例会把线上消息抢走并在退出时丢掉
+// pending 状态。`--no-startup-invoke`（或 CORDIS_NO_STARTUP_INVOKE
+// 环境变量非空）跳过启动段的全部自动 invoke，插件加载与 REPL 功能
+// 不受影响。
+fn parse_serve_args(
     args: &[String],
     default_root: &str,
-) -> Result<(PathBuf, bool), Box<dyn std::error::Error>> {
+) -> Result<(PathBuf, bool, bool), Box<dyn std::error::Error>> {
+    let env_no_startup_invoke = std::env::var("CORDIS_NO_STARTUP_INVOKE")
+        .map(|v| !v.is_empty())
+        .unwrap_or(false);
+    parse_serve_args_with_env(args, default_root, env_no_startup_invoke)
+}
+
+fn parse_serve_args_with_env(
+    args: &[String],
+    default_root: &str,
+    env_no_startup_invoke: bool,
+) -> Result<(PathBuf, bool, bool), Box<dyn std::error::Error>> {
     let mut root = PathBuf::from(default_root);
     let mut runtime_only = false;
+    let mut no_startup_invoke = env_no_startup_invoke;
     let mut seen_root = false;
 
     for token in args {
         if token == "--runtime-only" {
             runtime_only = true;
+            continue;
+        }
+        if token == "--no-startup-invoke" {
+            no_startup_invoke = true;
             continue;
         }
         if token.starts_with("--") {
@@ -1981,7 +2004,7 @@ fn parse_root_and_runtime_only(
         seen_root = true;
     }
 
-    Ok((root, runtime_only))
+    Ok((root, runtime_only, no_startup_invoke))
 }
 
 fn runtime_mode_error(
@@ -2002,7 +2025,7 @@ fn runtime_mode_error(
 fn usage() -> String {
     "Usage:
   cargo run -p cordis-runtime -- <fixtures_root>
-  cargo run -p cordis-runtime -- serve [fixtures_root] [--runtime-only]
+  cargo run -p cordis-runtime -- serve [fixtures_root] [--runtime-only] [--no-startup-invoke]
   cargo run -p cordis-runtime -- invoke <plugin_path> <node_id> --payload-json=<json> [--fixtures-root=fixtures] [--runtime-only]
   cargo run -p cordis-runtime -- execute <node_fqn> --payload-json=<json> [--fixtures-root=fixtures] [--runtime-only]
   cargo run -p cordis-runtime -- llm-auto-update <workspace_root> --instruction=<text> --path=<relative_path> [--path=<relative_path> ...] [--issue-id=<id>] [--patch-id=<id>] [--manual-approved] [--tests-command=<shell>] [--safety-command=<shell>] [--verify-profile=<default|rust-workspace>] [--quality-score=<u32>] [--dry-run]
@@ -2058,6 +2081,62 @@ fn agent_chat_usage() -> &'static str {
   /status  show the current shared agent session status
   /reset   start a fresh shared agent session
   /exit    leave agent chat mode and return to serve commands"
+}
+
+#[cfg(test)]
+mod serve_args_tests {
+    use super::parse_serve_args_with_env;
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn defaults_without_flags() {
+        let (root, runtime_only, no_startup) =
+            parse_serve_args_with_env(&args(&[]), "fixtures", false).unwrap();
+        assert_eq!(root, std::path::PathBuf::from("fixtures"));
+        assert!(!runtime_only);
+        assert!(!no_startup);
+    }
+
+    #[test]
+    fn no_startup_invoke_flag_alone_and_combined() {
+        let (_, runtime_only, no_startup) =
+            parse_serve_args_with_env(&args(&["--no-startup-invoke"]), "fixtures", false).unwrap();
+        assert!(!runtime_only);
+        assert!(no_startup);
+
+        let (root, runtime_only, no_startup) = parse_serve_args_with_env(
+            &args(&["myroot", "--runtime-only", "--no-startup-invoke"]),
+            "fixtures",
+            false,
+        )
+        .unwrap();
+        assert_eq!(root, std::path::PathBuf::from("myroot"));
+        assert!(runtime_only);
+        assert!(no_startup);
+    }
+
+    #[test]
+    fn env_var_enables_skip_and_flag_still_works_on_top() {
+        // CORDIS_NO_STARTUP_INVOKE 生效路径（env 读取在 parse_serve_args
+        // 外壳完成，这里注入解析后的值，避免测试间 env 竞争）。
+        let (_, _, no_startup) = parse_serve_args_with_env(&args(&[]), "fixtures", true).unwrap();
+        assert!(no_startup);
+        let (_, _, no_startup) =
+            parse_serve_args_with_env(&args(&["--no-startup-invoke"]), "fixtures", true).unwrap();
+        assert!(no_startup);
+    }
+
+    #[test]
+    fn unknown_flag_still_rejected() {
+        assert!(parse_serve_args_with_env(&args(&["--bogus"]), "fixtures", false).is_err());
+        assert!(
+            parse_serve_args_with_env(&args(&["a", "b"]), "fixtures", false).is_err(),
+            "extra positional arg must still error"
+        );
+    }
 }
 
 #[cfg(test)]

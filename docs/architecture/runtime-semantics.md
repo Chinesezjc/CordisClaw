@@ -172,6 +172,8 @@ Local(当前插件 -> 祖先插件中被 grants 明确允许的服务)
 
 ### 3.5 多用户消息链路语义（J-P 批，2026-07-21）
 
+serve 启动段会执行 `fixtures/startup_invoke.json` 里的全部调用（拉起 qq HTTP、feishu WSS 等外部协议服务）。`--no-startup-invoke` flag 或 `CORDIS_NO_STARTUP_INVOKE` 环境变量（非空）跳过这一段：插件照常加载、invoke/execute/REPL 全部可用，只是不连外部协议——本地落地测试必须带该开关，否则测试实例会与线上实例共用渠道凭证抢走真实用户消息（并在退出时丢弃 feishu 两段式回复的 pending 卡片，用户侧永远停在"思考中"）。
+
 `--runtime-only` 模式下，渠道插件（feishu/qq）经 `agent_trigger` FFI 投递 JSON envelope，单 inbox 线程串行消费。envelope 携带回复路由（source_plugin/reply_node/reply_target）与**身份**（`sender_id`、`conversation_kind`）；soul 作用域键 = `{sender_id}#{conversation_kind}`（无身份的 legacy 调用回落 session_key）。
 
 一条消息的处理顺序：
