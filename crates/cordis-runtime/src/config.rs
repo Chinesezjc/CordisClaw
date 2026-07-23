@@ -467,3 +467,260 @@ mod llm_profile_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod load_tests {
+    use super::*;
+    use serial_test::serial;
+    use std::fs;
+    use tempfile::TempDir;
+
+    /// Point every test at its own config dir via `CORDIS_CONFIG_DIR`,
+    /// avoiding the sibling-directory heuristic and cross-test env leakage.
+    /// Serialized because it mutates a process-global env var.
+    struct ConfigDirGuard;
+    impl ConfigDirGuard {
+        fn set(dir: &Path) -> Self {
+            std::env::set_var("CORDIS_CONFIG_DIR", dir);
+            ConfigDirGuard
+        }
+    }
+    impl Drop for ConfigDirGuard {
+        fn drop(&mut self) {
+            std::env::remove_var("CORDIS_CONFIG_DIR");
+        }
+    }
+
+    // ---------- discover_config_dir ----------
+
+    #[test]
+    #[serial]
+    fn discover_honors_env_override() {
+        let tmp = TempDir::new().unwrap();
+        let _g = ConfigDirGuard::set(tmp.path());
+        assert_eq!(discover_config_dir(Path::new("/anything")), tmp.path());
+    }
+
+    #[test]
+    #[serial]
+    fn discover_empty_env_is_ignored() {
+        // An empty override must not short-circuit the heuristic.
+        std::env::set_var("CORDIS_CONFIG_DIR", "");
+        let out = discover_config_dir(Path::new("/tmp/whatever/fixtures"));
+        std::env::remove_var("CORDIS_CONFIG_DIR");
+        // fixtures dir name triggers the sibling `config` branch.
+        assert_eq!(out, Path::new("/tmp/whatever/config"));
+    }
+
+    #[test]
+    #[serial]
+    fn discover_fixtures_named_dir_uses_sibling() {
+        std::env::remove_var("CORDIS_CONFIG_DIR");
+        let out = discover_config_dir(Path::new("/root/fixtures"));
+        assert_eq!(out, Path::new("/root/config"));
+    }
+
+    #[test]
+    #[serial]
+    fn discover_non_fixtures_falls_back_to_join() {
+        std::env::remove_var("CORDIS_CONFIG_DIR");
+        // A non-"fixtures" dir with no sibling config/ joins config under it.
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("workspace");
+        fs::create_dir_all(&root).unwrap();
+        assert_eq!(discover_config_dir(&root), root.join("config"));
+    }
+
+    // ---------- RuntimeConfig::load ----------
+
+    #[test]
+    #[serial]
+    fn load_missing_config_dir_returns_defaults() {
+        let tmp = TempDir::new().unwrap();
+        let missing = tmp.path().join("no-config-here");
+        let _g = ConfigDirGuard::set(&missing);
+        let cfg = RuntimeConfig::load(tmp.path()).unwrap();
+        // Defaults intact when the config dir does not exist.
+        assert_eq!(cfg.kernel.change_history_limit, 1_024);
+        assert_eq!(cfg.kernel.min_quality_score, 80);
+        assert_eq!(cfg.llm_api.provider, "openai");
+        assert!(cfg.plugin_configs.is_empty());
+        assert_eq!(cfg.config_dir, missing);
+    }
+
+    #[test]
+    #[serial]
+    fn load_runtime_yaml_overrides_kernel_and_runtime() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("runtime.yaml"),
+            "runtime:\n  snapshot_root: snaps\nkernel:\n  change_history_limit: 7\n  min_quality_score: 55\n",
+        )
+        .unwrap();
+        let _g = ConfigDirGuard::set(dir.path());
+        let cfg = RuntimeConfig::load(dir.path()).unwrap();
+        assert_eq!(cfg.kernel.change_history_limit, 7);
+        assert_eq!(cfg.kernel.min_quality_score, 55);
+        assert_eq!(cfg.runtime.snapshot_root.as_deref(), Some("snaps"));
+    }
+
+    #[test]
+    #[serial]
+    fn load_runtime_yaml_partial_keeps_defaults() {
+        // Only `runtime` present; `kernel` absent → kernel stays default.
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("runtime.yaml"),
+            "runtime:\n  snapshot_root: /abs/snaps\n",
+        )
+        .unwrap();
+        let _g = ConfigDirGuard::set(dir.path());
+        let cfg = RuntimeConfig::load(dir.path()).unwrap();
+        assert_eq!(cfg.kernel.change_history_limit, 1_024);
+        assert_eq!(cfg.runtime.snapshot_root.as_deref(), Some("/abs/snaps"));
+    }
+
+    #[test]
+    #[serial]
+    fn load_bad_runtime_yaml_is_config_parse_error() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("runtime.yaml"),
+            "kernel:\n  change_history_limit: \"not a number\"\n",
+        )
+        .unwrap();
+        let _g = ConfigDirGuard::set(dir.path());
+        let err = RuntimeConfig::load(dir.path()).unwrap_err();
+        assert!(matches!(err, RuntimeError::ConfigParse { .. }));
+    }
+
+    #[test]
+    #[serial]
+    fn load_llm_api_yaml_legacy_and_profiles() {
+        // Legacy single-doc form becomes the default profile + syncs llm_api.
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("llm_api.yaml"),
+            "provider: deepseek\nmodel: deepseek-chat\n",
+        )
+        .unwrap();
+        let _g = ConfigDirGuard::set(dir.path());
+        let cfg = RuntimeConfig::load(dir.path()).unwrap();
+        assert_eq!(cfg.llm_api.provider, "deepseek");
+        assert_eq!(
+            cfg.llm_profiles.default_profile().api.model,
+            "deepseek-chat"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn load_bad_llm_api_yaml_is_config_parse_error() {
+        let dir = TempDir::new().unwrap();
+        // `profiles` present but a body is a scalar, not a profile map.
+        fs::write(
+            dir.path().join("llm_api.yaml"),
+            "profiles:\n  default: 12345\n",
+        )
+        .unwrap();
+        let _g = ConfigDirGuard::set(dir.path());
+        let err = RuntimeConfig::load(dir.path()).unwrap_err();
+        assert!(matches!(err, RuntimeError::ConfigParse { .. }));
+    }
+
+    #[test]
+    #[serial]
+    fn load_scans_plugin_dir_and_backfills_name() {
+        let dir = TempDir::new().unwrap();
+        let plugins = dir.path().join("plugins");
+        fs::create_dir_all(&plugins).unwrap();
+        // Explicit plugin name.
+        fs::write(
+            plugins.join("a.yaml"),
+            "plugin: alpha\nenabled: false\nsettings:\n  k: v\n",
+        )
+        .unwrap();
+        // Empty plugin field → backfilled from file stem "beta".
+        fs::write(plugins.join("beta.yml"), "settings: {}\n").unwrap();
+        // Non-yaml file is ignored.
+        fs::write(plugins.join("notes.txt"), "ignore me\n").unwrap();
+        let _g = ConfigDirGuard::set(dir.path());
+        let cfg = RuntimeConfig::load(dir.path()).unwrap();
+        assert_eq!(cfg.plugin_configs.len(), 2);
+        let alpha = &cfg.plugin_configs["alpha"];
+        assert!(!alpha.enabled);
+        assert_eq!(alpha.settings["k"], "v");
+        // beta backfilled its name and defaults enabled=true.
+        let beta = &cfg.plugin_configs["beta"];
+        assert!(beta.enabled);
+    }
+
+    #[test]
+    #[serial]
+    fn load_bad_plugin_yaml_is_config_parse_error() {
+        let dir = TempDir::new().unwrap();
+        let plugins = dir.path().join("plugins");
+        fs::create_dir_all(&plugins).unwrap();
+        fs::write(plugins.join("broken.yaml"), "enabled: \"yes please\"\n").unwrap();
+        let _g = ConfigDirGuard::set(dir.path());
+        let err = RuntimeConfig::load(dir.path()).unwrap_err();
+        assert!(matches!(err, RuntimeError::ConfigParse { .. }));
+    }
+
+    // ---------- resolve_snapshot_root ----------
+
+    #[test]
+    fn resolve_snapshot_root_none_when_unset_or_blank() {
+        let mut cfg = RuntimeConfig::default();
+        assert!(cfg.resolve_snapshot_root(Path::new("/fx")).is_none());
+        cfg.runtime.snapshot_root = Some("   ".to_string());
+        assert!(cfg.resolve_snapshot_root(Path::new("/fx")).is_none());
+    }
+
+    #[test]
+    fn resolve_snapshot_root_absolute_is_returned_verbatim() {
+        let mut cfg = RuntimeConfig::default();
+        cfg.runtime.snapshot_root = Some("/abs/snaps".to_string());
+        assert_eq!(
+            cfg.resolve_snapshot_root(Path::new("/fx")).unwrap(),
+            PathBuf::from("/abs/snaps")
+        );
+    }
+
+    #[test]
+    fn resolve_snapshot_root_relative_joins_config_dir_when_present() {
+        let dir = TempDir::new().unwrap();
+        let mut cfg = RuntimeConfig {
+            config_dir: dir.path().to_path_buf(),
+            ..RuntimeConfig::default()
+        };
+        cfg.runtime.snapshot_root = Some("rel".to_string());
+        assert_eq!(
+            cfg.resolve_snapshot_root(Path::new("/fx")).unwrap(),
+            dir.path().join("rel")
+        );
+    }
+
+    #[test]
+    fn resolve_snapshot_root_relative_joins_fixtures_when_no_config_dir() {
+        let mut cfg = RuntimeConfig {
+            config_dir: PathBuf::from("/does/not/exist"),
+            ..RuntimeConfig::default()
+        };
+        cfg.runtime.snapshot_root = Some("rel".to_string());
+        assert_eq!(
+            cfg.resolve_snapshot_root(Path::new("/fx")).unwrap(),
+            PathBuf::from("/fx/rel")
+        );
+    }
+
+    // ---------- PluginConfigFile / defaults ----------
+
+    #[test]
+    fn plugin_config_file_default_enabled_and_empty_object() {
+        let pc = PluginConfigFile::default();
+        assert!(pc.enabled);
+        assert!(pc.plugin.is_empty());
+        assert!(pc.settings.is_object());
+    }
+}

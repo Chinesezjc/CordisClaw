@@ -1140,6 +1140,550 @@ mod tests {
         }
     }
 
+    struct FailStartService;
+    impl Service for FailStartService {
+        fn start(&self) -> Result<(), String> {
+            Err("boom on start".to_string())
+        }
+        fn stop(&self) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    struct FailStopService;
+    impl Service for FailStopService {
+        fn start(&self) -> Result<(), String> {
+            Ok(())
+        }
+        fn stop(&self) -> Result<(), String> {
+            Err("boom on stop".to_string())
+        }
+    }
+
+    /// A service whose `stop()` blocks on a channel receive until the test
+    /// sends (or drops the sender). Lets us deterministically drive the
+    /// 5-second stop-timeout path in `stop_plugin_services_timed`.
+    struct BlockingStopService {
+        rx: Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl Service for BlockingStopService {
+        fn start(&self) -> Result<(), String> {
+            Ok(())
+        }
+        fn stop(&self) -> Result<(), String> {
+            let _ = self.rx.lock().unwrap_or_else(|p| p.into_inner()).recv();
+            Ok(())
+        }
+    }
+
+    fn slot_meta() -> SlotMeta {
+        SlotMeta {
+            required: false,
+            ttl_ms: None,
+            sensitivity: Sensitivity::Low,
+            owner: "test".to_string(),
+        }
+    }
+
+    fn key(ns: &str, name: &str, version: u32) -> ContextKey {
+        ContextKey {
+            namespace: ns.to_string(),
+            name: name.to_string(),
+            version,
+        }
+    }
+
+    // ---------- ContextKey / ScopeStore ----------
+
+    #[test]
+    fn context_key_as_compact_format() {
+        let k = key("agent", "budget", 3);
+        assert_eq!(k.as_compact(), "agent/budget@v3");
+    }
+
+    // ---------- ContextRegistry: provide / inject / maybe / dispose ----------
+
+    #[test]
+    fn provide_inject_dispose_across_scopes() {
+        let mut ctx = RuntimeContext::default();
+        ctx.provide(ContextScope::Global, None, "g", 1u32).unwrap();
+        ctx.provide(ContextScope::Session, None, "s", 2u32).unwrap();
+        ctx.provide(ContextScope::Request, None, "r", 3u32).unwrap();
+
+        assert_eq!(*ctx.inject::<u32>("p", "g").unwrap(), 1);
+        assert_eq!(*ctx.inject::<u32>("p", "s").unwrap(), 2);
+        assert_eq!(*ctx.inject::<u32>("p", "r").unwrap(), 3);
+
+        // maybe: hit and miss.
+        assert!(ctx.maybe::<u32>("p", "g").is_some());
+        assert!(ctx.maybe::<u32>("p", "nope").is_none());
+
+        ctx.dispose(ContextScope::Global, None, "g").unwrap();
+        assert!(matches!(
+            ctx.inject::<u32>("p", "g"),
+            Err(RuntimeError::ServiceNotFound { .. })
+        ));
+    }
+
+    #[test]
+    fn provide_duplicate_in_scope_is_rejected() {
+        let mut ctx = RuntimeContext::default();
+        ctx.provide(ContextScope::Global, None, "dup", 1u32)
+            .unwrap();
+        let err = ctx
+            .provide(ContextScope::Global, None, "dup", 2u32)
+            .unwrap_err();
+        assert!(matches!(err, RuntimeError::DuplicateService { .. }));
+    }
+
+    #[test]
+    fn provide_priority_request_over_session_over_global() {
+        let mut ctx = RuntimeContext::default();
+        ctx.provide(ContextScope::Global, None, "svc", 100u32)
+            .unwrap();
+        ctx.provide(ContextScope::Session, None, "svc", 200u32)
+            .unwrap();
+        ctx.provide(ContextScope::Request, None, "svc", 300u32)
+            .unwrap();
+        // Request wins the lookup chain.
+        assert_eq!(*ctx.inject::<u32>("p", "svc").unwrap(), 300);
+    }
+
+    #[test]
+    fn provide_local_requires_plugin_path() {
+        let mut ctx = RuntimeContext::default();
+        let err = ctx
+            .provide(ContextScope::Local, None, "x", 1u32)
+            .unwrap_err();
+        assert!(matches!(err, RuntimeError::Invariant { .. }));
+    }
+
+    #[test]
+    fn provide_local_duplicate_is_rejected() {
+        let mut ctx = RuntimeContext::default();
+        ctx.provide(ContextScope::Local, Some("pl"), "x", 1u32)
+            .unwrap();
+        let err = ctx
+            .provide(ContextScope::Local, Some("pl"), "x", 2u32)
+            .unwrap_err();
+        assert!(matches!(err, RuntimeError::DuplicateService { .. }));
+    }
+
+    #[test]
+    fn inject_type_mismatch_is_structured_error() {
+        let mut ctx = RuntimeContext::default();
+        ctx.provide(ContextScope::Global, None, "svc", 7u32)
+            .unwrap();
+        let err = ctx.inject::<String>("p", "svc").unwrap_err();
+        assert!(matches!(err, RuntimeError::ServiceTypeMismatch { .. }));
+    }
+
+    #[test]
+    fn inject_unavailable_plugin_fails_fast() {
+        let mut ctx = RuntimeContext::default();
+        ctx.set_plugin_state(
+            "p",
+            PluginLoadResult::Unavailable(
+                crate::core::models::PluginUnavailableReason::AbiMismatch,
+            ),
+        );
+        let err = ctx.inject::<u32>("p", "svc").unwrap_err();
+        assert!(matches!(err, RuntimeError::ContextPluginUnavailable { .. }));
+    }
+
+    #[test]
+    fn dispose_local_requires_plugin_path_and_reports_missing() {
+        let mut ctx = RuntimeContext::default();
+        let err = ctx.dispose(ContextScope::Local, None, "x").unwrap_err();
+        assert!(matches!(err, RuntimeError::Invariant { .. }));
+
+        let err = ctx
+            .dispose(ContextScope::Global, None, "ghost")
+            .unwrap_err();
+        assert!(matches!(err, RuntimeError::ServiceNotFound { .. }));
+    }
+
+    // ---------- Local hierarchy chain + grants ----------
+
+    #[test]
+    fn inject_local_current_scope_hit() {
+        let mut ctx = RuntimeContext::default();
+        ctx.ensure_local_scope("child");
+        ctx.provide(ContextScope::Local, Some("child"), "own", 42u32)
+            .unwrap();
+        assert_eq!(*ctx.inject::<u32>("child", "own").unwrap(), 42);
+    }
+
+    #[test]
+    fn inject_parent_local_requires_grant() {
+        let mut hierarchy = PluginHierarchy::default();
+        hierarchy
+            .parent_of
+            .insert("child".to_string(), "parent".to_string());
+        let mut ctx = RuntimeContext::with_hierarchy(hierarchy);
+        ctx.provide(ContextScope::Local, Some("parent"), "shared", 9u32)
+            .unwrap();
+
+        // Without a grant on the child->parent edge, injection is denied.
+        let err = ctx.inject::<u32>("child", "shared").unwrap_err();
+        assert!(matches!(err, RuntimeError::PermissionDenied { .. }));
+    }
+
+    #[test]
+    fn inject_parent_local_with_grant_succeeds() {
+        let mut hierarchy = PluginHierarchy::default();
+        hierarchy
+            .parent_of
+            .insert("child".to_string(), "parent".to_string());
+        let mut grant = BTreeSet::new();
+        grant.insert("shared".to_string());
+        hierarchy
+            .grants_from_parent
+            .insert("child".to_string(), grant);
+        let mut ctx = RuntimeContext::with_hierarchy(hierarchy);
+        ctx.provide(ContextScope::Local, Some("parent"), "shared", 9u32)
+            .unwrap();
+        assert_eq!(*ctx.inject::<u32>("child", "shared").unwrap(), 9);
+    }
+
+    #[test]
+    fn inject_local_chain_stops_at_unavailable_parent() {
+        let mut hierarchy = PluginHierarchy::default();
+        hierarchy
+            .parent_of
+            .insert("child".to_string(), "parent".to_string());
+        let mut ctx = RuntimeContext::with_hierarchy(hierarchy);
+        ctx.ensure_local_scope("child");
+        ctx.set_plugin_state(
+            "parent",
+            PluginLoadResult::Unavailable(crate::core::models::PluginUnavailableReason::InitFailed),
+        );
+        let err = ctx.inject::<u32>("child", "missing").unwrap_err();
+        assert!(matches!(err, RuntimeError::ContextPluginUnavailable { .. }));
+    }
+
+    // ---------- ContextRead / ContextWrite: slots ----------
+
+    #[test]
+    fn slot_put_get_contains_and_meta() {
+        let ctx = RuntimeContext::default();
+        let k = key("ns", "answer", 1);
+        let meta = SlotMeta {
+            required: true,
+            ttl_ms: Some(1_500),
+            sensitivity: Sensitivity::Sensitive,
+            owner: "writer".to_string(),
+        };
+        ctx.put(k.clone(), serde_json::json!({"v": 42}), meta.clone())
+            .unwrap();
+        assert!(ctx.contains(&k));
+        let got: serde_json::Value = ctx.get(&k).unwrap().unwrap();
+        assert_eq!(got["v"], 42);
+        // meta round-trips including ttl_ms.
+        let m = ctx.meta(&k).unwrap().unwrap();
+        assert_eq!(m.ttl_ms, Some(1_500));
+        assert_eq!(m.sensitivity, Sensitivity::Sensitive);
+        assert!(m.required);
+    }
+
+    #[test]
+    fn slot_get_missing_is_none() {
+        let ctx = RuntimeContext::default();
+        assert!(ctx
+            .get::<serde_json::Value>(&key("ns", "absent", 1))
+            .unwrap()
+            .is_none());
+        assert!(!ctx.contains(&key("ns", "absent", 1)));
+        assert!(ctx.meta(&key("ns", "absent", 1)).unwrap().is_none());
+    }
+
+    #[test]
+    fn slot_get_deserialize_type_error() {
+        let ctx = RuntimeContext::default();
+        let k = key("ns", "obj", 1);
+        ctx.put(k.clone(), serde_json::json!({"a": 1}), slot_meta())
+            .unwrap();
+        // Ask for a String but the stored value is an object.
+        let err = ctx.get::<String>(&k).unwrap_err();
+        assert!(matches!(err, RuntimeError::ContextDeserialize { .. }));
+    }
+
+    #[test]
+    fn slot_remove_deletes() {
+        let ctx = RuntimeContext::default();
+        let k = key("ns", "tmp", 1);
+        ctx.put(k.clone(), serde_json::json!(1), slot_meta())
+            .unwrap();
+        assert!(ctx.contains(&k));
+        ctx.remove(&k).unwrap();
+        assert!(!ctx.contains(&k));
+    }
+
+    #[test]
+    fn slot_version_incompatible_across_major() {
+        let ctx = RuntimeContext::default();
+        // Store major 1 (v100), request major 2 (v250) same ns/name.
+        ctx.put(key("ns", "schema", 100), serde_json::json!(1), slot_meta())
+            .unwrap();
+        let err = ctx
+            .get::<serde_json::Value>(&key("ns", "schema", 250))
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            RuntimeError::ContextVersionIncompatible { .. }
+        ));
+    }
+
+    #[test]
+    fn mark_skipped_tracks_nodes() {
+        let ctx = RuntimeContext::default();
+        ctx.mark_skipped("node-a").unwrap();
+        ctx.mark_skipped("node-b").unwrap();
+        let skipped = ctx.skipped_nodes();
+        assert!(skipped.contains("node-a") && skipped.contains("node-b"));
+    }
+
+    #[test]
+    fn metrics_count_reads_and_writes() {
+        let ctx = RuntimeContext::default();
+        let before = ctx.metrics();
+        ctx.put(key("ns", "m", 1), serde_json::json!(1), slot_meta())
+            .unwrap();
+        let _ = ctx.get::<serde_json::Value>(&key("ns", "m", 1)).unwrap();
+        let after = ctx.metrics();
+        assert!(after.context_write_total > before.context_write_total);
+        assert!(after.context_read_total > before.context_read_total);
+    }
+
+    // ---------- ContextTxn: overlays ----------
+
+    #[test]
+    fn overlay_commit_promotes_writes_to_request() {
+        let ctx = RuntimeContext::default();
+        ctx.begin_subgraph("sg1").unwrap();
+        let k = key("ns", "in_overlay", 1);
+        ctx.put(k.clone(), serde_json::json!("v"), slot_meta())
+            .unwrap();
+        // Visible inside the active overlay.
+        assert!(ctx.contains(&k));
+        ctx.commit_overlay("sg1").unwrap();
+        // After commit the overlay closes and the value lives in request scope.
+        assert!(ctx.contains(&k));
+        let got: serde_json::Value = ctx.get(&k).unwrap().unwrap();
+        assert_eq!(got, serde_json::json!("v"));
+    }
+
+    #[test]
+    fn overlay_commit_applies_removals() {
+        let ctx = RuntimeContext::default();
+        let k = key("ns", "base", 1);
+        ctx.put(k.clone(), serde_json::json!(1), slot_meta())
+            .unwrap();
+        ctx.begin_subgraph("sg").unwrap();
+        ctx.remove(&k).unwrap();
+        // Removal is masked inside the overlay.
+        assert!(!ctx.contains(&k));
+        ctx.commit_overlay("sg").unwrap();
+        assert!(!ctx.contains(&k));
+    }
+
+    #[test]
+    fn overlay_rollback_discards_writes_and_counts_metric() {
+        let ctx = RuntimeContext::default();
+        let before = ctx.metrics().context_overlay_rollback_total;
+        ctx.begin_subgraph("sg").unwrap();
+        let k = key("ns", "scratch", 1);
+        ctx.put(k.clone(), serde_json::json!(1), slot_meta())
+            .unwrap();
+        ctx.rollback_overlay("sg").unwrap();
+        // Overlay write is gone after rollback.
+        assert!(!ctx.contains(&k));
+        assert_eq!(ctx.metrics().context_overlay_rollback_total, before + 1);
+    }
+
+    #[test]
+    fn begin_subgraph_rejects_second_active() {
+        let ctx = RuntimeContext::default();
+        ctx.begin_subgraph("a").unwrap();
+        let err = ctx.begin_subgraph("b").unwrap_err();
+        assert!(matches!(err, RuntimeError::SubgraphAlreadyActive { .. }));
+    }
+
+    #[test]
+    fn commit_and_rollback_unknown_subgraph_error() {
+        let ctx = RuntimeContext::default();
+        assert!(matches!(
+            ctx.commit_overlay("ghost"),
+            Err(RuntimeError::SubgraphNotFound { .. })
+        ));
+        assert!(matches!(
+            ctx.rollback_overlay("ghost"),
+            Err(RuntimeError::SubgraphNotFound { .. })
+        ));
+    }
+
+    // ---------- Clone isolates slot maps ----------
+
+    #[test]
+    fn clone_snapshots_slots_independently() {
+        let ctx = RuntimeContext::default();
+        let k = key("ns", "shared", 1);
+        ctx.put(k.clone(), serde_json::json!(1), slot_meta())
+            .unwrap();
+        let cloned = ctx.clone();
+        // Mutating the original must not leak into the clone's slot map.
+        ctx.put(key("ns", "only_orig", 1), serde_json::json!(2), slot_meta())
+            .unwrap();
+        assert!(cloned.contains(&k));
+        assert!(!cloned.contains(&key("ns", "only_orig", 1)));
+    }
+
+    // ---------- ServiceRegistry: extra branches ----------
+
+    #[test]
+    fn service_start_failure_reported() {
+        let registry = ServiceRegistry::new();
+        let err = registry
+            .start_service("p", "n", Box::new(FailStartService))
+            .unwrap_err();
+        assert!(matches!(err, RuntimeError::Invariant { .. }));
+        assert_eq!(registry.len(), 0);
+    }
+
+    #[test]
+    fn service_stop_error_does_not_panic() {
+        let registry = ServiceRegistry::new();
+        registry
+            .start_service("p", "n", Box::new(FailStopService))
+            .unwrap();
+        // stop error is logged, not propagated; entry still removed.
+        registry.stop_plugin_services("p");
+        assert_eq!(registry.len(), 0);
+    }
+
+    #[test]
+    fn service_registry_debug_reports_count() {
+        let registry = ServiceRegistry::new();
+        registry
+            .start_service("p", "n", Box::new(CounterService::new()))
+            .unwrap();
+        let dbg = format!("{registry:?}");
+        assert!(dbg.contains("ServiceRegistry") && dbg.contains("service_count"));
+    }
+
+    #[test]
+    fn stop_all_drains_registry() {
+        let registry = ServiceRegistry::new();
+        registry
+            .start_service("p", "a", Box::new(CounterService::new()))
+            .unwrap();
+        registry
+            .start_service("p", "b", Box::new(FailStopService))
+            .unwrap();
+        registry.stop_all();
+        assert!(registry.is_empty());
+    }
+
+    #[test]
+    fn stop_timed_quick_service_leaves_no_zombie() {
+        let registry = ServiceRegistry::new();
+        registry
+            .start_service("p", "quick", Box::new(CounterService::new()))
+            .unwrap();
+        registry.stop_plugin_services_timed("p");
+        assert_eq!(registry.len(), 0);
+        assert_eq!(registry.zombie_count(), 0);
+    }
+
+    #[test]
+    fn kill_zombie_services_recovered_and_stuck_branches() {
+        // Build zombies directly (same-module access) to exercise both
+        // branches of kill_zombie_services without waiting on the real
+        // 5-second stop timeout.
+        let registry = ServiceRegistry::new();
+
+        // Recovered: a handle that has already finished.
+        let finished = std::thread::spawn(|| Ok::<(), String>(()));
+        while !finished.is_finished() {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        // Stuck: a handle blocked on a channel we never signal until the end.
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let stuck = std::thread::spawn(move || {
+            let _ = rx.recv();
+            Ok::<(), String>(())
+        });
+
+        {
+            let mut z = registry.zombies.lock().unwrap();
+            z.push(ZombieEntry {
+                key: "plug::recovered".to_string(),
+                plugin_path: "plug".to_string(),
+                stuck_since: Instant::now(),
+                stop_handle: finished,
+            });
+            z.push(ZombieEntry {
+                key: "plug::stuck".to_string(),
+                plugin_path: "plug".to_string(),
+                stuck_since: Instant::now(),
+                stop_handle: stuck,
+            });
+        }
+        assert_eq!(registry.zombie_count(), 2);
+
+        let killed = registry.kill_zombie_services("plug");
+        assert_eq!(killed, 2, "both matched zombies are removed from tracking");
+        assert_eq!(registry.zombie_count(), 0);
+
+        // Non-matching prefix removes nothing.
+        assert_eq!(registry.kill_zombie_services("other"), 0);
+
+        // Let the still-stuck detached thread exit cleanly.
+        let _ = tx.send(());
+    }
+
+    /// Real end-to-end stop-timeout path: a service whose `stop()` blocks
+    /// past the 5s deadline is moved to the zombie list, then recovered
+    /// once unblocked. Slow (~5s) but exercises the timed-stop timeout code.
+    #[test]
+    fn stop_timed_slow_service_becomes_zombie_then_recovers() {
+        let registry = ServiceRegistry::new();
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        registry
+            .start_service(
+                "slow",
+                "svc",
+                Box::new(BlockingStopService { rx: Mutex::new(rx) }),
+            )
+            .unwrap();
+        // Blocks ~5s waiting on the stuck stop, then parks it as a zombie.
+        registry.stop_plugin_services_timed("slow");
+        assert_eq!(registry.len(), 0);
+        assert_eq!(registry.zombie_count(), 1);
+
+        // Unblock the stop thread so the handle finishes, then reap it.
+        tx.send(()).unwrap();
+        // Give the stop thread a moment to complete.
+        for _ in 0..50 {
+            std::thread::sleep(Duration::from_millis(20));
+            let done = registry
+                .zombies
+                .lock()
+                .unwrap()
+                .first()
+                .map(|z| z.stop_handle.is_finished())
+                .unwrap_or(true);
+            if done {
+                break;
+            }
+        }
+        let killed = registry.kill_zombie_services("slow");
+        assert_eq!(killed, 1);
+        assert_eq!(registry.zombie_count(), 0);
+    }
+
     #[test]
     fn service_start_stop_lifecycle() {
         let registry = ServiceRegistry::new();

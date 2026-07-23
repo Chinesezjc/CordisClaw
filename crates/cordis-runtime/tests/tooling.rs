@@ -1,5 +1,11 @@
+use cordis_plugin_sdk::{plugin_docs, pretty_json, AbiFingerprint};
+use cordis_runtime::core::error::RuntimeError;
+use cordis_runtime::core::models::{
+    ArtifactIndex, ArtifactIndexEntry, ArtifactKind, InputProbe, PluginArtifact,
+    ARTIFACT_INDEX_SCHEMA_VERSION,
+};
 use cordis_runtime::plugin::package::PackageResolver;
-use cordis_runtime::plugin::tooling::{refresh_artifact_index, sync_plugin_docs};
+use cordis_runtime::plugin::tooling::{read_plugin_docs, refresh_artifact_index, sync_plugin_docs};
 use serde_json::Value;
 use std::fs;
 use std::path::Path;
@@ -8,6 +14,88 @@ use tempfile::TempDir;
 mod support;
 
 use support::fixtures_root;
+
+// ---------------------------------------------------------------------------
+// Synthetic JSON-only workspace helpers. These exercise the public
+// tooling surface (sync_plugin_docs / refresh_artifact_index /
+// read_plugin_docs) without any dylib or `cargo` build, so they run on
+// every host regardless of the fixture artifacts' target triple.
+// ---------------------------------------------------------------------------
+
+fn sample_abi() -> AbiFingerprint {
+    AbiFingerprint {
+        rustc_version: "rustc-test".to_string(),
+        target_triple: "test-triple".to_string(),
+        crate_hash: "crate_v1".to_string(),
+        api_hash: "api_v1".to_string(),
+    }
+}
+
+fn json_entry(plugin_path: &str, artifact_rel: &str, sha: &str) -> ArtifactIndexEntry {
+    ArtifactIndexEntry {
+        plugin_path: plugin_path.to_string(),
+        version: "0.1.0".to_string(),
+        abi_fingerprint: sample_abi(),
+        artifact_path: artifact_rel.to_string(),
+        sha256: sha.to_string(),
+        built_at: "0".to_string(),
+        parent: None,
+        required: true,
+        grants_from_parent: Vec::new(),
+        docs: plugin_docs(
+            plugin_path,
+            plugin_path,
+            "0.1.0",
+            Some("Cmd"),
+            Vec::new(),
+            None,
+        ),
+        exports: Vec::new(),
+        execution: None,
+        artifact_kind: ArtifactKind::Json,
+        build_fingerprint: "fp".to_string(),
+        input_probe: InputProbe::default(),
+        local_path_deps: Vec::new(),
+    }
+}
+
+/// Build a minimal fixtures root: `plugins/Cargo.toml` (workspace marker
+/// so sync_plugin_docs accepts it) + `artifacts/index.json` referencing
+/// JSON artifacts written under `artifacts/`.
+fn synthetic_fixtures(entries: Vec<ArtifactIndexEntry>) -> TempDir {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("plugins")).unwrap();
+    fs::write(root.join("plugins/Cargo.toml"), "[workspace]\n").unwrap();
+    let artifacts_dir = root.join("artifacts");
+    fs::create_dir_all(&artifacts_dir).unwrap();
+
+    for entry in &entries {
+        // Materialise the JSON artifact the entry points at so sha256_file
+        // can hash it during refresh.
+        let artifact = PluginArtifact {
+            plugin_path: entry.plugin_path.clone(),
+            abi_fingerprint: entry.abi_fingerprint.clone(),
+            docs: entry.docs.clone(),
+            exports: Vec::new(),
+            execution: None,
+        };
+        let path = artifacts_dir.join(&entry.artifact_path);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(&path, pretty_json(&artifact)).unwrap();
+    }
+
+    let index = ArtifactIndex {
+        schema_version: ARTIFACT_INDEX_SCHEMA_VERSION,
+        generated_at: "0".to_string(),
+        topo_order: entries.iter().map(|e| e.plugin_path.clone()).collect(),
+        entries,
+    };
+    fs::write(artifacts_dir.join("index.json"), pretty_json(&index)).unwrap();
+    temp
+}
 
 fn copy_dir_all(src: &Path, dst: &Path) {
     fs::create_dir_all(dst).expect("create destination");
@@ -300,4 +388,132 @@ fn package_resolver_allows_new_dylib_child_without_generated_agent_docs() {
         plugin.docs.nodes.is_empty(),
         "missing generated docs should synthesize a placeholder until rebuild writes real docs"
     );
+}
+
+// ---------------------------------------------------------------------------
+// sync_plugin_docs — JSON-only, cross-platform.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn sync_plugin_docs_writes_interfaces_for_json_entries() {
+    let temp = synthetic_fixtures(vec![
+        json_entry("alpha", "alpha.json", "aa"),
+        json_entry("beta/child", "beta_child.json", "bb"),
+    ]);
+    let written = sync_plugin_docs(temp.path()).expect("sync docs ok");
+    assert_eq!(written.len(), 2);
+
+    // Nested plugin path resolves under plugins/<segments>/docs/agent/.
+    let alpha_docs = temp.path().join("plugins/alpha/docs/agent/interfaces.json");
+    let beta_docs = temp
+        .path()
+        .join("plugins/beta/child/docs/agent/interfaces.json");
+    assert!(alpha_docs.exists());
+    assert!(beta_docs.exists());
+    assert!(written.contains(&alpha_docs));
+    assert!(written.contains(&beta_docs));
+
+    let value: Value = serde_json::from_str(&fs::read_to_string(&alpha_docs).unwrap()).unwrap();
+    assert_eq!(
+        value.get("plugin_path").and_then(|v| v.as_str()),
+        Some("alpha")
+    );
+    assert_eq!(
+        value.get("command_name").and_then(|v| v.as_str()),
+        Some("Cmd")
+    );
+}
+
+#[test]
+fn sync_plugin_docs_overwrites_drifted_interfaces_json() {
+    let temp = synthetic_fixtures(vec![json_entry("alpha", "alpha.json", "aa")]);
+    let docs_path = temp.path().join("plugins/alpha/docs/agent/interfaces.json");
+    fs::create_dir_all(docs_path.parent().unwrap()).unwrap();
+    fs::write(&docs_path, "{\"plugin_path\":\"WRONG\"}\n").unwrap();
+
+    sync_plugin_docs(temp.path()).expect("sync docs ok");
+    let value: Value = serde_json::from_str(&fs::read_to_string(&docs_path).unwrap()).unwrap();
+    assert_eq!(
+        value.get("plugin_path").and_then(|v| v.as_str()),
+        Some("alpha"),
+        "drifted docs should be rewritten from the index entry"
+    );
+}
+
+#[test]
+fn sync_plugin_docs_rejects_missing_plugins_workspace() {
+    let temp = TempDir::new().unwrap();
+    // No plugins/Cargo.toml -> Invariant error.
+    let err = sync_plugin_docs(temp.path());
+    assert!(matches!(err, Err(RuntimeError::Invariant { .. })));
+}
+
+#[test]
+fn sync_plugin_docs_errors_when_index_missing() {
+    let temp = TempDir::new().unwrap();
+    fs::create_dir_all(temp.path().join("plugins")).unwrap();
+    fs::write(temp.path().join("plugins/Cargo.toml"), "[workspace]\n").unwrap();
+    // plugins workspace exists but artifacts/index.json does not.
+    let err = sync_plugin_docs(temp.path());
+    assert!(matches!(err, Err(RuntimeError::Io { .. })));
+}
+
+// ---------------------------------------------------------------------------
+// refresh_artifact_index — JSON-only, cross-platform.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn refresh_artifact_index_rewrites_all_hashes() {
+    let temp = synthetic_fixtures(vec![
+        json_entry("alpha", "alpha.json", "deadbeef"),
+        json_entry("beta", "beta.json", "cafef00d"),
+    ]);
+    let index_path = temp.path().join("artifacts/index.json");
+
+    let refreshed = refresh_artifact_index(temp.path()).expect("refresh ok");
+    assert_eq!(refreshed.len(), 2);
+    // Returned hashes are real 64-char sha256 hex, not the placeholder.
+    for (_, hash) in &refreshed {
+        assert_eq!(hash.len(), 64);
+        assert_ne!(hash, "deadbeef");
+    }
+
+    // On-disk index is updated to match.
+    let updated: Value = serde_json::from_str(&fs::read_to_string(&index_path).unwrap()).unwrap();
+    let entries = updated.get("entries").and_then(|v| v.as_array()).unwrap();
+    for entry in entries {
+        let sha = entry.get("sha256").and_then(|v| v.as_str()).unwrap();
+        assert_eq!(sha.len(), 64);
+    }
+}
+
+#[test]
+fn refresh_artifact_index_errors_when_artifact_file_missing() {
+    let temp = synthetic_fixtures(vec![json_entry("alpha", "alpha.json", "aa")]);
+    // Delete the referenced artifact so sha256_file fails.
+    fs::remove_file(temp.path().join("artifacts/alpha.json")).unwrap();
+    let err = refresh_artifact_index(temp.path());
+    assert!(matches!(err, Err(RuntimeError::Io { .. })));
+}
+
+#[test]
+fn refresh_artifact_index_errors_on_bad_index_json() {
+    let temp = TempDir::new().unwrap();
+    fs::create_dir_all(temp.path().join("artifacts")).unwrap();
+    fs::write(temp.path().join("artifacts/index.json"), "{ broken").unwrap();
+    let err = refresh_artifact_index(temp.path());
+    assert!(matches!(err, Err(RuntimeError::ArtifactIndexParse { .. })));
+}
+
+// ---------------------------------------------------------------------------
+// read_plugin_docs — JSON artifact path, cross-platform.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn read_plugin_docs_from_json_artifact_roundtrips() {
+    let temp = synthetic_fixtures(vec![json_entry("alpha", "alpha.json", "aa")]);
+    let artifact = temp.path().join("artifacts/alpha.json");
+    let docs = read_plugin_docs(&artifact).expect("read docs ok");
+    assert_eq!(docs.plugin_path, "alpha");
+    assert_eq!(docs.command_name.as_deref(), Some("Cmd"));
 }

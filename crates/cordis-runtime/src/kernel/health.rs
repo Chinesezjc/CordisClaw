@@ -129,4 +129,62 @@ mod tests {
         assert!(completed);
         assert!(started.elapsed() >= Duration::from_millis(140));
     }
+
+    /// Boot a minimal host from a fixtures dir containing only an empty
+    /// artifact index (zero plugins). No dylib load → boots on any host OS
+    /// (no x86_64-linux dependency).
+    fn boot_empty_host() -> Arc<RuntimeHost> {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let artifacts = temp.path().join("artifacts");
+        std::fs::create_dir_all(&artifacts).expect("artifacts dir");
+        std::fs::write(
+            artifacts.join("index.json"),
+            r#"{"generated_at":"1970-01-01T00:00:00Z","topo_order":[],"entries":[]}"#,
+        )
+        .expect("write empty index");
+        // Leak the TempDir so the snapshot root survives for the host's
+        // lifetime; the test process exit reclaims it.
+        let path = temp.keep();
+        Arc::new(RuntimeHost::boot(&path).expect("empty host should boot"))
+    }
+
+    /// `run_check` inspects live status and formats a report. With zero
+    /// zombies it must pick the healthy icon; the notify send is a no-op
+    /// because no handler is registered for this host.
+    #[test]
+    fn run_check_inspects_status_without_panicking() {
+        let host = boot_empty_host();
+        // Sanity: an empty host reports zero zombies → healthy branch.
+        assert_eq!(host.service_registry.zombie_count(), 0);
+        // Exercise the full code path (status + format + notify::send).
+        run_check(&host);
+    }
+
+    /// `start_health_loop` must spawn a worker and, when stopped before the
+    /// 10s startup delay elapses, exit cleanly via the interruptible sleep
+    /// without ever hitting the periodic check.
+    #[test]
+    fn start_health_loop_stops_promptly_during_startup_delay() {
+        let host = boot_empty_host();
+        let started = Instant::now();
+        let handle = start_health_loop(host, 3600);
+        // Give the worker a moment to enter the startup sleep, then stop.
+        std::thread::sleep(Duration::from_millis(30));
+        handle.stop();
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "stop() should join within one poll window, got {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// Dropping the handle (instead of calling `stop`) also signals the loop
+    /// and joins the worker — the P1-11 teardown guarantee.
+    #[test]
+    fn dropping_handle_signals_and_joins() {
+        let host = boot_empty_host();
+        let handle = start_health_loop(host, 3600);
+        std::thread::sleep(Duration::from_millis(30));
+        drop(handle); // Drop impl sets the flag and joins.
+    }
 }

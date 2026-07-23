@@ -2,18 +2,20 @@ use cordis_runtime::context::{
     ContextKey, ContextRead, ContextTxn, ContextWrite, RuntimeContext, Sensitivity, SlotMeta,
 };
 use cordis_runtime::core::error::RuntimeError;
-use cordis_runtime::core::models::NodeOutcome;
+use cordis_runtime::core::models::{GatePolicy, NodeOutcome};
 use cordis_runtime::execution::engine::{
     execute_net, ExecutionConfig, ExecutionNetSpec, ExecutionTransitionKind,
     ExecutionTransitionSpec, SchedulerMode, TransitionRunResult,
 };
-use cordis_runtime::execution::gate::{BackoffPolicy, RunPolicy};
+use cordis_runtime::execution::gate::{evaluate_gate, BackoffPolicy, GateDecision, RunPolicy};
 use cordis_runtime::execution::net::{
     build_petri_net, ArcDirection, ArcSpec, JoinPolicy, PetriNetBuildError, PetriNetSpec,
     PlaceSpec, TransitionSpec,
 };
+use cordis_runtime::execution::router::{execute_router, RouterMetrics};
 use cordis_runtime::execution::scheduler::SchedulerConfig;
 use serde_json::json;
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
@@ -851,4 +853,780 @@ fn single_threaded_mode_unchanged() {
     assert_eq!(output.order, vec!["t1", "t2"]);
     assert_eq!(output.outcomes.get("t1"), Some(&NodeOutcome::Success));
     assert_eq!(output.outcomes.get("t2"), Some(&NodeOutcome::Success));
+}
+
+// --------------------------------------------------------------------------
+// gate.rs — `evaluate_gate` policy branches (pure function, called directly).
+// --------------------------------------------------------------------------
+
+fn gate_outcomes(pairs: &[(&str, NodeOutcome)]) -> BTreeMap<String, NodeOutcome> {
+    pairs.iter().map(|(k, v)| (k.to_string(), *v)).collect()
+}
+
+#[test]
+fn gate_all_of_empty_upstream_is_success() {
+    // eval_all_of: empty upstream short-circuits to CompleteSuccess.
+    let empty: Vec<String> = Vec::new();
+    let out = BTreeMap::new();
+    assert_eq!(
+        evaluate_gate(GatePolicy::AllOf, &[], &out, &empty),
+        GateDecision::CompleteSuccess
+    );
+}
+
+#[test]
+fn gate_all_of_waits_on_non_terminal_upstream() {
+    // A Cancelled/Skipped/None upstream (not a hard Failure) keeps AllOf in Wait.
+    let up = vec!["a".to_string(), "b".to_string()];
+    let empty: Vec<String> = Vec::new();
+    let out = gate_outcomes(&[("a", NodeOutcome::Success), ("b", NodeOutcome::Cancelled)]);
+    assert_eq!(
+        evaluate_gate(GatePolicy::AllOf, &up, &out, &empty),
+        GateDecision::Wait
+    );
+}
+
+#[test]
+fn gate_any_of_all_branches() {
+    let up = vec!["a".to_string(), "b".to_string()];
+    let empty: Vec<String> = Vec::new();
+
+    // empty upstream -> CompleteFailure
+    assert_eq!(
+        evaluate_gate(GatePolicy::AnyOf, &[], &BTreeMap::new(), &empty),
+        GateDecision::CompleteFailure
+    );
+    // any success -> CompleteSuccess
+    let with_success = gate_outcomes(&[("a", NodeOutcome::Failure), ("b", NodeOutcome::Success)]);
+    assert_eq!(
+        evaluate_gate(GatePolicy::AnyOf, &up, &with_success, &empty),
+        GateDecision::CompleteSuccess
+    );
+    // all terminal, none success -> CompleteFailure
+    let all_fail = gate_outcomes(&[("a", NodeOutcome::Failure), ("b", NodeOutcome::Cancelled)]);
+    assert_eq!(
+        evaluate_gate(GatePolicy::AnyOf, &up, &all_fail, &empty),
+        GateDecision::CompleteFailure
+    );
+    // some still pending -> Wait
+    let partial = gate_outcomes(&[("a", NodeOutcome::Failure)]);
+    assert_eq!(
+        evaluate_gate(GatePolicy::AnyOf, &up, &partial, &empty),
+        GateDecision::Wait
+    );
+}
+
+#[test]
+fn gate_first_success_skips_non_upstream_and_pending_in_order() {
+    // completion_order lists a node not in upstream (continue), then a
+    // pending-but-not-success upstream (inner outcome check falls through).
+    let up = vec!["a".to_string(), "b".to_string()];
+    let out = gate_outcomes(&[("a", NodeOutcome::Failure), ("b", NodeOutcome::Success)]);
+    let order = vec!["stranger".to_string(), "a".to_string(), "b".to_string()];
+    match evaluate_gate(GatePolicy::FirstSuccess, &up, &out, &order) {
+        GateDecision::CompleteAndCancel {
+            success,
+            cancel_nodes,
+        } => {
+            assert!(success);
+            // both a and b are terminal so nothing pending to cancel
+            assert!(cancel_nodes.is_empty());
+        }
+        d => panic!("expected CompleteAndCancel, got {d:?}"),
+    }
+}
+
+#[test]
+fn gate_first_completed_all_branches() {
+    let up = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+
+    // First terminal is Success with a pending peer -> CompleteAndCancel(success).
+    let out = gate_outcomes(&[("a", NodeOutcome::Success)]);
+    let order = vec!["a".to_string()];
+    match evaluate_gate(GatePolicy::FirstCompleted, &up, &out, &order) {
+        GateDecision::CompleteAndCancel {
+            success,
+            cancel_nodes,
+        } => {
+            assert!(success);
+            assert_eq!(cancel_nodes.len(), 2);
+        }
+        d => panic!("expected CompleteAndCancel(success), got {d:?}"),
+    }
+
+    // First terminal is Success and every peer already terminal -> CompleteSuccess.
+    let out = gate_outcomes(&[
+        ("a", NodeOutcome::Success),
+        ("b", NodeOutcome::Failure),
+        ("c", NodeOutcome::Cancelled),
+    ]);
+    let order = vec!["a".to_string()];
+    assert_eq!(
+        evaluate_gate(GatePolicy::FirstCompleted, &up, &out, &order),
+        GateDecision::CompleteSuccess
+    );
+
+    // First terminal is Failure with a pending peer -> CompleteAndCancel(failure).
+    let out = gate_outcomes(&[("a", NodeOutcome::Failure)]);
+    let order = vec!["a".to_string()];
+    match evaluate_gate(GatePolicy::FirstCompleted, &up, &out, &order) {
+        GateDecision::CompleteAndCancel {
+            success,
+            cancel_nodes,
+        } => {
+            assert!(!success);
+            assert_eq!(cancel_nodes.len(), 2);
+        }
+        d => panic!("expected CompleteAndCancel(failure), got {d:?}"),
+    }
+
+    // First terminal is Failure and every peer already terminal -> CompleteFailure.
+    let out = gate_outcomes(&[
+        ("a", NodeOutcome::Failure),
+        ("b", NodeOutcome::Timeout),
+        ("c", NodeOutcome::Skipped),
+    ]);
+    let order = vec!["a".to_string()];
+    assert_eq!(
+        evaluate_gate(GatePolicy::FirstCompleted, &up, &out, &order),
+        GateDecision::CompleteFailure
+    );
+
+    // completion_order lists a stranger, then a non-terminal upstream that is
+    // skipped via the `is_terminal` continue -> Wait (nothing terminal yet).
+    let out: BTreeMap<String, NodeOutcome> = BTreeMap::new();
+    let order = vec!["stranger".to_string()];
+    assert_eq!(
+        evaluate_gate(GatePolicy::FirstCompleted, &up, &out, &order),
+        GateDecision::Wait
+    );
+}
+
+#[test]
+fn gate_at_least_all_branches() {
+    let up = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+    let empty: Vec<String> = Vec::new();
+
+    // k == 0 -> immediate CompleteSuccess.
+    assert_eq!(
+        evaluate_gate(GatePolicy::AtLeast(0), &up, &BTreeMap::new(), &empty),
+        GateDecision::CompleteSuccess
+    );
+
+    // One success, two pending, need 2 -> still possible -> Wait.
+    let one_ok = gate_outcomes(&[("a", NodeOutcome::Success)]);
+    assert_eq!(
+        evaluate_gate(GatePolicy::AtLeast(2), &up, &one_ok, &empty),
+        GateDecision::Wait
+    );
+}
+
+// --------------------------------------------------------------------------
+// net.rs — remaining `build_petri_net` error branches.
+// --------------------------------------------------------------------------
+
+#[test]
+fn petri_net_build_fails_on_duplicate_place_id() {
+    let err = build_petri_net(PetriNetSpec {
+        places: vec![place("p"), place("p")],
+        transitions: vec![],
+        arcs: vec![],
+    })
+    .expect_err("duplicate place id should fail");
+    assert!(matches!(err, PetriNetBuildError::DuplicatePlaceId { .. }));
+}
+
+#[test]
+fn petri_net_build_fails_on_duplicate_arc_id() {
+    let err = build_petri_net(PetriNetSpec {
+        places: vec![place("p")],
+        transitions: vec![TransitionSpec {
+            transition_id: "t".to_string(),
+            priority: 0,
+            join_policy: JoinPolicy::AllOf,
+        }],
+        arcs: vec![
+            ArcSpec {
+                arc_id: "dup".to_string(),
+                place_id: "p".to_string(),
+                transition_id: "t".to_string(),
+                direction: ArcDirection::PlaceToTransition,
+                label: None,
+                required: false,
+            },
+            ArcSpec {
+                arc_id: "dup".to_string(),
+                place_id: "p".to_string(),
+                transition_id: "t".to_string(),
+                direction: ArcDirection::TransitionToPlace,
+                label: None,
+                required: false,
+            },
+        ],
+    })
+    .expect_err("duplicate arc id should fail");
+    assert!(matches!(err, PetriNetBuildError::DuplicateArcId { .. }));
+}
+
+#[test]
+fn petri_net_build_fails_on_unknown_transition_arc() {
+    let err = build_petri_net(PetriNetSpec {
+        places: vec![place("p")],
+        transitions: vec![TransitionSpec {
+            transition_id: "t".to_string(),
+            priority: 0,
+            join_policy: JoinPolicy::AllOf,
+        }],
+        arcs: vec![ArcSpec {
+            arc_id: "a".to_string(),
+            place_id: "p".to_string(),
+            transition_id: "missing".to_string(),
+            direction: ArcDirection::PlaceToTransition,
+            label: None,
+            required: false,
+        }],
+    })
+    .expect_err("unknown transition should fail");
+    assert!(matches!(
+        err,
+        PetriNetBuildError::ArcTransitionNotFound { .. }
+    ));
+}
+
+#[test]
+fn petri_net_build_fails_on_place_with_multiple_consumers() {
+    // Two distinct transitions both consume from place `p` -> a place may
+    // have at most one consumer transition.
+    let err = build_petri_net(PetriNetSpec {
+        places: vec![place("p")],
+        transitions: vec![
+            TransitionSpec {
+                transition_id: "t1".to_string(),
+                priority: 0,
+                join_policy: JoinPolicy::AllOf,
+            },
+            TransitionSpec {
+                transition_id: "t2".to_string(),
+                priority: 0,
+                join_policy: JoinPolicy::AllOf,
+            },
+        ],
+        arcs: vec![
+            ArcSpec {
+                arc_id: "a1".to_string(),
+                place_id: "p".to_string(),
+                transition_id: "t1".to_string(),
+                direction: ArcDirection::PlaceToTransition,
+                label: None,
+                required: false,
+            },
+            ArcSpec {
+                arc_id: "a2".to_string(),
+                place_id: "p".to_string(),
+                transition_id: "t2".to_string(),
+                direction: ArcDirection::PlaceToTransition,
+                label: None,
+                required: false,
+            },
+        ],
+    })
+    .expect_err("multiple consumers should fail");
+    assert!(matches!(
+        err,
+        PetriNetBuildError::PlaceMultipleConsumers { .. }
+    ));
+}
+
+// --------------------------------------------------------------------------
+// router.rs — Cancelled / Skipped run outcomes roll back the overlay.
+// --------------------------------------------------------------------------
+
+#[test]
+fn router_cancelled_outcome_rolls_back_and_counts() {
+    let mut ctx = RuntimeContext::default();
+    let mut metrics = RouterMetrics::default();
+    let result = execute_router(
+        &mut ctx,
+        "sg-cancel",
+        &mut metrics,
+        |_ctx| NodeOutcome::Cancelled,
+        0,
+    )
+    .expect("router should not error");
+    assert_eq!(result.outcome, NodeOutcome::Cancelled);
+    assert_eq!(metrics.router_cancelled_total, 1);
+    assert_eq!(metrics.router_overlay_rollback_total, 1);
+    assert_eq!(metrics.router_overlay_commit_total, 0);
+}
+
+#[test]
+fn router_skipped_outcome_rolls_back_and_counts() {
+    let mut ctx = RuntimeContext::default();
+    let mut metrics = RouterMetrics::default();
+    let result = execute_router(
+        &mut ctx,
+        "sg-skip",
+        &mut metrics,
+        |_ctx| NodeOutcome::Skipped,
+        0,
+    )
+    .expect("router should not error");
+    assert_eq!(result.outcome, NodeOutcome::Skipped);
+    assert_eq!(metrics.router_skipped_total, 1);
+    assert_eq!(metrics.router_overlay_rollback_total, 1);
+}
+
+// --------------------------------------------------------------------------
+// engine.rs — parallel key-sharded path (max_concurrency > 1) branches.
+// --------------------------------------------------------------------------
+
+#[test]
+fn parallel_path_retries_failed_task_then_succeeds() {
+    // A single root task in the parallel path fails on attempt 0 and is
+    // re-queued (retry branch), then succeeds on attempt 1.
+    let mut retry_task = transition(
+        "retry_task",
+        JoinPolicy::AllOf,
+        0,
+        ExecutionTransitionKind::Task,
+    );
+    retry_task.run_policy = RunPolicy {
+        timeout_ms: 5_000,
+        max_retries: 2,
+        backoff: BackoffPolicy::None,
+    };
+    let net = ExecutionNetSpec {
+        places: vec![],
+        transitions: vec![retry_task],
+        arcs: vec![],
+    };
+
+    let mut ctx = RuntimeContext::default();
+    let output = execute_net(
+        ExecutionConfig {
+            scheduler: SchedulerConfig {
+                max_parallelism: 1,
+                max_concurrency: 4,
+            },
+            scheduler_mode: SchedulerMode::Deterministic,
+        },
+        net,
+        &mut ctx,
+        |_, attempt, _, _| {
+            if attempt == 0 {
+                TransitionRunResult::from_outcome(NodeOutcome::Failure)
+            } else {
+                TransitionRunResult::from_outcome(NodeOutcome::Success)
+            }
+        },
+    )
+    .expect("engine run should pass");
+
+    assert_eq!(
+        output.outcomes.get("retry_task"),
+        Some(&NodeOutcome::Success)
+    );
+    assert_eq!(output.metrics.node_retry_total, 1);
+    assert_eq!(output.order, vec!["retry_task", "retry_task"]);
+}
+
+#[test]
+fn parallel_path_router_transition_is_precomputed_serially() {
+    // A Router transition in the parallel path is run in the serial
+    // pre-compute phase (router_run = Some(..)) and its overlay committed.
+    let net = ExecutionNetSpec {
+        places: vec![],
+        transitions: vec![transition(
+            "router",
+            JoinPolicy::AllOf,
+            0,
+            ExecutionTransitionKind::Router {
+                subgraph_id: "sg_par".to_string(),
+            },
+        )],
+        arcs: vec![],
+    };
+
+    let mut ctx = RuntimeContext::default();
+    let output = execute_net(
+        ExecutionConfig {
+            scheduler: SchedulerConfig {
+                max_parallelism: 1,
+                max_concurrency: 4,
+            },
+            scheduler_mode: SchedulerMode::Deterministic,
+        },
+        net,
+        &mut ctx,
+        |_, _, _, _| TransitionRunResult::from_outcome(NodeOutcome::Success),
+    )
+    .expect("engine run should pass");
+
+    assert_eq!(output.outcomes.get("router"), Some(&NodeOutcome::Success));
+    assert_eq!(output.metrics.router.router_execute_total, 1);
+    assert_eq!(output.metrics.router.router_overlay_commit_total, 1);
+}
+
+#[test]
+fn parallel_path_skips_all_of_with_failed_upstream() {
+    // In the parallel path, an AllOf consumer whose upstream token carries a
+    // non-Success outcome is Skipped (the `skip` branch + Skipped merge).
+    let net = ExecutionNetSpec {
+        places: vec![place("p")],
+        transitions: vec![
+            transition("prod", JoinPolicy::AllOf, 0, ExecutionTransitionKind::Task),
+            transition("cons", JoinPolicy::AllOf, 0, ExecutionTransitionKind::Task),
+        ],
+        arcs: vec![arc_out("prod", "p", None), arc_in("cons", "p", None)],
+    };
+
+    let mut ctx = RuntimeContext::default();
+    let output = execute_net(
+        ExecutionConfig {
+            scheduler: SchedulerConfig {
+                max_parallelism: 1,
+                max_concurrency: 4,
+            },
+            scheduler_mode: SchedulerMode::Deterministic,
+        },
+        net,
+        &mut ctx,
+        |spec, _, _, _| {
+            if spec.transition.transition_id == "prod" {
+                TransitionRunResult::from_outcome(NodeOutcome::Failure)
+            } else {
+                TransitionRunResult::from_outcome(NodeOutcome::Success)
+            }
+        },
+    )
+    .expect("engine run should pass");
+
+    assert_eq!(output.outcomes.get("prod"), Some(&NodeOutcome::Failure));
+    assert_eq!(output.outcomes.get("cons"), Some(&NodeOutcome::Skipped));
+}
+
+#[test]
+fn parallel_path_terminal_cancels_pending_transitions() {
+    // A Terminal transition firing in the parallel path clears the ready
+    // queue and marks every not-yet-completed transition as Cancelled.
+    let net = ExecutionNetSpec {
+        places: vec![place("p")],
+        transitions: vec![
+            // Root terminal fires immediately; downstream `late` never runs.
+            transition(
+                "root_terminal",
+                JoinPolicy::AllOf,
+                0,
+                ExecutionTransitionKind::Terminal,
+            ),
+            transition("late", JoinPolicy::AllOf, 0, ExecutionTransitionKind::Task),
+        ],
+        // `late` consumes from a place nobody ever fills -> stays pending.
+        arcs: vec![arc_in("late", "p", None)],
+    };
+
+    let mut ctx = RuntimeContext::default();
+    let output = execute_net(
+        ExecutionConfig {
+            scheduler: SchedulerConfig {
+                max_parallelism: 1,
+                max_concurrency: 4,
+            },
+            scheduler_mode: SchedulerMode::Deterministic,
+        },
+        net,
+        &mut ctx,
+        |_, _, _, _| TransitionRunResult::from_outcome(NodeOutcome::Success),
+    )
+    .expect("engine run should pass");
+
+    assert_eq!(
+        output.outcomes.get("root_terminal"),
+        Some(&NodeOutcome::Success)
+    );
+    assert_eq!(output.outcomes.get("late"), Some(&NodeOutcome::Cancelled));
+}
+
+#[test]
+fn parallel_path_runner_panic_becomes_runtime_error() {
+    // A runner panic on a worker thread is caught and surfaced as a
+    // RuntimeError rather than unwinding through the executor.
+    let net = ExecutionNetSpec {
+        places: vec![],
+        transitions: vec![transition(
+            "boom",
+            JoinPolicy::AllOf,
+            0,
+            ExecutionTransitionKind::Task,
+        )],
+        arcs: vec![],
+    };
+
+    let mut ctx = RuntimeContext::default();
+    let err = execute_net(
+        ExecutionConfig {
+            scheduler: SchedulerConfig {
+                max_parallelism: 1,
+                max_concurrency: 4,
+            },
+            scheduler_mode: SchedulerMode::Deterministic,
+        },
+        net,
+        &mut ctx,
+        |_, _, _, _| panic!("runner exploded"),
+    )
+    .expect_err("runner panic must surface as error");
+
+    match err {
+        RuntimeError::ExecutionFailed { message, .. } => {
+            assert!(
+                message.contains("runner panic") && message.contains("runner exploded"),
+                "unexpected message: {message}"
+            );
+        }
+        other => panic!("expected ExecutionFailed, got {other:?}"),
+    }
+}
+
+// --------------------------------------------------------------------------
+// engine.rs — single-threaded path: terminal cancellation, Cancelled metric,
+// Gate kind, exponential backoff, and remaining join policies.
+// --------------------------------------------------------------------------
+
+#[test]
+fn single_thread_terminal_cancels_pending_transitions() {
+    // Terminal fires first (sorts before `zzz_pending`) and cancels the peer
+    // that can never become ready.
+    let net = ExecutionNetSpec {
+        places: vec![place("p")],
+        transitions: vec![
+            transition(
+                "aaa_terminal",
+                JoinPolicy::AllOf,
+                0,
+                ExecutionTransitionKind::Terminal,
+            ),
+            transition(
+                "zzz_pending",
+                JoinPolicy::AllOf,
+                0,
+                ExecutionTransitionKind::Task,
+            ),
+        ],
+        arcs: vec![arc_in("zzz_pending", "p", None)],
+    };
+
+    let mut ctx = RuntimeContext::default();
+    let output = execute_net(ExecutionConfig::default(), net, &mut ctx, |_, _, _, _| {
+        TransitionRunResult::from_outcome(NodeOutcome::Success)
+    })
+    .expect("engine run should pass");
+
+    assert_eq!(
+        output.outcomes.get("aaa_terminal"),
+        Some(&NodeOutcome::Success)
+    );
+    assert_eq!(
+        output.outcomes.get("zzz_pending"),
+        Some(&NodeOutcome::Cancelled)
+    );
+}
+
+#[test]
+fn runner_cancelled_outcome_increments_cancel_metric() {
+    // A runner returning Cancelled flows through complete_transition and
+    // increments execution_cancel_total.
+    let net = ExecutionNetSpec {
+        places: vec![],
+        transitions: vec![transition(
+            "c",
+            JoinPolicy::AllOf,
+            0,
+            ExecutionTransitionKind::Task,
+        )],
+        arcs: vec![],
+    };
+
+    let mut ctx = RuntimeContext::default();
+    let output = execute_net(ExecutionConfig::default(), net, &mut ctx, |_, _, _, _| {
+        TransitionRunResult::from_outcome(NodeOutcome::Cancelled)
+    })
+    .expect("engine run should pass");
+
+    assert_eq!(output.outcomes.get("c"), Some(&NodeOutcome::Cancelled));
+    assert_eq!(output.metrics.execution_cancel_total, 1);
+}
+
+#[test]
+fn gate_kind_transition_runs_as_success() {
+    // A Gate-kind transition is executed by run_transition and always yields
+    // Success (the gate policy body just short-circuits).
+    let net = ExecutionNetSpec {
+        places: vec![place("p")],
+        transitions: vec![
+            transition("prod", JoinPolicy::AllOf, 0, ExecutionTransitionKind::Task),
+            transition(
+                "gate",
+                JoinPolicy::AllOf,
+                0,
+                ExecutionTransitionKind::Gate {
+                    policy: GatePolicy::AllOf,
+                },
+            ),
+        ],
+        arcs: vec![arc_out("prod", "p", None), arc_in("gate", "p", None)],
+    };
+
+    let mut ctx = RuntimeContext::default();
+    let output = execute_net(
+        ExecutionConfig::default(),
+        net,
+        &mut ctx,
+        // `prod` succeeds so the AllOf gate is not skipped; the gate's own
+        // runner returns Failure, but the Gate kind ignores the runner and
+        // returns Success regardless.
+        |spec, _, _, _| {
+            if spec.transition.transition_id == "gate" {
+                TransitionRunResult::from_outcome(NodeOutcome::Failure)
+            } else {
+                TransitionRunResult::from_outcome(NodeOutcome::Success)
+            }
+        },
+    )
+    .expect("engine run should pass");
+
+    assert_eq!(output.outcomes.get("gate"), Some(&NodeOutcome::Success));
+}
+
+#[test]
+fn engine_exponential_backoff_is_applied_for_retry() {
+    // BackoffPolicy::Exponential delays the retry by base_ms << (attempt-1).
+    let mut retry_task = transition(
+        "retry_exp",
+        JoinPolicy::AllOf,
+        0,
+        ExecutionTransitionKind::Task,
+    );
+    retry_task.run_policy = RunPolicy {
+        timeout_ms: 5_000,
+        max_retries: 1,
+        backoff: BackoffPolicy::Exponential {
+            base_ms: 20,
+            max_ms: 1_000,
+        },
+    };
+    let net = ExecutionNetSpec {
+        places: vec![],
+        transitions: vec![retry_task],
+        arcs: vec![],
+    };
+
+    let mut ctx = RuntimeContext::default();
+    let started = Instant::now();
+    let output = execute_net(
+        ExecutionConfig::default(),
+        net,
+        &mut ctx,
+        |_, attempt, _, _| {
+            if attempt == 0 {
+                TransitionRunResult::from_outcome(NodeOutcome::Failure)
+            } else {
+                TransitionRunResult::from_outcome(NodeOutcome::Success)
+            }
+        },
+    )
+    .expect("engine run should pass");
+    let elapsed_ms = started.elapsed().as_millis();
+
+    assert_eq!(
+        output.outcomes.get("retry_exp"),
+        Some(&NodeOutcome::Success)
+    );
+    assert_eq!(output.metrics.node_retry_total, 1);
+    assert!(
+        elapsed_ms >= 15,
+        "expected elapsed >= 15ms with exponential backoff, got {elapsed_ms}ms"
+    );
+}
+
+#[test]
+fn join_policy_quorum_zero_fires_immediately() {
+    // Quorum(0) is satisfied as soon as any upstream token arrives.
+    let net = ExecutionNetSpec {
+        places: vec![place("p")],
+        transitions: vec![
+            transition("prod", JoinPolicy::AllOf, 0, ExecutionTransitionKind::Task),
+            transition(
+                "q0",
+                JoinPolicy::Quorum(0),
+                0,
+                ExecutionTransitionKind::Task,
+            ),
+        ],
+        arcs: vec![arc_out("prod", "p", None), arc_in("q0", "p", None)],
+    };
+
+    let mut ctx = RuntimeContext::default();
+    let output = execute_net(ExecutionConfig::default(), net, &mut ctx, |_, _, _, _| {
+        TransitionRunResult::from_outcome(NodeOutcome::Success)
+    })
+    .expect("engine run should pass");
+
+    assert_eq!(output.outcomes.get("q0"), Some(&NodeOutcome::Success));
+}
+
+#[test]
+fn join_policy_keyed_group_and_first_completed_fire() {
+    // KeyedGroup requires all input places non-empty for the same key;
+    // FirstCompleted fires on the first non-empty input place.
+    for policy in [JoinPolicy::KeyedGroup, JoinPolicy::FirstCompleted] {
+        let net = ExecutionNetSpec {
+            places: vec![place("p1"), place("p2")],
+            transitions: vec![
+                transition_grouped(
+                    "u1",
+                    JoinPolicy::AllOf,
+                    0,
+                    ExecutionTransitionKind::Task,
+                    "g",
+                ),
+                transition_grouped(
+                    "u2",
+                    JoinPolicy::AllOf,
+                    0,
+                    ExecutionTransitionKind::Task,
+                    "g",
+                ),
+                transition("join", policy, 0, ExecutionTransitionKind::Task),
+            ],
+            arcs: vec![
+                arc_out("u1", "p1", Some("a")),
+                arc_out("u2", "p2", Some("b")),
+                ArcSpec {
+                    arc_id: "in::join::p1".to_string(),
+                    place_id: "p1".to_string(),
+                    transition_id: "join".to_string(),
+                    direction: ArcDirection::PlaceToTransition,
+                    label: Some("a".to_string()),
+                    required: false,
+                },
+                ArcSpec {
+                    arc_id: "in::join::p2".to_string(),
+                    place_id: "p2".to_string(),
+                    transition_id: "join".to_string(),
+                    direction: ArcDirection::PlaceToTransition,
+                    label: Some("b".to_string()),
+                    required: false,
+                },
+            ],
+        };
+
+        let mut ctx = RuntimeContext::default();
+        let output = execute_net(ExecutionConfig::default(), net, &mut ctx, |_, _, _, _| {
+            TransitionRunResult::from_outcome(NodeOutcome::Success)
+        })
+        .expect("engine run should pass");
+
+        assert_eq!(output.outcomes.get("join"), Some(&NodeOutcome::Success));
+    }
 }

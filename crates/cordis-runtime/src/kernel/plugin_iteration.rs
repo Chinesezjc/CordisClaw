@@ -1740,4 +1740,707 @@ mod tests {
             "created file should be removed on rollback"
         );
     }
+
+    // ---------- pure-logic / helper coverage ----------
+
+    use super::{
+        apply_operation, deepest_matching_writable_root, file_sha256, now_ms,
+        plugin_subtree_surface_kind, resolve_under_workspace,
+        validate_reserved_child_keyword_identifiers, KernelPluginIssueStatus,
+        PluginIterationFinalVerdict, PluginIterationNetSpec, PluginSubtreeSurfaceKind, UpdatedFile,
+        VerifierVerdict,
+    };
+    use crate::core::error::RuntimeError;
+    use crate::kernel::auto_update::{AutoUpdatePlan, FilePatch};
+    use std::collections::BTreeSet;
+    use std::path::Path;
+
+    fn sha_hex(s: &str) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(s.as_bytes());
+        hex::encode(hasher.finalize())
+    }
+
+    // `UpdatedFile` deliberately has no `Debug` impl, so `unwrap_err` on an
+    // `apply_operation` result won't compile. Collapse the Ok payload to `()`
+    // for error-path assertions.
+    fn apply_err(
+        rel: &str,
+        operation: &PluginEditOperation,
+        abs: &Path,
+        original: Option<&[u8]>,
+    ) -> RuntimeError {
+        apply_operation(rel, operation, abs, original)
+            .map(|_| ())
+            .unwrap_err()
+    }
+
+    fn op(kind: PluginEditOpKind) -> PluginEditOperation {
+        PluginEditOperation {
+            path: "plugins/demo/src/lib.rs".to_string(),
+            kind,
+            expected_old_string: None,
+            expected_sha256: None,
+            new_content: None,
+            pointer: None,
+            dotted_key: None,
+            value: None,
+        }
+    }
+
+    #[test]
+    fn issue_source_priority_is_ordered() {
+        use super::KernelPluginIssueSource as S;
+        let priorities = [
+            S::LoadFailure.priority(),
+            S::CanaryFailure.priority(),
+            S::VerifierFailure.priority(),
+            S::InvokeFailure.priority(),
+            S::DocsDrift.priority(),
+            S::PolicyBlocked.priority(),
+        ];
+        assert_eq!(priorities, [0, 1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn net_spec_default_lists_full_pipeline() {
+        let spec = PluginIterationNetSpec::default();
+        assert_eq!(spec.transition_ids.first().unwrap(), "observe");
+        assert_eq!(spec.transition_ids.last().unwrap(), "promote_or_rollback");
+        assert_eq!(spec.transition_ids.len(), 9);
+    }
+
+    #[test]
+    fn enum_serde_round_trips() {
+        for status in [
+            KernelPluginIssueStatus::Open,
+            KernelPluginIssueStatus::Running,
+            KernelPluginIssueStatus::Blocked,
+            KernelPluginIssueStatus::Resolved,
+        ] {
+            let json = serde_json::to_string(&status).unwrap();
+            assert_eq!(
+                serde_json::from_str::<KernelPluginIssueStatus>(&json).unwrap(),
+                status
+            );
+        }
+        for verdict in [
+            VerifierVerdict::Pass,
+            VerifierVerdict::Fail,
+            VerifierVerdict::Partial,
+        ] {
+            let json = serde_json::to_string(&verdict).unwrap();
+            assert_eq!(
+                serde_json::from_str::<VerifierVerdict>(&json).unwrap(),
+                verdict
+            );
+        }
+        for verdict in [
+            PluginIterationFinalVerdict::Promoted,
+            PluginIterationFinalVerdict::RolledBack,
+            PluginIterationFinalVerdict::Blocked,
+        ] {
+            let json = serde_json::to_string(&verdict).unwrap();
+            assert_eq!(
+                serde_json::from_str::<PluginIterationFinalVerdict>(&json).unwrap(),
+                verdict
+            );
+        }
+    }
+
+    #[test]
+    fn diff_line_estimate_by_kind() {
+        // ReplaceExact: max(old lines, new lines, 1).
+        let mut replace = op(PluginEditOpKind::ReplaceExact);
+        replace.expected_old_string = Some("a\nb".to_string());
+        replace.new_content = Some("x\ny\nz".to_string());
+        assert_eq!(replace.diff_line_estimate(), 3);
+        // CreateFile counts new_content lines, floored at 1.
+        let mut create = op(PluginEditOpKind::CreateFile);
+        create.new_content = Some("one\ntwo".to_string());
+        assert_eq!(create.diff_line_estimate(), 2);
+        let empty_create = op(PluginEditOpKind::CreateFile);
+        assert_eq!(empty_create.diff_line_estimate(), 1);
+        // Json/Toml sets always estimate 1.
+        assert_eq!(op(PluginEditOpKind::JsonSet).diff_line_estimate(), 1);
+        assert_eq!(op(PluginEditOpKind::TomlSet).diff_line_estimate(), 1);
+    }
+
+    #[test]
+    fn plan_diff_lines_and_changed_paths_dedup_sorted() {
+        let mut a = op(PluginEditOpKind::JsonSet);
+        a.path = "plugins/z/x.json".to_string();
+        let mut b = op(PluginEditOpKind::TomlSet);
+        b.path = "plugins/a/y.toml".to_string();
+        let mut c = op(PluginEditOpKind::JsonSet);
+        c.path = "plugins/z/x.json".to_string(); // duplicate path
+        let plan = PluginEditPlan {
+            issue_id: "i".to_string(),
+            patch_id: "p".to_string(),
+            summary: "s".to_string(),
+            operations: vec![a, b, c],
+        };
+        assert_eq!(plan.diff_lines(), 3);
+        // changed_paths is deduped and sorted (BTreeSet).
+        assert_eq!(
+            plan.changed_paths(),
+            vec![
+                "plugins/a/y.toml".to_string(),
+                "plugins/z/x.json".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn from_auto_update_plan_maps_every_patch_kind() {
+        let temp = TempDir::new().unwrap();
+        let ws = temp.path();
+        fs::create_dir_all(ws.join("plugins/demo")).unwrap();
+        fs::write(ws.join("plugins/demo/data.json"), "{\"k\":1}").unwrap();
+        fs::write(ws.join("plugins/demo/conf.toml"), "k = 1\n").unwrap();
+
+        let plan = AutoUpdatePlan {
+            issue_id: "issue-9".to_string(),
+            patch_id: "patch-9".to_string(),
+            manual_approved: false,
+            diff_lines: 0,
+            patches: vec![
+                FilePatch::text("plugins/demo/src/lib.rs", "old", "new"),
+                FilePatch::json_value("plugins/demo/data.json", "/k", serde_json::json!(2)),
+                FilePatch::toml_value("plugins/demo/conf.toml", "k", serde_json::json!(2)),
+            ],
+        };
+        let edit_plan =
+            PluginEditPlan::from_auto_update_plan(ws, "converted".to_string(), plan).unwrap();
+        assert_eq!(edit_plan.issue_id, "issue-9");
+        assert_eq!(edit_plan.patch_id, "patch-9");
+        assert_eq!(edit_plan.summary, "converted");
+        assert_eq!(edit_plan.operations.len(), 3);
+        assert_eq!(edit_plan.operations[0].kind, PluginEditOpKind::ReplaceExact);
+        assert_eq!(
+            edit_plan.operations[0].expected_old_string.as_deref(),
+            Some("old")
+        );
+        assert_eq!(edit_plan.operations[1].kind, PluginEditOpKind::JsonSet);
+        assert_eq!(edit_plan.operations[1].pointer.as_deref(), Some("/k"));
+        assert!(edit_plan.operations[1].expected_sha256.is_some());
+        assert_eq!(edit_plan.operations[2].kind, PluginEditOpKind::TomlSet);
+        assert_eq!(edit_plan.operations[2].dotted_key.as_deref(), Some("k"));
+        assert!(edit_plan.operations[2].expected_sha256.is_some());
+    }
+
+    #[test]
+    fn validate_path_allows_top_level_workspace_manifest() {
+        let allowed = BTreeMap::new();
+        // plugins/Cargo.toml is explicitly always editable.
+        PluginIterationPolicy::default()
+            .validate_path(&allowed, "plugins/Cargo.toml")
+            .expect("workspace manifest must be writable");
+    }
+
+    #[test]
+    fn validate_path_rejects_manifest_when_edits_disabled() {
+        let mut allowed = BTreeMap::new();
+        allowed.insert("demo".to_string(), "plugins/demo".to_string());
+        let policy = PluginIterationPolicy {
+            forbidden_prefixes: PluginIterationPolicy::default().forbidden_prefixes,
+            allow_plugin_manifest_edits: false,
+        };
+        let err = policy
+            .validate_path(&allowed, "plugins/demo/Cargo.toml")
+            .expect_err("manifest edit should be blocked");
+        assert!(err
+            .to_string()
+            .contains("plugin manifest edits are disabled"));
+    }
+
+    #[test]
+    fn validate_path_rejects_outside_selected_subtree() {
+        let mut allowed = BTreeMap::new();
+        allowed.insert("demo".to_string(), "plugins/demo".to_string());
+        // plugins/other is a plugin path but not in the selected subtree.
+        let err = PluginIterationPolicy::default()
+            .validate_path(&allowed, "plugins/other/src/lib.rs")
+            .expect_err("path outside selected subtree should be blocked");
+        assert!(err
+            .to_string()
+            .contains("not inside the selected plugin subtree"));
+    }
+
+    #[test]
+    fn subtree_surface_kind_classification() {
+        let root = "plugins/demo";
+        // Root manifest is writable.
+        assert_eq!(
+            plugin_subtree_surface_kind("plugins/demo/Cargo.toml", root),
+            Some(PluginSubtreeSurfaceKind::WritableManifest)
+        );
+        // Nested child plugin manifest is writable.
+        assert_eq!(
+            plugin_subtree_surface_kind("plugins/demo/child/Cargo.toml", root),
+            Some(PluginSubtreeSurfaceKind::WritableManifest)
+        );
+        // Source files are writable.
+        assert_eq!(
+            plugin_subtree_surface_kind("plugins/demo/src/lib.rs", root),
+            Some(PluginSubtreeSurfaceKind::WritableOther)
+        );
+        // tests/ files are writable.
+        assert_eq!(
+            plugin_subtree_surface_kind("plugins/demo/tests/it.rs", root),
+            Some(PluginSubtreeSurfaceKind::WritableOther)
+        );
+        // Human docs are writable.
+        assert_eq!(
+            plugin_subtree_surface_kind("plugins/demo/docs/human/guide.md", root),
+            Some(PluginSubtreeSurfaceKind::WritableOther)
+        );
+        // Generated agent docs are read-only.
+        assert_eq!(
+            plugin_subtree_surface_kind("plugins/demo/docs/agent/interfaces.json", root),
+            Some(PluginSubtreeSurfaceKind::ReadOnlyGenerated)
+        );
+        // A path outside the subtree yields None (no strip_prefix match).
+        assert_eq!(
+            plugin_subtree_surface_kind("plugins/other/src/lib.rs", root),
+            None
+        );
+        // A file directly under the root with no recognised surface segment.
+        assert_eq!(
+            plugin_subtree_surface_kind("plugins/demo/README.md", root),
+            None
+        );
+        // docs with an unrecognised second segment yields None.
+        assert_eq!(
+            plugin_subtree_surface_kind("plugins/demo/docs/misc/x.md", root),
+            None
+        );
+    }
+
+    #[test]
+    fn deepest_matching_writable_root_prefers_longest() {
+        let mut roots = BTreeSet::new();
+        roots.insert("plugins/expr".to_string());
+        roots.insert("plugins/expr/evaluator".to_string());
+        assert_eq!(
+            deepest_matching_writable_root("plugins/expr/evaluator/add/Cargo.toml", &roots),
+            Some("plugins/expr/evaluator")
+        );
+        // Exact-equal path matches its root.
+        assert_eq!(
+            deepest_matching_writable_root("plugins/expr", &roots),
+            Some("plugins/expr")
+        );
+        // Non-matching path yields None.
+        assert_eq!(
+            deepest_matching_writable_root("plugins/other/x.rs", &roots),
+            None
+        );
+    }
+
+    #[test]
+    fn reserved_keyword_validation_flags_raw_mod_identifier() {
+        let mut roots = BTreeSet::new();
+        roots.insert("plugins/x".to_string());
+        let manifest = PluginEditOperation {
+            path: "plugins/x/mod/Cargo.toml".to_string(),
+            kind: PluginEditOpKind::CreateFile,
+            expected_old_string: Some(String::new()),
+            expected_sha256: None,
+            new_content: Some("[package]\n".to_string()),
+            pointer: None,
+            dotted_key: None,
+            value: None,
+        };
+        let source = PluginEditOperation {
+            path: "plugins/x/mod/src/core.rs".to_string(),
+            kind: PluginEditOpKind::CreateFile,
+            expected_old_string: Some(String::new()),
+            expected_sha256: None,
+            new_content: Some("let mod = 1;\n".to_string()),
+            pointer: None,
+            dotted_key: None,
+            value: None,
+        };
+        let err = validate_reserved_child_keyword_identifiers(&[manifest.clone(), source], &roots)
+            .expect_err("raw `mod` identifier usage should be rejected");
+        assert!(matches!(err, RuntimeError::LlmResponseInvalid { .. }));
+
+        // A source file that only uses the path component (not a raw
+        // identifier) passes.
+        let ok_source = PluginEditOperation {
+            path: "plugins/x/mod/src/core.rs".to_string(),
+            kind: PluginEditOpKind::CreateFile,
+            expected_old_string: Some(String::new()),
+            expected_sha256: None,
+            new_content: Some("pub struct ModPlugin;\n".to_string()),
+            pointer: None,
+            dotted_key: None,
+            value: None,
+        };
+        validate_reserved_child_keyword_identifiers(&[manifest, ok_source], &roots)
+            .expect("PascalCase usage should be allowed");
+    }
+
+    #[test]
+    fn reserved_keyword_validation_noop_without_reserved_child() {
+        let mut roots = BTreeSet::new();
+        roots.insert("plugins/x".to_string());
+        // Child plugin name is not a reserved keyword → nothing to validate.
+        let manifest = PluginEditOperation {
+            path: "plugins/x/helper/Cargo.toml".to_string(),
+            kind: PluginEditOpKind::CreateFile,
+            expected_old_string: Some(String::new()),
+            expected_sha256: None,
+            new_content: Some("[package]\n".to_string()),
+            pointer: None,
+            dotted_key: None,
+            value: None,
+        };
+        let source = PluginEditOperation {
+            path: "plugins/x/helper/src/core.rs".to_string(),
+            kind: PluginEditOpKind::CreateFile,
+            expected_old_string: Some(String::new()),
+            expected_sha256: None,
+            new_content: Some("let mod = 1;\n".to_string()),
+            pointer: None,
+            dotted_key: None,
+            value: None,
+        };
+        validate_reserved_child_keyword_identifiers(&[manifest, source], &roots)
+            .expect("no reserved child keyword means no restriction");
+    }
+
+    // ---------- apply_operation branch coverage ----------
+
+    #[test]
+    fn apply_replace_exact_success_and_errors() {
+        let abs = Path::new("/tmp/x/lib.rs");
+        let mut o = op(PluginEditOpKind::ReplaceExact);
+        // Missing expected_old_string.
+        assert!(matches!(
+            apply_err("p", &o, abs, Some(b"orig")),
+            RuntimeError::AutoUpdatePatchInvalid { .. }
+        ));
+        // Pattern not found.
+        o.expected_old_string = Some("nope".to_string());
+        assert!(matches!(
+            apply_err("p", &o, abs, Some(b"orig")),
+            RuntimeError::AutoUpdatePatternNotFound { .. }
+        ));
+        // Found but missing new_content.
+        o.expected_old_string = Some("ori".to_string());
+        assert!(matches!(
+            apply_err("p", &o, abs, Some(b"orig")),
+            RuntimeError::AutoUpdatePatchInvalid { .. }
+        ));
+        // Success replaces first occurrence.
+        o.new_content = Some("ORI".to_string());
+        match apply_operation("p", &o, abs, Some(b"orig")).unwrap() {
+            UpdatedFile::Write(bytes) => assert_eq!(bytes, b"ORIg"),
+            UpdatedFile::Delete => panic!("expected write"),
+        }
+    }
+
+    #[test]
+    fn apply_create_file_success_and_errors() {
+        let abs = Path::new("/tmp/x/new.rs");
+        let mut o = op(PluginEditOpKind::CreateFile);
+        // Missing expected_old_string.
+        assert!(matches!(
+            apply_err("p", &o, abs, None),
+            RuntimeError::AutoUpdatePatchInvalid { .. }
+        ));
+        // Target already exists.
+        o.expected_old_string = Some(String::new());
+        assert!(matches!(
+            apply_err("p", &o, abs, Some(b"existing")),
+            RuntimeError::AutoUpdatePatchInvalid { .. }
+        ));
+        // Non-empty expected_old_string.
+        o.expected_old_string = Some("not-empty".to_string());
+        assert!(matches!(
+            apply_err("p", &o, abs, None),
+            RuntimeError::AutoUpdatePatchInvalid { .. }
+        ));
+        // Success writes new_content.
+        o.expected_old_string = Some(String::new());
+        o.new_content = Some("hello".to_string());
+        match apply_operation("p", &o, abs, None).unwrap() {
+            UpdatedFile::Write(bytes) => assert_eq!(bytes, b"hello"),
+            UpdatedFile::Delete => panic!("expected write"),
+        }
+    }
+
+    #[test]
+    fn apply_delete_file_success_and_errors() {
+        let abs = Path::new("/tmp/x/gone.rs");
+        let mut o = op(PluginEditOpKind::DeleteFile);
+        // Missing expected_sha256.
+        assert!(matches!(
+            apply_err("p", &o, abs, Some(b"data")),
+            RuntimeError::AutoUpdatePatchInvalid { .. }
+        ));
+        // Hash mismatch → policy blocked.
+        o.expected_sha256 = Some("deadbeef".to_string());
+        assert!(matches!(
+            apply_err("p", &o, abs, Some(b"data")),
+            RuntimeError::PluginIterationPolicyBlocked { .. }
+        ));
+        // Correct hash but file does not exist.
+        o.expected_sha256 = Some(sha_hex(""));
+        assert!(matches!(
+            apply_err("p", &o, abs, None),
+            RuntimeError::AutoUpdatePatchInvalid { .. }
+        ));
+        // Success.
+        o.expected_sha256 = Some(sha_hex("data"));
+        match apply_operation("p", &o, abs, Some(b"data")).unwrap() {
+            UpdatedFile::Delete => {}
+            UpdatedFile::Write(_) => panic!("expected delete"),
+        }
+    }
+
+    #[test]
+    fn apply_json_set_success_and_errors() {
+        let abs = Path::new("/tmp/x/data.json");
+        let original = "{\"k\":1}";
+        let mut o = op(PluginEditOpKind::JsonSet);
+        // Missing sha.
+        assert!(matches!(
+            apply_err("p", &o, abs, Some(original.as_bytes())),
+            RuntimeError::AutoUpdatePatchInvalid { .. }
+        ));
+        o.expected_sha256 = Some(sha_hex(original));
+        // Missing pointer.
+        assert!(matches!(
+            apply_err("p", &o, abs, Some(original.as_bytes())),
+            RuntimeError::AutoUpdatePatchInvalid { .. }
+        ));
+        o.pointer = Some("/k".to_string());
+        // Missing value.
+        assert!(matches!(
+            apply_err("p", &o, abs, Some(original.as_bytes())),
+            RuntimeError::AutoUpdatePatchInvalid { .. }
+        ));
+        o.value = Some(serde_json::json!(2));
+        // Parse failure on bad JSON (recompute sha for the bad content).
+        let bad = "not json";
+        let mut bad_op = o.clone();
+        bad_op.expected_sha256 = Some(sha_hex(bad));
+        assert!(matches!(
+            apply_err("p", &bad_op, abs, Some(bad.as_bytes())),
+            RuntimeError::AutoUpdatePatchInvalid { .. }
+        ));
+        // Pointer not found.
+        let mut miss = o.clone();
+        miss.pointer = Some("/missing".to_string());
+        assert!(matches!(
+            apply_err("p", &miss, abs, Some(original.as_bytes())),
+            RuntimeError::AutoUpdatePatchInvalid { .. }
+        ));
+        // Success.
+        match apply_operation("p", &o, abs, Some(original.as_bytes())).unwrap() {
+            UpdatedFile::Write(bytes) => {
+                let doc: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(doc["k"], serde_json::json!(2));
+            }
+            UpdatedFile::Delete => panic!("expected write"),
+        }
+    }
+
+    #[test]
+    fn apply_toml_set_success_and_errors() {
+        let abs = Path::new("/tmp/x/conf.toml");
+        let original = "[table]\nk = 1\n";
+        let mut o = op(PluginEditOpKind::TomlSet);
+        // Missing sha.
+        assert!(matches!(
+            apply_err("p", &o, abs, Some(original.as_bytes())),
+            RuntimeError::AutoUpdatePatchInvalid { .. }
+        ));
+        o.expected_sha256 = Some(sha_hex(original));
+        // Missing dotted_key.
+        assert!(matches!(
+            apply_err("p", &o, abs, Some(original.as_bytes())),
+            RuntimeError::AutoUpdatePatchInvalid { .. }
+        ));
+        o.dotted_key = Some("table.k".to_string());
+        // Missing value.
+        assert!(matches!(
+            apply_err("p", &o, abs, Some(original.as_bytes())),
+            RuntimeError::AutoUpdatePatchInvalid { .. }
+        ));
+        o.value = Some(serde_json::json!(2));
+        // Dotted key not found.
+        let mut miss = o.clone();
+        miss.dotted_key = Some("table.missing".to_string());
+        assert!(matches!(
+            apply_err("p", &miss, abs, Some(original.as_bytes())),
+            RuntimeError::AutoUpdatePatchInvalid { .. }
+        ));
+        // Intermediate key not a table.
+        let mut not_table = o.clone();
+        not_table.dotted_key = Some("table.k.deeper".to_string());
+        assert!(matches!(
+            apply_err("p", &not_table, abs, Some(original.as_bytes())),
+            RuntimeError::AutoUpdatePatchInvalid { .. }
+        ));
+        // Success.
+        match apply_operation("p", &o, abs, Some(original.as_bytes())).unwrap() {
+            UpdatedFile::Write(bytes) => {
+                let text = String::from_utf8(bytes).unwrap();
+                assert!(text.contains("k = 2"));
+            }
+            UpdatedFile::Delete => panic!("expected write"),
+        }
+    }
+
+    // ---------- path / hash helpers ----------
+
+    #[test]
+    fn normalize_rel_path_rejects_absolute_and_normalizes() {
+        assert!(matches!(
+            normalize_rel_path("/etc/passwd").unwrap_err(),
+            RuntimeError::AutoUpdateInvalidPath { .. }
+        ));
+        // Current-dir components are stripped.
+        assert_eq!(normalize_rel_path("./a/b.rs").unwrap(), "a/b.rs");
+    }
+
+    #[test]
+    fn file_sha256_matches_manual_hash() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("f.txt");
+        fs::write(&path, "content").unwrap();
+        assert_eq!(file_sha256(&path).unwrap(), sha_hex("content"));
+        // Reading a missing file is an Io error.
+        assert!(matches!(
+            file_sha256(&temp.path().join("missing")).unwrap_err(),
+            RuntimeError::Io { .. }
+        ));
+    }
+
+    #[test]
+    fn resolve_under_workspace_reattaches_missing_tail() {
+        let temp = TempDir::new().unwrap();
+        let existing = temp.path().canonicalize().unwrap();
+        // Non-existent nested tail under an existing dir resolves by
+        // re-attaching the tail to the canonical existing ancestor.
+        let target = temp.path().join("a/b/c.rs");
+        let resolved = resolve_under_workspace(&target).unwrap();
+        assert!(resolved.starts_with(&existing));
+        assert!(resolved.ends_with("a/b/c.rs"));
+    }
+
+    #[test]
+    fn now_ms_is_populated() {
+        assert!(now_ms() > 0);
+    }
+
+    #[test]
+    fn atomic_write_rejects_target_without_filename() {
+        // A root path ("/") has no file_name → error.
+        let err = atomic_write(Path::new("/"), b"x").unwrap_err();
+        assert!(matches!(err, RuntimeError::Io { .. }));
+    }
+
+    #[test]
+    fn execute_rejects_create_over_existing_file() {
+        // Drives apply_operation's CreateFile "already exists" branch through
+        // the real executor, exercising the in-execute error return.
+        let temp = TempDir::new().unwrap();
+        let ws = temp.path();
+        let target = ws.join("plugins/demo/src/lib.rs");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(&target, b"already").unwrap();
+        let mut allowed = BTreeMap::new();
+        allowed.insert("demo".to_string(), "plugins/demo".to_string());
+        let plan = PluginEditPlan {
+            issue_id: "i".to_string(),
+            patch_id: "p".to_string(),
+            summary: "s".to_string(),
+            operations: vec![PluginEditOperation {
+                path: "plugins/demo/src/lib.rs".to_string(),
+                kind: PluginEditOpKind::CreateFile,
+                expected_old_string: Some(String::new()),
+                expected_sha256: None,
+                new_content: Some("new".to_string()),
+                pointer: None,
+                dotted_key: None,
+                value: None,
+            }],
+        };
+        let err = PluginEditExecutor::new(ws)
+            .execute(&PluginIterationPolicy::default(), &allowed, &plan)
+            .expect_err("create over existing file must fail");
+        assert!(matches!(err, RuntimeError::AutoUpdatePatchInvalid { .. }));
+        // Original file is untouched.
+        assert_eq!(fs::read(&target).unwrap(), b"already");
+    }
+
+    #[test]
+    fn execute_deletes_file_with_matching_hash() {
+        let temp = TempDir::new().unwrap();
+        let ws = temp.path();
+        let target = ws.join("plugins/demo/src/old.rs");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(&target, b"payload").unwrap();
+        let mut allowed = BTreeMap::new();
+        allowed.insert("demo".to_string(), "plugins/demo".to_string());
+        let plan = PluginEditPlan {
+            issue_id: "i".to_string(),
+            patch_id: "p".to_string(),
+            summary: "s".to_string(),
+            operations: vec![PluginEditOperation {
+                path: "plugins/demo/src/old.rs".to_string(),
+                kind: PluginEditOpKind::DeleteFile,
+                expected_old_string: None,
+                expected_sha256: Some(sha_hex("payload")),
+                new_content: None,
+                pointer: None,
+                dotted_key: None,
+                value: None,
+            }],
+        };
+        let (result, rollback) = PluginEditExecutor::new(ws)
+            .execute(&PluginIterationPolicy::default(), &allowed, &plan)
+            .expect("delete should succeed");
+        assert!(!target.exists());
+        assert_eq!(result.changed_paths, vec!["plugins/demo/src/old.rs"]);
+        // Rollback recreates the deleted file.
+        rollback.rollback().unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"payload");
+    }
+
+    #[test]
+    fn absorb_rejects_workspace_mismatch() {
+        let a = PluginEditRollback::empty("/ws/a");
+        let mut b = PluginEditRollback::empty("/ws/b");
+        let err = b.absorb(a).expect_err("workspace mismatch must error");
+        assert!(matches!(err, RuntimeError::Invariant { .. }));
+    }
+
+    #[test]
+    fn load_journal_returns_none_when_absent() {
+        let temp = TempDir::new().unwrap();
+        let jp = temp.path().join("absent.json");
+        assert!(PluginEditRollback::load_journal(temp.path(), &jp)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn load_journal_rejects_corrupt_content() {
+        let temp = TempDir::new().unwrap();
+        let jp = temp.path().join("j.json");
+        fs::write(&jp, b"{ not valid json").unwrap();
+        let err = PluginEditRollback::load_journal(temp.path(), &jp).unwrap_err();
+        assert!(matches!(err, RuntimeError::Invariant { .. }));
+        // journal_generation_id tolerates corrupt content and returns None.
+        assert!(PluginEditRollback::journal_generation_id(&jp)
+            .unwrap()
+            .is_none());
+    }
 }
