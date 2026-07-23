@@ -807,8 +807,13 @@ mod tests {
     #[test]
     fn invoke_dylib_missing_entry_symbol_is_io_error() {
         // A valid dylib that lacks the cordis entry symbol -> symbol lookup
-        // fails. Copy a system dylib into the temp tree with a .dylib name.
-        let sys = Path::new("/usr/lib/libz.1.2.12.dylib");
+        // fails. Copy a real system dylib into the temp tree with a .dylib
+        // name. `libgmalloc.dylib` is a genuine on-disk file (unlike e.g.
+        // `libz.1.2.12.dylib`, a symlink whose target lives only in the dyld
+        // shared cache), so `Path::exists()` is true and `Library::new`
+        // succeeds — actually exercising the symbol-lookup-failure branch
+        // rather than skipping. If it is ever absent, fall back to a skip.
+        let sys = Path::new("/usr/lib/libgmalloc.dylib");
         if !sys.exists() {
             eprintln!("skipping: {} not present", sys.display());
             return;
@@ -831,6 +836,212 @@ mod tests {
             }
             other => panic!("expected Io symbol failure, got {other:?}"),
         }
+    }
+
+    // ── invoke_dylib fingerprint-parse + handle-panic branches ────────────
+    //
+    // These branches are unreachable through a *real* plugin dylib in a unit
+    // test: a panic raised inside a separately-compiled dylib links that
+    // dylib's own panic runtime, so it cannot unwind back across the C-ABI
+    // boundary — modern rustc aborts the process ("Rust cannot catch foreign
+    // exceptions") before `catch_unwind` on the host side sees anything.
+    //
+    // We therefore drive the private `invoke_dylib` directly: pre-populate a
+    // `CatalogPlugin.library` with a `LoadedDylib` whose `api_ptr` points at
+    // an in-test `static RustPluginApiV2`. The function pointers then live in
+    // *this* binary, so a panic is caught by the host `catch_unwind` exactly
+    // as it would be for a same-toolchain dylib. A real, on-disk
+    // `libgmalloc.dylib` is kept mapped in the `library` field to satisfy the
+    // "keep the module alive" invariant the struct documents.
+
+    fn fp_current_build() -> PluginResponse {
+        // Serializes to a value that DOES parse as AbiFingerprint.
+        PluginResponse {
+            payload: serde_json::to_string(&AbiFingerprint::current_build("crate_x", "api_v2"))
+                .unwrap(),
+        }
+    }
+    fn fp_not_json() -> PluginResponse {
+        PluginResponse {
+            payload: "<<not valid json>>".to_string(),
+        }
+    }
+    fn dummy_docs() -> PluginResponse {
+        PluginResponse {
+            payload: "{}".to_string(),
+        }
+    }
+    fn handle_ok(req: PluginRequest) -> PluginResponse {
+        PluginResponse {
+            payload: format!("echo:{}", req.payload),
+        }
+    }
+    fn handle_panic_str(_req: PluginRequest) -> PluginResponse {
+        panic!("boom static str");
+    }
+    fn handle_panic_string(_req: PluginRequest) -> PluginResponse {
+        std::panic::panic_any(String::from("boom owned string"));
+    }
+    fn handle_panic_other(_req: PluginRequest) -> PluginResponse {
+        std::panic::panic_any(42_u64);
+    }
+
+    static API_OK: RustPluginApiV2 = RustPluginApiV2 {
+        abi_kind: cordis_plugin_sdk::DylibAbiKind::Rust,
+        abi_fingerprint: fp_current_build,
+        docs: dummy_docs,
+        handle: handle_ok,
+    };
+    static API_FP_NOT_JSON: RustPluginApiV2 = RustPluginApiV2 {
+        abi_kind: cordis_plugin_sdk::DylibAbiKind::Rust,
+        abi_fingerprint: fp_not_json,
+        docs: dummy_docs,
+        handle: handle_ok,
+    };
+    static API_PANIC_STR: RustPluginApiV2 = RustPluginApiV2 {
+        abi_kind: cordis_plugin_sdk::DylibAbiKind::Rust,
+        abi_fingerprint: fp_current_build,
+        docs: dummy_docs,
+        handle: handle_panic_str,
+    };
+    static API_PANIC_STRING: RustPluginApiV2 = RustPluginApiV2 {
+        abi_kind: cordis_plugin_sdk::DylibAbiKind::Rust,
+        abi_fingerprint: fp_current_build,
+        docs: dummy_docs,
+        handle: handle_panic_string,
+    };
+    static API_PANIC_OTHER: RustPluginApiV2 = RustPluginApiV2 {
+        abi_kind: cordis_plugin_sdk::DylibAbiKind::Rust,
+        abi_fingerprint: fp_current_build,
+        docs: dummy_docs,
+        handle: handle_panic_other,
+    };
+
+    /// A real on-disk dylib to keep mapped inside the synthetic `LoadedDylib`.
+    /// `libgmalloc.dylib` is a genuine file (see the missing-symbol test).
+    fn live_gmalloc_or_skip() -> Option<Library> {
+        let sys = Path::new("/usr/lib/libgmalloc.dylib");
+        if !sys.exists() {
+            eprintln!("skipping: {} not present", sys.display());
+            return None;
+        }
+        Some(unsafe { Library::new(sys) }.expect("load libgmalloc"))
+    }
+
+    /// Build a `CatalogPlugin` whose `library` slot is pre-loaded with a
+    /// `LoadedDylib` pointing at `api` (an in-test static), so `invoke_dylib`
+    /// skips `Library::new`/symbol-lookup and runs the fingerprint + handle
+    /// tail against our synthetic function table.
+    fn plugin_with_static_api(
+        api: &'static RustPluginApiV2,
+        expected_abi_fingerprint: Option<AbiFingerprint>,
+        library: Library,
+    ) -> CatalogPlugin {
+        CatalogPlugin {
+            plugin_path: "synthetic".to_string(),
+            docs: serde_json::from_str(&docs_json("synthetic", "n")).unwrap(),
+            // A .dylib extension so `invoke_artifact` routes to `invoke_dylib`.
+            artifact_path: PathBuf::from("/synthetic/plugin.dylib"),
+            execution: None,
+            expected_abi_fingerprint,
+            library: Arc::new(Mutex::new(Some(LoadedDylib {
+                library,
+                api_ptr: api as *const RustPluginApiV2,
+                fingerprint_verified: false,
+            }))),
+        }
+    }
+
+    #[test]
+    fn invoke_dylib_fingerprint_not_parseable_is_invocation_failed() {
+        let Some(lib) = live_gmalloc_or_skip() else {
+            return;
+        };
+        // expected fingerprint present -> verification runs -> abi_fingerprint
+        // returns non-JSON -> serde parse fails -> PluginInvocationFailed.
+        let expected = AbiFingerprint::current_build("crate_x", "api_v2");
+        let plugin = plugin_with_static_api(&API_FP_NOT_JSON, Some(expected), lib);
+        let err = invoke_dylib(&plugin, "{}".to_string()).unwrap_err();
+        match err {
+            PluginHostError::PluginInvocationFailed {
+                plugin_path,
+                message,
+            } => {
+                assert_eq!(plugin_path, "synthetic");
+                assert!(
+                    message.contains("abi_fingerprint response was not parseable"),
+                    "{message}"
+                );
+            }
+            other => panic!("expected PluginInvocationFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn invoke_dylib_handle_panic_static_str_is_isolated() {
+        let Some(lib) = live_gmalloc_or_skip() else {
+            return;
+        };
+        // No expected fingerprint -> verification skipped -> straight to
+        // handle, which panics with a &'static str payload.
+        let plugin = plugin_with_static_api(&API_PANIC_STR, None, lib);
+        let err = invoke_dylib(&plugin, "{}".to_string()).unwrap_err();
+        match err {
+            PluginHostError::PluginInvocationFailed { message, .. } => {
+                assert!(message.contains("plugin handle panicked"), "{message}");
+                assert!(message.contains("boom static str"), "{message}");
+            }
+            other => panic!("expected PluginInvocationFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn invoke_dylib_handle_panic_owned_string_is_isolated() {
+        let Some(lib) = live_gmalloc_or_skip() else {
+            return;
+        };
+        let plugin = plugin_with_static_api(&API_PANIC_STRING, None, lib);
+        let err = invoke_dylib(&plugin, "{}".to_string()).unwrap_err();
+        match err {
+            PluginHostError::PluginInvocationFailed { message, .. } => {
+                assert!(message.contains("boom owned string"), "{message}");
+            }
+            other => panic!("expected PluginInvocationFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn invoke_dylib_handle_panic_non_string_payload_is_isolated() {
+        let Some(lib) = live_gmalloc_or_skip() else {
+            return;
+        };
+        // u64 payload -> neither &str nor String downcast matches -> the
+        // "<non-string panic payload>" fallback arm.
+        let plugin = plugin_with_static_api(&API_PANIC_OTHER, None, lib);
+        let err = invoke_dylib(&plugin, "{}".to_string()).unwrap_err();
+        match err {
+            PluginHostError::PluginInvocationFailed { message, .. } => {
+                assert!(message.contains("<non-string panic payload>"), "{message}");
+            }
+            other => panic!("expected PluginInvocationFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn invoke_dylib_static_api_happy_path_marks_verified() {
+        let Some(lib) = live_gmalloc_or_skip() else {
+            return;
+        };
+        // Matching fingerprint -> verification passes and sets
+        // fingerprint_verified; handle returns normally.
+        let expected = AbiFingerprint::current_build("crate_x", "api_v2");
+        let plugin = plugin_with_static_api(&API_OK, Some(expected), lib);
+        let resp = invoke_dylib(&plugin, "ping".to_string()).expect("first invoke ok");
+        assert_eq!(resp.payload, "echo:ping");
+        // Second invoke reuses the already-verified handle (guard is Some,
+        // fingerprint_verified now true).
+        let resp2 = invoke_dylib(&plugin, "pong".to_string()).expect("second invoke ok");
+        assert_eq!(resp2.payload, "echo:pong");
     }
 
     // ── process (JSON artifact) execution ─────────────────────────────────
@@ -864,7 +1075,11 @@ mod tests {
                     "plugin_path": "p",
                     "artifact_path": "proc.json",
                     "docs": {},
-                    "execution": {{ "kind": "process", "command": "/usr/bin/false" }}
+                    "execution": {{
+                        "kind": "process",
+                        "command": "/bin/sh",
+                        "args": ["-c", "cat > /dev/null; exit 1"]
+                    }}
                 }}
             ] }}"#,
             docs_json("p", "run")
@@ -951,6 +1166,36 @@ mod tests {
         match err {
             PluginHostError::PluginInvocationFailed { message, .. } => {
                 assert!(message.contains("stdout was not utf-8"), "{message}");
+            }
+            other => panic!("expected PluginInvocationFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn invoke_process_write_stdin_broken_pipe_is_invocation_failed() {
+        // `/usr/bin/true` exits immediately and never reads stdin, closing the
+        // read end of the pipe. Writing a large payload then fails with
+        // BrokenPipe inside `stdin.write_all`, exercising the write-stdin
+        // error branch of `invoke_json_artifact`.
+        let index = format!(
+            r#"{{ "schema_version": 2, "entries": [
+                {{
+                    "plugin_path": "p",
+                    "artifact_path": "proc.json",
+                    "docs": {},
+                    "execution": {{ "kind": "process", "command": "/usr/bin/true" }}
+                }}
+            ] }}"#,
+            docs_json("p", "run")
+        );
+        let (_tmp, catalog) = build_catalog(&index);
+        // A payload far larger than the OS pipe buffer so the write cannot be
+        // fully buffered before the reader exits.
+        let big = "x".repeat(4_000_000);
+        let err = catalog.invoke("p", "run", big).unwrap_err();
+        match err {
+            PluginHostError::PluginInvocationFailed { message, .. } => {
+                assert!(message.contains("write stdin failed"), "{message}");
             }
             other => panic!("expected PluginInvocationFailed, got {other:?}"),
         }

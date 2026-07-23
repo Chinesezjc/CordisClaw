@@ -595,7 +595,11 @@ fn json_artifact_non_zero_exit_reports_stderr() {
     std::fs::write(&artifact, "{}").expect("write artifact stub");
 
     let script = dir.path().join("fail.sh");
-    std::fs::write(&script, "#!/bin/sh\necho 'boom detail' >&2\nexit 3\n").expect("write script");
+    std::fs::write(
+        &script,
+        "#!/bin/sh\ncat > /dev/null\necho 'boom detail' >&2\nexit 3\n",
+    )
+    .expect("write script");
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -678,10 +682,13 @@ fn json_artifact_non_zero_exit_empty_stderr_synthesizes_message() {
         "json/silentfail",
         "n",
         &artifact,
-        // `false` exits 1 with no output on any stream.
+        // 先读完 stdin 再以 1 退出且不输出任何内容：直接用 `false` 的话
+        // 进程不读 stdin 立即退出，runtime 写 payload 收到 EPIPE，错误
+        // 停在 "write stdin failed" 而到不了本用例要覆盖的空 stderr
+        // 合成分支（Linux 上必现）。
         Some(PluginExecution::Process {
-            command: "/usr/bin/false".to_string(),
-            args: vec![],
+            command: "/bin/sh".to_string(),
+            args: vec!["-c".to_string(), "cat > /dev/null; exit 1".to_string()],
         }),
     );
 
@@ -745,6 +752,87 @@ fn json_artifact_non_utf8_stdout_is_rejected() {
         } => {
             assert_eq!(plugin_path, "json/binout");
             assert!(message.contains("not utf-8"), "msg={message}");
+        }
+        other => panic!("wrong variant: {other:?}"),
+    }
+}
+
+// A child that exits WITHOUT reading its stdin, combined with a large payload
+// that overflows the pipe buffer, forces `write_all(payload)` to fail with
+// EPIPE (BrokenPipe) → the "write stdin failed" branch of invoke_json_artifact.
+// The write is retried via a small loop because the child's exit races the
+// first write; a payload far larger than the pipe capacity (64 KiB on Linux,
+// smaller on macOS) makes the broken-pipe outcome deterministic once the child
+// is gone.
+#[test]
+fn json_artifact_stdin_write_failure_is_reported() {
+    use std::io::Write;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let artifact = dir.path().join("plugin.json");
+    std::fs::write(&artifact, "{}").expect("write artifact stub");
+
+    // Child closes stdin immediately (never reads) and exits 0.
+    let script = dir.path().join("noread.sh");
+    std::fs::write(&script, "#!/bin/sh\nexec 0<&-\nexit 0\n").expect("write script");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perm = std::fs::metadata(&script).expect("meta").permissions();
+        perm.set_mode(0o755);
+        std::fs::set_permissions(&script, perm).expect("chmod");
+    }
+
+    // A multi-megabyte JSON payload: far larger than any pipe buffer, so once
+    // the child is gone the runtime's `write_all` cannot complete and returns
+    // BrokenPipe. Kept valid JSON so the earlier payload guards don't trip.
+    let big = format!(r#"{{"blob":"{}"}}"#, "x".repeat(8 * 1024 * 1024));
+
+    let registry = PluginRegistry::default();
+    register_json_plugin(
+        &registry,
+        "json/nostdin",
+        "n",
+        &artifact,
+        Some(PluginExecution::Process {
+            command: script.to_string_lossy().to_string(),
+            args: vec![],
+        }),
+    );
+
+    // Sanity check the local pipe semantics this test relies on: writing a
+    // large buffer to a spawned process that has closed stdin must eventually
+    // error. If this platform buffers the entire payload without error (highly
+    // unlikely at 8 MiB), skip rather than produce a flaky failure.
+    {
+        use std::process::{Command, Stdio};
+        let mut probe = Command::new(&script)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn probe");
+        let _ = probe.wait();
+        let write_errs = probe
+            .stdin
+            .as_mut()
+            .map(|s| s.write_all(big.as_bytes()).is_err())
+            .unwrap_or(true);
+        if !write_errs {
+            eprintln!("[skip] host buffered the full payload; EPIPE not observable");
+            return;
+        }
+    }
+
+    let err = invoke_registered_plugin(&registry, "json/nostdin", "n", big)
+        .expect_err("stdin write to a closed pipe must fail");
+    match err {
+        RuntimeError::PluginInvocationFailed {
+            plugin_path,
+            message,
+        } => {
+            assert_eq!(plugin_path, "json/nostdin");
+            assert!(message.contains("write stdin failed"), "msg={message}");
         }
         other => panic!("wrong variant: {other:?}"),
     }
