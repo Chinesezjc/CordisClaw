@@ -1177,6 +1177,19 @@ mod tests {
         }
     }
 
+    /// A service whose `stop()` panics. On the timed-stop path the stop
+    /// thread finishes (panicked) quickly, so `handle.join()` returns `Err`,
+    /// driving the "stop panicked" arm.
+    struct PanicStopService;
+    impl Service for PanicStopService {
+        fn start(&self) -> Result<(), String> {
+            Ok(())
+        }
+        fn stop(&self) -> Result<(), String> {
+            panic!("stop panicked on purpose");
+        }
+    }
+
     fn slot_meta() -> SlotMeta {
         SlotMeta {
             required: false,
@@ -1834,5 +1847,154 @@ mod tests {
         let ca = a.join().unwrap();
         let cb = b.join().unwrap();
         assert!(ca > 0 && cb > 0, "workers should progress, got {ca} / {cb}");
+    }
+
+    // ---------- dispose: Session / Request / Local-hit removal arms ----------
+
+    #[test]
+    fn dispose_session_and_request_scopes_remove() {
+        let mut ctx = RuntimeContext::default();
+        ctx.provide(ContextScope::Session, None, "s", 1u32).unwrap();
+        ctx.provide(ContextScope::Request, None, "r", 2u32).unwrap();
+        // Both scopes dispose successfully (exercises the Session/Request arms).
+        ctx.dispose(ContextScope::Session, None, "s").unwrap();
+        ctx.dispose(ContextScope::Request, None, "r").unwrap();
+        assert!(matches!(
+            ctx.inject::<u32>("p", "s"),
+            Err(RuntimeError::ServiceNotFound { .. })
+        ));
+        assert!(matches!(
+            ctx.inject::<u32>("p", "r"),
+            Err(RuntimeError::ServiceNotFound { .. })
+        ));
+    }
+
+    #[test]
+    fn dispose_local_scope_hit_removes() {
+        let mut ctx = RuntimeContext::default();
+        ctx.ensure_local_scope("pl");
+        ctx.provide(ContextScope::Local, Some("pl"), "x", 5u32)
+            .unwrap();
+        // Local dispose with an existing scope+id hits the map get_mut/remove arm.
+        ctx.dispose(ContextScope::Local, Some("pl"), "x").unwrap();
+        assert!(matches!(
+            ctx.inject::<u32>("pl", "x"),
+            Err(RuntimeError::ServiceNotFound { .. })
+        ));
+        // Disposing a missing id from an existing scope reports ServiceNotFound.
+        let err = ctx
+            .dispose(ContextScope::Local, Some("pl"), "ghost")
+            .unwrap_err();
+        assert!(matches!(err, RuntimeError::ServiceNotFound { .. }));
+    }
+
+    // ---------- put: serialize failure ----------
+
+    #[test]
+    fn put_non_serializable_value_is_context_serialize_error() {
+        let ctx = RuntimeContext::default();
+        // A map with non-string keys cannot serialize to a JSON object; this
+        // drives `to_value` into the error closure (ContextSerialize).
+        let mut bad = std::collections::BTreeMap::new();
+        bad.insert(vec![1u8, 2u8], "v");
+        let err = ctx.put(key("ns", "bad", 1), bad, slot_meta()).unwrap_err();
+        assert!(
+            matches!(err, RuntimeError::ContextSerialize { .. }),
+            "got {err:?}"
+        );
+    }
+
+    // ---------- list_by_ns: overlay add + remove masking ----------
+
+    #[test]
+    fn list_by_ns_reflects_overlay_add_and_removal() {
+        let ctx = RuntimeContext::default();
+        let base = key("ns", "base", 1);
+        ctx.put(base.clone(), serde_json::json!(1), slot_meta())
+            .unwrap();
+        ctx.begin_subgraph("sg").unwrap();
+        // Overlay adds a new key and masks the base key with a removal.
+        let added = key("ns", "added", 1);
+        ctx.put(added.clone(), serde_json::json!(2), slot_meta())
+            .unwrap();
+        ctx.remove(&base).unwrap();
+        let listed = ctx.list_by_ns("ns");
+        assert!(
+            listed.contains(&added),
+            "overlay add must appear: {listed:?}"
+        );
+        assert!(
+            !listed.contains(&base),
+            "overlay removal must mask base: {listed:?}"
+        );
+    }
+
+    // ---------- timed-stop: quick stop that errors / panics ----------
+
+    #[test]
+    fn stop_timed_quick_stop_error_leaves_no_zombie() {
+        // FailStopService::stop returns Err immediately; the stop thread
+        // finishes fast, so join() -> Ok(Err(..)) (the "stop error" arm) and
+        // no zombie is parked.
+        let registry = ServiceRegistry::new();
+        registry
+            .start_service("p", "failstop", Box::new(FailStopService))
+            .unwrap();
+        registry.stop_plugin_services_timed("p");
+        assert_eq!(registry.len(), 0);
+        assert_eq!(registry.zombie_count(), 0);
+    }
+
+    #[test]
+    fn stop_timed_quick_stop_panic_leaves_no_zombie() {
+        // PanicStopService::stop panics; the stop thread finishes (unwound),
+        // so join() -> Err(..) (the "stop panicked" arm) and no zombie is
+        // parked because the handle is finished before the deadline.
+        let registry = ServiceRegistry::new();
+        registry
+            .start_service("p", "panicstop", Box::new(PanicStopService))
+            .unwrap();
+        registry.stop_plugin_services_timed("p");
+        assert_eq!(registry.len(), 0);
+        assert_eq!(registry.zombie_count(), 0);
+    }
+
+    // ---------- kill_zombie_services: recovered-with-error / panicked arms ----
+
+    #[test]
+    fn kill_zombie_recovered_error_and_panic_arms() {
+        let registry = ServiceRegistry::new();
+
+        // A finished handle that returned Err -> "zombie stop error" arm.
+        let errored = std::thread::spawn(|| Err::<(), String>("boom".to_string()));
+        while !errored.is_finished() {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // A finished handle that panicked -> "zombie stop panicked" arm.
+        let panicked = std::thread::spawn(|| -> Result<(), String> {
+            panic!("zombie panic");
+        });
+        while !panicked.is_finished() {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        {
+            let mut z = registry.zombies.lock().unwrap();
+            z.push(ZombieEntry {
+                key: "plug::errored".to_string(),
+                plugin_path: "plug".to_string(),
+                stuck_since: Instant::now(),
+                stop_handle: errored,
+            });
+            z.push(ZombieEntry {
+                key: "plug::panicked".to_string(),
+                plugin_path: "plug".to_string(),
+                stuck_since: Instant::now(),
+                stop_handle: panicked,
+            });
+        }
+        let killed = registry.kill_zombie_services("plug");
+        assert_eq!(killed, 2);
+        assert_eq!(registry.zombie_count(), 0);
     }
 }

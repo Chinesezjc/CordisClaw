@@ -352,4 +352,189 @@ mod tests {
         // /help therefore lists only the builtins.
         assert!(plugin_commands(&host).is_empty());
     }
+
+    /// Read-error branch of `/soul`: a soul_key whose on-disk file is a
+    /// directory makes `FileSoulProvider::get` return a non-NotFound Io
+    /// error, which `soul_text` renders as "读取 soul 失败".
+    #[test]
+    fn dispatch_soul_read_error_is_reported() {
+        let (_t, host) = boot_minimal();
+        let key = "scope_read_err#private";
+        // Place a directory exactly where the provider would read the soul
+        // JSON file, forcing a read I/O error (not NotFound).
+        let souls = host.data_dir().join("souls");
+        std::fs::create_dir_all(&souls).unwrap();
+        std::fs::create_dir_all(
+            souls.join(format!("{}.json", crate::soul::sanitize_soul_key(key))),
+        )
+        .unwrap();
+        match dispatch(&host, &ctx_with_soul(key), "/soul") {
+            CommandOutcome::Reply(text) => {
+                assert!(text.contains("读取 soul 失败"), "text: {text}");
+            }
+            other => panic!("expected Reply, got {other:?}"),
+        }
+    }
+
+    /// Register a synthetic Loaded plugin that declares a `command_name` plus
+    /// a conventional `command_entry` node, backed by a JSON artifact whose
+    /// execution is a stock system binary. This is the only way to exercise
+    /// `plugin_commands` / `dispatch_plugin_command` without an x86_64-linux
+    /// dylib, since no cross-platform fixture ships a `command_entry` node.
+    fn register_command_plugin(
+        host: &RuntimeHost,
+        tmp: &std::path::Path,
+        plugin_path: &str,
+        command_name: &str,
+        command: &str,
+        args: &[&str],
+    ) {
+        use crate::core::models::{ArtifactKind, PluginExecution};
+        use cordis_plugin_sdk::{AbiFingerprint, NodeDoc, NodeType, PluginDocs};
+
+        let artifact = tmp.join(format!("{}.json", command_name.trim().to_lowercase()));
+        std::fs::write(&artifact, "{}").unwrap();
+
+        let docs = PluginDocs {
+            plugin_id: plugin_path.replace('/', "_"),
+            plugin_path: plugin_path.to_string(),
+            plugin_version: "0.1.0".to_string(),
+            abi_version: 2,
+            command_name: Some(command_name.to_string()),
+            nodes: vec![NodeDoc {
+                id: "command_entry".to_string(),
+                summary: "bypass-LLM command entry".to_string(),
+                input_schema: serde_json::json!({"type": "object"}),
+                output_schema: serde_json::json!({"type": "object"}),
+                side_effects: vec![],
+                failure_modes: vec![],
+                node_type: NodeType::Router,
+                agent_accessible: true,
+            }],
+            system_hint: None,
+        };
+
+        host.current_snapshot().plugin_registry().insert_loaded(
+            plugin_path.to_string(),
+            None,
+            true,
+            std::collections::BTreeSet::new(),
+            docs,
+            artifact,
+            ArtifactKind::Json,
+            AbiFingerprint::current_build("crate_cmd_v1", "api_v2"),
+            Some(PluginExecution::Process {
+                command: command.to_string(),
+                args: args.iter().map(|s| s.to_string()).collect(),
+            }),
+        );
+    }
+
+    // Plugin-declared command dispatch: the plugin echoes a JSON body with a
+    // `message` field, and `dispatch_plugin_command` prefers that field.
+    #[test]
+    fn dispatch_plugin_command_prefers_message_field() {
+        let (tmp, host) = boot_minimal();
+        // `printf` writes a fixed JSON payload to stdout regardless of stdin,
+        // giving a deterministic `{"message": ...}` reply.
+        register_command_plugin(
+            &host,
+            tmp.path(),
+            "plugins/echocmd",
+            "Echo",
+            "/usr/bin/printf",
+            &[r#"{"message":"插件已处理"}"#],
+        );
+
+        // The command name is matched case-insensitively (/echo -> "echo").
+        match dispatch(&host, &CommandContext::default(), "/echo hello world") {
+            CommandOutcome::Reply(text) => {
+                assert_eq!(text, "插件已处理", "should surface the message field");
+            }
+            other => panic!("expected Reply, got {other:?}"),
+        }
+
+        // The declared command also appears in /help alongside the builtins.
+        match dispatch(&host, &CommandContext::default(), "/help") {
+            CommandOutcome::Reply(text) => {
+                assert!(
+                    text.contains("/echo"),
+                    "help should list plugin cmd: {text}"
+                );
+                assert!(
+                    text.contains("plugins/echocmd"),
+                    "help should name the plugin path: {text}"
+                );
+            }
+            other => panic!("expected Reply, got {other:?}"),
+        }
+
+        // plugin_commands surfaces exactly the registered command.
+        let cmds = plugin_commands(&host);
+        assert_eq!(
+            cmds,
+            vec![("echo".to_string(), "plugins/echocmd".to_string())]
+        );
+    }
+
+    // When the plugin reply is not a JSON object with a `message` field, the
+    // raw payload is returned verbatim.
+    #[test]
+    fn dispatch_plugin_command_falls_back_to_raw_payload() {
+        let (tmp, host) = boot_minimal();
+        register_command_plugin(
+            &host,
+            tmp.path(),
+            "plugins/rawcmd",
+            "Raw",
+            "/usr/bin/printf",
+            &["just text, not json"],
+        );
+        match dispatch(&host, &CommandContext::default(), "/raw") {
+            CommandOutcome::Reply(text) => {
+                assert_eq!(text, "just text, not json");
+            }
+            other => panic!("expected Reply, got {other:?}"),
+        }
+    }
+
+    // Plugin command whose backing process fails to spawn → the invoke error
+    // is rendered through the "指令执行失败" branch.
+    #[test]
+    fn dispatch_plugin_command_invoke_failure_is_reported() {
+        let (tmp, host) = boot_minimal();
+        register_command_plugin(
+            &host,
+            tmp.path(),
+            "plugins/brokencmd",
+            "Broken",
+            "/nonexistent/binary/xyzzy",
+            &[],
+        );
+        match dispatch(&host, &CommandContext::default(), "/broken") {
+            CommandOutcome::Reply(text) => {
+                assert!(text.contains("指令执行失败"), "text: {text}");
+            }
+            other => panic!("expected Reply, got {other:?}"),
+        }
+    }
+
+    // A plugin that sets an empty/whitespace command_name is skipped by
+    // `plugin_commands` (the `name.trim().is_empty()` guard).
+    #[test]
+    fn plugin_commands_skips_blank_command_name() {
+        let (tmp, host) = boot_minimal();
+        register_command_plugin(
+            &host,
+            tmp.path(),
+            "plugins/blankcmd",
+            "   ",
+            "/usr/bin/printf",
+            &["{}"],
+        );
+        assert!(
+            plugin_commands(&host).is_empty(),
+            "blank command_name must be ignored"
+        );
+    }
 }

@@ -667,6 +667,32 @@ mod load_tests {
         assert!(matches!(err, RuntimeError::ConfigParse { .. }));
     }
 
+    // `plugins` exists but is a FILE, not a directory: the `plugin_dir.exists()`
+    // guard passes, but `fs::read_dir` then fails with a non-parse Io error.
+    #[test]
+    #[serial]
+    fn load_plugins_path_is_file_is_io_error() {
+        let dir = TempDir::new().unwrap();
+        // A regular file named `plugins` where a directory is expected.
+        fs::write(dir.path().join("plugins"), b"not a dir").unwrap();
+        let _g = ConfigDirGuard::set(dir.path());
+        let err = RuntimeConfig::load(dir.path()).unwrap_err();
+        assert!(matches!(err, RuntimeError::Io { .. }), "got {err:?}");
+    }
+
+    // `runtime.yaml` exists but is a DIRECTORY: `read_yaml_file`'s
+    // `read_to_string` fails with a non-parse Io error (exercises the Io
+    // arm rather than ConfigParse).
+    #[test]
+    #[serial]
+    fn load_runtime_yaml_path_is_directory_is_io_error() {
+        let dir = TempDir::new().unwrap();
+        fs::create_dir_all(dir.path().join("runtime.yaml")).unwrap();
+        let _g = ConfigDirGuard::set(dir.path());
+        let err = RuntimeConfig::load(dir.path()).unwrap_err();
+        assert!(matches!(err, RuntimeError::Io { .. }), "got {err:?}");
+    }
+
     // ---------- resolve_snapshot_root ----------
 
     #[test]
