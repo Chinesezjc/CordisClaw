@@ -42,6 +42,12 @@ fn artifacts_dir() -> PathBuf {
         .expect("fixtures/artifacts must exist")
 }
 
+/// prepare-artifacts 按宿主平台命名产物（Linux `time.so` / macOS
+/// `time.dylib`），路径必须用 DLL_SUFFIX 拼接而不能写死。
+fn time_artifact() -> PathBuf {
+    artifacts_dir().join(format!("time{}", std::env::consts::DLL_SUFFIX))
+}
+
 /// Read the real ABI fingerprint and docs a fixture dylib exports, so a
 /// hand-registered `Loaded` entry passes the runtime contract checks.
 fn dylib_fingerprint_and_docs(dylib: &Path) -> (AbiFingerprint, PluginDocs) {
@@ -163,7 +169,7 @@ fn unavailable_plugin_propagates_reason() {
 #[test]
 fn loaded_dylib_missing_node_errors() {
     let registry = PluginRegistry::default();
-    register_loaded_dylib(&registry, "time", &artifacts_dir().join("time.dylib"));
+    register_loaded_dylib(&registry, "time", &time_artifact());
     let err = invoke_registered_plugin(&registry, "time", "no_such_node", "{}".to_string())
         .expect_err("missing node must fail");
     match err {
@@ -183,7 +189,7 @@ fn loaded_dylib_missing_node_errors() {
 #[test]
 fn loaded_dylib_rejects_non_json_payload() {
     let registry = PluginRegistry::default();
-    register_loaded_dylib(&registry, "time", &artifacts_dir().join("time.dylib"));
+    register_loaded_dylib(&registry, "time", &time_artifact());
     let err = invoke_registered_plugin(&registry, "time", "time_now", "not json".to_string())
         .expect_err("malformed payload must fail");
     match err {
@@ -204,7 +210,7 @@ fn loaded_dylib_rejects_non_json_payload() {
 #[test]
 fn loaded_dylib_router_invoke_succeeds() {
     let registry = PluginRegistry::default();
-    register_loaded_dylib(&registry, "time", &artifacts_dir().join("time.dylib"));
+    register_loaded_dylib(&registry, "time", &time_artifact());
 
     let resp = invoke_registered_plugin(&registry, "time", "time_now", "{}".to_string())
         .expect("time_now should invoke");
@@ -225,7 +231,7 @@ fn loaded_dylib_router_invoke_succeeds() {
 #[test]
 fn loaded_dylib_invoke_preserves_explicit_node_id() {
     let registry = PluginRegistry::default();
-    register_loaded_dylib(&registry, "time", &artifacts_dir().join("time.dylib"));
+    register_loaded_dylib(&registry, "time", &time_artifact());
 
     let resp = invoke_registered_plugin(
         &registry,
@@ -247,7 +253,11 @@ fn loaded_dylib_invoke_preserves_explicit_node_id() {
 #[test]
 fn loaded_dylib_task_node_keeps_alive_and_returns() {
     let registry = PluginRegistry::default();
-    register_loaded_dylib(&registry, "vision", &artifacts_dir().join("vision.dylib"));
+    register_loaded_dylib(
+        &registry,
+        "vision",
+        &artifacts_dir().join(format!("vision{}", std::env::consts::DLL_SUFFIX)),
+    );
 
     let resp = invoke_registered_plugin(&registry, "vision", "vision_ocr", "{}".to_string())
         .expect("vision_ocr should return a structured error, not fail the invoke");
@@ -275,7 +285,11 @@ fn unregister_task_library_is_idempotent_noop_for_unknown() {
     // After a real Task invocation the handle exists; dropping it twice is
     // still safe.
     let registry = PluginRegistry::default();
-    register_loaded_dylib(&registry, "vision", &artifacts_dir().join("vision.dylib"));
+    register_loaded_dylib(
+        &registry,
+        "vision",
+        &artifacts_dir().join(format!("vision{}", std::env::consts::DLL_SUFFIX)),
+    );
     let _ = invoke_registered_plugin(&registry, "vision", "vision_ocr", "{}".to_string())
         .expect("task invoke");
     unregister_task_library("vision");
@@ -293,7 +307,7 @@ fn unregister_task_library_is_idempotent_noop_for_unknown() {
 #[test]
 fn fingerprint_mismatch_downgrades_and_errors() {
     let registry = PluginRegistry::default();
-    let artifact = artifacts_dir().join("time.dylib");
+    let artifact = time_artifact();
     let (_real_fp, docs) = dylib_fingerprint_and_docs(&artifact);
     // Register with a deliberately wrong crate_hash.
     let wrong_fp = AbiFingerprint {
@@ -347,7 +361,7 @@ fn fingerprint_mismatch_downgrades_and_errors() {
 #[test]
 fn docs_mismatch_downgrades_to_contract_violation() {
     let registry = PluginRegistry::default();
-    let artifact = artifacts_dir().join("time.dylib");
+    let artifact = time_artifact();
     let (fp, mut docs) = dylib_fingerprint_and_docs(&artifact);
     // Keep node ids intact (so the node-existence guard passes) but perturb a
     // docs field the runtime compares, forcing docs inequality.
@@ -389,7 +403,7 @@ fn unopenable_dylib_downgrades_to_symbol_missing() {
     let registry = PluginRegistry::default();
     // A real JSON file with a .dylib extension: dlopen will fail.
     let bogus = artifacts_dir().join("index.json");
-    let (fp, docs) = dylib_fingerprint_and_docs(&artifacts_dir().join("time.dylib"));
+    let (fp, docs) = dylib_fingerprint_and_docs(&time_artifact());
     registry.insert_loaded(
         "time".to_string(),
         None,
@@ -697,8 +711,11 @@ fn json_artifact_non_utf8_stdout_is_rejected() {
     std::fs::write(&artifact, "{}").expect("write artifact stub");
 
     let script = dir.path().join("binary_out.sh");
-    // Emit a lone 0xFF byte — never valid UTF-8 — then exit 0.
-    std::fs::write(&script, "#!/bin/sh\nprintf '\\377'\n").expect("write script");
+    // 必须先读完 stdin：runtime 会向子进程写 payload，脚本立即退出会让
+    // 该写入收到 EPIPE，错误停在 "write stdin failed" 而到不了 utf-8
+    // 校验分支（Linux 上进程退出快，实测必现）。消费 stdin 后再输出
+    // 一个 0xFF 字节 — 永远不是合法 UTF-8 — 然后以 0 退出。
+    std::fs::write(&script, "#!/bin/sh\ncat > /dev/null\nprintf '\\377'\n").expect("write script");
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
