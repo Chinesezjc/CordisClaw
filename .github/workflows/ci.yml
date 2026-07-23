@@ -41,5 +41,16 @@ jobs:
       - name: build
         run: cargo build --all-targets --locked
 
+      # fixtures/artifacts/ 不入库；host.rs / verifier.rs 的 lib 单测直接
+      # RuntimeHost::boot，不走集成测试 support::fixtures_root() 的
+      # ensure_fixture_artifacts()，所以必须在 test 之前显式预构建。
+      - name: prepare fixture artifacts
+        run: cargo run --locked -p cordis-runtime -- prepare-artifacts fixtures
+
+      # --test-threads=1: host.rs / verifier.rs 等 lib 单测共享
+      # default_snapshot_root(repo fixtures)，boot 时会清理该目录下全部
+      # snapshot-*，并行 boot 会互删对方 in-flight snapshot staging
+      # （已在 x86_64-linux 实测复现 "rename staging -> target failed"）。
+      # 代码级修复（按测试隔离 snapshot root）待办，闭合后可去掉此串行开关。
       - name: test
-        run: cargo test --locked
+        run: cargo test --locked -- --test-threads=1
