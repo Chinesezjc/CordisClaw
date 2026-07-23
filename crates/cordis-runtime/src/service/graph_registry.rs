@@ -278,8 +278,7 @@ fn build_registered_net(
     plugin_registry: &PluginRegistry,
     node_registry: &NodeRegistry,
 ) -> RegisteredNet {
-    let mut meta =
-        BTreeMap::<String, (String, String, Vec<String>, Vec<String>, NodeType)>::new();
+    let mut meta = BTreeMap::<String, (String, String, Vec<String>, Vec<String>, NodeType)>::new();
     let mut producers_by_output = BTreeMap::<String, Vec<String>>::new();
 
     for (_, node) in node_registry.iter() {
@@ -381,16 +380,14 @@ fn build_registered_net(
     let mut nodes = meta
         .into_iter()
         .map(
-            |(node_fqn, (plugin_path, node_id, consumes, produces, node_type))| {
-                RegisteredNetNode {
-                    topo_level: levels.get(&node_fqn).copied().unwrap_or(0),
-                    node_fqn,
-                    plugin_path,
-                    node_id,
-                    consumes,
-                    produces,
-                    node_type,
-                }
+            |(node_fqn, (plugin_path, node_id, consumes, produces, node_type))| RegisteredNetNode {
+                topo_level: levels.get(&node_fqn).copied().unwrap_or(0),
+                node_fqn,
+                plugin_path,
+                node_id,
+                consumes,
+                produces,
+                node_type,
             },
         )
         .collect::<Vec<_>>();

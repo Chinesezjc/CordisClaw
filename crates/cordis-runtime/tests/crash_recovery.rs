@@ -60,7 +60,10 @@ fn recovery_restores_edited_file_after_simulated_crash() {
     // Drop `rb` without calling `clear_journal` — the process would
     // have SIGKILL'd here in a real crash.
     drop(rb);
-    assert!(journal_path(&snapshot_root).exists(), "journal survives crash");
+    assert!(
+        journal_path(&snapshot_root).exists(),
+        "journal survives crash"
+    );
 
     // "Boot 2": run recovery. Expected: rollback restores PRE-EDIT bytes,
     // journal file is removed.
@@ -201,9 +204,11 @@ fn stale_marker_does_not_block_a_new_journal() {
         .unwrap();
     fs::write(&target, b"NEW-DIRTY").unwrap();
 
-    let restored =
-        apply_plugin_iteration_journal(&workspace, &snapshot_root, None).unwrap();
-    assert!(restored, "fresh journal must be replayed despite stale marker");
+    let restored = apply_plugin_iteration_journal(&workspace, &snapshot_root, None).unwrap();
+    assert!(
+        restored,
+        "fresh journal must be replayed despite stale marker"
+    );
     assert_eq!(fs::read(&target).unwrap(), b"NEW-PRE");
 }
 
@@ -255,8 +260,7 @@ fn in_memory_rollback_path_applies_when_no_journal() {
     fs::write(&target, b"MUTATED").unwrap();
 
     // No on-disk journal — recovery uses the in-memory rollback.
-    let restored =
-        apply_plugin_iteration_journal(&workspace, &snapshot_root, Some(&rb)).unwrap();
+    let restored = apply_plugin_iteration_journal(&workspace, &snapshot_root, Some(&rb)).unwrap();
     assert!(restored);
     assert_eq!(fs::read(&target).unwrap(), b"ORIG");
     // Nothing to clean up on disk (no journal was ever written).

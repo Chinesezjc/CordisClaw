@@ -78,19 +78,14 @@ pub(crate) fn handler_count_for(plugin_path: &str) -> usize {
 
 /// Send a message to all registered notification handlers.
 pub fn send(host: &RuntimeHost, message: &str) {
-    let handlers = HANDLERS
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .clone();
+    let handlers = HANDLERS.lock().unwrap_or_else(|p| p.into_inner()).clone();
     for (plugin_path, node_id) in &handlers {
         let payload = json!({
             "node_id": node_id,
             "message": message,
         });
         if let Err(e) = host.invoke(plugin_path, node_id, payload.to_string()) {
-            eprintln!(
-                "[notify] {plugin_path}::{node_id} failed: {e}"
-            );
+            eprintln!("[notify] {plugin_path}::{node_id} failed: {e}");
         }
     }
 }

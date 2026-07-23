@@ -220,9 +220,16 @@ impl CommandVerifier {
         // P0-2: at least one stage must have really executed (not Skipped).
         // If every stage was skipped, treat as verifier failure — a plan
         // without any command is a rubber stamp.
-        let any_executed = matches!(static_check.stage.status, VerificationStageStatus::Passed | VerificationStageStatus::Failed)
-            || matches!(tests.stage.status, VerificationStageStatus::Passed | VerificationStageStatus::Failed)
-            || matches!(safety.stage.status, VerificationStageStatus::Passed | VerificationStageStatus::Failed);
+        let any_executed = matches!(
+            static_check.stage.status,
+            VerificationStageStatus::Passed | VerificationStageStatus::Failed
+        ) || matches!(
+            tests.stage.status,
+            VerificationStageStatus::Passed | VerificationStageStatus::Failed
+        ) || matches!(
+            safety.stage.status,
+            VerificationStageStatus::Passed | VerificationStageStatus::Failed
+        );
 
         stages.push(static_check.stage);
         stages.push(tests.stage);
@@ -727,21 +734,24 @@ mod tests {
         .expect("verify should return report");
         // The runner may treat `;` as an argument or fail; the only invariant
         // that matters is that no shell interpreted it.
-        assert!(!marker.exists(), "shell metachars must not spawn a subshell");
+        assert!(
+            !marker.exists(),
+            "shell metachars must not spawn a subshell"
+        );
         let _ = report;
     }
 
     #[test]
     fn shell_command_honors_timeout() {
         let temp = TempDir::new().expect("tempdir");
-        let result = run_shell_command(
-            "sleep 5",
-            temp.path(),
-            Duration::from_millis(200),
-        )
-        .expect("timeout path should not panic");
+        let result = run_shell_command("sleep 5", temp.path(), Duration::from_millis(200))
+            .expect("timeout path should not panic");
         assert!(!result.success);
-        assert!(result.stderr.contains("timed out"), "stderr: {}", result.stderr);
+        assert!(
+            result.stderr.contains("timed out"),
+            "stderr: {}",
+            result.stderr
+        );
     }
 
     #[test]

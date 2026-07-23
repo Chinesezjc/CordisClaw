@@ -110,13 +110,12 @@ impl RuntimeConfig {
         let llm_api_path = config_dir.join("llm_api.yaml");
         if llm_api_path.exists() {
             let raw: serde_yaml::Value = read_yaml_file(&llm_api_path)?;
-            config.llm_profiles =
-                LlmProfileRegistry::from_yaml_value(raw).map_err(|message| {
-                    RuntimeError::ConfigParse {
-                        path: llm_api_path.clone(),
-                        message,
-                    }
-                })?;
+            config.llm_profiles = LlmProfileRegistry::from_yaml_value(raw).map_err(|message| {
+                RuntimeError::ConfigParse {
+                    path: llm_api_path.clone(),
+                    message,
+                }
+            })?;
             config.llm_api = config.llm_profiles.default_profile().api.clone();
         }
 
@@ -285,7 +284,10 @@ impl Default for LlmProfileRegistry {
         let mut profiles = BTreeMap::new();
         profiles.insert(
             "default".to_string(),
-            LlmProfile { api: LlmApiConfig::default(), fallback: None },
+            LlmProfile {
+                api: LlmApiConfig::default(),
+                fallback: None,
+            },
         );
         Self { profiles }
     }
@@ -301,20 +303,31 @@ impl LlmProfileRegistry {
         } else {
             let api = serde_yaml::from_value::<LlmApiConfig>(raw).map_err(|e| e.to_string())?;
             let mut profiles = BTreeMap::new();
-            profiles.insert("default".to_string(), LlmProfile { api, fallback: None });
+            profiles.insert(
+                "default".to_string(),
+                LlmProfile {
+                    api,
+                    fallback: None,
+                },
+            );
             Self { profiles }
         };
         registry
             .profiles
             .entry("default".to_string())
-            .or_insert_with(|| LlmProfile { api: LlmApiConfig::default(), fallback: None });
+            .or_insert_with(|| LlmProfile {
+                api: LlmApiConfig::default(),
+                fallback: None,
+            });
         Ok(registry)
     }
 
     /// Look up a profile by name; unknown or empty names fall back to
     /// `default` (guaranteed present by construction).
     pub fn resolve(&self, name: &str) -> &LlmProfile {
-        self.profiles.get(name).unwrap_or_else(|| self.default_profile())
+        self.profiles
+            .get(name)
+            .unwrap_or_else(|| self.default_profile())
     }
 
     pub fn default_profile(&self) -> &LlmProfile {
@@ -426,7 +439,10 @@ mod llm_profile_tests {
     #[test]
     fn resolve_unknown_falls_back_default() {
         let reg = LlmProfileRegistry::default();
-        assert_eq!(reg.resolve("nonexistent").api.provider, reg.default_profile().api.provider);
+        assert_eq!(
+            reg.resolve("nonexistent").api.provider,
+            reg.default_profile().api.provider
+        );
     }
 
     // profiles 表缺 default 时自动补齐；fallback 指向不存在/自身时失效。
@@ -444,6 +460,10 @@ mod llm_profile_tests {
         )
         .unwrap();
         let reg = LlmProfileRegistry::from_yaml_value(raw).unwrap();
-        assert_eq!(reg.fallback_of("default"), None, "不存在的 fallback 目标无效");
+        assert_eq!(
+            reg.fallback_of("default"),
+            None,
+            "不存在的 fallback 目标无效"
+        );
     }
 }

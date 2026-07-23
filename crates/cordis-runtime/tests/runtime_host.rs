@@ -7,8 +7,8 @@ use cordis_runtime::kernel::plugin_iteration::{
 };
 use cordis_runtime::kernel::verifier::VerificationProfile;
 use cordis_runtime::plugin::tooling::refresh_artifact_index;
-use serial_test::serial;
 use serde_json::{json, Value};
+use serial_test::serial;
 use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::{symlink, PermissionsExt};
@@ -637,7 +637,9 @@ fn runtime_host_reload_removes_plugin_but_old_snapshot_stays_usable() {
         serde_json::to_string_pretty(&value).expect("serialize index"),
     )
     .expect("write updated index");
-    let report = host.reload("/").expect("reload without shell should succeed");
+    let report = host
+        .reload("/")
+        .expect("reload without shell should succeed");
 
     assert!(report
         .removed_plugins
@@ -715,8 +717,8 @@ fn runtime_host_reload_observes_docs_drift_issue() {
         original_summary
     );
     // And the on-disk cache is healed back too.
-    let index_text = fs::read_to_string(temp.path().join("artifacts/index.json"))
-        .expect("read healed index");
+    let index_text =
+        fs::read_to_string(temp.path().join("artifacts/index.json")).expect("read healed index");
     assert!(
         !index_text.contains(tampered_summary),
         "tampered summary must be healed out of index.json"
@@ -1357,10 +1359,7 @@ fn runtime_host_iterate_plugins_agent_adds_dist_child_plugin_and_promotes() {
         .expect("promoted expr plugin should support dist");
     let dist_value: Value =
         serde_json::from_str(&dist_response.payload).expect("dist response json");
-    assert_eq!(
-        dist_value.get("value").and_then(|v| v.as_f64()),
-        Some(4.0)
-    );
+    assert_eq!(dist_value.get("value").and_then(|v| v.as_f64()), Some(4.0));
 }
 
 #[serial]
@@ -2105,13 +2104,25 @@ fn serve_mode_supports_candidate_control_plane() {
     );
 
     let stdout = String::from_utf8(output.stdout).expect("stdout utf-8");
-    assert!(stdout.contains("serve ready snapshot_id="), "stdout: {stdout}");
+    assert!(
+        stdout.contains("serve ready snapshot_id="),
+        "stdout: {stdout}"
+    );
     assert!(stdout.contains("null"), "stdout: {stdout}");
     assert!(stdout.contains("\"status\":\"staged\""), "stdout: {stdout}");
-    assert!(stdout.contains("\"candidate_snapshot_id\""), "stdout: {stdout}");
+    assert!(
+        stdout.contains("\"candidate_snapshot_id\""),
+        "stdout: {stdout}"
+    );
     assert!(stdout.contains("\"value\":5.0"), "stdout: {stdout}");
-    assert!(stdout.contains("\"current_snapshot_id\""), "stdout: {stdout}");
-    assert!(stdout.contains("\"candidate_snapshot\":null"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("\"current_snapshot_id\""),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("\"candidate_snapshot\":null"),
+        "stdout: {stdout}"
+    );
 }
 
 // L批: LLM profile fallback 状态机。default 指向死端口 → 自动切 fallback
@@ -2196,7 +2207,10 @@ fn llm_profile_fallback_degrades_and_recovers() {
     let handle = host
         .agent_start_with(
             AgentSessionKind::RuntimeShell,
-            AgentStartOptions { profile: Some("default".to_string()), ..Default::default() },
+            AgentStartOptions {
+                profile: Some("default".to_string()),
+                ..Default::default()
+            },
         )
         .expect("agent start");
     let sid = handle.session_id.as_str();
@@ -2205,7 +2219,11 @@ fn llm_profile_fallback_degrades_and_recovers() {
     let reply = host
         .agent_send_with_fallback(sid, "hello")
         .expect("fallback should rescue the request");
-    assert!(reply.content.contains("served by fast"), "content: {}", reply.content);
+    assert!(
+        reply.content.contains("served by fast"),
+        "content: {}",
+        reply.content
+    );
     let issues = host.kernel().plugin_issues();
     assert!(
         issues.iter().any(|i| i.root_plugin_path == "/llm-profile"
@@ -2258,7 +2276,8 @@ fn soul_roundtrip_profile_reference_and_scope_guard() {
     // agent 工具写路径（merge 语义：先 persona 后 profile 不互相覆盖）。
     host.agent_set_soul(soul_key, Some("你是毒舌但可靠的运维助手"), None)
         .expect("set persona");
-    host.agent_set_soul(soul_key, None, Some("fast")).expect("set profile");
+    host.agent_set_soul(soul_key, None, Some("fast"))
+        .expect("set profile");
     let soul: Soul = host.get_soul(soul_key).expect("get").expect("exists");
     assert_eq!(soul.persona, "你是毒舌但可靠的运维助手");
     assert_eq!(soul.profile.as_deref(), Some("fast"));
@@ -2312,16 +2331,16 @@ fn soul_store_plugin_overrides_file_provider() {
     assert_eq!(soul.persona, "SQLite 里的我");
 
     // 覆写生效的证据：文件 provider 的目录不应有这个 key 的文件。
-    let file_path = temp
-        .path()
-        .join("data/souls")
-        .join("qq_789#group.json");
+    let file_path = temp.path().join("data/souls").join("qq_789#group.json");
     assert!(
         !file_path.exists(),
         "soul must live in souls.db, not {}",
         file_path.display()
     );
-    assert!(temp.path().join("data/souls.db").exists(), "souls.db should exist");
+    assert!(
+        temp.path().join("data/souls.db").exists(),
+        "souls.db should exist"
+    );
 }
 
 // H1: 群聊 soul 错位修复。session 的 soul_key 由 inbox 随最近发言者刷新
@@ -2433,17 +2452,11 @@ fn drop_session_evicts_memory_and_disk() {
     let host = RuntimeHost::boot(&fixtures).expect("host should boot");
 
     let s1 = host
-        .agent_start_with(
-            AgentSessionKind::RuntimeShell,
-            AgentStartOptions::default(),
-        )
+        .agent_start_with(AgentSessionKind::RuntimeShell, AgentStartOptions::default())
         .expect("start s1")
         .session_id;
     let s2 = host
-        .agent_start_with(
-            AgentSessionKind::RuntimeShell,
-            AgentStartOptions::default(),
-        )
+        .agent_start_with(AgentSessionKind::RuntimeShell, AgentStartOptions::default())
         .expect("start s2")
         .session_id;
 
@@ -2460,10 +2473,7 @@ fn drop_session_evicts_memory_and_disk() {
         "two live sessions across the tracked maps"
     );
 
-    let s1_snapshot = temp
-        .path()
-        .join("data/sessions")
-        .join(format!("{s1}.json"));
+    let s1_snapshot = temp.path().join("data/sessions").join(format!("{s1}.json"));
     assert!(s1_snapshot.exists(), "s1 snapshot should exist after send");
 
     // Drop the first session: memory maps shrink and disk snapshot removed.
@@ -2548,7 +2558,9 @@ fn command_router_dispatch_table() {
         ),
         (
             "/help",
-            Box::new(|t: &str| t.contains("可用指令") && t.contains("/status") && t.contains("/soul")),
+            Box::new(|t: &str| {
+                t.contains("可用指令") && t.contains("/status") && t.contains("/soul")
+            }),
         ),
         (
             "/soul",
@@ -2570,7 +2582,10 @@ fn command_router_dispatch_table() {
 
     // /reset is the one non-Reply outcome.
     assert!(
-        matches!(dispatch(&host, &ctx, "/reset"), CommandOutcome::ResetSession(_)),
+        matches!(
+            dispatch(&host, &ctx, "/reset"),
+            CommandOutcome::ResetSession(_)
+        ),
         "/reset must yield ResetSession"
     );
 

@@ -5,8 +5,9 @@ use crate::agent::{
 use crate::config::{LlmApiConfig, PluginConfigFile, RuntimeConfig};
 use crate::context::RuntimeContext;
 use crate::core::error::RuntimeError;
-use crate::core::models::{AbiFingerprint, GatePolicy, NodeOutcome, PluginDocs, PluginLoadResult, PluginUnavailableReason};
-use cordis_plugin_sdk::NodeType;
+use crate::core::models::{
+    AbiFingerprint, GatePolicy, NodeOutcome, PluginDocs, PluginLoadResult, PluginUnavailableReason,
+};
 use crate::execution::engine::{
     execute_net, ExecutionConfig, ExecutionNetSpec, ExecutionOutput, ExecutionTransitionKind,
     ExecutionTransitionSpec, TransitionRunResult, TriggerInput,
@@ -20,12 +21,11 @@ use crate::kernel::auto_update::{
 use crate::kernel::evaluator::VerificationInput;
 use crate::kernel::memory::{ChangeMemory, ChangeRecord};
 use crate::kernel::plugin_iteration::{
-    validate_reserved_child_keyword_identifiers,
-    file_sha256, normalize_rel_path, now_ms, CanaryReport, CanaryVerdict, KernelPluginIssue,
-    KernelPluginIssueSource, KernelPluginIssueStatus, KernelPluginIterationRequest,
-    PluginEditExecutor, PluginEditOpKind, PluginEditOperation, PluginEditPlan, PluginEditRollback,
-    PluginIterationFinalVerdict, PluginIterationHistoryEntry,
-    PluginIterationPolicy, PluginIterationStatus, VerifierVerdict,
+    file_sha256, normalize_rel_path, now_ms, validate_reserved_child_keyword_identifiers,
+    CanaryReport, CanaryVerdict, KernelPluginIssue, KernelPluginIssueSource,
+    KernelPluginIssueStatus, KernelPluginIterationRequest, PluginEditExecutor, PluginEditOpKind,
+    PluginEditOperation, PluginEditPlan, PluginEditRollback, PluginIterationFinalVerdict,
+    PluginIterationHistoryEntry, PluginIterationPolicy, PluginIterationStatus, VerifierVerdict,
 };
 use crate::kernel::verifier::{
     hash_source_tree, CommandVerifier, VerificationProfile, VerificationReport, VerifyOptions,
@@ -37,6 +37,7 @@ use crate::plugin::registry::{NodeRegistry, PluginRegistry, RegisteredPlugin};
 use crate::plugin::tooling::rebuild_plugin_workspace;
 use crate::service::doc_registry::DocRegistry;
 use crate::service::graph_registry::{GraphRegistry, RegisteredNet, RegisteredNetEdgeKind};
+use cordis_plugin_sdk::NodeType;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -47,7 +48,6 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
-
 
 use toml::Value as TomlValue;
 
@@ -130,7 +130,10 @@ impl RuntimeSnapshot {
         let traces = Mutex::new(BTreeMap::<String, ExecutionInvocationTrace>::new());
         let output = execute_net(
             ExecutionConfig {
-                scheduler: SchedulerConfig { max_parallelism: 1, max_concurrency: 1 },
+                scheduler: SchedulerConfig {
+                    max_parallelism: 1,
+                    max_concurrency: 1,
+                },
                 ..ExecutionConfig::default()
             },
             net,
@@ -886,8 +889,7 @@ impl RuntimeKernel {
                 PluginIterationFinalVerdict::Blocked => {
                     blocked.insert(result.iteration_id.clone(), result.clone());
                 }
-                PluginIterationFinalVerdict::Promoted
-                | PluginIterationFinalVerdict::RolledBack => {
+                PluginIterationFinalVerdict::Promoted | PluginIterationFinalVerdict::RolledBack => {
                     blocked.remove(&result.iteration_id);
                 }
             }
@@ -915,9 +917,9 @@ impl RuntimeKernel {
                 .unwrap_or_else(|poison| poison.into_inner());
             metrics.iteration_total += 1;
         }
-        let result = self.updater.execute(plan, |_| {
-            Ok(VerificationEnvelope::from(verification))
-        })?;
+        let result = self
+            .updater
+            .execute(plan, |_| Ok(VerificationEnvelope::from(verification)))?;
         {
             let mut metrics = self
                 .iteration_metrics
@@ -1052,7 +1054,9 @@ impl crate::soul::SoulProvider for PluginSoulProvider<'_> {
                 "data_dir": self.host.data_dir().display().to_string(),
             },
         });
-        let response = self.host.invoke(&self.plugin_path, "soul_get", payload.to_string())?;
+        let response = self
+            .host
+            .invoke(&self.plugin_path, "soul_get", payload.to_string())?;
         let value: serde_json::Value =
             serde_json::from_str(&response.payload).map_err(|e| RuntimeError::InvalidArgument {
                 message: format!("soul_get reply from {} is not JSON: {e}", self.plugin_path),
@@ -1076,7 +1080,8 @@ impl crate::soul::SoulProvider for PluginSoulProvider<'_> {
                 "data_dir": self.host.data_dir().display().to_string(),
             },
         });
-        self.host.invoke(&self.plugin_path, "soul_set", payload.to_string())?;
+        self.host
+            .invoke(&self.plugin_path, "soul_set", payload.to_string())?;
         Ok(())
     }
 }
@@ -1207,7 +1212,9 @@ impl RuntimeHost {
             for entry in entries.flatten() {
                 let name = entry.file_name();
                 let name_str = name.to_string_lossy();
-                if name_str.starts_with("snapshot-") && entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                if name_str.starts_with("snapshot-")
+                    && entry.file_type().map(|t| t.is_dir()).unwrap_or(false)
+                {
                     let _ = fs::remove_dir_all(entry.path());
                 }
             }
@@ -1239,11 +1246,7 @@ impl RuntimeHost {
         // but before any user request lands. Errors are logged and the
         // orphan journal is left on disk for operator inspection rather than
         // panicking `boot`.
-        match restore_plugin_iteration_workspace(
-            &host.fixtures_root,
-            &host.snapshot_root,
-            None,
-        ) {
+        match restore_plugin_iteration_workspace(&host.fixtures_root, &host.snapshot_root, None) {
             Err(err) => {
                 eprintln!(
                     "[plugin-iteration-recovery] boot-time restore failed: {err}; \
@@ -1259,9 +1262,7 @@ impl RuntimeHost {
                 // restored tree — otherwise docs/nodes from the rolled-back
                 // candidate leak into the recovered snapshot.
                 if let Err(err) = host.reload("/") {
-                    eprintln!(
-                        "[plugin-iteration-recovery] post-restore reload failed: {err}"
-                    );
+                    eprintln!("[plugin-iteration-recovery] post-restore reload failed: {err}");
                 }
             }
             Ok(false) => {}
@@ -1276,35 +1277,46 @@ impl RuntimeHost {
     /// Write a shutdown memory snapshot to data/memory/shutdown.json.
     /// Uses try_lock to avoid deadlocking with active agent sessions.
     pub fn write_shutdown_memory(&self) {
-        let ws_root = self.fixtures_root.parent()
+        let ws_root = self
+            .fixtures_root
+            .parent()
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| self.fixtures_root.clone());
         let path = ws_root.join("data/memory/shutdown.json");
         let _ = std::fs::create_dir_all(path.parent().unwrap());
-        let now = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%z").to_string();
+        let now = chrono::Local::now()
+            .format("%Y-%m-%dT%H:%M:%S%z")
+            .to_string();
         // Use try_lock to avoid deadlocking if an agent session is active.
         let sessions: Vec<serde_json::Value> = self
             .agent_sessions
             .try_lock()
             .map(|guard| {
-                guard.iter().map(|(sid, s)| {
-                    let st = s.session.status();
-                    serde_json::json!({
-                        "session_id": sid,
-                        "kind": st.kind,
-                        "completed_turns": st.completed_turns,
-                        "model": st.model,
+                guard
+                    .iter()
+                    .map(|(sid, s)| {
+                        let st = s.session.status();
+                        serde_json::json!({
+                            "session_id": sid,
+                            "kind": st.kind,
+                            "completed_turns": st.completed_turns,
+                            "model": st.model,
+                        })
                     })
-                }).collect()
+                    .collect()
             })
             .unwrap_or_default();
         let snapshot = self.current_snapshot();
-        let plugins: Vec<serde_json::Value> = snapshot.plugin_registry().iter().map(|(p, pl)| {
-            serde_json::json!({
-                "plugin_path": p,
-                "load_result": format!("{:?}", pl.load_result),
+        let plugins: Vec<serde_json::Value> = snapshot
+            .plugin_registry()
+            .iter()
+            .map(|(p, pl)| {
+                serde_json::json!({
+                    "plugin_path": p,
+                    "load_result": format!("{:?}", pl.load_result),
+                })
             })
-        }).collect();
+            .collect();
         let memory = serde_json::json!({
             "shutdown_at": now,
             "sessions": sessions,
@@ -1334,13 +1346,19 @@ impl RuntimeHost {
         let snapshot = self.current_snapshot();
         for (plugin_path, plugin) in snapshot.plugin_registry().iter() {
             let Some(docs) = &plugin.docs else { continue };
-            if !matches!(plugin.load_result, crate::core::models::PluginLoadResult::Loaded) {
+            if !matches!(
+                plugin.load_result,
+                crate::core::models::PluginLoadResult::Loaded
+            ) {
                 continue;
             }
             let has_get = docs.nodes.iter().any(|n| n.id == "soul_get");
             let has_set = docs.nodes.iter().any(|n| n.id == "soul_set");
             if has_get && has_set {
-                return Box::new(PluginSoulProvider { host: self, plugin_path });
+                return Box::new(PluginSoulProvider {
+                    host: self,
+                    plugin_path,
+                });
             }
         }
         Box::new(crate::soul::FileSoulProvider::new(&self.data_dir()))
@@ -1391,10 +1409,7 @@ impl RuntimeHost {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(
-                &sessions_dir,
-                std::fs::Permissions::from_mode(0o700),
-            );
+            let _ = std::fs::set_permissions(&sessions_dir, std::fs::Permissions::from_mode(0o700));
         }
         let snapshot = session.to_snapshot();
         let json = match serde_json::to_vec(&snapshot) {
@@ -1516,10 +1531,7 @@ impl RuntimeHost {
             let json = match std::fs::read(&path) {
                 Ok(v) => v,
                 Err(e) => {
-                    eprintln!(
-                        "[crash-recovery] read failed for {}: {e}",
-                        path.display()
-                    );
+                    eprintln!("[crash-recovery] read failed for {}: {e}", path.display());
                     skipped += 1;
                     continue;
                 }
@@ -1527,10 +1539,7 @@ impl RuntimeHost {
             let snapshot: AgentSessionSnapshot = match serde_json::from_slice(&json) {
                 Ok(s) => s,
                 Err(e) => {
-                    eprintln!(
-                        "[crash-recovery] parse failed for {}: {e}",
-                        path.display()
-                    );
+                    eprintln!("[crash-recovery] parse failed for {}: {e}", path.display());
                     skipped += 1;
                     continue;
                 }
@@ -1566,7 +1575,10 @@ impl RuntimeHost {
                     // concession, not a correctness gap.
                     ManagedAgentState::RuntimeShell,
                 ),
-                _ => (AgentSessionKind::RuntimeShell, ManagedAgentState::RuntimeShell),
+                _ => (
+                    AgentSessionKind::RuntimeShell,
+                    ManagedAgentState::RuntimeShell,
+                ),
             };
             let handle = AgentSessionHandle {
                 session_id: session_id.clone(),
@@ -1586,9 +1598,7 @@ impl RuntimeHost {
             recovered += 1;
         }
         if recovered > 0 || skipped > 0 {
-            eprintln!(
-                "[crash-recovery] recovered {recovered} session(s), skipped {skipped}"
-            );
+            eprintln!("[crash-recovery] recovered {recovered} session(s), skipped {skipped}");
         }
     }
 
@@ -1603,9 +1613,7 @@ impl RuntimeHost {
             .start_service(plugin_path, node_id, svc)
     }
 
-    pub(crate) fn interactive_rollback(
-        &self,
-    ) -> std::sync::MutexGuard<'_, PluginEditRollback> {
+    pub(crate) fn interactive_rollback(&self) -> std::sync::MutexGuard<'_, PluginEditRollback> {
         self.interactive_rollback
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
@@ -1613,12 +1621,19 @@ impl RuntimeHost {
 
     /// Resolve a relative path within the fixtures root, rejecting traversal
     /// attempts (absolute paths, `..` components) and symlink escapes.
-    pub fn check_agent_accessible(&self, plugin_path: &str, node_id: &str) -> Result<(), RuntimeError> {
+    pub fn check_agent_accessible(
+        &self,
+        plugin_path: &str,
+        node_id: &str,
+    ) -> Result<(), RuntimeError> {
         let snapshot = self.current_snapshot();
         let registry = snapshot.plugin_registry();
-        let plugin = registry.get(plugin_path).ok_or_else(|| RuntimeError::PluginNotRegistered {
-            plugin_path: plugin_path.to_string(),
-        })?;
+        let plugin =
+            registry
+                .get(plugin_path)
+                .ok_or_else(|| RuntimeError::PluginNotRegistered {
+                    plugin_path: plugin_path.to_string(),
+                })?;
         if let Some(docs) = &plugin.docs {
             if let Some(node) = docs.nodes.iter().find(|n| n.id == node_id) {
                 if node.agent_accessible {
@@ -1633,10 +1648,25 @@ impl RuntimeHost {
 
     pub fn check_sensitive_path(&self, path: &str) -> Result<(), RuntimeError> {
         let lower = path.to_lowercase();
-        for kw in &[".ssh", ".claude", "auth.json", "credentials", ".env",
-                    "id_rsa", "id_ed25519", "id_ecdsa", "known_hosts",
-                    "access_token", "api_key", "api_secret", "private_key",
-                    "/etc/passwd", "/etc/shadow", "/proc/", "/sys/"] {
+        for kw in &[
+            ".ssh",
+            ".claude",
+            "auth.json",
+            "credentials",
+            ".env",
+            "id_rsa",
+            "id_ed25519",
+            "id_ecdsa",
+            "known_hosts",
+            "access_token",
+            "api_key",
+            "api_secret",
+            "private_key",
+            "/etc/passwd",
+            "/etc/shadow",
+            "/proc/",
+            "/sys/",
+        ] {
             if lower.contains(kw) {
                 return Err(RuntimeError::InvalidArgument {
                     message: format!("blocked: path references sensitive resource ({kw})"),
@@ -1648,9 +1678,23 @@ impl RuntimeHost {
 
     pub fn check_sensitive_command(&self, command: &str) -> Result<(), RuntimeError> {
         let lower = command.to_lowercase();
-        for kw in &["ssh", "scp", "ssh-keygen", "cat /etc/passwd", "cat /etc/shadow",
-                    ".ssh/id", ".claude/", "auth.json", "token", "password",
-                    "secret", "credential", "export ", "unset ", "declare -"] {
+        for kw in &[
+            "ssh",
+            "scp",
+            "ssh-keygen",
+            "cat /etc/passwd",
+            "cat /etc/shadow",
+            ".ssh/id",
+            ".claude/",
+            "auth.json",
+            "token",
+            "password",
+            "secret",
+            "credential",
+            "export ",
+            "unset ",
+            "declare -",
+        ] {
             if lower.contains(kw) {
                 return Err(RuntimeError::InvalidArgument {
                     message: format!("blocked: command references sensitive operation ({kw})"),
@@ -1678,7 +1722,9 @@ impl RuntimeHost {
         // Paths under data/ resolve against the workspace root (parent of
         // fixtures/) so the agent can persist data outside the sandbox.
         let (base_root, canonical_root) = if rel.starts_with("data/") || rel == "data" {
-            let ws = self.fixtures_root.parent()
+            let ws = self
+                .fixtures_root
+                .parent()
                 .map(|p| p.to_path_buf())
                 .unwrap_or_else(|| self.fixtures_root.clone());
             let canon = ws.canonicalize().unwrap_or_else(|_| ws.clone());
@@ -1806,7 +1852,11 @@ impl RuntimeHost {
             .clone()
     }
 
-    pub fn create_plugin(&self, name: &str, description: Option<&str>) -> Result<Value, RuntimeError> {
+    pub fn create_plugin(
+        &self,
+        name: &str,
+        description: Option<&str>,
+    ) -> Result<Value, RuntimeError> {
         // Validate name
         if name.is_empty() {
             return Err(RuntimeError::InvalidArgument {
@@ -1962,12 +2012,11 @@ export_plugin_api! {{
         let workspace_manifest = self.fixtures_root.join("plugins").join("Cargo.toml");
         let lock_path = workspace_manifest.with_extension("toml.create-lock");
         let _lock = workspace_manifest_lock::acquire(&lock_path);
-        let manifest_text = std::fs::read_to_string(&workspace_manifest).map_err(|e| {
-            RuntimeError::Io {
+        let manifest_text =
+            std::fs::read_to_string(&workspace_manifest).map_err(|e| RuntimeError::Io {
                 path: workspace_manifest.clone(),
                 message: format!("failed to read workspace manifest: {e}"),
-            }
-        })?;
+            })?;
         let mut document: TomlValue =
             toml::from_str(&manifest_text).map_err(|e| RuntimeError::InvalidArgument {
                 message: format!("failed to parse workspace manifest: {e}"),
@@ -2039,7 +2088,10 @@ export_plugin_api! {{
             .unwrap_or_else(|poison| poison.into_inner())
             .insert(
                 handle.session_id.clone(),
-                ProfileFallbackEntry { desired: profile_name.to_string(), degraded: false },
+                ProfileFallbackEntry {
+                    desired: profile_name.to_string(),
+                    degraded: false,
+                },
             );
         self.agent_sessions
             .lock()
@@ -2201,9 +2253,12 @@ export_plugin_api! {{
             .agent_sessions
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        let managed = guard.get_mut(session_id).ok_or_else(|| {
-            RuntimeError::AgentSessionNotFound { session_id: session_id.to_string() }
-        })?;
+        let managed =
+            guard
+                .get_mut(session_id)
+                .ok_or_else(|| RuntimeError::AgentSessionNotFound {
+                    session_id: session_id.to_string(),
+                })?;
         managed.session.swap_config(api)
     }
 
@@ -2220,9 +2275,12 @@ export_plugin_api! {{
             .agent_sessions
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        let managed = guard.get_mut(session_id).ok_or_else(|| {
-            RuntimeError::AgentSessionNotFound { session_id: session_id.to_string() }
-        })?;
+        let managed =
+            guard
+                .get_mut(session_id)
+                .ok_or_else(|| RuntimeError::AgentSessionNotFound {
+                    session_id: session_id.to_string(),
+                })?;
         managed.session.set_soul_key(soul_key.to_string());
         Ok(())
     }
@@ -2272,12 +2330,15 @@ export_plugin_api! {{
             .agent_sessions
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        let session = guard
-            .get_mut(session_id)
-            .ok_or_else(|| RuntimeError::AgentSessionNotFound {
-                session_id: session_id.to_string(),
-            })?;
-        session.session.inject_exchange(user_input, assistant_output);
+        let session =
+            guard
+                .get_mut(session_id)
+                .ok_or_else(|| RuntimeError::AgentSessionNotFound {
+                    session_id: session_id.to_string(),
+                })?;
+        session
+            .session
+            .inject_exchange(user_input, assistant_output);
         Ok(())
     }
 
@@ -2599,11 +2660,10 @@ export_plugin_api! {{
 
         let artifacts_dir = self.fixtures_root().join("artifacts");
         let index_path = artifacts_dir.join("index.json");
-        let index = crate::plugin::artifact::load_artifact_index(&index_path)
-            .map_err(|e| {
-                let attempt = self.make_failed_attempt(&previous_snapshot, started_at, &e);
-                (e, Box::new(attempt))
-            })?;
+        let index = crate::plugin::artifact::load_artifact_index(&index_path).map_err(|e| {
+            let attempt = self.make_failed_attempt(&previous_snapshot, started_at, &e);
+            (e, Box::new(attempt))
+        })?;
         let index_map = crate::plugin::artifact::artifact_index_map(&index);
 
         // Stop background services + Task node threads before .so is dlclose'd.
@@ -2682,11 +2742,10 @@ export_plugin_api! {{
 
             let resolved =
                 crate::plugin::artifact::resolve_artifact_path(&index_path, &entry.artifact_path);
-            let dylib =
-                crate::plugin::dynamic::LoadedDylibApi::open(&resolved).map_err(|e| {
-                    let attempt = self.make_failed_attempt(&previous_snapshot, started_at, &e);
-                    (e, Box::new(attempt))
-                })?;
+            let dylib = crate::plugin::dynamic::LoadedDylibApi::open(&resolved).map_err(|e| {
+                let attempt = self.make_failed_attempt(&previous_snapshot, started_at, &e);
+                (e, Box::new(attempt))
+            })?;
             let api = dylib.api();
 
             // Strict docs comparison.
@@ -2761,11 +2820,7 @@ export_plugin_api! {{
                 .stop_plugin_services_timed(&p.plugin_path);
         }
         for p in &prepared {
-            registry.reload_plugin_entry(
-                &p.plugin_path,
-                p.docs.clone(),
-                p.abi_fingerprint.clone(),
-            );
+            registry.reload_plugin_entry(&p.plugin_path, p.docs.clone(), p.abi_fingerprint.clone());
             changed_plugins.push(p.plugin_path.clone());
             changed_reasons.insert(p.plugin_path.clone(), vec!["subtree reload".to_string()]);
             eprintln!("reload_subtree: reloaded {}", p.plugin_path);
@@ -3038,154 +3093,180 @@ export_plugin_api! {{
         // Wrap the entire iteration body in a panic guard: if any step panics
         // (e.g. inside the agent loop, rebuild, or verification), we catch it
         // and perform emergency rollback instead of crashing the server.
-        let result: std::thread::Result<
-            Result<KernelPluginIterationResult, RuntimeError>,
-        > = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let mut state = PluginIterationRunState::new(prepared.clone());
+        let result: std::thread::Result<Result<KernelPluginIterationResult, RuntimeError>> =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut state = PluginIterationRunState::new(prepared.clone());
 
-            // Step 1: Run the agent loop — the agent freely decides what to do.
-            match self.run_plugin_iteration_agent(&state.prepared) {
-                Ok(agent) => {
-                    state.agent_session_id = agent.session_id;
-                    state.tool_execution_summary = agent.tool_summary;
-                    state.derived_edit_plan = Some(agent.snapshot.derived_edit_plan.clone());
-                    state.transcript_excerpt = agent.transcript_excerpt;
-                    state.rollback = Some(agent.snapshot.rollback);
-                    state.changed_paths = agent.snapshot.changed_paths;
-                    state.diff_lines = agent.snapshot.derived_edit_plan.diff_lines();
-                    state.tests_command = agent.snapshot.tests_command;
-                    state.safety_command = agent.snapshot.safety_command;
-                    if agent.snapshot.recorded_summary.is_none() {
-                        let err_msg = format!(
+                // Step 1: Run the agent loop — the agent freely decides what to do.
+                match self.run_plugin_iteration_agent(&state.prepared) {
+                    Ok(agent) => {
+                        state.agent_session_id = agent.session_id;
+                        state.tool_execution_summary = agent.tool_summary;
+                        state.derived_edit_plan = Some(agent.snapshot.derived_edit_plan.clone());
+                        state.transcript_excerpt = agent.transcript_excerpt;
+                        state.rollback = Some(agent.snapshot.rollback);
+                        state.changed_paths = agent.snapshot.changed_paths;
+                        state.diff_lines = agent.snapshot.derived_edit_plan.diff_lines();
+                        state.tests_command = agent.snapshot.tests_command;
+                        state.safety_command = agent.snapshot.safety_command;
+                        if agent.snapshot.recorded_summary.is_none() {
+                            let err_msg = format!(
                             "plugin iteration agent session {} exited without calling record_iteration_summary",
                             state.agent_session_id.as_deref().unwrap_or("unknown-session")
                         );
-                        self.observe_plugin_iteration_failure(&state.prepared, "agent", &RuntimeError::LlmResponseInvalid { message: err_msg.clone() });
-                        state.stage_error = Some(err_msg);
+                            self.observe_plugin_iteration_failure(
+                                &state.prepared,
+                                "agent",
+                                &RuntimeError::LlmResponseInvalid {
+                                    message: err_msg.clone(),
+                                },
+                            );
+                            state.stage_error = Some(err_msg);
+                        }
+                    }
+                    Err(err) => {
+                        self.observe_plugin_iteration_failure(&state.prepared, "agent", &err);
+                        state.stage_error = Some(err.to_string());
                     }
                 }
-                Err(err) => {
-                    self.observe_plugin_iteration_failure(&state.prepared, "agent", &err);
-                    state.stage_error = Some(err.to_string());
-                }
-            }
 
-            // Step 2: Persist the rollback journal.
-            if state.stage_error.is_none() {
-                match state.rollback.as_ref() {
-                    Some(rollback) => {
-                        if let Err(err) = rollback.persist_journal(
-                            &plugin_iteration_journal_path(&self.snapshot_root),
-                            &state.prepared.iteration_id,
-                        ) {
+                // Step 2: Persist the rollback journal.
+                if state.stage_error.is_none() {
+                    match state.rollback.as_ref() {
+                        Some(rollback) => {
+                            if let Err(err) = rollback.persist_journal(
+                                &plugin_iteration_journal_path(&self.snapshot_root),
+                                &state.prepared.iteration_id,
+                            ) {
+                                self.observe_plugin_iteration_failure(
+                                    &state.prepared,
+                                    "edit",
+                                    &err,
+                                );
+                                state.stage_error = Some(err.to_string());
+                            }
+                        }
+                        None => {
+                            let err = RuntimeError::Invariant {
+                            message: "plugin iteration rollback journal missing after agent execution".to_string(),
+                        };
                             self.observe_plugin_iteration_failure(&state.prepared, "edit", &err);
                             state.stage_error = Some(err.to_string());
                         }
                     }
-                    None => {
-                        let err = RuntimeError::Invariant {
-                            message: "plugin iteration rollback journal missing after agent execution".to_string(),
-                        };
-                        self.observe_plugin_iteration_failure(&state.prepared, "edit", &err);
-                        state.stage_error = Some(err.to_string());
-                    }
                 }
-            }
 
-            // Step 3: Rebuild the target plugin only — UNLESS the iteration
-            // touched any Cargo.toml. A manifest change is structural: a
-            // scaffolded child plugin (new crate + parent children entry)
-            // exists neither in the cargo build graph of `-p <target>` nor
-            // in artifacts/index.json, so a target-only rebuild would
-            // silently drop it and the subsequent candidate load could
-            // never register it (the `45febba` regression). Manifest-touching
-            // iterations take the full `rebuild_fixture_artifacts` path,
-            // which re-resolves the plugin graph and regenerates the index.
-            if state.stage_error.is_none() {
-                let manifest_changed = state
-                    .changed_paths
-                    .iter()
-                    .any(|path| path.ends_with("Cargo.toml"));
-                let plugin_path = if manifest_changed {
-                    "/".to_string()
-                } else {
-                    format!("/{}", state.prepared.root_plugin_path)
-                };
-                // P0-8: capture the current `.so` before rebuild so rollback
-                // reverts BOTH source and compiled artifact. Otherwise
-                // source-code rollback runs but the new `.so` stays on disk,
-                // producing silent behaviour drift on the next run.
-                if let Some(rollback) = state.rollback.as_mut() {
-                    let artifact_backup = artifact_paths_to_backup(
-                        &self.fixtures_root,
-                        &state.prepared.root_plugin_path,
-                    );
-                    for (rel_path, abs_path) in &artifact_backup {
-                        let original = fs::read(abs_path).ok();
-                        let single =
-                            crate::kernel::plugin_iteration::PluginEditRollback::single_backup(
-                                self.fixtures_root.clone(),
-                                rel_path,
-                                original,
-                            );
-                        if let Err(err) = rollback.absorb(single) {
-                            self.observe_plugin_iteration_failure(&state.prepared, "rebuild", &err);
-                            state.stage_error = Some(err.to_string());
-                            break;
+                // Step 3: Rebuild the target plugin only — UNLESS the iteration
+                // touched any Cargo.toml. A manifest change is structural: a
+                // scaffolded child plugin (new crate + parent children entry)
+                // exists neither in the cargo build graph of `-p <target>` nor
+                // in artifacts/index.json, so a target-only rebuild would
+                // silently drop it and the subsequent candidate load could
+                // never register it (the `45febba` regression). Manifest-touching
+                // iterations take the full `rebuild_fixture_artifacts` path,
+                // which re-resolves the plugin graph and regenerates the index.
+                if state.stage_error.is_none() {
+                    let manifest_changed = state
+                        .changed_paths
+                        .iter()
+                        .any(|path| path.ends_with("Cargo.toml"));
+                    let plugin_path = if manifest_changed {
+                        "/".to_string()
+                    } else {
+                        format!("/{}", state.prepared.root_plugin_path)
+                    };
+                    // P0-8: capture the current `.so` before rebuild so rollback
+                    // reverts BOTH source and compiled artifact. Otherwise
+                    // source-code rollback runs but the new `.so` stays on disk,
+                    // producing silent behaviour drift on the next run.
+                    if let Some(rollback) = state.rollback.as_mut() {
+                        let artifact_backup = artifact_paths_to_backup(
+                            &self.fixtures_root,
+                            &state.prepared.root_plugin_path,
+                        );
+                        for (rel_path, abs_path) in &artifact_backup {
+                            let original = fs::read(abs_path).ok();
+                            let single =
+                                crate::kernel::plugin_iteration::PluginEditRollback::single_backup(
+                                    self.fixtures_root.clone(),
+                                    rel_path,
+                                    original,
+                                );
+                            if let Err(err) = rollback.absorb(single) {
+                                self.observe_plugin_iteration_failure(
+                                    &state.prepared,
+                                    "rebuild",
+                                    &err,
+                                );
+                                state.stage_error = Some(err.to_string());
+                                break;
+                            }
+                        }
+                    }
+                    if state.stage_error.is_none() {
+                        // Re-persist the journal now that artifact backups landed
+                        // in the rollback; otherwise a crash after rebuild would
+                        // leave the artifact rollback-able only in memory.
+                        if let Some(rollback) = state.rollback.as_ref() {
+                            if let Err(err) = rollback.persist_journal(
+                                &plugin_iteration_journal_path(&self.snapshot_root),
+                                &state.prepared.iteration_id,
+                            ) {
+                                self.observe_plugin_iteration_failure(
+                                    &state.prepared,
+                                    "rebuild",
+                                    &err,
+                                );
+                                state.stage_error = Some(err.to_string());
+                            }
+                        }
+                    }
+                    if state.stage_error.is_none() {
+                        match rebuild_plugin_workspace(&self.fixtures_root, &plugin_path) {
+                            Ok(rebuilt) => {
+                                state.rebuilt_artifacts = rebuilt;
+                            }
+                            Err(err) => {
+                                self.observe_plugin_iteration_failure(
+                                    &state.prepared,
+                                    "rebuild",
+                                    &err,
+                                );
+                                state.stage_error = Some(err.to_string());
+                            }
                         }
                     }
                 }
+
+                // Step 4: Stage candidate snapshot.
                 if state.stage_error.is_none() {
-                    // Re-persist the journal now that artifact backups landed
-                    // in the rollback; otherwise a crash after rebuild would
-                    // leave the artifact rollback-able only in memory.
-                    if let Some(rollback) = state.rollback.as_ref() {
-                        if let Err(err) = rollback.persist_journal(
-                            &plugin_iteration_journal_path(&self.snapshot_root),
-                            &state.prepared.iteration_id,
-                        ) {
-                            self.observe_plugin_iteration_failure(&state.prepared, "rebuild", &err);
-                            state.stage_error = Some(err.to_string());
-                        }
-                    }
-                }
-                if state.stage_error.is_none() {
-                    match rebuild_plugin_workspace(&self.fixtures_root, &plugin_path) {
-                        Ok(rebuilt) => {
-                            state.rebuilt_artifacts = rebuilt;
+                    match self.reload_candidate() {
+                        Ok(candidate) => {
+                            state.candidate = Some(candidate);
                         }
                         Err(err) => {
-                            self.observe_plugin_iteration_failure(&state.prepared, "rebuild", &err);
+                            self.observe_plugin_iteration_failure(
+                                &state.prepared,
+                                "stage_candidate",
+                                &err,
+                            );
                             state.stage_error = Some(err.to_string());
                         }
                     }
                 }
-            }
 
-            // Step 4: Stage candidate snapshot.
-            if state.stage_error.is_none() {
-                match self.reload_candidate() {
-                    Ok(candidate) => {
-                        state.candidate = Some(candidate);
-                    }
-                    Err(err) => {
-                        self.observe_plugin_iteration_failure(&state.prepared, "stage_candidate", &err);
-                        state.stage_error = Some(err.to_string());
-                    }
-                }
-            }
-
-            // Step 5: Verify.
-            if state.stage_error.is_none() {
-                match self.verify_plugin_iteration(&state) {
-                    Ok(report) => {
-                        let verdict = if report.input.tests_passed && report.input.safety_checks_passed {
-                            VerifierVerdict::Pass
-                        } else {
-                            VerifierVerdict::Fail
-                        };
-                        if verdict == VerifierVerdict::Fail {
-                            self.kernel.observe_plugin_issue(
+                // Step 5: Verify.
+                if state.stage_error.is_none() {
+                    match self.verify_plugin_iteration(&state) {
+                        Ok(report) => {
+                            let verdict =
+                                if report.input.tests_passed && report.input.safety_checks_passed {
+                                    VerifierVerdict::Pass
+                                } else {
+                                    VerifierVerdict::Fail
+                                };
+                            if verdict == VerifierVerdict::Fail {
+                                self.kernel.observe_plugin_issue(
                                 KernelPluginIssueSource::VerifierFailure,
                                 state.prepared.root_plugin_path.clone(),
                                 format!(
@@ -3195,60 +3276,60 @@ export_plugin_api! {{
                                     report.input.safety_checks_passed,
                                 ),
                             );
+                            }
+                            state.verification = Some(report);
+                            state.verifier_verdict = Some(verdict);
                         }
-                        state.verification = Some(report);
-                        state.verifier_verdict = Some(verdict);
-                    }
-                    Err(err) => {
-                        self.observe_plugin_iteration_failure(&state.prepared, "verify", &err);
-                        state.stage_error = Some(err.to_string());
+                        Err(err) => {
+                            self.observe_plugin_iteration_failure(&state.prepared, "verify", &err);
+                            state.stage_error = Some(err.to_string());
+                        }
                     }
                 }
-            }
 
-            // Step 6: Canary replay.
-            if state.stage_error.is_none() {
-                match self.run_plugin_canary(&state) {
-                    Ok(report) => {
-                        if report.verdict == CanaryVerdict::Fail {
-                            self.kernel.observe_plugin_issue(
-                                KernelPluginIssueSource::CanaryFailure,
-                                state.prepared.root_plugin_path.clone(),
-                                format!(
-                                    "plugin canary failed for {}: {}",
-                                    state.prepared.root_plugin_path, report.message
-                                ),
-                            );
+                // Step 6: Canary replay.
+                if state.stage_error.is_none() {
+                    match self.run_plugin_canary(&state) {
+                        Ok(report) => {
+                            if report.verdict == CanaryVerdict::Fail {
+                                self.kernel.observe_plugin_issue(
+                                    KernelPluginIssueSource::CanaryFailure,
+                                    state.prepared.root_plugin_path.clone(),
+                                    format!(
+                                        "plugin canary failed for {}: {}",
+                                        state.prepared.root_plugin_path, report.message
+                                    ),
+                                );
+                            }
+                            state.canary = Some(report);
                         }
-                        state.canary = Some(report);
-                    }
-                    Err(err) => {
-                        self.observe_plugin_iteration_failure(&state.prepared, "canary", &err);
-                        state.stage_error = Some(err.to_string());
+                        Err(err) => {
+                            self.observe_plugin_iteration_failure(&state.prepared, "canary", &err);
+                            state.stage_error = Some(err.to_string());
+                        }
                     }
                 }
-            }
 
-            // Step 7: Promote or rollback (always runs, even after stage errors).
-            let _final_verdict = self.finalize_plugin_iteration(&mut state)?;
+                // Step 7: Promote or rollback (always runs, even after stage errors).
+                let _final_verdict = self.finalize_plugin_iteration(&mut state)?;
 
-            let net_output = ExecutionOutput {
-                execution_id: format!("plugin-iteration-{iteration_id}"),
-                order: vec![
-                    "plugin_iteration::agent".to_string(),
-                    "plugin_iteration::edit".to_string(),
-                    "plugin_iteration::rebuild".to_string(),
-                    "plugin_iteration::stage_candidate".to_string(),
-                    "plugin_iteration::verify".to_string(),
-                    "plugin_iteration::canary".to_string(),
-                    "plugin_iteration::promote_or_rollback".to_string(),
-                ],
-                outcomes: std::collections::BTreeMap::new(),
-                keyed_outcomes: std::collections::BTreeMap::new(),
-                metrics: crate::execution::engine::ExecutionMetrics::default(),
-            };
-            state.into_result(net_output)
-        }));
+                let net_output = ExecutionOutput {
+                    execution_id: format!("plugin-iteration-{iteration_id}"),
+                    order: vec![
+                        "plugin_iteration::agent".to_string(),
+                        "plugin_iteration::edit".to_string(),
+                        "plugin_iteration::rebuild".to_string(),
+                        "plugin_iteration::stage_candidate".to_string(),
+                        "plugin_iteration::verify".to_string(),
+                        "plugin_iteration::canary".to_string(),
+                        "plugin_iteration::promote_or_rollback".to_string(),
+                    ],
+                    outcomes: std::collections::BTreeMap::new(),
+                    keyed_outcomes: std::collections::BTreeMap::new(),
+                    metrics: crate::execution::engine::ExecutionMetrics::default(),
+                };
+                state.into_result(net_output)
+            }));
 
         self.kernel.finish_plugin_iteration(&iteration_id);
 
@@ -3593,111 +3674,111 @@ export_plugin_api! {{
         let final_verdict = if effective_verifier == VerifierVerdict::Pass
             && canary_verdict == CanaryVerdict::Pass
         {
-                // P2-25: promote failure used to `?` propagate straight
-                // out, leaving the workspace modified with journal on
-                // disk but no rollback trigger (catch_unwind doesn't fire
-                // for normal Err). Now: on promote failure, run rollback
-                // + restore explicitly before propagating the promote
-                // error so the workspace is clean.
-                match self.promote_candidate() {
-                    Ok(_) => PluginIterationFinalVerdict::Promoted,
-                    Err(err) => {
-                        let mut rollback_errors = Vec::new();
-                        if self.candidate_snapshot().is_some() {
-                            if let Err(e) = self.rollback_candidate() {
-                                rollback_errors.push(format!("candidate rollback: {e}"));
-                            }
+            // P2-25: promote failure used to `?` propagate straight
+            // out, leaving the workspace modified with journal on
+            // disk but no rollback trigger (catch_unwind doesn't fire
+            // for normal Err). Now: on promote failure, run rollback
+            // + restore explicitly before propagating the promote
+            // error so the workspace is clean.
+            match self.promote_candidate() {
+                Ok(_) => PluginIterationFinalVerdict::Promoted,
+                Err(err) => {
+                    let mut rollback_errors = Vec::new();
+                    if self.candidate_snapshot().is_some() {
+                        if let Err(e) = self.rollback_candidate() {
+                            rollback_errors.push(format!("candidate rollback: {e}"));
                         }
-                        if let Err(e) = restore_plugin_iteration_workspace(
-                            &self.fixtures_root,
-                            &self.snapshot_root,
-                            state.rollback.as_ref(),
-                        ) {
-                            rollback_errors.push(format!("workspace restore: {e}"));
-                        }
-                        state.blocked_reason = Some(if rollback_errors.is_empty() {
-                            format!("promote failed: {err}")
-                        } else {
-                            format!(
-                                "promote failed: {err}; rollback errors: [{}]",
-                                rollback_errors.join(", ")
-                            )
-                        });
-                        return Err(err);
                     }
-                }
-            } else if effective_verifier == VerifierVerdict::Pass
-                && canary_verdict == CanaryVerdict::Partial
-                && state.prepared.manual_approved
-            {
-                // When the user explicitly approves, allow promotion without canary evidence.
-                // Same rollback-on-promote-failure guard as above.
-                match self.promote_candidate() {
-                    Ok(_) => PluginIterationFinalVerdict::Promoted,
-                    Err(err) => {
-                        let mut rollback_errors = Vec::new();
-                        if self.candidate_snapshot().is_some() {
-                            if let Err(e) = self.rollback_candidate() {
-                                rollback_errors.push(format!("candidate rollback: {e}"));
-                            }
-                        }
-                        if let Err(e) = restore_plugin_iteration_workspace(
-                            &self.fixtures_root,
-                            &self.snapshot_root,
-                            state.rollback.as_ref(),
-                        ) {
-                            rollback_errors.push(format!("workspace restore: {e}"));
-                        }
-                        state.blocked_reason = Some(if rollback_errors.is_empty() {
-                            format!("promote (manual-approved) failed: {err}")
-                        } else {
-                            format!(
-                                "promote (manual-approved) failed: {err}; rollback errors: [{}]",
-                                rollback_errors.join(", ")
-                            )
-                        });
-                        return Err(err);
+                    if let Err(e) = restore_plugin_iteration_workspace(
+                        &self.fixtures_root,
+                        &self.snapshot_root,
+                        state.rollback.as_ref(),
+                    ) {
+                        rollback_errors.push(format!("workspace restore: {e}"));
                     }
+                    state.blocked_reason = Some(if rollback_errors.is_empty() {
+                        format!("promote failed: {err}")
+                    } else {
+                        format!(
+                            "promote failed: {err}; rollback errors: [{}]",
+                            rollback_errors.join(", ")
+                        )
+                    });
+                    return Err(err);
                 }
-            } else if canary_verdict == CanaryVerdict::Partial {
-                // P2-24: `Partial` without manual_approved → Blocked. We
-                // intentionally keep the candidate snapshot alive so the
-                // user can call `approve_blocked_iteration(...)` later;
-                // discarding here would forfeit that path. If a new
-                // `iterate_plugins` runs before approval it will replace
-                // this candidate (see `reload_candidate_internal`), so
-                // long-lived blocked candidates are not a memory leak —
-                // just a UX hazard callers should be aware of.
-                state.blocked_reason = Some(
-                    state
-                        .canary
-                        .as_ref()
-                        .map(|report| report.message.clone())
-                        .unwrap_or_else(|| "canary returned partial".to_string()),
-                );
-                PluginIterationFinalVerdict::Blocked
-            } else {
-                if let Some(reason) = source_drift_reason.as_ref() {
-                    state.blocked_reason = Some(reason.clone());
-                }
-                let mut rollback_errors = Vec::new();
-                if self.candidate_snapshot().is_some() {
-                    if let Err(err) = self.rollback_candidate() {
-                        rollback_errors.push(format!("candidate rollback: {err}"));
+            }
+        } else if effective_verifier == VerifierVerdict::Pass
+            && canary_verdict == CanaryVerdict::Partial
+            && state.prepared.manual_approved
+        {
+            // When the user explicitly approves, allow promotion without canary evidence.
+            // Same rollback-on-promote-failure guard as above.
+            match self.promote_candidate() {
+                Ok(_) => PluginIterationFinalVerdict::Promoted,
+                Err(err) => {
+                    let mut rollback_errors = Vec::new();
+                    if self.candidate_snapshot().is_some() {
+                        if let Err(e) = self.rollback_candidate() {
+                            rollback_errors.push(format!("candidate rollback: {e}"));
+                        }
                     }
+                    if let Err(e) = restore_plugin_iteration_workspace(
+                        &self.fixtures_root,
+                        &self.snapshot_root,
+                        state.rollback.as_ref(),
+                    ) {
+                        rollback_errors.push(format!("workspace restore: {e}"));
+                    }
+                    state.blocked_reason = Some(if rollback_errors.is_empty() {
+                        format!("promote (manual-approved) failed: {err}")
+                    } else {
+                        format!(
+                            "promote (manual-approved) failed: {err}; rollback errors: [{}]",
+                            rollback_errors.join(", ")
+                        )
+                    });
+                    return Err(err);
                 }
-                restore_plugin_iteration_workspace(
-                    &self.fixtures_root,
-                    &self.snapshot_root,
-                    state.rollback.as_ref(),
-                )?;
-                if let Some(first_err) = rollback_errors.into_iter().next() {
-                    state.blocked_reason = Some(format!(
-                        "verdict rollback with partial candidate cleanup error: {first_err}"
-                    ));
+            }
+        } else if canary_verdict == CanaryVerdict::Partial {
+            // P2-24: `Partial` without manual_approved → Blocked. We
+            // intentionally keep the candidate snapshot alive so the
+            // user can call `approve_blocked_iteration(...)` later;
+            // discarding here would forfeit that path. If a new
+            // `iterate_plugins` runs before approval it will replace
+            // this candidate (see `reload_candidate_internal`), so
+            // long-lived blocked candidates are not a memory leak —
+            // just a UX hazard callers should be aware of.
+            state.blocked_reason = Some(
+                state
+                    .canary
+                    .as_ref()
+                    .map(|report| report.message.clone())
+                    .unwrap_or_else(|| "canary returned partial".to_string()),
+            );
+            PluginIterationFinalVerdict::Blocked
+        } else {
+            if let Some(reason) = source_drift_reason.as_ref() {
+                state.blocked_reason = Some(reason.clone());
+            }
+            let mut rollback_errors = Vec::new();
+            if self.candidate_snapshot().is_some() {
+                if let Err(err) = self.rollback_candidate() {
+                    rollback_errors.push(format!("candidate rollback: {err}"));
                 }
-                PluginIterationFinalVerdict::RolledBack
-            };
+            }
+            restore_plugin_iteration_workspace(
+                &self.fixtures_root,
+                &self.snapshot_root,
+                state.rollback.as_ref(),
+            )?;
+            if let Some(first_err) = rollback_errors.into_iter().next() {
+                state.blocked_reason = Some(format!(
+                    "verdict rollback with partial candidate cleanup error: {first_err}"
+                ));
+            }
+            PluginIterationFinalVerdict::RolledBack
+        };
         state.final_verdict = Some(final_verdict);
         Ok(final_verdict)
     }
@@ -3965,8 +4046,10 @@ export_plugin_api! {{
 
     fn reload_candidate_internal(
         &self,
-    ) -> Result<(CandidateSnapshotStatus, ReloadAttemptReport), (RuntimeError, Box<ReloadAttemptReport>)>
-    {
+    ) -> Result<
+        (CandidateSnapshotStatus, ReloadAttemptReport),
+        (RuntimeError, Box<ReloadAttemptReport>),
+    > {
         let previous_snapshot = self.current_snapshot();
         let staged_artifact_root = next_staged_artifact_root(&self.snapshot_root);
         let started_at = Instant::now();
@@ -4719,7 +4802,9 @@ impl<'a> PluginIterationAgentBackend<'a> {
 
 impl<'a> AgentBackend for PluginIterationAgentBackend<'a> {
     type Host = RuntimeHost;
-    fn host(&self) -> &RuntimeHost { self.host }
+    fn host(&self) -> &RuntimeHost {
+        self.host
+    }
     fn system_prompt(&self) -> String {
         format!(
             "You are the Cordis plugin-iteration agent.\n\
@@ -4812,9 +4897,7 @@ Do not attempt to modify runtime crates, repository root manifests, config, .git
                 parameters: json!({"type":"object","properties":{"plugin_path":{"type":"string","description":"\"/\" = all, \"/qq\" = single plugin"}},"required":["plugin_path"],"additionalProperties":false}),
             },
         ];
-        if self.state.verification_successes > 0
-            && self.state.recorded_summary.is_none()
-        {
+        if self.state.verification_successes > 0 && self.state.recorded_summary.is_none() {
             tools.push(AgentToolSpec {
                 name: PLUGIN_AGENT_TOOL_RECORD_ITERATION_SUMMARY,
                 description: "Record the final iteration summary and optional verification commands. This must be your last tool call and ends the iteration session immediately.",
@@ -4933,7 +5016,9 @@ Do not attempt to modify runtime crates, repository root manifests, config, .git
                 let default = if pp_trimmed.is_empty() {
                     "cargo check --quiet --manifest-path plugins/Cargo.toml".to_string()
                 } else {
-                    format!("cargo check --quiet --manifest-path plugins/Cargo.toml -p {pp_trimmed}")
+                    format!(
+                        "cargo check --quiet --manifest-path plugins/Cargo.toml -p {pp_trimmed}"
+                    )
                 };
                 let command = validated_verification_command(
                     normalize_optional_command(args.command),
@@ -4952,8 +5037,9 @@ Do not attempt to modify runtime crates, repository root manifests, config, .git
                     format!("cargo test --quiet --manifest-path plugins/Cargo.toml -p {pp_trimmed}")
                 };
                 let command = validated_verification_command(
-                    normalize_optional_command(args.command)
-                        .or_else(|| normalize_optional_command(self.state.prepared.tests_command.clone())),
+                    normalize_optional_command(args.command).or_else(|| {
+                        normalize_optional_command(self.state.prepared.tests_command.clone())
+                    }),
                     Some(default),
                     "cargo test",
                 )?;
@@ -4962,7 +5048,10 @@ Do not attempt to modify runtime crates, repository root manifests, config, .git
             PLUGIN_AGENT_TOOL_REBUILD_PLUGIN_WORKSPACE => {
                 self.state.verification_attempts += 1;
                 let args: serde_json::Value = arguments;
-                let pp = args.get("plugin_path").and_then(|v| v.as_str()).unwrap_or("/");
+                let pp = args
+                    .get("plugin_path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("/");
                 let rebuilt = rebuild_plugin_workspace(&self.host.fixtures_root, pp)?;
                 Ok(json!({
                     "rebuilt_count": rebuilt.len(),
@@ -5033,7 +5122,12 @@ fn transcript_excerpt(
     transcript: &[AgentTranscriptEntry],
     limit: usize,
 ) -> Vec<AgentTranscriptEntry> {
-    let mut excerpt = transcript.iter().rev().take(limit).cloned().collect::<Vec<_>>();
+    let mut excerpt = transcript
+        .iter()
+        .rev()
+        .take(limit)
+        .cloned()
+        .collect::<Vec<_>>();
     excerpt.reverse();
     excerpt
 }
@@ -5150,11 +5244,12 @@ fn validated_verification_command(
     fallback: Option<String>,
     required_prefix: &str,
 ) -> Result<String, RuntimeError> {
-    let command = explicit
-        .or_else(|| fallback.clone())
-        .ok_or_else(|| RuntimeError::InvalidArgument {
-            message: format!("missing verification command for {required_prefix}"),
-        })?;
+    let command =
+        explicit
+            .or_else(|| fallback.clone())
+            .ok_or_else(|| RuntimeError::InvalidArgument {
+                message: format!("missing verification command for {required_prefix}"),
+            })?;
     let trimmed = command.trim();
     if matches!(
         (required_prefix, trimmed),
@@ -5779,10 +5874,7 @@ fn build_snapshot_with_staged_root(
     Ok(runtime_snapshot_from_output(output, staged_artifact_root))
 }
 
-fn register_builtin_agent_node(
-    plugin_registry: &PluginRegistry,
-    node_registry: &mut NodeRegistry,
-) {
+fn register_builtin_agent_node(plugin_registry: &PluginRegistry, node_registry: &mut NodeRegistry) {
     use crate::core::models::PluginDocs;
     use cordis_plugin_sdk::NodeDoc;
 
@@ -5794,7 +5886,9 @@ fn register_builtin_agent_node(
         command_name: None,
         nodes: vec![NodeDoc {
             id: "agent_router".to_string(),
-            summary: "Kernel agent router — receives messages and routes them through the LLM agent.".to_string(),
+            summary:
+                "Kernel agent router — receives messages and routes them through the LLM agent."
+                    .to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -6328,10 +6422,7 @@ fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let tmp = match path.file_name() {
         Some(name) => {
             let mut owned = name.to_os_string();
-            owned.push(format!(
-                ".cordis-tmp.{}",
-                std::process::id()
-            ));
+            owned.push(format!(".cordis-tmp.{}", std::process::id()));
             path.with_file_name(owned)
         }
         None => {
@@ -6353,7 +6444,10 @@ fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
-fn artifact_paths_to_backup(fixtures_root: &Path, root_plugin_path: &str) -> Vec<(String, PathBuf)> {
+fn artifact_paths_to_backup(
+    fixtures_root: &Path,
+    root_plugin_path: &str,
+) -> Vec<(String, PathBuf)> {
     let name = root_plugin_path.trim_start_matches('/');
     if name.is_empty() {
         return Vec::new();
@@ -6384,11 +6478,8 @@ fn restore_plugin_iteration_workspace(
     // Split into two phases so integration tests can exercise the
     // journal + rollback semantics without needing a real
     // `cargo build`-capable fixtures tree.
-    let restored = apply_plugin_iteration_journal(
-        fixtures_root,
-        snapshot_root,
-        in_memory_rollback,
-    )?;
+    let restored =
+        apply_plugin_iteration_journal(fixtures_root, snapshot_root, in_memory_rollback)?;
     if restored {
         rebuild_plugin_workspace(fixtures_root, "/")?;
     }
@@ -6419,7 +6510,10 @@ pub fn apply_plugin_iteration_journal(
     // this work — replaying it would revert source that has since been
     // legitimately touched (or fail loudly on a moved file).
     if journal_path.exists() && applied_marker.exists() {
-        let journal_gen = crate::kernel::plugin_iteration::PluginEditRollback::journal_generation_id(&journal_path)?;
+        let journal_gen =
+            crate::kernel::plugin_iteration::PluginEditRollback::journal_generation_id(
+                &journal_path,
+            )?;
         let applied_gen = fs::read_to_string(&applied_marker).ok();
         if let (Some(j), Some(a)) = (journal_gen.as_deref(), applied_gen.as_deref()) {
             if j.trim() == a.trim() {
@@ -6435,16 +6529,18 @@ pub fn apply_plugin_iteration_journal(
         fixtures_root,
         &journal_path,
     )? {
-        let generation_id = crate::kernel::plugin_iteration::PluginEditRollback::journal_generation_id(&journal_path)?;
+        let generation_id =
+            crate::kernel::plugin_iteration::PluginEditRollback::journal_generation_id(
+                &journal_path,
+            )?;
         rollback.rollback()?;
         // Persist the applied marker BEFORE clearing the journal. If we crash
         // between rollback and clear, next boot sees marker + journal with the
         // same id → skips the replay.
         if let Some(id) = generation_id {
-            if let Err(err) = crate::kernel::plugin_iteration::atomic_write(
-                &applied_marker,
-                id.as_bytes(),
-            ) {
+            if let Err(err) =
+                crate::kernel::plugin_iteration::atomic_write(&applied_marker, id.as_bytes())
+            {
                 eprintln!(
                     "[plugin-iteration-recovery] failed to write applied marker at {}: {err}",
                     applied_marker.display()
@@ -6486,9 +6582,8 @@ mod tests {
         PLUGIN_AGENT_TOOL_CREATE_FILE, PLUGIN_AGENT_TOOL_DELETE_FILE,
         PLUGIN_AGENT_TOOL_INSPECT_PLUGIN_CATALOG, PLUGIN_AGENT_TOOL_JSON_SET,
         PLUGIN_AGENT_TOOL_LIST_CONTEXT_FILES, PLUGIN_AGENT_TOOL_READ_CONTEXT_FILES,
-        PLUGIN_AGENT_TOOL_REPLACE_FILE_EXACT, PLUGIN_AGENT_TOOL_REPLACE_FILES_EXACT,
-        PLUGIN_AGENT_TOOL_SCAFFOLD_CHILD_PLUGIN,
-        PLUGIN_AGENT_TOOL_TOML_SET,
+        PLUGIN_AGENT_TOOL_REPLACE_FILES_EXACT, PLUGIN_AGENT_TOOL_REPLACE_FILE_EXACT,
+        PLUGIN_AGENT_TOOL_SCAFFOLD_CHILD_PLUGIN, PLUGIN_AGENT_TOOL_TOML_SET,
     };
     use crate::core::error::RuntimeError;
     use crate::kernel::plugin_iteration::{
@@ -6867,7 +6962,10 @@ mod tests {
             "cargo check",
         )
         .expect("check alias should use default command");
-        assert_eq!(check, "cargo check --quiet --manifest-path plugins/Cargo.toml");
+        assert_eq!(
+            check,
+            "cargo check --quiet --manifest-path plugins/Cargo.toml"
+        );
 
         let test = super::validated_verification_command(
             Some("test".to_string()),
@@ -6875,7 +6973,10 @@ mod tests {
             "cargo test",
         )
         .expect("test alias should use default command");
-        assert_eq!(test, "cargo test --quiet --manifest-path plugins/Cargo.toml");
+        assert_eq!(
+            test,
+            "cargo test --quiet --manifest-path plugins/Cargo.toml"
+        );
 
         let empty = super::validated_verification_command(
             super::normalize_optional_command(Some(String::new())),
@@ -6883,7 +6984,10 @@ mod tests {
             "cargo check",
         )
         .expect("empty command should fall back to default");
-        assert_eq!(empty, "cargo check --quiet --manifest-path plugins/Cargo.toml");
+        assert_eq!(
+            empty,
+            "cargo check --quiet --manifest-path plugins/Cargo.toml"
+        );
     }
 
     #[test]

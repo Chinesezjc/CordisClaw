@@ -8,8 +8,13 @@ use std::collections::{BTreeMap, BTreeSet};
 pub enum BackoffPolicy {
     #[default]
     None,
-    Fixed { delay_ms: u64 },
-    Exponential { base_ms: u64, max_ms: u64 },
+    Fixed {
+        delay_ms: u64,
+    },
+    Exponential {
+        base_ms: u64,
+        max_ms: u64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -151,11 +156,9 @@ fn eval_first_success(
     // gate in Wait forever. Now: if every upstream has some terminal
     // outcome and none of them are Success, we complete as failure.
     let all_terminal_non_success = !upstream_nodes.is_empty()
-        && upstream_nodes.iter().all(|n| {
-            outcomes
-                .get(n)
-                .is_some_and(|o| is_terminal(*o))
-        });
+        && upstream_nodes
+            .iter()
+            .all(|n| outcomes.get(n).is_some_and(|o| is_terminal(*o)));
     if all_terminal_non_success {
         GateDecision::CompleteFailure
     } else {
@@ -255,10 +258,7 @@ mod tests {
     use crate::core::models::GatePolicy;
 
     fn outcomes(pairs: &[(&str, NodeOutcome)]) -> BTreeMap<String, NodeOutcome> {
-        pairs
-            .iter()
-            .map(|(k, v)| (k.to_string(), *v))
-            .collect()
+        pairs.iter().map(|(k, v)| (k.to_string(), *v)).collect()
     }
 
     /// P1-8: `eval_first_success` must decide `CompleteFailure` as soon
@@ -298,7 +298,10 @@ mod tests {
         ]);
         let order = vec!["a".to_string(), "b".to_string()];
         match evaluate_gate(GatePolicy::FirstSuccess, &up, &out, &order) {
-            GateDecision::CompleteAndCancel { success, cancel_nodes } => {
+            GateDecision::CompleteAndCancel {
+                success,
+                cancel_nodes,
+            } => {
                 assert!(success);
                 assert_eq!(cancel_nodes, vec!["c".to_string()]);
             }

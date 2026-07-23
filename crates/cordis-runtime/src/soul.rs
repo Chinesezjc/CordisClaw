@@ -52,18 +52,27 @@ pub struct FileSoulProvider {
 
 impl FileSoulProvider {
     pub fn new(data_dir: &Path) -> Self {
-        Self { root: data_dir.join("souls") }
+        Self {
+            root: data_dir.join("souls"),
+        }
     }
 
     fn path_for(&self, soul_key: &str) -> PathBuf {
-        self.root.join(format!("{}.json", sanitize_soul_key(soul_key)))
+        self.root
+            .join(format!("{}.json", sanitize_soul_key(soul_key)))
     }
 }
 
 /// Keep soul filenames inside the souls dir regardless of key content.
 pub fn sanitize_soul_key(key: &str) -> String {
     key.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '#' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '#' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 
@@ -74,12 +83,18 @@ impl SoulProvider for FileSoulProvider {
             Ok(t) => t,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => {
-                return Err(RuntimeError::Io { path, message: e.to_string() });
+                return Err(RuntimeError::Io {
+                    path,
+                    message: e.to_string(),
+                });
             }
         };
         serde_json::from_str(&text)
             .map(Some)
-            .map_err(|e| RuntimeError::Io { path, message: format!("soul parse: {e}") })
+            .map_err(|e| RuntimeError::Io {
+                path,
+                message: format!("soul parse: {e}"),
+            })
     }
 
     fn set(&self, soul_key: &str, soul: &Soul) -> Result<(), RuntimeError> {
@@ -101,7 +116,10 @@ impl SoulProvider for FileSoulProvider {
         let tmp = path.with_extension("json.tmp");
         std::fs::write(&tmp, &bytes)
             .and_then(|_| std::fs::rename(&tmp, &path))
-            .map_err(|e| RuntimeError::Io { path, message: e.to_string() })
+            .map_err(|e| RuntimeError::Io {
+                path,
+                message: e.to_string(),
+            })
     }
 }
 

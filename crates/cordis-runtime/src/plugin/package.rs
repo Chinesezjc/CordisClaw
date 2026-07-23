@@ -562,7 +562,10 @@ mod normalize_tests {
         assert_eq!(normalize_crate_name("foo-bar"), "foo_bar");
         assert_eq!(normalize_crate_name("foo/bar"), "foo_bar");
         assert_eq!(normalize_crate_name("foo.bar"), "foo_bar");
-        assert_eq!(normalize_crate_name("expr/evaluator/pow"), "expr_evaluator_pow");
+        assert_eq!(
+            normalize_crate_name("expr/evaluator/pow"),
+            "expr_evaluator_pow"
+        );
         // Underscore already — passthrough.
         assert_eq!(normalize_crate_name("foo_bar"), "foo_bar");
     }

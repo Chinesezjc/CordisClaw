@@ -39,7 +39,10 @@ pub fn set_agent_inject_queue(q: Arc<Mutex<VecDeque<String>>>) {
 fn drain_inject_queue() -> Vec<String> {
     let guard = AGENT_INJECT_QUEUE.lock().unwrap_or_else(|p| p.into_inner());
     if let Some(ref q) = *guard {
-        q.lock().unwrap_or_else(|p| p.into_inner()).drain(..).collect()
+        q.lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .drain(..)
+            .collect()
     } else {
         Vec::new()
     }
@@ -107,11 +110,7 @@ pub trait AgentToolHost {
         limit: Option<usize>,
     ) -> Result<Value, RuntimeError>;
     fn agent_list_directory(&self, path: &str) -> Result<Value, RuntimeError>;
-    fn agent_search_code(
-        &self,
-        pattern: &str,
-        path: Option<&str>,
-    ) -> Result<Value, RuntimeError>;
+    fn agent_search_code(&self, pattern: &str, path: Option<&str>) -> Result<Value, RuntimeError>;
     fn agent_write_file(&self, path: &str, content: &str) -> Result<Value, RuntimeError>;
     fn agent_replace_in_file(
         &self,
@@ -128,8 +127,16 @@ pub trait AgentToolHost {
     fn agent_compact_context(&self, session_id: &str) -> Result<Value, RuntimeError>;
     fn agent_append_file(&self, path: &str, content: &str) -> Result<Value, RuntimeError>;
     fn agent_run_plugin_test(&self, command: Option<&str>) -> Result<Value, RuntimeError>;
-    fn agent_request_iteration(&self, plugin_path: &str, instruction: &str) -> Result<Value, RuntimeError>;
-    fn agent_create_plugin(&self, name: &str, description: Option<&str>) -> Result<Value, RuntimeError>;
+    fn agent_request_iteration(
+        &self,
+        plugin_path: &str,
+        instruction: &str,
+    ) -> Result<Value, RuntimeError>;
+    fn agent_create_plugin(
+        &self,
+        name: &str,
+        description: Option<&str>,
+    ) -> Result<Value, RuntimeError>;
     fn agent_send_warning_to_test_groups(&self, message: &str);
     /// O批: persona overlay text for the given soul scope, if any.
     /// Default None keeps non-runtime hosts (tests) working unchanged.
@@ -210,7 +217,10 @@ impl AgentToolHost for RuntimeHost {
     }
 
     fn agent_reload_runtime(&self, plugin_path: &str) -> Result<Value, RuntimeError> {
-        to_json_value("reload diagnostics", self.reload_with_diagnostics(plugin_path))
+        to_json_value(
+            "reload diagnostics",
+            self.reload_with_diagnostics(plugin_path),
+        )
     }
 
     fn agent_build_plugins(&self, plugin_name: &str) -> Result<Value, RuntimeError> {
@@ -247,11 +257,22 @@ impl AgentToolHost for RuntimeHost {
                 Ok(bytes) => {
                     // Atomically rename staging → live (same filesystem = atomic).
                     let _ = std::fs::rename(&staging, &dst);
-                    result["synced_artifact"] = json!(format!("{} -> artifacts/{}.so ({} bytes)", src.display(), plugin_name, bytes));
-                    eprintln!("build_plugins: synced {} -> {}", src.display(), dst.display());
+                    result["synced_artifact"] = json!(format!(
+                        "{} -> artifacts/{}.so ({} bytes)",
+                        src.display(),
+                        plugin_name,
+                        bytes
+                    ));
+                    eprintln!(
+                        "build_plugins: synced {} -> {}",
+                        src.display(),
+                        dst.display()
+                    );
                     // Reload: old snapshot is dropped, new snapshot loads the new .so.
                     match self.agent_reload_runtime(&format!("/{plugin_name}")) {
-                        Ok(reload) => { result["reload"] = reload; }
+                        Ok(reload) => {
+                            result["reload"] = reload;
+                        }
                         Err(e) => {
                             eprintln!("build_plugins: reload failed for {plugin_name}: {e}");
                             return Err(e);
@@ -362,9 +383,7 @@ impl AgentToolHost for RuntimeHost {
         let excerpt: Vec<serde_json::Value> = lines[start..end]
             .iter()
             .enumerate()
-            .map(|(i, line)| {
-                json!({"line": start + i + 1, "text": line})
-            })
+            .map(|(i, line)| json!({"line": start + i + 1, "text": line}))
             .collect();
         Ok(json!({
             "path": path,
@@ -412,12 +431,10 @@ impl AgentToolHost for RuntimeHost {
         }))
     }
 
-    fn agent_search_code(
-        &self,
-        pattern: &str,
-        path: Option<&str>,
-    ) -> Result<Value, RuntimeError> {
-        if let Some(p) = path { self.check_sensitive_path(p)?; }
+    fn agent_search_code(&self, pattern: &str, path: Option<&str>) -> Result<Value, RuntimeError> {
+        if let Some(p) = path {
+            self.check_sensitive_path(p)?;
+        }
         let search_root = match path {
             Some(p) => self.resolve_sandboxed_path(p)?,
             None => self.fixtures_root().to_path_buf(),
@@ -513,9 +530,7 @@ impl AgentToolHost for RuntimeHost {
         let occurrences = original.matches(find).count();
         if occurrences == 0 {
             return Err(RuntimeError::InvalidArgument {
-                message: format!(
-                    "replace_in_file: pattern not found in {path}: {find}"
-                ),
+                message: format!("replace_in_file: pattern not found in {path}: {find}"),
             });
         }
         if occurrences > 1 {
@@ -561,9 +576,11 @@ impl AgentToolHost for RuntimeHost {
         let argv = shell_words::split(command).map_err(|err| RuntimeError::InvalidArgument {
             message: format!("run_command tokenisation failed: {err}"),
         })?;
-        let (program, args) = argv.split_first().ok_or_else(|| RuntimeError::InvalidArgument {
-            message: "run_command received an empty command string".to_string(),
-        })?;
+        let (program, args) = argv
+            .split_first()
+            .ok_or_else(|| RuntimeError::InvalidArgument {
+                message: "run_command received an empty command string".to_string(),
+            })?;
         if program.is_empty() {
             return Err(RuntimeError::InvalidArgument {
                 message: "run_command program was empty after tokenisation".to_string(),
@@ -588,7 +605,8 @@ impl AgentToolHost for RuntimeHost {
         let mut rollback = self.interactive_rollback();
         let count = rollback.len();
         rollback.rollback()?;
-        *rollback = crate::kernel::plugin_iteration::PluginEditRollback::empty(self.fixtures_root());
+        *rollback =
+            crate::kernel::plugin_iteration::PluginEditRollback::empty(self.fixtures_root());
         Ok(json!({
             "reverted_files": count,
         }))
@@ -793,7 +811,11 @@ impl AgentToolHost for RuntimeHost {
         }))
     }
 
-    fn agent_request_iteration(&self, plugin_path: &str, instruction: &str) -> Result<Value, RuntimeError> {
+    fn agent_request_iteration(
+        &self,
+        plugin_path: &str,
+        instruction: &str,
+    ) -> Result<Value, RuntimeError> {
         let pp = plugin_path.trim_start_matches('/');
         // Empty plugin_path (from "/") means root workspace mode — the agent
         // can create/edit files anywhere under plugins/, not just one subtree.
@@ -826,7 +848,11 @@ impl AgentToolHost for RuntimeHost {
         }
     }
 
-    fn agent_create_plugin(&self, name: &str, description: Option<&str>) -> Result<Value, RuntimeError> {
+    fn agent_create_plugin(
+        &self,
+        name: &str,
+        description: Option<&str>,
+    ) -> Result<Value, RuntimeError> {
         self.create_plugin(name, description)
     }
 
@@ -866,7 +892,11 @@ impl AgentToolHost for RuntimeHost {
         }
         if let Some(p) = profile {
             let trimmed = p.trim();
-            soul.profile = if trimmed.is_empty() { None } else { Some(trimmed.to_string()) };
+            soul.profile = if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            };
             if let Some(name) = &soul.profile {
                 let profiles = &self.config().llm_profiles.profiles;
                 if !profiles.contains_key(name) {
@@ -1233,10 +1263,18 @@ impl AgentSession {
             {
                 let new_msgs = drain_inject_queue();
                 for m in new_msgs {
-                    if m.trim().is_empty() { continue; }
-                    emit_agent_diagnostic(format!("agent_inject kind={} turn={} len={}", self.kind, turn + 1, m.len()));
+                    if m.trim().is_empty() {
+                        continue;
+                    }
+                    emit_agent_diagnostic(format!(
+                        "agent_inject kind={} turn={} len={}",
+                        self.kind,
+                        turn + 1,
+                        m.len()
+                    ));
                     messages.push(json!({"role": "user", "content": &m}));
-                    self.transcript.push(AgentTranscriptEntry::User { content: m });
+                    self.transcript
+                        .push(AgentTranscriptEntry::User { content: m });
                 }
             }
 
@@ -1257,14 +1295,17 @@ impl AgentSession {
             for (idx, msg) in messages.iter().enumerate() {
                 if msg.get("role").and_then(|v| v.as_str()) == Some("assistant") {
                     if let Some(tc_arr) = msg.get("tool_calls").and_then(|v| v.as_array()) {
-                        let expected: Vec<&str> = tc_arr.iter()
+                        let expected: Vec<&str> = tc_arr
+                            .iter()
                             .filter_map(|tc| tc.get("id").and_then(|v| v.as_str()))
                             .collect();
                         let mut found: Vec<&str> = Vec::new();
                         for next in messages.iter().skip(idx + 1) {
                             match next.get("role").and_then(|v| v.as_str()) {
                                 Some("tool") => {
-                                    if let Some(tid) = next.get("tool_call_id").and_then(|v| v.as_str()) {
+                                    if let Some(tid) =
+                                        next.get("tool_call_id").and_then(|v| v.as_str())
+                                    {
                                         found.push(tid);
                                     }
                                 }
@@ -1275,10 +1316,14 @@ impl AgentSession {
                         if found.len() < expected.len() {
                             eprintln!(
                                 "[tool_calls repair] turn={} msg_idx={} expected={:?} found={:?}",
-                                turn + 1, idx, expected, found,
+                                turn + 1,
+                                idx,
+                                expected,
+                                found,
                             );
                             // Keep only tool_calls that have matching tool messages.
-                            let repaired: Vec<Value> = tc_arr.iter()
+                            let repaired: Vec<Value> = tc_arr
+                                .iter()
                                 .filter(|tc| {
                                     tc.get("id")
                                         .and_then(|v| v.as_str())
@@ -1362,7 +1407,11 @@ impl AgentSession {
                 for tool_call in &unknown_calls {
                     let tool_name = &tool_call.function.name;
                     self.unknown_tool_strikes += 1;
-                    let tool_list = available_tools.iter().cloned().collect::<Vec<_>>().join(", ");
+                    let tool_list = available_tools
+                        .iter()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", ");
                     let err_msg = if self.unknown_tool_strikes >= UNKNOWN_TOOL_STRIKE_LIMIT {
                         format!(
                             "STOP — tool '{tool_name}' does not exist. Strike {}/{}. You are in a {} session. Your ONLY tools: {}",
@@ -1375,7 +1424,11 @@ impl AgentSession {
                             self.unknown_tool_strikes, UNKNOWN_TOOL_STRIKE_LIMIT, tool_list,
                         )
                     };
-                    let _ = writeln!(std::io::stdout(), "⚙ {} (rejected — unknown tool)", tool_name);
+                    let _ = writeln!(
+                        std::io::stdout(),
+                        "⚙ {} (rejected — unknown tool)",
+                        tool_name
+                    );
                     let _ = std::io::stdout().flush();
                     messages.push(json!({"role": "user", "content": err_msg}));
                 }
@@ -1385,14 +1438,11 @@ impl AgentSession {
                 }
                 for tool_call in &valid_calls {
                     // Announce tool execution in real-time.
-                    let tool_args_preview: String = serde_json::from_str::<Value>(
-                        &tool_call.function.arguments,
-                    )
-                    .ok()
-                    .and_then(|v| {
-                        serde_json::to_string(&v).ok()
-                    })
-                    .unwrap_or_else(|| tool_call.function.arguments.clone());
+                    let tool_args_preview: String =
+                        serde_json::from_str::<Value>(&tool_call.function.arguments)
+                            .ok()
+                            .and_then(|v| serde_json::to_string(&v).ok())
+                            .unwrap_or_else(|| tool_call.function.arguments.clone());
                     let _ = writeln!(
                         std::io::stdout(),
                         "⚙ {} {}",
@@ -1400,8 +1450,13 @@ impl AgentSession {
                         tool_args_preview
                     );
                     let _ = std::io::stdout().flush();
-                    let (event, tool_output) =
-                        execute_agent_tool_call(backend, &available_tools, &self.kind, tool_call, &mut self.unknown_tool_strikes);
+                    let (event, tool_output) = execute_agent_tool_call(
+                        backend,
+                        &available_tools,
+                        &self.kind,
+                        tool_call,
+                        &mut self.unknown_tool_strikes,
+                    );
                     let event_name = event.name.clone();
                     let terminal_reply = event
                         .ok
@@ -1466,13 +1521,20 @@ impl AgentSession {
                         let new_msgs = drain_inject_queue();
                         if !new_msgs.is_empty() {
                             for m in new_msgs {
-                                if m.trim().is_empty() { continue; }
+                                if m.trim().is_empty() {
+                                    continue;
+                                }
                                 messages.push(json!({"role": "user", "content": &m}));
-                                self.transcript.push(AgentTranscriptEntry::User { content: m });
+                                self.transcript
+                                    .push(AgentTranscriptEntry::User { content: m });
                             }
                             continue;
                         }
-                        self.remember_exchange(trimmed, &reply_content, message.reasoning_content.as_deref());
+                        self.remember_exchange(
+                            trimmed,
+                            &reply_content,
+                            message.reasoning_content.as_deref(),
+                        );
                         self.completed_turns += 1;
                         self.transcript.push(AgentTranscriptEntry::Assistant {
                             content: reply_content.clone(),
@@ -1498,9 +1560,12 @@ impl AgentSession {
                 let new_msgs = drain_inject_queue();
                 if !new_msgs.is_empty() {
                     for m in new_msgs {
-                        if m.trim().is_empty() { continue; }
+                        if m.trim().is_empty() {
+                            continue;
+                        }
                         messages.push(json!({"role": "user", "content": &m}));
-                        self.transcript.push(AgentTranscriptEntry::User { content: m });
+                        self.transcript
+                            .push(AgentTranscriptEntry::User { content: m });
                     }
                     continue; // re-enter loop with new messages
                 }
@@ -1580,7 +1645,11 @@ impl AgentSession {
         user_input: &str,
     ) -> Result<AgentReply, RuntimeError> {
         let soul_key = self.soul_key.clone();
-        let mut backend = RuntimeShellAgentBackend { host, session_id, soul_key };
+        let mut backend = RuntimeShellAgentBackend {
+            host,
+            session_id,
+            soul_key,
+        };
         self.respond(&mut backend, user_input)
     }
 
@@ -1610,7 +1679,9 @@ impl AgentSession {
         for msg in &old_messages {
             let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("");
             let content = msg.get("content").and_then(|v| v.as_str()).unwrap_or("");
-            if content.is_empty() { continue; }
+            if content.is_empty() {
+                continue;
+            }
             // P1-33: `content.chars().take(500)` is char-based, but the
             // `content.len() > 500` guard was byte-based. For Chinese /
             // multi-byte text the `…` suffix would fire inconsistently
@@ -1643,10 +1714,7 @@ impl AgentSession {
             .history
             .iter()
             .map(|msg| {
-                let content = msg
-                    .get("content")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
+                let content = msg.get("content").and_then(|v| v.as_str()).unwrap_or("");
                 estimate_tokens(content)
             })
             .sum();
@@ -1799,12 +1867,9 @@ impl AgentSession {
                     // burns network round trips and can trigger rate-
                     // limit escalation.
                     let code = status.as_u16();
-                    let is_permanent_4xx =
-                        (400..500).contains(&code) && code != 408 && code != 429;
+                    let is_permanent_4xx = (400..500).contains(&code) && code != 408 && code != 429;
                     if is_permanent_4xx {
-                        emit_agent_diagnostic(format!(
-                            "{message} not-retrying (permanent 4xx)"
-                        ));
+                        emit_agent_diagnostic(format!("{message} not-retrying (permanent 4xx)"));
                         return Err(RuntimeError::LlmRequestFailed { message });
                     }
                     emit_agent_diagnostic(format!(
@@ -1817,7 +1882,12 @@ impl AgentSession {
             }
 
             let stream_timeout = Duration::from_secs(self.config.stream_timeout_secs);
-            let streamed = match read_chat_stream(response, &request_summary, attempt, stream_timeout) {
+            let streamed = match read_chat_stream(
+                response,
+                &request_summary,
+                attempt,
+                stream_timeout,
+            ) {
                 Ok(streamed) => streamed,
                 Err(ChatStreamReadError::Io(err)) => {
                     let message = format!(
@@ -1943,12 +2013,14 @@ impl ShellAgentSession {
         session_id: &str,
         user_input: &str,
     ) -> Result<ShellAgentReply, RuntimeError> {
-        self.inner.respond_with_runtime_host(host, session_id, user_input)
+        self.inner
+            .respond_with_runtime_host(host, session_id, user_input)
     }
 
     #[cfg(test)]
     fn remember_exchange(&mut self, user_input: &str, assistant_output: &str) {
-        self.inner.remember_exchange(user_input, assistant_output, None);
+        self.inner
+            .remember_exchange(user_input, assistant_output, None);
         self.inner.completed_turns += 1;
     }
 }
@@ -2265,7 +2337,9 @@ struct CopyFileArgs {
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
-struct BuildPluginsArgs { plugin_name: String }
+struct BuildPluginsArgs {
+    plugin_name: String,
+}
 
 #[derive(Debug, Clone, Deserialize)]
 struct RunPluginTestArgs {
@@ -2300,7 +2374,9 @@ struct SetSoulArgs {
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
-struct ReloadRuntimeArgs { plugin_path: String }
+struct ReloadRuntimeArgs {
+    plugin_path: String,
+}
 
 fn execute_agent_tool_call<B: AgentBackend + ?Sized>(
     backend: &mut B,
@@ -2322,7 +2398,11 @@ fn execute_agent_tool_call<B: AgentBackend + ?Sized>(
             false,
             "execute_agent_tool_call reached with unknown tool {tool_name}; caller should filter"
         );
-        let tool_list = available_tools.iter().cloned().collect::<Vec<_>>().join(", ");
+        let tool_list = available_tools
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
         let error = json!({
             "ok": false,
             "error": format!(
@@ -2735,7 +2815,9 @@ struct RuntimeShellAgentBackend<'a, H: AgentToolHost + ?Sized> {
 
 impl<'a, H: AgentToolHost + ?Sized> AgentBackend for RuntimeShellAgentBackend<'a, H> {
     type Host = H;
-    fn host(&self) -> &H { self.host }
+    fn host(&self) -> &H {
+        self.host
+    }
     /// O批: three-part prompt — base, soul overlay, plugin hints. The
     /// overlay sits between them so a persona can adjust tone/behaviour
     /// while plugin usage contracts still land last (highest recency).
@@ -2839,18 +2921,15 @@ impl<'a, H: AgentToolHost + ?Sized> AgentBackend for RuntimeShellAgentBackend<'a
             }
             AGENT_TOOL_RENAME_FILE => {
                 let args = parse_tool_value_arguments::<RenameFileArgs>(arguments, name)?;
-                self.host
-                    .agent_rename_file(&args.path, &args.new_path)
+                self.host.agent_rename_file(&args.path, &args.new_path)
             }
             AGENT_TOOL_MOVE_FILE => {
                 let args = parse_tool_value_arguments::<MoveFileArgs>(arguments, name)?;
-                self.host
-                    .agent_move_file(&args.path, &args.new_path)
+                self.host.agent_move_file(&args.path, &args.new_path)
             }
             AGENT_TOOL_COPY_FILE => {
                 let args = parse_tool_value_arguments::<CopyFileArgs>(arguments, name)?;
-                self.host
-                    .agent_copy_file(&args.path, &args.new_path)
+                self.host.agent_copy_file(&args.path, &args.new_path)
             }
             AGENT_TOOL_COMPACT_CONTEXT => {
                 parse_tool_value_arguments::<EmptyArgs>(arguments, name)?;
@@ -2862,11 +2941,13 @@ impl<'a, H: AgentToolHost + ?Sized> AgentBackend for RuntimeShellAgentBackend<'a
             }
             AGENT_TOOL_REQUEST_ITERATION => {
                 let args = parse_tool_value_arguments::<RequestIterationArgs>(arguments, name)?;
-                self.host.agent_request_iteration(&args.plugin_path, &args.instruction)
+                self.host
+                    .agent_request_iteration(&args.plugin_path, &args.instruction)
             }
             AGENT_TOOL_CREATE_PLUGIN => {
                 let args = parse_tool_value_arguments::<CreatePluginArgs>(arguments, name)?;
-                self.host.agent_create_plugin(&args.name, args.description.as_deref())
+                self.host
+                    .agent_create_plugin(&args.name, args.description.as_deref())
             }
             AGENT_TOOL_SET_SOUL => {
                 let args = parse_tool_value_arguments::<SetSoulArgs>(arguments, name)?;
@@ -3357,7 +3438,9 @@ mod tests {
 
     impl AgentBackend for TerminalTestBackend {
         type Host = FakeHost;
-        fn host(&self) -> &FakeHost { &FakeHost }
+        fn host(&self) -> &FakeHost {
+            &FakeHost
+        }
         fn system_prompt(&self) -> String {
             "test backend".to_string()
         }
@@ -3531,11 +3614,19 @@ mod tests {
             Ok(json!({ "success": true, "stdout": "", "stderr": "" }))
         }
 
-        fn agent_request_iteration(&self, _plugin_path: &str, _instruction: &str) -> Result<Value, RuntimeError> {
+        fn agent_request_iteration(
+            &self,
+            _plugin_path: &str,
+            _instruction: &str,
+        ) -> Result<Value, RuntimeError> {
             Ok(json!({ "ok": true, "summary": "mock iteration", "verdict": "SimulatedSuccess" }))
         }
 
-        fn agent_create_plugin(&self, name: &str, _description: Option<&str>) -> Result<Value, RuntimeError> {
+        fn agent_create_plugin(
+            &self,
+            name: &str,
+            _description: Option<&str>,
+        ) -> Result<Value, RuntimeError> {
             Ok(json!({ "ok": true, "plugin_path": format!("/{name}") }))
         }
 
@@ -3558,7 +3649,10 @@ mod tests {
             tool_calls: Vec::new(),
         };
         let request = message.to_request_message();
-        assert_eq!(request.get("role").and_then(Value::as_str), Some("assistant"));
+        assert_eq!(
+            request.get("role").and_then(Value::as_str),
+            Some("assistant")
+        );
         assert_eq!(request.get("content").and_then(Value::as_str), Some(""));
         assert_eq!(
             request.get("reasoning_content").and_then(Value::as_str),
@@ -3640,7 +3734,11 @@ mod tests {
         };
         let mut session = ShellAgentSession::new(config).expect("build session");
         let reply = session
-            .respond(&FakeHost, "test-session-1", "What is the runtime status right now?")
+            .respond(
+                &FakeHost,
+                "test-session-1",
+                "What is the runtime status right now?",
+            )
             .expect("agent reply");
 
         assert_eq!(reply.content, "Runtime is healthy and loaded.");

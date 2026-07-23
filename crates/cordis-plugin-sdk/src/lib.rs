@@ -200,9 +200,7 @@ pub fn agent_trigger(msg: &str) {
     // Resolve at runtime via dlsym so plugins don't get a hard
     // undefined-symbol dependency on the host binary.
     type TriggerFn = unsafe extern "C" fn(*const std::ffi::c_char);
-    let ptr = unsafe {
-        libc::dlsym(libc::RTLD_DEFAULT, c"_cordis_agent_trigger".as_ptr())
-    };
+    let ptr = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"_cordis_agent_trigger".as_ptr()) };
     if !ptr.is_null() {
         let c_str = std::ffi::CString::new(msg).unwrap();
         unsafe {
@@ -299,7 +297,6 @@ macro_rules! export_plugin_api {
         };
     };
 }
-
 
 // ── Service Factory Bridge ─────────────────────────────────────────────
 
@@ -410,7 +407,9 @@ extern "C" {
 
 #[cfg(test)]
 #[no_mangle]
-pub extern "C" fn _cordis_create_service(_node_id: *const std::ffi::c_char) -> *const ServiceVTable {
+pub extern "C" fn _cordis_create_service(
+    _node_id: *const std::ffi::c_char,
+) -> *const ServiceVTable {
     std::ptr::null()
 }
 
@@ -425,7 +424,11 @@ mod fingerprint_tests {
         // should start with the word "rustc".
         let fp = AbiFingerprint::current_build("crate_test_v1", "api_v2");
         assert!(!fp.rustc_version.is_empty(), "rustc_version stamped");
-        assert!(fp.rustc_version.starts_with("rustc"), "looks like rustc --version output: {}", fp.rustc_version);
+        assert!(
+            fp.rustc_version.starts_with("rustc"),
+            "looks like rustc --version output: {}",
+            fp.rustc_version
+        );
         assert!(!fp.target_triple.is_empty(), "target_triple stamped");
         assert_eq!(fp.crate_hash, "crate_test_v1");
         assert_eq!(fp.api_hash, "api_v2");
@@ -512,10 +515,16 @@ mod service_panic_isolation_tests {
             stop = panicking_stop,
         };
         let code = (vtable.start)(vtable.data);
-        assert_eq!(code, -1, "extern C start shim must catch the panic and return -1");
+        assert_eq!(
+            code, -1,
+            "extern C start shim must catch the panic and return -1"
+        );
         // The stop path must be equally protected.
         let stop_code = (vtable.stop)(vtable.data);
-        assert_eq!(stop_code, -1, "extern C stop shim must catch the panic and return -1");
+        assert_eq!(
+            stop_code, -1,
+            "extern C stop shim must catch the panic and return -1"
+        );
     }
 
     #[test]
@@ -526,7 +535,15 @@ mod service_panic_isolation_tests {
             start = ok_start,
             stop = ok_stop,
         };
-        assert_eq!((vtable.start)(vtable.data), 0, "non-panicking start returns its own code");
-        assert_eq!((vtable.stop)(vtable.data), 0, "non-panicking stop returns 0");
+        assert_eq!(
+            (vtable.start)(vtable.data),
+            0,
+            "non-panicking start returns its own code"
+        );
+        assert_eq!(
+            (vtable.stop)(vtable.data),
+            0,
+            "non-panicking stop returns 0"
+        );
     }
 }

@@ -682,11 +682,8 @@ impl PluginEditRollback {
         // fully undoes the run — a mid-run intermediate is never useful
         // for recovery. Existing entries win: whichever rollback saw the
         // file first records the correct pre-edit bytes.
-        let mut existing: std::collections::HashSet<String> = self
-            .backups
-            .iter()
-            .map(|b| b.rel_path.clone())
-            .collect();
+        let mut existing: std::collections::HashSet<String> =
+            self.backups.iter().map(|b| b.rel_path.clone()).collect();
         for backup in other.backups.drain(..) {
             if existing.insert(backup.rel_path.clone()) {
                 self.backups.push(backup);
@@ -759,9 +756,7 @@ impl PluginEditRollback {
     /// Rollback-generation id recorded in the journal header. Used by the boot
     /// recovery path to detect that a rollback has already been applied for
     /// this journal (P0-7).
-    pub fn journal_generation_id(
-        journal_path: &Path,
-    ) -> Result<Option<String>, RuntimeError> {
+    pub fn journal_generation_id(journal_path: &Path) -> Result<Option<String>, RuntimeError> {
         if !journal_path.exists() {
             return Ok(None);
         }
@@ -1285,7 +1280,11 @@ pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), RuntimeError
     }
     fs::rename(&tmp_path, path).map_err(|err| RuntimeError::Io {
         path: path.to_path_buf(),
-        message: format!("rename {} -> {} failed: {err}", tmp_path.display(), path.display()),
+        message: format!(
+            "rename {} -> {} failed: {err}",
+            tmp_path.display(),
+            path.display()
+        ),
     })?;
     Ok(())
 }
@@ -1736,6 +1735,9 @@ mod tests {
 
         rb.rollback().unwrap();
         assert_eq!(fs::read(&existing).unwrap(), b"before");
-        assert!(!fresh.exists(), "created file should be removed on rollback");
+        assert!(
+            !fresh.exists(),
+            "created file should be removed on rollback"
+        );
     }
 }
