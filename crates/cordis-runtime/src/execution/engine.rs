@@ -5,7 +5,6 @@
 use crate::context::{ContextWrite, RuntimeContext};
 use crate::core::error::RuntimeError;
 use crate::core::models::{GatePolicy, NodeOutcome};
-use cordis_plugin_sdk::NodeType;
 use crate::execution::gate::{BackoffPolicy, RunPolicy};
 use crate::execution::net::{
     build_petri_net, ArcDirection, ArcSpec, CorrelationKey, JoinPolicy, PetriNetBuildError,
@@ -13,6 +12,7 @@ use crate::execution::net::{
 };
 use crate::execution::router::{execute_router, RouterMetrics};
 use crate::execution::scheduler::SchedulerConfig;
+use cordis_plugin_sdk::NodeType;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::cmp::Ordering;
@@ -218,8 +218,7 @@ where
                 // ---- single-threaded path (unchanged) ----
                 let batch = state.next_batch(&config);
                 for item in batch {
-                    terminal_fired =
-                        process_one_item(&mut state, item, context, &runner, &config)?;
+                    terminal_fired = process_one_item(&mut state, item, context, &runner, &config)?;
                     if terminal_fired {
                         break;
                     }
@@ -274,16 +273,17 @@ where
                         .attempts
                         .get(&(item.transition_id.clone(), item.key.clone()))
                         .unwrap_or(&0);
-                    let trigger =
-                        state.ensure_trigger_inputs(&item.transition_id, &item.key)?;
-                    let spec = state.specs.get(&item.transition_id).cloned().ok_or_else(
-                        || RuntimeError::Invariant {
+                    let trigger = state.ensure_trigger_inputs(&item.transition_id, &item.key)?;
+                    let spec = state
+                        .specs
+                        .get(&item.transition_id)
+                        .cloned()
+                        .ok_or_else(|| RuntimeError::Invariant {
                             message: format!(
                                 "ready transition missing spec: {}",
                                 item.transition_id
                             ),
-                        },
-                    )?;
+                        })?;
 
                     state.order.push(item.transition_id.clone());
 
@@ -302,20 +302,19 @@ where
                             .inputs
                             .iter()
                             .any(|i| i.token.meta.outcome != NodeOutcome::Success);
-                    let router_run = if !skip
-                        && matches!(spec.kind, ExecutionTransitionKind::Router { .. })
-                    {
-                        Some(run_transition_router(
-                            &spec,
-                            attempt,
-                            &trigger,
-                            &mut state.metrics,
-                            context,
-                            &runner,
-                        )?)
-                    } else {
-                        None
-                    };
+                    let router_run =
+                        if !skip && matches!(spec.kind, ExecutionTransitionKind::Router { .. }) {
+                            Some(run_transition_router(
+                                &spec,
+                                attempt,
+                                &trigger,
+                                &mut state.metrics,
+                                context,
+                                &runner,
+                            )?)
+                        } else {
+                            None
+                        };
 
                     jobs.push(ParallelJob {
                         transition_id: item.transition_id,
@@ -336,52 +335,52 @@ where
                 // Router jobs were already handled in the pre-compute phase.
                 let ctx: &RuntimeContext = &*context;
                 let runner_ref: &F = &runner;
-                let parallel_results: Vec<(
-                    usize,
-                    Result<TransitionRunResult, RuntimeError>,
-                )> = std::thread::scope(|s| {
-                    let mut handles = Vec::new();
-                    for (idx, job) in jobs.iter().enumerate() {
-                        if job.skip || job.router_run.is_some() {
-                            continue;
-                        }
-                        let spec = &job.spec;
-                        let attempt = job.attempt;
-                        let trigger = &job.trigger;
-                        handles.push((
-                            idx,
-                            s.spawn(move || {
-                                run_transition(spec, attempt, trigger, ctx, runner_ref)
-                            }),
-                        ));
-                    }
-                    // P1-5: turn a runner-thread panic into a RuntimeError
-                    // instead of unwinding through the whole executor.
-                    // Previously `h.join().unwrap()` propagated the panic to
-                    // the main loop, losing every other job in the batch and
-                    // giving the caller no chance to retry.
-                    handles
-                        .into_iter()
-                        .map(|(idx, h)| match h.join() {
-                            Ok(result) => (idx, result),
-                            Err(panic_payload) => {
-                                let message = if let Some(s) = panic_payload.downcast_ref::<&'static str>() {
-                                    (*s).to_string()
-                                } else if let Some(s) = panic_payload.downcast_ref::<String>() {
-                                    s.clone()
-                                } else {
-                                    "runner thread panicked".to_string()
-                                };
-                                (
-                                    idx,
-                                    Err(RuntimeError::Invariant {
-                                        message: format!("runner panic: {message}"),
-                                    }),
-                                )
+                let parallel_results: Vec<(usize, Result<TransitionRunResult, RuntimeError>)> =
+                    std::thread::scope(|s| {
+                        let mut handles = Vec::new();
+                        for (idx, job) in jobs.iter().enumerate() {
+                            if job.skip || job.router_run.is_some() {
+                                continue;
                             }
-                        })
-                        .collect()
-                });
+                            let spec = &job.spec;
+                            let attempt = job.attempt;
+                            let trigger = &job.trigger;
+                            handles.push((
+                                idx,
+                                s.spawn(move || {
+                                    run_transition(spec, attempt, trigger, ctx, runner_ref)
+                                }),
+                            ));
+                        }
+                        // P1-5: turn a runner-thread panic into a RuntimeError
+                        // instead of unwinding through the whole executor.
+                        // Previously `h.join().unwrap()` propagated the panic to
+                        // the main loop, losing every other job in the batch and
+                        // giving the caller no chance to retry.
+                        handles
+                            .into_iter()
+                            .map(|(idx, h)| match h.join() {
+                                Ok(result) => (idx, result),
+                                Err(panic_payload) => {
+                                    let message = if let Some(s) =
+                                        panic_payload.downcast_ref::<&'static str>()
+                                    {
+                                        (*s).to_string()
+                                    } else if let Some(s) = panic_payload.downcast_ref::<String>() {
+                                        s.clone()
+                                    } else {
+                                        "runner thread panicked".to_string()
+                                    };
+                                    (
+                                        idx,
+                                        Err(RuntimeError::Invariant {
+                                            message: format!("runner panic: {message}"),
+                                        }),
+                                    )
+                                }
+                            })
+                            .collect()
+                    });
 
                 // Merge parallel + pre-computed Router results (serial phase).
                 let mut run_results: Vec<(usize, TransitionRunResult)> =
@@ -397,10 +396,8 @@ where
                     if let Some(run) = job.router_run.clone() {
                         run_results.push((idx, run));
                     } else if job.skip {
-                        run_results.push((
-                            idx,
-                            TransitionRunResult::from_outcome(NodeOutcome::Skipped),
-                        ));
+                        run_results
+                            .push((idx, TransitionRunResult::from_outcome(NodeOutcome::Skipped)));
                     }
                 }
                 run_results.sort_by_key(|(idx, _)| *idx);
@@ -418,45 +415,28 @@ where
                                     next_attempt,
                                 );
                                 state.metrics.node_retry_total += 1;
-                                let delay_ms = retry_backoff_delay_ms(
-                                    &job.spec.run_policy,
-                                    next_attempt,
-                                );
+                                let delay_ms =
+                                    retry_backoff_delay_ms(&job.spec.run_policy, next_attempt);
                                 if delay_ms > 0 {
                                     sleep(Duration::from_millis(delay_ms));
                                 }
-                                state.push_ready(
-                                    &job.transition_id,
-                                    job.key.clone(),
-                                    true,
-                                )?;
+                                state.push_ready(&job.transition_id, job.key.clone(), true)?;
                                 continue;
                             }
                         }
-                        NodeOutcome::Success
-                        | NodeOutcome::Cancelled
-                        | NodeOutcome::Skipped => {}
+                        NodeOutcome::Success | NodeOutcome::Cancelled | NodeOutcome::Skipped => {}
                     }
 
-                    let is_terminal =
-                        job.spec.kind == ExecutionTransitionKind::Terminal;
+                    let is_terminal = job.spec.kind == ExecutionTransitionKind::Terminal;
 
-                    state.complete_transition(
-                        &job.transition_id,
-                        &job.key,
-                        run,
-                        context,
-                    )?;
+                    state.complete_transition(&job.transition_id, &job.key, run, context)?;
 
                     if is_terminal {
                         state.ready.clear();
                         state.ready_set.clear();
                         for tid in state.specs.keys() {
                             if !state.outcomes.contains_key(tid) {
-                                state.outcomes.insert(
-                                    tid.clone(),
-                                    NodeOutcome::Cancelled,
-                                );
+                                state.outcomes.insert(tid.clone(), NodeOutcome::Cancelled);
                             }
                         }
                         terminal_fired = true;
@@ -522,11 +502,12 @@ where
         .unwrap_or(&0);
 
     let trigger = state.ensure_trigger_inputs(&item.transition_id, &item.key)?;
-    let spec = state.specs.get(&item.transition_id).ok_or_else(|| {
-        RuntimeError::Invariant {
+    let spec = state
+        .specs
+        .get(&item.transition_id)
+        .ok_or_else(|| RuntimeError::Invariant {
             message: format!("ready transition missing spec: {}", item.transition_id),
-        }
-    })?;
+        })?;
 
     state.order.push(item.transition_id.clone());
     let run = if spec.transition.join_policy == JoinPolicy::AllOf
@@ -547,10 +528,9 @@ where
         NodeOutcome::Failure | NodeOutcome::Timeout => {
             let next_attempt = attempt + 1;
             if next_attempt <= spec.run_policy.max_retries {
-                state.attempts.insert(
-                    (item.transition_id.clone(), item.key.clone()),
-                    next_attempt,
-                );
+                state
+                    .attempts
+                    .insert((item.transition_id.clone(), item.key.clone()), next_attempt);
                 state.metrics.node_retry_total += 1;
                 let delay_ms = retry_backoff_delay_ms(&spec.run_policy, next_attempt);
                 if delay_ms > 0 {
@@ -572,8 +552,7 @@ where
         state.ready_set.clear();
         for tid in state.specs.keys() {
             if !state.outcomes.contains_key(tid) {
-                state.outcomes
-                    .insert(tid.clone(), NodeOutcome::Cancelled);
+                state.outcomes.insert(tid.clone(), NodeOutcome::Cancelled);
             }
         }
         return Ok(true);
@@ -606,14 +585,12 @@ where
     let started_at = Instant::now();
 
     match &spec.kind {
-        ExecutionTransitionKind::Router { .. } => {
-            Err(RuntimeError::Invariant {
-                message: format!(
-                    "Router transition {} must be run via run_transition_router",
-                    spec.transition.transition_id,
-                ),
-            })
-        }
+        ExecutionTransitionKind::Router { .. } => Err(RuntimeError::Invariant {
+            message: format!(
+                "Router transition {} must be run via run_transition_router",
+                spec.transition.transition_id,
+            ),
+        }),
         ExecutionTransitionKind::Task | ExecutionTransitionKind::Terminal => {
             let mut result = runner(spec, attempt, trigger, context);
             if spec.run_policy.timeout_ms > 0
@@ -1092,15 +1069,13 @@ fn evaluate_join_policy(policy: JoinPolicy, tokens_per_place: &[(String, Vec<Tok
         // The engine's per-correlation-key token isolation ensures tokens
         // within each key-group are matched correctly.
         JoinPolicy::KeyedPair => {
-            tokens_per_place.len() == 2
-                && tokens_per_place.iter().all(|(_, t)| !t.is_empty())
+            tokens_per_place.len() == 2 && tokens_per_place.iter().all(|(_, t)| !t.is_empty())
         }
         // KeyedGroup: requires all input places to be non-empty within the
         // same correlation-key bucket (enforced by the engine's key-based
         // token storage).
         JoinPolicy::KeyedGroup => {
-            !tokens_per_place.is_empty()
-                && tokens_per_place.iter().all(|(_, t)| !t.is_empty())
+            !tokens_per_place.is_empty() && tokens_per_place.iter().all(|(_, t)| !t.is_empty())
         }
     }
 }

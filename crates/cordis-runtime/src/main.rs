@@ -119,12 +119,20 @@ mod pending {
 
     fn sanitize(key: &str) -> String {
         key.chars()
-            .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
             .collect()
     }
 
     pub fn path_for(data_dir: &Path, session_key: &str) -> PathBuf {
-        data_dir.join("pending").join(format!("{}.json", sanitize(session_key)))
+        data_dir
+            .join("pending")
+            .join(format!("{}.json", sanitize(session_key)))
     }
 
     pub fn save(data_dir: &Path, msg: &PendingMessage) {
@@ -228,8 +236,7 @@ struct ServeState {
 static AGENT_TRIGGER_TX: std::sync::OnceLock<std::sync::mpsc::SyncSender<String>> =
     std::sync::OnceLock::new();
 const AGENT_TRIGGER_CAPACITY: usize = 256;
-static AGENT_TRIGGER_DROPPED: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+static AGENT_TRIGGER_DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// C ABI entry point plugins call to push a message into the agent inbox.
 ///
@@ -241,13 +248,14 @@ static AGENT_TRIGGER_DROPPED: std::sync::atomic::AtomicU64 =
 /// pointer is undefined behaviour.
 #[no_mangle]
 pub unsafe extern "C" fn _cordis_agent_trigger(msg: *const std::ffi::c_char) {
-    if msg.is_null() { return; }
+    if msg.is_null() {
+        return;
+    }
     let s = unsafe { std::ffi::CStr::from_ptr(msg).to_string_lossy().to_string() };
     if let Some(tx) = AGENT_TRIGGER_TX.get() {
         if tx.try_send(s).is_err() {
-            let dropped = AGENT_TRIGGER_DROPPED
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                + 1;
+            let dropped =
+                AGENT_TRIGGER_DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
             // Log every drop at first, then only every 50th so a sustained
             // flood doesn't turn stderr into its own overload problem.
             if dropped <= 5 || dropped.is_multiple_of(50) {
@@ -261,7 +269,9 @@ pub unsafe extern "C" fn _cordis_agent_trigger(msg: *const std::ffi::c_char) {
 }
 
 extern "C" fn sigterm_to_sigint(_sig: libc::c_int) {
-    unsafe { libc::raise(libc::SIGINT); }
+    unsafe {
+        libc::raise(libc::SIGINT);
+    }
 }
 
 /// P1-12: install SIGTERM → SIGINT forwarding using `sigaction(2)`, the
@@ -463,7 +473,8 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     for item in &items {
                         let plugin_path = item["plugin_path"].as_str().unwrap_or("");
                         let node_id = item["node_id"].as_str().unwrap_or("");
-                        let payload = item["payload"].as_object()
+                        let payload = item["payload"]
+                            .as_object()
                             .map(|o| serde_json::to_string(o).unwrap_or_default())
                             .unwrap_or_else(|| "{}".to_string());
                         if !plugin_path.is_empty() && !node_id.is_empty() {
@@ -505,7 +516,9 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     if runtime_only {
         eprintln!("runtime-only: inbox started");
         let (tx, rx) = std::sync::mpsc::sync_channel::<String>(AGENT_TRIGGER_CAPACITY);
-        let inject_queue = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::<String>::new()));
+        let inject_queue = std::sync::Arc::new(std::sync::Mutex::new(
+            std::collections::VecDeque::<String>::new(),
+        ));
         // OnceLock::set returns Err if already set; runtime-only branch is
         // entered at most once so the first-set path always wins.
         let _ = AGENT_TRIGGER_TX.set(tx);
@@ -532,11 +545,16 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 for msg in msgs {
                     let env = AgentEnvelope::parse(&msg);
                     if !env.session_key.is_empty() {
-                        by_session.entry(env.session_key.clone()).or_default().push(env);
+                        by_session
+                            .entry(env.session_key.clone())
+                            .or_default()
+                            .push(env);
                     }
                 }
                 for (session_key, envs) in &by_session {
-                    if session_key.is_empty() || envs.is_empty() { continue; }
+                    if session_key.is_empty() || envs.is_empty() {
+                        continue;
+                    }
                     let data_dir = host.data_dir();
                     // Fixed-template reply through a GIVEN envelope's route —
                     // the no-LLM send path shared by command replies and
@@ -544,7 +562,9 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     // in a mixed batch answers its own sender/target.
                     let send_via = |env: &AgentEnvelope, message: &str| {
                         if !env.can_reply() {
-                            eprintln!("inbox: no reply route for {session_key}, direct reply dropped");
+                            eprintln!(
+                                "inbox: no reply route for {session_key}, direct reply dropped"
+                            );
                             return;
                         }
                         let payload = serde_json::json!({
@@ -552,7 +572,9 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                             "target": env.reply_target,
                             "message": message,
                         });
-                        if let Err(e) = host.invoke(&env.source_plugin, &env.reply_node, payload.to_string()) {
+                        if let Err(e) =
+                            host.invoke(&env.source_plugin, &env.reply_node, payload.to_string())
+                        {
                             eprintln!("inbox: direct reply failed: {e}");
                         }
                     };
@@ -616,7 +638,9 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     let route = normals.last().cloned().unwrap();
                     eprintln!(
                         "inbox: [{session_key}] (soul {}) batch {} msgs: {}",
-                        route.soul_key(), normals.len(), combined
+                        route.soul_key(),
+                        normals.len(),
+                        combined
                     );
                     // P1-53: don't drain rx.try_recv() here — messages on the
                     // channel are from ALL sessions; the outer loop shards
@@ -626,11 +650,7 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     // next message via agent_start.
                     const MAX_SESSIONS: usize = 512;
                     if !sessions.contains_key(session_key) && sessions.len() >= MAX_SESSIONS {
-                        if let Some(evict_key) = sessions
-                            .keys()
-                            .next()
-                            .cloned()
-                        {
+                        if let Some(evict_key) = sessions.keys().next().cloned() {
                             if let Some(evicted_sid) = sessions.remove(&evict_key) {
                                 eprintln!(
                                     "inbox: evicting oldest session for {} (session {})",
@@ -645,16 +665,16 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     // persona overlays the system prompt. Unknown profile
                     // names fall back to default inside resolve().
                     let soul_key = route.soul_key();
-                    let sid = sessions.entry(session_key.clone())
-                        .or_insert_with(|| {
-                            let soul = host.get_soul(&soul_key).ok().flatten();
-                            let options = cordis_runtime::host::AgentStartOptions {
-                                profile: soul.as_ref().and_then(|s| s.profile.clone()),
-                                soul_key: soul_key.clone(),
-                            };
-                            host.agent_start_with(AgentSessionKind::RuntimeShell, options)
-                                .map(|s| s.session_id).unwrap_or_default()
-                        });
+                    let sid = sessions.entry(session_key.clone()).or_insert_with(|| {
+                        let soul = host.get_soul(&soul_key).ok().flatten();
+                        let options = cordis_runtime::host::AgentStartOptions {
+                            profile: soul.as_ref().and_then(|s| s.profile.clone()),
+                            soul_key: soul_key.clone(),
+                        };
+                        host.agent_start_with(AgentSessionKind::RuntimeShell, options)
+                            .map(|s| s.session_id)
+                            .unwrap_or_default()
+                    });
                     // H1: re-scope the soul to THIS batch's speaker before
                     // sending. Idempotent — a cheap no-op when unchanged, and
                     // also covers the just-created session. Errors ignored
@@ -664,7 +684,9 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     // the reply back to the ORIGINATING plugin (route). Returns
                     // Some(feedback) if the agent needs to retry.
                     let process = |raw: String, label: &str| -> Option<String> {
-                        if raw.is_empty() { return None; }
+                        if raw.is_empty() {
+                            return None;
+                        }
                         // Preprocess: escape newlines and embedded quotes inside JSON strings.
                         let chars: Vec<char> = raw.chars().collect();
                         let mut out = String::with_capacity(raw.len() + 64);
@@ -675,29 +697,53 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                             if ch == '"' {
                                 if in_string {
                                     let already_escaped = i > 0 && chars[i - 1] == '\\';
-                                    if already_escaped { out.push('"'); }
-                                    else {
+                                    if already_escaped {
+                                        out.push('"');
+                                    } else {
                                         let mut j = i + 1;
-                                        while j < chars.len() && chars[j] == ' ' { j += 1; }
+                                        while j < chars.len() && chars[j] == ' ' {
+                                            j += 1;
+                                        }
                                         let next = chars.get(j).copied();
-                                        if matches!(next, Some(':') | Some(',') | Some('}') | Some(']') | None) {
-                                            in_string = false; out.push('"');
-                                        } else { out.push_str("\\\""); }
+                                        if matches!(
+                                            next,
+                                            Some(':') | Some(',') | Some('}') | Some(']') | None
+                                        ) {
+                                            in_string = false;
+                                            out.push('"');
+                                        } else {
+                                            out.push_str("\\\"");
+                                        }
                                     }
-                                } else { in_string = true; out.push('"'); }
-                            } else if ch == '\n' && in_string { out.push_str("\\n"); }
-                            else { out.push(ch); }
+                                } else {
+                                    in_string = true;
+                                    out.push('"');
+                                }
+                            } else if ch == '\n' && in_string {
+                                out.push_str("\\n");
+                            } else {
+                                out.push(ch);
+                            }
                             i += 1;
                         }
                         match serde_json::from_str::<Value>(&out) {
-                            Ok(ref cmd) if cmd.get("action").and_then(|v| v.as_str()) == Some("suspend") => {
+                            Ok(ref cmd)
+                                if cmd.get("action").and_then(|v| v.as_str())
+                                    == Some("suspend") =>
+                            {
                                 eprintln!("inbox: session suspended ({label})");
                                 None
                             }
-                            Ok(ref cmd) if cmd.get("action").and_then(|v| v.as_str()) == Some("respond") => {
+                            Ok(ref cmd)
+                                if cmd.get("action").and_then(|v| v.as_str())
+                                    == Some("respond") =>
+                            {
                                 let msg = cmd.get("message").and_then(|v| v.as_str()).unwrap_or("");
                                 if !msg.is_empty() {
-                                    eprintln!("inbox: agent reply ({label}): {}...", msg.chars().take(100).collect::<String>());
+                                    eprintln!(
+                                        "inbox: agent reply ({label}): {}...",
+                                        msg.chars().take(100).collect::<String>()
+                                    );
                                     if route.can_reply() {
                                         let mut payload = serde_json::json!({
                                             "node_id": route.reply_node,
@@ -707,9 +753,19 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                                         if let Some(rt) = &route.reply_to {
                                             payload["reply_to"] = serde_json::json!(rt);
                                         }
-                                        match host.invoke(&route.source_plugin, &route.reply_node, payload.to_string()) {
-                                            Ok(_) => eprintln!("inbox: {}::{} OK ({label})", route.source_plugin, route.reply_node),
-                                            Err(e) => eprintln!("inbox: {}::{} failed ({label}): {e}", route.source_plugin, route.reply_node),
+                                        match host.invoke(
+                                            &route.source_plugin,
+                                            &route.reply_node,
+                                            payload.to_string(),
+                                        ) {
+                                            Ok(_) => eprintln!(
+                                                "inbox: {}::{} OK ({label})",
+                                                route.source_plugin, route.reply_node
+                                            ),
+                                            Err(e) => eprintln!(
+                                                "inbox: {}::{} failed ({label}): {e}",
+                                                route.source_plugin, route.reply_node
+                                            ),
                                         }
                                     } else {
                                         eprintln!("inbox: no reply route for session {session_key}, dropping reply ({label})");
@@ -718,14 +774,25 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                                 None
                             }
                             Ok(ref cmd) => {
-                                let action = cmd.get("action").and_then(|v| v.as_str()).unwrap_or("?");
-                                eprintln!("inbox: unknown JSON action={action}, dropping raw={}...", raw.chars().take(200).collect::<String>().replace('\n', " "));
+                                let action =
+                                    cmd.get("action").and_then(|v| v.as_str()).unwrap_or("?");
+                                eprintln!(
+                                    "inbox: unknown JSON action={action}, dropping raw={}...",
+                                    raw.chars().take(200).collect::<String>().replace('\n', " ")
+                                );
                                 cordis_runtime::kernel::notify::send(&host, &format!("[{session_key}] ⚠️ 回复异常（未知动作: {action}），正在重试..."));
                                 Some(format!("SYSTEM: Your last output was valid JSON but had unknown action \"{action}\". Allowed actions: \"suspend\" or \"respond\". Please retry.\n\nYour raw output was:\n{raw}"))
                             }
                             Err(e) => {
-                                eprintln!("inbox: JSON parse failed: {e} — raw={}... preprocessed={}...", raw.chars().take(200).collect::<String>().replace('\n', " "), out.chars().take(200).collect::<String>().replace('\n', " "));
-                                cordis_runtime::kernel::notify::send(&host, &format!("[{session_key}] ⚠️ 回复格式异常，正在重试...（{e}）"));
+                                eprintln!(
+                                    "inbox: JSON parse failed: {e} — raw={}... preprocessed={}...",
+                                    raw.chars().take(200).collect::<String>().replace('\n', " "),
+                                    out.chars().take(200).collect::<String>().replace('\n', " ")
+                                );
+                                cordis_runtime::kernel::notify::send(
+                                    &host,
+                                    &format!("[{session_key}] ⚠️ 回复格式异常，正在重试...（{e}）"),
+                                );
                                 Some(format!("SYSTEM: Your last output was not valid JSON and was dropped. Parse error: {e}\n\nPlease fix the JSON formatting and retry. Final output must be exactly {{\"action\":\"suspend\"}} or {{\"action\":\"respond\",\"message\":\"...\"}}.\n\nYour raw output was:\n{raw}"))
                             }
                         }
@@ -753,14 +820,17 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                                 .map(|e| e.display.as_str())
                                 .collect::<Vec<_>>()
                                 .join("\n");
-                            pending::save(&data_dir, &pending::PendingMessage {
-                                session_key: session_key.clone(),
-                                combined: batch_only,
-                                enqueued_at_ms: std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .map(|d| d.as_millis() as u64)
-                                    .unwrap_or(0),
-                            });
+                            pending::save(
+                                &data_dir,
+                                &pending::PendingMessage {
+                                    session_key: session_key.clone(),
+                                    combined: batch_only,
+                                    enqueued_at_ms: std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .map(|d| d.as_millis() as u64)
+                                        .unwrap_or(0),
+                                },
+                            );
                             if route.can_reply() {
                                 let payload = serde_json::json!({
                                     "node_id": route.reply_node,
@@ -777,7 +847,9 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                             }
                             cordis_runtime::kernel::notify::send(
                                 &host,
-                                &format!("[{session_key}] ⚠️ LLM 请求失败（消息已暂存待重放）: {e}"),
+                                &format!(
+                                    "[{session_key}] ⚠️ LLM 请求失败（消息已暂存待重放）: {e}"
+                                ),
                             );
                         }
                     }
@@ -798,8 +870,7 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         // Leaking (via mem::forget) prevents Drop from firing at scope
         // end, so the loop keeps ticking; a future shutdown-orchestration
         // pass can replace this with `handle.stop()` at the exit sink.
-        let health_handle =
-            cordis_runtime::kernel::health::start_health_loop(health_host, 3600);
+        let health_handle = cordis_runtime::kernel::health::start_health_loop(health_host, 3600);
         std::mem::forget(health_handle);
 
         // Park — background threads keep running.
@@ -1103,11 +1174,8 @@ fn handle_agent_chat_line(
                     }
                     Err(err) => {
                         // Save partial changes as draft, revert workspace.
-                        let reverted = host
-                            .revert_interactive_changes()
-                            .unwrap_or(0);
-                        let saved =
-                            save_draft_and_revert(host.fixtures_root(), "error");
+                        let reverted = host.revert_interactive_changes().unwrap_or(0);
+                        let saved = save_draft_and_revert(host.fixtures_root(), "error");
                         if let Some(path) = saved {
                             println!(
                                 "\n💾 draft saved: {path} ({n} file(s) reverted)\n   replay: cd fixtures && git apply {path}",
@@ -1653,12 +1721,15 @@ fn run_llm_auto_update(args: &[String]) -> Result<(), Box<dyn std::error::Error>
     };
 
     if dry_run {
-        println!("{}", serde_json::to_string_pretty(&json!({
-            "dry_run": true,
-            "message": "agent loop dry-run",
-            "paths": paths,
-            "target_plugin_paths": request.target_plugin_paths,
-        }))?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "dry_run": true,
+                "message": "agent loop dry-run",
+                "paths": paths,
+                "target_plugin_paths": request.target_plugin_paths,
+            }))?
+        );
         return Ok(());
     }
 
@@ -2032,16 +2103,22 @@ mod pending_tests {
         let _ = std::fs::remove_dir_all(&temp);
         let key = "feishu:chat:oc_x";
         assert!(pending::load(&temp, key).is_none());
-        pending::save(&temp, &pending::PendingMessage {
-            session_key: key.to_string(),
-            combined: "第一条".to_string(),
-            enqueued_at_ms: 100,
-        });
-        pending::save(&temp, &pending::PendingMessage {
-            session_key: key.to_string(),
-            combined: "第二条".to_string(),
-            enqueued_at_ms: 200,
-        });
+        pending::save(
+            &temp,
+            &pending::PendingMessage {
+                session_key: key.to_string(),
+                combined: "第一条".to_string(),
+                enqueued_at_ms: 100,
+            },
+        );
+        pending::save(
+            &temp,
+            &pending::PendingMessage {
+                session_key: key.to_string(),
+                combined: "第二条".to_string(),
+                enqueued_at_ms: 200,
+            },
+        );
         let loaded = pending::load(&temp, key).expect("pending should exist");
         assert_eq!(loaded.combined, "第一条\n第二条");
         assert_eq!(loaded.enqueued_at_ms, 100, "保留最早时间戳");
@@ -2132,7 +2209,10 @@ mod batch_tests {
     // 带 `]: ` 前缀提取、无前缀回落原文、两侧 trim。
     #[test]
     fn extract_user_text_variants() {
-        assert_eq!(extract_user_text("[feishu (user 张三)]: /status"), "/status");
+        assert_eq!(
+            extract_user_text("[feishu (user 张三)]: /status"),
+            "/status"
+        );
         assert_eq!(extract_user_text("[qq (user 42)]:   在吗  "), "在吗");
         // No "]: " marker → whole string, trimmed.
         assert_eq!(extract_user_text("  plain text  "), "plain text");

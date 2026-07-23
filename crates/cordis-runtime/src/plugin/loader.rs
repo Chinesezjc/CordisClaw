@@ -209,9 +209,7 @@ impl Loader {
                         );
                         context.set_plugin_state(
                             plugin_path,
-                            PluginLoadResult::Unavailable(
-                                PluginUnavailableReason::HashMismatch,
-                            ),
+                            PluginLoadResult::Unavailable(PluginUnavailableReason::HashMismatch),
                         );
                         metrics.plugin_unavailable_total += 1;
                         metrics.dylib_no_fallback_total += 1;
@@ -241,9 +239,7 @@ impl Loader {
                     );
                     context.set_plugin_state(
                         plugin_path,
-                        PluginLoadResult::Unavailable(
-                            PluginUnavailableReason::HashMismatch,
-                        ),
+                        PluginLoadResult::Unavailable(PluginUnavailableReason::HashMismatch),
                     );
                     metrics.plugin_unavailable_total += 1;
                     metrics.dylib_no_fallback_total += 1;
@@ -416,9 +412,7 @@ impl Loader {
                         );
                         context.set_plugin_state(
                             plugin_path,
-                            PluginLoadResult::Unavailable(
-                                PluginUnavailableReason::SymbolMissing,
-                            ),
+                            PluginLoadResult::Unavailable(PluginUnavailableReason::SymbolMissing),
                         );
                         metrics.plugin_unavailable_total += 1;
                         metrics.dylib_no_fallback_total += 1;
@@ -551,9 +545,7 @@ impl Loader {
                     }
                 }
                 Err(e) => {
-                    eprintln!(
-                        "[loader] docs-drift: failed to serialize artifact index: {e}"
-                    );
+                    eprintln!("[loader] docs-drift: failed to serialize artifact index: {e}");
                 }
             }
         }
@@ -681,8 +673,16 @@ mod loader_helper_tests {
         let a = unique_staging_path(base);
         let b = unique_staging_path(base);
         assert_ne!(a, b);
-        assert!(a.file_name().unwrap().to_string_lossy().contains(".cordis-tmp."));
-        assert!(a.file_name().unwrap().to_string_lossy().starts_with("index.json.cordis-tmp."));
+        assert!(a
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .contains(".cordis-tmp."));
+        assert!(a
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("index.json.cordis-tmp."));
     }
 
     #[test]

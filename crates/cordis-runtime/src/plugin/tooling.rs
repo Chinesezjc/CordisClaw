@@ -197,7 +197,8 @@ pub fn rebuild_plugin_workspace(
     cmd.arg("build")
         .arg("--manifest-path")
         .arg(workspace_root.join("plugins").join("Cargo.toml"))
-        .arg("-p").arg(name);
+        .arg("-p")
+        .arg(name);
     // P2-29: strip HTTP proxy env vars so cargo doesn't try to
     // contact a corporate proxy for the offline / local-path deps that
     // fixtures use. `run_command` (the other cargo path in this file)
@@ -276,7 +277,10 @@ pub fn rebuild_plugin_workspace(
         }
     }
 
-    Ok(vec![(name.to_string(), format!("{} -> {}", src.display(), dst.display()))])
+    Ok(vec![(
+        name.to_string(),
+        format!("{} -> {}", src.display(), dst.display()),
+    )])
 }
 
 /// Copy `src` -> `dst` atomically: write to `<dst>.cordis-tmp`, fsync,
@@ -293,10 +297,12 @@ pub(crate) fn stage_then_rename_file(src: &Path, dst: &Path) -> Result<(), Runti
         message: format!("open source: {e}"),
     })?;
     let mut buf = Vec::new();
-    src_file.read_to_end(&mut buf).map_err(|e| RuntimeError::Io {
-        path: src.to_path_buf(),
-        message: format!("read source: {e}"),
-    })?;
+    src_file
+        .read_to_end(&mut buf)
+        .map_err(|e| RuntimeError::Io {
+            path: src.to_path_buf(),
+            message: format!("read source: {e}"),
+        })?;
     let tmp = match dst.file_name() {
         Some(name) => {
             let mut owned = name.to_os_string();
@@ -1042,7 +1048,11 @@ fn read_plugin_build_spec(manifest_path: &Path) -> Result<PluginBuildSpec, Runti
         is_dylib: manifest
             .lib
             .as_ref()
-            .map(|lib| lib.crate_type.iter().any(|kind| kind == "dylib" || kind == "cdylib"))
+            .map(|lib| {
+                lib.crate_type
+                    .iter()
+                    .any(|kind| kind == "dylib" || kind == "cdylib")
+            })
             .unwrap_or(false),
         artifact: package
             .metadata
@@ -1450,7 +1460,11 @@ fn cleanup_fixture_lockfiles(plugins_root: &Path) -> Result<(), RuntimeError> {
     // and prevents reproducible builds. The historical behaviour is kept
     // for callers who really need it; the default is now to leave lock
     // files alone.
-    if std::env::var("CORDIS_CLEAN_FIXTURE_LOCKFILES").ok().as_deref() != Some("1") {
+    if std::env::var("CORDIS_CLEAN_FIXTURE_LOCKFILES")
+        .ok()
+        .as_deref()
+        != Some("1")
+    {
         return Ok(());
     }
 

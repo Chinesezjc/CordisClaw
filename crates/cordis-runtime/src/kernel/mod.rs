@@ -3,8 +3,8 @@
 pub mod auto_update;
 pub mod evaluator;
 pub mod health;
-pub mod notify;
 pub mod memory;
+pub mod notify;
 pub mod plugin_iteration;
 pub mod policy;
 pub mod verifier;

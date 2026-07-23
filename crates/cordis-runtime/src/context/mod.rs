@@ -185,8 +185,7 @@ pub struct RuntimeContext {
     #[allow(clippy::type_complexity)]
     request_slots: Arc<Mutex<BTreeMap<ContextKey, SlotEntry>>>,
     #[allow(clippy::type_complexity)]
-    subgraph_overlays:
-        Arc<Mutex<BTreeMap<String, BTreeMap<ContextKey, Option<SlotEntry>>>>>,
+    subgraph_overlays: Arc<Mutex<BTreeMap<String, BTreeMap<ContextKey, Option<SlotEntry>>>>>,
     active_subgraph: Arc<Mutex<Option<String>>>,
     session_version: AtomicU64,
     skipped_nodes: Arc<Mutex<BTreeSet<String>>>,
@@ -246,11 +245,7 @@ pub trait ContextTxn {
     fn begin_subgraph(&self, subgraph_id: &str) -> Result<(), RuntimeError>;
     fn commit_overlay(&self, subgraph_id: &str) -> Result<(), RuntimeError>;
     fn rollback_overlay(&self, subgraph_id: &str) -> Result<(), RuntimeError>;
-    fn commit_session(
-        &self,
-        session_id: &str,
-        expected_version: u64,
-    ) -> Result<(), RuntimeError>;
+    fn commit_session(&self, session_id: &str, expected_version: u64) -> Result<(), RuntimeError>;
 }
 
 impl Default for RuntimeContext {
@@ -281,25 +276,13 @@ impl Clone for RuntimeContext {
             session: self.session.clone(),
             request: self.request.clone(),
             local: self.local.clone(),
-            global_slots: Arc::new(Mutex::new(
-                self.global_slots.lock().unwrap().clone(),
-            )),
-            session_slots: Arc::new(Mutex::new(
-                self.session_slots.lock().unwrap().clone(),
-            )),
-            request_slots: Arc::new(Mutex::new(
-                self.request_slots.lock().unwrap().clone(),
-            )),
-            subgraph_overlays: Arc::new(Mutex::new(
-                self.subgraph_overlays.lock().unwrap().clone(),
-            )),
-            active_subgraph: Arc::new(Mutex::new(
-                self.active_subgraph.lock().unwrap().clone(),
-            )),
+            global_slots: Arc::new(Mutex::new(self.global_slots.lock().unwrap().clone())),
+            session_slots: Arc::new(Mutex::new(self.session_slots.lock().unwrap().clone())),
+            request_slots: Arc::new(Mutex::new(self.request_slots.lock().unwrap().clone())),
+            subgraph_overlays: Arc::new(Mutex::new(self.subgraph_overlays.lock().unwrap().clone())),
+            active_subgraph: Arc::new(Mutex::new(self.active_subgraph.lock().unwrap().clone())),
             session_version: AtomicU64::new(self.session_version.load(Ordering::SeqCst)),
-            skipped_nodes: Arc::new(Mutex::new(
-                self.skipped_nodes.lock().unwrap().clone(),
-            )),
+            skipped_nodes: Arc::new(Mutex::new(self.skipped_nodes.lock().unwrap().clone())),
             hierarchy: self.hierarchy.clone(),
             plugin_state: self.plugin_state.clone(),
             metrics: self.metrics.clone(),
@@ -384,11 +367,7 @@ impl RuntimeContext {
 
         // Schema compatibility check.
         let requested_major = key.version / 100;
-        for existing in request
-            .keys()
-            .chain(session.keys())
-            .chain(global.keys())
-        {
+        for existing in request.keys().chain(session.keys()).chain(global.keys()) {
             if existing.namespace == key.namespace && existing.name == key.name {
                 let existing_major = existing.version / 100;
                 if existing_major != requested_major {
@@ -595,15 +574,16 @@ impl ContextRead for RuntimeContext {
             .unwrap_or_else(|poison| poison.into_inner());
         let active_id = active.clone();
         drop(active);
-        let overlay_snapshot: Option<BTreeMap<ContextKey, Option<SlotEntry>>> = if let Some(id) = active_id.as_deref() {
-            let overlays = self
-                .subgraph_overlays
-                .lock()
-                .unwrap_or_else(|poison| poison.into_inner());
-            overlays.get(id).cloned()
-        } else {
-            None
-        };
+        let overlay_snapshot: Option<BTreeMap<ContextKey, Option<SlotEntry>>> =
+            if let Some(id) = active_id.as_deref() {
+                let overlays = self
+                    .subgraph_overlays
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner());
+                overlays.get(id).cloned()
+            } else {
+                None
+            };
 
         let request = self
             .request_slots
@@ -761,11 +741,12 @@ impl ContextTxn for RuntimeContext {
             .subgraph_overlays
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        let overlay = overlays.remove(subgraph_id).ok_or_else(|| {
-            RuntimeError::SubgraphNotFound {
-                subgraph_id: subgraph_id.to_string(),
-            }
-        })?;
+        let overlay =
+            overlays
+                .remove(subgraph_id)
+                .ok_or_else(|| RuntimeError::SubgraphNotFound {
+                    subgraph_id: subgraph_id.to_string(),
+                })?;
         *active = None;
         drop(active);
         drop(overlays);
@@ -816,11 +797,7 @@ impl ContextTxn for RuntimeContext {
         Ok(())
     }
 
-    fn commit_session(
-        &self,
-        session_id: &str,
-        expected_version: u64,
-    ) -> Result<(), RuntimeError> {
+    fn commit_session(&self, session_id: &str, expected_version: u64) -> Result<(), RuntimeError> {
         // P1-1: single-step CAS on session_version. Previously this method
         // did `load` → work → `fetch_add`, so two threads at the same
         // `expected_version` could both pass the equality check and both
@@ -1066,14 +1043,10 @@ impl ServiceRegistry {
     /// Force-kill zombies matching `plugin_path` prefix.
     /// Returns the number of zombies killed.
     pub fn kill_zombie_services(&self, plugin_path: &str) -> usize {
-        let mut zombies = self
-            .zombies
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        let (matched, rest): (Vec<_>, Vec<_>) =
-            std::mem::take(&mut *zombies)
-                .into_iter()
-                .partition(|z| z.key.starts_with(plugin_path));
+        let mut zombies = self.zombies.lock().unwrap_or_else(|p| p.into_inner());
+        let (matched, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut *zombies)
+            .into_iter()
+            .partition(|z| z.key.starts_with(plugin_path));
 
         let killed = matched.len();
         for z in matched {
@@ -1100,10 +1073,7 @@ impl ServiceRegistry {
 
     /// Number of zombie services currently tracked.
     pub fn zombie_count(&self) -> usize {
-        self.zombies
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .len()
+        self.zombies.lock().unwrap_or_else(|p| p.into_inner()).len()
     }
 
     /// Stop and remove all registered services.

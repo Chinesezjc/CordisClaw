@@ -1,5 +1,3 @@
-use cordis_plugin_sdk::NodeType;
-use libloading;
 use crate::core::error::RuntimeError;
 use crate::core::models::{
     ArtifactKind, DylibAbiKind, PluginExecution, PluginLoadResult, PluginUnavailableReason,
@@ -8,6 +6,8 @@ use crate::plugin::abi::{PluginRequest, PluginResponse};
 use crate::plugin::dynamic::{is_dylib_path, LoadedDylibApi};
 use crate::plugin::loader::{default_loader_config, Loader};
 use crate::plugin::registry::PluginRegistry;
+use cordis_plugin_sdk::NodeType;
+use libloading;
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -221,7 +221,8 @@ pub fn invoke_registered_plugin(
             message: format!("plugin invoke payload was not valid JSON: {err}"),
         })?;
     if let Some(obj) = payload_value.as_object_mut() {
-        obj.entry("node_id").or_insert_with(|| serde_json::json!(node_id));
+        obj.entry("node_id")
+            .or_insert_with(|| serde_json::json!(node_id));
     }
     let payload = serde_json::to_string(&payload_value).map_err(|err| RuntimeError::Invariant {
         message: format!("plugin invoke payload re-serialize failed: {err}"),
@@ -239,13 +240,10 @@ pub fn invoke_registered_plugin(
         // node_id containing an interior NUL byte silently became empty
         // and the plugin returned the wrong service vtable (or null).
         // Fail closed with a clear error.
-        let c_node = std::ffi::CString::new(node_id).map_err(|err| {
-            RuntimeError::InvalidArgument {
-                message: format!(
-                    "plugin invoke node_id contains NUL byte: {err}"
-                ),
-            }
-        })?;
+        let c_node =
+            std::ffi::CString::new(node_id).map_err(|err| RuntimeError::InvalidArgument {
+                message: format!("plugin invoke node_id contains NUL byte: {err}"),
+            })?;
         let create_sym: Result<
             libloading::Symbol<
                 unsafe extern "C" fn(
@@ -410,7 +408,9 @@ mod panic_isolation_tests {
         let err = call_handle_catch_unwind(
             "test/panicker",
             boom,
-            PluginRequest { payload: "{}".to_string() },
+            PluginRequest {
+                payload: "{}".to_string(),
+            },
         )
         .expect_err("panic must convert to Err");
         match err {
@@ -426,12 +426,16 @@ mod panic_isolation_tests {
     #[test]
     fn handle_ok_passes_through() {
         fn happy(_: PluginRequest) -> PluginResponse {
-            PluginResponse { payload: r#"{"ok":true}"#.to_string() }
+            PluginResponse {
+                payload: r#"{"ok":true}"#.to_string(),
+            }
         }
         let resp = call_handle_catch_unwind(
             "test/happy",
             happy,
-            PluginRequest { payload: "{}".to_string() },
+            PluginRequest {
+                payload: "{}".to_string(),
+            },
         )
         .expect("no panic");
         assert_eq!(resp.payload, r#"{"ok":true}"#);

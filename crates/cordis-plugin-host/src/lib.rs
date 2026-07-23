@@ -34,7 +34,9 @@ pub fn call_handler(input: &str) -> Option<String> {
     HANDLER.get().map(|f| {
         let c_in = CString::new(input).unwrap();
         let c_out = f(c_in.as_ptr());
-        let s = unsafe { CStr::from_ptr(c_out) }.to_string_lossy().into_owned();
+        let s = unsafe { CStr::from_ptr(c_out) }
+            .to_string_lossy()
+            .into_owned();
         unsafe { libc::free(c_out as *mut std::ffi::c_void) };
         s
     })
@@ -301,18 +303,18 @@ fn invoke_dylib(
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
     if guard.is_none() {
-        let lib = unsafe { Library::new(&plugin.artifact_path) }.map_err(|err| {
-            PluginHostError::Io {
+        let lib =
+            unsafe { Library::new(&plugin.artifact_path) }.map_err(|err| PluginHostError::Io {
                 path: plugin.artifact_path.clone(),
                 message: format!("load dylib failed: {err}"),
-            }
-        })?;
+            })?;
         let symbol_name = format!("{RUST_PLUGIN_ENTRY_SYMBOL}\0");
-        let symbol = unsafe { lib.get::<*const RustPluginApiV2>(symbol_name.as_bytes()) }
-            .map_err(|err| PluginHostError::Io {
+        let symbol = unsafe { lib.get::<*const RustPluginApiV2>(symbol_name.as_bytes()) }.map_err(
+            |err| PluginHostError::Io {
                 path: plugin.artifact_path.clone(),
                 message: format!("symbol lookup failed ({RUST_PLUGIN_ENTRY_SYMBOL}): {err}"),
-            })?;
+            },
+        )?;
         let api_ptr = *symbol;
         if api_ptr.is_null() {
             return Err(PluginHostError::Io {
@@ -353,7 +355,9 @@ fn invoke_dylib(
     let api = unsafe { &*loaded.api_ptr };
     let handle = api.handle;
     let plugin_path_for_msg = plugin.plugin_path.clone();
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handle(PluginRequest { payload }))) {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        handle(PluginRequest { payload })
+    })) {
         Ok(resp) => Ok(resp),
         Err(payload) => {
             let msg = if let Some(s) = payload.downcast_ref::<&'static str>() {

@@ -55,7 +55,9 @@ fn plugin_commands(host: &RuntimeHost) -> Vec<(String, String)> {
     let mut commands = Vec::new();
     for (plugin_path, plugin) in snapshot.plugin_registry().iter() {
         let Some(docs) = &plugin.docs else { continue };
-        let Some(name) = &docs.command_name else { continue };
+        let Some(name) = &docs.command_name else {
+            continue;
+        };
         if name.trim().is_empty() {
             continue;
         }
@@ -86,9 +88,7 @@ pub fn dispatch(host: &RuntimeHost, ctx: &CommandContext, input: &str) -> Comman
                     return dispatch_plugin_command(host, ctx, &plugin_path, &args);
                 }
             }
-            CommandOutcome::Reply(format!(
-                "未知指令 /{name}。输入 /help 查看可用指令。"
-            ))
+            CommandOutcome::Reply(format!("未知指令 /{name}。输入 /help 查看可用指令。"))
         }
     }
 }

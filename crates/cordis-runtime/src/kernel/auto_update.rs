@@ -220,35 +220,34 @@ impl AutoUpdater {
         // previous implementation used `?` in this loop, leaving files
         // modified with no rollback trigger and no way for the caller to
         // restore prior state.
-        let apply_one =
-            |patch: &crate::kernel::auto_update::FilePatch,
-             backups: &mut Vec<AppliedBackup>,
-             changed_paths: &mut BTreeSet<String>|
-             -> Result<(), RuntimeError> {
-                patch.validate_shape()?;
-                let abs_path = self.resolve_patch_path(&patch.path)?;
-                let original = fs::read_to_string(&abs_path).map_err(|e| RuntimeError::Io {
-                    path: abs_path.clone(),
-                    message: e.to_string(),
-                })?;
-                let updated = match patch.kind {
-                    FilePatchKind::Text => apply_text_patch(patch, &abs_path, &original)?,
-                    FilePatchKind::JsonValue => apply_json_patch(patch, &abs_path, &original)?,
-                    FilePatchKind::TomlValue => apply_toml_patch(patch, &abs_path, &original)?,
-                };
-                // Record the backup BEFORE mutating disk so a failed write
-                // is still recoverable (mirrors the P0-5 rollback pattern).
-                backups.push(AppliedBackup {
-                    abs_path: abs_path.clone(),
-                    original,
-                });
-                fs::write(&abs_path, updated).map_err(|e| RuntimeError::Io {
-                    path: abs_path.clone(),
-                    message: e.to_string(),
-                })?;
-                changed_paths.insert(patch.path.clone());
-                Ok(())
+        let apply_one = |patch: &crate::kernel::auto_update::FilePatch,
+                         backups: &mut Vec<AppliedBackup>,
+                         changed_paths: &mut BTreeSet<String>|
+         -> Result<(), RuntimeError> {
+            patch.validate_shape()?;
+            let abs_path = self.resolve_patch_path(&patch.path)?;
+            let original = fs::read_to_string(&abs_path).map_err(|e| RuntimeError::Io {
+                path: abs_path.clone(),
+                message: e.to_string(),
+            })?;
+            let updated = match patch.kind {
+                FilePatchKind::Text => apply_text_patch(patch, &abs_path, &original)?,
+                FilePatchKind::JsonValue => apply_json_patch(patch, &abs_path, &original)?,
+                FilePatchKind::TomlValue => apply_toml_patch(patch, &abs_path, &original)?,
             };
+            // Record the backup BEFORE mutating disk so a failed write
+            // is still recoverable (mirrors the P0-5 rollback pattern).
+            backups.push(AppliedBackup {
+                abs_path: abs_path.clone(),
+                original,
+            });
+            fs::write(&abs_path, updated).map_err(|e| RuntimeError::Io {
+                path: abs_path.clone(),
+                message: e.to_string(),
+            })?;
+            changed_paths.insert(patch.path.clone());
+            Ok(())
+        };
 
         for patch in &plan.patches {
             if let Err(err) = apply_one(patch, &mut backups, &mut changed_paths) {
@@ -481,9 +480,15 @@ mod tests {
         fs::write(ws.path().join("f.txt"), "unrelated").unwrap();
         let updater = AutoUpdater::new(ws.path());
         let err = updater
-            .execute(plan(vec![FilePatch::text("f.txt", "nope", "yes")]), verify_ok)
+            .execute(
+                plan(vec![FilePatch::text("f.txt", "nope", "yes")]),
+                verify_ok,
+            )
             .unwrap_err();
-        assert!(matches!(err, RuntimeError::AutoUpdatePatternNotFound { .. }));
+        assert!(matches!(
+            err,
+            RuntimeError::AutoUpdatePatternNotFound { .. }
+        ));
     }
 
     #[test]
@@ -492,10 +497,16 @@ mod tests {
         fs::write(ws.path().join("f.txt"), "hello hello").unwrap();
         let updater = AutoUpdater::new(ws.path());
         let err = updater
-            .execute(plan(vec![FilePatch::text("f.txt", "hello", "world")]), verify_ok)
+            .execute(
+                plan(vec![FilePatch::text("f.txt", "hello", "world")]),
+                verify_ok,
+            )
             .unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("appears") && msg.contains("2"), "unexpected: {msg}");
+        assert!(
+            msg.contains("appears") && msg.contains("2"),
+            "unexpected: {msg}"
+        );
         // File must be unchanged.
         assert_eq!(
             fs::read_to_string(ws.path().join("f.txt")).unwrap(),
@@ -509,10 +520,16 @@ mod tests {
         fs::write(ws.path().join("a.txt"), "foo bar").unwrap();
         let updater = AutoUpdater::new(ws.path());
         let result = updater
-            .execute(plan(vec![FilePatch::text("a.txt", "foo", "FOO")]), verify_ok)
+            .execute(
+                plan(vec![FilePatch::text("a.txt", "foo", "FOO")]),
+                verify_ok,
+            )
             .unwrap();
         assert!(!result.rolled_back);
-        assert_eq!(fs::read_to_string(ws.path().join("a.txt")).unwrap(), "FOO bar");
+        assert_eq!(
+            fs::read_to_string(ws.path().join("a.txt")).unwrap(),
+            "FOO bar"
+        );
     }
 
     /// P1-18: if patch N fails, patches 1..N-1 must be rolled back —
@@ -535,7 +552,10 @@ mod tests {
                 verify_ok,
             )
             .unwrap_err();
-        assert!(matches!(err, RuntimeError::AutoUpdatePatternNotFound { .. }));
+        assert!(matches!(
+            err,
+            RuntimeError::AutoUpdatePatternNotFound { .. }
+        ));
         assert_eq!(
             fs::read_to_string(ws.path().join("a.txt")).unwrap(),
             "before",

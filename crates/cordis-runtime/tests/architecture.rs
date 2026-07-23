@@ -1,14 +1,12 @@
+use cordis_plugin_sdk::{AbiFingerprint, NodeDoc, PluginDocs};
 use cordis_runtime::context::ContextRegistry;
 use cordis_runtime::core::error::RuntimeError;
-use cordis_runtime::core::models::{
-    ArtifactKind, PluginLoadResult, PluginUnavailableReason,
-};
+use cordis_runtime::core::models::{ArtifactKind, PluginLoadResult, PluginUnavailableReason};
 use cordis_runtime::plugin::invoke::PluginInvoker;
 use cordis_runtime::plugin::loader::{default_loader_config, Loader};
 use cordis_runtime::plugin::registry::{NodeRegistry, PluginRegistry};
 use cordis_runtime::plugin::tooling::{prepare_artifacts, PrepareMode};
 use cordis_runtime::service::graph_registry::GraphRegistry;
-use cordis_plugin_sdk::{AbiFingerprint, NodeDoc, PluginDocs};
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
 use std::fs;
@@ -65,11 +63,7 @@ fn make_node_doc(id: &str, consumes: &[&str], produces: &[&str]) -> NodeDoc {
     }
 }
 
-fn insert_test_plugin(
-    plugin_registry: &PluginRegistry,
-    plugin_path: &str,
-    docs: &PluginDocs,
-) {
+fn insert_test_plugin(plugin_registry: &PluginRegistry, plugin_path: &str, docs: &PluginDocs) {
     plugin_registry.insert_loaded(
         plugin_path.to_string(),
         None,
@@ -653,15 +647,9 @@ fn multi_producer_input_generates_warning() {
     insert_test_plugin(&plugin_registry, "pkg/b", &docs_b);
     insert_test_plugin(&plugin_registry, "pkg/c", &docs_c);
 
-    node_registry
-        .register_from_docs("pkg/a", &docs_a)
-        .unwrap();
-    node_registry
-        .register_from_docs("pkg/b", &docs_b)
-        .unwrap();
-    node_registry
-        .register_from_docs("pkg/c", &docs_c)
-        .unwrap();
+    node_registry.register_from_docs("pkg/a", &docs_a).unwrap();
+    node_registry.register_from_docs("pkg/b", &docs_b).unwrap();
+    node_registry.register_from_docs("pkg/c", &docs_c).unwrap();
 
     let graph_registry = GraphRegistry::from_registries(&plugin_registry, &node_registry);
     let net = graph_registry.net();
@@ -684,7 +672,10 @@ fn multi_producer_input_generates_warning() {
         .diagnostics
         .iter()
         .any(|d| d.contains("multi-producer") && d.contains("result"));
-    assert!(has_multi, "expected multi-producer diagnostic, got: {net:?}");
+    assert!(
+        has_multi,
+        "expected multi-producer diagnostic, got: {net:?}"
+    );
 }
 
 #[test]
@@ -701,9 +692,7 @@ fn cycle_detection_produces_diagnostic() {
 
     let docs = make_plugin_docs("cycle", vec![node_a, node_b, node_c]);
     insert_test_plugin(&plugin_registry, "cycle", &docs);
-    node_registry
-        .register_from_docs("cycle", &docs)
-        .unwrap();
+    node_registry.register_from_docs("cycle", &docs).unwrap();
 
     let graph_registry = GraphRegistry::from_registries(&plugin_registry, &node_registry);
     let net = graph_registry.net();
@@ -728,9 +717,7 @@ fn orphan_node_appears_without_edges() {
     let orphan = make_node_doc("orphan", &[], &[]);
     let docs = make_plugin_docs("pkg", vec![orphan]);
     insert_test_plugin(&plugin_registry, "pkg", &docs);
-    node_registry
-        .register_from_docs("pkg", &docs)
-        .unwrap();
+    node_registry.register_from_docs("pkg", &docs).unwrap();
 
     let graph_registry = GraphRegistry::from_registries(&plugin_registry, &node_registry);
     let net = graph_registry.net();
@@ -775,12 +762,8 @@ fn edge_deduplication_keeps_single_edge() {
     let docs_c = make_plugin_docs("pkg/c", vec![consumer]);
     insert_test_plugin(&plugin_registry, "pkg/p", &docs_p);
     insert_test_plugin(&plugin_registry, "pkg/c", &docs_c);
-    node_registry
-        .register_from_docs("pkg/p", &docs_p)
-        .unwrap();
-    node_registry
-        .register_from_docs("pkg/c", &docs_c)
-        .unwrap();
+    node_registry.register_from_docs("pkg/p", &docs_p).unwrap();
+    node_registry.register_from_docs("pkg/c", &docs_c).unwrap();
 
     let graph_registry = GraphRegistry::from_registries(&plugin_registry, &node_registry);
     let net = graph_registry.net();

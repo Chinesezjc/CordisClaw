@@ -204,7 +204,11 @@ fn keyed_pair_matches_same_group_without_cross_wiring() {
     )
     .expect("engine run should pass");
 
-    assert_eq!(join_seen.load(Ordering::SeqCst), 2, "join should fire once for each group key");
+    assert_eq!(
+        join_seen.load(Ordering::SeqCst),
+        2,
+        "join should fire once for each group key"
+    );
     let join_keys = output
         .keyed_outcomes
         .get("join")
@@ -269,7 +273,10 @@ fn join_policy_first_success_marks_late_tokens_as_zombie() {
     let mut ctx = RuntimeContext::default();
     let output = execute_net(
         ExecutionConfig {
-            scheduler: SchedulerConfig { max_parallelism: 1, max_concurrency: 1 },
+            scheduler: SchedulerConfig {
+                max_parallelism: 1,
+                max_concurrency: 1,
+            },
             scheduler_mode: SchedulerMode::Deterministic,
         },
         net,
@@ -565,7 +572,10 @@ fn engine_deterministic_mode_is_reproducible() {
         let mut ctx = RuntimeContext::default();
         execute_net(
             ExecutionConfig {
-                scheduler: SchedulerConfig { max_parallelism: 1, max_concurrency: 1 },
+                scheduler: SchedulerConfig {
+                    max_parallelism: 1,
+                    max_concurrency: 1,
+                },
                 scheduler_mode: SchedulerMode::Deterministic,
             },
             make_net(),
@@ -725,28 +735,46 @@ fn parallel_execution_of_independent_key_groups() {
         places: vec![place("p_a"), place("p_b"), place("p_c")],
         transitions: vec![
             transition_grouped(
-                "prod_a", JoinPolicy::AllOf, 0,
-                ExecutionTransitionKind::Task, "ka",
+                "prod_a",
+                JoinPolicy::AllOf,
+                0,
+                ExecutionTransitionKind::Task,
+                "ka",
             ),
             transition_grouped(
-                "prod_b", JoinPolicy::AllOf, 0,
-                ExecutionTransitionKind::Task, "kb",
+                "prod_b",
+                JoinPolicy::AllOf,
+                0,
+                ExecutionTransitionKind::Task,
+                "kb",
             ),
             transition_grouped(
-                "prod_c", JoinPolicy::AllOf, 0,
-                ExecutionTransitionKind::Task, "kc",
+                "prod_c",
+                JoinPolicy::AllOf,
+                0,
+                ExecutionTransitionKind::Task,
+                "kc",
             ),
             transition_grouped(
-                "cons_a", JoinPolicy::AllOf, 0,
-                ExecutionTransitionKind::Task, "ka",
+                "cons_a",
+                JoinPolicy::AllOf,
+                0,
+                ExecutionTransitionKind::Task,
+                "ka",
             ),
             transition_grouped(
-                "cons_b", JoinPolicy::AllOf, 0,
-                ExecutionTransitionKind::Task, "kb",
+                "cons_b",
+                JoinPolicy::AllOf,
+                0,
+                ExecutionTransitionKind::Task,
+                "kb",
             ),
             transition_grouped(
-                "cons_c", JoinPolicy::AllOf, 0,
-                ExecutionTransitionKind::Task, "kc",
+                "cons_c",
+                JoinPolicy::AllOf,
+                0,
+                ExecutionTransitionKind::Task,
+                "kc",
             ),
         ],
         arcs: vec![
@@ -802,10 +830,7 @@ fn single_threaded_mode_unchanged() {
             transition("t1", JoinPolicy::AllOf, 0, ExecutionTransitionKind::Task),
             transition("t2", JoinPolicy::AllOf, 0, ExecutionTransitionKind::Task),
         ],
-        arcs: vec![
-            arc_out("t1", "p", None),
-            arc_in("t2", "p", None),
-        ],
+        arcs: vec![arc_out("t1", "p", None), arc_in("t2", "p", None)],
     };
 
     let mut ctx = RuntimeContext::default();
