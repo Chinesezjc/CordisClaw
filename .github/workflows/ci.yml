@@ -44,8 +44,15 @@ jobs:
       # fixtures/artifacts/ 不入库；host.rs / verifier.rs 的 lib 单测直接
       # RuntimeHost::boot，不走集成测试 support::fixtures_root() 的
       # ensure_fixture_artifacts()，所以必须在 test 之前显式预构建。
+      # 失败时把输出尾部写成 ::error:: 注解，便于从 check-runs API 读取
+      # 失败原因（GitHub 的原始日志接口需要认证）。
       - name: prepare fixture artifacts
-        run: cargo run --locked -p cordis-runtime -- prepare-artifacts fixtures
+        run: |
+          set -o pipefail
+          cargo run --locked -p cordis-runtime -- prepare-artifacts fixtures 2>&1 | tee /tmp/prepare.log || {
+            echo "::error::prepare-artifacts failed: $(tail -c 700 /tmp/prepare.log | tr '\n' ' ')"
+            exit 1
+          }
 
       # --test-threads=1: host.rs / verifier.rs 等 lib 单测共享
       # default_snapshot_root(repo fixtures)，boot 时会清理该目录下全部
