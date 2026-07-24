@@ -5417,11 +5417,43 @@ fn warning_diagnostics_for_changed_paths(
         return Vec::new();
     }
 
-    extract_warning_blocks(stdout)
+    // 嵌套 cargo 在 CARGO_TERM_COLOR=always 下（GitHub Actions 的
+    // dtolnay/rust-toolchain 未设置该 env 时会自动注入 always）输出带
+    // ANSI 颜色码，`warning` 与 `:` 之间夹转义序列，starts_with("warning:")
+    // 与 `--> ` 路径行的匹配全部落空。检测入口统一剥离，不依赖子进程的
+    // 着色配置。
+    let stdout = strip_ansi_sequences(stdout);
+    let stderr = strip_ansi_sequences(stderr);
+
+    extract_warning_blocks(&stdout)
         .into_iter()
-        .chain(extract_warning_blocks(stderr))
+        .chain(extract_warning_blocks(&stderr))
         .filter(|block| warning_block_matches_changed_paths(block, &tracked_paths, fixtures_root))
         .collect()
+}
+
+fn strip_ansi_sequences(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '\u{1b}' {
+            out.push(ch);
+            continue;
+        }
+        // CSI 序列: ESC [ 参数/中间字节(0x20-0x3f) ... 终结字节(0x40-0x7e)。
+        // 其余 ESC 开头的双字符序列（如 ESC c）丢弃 ESC 与后一个字符。
+        if chars.peek() == Some(&'[') {
+            chars.next();
+            for follow in chars.by_ref() {
+                if ('\u{40}'..='\u{7e}').contains(&follow) {
+                    break;
+                }
+            }
+        } else {
+            chars.next();
+        }
+    }
+    out
 }
 
 fn tracked_warning_paths(operations: &[PluginEditOperation]) -> BTreeSet<String> {
@@ -6748,6 +6780,53 @@ mod tests {
         assert_eq!(diagnostics.len(), 1);
         assert!(diagnostics[0].contains("function `apply` is never used"));
         assert!(!diagnostics[0].contains("clab-notify"));
+    }
+
+    #[test]
+    fn strip_ansi_sequences_removes_csi_and_keeps_plain_text() {
+        use super::strip_ansi_sequences;
+        assert_eq!(
+            strip_ansi_sequences(
+                "\u{1b}[1m\u{1b}[33mwarning\u{1b}[0m\u{1b}[1m: unused import\u{1b}[0m"
+            ),
+            "warning: unused import"
+        );
+        assert_eq!(
+            strip_ansi_sequences("no escapes at all"),
+            "no escapes at all"
+        );
+        // 非 CSI 的 ESC 双字符序列同样被剥掉，不残留 ESC。
+        assert_eq!(strip_ansi_sequences("a\u{1b}cb"), "ab");
+        // 文本截断在未终结的 CSI 序列中间时不 panic。
+        assert_eq!(strip_ansi_sequences("tail\u{1b}[1;3"), "tail");
+    }
+
+    #[test]
+    fn warning_detection_survives_ansi_colored_output() {
+        let operations = vec![PluginEditOperation {
+            path: "plugins/expr/evaluator/dist/src/core.rs".to_string(),
+            kind: PluginEditOpKind::ReplaceExact,
+            expected_old_string: Some("old".to_string()),
+            expected_sha256: None,
+            new_content: Some("new".to_string()),
+            pointer: None,
+            dotted_key: None,
+            value: None,
+        }];
+        // CI 实测字节序列：CARGO_TERM_COLOR=always 下嵌套 cargo 的 stderr。
+        let colored_stderr = "\u{1b}[1m\u{1b}[33mwarning\u{1b}[0m\u{1b}[1m: unused import: `std::fmt`\u{1b}[0m\n \u{1b}[1m\u{1b}[94m--> \u{1b}[0mexpr/src/../evaluator/src/../dist/src/core.rs:2:5\n  \u{1b}[1m\u{1b}[94m|\u{1b}[0m\n\u{1b}[1m\u{1b}[94m2\u{1b}[0m \u{1b}[1m\u{1b}[94m|\u{1b}[0m use std::fmt;\n  \u{1b}[1m\u{1b}[94m|\u{1b}[0m     \u{1b}[1m\u{1b}[33m^^^^^^^^\u{1b}[0m\n";
+        let diagnostics = warning_diagnostics_for_changed_paths(
+            "",
+            colored_stderr,
+            &operations,
+            Path::new("/tmp/fixtures"),
+        );
+        assert_eq!(diagnostics.len(), 1);
+        assert!(diagnostics[0].contains("unused import: `std::fmt`"));
+        assert!(
+            !diagnostics[0].contains('\u{1b}'),
+            "excerpt sent to the LLM must be free of escape sequences"
+        );
     }
 
     #[test]

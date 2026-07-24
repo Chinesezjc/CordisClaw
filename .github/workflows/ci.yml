@@ -9,11 +9,10 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-# 不设 CARGO_TERM_COLOR=always：该 env 会被 runtime 内部嵌套执行的
-# cargo（verifier 的 tests_command 等）继承，warning 输出带 ANSI 颜色码
-# （warning 与 : 之间夹转义序列），host.rs 的 warning 检测匹配不上，
-# agent 迭代的 warning-反馈-重试链路整段失效
-# （agent_retries_on_warning 在 CI 上以"反馈请求缺失"复现）。
+# CARGO_TERM_COLOR 无需任何约定：dtolnay/rust-toolchain 在该 env 未设置时
+# 会自动向 GITHUB_ENV 注入 always（因此在这里删除或不设都拦不住着色）。
+# runtime 内部嵌套 cargo 的 warning 检测已在入口剥离 ANSI 转义序列
+# （host.rs strip_ansi_sequences），对着色输出免疫。
 
 jobs:
   ci:
