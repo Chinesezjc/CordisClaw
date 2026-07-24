@@ -887,8 +887,19 @@ fn load_workspace_metadata(
         ],
         workspace_manifest_path.parent(),
     )?;
-    serde_json::from_slice(&output).map_err(|e| RuntimeError::ArtifactIndexParse {
-        path: workspace_manifest_path.to_path_buf(),
+    parse_cargo_metadata(workspace_manifest_path, &output)
+}
+
+/// Deserialize `cargo metadata --format-version 1` output. A subprocess
+/// failure can't be exercised in a unit test, so the JSON->struct step is
+/// factored out here and mapped to `ArtifactIndexParse` with a byte-stable
+/// message shared by both `load_workspace_metadata` and `built_dylib_path`.
+fn parse_cargo_metadata(
+    manifest_path: &Path,
+    bytes: &[u8],
+) -> Result<CargoMetadataOutput, RuntimeError> {
+    serde_json::from_slice(bytes).map_err(|e| RuntimeError::ArtifactIndexParse {
+        path: manifest_path.to_path_buf(),
         message: format!("cargo metadata parse failed: {e}"),
     })
 }
@@ -1093,11 +1104,7 @@ fn built_dylib_path(manifest_path: &Path, package_name: &str) -> Result<PathBuf,
         ],
         manifest_path.parent(),
     )?;
-    let parsed: CargoMetadataOutput =
-        serde_json::from_slice(&metadata).map_err(|e| RuntimeError::ArtifactIndexParse {
-            path: manifest_path.to_path_buf(),
-            message: format!("cargo metadata parse failed: {e}"),
-        })?;
+    let parsed = parse_cargo_metadata(manifest_path, &metadata)?;
     let dylib_name = format!(
         "{DLL_PREFIX}{}.{}",
         package_name.replace('-', "_"),
@@ -2217,12 +2224,10 @@ exports = ["svc_a", "svc_b"]
         let mut cmd = Command::new("sleep");
         cmd.arg("30");
         let err = run_command_with_timeout(cmd, std::time::Duration::from_millis(150));
-        match err {
-            Err(RuntimeError::InvalidArgument { message }) => {
-                assert!(message.contains("timeout"), "unexpected message: {message}");
-            }
-            other => panic!("expected timeout error, got {other:?}"),
-        }
+        assert!(
+            matches!(&err, Err(RuntimeError::InvalidArgument { message }) if message.contains("timeout")),
+            "expected timeout error, got {err:?}"
+        );
     }
 
     // ---------- lock lifecycle ----------
@@ -2485,40 +2490,292 @@ exports = ["svc_a", "svc_b"]
         }
     }
 
-    // ---------- write_pretty_json deeper error arms ----------
+    // ---------- parse_cargo_metadata (extracted mapper) ----------
 
-    /// `write_pretty_json` fails at `create_dir_all(parent)` when the parent
-    /// path traverses through an existing regular file — the `create parent`
-    /// map_err arm.
+    #[test]
+    fn parse_cargo_metadata_reads_valid_output() {
+        use super::parse_cargo_metadata;
+        use std::path::Path;
+        let json = br#"{
+            "packages": [],
+            "workspace_members": [],
+            "target_directory": "/tmp/td",
+            "resolve": null
+        }"#;
+        let parsed = parse_cargo_metadata(Path::new("/repo/Cargo.toml"), json).unwrap();
+        assert_eq!(parsed.target_directory, "/tmp/td");
+        assert!(parsed.packages.is_empty());
+        assert!(parsed.workspace_members.is_empty());
+        assert!(parsed.resolve.is_none());
+    }
+
+    #[test]
+    fn parse_cargo_metadata_maps_bad_json_to_artifact_index_parse() {
+        use super::parse_cargo_metadata;
+        use crate::core::error::RuntimeError;
+        use std::path::Path;
+        let manifest = Path::new("/repo/plugins/Cargo.toml");
+        let result = parse_cargo_metadata(manifest, b"{ not json");
+        assert!(
+            matches!(&result, Err(RuntimeError::ArtifactIndexParse { path, message }) if path == &manifest.to_path_buf() && message.starts_with("cargo metadata parse failed: ")),
+            "expected ArtifactIndexParse, got {result:?}"
+        );
+    }
+
+    // ---------- IO-arm fault injection (read-only dir / parent-is-file) ----------
+
+    /// P1-17 durable-write create-tmp arm: when the target directory cannot
+    /// be written (read-only), `fs::File::create(&tmp)` fails and maps to Io.
+    #[cfg(unix)]
+    #[test]
+    fn write_pretty_json_errors_when_tmp_create_fails_in_readonly_dir() {
+        use super::write_pretty_json;
+        use crate::core::error::RuntimeError;
+        use std::os::unix::fs::PermissionsExt;
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        let ro = dir.path().join("ro");
+        std::fs::create_dir(&ro).unwrap();
+        // Directory exists (so create_dir_all is a no-op) but is not writable,
+        // so the staging tmp file cannot be created.
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let target = ro.join("index.json");
+        let err = write_pretty_json(&target, &serde_json::json!({"k": 1}));
+        // Restore perms so TempDir cleanup succeeds regardless of outcome.
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            matches!(&err, Err(RuntimeError::Io { message, .. }) if message.starts_with("create tmp: ")),
+            "expected Io create-tmp error, got {err:?}"
+        );
+    }
+
+    /// `write_pretty_json` create_dir_all arm: a path whose parent is an
+    /// existing regular file cannot be turned into a directory.
     #[test]
     fn write_pretty_json_errors_when_parent_is_a_file() {
         use super::write_pretty_json;
         use crate::core::error::RuntimeError;
         use tempfile::TempDir;
         let dir = TempDir::new().unwrap();
-        // `blocker` is a file; using it as a directory component makes
-        // create_dir_all fail (NotADirectory).
-        let blocker = dir.path().join("blocker");
-        std::fs::write(&blocker, b"x").unwrap();
-        let target = blocker.join("nested").join("index.json");
-        let err = write_pretty_json(&target, &serde_json::json!({"k": 1}));
-        assert!(matches!(err, Err(RuntimeError::Io { .. })), "err: {err:?}");
+        let file = dir.path().join("afile");
+        std::fs::write(&file, b"x").unwrap();
+        // parent (`afile`) is a regular file -> create_dir_all fails.
+        let target = file.join("child.json");
+        assert!(matches!(
+            write_pretty_json(&target, &serde_json::json!({"k": 1})),
+            Err(RuntimeError::Io { .. })
+        ));
     }
 
-    // ---------- collect_files_recursively error arm ----------
-
-    /// `collect_files_recursively` propagates an Io error when handed a path
-    /// that is not a readable directory (read_dir on a missing path).
+    /// `stage_then_rename_file` create-tmp arm: read-only destination dir
+    /// makes `File::create(&tmp)` fail.
+    #[cfg(unix)]
     #[test]
-    fn collect_files_recursively_errors_on_unreadable_dir() {
+    fn stage_then_rename_errors_when_tmp_create_fails_in_readonly_dir() {
+        use super::stage_then_rename_file;
+        use crate::core::error::RuntimeError;
+        use std::os::unix::fs::PermissionsExt;
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        let src = dir.path().join("src.so");
+        std::fs::write(&src, b"bytes").unwrap();
+        let ro = dir.path().join("ro");
+        std::fs::create_dir(&ro).unwrap();
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let dst = ro.join("out.so");
+        let err = stage_then_rename_file(&src, &dst);
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            matches!(&err, Err(RuntimeError::Io { message, .. }) if message.starts_with("create tmp: ")),
+            "expected Io create-tmp error, got {err:?}"
+        );
+    }
+
+    /// `collect_files_recursively` read_dir arm: a missing directory makes
+    /// `fs::read_dir` fail and map to Io with the dir path.
+    #[test]
+    fn collect_files_recursively_errors_when_dir_unreadable() {
         use super::collect_files_recursively;
         use crate::core::error::RuntimeError;
         use tempfile::TempDir;
         let dir = TempDir::new().unwrap();
+        let missing = dir.path().join("nope");
         let mut out = Vec::new();
-        let missing = dir.path().join("no_such_dir");
-        let err = collect_files_recursively(&missing, &mut out);
-        assert!(matches!(err, Err(RuntimeError::Io { .. })), "err: {err:?}");
+        assert!(matches!(
+            collect_files_recursively(&missing, &mut out),
+            Err(RuntimeError::Io { .. })
+        ));
+    }
+
+    /// `cleanup_fixture_lockfiles` read_dir arm (opt-in enabled): a read-only
+    /// (unreadable) plugins root makes the top-level `read_dir` fail.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn cleanup_fixture_lockfiles_errors_when_root_unreadable() {
+        use super::cleanup_fixture_lockfiles;
+        use crate::core::error::RuntimeError;
+        use std::os::unix::fs::PermissionsExt;
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        let plugins_root = dir.path().join("plugins");
+        std::fs::create_dir(&plugins_root).unwrap();
+        // Deny read/exec so read_dir fails.
+        std::fs::set_permissions(&plugins_root, std::fs::Permissions::from_mode(0o000)).unwrap();
+        std::env::set_var("CORDIS_CLEAN_FIXTURE_LOCKFILES", "1");
+        let err = cleanup_fixture_lockfiles(&plugins_root);
+        std::env::remove_var("CORDIS_CLEAN_FIXTURE_LOCKFILES");
+        std::fs::set_permissions(&plugins_root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(matches!(err, Err(RuntimeError::Io { .. })));
+    }
+
+    /// `remove_lockfiles_recursively` read_dir arm: an unreadable subdirectory
+    /// makes the recursive `read_dir` fail.
+    #[cfg(unix)]
+    #[test]
+    fn remove_lockfiles_recursively_errors_when_subdir_unreadable() {
+        use super::remove_lockfiles_recursively;
+        use crate::core::error::RuntimeError;
+        use std::os::unix::fs::PermissionsExt;
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        let sub = dir.path().join("locked");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let err = remove_lockfiles_recursively(&sub);
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(matches!(err, Err(RuntimeError::Io { .. })));
+    }
+
+    /// `lock_pid_is_live(0)` short-circuits to `false` (pid 0 is never a
+    /// live process the caller could own).
+    #[cfg(unix)]
+    #[test]
+    fn lock_pid_is_live_returns_false_for_pid_zero() {
+        use super::lock_pid_is_live;
+        assert!(!lock_pid_is_live(0));
+    }
+
+    // ---------- collect_local_dependency_dirs (pure resolve walk) ----------
+
+    fn meta_package(
+        id: &str,
+        manifest_path: &str,
+        source: Option<&str>,
+    ) -> super::CargoMetadataPackage {
+        super::CargoMetadataPackage {
+            id: id.to_string(),
+            name: id.to_string(),
+            manifest_path: manifest_path.to_string(),
+            source: source.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn collect_local_dependency_dirs_empty_when_root_package_unknown() {
+        use super::collect_local_dependency_dirs;
+        use std::collections::HashMap;
+        // packages_by_id has no entry for the requested id -> early Vec::new().
+        let packages = HashMap::new();
+        let nodes = HashMap::new();
+        assert!(collect_local_dependency_dirs("ghost 0.1.0", &packages, &nodes).is_empty());
+    }
+
+    #[test]
+    fn collect_local_dependency_dirs_skips_missing_resolve_node_and_registry_deps() {
+        use super::collect_local_dependency_dirs;
+        use std::collections::HashMap;
+        use std::path::PathBuf;
+        // Root has a resolve node listing two deps: one local (source None) and
+        // one from crates.io (source Some). Only the local one is collected.
+        // A third dep id present in the node but absent from packages_by_id
+        // exercises the "missing dep_package" continue.
+        let mut packages = HashMap::new();
+        packages.insert(
+            "root 0.1.0".to_string(),
+            meta_package("root 0.1.0", "/repo/root/Cargo.toml", None),
+        );
+        packages.insert(
+            "localdep 0.1.0".to_string(),
+            meta_package("localdep 0.1.0", "/repo/localdep/Cargo.toml", None),
+        );
+        packages.insert(
+            "serde 1.0.0".to_string(),
+            meta_package(
+                "serde 1.0.0",
+                "/reg/serde/Cargo.toml",
+                Some("registry+https://github.com/rust-lang/crates.io-index"),
+            ),
+        );
+        let mut nodes = HashMap::new();
+        nodes.insert(
+            "root 0.1.0".to_string(),
+            vec![
+                "localdep 0.1.0".to_string(),
+                "serde 1.0.0".to_string(),
+                "phantom 9.9.9".to_string(), // present in node, absent from packages
+            ],
+        );
+        // `localdep` and `serde` have no resolve node of their own -> the
+        // `nodes_by_id.get` continue arm fires for them.
+        let deps = collect_local_dependency_dirs("root 0.1.0", &packages, &nodes);
+        assert_eq!(deps, vec![PathBuf::from("/repo/localdep")]);
+    }
+
+    // ---------- maybe_remove_stale_lock remove_file error arms ----------
+
+    /// JSON stale-lock path: a dead-pid JSON lock is slated for removal, but a
+    /// read-only parent dir makes `fs::remove_file` fail (EACCES != NotFound),
+    /// exercising the Io error arm rather than the Ok/NotFound arms.
+    #[cfg(unix)]
+    #[test]
+    fn maybe_remove_stale_lock_json_remove_failure_maps_to_io() {
+        use super::current_epoch_ms;
+        use super::{maybe_remove_stale_lock, ArtifactBuildLockState};
+        use crate::core::error::RuntimeError;
+        use std::os::unix::fs::PermissionsExt;
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        let holder = dir.path().join("holder");
+        std::fs::create_dir(&holder).unwrap();
+        let path = holder.join("dead.lock");
+        let dead = ArtifactBuildLockState {
+            pid: u32::MAX - 1,
+            created_at_ms: current_epoch_ms(),
+        };
+        std::fs::write(&path, serde_json::to_vec(&dead).unwrap()).unwrap();
+        // Deny write on the parent dir so unlink of the lock file is refused.
+        std::fs::set_permissions(&holder, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let err = maybe_remove_stale_lock(&path);
+        std::fs::set_permissions(&holder, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(matches!(err, Err(RuntimeError::Io { .. })));
+    }
+
+    /// Legacy (non-JSON) stale-lock path: an ancient non-JSON lock is slated
+    /// for removal, but a read-only parent dir makes `fs::remove_file` fail,
+    /// exercising the legacy Io error arm.
+    #[cfg(unix)]
+    #[test]
+    fn maybe_remove_stale_lock_legacy_remove_failure_maps_to_io() {
+        use super::maybe_remove_stale_lock;
+        use crate::core::error::RuntimeError;
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{Duration, SystemTime};
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        let holder = dir.path().join("holder");
+        std::fs::create_dir(&holder).unwrap();
+        let path = holder.join("legacy.lock");
+        std::fs::write(&path, "not json at all").unwrap();
+        // Backdate mtime past LEGACY_STALE_LOCK_TIMEOUT so removal is attempted.
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_modified(SystemTime::now() - Duration::from_secs(120))
+            .unwrap();
+        drop(file);
+        std::fs::set_permissions(&holder, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let err = maybe_remove_stale_lock(&path);
+        std::fs::set_permissions(&holder, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(matches!(err, Err(RuntimeError::Io { .. })));
     }
 
     // ---------- run_command_with_timeout spawn failure ----------

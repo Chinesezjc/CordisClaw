@@ -2245,18 +2245,18 @@ mod batch_tests {
         let items = partition_batch(batch);
         assert_eq!(items.len(), 3);
         // First and last are Normal (A then C), middle is Command (B).
-        match &items[0] {
-            BatchItem::Normal(e) => assert_eq!(e.sender_id, "A"),
-            _ => panic!("item 0 should be Normal"),
-        }
-        match &items[1] {
-            BatchItem::Command(e) => assert_eq!(e.sender_id, "B"),
-            _ => panic!("item 1 should be Command"),
-        }
-        match &items[2] {
-            BatchItem::Normal(e) => assert_eq!(e.sender_id, "C"),
-            _ => panic!("item 2 should be Normal"),
-        }
+        assert!(
+            matches!(&items[0], BatchItem::Normal(e) if e.sender_id == "A"),
+            "item 0 should be Normal(A)"
+        );
+        assert!(
+            matches!(&items[1], BatchItem::Command(e) if e.sender_id == "B"),
+            "item 1 should be Command(B)"
+        );
+        assert!(
+            matches!(&items[2], BatchItem::Normal(e) if e.sender_id == "C"),
+            "item 2 should be Normal(C)"
+        );
         let normals = items
             .iter()
             .filter(|i| matches!(i, BatchItem::Normal(_)))

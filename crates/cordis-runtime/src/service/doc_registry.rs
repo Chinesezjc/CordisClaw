@@ -51,21 +51,27 @@ impl DocRegistry {
     pub fn handle_get(&self, path: &str) -> Result<Value, RuntimeError> {
         if let Some(plugin_path) = parse_plugin_docs_path(path) {
             let docs = self.get_plugin_docs(&plugin_path)?;
-            return serde_json::to_value(docs).map_err(|err| RuntimeError::Invariant {
-                message: format!("serialize plugin docs failed: {err}"),
-            });
+            return serde_json::to_value(docs).map_err(serialize_docs_error("plugin"));
         }
 
         if let Some((plugin_path, node_id)) = parse_node_docs_path(path) {
             let docs = self.get_node_docs(&plugin_path, &node_id)?;
-            return serde_json::to_value(docs).map_err(|err| RuntimeError::Invariant {
-                message: format!("serialize node docs failed: {err}"),
-            });
+            return serde_json::to_value(docs).map_err(serialize_docs_error("node"));
         }
 
         Err(RuntimeError::InvalidDocsRoute {
             path: path.to_string(),
         })
+    }
+}
+
+/// Maps a serde serialization failure for docs values to an `Invariant`
+/// error. Extracted so the mapping is unit-testable: serializing `PluginDocs`
+/// / `NodeDoc` never actually fails (no non-string map keys, no custom
+/// `Serialize` that can error), so the closure is otherwise unreachable.
+fn serialize_docs_error(kind: &'static str) -> impl Fn(serde_json::Error) -> RuntimeError {
+    move |err| RuntimeError::Invariant {
+        message: format!("serialize {kind} docs failed: {err}"),
     }
 }
 
@@ -176,12 +182,11 @@ mod tests {
     #[test]
     fn get_plugin_docs_missing_yields_not_found() {
         let docs = DocRegistry::from_plugin_registry(&registry_with("root/plugin"));
-        match docs.get_plugin_docs("root/absent") {
-            Err(RuntimeError::PluginDocsNotFound { plugin_path }) => {
-                assert_eq!(plugin_path, "root/absent");
-            }
-            other => panic!("unexpected: {other:?}"),
-        }
+        let got = docs.get_plugin_docs("root/absent");
+        assert!(
+            matches!(&got, Err(RuntimeError::PluginDocsNotFound { plugin_path }) if plugin_path == "root/absent"),
+            "unexpected: {got:?}"
+        );
     }
 
     #[test]
@@ -191,16 +196,11 @@ mod tests {
             .get_node_docs("root/plugin", "n0")
             .expect("node present");
         assert_eq!(node.id, "n0");
-        match docs.get_node_docs("root/plugin", "absent") {
-            Err(RuntimeError::NodeDocsNotFound {
-                plugin_path,
-                node_id,
-            }) => {
-                assert_eq!(plugin_path, "root/plugin");
-                assert_eq!(node_id, "absent");
-            }
-            other => panic!("unexpected: {other:?}"),
-        }
+        let got = docs.get_node_docs("root/plugin", "absent");
+        assert!(
+            matches!(&got, Err(RuntimeError::NodeDocsNotFound { plugin_path, node_id }) if plugin_path == "root/plugin" && node_id == "absent"),
+            "unexpected: {got:?}"
+        );
     }
 
     #[test]
@@ -224,12 +224,11 @@ mod tests {
     #[test]
     fn handle_get_invalid_route() {
         let docs = DocRegistry::from_plugin_registry(&registry_with("root/plugin"));
-        match docs.handle_get("/not/a/known/route") {
-            Err(RuntimeError::InvalidDocsRoute { path }) => {
-                assert_eq!(path, "/not/a/known/route");
-            }
-            other => panic!("unexpected: {other:?}"),
-        }
+        let got = docs.handle_get("/not/a/known/route");
+        assert!(
+            matches!(&got, Err(RuntimeError::InvalidDocsRoute { path }) if path == "/not/a/known/route"),
+            "unexpected: {got:?}"
+        );
     }
 
     #[test]
@@ -247,12 +246,11 @@ mod tests {
         // `?`-propagated `PluginDocsNotFound` from `get_plugin_docs` rather
         // than a `NodeDocsNotFound`.
         let docs = DocRegistry::from_plugin_registry(&registry_with("root/plugin"));
-        match docs.get_node_docs("root/absent", "n0") {
-            Err(RuntimeError::PluginDocsNotFound { plugin_path }) => {
-                assert_eq!(plugin_path, "root/absent");
-            }
-            other => panic!("unexpected: {other:?}"),
-        }
+        let got = docs.get_node_docs("root/absent", "n0");
+        assert!(
+            matches!(&got, Err(RuntimeError::PluginDocsNotFound { plugin_path }) if plugin_path == "root/absent"),
+            "unexpected: {got:?}"
+        );
     }
 
     #[test]
@@ -306,5 +304,25 @@ mod tests {
         assert_eq!(parse_node_docs_path("/plugins//nodes/n0/docs"), None);
         // wrong suffix.
         assert_eq!(parse_node_docs_path("/plugins/root/nodes/n0/info"), None);
+    }
+
+    #[test]
+    fn serialize_docs_error_maps_to_invariant() {
+        // The serde closure inside `handle_get` is unreachable through real
+        // docs values (PluginDocs/NodeDoc always serialize), so drive the
+        // extracted mapper directly. Synthesize a serde error by deserializing
+        // malformed JSON.
+        let err = serde_json::from_str::<Value>("{bad").unwrap_err();
+        let mapped = serialize_docs_error("plugin")(err);
+        assert!(
+            matches!(&mapped, RuntimeError::Invariant { message } if message.starts_with("serialize plugin docs failed: ")),
+            "expected Invariant, got {mapped:?}"
+        );
+        let err = serde_json::from_str::<Value>("{bad").unwrap_err();
+        let mapped = serialize_docs_error("node")(err);
+        assert!(
+            matches!(&mapped, RuntimeError::Invariant { message } if message.starts_with("serialize node docs failed: ")),
+            "expected Invariant, got {mapped:?}"
+        );
     }
 }

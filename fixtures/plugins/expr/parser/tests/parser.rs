@@ -4,29 +4,31 @@ use expr_parser::{parse_expression, BinaryOp, ExprAst, ParseExpressionError};
 fn parses_with_operator_precedence() {
     let ast = parse_expression("1 + 2 * 3").expect("must parse");
 
-    match ast {
+    let ExprAst::Binary {
+        op: BinaryOp::Add,
+        lhs,
+        rhs,
+    } = ast
+    else {
+        panic!("unexpected ast shape")
+    };
+    assert_eq!(*lhs, ExprAst::Number(1.0));
+    assert!(matches!(
+        *rhs,
         ExprAst::Binary {
-            op: BinaryOp::Add,
-            lhs,
-            rhs,
-        } => {
-            assert_eq!(*lhs, ExprAst::Number(1.0));
-            assert!(matches!(
-                *rhs,
-                ExprAst::Binary {
-                    op: BinaryOp::Mul,
-                    ..
-                }
-            ));
+            op: BinaryOp::Mul,
+            ..
         }
-        _ => panic!("unexpected ast shape"),
-    }
+    ));
 }
 
 #[test]
 fn rejects_missing_right_paren() {
     let err = parse_expression("(1 + 2").expect_err("must fail");
-    assert!(matches!(err, ParseExpressionError::MissingRightParen { .. }));
+    assert!(matches!(
+        err,
+        ParseExpressionError::MissingRightParen { .. }
+    ));
 }
 
 #[test]

@@ -5,6 +5,18 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+/// Map a filesystem path + error into `RuntimeError::Io`, preserving the
+/// error text byte-for-byte via `to_string`. Extracted so the per-entry
+/// `read_dir` error mapper — which is hard to trigger deterministically in a
+/// portable test (it requires a mid-iteration `DirEntry` failure) — is
+/// directly unit-testable.
+fn io_error(path: &Path, message: impl std::fmt::Display) -> RuntimeError {
+    RuntimeError::Io {
+        path: path.to_path_buf(),
+        message: message.to_string(),
+    }
+}
+
 fn default_change_history_limit() -> usize {
     1_024
 }
@@ -129,10 +141,7 @@ impl RuntimeConfig {
 
             let mut paths = Vec::new();
             for entry in entries {
-                let entry = entry.map_err(|e| RuntimeError::Io {
-                    path: plugin_dir.clone(),
-                    message: e.to_string(),
-                })?;
+                let entry = entry.map_err(|e| io_error(&plugin_dir, e))?;
                 let path = entry.path();
                 if !matches!(
                     path.extension().and_then(|ext| ext.to_str()),
@@ -489,6 +498,20 @@ mod load_tests {
         fn drop(&mut self) {
             std::env::remove_var("CORDIS_CONFIG_DIR");
         }
+    }
+
+    // ---------- io_error mapper ----------
+
+    // Equivalent logic of the per-entry read_dir error mapper (config.rs
+    // 133-135): a mid-iteration DirEntry failure is not portably reproducible,
+    // so the extracted mapper is asserted directly — path + text byte-for-byte.
+    #[test]
+    fn io_error_preserves_path_and_message() {
+        let err = io_error(Path::new("/plugins"), "permission denied");
+        assert!(
+            matches!(&err, RuntimeError::Io { path, message } if path == &PathBuf::from("/plugins") && message == "permission denied"),
+            "expected Io, got {err:?}"
+        );
     }
 
     // ---------- discover_config_dir ----------

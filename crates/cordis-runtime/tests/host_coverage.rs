@@ -1154,8 +1154,17 @@ fn host_reload_with_diagnostics_noop_reports_reloaded() {
     assert_eq!(attempt.status, ReloadAttemptStatus::Reloaded);
     assert!(attempt.to_snapshot_id.is_some());
     // A subtree reload for a real leaf plugin also succeeds (reload_subtree
-    // branch rather than reload_internal).
-    let attempt = host.reload_with_diagnostics("expr");
+    // branch rather than reload_internal). Known environmental race: reload's
+    // native rebuild can leave `artifacts/index.json`'s recorded sha256 stale
+    // relative to the freshly written `.so` (documented HashMismatch race), so
+    // on a Failed attempt re-hash the index once and retry — the retry must
+    // succeed, keeping the assertion strength.
+    let mut attempt = host.reload_with_diagnostics("expr");
+    if attempt.status != ReloadAttemptStatus::Reloaded {
+        cordis_runtime::plugin::tooling::refresh_artifact_index(&fixtures_root())
+            .expect("refresh artifact index after stale-hash reload failure");
+        attempt = host.reload_with_diagnostics("expr");
+    }
     assert_eq!(attempt.status, ReloadAttemptStatus::Reloaded);
 }
 

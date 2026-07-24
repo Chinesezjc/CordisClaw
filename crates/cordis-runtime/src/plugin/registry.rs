@@ -545,18 +545,10 @@ mod tests {
         let err = registry
             .register_from_docs("shared", &second)
             .expect_err("duplicate fqn must conflict");
-        match err {
-            RuntimeError::NodeFqnConflict {
-                node_fqn,
-                first,
-                second,
-            } => {
-                assert_eq!(node_fqn, "shared::dup");
-                assert_eq!(first, "shared");
-                assert_eq!(second, "shared");
-            }
-            other => panic!("wrong variant: {other:?}"),
-        }
+        assert!(
+            matches!(&err, RuntimeError::NodeFqnConflict { node_fqn, first, second } if node_fqn == "shared::dup" && first == "shared" && second == "shared"),
+            "wrong variant: {err:?}"
+        );
     }
 
     // remove_by_plugin drops exactly the nodes owned by the given plugin and
@@ -600,5 +592,47 @@ mod tests {
         let mut fqns = registry.task_node_fqns();
         fqns.sort();
         assert_eq!(fqns, vec!["p1::t1".to_string(), "p2::t2".to_string()]);
+    }
+
+    // Poison the inner RwLock (panic while holding the write guard) and confirm
+    // every PluginRegistry accessor still recovers via
+    // `unwrap_or_else(|poison| poison.into_inner())` rather than propagating the
+    // poison as a panic. One poisoned registry, cloned across the Arc, exercises
+    // the recovery arm on the read path (get/iter/len/is_empty) and the write
+    // path (insert/mark/reload).
+    #[test]
+    fn poisoned_lock_is_recovered_on_every_accessor() {
+        let registry = PluginRegistry::default();
+        insert_sample_loaded(&registry, "before/poison");
+
+        // Poison the lock: take the write guard on a clone, then panic.
+        let clone = registry.clone();
+        let poisoned = std::thread::spawn(move || {
+            let _guard = clone.plugins.write().unwrap();
+            panic!("deliberately poison the registry lock");
+        })
+        .join();
+        assert!(poisoned.is_err(), "the spawned thread must have panicked");
+
+        // Read paths recover and still see the pre-poison entry.
+        assert_eq!(registry.len(), 1);
+        assert!(!registry.is_empty());
+        assert!(registry.get("before/poison").is_some());
+        assert_eq!(registry.iter().count(), 1);
+
+        // Write paths recover too: insert, mark, reload all proceed.
+        insert_sample_loaded(&registry, "after/poison");
+        assert_eq!(registry.len(), 2);
+        registry.mark_unavailable("after/poison", PluginUnavailableReason::InitFailed);
+        registry.mark_runtime_unavailable(
+            "before/poison",
+            PluginUnavailableReason::AbiMismatch,
+            vec!["diff".to_string()],
+        );
+        assert!(registry.reload_plugin_entry(
+            "after/poison",
+            sample_docs("after/poison"),
+            sample_fingerprint(),
+        ));
     }
 }

@@ -139,6 +139,19 @@ fn staged_artifact_path(
     Ok(staged_root.join(relative))
 }
 
+/// Invariant error for a staged process command whose target path has no
+/// parent directory. Unreachable through `stage_artifact_bundle` (the command
+/// is validated relative + non-empty upstream), but kept as a fail-closed
+/// guard should a future caller pass a bare filename.
+fn staged_command_missing_parent(target_path: &Path) -> RuntimeError {
+    RuntimeError::Invariant {
+        message: format!(
+            "staged process command missing parent: {}",
+            target_path.display()
+        ),
+    }
+}
+
 fn stage_process_command(
     original_artifact_path: &Path,
     staged_artifact_path: &Path,
@@ -159,14 +172,14 @@ fn stage_process_command(
         .unwrap_or_else(|| Path::new("."))
         .join(command_path);
 
+    // Defensive: `target_path` is `<staged dir>/<relative command>` (the
+    // command is guaranteed relative and non-empty by the `is_absolute`
+    // guard above), so it always has a parent. Keep the guard as a named,
+    // unit-tested mapper rather than an inline closure the public path can't
+    // reach.
     let target_parent = target_path
         .parent()
-        .ok_or_else(|| RuntimeError::Invariant {
-            message: format!(
-                "staged process command missing parent: {}",
-                target_path.display()
-            ),
-        })?;
+        .ok_or_else(|| staged_command_missing_parent(&target_path))?;
     fs::create_dir_all(target_parent).map_err(|e| RuntimeError::Io {
         path: target_parent.to_path_buf(),
         message: e.to_string(),
@@ -357,12 +370,10 @@ mod tests {
         };
         let path = write_index(tmp.path(), &index);
         let err = load_artifact_index(&path).unwrap_err();
-        match err {
-            RuntimeError::ArtifactIndexParse { message, .. } => {
-                assert!(message.contains("unsupported schema_version"), "{message}");
-            }
-            other => panic!("expected ArtifactIndexParse, got {other:?}"),
-        }
+        assert!(
+            matches!(&err, RuntimeError::ArtifactIndexParse { message, .. } if message.contains("unsupported schema_version")),
+            "expected ArtifactIndexParse, got {err:?}"
+        );
     }
 
     // --- artifact_index_map --------------------------------------------------
@@ -479,12 +490,10 @@ mod tests {
         let path = tmp.path().join("bad.json");
         fs::write(&path, "{}").unwrap();
         let err = load_plugin_artifact(&path).unwrap_err();
-        match err {
-            RuntimeError::ArtifactIndexParse { message, .. } => {
-                assert!(message.contains("artifact parse failed"), "{message}");
-            }
-            other => panic!("expected ArtifactIndexParse, got {other:?}"),
-        }
+        assert!(
+            matches!(&err, RuntimeError::ArtifactIndexParse { message, .. } if message.contains("artifact parse failed")),
+            "expected ArtifactIndexParse, got {err:?}"
+        );
     }
 
     // --- stage_artifact_bundle: JSON artifact, no execution ------------------
@@ -608,6 +617,20 @@ mod tests {
         assert!(staged.exists());
     }
 
+    // --- staged_command_missing_parent mapper --------------------------------
+
+    // The defensive Invariant mapper for a target path with no parent (a bare
+    // filename). Unreachable through the public staging path, but the mapper
+    // itself must format the fail-closed message.
+    #[test]
+    fn staged_command_missing_parent_is_invariant() {
+        let err = staged_command_missing_parent(Path::new("run.sh"));
+        assert!(
+            matches!(&err, RuntimeError::Invariant { message } if message.contains("staged process command missing parent") && message.contains("run.sh")),
+            "expected Invariant, got {err:?}"
+        );
+    }
+
     // --- stage_process_command escape guard ----------------------------------
 
     #[test]
@@ -660,12 +683,10 @@ mod tests {
         fs::write(&src, b"x").unwrap();
         // `/` has no parent component.
         let err = stage_file(&src, Path::new("/")).unwrap_err();
-        match err {
-            RuntimeError::Invariant { message } => {
-                assert!(message.contains("missing parent"), "{message}");
-            }
-            other => panic!("expected Invariant, got {other:?}"),
-        }
+        assert!(
+            matches!(&err, RuntimeError::Invariant { message } if message.contains("missing parent")),
+            "expected Invariant, got {err:?}"
+        );
     }
 
     // create_dir_all(target_parent) fails when a path component is a regular
@@ -696,12 +717,10 @@ mod tests {
         // "<realdir>/.." : parent() is Some(realdir) but file_name() is None.
         let target = real_dir.join("..");
         let err = stage_file(&src, &target).unwrap_err();
-        match err {
-            RuntimeError::Invariant { message } => {
-                assert!(message.contains("no filename"), "{message}");
-            }
-            other => panic!("expected Invariant, got {other:?}"),
-        }
+        assert!(
+            matches!(&err, RuntimeError::Invariant { message } if message.contains("no filename")),
+            "expected Invariant, got {err:?}"
+        );
     }
 
     // The copy step fails when the source does not exist → Io tagged with the
@@ -731,12 +750,10 @@ mod tests {
         let target = tmp.path().join("target_is_dir");
         fs::create_dir_all(&target).unwrap();
         let err = stage_file(&src, &target).unwrap_err();
-        match err {
-            RuntimeError::Io { message, .. } => {
-                assert!(message.contains("rename staging -> target"), "{message}");
-            }
-            other => panic!("expected Io rename failure, got {other:?}"),
-        }
+        assert!(
+            matches!(&err, RuntimeError::Io { message, .. } if message.contains("rename staging -> target")),
+            "expected Io rename failure, got {err:?}"
+        );
         // The staging sibling file must have been removed on failure.
         let leftover: Vec<_> = fs::read_dir(tmp.path())
             .unwrap()
@@ -771,12 +788,10 @@ mod tests {
             staged_root,
         )
         .unwrap_err();
-        match err {
-            RuntimeError::Invariant { message } => {
-                assert!(message.contains("missing file name"), "{message}");
-            }
-            other => panic!("expected Invariant, got {other:?}"),
-        }
+        assert!(
+            matches!(&err, RuntimeError::Invariant { message } if message.contains("missing file name")),
+            "expected Invariant, got {err:?}"
+        );
     }
 
     // --- stage_process_command: create_dir_all failure -----------------------
@@ -819,11 +834,9 @@ mod tests {
         let staged_root = tmp.path().join("does/not/exist");
         let err = stage_process_command(&original, &staged_artifact, "bin/run.sh", &staged_root)
             .unwrap_err();
-        match err {
-            RuntimeError::Invariant { message } => {
-                assert!(message.contains("escapes snapshot root"), "{message}");
-            }
-            other => panic!("expected escape Invariant, got {other:?}"),
-        }
+        assert!(
+            matches!(&err, RuntimeError::Invariant { message } if message.contains("escapes snapshot root")),
+            "expected escape Invariant, got {err:?}"
+        );
     }
 }

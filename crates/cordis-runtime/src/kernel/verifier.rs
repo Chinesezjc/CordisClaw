@@ -351,6 +351,17 @@ fn run_check_command(
     run_shell_command(command, current_dir, timeout)
 }
 
+/// Map a serde_json serialization failure of a plugin's `payload_json` into
+/// the `InvalidArgument` error surfaced to the verifier caller. Extracted so
+/// the (in practice unreachable — a `Value` round-trips) error text stays
+/// byte-for-byte stable and is unit-testable without provoking a real serde
+/// failure.
+fn payload_not_serializable(err: serde_json::Error) -> RuntimeError {
+    RuntimeError::InvalidArgument {
+        message: format!("plugin payload_json was not serializable: {err}"),
+    }
+}
+
 fn run_plugin_command(
     original_command: &str,
     spec_json: &str,
@@ -361,10 +372,7 @@ fn run_plugin_command(
         serde_json::from_str(spec_json).map_err(|err| RuntimeError::InvalidArgument {
             message: format!("invalid plugin verifier spec: {err}"),
         })?;
-    let payload =
-        serde_json::to_string(&spec.payload_json).map_err(|err| RuntimeError::InvalidArgument {
-            message: format!("plugin payload_json was not serializable: {err}"),
-        })?;
+    let payload = serde_json::to_string(&spec.payload_json).map_err(payload_not_serializable)?;
 
     // P0-4: route through the caller-supplied candidate invoker when present.
     // Falling back to `PluginInvoker::load` would verify the currently-running
@@ -477,6 +485,19 @@ fn resolve_plugin_fixtures_root(current_dir: &Path, requested_root: Option<&str>
     current_dir.to_path_buf()
 }
 
+/// Wrap a `Child::try_wait` failure into the `CommandFailed` error returned by
+/// `run_shell_command`. This poll-loop arm only fires if the OS refuses to
+/// report the child's status (a kernel-level condition not reproducible from a
+/// unit test), so the mapper is extracted to keep the error text byte-for-byte
+/// stable and independently testable.
+fn command_wait_error(program: &str, args: &[String], err: &std::io::Error) -> RuntimeError {
+    RuntimeError::CommandFailed {
+        program: program.to_string(),
+        args: args.to_vec(),
+        message: format!("wait failed: {err}"),
+    }
+}
+
 /// P0-1: run the command as a real argv, NEVER through `bash -lc`.
 /// The command string is split via `shell_words` (POSIX-shell tokenisation
 /// with quoting, no expansion of `$VAR` / backticks / `$()`), then dispatched
@@ -551,11 +572,7 @@ fn run_shell_command(
                 thread::sleep(Duration::from_millis(50));
             }
             Err(err) => {
-                return Err(RuntimeError::CommandFailed {
-                    program: program.clone(),
-                    args: args.to_vec(),
-                    message: format!("wait failed: {err}"),
-                });
+                return Err(command_wait_error(program, args, &err));
             }
         }
     };
@@ -672,9 +689,10 @@ fn collect_source_tree(
 #[cfg(test)]
 mod tests {
     use super::{
-        collect_source_tree, discover_rust_workspace_manifest, hash_source_tree,
-        normalize_optional_command, resolve_plugin_fixtures_root, run_shell_command, shell_quote,
-        CommandVerifier, PluginResponse, RuntimeError, VerificationProfile, VerificationRunner,
+        collect_source_tree, command_wait_error, discover_rust_workspace_manifest,
+        hash_source_tree, normalize_optional_command, payload_not_serializable,
+        resolve_plugin_fixtures_root, run_shell_command, shell_quote, CommandVerifier,
+        PluginResponse, RuntimeError, VerificationProfile, VerificationRunner,
         VerificationStageKind, VerificationStageStatus, VerifyOptions,
     };
     use serde_json::json;
@@ -683,6 +701,37 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::Duration;
     use tempfile::TempDir;
+
+    /// `command_wait_error` builds the `CommandFailed` error the poll loop
+    /// returns when `Child::try_wait` fails. That arm is unreachable from a
+    /// unit test (the OS would have to refuse status reporting for a live
+    /// child), so this asserts the mapper's byte-exact message and field
+    /// propagation directly.
+    #[test]
+    fn command_wait_error_wraps_program_args_and_message() {
+        let io = std::io::Error::other("boom");
+        let err = command_wait_error("cargo", &["test".to_string(), "-q".to_string()], &io);
+        assert!(
+            matches!(&err, RuntimeError::CommandFailed { program, args, message } if program == "cargo" && args == &vec!["test".to_string(), "-q".to_string()] && message == "wait failed: boom"),
+            "unexpected: {err:?}"
+        );
+    }
+
+    /// `payload_not_serializable` maps a serde_json failure into
+    /// `InvalidArgument`. Serializing a `Value` never fails in practice, so the
+    /// mapper is tested with a synthetic serde error to lock the message text.
+    #[test]
+    fn payload_not_serializable_wraps_serde_error() {
+        // Serializing a `Value` never fails in practice, so fabricate a real
+        // `serde_json::Error` from a malformed parse to lock the message text.
+        let serde_err = serde_json::from_str::<serde_json::Value>("{")
+            .expect_err("malformed json should error");
+        let err = payload_not_serializable(serde_err);
+        assert!(
+            matches!(&err, RuntimeError::InvalidArgument { message } if message.starts_with("plugin payload_json was not serializable: ")),
+            "unexpected: {err:?}"
+        );
+    }
 
     #[test]
     fn verify_without_any_command_now_fails() {

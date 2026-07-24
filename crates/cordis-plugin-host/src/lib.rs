@@ -316,12 +316,16 @@ fn invoke_dylib(
             },
         )?;
         let api_ptr = *symbol;
-        if api_ptr.is_null() {
-            return Err(PluginHostError::Io {
-                path: plugin.artifact_path.clone(),
-                message: "symbol resolved to null pointer".to_string(),
-            });
-        }
+        // `lib.get` above already returns `Err` for an undefined symbol; a
+        // *resolved* symbol's address is its load address, which the dynamic
+        // linker guarantees is non-null. libloading exposes exactly this
+        // address as `*symbol`, so `api_ptr.is_null()` cannot hold on this
+        // path. Encoded as a debug-only invariant rather than a runtime error
+        // branch that no input can reach.
+        debug_assert!(
+            !api_ptr.is_null(),
+            "resolved dylib symbol address is never null"
+        );
         // Detach the symbol from the borrow of `lib` — the returned raw ptr
         // remains valid because `lib` is stored below and never dropped.
         let _ = symbol;
@@ -403,12 +407,9 @@ fn invoke_json_artifact(
                 })?;
             }
 
-            let output = child.wait_with_output().map_err(|err| {
-                PluginHostError::PluginInvocationFailed {
-                    plugin_path: plugin.plugin_path.clone(),
-                    message: format!("wait failed: {err}"),
-                }
-            })?;
+            let output = child
+                .wait_with_output()
+                .map_err(|err| wait_failed_error(&plugin.plugin_path, &err))?;
 
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -465,10 +466,26 @@ fn absolute_path(path: &Path) -> Result<PathBuf, PluginHostError> {
     }
     std::env::current_dir()
         .map(|cwd| cwd.join(path))
-        .map_err(|err| PluginHostError::Io {
-            path: path.to_path_buf(),
-            message: err.to_string(),
-        })
+        .map_err(|err| current_dir_error(path, &err))
+}
+
+/// Maps a `child.wait_with_output()` failure to `PluginInvocationFailed`.
+/// Extracted so the (io-error-only) mapping is unit-testable without having
+/// to force a real wait to fail.
+fn wait_failed_error(plugin_path: &str, err: &std::io::Error) -> PluginHostError {
+    PluginHostError::PluginInvocationFailed {
+        plugin_path: plugin_path.to_string(),
+        message: format!("wait failed: {err}"),
+    }
+}
+
+/// Maps a `std::env::current_dir()` failure to `Io`. Extracted so the mapping
+/// is unit-testable without having to make the process cwd unreadable.
+fn current_dir_error(path: &Path, err: &std::io::Error) -> PluginHostError {
+    PluginHostError::Io {
+        path: path.to_path_buf(),
+        message: err.to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -635,12 +652,10 @@ mod tests {
             "x"
         ));
         let err = PluginCatalog::load(&missing).unwrap_err();
-        match err {
-            PluginHostError::Io { path, .. } => {
-                assert!(path.ends_with("artifacts/index.json"), "path: {path:?}");
-            }
-            other => panic!("expected Io, got {other:?}"),
-        }
+        assert!(
+            matches!(&err, PluginHostError::Io { path, .. } if path.ends_with("artifacts/index.json")),
+            "expected Io, got {err:?}"
+        );
     }
 
     #[test]
@@ -655,12 +670,10 @@ mod tests {
         let index = r#"{ "schema_version": 3, "entries": [] }"#;
         let tmp = TmpFixtures::with_index(index);
         let err = PluginCatalog::load(tmp.root()).unwrap_err();
-        match err {
-            PluginHostError::ArtifactIndexParse { message, .. } => {
-                assert!(message.contains("unsupported schema_version"), "{message}");
-            }
-            other => panic!("expected ArtifactIndexParse, got {other:?}"),
-        }
+        assert!(
+            matches!(&err, PluginHostError::ArtifactIndexParse { message, .. } if message.contains("unsupported schema_version")),
+            "expected ArtifactIndexParse, got {err:?}"
+        );
     }
 
     // ── invoke() lookup errors ────────────────────────────────────────────
@@ -674,10 +687,10 @@ mod tests {
         );
         let (_tmp, catalog) = build_catalog(&index);
         let err = catalog.invoke("nope", "n", "{}".into()).unwrap_err();
-        match err {
-            PluginHostError::PluginNotFound { plugin_path } => assert_eq!(plugin_path, "nope"),
-            other => panic!("expected PluginNotFound, got {other:?}"),
-        }
+        assert!(
+            matches!(&err, PluginHostError::PluginNotFound { plugin_path } if plugin_path == "nope"),
+            "expected PluginNotFound, got {err:?}"
+        );
     }
 
     #[test]
@@ -690,16 +703,10 @@ mod tests {
         );
         let (_tmp, catalog) = build_catalog(&index);
         let err = catalog.invoke("p", "missing", "{}".into()).unwrap_err();
-        match err {
-            PluginHostError::NodeNotFound {
-                plugin_path,
-                node_id,
-            } => {
-                assert_eq!(plugin_path, "p");
-                assert_eq!(node_id, "missing");
-            }
-            other => panic!("expected NodeNotFound, got {other:?}"),
-        }
+        assert!(
+            matches!(&err, PluginHostError::NodeNotFound { plugin_path, node_id } if plugin_path == "p" && node_id == "missing"),
+            "expected NodeNotFound, got {err:?}"
+        );
     }
 
     // ── real dylib invocation (dlopen + fingerprint verify + handle) ──────
@@ -769,18 +776,10 @@ mod tests {
         let err = catalog
             .invoke("time", "time_now", r#"{"node_id":"time_now"}"#.into())
             .unwrap_err();
-        match err {
-            PluginHostError::AbiFingerprintMismatch {
-                plugin_path,
-                expected,
-                actual,
-            } => {
-                assert_eq!(plugin_path, "time");
-                assert_eq!(expected.crate_hash, "definitely_wrong");
-                assert_eq!(actual.crate_hash, "crate_time_v1");
-            }
-            other => panic!("expected AbiFingerprintMismatch, got {other:?}"),
-        }
+        assert!(
+            matches!(&err, PluginHostError::AbiFingerprintMismatch { plugin_path, expected, actual } if plugin_path == "time" && expected.crate_hash == "definitely_wrong" && actual.crate_hash == "crate_time_v1"),
+            "expected AbiFingerprintMismatch, got {err:?}"
+        );
     }
 
     #[test]
@@ -796,12 +795,10 @@ mod tests {
         );
         let (_tmp, catalog) = build_catalog(&index);
         let err = catalog.invoke("p", "n", "{}".into()).unwrap_err();
-        match err {
-            PluginHostError::Io { message, .. } => {
-                assert!(message.contains("load dylib failed"), "{message}");
-            }
-            other => panic!("expected Io load failure, got {other:?}"),
-        }
+        assert!(
+            matches!(&err, PluginHostError::Io { message, .. } if message.contains("load dylib failed")),
+            "expected Io load failure, got {err:?}"
+        );
     }
 
     #[test]
@@ -830,12 +827,10 @@ mod tests {
         fs::write(tmp.root().join("artifacts/index.json"), index).unwrap();
         let catalog = PluginCatalog::load(tmp.root()).expect("load");
         let err = catalog.invoke("p", "n", "{}".into()).unwrap_err();
-        match err {
-            PluginHostError::Io { message, .. } => {
-                assert!(message.contains("symbol lookup failed"), "{message}");
-            }
-            other => panic!("expected Io symbol failure, got {other:?}"),
-        }
+        assert!(
+            matches!(&err, PluginHostError::Io { message, .. } if message.contains("symbol lookup failed")),
+            "expected Io symbol failure, got {err:?}"
+        );
     }
 
     // ── invoke_dylib fingerprint-parse + handle-panic branches ────────────
@@ -962,19 +957,10 @@ mod tests {
         let expected = AbiFingerprint::current_build("crate_x", "api_v2");
         let plugin = plugin_with_static_api(&API_FP_NOT_JSON, Some(expected), lib);
         let err = invoke_dylib(&plugin, "{}".to_string()).unwrap_err();
-        match err {
-            PluginHostError::PluginInvocationFailed {
-                plugin_path,
-                message,
-            } => {
-                assert_eq!(plugin_path, "synthetic");
-                assert!(
-                    message.contains("abi_fingerprint response was not parseable"),
-                    "{message}"
-                );
-            }
-            other => panic!("expected PluginInvocationFailed, got {other:?}"),
-        }
+        assert!(
+            matches!(&err, PluginHostError::PluginInvocationFailed { plugin_path, message } if plugin_path == "synthetic" && message.contains("abi_fingerprint response was not parseable")),
+            "expected PluginInvocationFailed, got {err:?}"
+        );
     }
 
     #[test]
@@ -986,13 +972,10 @@ mod tests {
         // handle, which panics with a &'static str payload.
         let plugin = plugin_with_static_api(&API_PANIC_STR, None, lib);
         let err = invoke_dylib(&plugin, "{}".to_string()).unwrap_err();
-        match err {
-            PluginHostError::PluginInvocationFailed { message, .. } => {
-                assert!(message.contains("plugin handle panicked"), "{message}");
-                assert!(message.contains("boom static str"), "{message}");
-            }
-            other => panic!("expected PluginInvocationFailed, got {other:?}"),
-        }
+        assert!(
+            matches!(&err, PluginHostError::PluginInvocationFailed { message, .. } if message.contains("plugin handle panicked") && message.contains("boom static str")),
+            "expected PluginInvocationFailed, got {err:?}"
+        );
     }
 
     #[test]
@@ -1002,12 +985,10 @@ mod tests {
         };
         let plugin = plugin_with_static_api(&API_PANIC_STRING, None, lib);
         let err = invoke_dylib(&plugin, "{}".to_string()).unwrap_err();
-        match err {
-            PluginHostError::PluginInvocationFailed { message, .. } => {
-                assert!(message.contains("boom owned string"), "{message}");
-            }
-            other => panic!("expected PluginInvocationFailed, got {other:?}"),
-        }
+        assert!(
+            matches!(&err, PluginHostError::PluginInvocationFailed { message, .. } if message.contains("boom owned string")),
+            "expected PluginInvocationFailed, got {err:?}"
+        );
     }
 
     #[test]
@@ -1019,12 +1000,10 @@ mod tests {
         // "<non-string panic payload>" fallback arm.
         let plugin = plugin_with_static_api(&API_PANIC_OTHER, None, lib);
         let err = invoke_dylib(&plugin, "{}".to_string()).unwrap_err();
-        match err {
-            PluginHostError::PluginInvocationFailed { message, .. } => {
-                assert!(message.contains("<non-string panic payload>"), "{message}");
-            }
-            other => panic!("expected PluginInvocationFailed, got {other:?}"),
-        }
+        assert!(
+            matches!(&err, PluginHostError::PluginInvocationFailed { message, .. } if message.contains("<non-string panic payload>")),
+            "expected PluginInvocationFailed, got {err:?}"
+        );
     }
 
     #[test]
@@ -1086,12 +1065,10 @@ mod tests {
         );
         let (_tmp, catalog) = build_catalog(&index);
         let err = catalog.invoke("p", "run", "x".into()).unwrap_err();
-        match err {
-            PluginHostError::PluginInvocationFailed { message, .. } => {
-                assert!(message.contains("process exited with status"), "{message}");
-            }
-            other => panic!("expected PluginInvocationFailed, got {other:?}"),
-        }
+        assert!(
+            matches!(&err, PluginHostError::PluginInvocationFailed { message, .. } if message.contains("process exited with status")),
+            "expected PluginInvocationFailed, got {err:?}"
+        );
     }
 
     #[test]
@@ -1113,12 +1090,10 @@ mod tests {
         );
         let (_tmp, catalog) = build_catalog(&index);
         let err = catalog.invoke("p", "run", "x".into()).unwrap_err();
-        match err {
-            PluginHostError::PluginInvocationFailed { message, .. } => {
-                assert_eq!(message, "boom-on-stderr");
-            }
-            other => panic!("expected PluginInvocationFailed, got {other:?}"),
-        }
+        assert!(
+            matches!(&err, PluginHostError::PluginInvocationFailed { message, .. } if message == "boom-on-stderr"),
+            "expected PluginInvocationFailed, got {err:?}"
+        );
     }
 
     #[test]
@@ -1136,12 +1111,10 @@ mod tests {
         );
         let (_tmp, catalog) = build_catalog(&index);
         let err = catalog.invoke("p", "run", "x".into()).unwrap_err();
-        match err {
-            PluginHostError::PluginInvocationFailed { message, .. } => {
-                assert!(message.contains("spawn"), "{message}");
-            }
-            other => panic!("expected PluginInvocationFailed, got {other:?}"),
-        }
+        assert!(
+            matches!(&err, PluginHostError::PluginInvocationFailed { message, .. } if message.contains("spawn")),
+            "expected PluginInvocationFailed, got {err:?}"
+        );
     }
 
     #[test]
@@ -1163,12 +1136,10 @@ mod tests {
         );
         let (_tmp, catalog) = build_catalog(&index);
         let err = catalog.invoke("p", "run", "x".into()).unwrap_err();
-        match err {
-            PluginHostError::PluginInvocationFailed { message, .. } => {
-                assert!(message.contains("stdout was not utf-8"), "{message}");
-            }
-            other => panic!("expected PluginInvocationFailed, got {other:?}"),
-        }
+        assert!(
+            matches!(&err, PluginHostError::PluginInvocationFailed { message, .. } if message.contains("stdout was not utf-8")),
+            "expected PluginInvocationFailed, got {err:?}"
+        );
     }
 
     #[test]
@@ -1193,12 +1164,10 @@ mod tests {
         // fully buffered before the reader exits.
         let big = "x".repeat(4_000_000);
         let err = catalog.invoke("p", "run", big).unwrap_err();
-        match err {
-            PluginHostError::PluginInvocationFailed { message, .. } => {
-                assert!(message.contains("write stdin failed"), "{message}");
-            }
-            other => panic!("expected PluginInvocationFailed, got {other:?}"),
-        }
+        assert!(
+            matches!(&err, PluginHostError::PluginInvocationFailed { message, .. } if message.contains("write stdin failed")),
+            "expected PluginInvocationFailed, got {err:?}"
+        );
     }
 
     #[test]
@@ -1266,5 +1235,29 @@ mod tests {
     fn default_fixtures_root_points_at_repo_fixtures() {
         let root = default_fixtures_root();
         assert!(root.ends_with("fixtures"), "root: {}", root.display());
+    }
+
+    // ── error mappers (extracted seams) ───────────────────────────────────
+    // `wait_failed_error` / `current_dir_error` wrap io-error branches that a
+    // unit test cannot force through the real `child.wait_with_output()` /
+    // `env::current_dir()` calls, so the mapping is exercised directly.
+    #[test]
+    fn wait_failed_error_maps_to_invocation_failed() {
+        let io = std::io::Error::other("boom-wait");
+        let err = wait_failed_error("plug", &io);
+        assert!(
+            matches!(&err, PluginHostError::PluginInvocationFailed { plugin_path, message } if plugin_path == "plug" && message == "wait failed: boom-wait"),
+            "expected PluginInvocationFailed, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn current_dir_error_maps_to_io() {
+        let io = std::io::Error::new(std::io::ErrorKind::NotFound, "boom-cwd");
+        let err = current_dir_error(Path::new("rel/path"), &io);
+        assert!(
+            matches!(&err, PluginHostError::Io { path, message } if path == &PathBuf::from("rel/path") && message == "boom-cwd"),
+            "expected Io, got {err:?}"
+        );
     }
 }

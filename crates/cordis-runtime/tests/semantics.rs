@@ -716,16 +716,10 @@ fn engine_error_contains_execution_id_and_net_build_message() {
     })
     .expect_err("must fail in net build phase");
 
-    match err {
-        RuntimeError::ExecutionFailed {
-            execution_id,
-            message,
-        } => {
-            assert!(execution_id.starts_with("exec-"));
-            assert!(message.contains("net build failed"));
-        }
-        other => panic!("expected ExecutionFailed, got {other:?}"),
-    }
+    assert!(
+        matches!(&err, RuntimeError::ExecutionFailed { execution_id, message } if execution_id.starts_with("exec-") && message.contains("net build failed")),
+        "expected ExecutionFailed, got {err:?}"
+    );
 }
 
 #[test]
@@ -1377,15 +1371,10 @@ fn parallel_path_runner_panic_becomes_runtime_error() {
     )
     .expect_err("runner panic must surface as error");
 
-    match err {
-        RuntimeError::ExecutionFailed { message, .. } => {
-            assert!(
-                message.contains("runner panic") && message.contains("runner exploded"),
-                "unexpected message: {message}"
-            );
-        }
-        other => panic!("expected ExecutionFailed, got {other:?}"),
-    }
+    assert!(
+        matches!(&err, RuntimeError::ExecutionFailed { message, .. } if message.contains("runner panic") && message.contains("runner exploded")),
+        "expected ExecutionFailed, got {err:?}"
+    );
 }
 
 #[test]

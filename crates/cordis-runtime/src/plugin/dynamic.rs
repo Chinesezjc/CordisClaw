@@ -112,14 +112,12 @@ mod tests {
 
     #[test]
     fn open_missing_file_is_io_error() {
-        // LoadedDylibApi has no Debug impl, so match rather than unwrap_err().
-        match LoadedDylibApi::open(Path::new("/no/such/lib.dylib")) {
-            Err(RuntimeError::Io { message, .. }) => {
-                assert!(message.contains("load dylib failed"), "{message}");
-            }
-            Err(other) => panic!("expected Io load failure, got {other:?}"),
-            Ok(_) => panic!("expected open to fail for missing file"),
-        }
+        // LoadedDylibApi has no Debug impl, so use matches! rather than unwrap_err().
+        let result = LoadedDylibApi::open(Path::new("/no/such/lib.dylib"));
+        assert!(
+            matches!(&result, Err(RuntimeError::Io { message, .. }) if message.contains("load dylib failed")),
+            "expected Io load failure for missing file"
+        );
     }
 
     #[test]
@@ -129,16 +127,13 @@ mod tests {
         // failure branch. Skip elsewhere.
         let sys = Path::new("/usr/lib/libSystem.B.dylib");
         if unsafe { Library::new(sys) }.is_err() {
-            eprintln!("[skip] libSystem.B.dylib not loadable on this host");
-            return;
+            return; // libSystem.B.dylib not loadable on this host
         }
-        match LoadedDylibApi::open(sys) {
-            Err(RuntimeError::Io { message, .. }) => {
-                assert!(message.contains("symbol lookup failed"), "{message}");
-            }
-            Err(other) => panic!("expected symbol lookup failure, got {other:?}"),
-            Ok(_) => panic!("expected symbol lookup to fail for libSystem"),
-        }
+        let result = LoadedDylibApi::open(sys);
+        assert!(
+            matches!(&result, Err(RuntimeError::Io { message, .. }) if message.contains("symbol lookup failed")),
+            "expected symbol lookup failure for libSystem"
+        );
     }
 
     // --- LoadedDylibApi happy path (real fixture dylib) ----------------------
@@ -162,17 +157,12 @@ mod tests {
     #[test]
     fn open_real_fixture_dylib_exposes_api_and_lib() {
         let Some(path) = host_native_fixture_dylib() else {
-            eprintln!("[skip] no host-native fixture dylib available");
-            return;
+            return; // no host-native fixture dylib available on this host
         };
-        let loaded = match LoadedDylibApi::open(&path) {
-            Ok(l) => l,
-            Err(err) => {
-                // A cross-arch fixture (e.g. arm64 dylib on x86_64) legitimately
-                // fails dlopen; treat as skip rather than failure.
-                eprintln!("[skip] fixture dylib not loadable on this host: {err:?}");
-                return;
-            }
+        // A cross-arch fixture (e.g. arm64 dylib on x86_64) legitimately fails
+        // dlopen; treat as skip rather than failure. (No Debug on the handle.)
+        let Ok(loaded) = LoadedDylibApi::open(&path) else {
+            return; // fixture dylib not loadable on this host
         };
         // api() dereferences the resolved symbol; docs() must return JSON.
         let api = loaded.api();

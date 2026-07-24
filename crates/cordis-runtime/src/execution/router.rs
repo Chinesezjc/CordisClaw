@@ -188,4 +188,39 @@ mod tests {
         assert_eq!(result.outcome, NodeOutcome::Timeout);
         assert_eq!(metrics.router_timeout_total, 1);
     }
+
+    /// Drive each non-timeout terminal outcome through `execute_router` with a
+    /// generous (non-blown) deadline so the raw outcome is preserved, and
+    /// assert the matching rollback/commit metric arm fires. Covers the
+    /// Failure / Cancelled / Skipped arms that the timeout tests don't reach.
+    fn run_fast(outcome: NodeOutcome) -> RouterMetrics {
+        let mut ctx = RuntimeContext::default();
+        let mut metrics = RouterMetrics::default();
+        let result = execute_router(&mut ctx, "sg", &mut metrics, move |_ctx| outcome, 10_000)
+            .expect("router should not error");
+        assert_eq!(result.outcome, outcome);
+        metrics
+    }
+
+    #[test]
+    fn fast_failure_rolls_back_and_counts() {
+        let m = run_fast(NodeOutcome::Failure);
+        assert_eq!(m.router_failure_total, 1);
+        assert_eq!(m.router_overlay_rollback_total, 1);
+        assert_eq!(m.router_success_total, 0);
+    }
+
+    #[test]
+    fn fast_cancelled_rolls_back_and_counts() {
+        let m = run_fast(NodeOutcome::Cancelled);
+        assert_eq!(m.router_cancelled_total, 1);
+        assert_eq!(m.router_overlay_rollback_total, 1);
+    }
+
+    #[test]
+    fn fast_skipped_rolls_back_and_counts() {
+        let m = run_fast(NodeOutcome::Skipped);
+        assert_eq!(m.router_skipped_total, 1);
+        assert_eq!(m.router_overlay_rollback_total, 1);
+    }
 }

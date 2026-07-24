@@ -380,10 +380,28 @@ fn apply_json_patch(
     };
     *target = replacement;
 
-    serde_json::to_string_pretty(&document).map_err(|err| RuntimeError::Io {
+    serde_json::to_string_pretty(&document).map_err(|err| json_serialize_io_error(abs_path, &err))
+}
+
+/// Map a JSON re-serialization failure to `RuntimeError::Io`. Serializing a
+/// `Value` that was just parsed never fails in practice, so this arm is
+/// unreachable at runtime; extracting it keeps the error text byte-stable and
+/// unit-testable.
+fn json_serialize_io_error(abs_path: &Path, err: &serde_json::Error) -> RuntimeError {
+    RuntimeError::Io {
         path: abs_path.to_path_buf(),
         message: format!("json serialize failed: {err}"),
-    })
+    }
+}
+
+/// Map a TOML re-serialization failure to `RuntimeError::Io`. As with the JSON
+/// counterpart this is unreachable for a document that just parsed; extracted
+/// for byte-stable text and direct testing.
+fn toml_serialize_io_error(abs_path: &Path, err: &toml::ser::Error) -> RuntimeError {
+    RuntimeError::Io {
+        path: abs_path.to_path_buf(),
+        message: format!("toml serialize failed: {err}"),
+    }
 }
 
 fn apply_toml_patch(
@@ -427,10 +445,8 @@ fn apply_toml_patch(
                 });
             };
             *target = replacement;
-            return toml::to_string_pretty(&document).map_err(|err| RuntimeError::Io {
-                path: abs_path.to_path_buf(),
-                message: format!("toml serialize failed: {err}"),
-            });
+            return toml::to_string_pretty(&document)
+                .map_err(|err| toml_serialize_io_error(abs_path, &err));
         }
 
         cursor = table
@@ -694,12 +710,10 @@ mod tests {
         let ws = TempDir::new().unwrap();
         let updater = AutoUpdater::new(ws.path());
         let err = updater.resolve_patch_path("../escape.txt").unwrap_err();
-        match err {
-            RuntimeError::AutoUpdateInvalidPath { reason, .. } => {
-                assert!(reason.contains("parent directory"), "reason: {reason}");
-            }
-            other => panic!("unexpected: {other:?}"),
-        }
+        assert!(
+            matches!(&err, RuntimeError::AutoUpdateInvalidPath { reason, .. } if reason.contains("parent directory")),
+            "unexpected: {err:?}"
+        );
     }
 
     #[test]
@@ -770,12 +784,10 @@ mod tests {
                 verify_ok,
             )
             .unwrap_err();
-        match err {
-            RuntimeError::AutoUpdatePatchInvalid { reason, .. } => {
-                assert!(reason.contains("json parse failed"), "reason: {reason}");
-            }
-            other => panic!("unexpected: {other:?}"),
-        }
+        assert!(
+            matches!(&err, RuntimeError::AutoUpdatePatchInvalid { reason, .. } if reason.contains("json parse failed")),
+            "unexpected: {err:?}"
+        );
     }
 
     #[test]
@@ -843,12 +855,10 @@ mod tests {
                 verify_ok,
             )
             .unwrap_err();
-        match err {
-            RuntimeError::AutoUpdatePatchInvalid { reason, .. } => {
-                assert!(reason.contains("not a table"), "reason: {reason}");
-            }
-            other => panic!("unexpected: {other:?}"),
-        }
+        assert!(
+            matches!(&err, RuntimeError::AutoUpdatePatchInvalid { reason, .. } if reason.contains("not a table")),
+            "unexpected: {err:?}"
+        );
     }
 
     #[test]
@@ -913,15 +923,10 @@ mod tests {
             value: None,
         };
         let err = apply_json_patch(&patch, Path::new("/tmp/c.json"), r#"{"k":1}"#).unwrap_err();
-        match err {
-            RuntimeError::AutoUpdatePatchInvalid { reason, .. } => {
-                assert!(
-                    reason.contains("missing replacement value"),
-                    "reason: {reason}"
-                );
-            }
-            other => panic!("unexpected: {other:?}"),
-        }
+        assert!(
+            matches!(&err, RuntimeError::AutoUpdatePatchInvalid { reason, .. } if reason.contains("missing replacement value")),
+            "unexpected: {err:?}"
+        );
     }
 
     #[test]
@@ -936,15 +941,10 @@ mod tests {
             value: None,
         };
         let err = apply_toml_patch(&patch, Path::new("/tmp/c.toml"), "k = 1\n").unwrap_err();
-        match err {
-            RuntimeError::AutoUpdatePatchInvalid { reason, .. } => {
-                assert!(
-                    reason.contains("missing replacement value"),
-                    "reason: {reason}"
-                );
-            }
-            other => panic!("unexpected: {other:?}"),
-        }
+        assert!(
+            matches!(&err, RuntimeError::AutoUpdatePatchInvalid { reason, .. } if reason.contains("missing replacement value")),
+            "unexpected: {err:?}"
+        );
     }
 
     #[test]
@@ -952,15 +952,10 @@ mod tests {
         // serde_json null has no TOML representation → try_from errors.
         let patch = FilePatch::toml_value("c.toml", "k", serde_json::Value::Null);
         let err = apply_toml_patch(&patch, Path::new("/tmp/c.toml"), "k = 1\n").unwrap_err();
-        match err {
-            RuntimeError::AutoUpdatePatchInvalid { reason, .. } => {
-                assert!(
-                    reason.contains("toml value conversion failed"),
-                    "reason: {reason}"
-                );
-            }
-            other => panic!("unexpected: {other:?}"),
-        }
+        assert!(
+            matches!(&err, RuntimeError::AutoUpdatePatchInvalid { reason, .. } if reason.contains("toml value conversion failed")),
+            "unexpected: {err:?}"
+        );
     }
 
     #[test]
@@ -969,12 +964,39 @@ mod tests {
         // Not valid TOML.
         let err = apply_toml_patch(&patch, Path::new("/tmp/c.toml"), "this is : not = toml [[[")
             .unwrap_err();
-        match err {
-            RuntimeError::AutoUpdatePatchInvalid { reason, .. } => {
-                assert!(reason.contains("toml parse failed"), "reason: {reason}");
-            }
-            other => panic!("unexpected: {other:?}"),
-        }
+        assert!(
+            matches!(&err, RuntimeError::AutoUpdatePatchInvalid { reason, .. } if reason.contains("toml parse failed")),
+            "unexpected: {err:?}"
+        );
+    }
+
+    /// The JSON serialize failure arm in `apply_json_patch` is unreachable
+    /// (a just-parsed `Value` always re-serializes), so exercise the extracted
+    /// mapper directly to lock its `Io` variant and byte-exact message.
+    #[test]
+    fn json_serialize_io_error_wraps_path_and_message() {
+        let serde_err =
+            serde_json::from_str::<serde_json::Value>("{").expect_err("malformed json errors");
+        let err = json_serialize_io_error(Path::new("/tmp/x.json"), &serde_err);
+        assert!(
+            matches!(&err, RuntimeError::Io { path, message } if path == Path::new("/tmp/x.json") && message.starts_with("json serialize failed: ")),
+            "unexpected: {err:?}"
+        );
+    }
+
+    /// Same for the TOML serialize failure arm in `apply_toml_patch`. A real
+    /// `toml::ser::Error` arises from a map whose keys are not strings, which
+    /// TOML cannot represent.
+    #[test]
+    fn toml_serialize_io_error_wraps_path_and_message() {
+        let mut map = std::collections::BTreeMap::new();
+        map.insert(vec![1u8, 2u8], 3u8);
+        let ser_err = toml::to_string_pretty(&map).expect_err("non-string key errors");
+        let err = toml_serialize_io_error(Path::new("/tmp/x.toml"), &ser_err);
+        assert!(
+            matches!(&err, RuntimeError::Io { path, message } if path == Path::new("/tmp/x.toml") && message.starts_with("toml serialize failed: ")),
+            "unexpected: {err:?}"
+        );
     }
 
     #[test]
@@ -984,12 +1006,10 @@ mod tests {
         let patch = FilePatch::toml_value("c.toml", "a.b", serde_json::json!(2));
         let err =
             apply_toml_patch(&patch, Path::new("/tmp/c.toml"), "[other]\nx = 1\n").unwrap_err();
-        match err {
-            RuntimeError::AutoUpdatePatchInvalid { reason, .. } => {
-                assert!(reason.contains("dotted key not found"), "reason: {reason}");
-            }
-            other => panic!("unexpected: {other:?}"),
-        }
+        assert!(
+            matches!(&err, RuntimeError::AutoUpdatePatchInvalid { reason, .. } if reason.contains("dotted key not found")),
+            "unexpected: {err:?}"
+        );
     }
 
     #[test]
@@ -1036,12 +1056,10 @@ mod tests {
                 verify_ok,
             )
             .unwrap_err();
-        match err {
-            RuntimeError::Invariant { message } => {
-                assert!(message.contains("rollback failed"), "message: {message}");
-            }
-            other => panic!("expected Invariant, got: {other:?}"),
-        }
+        assert!(
+            matches!(&err, RuntimeError::Invariant { message } if message.contains("rollback failed")),
+            "expected Invariant, got: {err:?}"
+        );
 
         // Restore perms for TempDir cleanup.
         let mut perms = fs::metadata(&target).unwrap().permissions();

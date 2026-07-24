@@ -1043,12 +1043,10 @@ fn prepare_artifacts_detects_abi_fingerprint_mismatch() {
     fs::write(&manifest, patched).unwrap();
 
     let err = prepare_artifacts(temp.path(), PrepareMode::Full);
-    match err {
-        Err(RuntimeError::AbiMismatch { plugin_path, .. }) => {
-            assert_eq!(plugin_path, "demo");
-        }
-        other => panic!("expected AbiMismatch, got {other:?}"),
-    }
+    assert!(
+        matches!(&err, Err(RuntimeError::AbiMismatch { plugin_path, .. }) if plugin_path == "demo"),
+        "expected AbiMismatch, got {err:?}"
+    );
 }
 
 #[test]

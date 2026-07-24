@@ -231,4 +231,52 @@ mod tests {
         send(&host, "no handlers now");
         assert_eq!(handler_count_for(p), 0);
     }
+
+    /// Every accessor recovers from a poisoned `HANDLERS` mutex via
+    /// `unwrap_or_else(|p| p.into_inner())` instead of panicking. Poison the
+    /// lock once (a thread that panics while holding it), then confirm each
+    /// entry point still operates. The poison is permanent for the process,
+    /// but harmless: all accessors take the recovery path. This test therefore
+    /// runs last-effect and uses a unique plugin key so it does not corrupt
+    /// other tests' expectations of the shared `HANDLERS`.
+    #[test]
+    fn accessors_recover_from_poisoned_mutex() {
+        // Poison the global lock: a thread panics while holding the guard.
+        let _ = std::thread::spawn(|| {
+            let _guard = HANDLERS.lock().unwrap();
+            panic!("intentional poison");
+        })
+        .join();
+        assert!(HANDLERS.is_poisoned(), "lock should be poisoned now");
+
+        let p = "notify_test_poison_recovery";
+        // register / handler_count_for / unregister / unregister_plugin must all
+        // work despite the poison.
+        unregister_plugin(p);
+        register(p, "n1");
+        register(p, "n1");
+        assert_eq!(handler_count_for(p), 1);
+        register(p, "n2");
+        assert_eq!(handler_count_for(p), 2);
+        unregister(p, "n1");
+        assert_eq!(handler_count_for(p), 1);
+        // `send` also locks HANDLERS; drive it once under poison so its own
+        // recovery arm executes. Boot a minimal host (zero plugins) so the
+        // fan-out is a no-op that cannot panic.
+        {
+            use crate::host::RuntimeHost;
+            let dir = tempfile::TempDir::new().expect("tempdir");
+            let artifacts = dir.path().join("artifacts");
+            std::fs::create_dir_all(&artifacts).expect("artifacts dir");
+            std::fs::write(
+                artifacts.join("index.json"),
+                r#"{"generated_at":"1970-01-01T00:00:00Z","topo_order":[],"entries":[]}"#,
+            )
+            .expect("write empty index");
+            let host = RuntimeHost::boot(dir.path()).expect("empty host should boot");
+            send(&host, "under poison");
+        }
+        unregister_plugin(p);
+        assert_eq!(handler_count_for(p), 0);
+    }
 }

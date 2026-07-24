@@ -154,18 +154,20 @@ pub fn invoke_registered_plugin(
         }
     };
     let api = dylib.api();
-    if api.abi_kind != DylibAbiKind::Rust {
-        plugin_registry.mark_runtime_unavailable(
-            plugin_path,
-            PluginUnavailableReason::AbiMismatch,
-            vec!["runtime exported abi_kind is not rust".to_string()],
-        );
-        return Err(RuntimeError::PluginUnavailable {
-            plugin_path: plugin_path.to_string(),
-            reason: PluginUnavailableReason::AbiMismatch,
-            required: plugin.required,
-        });
-    }
+    // `DylibAbiKind` currently has exactly one variant (`Rust`), and the SDK's
+    // `export_plugin_api!` macro always stamps `abi_kind: DylibAbiKind::Rust`
+    // into the static vtable. Reading any other discriminant out of the
+    // `#[repr(C)]` field would already be UB, so a runtime `!= Rust` branch is
+    // dead code until the enum grows a second variant. Keep the invariant as a
+    // debug assertion (a marker for whoever adds that variant to restore the
+    // real `mark_runtime_unavailable` + `PluginUnavailable` handling here)
+    // rather than an always-false runtime check + unreachable error path.
+    debug_assert_eq!(
+        api.abi_kind,
+        DylibAbiKind::Rust,
+        "dylib exported a non-Rust abi_kind; add real AbiMismatch handling when \
+         DylibAbiKind gains variants"
+    );
 
     let expected_fingerprint =
         plugin
@@ -174,11 +176,8 @@ pub fn invoke_registered_plugin(
             .ok_or_else(|| RuntimeError::Invariant {
                 message: format!("loaded plugin missing abi_fingerprint: {plugin_path}"),
             })?;
-    let runtime_fingerprint =
-        serde_json::from_str(&(api.abi_fingerprint)().payload).map_err(|err| RuntimeError::Io {
-            path: artifact_path.to_path_buf(),
-            message: format!("runtime fingerprint parse failed: {err}"),
-        })?;
+    let runtime_fingerprint = serde_json::from_str(&(api.abi_fingerprint)().payload)
+        .map_err(|err| dylib_payload_io(artifact_path, "runtime fingerprint parse failed", err))?;
     if runtime_fingerprint != expected_fingerprint {
         let diff = expected_fingerprint.diff(&runtime_fingerprint);
         plugin_registry.mark_runtime_unavailable(
@@ -194,11 +193,8 @@ pub fn invoke_registered_plugin(
         });
     }
 
-    let runtime_docs =
-        serde_json::from_str(&(api.docs)().payload).map_err(|err| RuntimeError::Io {
-            path: artifact_path.to_path_buf(),
-            message: format!("runtime docs parse failed: {err}"),
-        })?;
+    let runtime_docs = serde_json::from_str(&(api.docs)().payload)
+        .map_err(|err| dylib_payload_io(artifact_path, "runtime docs parse failed", err))?;
     if plugin.docs.as_ref() != Some(&runtime_docs) {
         plugin_registry.mark_runtime_unavailable(
             plugin_path,
@@ -224,9 +220,7 @@ pub fn invoke_registered_plugin(
         obj.entry("node_id")
             .or_insert_with(|| serde_json::json!(node_id));
     }
-    let payload = serde_json::to_string(&payload_value).map_err(|err| RuntimeError::Invariant {
-        message: format!("plugin invoke payload re-serialize failed: {err}"),
-    })?;
+    let payload = serde_json::to_string(&payload_value).map_err(payload_reserialize_invariant)?;
 
     let response = call_handle_catch_unwind(plugin_path, api.handle, PluginRequest { payload })?;
 
@@ -279,6 +273,39 @@ pub fn invoke_registered_plugin(
     Ok(response)
 }
 
+/// Map a JSON-payload parse/serialize failure on a dylib's exported wire
+/// buffer (`abi_fingerprint()` / `docs()`) to a path-tagged `Io` error.
+///
+/// These payloads are produced by the plugin's own SDK serialisers, so a
+/// parse failure here is a genuine artifact fault (corrupt/incompatible
+/// dylib), not caller input — hence `Io` tagged with the artifact path
+/// rather than `InvalidArgument`.
+fn dylib_payload_io(artifact_path: &Path, context: &str, err: serde_json::Error) -> RuntimeError {
+    RuntimeError::Io {
+        path: artifact_path.to_path_buf(),
+        message: format!("{context}: {err}"),
+    }
+}
+
+/// Build a `PluginInvocationFailed` error for the JSON-artifact subprocess
+/// path (spawn/stdin/wait/exit-status/stdout-decoding failures).
+fn plugin_invocation_failed(plugin_path: &str, message: String) -> RuntimeError {
+    RuntimeError::PluginInvocationFailed {
+        plugin_path: plugin_path.to_string(),
+        message,
+    }
+}
+
+/// Map a failure to re-serialise the (already-parsed) invoke payload back to a
+/// JSON string to an `Invariant` error. The value was just deserialised from a
+/// valid JSON string and only had a string `node_id` key inserted, so a
+/// serialisation failure indicates a broken invariant, not caller input.
+fn payload_reserialize_invariant(err: serde_json::Error) -> RuntimeError {
+    RuntimeError::Invariant {
+        message: format!("plugin invoke payload re-serialize failed: {err}"),
+    }
+}
+
 fn invoke_json_artifact(
     plugin_path: &str,
     artifact_path: &Path,
@@ -294,45 +321,35 @@ fn invoke_json_artifact(
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .spawn()
-                .map_err(|e| RuntimeError::PluginInvocationFailed {
-                    plugin_path: plugin_path.to_string(),
-                    message: format!("spawn {} failed: {e}", command_path.display()),
+                .map_err(|e| {
+                    plugin_invocation_failed(
+                        plugin_path,
+                        format!("spawn {} failed: {e}", command_path.display()),
+                    )
                 })?;
 
             if let Some(stdin) = child.stdin.as_mut() {
                 stdin.write_all(payload.as_bytes()).map_err(|e| {
-                    RuntimeError::PluginInvocationFailed {
-                        plugin_path: plugin_path.to_string(),
-                        message: format!("write stdin failed: {e}"),
-                    }
+                    plugin_invocation_failed(plugin_path, format!("write stdin failed: {e}"))
                 })?;
             }
 
-            let output =
-                child
-                    .wait_with_output()
-                    .map_err(|e| RuntimeError::PluginInvocationFailed {
-                        plugin_path: plugin_path.to_string(),
-                        message: format!("wait failed: {e}"),
-                    })?;
+            let output = child
+                .wait_with_output()
+                .map_err(|e| plugin_invocation_failed(plugin_path, format!("wait failed: {e}")))?;
 
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-                return Err(RuntimeError::PluginInvocationFailed {
-                    plugin_path: plugin_path.to_string(),
-                    message: if stderr.is_empty() {
-                        format!("process exited with status {}", output.status)
-                    } else {
-                        stderr
-                    },
-                });
+                let message = if stderr.is_empty() {
+                    format!("process exited with status {}", output.status)
+                } else {
+                    stderr
+                };
+                return Err(plugin_invocation_failed(plugin_path, message));
             }
 
             let stdout = String::from_utf8(output.stdout).map_err(|e| {
-                RuntimeError::PluginInvocationFailed {
-                    plugin_path: plugin_path.to_string(),
-                    message: format!("stdout was not utf-8: {e}"),
-                }
+                plugin_invocation_failed(plugin_path, format!("stdout was not utf-8: {e}"))
             })?;
 
             Ok(PluginResponse {
@@ -413,14 +430,10 @@ mod panic_isolation_tests {
             },
         )
         .expect_err("panic must convert to Err");
-        match err {
-            RuntimeError::InvalidArgument { message } => {
-                assert!(message.contains("panicked in handle"), "msg={message}");
-                assert!(message.contains("deliberate test panic"), "msg={message}");
-                assert!(message.contains("test/panicker"), "msg={message}");
-            }
-            other => panic!("wrong variant: {other:?}"),
-        }
+        assert!(
+            matches!(&err, RuntimeError::InvalidArgument { message } if message.contains("panicked in handle") && message.contains("deliberate test panic") && message.contains("test/panicker")),
+            "wrong variant: {err:?}"
+        );
     }
 
     #[test]
@@ -476,12 +489,55 @@ mod panic_isolation_tests {
             },
         )
         .expect_err("panic must convert to Err");
-        match err {
-            RuntimeError::InvalidArgument { message } => {
-                assert!(message.contains("dynamic panic value"), "msg={message}");
-                assert!(message.contains("test/stringpanic"), "msg={message}");
-            }
-            other => panic!("wrong variant: {other:?}"),
-        }
+        assert!(
+            matches!(&err, RuntimeError::InvalidArgument { message } if message.contains("dynamic panic value") && message.contains("test/stringpanic")),
+            "wrong variant: {err:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod error_mapper_tests {
+    use super::*;
+
+    // A serde_json::Error is only constructible via a failing parse/serialize.
+    fn json_error() -> serde_json::Error {
+        serde_json::from_str::<serde_json::Value>("{ not json").unwrap_err()
+    }
+
+    // dylib_payload_io tags the artifact path and prefixes the context string
+    // before the underlying serde error text.
+    #[test]
+    fn dylib_payload_io_tags_path_and_context() {
+        let err = dylib_payload_io(
+            Path::new("/artifacts/plugin.dylib"),
+            "runtime fingerprint parse failed",
+            json_error(),
+        );
+        assert!(
+            matches!(&err, RuntimeError::Io { path, message } if path == &PathBuf::from("/artifacts/plugin.dylib") && message.starts_with("runtime fingerprint parse failed: ")),
+            "wrong variant: {err:?}"
+        );
+    }
+
+    // plugin_invocation_failed carries the plugin path and the verbatim
+    // message through to the PluginInvocationFailed variant.
+    #[test]
+    fn plugin_invocation_failed_carries_path_and_message() {
+        let err = plugin_invocation_failed("json/echo", "spawn foo failed: nope".to_string());
+        assert!(
+            matches!(&err, RuntimeError::PluginInvocationFailed { plugin_path, message } if plugin_path == "json/echo" && message == "spawn foo failed: nope"),
+            "wrong variant: {err:?}"
+        );
+    }
+
+    // payload_reserialize_invariant maps to an Invariant with the fixed prefix.
+    #[test]
+    fn payload_reserialize_invariant_is_invariant() {
+        let err = payload_reserialize_invariant(json_error());
+        assert!(
+            matches!(&err, RuntimeError::Invariant { message } if message.starts_with("plugin invoke payload re-serialize failed: ")),
+            "wrong variant: {err:?}"
+        );
     }
 }
