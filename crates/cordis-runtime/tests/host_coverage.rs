@@ -1158,3 +1158,122 @@ fn host_reload_with_diagnostics_noop_reports_reloaded() {
     let attempt = host.reload_with_diagnostics("expr");
     assert_eq!(attempt.status, ReloadAttemptStatus::Reloaded);
 }
+
+// ===========================================================================
+// Group I — agent-driven plugin iteration failure + error enrichment.
+//
+// `iterate_plugins` with no `edit_plan` takes the agent-driven branch: it
+// starts a plugin-iteration agent session and calls `agent_send`. Pointing
+// the LLM at a dead loopback port makes `agent_send` fail after its in-profile
+// retries, driving `run_plugin_iteration_agent`'s error path through
+// `enrich_plugin_iteration_agent_error`. The enriched message (tool summary +
+// transcript excerpt) becomes the iteration's `blocked_reason`.
+//
+// This boots a *fresh* host (not the shared one) against the real fixtures so
+// the real plugins/expr source tree is present for context collection, but
+// with a throwaway config dir (dead LLM base_url) and its own snapshot_root so
+// it can't clobber the shared host's staged artifacts.
+// ===========================================================================
+
+#[test]
+#[serial]
+fn host_iterate_plugins_agent_failure_surfaces_enriched_error() {
+    use std::net::TcpListener;
+
+    let fixtures = fixtures_root();
+    // Keep the fixtures artifact index consistent with the on-disk dylibs
+    // (other tests may have rebuilt them mid-suite).
+    cordis_runtime::plugin::tooling::refresh_artifact_index(&fixtures)
+        .expect("refresh artifact index before boot");
+
+    // Reserve then release a loopback port so a connection there is refused
+    // immediately — a deterministic, fast LLM failure.
+    let dead_port = {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind to reserve port");
+        let port = listener.local_addr().expect("addr").port();
+        drop(listener);
+        port
+    };
+
+    // Throwaway config dir: dead LLM endpoint + an isolated snapshot_root so
+    // this host never touches the shared host's snapshot tree.
+    let cfg_temp = TempDir::new().expect("config tempdir");
+    let snap_temp = TempDir::new().expect("snapshot tempdir");
+    let config_dir = cfg_temp.path();
+    fs::write(
+        config_dir.join("llm_api.yaml"),
+        format!(
+            "provider: deepseek\nbase_url: http://127.0.0.1:{dead_port}/v1\napi_key: test-key\nmodel: deepseek-chat\ntemperature: 0.0\nmax_tokens: 128\ntimeout_ms: 3000\nstream_timeout_secs: 2\n"
+        ),
+    )
+    .expect("write dead llm config");
+    fs::write(
+        config_dir.join("runtime.yaml"),
+        format!(
+            "runtime:\n  snapshot_root: {}\n",
+            snap_temp.path().display()
+        ),
+    )
+    .expect("write runtime config");
+
+    // CORDIS_CONFIG_DIR is process-global; #[serial] guarantees no other test
+    // observes it. Set it only across boot, then restore.
+    let prev = std::env::var_os("CORDIS_CONFIG_DIR");
+    std::env::set_var("CORDIS_CONFIG_DIR", config_dir);
+    let host = RuntimeHost::boot(&fixtures).expect("host should boot with dead-LLM config");
+    match prev {
+        Some(value) => std::env::set_var("CORDIS_CONFIG_DIR", value),
+        None => std::env::remove_var("CORDIS_CONFIG_DIR"),
+    }
+
+    // No edit_plan → agent-driven path. The agent's first (and only) send hits
+    // the dead endpoint and fails; the iteration rolls back.
+    let result = host
+        .iterate_plugins(KernelPluginIterationRequest {
+            issue_id: None,
+            target_plugin_paths: vec!["expr".to_string()],
+            instruction: Some("inspect the expr subtree".to_string()),
+            edit_plan: None,
+            manual_approved: false,
+            tests_command: None,
+            safety_command: None,
+            verify_profile: Some(VerificationProfile::RustWorkspace),
+            quality_score: Some(95),
+        })
+        .expect("iteration returns a result even when the agent fails");
+
+    assert_eq!(
+        result.final_verdict,
+        PluginIterationFinalVerdict::RolledBack
+    );
+    assert!(
+        result.changed_paths.is_empty(),
+        "a failed agent must not report changed paths: {:?}",
+        result.changed_paths
+    );
+
+    // The blocked_reason carries the enriched agent-error detail: the session
+    // header, the tool-execution summary, and the transcript excerpt.
+    let reason = result
+        .blocked_reason
+        .as_deref()
+        .expect("failed iteration records a blocked_reason");
+    assert!(
+        reason.contains("plugin iteration agent session"),
+        "enriched error should name the agent session: {reason}"
+    );
+    assert!(
+        reason.contains("tool summary: total_calls="),
+        "enriched error should embed the tool-execution summary: {reason}"
+    );
+    assert!(
+        reason.contains("transcript excerpt:"),
+        "enriched error should embed the transcript excerpt: {reason}"
+    );
+    // The excerpt records the failed LLM turn: a user prompt entry plus the
+    // synthetic assistant "[error]" placeholder respond() inserts on failure.
+    assert!(
+        reason.contains("LLM request failed") || reason.contains("[error]"),
+        "excerpt should carry the underlying LLM failure detail: {reason}"
+    );
+}
