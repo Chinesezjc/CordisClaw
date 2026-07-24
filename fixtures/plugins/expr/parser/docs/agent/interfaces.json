@@ -9,20 +9,20 @@
       "id": "expr_parser",
       "summary": "Build an AST from lexer tokens.",
       "input_schema": {
+        "type": "object",
         "properties": {
           "tokens": {
             "type": "array"
           }
-        },
-        "type": "object"
+        }
       },
       "output_schema": {
+        "type": "object",
         "properties": {
           "ast": {
             "type": "object"
           }
-        },
-        "type": "object"
+        }
       },
       "side_effects": [],
       "failure_modes": [

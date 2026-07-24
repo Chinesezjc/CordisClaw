@@ -3493,7 +3493,11 @@ mod tests {
             }),
         ];
         let filtered = filter_kernel_introspection_messages(&turn);
-        assert_eq!(filtered.len(), 2, "expected assistant + read result: {filtered:?}");
+        assert_eq!(
+            filtered.len(),
+            2,
+            "expected assistant + read result: {filtered:?}"
+        );
         let tool_calls = filtered[0]
             .get("tool_calls")
             .and_then(|v| v.as_array())

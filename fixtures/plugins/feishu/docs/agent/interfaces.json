@@ -9,44 +9,44 @@
       "id": "feishu_serve",
       "summary": "Start Feishu event intake. mode='ws' (default): long connection — dials out to Feishu (/callback/ws/endpoint), no public URL needed. mode='webhook': HTTP server receiving event callbacks at POST /feishu/event (url_verification challenge, token check, optional AES decryption). Both modes apply the access policy (dm_policy/group_policy/require_mention/pairing), dedup, and forward accepted messages to the agent.",
       "input_schema": {
+        "type": "object",
         "properties": {
-          "action": {
-            "enum": [
-              "stop"
-            ],
-            "type": "string"
-          },
           "node_id": {
             "const": "feishu_serve"
           },
+          "action": {
+            "type": "string",
+            "enum": [
+              "stop"
+            ]
+          },
           "payload": {
+            "type": "object",
             "properties": {
               "mode": {
+                "type": "string",
                 "enum": [
                   "ws",
                   "webhook"
-                ],
-                "type": "string"
+                ]
               },
               "port": {
                 "type": "integer"
               }
-            },
-            "type": "object"
+            }
           }
-        },
-        "type": "object"
+        }
       },
       "output_schema": {
+        "type": "object",
         "properties": {
-          "message": {
-            "type": "string"
-          },
           "ok": {
             "type": "boolean"
+          },
+          "message": {
+            "type": "string"
           }
-        },
-        "type": "object"
+        }
       },
       "side_effects": [
         "network:listen",
@@ -63,47 +63,47 @@
       "id": "feishu_send",
       "summary": "Send a message to a Feishu chat or user. target is 'chat:<chat_id>' or 'user:<open_id>'. Provide either `message` (text) or `card` (interactive card JSON). Optional `reply_to` quote-replies to a message_id. If a pending 'thinking…' card exists for the target (two-stage replies) the content PATCHes that card; payload.update_message_id forces updating a specific message.",
       "input_schema": {
+        "type": "object",
+        "required": [
+          "node_id",
+          "target"
+        ],
         "properties": {
-          "card": {
-            "type": "object"
+          "node_id": {
+            "const": "feishu_send"
+          },
+          "target": {
+            "type": "string"
           },
           "message": {
             "type": "string"
           },
-          "node_id": {
-            "const": "feishu_send"
-          },
-          "payload": {
-            "properties": {
-              "update_message_id": {
-                "type": "string"
-              }
-            },
+          "card": {
             "type": "object"
           },
           "reply_to": {
             "type": "string"
           },
-          "target": {
-            "type": "string"
+          "payload": {
+            "type": "object",
+            "properties": {
+              "update_message_id": {
+                "type": "string"
+              }
+            }
           }
-        },
-        "required": [
-          "node_id",
-          "target"
-        ],
-        "type": "object"
+        }
       },
       "output_schema": {
+        "type": "object",
         "properties": {
-          "data": {
-            "type": "object"
-          },
           "ok": {
             "type": "boolean"
+          },
+          "data": {
+            "type": "object"
           }
-        },
-        "type": "object"
+        }
       },
       "side_effects": [
         "network:feishu-api"
@@ -119,35 +119,35 @@
       "id": "feishu_entry",
       "summary": "Configure the Feishu plugin or manage access. action='configure' with payload (app_id/app_secret/bot_open_id/api_base/verification_token/encrypt_key + policies: dm_policy open|allowlist|pairing, dm_allow_from[], group_policy open|allowlist|disabled, group_allow_from[], require_mention, card_replies). action='status' for a summary. action='approve_pairing' with payload.code approves a pending DM pairing. action='list_pending' lists pending pairings.",
       "input_schema": {
+        "type": "object",
+        "required": [
+          "node_id"
+        ],
         "properties": {
+          "node_id": {
+            "const": "feishu_entry"
+          },
           "action": {
+            "type": "string",
             "enum": [
               "configure",
               "status",
               "approve_pairing",
               "list_pending"
-            ],
-            "type": "string"
-          },
-          "node_id": {
-            "const": "feishu_entry"
+            ]
           },
           "payload": {
             "type": "object"
           }
-        },
-        "required": [
-          "node_id"
-        ],
-        "type": "object"
+        }
       },
       "output_schema": {
+        "type": "object",
         "properties": {
           "ok": {
             "type": "boolean"
           }
-        },
-        "type": "object"
+        }
       },
       "side_effects": [
         "config write"
@@ -162,66 +162,66 @@
       "id": "feishu_fetch_resource",
       "summary": "Download a Feishu message resource (image or file) to a local temp file and return its path. Use the file_key from an inbound placeholder, and take message_id from the display prefix's msg=<id>. type='image' for image messages and post img runs (image_key); type='file' for file/audio/video/sticker messages (file_key). Optional as_base64=true inlines base64 for resources <=1MB.",
       "input_schema": {
+        "type": "object",
+        "required": [
+          "node_id",
+          "payload"
+        ],
         "properties": {
           "node_id": {
             "const": "feishu_fetch_resource"
           },
           "payload": {
-            "properties": {
-              "as_base64": {
-                "type": "boolean"
-              },
-              "file_key": {
-                "type": "string"
-              },
-              "message_id": {
-                "type": "string"
-              },
-              "type": {
-                "enum": [
-                  "image",
-                  "file"
-                ],
-                "type": "string"
-              }
-            },
+            "type": "object",
             "required": [
               "message_id",
               "file_key"
             ],
-            "type": "object"
+            "properties": {
+              "message_id": {
+                "type": "string"
+              },
+              "file_key": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "image",
+                  "file"
+                ]
+              },
+              "as_base64": {
+                "type": "boolean"
+              }
+            }
           }
-        },
-        "required": [
-          "node_id",
-          "payload"
-        ],
-        "type": "object"
+        }
       },
       "output_schema": {
+        "type": "object",
         "properties": {
+          "ok": {
+            "type": "boolean"
+          },
           "data": {
+            "type": "object",
             "properties": {
-              "base64": {
-                "type": "string"
-              },
-              "mime": {
-                "type": "string"
-              },
               "path": {
                 "type": "string"
               },
               "size": {
                 "type": "integer"
+              },
+              "mime": {
+                "type": "string"
+              },
+              "base64": {
+                "type": "string"
               }
-            },
-            "type": "object"
-          },
-          "ok": {
-            "type": "boolean"
+            }
           }
-        },
-        "type": "object"
+        }
       },
       "side_effects": [
         "network:feishu-api",
@@ -240,56 +240,56 @@
       "id": "feishu_fetch_image",
       "summary": "Download an image resource (type is forced to 'image') to a local temp file and return its path. Same as feishu_fetch_resource with type='image'; use the file_key from an '[image file_key=...]' placeholder and message_id from the display prefix's msg=<id>.",
       "input_schema": {
+        "type": "object",
+        "required": [
+          "node_id",
+          "payload"
+        ],
         "properties": {
           "node_id": {
             "const": "feishu_fetch_image"
           },
           "payload": {
-            "properties": {
-              "as_base64": {
-                "type": "boolean"
-              },
-              "file_key": {
-                "type": "string"
-              },
-              "message_id": {
-                "type": "string"
-              }
-            },
+            "type": "object",
             "required": [
               "message_id",
               "file_key"
             ],
-            "type": "object"
-          }
-        },
-        "required": [
-          "node_id",
-          "payload"
-        ],
-        "type": "object"
-      },
-      "output_schema": {
-        "properties": {
-          "data": {
             "properties": {
-              "mime": {
+              "message_id": {
                 "type": "string"
               },
+              "file_key": {
+                "type": "string"
+              },
+              "as_base64": {
+                "type": "boolean"
+              }
+            }
+          }
+        }
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "ok": {
+            "type": "boolean"
+          },
+          "data": {
+            "type": "object",
+            "properties": {
               "path": {
                 "type": "string"
               },
               "size": {
                 "type": "integer"
+              },
+              "mime": {
+                "type": "string"
               }
-            },
-            "type": "object"
-          },
-          "ok": {
-            "type": "boolean"
+            }
           }
-        },
-        "type": "object"
+        }
       },
       "side_effects": [
         "network:feishu-api",
@@ -308,11 +308,23 @@
       "id": "feishu_send_image",
       "summary": "Send an image to a Feishu chat or user. target is 'chat:<chat_id>' or 'user:<open_id>'. Provide either image_key (already uploaded) or path (a local file under the system temp directory, uploaded first). Optional reply_to quote-replies. URLs are not supported.",
       "input_schema": {
+        "type": "object",
+        "required": [
+          "node_id",
+          "target"
+        ],
         "properties": {
           "node_id": {
             "const": "feishu_send_image"
           },
+          "target": {
+            "type": "string"
+          },
+          "reply_to": {
+            "type": "string"
+          },
           "payload": {
+            "type": "object",
             "properties": {
               "image_key": {
                 "type": "string"
@@ -320,31 +332,24 @@
               "path": {
                 "type": "string"
               },
-              "reply_to": {
-                "type": "string"
-              },
               "target": {
                 "type": "string"
+              },
+              "reply_to": {
+                "type": "string"
               }
-            },
-            "type": "object"
-          },
-          "reply_to": {
-            "type": "string"
-          },
-          "target": {
-            "type": "string"
+            }
           }
-        },
-        "required": [
-          "node_id",
-          "target"
-        ],
-        "type": "object"
+        }
       },
       "output_schema": {
+        "type": "object",
         "properties": {
+          "ok": {
+            "type": "boolean"
+          },
           "data": {
+            "type": "object",
             "properties": {
               "image_key": {
                 "type": "string"
@@ -352,14 +357,9 @@
               "message_id": {
                 "type": "string"
               }
-            },
-            "type": "object"
-          },
-          "ok": {
-            "type": "boolean"
+            }
           }
-        },
-        "type": "object"
+        }
       },
       "side_effects": [
         "network:feishu-api"
@@ -377,38 +377,38 @@
       "id": "feishu_get_message",
       "summary": "Fetch a message by message_id (im/v1/messages/{message_id}). Synthetic cardaction ids are rejected.",
       "input_schema": {
+        "type": "object",
+        "required": [
+          "node_id",
+          "payload"
+        ],
         "properties": {
           "node_id": {
             "const": "feishu_get_message"
           },
           "payload": {
+            "type": "object",
+            "required": [
+              "message_id"
+            ],
             "properties": {
               "message_id": {
                 "type": "string"
               }
-            },
-            "required": [
-              "message_id"
-            ],
-            "type": "object"
+            }
           }
-        },
-        "required": [
-          "node_id",
-          "payload"
-        ],
-        "type": "object"
+        }
       },
       "output_schema": {
+        "type": "object",
         "properties": {
-          "data": {
-            "type": "object"
-          },
           "ok": {
             "type": "boolean"
+          },
+          "data": {
+            "type": "object"
           }
-        },
-        "type": "object"
+        }
       },
       "side_effects": [
         "network:feishu-api"
@@ -425,38 +425,38 @@
       "id": "feishu_get_chat_info",
       "summary": "Fetch chat/group info by chat_id (im/v1/chats/{chat_id}).",
       "input_schema": {
+        "type": "object",
+        "required": [
+          "node_id",
+          "payload"
+        ],
         "properties": {
           "node_id": {
             "const": "feishu_get_chat_info"
           },
           "payload": {
+            "type": "object",
+            "required": [
+              "chat_id"
+            ],
             "properties": {
               "chat_id": {
                 "type": "string"
               }
-            },
-            "required": [
-              "chat_id"
-            ],
-            "type": "object"
+            }
           }
-        },
-        "required": [
-          "node_id",
-          "payload"
-        ],
-        "type": "object"
+        }
       },
       "output_schema": {
+        "type": "object",
         "properties": {
-          "data": {
-            "type": "object"
-          },
           "ok": {
             "type": "boolean"
+          },
+          "data": {
+            "type": "object"
           }
-        },
-        "type": "object"
+        }
       },
       "side_effects": [
         "network:feishu-api"
@@ -472,11 +472,16 @@
       "id": "feishu_list_chats",
       "summary": "List chats the bot belongs to (im/v1/chats). Optional page_size and page_token for pagination.",
       "input_schema": {
+        "type": "object",
+        "required": [
+          "node_id"
+        ],
         "properties": {
           "node_id": {
             "const": "feishu_list_chats"
           },
           "payload": {
+            "type": "object",
             "properties": {
               "page_size": {
                 "type": "integer"
@@ -484,25 +489,20 @@
               "page_token": {
                 "type": "string"
               }
-            },
-            "type": "object"
+            }
           }
-        },
-        "required": [
-          "node_id"
-        ],
-        "type": "object"
+        }
       },
       "output_schema": {
+        "type": "object",
         "properties": {
-          "data": {
-            "type": "object"
-          },
           "ok": {
             "type": "boolean"
+          },
+          "data": {
+            "type": "object"
           }
-        },
-        "type": "object"
+        }
       },
       "side_effects": [
         "network:feishu-api"

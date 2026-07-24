@@ -9,8 +9,8 @@
 //! Safety: all paths are validated by a whitelist.
 
 use cordis_plugin_sdk::{
-    export_plugin_api, json_response, node_doc, plugin_docs, AbiFingerprint,
-    PluginRequest, PluginResponse,
+    export_plugin_api, json_response, node_doc, plugin_docs, AbiFingerprint, PluginRequest,
+    PluginResponse,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -162,46 +162,62 @@ struct FsResponse {
 
 fn handle_fs_read(req: &FsRequest) -> Result<FsResponse, String> {
     let path_str = req.path.as_deref().unwrap_or("").trim();
-    if path_str.is_empty() { return Err("path is required for fs_read".into()); }
+    if path_str.is_empty() {
+        return Err("path is required for fs_read".into());
+    }
     let path = resolve(path_str)?;
     if !is_allowed_read(&path) {
         return Err("access denied: path is outside allowed read directories".into());
     }
-    let content = std::fs::read_to_string(&path)
-        .map_err(|e| format!("read {path_str}: {e}"))?;
+    let content = std::fs::read_to_string(&path).map_err(|e| format!("read {path_str}: {e}"))?;
     let all_lines: Vec<&str> = content.lines().collect();
     let total = all_lines.len();
     let start = req.offset.unwrap_or(0).min(total);
     let end = req.limit.map(|n| (start + n).min(total)).unwrap_or(total);
     let lines: Vec<Value> = all_lines[start..end]
-        .iter().enumerate()
+        .iter()
+        .enumerate()
         .map(|(i, l)| json!({"line": start + i + 1, "text": l}))
         .collect();
     Ok(FsResponse {
-        ok: true, node_id: "fs_read".into(), path: Some(path_str.into()),
-        text: None, lines: Some(lines), entries: None, matches: None,
-        total_lines: Some(total), replaced: None, error: None,
+        ok: true,
+        node_id: "fs_read".into(),
+        path: Some(path_str.into()),
+        text: None,
+        lines: Some(lines),
+        entries: None,
+        matches: None,
+        total_lines: Some(total),
+        replaced: None,
+        error: None,
     })
 }
 
 fn handle_fs_write(req: &FsRequest) -> Result<FsResponse, String> {
     let path_str = req.path.as_deref().unwrap_or("").trim();
-    if path_str.is_empty() { return Err("path is required for fs_write".into()); }
+    if path_str.is_empty() {
+        return Err("path is required for fs_write".into());
+    }
     let content = req.content.as_deref().unwrap_or("").trim();
     let path = resolve(path_str)?;
     if !is_allowed_write(&path) {
         return Err("access denied: writes only allowed under plugins/".into());
     }
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("mkdir {path_str}: {e}"))?;
+        std::fs::create_dir_all(parent).map_err(|e| format!("mkdir {path_str}: {e}"))?;
     }
-    std::fs::write(&path, content)
-        .map_err(|e| format!("write {path_str}: {e}"))?;
+    std::fs::write(&path, content).map_err(|e| format!("write {path_str}: {e}"))?;
     Ok(FsResponse {
-        ok: true, node_id: "fs_write".into(), path: Some(path_str.into()),
-        text: None, lines: None, entries: None, matches: None,
-        total_lines: None, replaced: None, error: None,
+        ok: true,
+        node_id: "fs_write".into(),
+        path: Some(path_str.into()),
+        text: None,
+        lines: None,
+        entries: None,
+        matches: None,
+        total_lines: None,
+        replaced: None,
+        error: None,
     })
 }
 
@@ -213,11 +229,11 @@ fn handle_fs_list(req: &FsRequest) -> Result<FsResponse, String> {
     }
     let mut entries: Vec<Value> = Vec::new();
     if path.is_dir() {
-        for entry in std::fs::read_dir(&path)
-            .map_err(|e| format!("list {path_str}: {e}"))?
-        {
+        for entry in std::fs::read_dir(&path).map_err(|e| format!("list {path_str}: {e}"))? {
             let entry = entry.map_err(|e| format!("entry {path_str}: {e}"))?;
-            let ft = entry.file_type().map_err(|e| format!("type {path_str}: {e}"))?;
+            let ft = entry
+                .file_type()
+                .map_err(|e| format!("type {path_str}: {e}"))?;
             entries.push(json!({
                 "name": entry.file_name().to_string_lossy(),
                 "kind": if ft.is_dir() { "dir" } else { "file" },
@@ -227,18 +243,28 @@ fn handle_fs_list(req: &FsRequest) -> Result<FsResponse, String> {
     entries.sort_by(|a, b| {
         let ka = a["kind"].as_str().unwrap_or("");
         let kb = b["kind"].as_str().unwrap_or("");
-        ka.cmp(kb).then_with(|| a["name"].as_str().cmp(&b["name"].as_str()))
+        ka.cmp(kb)
+            .then_with(|| a["name"].as_str().cmp(&b["name"].as_str()))
     });
     Ok(FsResponse {
-        ok: true, node_id: "fs_list".into(), path: Some(path_str.into()),
-        text: None, lines: None, entries: Some(entries), matches: None,
-        total_lines: None, replaced: None, error: None,
+        ok: true,
+        node_id: "fs_list".into(),
+        path: Some(path_str.into()),
+        text: None,
+        lines: None,
+        entries: Some(entries),
+        matches: None,
+        total_lines: None,
+        replaced: None,
+        error: None,
     })
 }
 
 fn handle_fs_search(req: &FsRequest) -> Result<FsResponse, String> {
     let pattern = req.pattern.as_deref().unwrap_or("").trim();
-    if pattern.is_empty() { return Err("pattern is required for fs_search".into()); }
+    if pattern.is_empty() {
+        return Err("pattern is required for fs_search".into());
+    }
     let path_str = req.path.as_deref().unwrap_or(".");
     let path = resolve(path_str)?;
     if !is_allowed_read(&path) {
@@ -252,11 +278,18 @@ fn handle_fs_search(req: &FsRequest) -> Result<FsResponse, String> {
             .map_err(|e| format!("read_dir {path_str}: {e}"))?
             .filter_map(|e| e.ok())
         {
-            if count >= max_results { break; }
+            if count >= max_results {
+                break;
+            }
             let fpath = entry.path();
-            let content = match std::fs::read_to_string(&fpath) { Ok(c) => c, Err(_) => continue };
+            let content = match std::fs::read_to_string(&fpath) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
             for (lineno, line) in content.lines().enumerate() {
-                if count >= max_results { break; }
+                if count >= max_results {
+                    break;
+                }
                 if line.contains(pattern) {
                     matches.push(json!({
                         "file": fpath.strip_prefix(&path).unwrap_or(fpath.as_path()).to_string_lossy().into_owned(),
@@ -269,9 +302,16 @@ fn handle_fs_search(req: &FsRequest) -> Result<FsResponse, String> {
         }
     }
     Ok(FsResponse {
-        ok: true, node_id: "fs_search".into(), path: Some(path_str.into()),
-        text: None, lines: None, entries: None, matches: Some(matches),
-        total_lines: None, replaced: None, error: None,
+        ok: true,
+        node_id: "fs_search".into(),
+        path: Some(path_str.into()),
+        text: None,
+        lines: None,
+        entries: None,
+        matches: Some(matches),
+        total_lines: None,
+        replaced: None,
+        error: None,
     })
 }
 
@@ -279,9 +319,9 @@ fn handle_fs_search(req: &FsRequest) -> Result<FsResponse, String> {
 
 fn handle(req: &FsRequest) -> Result<FsResponse, String> {
     match req.node_id.as_str() {
-        "fs_read"   => handle_fs_read(req),
-        "fs_write"  => handle_fs_write(req),
-        "fs_list"   => handle_fs_list(req),
+        "fs_read" => handle_fs_read(req),
+        "fs_write" => handle_fs_write(req),
+        "fs_list" => handle_fs_list(req),
         "fs_search" => handle_fs_search(req),
         other => Err(format!("unknown node_id: {other}")),
     }
@@ -316,9 +356,16 @@ fn api_handle(req: PluginRequest) -> PluginResponse {
     {
         Ok(resp) => json_response(&resp),
         Err(e) => json_response(&FsResponse {
-            ok: false, node_id: "error".into(), path: None, text: None,
-            lines: None, entries: None, matches: None,
-            total_lines: None, replaced: None, error: Some(e),
+            ok: false,
+            node_id: "error".into(),
+            path: None,
+            text: None,
+            lines: None,
+            entries: None,
+            matches: None,
+            total_lines: None,
+            replaced: None,
+            error: Some(e),
         }),
     }
 }

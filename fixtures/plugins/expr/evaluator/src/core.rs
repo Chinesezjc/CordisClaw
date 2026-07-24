@@ -1,32 +1,32 @@
 //! Evaluator core logic shared by the evaluator dylib wrapper and the top-level expr plugin.
 
-#[path = "../../parser/src/core.rs"]
-pub mod parser_core;
 #[path = "../add/src/core.rs"]
 pub mod add_core;
-#[path = "../sub/src/core.rs"]
-pub mod sub_core;
-#[path = "../mul/src/core.rs"]
-pub mod mul_core;
 #[path = "../div/src/core.rs"]
 pub mod div_core;
-#[path = "../modulo/src/core.rs"]
-pub mod modulo_core;
-#[path = "../pow/src/core.rs"]
-pub mod pow_core;
 #[path = "../factorial/src/core.rs"]
 pub mod factorial_core;
+#[path = "../modulo/src/core.rs"]
+pub mod modulo_core;
+#[path = "../mul/src/core.rs"]
+pub mod mul_core;
+#[path = "../../parser/src/core.rs"]
+pub mod parser_core;
+#[path = "../pow/src/core.rs"]
+pub mod pow_core;
+#[path = "../sub/src/core.rs"]
+pub mod sub_core;
 
 pub use add_core::AddPlugin;
 pub use div_core::{DivError, DivPlugin};
 pub use factorial_core::{FactorialError, FactorialPlugin};
 pub use modulo_core::{ModError, ModPlugin};
 pub use mul_core::MulPlugin;
-pub use pow_core::PowPlugin;
 pub use parser_core::{BinaryOp, ExprAst, ParseExpressionError, UnaryOp};
+pub use pow_core::PowPlugin;
+use serde::{Deserialize, Serialize};
 pub use sub_core::SubPlugin;
 use thiserror::Error;
-use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

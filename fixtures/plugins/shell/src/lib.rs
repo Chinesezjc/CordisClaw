@@ -1,8 +1,8 @@
+use cordis_plugin_host::{default_fixtures_root, CatalogPlugin, PluginCatalog};
 use cordis_plugin_sdk::{
     export_plugin_api, json_response, node_doc, plugin_docs, AbiFingerprint, NodeDoc, PluginDocs,
     PluginRequest, PluginResponse,
 };
-use cordis_plugin_host::{default_fixtures_root, CatalogPlugin, PluginCatalog};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -54,7 +54,10 @@ impl ShellPlugin {
         }
     }
 
-    fn start_terminal(&self, req: ShellPluginRequest) -> Result<ShellPluginResponsePayload, String> {
+    fn start_terminal(
+        &self,
+        req: ShellPluginRequest,
+    ) -> Result<ShellPluginResponsePayload, String> {
         if let Some(shell) = &req.shell {
             if shell != "cordis" {
                 return Err(format!(
@@ -139,10 +142,12 @@ impl BuiltinShell {
         let cwd = match cwd {
             Some(path) => {
                 let p = PathBuf::from(path);
-                let resolved = if p.is_absolute() { p } else { sandbox_root.join(p) };
-                let canonical = resolved
-                    .canonicalize()
-                    .unwrap_or_else(|_| resolved.clone());
+                let resolved = if p.is_absolute() {
+                    p
+                } else {
+                    sandbox_root.join(p)
+                };
+                let canonical = resolved.canonicalize().unwrap_or_else(|_| resolved.clone());
                 if !canonical.starts_with(&sandbox_root) {
                     return Err(format!(
                         "shell cwd escapes sandbox root ({} not under {})",
@@ -235,7 +240,10 @@ impl BuiltinShell {
                 continue;
             }
             match self.run_single(command) {
-                CommandOutcome::Continue { exit_code: _, output } => {
+                CommandOutcome::Continue {
+                    exit_code: _,
+                    output,
+                } => {
                     if !output.is_empty() {
                         println!("{output}");
                     }
@@ -294,10 +302,7 @@ impl BuiltinShell {
                     Err(_) => {
                         return CommandOutcome::Continue {
                             exit_code: 1,
-                            output: format!(
-                                "cd: no such directory: {}",
-                                target.display()
-                            ),
+                            output: format!("cd: no such directory: {}", target.display()),
                         };
                     }
                 };
@@ -445,7 +450,10 @@ fn available_shell_commands(plugin_catalog: &PluginCatalog) -> Vec<String> {
     commands
 }
 
-fn resolve_shell_command(plugin_catalog: &PluginCatalog, command: &str) -> Result<Option<ShellCommandBinding>, String> {
+fn resolve_shell_command(
+    plugin_catalog: &PluginCatalog,
+    command: &str,
+) -> Result<Option<ShellCommandBinding>, String> {
     let mut matches = Vec::new();
     for plugin in plugin_catalog.plugins() {
         if let Some(binding) = shell_command_binding(plugin) {
@@ -487,7 +495,11 @@ fn shell_command_binding(plugin: &CatalogPlugin) -> Option<ShellCommandBinding> 
     })
 }
 
-fn build_shell_payload(node: &NodeDoc, display_name: &str, raw_args: &str) -> Result<String, String> {
+fn build_shell_payload(
+    node: &NodeDoc,
+    display_name: &str,
+    raw_args: &str,
+) -> Result<String, String> {
     let input_fields = schema_property_names(&node.input_schema);
     let required_fields = required_field_names(&node.input_schema);
     let trimmed = raw_args.trim();
@@ -549,7 +561,11 @@ fn format_plugin_response(command: &str, output_schema: &Value, payload: &str) -
         if let Some(value) = parsed.get(field) {
             return CommandOutcome::Continue {
                 exit_code: 0,
-                output: format!("{}: {}", display_field_name(field), format_json_value(value)),
+                output: format!(
+                    "{}: {}",
+                    display_field_name(field),
+                    format_json_value(value)
+                ),
             };
         }
     }
@@ -569,7 +585,11 @@ fn format_plugin_response(command: &str, output_schema: &Value, payload: &str) -
             let (field, value) = visible[0];
             return CommandOutcome::Continue {
                 exit_code: 0,
-                output: format!("{}: {}", display_field_name(field), format_json_value(value)),
+                output: format!(
+                    "{}: {}",
+                    display_field_name(field),
+                    format_json_value(value)
+                ),
             };
         }
     }
@@ -705,9 +725,13 @@ fn docs_value() -> PluginDocs {
                 }
             }),
             &["reads stdin", "writes stdout"],
-            &["unsupported action", "invalid shell backend", "command not found"],
+            &[
+                "unsupported action",
+                "invalid shell backend",
+                "command not found",
+            ],
         )],
-    None
+        None,
     )
 }
 

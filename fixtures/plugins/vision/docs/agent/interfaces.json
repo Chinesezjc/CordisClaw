@@ -9,37 +9,32 @@
       "id": "vision_ocr",
       "summary": "Run tesseract OCR on an image to extract text. Supply the image with either `url` (downloaded over HTTP) or `path` (a local file under the system temp directory); provide exactly one of them. Requires tesseract installed on the system. Default language: chi_sim+eng.",
       "input_schema": {
-        "properties": {
-          "lang": {
-            "description": "Tesseract language code (default: chi_sim+eng)",
-            "type": "string"
-          },
-          "node_id": {
-            "const": "vision_ocr",
-            "type": "string"
-          },
-          "path": {
-            "description": "Absolute path to a local image file. Must be located under the system temp directory. Provide url or path, not both.",
-            "type": "string"
-          },
-          "url": {
-            "description": "Image URL to OCR (provide url or path, not both)",
-            "type": "string"
-          }
-        },
+        "type": "object",
         "required": [
           "node_id"
         ],
-        "type": "object"
+        "properties": {
+          "node_id": {
+            "type": "string",
+            "const": "vision_ocr"
+          },
+          "url": {
+            "type": "string",
+            "description": "Image URL to OCR (provide url or path, not both)"
+          },
+          "path": {
+            "type": "string",
+            "description": "Absolute path to a local image file. Must be located under the system temp directory. Provide url or path, not both."
+          },
+          "lang": {
+            "type": "string",
+            "description": "Tesseract language code (default: chi_sim+eng)"
+          }
+        }
       },
       "output_schema": {
+        "type": "object",
         "properties": {
-          "error": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
           "ok": {
             "type": "boolean"
           },
@@ -48,9 +43,14 @@
               "string",
               "null"
             ]
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
           }
-        },
-        "type": "object"
+        }
       },
       "side_effects": [
         "reads image from url or local temp path",
@@ -70,32 +70,36 @@
       "id": "vision_describe",
       "summary": "Send an image to an OpenAI-compatible vision API (default: gpt-4o-mini) for AI-powered description. Supply the image with either `url` (downloaded over HTTP) or `path` (a local file under the system temp directory); provide exactly one of them. Requires OPENAI_API_KEY (or VISION_API_KEY) env var. Supports OPENAI_BASE_URL for custom endpoints.",
       "input_schema": {
-        "properties": {
-          "node_id": {
-            "const": "vision_describe",
-            "type": "string"
-          },
-          "path": {
-            "description": "Absolute path to a local image file. Must be located under the system temp directory. Provide url or path, not both.",
-            "type": "string"
-          },
-          "prompt": {
-            "description": "Custom prompt for the vision model",
-            "type": "string"
-          },
-          "url": {
-            "description": "Image URL to analyze (provide url or path, not both)",
-            "type": "string"
-          }
-        },
+        "type": "object",
         "required": [
           "node_id"
         ],
-        "type": "object"
+        "properties": {
+          "node_id": {
+            "type": "string",
+            "const": "vision_describe"
+          },
+          "url": {
+            "type": "string",
+            "description": "Image URL to analyze (provide url or path, not both)"
+          },
+          "path": {
+            "type": "string",
+            "description": "Absolute path to a local image file. Must be located under the system temp directory. Provide url or path, not both."
+          },
+          "prompt": {
+            "type": "string",
+            "description": "Custom prompt for the vision model"
+          }
+        }
       },
       "output_schema": {
+        "type": "object",
         "properties": {
-          "error": {
+          "ok": {
+            "type": "boolean"
+          },
+          "text": {
             "type": [
               "string",
               "null"
@@ -107,17 +111,13 @@
               "null"
             ]
           },
-          "ok": {
-            "type": "boolean"
-          },
-          "text": {
+          "error": {
             "type": [
               "string",
               "null"
             ]
           }
-        },
-        "type": "object"
+        }
       },
       "side_effects": [
         "reads image from url or local temp path",

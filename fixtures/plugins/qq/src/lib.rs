@@ -16,10 +16,10 @@ use cordis_plugin_sdk::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::VecDeque;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::sync::Mutex;
 use std::thread;
+use std::time::Duration;
 // ---------------------------------------------------------------------------
 // Plugin state
 // ---------------------------------------------------------------------------
@@ -94,8 +94,7 @@ static MESSAGE_QUEUE_DROPPED: AtomicU64 = AtomicU64::new(0);
 /// qq_serve and qq_ws_serve start the poller; without this guard a
 /// process running both servers (or a repeated start) would spawn
 /// duplicate pollers all draining the same MESSAGE_QUEUE.
-static POLLER_STARTED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static POLLER_STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 // ---------------------------------------------------------------------------
 // Data types
@@ -235,7 +234,12 @@ struct NodeResponse {
 // OneBot v11 HTTP API helpers (legacy — unchanged)
 // ---------------------------------------------------------------------------
 
-fn onebot_call(base_url: &str, endpoint: &str, params: &Value, token: Option<&str>) -> Result<Value, String> {
+fn onebot_call(
+    base_url: &str,
+    endpoint: &str,
+    params: &Value,
+    token: Option<&str>,
+) -> Result<Value, String> {
     let url = format!("{}/{}", base_url.trim_end_matches('/'), endpoint);
     let body = serde_json::to_string(params).map_err(|e| format!("json encode: {e}"))?;
 
@@ -260,10 +264,7 @@ fn onebot_call(base_url: &str, endpoint: &str, params: &Value, token: Option<&st
         .and_then(|v| v.as_str())
         .unwrap_or("unknown");
     if api_status == "failed" {
-        let retcode = parsed
-            .get("retcode")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(-1);
+        let retcode = parsed.get("retcode").and_then(|v| v.as_i64()).unwrap_or(-1);
         let wording = parsed
             .get("wording")
             .and_then(|v| v.as_str())
@@ -312,9 +313,9 @@ pub enum TargetKind {
 }
 
 pub fn parse_target(raw: &str) -> Result<(TargetKind, i64), String> {
-    let (kind_str, id_str) = raw
-        .split_once(':')
-        .ok_or_else(|| format!("invalid target '{raw}': expected 'group:<id>' or 'private:<id>'"))?;
+    let (kind_str, id_str) = raw.split_once(':').ok_or_else(|| {
+        format!("invalid target '{raw}': expected 'group:<id>' or 'private:<id>'")
+    })?;
     let id: i64 = id_str
         .trim()
         .parse()
@@ -322,7 +323,11 @@ pub fn parse_target(raw: &str) -> Result<(TargetKind, i64), String> {
     let kind = match kind_str.trim().to_lowercase().as_str() {
         "group" | "g" => TargetKind::Group,
         "private" | "priv" | "p" | "user" | "u" => TargetKind::Private,
-        other => return Err(format!("unknown target kind '{other}'; use 'group' or 'private'")),
+        other => {
+            return Err(format!(
+                "unknown target kind '{other}'; use 'group' or 'private'"
+            ))
+        }
     };
     Ok((kind, id))
 }
@@ -348,19 +353,31 @@ fn handle_legacy(req: QqRequest) -> Result<QqResponse, String> {
 
 fn handle_configure(req: QqRequest) -> Result<QqResponse, String> {
     let mut state = STATE.lock().map_err(|e| format!("lock: {e}"))?;
-    if let Some(url) = req.url { state.onebot_url = Some(url); }
-    if let Some(target) = req.target { parse_target(&target)?; state.default_target = Some(target); }
+    if let Some(url) = req.url {
+        state.onebot_url = Some(url);
+    }
+    if let Some(target) = req.target {
+        parse_target(&target)?;
+        state.default_target = Some(target);
+    }
     // Parse allow_groups from payload.
     if let Some(ref payload) = req.payload {
         if let Some(arr) = payload.get("allow_groups").and_then(|v| v.as_array()) {
-            state.allow_groups = arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect();
+            state.allow_groups = arr
+                .iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect();
         }
         if let Some(arr) = payload.get("block_groups").and_then(|v| v.as_array()) {
-            state.block_groups = arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect();
+            state.block_groups = arr
+                .iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect();
         }
     }
     Ok(QqResponse {
-        ok: true, action: "configure".to_string(),
+        ok: true,
+        action: "configure".to_string(),
         message: Some(format!(
             "url={} target={} allow={:?} block={:?}",
             state.onebot_url.as_deref().unwrap_or("(unchanged)"),
@@ -373,7 +390,10 @@ fn handle_configure(req: QqRequest) -> Result<QqResponse, String> {
 }
 
 fn handle_block(req: QqRequest) -> Result<QqResponse, String> {
-    let target = req.target.as_deref().ok_or("block requires 'target' field (group:<id>)")?;
+    let target = req
+        .target
+        .as_deref()
+        .ok_or("block requires 'target' field (group:<id>)")?;
     let (_kind, id) = parse_target(target)?;
     let gid = id.to_string();
     let mut state = STATE.lock().map_err(|e| format!("lock: {e}"))?;
@@ -386,14 +406,21 @@ fn handle_block(req: QqRequest) -> Result<QqResponse, String> {
         save_runtime_config(&config);
     }
     Ok(QqResponse {
-        ok: true, action: "block".to_string(),
-        message: Some(format!("group {} blocked. block_groups={:?}", gid, state.block_groups)),
+        ok: true,
+        action: "block".to_string(),
+        message: Some(format!(
+            "group {} blocked. block_groups={:?}",
+            gid, state.block_groups
+        )),
         data: None,
     })
 }
 
 fn handle_unblock(req: QqRequest) -> Result<QqResponse, String> {
-    let target = req.target.as_deref().ok_or("unblock requires 'target' field (group:<id>)")?;
+    let target = req
+        .target
+        .as_deref()
+        .ok_or("unblock requires 'target' field (group:<id>)")?;
     let (_kind, id) = parse_target(target)?;
     let gid = id.to_string();
     let mut state = STATE.lock().map_err(|e| format!("lock: {e}"))?;
@@ -404,14 +431,21 @@ fn handle_unblock(req: QqRequest) -> Result<QqResponse, String> {
         save_runtime_config(&config);
     }
     Ok(QqResponse {
-        ok: true, action: "unblock".to_string(),
-        message: Some(format!("group {} unblocked. block_groups={:?}", gid, state.block_groups)),
+        ok: true,
+        action: "unblock".to_string(),
+        message: Some(format!(
+            "group {} unblocked. block_groups={:?}",
+            gid, state.block_groups
+        )),
         data: None,
     })
 }
 
 fn handle_allow_group(req: QqRequest) -> Result<QqResponse, String> {
-    let target = req.target.as_deref().ok_or("allow_group requires 'target' field (group:<id>)")?;
+    let target = req
+        .target
+        .as_deref()
+        .ok_or("allow_group requires 'target' field (group:<id>)")?;
     let (_kind, id) = parse_target(target)?;
     let gid = id.to_string();
     let mut state = STATE.lock().map_err(|e| format!("lock: {e}"))?;
@@ -419,21 +453,32 @@ fn handle_allow_group(req: QqRequest) -> Result<QqResponse, String> {
         state.allow_groups.push(gid.clone());
     }
     Ok(QqResponse {
-        ok: true, action: "allow_group".to_string(),
-        message: Some(format!("group {} added to allow list. allow_groups={:?}", gid, state.allow_groups)),
+        ok: true,
+        action: "allow_group".to_string(),
+        message: Some(format!(
+            "group {} added to allow list. allow_groups={:?}",
+            gid, state.allow_groups
+        )),
         data: None,
     })
 }
 
 fn handle_disallow_group(req: QqRequest) -> Result<QqResponse, String> {
-    let target = req.target.as_deref().ok_or("disallow_group requires 'target' field (group:<id>)")?;
+    let target = req
+        .target
+        .as_deref()
+        .ok_or("disallow_group requires 'target' field (group:<id>)")?;
     let (_kind, id) = parse_target(target)?;
     let gid = id.to_string();
     let mut state = STATE.lock().map_err(|e| format!("lock: {e}"))?;
     state.allow_groups.retain(|g| g != &gid);
     Ok(QqResponse {
-        ok: true, action: "disallow_group".to_string(),
-        message: Some(format!("group {} removed from allow list. allow_groups={:?}", gid, state.allow_groups)),
+        ok: true,
+        action: "disallow_group".to_string(),
+        message: Some(format!(
+            "group {} removed from allow list. allow_groups={:?}",
+            gid, state.allow_groups
+        )),
         data: None,
     })
 }
@@ -441,11 +486,11 @@ fn handle_disallow_group(req: QqRequest) -> Result<QqResponse, String> {
 fn handle_list_groups() -> Result<QqResponse, String> {
     let state = STATE.lock().map_err(|e| format!("lock: {e}"))?;
     Ok(QqResponse {
-        ok: true, action: "list_groups".to_string(),
+        ok: true,
+        action: "list_groups".to_string(),
         message: Some(format!(
             "allow_groups={:?} block_groups={:?}",
-            state.allow_groups,
-            state.block_groups,
+            state.allow_groups, state.block_groups,
         )),
         data: None,
     })
@@ -453,25 +498,36 @@ fn handle_list_groups() -> Result<QqResponse, String> {
 
 fn handle_send(req: QqRequest) -> Result<QqResponse, String> {
     let message = req.message.as_deref().unwrap_or("").trim().to_string();
-    if message.is_empty() { return Err("message is empty".to_string()); }
+    if message.is_empty() {
+        return Err("message is empty".to_string());
+    }
     let (kind, id) = {
         let state = STATE.lock().map_err(|e| format!("lock: {e}"))?;
-        let target_str = req.target.as_deref()
+        let target_str = req
+            .target
+            .as_deref()
             .or(state.default_target.as_deref())
             .ok_or("no target configured; use 'configure' first or provide a 'target' field")?;
         parse_target(target_str)?
     };
     let base_url = {
         let state = STATE.lock().map_err(|e| format!("lock: {e}"))?;
-        state.onebot_url.clone().ok_or("no OneBot URL configured; use 'configure' first")?
+        state
+            .onebot_url
+            .clone()
+            .ok_or("no OneBot URL configured; use 'configure' first")?
     };
     let data = match kind {
         TargetKind::Group => onebot_send_group_msg(&base_url, id, &message, None, None)?,
         TargetKind::Private => onebot_send_private_msg(&base_url, id, &message, None, None)?,
     };
-    let msg_id = data.get("data").and_then(|d| d.get("message_id")).and_then(|v| v.as_i64());
+    let msg_id = data
+        .get("data")
+        .and_then(|d| d.get("message_id"))
+        .and_then(|v| v.as_i64());
     Ok(QqResponse {
-        ok: true, action: "send".to_string(),
+        ok: true,
+        action: "send".to_string(),
         message: msg_id.map(|mid| format!("message_id={mid}")),
         data: Some(data),
     })
@@ -481,9 +537,12 @@ fn handle_status() -> Result<QqResponse, String> {
     let state = STATE.lock().map_err(|e| format!("lock: {e}"))?;
     let connected = if let Some(ref url) = state.onebot_url {
         onebot_call(url, "get_status", &json!({}), None).is_ok()
-    } else { false };
+    } else {
+        false
+    };
     Ok(QqResponse {
-        ok: true, action: "status".to_string(),
+        ok: true,
+        action: "status".to_string(),
         message: Some(format!(
             "url={} target={} connected={connected}",
             state.onebot_url.as_deref().unwrap_or("(not set)"),
@@ -495,15 +554,25 @@ fn handle_status() -> Result<QqResponse, String> {
 
 fn handle_call(req: QqRequest) -> Result<QqResponse, String> {
     let payload = req.payload.ok_or("missing 'payload' for call action")?;
-    let endpoint = payload.get("endpoint").and_then(|v| v.as_str())
+    let endpoint = payload
+        .get("endpoint")
+        .and_then(|v| v.as_str())
         .ok_or("payload must contain 'endpoint' string")?;
     let params = payload.get("params").cloned().unwrap_or(json!({}));
     let base_url = {
         let state = STATE.lock().map_err(|e| format!("lock: {e}"))?;
-        state.onebot_url.clone().ok_or("no OneBot URL configured; use 'configure' first")?
+        state
+            .onebot_url
+            .clone()
+            .ok_or("no OneBot URL configured; use 'configure' first")?
     };
     let data = onebot_call(&base_url, endpoint, &params, None)?;
-    Ok(QqResponse { ok: true, action: "call".to_string(), message: None, data: Some(data) })
+    Ok(QqResponse {
+        ok: true,
+        action: "call".to_string(),
+        message: None,
+        data: Some(data),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -522,10 +591,13 @@ fn stop_qq_serve() {
 
 fn run_event_loop(server: tiny_http::Server) {
     loop {
-        if SERVER_SHUTDOWN.load(Ordering::SeqCst) { break; }
+        if SERVER_SHUTDOWN.load(Ordering::SeqCst) {
+            break;
+        }
         match server.recv_timeout(Duration::from_millis(500)) {
             Ok(Some(mut request)) => {
-                if request.url() == "/onebot/event" && request.method() == &tiny_http::Method::Post {
+                if request.url() == "/onebot/event" && request.method() == &tiny_http::Method::Post
+                {
                     // P0-23: OneBot v11 signs the request body with HMAC-SHA1
                     // keyed by `access_token`, and passes it in the
                     // `X-Signature: sha1=<hex>` header. If a token is
@@ -576,8 +648,7 @@ fn run_event_loop(server: tiny_http::Server) {
                         }
                     } else {
                         let _ = request.respond(
-                            tiny_http::Response::from_string("bad request")
-                                .with_status_code(400),
+                            tiny_http::Response::from_string("bad request").with_status_code(400),
                         );
                     }
                 } else if request.url() == "/health" {
@@ -712,14 +783,14 @@ fn stop_qq_ws_serve() {
     }
 }
 
-
 fn handle_onebot_event(event: &OneBotEvent) {
     if event.post_type != "message" {
         return;
     }
 
     // Extract message text and reply context.
-    let (message_text, reply_to_msg_id) = extract_message_info(&event.message, event.raw_message.as_deref());
+    let (message_text, reply_to_msg_id) =
+        extract_message_info(&event.message, event.raw_message.as_deref());
 
     // Extract user_id.
     let user_id = match &event.user_id {
@@ -737,13 +808,21 @@ fn handle_onebot_event(event: &OneBotEvent) {
         };
 
         // Blacklist check (takes priority over allow_groups).
-        let block = STATE.lock().ok().map(|s| s.block_groups.clone()).unwrap_or_default();
+        let block = STATE
+            .lock()
+            .ok()
+            .map(|s| s.block_groups.clone())
+            .unwrap_or_default();
         if block.contains(&gid_str) {
             return;
         }
 
         // Grayscale whitelist check.
-        let allow = STATE.lock().ok().map(|s| s.allow_groups.clone()).unwrap_or_default();
+        let allow = STATE
+            .lock()
+            .ok()
+            .map(|s| s.allow_groups.clone())
+            .unwrap_or_default();
         if !allow.is_empty() && !allow.contains(&gid_str) {
             return;
         }
@@ -796,9 +875,7 @@ fn handle_onebot_event(event: &OneBotEvent) {
             // P1-39: don't drop silently — surface the count.
             let dropped = MESSAGE_QUEUE_DROPPED.fetch_add(1, Ordering::Relaxed) + 1;
             if dropped.is_power_of_two() {
-                eprintln!(
-                    "[qq] MESSAGE_QUEUE full (>=128); dropped total = {dropped}"
-                );
+                eprintln!("[qq] MESSAGE_QUEUE full (>=128); dropped total = {dropped}");
             }
         }
     }
@@ -819,25 +896,29 @@ fn parse_cq_codes(raw: &str) -> Vec<String> {
             let cq = &remaining[start + 1..start + end]; // inside brackets, e.g. "CQ:at,qq=123"
             let cq_body = cq.strip_prefix("CQ:").unwrap_or(cq);
             let (cq_type, cq_data) = cq_body.split_once(',').unwrap_or((cq_body, ""));
-            
+
             match cq_type {
                 "at" => {
-                    let qq = cq_data.split(',')
+                    let qq = cq_data
+                        .split(',')
                         .find(|kv| kv.starts_with("qq="))
                         .and_then(|kv| kv.strip_prefix("qq="))
                         .unwrap_or("unknown");
-                    let name = cq_data.split(',')
+                    let name = cq_data
+                        .split(',')
                         .find(|kv| kv.starts_with("name="))
                         .and_then(|kv| kv.strip_prefix("name="))
                         .unwrap_or(qq);
                     parts.push(format!("@[id={},name={}]", qq, name));
                 }
                 "image" => {
-                    let url = cq_data.split(',')
+                    let url = cq_data
+                        .split(',')
                         .find(|kv| kv.starts_with("url="))
                         .and_then(|kv| kv.strip_prefix("url="))
                         .unwrap_or("");
-                    let file = cq_data.split(',')
+                    let file = cq_data
+                        .split(',')
                         .find(|kv| kv.starts_with("file="))
                         .and_then(|kv| kv.strip_prefix("file="))
                         .unwrap_or("");
@@ -902,30 +983,58 @@ fn extract_message_info(message: &Value, raw_message: Option<&str>) -> (String, 
                     }
                 }
                 "text" => {
-                    if let Some(t) = seg.get("data").and_then(|d| d.get("text")).and_then(|t| t.as_str()) {
+                    if let Some(t) = seg
+                        .get("data")
+                        .and_then(|d| d.get("text"))
+                        .and_then(|t| t.as_str())
+                    {
                         parts.push(t.to_string());
                     }
                 }
                 "image" => {
-                    if let Some(url) = seg.get("data").and_then(|d| d.get("url")).and_then(|u| u.as_str()) {
+                    if let Some(url) = seg
+                        .get("data")
+                        .and_then(|d| d.get("url"))
+                        .and_then(|u| u.as_str())
+                    {
                         parts.push(format!("[image: {url}]"));
-                    } else if let Some(file) = seg.get("data").and_then(|d| d.get("file")).and_then(|f| f.as_str()) {
+                    } else if let Some(file) = seg
+                        .get("data")
+                        .and_then(|d| d.get("file"))
+                        .and_then(|f| f.as_str())
+                    {
                         parts.push(format!("[image file: {file}]"));
                     }
                 }
                 "json" => {
-                    if let Some(data) = seg.get("data").and_then(|d| d.get("data")).and_then(|d| d.as_str()) {
+                    if let Some(data) = seg
+                        .get("data")
+                        .and_then(|d| d.get("data"))
+                        .and_then(|d| d.as_str())
+                    {
                         parts.push(format!("[json: {data}]"));
                     }
                 }
                 "forward" => {
-                    if let Some(id) = seg.get("data").and_then(|d| d.get("id")).and_then(|d| d.as_str()) {
+                    if let Some(id) = seg
+                        .get("data")
+                        .and_then(|d| d.get("id"))
+                        .and_then(|d| d.as_str())
+                    {
                         parts.push(format!("[chat history: id={id}]"));
                     }
                 }
                 "at" => {
-                    let qq = seg.get("data").and_then(|d| d.get("qq")).and_then(|q| q.as_str()).unwrap_or("unknown");
-                    let name = seg.get("data").and_then(|d| d.get("name")).and_then(|n| n.as_str()).unwrap_or(qq);
+                    let qq = seg
+                        .get("data")
+                        .and_then(|d| d.get("qq"))
+                        .and_then(|q| q.as_str())
+                        .unwrap_or("unknown");
+                    let name = seg
+                        .get("data")
+                        .and_then(|d| d.get("name"))
+                        .and_then(|n| n.as_str())
+                        .unwrap_or(qq);
                     parts.push(format!("@[id={},name={}]", qq, name));
                 }
                 "face" | "sticker" => {
@@ -965,7 +1074,9 @@ fn extract_i64(val: &Value) -> Option<i64> {
 /// `/`-prefixed commands ARE forwarded (N批): the runtime's command
 /// router executes them without the LLM (usable during model outages).
 fn should_process(text: &str) -> bool {
-    if text.starts_with('/') { return text.len() > 1; }
+    if text.starts_with('/') {
+        return text.len() > 1;
+    }
     text.len() > 2
 }
 
@@ -1018,7 +1129,9 @@ fn start_agent_poller() {
                 queue.drain(..).collect()
             };
             for msg in msgs {
-                if !should_process(&msg.message) { continue; }
+                if !should_process(&msg.message) {
+                    continue;
+                }
                 cordis_plugin_sdk::agent_trigger(&build_envelope(&msg));
             }
             thread::sleep(std::time::Duration::from_secs(5));
@@ -1030,23 +1143,44 @@ fn handle_qq_serve(req: &NodeRequest) -> Result<NodeResponse, String> {
     if req.action.as_deref() == Some("stop") {
         stop_qq_serve();
         *SERVER_RUNNING.lock().map_err(|e| format!("lock: {e}"))? = false;
-        return Ok(NodeResponse { ok: true, node_id: "qq_serve".to_string(), message: Some("stopped".to_string()), messages: None, data: None, error: None });
+        return Ok(NodeResponse {
+            ok: true,
+            node_id: "qq_serve".to_string(),
+            message: Some("stopped".to_string()),
+            messages: None,
+            data: None,
+            error: None,
+        });
     }
-    let port: u16 = req.payload.as_ref()
+    let port: u16 = req
+        .payload
+        .as_ref()
         .and_then(|p| p.get("port"))
         .and_then(|v| v.as_u64())
         .unwrap_or(8080) as u16;
 
-    let allow_groups: Vec<String> = req.payload.as_ref()
+    let allow_groups: Vec<String> = req
+        .payload
+        .as_ref()
         .and_then(|p| p.get("allow_groups"))
         .and_then(|v| v.as_array())
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect()
+        })
         .unwrap_or_default();
 
-    let block_groups: Vec<String> = req.payload.as_ref()
+    let block_groups: Vec<String> = req
+        .payload
+        .as_ref()
         .and_then(|p| p.get("block_groups"))
         .and_then(|v| v.as_array())
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect()
+        })
         .unwrap_or_default();
 
     // Store configuration. Merge with persisted values from runtime config.
@@ -1055,23 +1189,56 @@ fn handle_qq_serve(req: &NodeRequest) -> Result<NodeResponse, String> {
         // Load persisted block_groups from runtime config as a base.
         let persisted_block: Vec<String> = load_runtime_config()
             .and_then(|c| c.get("block_groups")?.as_array().cloned())
-            .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
             .unwrap_or_default();
         state.allow_groups = allow_groups.clone();
-        state.block_groups = if block_groups.is_empty() { persisted_block } else { block_groups.clone() };
-        if let Some(url) = req.payload.as_ref().and_then(|p| p.get("onebot_url")).and_then(|v| v.as_str()) {
+        state.block_groups = if block_groups.is_empty() {
+            persisted_block
+        } else {
+            block_groups.clone()
+        };
+        if let Some(url) = req
+            .payload
+            .as_ref()
+            .and_then(|p| p.get("onebot_url"))
+            .and_then(|v| v.as_str())
+        {
             state.onebot_url = Some(url.to_string());
         }
-        if let Some(t) = req.payload.as_ref().and_then(|p| p.get("access_token")).and_then(|v| v.as_str()) {
+        if let Some(t) = req
+            .payload
+            .as_ref()
+            .and_then(|p| p.get("access_token"))
+            .and_then(|v| v.as_str())
+        {
             state.access_token = Some(t.to_string());
         }
-        if let Some(u) = req.payload.as_ref().and_then(|p| p.get("llm_api_url")).and_then(|v| v.as_str()) {
+        if let Some(u) = req
+            .payload
+            .as_ref()
+            .and_then(|p| p.get("llm_api_url"))
+            .and_then(|v| v.as_str())
+        {
             state.llm_api_url = Some(u.to_string());
         }
-        if let Some(k) = req.payload.as_ref().and_then(|p| p.get("llm_api_key")).and_then(|v| v.as_str()) {
+        if let Some(k) = req
+            .payload
+            .as_ref()
+            .and_then(|p| p.get("llm_api_key"))
+            .and_then(|v| v.as_str())
+        {
             state.llm_api_key = Some(k.to_string());
         }
-        if let Some(m) = req.payload.as_ref().and_then(|p| p.get("llm_model")).and_then(|v| v.as_str()) {
+        if let Some(m) = req
+            .payload
+            .as_ref()
+            .and_then(|p| p.get("llm_model"))
+            .and_then(|v| v.as_str())
+        {
             state.llm_model = Some(m.to_string());
         }
     }
@@ -1122,10 +1289,7 @@ fn handle_qq_fetch_messages() -> Result<NodeResponse, String> {
     for msg in drained {
         let dedup_key = match msg.message_id {
             Some(mid) => format!("msg:{}", mid),
-            None => format!(
-                "hash:{},{},{}",
-                msg.sender_id, msg.user_id, msg.message
-            ),
+            None => format!("hash:{},{},{}", msg.sender_id, msg.user_id, msg.message),
         };
         let mut seen = RECENT_MESSAGE_IDS.lock().unwrap_or_else(|p| p.into_inner());
         if seen.iter().any(|k| k == &dedup_key) {
@@ -1155,8 +1319,7 @@ fn handle_qq_fetch_messages() -> Result<NodeResponse, String> {
 /// across environments and testing setups.
 fn runtime_config_path() -> std::path::PathBuf {
     match std::env::var("CORDIS_FIXTURES_ROOT") {
-        Ok(root) => std::path::PathBuf::from(root)
-            .join(".cordis-drafts/qq_runtime_config.json"),
+        Ok(root) => std::path::PathBuf::from(root).join(".cordis-drafts/qq_runtime_config.json"),
         Err(_) => std::path::PathBuf::from(
             "/root/CordisClaw/fixtures/.cordis-drafts/qq_runtime_config.json",
         ),
@@ -1211,7 +1374,10 @@ fn verify_onebot_signature(access_token: &str, body: &[u8], header_value: &str) 
     use hmac::{Hmac, Mac};
     use sha1::Sha1;
     use subtle::ConstantTimeEq;
-    let hex_from_header = header_value.trim().strip_prefix("sha1=").unwrap_or(header_value.trim());
+    let hex_from_header = header_value
+        .trim()
+        .strip_prefix("sha1=")
+        .unwrap_or(header_value.trim());
     let expected_bytes = match hex::decode(hex_from_header) {
         Ok(b) => b,
         Err(_) => return false,
@@ -1230,25 +1396,45 @@ fn verify_onebot_signature(access_token: &str, body: &[u8], header_value: &str) 
 
 fn handle_qq_get_group_members(req: &NodeRequest) -> Result<NodeResponse, String> {
     let target = req.target.as_deref().unwrap_or("").trim();
-    if target.is_empty() { return Err("target is required for qq_get_group_members (group:<id>)".to_string()); }
+    if target.is_empty() {
+        return Err("target is required for qq_get_group_members (group:<id>)".to_string());
+    }
     let (kind, id) = parse_target(target)?;
-    if kind != TargetKind::Group { return Err("target must be group:<id> for qq_get_group_members".to_string()); }
+    if kind != TargetKind::Group {
+        return Err("target must be group:<id> for qq_get_group_members".to_string());
+    }
 
-    let base_url = req.payload.as_ref()
-        .and_then(|p| p.get("onebot_url")).and_then(|v| v.as_str())
+    let base_url = req
+        .payload
+        .as_ref()
+        .and_then(|p| p.get("onebot_url"))
+        .and_then(|v| v.as_str())
         .map(|s| s.to_string())
         .or_else(|| STATE.lock().ok().and_then(|s| s.onebot_url.clone()))
-        .or_else(|| load_runtime_config().and_then(|c| c.get("onebot_url")?.as_str().map(|s| s.to_string())))
+        .or_else(|| {
+            load_runtime_config().and_then(|c| c.get("onebot_url")?.as_str().map(|s| s.to_string()))
+        })
         .ok_or("no OneBot URL configured")?;
 
-    let token = req.payload.as_ref()
-        .and_then(|p| p.get("access_token")).and_then(|v| v.as_str())
+    let token = req
+        .payload
+        .as_ref()
+        .and_then(|p| p.get("access_token"))
+        .and_then(|v| v.as_str())
         .map(|s| s.to_string())
         .or_else(|| STATE.lock().ok().and_then(|s| s.access_token.clone()))
-        .or_else(|| load_runtime_config().and_then(|c| c.get("access_token")?.as_str().map(|s| s.to_string())));
+        .or_else(|| {
+            load_runtime_config()
+                .and_then(|c| c.get("access_token")?.as_str().map(|s| s.to_string()))
+        });
 
     let params = json!({ "group_id": id });
-    let data = onebot_call(&base_url, "get_group_member_list", &params, token.as_deref())?;
+    let data = onebot_call(
+        &base_url,
+        "get_group_member_list",
+        &params,
+        token.as_deref(),
+    )?;
 
     Ok(NodeResponse {
         ok: true,
@@ -1264,20 +1450,39 @@ fn handle_qq_get_group_members(req: &NodeRequest) -> Result<NodeResponse, String
 /// Sends a message to all configured test groups.
 fn handle_qq_system_notify(req: &NodeRequest) -> Result<NodeResponse, String> {
     let msg = req.message.as_deref().unwrap_or("").trim();
-    if msg.is_empty() { return Err("message is required for qq_system_notify".to_string()); }
+    if msg.is_empty() {
+        return Err("message is required for qq_system_notify".to_string());
+    }
 
     let test_groups: Vec<String> = load_runtime_config()
         .and_then(|c| c.get("test_groups")?.as_array().cloned())
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect()
+        })
         .unwrap_or_default();
 
-    if test_groups.is_empty() { return Err("no test_groups configured".to_string()); }
+    if test_groups.is_empty() {
+        return Err("no test_groups configured".to_string());
+    }
 
-    let base_url = STATE.lock().ok().and_then(|s| s.onebot_url.clone())
-        .or_else(|| load_runtime_config().and_then(|c| c.get("onebot_url")?.as_str().map(|s| s.to_string())))
+    let base_url = STATE
+        .lock()
+        .ok()
+        .and_then(|s| s.onebot_url.clone())
+        .or_else(|| {
+            load_runtime_config().and_then(|c| c.get("onebot_url")?.as_str().map(|s| s.to_string()))
+        })
         .ok_or("no OneBot URL configured")?;
-    let token = STATE.lock().ok().and_then(|s| s.access_token.clone())
-        .or_else(|| load_runtime_config().and_then(|c| c.get("access_token")?.as_str().map(|s| s.to_string())));
+    let token = STATE
+        .lock()
+        .ok()
+        .and_then(|s| s.access_token.clone())
+        .or_else(|| {
+            load_runtime_config()
+                .and_then(|c| c.get("access_token")?.as_str().map(|s| s.to_string()))
+        });
 
     for gid in &test_groups {
         // P1-26: was `.parse().unwrap_or(0)` — a mis-typed / non-numeric
@@ -1289,9 +1494,7 @@ fn handle_qq_system_notify(req: &NodeRequest) -> Result<NodeResponse, String> {
                 let _ = onebot_send_group_msg(&base_url, id, msg, None, token.as_deref());
             }
             _ => {
-                eprintln!(
-                    "[qq_system_notify] skipping invalid group id in test_groups: {gid}"
-                );
+                eprintln!("[qq_system_notify] skipping invalid group id in test_groups: {gid}");
             }
         }
     }
@@ -1308,27 +1511,43 @@ fn handle_qq_system_notify(req: &NodeRequest) -> Result<NodeResponse, String> {
 
 fn handle_qq_get_group_info(req: &NodeRequest) -> Result<NodeResponse, String> {
     let target = req.target.as_deref().unwrap_or("").trim();
-    if target.is_empty() { return Err("target is required for qq_get_group_info (group:<id>)".to_string()); }
+    if target.is_empty() {
+        return Err("target is required for qq_get_group_info (group:<id>)".to_string());
+    }
     let (kind, id) = parse_target(target)?;
-    if kind != TargetKind::Group { return Err("target must be group:<id> for qq_get_group_info".to_string()); }
+    if kind != TargetKind::Group {
+        return Err("target must be group:<id> for qq_get_group_info".to_string());
+    }
 
-    let base_url = req.payload.as_ref()
-        .and_then(|p| p.get("onebot_url")).and_then(|v| v.as_str())
+    let base_url = req
+        .payload
+        .as_ref()
+        .and_then(|p| p.get("onebot_url"))
+        .and_then(|v| v.as_str())
         .map(|s| s.to_string())
         .or_else(|| STATE.lock().ok().and_then(|s| s.onebot_url.clone()))
-        .or_else(|| load_runtime_config().and_then(|c| c.get("onebot_url")?.as_str().map(|s| s.to_string())))
+        .or_else(|| {
+            load_runtime_config().and_then(|c| c.get("onebot_url")?.as_str().map(|s| s.to_string()))
+        })
         .ok_or("no OneBot URL configured")?;
 
-    let token = req.payload.as_ref()
-        .and_then(|p| p.get("access_token")).and_then(|v| v.as_str())
+    let token = req
+        .payload
+        .as_ref()
+        .and_then(|p| p.get("access_token"))
+        .and_then(|v| v.as_str())
         .map(|s| s.to_string())
         .or_else(|| STATE.lock().ok().and_then(|s| s.access_token.clone()))
-        .or_else(|| load_runtime_config().and_then(|c| c.get("access_token")?.as_str().map(|s| s.to_string())));
+        .or_else(|| {
+            load_runtime_config()
+                .and_then(|c| c.get("access_token")?.as_str().map(|s| s.to_string()))
+        });
 
     let params = json!({ "group_id": id });
     let data = onebot_call(&base_url, "get_group_info", &params, token.as_deref())?;
 
-    let group_name = data.get("data")
+    let group_name = data
+        .get("data")
         .and_then(|d| d.get("group_name"))
         .and_then(|v| v.as_str())
         .unwrap_or("unknown");
@@ -1348,29 +1567,53 @@ fn handle_qq_send(req: &NodeRequest) -> Result<NodeResponse, String> {
     let message = req.message.as_deref().unwrap_or("").trim();
     let reply_to = req.reply_to;
 
-    if target.is_empty() { return Err("target is required for qq_send".to_string()); }
-    if message.is_empty() { return Err("message is required for qq_send".to_string()); }
+    if target.is_empty() {
+        return Err("target is required for qq_send".to_string());
+    }
+    if message.is_empty() {
+        return Err("message is required for qq_send".to_string());
+    }
 
     // Read config: payload → STATE → config file (persisted by qq_serve).
-    let base_url = req.payload.as_ref()
-        .and_then(|p| p.get("onebot_url")).and_then(|v| v.as_str())
+    let base_url = req
+        .payload
+        .as_ref()
+        .and_then(|p| p.get("onebot_url"))
+        .and_then(|v| v.as_str())
         .map(|s| s.to_string())
         .or_else(|| STATE.lock().ok().and_then(|s| s.onebot_url.clone()))
-        .or_else(|| load_runtime_config().and_then(|c| c.get("onebot_url")?.as_str().map(|s| s.to_string())))
+        .or_else(|| {
+            load_runtime_config().and_then(|c| c.get("onebot_url")?.as_str().map(|s| s.to_string()))
+        })
         .ok_or("no OneBot URL configured")?;
-    let token = req.payload.as_ref()
-        .and_then(|p| p.get("access_token")).and_then(|v| v.as_str())
+    let token = req
+        .payload
+        .as_ref()
+        .and_then(|p| p.get("access_token"))
+        .and_then(|v| v.as_str())
         .map(|s| s.to_string())
         .or_else(|| STATE.lock().ok().and_then(|s| s.access_token.clone()))
-        .or_else(|| load_runtime_config().and_then(|c| c.get("access_token")?.as_str().map(|s| s.to_string())));
+        .or_else(|| {
+            load_runtime_config()
+                .and_then(|c| c.get("access_token")?.as_str().map(|s| s.to_string()))
+        });
 
     let (kind, id) = parse_target(target)?;
     let data = match kind {
-        TargetKind::Group => onebot_send_group_msg(&base_url, id, message, reply_to, token.as_deref())?,
-        TargetKind::Private => onebot_send_private_msg(&base_url, id, message, reply_to, token.as_deref())?,
+        TargetKind::Group => {
+            onebot_send_group_msg(&base_url, id, message, reply_to, token.as_deref())?
+        }
+        TargetKind::Private => {
+            onebot_send_private_msg(&base_url, id, message, reply_to, token.as_deref())?
+        }
     };
-    let _msg_id = data.get("data").and_then(|d| d.get("message_id")).and_then(|v| v.as_i64());
-    let reply_note = reply_to.map(|mid| format!(" (reply to {})", mid)).unwrap_or_default();
+    let _msg_id = data
+        .get("data")
+        .and_then(|d| d.get("message_id"))
+        .and_then(|v| v.as_i64());
+    let reply_note = reply_to
+        .map(|mid| format!(" (reply to {})", mid))
+        .unwrap_or_default();
 
     Ok(NodeResponse {
         ok: true,
@@ -1789,7 +2032,10 @@ mod chain_tests {
 
     fn clear_globals() {
         MESSAGE_QUEUE.lock().unwrap().clear();
-        RECENT_MESSAGE_IDS.lock().unwrap_or_else(|p| p.into_inner()).clear();
+        RECENT_MESSAGE_IDS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear();
         let mut s = STATE.lock().unwrap();
         s.allow_groups.clear();
         s.block_groups.clear();
@@ -1849,9 +2095,14 @@ mod chain_tests {
         let ev: OneBotEvent = serde_json::from_value(json!({
             "post_type": "meta_event",
             "user_id": 0
-        })).unwrap();
+        }))
+        .unwrap();
         handle_onebot_event(&ev);
-        assert_eq!(MESSAGE_QUEUE.lock().unwrap().len(), 0, "非 message 事件应被忽略");
+        assert_eq!(
+            MESSAGE_QUEUE.lock().unwrap().len(),
+            0,
+            "非 message 事件应被忽略"
+        );
         clear_globals();
     }
 
@@ -1862,12 +2113,25 @@ mod chain_tests {
     fn agent_prompt_format_is_parseable_by_session_router() {
         let sender_id = "222";
         let user_id = "111";
-        let prompt = format!("[QQ group from {} (user {})]: {}", sender_id, user_id, "在吗");
+        let prompt = format!(
+            "[QQ group from {} (user {})]: {}",
+            sender_id, user_id, "在吗"
+        );
         let gid = prompt
             .strip_prefix("[QQ group from ")
             .and_then(|rest| rest.find("]: ").map(|end| &rest[..end]))
-            .map(|prefix| prefix.split_once(" (user ").map(|(g, _)| g).unwrap_or(prefix).to_string());
-        assert_eq!(gid.as_deref(), Some("222"), "runtime 应能从 prompt 还原 group_id");
+            .map(|prefix| {
+                prefix
+                    .split_once(" (user ")
+                    .map(|(g, _)| g)
+                    .unwrap_or(prefix)
+                    .to_string()
+            });
+        assert_eq!(
+            gid.as_deref(),
+            Some("222"),
+            "runtime 应能从 prompt 还原 group_id"
+        );
     }
 
     // 消息文本抽取：结构化 segments（text/at/image/reply）。
@@ -1987,10 +2251,7 @@ mod ws_tests {
         let _held = TcpListener::bind(("0.0.0.0", occupied))
             .expect("test harness should be able to bind the probe port");
         let err = handle_qq_ws_serve(&start_req(occupied));
-        assert!(
-            err.is_err(),
-            "bind 被占用端口应返回 Err，实际: {err:?}"
-        );
+        assert!(err.is_err(), "bind 被占用端口应返回 Err，实际: {err:?}");
         assert!(
             !*WS_SERVER_RUNNING.lock().unwrap(),
             "bind 失败后 running 标志不应被置位"

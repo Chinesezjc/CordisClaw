@@ -97,8 +97,8 @@ fn read_llm_config() -> Option<(String, String, String)> {
 }
 
 fn web_search_anthropic(query: &str) -> Result<String, String> {
-    let (api_key, model, _base_url) = read_llm_config()
-        .ok_or("no api_key found in config/llm_api.yaml".to_string())?;
+    let (api_key, model, _base_url) =
+        read_llm_config().ok_or("no api_key found in config/llm_api.yaml".to_string())?;
 
     let client = Client::builder()
         .timeout(Duration::from_secs(TIMEOUT_SECS))
@@ -140,9 +140,12 @@ fn web_search_anthropic(query: &str) -> Result<String, String> {
         serde_json::from_str(&resp_body).map_err(|e| format!("Anthropic parse JSON: {e}"))?;
 
     // Extract structured search results + model text from content blocks.
-    let content_blocks = json["content"]
-        .as_array()
-        .ok_or_else(|| format!("unexpected response format: {}", resp_body.chars().take(500).collect::<String>()))?;
+    let content_blocks = json["content"].as_array().ok_or_else(|| {
+        format!(
+            "unexpected response format: {}",
+            resp_body.chars().take(500).collect::<String>()
+        )
+    })?;
 
     let mut results: Vec<String> = Vec::new();
     let mut model_text = String::new();

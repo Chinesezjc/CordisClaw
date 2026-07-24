@@ -9,20 +9,20 @@
       "id": "expr_eval",
       "summary": "Evaluate the AST and delegate arithmetic to child operator plugins.",
       "input_schema": {
+        "type": "object",
         "properties": {
           "ast": {
             "type": "object"
           }
-        },
-        "type": "object"
+        }
       },
       "output_schema": {
+        "type": "object",
         "properties": {
           "value": {
             "type": "number"
           }
-        },
-        "type": "object"
+        }
       },
       "side_effects": [],
       "failure_modes": [

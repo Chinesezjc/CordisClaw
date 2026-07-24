@@ -9,6 +9,11 @@
       "id": "expr_pow",
       "summary": "Raise lhs to the power of rhs.",
       "input_schema": {
+        "type": "object",
+        "required": [
+          "lhs",
+          "rhs"
+        ],
         "properties": {
           "lhs": {
             "type": "number"
@@ -16,20 +21,15 @@
           "rhs": {
             "type": "number"
           }
-        },
-        "required": [
-          "lhs",
-          "rhs"
-        ],
-        "type": "object"
+        }
       },
       "output_schema": {
+        "type": "object",
         "properties": {
           "value": {
             "type": "number"
           }
-        },
-        "type": "object"
+        }
       },
       "side_effects": [],
       "failure_modes": [],
