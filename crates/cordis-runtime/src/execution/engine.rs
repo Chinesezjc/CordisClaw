@@ -247,9 +247,14 @@ where
                     .take(config.scheduler.max_concurrency)
                     .collect();
 
-                if batch.is_empty() {
-                    continue;
-                }
+                // Invariant: the enclosing `while !state.ready.is_empty()`
+                // guarantees the drain loop above popped at least one item, so
+                // `key_items` has at least one entry and (with
+                // `max_concurrency >= 2` on this path) `batch` is non-empty.
+                // If the invariant were ever violated the fall-through is still
+                // safe: an empty batch drives the loops below through zero
+                // iterations.
+                debug_assert!(!batch.is_empty());
 
                 // Pre-compute all inputs (serial phase — needs &mut state).
                 // Router transitions are handled inline here because they
@@ -327,9 +332,14 @@ where
                     });
                 }
 
-                if jobs.is_empty() {
-                    continue;
-                }
+                // Invariant: `batch` is non-empty and every batched item names
+                // a (transition, key) that reached `ready` via `push_ready`,
+                // which refuses already-completed keys; no completion runs
+                // between draining `ready` and building `jobs`, so the
+                // `is_key_done` guard above cannot skip every item. If it ever
+                // did, the empty-jobs fall-through is safe: the thread scope and
+                // merge loops below run zero iterations.
+                debug_assert!(!jobs.is_empty());
 
                 // Parallel execution of runner closures (Task/Terminal/Gate only).
                 // Router jobs were already handled in the pre-compute phase.
@@ -470,6 +480,20 @@ fn map_build_error(err: PetriNetBuildError) -> RuntimeError {
     }
 }
 
+/// Construct a kernel-invariant `RuntimeError` from a caller-formatted message.
+///
+/// These invariants guard engine-internal consistency (a ready transition must
+/// have a spec, a token target place must exist, a queued transition must still
+/// be enabled at run time). They are not reachable through any valid net build
+/// or execution path; hitting one means the engine's own bookkeeping is broken.
+/// Centralizing the construction keeps the message text at the call sites while
+/// giving the branch a single unit-testable entry point.
+fn engine_invariant(msg: &str) -> RuntimeError {
+    RuntimeError::Invariant {
+        message: msg.to_string(),
+    }
+}
+
 /// Process a single ready item in single-threaded mode.
 /// Returns `Ok(true)` if a Terminal transition fired.
 fn process_one_item<F>(
@@ -502,12 +526,12 @@ where
         .unwrap_or(&0);
 
     let trigger = state.ensure_trigger_inputs(&item.transition_id, &item.key)?;
-    let spec = state
-        .specs
-        .get(&item.transition_id)
-        .ok_or_else(|| RuntimeError::Invariant {
-            message: format!("ready transition missing spec: {}", item.transition_id),
-        })?;
+    let spec = state.specs.get(&item.transition_id).ok_or_else(|| {
+        engine_invariant(&format!(
+            "ready transition missing spec: {}",
+            item.transition_id
+        ))
+    })?;
 
     state.order.push(item.transition_id.clone());
     let run = if spec.transition.join_policy == JoinPolicy::AllOf
@@ -774,12 +798,9 @@ impl EngineState {
         if self.ready_set.contains(&ready_key) || self.is_key_done(transition_id, &key) {
             return Ok(());
         }
-        let spec = self
-            .specs
-            .get(transition_id)
-            .ok_or_else(|| RuntimeError::Invariant {
-                message: format!("push_ready missing transition: {transition_id}"),
-            })?;
+        let spec = self.specs.get(transition_id).ok_or_else(|| {
+            engine_invariant(&format!("push_ready missing transition: {transition_id}"))
+        })?;
         self.ready.push_back(ReadyItem {
             transition_id: transition_id.to_string(),
             key,
@@ -812,12 +833,10 @@ impl EngineState {
         }
 
         if !self.is_transition_ready(transition_id, key)? {
-            return Err(RuntimeError::Invariant {
-                message: format!(
-                    "transition became not-ready before run: transition={transition_id}, key={}",
-                    key.0
-                ),
-            });
+            return Err(engine_invariant(&format!(
+                "transition became not-ready before run: transition={transition_id}, key={}",
+                key.0
+            )));
         }
 
         let inputs = self.consume_inputs_for_key(transition_id, key)?;
@@ -839,12 +858,9 @@ impl EngineState {
             return Ok(false);
         }
 
-        let spec = self
-            .specs
-            .get(transition_id)
-            .ok_or_else(|| RuntimeError::Invariant {
-                message: format!("missing transition spec: {transition_id}"),
-            })?;
+        let spec = self.specs.get(transition_id).ok_or_else(|| {
+            engine_invariant(&format!("missing transition spec: {transition_id}"))
+        })?;
         let input_arcs = self
             .graph
             .input_arcs_by_transition
@@ -912,9 +928,10 @@ impl EngineState {
         let mut all_inputs = Vec::<TriggerInput>::new();
         for arc in input_arcs {
             let Some(by_key) = self.place_tokens.get_mut(&arc.place_id) else {
-                return Err(RuntimeError::Invariant {
-                    message: format!("missing place token bucket: {}", arc.place_id),
-                });
+                return Err(engine_invariant(&format!(
+                    "missing place token bucket: {}",
+                    arc.place_id
+                )));
             };
             let tokens = by_key.remove(key).unwrap_or_default();
             for token in tokens {
@@ -956,9 +973,13 @@ impl EngineState {
             .unwrap_or_else(|| "default".to_string());
 
         for arc in output_arcs {
-            if arc.direction != ArcDirection::TransitionToPlace {
-                continue;
-            }
+            // Structural invariant: net.rs::build_petri_net only pushes an arc
+            // into `output_arcs_by_transition` from the
+            // `ArcDirection::TransitionToPlace` match arm (net.rs:186-195), and
+            // `PetriNetGraph` is constructed only there. So every arc in this
+            // collection is necessarily T→P; the former `continue` branch was a
+            // structurally dead filter.
+            debug_assert_eq!(arc.direction, ArcDirection::TransitionToPlace);
             let sequence = self.next_token_sequence();
             self.insert_token(
                 &arc.place_id,
@@ -1007,9 +1028,9 @@ impl EngineState {
         }
 
         let Some(by_key) = self.place_tokens.get_mut(place_id) else {
-            return Err(RuntimeError::Invariant {
-                message: format!("insert token missing place: {place_id}"),
-            });
+            return Err(engine_invariant(&format!(
+                "insert token missing place: {place_id}"
+            )));
         };
         by_key
             .entry(token.key.clone())
@@ -1133,6 +1154,18 @@ mod tests {
         PlaceSpec {
             place_id: id.to_string(),
         }
+    }
+
+    /// `engine_invariant` wraps a caller-formatted message verbatim into a
+    /// `RuntimeError::Invariant`. These branches are otherwise unreachable
+    /// through valid nets, so the constructor is tested directly.
+    #[test]
+    fn engine_invariant_wraps_message_verbatim() {
+        let err = engine_invariant("ready transition missing spec: t42");
+        assert!(
+            matches!(&err, RuntimeError::Invariant { message } if message == "ready transition missing spec: t42"),
+            "expected Invariant, got {err:?}"
+        );
     }
 
     fn arc_in(arc_id: &str, place: &str, transition: &str) -> ArcSpec {
@@ -1298,13 +1331,10 @@ mod tests {
             TransitionRunResult::from_outcome(NodeOutcome::Success)
         })
         .unwrap_err();
-        match err {
-            RuntimeError::Invariant { message } => {
-                assert!(message.contains("run_transition_router"), "msg: {message}");
-                assert!(message.contains('r'), "msg: {message}");
-            }
-            other => panic!("expected Invariant, got {other:?}"),
-        }
+        assert!(
+            matches!(&err, RuntimeError::Invariant { message } if message.contains("run_transition_router") && message.contains('r')),
+            "expected Invariant, got {err:?}"
+        );
     }
 
     /// The Task-kind timeout override: when the runner takes longer than
@@ -1361,12 +1391,10 @@ mod tests {
             &|_, _, _, _| TransitionRunResult::from_outcome(NodeOutcome::Success),
         )
         .unwrap_err();
-        match err {
-            RuntimeError::Invariant { message } => {
-                assert!(message.contains("non-Router"), "msg: {message}");
-            }
-            other => panic!("expected Invariant, got {other:?}"),
-        }
+        assert!(
+            matches!(&err, RuntimeError::Invariant { message } if message.contains("non-Router")),
+            "expected Invariant, got {err:?}"
+        );
     }
 
     /// `retry_backoff_delay_ms` branch table: None→0, Fixed→delay,
@@ -1483,12 +1511,9 @@ mod tests {
             |_, _, _, _| panic!("{}", String::from("string boom")),
         )
         .unwrap_err();
-        match err {
-            RuntimeError::ExecutionFailed { message, .. } => {
-                assert!(message.contains("runner panic"), "msg: {message}");
-                assert!(message.contains("string boom"), "msg: {message}");
-            }
-            other => panic!("expected ExecutionFailed, got {other:?}"),
-        }
+        assert!(
+            matches!(&err, RuntimeError::ExecutionFailed { message, .. } if message.contains("runner panic") && message.contains("string boom")),
+            "expected ExecutionFailed, got {err:?}"
+        );
     }
 }

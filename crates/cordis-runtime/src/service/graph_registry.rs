@@ -107,18 +107,10 @@ impl GraphRegistry {
 
     pub fn handle_get_json(&self, path: &str) -> Result<Value, RuntimeError> {
         match path {
-            "/graphs/registered-nodes" => {
-                serde_json::to_value(&self.registration_graph).map_err(|err| {
-                    RuntimeError::Invariant {
-                        message: format!("serialize registered graph failed: {err}"),
-                    }
-                })
-            }
-            "/graphs/registered-net" => {
-                serde_json::to_value(&self.net_graph).map_err(|err| RuntimeError::Invariant {
-                    message: format!("serialize registered net failed: {err}"),
-                })
-            }
+            "/graphs/registered-nodes" => serde_json::to_value(&self.registration_graph)
+                .map_err(serialize_graph_error("registered graph")),
+            "/graphs/registered-net" => serde_json::to_value(&self.net_graph)
+                .map_err(serialize_graph_error("registered net")),
             _ => Err(RuntimeError::InvalidDocsRoute {
                 path: path.to_string(),
             }),
@@ -210,6 +202,36 @@ impl GraphRegistry {
         w.raw("</body></html>");
         w.into_string()
     }
+}
+
+/// Maps a serde serialization failure for graph values to an `Invariant`
+/// error. Extracted so the mapping is unit-testable: `RegisteredGraph` /
+/// `RegisteredNet` always serialize (plain structs, no non-string map keys),
+/// so the closure is otherwise unreachable through `handle_get_json`.
+fn serialize_graph_error(kind: &'static str) -> impl Fn(serde_json::Error) -> RuntimeError {
+    move |err| RuntimeError::Invariant {
+        message: format!("serialize {kind} failed: {err}"),
+    }
+}
+
+/// Sorts net edges by `(from, to, label)` and collapses runs of fully
+/// identical edges (same `from`/`to`/`label`/kind). The real net builder
+/// emits at most one edge per `(consumer, input)` pair, so the `to`/`label`
+/// legs of the dedup predicate never fire in production; extracting the pass
+/// lets a unit test feed genuinely duplicate edges to exercise them.
+fn sort_and_dedup_net_edges(edges: &mut Vec<RegisteredNetEdge>) {
+    edges.sort_by(|left, right| {
+        left.from
+            .cmp(&right.from)
+            .then_with(|| left.to.cmp(&right.to))
+            .then_with(|| left.label.cmp(&right.label))
+    });
+    edges.dedup_by(|left, right| {
+        left.from == right.from
+            && left.to == right.to
+            && left.label == right.label
+            && std::mem::discriminant(&left.kind) == std::mem::discriminant(&right.kind)
+    });
 }
 
 fn build_registration_graph(
@@ -362,18 +384,7 @@ fn build_registered_net(
         }
     }
 
-    edges.sort_by(|left, right| {
-        left.from
-            .cmp(&right.from)
-            .then_with(|| left.to.cmp(&right.to))
-            .then_with(|| left.label.cmp(&right.label))
-    });
-    edges.dedup_by(|left, right| {
-        left.from == right.from
-            && left.to == right.to
-            && left.label == right.label
-            && std::mem::discriminant(&left.kind) == std::mem::discriminant(&right.kind)
-    });
+    sort_and_dedup_net_edges(&mut edges);
 
     let levels = topo_levels(meta.keys().cloned().collect(), &edges, &mut diagnostics);
 
@@ -923,71 +934,27 @@ mod tests {
         assert!(reg.net().nodes[0].produces.is_empty());
     }
 
-    // A consumer whose declared input has no producer anywhere in the net
-    // takes the `candidates.is_empty()` early-`continue` in
-    // `build_registered_net`: no edge is synthesised for that input.
     #[test]
-    fn consumer_input_without_producer_yields_no_edge() {
+    fn consumer_with_no_producer_input_yields_no_edge() {
+        // A consumer reads `missing`, which no node produces. The candidate
+        // list is empty, exercising the `if candidates.is_empty() { continue }`
+        // arm in `build_registered_net` — the node survives with no edge.
         let plugins = PluginRegistry::default();
         let docs = plugin_docs(
             "p",
             "root/p",
             "0.1.0",
             None,
-            // `orphan` consumes `never_produced`; nobody produces it.
-            vec![doc_with_schema("orphan", &["never_produced"], &[])],
+            vec![doc_with_schema("consumer", &["missing"], &[])],
             None,
         );
         insert_plugin(&plugins, "root/p", None, docs.clone());
         let mut nodes = NodeRegistry::default();
         nodes.register_from_docs("root/p", &docs).unwrap();
         let reg = GraphRegistry::from_registries(&plugins, &nodes);
-        // The node is present, but no data edge feeds its unproduced input.
         assert_eq!(reg.net().nodes.len(), 1);
-        assert!(
-            reg.net().edges.is_empty(),
-            "no producer means no edge: {:?}",
-            reg.net().edges
-        );
-    }
-
-    fn edge(from: &str, to: &str, kind: RegisteredNetEdgeKind) -> RegisteredNetEdge {
-        RegisteredNetEdge {
-            from: from.to_string(),
-            to: to.to_string(),
-            kind,
-            label: None,
-        }
-    }
-
-    // `topo_levels` accepts both Data and Control edges as real dependencies,
-    // and silently skips edges whose endpoints are not among the known node
-    // ids (a dangling edge left over from a partial graph). Called directly
-    // because `build_registered_net` only ever emits Data edges between known
-    // nodes, so these guard branches are unreachable through the public path.
-    #[test]
-    fn topo_levels_honors_control_edges_and_skips_dangling() {
-        let node_ids = vec!["a".to_string(), "b".to_string(), "c".to_string()];
-        let edges = vec![
-            // Control edge a->b is a real ordering dependency: b sits below a.
-            edge("a", "b", RegisteredNetEdgeKind::Control),
-            // Data edge b->c: c sits below b.
-            edge("b", "c", RegisteredNetEdgeKind::Data),
-            // Dangling edges referencing unknown nodes must be ignored, not
-            // panic or inflate indegree.
-            edge("a", "ghost", RegisteredNetEdgeKind::Data),
-            edge("ghost", "c", RegisteredNetEdgeKind::Control),
-        ];
-        let mut diagnostics = Vec::new();
-        let levels = topo_levels(node_ids, &edges, &mut diagnostics);
-        assert_eq!(levels.get("a"), Some(&0));
-        assert_eq!(levels.get("b"), Some(&1));
-        assert_eq!(levels.get("c"), Some(&2));
-        // No cycle among the real nodes → no cycle diagnostic.
-        assert!(
-            !diagnostics.iter().any(|d| d.contains("cycle")),
-            "diagnostics: {diagnostics:?}"
-        );
+        assert!(reg.net().edges.is_empty(), "no producer -> no edge");
+        assert_eq!(reg.net().nodes[0].consumes, vec!["missing".to_string()]);
     }
 
     // Two edges sharing the same `from` (one producer, two distinct inputs to
@@ -1031,5 +998,87 @@ mod tests {
         let mut labels: Vec<_> = incoming.iter().filter_map(|e| e.label.clone()).collect();
         labels.sort();
         assert_eq!(labels, vec!["x".to_string(), "y".to_string()]);
+    }
+
+    #[test]
+    fn serialize_graph_error_maps_to_invariant() {
+        // The serde closures in `handle_get_json` are unreachable through real
+        // graph values (they always serialize), so drive the extracted mapper
+        // directly with a synthesized serde error.
+        let err = serde_json::from_str::<Value>("{bad").unwrap_err();
+        let mapped = serialize_graph_error("registered graph")(err);
+        assert!(
+            matches!(&mapped, RuntimeError::Invariant { message } if message.starts_with("serialize registered graph failed: ")),
+            "expected Invariant, got {mapped:?}"
+        );
+        let err = serde_json::from_str::<Value>("{bad").unwrap_err();
+        let mapped = serialize_graph_error("registered net")(err);
+        assert!(
+            matches!(&mapped, RuntimeError::Invariant { message } if message.starts_with("serialize registered net failed: ")),
+            "expected Invariant, got {mapped:?}"
+        );
+    }
+
+    fn data_edge(from: &str, to: &str, label: &str) -> RegisteredNetEdge {
+        RegisteredNetEdge {
+            from: from.to_string(),
+            to: to.to_string(),
+            kind: RegisteredNetEdgeKind::Data,
+            label: Some(label.to_string()),
+        }
+    }
+
+    #[test]
+    fn sort_and_dedup_net_edges_collapses_fully_identical_edges() {
+        // Two byte-for-byte identical edges (same from/to/label/kind) collapse
+        // to one — this exercises the `to == to && label == label` legs of the
+        // dedup predicate that the real net builder never triggers (it emits
+        // at most one edge per consumer input). A third edge differing only in
+        // `label` must survive.
+        let mut edges = vec![
+            data_edge("a", "b", "x"),
+            data_edge("a", "b", "x"),
+            data_edge("a", "b", "y"),
+        ];
+        sort_and_dedup_net_edges(&mut edges);
+        assert_eq!(edges.len(), 2, "identical pair collapsed, distinct kept");
+        assert_eq!(edges[0].label.as_deref(), Some("x"));
+        assert_eq!(edges[1].label.as_deref(), Some("y"));
+    }
+
+    #[test]
+    fn topo_levels_assigns_chain_levels_and_skips_unknown_and_control() {
+        // Directly drive `topo_levels` to cover its internal branches:
+        // - a Data chain a->b->c decrements indegree and push_backs (the
+        //   `*deg == 0 -> queue.push_back` arm),
+        // - a Control edge is accepted by the `matches!` guard,
+        // - an edge referencing an unknown node is skipped by the
+        //   `indegree.contains_key` guard.
+        let nodes = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let edges = vec![
+            data_edge("a", "b", "x"),
+            data_edge("b", "c", "y"),
+            RegisteredNetEdge {
+                from: "c".to_string(),
+                to: "ghost".to_string(),
+                kind: RegisteredNetEdgeKind::Data,
+                label: None,
+            },
+            RegisteredNetEdge {
+                from: "a".to_string(),
+                to: "c".to_string(),
+                kind: RegisteredNetEdgeKind::Control,
+                label: None,
+            },
+        ];
+        let mut diagnostics = Vec::new();
+        let levels = topo_levels(nodes, &edges, &mut diagnostics);
+        assert_eq!(levels.get("a"), Some(&0));
+        assert_eq!(levels.get("b"), Some(&1));
+        // c is max(via b at level 1 +1, via a control at level 0 +1) = 2.
+        assert_eq!(levels.get("c"), Some(&2));
+        // The edge to the unknown `ghost` node was skipped, so no entry.
+        assert!(!levels.contains_key("ghost"));
+        assert!(diagnostics.is_empty(), "acyclic -> no diagnostics");
     }
 }

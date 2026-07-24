@@ -25,8 +25,8 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::{
-    api_base, current_policy, interpret_inbound, process_outcome, InboundOutcome,
-    SERVER_SHUTDOWN, STATE,
+    api_base, current_policy, interpret_inbound, process_outcome, InboundOutcome, SERVER_SHUTDOWN,
+    STATE,
 };
 
 // ---------------------------------------------------------------------------
@@ -153,7 +153,8 @@ impl Frame {
                         let htag = get_varint(chunk, &mut hp)?;
                         match (htag >> 3, htag & 0x7) {
                             (1, 2) => {
-                                key = String::from_utf8_lossy(get_chunk(chunk, &mut hp)?).to_string()
+                                key =
+                                    String::from_utf8_lossy(get_chunk(chunk, &mut hp)?).to_string()
                             }
                             (2, 2) => {
                                 value =
@@ -313,9 +314,17 @@ pub(crate) fn bootstrap_endpoint(
     match code {
         0 => {}
         // 1 = system busy, 1000040343 = internal — transient.
-        1 | 1000040343 => return Err(BootstrapError::Transient(format!("endpoint code={code}: {msg}"))),
+        1 | 1000040343 => {
+            return Err(BootstrapError::Transient(format!(
+                "endpoint code={code}: {msg}"
+            )))
+        }
         // 403 forbidden / 514 auth failed / anything else client-side.
-        _ => return Err(BootstrapError::Fatal(format!("endpoint code={code}: {msg}"))),
+        _ => {
+            return Err(BootstrapError::Fatal(format!(
+                "endpoint code={code}: {msg}"
+            )))
+        }
     }
 
     let endpoint = body
@@ -362,12 +371,19 @@ impl Reassembler {
     }
 
     /// Feed one fragment; returns the full payload once all parts arrived.
-    pub(crate) fn feed(&mut self, msg_id: &str, sum: usize, seq: usize, data: Vec<u8>) -> Option<Vec<u8>> {
+    pub(crate) fn feed(
+        &mut self,
+        msg_id: &str,
+        sum: usize,
+        seq: usize,
+        data: Vec<u8>,
+    ) -> Option<Vec<u8>> {
         if sum <= 1 {
             return Some(data);
         }
         // GC expired windows.
-        self.parts.retain(|_, (t, _)| t.elapsed() < Duration::from_secs(5));
+        self.parts
+            .retain(|_, (t, _)| t.elapsed() < Duration::from_secs(5));
 
         let entry = self
             .parts
@@ -485,8 +501,7 @@ pub(crate) fn run_ws_loop() {
 fn pump_connection(endpoint: &str, cfg: WsClientConfig) -> Result<(), String> {
     use tungstenite::stream::MaybeTlsStream;
 
-    let (mut socket, _resp) =
-        tungstenite::connect(endpoint).map_err(|e| format!("dial: {e}"))?;
+    let (mut socket, _resp) = tungstenite::connect(endpoint).map_err(|e| format!("dial: {e}"))?;
 
     // Short read timeout so one thread can pump reads AND emit pings.
     match socket.get_ref() {
@@ -602,10 +617,7 @@ fn handle_data_frame(mut frame: Frame, reassembler: &mut Reassembler) -> Option<
     }
 
     // ACK: same frame, payload swapped for a response envelope.
-    frame.set_header(
-        "biz_rt",
-        started.elapsed().as_millis().to_string(),
-    );
+    frame.set_header("biz_rt", started.elapsed().as_millis().to_string());
     frame.payload = json!({"code": 200, "headers": null, "data": null})
         .to_string()
         .into_bytes();
@@ -656,7 +668,17 @@ mod tests {
     #[test]
     fn varint_multibyte_roundtrip() {
         let mut buf = Vec::new();
-        for v in [0u64, 1, 127, 128, 300, 16383, 16384, u32::MAX as u64, u64::MAX] {
+        for v in [
+            0u64,
+            1,
+            127,
+            128,
+            300,
+            16383,
+            16384,
+            u32::MAX as u64,
+            u64::MAX,
+        ] {
             buf.clear();
             put_varint(&mut buf, v);
             let mut pos = 0;

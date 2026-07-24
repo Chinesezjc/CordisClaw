@@ -402,6 +402,19 @@ mod tests {
         BTreeMap::new()
     }
 
+    // FirstCompleted: completion_order is still empty even though an outcome
+    // is already recorded → nothing to inspect yet → Wait.
+    #[test]
+    fn first_completed_empty_order_waits() {
+        let up = vec!["a".to_string()];
+        let empty: Vec<String> = Vec::new();
+        let out = outcomes(&[("a", NodeOutcome::Success)]);
+        assert_eq!(
+            evaluate_gate(GatePolicy::FirstCompleted, &up, &out, &empty),
+            GateDecision::Wait
+        );
+    }
+
     // FirstCompleted: the first terminal node in completion_order is a failure,
     // and another upstream is still pending → cancel the pending branch and
     // report failure (covers the failure+cancel arm).
@@ -409,6 +422,25 @@ mod tests {
     fn first_completed_failure_cancels_pending() {
         let up = vec!["a".to_string(), "b".to_string()];
         let out = outcomes(&[("a", NodeOutcome::Failure)]);
+        let order = vec!["a".to_string()];
+        match evaluate_gate(GatePolicy::FirstCompleted, &up, &out, &order) {
+            GateDecision::CompleteAndCancel {
+                success,
+                cancel_nodes,
+            } => {
+                assert!(!success);
+                assert_eq!(cancel_nodes, vec!["b".to_string()]);
+            }
+            d => panic!("expected CompleteAndCancel failure, got {d:?}"),
+        }
+    }
+
+    // FirstCompleted: Timeout is a terminal non-success the same way — the
+    // pending peer is cancelled and the gate reports failure.
+    #[test]
+    fn first_completed_timeout_cancels_pending_as_failure() {
+        let up = vec!["a".to_string(), "b".to_string()];
+        let out = outcomes(&[("a", NodeOutcome::Timeout)]);
         let order = vec!["a".to_string()];
         match evaluate_gate(GatePolicy::FirstCompleted, &up, &out, &order) {
             GateDecision::CompleteAndCancel {
@@ -462,6 +494,26 @@ mod tests {
                 assert_eq!(cancel_nodes, vec!["b".to_string()]);
             }
             d => panic!("expected CompleteAndCancel success, got {d:?}"),
+        }
+    }
+
+    // FirstCompleted: a foreign completion_order entry (not upstream) and an
+    // upstream entry with no recorded outcome are both skipped before the
+    // first real terminal decides; the still-pending upstream is cancelled.
+    #[test]
+    fn first_completed_skips_foreign_and_unrecorded_entries() {
+        let up = vec!["a".to_string(), "b".to_string()];
+        let out = outcomes(&[("b", NodeOutcome::Success)]);
+        let order = vec!["z".to_string(), "a".to_string(), "b".to_string()];
+        match evaluate_gate(GatePolicy::FirstCompleted, &up, &out, &order) {
+            GateDecision::CompleteAndCancel {
+                success,
+                cancel_nodes,
+            } => {
+                assert!(success);
+                assert_eq!(cancel_nodes, vec!["a".to_string()]);
+            }
+            d => panic!("expected CompleteAndCancel, got {d:?}"),
         }
     }
 

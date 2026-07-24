@@ -2529,6 +2529,7 @@ fn command_router_dispatch_table() {
     }
     use cordis_runtime::agent::AgentToolHost;
     use cordis_runtime::command_router::{dispatch, CommandContext, CommandOutcome};
+    use CommandOutcome::Reply;
 
     let temp = setup_fixture_workspace_copy();
     let fixtures = temp.path().join("fixtures");
@@ -2574,12 +2575,9 @@ fn command_router_dispatch_table() {
         ),
     ];
     for (input, ok) in reply_cases {
-        match dispatch(&host, &ctx, input) {
-            CommandOutcome::Reply(text) => {
-                assert!(ok(&text), "dispatch({input}) reply mismatch: {text}");
-            }
-            other => panic!("dispatch({input}) expected Reply, got {other:?}"),
-        }
+        let out = dispatch(&host, &ctx, input);
+        let Reply(text) = out else { panic!("{out:?}") };
+        assert!(ok(&text), "dispatch({input}) reply mismatch: {text}");
     }
 
     // /reset is the one non-Reply outcome.
@@ -2594,17 +2592,14 @@ fn command_router_dispatch_table() {
     // /soul with an empty soul_key (identity-less session) falls back to the
     // "no identity" message instead of leaking another user's persona.
     let anon = CommandContext::default();
-    match dispatch(&host, &anon, "/soul") {
-        CommandOutcome::Reply(text) => {
-            assert!(
-                text.contains("没有身份") || text.contains("无法定位"),
-                "/soul without soul_key should explain the missing identity: {text}"
-            );
-            assert!(
-                !text.contains("表驱动测试人格"),
-                "/soul without soul_key must not leak another scope's persona"
-            );
-        }
-        other => panic!("/soul (anon) expected Reply, got {other:?}"),
-    }
+    let out = dispatch(&host, &anon, "/soul");
+    let Reply(text) = out else { panic!("{out:?}") };
+    assert!(
+        text.contains("没有身份") || text.contains("无法定位"),
+        "/soul without soul_key should explain the missing identity: {text}"
+    );
+    assert!(
+        !text.contains("表驱动测试人格"),
+        "/soul without soul_key must not leak another scope's persona"
+    );
 }

@@ -63,6 +63,17 @@ impl FileSoulProvider {
     }
 }
 
+/// Map a soul-file I/O or serialization failure to `RuntimeError::Io`,
+/// preserving the underlying error text byte-for-byte via `to_string`.
+/// Extracted so the (in practice serialize-infallible) mapper at the
+/// `to_vec_pretty` call site is directly unit-testable.
+fn soul_io_error(path: &Path, message: impl std::fmt::Display) -> RuntimeError {
+    RuntimeError::Io {
+        path: path.to_path_buf(),
+        message: message.to_string(),
+    }
+}
+
 /// Keep soul filenames inside the souls dir regardless of key content.
 pub fn sanitize_soul_key(key: &str) -> String {
     key.chars()
@@ -108,10 +119,7 @@ impl SoulProvider for FileSoulProvider {
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(&self.root, std::fs::Permissions::from_mode(0o700));
         }
-        let bytes = serde_json::to_vec_pretty(soul).map_err(|e| RuntimeError::Io {
-            path: path.clone(),
-            message: e.to_string(),
-        })?;
+        let bytes = serde_json::to_vec_pretty(soul).map_err(|e| soul_io_error(&path, e))?;
         // Atomic tmp+rename, same discipline as session auto-save.
         let tmp = path.with_extension("json.tmp");
         std::fs::write(&tmp, &bytes)
@@ -163,6 +171,17 @@ mod tests {
         assert!(!p.to_string_lossy().contains(".."), "path: {}", p.display());
     }
 
+    // soul_io_error mapper：路径与错误文本逐字保留（覆盖 to_vec_pretty 侧
+    // 在实践中不可达的序列化错误分支的等价逻辑）。
+    #[test]
+    fn soul_io_error_preserves_path_and_message() {
+        let err = soul_io_error(Path::new("/tmp/x.json"), "boom detail");
+        assert!(
+            matches!(&err, RuntimeError::Io { path, message } if path == &PathBuf::from("/tmp/x.json") && message == "boom detail"),
+            "expected Io, got {err:?}"
+        );
+    }
+
     // 旧格式 soul JSON（缺字段）反序列化不炸。
     #[test]
     fn soul_deserialize_tolerates_missing_fields() {
@@ -182,12 +201,10 @@ mod tests {
         std::fs::create_dir_all(dir.join("souls")).unwrap();
         std::fs::write(provider.path_for(key), b"{ this is not json").unwrap();
         let err = provider.get(key).unwrap_err();
-        match err {
-            RuntimeError::Io { message, .. } => {
-                assert!(message.contains("soul parse"), "message: {message}");
-            }
-            other => panic!("expected Io parse error, got {other:?}"),
-        }
+        assert!(
+            matches!(&err, RuntimeError::Io { message, .. } if message.contains("soul parse")),
+            "expected Io parse error, got {err:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

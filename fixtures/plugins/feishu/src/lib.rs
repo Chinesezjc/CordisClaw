@@ -216,7 +216,13 @@ struct NodeResponse {
 
 impl NodeResponse {
     fn err(node_id: &str, e: impl Into<String>) -> Self {
-        NodeResponse { ok: false, node_id: node_id.to_string(), message: None, data: None, error: Some(e.into()) }
+        NodeResponse {
+            ok: false,
+            node_id: node_id.to_string(),
+            message: None,
+            data: None,
+            error: Some(e.into()),
+        }
     }
 }
 
@@ -267,7 +273,11 @@ fn save_runtime_config(config: &Value) -> Result<(), String> {
 }
 
 /// Read a config value with three-level fallback: request payload → STATE → file.
-fn config_str(payload: Option<&Value>, key: &str, state_get: impl Fn(&FeishuState) -> Option<String>) -> Option<String> {
+fn config_str(
+    payload: Option<&Value>,
+    key: &str,
+    state_get: impl Fn(&FeishuState) -> Option<String>,
+) -> Option<String> {
     payload
         .and_then(|p| p.get(key))
         .and_then(|v| v.as_str())
@@ -341,7 +351,11 @@ pub(crate) fn interpret_inbound(
                         Ok(plain) => plain,
                         Err(e) => return InboundOutcome::Rejected(format!("decrypt failed: {e}")),
                     },
-                    None => return InboundOutcome::Rejected("encrypted event but no encrypt_key configured".into()),
+                    None => {
+                        return InboundOutcome::Rejected(
+                            "encrypted event but no encrypt_key configured".into(),
+                        )
+                    }
                 }
             } else {
                 raw_body.to_string()
@@ -438,9 +452,7 @@ fn policy_gate(im: IncomingMessage, policy: &AccessPolicy) -> InboundOutcome {
 
     // Group chats.
     match policy.group_policy.as_str() {
-        "disabled" => {
-            return InboundOutcome::Ignore("group_policy=disabled; skipped".to_string())
-        }
+        "disabled" => return InboundOutcome::Ignore("group_policy=disabled; skipped".to_string()),
         "open" => {}
         // Default & explicit "allowlist".
         _ => {
@@ -470,7 +482,11 @@ fn extract_content(message_type: &str, content: &Value) -> (String, bool) {
         "image" => (format!("[image file_key={}]", s("image_key")), true),
         "post" => render_post(content),
         "file" => (
-            format!("[file file_key={} name=\"{}\"]", s("file_key"), s("file_name")),
+            format!(
+                "[file file_key={} name=\"{}\"]",
+                s("file_key"),
+                s("file_name")
+            ),
             true,
         ),
         "audio" => {
@@ -479,10 +495,17 @@ fn extract_content(message_type: &str, content: &Value) -> (String, bool) {
                 .and_then(|d| d.as_i64())
                 .map(|d| d.to_string())
                 .unwrap_or_else(|| s("duration").to_string());
-            (format!("[audio file_key={} duration={duration}ms]", s("file_key")), true)
+            (
+                format!("[audio file_key={} duration={duration}ms]", s("file_key")),
+                true,
+            )
         }
         "media" => (
-            format!("[video file_key={} name=\"{}\"]", s("file_key"), s("file_name")),
+            format!(
+                "[video file_key={} name=\"{}\"]",
+                s("file_key"),
+                s("file_name")
+            ),
             true,
         ),
         "sticker" => (format!("[sticker file_key={}]", s("file_key")), true),
@@ -507,7 +530,9 @@ fn render_post(content: &Value) -> (String, bool) {
 
     if let Some(paragraphs) = content.get("content").and_then(|c| c.as_array()) {
         for paragraph in paragraphs {
-            let Some(runs) = paragraph.as_array() else { continue };
+            let Some(runs) = paragraph.as_array() else {
+                continue;
+            };
             let mut line = String::new();
             for run in runs {
                 let tag = run.get("tag").and_then(|t| t.as_str()).unwrap_or("");
@@ -546,9 +571,16 @@ fn parse_message_event(v: &Value, bot_open_id: Option<&str>) -> Option<IncomingM
     let event = v.get("event")?;
     let message = event.get("message")?;
     let chat_id = message.get("chat_id")?.as_str()?.to_string();
-    let chat_type = message.get("chat_type").and_then(|c| c.as_str()).unwrap_or("group").to_string();
+    let chat_type = message
+        .get("chat_type")
+        .and_then(|c| c.as_str())
+        .unwrap_or("group")
+        .to_string();
     let message_id = message.get("message_id")?.as_str()?.to_string();
-    let root_id = message.get("root_id").and_then(|r| r.as_str()).map(|s| s.to_string());
+    let root_id = message
+        .get("root_id")
+        .and_then(|r| r.as_str())
+        .map(|s| s.to_string());
     let open_id = event
         .get("sender")
         .and_then(|s| s.get("sender_id"))
@@ -563,7 +595,10 @@ fn parse_message_event(v: &Value, bot_open_id: Option<&str>) -> Option<IncomingM
         .and_then(|t| t.as_str())
         .unwrap_or("text")
         .to_string();
-    let content_raw = message.get("content").and_then(|c| c.as_str()).unwrap_or("{}");
+    let content_raw = message
+        .get("content")
+        .and_then(|c| c.as_str())
+        .unwrap_or("{}");
     let content: Value = serde_json::from_str(content_raw).unwrap_or(Value::Null);
     let (text, has_media) = extract_content(&message_type, &content);
 
@@ -672,7 +707,10 @@ fn strip_mention_tokens(text: &str) -> String {
 /// Parse a card button action into a synthetic inbound message. Our cards
 /// embed `{"value": {"text": "...", "chat_id": "..."}}` on buttons.
 fn parse_card_action(v: &Value) -> Option<IncomingMessage> {
-    let action = v.get("event").and_then(|e| e.get("action")).or_else(|| v.get("action"))?;
+    let action = v
+        .get("event")
+        .and_then(|e| e.get("action"))
+        .or_else(|| v.get("action"))?;
     let value = action.get("value")?;
     let text = value.get("text").and_then(|t| t.as_str())?.to_string();
     let chat_id = value
@@ -697,7 +735,10 @@ fn parse_card_action(v: &Value) -> Option<IncomingMessage> {
         chat_id,
         open_id,
         text,
-        message_id: format!("cardaction:{}", value.get("text").and_then(|t| t.as_str()).unwrap_or("")),
+        message_id: format!(
+            "cardaction:{}",
+            value.get("text").and_then(|t| t.as_str()).unwrap_or("")
+        ),
         root_id: None,
         // A button click is always an explicit interaction with the bot.
         mentioned: true,
@@ -715,7 +756,9 @@ fn api_base() -> String {
         .lock()
         .ok()
         .and_then(|s| s.api_base.clone())
-        .or_else(|| load_runtime_config().and_then(|c| c.get("api_base")?.as_str().map(|s| s.to_string())))
+        .or_else(|| {
+            load_runtime_config().and_then(|c| c.get("api_base")?.as_str().map(|s| s.to_string()))
+        })
         .unwrap_or_else(|| DEFAULT_API_BASE.to_string())
 }
 
@@ -729,15 +772,23 @@ fn tenant_access_token(app_id: &str, app_secret: &str) -> Result<String, String>
             }
         }
     }
-    let url = format!("{}/open-apis/auth/v3/tenant_access_token/internal", api_base());
+    let url = format!(
+        "{}/open-apis/auth/v3/tenant_access_token/internal",
+        api_base()
+    );
     let resp = ureq::post(&url)
         .set("Content-Type", "application/json; charset=utf-8")
         .send_json(json!({ "app_id": app_id, "app_secret": app_secret }))
         .map_err(|e| format!("tenant token request failed: {e}"))?;
-    let body: Value = resp.into_json().map_err(|e| format!("tenant token parse: {e}"))?;
+    let body: Value = resp
+        .into_json()
+        .map_err(|e| format!("tenant token parse: {e}"))?;
     let code = body.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
     if code != 0 {
-        return Err(format!("tenant token error code={code}: {}", body.get("msg").and_then(|m| m.as_str()).unwrap_or("")));
+        return Err(format!(
+            "tenant token error code={code}: {}",
+            body.get("msg").and_then(|m| m.as_str()).unwrap_or("")
+        ));
     }
     let token = body
         .get("tenant_access_token")
@@ -785,7 +836,9 @@ fn feishu_update_card(token: &str, message_id: &str, card: &Value) -> Result<Val
         .set("Content-Type", "application/json; charset=utf-8")
         .send_json(json!({ "content": card.to_string() }))
         .map_err(|e| format!("feishu card update failed: {e}"))?;
-    let parsed: Value = resp.into_json().map_err(|e| format!("feishu card update parse: {e}"))?;
+    let parsed: Value = resp
+        .into_json()
+        .map_err(|e| format!("feishu card update parse: {e}"))?;
     let code = parsed.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
     if code != 0 {
         return Err(format!(
@@ -835,10 +888,15 @@ fn feishu_send_message(
         .set("Content-Type", "application/json; charset=utf-8")
         .send_json(body)
         .map_err(|e| format!("feishu send failed: {e}"))?;
-    let parsed: Value = resp.into_json().map_err(|e| format!("feishu send parse: {e}"))?;
+    let parsed: Value = resp
+        .into_json()
+        .map_err(|e| format!("feishu send parse: {e}"))?;
     let code = parsed.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
     if code != 0 {
-        return Err(format!("feishu send error code={code}: {}", parsed.get("msg").and_then(|m| m.as_str()).unwrap_or("")));
+        return Err(format!(
+            "feishu send error code={code}: {}",
+            parsed.get("msg").and_then(|m| m.as_str()).unwrap_or("")
+        ));
     }
     Ok(parsed)
 }
@@ -920,8 +978,8 @@ fn feishu_download_resource(
     }
     // A JSON body on this endpoint is always an error payload, never a
     // resource — parse it and surface code/msg instead of writing garbage.
-    let looks_json = content_type.contains("application/json")
-        || bytes.first().is_some_and(|b| *b == b'{');
+    let looks_json =
+        content_type.contains("application/json") || bytes.first().is_some_and(|b| *b == b'{');
     if looks_json {
         if let Ok(v) = serde_json::from_slice::<Value>(&bytes) {
             let code = v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
@@ -940,7 +998,9 @@ fn feishu_get_json(api_base: &str, token: &str, path: &str) -> Result<Value, Str
         .set("Authorization", &format!("Bearer {token}"))
         .call()
         .map_err(|e| format!("feishu GET {path} failed: {e}"))?;
-    let parsed: Value = resp.into_json().map_err(|e| format!("feishu GET {path} parse: {e}"))?;
+    let parsed: Value = resp
+        .into_json()
+        .map_err(|e| format!("feishu GET {path} parse: {e}"))?;
     let code = parsed.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
     if code != 0 {
         return Err(format!(
@@ -955,11 +1015,19 @@ fn feishu_get_message_api(api_base: &str, token: &str, message_id: &str) -> Resu
     if message_id.starts_with("cardaction:") {
         return Err("synthetic cardaction message_id cannot be fetched".to_string());
     }
-    feishu_get_json(api_base, token, &format!("/open-apis/im/v1/messages/{message_id}"))
+    feishu_get_json(
+        api_base,
+        token,
+        &format!("/open-apis/im/v1/messages/{message_id}"),
+    )
 }
 
 fn feishu_get_chat_api(api_base: &str, token: &str, chat_id: &str) -> Result<Value, String> {
-    feishu_get_json(api_base, token, &format!("/open-apis/im/v1/chats/{chat_id}"))
+    feishu_get_json(
+        api_base,
+        token,
+        &format!("/open-apis/im/v1/chats/{chat_id}"),
+    )
 }
 
 fn feishu_list_chats_api(
@@ -1013,15 +1081,23 @@ fn feishu_upload_image(api_base: &str, token: &str, bytes: &[u8]) -> Result<Stri
         return Err(format!("image exceeds {MAX_RESOURCE_BYTES} bytes"));
     }
     let ext = guess_ext(bytes);
-    let boundary = format!("cordisfeishu{:x}", RESOURCE_SEQ.fetch_add(1, Ordering::Relaxed));
+    let boundary = format!(
+        "cordisfeishu{:x}",
+        RESOURCE_SEQ.fetch_add(1, Ordering::Relaxed)
+    );
     let body = build_multipart_image_body(&boundary, bytes, ext);
     let url = format!("{api_base}/open-apis/im/v1/images");
     let resp = ureq::post(&url)
         .set("Authorization", &format!("Bearer {token}"))
-        .set("Content-Type", &format!("multipart/form-data; boundary={boundary}"))
+        .set(
+            "Content-Type",
+            &format!("multipart/form-data; boundary={boundary}"),
+        )
         .send_bytes(&body)
         .map_err(|e| format!("feishu image upload failed: {e}"))?;
-    let parsed: Value = resp.into_json().map_err(|e| format!("feishu image upload parse: {e}"))?;
+    let parsed: Value = resp
+        .into_json()
+        .map_err(|e| format!("feishu image upload parse: {e}"))?;
     let code = parsed.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
     if code != 0 {
         return Err(format!(
@@ -1110,14 +1186,21 @@ fn handle_feishu_send(req: &NodeRequest) -> Result<NodeResponse, String> {
         &content,
         req.reply_to.as_deref(),
     )?;
-    Ok(NodeResponse { ok: true, node_id: "feishu_send".to_string(), message: Some("sent".to_string()), data: Some(data), error: None })
+    Ok(NodeResponse {
+        ok: true,
+        node_id: "feishu_send".to_string(),
+        message: Some("sent".to_string()),
+        data: Some(data),
+        error: None,
+    })
 }
 
 /// Resolve app credentials from payload/STATE/config and mint a token.
 fn resolve_token(payload: Option<&Value>) -> Result<String, String> {
-    let app_id = config_str(payload, "app_id", |s| s.app_id.clone()).ok_or("no app_id configured")?;
-    let app_secret =
-        config_str(payload, "app_secret", |s| s.app_secret.clone()).ok_or("no app_secret configured")?;
+    let app_id =
+        config_str(payload, "app_id", |s| s.app_id.clone()).ok_or("no app_id configured")?;
+    let app_secret = config_str(payload, "app_secret", |s| s.app_secret.clone())
+        .ok_or("no app_secret configured")?;
     tenant_access_token(&app_id, &app_secret)
 }
 
@@ -1136,12 +1219,18 @@ fn fetch_resource_core(payload: &Value, forced_type: Option<&str>) -> Result<Val
         .and_then(|v| v.as_str())
         .ok_or("file_key is required")?;
     let kind = forced_type.unwrap_or_else(|| {
-        payload.get("type").and_then(|v| v.as_str()).unwrap_or("image")
+        payload
+            .get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("image")
     });
     if kind != "image" && kind != "file" {
         return Err(format!("type must be 'image' or 'file', got {kind}"));
     }
-    let as_base64 = payload.get("as_base64").and_then(|v| v.as_bool()).unwrap_or(false);
+    let as_base64 = payload
+        .get("as_base64")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     let token = resolve_token(Some(payload))?;
     let base = api_base();
@@ -1163,11 +1252,20 @@ fn fetch_resource_core(payload: &Value, forced_type: Option<&str>) -> Result<Val
     Ok(data)
 }
 
-fn handle_feishu_fetch_resource(req: &NodeRequest, forced_type: Option<&str>) -> Result<NodeResponse, String> {
+fn handle_feishu_fetch_resource(
+    req: &NodeRequest,
+    forced_type: Option<&str>,
+) -> Result<NodeResponse, String> {
     let payload = req.payload.as_ref().ok_or("payload is required")?;
     let data = fetch_resource_core(payload, forced_type)?;
     let node_id = req.node_id.clone();
-    Ok(NodeResponse { ok: true, node_id, message: None, data: Some(data), error: None })
+    Ok(NodeResponse {
+        ok: true,
+        node_id,
+        message: None,
+        data: Some(data),
+        error: None,
+    })
 }
 
 fn handle_feishu_send_image(req: &NodeRequest) -> Result<NodeResponse, String> {
@@ -1180,12 +1278,16 @@ fn handle_feishu_send_image(req: &NodeRequest) -> Result<NodeResponse, String> {
         .trim()
         .to_string();
     if target.is_empty() {
-        return Err("target is required for feishu_send_image (chat:<id> or user:<id>)".to_string());
+        return Err(
+            "target is required for feishu_send_image (chat:<id> or user:<id>)".to_string(),
+        );
     }
-    let reply_to = req
-        .reply_to
-        .clone()
-        .or_else(|| payload.get("reply_to").and_then(|v| v.as_str()).map(|s| s.to_string()));
+    let reply_to = req.reply_to.clone().or_else(|| {
+        payload
+            .get("reply_to")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    });
 
     let token = resolve_token(req.payload.as_ref())?;
     let base = api_base();
@@ -1216,7 +1318,14 @@ fn handle_feishu_send_image(req: &NodeRequest) -> Result<NodeResponse, String> {
 
     let (recv_type, recv_id) = parse_target(&target)?;
     let content = json!({ "image_key": image_key }).to_string();
-    let sent = feishu_send_message(&token, recv_type, &recv_id, "image", &content, reply_to.as_deref())?;
+    let sent = feishu_send_message(
+        &token,
+        recv_type,
+        &recv_id,
+        "image",
+        &content,
+        reply_to.as_deref(),
+    )?;
     let message_id = sent
         .get("data")
         .and_then(|d| d.get("message_id"))
@@ -1287,8 +1396,14 @@ fn handle_feishu_entry(req: &NodeRequest) -> Result<NodeResponse, String> {
             // Merge into existing config so partial updates work.
             let mut config = load_runtime_config().unwrap_or_else(|| json!({}));
             for key in [
-                "app_id", "app_secret", "verification_token", "encrypt_key",
-                "bot_open_id", "api_base", "dm_policy", "group_policy",
+                "app_id",
+                "app_secret",
+                "verification_token",
+                "encrypt_key",
+                "bot_open_id",
+                "api_base",
+                "dm_policy",
+                "group_policy",
             ] {
                 if let Some(val) = payload.get(key).and_then(|v| v.as_str()) {
                     config[key] = json!(val);
@@ -1309,7 +1424,13 @@ fn handle_feishu_entry(req: &NodeRequest) -> Result<NodeResponse, String> {
             if let Ok(mut s) = STATE.lock() {
                 apply_config_to_state(&mut s, &config);
             }
-            Ok(NodeResponse { ok: true, node_id: "feishu_entry".to_string(), message: Some("configured".to_string()), data: None, error: None })
+            Ok(NodeResponse {
+                ok: true,
+                node_id: "feishu_entry".to_string(),
+                message: Some("configured".to_string()),
+                data: None,
+                error: None,
+            })
         }
         Some("status") => {
             let policy = current_policy();
@@ -1328,7 +1449,13 @@ fn handle_feishu_entry(req: &NodeRequest) -> Result<NodeResponse, String> {
                 "group_allow_count": policy.group_allow_from.len(),
                 "pending_pairings": PENDING_PAIRINGS.lock().map(|g| g.len()).unwrap_or(0),
             });
-            Ok(NodeResponse { ok: true, node_id: "feishu_entry".to_string(), message: None, data: Some(data), error: None })
+            Ok(NodeResponse {
+                ok: true,
+                node_id: "feishu_entry".to_string(),
+                message: None,
+                data: Some(data),
+                error: None,
+            })
         }
         Some("approve_pairing") => {
             let code = req
@@ -1365,7 +1492,12 @@ fn handle_feishu_entry(req: &NodeRequest) -> Result<NodeResponse, String> {
 }
 
 pub(crate) fn apply_config_to_state(s: &mut FeishuState, config: &Value) {
-    let g = |k: &str| config.get(k).and_then(|v| v.as_str()).map(|v| v.to_string());
+    let g = |k: &str| {
+        config
+            .get(k)
+            .and_then(|v| v.as_str())
+            .map(|v| v.to_string())
+    };
     let list = |k: &str| -> Vec<String> {
         config
             .get(k)
@@ -1399,7 +1531,13 @@ fn handle_feishu_serve(req: &NodeRequest) -> Result<NodeResponse, String> {
     if req.action.as_deref() == Some("stop") {
         SERVER_SHUTDOWN.store(true, Ordering::SeqCst);
         *SERVER_RUNNING.lock().map_err(|e| format!("lock: {e}"))? = false;
-        return Ok(NodeResponse { ok: true, node_id: "feishu_serve".to_string(), message: Some("stopped".to_string()), data: None, error: None });
+        return Ok(NodeResponse {
+            ok: true,
+            node_id: "feishu_serve".to_string(),
+            message: Some("stopped".to_string()),
+            data: None,
+            error: None,
+        });
     }
 
     // Hydrate STATE from persisted config on boot.
@@ -1419,7 +1557,13 @@ fn handle_feishu_serve(req: &NodeRequest) -> Result<NodeResponse, String> {
 
     let mut running = SERVER_RUNNING.lock().map_err(|e| format!("lock: {e}"))?;
     if *running {
-        return Ok(NodeResponse { ok: true, node_id: "feishu_serve".to_string(), message: Some(format!("already running (mode={mode})")), data: None, error: None });
+        return Ok(NodeResponse {
+            ok: true,
+            node_id: "feishu_serve".to_string(),
+            message: Some(format!("already running (mode={mode})")),
+            data: None,
+            error: None,
+        });
     }
 
     let message = if mode == "webhook" {
@@ -1480,33 +1624,50 @@ fn run_event_loop(server: tiny_http::Server) {
             continue;
         }
         if url != "/feishu/event" || method != tiny_http::Method::Post {
-            let _ = request.respond(tiny_http::Response::from_string("not found").with_status_code(404));
+            let _ = request
+                .respond(tiny_http::Response::from_string("not found").with_status_code(404));
             continue;
         }
 
         let mut request = request;
         let mut body = String::new();
         if request.as_reader().read_to_string(&mut body).is_err() {
-            let _ = request.respond(tiny_http::Response::from_string("bad body").with_status_code(400));
+            let _ =
+                request.respond(tiny_http::Response::from_string("bad body").with_status_code(400));
             continue;
         }
 
         let (vtoken, ekey, bot) = {
             let s = STATE.lock().unwrap_or_else(|p| p.into_inner());
-            (s.verification_token.clone(), s.encrypt_key.clone(), s.bot_open_id.clone())
+            (
+                s.verification_token.clone(),
+                s.encrypt_key.clone(),
+                s.bot_open_id.clone(),
+            )
         };
         let policy = current_policy();
 
-        match interpret_inbound(&body, vtoken.as_deref(), ekey.as_deref(), bot.as_deref(), &policy) {
+        match interpret_inbound(
+            &body,
+            vtoken.as_deref(),
+            ekey.as_deref(),
+            bot.as_deref(),
+            &policy,
+        ) {
             InboundOutcome::Challenge(resp) => {
                 let _ = request.respond(
-                    tiny_http::Response::from_string(resp)
-                        .with_header("Content-Type: application/json".parse::<tiny_http::Header>().unwrap()),
+                    tiny_http::Response::from_string(resp).with_header(
+                        "Content-Type: application/json"
+                            .parse::<tiny_http::Header>()
+                            .unwrap(),
+                    ),
                 );
             }
             InboundOutcome::Rejected(reason) => {
                 eprintln!("[feishu] rejected: {reason}");
-                let _ = request.respond(tiny_http::Response::from_string("unauthorized").with_status_code(401));
+                let _ = request.respond(
+                    tiny_http::Response::from_string("unauthorized").with_status_code(401),
+                );
             }
             outcome => {
                 // Always 200 first so Feishu doesn't retry.
@@ -1527,9 +1688,12 @@ pub(crate) fn process_outcome(outcome: InboundOutcome) {
             eprintln!("[feishu] pairing request from {open_id}: code {code}");
             // Best-effort: tell the user their pairing code. Failure is
             // non-fatal (e.g. credentials not yet configured).
-            if let Err(e) = send_text_to(&format!("user:{open_id}"), &format!(
-                "你还未获得使用授权。配对码：{code}\n请联系管理员执行 approve_pairing 批准。"
-            )) {
+            if let Err(e) = send_text_to(
+                &format!("user:{open_id}"),
+                &format!(
+                    "你还未获得使用授权。配对码：{code}\n请联系管理员执行 approve_pairing 批准。"
+                ),
+            ) {
                 eprintln!("[feishu] pairing reply failed: {e}");
             }
         }
@@ -1542,8 +1706,8 @@ pub(crate) fn process_outcome(outcome: InboundOutcome) {
 /// Minimal internal text send (used for pairing replies).
 fn send_text_to(target: &str, message: &str) -> Result<(), String> {
     let app_id = config_str(None, "app_id", |s| s.app_id.clone()).ok_or("no app_id configured")?;
-    let app_secret =
-        config_str(None, "app_secret", |s| s.app_secret.clone()).ok_or("no app_secret configured")?;
+    let app_secret = config_str(None, "app_secret", |s| s.app_secret.clone())
+        .ok_or("no app_secret configured")?;
     let token = tenant_access_token(&app_id, &app_secret)?;
     let (recv_type, recv_id) = parse_target(target)?;
     feishu_send_message(
@@ -1668,7 +1832,11 @@ fn should_process(msg: &IncomingMessage) -> bool {
 fn build_envelope(msg: &IncomingMessage) -> String {
     let reply_target = format!("chat:{}", msg.chat_id);
     let session_key = format!("feishu:{}", reply_target);
-    let scope = if msg.chat_type == "p2p" { "private" } else { "group" };
+    let scope = if msg.chat_type == "p2p" {
+        "private"
+    } else {
+        "group"
+    };
     // Media messages carry a msg=<message_id> in the display prefix so the
     // agent can pass it to feishu_fetch_resource alongside the file_key from
     // the placeholder. Synthetic card-action ids are not real messages.
@@ -1857,14 +2025,14 @@ mod tests {
 
     #[test]
     fn challenge_handshake_echoes_challenge() {
-        let body = json!({"type":"url_verification","challenge":"abc123","token":"vtok"}).to_string();
-        match interpret_inbound(&body, Some("vtok"), None, None, &open_policy()) {
-            InboundOutcome::Challenge(resp) => {
-                let v: Value = serde_json::from_str(&resp).unwrap();
-                assert_eq!(v.get("challenge").unwrap().as_str().unwrap(), "abc123");
-            }
-            other => panic!("expected Challenge, got {:?}", std::mem::discriminant(&other)),
-        }
+        let body =
+            json!({"type":"url_verification","challenge":"abc123","token":"vtok"}).to_string();
+        let out = interpret_inbound(&body, Some("vtok"), None, None, &open_policy());
+        let InboundOutcome::Challenge(resp) = out else {
+            panic!("expected Challenge")
+        };
+        let v: Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v.get("challenge").unwrap().as_str().unwrap(), "abc123");
     }
 
     #[test]
@@ -1881,7 +2049,8 @@ mod tests {
         let body = json!({
             "header": {"event_type":"im.message.receive_v1","token":"BAD"},
             "event": {}
-        }).to_string();
+        })
+        .to_string();
         assert!(matches!(
             interpret_inbound(&body, Some("vtok"), None, None, &open_policy()),
             InboundOutcome::Rejected(_)
@@ -1891,13 +2060,12 @@ mod tests {
     #[test]
     fn p2p_message_is_actionable() {
         let body = message_event("p2p", "oc_1", "om_1", "hello there", &[]).to_string();
-        match interpret_inbound(&body, Some("vtok"), None, Some("ou_bot"), &open_policy()) {
-            InboundOutcome::Message(im) => {
-                assert_eq!(im.chat_id, "oc_1");
-                assert_eq!(im.text, "hello there");
-            }
-            _ => panic!("expected Message"),
-        }
+        let out = interpret_inbound(&body, Some("vtok"), None, Some("ou_bot"), &open_policy());
+        let InboundOutcome::Message(im) = out else {
+            panic!("expected Message")
+        };
+        assert_eq!(im.chat_id, "oc_1");
+        assert_eq!(im.text, "hello there");
     }
 
     #[test]
@@ -1911,20 +2079,21 @@ mod tests {
 
     #[test]
     fn group_message_with_at_bot_is_actionable() {
-        let body = message_event("group", "oc_3", "om_3", "@_user_1 hi bot", &["ou_bot"]).to_string();
-        match interpret_inbound(&body, Some("vtok"), None, Some("ou_bot"), &open_policy()) {
-            InboundOutcome::Message(im) => {
-                assert_eq!(im.chat_id, "oc_3");
-                // mention placeholder stripped
-                assert_eq!(im.text, "hi bot");
-            }
-            _ => panic!("expected Message"),
-        }
+        let body =
+            message_event("group", "oc_3", "om_3", "@_user_1 hi bot", &["ou_bot"]).to_string();
+        let out = interpret_inbound(&body, Some("vtok"), None, Some("ou_bot"), &open_policy());
+        let InboundOutcome::Message(im) = out else {
+            panic!("expected Message")
+        };
+        assert_eq!(im.chat_id, "oc_3");
+        // mention placeholder stripped
+        assert_eq!(im.text, "hi bot");
     }
 
     #[test]
     fn group_at_someone_else_is_skipped() {
-        let body = message_event("group", "oc_4", "om_4", "@_user_1 hi", &["ou_someone"]).to_string();
+        let body =
+            message_event("group", "oc_4", "om_4", "@_user_1 hi", &["ou_someone"]).to_string();
         assert!(matches!(
             interpret_inbound(&body, Some("vtok"), None, Some("ou_bot"), &open_policy()),
             InboundOutcome::Ignore(_)
@@ -1933,8 +2102,14 @@ mod tests {
 
     #[test]
     fn parse_target_variants() {
-        assert_eq!(parse_target("chat:oc_x").unwrap(), ("chat_id", "oc_x".to_string()));
-        assert_eq!(parse_target("user:ou_y").unwrap(), ("open_id", "ou_y".to_string()));
+        assert_eq!(
+            parse_target("chat:oc_x").unwrap(),
+            ("chat_id", "oc_x".to_string())
+        );
+        assert_eq!(
+            parse_target("user:ou_y").unwrap(),
+            ("open_id", "ou_y".to_string())
+        );
         assert!(parse_target("bogus").is_err());
     }
 
@@ -1996,14 +2171,14 @@ mod tests {
                 "action": {"value": {"text":"button clicked","chat_id":"oc_card"}},
                 "operator": {"open_id":"ou_op"}
             }
-        }).to_string();
-        match interpret_inbound(&body, Some("vtok"), None, None, &open_policy()) {
-            InboundOutcome::CardAction(im) => {
-                assert_eq!(im.chat_id, "oc_card");
-                assert_eq!(im.text, "button clicked");
-            }
-            _ => panic!("expected CardAction"),
-        }
+        })
+        .to_string();
+        let out = interpret_inbound(&body, Some("vtok"), None, None, &open_policy());
+        let InboundOutcome::CardAction(im) = out else {
+            panic!("expected CardAction")
+        };
+        assert_eq!(im.chat_id, "oc_card");
+        assert_eq!(im.text, "button clicked");
     }
 
     // ---- Access-policy matrix -------------------------------------------
@@ -2036,7 +2211,10 @@ mod tests {
 
     #[test]
     fn dm_open_allows_anyone() {
-        let p = AccessPolicy { dm_policy: "open".into(), ..AccessPolicy::default() };
+        let p = AccessPolicy {
+            dm_policy: "open".into(),
+            ..AccessPolicy::default()
+        };
         assert!(matches!(
             policy_gate(msg("p2p", "oc", "ou_stranger", false), &p),
             InboundOutcome::Message(_)
@@ -2064,19 +2242,17 @@ mod tests {
     fn dm_pairing_issues_code_for_unknown_then_allows_after_approve() {
         let p = AccessPolicy::default(); // dm_policy = pairing
         let outcome = policy_gate(msg("p2p", "oc", "ou_new", false), &p);
-        let code = match outcome {
-            InboundOutcome::Pairing(oid, code) => {
-                assert_eq!(oid, "ou_new");
-                assert_eq!(code.len(), 6);
-                code
-            }
-            _ => panic!("expected Pairing"),
+        let InboundOutcome::Pairing(oid, code) = outcome else {
+            panic!("expected Pairing")
         };
+        assert_eq!(oid, "ou_new");
+        assert_eq!(code.len(), 6);
         // Same user retries → same code (deterministic).
-        match policy_gate(msg("p2p", "oc", "ou_new", false), &p) {
-            InboundOutcome::Pairing(_, code2) => assert_eq!(code2, code),
-            _ => panic!("expected Pairing again"),
-        }
+        let retry = policy_gate(msg("p2p", "oc", "ou_new", false), &p);
+        let InboundOutcome::Pairing(_, code2) = retry else {
+            panic!("expected Pairing again")
+        };
+        assert_eq!(code2, code);
         // Known users pass without pairing.
         let p_known = AccessPolicy {
             dm_allow_from: vec!["ou_new".into()],
@@ -2090,7 +2266,10 @@ mod tests {
 
     #[test]
     fn group_disabled_ignores_everything() {
-        let p = AccessPolicy { group_policy: "disabled".into(), ..AccessPolicy::default() };
+        let p = AccessPolicy {
+            group_policy: "disabled".into(),
+            ..AccessPolicy::default()
+        };
         assert!(matches!(
             policy_gate(msg("group", "oc_g", "ou", true), &p),
             InboundOutcome::Ignore(_)
@@ -2127,7 +2306,10 @@ mod tests {
             InboundOutcome::Message(_)
         ));
         // Explicit require_mention=true still gates.
-        let p2 = AccessPolicy { require_mention: Some(true), ..p };
+        let p2 = AccessPolicy {
+            require_mention: Some(true),
+            ..p
+        };
         assert!(matches!(
             policy_gate(msg("group", "oc_any", "ou", false), &p2),
             InboundOutcome::Ignore(_)
@@ -2156,14 +2338,23 @@ mod tests {
     #[test]
     fn cards_have_expected_shape() {
         let lc = loading_card();
-        assert!(lc["elements"][0]["text"]["content"].as_str().unwrap().contains("思考中"));
+        assert!(lc["elements"][0]["text"]["content"]
+            .as_str()
+            .unwrap()
+            .contains("思考中"));
         let fc = final_card("**done**");
         assert_eq!(fc["elements"][0]["tag"], "markdown");
         assert_eq!(fc["elements"][0]["content"], "**done**");
     }
 
     // Build an im.message.receive_v1 event with optional @mention open_ids.
-    fn message_event(chat_type: &str, chat_id: &str, msg_id: &str, text: &str, mentions: &[&str]) -> Value {
+    fn message_event(
+        chat_type: &str,
+        chat_id: &str,
+        msg_id: &str,
+        text: &str,
+        mentions: &[&str],
+    ) -> Value {
         let mention_arr: Vec<Value> = mentions
             .iter()
             .map(|oid| json!({"id":{"open_id":oid}}))
@@ -2218,14 +2409,13 @@ mod tests {
             json!({"image_key": "img_key_1"}),
         )
         .to_string();
-        match interpret_inbound(&body, Some("vtok"), None, Some("ou_bot"), &open_policy()) {
-            InboundOutcome::Message(im) => {
-                assert_eq!(im.text, "[image file_key=img_key_1]");
-                assert!(im.has_media);
-                assert_eq!(im.message_type, "image");
-            }
-            _ => panic!("expected Message"),
-        }
+        let out = interpret_inbound(&body, Some("vtok"), None, Some("ou_bot"), &open_policy());
+        let InboundOutcome::Message(im) = out else {
+            panic!("expected Message")
+        };
+        assert_eq!(im.text, "[image file_key=img_key_1]");
+        assert!(im.has_media);
+        assert_eq!(im.message_type, "image");
     }
 
     #[test]
@@ -2291,26 +2481,31 @@ mod tests {
 
     #[test]
     fn unknown_message_type_is_forwarded_as_unsupported() {
-        let body = media_event("p2p", "oc_u", "om_u", "share_chat", json!({"chat_id":"x"}))
-            .to_string();
-        match interpret_inbound(&body, Some("vtok"), None, Some("ou_bot"), &open_policy()) {
-            InboundOutcome::Message(im) => {
-                assert_eq!(im.text, "[unsupported message_type=share_chat]");
-                assert!(im.has_media);
-            }
-            _ => panic!("expected Message"),
-        }
+        let body =
+            media_event("p2p", "oc_u", "om_u", "share_chat", json!({"chat_id":"x"})).to_string();
+        let out = interpret_inbound(&body, Some("vtok"), None, Some("ou_bot"), &open_policy());
+        let InboundOutcome::Message(im) = out else {
+            panic!("expected Message")
+        };
+        assert_eq!(im.text, "[unsupported message_type=share_chat]");
+        assert!(im.has_media);
     }
 
     #[test]
     fn extract_content_malformed_does_not_panic() {
         // Missing keys degrade to empty placeholders.
-        assert_eq!(extract_content("image", &Value::Null), ("[image file_key=]".to_string(), true));
+        assert_eq!(
+            extract_content("image", &Value::Null),
+            ("[image file_key=]".to_string(), true)
+        );
         assert_eq!(
             extract_content("file", &json!({})),
             ("[file file_key= name=\"\"]".to_string(), true)
         );
-        assert_eq!(extract_content("text", &Value::Null), (String::new(), false));
+        assert_eq!(
+            extract_content("text", &Value::Null),
+            (String::new(), false)
+        );
         // A post with no content array is just an empty string.
         assert_eq!(extract_content("post", &json!({})), (String::new(), false));
     }
@@ -2352,10 +2547,12 @@ mod tests {
     #[test]
     fn download_rejects_cardaction_id_without_network() {
         // The cardaction guard is the first check, so no network is touched.
-        let err = feishu_download_resource("http://127.0.0.1:0", "tok", "cardaction:foo", "k", "image")
-            .unwrap_err();
+        let err =
+            feishu_download_resource("http://127.0.0.1:0", "tok", "cardaction:foo", "k", "image")
+                .unwrap_err();
         assert!(err.contains("cardaction"));
-        let err = feishu_get_message_api("http://127.0.0.1:0", "tok", "cardaction:foo").unwrap_err();
+        let err =
+            feishu_get_message_api("http://127.0.0.1:0", "tok", "cardaction:foo").unwrap_err();
         assert!(err.contains("cardaction"));
     }
 

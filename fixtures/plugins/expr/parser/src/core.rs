@@ -97,7 +97,9 @@ pub fn parse(tokens: &[Token]) -> Result<ExprAst, ParseError> {
 
 fn map_lex_error(err: LexError) -> ParseExpressionError {
     match err {
-        LexError::UnexpectedToken { position } => ParseExpressionError::UnexpectedToken { position },
+        LexError::UnexpectedToken { position } => {
+            ParseExpressionError::UnexpectedToken { position }
+        }
         LexError::InvalidNumber { text, position } => {
             ParseExpressionError::InvalidNumber { text, position }
         }
@@ -106,12 +108,18 @@ fn map_lex_error(err: LexError) -> ParseExpressionError {
 
 fn map_parse_error(err: ParseError) -> ParseExpressionError {
     match err {
-        ParseError::UnexpectedToken { position } => ParseExpressionError::UnexpectedToken { position },
+        ParseError::UnexpectedToken { position } => {
+            ParseExpressionError::UnexpectedToken { position }
+        }
         ParseError::MissingRightParen { position } => {
             ParseExpressionError::MissingRightParen { position }
         }
-        ParseError::ExpectedNumber { position } => ParseExpressionError::ExpectedNumber { position },
-        ParseError::TooDeep { position, limit } => ParseExpressionError::TooDeep { position, limit },
+        ParseError::ExpectedNumber { position } => {
+            ParseExpressionError::ExpectedNumber { position }
+        }
+        ParseError::TooDeep { position, limit } => {
+            ParseExpressionError::TooDeep { position, limit }
+        }
     }
 }
 

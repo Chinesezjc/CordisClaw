@@ -18,7 +18,7 @@ use cordis_runtime::core::models::NodeOutcome;
 use cordis_runtime::execution::engine::{ExecutionMetrics, ExecutionOutput};
 use cordis_runtime::host::{
     AgentSessionKind, AgentStartOptions, KernelPluginIterationResult, ReloadAttemptStatus,
-    RuntimeHost, RuntimeKernel,
+    RuntimeHost, RuntimeKernel, WalkControl,
 };
 use cordis_runtime::kernel::plugin_iteration::{
     CanaryReport, CanaryVerdict, KernelPluginIssueSource, KernelPluginIterationRequest,
@@ -30,7 +30,7 @@ use serde_json::json;
 use serial_test::serial;
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
 mod support;
@@ -698,4 +698,144 @@ fn kernel_run_iteration_records_change_memory_entry() {
     let status = kernel.status();
     assert_eq!(status.history_len, 1);
     assert!(status.last_change.is_some());
+}
+/// Copy only `artifacts/` (+ small top-level config files) into a fresh temp
+/// dir and boot a host on it. The returned `TempDir` owns the tree; the
+/// `PathBuf` is the fixtures root passed to `boot`.
+fn boot_on_artifacts_copy() -> (TempDir, PathBuf, RuntimeHost) {
+    let temp = TempDir::new().expect("tempdir");
+    let root = fixtures_root();
+    copy_dir_all(&root.join("artifacts"), &temp.path().join("artifacts"));
+    for name in ["notify_handlers.json", "startup_invoke.json"] {
+        let src = root.join(name);
+        if src.exists() {
+            fs::copy(&src, temp.path().join(name)).expect("copy top-level fixture file");
+        }
+    }
+    let fixtures = temp.path().to_path_buf();
+    // Flaky-guard (mirrors `host_coverage::shared_host`): concurrent suites
+    // rebuild the fixture dylibs mid-run, so the copied `index.json`'s recorded
+    // sha256 can be stale relative to the copied `.so`. A boot would then fail
+    // with `PluginUnavailable { HashMismatch }`. Re-hash the copied artifacts
+    // against the copied index before booting.
+    cordis_runtime::plugin::tooling::refresh_artifact_index(&fixtures)
+        .expect("refresh copied artifact index before boot");
+    let host = RuntimeHost::boot(&fixtures).expect("host should boot on artifacts-only copy");
+    (temp, fixtures, host)
+}
+
+// create_plugin: workspace manifest is present but not valid TOML. The skeleton
+// (src dir + Cargo.toml + lib.rs) is written first, then the read succeeds but
+// `toml::from_str` fails → InvalidArgument "failed to parse workspace manifest".
+#[test]
+#[serial]
+fn create_plugin_rejects_malformed_workspace_manifest() {
+    let (_temp, fixtures, host) = boot_on_artifacts_copy();
+    let plugins = fixtures.join("plugins");
+    fs::create_dir_all(&plugins).expect("mkdir plugins");
+    fs::write(plugins.join("Cargo.toml"), "this = = not valid toml").expect("write bad manifest");
+
+    let err = host
+        .create_plugin("widget", Some("a widget"))
+        .expect_err("malformed workspace manifest must abort create_plugin");
+    assert!(
+        matches!(&err, RuntimeError::InvalidArgument { message } if message.starts_with("failed to parse workspace manifest:")),
+        "expected InvalidArgument, got {err:?}"
+    );
+    // The skeleton files were written before the manifest RMW failed.
+    assert!(plugins.join("widget/Cargo.toml").exists());
+    assert!(plugins.join("widget/src/lib.rs").exists());
+}
+
+// create_plugin: workspace manifest is entirely absent. The read arm surfaces
+// as an Io error with the "failed to read workspace manifest" message.
+#[test]
+#[serial]
+fn create_plugin_errors_when_workspace_manifest_missing() {
+    let (_temp, fixtures, host) = boot_on_artifacts_copy();
+    // No plugins/Cargo.toml exists (only the artifacts tree was copied).
+    let err = host
+        .create_plugin("gizmo", None)
+        .expect_err("missing workspace manifest must abort create_plugin");
+    assert!(
+        matches!(&err, RuntimeError::Io { path, message } if path == &fixtures.join("plugins").join("Cargo.toml") && message.starts_with("failed to read workspace manifest:")),
+        "expected Io, got {err:?}"
+    );
+}
+
+// create_plugin: the workspace table has no `members` array → InvalidArgument
+// "workspace.members not found".
+#[test]
+#[serial]
+fn create_plugin_rejects_manifest_without_members() {
+    let (_temp, fixtures, host) = boot_on_artifacts_copy();
+    let plugins = fixtures.join("plugins");
+    fs::create_dir_all(&plugins).expect("mkdir plugins");
+    // Valid TOML, but no [workspace].members key.
+    fs::write(
+        plugins.join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\n",
+    )
+    .expect("write manifest without members");
+
+    let err = host
+        .create_plugin("sprocket", None)
+        .expect_err("manifest without members must abort create_plugin");
+    assert!(
+        matches!(&err, RuntimeError::InvalidArgument { message } if message == "workspace.members not found in plugins/Cargo.toml"),
+        "expected InvalidArgument, got {err:?}"
+    );
+}
+
+// walk_code_files: directories named target / .git / node_modules are pruned,
+// so source files nested inside them are never visited, while a sibling source
+// file at the tree root is.
+#[test]
+#[serial]
+fn walk_code_files_prunes_target_git_and_node_modules() {
+    let (_temp, _fixtures, host) = boot_on_artifacts_copy();
+    let tree = TempDir::new().expect("walk tree");
+    let root = tree.path();
+    // A visible source file at the root.
+    fs::write(root.join("keep.rs"), "// keep").expect("write keep.rs");
+    // Source files buried in pruned directories.
+    for dir in ["target", ".git", "node_modules"] {
+        let d = root.join(dir);
+        fs::create_dir_all(&d).expect("mkdir pruned dir");
+        fs::write(d.join("hidden.rs"), "// hidden").expect("write hidden.rs");
+    }
+
+    let mut seen: Vec<String> = Vec::new();
+    host.walk_code_files(root, &mut |rel, _abs| seen.push(rel.to_string()))
+        .expect("walk should succeed");
+
+    assert!(
+        seen.iter().any(|r| r == "keep.rs"),
+        "root source file should be visited: {seen:?}"
+    );
+    assert!(
+        !seen.iter().any(|r| r.contains("hidden.rs")),
+        "files under target/.git/node_modules must be pruned: {seen:?}"
+    );
+}
+
+// walk_code_files honors an early Stop from the visitor via walk_code_files_ctl
+// (the public non-ctl wrapper always Continues; this asserts the Stop return).
+#[test]
+#[serial]
+fn walk_code_files_ctl_stops_early() {
+    let (_temp, _fixtures, host) = boot_on_artifacts_copy();
+    let tree = TempDir::new().expect("walk tree");
+    let root = tree.path();
+    for name in ["a.rs", "b.rs", "c.rs"] {
+        fs::write(root.join(name), "// src").expect("write src");
+    }
+
+    let mut count = 0usize;
+    host.walk_code_files_ctl(root, &mut |_, _| {
+        count += 1;
+        WalkControl::Stop
+    })
+    .expect("walk_ctl should succeed");
+    assert_eq!(count, 1, "Stop after the first hit must end the walk");
 }
