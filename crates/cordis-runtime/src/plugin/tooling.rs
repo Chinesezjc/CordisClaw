@@ -876,7 +876,22 @@ fn collect_local_dependency_dirs(
 fn load_workspace_metadata(
     workspace_manifest_path: &Path,
 ) -> Result<CargoMetadataOutput, RuntimeError> {
-    let output = run_command(
+    load_workspace_metadata_with_runner(workspace_manifest_path, run_command)
+}
+
+/// Runner-parameterized core of `load_workspace_metadata`. The public entry
+/// point injects the real `run_command`; tests inject a runner that fails or
+/// returns synthetic bytes so the subprocess-failure and parse arms can be
+/// exercised without spawning `cargo`. Argument order, timing, and error text
+/// are identical to the direct implementation.
+fn load_workspace_metadata_with_runner<R>(
+    workspace_manifest_path: &Path,
+    runner: R,
+) -> Result<CargoMetadataOutput, RuntimeError>
+where
+    R: Fn(&str, &[String], Option<&Path>) -> Result<Vec<u8>, RuntimeError>,
+{
+    let output = runner(
         "cargo",
         &[
             "metadata".to_string(),
@@ -1074,12 +1089,28 @@ fn read_plugin_build_spec(manifest_path: &Path) -> Result<PluginBuildSpec, Runti
 }
 
 fn build_plugin_artifact(fixtures_root: &Path, manifest_path: &Path) -> Result<(), RuntimeError> {
+    build_plugin_artifact_with_runner(fixtures_root, manifest_path, run_command)
+}
+
+/// Runner-parameterized core of `build_plugin_artifact`. The public entry
+/// point injects the real `run_command`; tests inject a failing runner to hit
+/// the `cargo build` failure arm without spawning a subprocess. The
+/// missing-parent invariant and command arguments are identical to the direct
+/// implementation.
+fn build_plugin_artifact_with_runner<R>(
+    fixtures_root: &Path,
+    manifest_path: &Path,
+    runner: R,
+) -> Result<(), RuntimeError>
+where
+    R: Fn(&str, &[String], Option<&Path>) -> Result<Vec<u8>, RuntimeError>,
+{
     let repo_root = fixtures_root
         .parent()
         .ok_or_else(|| RuntimeError::Invariant {
             message: format!("fixtures root missing parent: {}", fixtures_root.display()),
         })?;
-    run_command(
+    runner(
         "cargo",
         &[
             "build".to_string(),
@@ -1092,7 +1123,23 @@ fn build_plugin_artifact(fixtures_root: &Path, manifest_path: &Path) -> Result<(
 }
 
 fn built_dylib_path(manifest_path: &Path, package_name: &str) -> Result<PathBuf, RuntimeError> {
-    let metadata = run_command(
+    built_dylib_path_with_runner(manifest_path, package_name, run_command)
+}
+
+/// Runner-parameterized core of `built_dylib_path`. The public entry point
+/// injects the real `run_command`; tests inject a failing runner (metadata
+/// subprocess failure arm) or a runner returning synthetic metadata bytes
+/// (parse + path-composition arm) without spawning `cargo`. Command arguments
+/// and the resulting path layout are identical to the direct implementation.
+fn built_dylib_path_with_runner<R>(
+    manifest_path: &Path,
+    package_name: &str,
+    runner: R,
+) -> Result<PathBuf, RuntimeError>
+where
+    R: Fn(&str, &[String], Option<&Path>) -> Result<Vec<u8>, RuntimeError>,
+{
+    let metadata = runner(
         "cargo",
         &[
             "metadata".to_string(),
@@ -2795,5 +2842,237 @@ exports = ["svc_a", "svc_b"]
             }
             other => panic!("expected InvalidArgument(spawn), got {other:?}"),
         }
+
+    // ---------- P2 command-executor parameterization ----------
+    //
+    // The cargo-subprocess orchestration helpers (`load_workspace_metadata`,
+    // `build_plugin_artifact`, `built_dylib_path`) are factored into
+    // `*_with_runner` cores. The public entry points inject the real
+    // `run_command`; these tests inject a runner closure so the subprocess
+    // failure / synthetic-metadata arms run without spawning `cargo`. Argument
+    // order and error text are identical to the direct path.
+
+    /// A runner that always fails, mimicking a `cargo` subprocess that exited
+    /// non-zero. Used to drive the `?` early-return of each orchestration core.
+    fn failing_runner(
+        _program: &str,
+        args: &[String],
+        _dir: Option<&std::path::Path>,
+    ) -> Result<Vec<u8>, super::RuntimeError> {
+        Err(super::RuntimeError::CommandFailed {
+            program: "cargo".to_string(),
+            args: args.to_vec(),
+            message: "synthetic build failure".to_string(),
+        })
+    }
+
+    #[test]
+    fn load_workspace_metadata_with_runner_propagates_subprocess_failure() {
+        use super::load_workspace_metadata_with_runner;
+        use crate::core::error::RuntimeError;
+        use std::path::Path;
+        let err = load_workspace_metadata_with_runner(
+            Path::new("/repo/plugins/Cargo.toml"),
+            failing_runner,
+        );
+        assert!(matches!(err, Err(RuntimeError::CommandFailed { .. })));
+    }
+
+    #[test]
+    fn load_workspace_metadata_with_runner_parses_injected_bytes() {
+        use super::load_workspace_metadata_with_runner;
+        use std::path::Path;
+        let runner = |_p: &str, _a: &[String], _d: Option<&Path>| {
+            Ok(br#"{"packages":[],"workspace_members":[],"target_directory":"/tmp/wtd","resolve":null}"#.to_vec())
+        };
+        let parsed =
+            load_workspace_metadata_with_runner(Path::new("/repo/plugins/Cargo.toml"), runner)
+                .expect("synthetic metadata parses");
+        assert_eq!(parsed.target_directory, "/tmp/wtd");
+        assert!(parsed.packages.is_empty());
+    }
+
+    #[test]
+    fn load_workspace_metadata_with_runner_maps_bad_bytes_to_parse_error() {
+        use super::load_workspace_metadata_with_runner;
+        use crate::core::error::RuntimeError;
+        use std::path::Path;
+        let runner = |_p: &str, _a: &[String], _d: Option<&Path>| Ok(b"{ not json".to_vec());
+        let err = load_workspace_metadata_with_runner(Path::new("/repo/Cargo.toml"), runner);
+        assert!(matches!(err, Err(RuntimeError::ArtifactIndexParse { .. })));
+    }
+
+    #[test]
+    fn build_plugin_artifact_with_runner_propagates_subprocess_failure() {
+        use super::build_plugin_artifact_with_runner;
+        use crate::core::error::RuntimeError;
+        use std::path::Path;
+        // fixtures_root has a parent, so we reach the runner call.
+        let err = build_plugin_artifact_with_runner(
+            Path::new("/repo/fixtures"),
+            Path::new("/repo/fixtures/plugins/qq/Cargo.toml"),
+            failing_runner,
+        );
+        assert!(matches!(err, Err(RuntimeError::CommandFailed { .. })));
+    }
+
+    #[test]
+    fn build_plugin_artifact_with_runner_errors_when_fixtures_root_has_no_parent() {
+        use super::build_plugin_artifact_with_runner;
+        use crate::core::error::RuntimeError;
+        use std::path::Path;
+        // Root "/" has no parent -> Invariant before the runner is consulted.
+        let runner = |_p: &str, _a: &[String], _d: Option<&Path>| {
+            panic!("runner must not be called when fixtures_root has no parent")
+        };
+        let err = build_plugin_artifact_with_runner(
+            Path::new("/"),
+            Path::new("/plugins/qq/Cargo.toml"),
+            runner,
+        );
+        assert!(matches!(err, Err(RuntimeError::Invariant { .. })));
+    }
+
+    #[test]
+    fn build_plugin_artifact_with_runner_succeeds_on_ok_runner() {
+        use super::build_plugin_artifact_with_runner;
+        use std::path::Path;
+        let runner = |_p: &str, _a: &[String], _d: Option<&Path>| Ok(Vec::new());
+        build_plugin_artifact_with_runner(
+            Path::new("/repo/fixtures"),
+            Path::new("/repo/fixtures/plugins/qq/Cargo.toml"),
+            runner,
+        )
+        .expect("ok runner -> Ok(())");
+    }
+
+    #[test]
+    fn built_dylib_path_with_runner_propagates_subprocess_failure() {
+        use super::built_dylib_path_with_runner;
+        use crate::core::error::RuntimeError;
+        use std::path::Path;
+        let err = built_dylib_path_with_runner(
+            Path::new("/repo/plugins/qq/Cargo.toml"),
+            "qq",
+            failing_runner,
+        );
+        assert!(matches!(err, Err(RuntimeError::CommandFailed { .. })));
+    }
+
+    #[test]
+    fn built_dylib_path_with_runner_composes_path_from_injected_metadata() {
+        use super::built_dylib_path_with_runner;
+        use std::env::consts::{DLL_EXTENSION, DLL_PREFIX};
+        use std::path::{Path, PathBuf};
+        let runner = |_p: &str, _a: &[String], _d: Option<&Path>| {
+            Ok(br#"{"packages":[],"workspace_members":[],"target_directory":"/tmp/td","resolve":null}"#.to_vec())
+        };
+        let path = built_dylib_path_with_runner(
+            Path::new("/repo/plugins/my-plugin/Cargo.toml"),
+            "my-plugin",
+            runner,
+        )
+        .expect("path composed from metadata");
+        let expected = PathBuf::from("/tmp/td")
+            .join("debug")
+            .join(format!("{DLL_PREFIX}my_plugin.{DLL_EXTENSION}"));
+        assert_eq!(path, expected);
+    }
+
+    #[test]
+    fn built_dylib_path_with_runner_maps_bad_bytes_to_parse_error() {
+        use super::built_dylib_path_with_runner;
+        use crate::core::error::RuntimeError;
+        use std::path::Path;
+        let runner = |_p: &str, _a: &[String], _d: Option<&Path>| Ok(b"{ not json".to_vec());
+        let err =
+            built_dylib_path_with_runner(Path::new("/repo/plugins/qq/Cargo.toml"), "qq", runner);
+        assert!(matches!(err, Err(RuntimeError::ArtifactIndexParse { .. })));
+    }
+
+    // ---------- collect_files_recursively `target` skip ----------
+
+    /// A `target` subdirectory is skipped without descending; sibling regular
+    /// files are still collected. Covers the `entry.file_name() == "target"`
+    /// continue arm of `collect_files_recursively`.
+    #[test]
+    fn collect_files_recursively_skips_target_dir() {
+        use super::collect_files_recursively;
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("target/deep")).unwrap();
+        std::fs::write(dir.path().join("target/deep/junk.rs"), "x").unwrap();
+        std::fs::write(dir.path().join("keep.rs"), "y").unwrap();
+        let mut out = Vec::new();
+        collect_files_recursively(dir.path(), &mut out).unwrap();
+        assert!(out.iter().any(|p| p.ends_with("keep.rs")));
+        assert!(
+            !out.iter().any(|p| p.to_string_lossy().contains("target/")),
+            "target/ contents must be skipped, got {out:?}"
+        );
+    }
+
+    // ---------- remove_lockfiles_recursively non-existent path ----------
+
+    /// A path that does not exist is a no-op (the `!path.exists()` guard),
+    /// returning Ok without touching the filesystem.
+    #[test]
+    fn remove_lockfiles_recursively_noop_for_missing_path() {
+        use super::remove_lockfiles_recursively;
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        remove_lockfiles_recursively(&dir.path().join("does-not-exist")).unwrap();
+    }
+
+    /// `remove_lockfiles_recursively` skips a nested `target` directory: a
+    /// `Cargo.lock` under `target/` survives while a sibling one is removed.
+    #[test]
+    fn remove_lockfiles_recursively_skips_nested_target_dir() {
+        use super::remove_lockfiles_recursively;
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("crate");
+        std::fs::create_dir_all(root.join("target")).unwrap();
+        std::fs::write(root.join("target/Cargo.lock"), "l").unwrap();
+        std::fs::write(root.join("Cargo.lock"), "l").unwrap();
+        remove_lockfiles_recursively(&root).unwrap();
+        assert!(!root.join("Cargo.lock").exists());
+        assert!(
+            root.join("target/Cargo.lock").exists(),
+            "target/ is skipped"
+        );
+    }
+
+    // ---------- write_pretty_json rename-failure arm ----------
+
+    /// `write_pretty_json` maps a failed final rename to Io and removes the
+    /// staging tmp: the destination is an existing non-empty directory, so
+    /// `fs::rename(tmp, dst)` cannot replace it. Covers the `rename tmp ->
+    /// target` map_err arm (and the `fs::remove_file(&tmp)` cleanup).
+    #[test]
+    fn write_pretty_json_errors_and_cleans_tmp_when_rename_fails() {
+        use super::write_pretty_json;
+        use crate::core::error::RuntimeError;
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        // Target path is itself a non-empty directory; rename over it fails.
+        let target = dir.path().join("index.json");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("child"), b"x").unwrap();
+        let err = write_pretty_json(&target, &serde_json::json!({"k": 1}));
+        assert!(
+            matches!(&err, Err(RuntimeError::Io { message, .. }) if message.starts_with("rename tmp -> target: ")),
+            "expected Io rename error, got {err:?}"
+        );
+        // The staging tmp was cleaned up on the failure path.
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".cordis-tmp."))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "tmp should be removed on rename failure"
+        );
     }
 }

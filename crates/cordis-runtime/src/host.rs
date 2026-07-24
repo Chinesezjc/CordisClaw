@@ -36,7 +36,9 @@ use crate::plugin::loader::{default_loader_config, LoadOutput, Loader};
 use crate::plugin::registry::{NodeRegistry, PluginRegistry, RegisteredPlugin};
 use crate::plugin::tooling::rebuild_plugin_workspace;
 use crate::service::doc_registry::DocRegistry;
-use crate::service::graph_registry::{GraphRegistry, RegisteredNet, RegisteredNetEdgeKind};
+use crate::service::graph_registry::{
+    GraphRegistry, RegisteredNet, RegisteredNetEdge, RegisteredNetEdgeKind,
+};
 use cordis_plugin_sdk::NodeType;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -143,16 +145,7 @@ impl RuntimeSnapshot {
                 let Some(node) = self.node_registry.get(transition_id) else {
                     traces.lock().unwrap().insert(
                         transition_id.clone(),
-                        ExecutionInvocationTrace {
-                            node_fqn: transition_id.clone(),
-                            plugin_path: String::new(),
-                            node_id: String::new(),
-                            attempt,
-                            outcome: Some(NodeOutcome::Failure),
-                            request_payload: None,
-                            response_payload: None,
-                            error: Some("node missing from registry".to_string()),
-                        },
+                        missing_registry_trace(transition_id, attempt),
                     );
                     return TransitionRunResult::from_outcome(NodeOutcome::Failure);
                 };
@@ -164,16 +157,14 @@ impl RuntimeSnapshot {
                         Err(err) => {
                             traces.lock().unwrap().insert(
                                 transition_id.clone(),
-                                ExecutionInvocationTrace {
-                                    node_fqn: transition_id.clone(),
-                                    plugin_path: node.plugin_path.clone(),
-                                    node_id: node.node_id.clone(),
+                                request_serialize_failure_trace(
+                                    transition_id,
+                                    &node.plugin_path,
+                                    &node.node_id,
                                     attempt,
-                                    outcome: Some(NodeOutcome::Failure),
-                                    request_payload: Some(Value::Object(request_payload)),
-                                    response_payload: None,
-                                    error: Some(format!("request serialize failed: {err}")),
-                                },
+                                    request_payload,
+                                    &err,
+                                ),
                             );
                             return TransitionRunResult::from_outcome(NodeOutcome::Failure);
                         }
@@ -243,6 +234,261 @@ pub struct ExecutionInvocationTrace {
     pub request_payload: Option<Value>,
     pub response_payload: Option<Value>,
     pub error: Option<String>,
+}
+
+/// Failure trace for the `execute_registered_target` parallel path when the
+/// scheduler hands us a transition whose id is absent from the node registry.
+/// Extracted as a pure function so the trace shape is unit-testable without
+/// driving a full net execution (host.rs execute closure, registry-miss arm).
+fn missing_registry_trace(transition_id: &str, attempt: u32) -> ExecutionInvocationTrace {
+    ExecutionInvocationTrace {
+        node_fqn: transition_id.to_string(),
+        plugin_path: String::new(),
+        node_id: String::new(),
+        attempt,
+        outcome: Some(NodeOutcome::Failure),
+        request_payload: None,
+        response_payload: None,
+        error: Some("node missing from registry".to_string()),
+    }
+}
+
+/// Failure trace for the `execute_registered_target` parallel path when the
+/// request payload cannot be serialized to JSON before the plugin invoke.
+/// `request_payload` is moved in because the caller no longer needs it after
+/// the trace is recorded. Extracted for direct unit testing.
+fn request_serialize_failure_trace(
+    transition_id: &str,
+    plugin_path: &str,
+    node_id: &str,
+    attempt: u32,
+    request_payload: Map<String, Value>,
+    err: &serde_json::Error,
+) -> ExecutionInvocationTrace {
+    ExecutionInvocationTrace {
+        node_fqn: transition_id.to_string(),
+        plugin_path: plugin_path.to_string(),
+        node_id: node_id.to_string(),
+        attempt,
+        outcome: Some(NodeOutcome::Failure),
+        request_payload: Some(Value::Object(request_payload)),
+        response_payload: None,
+        error: Some(format!("request serialize failed: {err}")),
+    }
+}
+
+/// Build the `AbiMismatch` error raised by `reload_subtree` Phase 1 when the
+/// candidate dylib's docs disagree with the recorded index entry's node count.
+/// The `expected`/`actual` fingerprints are both the index entry's fingerprint
+/// (only the docs drifted, not the ABI hash) — this matches the historical
+/// report shape byte-for-byte. Extracted for direct unit testing of the report.
+fn reload_docs_mismatch_error(
+    plugin_path: &str,
+    entry_fingerprint: &AbiFingerprint,
+    expected_nodes: usize,
+    actual_nodes: usize,
+) -> RuntimeError {
+    RuntimeError::AbiMismatch {
+        plugin_path: plugin_path.to_string(),
+        expected: Box::new(entry_fingerprint.clone()),
+        actual: Box::new(entry_fingerprint.clone()),
+        fingerprint_diff: vec![format!(
+            "docs mismatch: expected {expected_nodes} nodes, got {actual_nodes}"
+        )],
+    }
+}
+
+/// Build the `AbiMismatch` error raised by `reload_subtree` Phase 1 when the
+/// candidate dylib's ABI fingerprint (crate_hash / api_hash) diverges from the
+/// recorded index entry. `actual_fingerprint` is moved in because the caller no
+/// longer needs it after the error is built. Extracted for direct unit testing.
+fn reload_abi_fingerprint_mismatch_error(
+    plugin_path: &str,
+    entry_fingerprint: &AbiFingerprint,
+    actual_fingerprint: AbiFingerprint,
+) -> RuntimeError {
+    let diff = vec![format!(
+        "expected crate={} api={}, got crate={} api={}",
+        entry_fingerprint.crate_hash,
+        entry_fingerprint.api_hash,
+        actual_fingerprint.crate_hash,
+        actual_fingerprint.api_hash,
+    )];
+    RuntimeError::AbiMismatch {
+        plugin_path: plugin_path.to_string(),
+        expected: Box::new(entry_fingerprint.clone()),
+        actual: Box::new(actual_fingerprint),
+        fingerprint_diff: diff,
+    }
+}
+
+/// Coverage for the execute-path trace constructors and the `reload_subtree`
+/// Phase-1 AbiMismatch report builders extracted above, plus the cheap
+/// `pub(crate)` session-map accessors. Kept in a dedicated module (pre-`impl`
+/// region) so concurrent edits to the primary `mod tests` never collide.
+#[cfg(test)]
+mod sr_host_a_seam_tests {
+    use super::{
+        missing_registry_trace, reload_abi_fingerprint_mismatch_error, reload_docs_mismatch_error,
+        request_serialize_failure_trace, PendingSessionAction, RuntimeHost,
+    };
+    use crate::core::error::RuntimeError;
+    use crate::core::models::NodeOutcome;
+    use cordis_plugin_sdk::AbiFingerprint;
+    use serde_json::{json, Map, Value};
+    use std::fs;
+    use std::path::PathBuf;
+    use tempfile::TempDir;
+
+    // ── Pure-fn: execute-path failure traces ─────────────────────────────
+
+    #[test]
+    fn missing_registry_trace_carries_transition_id_and_blank_plugin() {
+        let trace = missing_registry_trace("expr::add", 2);
+        assert_eq!(trace.node_fqn, "expr::add");
+        assert_eq!(trace.plugin_path, "");
+        assert_eq!(trace.node_id, "");
+        assert_eq!(trace.attempt, 2);
+        assert_eq!(trace.outcome, Some(NodeOutcome::Failure));
+        assert_eq!(trace.request_payload, None);
+        assert_eq!(trace.response_payload, None);
+        assert_eq!(trace.error.as_deref(), Some("node missing from registry"));
+    }
+
+    #[test]
+    fn request_serialize_failure_trace_preserves_payload_and_error_text() {
+        let mut payload = Map::new();
+        payload.insert("k".to_string(), json!("v"));
+        // Build a real serde_json error to embed verbatim.
+        let json_err = serde_json::from_str::<Value>("not json").unwrap_err();
+        let trace = request_serialize_failure_trace(
+            "web::fetch",
+            "web",
+            "fetch",
+            3,
+            payload.clone(),
+            &json_err,
+        );
+        assert_eq!(trace.node_fqn, "web::fetch");
+        assert_eq!(trace.plugin_path, "web");
+        assert_eq!(trace.node_id, "fetch");
+        assert_eq!(trace.attempt, 3);
+        assert_eq!(trace.outcome, Some(NodeOutcome::Failure));
+        assert_eq!(trace.request_payload, Some(Value::Object(payload)));
+        assert_eq!(trace.response_payload, None);
+        assert_eq!(
+            trace.error,
+            Some(format!("request serialize failed: {json_err}"))
+        );
+    }
+
+    // ── Pure-fn: reload_subtree Phase-1 AbiMismatch reports ──────────────
+
+    #[test]
+    fn reload_docs_mismatch_error_uses_entry_fingerprint_for_both_sides() {
+        let fp = AbiFingerprint::current_build("crate_h", "api_h");
+        let err = reload_docs_mismatch_error("qq", &fp, 3, 5);
+        match err {
+            RuntimeError::AbiMismatch {
+                plugin_path,
+                expected,
+                actual,
+                fingerprint_diff,
+            } => {
+                assert_eq!(plugin_path, "qq");
+                // Docs drifted, not the ABI hash → both sides are the entry fp.
+                assert_eq!(*expected, fp);
+                assert_eq!(*actual, fp);
+                assert_eq!(
+                    fingerprint_diff,
+                    vec!["docs mismatch: expected 3 nodes, got 5".to_string()]
+                );
+            }
+            other => panic!("expected AbiMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reload_abi_fingerprint_mismatch_error_reports_both_hashes() {
+        let expected_fp = AbiFingerprint::current_build("crate_old", "api_old");
+        let actual_fp = AbiFingerprint::current_build("crate_new", "api_new");
+        let err = reload_abi_fingerprint_mismatch_error("svc", &expected_fp, actual_fp.clone());
+        match err {
+            RuntimeError::AbiMismatch {
+                plugin_path,
+                expected,
+                actual,
+                fingerprint_diff,
+            } => {
+                assert_eq!(plugin_path, "svc");
+                assert_eq!(*expected, expected_fp);
+                assert_eq!(*actual, actual_fp);
+                assert_eq!(
+                    fingerprint_diff,
+                    vec![format!(
+                        "expected crate={} api={}, got crate={} api={}",
+                        expected_fp.crate_hash,
+                        expected_fp.api_hash,
+                        actual_fp.crate_hash,
+                        actual_fp.api_hash,
+                    )]
+                );
+            }
+            other => panic!("expected AbiMismatch, got {other:?}"),
+        }
+    }
+
+    // ── pub(crate) session-map accessors on a cheap empty-index host ─────
+
+    /// A near-instant, cross-platform fixtures tree: an `artifacts/index.json`
+    /// with zero entries. Boot registers no plugins and touches no dylib.
+    fn setup_empty_fixture() -> (TempDir, PathBuf) {
+        let temp = TempDir::new().expect("tempdir");
+        let fixtures = temp.path().join("fixtures");
+        let artifacts = fixtures.join("artifacts");
+        fs::create_dir_all(&artifacts).expect("create artifacts dir");
+        fs::write(
+            artifacts.join("index.json"),
+            r#"{
+  "schema_version": 2,
+  "generated_at": "2026-07-24T00:00:00Z",
+  "topo_order": [],
+  "entries": []
+}
+"#,
+        )
+        .expect("write empty artifact index");
+        (temp, fixtures)
+    }
+
+    #[test]
+    fn session_accessors_start_empty_and_queue_action_is_noop_on_fresh_host() {
+        let (_temp, fixtures) = setup_empty_fixture();
+        let host = RuntimeHost::boot(&fixtures).expect("boot on empty index");
+
+        // agent_sessions_mut: fresh boot registers no interactive sessions.
+        assert!(
+            host.agent_sessions_mut().is_empty(),
+            "a freshly booted host must have no agent sessions"
+        );
+
+        // revert_interactive_changes: nothing was edited → zero restored.
+        assert_eq!(
+            host.revert_interactive_changes()
+                .expect("revert on a clean rollback log succeeds"),
+            0
+        );
+
+        // queue_session_action: enqueues without touching agent_sessions. There
+        // is no in-crate reader for the pending map, so we assert the observable
+        // invariant (agent_sessions untouched) and that the call is total.
+        host.queue_session_action("session-xyz", PendingSessionAction::CompactHistory);
+        host.queue_session_action("session-xyz", PendingSessionAction::CompactHistory);
+        assert!(
+            host.agent_sessions_mut().is_empty(),
+            "queue_session_action must not create an agent session entry"
+        );
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2771,16 +3017,12 @@ export_plugin_api! {{
                     (err, Box::new(attempt))
                 })?;
             if new_docs.nodes != entry.docs.nodes {
-                let err = RuntimeError::AbiMismatch {
-                    plugin_path: plugin_path.clone(),
-                    expected: Box::new(entry.abi_fingerprint.clone()),
-                    actual: Box::new(entry.abi_fingerprint.clone()),
-                    fingerprint_diff: vec![format!(
-                        "docs mismatch: expected {} nodes, got {}",
-                        entry.docs.nodes.len(),
-                        new_docs.nodes.len()
-                    )],
-                };
+                let err = reload_docs_mismatch_error(
+                    plugin_path,
+                    &entry.abi_fingerprint,
+                    entry.docs.nodes.len(),
+                    new_docs.nodes.len(),
+                );
                 let attempt = self.make_failed_attempt(&previous_snapshot, started_at, &err);
                 return Err((err, Box::new(attempt)));
             }
@@ -2797,19 +3039,11 @@ export_plugin_api! {{
             if actual_fingerprint.crate_hash != entry.abi_fingerprint.crate_hash
                 || actual_fingerprint.api_hash != entry.abi_fingerprint.api_hash
             {
-                let diff = vec![format!(
-                    "expected crate={} api={}, got crate={} api={}",
-                    entry.abi_fingerprint.crate_hash,
-                    entry.abi_fingerprint.api_hash,
-                    actual_fingerprint.crate_hash,
-                    actual_fingerprint.api_hash,
-                )];
-                let err = RuntimeError::AbiMismatch {
-                    plugin_path: plugin_path.clone(),
-                    expected: Box::new(entry.abi_fingerprint.clone()),
-                    actual: Box::new(actual_fingerprint),
-                    fingerprint_diff: diff,
-                };
+                let err = reload_abi_fingerprint_mismatch_error(
+                    plugin_path,
+                    &entry.abi_fingerprint,
+                    actual_fingerprint,
+                );
                 let attempt = self.make_failed_attempt(&previous_snapshot, started_at, &err);
                 return Err((err, Box::new(attempt)));
             }
@@ -3610,33 +3844,35 @@ export_plugin_api! {{
         })
     }
 
+    /// Roll back the candidate snapshot iff one is staged. Returns `None` when
+    /// there is nothing to roll back, otherwise the rollback `Result` mapped to
+    /// `()`. Kept separate from `finalize_plugin_iteration` so the failure
+    /// aggregation feeds off a plain `Option<Result<(), _>>`.
+    fn rollback_candidate_if_staged(&self) -> Option<Result<(), RuntimeError>> {
+        if self.candidate_snapshot().is_some() {
+            Some(self.rollback_candidate().map(|_| ()))
+        } else {
+            None
+        }
+    }
+
     fn finalize_plugin_iteration(
         &self,
         state: &mut PluginIterationRunState,
     ) -> Result<PluginIterationFinalVerdict, RuntimeError> {
         if let Some(stage_error) = state.stage_error.clone() {
-            let mut rollback_errors = Vec::new();
-            if self.candidate_snapshot().is_some() {
-                if let Err(err) = self.rollback_candidate() {
-                    rollback_errors.push(format!("candidate rollback: {err}"));
-                }
-            }
-            if let Err(err) = restore_plugin_iteration_workspace(
+            let candidate_rollback = self.rollback_candidate_if_staged();
+            let workspace_restore = restore_plugin_iteration_workspace(
                 &self.fixtures_root,
                 &self.snapshot_root,
                 state.rollback.as_ref(),
-            ) {
-                rollback_errors.push(format!("workspace restore: {err}"));
-            }
-            state.blocked_reason = Some(if rollback_errors.is_empty() {
-                stage_error
-            } else {
-                format!(
-                    "{}; rollback errors: [{}]",
-                    stage_error,
-                    rollback_errors.join(", ")
-                )
-            });
+            )
+            .map(|_| ());
+            state.blocked_reason = Some(aggregate_rollback_failure(
+                stage_error,
+                candidate_rollback,
+                workspace_restore,
+            ));
             state.final_verdict = Some(PluginIterationFinalVerdict::RolledBack);
             return Ok(PluginIterationFinalVerdict::RolledBack);
         }
@@ -3686,27 +3922,18 @@ export_plugin_api! {{
             match self.promote_candidate() {
                 Ok(_) => PluginIterationFinalVerdict::Promoted,
                 Err(err) => {
-                    let mut rollback_errors = Vec::new();
-                    if self.candidate_snapshot().is_some() {
-                        if let Err(e) = self.rollback_candidate() {
-                            rollback_errors.push(format!("candidate rollback: {e}"));
-                        }
-                    }
-                    if let Err(e) = restore_plugin_iteration_workspace(
+                    let candidate_rollback = self.rollback_candidate_if_staged();
+                    let workspace_restore = restore_plugin_iteration_workspace(
                         &self.fixtures_root,
                         &self.snapshot_root,
                         state.rollback.as_ref(),
-                    ) {
-                        rollback_errors.push(format!("workspace restore: {e}"));
-                    }
-                    state.blocked_reason = Some(if rollback_errors.is_empty() {
-                        format!("promote failed: {err}")
-                    } else {
-                        format!(
-                            "promote failed: {err}; rollback errors: [{}]",
-                            rollback_errors.join(", ")
-                        )
-                    });
+                    )
+                    .map(|_| ());
+                    state.blocked_reason = Some(aggregate_rollback_failure(
+                        format!("promote failed: {err}"),
+                        candidate_rollback,
+                        workspace_restore,
+                    ));
                     return Err(err);
                 }
             }
@@ -3719,27 +3946,18 @@ export_plugin_api! {{
             match self.promote_candidate() {
                 Ok(_) => PluginIterationFinalVerdict::Promoted,
                 Err(err) => {
-                    let mut rollback_errors = Vec::new();
-                    if self.candidate_snapshot().is_some() {
-                        if let Err(e) = self.rollback_candidate() {
-                            rollback_errors.push(format!("candidate rollback: {e}"));
-                        }
-                    }
-                    if let Err(e) = restore_plugin_iteration_workspace(
+                    let candidate_rollback = self.rollback_candidate_if_staged();
+                    let workspace_restore = restore_plugin_iteration_workspace(
                         &self.fixtures_root,
                         &self.snapshot_root,
                         state.rollback.as_ref(),
-                    ) {
-                        rollback_errors.push(format!("workspace restore: {e}"));
-                    }
-                    state.blocked_reason = Some(if rollback_errors.is_empty() {
-                        format!("promote (manual-approved) failed: {err}")
-                    } else {
-                        format!(
-                            "promote (manual-approved) failed: {err}; rollback errors: [{}]",
-                            rollback_errors.join(", ")
-                        )
-                    });
+                    )
+                    .map(|_| ());
+                    state.blocked_reason = Some(aggregate_rollback_failure(
+                        format!("promote (manual-approved) failed: {err}"),
+                        candidate_rollback,
+                        workspace_restore,
+                    ));
                     return Err(err);
                 }
             }
@@ -5774,11 +5992,48 @@ fn build_execution_net(
         })
         .collect::<Vec<_>>();
 
+    let (places, arcs) = edges_to_net_specs(&net.edges, selected_nodes);
+
+    let mut transitions = transitions;
+    if !selected_nodes.contains(target_node_fqn) {
+        transitions.push(ExecutionTransitionSpec {
+            transition: TransitionSpec {
+                transition_id: fallback_target.node_fqn.clone(),
+                priority: 0,
+                join_policy: JoinPolicy::AllOf,
+            },
+            run_policy: RunPolicy::default(),
+            kind: ExecutionTransitionKind::Terminal,
+            logical_group: Some("execute".to_string()),
+            topo_level: 0,
+            node_type: None,
+        });
+    }
+
+    ExecutionNetSpec {
+        places,
+        transitions,
+        arcs,
+    }
+}
+
+/// P3 data-construction seam: translate the `selected`-scoped edges of a
+/// registered net into engine `PlaceSpec`/`ArcSpec` values. Pure function of
+/// the edge list plus the selected-node set, so it is unit-testable without a
+/// live runtime. Only edges whose `from` and `to` endpoints are both selected
+/// contribute; each such edge yields one place and a pair of arcs
+/// (transition→place, place→transition). The inbound arc is `required` iff the
+/// edge carries data (`RegisteredNetEdgeKind::Data`); control edges produce a
+/// non-required arc. Places are de-duplicated and returned in sorted order via
+/// the intermediate `BTreeSet`.
+fn edges_to_net_specs(
+    edges: &[RegisteredNetEdge],
+    selected_nodes: &BTreeSet<String>,
+) -> (Vec<PlaceSpec>, Vec<ArcSpec>) {
     let mut places = BTreeSet::<String>::new();
     let mut arcs = Vec::<ArcSpec>::new();
 
-    for edge in net
-        .edges
+    for edge in edges
         .iter()
         .filter(|edge| selected_nodes.contains(&edge.from) && selected_nodes.contains(&edge.to))
     {
@@ -5807,30 +6062,11 @@ fn build_execution_net(
         });
     }
 
-    let mut transitions = transitions;
-    if !selected_nodes.contains(target_node_fqn) {
-        transitions.push(ExecutionTransitionSpec {
-            transition: TransitionSpec {
-                transition_id: fallback_target.node_fqn.clone(),
-                priority: 0,
-                join_policy: JoinPolicy::AllOf,
-            },
-            run_policy: RunPolicy::default(),
-            kind: ExecutionTransitionKind::Terminal,
-            logical_group: Some("execute".to_string()),
-            topo_level: 0,
-            node_type: None,
-        });
-    }
-
-    ExecutionNetSpec {
-        places: places
-            .into_iter()
-            .map(|place_id| PlaceSpec { place_id })
-            .collect(),
-        transitions,
-        arcs,
-    }
+    let places = places
+        .into_iter()
+        .map(|place_id| PlaceSpec { place_id })
+        .collect();
+    (places, arcs)
 }
 
 fn build_execution_payload(
@@ -6607,6 +6843,38 @@ fn clear_plugin_iteration_journal(snapshot_root: &Path) -> Result<(), RuntimeErr
     crate::kernel::plugin_iteration::PluginEditRollback::clear_journal(
         &plugin_iteration_journal_path(snapshot_root),
     )
+}
+
+/// Assemble the `blocked_reason` string for a plugin-iteration rollback.
+///
+/// Pure result-aggregation: the real rollback side effects (candidate
+/// rollback, workspace restore) run at the call site and their outcomes are
+/// passed in here. `candidate_rollback` is `None` when there was no candidate
+/// snapshot to roll back; `Some(Ok(_))` when the rollback succeeded and
+/// `Some(Err(_))` when it failed. Byte-for-byte preserves the historical
+/// `"{base}; rollback errors: [candidate rollback: ..., workspace restore: ...]"`
+/// wording so error text stays stable across the extraction.
+fn aggregate_rollback_failure(
+    base_message: String,
+    candidate_rollback: Option<Result<(), RuntimeError>>,
+    workspace_restore: Result<(), RuntimeError>,
+) -> String {
+    let mut rollback_errors = Vec::new();
+    if let Some(Err(err)) = candidate_rollback {
+        rollback_errors.push(format!("candidate rollback: {err}"));
+    }
+    if let Err(err) = workspace_restore {
+        rollback_errors.push(format!("workspace restore: {err}"));
+    }
+    if rollback_errors.is_empty() {
+        base_message
+    } else {
+        format!(
+            "{}; rollback errors: [{}]",
+            base_message,
+            rollback_errors.join(", ")
+        )
+    }
 }
 
 fn plugin_iteration_applied_marker_path(snapshot_root: &Path) -> PathBuf {
@@ -7849,18 +8117,24 @@ mod ffi_panic_seam_tests {
 #[cfg(test)]
 mod seam_pure_fn_tests {
     use super::{
-        extract_response_field, infer_outcome_from_payload, is_warning_block_boundary,
-        parse_response_payload, plugin_change_reasons, plugin_iteration_status_from_history,
-        plugin_relative_depth, select_registered_net_subgraph, strip_rust_span_suffix,
-        truncate_warning_block, warning_cleanup_error_message, warning_path_aliases,
+        edges_to_net_specs, extract_response_field, infer_outcome_from_payload,
+        is_warning_block_boundary, normalize_warning_source_path, parse_response_payload,
+        plugin_change_reasons, plugin_iteration_status_from_history,
+        plugin_path_from_runtime_error, plugin_relative_depth, select_registered_net_subgraph,
+        strip_rust_span_suffix, truncate_warning_block, warning_cleanup_error_message,
+        warning_path_aliases,
     };
+    use crate::core::error::RuntimeError;
     use crate::core::models::NodeOutcome;
+    use crate::execution::net::ArcDirection;
     use crate::kernel::plugin_iteration::{
         CanaryVerdict, PluginIterationFinalVerdict, PluginIterationHistoryEntry, VerifierVerdict,
     };
     use crate::plugin::registry::RegisteredPlugin;
     use crate::service::graph_registry::{RegisteredNet, RegisteredNetEdge, RegisteredNetEdgeKind};
     use serde_json::json;
+    use std::collections::BTreeSet;
+    use std::path::Path;
 
     #[test]
     fn parse_response_payload_parses_json_or_falls_back_to_string() {
@@ -8011,6 +8285,168 @@ mod seam_pure_fn_tests {
     }
 
     #[test]
+    fn edges_to_net_specs_builds_place_and_arc_pair_per_selected_edge() {
+        // Data edge with a label, plus a control edge without a label, plus an
+        // edge whose endpoints are not both selected (must be skipped).
+        let edges = vec![
+            RegisteredNetEdge {
+                from: "a".to_string(),
+                to: "b".to_string(),
+                kind: RegisteredNetEdgeKind::Data,
+                label: Some("payload".to_string()),
+            },
+            RegisteredNetEdge {
+                from: "b".to_string(),
+                to: "c".to_string(),
+                kind: RegisteredNetEdgeKind::Control,
+                label: None,
+            },
+            // Endpoint `z` is not selected → edge contributes nothing.
+            RegisteredNetEdge {
+                from: "b".to_string(),
+                to: "z".to_string(),
+                kind: RegisteredNetEdgeKind::Data,
+                label: Some("dropped".to_string()),
+            },
+        ];
+        let selected = BTreeSet::from(["a".to_string(), "b".to_string(), "c".to_string()]);
+        let (places, arcs) = edges_to_net_specs(&edges, &selected);
+
+        // Two surviving edges → two places, four arcs.
+        let place_ids = places
+            .iter()
+            .map(|place| place.place_id.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            place_ids,
+            vec![
+                "place::a::b::payload".to_string(),
+                // Missing label falls back to the literal "control" segment.
+                "place::b::c::control".to_string(),
+            ]
+        );
+        assert_eq!(arcs.len(), 4);
+
+        // Labelled data edge a→b.
+        let out_ab = &arcs[0];
+        assert_eq!(out_ab.arc_id, "arc::a::out::place::a::b::payload");
+        assert_eq!(out_ab.place_id, "place::a::b::payload");
+        assert_eq!(out_ab.transition_id, "a");
+        assert!(matches!(out_ab.direction, ArcDirection::TransitionToPlace));
+        assert_eq!(out_ab.label.as_deref(), Some("payload"));
+        // Outbound arc is never required.
+        assert!(!out_ab.required);
+
+        let in_ab = &arcs[1];
+        assert_eq!(in_ab.arc_id, "arc::b::in::place::a::b::payload");
+        assert_eq!(in_ab.transition_id, "b");
+        assert!(matches!(in_ab.direction, ArcDirection::PlaceToTransition));
+        // Data edge → inbound arc is required.
+        assert!(in_ab.required);
+
+        // Control edge b→c: inbound arc must NOT be required, label is None.
+        let in_bc = &arcs[3];
+        assert_eq!(in_bc.arc_id, "arc::c::in::place::b::c::control");
+        assert!(matches!(in_bc.direction, ArcDirection::PlaceToTransition));
+        assert_eq!(in_bc.label, None);
+        assert!(!in_bc.required);
+    }
+
+    #[test]
+    fn edges_to_net_specs_dedups_repeated_place_ids() {
+        // Two identical edges collapse to a single place (BTreeSet), but each
+        // still emits its own arc pair.
+        let edge = RegisteredNetEdge {
+            from: "a".to_string(),
+            to: "b".to_string(),
+            kind: RegisteredNetEdgeKind::Data,
+            label: Some("x".to_string()),
+        };
+        let edges = vec![edge.clone(), edge];
+        let selected = BTreeSet::from(["a".to_string(), "b".to_string()]);
+        let (places, arcs) = edges_to_net_specs(&edges, &selected);
+        assert_eq!(places.len(), 1, "identical place ids are de-duplicated");
+        assert_eq!(arcs.len(), 4, "each edge still emits its own arc pair");
+    }
+
+    #[test]
+    fn edges_to_net_specs_empty_when_no_edges_selected() {
+        let edges = vec![RegisteredNetEdge {
+            from: "a".to_string(),
+            to: "b".to_string(),
+            kind: RegisteredNetEdgeKind::Data,
+            label: None,
+        }];
+        // Neither endpoint selected.
+        let selected = BTreeSet::from(["x".to_string()]);
+        let (places, arcs) = edges_to_net_specs(&edges, &selected);
+        assert!(places.is_empty());
+        assert!(arcs.is_empty());
+    }
+
+    #[test]
+    fn normalize_warning_source_path_handles_relative_absolute_and_traversal() {
+        let root = Path::new("/workspace/fixtures");
+        // Relative path with a rust span suffix: span stripped, kept relative.
+        assert_eq!(
+            normalize_warning_source_path("plugins/foo/src/lib.rs:12:5", root),
+            Some("plugins/foo/src/lib.rs".to_string())
+        );
+        // Absolute path under the root is made relative.
+        assert_eq!(
+            normalize_warning_source_path("/workspace/fixtures/plugins/foo/src/lib.rs", root),
+            Some("plugins/foo/src/lib.rs".to_string())
+        );
+        // Absolute path NOT under the root → strip_prefix fails → None.
+        assert_eq!(
+            normalize_warning_source_path("/elsewhere/foo.rs", root),
+            None
+        );
+        // CurDir components are dropped; ParentDir pops the prior segment.
+        assert_eq!(
+            normalize_warning_source_path("./a/./b/../c.rs", root),
+            Some("a/c.rs".to_string())
+        );
+        // Leading ParentDir with nothing to pop → None.
+        assert_eq!(normalize_warning_source_path("../escape.rs", root), None);
+        // Path that normalizes to empty → None.
+        assert_eq!(normalize_warning_source_path(".", root), None);
+    }
+
+    #[test]
+    fn plugin_path_from_runtime_error_extracts_owning_plugin() {
+        // Variant carrying `parent`.
+        assert_eq!(
+            plugin_path_from_runtime_error(&RuntimeError::ChildNotFound {
+                parent: "root/parent".to_string(),
+                child_source: "missing".to_string(),
+            }),
+            Some("root/parent".to_string())
+        );
+        // Variant carrying `plugin_path`.
+        assert_eq!(
+            plugin_path_from_runtime_error(&RuntimeError::PluginNotRegistered {
+                plugin_path: "root/child".to_string(),
+            }),
+            Some("root/child".to_string())
+        );
+        // CycleDetected returns the first node of the cycle.
+        assert_eq!(
+            plugin_path_from_runtime_error(&RuntimeError::CycleDetected {
+                cycle: vec!["a".to_string(), "b".to_string()],
+            }),
+            Some("a".to_string())
+        );
+        // A variant with no plugin association → None.
+        assert_eq!(
+            plugin_path_from_runtime_error(&RuntimeError::InvalidArgument {
+                message: "no plugin here".to_string(),
+            }),
+            None
+        );
+    }
+
+    #[test]
     fn plugin_change_reasons_reports_each_diff_field() {
         use crate::core::models::PluginLoadResult;
         use std::collections::BTreeSet;
@@ -8128,6 +8564,116 @@ mod seam_extraction_tests_low {
         assert!(
             matches!(&err, RuntimeError::InvalidArgument { message } if *message == format!("soul_get reply from /soul/plugin malformed: {val_err}")),
             "expected InvalidArgument, got {err:?}"
+        );
+    }
+}
+
+/// Seam tests for `aggregate_rollback_failure` — the pure result-aggregation
+/// half of `finalize_plugin_iteration`'s rollback path (P2-25 promote-failure
+/// chain + the `stage_error` early return). Placed in a dedicated module so
+/// concurrent edits to the primary `mod tests` do not collide. Asserts the
+/// full matrix of {no candidate / candidate-ok / candidate-err} ×
+/// {restore-ok / restore-err} produces byte-exact `blocked_reason` strings.
+#[cfg(test)]
+mod aggregate_rollback_failure_tests {
+    use super::aggregate_rollback_failure;
+    use super::validated_verification_command;
+    use crate::core::error::RuntimeError;
+
+    fn err(message: &str) -> RuntimeError {
+        RuntimeError::InvalidArgument {
+            message: message.to_string(),
+        }
+    }
+
+    #[test]
+    fn validated_verification_command_missing_command_errors_byte_exact() {
+        // Both explicit and fallback absent → InvalidArgument with the
+        // "missing verification command for <prefix>" wording (line 5298).
+        let out = validated_verification_command(None, None, "cargo test");
+        assert!(
+            matches!(&out, Err(RuntimeError::InvalidArgument { message })
+                if *message == "missing verification command for cargo test"),
+            "expected missing-command InvalidArgument, got {out:?}"
+        );
+    }
+
+    #[test]
+    fn validated_verification_command_prefix_mismatch_errors_byte_exact() {
+        // Explicit command that does not start with the required prefix and is
+        // not a recognized short alias → prefix-mismatch InvalidArgument
+        // (lines 5309-5314). `rm -rf` never matches `cargo build`.
+        let out = validated_verification_command(Some("rm -rf /".to_string()), None, "cargo build");
+        assert!(
+            matches!(&out, Err(RuntimeError::InvalidArgument { message })
+                if *message == "verification tool only allows commands starting with `cargo build`, got `rm -rf /`"),
+            "expected prefix-mismatch InvalidArgument, got {out:?}"
+        );
+    }
+
+    #[test]
+    fn no_rollback_errors_returns_base_message_verbatim() {
+        // No candidate staged, workspace restore succeeded → base unchanged.
+        let out = aggregate_rollback_failure("promote failed: boom".to_string(), None, Ok(()));
+        assert_eq!(out, "promote failed: boom");
+    }
+
+    #[test]
+    fn candidate_ok_and_restore_ok_returns_base_message() {
+        let out = aggregate_rollback_failure("stage error".to_string(), Some(Ok(())), Ok(()));
+        assert_eq!(out, "stage error");
+    }
+
+    #[test]
+    fn candidate_rollback_error_only() {
+        let out = aggregate_rollback_failure(
+            "promote failed: boom".to_string(),
+            Some(Err(err("cand kaput"))),
+            Ok(()),
+        );
+        assert_eq!(
+            out,
+            "promote failed: boom; rollback errors: [candidate rollback: invalid argument: cand kaput]"
+        );
+    }
+
+    #[test]
+    fn workspace_restore_error_only() {
+        let out = aggregate_rollback_failure(
+            "promote failed: boom".to_string(),
+            Some(Ok(())),
+            Err(err("restore kaput")),
+        );
+        assert_eq!(
+            out,
+            "promote failed: boom; rollback errors: [workspace restore: invalid argument: restore kaput]"
+        );
+    }
+
+    #[test]
+    fn no_candidate_but_workspace_restore_error() {
+        // stage_error early-return shape: candidate absent, restore failed.
+        let out =
+            aggregate_rollback_failure("stage error".to_string(), None, Err(err("restore kaput")));
+        assert_eq!(
+            out,
+            "stage error; rollback errors: [workspace restore: invalid argument: restore kaput]"
+        );
+    }
+
+    #[test]
+    fn both_candidate_and_restore_errors_are_ordered_and_comma_joined() {
+        // Candidate rollback error precedes workspace restore error, joined
+        // with ", " — must match the historical push order byte-for-byte.
+        let out = aggregate_rollback_failure(
+            "promote (manual-approved) failed: boom".to_string(),
+            Some(Err(err("cand kaput"))),
+            Err(err("restore kaput")),
+        );
+        assert_eq!(
+            out,
+            "promote (manual-approved) failed: boom; rollback errors: \
+             [candidate rollback: invalid argument: cand kaput, workspace restore: invalid argument: restore kaput]"
         );
     }
 }

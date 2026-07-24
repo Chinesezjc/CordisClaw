@@ -808,8 +808,27 @@ mod tests {
 
     #[test]
     fn verify_supports_plugin_command_specs() {
-        if cordis_plugin_sdk::CORDIS_TARGET != "x86_64-unknown-linux-gnu" {
-            eprintln!("[skip] fixture dylibs are x86_64-linux only; skipping on this host");
+        // The committed fixture dylibs are built for one target at a time (the
+        // artifact index records `abi_fingerprint.target_triple`). Probe the
+        // loader instead of hard-coding a triple: run the assertions only when
+        // the `expr` fixture actually loaded for this host, and skip cleanly
+        // otherwise. This lets the test exercise the plugin verification path
+        // on any host whose committed index matches (e.g. an arm64 clone with
+        // arm64 dylibs), not just x86_64-linux.
+        let fixtures_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures");
+        let expr_loadable = crate::plugin::invoke::PluginInvoker::load(&fixtures_root)
+            .ok()
+            .and_then(|invoker| invoker.plugin_registry().get("expr"))
+            .is_some_and(|plugin| {
+                matches!(
+                    plugin.load_result,
+                    crate::core::models::PluginLoadResult::Loaded
+                )
+            });
+        if !expr_loadable {
+            eprintln!(
+                "[skip] expr fixture dylib not loadable on this host (target/index mismatch)"
+            );
             return;
         }
         let spec = format!(
@@ -1423,6 +1442,25 @@ mod tests {
             None,
         )
         .expect_err("missing program must surface as verify error");
+        assert!(matches!(err, RuntimeError::CommandFailed { .. }));
+    }
+
+    #[test]
+    fn verify_propagates_safety_stage_spawn_error() {
+        // tests_command is None (that stage Skips), so the first stage that
+        // actually spawns is the safety stage. A safety_command whose program
+        // does not exist makes run_shell_command return Err(CommandFailed),
+        // propagated by the `?` on the safety stage result. Covers the
+        // safety-stage error-propagation arm specifically.
+        let temp = TempDir::new().expect("tempdir");
+        let err = CommandVerifier::verify(
+            temp.path(),
+            VerificationProfile::Default,
+            None,
+            Some("/nonexistent/definitely/not/here run"),
+            None,
+        )
+        .expect_err("missing safety program must surface as verify error");
         assert!(matches!(err, RuntimeError::CommandFailed { .. }));
     }
 

@@ -640,6 +640,46 @@ fn reload_subtree_missing_artifact_errors() {
 
 #[test]
 #[serial]
+fn reload_whole_tree_missing_artifact_index_records_failed_attempt() {
+    let temp = setup_artifacts_only_copy();
+    let host = RuntimeHost::boot(temp.path()).expect("host should boot");
+
+    // Delete the artifact index so the whole-tree snapshot rebuild inside
+    // `reload_internal` fails at `build_snapshot_with_staged_root`, driving
+    // the Failed-attempt construction arm (the reload_internal build-error
+    // branch that returns Err((err, attempt))).
+    let index = temp.path().join("artifacts/index.json");
+    fs::remove_file(&index).expect("remove artifact index");
+
+    let err = host
+        .reload("/")
+        .expect_err("whole-tree reload without an index must fail");
+    assert!(!err.to_string().is_empty());
+    let attempt = host.last_reload_attempt().expect("failed attempt recorded");
+    assert_eq!(attempt.status, ReloadAttemptStatus::Failed);
+    assert!(attempt.failure_summary.is_some());
+    assert!(attempt.to_snapshot_id.is_none());
+}
+
+#[test]
+#[serial]
+fn reload_candidate_missing_artifact_index_records_failed_attempt() {
+    let temp = setup_artifacts_only_copy();
+    let host = RuntimeHost::boot(temp.path()).expect("host should boot");
+
+    // Same failure injection, but through the candidate-staging path so the
+    // build-error arm of `reload_candidate_internal` is exercised.
+    let index = temp.path().join("artifacts/index.json");
+    fs::remove_file(&index).expect("remove artifact index");
+
+    let attempt = host.reload_candidate_with_diagnostics();
+    assert_eq!(attempt.status, ReloadAttemptStatus::Failed);
+    assert!(attempt.failure_summary.is_some());
+    assert!(attempt.to_snapshot_id.is_none());
+}
+
+#[test]
+#[serial]
 fn execute_unknown_target_records_kernel_issue() {
     let temp = setup_artifacts_only_copy();
     let host = RuntimeHost::boot(temp.path()).expect("host should boot");

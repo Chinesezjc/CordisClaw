@@ -1433,6 +1433,119 @@ mod loader_flow_tests {
         assert!(leftover.is_empty(), "tmp staging file was not cleaned up");
     }
 
+    // ensure_not_timed_out returns LoadTimeout when the elapsed time since
+    // `started_at` exceeds the configured budget. A 0ms budget plus a small
+    // real sleep makes `elapsed_ms > 0` hold deterministically, driving the
+    // error arm directly (the full-load `load_timeout_zero_budget_trips` test
+    // can race to a clean load on an impossibly fast host; this exercises the
+    // arm without that dependency).
+    #[test]
+    fn ensure_not_timed_out_trips_on_zero_budget() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = single_json_plugin(tmp.path(), "alpha");
+        config.budget.load_timeout_ms = 0;
+        let loader = Loader::new(config);
+        let started = Instant::now();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let err = loader
+            .ensure_not_timed_out(started)
+            .expect_err("0ms budget after a 2ms sleep must trip");
+        assert!(
+            matches!(&err, RuntimeError::LoadTimeout { limit_ms, elapsed_ms } if *limit_ms == 0 && *elapsed_ms > 0),
+            "wrong variant: {err:?}"
+        );
+    }
+
+    // docs-drift auto-heal, interfaces.json staging WRITE failure arm
+    // (AtomicWriteError::Write). The interfaces.json parent dir
+    // (`.../docs/agent`) is pre-created read-only, so `create_dir_all(parent)`
+    // returns Ok (it already exists) but writing the `.cordis-tmp.` staging
+    // sibling into a read-only dir fails → the Write arm logs and `continue`s.
+    // The index write-back (to the still-writable artifacts dir) still runs.
+    #[cfg(unix)]
+    #[test]
+    fn load_docs_drift_interfaces_staging_write_failure_is_logged_and_skipped() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let plugins_root = tmp.path().join("plugins");
+        // Pre-create the interfaces.json parent dir and make it read-only so the
+        // staging-file write (not create_dir_all) is what fails.
+        let agent_dir = plugins_root.join("alpha/docs/agent");
+        fs::create_dir_all(&agent_dir).unwrap();
+        fs::set_permissions(&agent_dir, fs::Permissions::from_mode(0o555)).unwrap();
+
+        let config = drifting_json_plugin_with_plugins_root(tmp.path(), plugins_root.clone());
+        let index_path = config.artifact_index_path.clone();
+        let out = Loader::new(config).load().unwrap();
+        // Load still succeeds with healed docs despite the interfaces sync failure.
+        let state = out.plugin_registry.get("alpha").unwrap();
+        assert!(matches!(state.load_result, PluginLoadResult::Loaded));
+        assert_eq!(
+            state.docs.as_ref().unwrap().system_hint.as_deref(),
+            Some("fresh")
+        );
+        // The index on disk WAS still rewritten with the healed docs.
+        let rewritten = load_artifact_index(&index_path).unwrap();
+        assert_eq!(
+            rewritten.entries[0].docs.system_hint.as_deref(),
+            Some("fresh")
+        );
+        // No staging leftover in the read-only dir.
+        fs::set_permissions(&agent_dir, fs::Permissions::from_mode(0o755)).unwrap();
+        let leftover: Vec<_> = fs::read_dir(&agent_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".cordis-tmp."))
+            .collect();
+        assert!(leftover.is_empty(), "tmp staging file was not cleaned up");
+    }
+
+    // docs-drift auto-heal, artifact-index write-back staging WRITE failure arm
+    // (AtomicWriteError::Write, lines 532-537). The artifacts dir holding
+    // index.json is made read-only, so the interfaces sync under the writable
+    // plugins_root succeeds (Ok arm) but the index write-back's `.cordis-tmp.`
+    // staging write into the read-only artifacts dir fails → the index Write arm
+    // logs. Load still succeeds (interface + index sync are both non-fatal).
+    #[cfg(unix)]
+    #[test]
+    fn load_docs_drift_index_writeback_staging_write_failure_is_logged() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let plugins_root = tmp.path().join("plugins");
+        let config = drifting_json_plugin_with_plugins_root(tmp.path(), plugins_root.clone());
+        let index_path = config.artifact_index_path.clone();
+        let artifacts_dir = index_path.parent().unwrap().to_path_buf();
+        // Make the artifacts dir read-only so the index write-back staging write
+        // fails while the interfaces sync (under plugins_root) still succeeds.
+        fs::set_permissions(&artifacts_dir, fs::Permissions::from_mode(0o555)).unwrap();
+
+        let out = Loader::new(config).load().unwrap();
+        let state = out.plugin_registry.get("alpha").unwrap();
+        assert!(matches!(state.load_result, PluginLoadResult::Loaded));
+        assert_eq!(
+            state.docs.as_ref().unwrap().system_hint.as_deref(),
+            Some("fresh")
+        );
+        // Interfaces.json under the writable plugins_root WAS healed.
+        let iface = plugins_root.join("alpha/docs/agent/interfaces.json");
+        assert!(iface.exists(), "interfaces.json should have been written");
+        // The on-disk index write-back failed, so index.json is unchanged (still
+        // lacks the healed system_hint).
+        fs::set_permissions(&artifacts_dir, fs::Permissions::from_mode(0o755)).unwrap();
+        let on_disk = load_artifact_index(&index_path).unwrap();
+        assert_eq!(on_disk.entries[0].docs.system_hint, None);
+        // No staging leftover next to the index.
+        let leftover: Vec<_> = fs::read_dir(&artifacts_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".cordis-tmp."))
+            .collect();
+        assert!(
+            leftover.is_empty(),
+            "index tmp staging file was not cleaned up"
+        );
+    }
+
     // --- propagate_parent_failure break arms ---------------------------------
 
     // A required child whose parent edge is NOT required: propagation marks the

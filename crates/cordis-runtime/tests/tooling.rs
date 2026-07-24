@@ -461,6 +461,22 @@ fn sync_plugin_docs_errors_when_index_missing() {
     assert!(matches!(err, Err(RuntimeError::Io { .. })));
 }
 
+/// `sync_plugin_docs` maps a failed `create_dir_all(docs_dir)` to Io: a
+/// read-only `plugins/` directory blocks creating the per-plugin
+/// `docs/agent/` path. Covers the create-docs-dir map_err arm.
+#[cfg(unix)]
+#[test]
+fn sync_plugin_docs_errors_when_docs_dir_cannot_be_created() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = synthetic_fixtures(vec![json_entry("alpha", "alpha.json", "aa")]);
+    let plugins = temp.path().join("plugins");
+    // Deny writes under plugins/ so create_dir_all(plugins/alpha/docs/agent) fails.
+    fs::set_permissions(&plugins, fs::Permissions::from_mode(0o555)).unwrap();
+    let err = sync_plugin_docs(temp.path());
+    fs::set_permissions(&plugins, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(matches!(err, Err(RuntimeError::Io { .. })), "err: {err:?}");
+}
+
 // ---------------------------------------------------------------------------
 // refresh_artifact_index — JSON-only, cross-platform.
 // ---------------------------------------------------------------------------
@@ -1091,4 +1107,166 @@ fn prepare_artifacts_detects_docs_plugin_path_mismatch() {
         }
         other => panic!("expected DocsContract, got {other:?}"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// JSON-artifact plugin path. A plugin whose crate is *not* a dylib
+// (`crate-type` omits dylib/cdylib) is materialized through the
+// `materialize_artifact_entry` JSON branch: no `cargo build`, no dylib
+// inspection — the resolved docs + build-spec exports/execution are written
+// straight into a `<plugin>.json` artifact. `DependencySnapshot::load` still
+// runs `cargo metadata` on the workspace, so this needs a working toolchain,
+// but it compiles nothing.
+// ---------------------------------------------------------------------------
+
+/// Write a minimal JSON-artifact plugin crate (no dylib crate-type) with the
+/// full scaffold `PackageResolver` requires: `src/lib.rs`, `tests/`,
+/// `docs/human/overview.md`, and a matching `docs/agent/interfaces.json`.
+fn write_json_plugin(dir: &Path, crate_name: &str, plugin_path: &str) {
+    fs::create_dir_all(dir.join("src")).unwrap();
+    fs::create_dir_all(dir.join("tests")).unwrap();
+    fs::create_dir_all(dir.join("docs/human")).unwrap();
+    fs::create_dir_all(dir.join("docs/agent")).unwrap();
+
+    fs::write(
+        dir.join("Cargo.toml"),
+        format!(
+            r#"[package]
+name = "{crate_name}"
+version = "0.1.0"
+edition = "2021"
+
+[package.metadata.cordis]
+plugin_path = "{plugin_path}"
+abi_kind = "rust"
+declared_nodes = ["nd"]
+children = []
+
+[package.metadata.cordis.abi_fingerprint]
+crate_hash = "crate_{crate_name}_v1"
+api_hash = "api_v2"
+
+[package.metadata.cordis.artifact]
+exports = ["svc.demo"]
+"#,
+        ),
+    )
+    .unwrap();
+    fs::write(dir.join("src/lib.rs"), "// json plugin, no dylib\n").unwrap();
+    fs::write(dir.join("tests/smoke.rs"), "fn main() {}\n").unwrap();
+    fs::write(
+        dir.join("docs/human/overview.md"),
+        format!("# {plugin_path}\n"),
+    )
+    .unwrap();
+
+    let docs = plugin_docs(
+        plugin_path,
+        plugin_path,
+        "0.1.0",
+        Some("Cmd"),
+        vec![node_doc(
+            "nd",
+            "demo node",
+            serde_json::json!({"type": "object"}),
+            serde_json::json!({"type": "object"}),
+            &[],
+            &[],
+        )],
+        None,
+    );
+    fs::write(dir.join("docs/agent/interfaces.json"), pretty_json(&docs)).unwrap();
+}
+
+/// Fixtures root whose `plugins/` workspace holds a single JSON-artifact
+/// plugin. The workspace manifest lists it as a member so `cargo metadata`
+/// resolves it.
+fn json_plugin_fixtures(crate_name: &str, plugin_path: &str) -> TempDir {
+    let temp = TempDir::new().expect("tempdir");
+    let plugins = temp.path().join("plugins");
+    fs::create_dir_all(&plugins).unwrap();
+    fs::write(
+        plugins.join("Cargo.toml"),
+        format!("[workspace]\nmembers = [\"{crate_name}\"]\nresolver = \"2\"\n"),
+    )
+    .unwrap();
+    write_json_plugin(&plugins.join(crate_name), crate_name, plugin_path);
+    temp
+}
+
+#[test]
+#[serial_test::serial]
+fn prepare_artifacts_full_writes_json_artifact_without_building() {
+    // A JSON-only plugin exercises materialize_artifact_entry's non-dylib
+    // branch: PluginArtifact is assembled from the resolved docs +
+    // exports/execution and written to `<plugin>.json`; no cargo build runs
+    // and no dylib is inspected.
+    let temp = json_plugin_fixtures("jsonp", "jsonp");
+
+    let report =
+        prepare_artifacts(temp.path(), PrepareMode::Full).expect("full prepare of JSON plugin");
+    assert!(report.full_rebuild);
+    assert_eq!(report.rebuilt.len(), 1);
+    assert_eq!(report.rebuilt[0].0, "jsonp");
+    assert_eq!(report.rebuilt[0].1.len(), 64, "sha256 of the JSON artifact");
+
+    // The staged artifact is a JSON file the loader parses (not a dylib).
+    let artifact = temp.path().join("artifacts/jsonp.json");
+    assert!(artifact.exists(), "JSON artifact should be written");
+    let value: Value = serde_json::from_str(&fs::read_to_string(&artifact).unwrap()).unwrap();
+    assert_eq!(value["plugin_path"], "jsonp");
+    // Exports declared in the manifest flow through the build spec into the
+    // artifact.
+    assert_eq!(value["exports"][0], "svc.demo");
+
+    // The index entry records the JSON kind.
+    let index = read_index(temp.path());
+    let entries = index.get("entries").and_then(|v| v.as_array()).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["artifact_kind"], "json");
+    assert_eq!(entries[0]["sha256"].as_str().map(str::len), Some(64));
+
+    // read_plugin_docs over the JSON artifact returns the resolved docs.
+    let docs = read_plugin_docs(&artifact).expect("read JSON artifact docs");
+    assert_eq!(docs.plugin_path, "jsonp");
+}
+
+#[test]
+#[serial_test::serial]
+fn prepare_artifacts_incremental_reuses_clean_json_entry() {
+    // Second incremental pass over an unchanged JSON plugin finds nothing
+    // dirty and reuses the entry (compute_dirty_state -> false), driving the
+    // reuse branch of prepare_artifacts_locked.
+    let temp = json_plugin_fixtures("jsonp", "jsonp");
+    prepare_artifacts(temp.path(), PrepareMode::Full).expect("seed JSON index");
+
+    let report =
+        prepare_artifacts(temp.path(), PrepareMode::Incremental).expect("incremental JSON prepare");
+    assert!(!report.full_rebuild);
+    assert!(report.rebuilt.is_empty(), "clean pass rebuilds nothing");
+    assert_eq!(report.reused, vec!["jsonp".to_string()]);
+}
+
+#[test]
+#[serial_test::serial]
+fn prepare_artifacts_second_full_pass_clears_existing_artifacts_dir() {
+    // A second Full pass finds the `artifacts/` directory already populated
+    // from the first build, so prepare_artifacts_locked takes the
+    // `full_rebuild && artifacts_dir.exists()` branch and removes it before
+    // rebuilding. A stray file planted in `artifacts/` must not survive.
+    let temp = json_plugin_fixtures("jsonp", "jsonp");
+    prepare_artifacts(temp.path(), PrepareMode::Full).expect("first full build");
+
+    let stray = temp.path().join("artifacts/stray.txt");
+    fs::write(&stray, b"leftover").unwrap();
+    assert!(stray.exists());
+
+    let report = prepare_artifacts(temp.path(), PrepareMode::Full).expect("second full build");
+    assert!(report.full_rebuild);
+    assert_eq!(report.rebuilt.len(), 1);
+    assert!(
+        !stray.exists(),
+        "second full pass should clear the existing artifacts dir"
+    );
+    assert!(temp.path().join("artifacts/jsonp.json").exists());
 }

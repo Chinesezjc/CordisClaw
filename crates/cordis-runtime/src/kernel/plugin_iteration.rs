@@ -1483,6 +1483,33 @@ mod tests {
     }
 
     #[test]
+    fn atomic_write_create_dir_all_failure_when_parent_is_a_file() {
+        use crate::core::error::RuntimeError;
+        // The target's parent directory is actually a regular file, so the
+        // leading `create_dir_all(parent)` fails before any tmp is written.
+        let temp = TempDir::new().unwrap();
+        fs::write(temp.path().join("afile"), b"x").unwrap();
+        let target = temp.path().join("afile/inner.json");
+        let err = atomic_write(&target, b"data").expect_err("create_dir_all over a file must fail");
+        assert!(matches!(err, RuntimeError::Io { .. }), "got: {err:?}");
+    }
+
+    #[test]
+    fn atomic_write_rename_failure_when_target_is_nonempty_dir() {
+        use crate::core::error::RuntimeError;
+        // tmp creation + fsync succeed, but the final rename of the tmp file
+        // over an existing *non-empty directory* at `path` fails, exercising
+        // the rename error map.
+        let temp = TempDir::new().unwrap();
+        let target = temp.path().join("target");
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("occupied"), b"x").unwrap();
+        let err =
+            atomic_write(&target, b"data").expect_err("rename over a non-empty dir must fail");
+        assert!(matches!(err, RuntimeError::Io { .. }), "got: {err:?}");
+    }
+
+    #[test]
     fn journal_persist_uses_atomic_rename_and_records_generation() {
         // P0-6: persist_journal must round-trip and the generation id must
         // be non-empty and readable by `journal_generation_id`.
@@ -1759,8 +1786,9 @@ mod tests {
     // ---------- pure-logic / helper coverage ----------
 
     use super::{
-        apply_operation, deepest_matching_writable_root, file_sha256, json_set_serialize_io_error,
-        now_ms, plugin_subtree_surface_kind, resolve_under_workspace, toml_set_serialize_io_error,
+        apply_operation, contains_raw_member_access, deepest_matching_writable_root, file_sha256,
+        json_set_serialize_io_error, now_ms, plugin_subtree_surface_kind, resolve_under_workspace,
+        toml_set_serialize_io_error, validate_expected_hash,
         validate_reserved_child_keyword_identifiers, KernelPluginIssueStatus,
         PluginIterationFinalVerdict, PluginIterationNetSpec, PluginSubtreeSurfaceKind, UpdatedFile,
         VerifierVerdict,
@@ -2155,6 +2183,73 @@ mod tests {
             .expect("no reserved child keyword means no restriction");
     }
 
+    #[test]
+    fn reserved_keyword_validation_flags_raw_member_access() {
+        // A reserved child (`mod`) plus a source file whose only reference is
+        // raw member access (`value.mod`, not caught by any direct identifier
+        // pattern) exercises the `contains_raw_member_access` scan path. A
+        // sibling op with `new_content = None` also proves the "skip when no
+        // content" guard is taken before the scan.
+        let mut roots = BTreeSet::new();
+        roots.insert("plugins/x".to_string());
+        let manifest = PluginEditOperation {
+            path: "plugins/x/mod/Cargo.toml".to_string(),
+            kind: PluginEditOpKind::CreateFile,
+            expected_old_string: Some(String::new()),
+            expected_sha256: None,
+            new_content: Some("[package]\n".to_string()),
+            pointer: None,
+            dotted_key: None,
+            value: None,
+        };
+        // A .rs op carrying no new_content is skipped (the `else { continue }`).
+        let no_content = PluginEditOperation {
+            path: "plugins/x/mod/src/skip.rs".to_string(),
+            kind: PluginEditOpKind::DeleteFile,
+            expected_old_string: None,
+            expected_sha256: Some(sha_hex("")),
+            new_content: None,
+            pointer: None,
+            dotted_key: None,
+            value: None,
+        };
+        // Raw member access `.mod` followed by a non-identifier char.
+        let member_access = PluginEditOperation {
+            path: "plugins/x/mod/src/core.rs".to_string(),
+            kind: PluginEditOpKind::CreateFile,
+            expected_old_string: Some(String::new()),
+            new_content: Some("let handle = value.mod;\n".to_string()),
+            expected_sha256: None,
+            pointer: None,
+            dotted_key: None,
+            value: None,
+        };
+        let err = validate_reserved_child_keyword_identifiers(
+            &[manifest, no_content, member_access],
+            &roots,
+        )
+        .expect_err("raw `.mod` member access should be rejected");
+        assert!(matches!(err, RuntimeError::LlmResponseInvalid { .. }));
+    }
+
+    #[test]
+    fn contains_raw_member_access_ignores_longer_identifiers() {
+        // `.module` extends `.mod` with an identifier char → not a bare `.mod`
+        // access, so the scan must skip it and keep looking (loop-advance arm).
+        assert!(!contains_raw_member_access("a.module_thing()", "mod"));
+        // A genuine `.mod` at end-of-string is flagged (next char is None).
+        assert!(contains_raw_member_access("a.mod", "mod"));
+        // `.mod` followed by another `.mod`: first is `.mod.` (dot is
+        // non-identifier) → flagged.
+        assert!(contains_raw_member_access("a.mod.b", "mod"));
+    }
+
+    #[test]
+    fn validate_expected_hash_none_is_ok() {
+        // When no expected hash is supplied the precondition is a no-op.
+        validate_expected_hash("p", "anything", None).expect("None hash must pass");
+    }
+
     // ---------- apply_operation branch coverage ----------
 
     #[test]
@@ -2180,10 +2275,10 @@ mod tests {
         ));
         // Success replaces first occurrence.
         o.new_content = Some("ORI".to_string());
-        match apply_operation("p", &o, abs, Some(b"orig")).unwrap() {
-            UpdatedFile::Write(bytes) => assert_eq!(bytes, b"ORIg"),
-            UpdatedFile::Delete => panic!("expected write"),
-        }
+        assert!(matches!(
+            apply_operation("p", &o, abs, Some(b"orig")).unwrap(),
+            UpdatedFile::Write(bytes) if bytes == b"ORIg"
+        ));
     }
 
     #[test]
@@ -2210,10 +2305,10 @@ mod tests {
         // Success writes new_content.
         o.expected_old_string = Some(String::new());
         o.new_content = Some("hello".to_string());
-        match apply_operation("p", &o, abs, None).unwrap() {
-            UpdatedFile::Write(bytes) => assert_eq!(bytes, b"hello"),
-            UpdatedFile::Delete => panic!("expected write"),
-        }
+        assert!(matches!(
+            apply_operation("p", &o, abs, None).unwrap(),
+            UpdatedFile::Write(bytes) if bytes == b"hello"
+        ));
     }
 
     #[test]
@@ -2239,10 +2334,10 @@ mod tests {
         ));
         // Success.
         o.expected_sha256 = Some(sha_hex("data"));
-        match apply_operation("p", &o, abs, Some(b"data")).unwrap() {
-            UpdatedFile::Delete => {}
-            UpdatedFile::Write(_) => panic!("expected delete"),
-        }
+        assert!(matches!(
+            apply_operation("p", &o, abs, Some(b"data")).unwrap(),
+            UpdatedFile::Delete
+        ));
     }
 
     #[test]
@@ -2284,13 +2379,12 @@ mod tests {
             RuntimeError::AutoUpdatePatchInvalid { .. }
         ));
         // Success.
-        match apply_operation("p", &o, abs, Some(original.as_bytes())).unwrap() {
-            UpdatedFile::Write(bytes) => {
-                let doc: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-                assert_eq!(doc["k"], serde_json::json!(2));
-            }
-            UpdatedFile::Delete => panic!("expected write"),
-        }
+        assert!(matches!(
+            apply_operation("p", &o, abs, Some(original.as_bytes())).unwrap(),
+            UpdatedFile::Write(bytes)
+                if serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["k"]
+                    == serde_json::json!(2)
+        ));
     }
 
     #[test]
@@ -2315,12 +2409,39 @@ mod tests {
             apply_err("p", &o, abs, Some(original.as_bytes())),
             RuntimeError::AutoUpdatePatchInvalid { .. }
         ));
+        // Original content that passes the sha gate but is not valid TOML →
+        // toml parse failure closure.
+        let bad = "this is = = not toml";
+        let mut bad_op = o.clone();
+        bad_op.value = Some(serde_json::json!(2));
+        bad_op.expected_sha256 = Some(sha_hex(bad));
+        assert!(matches!(
+            apply_err("p", &bad_op, abs, Some(bad.as_bytes())),
+            RuntimeError::AutoUpdatePatchInvalid { .. }
+        ));
         o.value = Some(serde_json::json!(2));
+        // Value that cannot be represented in TOML (JSON null) → conversion
+        // failure closure.
+        let mut null_value = o.clone();
+        null_value.value = Some(serde_json::Value::Null);
+        assert!(matches!(
+            apply_err("p", &null_value, abs, Some(original.as_bytes())),
+            RuntimeError::AutoUpdatePatchInvalid { .. }
+        ));
         // Dotted key not found.
         let mut miss = o.clone();
         miss.dotted_key = Some("table.missing".to_string());
         assert!(matches!(
             apply_err("p", &miss, abs, Some(original.as_bytes())),
+            RuntimeError::AutoUpdatePatchInvalid { .. }
+        ));
+        // Intermediate (non-final) dotted-key segment not found: first segment
+        // resolves against the root table but is absent, so the `.get_mut`
+        // ok_or_else arm fires before reaching the final segment.
+        let mut miss_intermediate = o.clone();
+        miss_intermediate.dotted_key = Some("nope.k".to_string());
+        assert!(matches!(
+            apply_err("p", &miss_intermediate, abs, Some(original.as_bytes())),
             RuntimeError::AutoUpdatePatchInvalid { .. }
         ));
         // Intermediate key not a table.
@@ -2331,13 +2452,11 @@ mod tests {
             RuntimeError::AutoUpdatePatchInvalid { .. }
         ));
         // Success.
-        match apply_operation("p", &o, abs, Some(original.as_bytes())).unwrap() {
-            UpdatedFile::Write(bytes) => {
-                let text = String::from_utf8(bytes).unwrap();
-                assert!(text.contains("k = 2"));
-            }
-            UpdatedFile::Delete => panic!("expected write"),
-        }
+        assert!(matches!(
+            apply_operation("p", &o, abs, Some(original.as_bytes())).unwrap(),
+            UpdatedFile::Write(bytes)
+                if String::from_utf8_lossy(&bytes).contains("k = 2")
+        ));
     }
 
     // ---------- path / hash helpers ----------
@@ -2569,6 +2688,100 @@ mod tests {
         perms.set_mode(0o755);
         fs::set_permissions(&src_dir, perms).unwrap();
         assert_eq!(fs::read(&target).unwrap(), b"foo");
+    }
+
+    #[test]
+    fn execute_create_dir_all_failure_when_parent_is_a_file() {
+        // A CreateFile whose parent directory is actually a regular file makes
+        // the per-operation `create_dir_all(parent)` fail *before* any backup is
+        // recorded (lines 577-582). validate_path still classifies the target as
+        // WritableOther (under `src/`), so we reach the disk phase.
+        let temp = TempDir::new().unwrap();
+        let ws = temp.path();
+        let src_dir = ws.join("plugins/demo/src");
+        fs::create_dir_all(&src_dir).unwrap();
+        // `afile` sits where a directory is required by the target path.
+        fs::write(src_dir.join("afile"), b"x").unwrap();
+        let plan = PluginEditPlan {
+            issue_id: "i".to_string(),
+            patch_id: "p".to_string(),
+            summary: "s".to_string(),
+            operations: vec![PluginEditOperation {
+                path: "plugins/demo/src/afile/new.rs".to_string(),
+                kind: PluginEditOpKind::CreateFile,
+                expected_old_string: Some(String::new()),
+                expected_sha256: None,
+                new_content: Some("hi".to_string()),
+                pointer: None,
+                dotted_key: None,
+                value: None,
+            }],
+        };
+        let executor = PluginEditExecutor::new(ws);
+        let err = executor
+            .execute(&PluginIterationPolicy::default(), &demo_allowed(), &plan)
+            .expect_err("create_dir_all over a file must fail");
+        assert!(matches!(err, RuntimeError::Io { .. }), "got: {err:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn execute_delete_failure_then_rollback_failure_surfaces_invariant() {
+        use std::os::unix::fs::PermissionsExt;
+        // Running as root bypasses file-mode permission checks, so skip.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("[skip] running as root; read-only ops would not fail");
+            return;
+        }
+        // A DeleteFile whose target is read-only inside a read-only directory:
+        // fs::read succeeds (so apply_operation validates and records a backup),
+        // but `fs::remove_file` fails (read-only dir → covers the Delete-branch
+        // error map, lines 599-601). Rollback then tries `fs::write` to restore
+        // the original into the still-read-only file and *also* fails, driving
+        // the nested "in-execute rollback failed" Invariant path (lines 614-618).
+        let temp = TempDir::new().unwrap();
+        let ws = temp.path();
+        let src_dir = ws.join("plugins/demo/src");
+        fs::create_dir_all(&src_dir).unwrap();
+        let target = src_dir.join("lib.rs");
+        fs::write(&target, b"foo").unwrap();
+        // File read-only so the rollback fs::write also fails.
+        let mut file_perms = fs::metadata(&target).unwrap().permissions();
+        file_perms.set_mode(0o444);
+        fs::set_permissions(&target, file_perms).unwrap();
+        // Directory read-only so remove_file fails.
+        let mut dir_perms = fs::metadata(&src_dir).unwrap().permissions();
+        dir_perms.set_mode(0o555);
+        fs::set_permissions(&src_dir, dir_perms).unwrap();
+
+        let plan = PluginEditPlan {
+            issue_id: "i".to_string(),
+            patch_id: "p".to_string(),
+            summary: "s".to_string(),
+            operations: vec![PluginEditOperation {
+                path: "plugins/demo/src/lib.rs".to_string(),
+                kind: PluginEditOpKind::DeleteFile,
+                expected_old_string: None,
+                expected_sha256: Some(sha_hex("foo")),
+                new_content: None,
+                pointer: None,
+                dotted_key: None,
+                value: None,
+            }],
+        };
+        let executor = PluginEditExecutor::new(ws);
+        let err = executor
+            .execute(&PluginIterationPolicy::default(), &demo_allowed(), &plan)
+            .expect_err("read-only delete with failed rollback must error");
+        assert!(
+            matches!(err, RuntimeError::Invariant { .. }),
+            "got: {err:?}"
+        );
+
+        // Restore perms so TempDir cleanup can proceed.
+        let mut dir_perms = fs::metadata(&src_dir).unwrap().permissions();
+        dir_perms.set_mode(0o755);
+        fs::set_permissions(&src_dir, dir_perms).unwrap();
     }
 
     #[test]
