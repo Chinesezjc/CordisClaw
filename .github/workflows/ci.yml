@@ -9,8 +9,11 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  CARGO_TERM_COLOR: always
+# 不设 CARGO_TERM_COLOR=always：该 env 会被 runtime 内部嵌套执行的
+# cargo（verifier 的 tests_command 等）继承，warning 输出带 ANSI 颜色码
+# （warning 与 : 之间夹转义序列），host.rs 的 warning 检测匹配不上，
+# agent 迭代的 warning-反馈-重试链路整段失效
+# （agent_retries_on_warning 在 CI 上以"反馈请求缺失"复现）。
 
 jobs:
   ci:
