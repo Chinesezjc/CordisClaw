@@ -358,4 +358,203 @@ mod tests {
     fn backoff_policy_default_is_none() {
         assert_eq!(BackoffPolicy::default(), BackoffPolicy::None);
     }
+
+    // `RunPolicy::default` sets the documented defaults: 30s timeout, no
+    // retries, no backoff. Exercises the hand-written Default impl.
+    #[test]
+    fn run_policy_default_values() {
+        let p = RunPolicy::default();
+        assert_eq!(p.timeout_ms, 30_000);
+        assert_eq!(p.max_retries, 0);
+        assert_eq!(p.backoff, BackoffPolicy::None);
+    }
+
+    // AnyOf: first Success short-circuits to CompleteSuccess; all-terminal
+    // non-success collapses to CompleteFailure; a pending upstream forces Wait.
+    #[test]
+    fn any_of_covers_all_branches() {
+        let up = vec!["a".to_string(), "b".to_string()];
+        let empty: Vec<String> = Vec::new();
+        let one_ok = outcomes(&[("a", NodeOutcome::Success)]);
+        assert_eq!(
+            evaluate_gate(GatePolicy::AnyOf, &up, &one_ok, &empty),
+            GateDecision::CompleteSuccess
+        );
+        let both_fail = outcomes(&[("a", NodeOutcome::Failure), ("b", NodeOutcome::Cancelled)]);
+        assert_eq!(
+            evaluate_gate(GatePolicy::AnyOf, &up, &both_fail, &empty),
+            GateDecision::CompleteFailure
+        );
+        let one_fail_one_pending = outcomes(&[("a", NodeOutcome::Failure)]);
+        assert_eq!(
+            evaluate_gate(GatePolicy::AnyOf, &up, &one_fail_one_pending, &empty),
+            GateDecision::Wait
+        );
+        // Empty upstream is a vacuous failure for AnyOf.
+        let none: Vec<String> = Vec::new();
+        assert_eq!(
+            evaluate_gate(GatePolicy::AnyOf, &none, &empty_map(), &empty),
+            GateDecision::CompleteFailure
+        );
+    }
+
+    fn empty_map() -> BTreeMap<String, NodeOutcome> {
+        BTreeMap::new()
+    }
+
+    // FirstCompleted: the first terminal node in completion_order is a failure,
+    // and another upstream is still pending → cancel the pending branch and
+    // report failure (covers the failure+cancel arm).
+    #[test]
+    fn first_completed_failure_cancels_pending() {
+        let up = vec!["a".to_string(), "b".to_string()];
+        let out = outcomes(&[("a", NodeOutcome::Failure)]);
+        let order = vec!["a".to_string()];
+        match evaluate_gate(GatePolicy::FirstCompleted, &up, &out, &order) {
+            GateDecision::CompleteAndCancel {
+                success,
+                cancel_nodes,
+            } => {
+                assert!(!success);
+                assert_eq!(cancel_nodes, vec!["b".to_string()]);
+            }
+            d => panic!("expected CompleteAndCancel failure, got {d:?}"),
+        }
+    }
+
+    // FirstCompleted: a lone terminal failure with no pending peers completes
+    // as plain failure (empty cancel set).
+    #[test]
+    fn first_completed_lone_failure_completes_failure() {
+        let up = vec!["a".to_string()];
+        let out = outcomes(&[("a", NodeOutcome::Failure)]);
+        let order = vec!["a".to_string()];
+        assert_eq!(
+            evaluate_gate(GatePolicy::FirstCompleted, &up, &out, &order),
+            GateDecision::CompleteFailure
+        );
+    }
+
+    // FirstCompleted: lone terminal success with no pending peers → success.
+    #[test]
+    fn first_completed_lone_success_completes_success() {
+        let up = vec!["a".to_string()];
+        let out = outcomes(&[("a", NodeOutcome::Success)]);
+        let order = vec!["a".to_string()];
+        assert_eq!(
+            evaluate_gate(GatePolicy::FirstCompleted, &up, &out, &order),
+            GateDecision::CompleteSuccess
+        );
+    }
+
+    // FirstCompleted: success with a pending peer → cancel then success.
+    #[test]
+    fn first_completed_success_cancels_pending() {
+        let up = vec!["a".to_string(), "b".to_string()];
+        let out = outcomes(&[("a", NodeOutcome::Success)]);
+        let order = vec!["a".to_string()];
+        match evaluate_gate(GatePolicy::FirstCompleted, &up, &out, &order) {
+            GateDecision::CompleteAndCancel {
+                success,
+                cancel_nodes,
+            } => {
+                assert!(success);
+                assert_eq!(cancel_nodes, vec!["b".to_string()]);
+            }
+            d => panic!("expected CompleteAndCancel success, got {d:?}"),
+        }
+    }
+
+    // FirstCompleted: nothing terminal yet → Wait (fallthrough past the loop).
+    #[test]
+    fn first_completed_waits_when_nothing_terminal() {
+        let up = vec!["a".to_string(), "b".to_string()];
+        let out = empty_map();
+        let order: Vec<String> = Vec::new();
+        assert_eq!(
+            evaluate_gate(GatePolicy::FirstCompleted, &up, &out, &order),
+            GateDecision::Wait
+        );
+    }
+
+    // FirstSuccess: a node listed in completion_order but with a non-Success
+    // outcome must be skipped (the loop keeps scanning), exercising the
+    // fall-through past the success check.
+    #[test]
+    fn first_success_skips_non_success_in_order() {
+        let up = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let out = outcomes(&[
+            ("a", NodeOutcome::Failure),
+            ("b", NodeOutcome::Cancelled),
+            ("c", NodeOutcome::Success),
+        ]);
+        let order = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        match evaluate_gate(GatePolicy::FirstSuccess, &up, &out, &order) {
+            GateDecision::CompleteAndCancel { success, .. } => assert!(success),
+            d => panic!("expected CompleteAndCancel, got {d:?}"),
+        }
+    }
+
+    // AllOf over an empty upstream set is vacuously satisfied → success
+    // (the `upstream_nodes.is_empty()` early return).
+    #[test]
+    fn all_of_empty_upstream_is_vacuous_success() {
+        let up: Vec<String> = Vec::new();
+        let empty: Vec<String> = Vec::new();
+        assert_eq!(
+            evaluate_gate(GatePolicy::AllOf, &up, &empty_map(), &empty),
+            GateDecision::CompleteSuccess
+        );
+    }
+
+    // FirstSuccess: a completion_order entry that is NOT among the upstream
+    // nodes must be skipped by the `!upstream.contains(node)` guard, so a
+    // stray ordered id doesn't spuriously win the gate.
+    #[test]
+    fn first_success_skips_order_entries_outside_upstream() {
+        let up = vec!["a".to_string()];
+        let out = outcomes(&[("a", NodeOutcome::Success), ("stray", NodeOutcome::Success)]);
+        // "stray" precedes "a" in the order but is not an upstream node.
+        let order = vec!["stray".to_string(), "a".to_string()];
+        match evaluate_gate(GatePolicy::FirstSuccess, &up, &out, &order) {
+            GateDecision::CompleteAndCancel {
+                success,
+                cancel_nodes,
+            } => {
+                assert!(success);
+                assert!(cancel_nodes.is_empty());
+            }
+            d => panic!("expected CompleteAndCancel, got {d:?}"),
+        }
+    }
+
+    // FirstCompleted: same guard — an ordered id outside the upstream set is
+    // ignored, and the real upstream terminal decides the gate.
+    #[test]
+    fn first_completed_skips_order_entries_outside_upstream() {
+        let up = vec!["a".to_string()];
+        let out = outcomes(&[("a", NodeOutcome::Failure), ("stray", NodeOutcome::Success)]);
+        let order = vec!["stray".to_string(), "a".to_string()];
+        assert_eq!(
+            evaluate_gate(GatePolicy::FirstCompleted, &up, &out, &order),
+            GateDecision::CompleteFailure
+        );
+    }
+
+    // AtLeast(0) is trivially satisfied; a still-reachable quorum waits.
+    #[test]
+    fn at_least_zero_and_wait_branches() {
+        let up = vec!["a".to_string(), "b".to_string()];
+        let empty: Vec<String> = Vec::new();
+        assert_eq!(
+            evaluate_gate(GatePolicy::AtLeast(0), &up, &empty_map(), &empty),
+            GateDecision::CompleteSuccess
+        );
+        // One success, one pending, need two → still reachable → Wait.
+        let one = outcomes(&[("a", NodeOutcome::Success)]);
+        assert_eq!(
+            evaluate_gate(GatePolicy::AtLeast(2), &up, &one, &empty),
+            GateDecision::Wait
+        );
+    }
 }

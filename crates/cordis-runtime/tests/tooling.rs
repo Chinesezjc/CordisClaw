@@ -6,8 +6,8 @@ use cordis_runtime::core::models::{
 };
 use cordis_runtime::plugin::package::PackageResolver;
 use cordis_runtime::plugin::tooling::{
-    prepare_artifacts, read_plugin_docs, rebuild_fixture_artifacts, rebuild_plugin_workspace,
-    refresh_artifact_index, sync_plugin_docs, PrepareMode,
+    ensure_fixture_artifacts, prepare_artifacts, read_plugin_docs, rebuild_fixture_artifacts,
+    rebuild_plugin_workspace, refresh_artifact_index, sync_plugin_docs, PrepareMode,
 };
 use serde_json::Value;
 use std::fs;
@@ -868,6 +868,28 @@ fn prepare_artifacts_incremental_noop_without_repo_sources() {
 }
 
 #[test]
+fn ensure_fixture_artifacts_is_false_without_repo_sources() {
+    // `ensure_fixture_artifacts` is a thin wrapper over
+    // prepare_artifacts(Incremental) returning whether anything was rebuilt.
+    // Against a workspace-less directory it is a no-op: nothing rebuilt.
+    let temp = TempDir::new().unwrap();
+    let rebuilt = ensure_fixture_artifacts(temp.path()).expect("ensure should succeed");
+    assert!(!rebuilt, "no repo sources -> nothing rebuilt");
+}
+
+#[test]
+#[serial_test::serial]
+fn ensure_fixture_artifacts_true_on_cold_dylib_build() {
+    // A cold fixtures root with dylib sources: the incremental pass has no
+    // prior index, so it performs a full build and reports rebuilt == true.
+    let temp = dylib_plugin_fixtures("demo", "demo");
+    let target = scoped_target_dir(&temp);
+    let _guard = TargetDirGuard::set(&target);
+    let rebuilt = ensure_fixture_artifacts(temp.path()).expect("cold ensure builds");
+    assert!(rebuilt, "cold build must report a rebuild");
+}
+
+#[test]
 #[serial_test::serial]
 fn rebuild_plugin_workspace_named_plugin_builds_and_refreshes_index() {
     let temp = dylib_plugin_fixtures("demo", "demo");
@@ -1026,5 +1048,49 @@ fn prepare_artifacts_detects_abi_fingerprint_mismatch() {
             assert_eq!(plugin_path, "demo");
         }
         other => panic!("expected AbiMismatch, got {other:?}"),
+    }
+}
+
+#[test]
+#[serial_test::serial]
+fn prepare_artifacts_detects_docs_plugin_path_mismatch() {
+    // materialize_artifact_entry compares the dylib's *runtime* docs.plugin_path
+    // (baked into `docs_value()` at compile time) against the resolved
+    // plugin.plugin_path (from the manifest). Rewrite only the source's
+    // `docs_value()` plugin_path so the compiled dylib reports a different
+    // plugin_path than the manifest declares. The manifest + interfaces.json
+    // still agree (resolution passes) and the ABI fingerprint is unchanged
+    // (AbiMismatch does NOT fire), so the DocsContract guard is what rejects it.
+    let temp = dylib_plugin_fixtures("demo", "demo");
+    let target = scoped_target_dir(&temp);
+    let _guard = TargetDirGuard::set(&target);
+
+    let lib = temp.path().join("plugins/demo/src/lib.rs");
+    let text = fs::read_to_string(&lib).unwrap();
+    // The plugin_path is the second positional arg to `plugin_docs`, uniquely
+    // identified by its adjacency to the version literal below it.
+    let patched = text.replace(
+        "        \"demo\",\n        \"0.1.0\",",
+        "        \"demo_runtime_diverged\",\n        \"0.1.0\",",
+    );
+    assert_ne!(
+        patched, text,
+        "docs_value plugin_path arg should be rewritten"
+    );
+    fs::write(&lib, patched).unwrap();
+
+    let err = prepare_artifacts(temp.path(), PrepareMode::Full);
+    match err {
+        Err(RuntimeError::DocsContract {
+            plugin_path,
+            message,
+        }) => {
+            assert_eq!(plugin_path, "demo");
+            assert!(
+                message.contains("demo_runtime_diverged"),
+                "message should name the divergent runtime path: {message}"
+            );
+        }
+        other => panic!("expected DocsContract, got {other:?}"),
     }
 }

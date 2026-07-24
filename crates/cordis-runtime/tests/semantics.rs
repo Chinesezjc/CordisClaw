@@ -1388,6 +1388,107 @@ fn parallel_path_runner_panic_becomes_runtime_error() {
     }
 }
 
+#[test]
+fn parallel_path_non_string_panic_payload_is_surfaced() {
+    // The panic-payload downcast in the parallel path has three arms:
+    // &'static str, String, and a generic fallback. A payload that is neither
+    // a &str nor a String (here a u32 via panic_any) exercises the
+    // "runner thread panicked" fallback branch.
+    let net = ExecutionNetSpec {
+        places: vec![],
+        transitions: vec![transition(
+            "boom",
+            JoinPolicy::AllOf,
+            0,
+            ExecutionTransitionKind::Task,
+        )],
+        arcs: vec![],
+    };
+
+    let mut ctx = RuntimeContext::default();
+    let err = execute_net(
+        ExecutionConfig {
+            scheduler: SchedulerConfig {
+                max_parallelism: 1,
+                max_concurrency: 4,
+            },
+            scheduler_mode: SchedulerMode::Deterministic,
+        },
+        net,
+        &mut ctx,
+        |_, _, _, _| std::panic::panic_any(42_u32),
+    )
+    .expect_err("non-string runner panic must surface as error");
+
+    match err {
+        RuntimeError::ExecutionFailed { message, .. } => {
+            assert!(
+                message.contains("runner panic") && message.contains("runner thread panicked"),
+                "expected generic panic fallback, got: {message}"
+            );
+        }
+        other => panic!("expected ExecutionFailed, got {other:?}"),
+    }
+}
+
+#[test]
+fn parallel_path_retry_applies_backoff_delay() {
+    // The parallel path's own retry branch sleeps for the backoff delay
+    // before re-queuing a failed task (distinct from the single-threaded
+    // retry path). A single root task under max_concurrency>1 fails on
+    // attempt 0 and retries with a Fixed backoff, so the executor must have
+    // slept before succeeding on attempt 1.
+    let mut retry_task = transition(
+        "retry_task",
+        JoinPolicy::AllOf,
+        0,
+        ExecutionTransitionKind::Task,
+    );
+    retry_task.run_policy = RunPolicy {
+        timeout_ms: 5_000,
+        max_retries: 2,
+        backoff: BackoffPolicy::Fixed { delay_ms: 20 },
+    };
+    let net = ExecutionNetSpec {
+        places: vec![],
+        transitions: vec![retry_task],
+        arcs: vec![],
+    };
+
+    let mut ctx = RuntimeContext::default();
+    let started = Instant::now();
+    let output = execute_net(
+        ExecutionConfig {
+            scheduler: SchedulerConfig {
+                max_parallelism: 1,
+                max_concurrency: 4,
+            },
+            scheduler_mode: SchedulerMode::Deterministic,
+        },
+        net,
+        &mut ctx,
+        |_, attempt, _, _| {
+            if attempt == 0 {
+                TransitionRunResult::from_outcome(NodeOutcome::Failure)
+            } else {
+                TransitionRunResult::from_outcome(NodeOutcome::Success)
+            }
+        },
+    )
+    .expect("engine run should pass");
+    let elapsed_ms = started.elapsed().as_millis();
+
+    assert_eq!(
+        output.outcomes.get("retry_task"),
+        Some(&NodeOutcome::Success)
+    );
+    assert_eq!(output.metrics.node_retry_total, 1);
+    assert!(
+        elapsed_ms >= 15,
+        "parallel retry should sleep for the backoff delay, got {elapsed_ms}ms"
+    );
+}
+
 // --------------------------------------------------------------------------
 // engine.rs — single-threaded path: terminal cancellation, Cancelled metric,
 // Gate kind, exponential backoff, and remaining join policies.

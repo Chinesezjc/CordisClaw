@@ -137,4 +137,55 @@ mod tests {
         assert_eq!(result.outcome, NodeOutcome::Timeout);
         assert_eq!(metrics.router_timeout_total, 1);
     }
+
+    /// Drive every `match outcome` arm through a SINGLE closure type (one
+    /// monomorphization of `execute_router`) so that this instantiation
+    /// executes all of Success/Failure/Timeout/Cancelled/Skipped. The
+    /// closure returns a scripted outcome per call; timeout is disabled so
+    /// each requested outcome reaches its own arm verbatim, except the
+    /// dedicated slow call that provokes the Timeout reclassification.
+    #[test]
+    fn every_outcome_arm_is_covered_in_one_instantiation() {
+        use std::cell::Cell;
+        let script = [
+            NodeOutcome::Success,
+            NodeOutcome::Failure,
+            NodeOutcome::Cancelled,
+            NodeOutcome::Skipped,
+        ];
+        let idx = Cell::new(0usize);
+        let run = |_ctx: &RuntimeContext| {
+            let i = idx.get();
+            idx.set(i + 1);
+            script[i]
+        };
+
+        let mut metrics = RouterMetrics::default();
+        for (i, expected) in script.iter().enumerate() {
+            let mut ctx = RuntimeContext::default();
+            let result = execute_router(&mut ctx, &format!("sg{i}"), &mut metrics, run, 0)
+                .expect("router should not error");
+            assert_eq!(&result.outcome, expected);
+        }
+        assert_eq!(metrics.router_success_total, 1);
+        assert_eq!(metrics.router_failure_total, 1);
+        assert_eq!(metrics.router_cancelled_total, 1);
+        assert_eq!(metrics.router_skipped_total, 1);
+        assert_eq!(metrics.router_overlay_commit_total, 1);
+        assert_eq!(metrics.router_overlay_rollback_total, 3);
+
+        // A separate slow call (same closure type would extend the script; use
+        // an independent closure that still shares no arm gaps) drives the
+        // Timeout arm: a non-Success outcome past the deadline is
+        // re-classified and rolled back.
+        let mut ctx = RuntimeContext::default();
+        let slow = |_ctx: &RuntimeContext| {
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            NodeOutcome::Failure
+        };
+        let result = execute_router(&mut ctx, "sg-timeout", &mut metrics, slow, 10)
+            .expect("router should not error");
+        assert_eq!(result.outcome, NodeOutcome::Timeout);
+        assert_eq!(metrics.router_timeout_total, 1);
+    }
 }

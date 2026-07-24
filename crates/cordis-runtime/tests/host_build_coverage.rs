@@ -26,9 +26,14 @@ use cordis_runtime::kernel::verifier::VerificationProfile;
 use cordis_runtime::plugin::tooling::{prepare_artifacts, PrepareMode};
 use serde_json::{json, Value};
 use serial_test::serial;
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
+
+mod support;
+
+use support::{spawn_chunked_mock_llm_server_sequence, sse_response};
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -689,4 +694,370 @@ fn iterate_plugins_canary_uses_declared_verify_node() {
     assert_eq!(canary.mode, "declared_plugin_verifier_node");
     assert_eq!(canary.node_id.as_deref(), Some("mini_verify"));
     assert!(host.candidate_snapshot().is_none());
+}
+
+// ---------------------------------------------------------------------------
+// Agent-driven execute_tool coverage
+// ---------------------------------------------------------------------------
+//
+// The tests below boot the *agent* iteration path (edit_plan: None) so
+// `RuntimeHost::iterate_plugins` starts a `PluginIterationAgentBackend` and
+// drives it against the scripted mock SSE server. Each scripted turn returns a
+// single `tool_calls` delta, exercising one `execute_tool` match arm plus its
+// error branches. Everything runs on the minimal `mini` workspace, so only the
+// tiny `mini` crate is rebuilt (one small `cargo build`), and a single agent
+// session covers many arms in one ~200s dylib-rebuilding test.
+
+/// Emit a scripted SSE turn that instructs the agent to call `tool_calls`.
+/// Mirrors the `tool_call_response` helper in `runtime_host.rs`.
+fn tool_call_turn(response_id: &str, calls: Vec<(&str, &str, Value)>) -> Vec<(u64, String)> {
+    sse_response(vec![
+        json!({
+            "id": response_id,
+            "choices": [{
+                "delta": {
+                    "tool_calls": calls
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, (call_id, name, arguments))| json!({
+                            "index": index,
+                            "id": call_id,
+                            "type": "function",
+                            "function": {
+                                "name": name,
+                                "arguments": serde_json::to_string(&arguments)
+                                    .expect("serialize tool arguments"),
+                            }
+                        }))
+                        .collect::<Vec<_>>()
+                }
+            }]
+        }),
+        json!({
+            "id": response_id,
+            "choices": [{ "delta": {}, "finish_reason": "tool_calls" }]
+        }),
+    ])
+}
+
+/// Single-tool convenience over `tool_call_turn`.
+fn one_tool_turn(response_id: &str, call_id: &str, name: &str, args: Value) -> Vec<(u64, String)> {
+    tool_call_turn(response_id, vec![(call_id, name, args)])
+}
+
+/// Write the single-profile `config/llm_api.yaml` next to the temp `fixtures`
+/// dir (the sibling-`config` layout `discover_config_dir` resolves).
+fn write_agent_llm_config(fixtures_root: &Path, url: &str) {
+    let config_dir = fixtures_root
+        .parent()
+        .expect("fixtures parent")
+        .join("config");
+    fs::create_dir_all(&config_dir).expect("create config dir");
+    fs::write(
+        config_dir.join("llm_api.yaml"),
+        format!(
+            "provider: deepseek\nbase_url: {url}\napi_key: test-key\nmodel: deepseek-reasoner\ntemperature: 0.0\nmax_tokens: 4096\ntimeout_ms: 600000\n"
+        ),
+    )
+    .expect("write agent llm config");
+}
+
+fn sha256_hex(text: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(text.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+fn agent_iteration_request() -> KernelPluginIterationRequest {
+    KernelPluginIterationRequest {
+        issue_id: None,
+        target_plugin_paths: vec!["mini".to_string()],
+        instruction: Some("Exercise the plugin-iteration agent tool surface on mini.".to_string()),
+        edit_plan: None,
+        manual_approved: false,
+        tests_command: Some(
+            "cargo test --quiet --manifest-path plugins/mini/Cargo.toml".to_string(),
+        ),
+        safety_command: None,
+        verify_profile: Some(VerificationProfile::RustWorkspace),
+        quality_score: Some(95),
+    }
+}
+
+// Full agent-driven promote path that walks through the previously-uncovered
+// `execute_tool` arms in one session:
+//   list_context_files(focus) → list_context_files(scope=all) →
+//   read_context_files → inspect_plugin_catalog → create_file →
+//   json_set → toml_set → delete_file → run_plugin_check →
+//   rebuild_plugin_workspace → run_plugin_test → record_iteration_summary.
+//
+// It also injects a handful of *failing* calls (bad scope, hidden/absent
+// context read, empty replace_files_exact batch, stale-hash json_set) to reach
+// each arm's error branch. A tool failure just injects a corrective user turn,
+// so the agent proceeds to the next scripted turn — no session abort.
+#[serial]
+#[test]
+fn iterate_plugins_agent_walks_execute_tool_surface_and_promotes() {
+    let (_temp, fixtures) = setup_minimal_workspace(MINI_SUMMARY);
+
+    // Content used by the create_file / json_set / delete_file chain. The file
+    // lives under the writable `src/` surface so the edit policy accepts it.
+    let scratch_rel = "plugins/mini/src/agent_scratch.json";
+    let scratch_initial = "{\n  \"marker\": \"initial\"\n}";
+    let scratch_after_set =
+        serde_json::to_string_pretty(&json!({ "marker": "updated" })).expect("pretty scratch");
+    let scratch_sha = sha256_hex(scratch_initial);
+    let scratch_sha_after = sha256_hex(&scratch_after_set);
+
+    // A real behaviour edit outside any scaffold so record_iteration_summary's
+    // scaffold-integration guard is satisfied (there are no scaffolds here, so
+    // the guard is a no-op, but the edit keeps the plugin compiling).
+    let lib_before = mini_lib_rs(MINI_SUMMARY, false);
+    let lib_after = lib_before.replace(
+        "        \"mini_echo\" => Ok(NodeResponse {",
+        "        // agent-touched\n        \"mini_echo\" => Ok(NodeResponse {",
+    );
+    assert_ne!(lib_before, lib_after, "lib edit anchor must match");
+
+    // Manifest sha for the toml_set guard (read the freshly-prepared manifest).
+    let manifest_rel = "plugins/mini/Cargo.toml";
+    let manifest_text =
+        fs::read_to_string(fixtures.join(manifest_rel)).expect("read mini manifest");
+    let manifest_sha = sha256_hex(&manifest_text);
+
+    let responses = vec![
+        // 1) focus scope listing.
+        one_tool_turn("iter_1", "c_list_focus", "list_context_files", json!({})),
+        // 2) invalid scope → parse_context_files_scope error arm.
+        one_tool_turn(
+            "iter_2",
+            "c_list_bad",
+            "list_context_files",
+            json!({ "scope": "everything" }),
+        ),
+        // 3) scope=all expands the visible set (context_scope_expanded=true).
+        one_tool_turn(
+            "iter_3",
+            "c_list_all",
+            "list_context_files",
+            json!({ "scope": "all" }),
+        ),
+        // 4) read a couple of now-visible context files.
+        one_tool_turn(
+            "iter_4",
+            "c_read",
+            "read_context_files",
+            json!({ "paths": ["plugins/mini/src/lib.rs", "plugins/mini/Cargo.toml"] }),
+        ),
+        // 5) read a path that is NOT in the session context → read_context_path
+        //    "not available" error arm.
+        one_tool_turn(
+            "iter_5",
+            "c_read_missing",
+            "read_context_files",
+            json!({ "paths": ["plugins/mini/src/does_not_exist.rs"] }),
+        ),
+        // 6) inspect the plugin catalog.
+        one_tool_turn("iter_6", "c_inspect", "inspect_plugin_catalog", json!({})),
+        // 7) empty replace_files_exact batch → explicit InvalidArgument arm.
+        one_tool_turn(
+            "iter_7",
+            "c_empty_batch",
+            "replace_files_exact",
+            json!({ "edits": [] }),
+        ),
+        // 8) create a new writable JSON file.
+        one_tool_turn(
+            "iter_8",
+            "c_create",
+            "create_file",
+            json!({ "path": scratch_rel, "new_content": scratch_initial }),
+        ),
+        // 9) json_set with a STALE hash → executor stale-precondition error arm.
+        one_tool_turn(
+            "iter_9",
+            "c_json_stale",
+            "json_set",
+            json!({
+                "path": scratch_rel,
+                "expected_sha256": scratch_sha_after,
+                "pointer": "/marker",
+                "value": "updated"
+            }),
+        ),
+        // 10) json_set with the correct hash → success arm.
+        one_tool_turn(
+            "iter_10",
+            "c_json_ok",
+            "json_set",
+            json!({
+                "path": scratch_rel,
+                "expected_sha256": scratch_sha,
+                "pointer": "/marker",
+                "value": "updated"
+            }),
+        ),
+        // 11) toml_set on the manifest. Rewrite an existing key to a
+        //     semantically-identical value ("2021") so the manifest is
+        //     re-serialised (exercising the TomlSet arm) without drifting the
+        //     package version away from the hand-written interfaces.json docs
+        //     contract, which would otherwise fail the candidate load.
+        one_tool_turn(
+            "iter_11",
+            "c_toml",
+            "toml_set",
+            json!({
+                "path": manifest_rel,
+                "expected_sha256": manifest_sha,
+                "dotted_key": "package.edition",
+                "value": "2021"
+            }),
+        ),
+        // 12) delete the scratch file (hash now reflects the json_set output).
+        one_tool_turn(
+            "iter_12",
+            "c_delete",
+            "delete_file",
+            json!({ "path": scratch_rel, "expected_sha256": scratch_sha_after }),
+        ),
+        // 13) a real lib.rs edit so the crate still compiles after the manifest
+        //     version bump; also the behaviour edit for the record guard.
+        one_tool_turn(
+            "iter_13",
+            "c_lib_edit",
+            "replace_file_exact",
+            json!({
+                "path": "plugins/mini/src/lib.rs",
+                "expected_old_string": lib_before,
+                "new_content": lib_after
+            }),
+        ),
+        // 14) run_plugin_check with an explicit single-plugin command.
+        one_tool_turn(
+            "iter_14",
+            "c_check",
+            "run_plugin_check",
+            json!({
+                "plugin_path": "/mini",
+                "command": "cargo check --quiet --manifest-path plugins/mini/Cargo.toml"
+            }),
+        ),
+        // 15) rebuild the mini workspace only.
+        one_tool_turn(
+            "iter_15",
+            "c_rebuild",
+            "rebuild_plugin_workspace",
+            json!({ "plugin_path": "/mini" }),
+        ),
+        // 16) run_plugin_test (safe default via empty plugin_path→"/").
+        one_tool_turn(
+            "iter_16",
+            "c_test",
+            "run_plugin_test",
+            json!({
+                "plugin_path": "/mini",
+                "command": "cargo test --quiet --manifest-path plugins/mini/Cargo.toml"
+            }),
+        ),
+        // 17) record_iteration_summary ends the session.
+        one_tool_turn(
+            "iter_17",
+            "c_record",
+            "record_iteration_summary",
+            json!({
+                "summary": "Walked the plugin-iteration agent tool surface on mini.",
+                "tests_command": "cargo test --quiet --manifest-path plugins/mini/Cargo.toml"
+            }),
+        ),
+    ];
+
+    let (url, requests_rx, handle) = spawn_chunked_mock_llm_server_sequence(responses);
+    write_agent_llm_config(&fixtures, &url);
+
+    let host = boot_and_seed(&fixtures);
+
+    // Seed a replay sample so run_plugin_canary has evidence → promote path.
+    host.invoke("mini", "mini_echo", json!({}).to_string())
+        .expect("seed invoke");
+
+    let result = host
+        .iterate_plugins(agent_iteration_request())
+        .expect("agent-driven iteration should complete");
+
+    let requests = requests_rx.recv().expect("captured requests");
+    handle.join().expect("join mock server");
+    assert_eq!(
+        requests.len(),
+        17,
+        "record_iteration_summary must end the session on the 17th turn"
+    );
+
+    assert_eq!(
+        result.final_verdict,
+        PluginIterationFinalVerdict::Promoted,
+        "blocked_reason={:?} verifier={:?} canary={:?}",
+        result.blocked_reason,
+        result.verifier_verdict,
+        result.canary.as_ref().map(|r| (&r.verdict, &r.message)),
+    );
+    assert_eq!(result.verifier_verdict, Some(VerifierVerdict::Pass));
+
+    // Tool-execution summary proves every targeted arm ran, and that the
+    // failing calls were surfaced as failures (not silently dropped).
+    let summary = result
+        .tool_execution_summary
+        .as_ref()
+        .expect("tool execution summary");
+    for expected in [
+        "list_context_files",
+        "read_context_files",
+        "inspect_plugin_catalog",
+        "replace_files_exact",
+        "create_file",
+        "json_set",
+        "toml_set",
+        "delete_file",
+        "replace_file_exact",
+        "run_plugin_check",
+        "rebuild_plugin_workspace",
+        "run_plugin_test",
+        "record_iteration_summary",
+    ] {
+        assert!(
+            summary.tool_names.iter().any(|n| n == expected),
+            "expected tool {expected} in {:?}",
+            summary.tool_names
+        );
+    }
+    assert!(
+        summary.failed_calls >= 4,
+        "the four deliberately-failing calls should be recorded: {summary:?}"
+    );
+    assert_eq!(summary.total_calls, 17);
+
+    // The manifest version bump and lib.rs edit both landed in changed_paths.
+    assert!(result
+        .changed_paths
+        .iter()
+        .any(|p| p == "plugins/mini/Cargo.toml"));
+    assert!(result
+        .changed_paths
+        .iter()
+        .any(|p| p == "plugins/mini/src/lib.rs"));
+    // The scratch file was created and then deleted within the session, so it
+    // must NOT survive as a net change.
+    assert!(
+        !fixtures.join(scratch_rel).exists(),
+        "scratch file should have been deleted"
+    );
+
+    // Live plugin still answers after promote.
+    let post = host
+        .invoke("mini", "mini_echo", json!({}).to_string())
+        .expect("post-promote invoke");
+    let post_value: Value = serde_json::from_str(&post.payload).expect("post json");
+    assert_eq!(
+        post_value.get("value").and_then(|v| v.as_str()),
+        Some("pong")
+    );
 }
