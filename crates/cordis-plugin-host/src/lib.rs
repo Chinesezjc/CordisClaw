@@ -1105,7 +1105,7 @@ mod tests {
                     "execution": {{
                         "kind": "process",
                         "command": "/bin/sh",
-                        "args": ["-c", "echo boom-on-stderr >&2; exit 3"]
+                        "args": ["-c", "cat > /dev/null; echo boom-on-stderr >&2; exit 3"]
                     }}
                 }}
             ] }}"#,
@@ -1155,7 +1155,7 @@ mod tests {
                     "execution": {{
                         "kind": "process",
                         "command": "/bin/sh",
-                        "args": ["-c", "printf '\\377'"]
+                        "args": ["-c", "cat > /dev/null; printf '\\377'"]
                     }}
                 }}
             ] }}"#,

@@ -1419,7 +1419,7 @@ fn maybe_remove_stale_lock(path: &Path) -> Result<(), RuntimeError> {
 /// Unix platforms and returns EPERM (still alive, other uid) or ESRCH (dead)
 /// without actually delivering a signal.
 #[cfg(unix)]
-fn lock_pid_is_live(pid: u32) -> bool {
+pub(crate) fn lock_pid_is_live(pid: u32) -> bool {
     if pid == 0 {
         return false;
     }
@@ -1437,7 +1437,7 @@ fn lock_pid_is_live(pid: u32) -> bool {
 }
 
 #[cfg(not(unix))]
-fn lock_pid_is_live(_pid: u32) -> bool {
+pub(crate) fn lock_pid_is_live(_pid: u32) -> bool {
     // Non-Unix: no portable liveness probe, so be conservative and assume
     // still alive; the staleness timer eventually reclaims true zombies.
     true
