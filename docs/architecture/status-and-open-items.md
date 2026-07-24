@@ -30,6 +30,16 @@
 
 ## 3. 已完成
 
+### 3.0 覆盖率治理战役（2026-07-23 ~ 07-24）
+
+行覆盖从 32.7% 提升到 **94.7%**（排除 `main.rs`/`agent.rs` 两个进程/网络边界文件），测试从 ~200 增至 **987**，全绿。CI coverage workflow 落 `--fail-under-lines 94` 门槛（PR 自动跑）。分六批完成：
+
+1. **四波补测**（+570 测试）：按模块并行补齐，含 mock SSE 驱动 LLM 链路、TempDir 最小原生插件树驱动 iterate_plugins 全链、真实 arm64 dylib FFI 路径。
+2. **接缝改造批**（+130 测试）：六类不可达行系统化处置——具名 error-mapper 提取、结构死分支 debug_assert 化（grep 论证不变量）、cfg(test) panic 注入点、测试脚手架死臂改写（单行 let-else / matches!）。
+3. **结构重构批**（+60 测试）：编排函数失败臂 P1 提取（promote 失败聚合、trace/报文构造）、`*_with_runner` 命令执行器参数化、纯数据段提取（edges_to_net_specs）、verifier fixture 门控改能力探测、跨平台 skip 盲区消除（libgmalloc → current_exe）。
+
+剩余 ~5% 为归档不可达：安全边界 fail-closed 分支（package 路径穿越/环检测，release 不弱化）、fsync/子进程中途故障臂、serde 不可失败闭包残留、llvm-cov 大括号伪影。归档理由在各测试模块注释。附带修复两个真 flaky：shared_host HashMismatch（boot 前 refresh index）、mock server 非阻塞流 WouldBlock（accept 后切回阻塞）。
+
 ### 3.1 Stage A-E 已经落地到可运行原型
 
 [system-overview.md](./system-overview.md) 明确把当前实现归纳为 Stage A-E：
