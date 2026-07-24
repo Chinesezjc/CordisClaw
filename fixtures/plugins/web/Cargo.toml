@@ -21,4 +21,4 @@ cordis-plugin-sdk = { path = "../../../crates/cordis-plugin-sdk" }
 cordis-net = { path = "../_net" }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["preserve_order"] }
