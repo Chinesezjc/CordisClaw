@@ -87,14 +87,7 @@ cargo test --test architecture        # 架构集成测试
 cargo clippy --all-targets -- -D warnings  # lint：必须零 warning（warning 即失败）
 ```
 
-## 提交与合入流程
+## 提交格式
 
-**默认走分支 + PR，不直推 main。** GitHub ruleset `protect-main` 要求 `ci` 状态检查通过才能合入（仓库所有者在 bypass 列表中，但 bypass 仅作紧急通道）。
-
-1. 在切分支前确认当前在 `main` 且已 `git pull`
-2. 建功能分支提交改动，push 后开 PR（CI 对所有 PR 自动触发：fmt / clippy / build / prepare-artifacts / test）
-3. CI 绿后合入 main；CI 红则在分支上继续修，禁止为绕过检查直推 main
-4. 例外（可直推）：紧急线上修复、纯文档/注释微调。用 bypass 直推后若 CI 红，必须立即跟进修复
-5. 提交信息不带 Co-Authored-By 等 coauthor 尾注
-
-**CI 环境差异提醒**：CI 在 x86_64-linux 上跑，本机 macOS 通过的测试可能在 CI 失败。常见坑：dylib 后缀要用 `std::env::consts::DLL_SUFFIX` 拼接（Linux `.so` / macOS `.dylib`）；子进程测试脚本必须先读完 stdin（`cat > /dev/null`）再退出，否则 runtime 写 payload 在 Linux 上必现 EPIPE。合入前可在 Linux 远端预验证。
+- 在切分支前确认当前在 `main`
+- 提交信息不带 Co-Authored-By 等 coauthor 尾注
