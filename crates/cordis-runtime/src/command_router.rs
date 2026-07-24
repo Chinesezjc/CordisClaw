@@ -435,15 +435,19 @@ mod tests {
     #[test]
     fn dispatch_plugin_command_prefers_message_field() {
         let (tmp, host) = boot_minimal();
-        // `printf` writes a fixed JSON payload to stdout regardless of stdin,
-        // giving a deterministic `{"message": ...}` reply.
+        // 先 cat 读完 stdin 再输出固定 JSON：runtime 会向子进程写 payload，
+        // 不读 stdin 的进程（如裸 printf）过早退出会让该写入概率性收到
+        // EPIPE（并行 cargo test 下 Linux 实测抖动），错误路径盖掉预期回复。
         register_command_plugin(
             &host,
             tmp.path(),
             "plugins/echocmd",
             "Echo",
-            "/usr/bin/printf",
-            &[r#"{"message":"插件已处理"}"#],
+            "/bin/sh",
+            &[
+                "-c",
+                r#"cat > /dev/null; printf '{"message":"插件已处理"}'"#,
+            ],
         );
 
         // The command name is matched case-insensitively (/echo -> "echo").
@@ -487,8 +491,8 @@ mod tests {
             tmp.path(),
             "plugins/rawcmd",
             "Raw",
-            "/usr/bin/printf",
-            &["just text, not json"],
+            "/bin/sh",
+            &["-c", "cat > /dev/null; printf 'just text, not json'"],
         );
         match dispatch(&host, &CommandContext::default(), "/raw") {
             CommandOutcome::Reply(text) => {
@@ -529,8 +533,8 @@ mod tests {
             tmp.path(),
             "plugins/blankcmd",
             "   ",
-            "/usr/bin/printf",
-            &["{}"],
+            "/bin/sh",
+            &["-c", "cat > /dev/null; printf '{}'"],
         );
         assert!(
             plugin_commands(&host).is_empty(),
