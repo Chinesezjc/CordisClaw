@@ -6647,11 +6647,14 @@ mod tests {
         PLUGIN_AGENT_TOOL_SCAFFOLD_CHILD_PLUGIN, PLUGIN_AGENT_TOOL_TOML_SET,
     };
     use crate::core::error::RuntimeError;
+    use crate::core::models::NodeOutcome;
     use crate::kernel::plugin_iteration::{
         KernelPluginIterationRequest, PluginEditOpKind, PluginEditOperation,
     };
+    use serial_test::serial;
     use std::fs;
     use std::path::{Path, PathBuf};
+    use std::sync::OnceLock;
 
     fn repo_fixtures_root() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -6693,6 +6696,31 @@ mod tests {
         assert!(!legacy.exists(), "legacy-format snapshot must be removed");
         assert!(unrelated.exists(), "non-snapshot dirs are untouched");
         assert!(file.exists(), "plain files are untouched");
+    }
+
+    // Shared read-only host against the real fixtures tree. The fixture
+    // dylibs under `fixtures/artifacts/` are rebuilt natively for the current
+    // host target (arm64 macOS included), so a real `RuntimeHost::boot`
+    // succeeds here without the x86_64-linux-only gate that used to guard
+    // these tests. Booting is cheap (the loader only reads `artifacts/`); we
+    // still boot once and share it, gating the mutating tests with `serial`
+    // so they don't race on the shared temp snapshot root.
+    //
+    // Flaky-guard (mirrors `tests/host_coverage.rs::shared_host`): a full
+    // suite run may rebuild the fixture dylibs mid-suite, leaving
+    // `artifacts/index.json`'s recorded sha256 stale relative to the on-disk
+    // dylib and failing boot with `PluginUnavailable { HashMismatch }`.
+    // Re-hash every staged artifact and rewrite the index right before
+    // booting so the shared host always sees a consistent index.
+    static SHARED_HOST: OnceLock<RuntimeHost> = OnceLock::new();
+
+    fn shared_host() -> &'static RuntimeHost {
+        SHARED_HOST.get_or_init(|| {
+            let root = repo_fixtures_root();
+            crate::plugin::tooling::refresh_artifact_index(&root)
+                .expect("refresh artifact index before shared boot");
+            RuntimeHost::boot(&root).expect("host should boot")
+        })
     }
 
     fn collect_plugin_paths(plugin_root: &Path, subtree: &Path, paths: &mut Vec<String>) {
@@ -6971,11 +6999,10 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn plugin_iteration_tool_surface_and_context_reads_expand_from_focus_to_all() {
-        if cordis_plugin_sdk::CORDIS_TARGET != "x86_64-unknown-linux-gnu" {
-            eprintln!("[skip] fixture dylibs are x86_64-linux only; skipping on this host");
-            return;
-        }
+        crate::plugin::tooling::refresh_artifact_index(&repo_fixtures_root())
+            .expect("refresh artifact index before boot");
         let fixtures_root = repo_fixtures_root();
         let host = RuntimeHost::boot(&fixtures_root).expect("host should boot");
         let snapshot = host.current_snapshot();
@@ -7134,13 +7161,9 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn drop_session_clears_all_maps() {
-        if cordis_plugin_sdk::CORDIS_TARGET != "x86_64-unknown-linux-gnu" {
-            eprintln!("[skip] fixture dylibs are x86_64-linux only; skipping on this host");
-            return;
-        }
-        let fixtures_root = repo_fixtures_root();
-        let host = RuntimeHost::boot(&fixtures_root).expect("host should boot");
+        let host = shared_host();
         // Boot may hydrate leftover session snapshots from data/sessions
         // (crash recovery), so assert deltas against the post-boot baseline
         // instead of absolute sizes.
@@ -7157,13 +7180,9 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn drop_session_idempotent_on_missing() {
-        if cordis_plugin_sdk::CORDIS_TARGET != "x86_64-unknown-linux-gnu" {
-            eprintln!("[skip] fixture dylibs are x86_64-linux only; skipping on this host");
-            return;
-        }
-        let fixtures_root = repo_fixtures_root();
-        let host = RuntimeHost::boot(&fixtures_root).expect("host should boot");
+        let host = shared_host();
         // Boot may hydrate leftover snapshots (crash recovery); baseline
         // against whatever is there rather than assuming empty maps.
         let baseline = host.debug_session_map_sizes();
@@ -7175,17 +7194,125 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn refresh_session_soul_unknown_sid_errors() {
-        if cordis_plugin_sdk::CORDIS_TARGET != "x86_64-unknown-linux-gnu" {
-            eprintln!("[skip] fixture dylibs are x86_64-linux only; skipping on this host");
-            return;
-        }
-        let fixtures_root = repo_fixtures_root();
-        let host = RuntimeHost::boot(&fixtures_root).expect("host should boot");
+        let host = shared_host();
         let err = host
             .refresh_session_soul("no-such-session", "user:42")
             .expect_err("unknown session should error");
         assert!(matches!(err, RuntimeError::AgentSessionNotFound { .. }));
+    }
+
+    // Build a one-node `RuntimeSnapshot` whose single plugin is registered as
+    // `Loaded` with valid docs (so its node enters the registered net as a
+    // Task transition), but whose `artifact_path` points at a file that does
+    // not exist. `invoke_registered_plugin` then fails when it tries to open
+    // the dylib, so `execute_registered_target` takes the invoke-`Err` trace
+    // arm (host.rs:204-218): outcome=Failure with the error string recorded.
+    fn snapshot_with_broken_artifact_node() -> super::RuntimeSnapshot {
+        use crate::core::models::{ArtifactKind, PluginDocs};
+        use cordis_plugin_sdk::{AbiFingerprint, NodeDoc, NodeType};
+
+        let plugin_path = "brokenplug".to_string();
+        let node_id = "broken_entry".to_string();
+        let docs = PluginDocs {
+            plugin_id: plugin_path.clone(),
+            plugin_path: plugin_path.clone(),
+            plugin_version: "0.1.0".to_string(),
+            abi_version: 2,
+            command_name: None,
+            nodes: vec![NodeDoc {
+                id: node_id.clone(),
+                summary: "always-failing node backed by a missing dylib".to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": { "value": { "type": "number" } }
+                }),
+                output_schema: serde_json::json!({ "type": "object" }),
+                side_effects: Vec::new(),
+                failure_modes: vec!["artifact missing".to_string()],
+                node_type: NodeType::Task,
+                agent_accessible: true,
+            }],
+            system_hint: None,
+        };
+
+        let plugin_registry = crate::plugin::registry::PluginRegistry::default();
+        plugin_registry.insert_loaded(
+            plugin_path.clone(),
+            None,
+            true,
+            std::collections::BTreeSet::new(),
+            docs.clone(),
+            // A dylib path that does not exist on disk: `LoadedDylibApi::open`
+            // fails and `invoke_registered_plugin` returns an `Err`.
+            PathBuf::from("/nonexistent/cordis-broken-artifact.dylib"),
+            ArtifactKind::Dylib,
+            AbiFingerprint::current_build("crate_broken_v1", "api_v2"),
+            None,
+        );
+
+        let mut node_registry = crate::plugin::registry::NodeRegistry::default();
+        node_registry
+            .register_from_docs(&plugin_path, &docs)
+            .expect("register broken node");
+
+        let doc_registry =
+            crate::service::doc_registry::DocRegistry::from_plugin_registry(&plugin_registry);
+        let graph_registry = crate::service::graph_registry::GraphRegistry::from_registries(
+            &plugin_registry,
+            &node_registry,
+        );
+
+        super::runtime_snapshot_from_output(
+            crate::plugin::loader::LoadOutput {
+                execution_id: "snapshot-broken-artifact".to_string(),
+                plugin_registry,
+                node_registry,
+                doc_registry,
+                graph_registry,
+                context: crate::context::RuntimeContext::default(),
+                metrics: crate::plugin::loader::LoaderMetrics::default(),
+            },
+            PathBuf::from("/tmp/cordis-broken-artifact-staged"),
+        )
+    }
+
+    #[test]
+    fn execute_registered_target_records_failure_trace_when_invoke_errs() {
+        let snapshot = snapshot_with_broken_artifact_node();
+        let result = snapshot
+            .execute_registered_target(
+                "brokenplug::broken_entry",
+                serde_json::json!({ "value": 1 }),
+            )
+            .expect("execute returns a result even when the node invoke fails");
+
+        assert_eq!(result.target_node_fqn, "brokenplug::broken_entry");
+        let trace = result
+            .traces
+            .get("brokenplug::broken_entry")
+            .expect("failing node should have a trace entry");
+        // The invoke-Err arm records plugin/node identity, a Failure outcome,
+        // the request payload, no response payload, and the error string.
+        assert_eq!(trace.outcome, Some(NodeOutcome::Failure));
+        assert_eq!(trace.plugin_path, "brokenplug");
+        assert_eq!(trace.node_id, "broken_entry");
+        assert!(trace.response_payload.is_none());
+        assert!(
+            trace.request_payload.is_some(),
+            "request payload should be captured before the failed invoke"
+        );
+        let err = trace
+            .error
+            .as_deref()
+            .expect("failure trace should carry the invoke error");
+        assert!(!err.is_empty(), "invoke error string should be non-empty");
+        // The overall net outcome for the target is Failure.
+        assert_eq!(
+            result.output.outcomes.get("brokenplug::broken_entry"),
+            Some(&NodeOutcome::Failure)
+        );
     }
 }
 
