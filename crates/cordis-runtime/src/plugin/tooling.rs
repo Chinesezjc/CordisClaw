@@ -2390,4 +2390,153 @@ exports = ["svc_a", "svc_b"]
         let dir = TempDir::new().unwrap();
         cleanup_fixture_lockfiles(&dir.path().join("does-not-exist")).unwrap();
     }
+
+    // ---------- stage_then_rename_file deeper error arms ----------
+
+    /// The destination path has no filename component (`/`), so the helper
+    /// rejects it before any tmp write — the `dst.file_name() == None` arm.
+    #[test]
+    fn stage_then_rename_errors_when_dst_has_no_filename() {
+        use super::stage_then_rename_file;
+        use crate::core::error::RuntimeError;
+        use std::path::Path;
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        let src = dir.path().join("src.so");
+        std::fs::write(&src, b"bytes").unwrap();
+        // Root path "/" has no file_name.
+        let err = stage_then_rename_file(&src, Path::new("/"));
+        match err {
+            Err(RuntimeError::Io { message, .. }) => {
+                assert!(message.contains("no filename"), "message: {message}");
+            }
+            other => panic!("expected Io(no filename), got {other:?}"),
+        }
+    }
+
+    /// Reading the source fails after a successful open: on Unix a directory
+    /// opens as a file handle but `read_to_end` errors (EISDIR), exercising
+    /// the `read source` map_err arm.
+    #[cfg(unix)]
+    #[test]
+    fn stage_then_rename_errors_when_source_is_a_directory() {
+        use super::stage_then_rename_file;
+        use crate::core::error::RuntimeError;
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        let src_dir = dir.path().join("src_is_dir");
+        std::fs::create_dir(&src_dir).unwrap();
+        let dst = dir.path().join("out.so");
+        let err = stage_then_rename_file(&src_dir, &dst);
+        match err {
+            Err(RuntimeError::Io { message, .. }) => {
+                assert!(
+                    message.contains("read source") || message.contains("open source"),
+                    "message: {message}"
+                );
+            }
+            other => panic!("expected Io reading directory, got {other:?}"),
+        }
+    }
+
+    /// Creating the staging tmp file fails when the destination's parent
+    /// directory does not exist — the `create tmp` map_err arm.
+    #[test]
+    fn stage_then_rename_errors_when_tmp_parent_missing() {
+        use super::stage_then_rename_file;
+        use crate::core::error::RuntimeError;
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        let src = dir.path().join("src.so");
+        std::fs::write(&src, b"bytes").unwrap();
+        // Parent "missing/" does not exist, so File::create(tmp) fails.
+        let dst = dir.path().join("missing").join("out.so");
+        let err = stage_then_rename_file(&src, &dst);
+        match err {
+            Err(RuntimeError::Io { message, .. }) => {
+                assert!(message.contains("create tmp"), "message: {message}");
+            }
+            other => panic!("expected Io(create tmp), got {other:?}"),
+        }
+    }
+
+    /// The final rename fails when the destination is a non-empty directory
+    /// (renaming a file over a populated dir is ENOTEMPTY/EISDIR) — the
+    /// `rename ... failed` map_err arm.
+    #[test]
+    fn stage_then_rename_errors_when_dst_is_nonempty_dir() {
+        use super::stage_then_rename_file;
+        use crate::core::error::RuntimeError;
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        let src = dir.path().join("src.so");
+        std::fs::write(&src, b"bytes").unwrap();
+        // dst is a directory that already contains a child, so rename(tmp, dst)
+        // cannot replace it.
+        let dst = dir.path().join("occupied.so");
+        std::fs::create_dir(&dst).unwrap();
+        std::fs::write(dst.join("child"), b"x").unwrap();
+        let err = stage_then_rename_file(&src, &dst);
+        match err {
+            Err(RuntimeError::Io { message, .. }) => {
+                assert!(message.contains("rename"), "message: {message}");
+            }
+            other => panic!("expected Io(rename), got {other:?}"),
+        }
+    }
+
+    // ---------- write_pretty_json deeper error arms ----------
+
+    /// `write_pretty_json` fails at `create_dir_all(parent)` when the parent
+    /// path traverses through an existing regular file — the `create parent`
+    /// map_err arm.
+    #[test]
+    fn write_pretty_json_errors_when_parent_is_a_file() {
+        use super::write_pretty_json;
+        use crate::core::error::RuntimeError;
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        // `blocker` is a file; using it as a directory component makes
+        // create_dir_all fail (NotADirectory).
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, b"x").unwrap();
+        let target = blocker.join("nested").join("index.json");
+        let err = write_pretty_json(&target, &serde_json::json!({"k": 1}));
+        assert!(matches!(err, Err(RuntimeError::Io { .. })), "err: {err:?}");
+    }
+
+    // ---------- collect_files_recursively error arm ----------
+
+    /// `collect_files_recursively` propagates an Io error when handed a path
+    /// that is not a readable directory (read_dir on a missing path).
+    #[test]
+    fn collect_files_recursively_errors_on_unreadable_dir() {
+        use super::collect_files_recursively;
+        use crate::core::error::RuntimeError;
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        let mut out = Vec::new();
+        let missing = dir.path().join("no_such_dir");
+        let err = collect_files_recursively(&missing, &mut out);
+        assert!(matches!(err, Err(RuntimeError::Io { .. })), "err: {err:?}");
+    }
+
+    // ---------- run_command_with_timeout spawn failure ----------
+
+    /// A program that cannot be spawned surfaces the `cargo spawn failed`
+    /// InvalidArgument arm of `run_command_with_timeout`.
+    #[test]
+    fn run_command_with_timeout_maps_spawn_failure() {
+        use super::run_command_with_timeout;
+        use crate::core::error::RuntimeError;
+        use std::process::Command;
+        let cmd = Command::new("cordis-no-such-binary-zzz");
+        let err = run_command_with_timeout(cmd, std::time::Duration::from_secs(5));
+        match err {
+            Err(RuntimeError::InvalidArgument { message }) => {
+                assert!(message.contains("spawn"), "message: {message}");
+            }
+            other => panic!("expected InvalidArgument(spawn), got {other:?}"),
+        }
+    }
 }
