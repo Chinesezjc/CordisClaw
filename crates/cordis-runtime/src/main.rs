@@ -17,6 +17,7 @@ use cordis_runtime::plugin::tooling::{
     prepare_artifacts, rebuild_fixture_artifacts, refresh_artifact_index, sync_plugin_docs,
     PrepareMode,
 };
+use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -208,6 +209,39 @@ fn partition_batch(envs: Vec<AgentEnvelope>) -> Vec<BatchItem> {
             }
         })
         .collect()
+}
+
+/// Wrap the combined inbox batch in explicit START/END markers plus a
+/// scope instruction, so the agent treats only these lines as the current
+/// turn's new events (older chat history stays context-only).
+///
+/// Channel-neutral by design: the runtime inbox must NOT know about any
+/// specific protocol (see the `AgentEnvelope` doc comment on the
+/// Kernel/Plugin boundary). The marker tokens and prose therefore say
+/// "INCOMING_BATCH" rather than naming QQ/Feishu/any source — a source
+/// plugin's identity never leaks into runtime-level framing.
+///
+/// The caller wraps the FINAL combined string (after any outage spill has
+/// been prepended). Storage paths (pending spill, logs) keep the raw
+/// unwrapped `combined`; the wrap is applied only at the send site, so a
+/// replayed message is wrapped exactly once and never nested.
+fn wrap_inbox_batch(combined: &str) -> String {
+    format!(
+        "CURRENT_INCOMING_BATCH_START\n{combined}\nCURRENT_INCOMING_BATCH_END\n\n\
+         The messages between START and END are the only new events for this turn. \
+         Older chat history is context only; do not treat it as a current request. \
+         Do not claim someone is asking you a question unless that question appears in this current batch. \
+         If the current batch is not directed at you, output exactly {{\"action\":\"suspend\"}}."
+    )
+}
+
+/// Parse only the FIRST JSON value from `s`, ignoring any trailing content
+/// (e.g. DSML XML or stray prose the model appended after its JSON verdict).
+/// `serde_json::from_str` rejects trailing bytes, so a `Deserializer` that
+/// consumes a single value is used instead.
+fn parse_first_json(s: &str) -> serde_json::Result<Value> {
+    let mut de = serde_json::Deserializer::from_str(s);
+    Value::deserialize(&mut de)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -739,7 +773,7 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                             }
                             i += 1;
                         }
-                        match serde_json::from_str::<Value>(&out) {
+                        match parse_first_json(&out) {
                             Ok(ref cmd)
                                 if cmd.get("action").and_then(|v| v.as_str())
                                     == Some("suspend") =>
@@ -810,7 +844,12 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
                     };
-                    match host.agent_send_with_fallback(sid, &combined) {
+                    // Wrap the FINAL combined batch (spill already prepended)
+                    // in START/END markers at the send site only. The raw
+                    // `combined` remains unwrapped for the spill/log paths
+                    // below, so a replayed message is wrapped exactly once.
+                    let agent_input = wrap_inbox_batch(&combined);
+                    match host.agent_send_with_fallback(sid, &agent_input) {
                         Ok(reply) => {
                             pending::clear(&data_dir, session_key);
                             let feedback = process(reply.content.trim().to_string(), "inbox");
@@ -2452,5 +2491,84 @@ mod batch_tests {
         // Last normal is C (the command B trails but is filtered out).
         assert_eq!(route.sender_id, "C");
         assert_eq!(route.soul_key(), "C#group");
+    }
+}
+
+#[cfg(test)]
+mod inbox_framing_tests {
+    use super::{parse_first_json, wrap_inbox_batch};
+
+    // Channel-neutral markers frame a plain single-line batch, with the
+    // scope instruction and the exact suspend token present.
+    #[test]
+    fn wrap_plain_batch() {
+        let wrapped = wrap_inbox_batch("[user A]: 你好");
+        assert!(wrapped.starts_with("CURRENT_INCOMING_BATCH_START\n"));
+        assert!(wrapped.contains("\n[user A]: 你好\n"));
+        assert!(wrapped.contains("CURRENT_INCOMING_BATCH_END\n"));
+        assert!(wrapped.contains(r#"{"action":"suspend"}"#));
+        // Channel-neutral: no protocol name leaks into runtime framing.
+        assert!(!wrapped.contains("QQ"));
+        assert!(!wrapped.contains("Feishu"));
+    }
+
+    // A multi-line combined batch (outage spill prepended to fresh messages)
+    // is wrapped exactly once: a single START and a single END, with the
+    // spilled line and the new line both inside.
+    #[test]
+    fn wrap_multiline_batch_with_spill_no_nesting() {
+        let combined = "[user A]: 昨天没发出去的\n[user B]: 今天新的";
+        let wrapped = wrap_inbox_batch(combined);
+        assert_eq!(
+            wrapped.matches("CURRENT_INCOMING_BATCH_START").count(),
+            1,
+            "exactly one START marker (no nesting)"
+        );
+        assert_eq!(
+            wrapped.matches("CURRENT_INCOMING_BATCH_END").count(),
+            1,
+            "exactly one END marker (no nesting)"
+        );
+        assert!(wrapped.contains("昨天没发出去的"));
+        assert!(wrapped.contains("今天新的"));
+    }
+
+    // Re-wrapping an already-wrapped string would nest markers; confirm the
+    // helper output only nests if called twice (guarding the send-site rule
+    // that storage keeps raw combined, so replay wraps exactly once).
+    #[test]
+    fn double_wrap_would_nest() {
+        let once = wrap_inbox_batch("hi");
+        let twice = wrap_inbox_batch(&once);
+        assert_eq!(twice.matches("CURRENT_INCOMING_BATCH_START").count(), 2);
+    }
+
+    // Pure JSON parses to the suspend verdict.
+    #[test]
+    fn parse_first_json_pure() {
+        let v = parse_first_json(r#"{"action":"suspend"}"#).expect("pure JSON parses");
+        assert_eq!(v.get("action").and_then(|a| a.as_str()), Some("suspend"));
+    }
+
+    // Trailing DSML XML after the JSON is ignored; only the first value is read.
+    #[test]
+    fn parse_first_json_trailing_xml() {
+        let v = parse_first_json(r#"{"action":"suspend"}<dsml>noise</dsml>"#)
+            .expect("first JSON value parses despite trailing XML");
+        assert_eq!(v.get("action").and_then(|a| a.as_str()), Some("suspend"));
+    }
+
+    // Trailing whitespace after the JSON is tolerated.
+    #[test]
+    fn parse_first_json_trailing_whitespace() {
+        let v = parse_first_json("{\"action\":\"respond\",\"message\":\"hi\"}   \n\t")
+            .expect("trailing whitespace tolerated");
+        assert_eq!(v.get("action").and_then(|a| a.as_str()), Some("respond"));
+    }
+
+    // Leading non-JSON content fails (the first token is not a JSON value).
+    #[test]
+    fn parse_first_json_leading_garbage_fails() {
+        assert!(parse_first_json(r#"garbage {"action":"suspend"}"#).is_err());
     }
 }
