@@ -87,6 +87,14 @@ pub fn spawn_chunked_mock_llm_server_sequence(
                     Err(err) => panic!("accept request: {err}"),
                 }
             };
+            // The listener is non-blocking (accept-with-timeout loop above) and
+            // the accepted stream inherits that mode on macOS: a read racing
+            // ahead of the client's first bytes then fails with WouldBlock
+            // instead of blocking. Switch the accepted stream back to blocking
+            // before reading the request.
+            stream
+                .set_nonblocking(false)
+                .expect("set stream blocking");
             let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
             let mut request = String::new();
 
