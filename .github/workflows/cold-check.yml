@@ -1,0 +1,42 @@
+name: cold-check
+
+on:
+  schedule:
+    # 每周六 UTC 20:41 全冷环境验证一次
+    - cron: '41 20 * * 6'
+  workflow_dispatch:
+
+jobs:
+  # 故意不挂 rust-cache：日常 CI 的缓存会掩盖"只在冷环境暴露"的问题
+  # （例如 P 轮修过的 cargo metadata --offline 在空 registry 上失败）。
+  cold-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: cold build
+        run: cargo build --all-targets --locked
+
+      - name: cold fixture artifacts
+        run: |
+          cargo fetch --manifest-path fixtures/plugins/Cargo.toml
+          cargo run --locked -p cordis-runtime -- prepare-artifacts fixtures
+
+  # 依赖过期报告：只输出到日志，不作为失败条件。
+  outdated:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-outdated
+
+      - name: report outdated dependencies
+        run: cargo outdated --workspace --exit-code 0 | tee -a "$GITHUB_STEP_SUMMARY"

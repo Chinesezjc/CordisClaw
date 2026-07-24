@@ -1,0 +1,34 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  build-release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: build release binary
+        run: cargo build --release --locked -p cordis-runtime
+
+      - name: package
+        run: |
+          tar -C target/release -czf \
+            cordis-runtime-${{ github.ref_name }}-x86_64-unknown-linux-gnu.tar.gz \
+            cordis-runtime
+
+      # 自动生成 release notes（两个 tag 之间的 commit 列表）并附上二进制。
+      # 服务器部署可从 Release 页面拉取对应版本产物。
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: cordis-runtime-${{ github.ref_name }}-x86_64-unknown-linux-gnu.tar.gz
+          generate_release_notes: true

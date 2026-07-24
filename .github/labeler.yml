@@ -1,0 +1,28 @@
+# actions/labeler v5 配置：按改动路径给 PR 自动打标签。
+kernel:
+  - changed-files:
+      - any-glob-to-any-file: 'crates/cordis-runtime/src/**'
+
+sdk:
+  - changed-files:
+      - any-glob-to-any-file: 'crates/cordis-plugin-sdk/**'
+
+plugin-host:
+  - changed-files:
+      - any-glob-to-any-file: 'crates/cordis-plugin-host/**'
+
+plugins:
+  - changed-files:
+      - any-glob-to-any-file: 'fixtures/plugins/**'
+
+tests:
+  - changed-files:
+      - any-glob-to-any-file: 'crates/*/tests/**'
+
+docs:
+  - changed-files:
+      - any-glob-to-any-file: 'docs/**'
+
+ci:
+  - changed-files:
+      - any-glob-to-any-file: '.github/**'

@@ -1,0 +1,36 @@
+name: audit
+
+on:
+  schedule:
+    # 每日 UTC 21:23（北京时间 05:23）扫描一次
+    - cron: '23 21 * * *'
+  push:
+    branches: [main]
+    paths:
+      - 'Cargo.lock'
+      - '**/Cargo.toml'
+  workflow_dispatch:
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      - name: audit root workspace
+        run: cargo audit
+
+      # fixtures/plugins 是独立 workspace 且 Cargo.lock 不入库（gitignore），
+      # 现场生成 lockfile 再审计。feishu/qq/web 等插件依赖网络与加密库
+      # （ureq/tungstenite/aes），是主要的漏洞暴露面。
+      - name: audit fixtures/plugins
+        run: |
+          cargo generate-lockfile --manifest-path fixtures/plugins/Cargo.toml
+          cargo audit -f fixtures/plugins/Cargo.lock
