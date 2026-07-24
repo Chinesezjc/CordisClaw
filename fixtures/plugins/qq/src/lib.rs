@@ -63,6 +63,16 @@ static SERVER_RUNNING: Mutex<bool> = Mutex::new(false);
 static SERVER_SHUTDOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static EVENT_LOOP_HANDLE: Mutex<Option<std::thread::JoinHandle<()>>> = Mutex::new(None);
 
+/// WebSocket reverse-connection server state (Napcat connects here as a WS
+/// client). Kept separate from the HTTP server's SERVER_SHUTDOWN /
+/// EVENT_LOOP_HANDLE / SERVER_RUNNING so stopping one server never trips the
+/// other's accept loop.
+static WS_SERVER_SHUTDOWN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static WS_SERVER_HANDLE: Mutex<Option<std::thread::JoinHandle<()>>> = Mutex::new(None);
+/// WebSocket server running flag — makes repeated qq_ws_serve start idempotent.
+static WS_SERVER_RUNNING: Mutex<bool> = Mutex::new(false);
+
 /// Stored agent session ID for message routing.
 static AGENT_SESSION_ID: Mutex<Option<String>> = Mutex::new(None);
 
@@ -79,6 +89,13 @@ static RECENT_MESSAGE_IDS: std::sync::LazyLock<Mutex<VecDeque<String>>> =
 /// full. Read + reset by qq_fetch_messages so the agent can see how
 /// many events it missed since the last poll.
 static MESSAGE_QUEUE_DROPPED: AtomicU64 = AtomicU64::new(0);
+
+/// Guards against spawning more than one agent poller thread. Both
+/// qq_serve and qq_ws_serve start the poller; without this guard a
+/// process running both servers (or a repeated start) would spawn
+/// duplicate pollers all draining the same MESSAGE_QUEUE.
+static POLLER_STARTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 // ---------------------------------------------------------------------------
 // Data types
@@ -584,7 +601,116 @@ fn run_event_loop(server: tiny_http::Server) {
         }
     }
 }
-// P1-40: WebSocket reverse-connection code removed (dead code, never wired).
+// P1-40 had removed the WebSocket reverse-connection code as unwired dead
+// code. It is restored below and wired through the node dispatch, because
+// production Napcat connects over a WS port rather than posting HTTP webhooks.
+
+// ---------------------------------------------------------------------------
+// WebSocket Server — receives OneBot events via WS reverse connection
+// ---------------------------------------------------------------------------
+
+/// Accept loop for the OneBot v11 reverse WebSocket connection. Napcat (or
+/// any OneBot client) connects here as a WS client and streams event frames.
+/// Non-blocking accept + WS_SERVER_SHUTDOWN check so a stop request can break
+/// the loop and let the thread exit (required before the .so is dlclose'd on
+/// reload — a thread still executing unloaded code causes SIGILL).
+fn start_ws_server(listener: std::net::TcpListener, port: u16) -> Result<(), String> {
+    listener
+        .set_nonblocking(true)
+        .map_err(|e| format!("ws: set_nonblocking: {e}"))?;
+    eprintln!("[qq] WebSocket server listening on port {port}");
+    loop {
+        if WS_SERVER_SHUTDOWN.load(Ordering::SeqCst) {
+            eprintln!("[qq] WebSocket server shutting down");
+            break;
+        }
+        match listener.accept() {
+            Ok((stream, _addr)) => {
+                // 5s read timeout so active connections drain promptly on
+                // shutdown instead of blocking the thread indefinitely.
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                let ws = match tungstenite::accept(stream) {
+                    Ok(w) => w,
+                    Err(e) => {
+                        eprintln!("[qq] ws handshake: {e}");
+                        continue;
+                    }
+                };
+                eprintln!("[qq] WebSocket client connected");
+                handle_ws_connection(ws);
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(500));
+                continue;
+            }
+            Err(e) => {
+                eprintln!("[qq] ws accept: {e}");
+                continue;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Read frames from one WS client. Text frames are parsed as OneBot events
+/// and fed into the shared inbound path (handle_onebot_event), so WS events
+/// go through the same dedup / whitelist / envelope machinery as HTTP.
+fn handle_ws_connection(mut ws: tungstenite::WebSocket<std::net::TcpStream>) {
+    loop {
+        if WS_SERVER_SHUTDOWN.load(Ordering::SeqCst) {
+            let _ = ws.close(None);
+            break;
+        }
+        match ws.read() {
+            Ok(tungstenite::Message::Text(text)) => {
+                if let Ok(event) = serde_json::from_str::<OneBotEvent>(&text) {
+                    handle_onebot_event(&event);
+                }
+            }
+            Ok(tungstenite::Message::Ping(data)) => {
+                let _ = ws.send(tungstenite::Message::Pong(data));
+            }
+            Ok(tungstenite::Message::Close(_)) => {
+                eprintln!("[qq] WebSocket client disconnected");
+                break;
+            }
+            Err(tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed) => {
+                break;
+            }
+            Err(e) => {
+                // A read timeout (WouldBlock) is expected every 5s; keep the
+                // loop alive so the shutdown check runs, only bail on real
+                // errors.
+                if let tungstenite::Error::Io(ref io) = e {
+                    if io.kind() == std::io::ErrorKind::WouldBlock
+                        || io.kind() == std::io::ErrorKind::TimedOut
+                    {
+                        continue;
+                    }
+                }
+                eprintln!("[qq] ws read error: {e}");
+                break;
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Stop the WebSocket server: signal shutdown, join the accept thread (so no
+/// code from this .so is still running), then clear the flag and running
+/// state so a later start can rebind the port cleanly.
+fn stop_qq_ws_serve() {
+    WS_SERVER_SHUTDOWN.store(true, Ordering::SeqCst);
+    if let Ok(mut guard) = WS_SERVER_HANDLE.lock() {
+        if let Some(handle) = guard.take() {
+            let _ = handle.join();
+        }
+    }
+    WS_SERVER_SHUTDOWN.store(false, Ordering::SeqCst);
+    if let Ok(mut running) = WS_SERVER_RUNNING.lock() {
+        *running = false;
+    }
+}
 
 
 fn handle_onebot_event(event: &OneBotEvent) {
@@ -878,6 +1004,12 @@ fn build_envelope(msg: &IncomingMessage) -> String {
 // MESSAGE_QUEUE and never reach the agent.
 // ═══════════════════════════════════════════════════════════════════════
 fn start_agent_poller() {
+    // Idempotent: only the first caller spawns the poller thread. qq_serve
+    // and qq_ws_serve both call this; a second poller would double-drain
+    // MESSAGE_QUEUE and double-trigger the agent.
+    if POLLER_STARTED.swap(true, Ordering::SeqCst) {
+        return;
+    }
     thread::spawn(move || {
         thread::sleep(std::time::Duration::from_secs(2));
         loop {
@@ -1254,9 +1386,74 @@ fn handle_qq_send(req: &NodeRequest) -> Result<NodeResponse, String> {
 // Entry point
 // ---------------------------------------------------------------------------
 
+fn handle_qq_ws_serve(req: &NodeRequest) -> Result<NodeResponse, String> {
+    if req.action.as_deref() == Some("stop") {
+        stop_qq_ws_serve();
+        return Ok(NodeResponse {
+            ok: true,
+            node_id: "qq_ws_serve".to_string(),
+            message: Some("WebSocket server stopped".to_string()),
+            messages: None,
+            data: None,
+            error: None,
+        });
+    }
+    let port: u16 = req
+        .payload
+        .as_ref()
+        .and_then(|p| p.get("port"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(8002) as u16;
+
+    // Store agent session ID if provided.
+    if let Some(ref sid) = req.agent_session_id {
+        *AGENT_SESSION_ID.lock().map_err(|e| format!("lock: {e}"))? = Some(sid.clone());
+    }
+
+    // Repeated start is idempotent: if the server is already running, report
+    // success without rebinding (which would fail with address-in-use).
+    {
+        let mut running = WS_SERVER_RUNNING.lock().map_err(|e| format!("lock: {e}"))?;
+        if !*running {
+            // ead1241 ordering: bind synchronously first so a port conflict
+            // surfaces as an Err to the caller. Only after a successful bind
+            // do we flip the running flag and spawn the accept thread. Hand
+            // the bound listener to the thread (rather than dropping and
+            // rebinding) so there is no bind race between check and serve.
+            let addr = format!("0.0.0.0:{port}");
+            let listener = std::net::TcpListener::bind(&addr)
+                .map_err(|e| format!("qq_ws_serve: cannot bind {addr}: {e}"))?;
+            // Reset shutdown flag now that we hold the socket (in case of a
+            // restart after a previous stop).
+            WS_SERVER_SHUTDOWN.store(false, Ordering::SeqCst);
+            *running = true;
+            drop(running);
+            let handle = thread::spawn(move || {
+                if let Err(e) = start_ws_server(listener, port) {
+                    eprintln!("[qq] ws server error: {e}");
+                }
+            });
+            if let Ok(mut guard) = WS_SERVER_HANDLE.lock() {
+                *guard = Some(handle);
+            }
+            start_agent_poller();
+        }
+    }
+
+    Ok(NodeResponse {
+        ok: true,
+        node_id: "qq_ws_serve".to_string(),
+        message: Some(format!("WebSocket server started on port {port}")),
+        messages: None,
+        data: None,
+        error: None,
+    })
+}
+
 fn handle(req: &NodeRequest) -> Result<NodeResponse, String> {
     match req.node_id.as_str() {
         "qq_serve" => handle_qq_serve(req),
+        "qq_ws_serve" => handle_qq_ws_serve(req),
         "qq_fetch_messages" => handle_qq_fetch_messages(),
         "qq_send" => handle_qq_send(req),
         "qq_get_group_members" => handle_qq_get_group_members(req),
@@ -1359,6 +1556,34 @@ fn docs_value() -> cordis_plugin_sdk::PluginDocs {
                 &["starts an HTTP server thread", "listens on configured port"],
                 &["port already in use", "OneBot client not configured to POST events"],
             ).with_agent_accessible(),
+            task_node_doc(
+                "qq_ws_serve",
+                "Start a WebSocket server to receive OneBot v11 message events via reverse WS connection. Configure your OneBot client (e.g. Napcat) to connect as a WebSocket client to ws://<host>:<port>/. Supports the same grayscale group whitelist as qq_serve.",
+                json!({
+                    "type": "object", "required": ["node_id"],
+                    "properties": {
+                        "node_id": { "type": "string", "const": "qq_ws_serve" },
+                        "action": { "type": "string", "description": "Set to \"stop\" to shut down the WebSocket server and release the port" },
+                        "payload": {
+                            "type": "object",
+                            "properties": {
+                                "port": { "type": "integer", "description": "WebSocket listen port (default 8002)" }
+                            }
+                        },
+                        "agent_session_id": { "type": "string", "description": "Optional: agent session ID for message routing" }
+                    }
+                }),
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "ok": { "type": "boolean" },
+                        "message": { "type": ["string", "null"] },
+                        "error": { "type": ["string", "null"] }
+                    }
+                }),
+                &["starts a WebSocket server thread", "listens on configured port for OneBot WS client connections"],
+                &["port already in use", "OneBot WS client not configured to connect"],
+            ),
             node_doc(
                 "qq_fetch_messages",
                 "Fetch queued incoming QQ messages received by qq_serve. Returns all messages and drains the queue. Agent should poll this periodically.",
@@ -1460,6 +1685,11 @@ ANTI-HALLUCINATION rules:\n\
 - If web search fails to yield a clear answer after 2 attempts, stop and tell the user what you found (or didn't find). Ask them to clarify.\n\
 - Pay attention to the group's recent conversation. The topic may be group-specific and not searchable on the web.\n\
 - A short honest \"not sure, can you clarify?\" is always better than a long wrong answer.\n\
+\n\
+KERNEL TOOL usage in QQ chat:\n\
+- Kernel introspection tools (get_runtime_status, list_plugins, list_nodes, get_kernel_status, get_kernel_issues) are for internal diagnostics only.\n\
+- Only call them when a user @mentions you with an explicit question about bot/runtime/plugin status.\n\
+- For images, stickers, casual chat, or ambiguous messages: suspend immediately — do NOT call any kernel tool.\n\
 \n\
 To send a progress update or proactive message to the group you're talking to:\n\
   invoke_plugin(qq, qq_send, {\"node_id\":\"qq_send\",\"target\":\"group:<group_id>\",\"message\":\"<your message>\"})
@@ -1707,5 +1937,104 @@ mod chain_tests {
         let req: NodeRequest =
             serde_json::from_str(r#"{"node_id":"qq_send","reply_to":"om_x"}"#).unwrap();
         assert_eq!(req.reply_to, None, "不可解析字符串降级为无引用");
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// qq_ws_serve 生命周期单测：bind 竞争 / 停机释放端口 / 重复 start 幂等。
+// 三段断言集中在一个 test 内串行执行，避免 cargo 并行跑 test 时对 WS
+// 全局静态（WS_SERVER_RUNNING / WS_SERVER_HANDLE / WS_SERVER_SHUTDOWN）的
+// 争用。用 OS 分配的随机高位端口，规避固定端口冲突。
+// ═══════════════════════════════════════════════════════════════════════
+#[cfg(test)]
+mod ws_tests {
+    use super::*;
+    use std::net::TcpListener;
+
+    /// Ask the OS for a free port, then release it so the caller can rebind.
+    /// A later bind may in theory race another process, but on a test host
+    /// the window is small and the high ephemeral range keeps collisions rare.
+    fn free_port() -> u16 {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        drop(l);
+        port
+    }
+
+    fn start_req(port: u16) -> NodeRequest {
+        serde_json::from_value(json!({
+            "node_id": "qq_ws_serve",
+            "payload": { "port": port }
+        }))
+        .unwrap()
+    }
+
+    fn stop_req() -> NodeRequest {
+        serde_json::from_value(json!({
+            "node_id": "qq_ws_serve",
+            "action": "stop"
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn ws_serve_bind_stop_idempotent_lifecycle() {
+        // Ensure a clean starting state regardless of test ordering.
+        stop_qq_ws_serve();
+
+        // ── 段1 端口被占用时 start 返回 Err ──────────────────────────
+        let occupied = free_port();
+        let _held = TcpListener::bind(("0.0.0.0", occupied))
+            .expect("test harness should be able to bind the probe port");
+        let err = handle_qq_ws_serve(&start_req(occupied));
+        assert!(
+            err.is_err(),
+            "bind 被占用端口应返回 Err，实际: {err:?}"
+        );
+        assert!(
+            !*WS_SERVER_RUNNING.lock().unwrap(),
+            "bind 失败后 running 标志不应被置位"
+        );
+        drop(_held);
+
+        // ── 段2 stop 后端口释放，可重新 bind ─────────────────────────
+        let port = free_port();
+        let resp = handle_qq_ws_serve(&start_req(port)).expect("start 应成功");
+        assert!(resp.ok, "首次 start 应 ok");
+        assert!(
+            *WS_SERVER_RUNNING.lock().unwrap(),
+            "start 成功后 running 标志应被置位"
+        );
+        // 端口此刻被服务线程持有，外部无法 bind。
+        assert!(
+            TcpListener::bind(("0.0.0.0", port)).is_err(),
+            "服务运行期间端口应被占用"
+        );
+        // 停机：join 线程、释放端口。
+        let resp = handle_qq_ws_serve(&stop_req()).expect("stop 应成功");
+        assert!(resp.ok, "stop 应 ok");
+        assert!(
+            !*WS_SERVER_RUNNING.lock().unwrap(),
+            "stop 后 running 标志应清除"
+        );
+        // 停机后同一端口应可被重新 bind。
+        let rebind = TcpListener::bind(("0.0.0.0", port));
+        assert!(
+            rebind.is_ok(),
+            "stop 后端口应释放可重新 bind，实际: {:?}",
+            rebind.err()
+        );
+        drop(rebind);
+
+        // ── 段3 重复 start 幂等：第二次 start 不报错、不重复 bind ─────
+        let port = free_port();
+        let r1 = handle_qq_ws_serve(&start_req(port)).expect("第一次 start 应成功");
+        assert!(r1.ok);
+        // 第二次用同端口 start：若非幂等会因 address-in-use 而 Err。
+        let r2 = handle_qq_ws_serve(&start_req(port)).expect("重复 start 应幂等返回 Ok");
+        assert!(r2.ok, "重复 start 应 ok");
+
+        // 清理，避免影响其它 test / 泄漏线程占用端口。
+        let _ = handle_qq_ws_serve(&stop_req());
     }
 }
