@@ -13,6 +13,12 @@ Configure your OneBot client to POST events to `http://<host>:<port>/onebot/even
 
 Supports grayscale testing via `allow_groups` whitelist.
 
+### `qq_ws_serve` (Task)
+Start a WebSocket server for the OneBot v11 reverse WS connection.
+Configure your OneBot client (e.g. Napcat) to connect as a WebSocket client to `ws://<host>:<port>/` (default port 8002).
+Inbound WS event frames go through the same dedup / grayscale whitelist / envelope path as `qq_serve`.
+Send `{"node_id":"qq_ws_serve","action":"stop"}` to stop the server and release the port; repeated start is idempotent.
+
 ### `qq_fetch_messages`
 Fetch queued incoming messages. The agent polls this node to check for new messages.
 Returns all queued messages and drains the queue.
