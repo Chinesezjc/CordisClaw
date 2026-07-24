@@ -9,45 +9,45 @@
       "id": "fs_read",
       "summary": "Read a file with line numbers.",
       "input_schema": {
-        "properties": {
-          "limit": {
-            "type": "integer"
-          },
-          "node_id": {
-            "const": "fs_read"
-          },
-          "offset": {
-            "type": "integer"
-          },
-          "path": {
-            "type": "string"
-          }
-        },
+        "type": "object",
         "required": [
           "node_id",
           "path"
         ],
-        "type": "object"
+        "properties": {
+          "node_id": {
+            "const": "fs_read"
+          },
+          "path": {
+            "type": "string"
+          },
+          "offset": {
+            "type": "integer"
+          },
+          "limit": {
+            "type": "integer"
+          }
+        }
       },
       "output_schema": {
+        "type": "object",
         "properties": {
+          "ok": {
+            "type": "boolean"
+          },
+          "lines": {
+            "type": "array"
+          },
+          "total_lines": {
+            "type": "integer"
+          },
           "error": {
             "type": [
               "string",
               "null"
             ]
-          },
-          "lines": {
-            "type": "array"
-          },
-          "ok": {
-            "type": "boolean"
-          },
-          "total_lines": {
-            "type": "integer"
           }
-        },
-        "type": "object"
+        }
       },
       "side_effects": [
         "reads file from disk"
@@ -63,40 +63,40 @@
       "id": "fs_write",
       "summary": "Write a file (plugins/ subtree only).",
       "input_schema": {
-        "properties": {
-          "content": {
-            "type": "string"
-          },
-          "node_id": {
-            "const": "fs_write"
-          },
-          "path": {
-            "type": "string"
-          }
-        },
+        "type": "object",
         "required": [
           "node_id",
           "path",
           "content"
         ],
-        "type": "object"
+        "properties": {
+          "node_id": {
+            "const": "fs_write"
+          },
+          "path": {
+            "type": "string"
+          },
+          "content": {
+            "type": "string"
+          }
+        }
       },
       "output_schema": {
+        "type": "object",
         "properties": {
-          "error": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
           "ok": {
             "type": "boolean"
           },
           "path": {
             "type": "string"
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
           }
-        },
-        "type": "object"
+        }
       },
       "side_effects": [
         "writes file to disk",
@@ -113,6 +113,10 @@
       "id": "fs_list",
       "summary": "List directory contents.",
       "input_schema": {
+        "type": "object",
+        "required": [
+          "node_id"
+        ],
         "properties": {
           "node_id": {
             "const": "fs_list"
@@ -120,14 +124,14 @@
           "path": {
             "type": "string"
           }
-        },
-        "required": [
-          "node_id"
-        ],
-        "type": "object"
+        }
       },
       "output_schema": {
+        "type": "object",
         "properties": {
+          "ok": {
+            "type": "boolean"
+          },
           "entries": {
             "type": "array"
           },
@@ -136,12 +140,8 @@
               "string",
               "null"
             ]
-          },
-          "ok": {
-            "type": "boolean"
           }
-        },
-        "type": "object"
+        }
       },
       "side_effects": [
         "reads directory from disk"
@@ -156,39 +156,39 @@
       "id": "fs_search",
       "summary": "Search for a pattern in files.",
       "input_schema": {
-        "properties": {
-          "node_id": {
-            "const": "fs_search"
-          },
-          "path": {
-            "type": "string"
-          },
-          "pattern": {
-            "type": "string"
-          }
-        },
+        "type": "object",
         "required": [
           "node_id",
           "pattern"
         ],
-        "type": "object"
+        "properties": {
+          "node_id": {
+            "const": "fs_search"
+          },
+          "pattern": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          }
+        }
       },
       "output_schema": {
+        "type": "object",
         "properties": {
+          "ok": {
+            "type": "boolean"
+          },
+          "matches": {
+            "type": "array"
+          },
           "error": {
             "type": [
               "string",
               "null"
             ]
-          },
-          "matches": {
-            "type": "array"
-          },
-          "ok": {
-            "type": "boolean"
           }
-        },
-        "type": "object"
+        }
       },
       "side_effects": [
         "reads files from disk"

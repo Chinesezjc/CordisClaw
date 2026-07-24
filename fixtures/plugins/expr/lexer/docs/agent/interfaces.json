@@ -9,23 +9,23 @@
       "id": "expr_lexer",
       "summary": "Convert expression text into tokens.",
       "input_schema": {
+        "type": "object",
+        "required": [
+          "expression"
+        ],
         "properties": {
           "expression": {
             "type": "string"
           }
-        },
-        "required": [
-          "expression"
-        ],
-        "type": "object"
+        }
       },
       "output_schema": {
+        "type": "object",
         "properties": {
           "tokens": {
             "type": "array"
           }
-        },
-        "type": "object"
+        }
       },
       "side_effects": [],
       "failure_modes": [

@@ -3681,7 +3681,8 @@ export_plugin_api! {{
 
         // Stop background services + Task node threads before .so is dlclose'd.
         for plugin_path in &targets {
-            self.service_registry.stop_plugin_services_timed(plugin_path);
+            self.service_registry
+                .stop_plugin_services_timed(plugin_path);
             // Also invoke stop action for Task nodes (plugins that don't
             // implement the Service trait call stop via node invocation).
             //
@@ -4928,7 +4929,8 @@ export_plugin_api! {{
         // Plugins the new snapshot dropped — stop their services.
         // 用 `_timed` 变体：stop 卡住时有上限，不会把 reload 拖死。
         for plugin_path in previous_plugins.difference(&next_plugins) {
-            self.service_registry.stop_plugin_services_timed(plugin_path);
+            self.service_registry
+                .stop_plugin_services_timed(plugin_path);
         }
         // Also stop services for plugins whose docs changed (the new snapshot
         // may have different Task nodes).
@@ -4940,7 +4942,8 @@ export_plugin_api! {{
             // Compare docs by JSON representation — if they differ, restart
             // services so the new plugin version's services are used.
             if prev_docs != next_docs {
-                self.service_registry.stop_plugin_services_timed(plugin_path);
+                self.service_registry
+                    .stop_plugin_services_timed(plugin_path);
             }
         }
 
@@ -10324,17 +10327,16 @@ mod seam_pure_fn_tests {
         is_warning_block_boundary, normalize_warning_source_path, parse_response_payload,
         plugin_change_reasons, plugin_iteration_status_from_history,
         plugin_path_from_runtime_error, plugin_relative_depth, select_registered_net_subgraph,
-        stop_result_diagnostic,
-        strip_rust_span_suffix, truncate_warning_block, warning_cleanup_error_message,
-        warning_path_aliases,
+        stop_result_diagnostic, strip_rust_span_suffix, truncate_warning_block,
+        warning_cleanup_error_message, warning_path_aliases,
     };
     use crate::core::error::RuntimeError;
     use crate::core::models::NodeOutcome;
     use crate::execution::net::ArcDirection;
-    use crate::plugin::abi::PluginResponse;
     use crate::kernel::plugin_iteration::{
         CanaryVerdict, PluginIterationFinalVerdict, PluginIterationHistoryEntry, VerifierVerdict,
     };
+    use crate::plugin::abi::PluginResponse;
     use crate::plugin::registry::RegisteredPlugin;
     use crate::service::graph_registry::{RegisteredNet, RegisteredNetEdge, RegisteredNetEdgeKind};
     use serde_json::json;
@@ -10381,7 +10383,8 @@ mod seam_pure_fn_tests {
         assert_eq!(
             stop_result_diagnostic("svc::svc_serve", &resp),
             Some(
-                "[reload] Task node svc::svc_serve stop returned ok=false: (no message)".to_string()
+                "[reload] Task node svc::svc_serve stop returned ok=false: (no message)"
+                    .to_string()
             )
         );
     }
@@ -10395,7 +10398,8 @@ mod seam_pure_fn_tests {
         assert_eq!(
             stop_result_diagnostic("svc::svc_serve", &missing_ok),
             Some(
-                "[reload] Task node svc::svc_serve stop returned ok=false: (no message)".to_string()
+                "[reload] Task node svc::svc_serve stop returned ok=false: (no message)"
+                    .to_string()
             )
         );
         // Unparseable payload -> Value::default() (Null) -> failure.
@@ -10405,7 +10409,8 @@ mod seam_pure_fn_tests {
         assert_eq!(
             stop_result_diagnostic("svc::svc_serve", &garbage),
             Some(
-                "[reload] Task node svc::svc_serve stop returned ok=false: (no message)".to_string()
+                "[reload] Task node svc::svc_serve stop returned ok=false: (no message)"
+                    .to_string()
             )
         );
     }
@@ -10414,10 +10419,9 @@ mod seam_pure_fn_tests {
     fn stop_result_diagnostic_invoke_error_reports_error() {
         // An invoke Err surfaces the invoke-failed diagnostic carrying the
         // error text.
-        let err: Result<PluginResponse, RuntimeError> =
-            Err(RuntimeError::InvalidArgument {
-                message: "boom".to_string(),
-            });
+        let err: Result<PluginResponse, RuntimeError> = Err(RuntimeError::InvalidArgument {
+            message: "boom".to_string(),
+        });
         let diag = stop_result_diagnostic("svc::svc_serve", &err)
             .expect("invoke error must produce a diagnostic");
         assert!(

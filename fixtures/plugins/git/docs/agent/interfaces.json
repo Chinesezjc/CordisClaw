@@ -9,32 +9,36 @@
       "id": "git_diff",
       "summary": "Show git working tree diff (unified format). Use to review changes before committing.",
       "input_schema": {
-        "properties": {
-          "fixtures_root": {
-            "description": "Path to the git repository root",
-            "type": "string"
-          },
-          "node_id": {
-            "const": "git_diff",
-            "type": "string"
-          },
-          "path": {
-            "description": "Optional: limit diff to a specific file or directory",
-            "type": "string"
-          },
-          "staged": {
-            "description": "Show staged changes only (default false)",
-            "type": "boolean"
-          }
-        },
+        "type": "object",
         "required": [
           "node_id",
           "fixtures_root"
         ],
-        "type": "object"
+        "properties": {
+          "node_id": {
+            "type": "string",
+            "const": "git_diff"
+          },
+          "fixtures_root": {
+            "type": "string",
+            "description": "Path to the git repository root"
+          },
+          "path": {
+            "type": "string",
+            "description": "Optional: limit diff to a specific file or directory"
+          },
+          "staged": {
+            "type": "boolean",
+            "description": "Show staged changes only (default false)"
+          }
+        }
       },
       "output_schema": {
+        "type": "object",
         "properties": {
+          "ok": {
+            "type": "boolean"
+          },
           "diff": {
             "type": [
               "string",
@@ -46,12 +50,8 @@
               "string",
               "null"
             ]
-          },
-          "ok": {
-            "type": "boolean"
           }
-        },
-        "type": "object"
+        }
       },
       "side_effects": [
         "reads git working tree"
@@ -67,37 +67,35 @@
       "id": "git_log",
       "summary": "Show recent git commit history (oneline format).",
       "input_schema": {
-        "properties": {
-          "fixtures_root": {
-            "description": "Path to the git repository root",
-            "type": "string"
-          },
-          "max_count": {
-            "description": "Max commits to show (default 10)",
-            "type": "integer"
-          },
-          "node_id": {
-            "const": "git_log",
-            "type": "string"
-          },
-          "path": {
-            "description": "Optional: limit log to a specific file",
-            "type": "string"
-          }
-        },
+        "type": "object",
         "required": [
           "node_id",
           "fixtures_root"
         ],
-        "type": "object"
+        "properties": {
+          "node_id": {
+            "type": "string",
+            "const": "git_log"
+          },
+          "fixtures_root": {
+            "type": "string",
+            "description": "Path to the git repository root"
+          },
+          "max_count": {
+            "type": "integer",
+            "description": "Max commits to show (default 10)"
+          },
+          "path": {
+            "type": "string",
+            "description": "Optional: limit log to a specific file"
+          }
+        }
       },
       "output_schema": {
+        "type": "object",
         "properties": {
-          "error": {
-            "type": [
-              "string",
-              "null"
-            ]
+          "ok": {
+            "type": "boolean"
           },
           "log": {
             "type": [
@@ -105,11 +103,13 @@
               "null"
             ]
           },
-          "ok": {
-            "type": "boolean"
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
           }
-        },
-        "type": "object"
+        }
       },
       "side_effects": [
         "reads git history"
@@ -124,30 +124,25 @@
       "id": "git_status",
       "summary": "Show git working tree status (short format).",
       "input_schema": {
-        "properties": {
-          "fixtures_root": {
-            "description": "Path to the git repository root",
-            "type": "string"
-          },
-          "node_id": {
-            "const": "git_status",
-            "type": "string"
-          }
-        },
+        "type": "object",
         "required": [
           "node_id",
           "fixtures_root"
         ],
-        "type": "object"
+        "properties": {
+          "node_id": {
+            "type": "string",
+            "const": "git_status"
+          },
+          "fixtures_root": {
+            "type": "string",
+            "description": "Path to the git repository root"
+          }
+        }
       },
       "output_schema": {
+        "type": "object",
         "properties": {
-          "error": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
           "ok": {
             "type": "boolean"
           },
@@ -156,9 +151,14 @@
               "string",
               "null"
             ]
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
           }
-        },
-        "type": "object"
+        }
       },
       "side_effects": [
         "reads git working tree"
@@ -173,44 +173,42 @@
       "id": "git_commit",
       "summary": "Stage and commit changes. Pass specific file paths or omit to commit all changes. Push and force-push are blocked.",
       "input_schema": {
-        "properties": {
-          "fixtures_root": {
-            "description": "Path to the git repository root",
-            "type": "string"
-          },
-          "message": {
-            "description": "Commit message",
-            "type": "string"
-          },
-          "node_id": {
-            "const": "git_commit",
-            "type": "string"
-          },
-          "paths": {
-            "description": "Optional: specific files to add and commit",
-            "items": {
-              "type": "string"
-            },
-            "type": "array"
-          }
-        },
+        "type": "object",
         "required": [
           "node_id",
           "fixtures_root",
           "message"
         ],
-        "type": "object"
+        "properties": {
+          "node_id": {
+            "type": "string",
+            "const": "git_commit"
+          },
+          "fixtures_root": {
+            "type": "string",
+            "description": "Path to the git repository root"
+          },
+          "message": {
+            "type": "string",
+            "description": "Commit message"
+          },
+          "paths": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Optional: specific files to add and commit"
+          }
+        }
       },
       "output_schema": {
+        "type": "object",
         "properties": {
-          "committed": {
+          "ok": {
             "type": "boolean"
           },
-          "error": {
-            "type": [
-              "string",
-              "null"
-            ]
+          "committed": {
+            "type": "boolean"
           },
           "head": {
             "type": [
@@ -218,11 +216,13 @@
               "null"
             ]
           },
-          "ok": {
-            "type": "boolean"
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
           }
-        },
-        "type": "object"
+        }
       },
       "side_effects": [
         "modifies git history (local only)"
@@ -240,37 +240,35 @@
       "id": "git_reset",
       "summary": "Reset HEAD to a target commit. Mode: soft (keep changes staged), mixed (default, keep changes unstaged), hard (discard all changes). Only local targets allowed.",
       "input_schema": {
-        "properties": {
-          "fixtures_root": {
-            "description": "Path to the git repository root",
-            "type": "string"
-          },
-          "mode": {
-            "description": "Reset mode: soft, mixed (default), or hard",
-            "type": "string"
-          },
-          "node_id": {
-            "const": "git_reset",
-            "type": "string"
-          },
-          "target": {
-            "description": "Commit-ish to reset to (default HEAD)",
-            "type": "string"
-          }
-        },
+        "type": "object",
         "required": [
           "node_id",
           "fixtures_root"
         ],
-        "type": "object"
+        "properties": {
+          "node_id": {
+            "type": "string",
+            "const": "git_reset"
+          },
+          "fixtures_root": {
+            "type": "string",
+            "description": "Path to the git repository root"
+          },
+          "target": {
+            "type": "string",
+            "description": "Commit-ish to reset to (default HEAD)"
+          },
+          "mode": {
+            "type": "string",
+            "description": "Reset mode: soft, mixed (default), or hard"
+          }
+        }
       },
       "output_schema": {
+        "type": "object",
         "properties": {
-          "error": {
-            "type": [
-              "string",
-              "null"
-            ]
+          "ok": {
+            "type": "boolean"
           },
           "head": {
             "type": [
@@ -278,17 +276,19 @@
               "null"
             ]
           },
-          "ok": {
-            "type": "boolean"
-          },
           "reset": {
             "type": [
               "string",
               "null"
             ]
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
           }
-        },
-        "type": "object"
+        }
       },
       "side_effects": [
         "modifies git history (local only)",
@@ -306,34 +306,32 @@
       "id": "git_rebase",
       "summary": "Rebase current branch onto another local branch. Only local targets allowed.",
       "input_schema": {
-        "properties": {
-          "fixtures_root": {
-            "description": "Path to the git repository root",
-            "type": "string"
-          },
-          "node_id": {
-            "const": "git_rebase",
-            "type": "string"
-          },
-          "onto": {
-            "description": "Branch to rebase onto (local branch only)",
-            "type": "string"
-          }
-        },
+        "type": "object",
         "required": [
           "node_id",
           "fixtures_root",
           "onto"
         ],
-        "type": "object"
+        "properties": {
+          "node_id": {
+            "type": "string",
+            "const": "git_rebase"
+          },
+          "fixtures_root": {
+            "type": "string",
+            "description": "Path to the git repository root"
+          },
+          "onto": {
+            "type": "string",
+            "description": "Branch to rebase onto (local branch only)"
+          }
+        }
       },
       "output_schema": {
+        "type": "object",
         "properties": {
-          "error": {
-            "type": [
-              "string",
-              "null"
-            ]
+          "ok": {
+            "type": "boolean"
           },
           "head": {
             "type": [
@@ -341,17 +339,19 @@
               "null"
             ]
           },
-          "ok": {
-            "type": "boolean"
-          },
           "rebased": {
             "type": [
               "string",
               "null"
             ]
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
           }
-        },
-        "type": "object"
+        }
       },
       "side_effects": [
         "rewrites git history (local only)",
@@ -369,36 +369,31 @@
       "id": "git_amend",
       "summary": "Amend the most recent commit. Stages all pending changes and amends. Pass a new message or omit to keep the previous message.",
       "input_schema": {
-        "properties": {
-          "fixtures_root": {
-            "description": "Path to the git repository root",
-            "type": "string"
-          },
-          "message": {
-            "description": "Optional: new commit message. Omit to keep previous message.",
-            "type": "string"
-          },
-          "node_id": {
-            "const": "git_amend",
-            "type": "string"
-          }
-        },
+        "type": "object",
         "required": [
           "node_id",
           "fixtures_root"
         ],
-        "type": "object"
+        "properties": {
+          "node_id": {
+            "type": "string",
+            "const": "git_amend"
+          },
+          "fixtures_root": {
+            "type": "string",
+            "description": "Path to the git repository root"
+          },
+          "message": {
+            "type": "string",
+            "description": "Optional: new commit message. Omit to keep previous message."
+          }
+        }
       },
       "output_schema": {
+        "type": "object",
         "properties": {
-          "amended": {
+          "ok": {
             "type": "boolean"
-          },
-          "error": {
-            "type": [
-              "string",
-              "null"
-            ]
           },
           "head": {
             "type": [
@@ -406,7 +401,7 @@
               "null"
             ]
           },
-          "ok": {
+          "amended": {
             "type": "boolean"
           },
           "output": {
@@ -414,9 +409,14 @@
               "string",
               "null"
             ]
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
           }
-        },
-        "type": "object"
+        }
       },
       "side_effects": [
         "rewrites git history (local only)"
@@ -432,32 +432,42 @@
       "id": "git_cherry_pick",
       "summary": "Cherry-pick one or more commits onto the current branch. Provide commit hashes.",
       "input_schema": {
-        "properties": {
-          "commits": {
-            "description": "Commit hashes to cherry-pick",
-            "items": {
-              "type": "string"
-            },
-            "type": "array"
-          },
-          "fixtures_root": {
-            "description": "Path to the git repository root",
-            "type": "string"
-          },
-          "node_id": {
-            "const": "git_cherry_pick",
-            "type": "string"
-          }
-        },
+        "type": "object",
         "required": [
           "node_id",
           "fixtures_root",
           "commits"
         ],
-        "type": "object"
+        "properties": {
+          "node_id": {
+            "type": "string",
+            "const": "git_cherry_pick"
+          },
+          "fixtures_root": {
+            "type": "string",
+            "description": "Path to the git repository root"
+          },
+          "commits": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Commit hashes to cherry-pick"
+          }
+        }
       },
       "output_schema": {
+        "type": "object",
         "properties": {
+          "ok": {
+            "type": "boolean"
+          },
+          "head": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "cherry_picked": {
             "type": [
               "string",
@@ -469,18 +479,8 @@
               "string",
               "null"
             ]
-          },
-          "head": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "ok": {
-            "type": "boolean"
           }
-        },
-        "type": "object"
+        }
       },
       "side_effects": [
         "adds commits to git history (local only)",

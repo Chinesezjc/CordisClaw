@@ -93,12 +93,15 @@ fn payload_str<'a>(payload: &'a Option<Value>, key: &str) -> Option<&'a str> {
 }
 
 fn handle_soul_get(req: &NodeRequest) -> Result<Value, String> {
-    let soul_key = payload_str(&req.payload, "soul_key").ok_or("soul_get requires payload.soul_key")?;
+    let soul_key =
+        payload_str(&req.payload, "soul_key").ok_or("soul_get requires payload.soul_key")?;
     let data_dir = payload_str(&req.payload, "data_dir").map(str::to_string);
     let _guard = DB_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let conn = open_db(data_dir.as_deref())?;
     let mut stmt = conn
-        .prepare("SELECT persona, profile, updated_at_ms, updated_by FROM souls WHERE soul_key = ?1")
+        .prepare(
+            "SELECT persona, profile, updated_at_ms, updated_by FROM souls WHERE soul_key = ?1",
+        )
         .map_err(|e| format!("prepare: {e}"))?;
     let mut rows = stmt.query([soul_key]).map_err(|e| format!("query: {e}"))?;
     match rows.next().map_err(|e| format!("row: {e}"))? {
@@ -125,10 +128,16 @@ fn handle_soul_set(req: &NodeRequest) -> Result<Value, String> {
         return Err("soul_key must not be empty".to_string());
     }
     let soul: Soul = serde_json::from_value(
-        payload.get("soul").cloned().ok_or("soul_set requires payload.soul")?,
+        payload
+            .get("soul")
+            .cloned()
+            .ok_or("soul_set requires payload.soul")?,
     )
     .map_err(|e| format!("malformed soul: {e}"))?;
-    let data_dir = payload.get("data_dir").and_then(|v| v.as_str()).map(str::to_string);
+    let data_dir = payload
+        .get("data_dir")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
     let _guard = DB_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let conn = open_db(data_dir.as_deref())?;
     conn.execute(
@@ -223,7 +232,10 @@ mod tests {
     use super::*;
 
     fn req(node_id: &str, payload: Value) -> NodeRequest {
-        NodeRequest { node_id: Some(node_id.to_string()), payload: Some(payload) }
+        NodeRequest {
+            node_id: Some(node_id.to_string()),
+            payload: Some(payload),
+        }
     }
 
     // CORDIS_FIXTURES_ROOT is process-global: parallel tests would race
@@ -234,11 +246,8 @@ mod tests {
     fn with_temp_db<T>(f: impl FnOnce() -> T) -> T {
         let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let seq = TEST_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let temp = std::env::temp_dir().join(format!(
-            "soul-store-test-{}-{}",
-            std::process::id(),
-            seq
-        ));
+        let temp =
+            std::env::temp_dir().join(format!("soul-store-test-{}-{}", std::process::id(), seq));
         let fixtures = temp.join("fixtures");
         let _ = std::fs::create_dir_all(&fixtures);
         std::env::set_var("CORDIS_FIXTURES_ROOT", &fixtures);
@@ -265,7 +274,8 @@ mod tests {
             assert_eq!(v["soul"]["persona"], "毒舌运维");
             assert_eq!(v["soul"]["profile"], "fast");
             // upsert 覆盖
-            let soul2 = json!({"persona":"温柔助手","profile":null,"updated_at_ms":2,"updated_by":"test"});
+            let soul2 =
+                json!({"persona":"温柔助手","profile":null,"updated_at_ms":2,"updated_by":"test"});
             handle(req("soul_set", json!({"soul_key":"u#group","soul":soul2}))).unwrap();
             let v = handle(req("soul_get", json!({"soul_key":"u#group"}))).unwrap();
             assert_eq!(v["soul"]["persona"], "温柔助手");
