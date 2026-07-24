@@ -2,7 +2,7 @@
 
 ## 1. 判定口径
 
-- 本文基于当前仓库现状整理，最近更新：2026-07-23。
+- 本文基于当前仓库现状整理，最近更新：2026-07-24。
 - 历史规划蓝图已经吸收进 [design-blueprint.md](./design-blueprint.md)，因此本文结论来自三类证据的交叉比对：
   - 设计蓝图：[design-blueprint.md](./design-blueprint.md)
   - 架构文档：[system-overview.md](./system-overview.md)、[contracts-and-loading.md](./contracts-and-loading.md)、[runtime-semantics.md](./runtime-semantics.md)、[maintenance-guide.md](./maintenance-guide.md)
@@ -26,7 +26,7 @@
 | 插件封装形态蓝图 | 部分完成 | `dylib` + JSON artifact + process 已落地；`cdylib` / `WASM` 未实现 |
 | 更真实的运行入口与服务化边界 | 部分完成 | `RuntimeHost`、`serve` REPL、agent chat、shell console 可用；尚未稳定化为外部服务边界 |
 | YAML 配置入口 | 已完成 | runtime / kernel / llm_api / plugins 配置模型完整 |
-| CI | 已完成 | GitHub Actions（`.github/workflows/ci.yml`）：push main + PR 触发，ubuntu-latest 上执行 fmt / clippy `-D warnings` / prepare-artifacts / build / test；x86_64-linux 门控恒真，dylib 集成测试全量执行，fixture 插件经 `prepare-artifacts` 预构建并由 rust-cache 缓存。test 带 `--test-threads=1`：host.rs 等 lib 单测共享 `default_snapshot_root(repo fixtures)`，boot 时清理全部 `snapshot-*`，并行 boot 互删对方 in-flight staging（x86_64-linux 实测复现）；按测试隔离 snapshot root 的代码级修复在 TODO |
+| CI | 已完成 | GitHub Actions（`.github/workflows/ci.yml`）：push main + PR 触发，ubuntu-latest 上执行 fmt / clippy `-D warnings` / prepare-artifacts / build / test（并行）；x86_64-linux 门控恒真，dylib 集成测试全量执行，fixture 插件经 `prepare-artifacts` 预构建并由 rust-cache 缓存。并行安全：snapshot 目录名带创建者 pid，boot 的 stale 清理只删已死进程的残留（`cleanup_stale_snapshot_dirs`）；mock LLM server accept 超时 CI 下 900s / 本地 30s（`mock_llm_accept_timeout`，冷缓存 runner 上迭代测试中途 cargo build 远超 30s） |
 
 ## 3. 已完成
 
@@ -173,9 +173,9 @@ Agent 现在可以自主完成：读代码 → 理解结构 → 写/改文件 �
 - [x] Plugin reload 时调用 `stop_plugin_services()` 停止被移除/变更插件的 services
 - [ ] Plugin boot 时自动 `start_service()` 需要 service factory 注册机制（当前手动调用 `host.start_service()`）
 
-### 5.1.1 lib 单测 snapshot root 共享导致并行互踩（2026-07-23 发现）
+### 5.1.1 lib 单测 snapshot root 共享导致并行互踩（2026-07-23 发现，2026-07-24 已闭合）
 
-- [ ] host.rs / verifier.rs 的 lib 单测直接 `RuntimeHost::boot(repo fixtures)`，snapshot root 均为 `default_snapshot_root(repo fixtures)`（fixtures 路径哈希派生，因此全部相同）；boot 时会删除该目录下所有 `snapshot-*`，多个测试并行 boot 时互删对方 in-flight snapshot staging，报 `rename staging -> target failed`（x86_64-linux `cargo test` 并行模式实测复现，5 例失败）。当前 CI 用 `--test-threads=1` 规避；代码级修复方向：测试内 boot 走 per-test 临时 snapshot root（`RuntimeConfig.snapshot_root` 已支持配置），或 boot 的 stale 清理改为只删属于已死 pid 的 snapshot。
+- [x] 根因：共享 repo fixtures 的测试派生同一 `default_snapshot_root`，boot 无条件删除目录下所有 `snapshot-*`，并行 boot 互删对方 in-flight staging（`rename staging -> target failed`，x86_64-linux 实测 5 例）。修复：snapshot 目录名改为 `snapshot-{pid}-{nanos}`，boot 清理抽为 `cleanup_stale_snapshot_dirs`，按目录名 pid 段经 `lock_pid_is_live`（tooling.rs，`kill(pid,0)` 探活，改 `pub(crate)` 复用）只删已死进程的残留；同进程并行测试线程共享活 pid 不再互删，旧格式 `snapshot-{nanos}` 视为 stale。配套单测 `stale_snapshot_cleanup_keeps_live_pid_dirs`（活 pid 保留 / 已死子进程 pid 删除 / 旧格式删除 / 非 snapshot 目录与普通文件不动）。CI 的 `--test-threads=1` 串行开关随之移除。
 
 ### 5.2 执行引擎缺口闭合（2026-06-05 大部分已闭合）
 

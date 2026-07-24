@@ -1207,18 +1207,7 @@ impl RuntimeHost {
             path: snapshot_root.clone(),
             message: e.to_string(),
         })?;
-        // Clean up stale snapshot directories from previous runs.
-        if let Ok(entries) = fs::read_dir(&snapshot_root) {
-            for entry in entries.flatten() {
-                let name = entry.file_name();
-                let name_str = name.to_string_lossy();
-                if name_str.starts_with("snapshot-")
-                    && entry.file_type().map(|t| t.is_dir()).unwrap_or(false)
-                {
-                    let _ = fs::remove_dir_all(entry.path());
-                }
-            }
-        }
+        cleanup_stale_snapshot_dirs(&snapshot_root);
         let initial_snapshot = Arc::new(build_snapshot(&loader, &snapshot_root)?);
         let interactive_rollback = Mutex::new(PluginEditRollback::empty(&fixtures_root));
         let service_registry = Arc::new(crate::context::ServiceRegistry::new());
@@ -6330,7 +6319,47 @@ fn make_snapshot_dir_name() -> String {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
         .unwrap_or(0);
-    format!("snapshot-{nanos}")
+    // 目录名携带创建者 pid：boot 的 stale 清理据此只删属于已死进程的
+    // snapshot（cleanup_stale_snapshot_dirs）。共享同一 fixtures root 的
+    // 并行测试线程同属一个 pid，不会互删对方 in-flight staging。
+    format!("snapshot-{}-{nanos}", std::process::id())
+}
+
+/// 删除 `snapshot_root` 下属于已死进程的 `snapshot-*` 残留目录。
+///
+/// 目录名格式 `snapshot-{pid}-{nanos}`：pid 段解析成功且进程仍存活
+/// （`lock_pid_is_live`，同进程恒真）→ 保留，这是某个活 host 的
+/// in-flight staging；进程已死或名字不含合法 pid 段（含历史
+/// `snapshot-{nanos}` 旧格式）→ 视为 stale 删除。此前无条件全删，
+/// 并行 `cargo test` 中多个测试 boot 同一 snapshot root 时互删对方
+/// 正在 staging 的目录，报 "rename staging -> target failed"。
+fn cleanup_stale_snapshot_dirs(snapshot_root: &Path) {
+    let Ok(entries) = fs::read_dir(snapshot_root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        let Some(rest) = name_str.strip_prefix("snapshot-") else {
+            continue;
+        };
+        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let owner_alive = rest
+            .split('-')
+            .next()
+            .and_then(|segment| segment.parse::<u32>().ok())
+            // pid 必须能落进正的 pid_t：`kill(-1, 0)` 语义是"探测所有
+            // 可发信号进程"，恒成功，超出 i32 的值直接判死而不是探活。
+            // 旧格式 `snapshot-{nanos}` 首段是纳秒时间戳，parse u32 失败
+            // → None → 按 stale 清理。
+            .filter(|pid| i32::try_from(*pid).is_ok())
+            .is_some_and(crate::plugin::tooling::lock_pid_is_live);
+        if !owner_alive {
+            let _ = fs::remove_dir_all(entry.path());
+        }
+    }
 }
 
 fn next_staged_artifact_root(snapshot_root: &Path) -> PathBuf {
@@ -6574,12 +6603,12 @@ fn default_snapshot_root(fixtures_root: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        collect_plugin_context_paths, ensure_scaffold_integration_edits, extract_warning_blocks,
-        render_child_plugin_core, render_child_plugin_test, sanitize_child_plugin_segment,
-        sort_plugin_context_paths, warning_diagnostics_for_changed_paths, AgentBackend,
-        AgentSessionKind, AgentStartOptions, ContextFilesScope, PluginIterationAgentBackend,
-        PluginIterationAgentState, RuntimeHost, ScaffoldedChildRegistration,
-        PLUGIN_AGENT_TOOL_CREATE_FILE, PLUGIN_AGENT_TOOL_DELETE_FILE,
+        cleanup_stale_snapshot_dirs, collect_plugin_context_paths,
+        ensure_scaffold_integration_edits, extract_warning_blocks, render_child_plugin_core,
+        render_child_plugin_test, sanitize_child_plugin_segment, sort_plugin_context_paths,
+        warning_diagnostics_for_changed_paths, AgentBackend, AgentSessionKind, AgentStartOptions,
+        ContextFilesScope, PluginIterationAgentBackend, PluginIterationAgentState, RuntimeHost,
+        ScaffoldedChildRegistration, PLUGIN_AGENT_TOOL_CREATE_FILE, PLUGIN_AGENT_TOOL_DELETE_FILE,
         PLUGIN_AGENT_TOOL_INSPECT_PLUGIN_CATALOG, PLUGIN_AGENT_TOOL_JSON_SET,
         PLUGIN_AGENT_TOOL_LIST_CONTEXT_FILES, PLUGIN_AGENT_TOOL_READ_CONTEXT_FILES,
         PLUGIN_AGENT_TOOL_REPLACE_FILES_EXACT, PLUGIN_AGENT_TOOL_REPLACE_FILE_EXACT,
@@ -6597,6 +6626,41 @@ mod tests {
             .join("../../fixtures")
             .canonicalize()
             .expect("fixtures root")
+    }
+
+    #[test]
+    fn stale_snapshot_cleanup_keeps_live_pid_dirs() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+
+        // 本进程的 in-flight snapshot：必须保留。
+        let live = root.join(format!("snapshot-{}-1", std::process::id()));
+        // 已死进程的残留：起一个立即退出的子进程并 wait 掉，用它的 pid。
+        // （wait 之后 pid 已回收；紧接着复用到新进程的概率可忽略。）
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn short-lived child");
+        let dead_pid = child.id();
+        child.wait().expect("reap child");
+        let dead = root.join(format!("snapshot-{dead_pid}-1"));
+        // 历史 `snapshot-{nanos}` 旧格式：首段纳秒时间戳 parse u32 失败，
+        // 按 stale 清理。
+        let legacy = root.join("snapshot-1784782891597667568");
+        // 前缀不匹配的目录与普通文件：不受清理影响。
+        let unrelated = root.join("candidate-1");
+        let file = root.join("snapshot-not-a-dir");
+        for dir in [&live, &dead, &legacy, &unrelated] {
+            fs::create_dir(dir).expect("create test dir");
+        }
+        fs::write(&file, b"x").expect("write file");
+
+        cleanup_stale_snapshot_dirs(root);
+
+        assert!(live.exists(), "live-pid snapshot must survive cleanup");
+        assert!(!dead.exists(), "dead-pid snapshot must be removed");
+        assert!(!legacy.exists(), "legacy-format snapshot must be removed");
+        assert!(unrelated.exists(), "non-snapshot dirs are untouched");
+        assert!(file.exists(), "plain files are untouched");
     }
 
     fn collect_plugin_paths(plugin_root: &Path, subtree: &Path, paths: &mut Vec<String>) {

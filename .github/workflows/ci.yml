@@ -62,15 +62,14 @@ jobs:
             exit 1
           }
 
-      # --test-threads=1: host.rs / verifier.rs 等 lib 单测共享
-      # default_snapshot_root(repo fixtures)，boot 时会清理该目录下全部
-      # snapshot-*，并行 boot 会互删对方 in-flight snapshot staging
-      # （已在 x86_64-linux 实测复现 "rename staging -> target failed"）。
-      # 代码级修复（按测试隔离 snapshot root）待办，闭合后可去掉此串行开关。
+      # 并行执行：boot 的 stale snapshot 清理已按目录名中的 pid 探活
+      # （host.rs cleanup_stale_snapshot_dirs），共享 snapshot root 的
+      # 并行测试不再互删 in-flight staging。mock LLM server 的 accept
+      # 超时在 CI 下放宽（tests/support/mod.rs mock_llm_accept_timeout）。
       - name: test
         run: |
           set -o pipefail
-          cargo test --locked -- --test-threads=1 2>&1 | tee /tmp/test.log || {
+          cargo test --locked 2>&1 | tee /tmp/test.log || {
             echo "::error::failed tests: $(grep -E '^test .* FAILED' /tmp/test.log | head -c 600 | tr '\n' ' ')"
             echo "::error::first panic: $(grep -m1 -A2 'panicked at' /tmp/test.log | tr '\n' ' ' | head -c 900)"
             exit 1

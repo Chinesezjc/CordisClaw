@@ -42,10 +42,27 @@ pub fn fixtures_root() -> PathBuf {
         .clone()
 }
 
+/// 两次 LLM 请求之间 mock server 等待 accept 的上限。
+///
+/// 本地 30 秒：足够覆盖迭代测试中间的热缓存 cargo build，又能让真死锁
+/// 的测试快速失败。CI（GitHub Actions 自动设 `CI=true`）放宽到 15 分钟：
+/// 冷缓存 runner 上迭代流程中途的 fixture `cargo build` 远超 30 秒，
+/// server 提前退出会丢掉后续请求，断言在"缺请求"上失败
+/// （runtime_host_iterate_plugins_agent_retries_on_warning_and_promotes
+/// 在 CI 第 9/11 轮以此方式复现）。
+fn mock_llm_accept_timeout() -> Duration {
+    if std::env::var_os("CI").is_some() {
+        Duration::from_secs(900)
+    } else {
+        Duration::from_secs(30)
+    }
+}
+
 #[allow(dead_code)]
 pub fn spawn_chunked_mock_llm_server_sequence(
     responses: Vec<Vec<(u64, String)>>,
 ) -> (String, mpsc::Receiver<Vec<String>>, thread::JoinHandle<()>) {
+    let accept_timeout = mock_llm_accept_timeout();
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
     listener
         .set_nonblocking(true)
@@ -61,7 +78,7 @@ pub fn spawn_chunked_mock_llm_server_sequence(
                 match listener.accept() {
                     Ok(stream) => break stream,
                     Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                        if accept_started.elapsed() >= Duration::from_secs(30) {
+                        if accept_started.elapsed() >= accept_timeout {
                             sender.send(requests).expect("send captured requests");
                             return;
                         }
