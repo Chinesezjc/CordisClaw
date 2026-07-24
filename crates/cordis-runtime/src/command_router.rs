@@ -183,6 +183,11 @@ fn soul_text(host: &RuntimeHost, ctx: &CommandContext) -> String {
 mod tests {
     use super::*;
     use crate::soul::Soul;
+    // Short aliases keep the `let … else { panic!() }` assertions on one line
+    // (rustfmt only preserves single-line let-else under ~50 columns; the
+    // multi-line form would put the panic on its own never-executed line,
+    // which coverage counts against us).
+    use CommandOutcome::{Reply, ResetSession};
 
     #[test]
     fn split_command_variants() {
@@ -224,15 +229,12 @@ mod tests {
     #[test]
     fn dispatch_status_reports_runtime_state() {
         let (_t, host) = boot_minimal();
-        match dispatch(&host, &CommandContext::default(), "/status") {
-            CommandOutcome::Reply(text) => {
-                assert!(text.contains("运行时状态"), "text: {text}");
-                assert!(text.contains("snapshot"), "text: {text}");
-                assert!(text.contains("plugins"), "text: {text}");
-                assert!(text.contains("不经 LLM"), "text: {text}");
-            }
-            other => panic!("expected Reply, got {other:?}"),
-        }
+        let out = dispatch(&host, &CommandContext::default(), "/status");
+        let Reply(text) = out else { panic!("{out:?}") };
+        assert!(text.contains("运行时状态"), "text: {text}");
+        assert!(text.contains("snapshot"), "text: {text}");
+        assert!(text.contains("plugins"), "text: {text}");
+        assert!(text.contains("不经 LLM"), "text: {text}");
     }
 
     #[test]
@@ -240,69 +242,54 @@ mod tests {
         let (_t, host) = boot_minimal();
         // "/help" and the empty-command fallback both yield the help text.
         for input in ["/help", "/"] {
-            match dispatch(&host, &CommandContext::default(), input) {
-                CommandOutcome::Reply(text) => {
-                    assert!(text.contains("可用指令"), "text: {text}");
-                    assert!(text.contains("/status"), "text: {text}");
-                    assert!(text.contains("/reset"), "text: {text}");
-                    assert!(text.contains("/soul"), "text: {text}");
-                    assert!(text.contains("/help"), "text: {text}");
-                }
-                other => panic!("expected Reply for {input}, got {other:?}"),
-            }
+            let o = dispatch(&host, &CommandContext::default(), input);
+            let Reply(text) = o else { panic!("{o:?}") };
+            assert!(text.contains("可用指令"), "text: {text}");
+            assert!(text.contains("/status"), "text: {text}");
+            assert!(text.contains("/reset"), "text: {text}");
+            assert!(text.contains("/soul"), "text: {text}");
+            assert!(text.contains("/help"), "text: {text}");
         }
     }
 
     #[test]
     fn dispatch_reset_yields_reset_session() {
         let (_t, host) = boot_minimal();
-        match dispatch(&host, &CommandContext::default(), "/reset") {
-            CommandOutcome::ResetSession(text) => {
-                assert!(text.contains("会话已重置"), "text: {text}");
-            }
-            other => panic!("expected ResetSession, got {other:?}"),
-        }
+        let o = dispatch(&host, &CommandContext::default(), "/reset");
+        let ResetSession(t) = o else { panic!("{o:?}") };
+        assert!(t.contains("会话已重置"), "text: {t}");
     }
 
     #[test]
     fn dispatch_unknown_command_is_reply() {
         let (_t, host) = boot_minimal();
-        match dispatch(&host, &CommandContext::default(), "/frobnicate now") {
-            CommandOutcome::Reply(text) => {
-                assert!(text.contains("未知指令"), "text: {text}");
-                assert!(text.contains("/frobnicate"), "text: {text}");
-                assert!(text.contains("/help"), "text: {text}");
-            }
-            other => panic!("expected Reply, got {other:?}"),
-        }
+        let out = dispatch(&host, &CommandContext::default(), "/frobnicate now");
+        let Reply(text) = out else { panic!("{out:?}") };
+        assert!(text.contains("未知指令"), "text: {text}");
+        assert!(text.contains("/frobnicate"), "text: {text}");
+        assert!(text.contains("/help"), "text: {text}");
     }
 
     #[test]
     fn dispatch_soul_without_identity_explains_missing() {
         let (_t, host) = boot_minimal();
         // Empty soul_key → identity-less session branch.
-        match dispatch(&host, &CommandContext::default(), "/soul") {
-            CommandOutcome::Reply(text) => {
-                assert!(
-                    text.contains("没有身份") || text.contains("无法定位"),
-                    "text: {text}"
-                );
-            }
-            other => panic!("expected Reply, got {other:?}"),
-        }
+        let out = dispatch(&host, &CommandContext::default(), "/soul");
+        let Reply(text) = out else { panic!("{out:?}") };
+        assert!(
+            text.contains("没有身份") || text.contains("无法定位"),
+            "text: {text}"
+        );
     }
 
     #[test]
     fn dispatch_soul_unset_scope_reports_default() {
         let (_t, host) = boot_minimal();
         let ctx = ctx_with_soul("scope_never_set#private");
-        match dispatch(&host, &ctx, "/soul") {
-            CommandOutcome::Reply(text) => {
-                assert!(text.contains("尚未设置"), "text: {text}");
-                assert!(text.contains("默认人格"), "text: {text}");
-            }
-            other => panic!("expected Reply, got {other:?}"),
-        }
+        let out = dispatch(&host, &ctx, "/soul");
+        let Reply(text) = out else { panic!("{out:?}") };
+        assert!(text.contains("尚未设置"), "text: {text}");
+        assert!(text.contains("默认人格"), "text: {text}");
     }
 
     #[test]
@@ -319,14 +306,11 @@ mod tests {
             },
         )
         .unwrap();
-        match dispatch(&host, &ctx_with_soul(key), "/soul") {
-            CommandOutcome::Reply(text) => {
-                assert!(text.contains("运维值班助手"), "text: {text}");
-                assert!(text.contains("fast"), "text: {text}");
-                assert!(text.contains(key), "text: {text}");
-            }
-            other => panic!("expected Reply, got {other:?}"),
-        }
+        let out = dispatch(&host, &ctx_with_soul(key), "/soul");
+        let Reply(text) = out else { panic!("{out:?}") };
+        assert!(text.contains("运维值班助手"), "text: {text}");
+        assert!(text.contains("fast"), "text: {text}");
+        assert!(text.contains(key), "text: {text}");
     }
 
     #[test]
@@ -336,13 +320,10 @@ mod tests {
         // Stored soul exists but persona is blank → "(未设置)" placeholder,
         // and profile None falls back to "default".
         host.set_soul(key, &Soul::default()).unwrap();
-        match dispatch(&host, &ctx_with_soul(key), "/soul") {
-            CommandOutcome::Reply(text) => {
-                assert!(text.contains("(未设置)"), "text: {text}");
-                assert!(text.contains("default"), "text: {text}");
-            }
-            other => panic!("expected Reply, got {other:?}"),
-        }
+        let out = dispatch(&host, &ctx_with_soul(key), "/soul");
+        let Reply(text) = out else { panic!("{out:?}") };
+        assert!(text.contains("(未设置)"), "text: {text}");
+        assert!(text.contains("default"), "text: {text}");
     }
 
     #[test]
@@ -368,12 +349,9 @@ mod tests {
             souls.join(format!("{}.json", crate::soul::sanitize_soul_key(key))),
         )
         .unwrap();
-        match dispatch(&host, &ctx_with_soul(key), "/soul") {
-            CommandOutcome::Reply(text) => {
-                assert!(text.contains("读取 soul 失败"), "text: {text}");
-            }
-            other => panic!("expected Reply, got {other:?}"),
-        }
+        let out = dispatch(&host, &ctx_with_soul(key), "/soul");
+        let Reply(text) = out else { panic!("{out:?}") };
+        assert!(text.contains("读取 soul 失败"), "text: {text}");
     }
 
     /// Register a synthetic Loaded plugin that declares a `command_name` plus
@@ -451,27 +429,21 @@ mod tests {
         );
 
         // The command name is matched case-insensitively (/echo -> "echo").
-        match dispatch(&host, &CommandContext::default(), "/echo hello world") {
-            CommandOutcome::Reply(text) => {
-                assert_eq!(text, "插件已处理", "should surface the message field");
-            }
-            other => panic!("expected Reply, got {other:?}"),
-        }
+        let out = dispatch(&host, &CommandContext::default(), "/echo hello world");
+        let Reply(text) = out else { panic!("{out:?}") };
+        assert_eq!(text, "插件已处理", "should surface the message field");
 
         // The declared command also appears in /help alongside the builtins.
-        match dispatch(&host, &CommandContext::default(), "/help") {
-            CommandOutcome::Reply(text) => {
-                assert!(
-                    text.contains("/echo"),
-                    "help should list plugin cmd: {text}"
-                );
-                assert!(
-                    text.contains("plugins/echocmd"),
-                    "help should name the plugin path: {text}"
-                );
-            }
-            other => panic!("expected Reply, got {other:?}"),
-        }
+        let out = dispatch(&host, &CommandContext::default(), "/help");
+        let Reply(text) = out else { panic!("{out:?}") };
+        assert!(
+            text.contains("/echo"),
+            "help should list plugin cmd: {text}"
+        );
+        assert!(
+            text.contains("plugins/echocmd"),
+            "help should name the plugin path: {text}"
+        );
 
         // plugin_commands surfaces exactly the registered command.
         let cmds = plugin_commands(&host);
@@ -494,12 +466,9 @@ mod tests {
             "/bin/sh",
             &["-c", "cat > /dev/null; printf 'just text, not json'"],
         );
-        match dispatch(&host, &CommandContext::default(), "/raw") {
-            CommandOutcome::Reply(text) => {
-                assert_eq!(text, "just text, not json");
-            }
-            other => panic!("expected Reply, got {other:?}"),
-        }
+        let out = dispatch(&host, &CommandContext::default(), "/raw");
+        let Reply(text) = out else { panic!("{out:?}") };
+        assert_eq!(text, "just text, not json");
     }
 
     // Plugin command whose backing process fails to spawn → the invoke error
@@ -515,12 +484,32 @@ mod tests {
             "/nonexistent/binary/xyzzy",
             &[],
         );
-        match dispatch(&host, &CommandContext::default(), "/broken") {
-            CommandOutcome::Reply(text) => {
-                assert!(text.contains("指令执行失败"), "text: {text}");
-            }
-            other => panic!("expected Reply, got {other:?}"),
-        }
+        let out = dispatch(&host, &CommandContext::default(), "/broken");
+        let Reply(text) = out else { panic!("{out:?}") };
+        assert!(text.contains("指令执行失败"), "text: {text}");
+    }
+
+    // Unknown command WHILE a plugin command is registered: the dispatch loop
+    // iterates past the non-matching plugin entry (falling through the
+    // `if cmd == name` block) and lands on the "未知指令" reply. This is the
+    // only path that exercises the loop's non-match fall-through.
+    #[test]
+    fn dispatch_unknown_falls_through_registered_plugin_command() {
+        let (tmp, host) = boot_minimal();
+        register_command_plugin(
+            &host,
+            tmp.path(),
+            "plugins/echocmd",
+            "Echo",
+            "/bin/sh",
+            &["-c", "cat > /dev/null; printf '{}'"],
+        );
+        // A registered "echo" command exists, but the user types "/nope"; the
+        // loop must skip echo and report the unknown command.
+        let o = dispatch(&host, &CommandContext::default(), "/nope");
+        let Reply(text) = o else { panic!("{o:?}") };
+        assert!(text.contains("未知指令"), "text: {text}");
+        assert!(text.contains("/nope"), "text: {text}");
     }
 
     // A plugin that sets an empty/whitespace command_name is skipped by

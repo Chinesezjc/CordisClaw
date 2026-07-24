@@ -45,7 +45,7 @@ fn docs_value() -> cordis_plugin_sdk::PluginDocs {
             &[],
             &["missing right paren", "unexpected token"],
         )],
-    None
+        None,
     )
 }
 

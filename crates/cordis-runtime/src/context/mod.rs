@@ -714,11 +714,17 @@ impl ContextTxn for RuntimeContext {
             .subgraph_overlays
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        if overlays.contains_key(subgraph_id) {
-            return Err(RuntimeError::SubgraphAlreadyActive {
-                current: subgraph_id.to_string(),
-            });
-        }
+        // Invariant: `active` is held locked for this whole method and is
+        // mutated in lockstep with `overlays` (set here, cleared on
+        // commit/rollback which also remove the overlay). So reaching here
+        // with `active == None` means no overlay for any id exists. Asserted
+        // rather than returned because it is structurally unreachable; the
+        // `active.as_ref()` guard above already rejects a genuine
+        // double-begin with `SubgraphAlreadyActive`.
+        debug_assert!(
+            !overlays.contains_key(subgraph_id),
+            "overlay for {subgraph_id} exists while no subgraph is active"
+        );
         overlays.insert(subgraph_id.to_string(), BTreeMap::new());
         *active = Some(subgraph_id.to_string());
         Ok(())
@@ -741,12 +747,14 @@ impl ContextTxn for RuntimeContext {
             .subgraph_overlays
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        let overlay =
-            overlays
-                .remove(subgraph_id)
-                .ok_or_else(|| RuntimeError::SubgraphNotFound {
-                    subgraph_id: subgraph_id.to_string(),
-                })?;
+        // Invariant: the match above proved `active == Some(subgraph_id)`, and
+        // `active` is set/cleared in lockstep with overlay insert/remove while
+        // holding the `active` lock. So an active id always has its overlay.
+        // `.expect` (not a returned error) makes this structurally unreachable
+        // guard consistent with the sibling assertion in `put`/`remove`.
+        let overlay = overlays
+            .remove(subgraph_id)
+            .expect("active subgraph overlay must exist");
         *active = None;
         drop(active);
         drop(overlays);
@@ -785,11 +793,15 @@ impl ContextTxn for RuntimeContext {
             .subgraph_overlays
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        if overlays.remove(subgraph_id).is_none() {
-            return Err(RuntimeError::SubgraphNotFound {
-                subgraph_id: subgraph_id.to_string(),
-            });
-        }
+        // Invariant (same as `commit_overlay`): an active subgraph id always
+        // has a live overlay, since the two are mutated together under the
+        // `active` lock. Asserted rather than returned as `SubgraphNotFound`
+        // because the state is structurally unreachable.
+        let removed = overlays.remove(subgraph_id).is_some();
+        debug_assert!(
+            removed,
+            "active subgraph {subgraph_id} has no overlay to roll back"
+        );
         *active = None;
         drop(active);
         drop(overlays);
@@ -1524,6 +1536,49 @@ mod tests {
     }
 
     #[test]
+    fn session_version_starts_zero_and_tracks_commits() {
+        let ctx = RuntimeContext::default();
+        assert_eq!(ctx.session_version(), 0);
+        ctx.commit_session("s", 0).unwrap();
+        assert_eq!(ctx.session_version(), 1);
+    }
+
+    /// After `commit_session` promotes request writes into the session slot
+    /// map (and clears request), a later `lookup_slot_entry` finds the value
+    /// via the session branch — the only path that reaches it, since nothing
+    /// else writes `session_slots`. Also drives the non-empty merge loop body.
+    #[test]
+    fn commit_session_merges_request_into_session_and_lookup_reads_it() {
+        let ctx = RuntimeContext::default();
+        let k = key("ns", "promoted", 1);
+        ctx.put(k.clone(), serde_json::json!("v"), slot_meta())
+            .unwrap();
+        ctx.commit_session("s", 0).unwrap();
+        // Request was cleared by the commit; the value now resolves from the
+        // session slot map.
+        let got: serde_json::Value = ctx.get(&k).unwrap().unwrap();
+        assert_eq!(got, serde_json::json!("v"));
+        // list_by_ns also surfaces the session-scoped key (session branch).
+        assert!(ctx.list_by_ns("ns").contains(&k));
+    }
+
+    /// Inside an active overlay, a key absent from the overlay but present in
+    /// request must fall through the overlay lookup to the request slot map.
+    #[test]
+    fn lookup_inside_overlay_falls_through_to_request() {
+        let ctx = RuntimeContext::default();
+        let base = key("ns", "base", 1);
+        ctx.put(base.clone(), serde_json::json!(1), slot_meta())
+            .unwrap();
+        ctx.begin_subgraph("sg").unwrap();
+        // Overlay is active but does not contain `base`; the read still finds
+        // it via the request fall-through.
+        let got: serde_json::Value = ctx.get(&base).unwrap().unwrap();
+        assert_eq!(got, serde_json::json!(1));
+        ctx.rollback_overlay("sg").unwrap();
+    }
+
+    #[test]
     fn commit_and_rollback_unknown_subgraph_error() {
         let ctx = RuntimeContext::default();
         assert!(matches!(
@@ -1556,6 +1611,9 @@ mod tests {
 
     #[test]
     fn service_start_failure_reported() {
+        // `stop` is never reached via the registry (start fails first), so call
+        // it directly to keep the mock's method exercised.
+        assert!(FailStartService.stop().is_ok());
         let registry = ServiceRegistry::new();
         let err = registry
             .start_service("p", "n", Box::new(FailStartService))

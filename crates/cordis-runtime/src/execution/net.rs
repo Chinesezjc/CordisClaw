@@ -218,3 +218,154 @@ pub fn build_petri_net(spec: PetriNetSpec) -> Result<PetriNetGraph, PetriNetBuil
         producer_transitions_by_place,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn place(id: &str) -> PlaceSpec {
+        PlaceSpec {
+            place_id: id.to_string(),
+        }
+    }
+
+    fn transition(id: &str) -> TransitionSpec {
+        TransitionSpec {
+            transition_id: id.to_string(),
+            priority: 0,
+            join_policy: JoinPolicy::AllOf,
+        }
+    }
+
+    fn arc(arc_id: &str, place_id: &str, transition_id: &str, direction: ArcDirection) -> ArcSpec {
+        ArcSpec {
+            arc_id: arc_id.to_string(),
+            place_id: place_id.to_string(),
+            transition_id: transition_id.to_string(),
+            direction,
+            label: None,
+            required: false,
+        }
+    }
+
+    #[test]
+    fn correlation_key_new_and_derive() {
+        assert_eq!(CorrelationKey::new("raw").0, "raw");
+        assert_eq!(CorrelationKey::derive("exec", "t1", "grp").0, "exec:t1:grp");
+    }
+
+    #[test]
+    fn build_valid_net_indexes_arcs_and_consumers() {
+        let spec = PetriNetSpec {
+            places: vec![place("p_in"), place("p_out")],
+            transitions: vec![transition("t")],
+            arcs: vec![
+                arc("a_in", "p_in", "t", ArcDirection::PlaceToTransition),
+                arc("a_out", "p_out", "t", ArcDirection::TransitionToPlace),
+            ],
+        };
+        let graph = build_petri_net(spec).unwrap();
+        assert_eq!(graph.input_arcs_by_transition["t"].len(), 1);
+        assert_eq!(graph.output_arcs_by_transition["t"].len(), 1);
+        assert_eq!(graph.consumer_by_place["p_in"], "t");
+        assert!(graph.producer_transitions_by_place["p_out"].contains("t"));
+    }
+
+    #[test]
+    fn build_rejects_duplicate_place_id() {
+        let spec = PetriNetSpec {
+            places: vec![place("p"), place("p")],
+            transitions: vec![],
+            arcs: vec![],
+        };
+        assert_eq!(
+            build_petri_net(spec).unwrap_err(),
+            PetriNetBuildError::DuplicatePlaceId {
+                place_id: "p".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn build_rejects_duplicate_transition_id() {
+        let spec = PetriNetSpec {
+            places: vec![],
+            transitions: vec![transition("t"), transition("t")],
+            arcs: vec![],
+        };
+        assert_eq!(
+            build_petri_net(spec).unwrap_err(),
+            PetriNetBuildError::DuplicateTransitionId {
+                transition_id: "t".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn build_rejects_duplicate_arc_id() {
+        let spec = PetriNetSpec {
+            places: vec![place("p")],
+            transitions: vec![transition("t")],
+            arcs: vec![
+                arc("dup", "p", "t", ArcDirection::PlaceToTransition),
+                arc("dup", "p", "t", ArcDirection::TransitionToPlace),
+            ],
+        };
+        assert_eq!(
+            build_petri_net(spec).unwrap_err(),
+            PetriNetBuildError::DuplicateArcId {
+                arc_id: "dup".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn build_rejects_arc_referencing_unknown_place() {
+        let spec = PetriNetSpec {
+            places: vec![],
+            transitions: vec![transition("t")],
+            arcs: vec![arc("a", "ghost", "t", ArcDirection::PlaceToTransition)],
+        };
+        assert_eq!(
+            build_petri_net(spec).unwrap_err(),
+            PetriNetBuildError::ArcPlaceNotFound {
+                arc_id: "a".to_string(),
+                place_id: "ghost".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn build_rejects_arc_referencing_unknown_transition() {
+        let spec = PetriNetSpec {
+            places: vec![place("p")],
+            transitions: vec![],
+            arcs: vec![arc("a", "p", "ghost", ArcDirection::PlaceToTransition)],
+        };
+        assert_eq!(
+            build_petri_net(spec).unwrap_err(),
+            PetriNetBuildError::ArcTransitionNotFound {
+                arc_id: "a".to_string(),
+                transition_id: "ghost".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn build_rejects_place_with_multiple_consumers() {
+        // Two distinct transitions both consume from `p` → invariant broken.
+        let spec = PetriNetSpec {
+            places: vec![place("p")],
+            transitions: vec![transition("t1"), transition("t2")],
+            arcs: vec![
+                arc("a1", "p", "t1", ArcDirection::PlaceToTransition),
+                arc("a2", "p", "t2", ArcDirection::PlaceToTransition),
+            ],
+        };
+        let err = build_petri_net(spec).unwrap_err();
+        assert!(
+            matches!(&err, PetriNetBuildError::PlaceMultipleConsumers { place_id, consumers } if place_id == "p" && consumers == &vec!["t1".to_string(), "t2".to_string()]),
+            "expected PlaceMultipleConsumers, got {err:?}"
+        );
+    }
+}

@@ -496,29 +496,28 @@ impl Loader {
                     }
                 }
                 match serde_json::to_string_pretty(new_docs) {
-                    Ok(json) => {
-                        let tmp = unique_staging_path(&docs_path);
-                        if let Err(e) = std::fs::write(&tmp, &json) {
-                            eprintln!(
-                                "[loader] docs-drift: failed to write tmp {}: {e}",
-                                tmp.display()
-                            );
-                            continue;
-                        }
-                        if let Err(e) = std::fs::rename(&tmp, &docs_path) {
-                            eprintln!(
-                                "[loader] docs-drift: failed to rename {} → {}: {e}",
-                                tmp.display(),
-                                docs_path.display()
-                            );
-                            let _ = std::fs::remove_file(&tmp);
-                        } else {
+                    Ok(json) => match atomic_write_via_staging(&docs_path, &json) {
+                        Ok(()) => {
                             eprintln!(
                                 "[loader] docs-drift: auto-healed {plugin_path} — \
                                  interfaces.json refreshed from artifact"
                             );
                         }
-                    }
+                        Err(AtomicWriteError::Write { tmp, err }) => {
+                            eprintln!(
+                                "[loader] docs-drift: failed to write tmp {}: {err}",
+                                tmp.display()
+                            );
+                            continue;
+                        }
+                        Err(AtomicWriteError::Rename { tmp, err }) => {
+                            eprintln!(
+                                "[loader] docs-drift: failed to rename {} → {}: {err}",
+                                tmp.display(),
+                                docs_path.display()
+                            );
+                        }
+                    },
                     Err(e) => {
                         eprintln!(
                             "[loader] docs-drift: failed to serialize docs for {plugin_path}: {e}"
@@ -528,22 +527,22 @@ impl Loader {
             }
             // Atomic write-back of the artifact index.
             match serde_json::to_string_pretty(&index) {
-                Ok(json) => {
-                    let tmp = unique_staging_path(index_path);
-                    if let Err(e) = std::fs::write(&tmp, &json) {
+                Ok(json) => match atomic_write_via_staging(index_path, &json) {
+                    Ok(()) => {}
+                    Err(AtomicWriteError::Write { tmp, err }) => {
                         eprintln!(
-                            "[loader] docs-drift: failed to write index tmp {}: {e}",
+                            "[loader] docs-drift: failed to write index tmp {}: {err}",
                             tmp.display()
                         );
-                    } else if let Err(e) = std::fs::rename(&tmp, index_path) {
+                    }
+                    Err(AtomicWriteError::Rename { tmp, err }) => {
                         eprintln!(
-                            "[loader] docs-drift: failed to rename index {} → {}: {e}",
+                            "[loader] docs-drift: failed to rename index {} → {}: {err}",
                             tmp.display(),
                             index_path.display()
                         );
-                        let _ = std::fs::remove_file(&tmp);
                     }
-                }
+                },
                 Err(e) => {
                     eprintln!("[loader] docs-drift: failed to serialize artifact index: {e}");
                 }
@@ -639,6 +638,33 @@ fn make_execution_id() -> String {
     format!("exec-{nanos:x}-{seq:x}")
 }
 
+/// Failure of the write-to-staging-then-rename sequence used by the docs-drift
+/// auto-heal. Carries the staging path so the (site-specific) caller can log a
+/// message identical to the original inline handling.
+#[derive(Debug)]
+enum AtomicWriteError {
+    Write { tmp: PathBuf, err: std::io::Error },
+    Rename { tmp: PathBuf, err: std::io::Error },
+}
+
+/// Write `contents` to a per-invocation staging sibling of `target`, then
+/// atomically rename it over `target`. On a rename failure the staging file is
+/// removed so no partial artifact is left behind. Extracted from the two
+/// near-identical inline blocks in the docs-drift auto-heal so the
+/// staging/rename/cleanup sequence is unit-testable; callers keep their own
+/// `eprintln!` so the log text stays byte-for-byte identical.
+fn atomic_write_via_staging(target: &Path, contents: &str) -> Result<(), AtomicWriteError> {
+    let tmp = unique_staging_path(target);
+    if let Err(err) = std::fs::write(&tmp, contents) {
+        return Err(AtomicWriteError::Write { tmp, err });
+    }
+    if let Err(err) = std::fs::rename(&tmp, target) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(AtomicWriteError::Rename { tmp, err });
+    }
+    Ok(())
+}
+
 /// P0-14: produce a per-process unique tmp path for atomic write-then-rename.
 /// The old code shared `<file>.tmp` between loaders, so two concurrent auto-
 /// heals raced on the same tmp file.  `<file>.cordis-tmp.<pid>-<seq>-<nanos>`
@@ -664,7 +690,7 @@ fn unique_staging_path(target: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod loader_helper_tests {
-    use super::unique_staging_path;
+    use super::{atomic_write_via_staging, unique_staging_path, AtomicWriteError};
     use std::path::{Path, PathBuf};
 
     #[test]
@@ -700,6 +726,62 @@ mod loader_helper_tests {
     fn unique_staging_path_no_filename_takes_extension_fallback() {
         let out = unique_staging_path(Path::new("/"));
         assert_eq!(out, PathBuf::from("/"));
+    }
+
+    // atomic_write_via_staging happy path: writes contents to target via a
+    // staging sibling that is renamed into place; no staging file is left
+    // behind.
+    #[test]
+    fn atomic_write_via_staging_writes_and_cleans_staging() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target = tmp.path().join("out.json");
+        atomic_write_via_staging(&target, "{\"k\":1}").expect("write ok");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "{\"k\":1}");
+        // No .cordis-tmp. staging leftovers next to the target.
+        let leftover: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".cordis-tmp."))
+            .collect();
+        assert!(leftover.is_empty(), "staging leftover: {leftover:?}");
+    }
+
+    // Write-arm failure: the staging file cannot be created because a path
+    // component under the target is a regular file → the Write variant carries
+    // the staging path.
+    #[test]
+    fn atomic_write_via_staging_write_failure_reports_tmp() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // A regular file where a parent directory would need to be.
+        let blocker = tmp.path().join("blocker");
+        std::fs::write(&blocker, b"x").unwrap();
+        let target = blocker.join("sub/out.json");
+        let result = atomic_write_via_staging(&target, "{}");
+        assert!(
+            matches!(&result, Err(AtomicWriteError::Write { tmp, .. }) if tmp.to_string_lossy().contains(".cordis-tmp.")),
+            "expected Write error, got {result:?}"
+        );
+    }
+
+    // Rename-arm failure: the target already exists AS A DIRECTORY, so the
+    // rename onto it fails (EISDIR); the staging file is cleaned up.
+    #[test]
+    fn atomic_write_via_staging_rename_failure_cleans_up() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target = tmp.path().join("target_is_dir");
+        std::fs::create_dir_all(&target).unwrap();
+        let result = atomic_write_via_staging(&target, "{}");
+        assert!(
+            matches!(&result, Err(AtomicWriteError::Rename { tmp: staged, .. }) if !staged.exists()),
+            "expected Rename error (staging file must be removed on rename failure), got {result:?}"
+        );
+        // No stray staging leftovers.
+        let leftover: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".cordis-tmp."))
+            .collect();
+        assert!(leftover.is_empty(), "staging leftover: {leftover:?}");
     }
 }
 

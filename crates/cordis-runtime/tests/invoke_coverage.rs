@@ -128,10 +128,10 @@ fn unregistered_plugin_errors() {
     let registry = PluginRegistry::default();
     let err =
         invoke_registered_plugin(&registry, "ghost", "n", "{}".to_string()).expect_err("must fail");
-    match err {
-        RuntimeError::PluginNotRegistered { plugin_path } => assert_eq!(plugin_path, "ghost"),
-        other => panic!("wrong variant: {other:?}"),
-    }
+    assert!(
+        matches!(&err, RuntimeError::PluginNotRegistered { plugin_path } if plugin_path == "ghost"),
+        "wrong variant: {err:?}"
+    );
 }
 
 // A plugin registered as Unavailable must not be invoked; the recorded reason
@@ -149,18 +149,10 @@ fn unavailable_plugin_propagates_reason() {
     );
     let err =
         invoke_registered_plugin(&registry, "down", "n", "{}".to_string()).expect_err("must fail");
-    match err {
-        RuntimeError::PluginUnavailable {
-            plugin_path,
-            reason,
-            required,
-        } => {
-            assert_eq!(plugin_path, "down");
-            assert_eq!(reason, PluginUnavailableReason::InitFailed);
-            assert!(required);
-        }
-        other => panic!("wrong variant: {other:?}"),
-    }
+    assert!(
+        matches!(&err, RuntimeError::PluginUnavailable { plugin_path, reason, required } if plugin_path == "down" && *reason == PluginUnavailableReason::InitFailed && *required),
+        "wrong variant: {err:?}"
+    );
 }
 
 // A Loaded dylib whose docs lack the requested node id must surface
@@ -172,16 +164,10 @@ fn loaded_dylib_missing_node_errors() {
     register_loaded_dylib(&registry, "time", &time_artifact());
     let err = invoke_registered_plugin(&registry, "time", "no_such_node", "{}".to_string())
         .expect_err("missing node must fail");
-    match err {
-        RuntimeError::NodeDocsNotFound {
-            plugin_path,
-            node_id,
-        } => {
-            assert_eq!(plugin_path, "time");
-            assert_eq!(node_id, "no_such_node");
-        }
-        other => panic!("wrong variant: {other:?}"),
-    }
+    assert!(
+        matches!(&err, RuntimeError::NodeDocsNotFound { plugin_path, node_id } if plugin_path == "time" && node_id == "no_such_node"),
+        "wrong variant: {err:?}"
+    );
 }
 
 // A malformed (non-JSON) payload must be rejected with `InvalidArgument`
@@ -192,12 +178,10 @@ fn loaded_dylib_rejects_non_json_payload() {
     register_loaded_dylib(&registry, "time", &time_artifact());
     let err = invoke_registered_plugin(&registry, "time", "time_now", "not json".to_string())
         .expect_err("malformed payload must fail");
-    match err {
-        RuntimeError::InvalidArgument { message } => {
-            assert!(message.contains("not valid JSON"), "msg={message}");
-        }
-        other => panic!("wrong variant: {other:?}"),
-    }
+    assert!(
+        matches!(&err, RuntimeError::InvalidArgument { message } if message.contains("not valid JSON")),
+        "wrong variant: {err:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -330,20 +314,10 @@ fn fingerprint_mismatch_downgrades_and_errors() {
 
     let err = invoke_registered_plugin(&registry, "time", "time_now", "{}".to_string())
         .expect_err("fingerprint mismatch must fail");
-    match err {
-        RuntimeError::AbiMismatch {
-            plugin_path,
-            fingerprint_diff,
-            ..
-        } => {
-            assert_eq!(plugin_path, "time");
-            assert!(
-                fingerprint_diff.iter().any(|d| d.contains("crate_hash")),
-                "diff should mention crate_hash: {fingerprint_diff:?}"
-            );
-        }
-        other => panic!("wrong variant: {other:?}"),
-    }
+    assert!(
+        matches!(&err, RuntimeError::AbiMismatch { plugin_path, fingerprint_diff, .. } if plugin_path == "time" && fingerprint_diff.iter().any(|d| d.contains("crate_hash"))),
+        "wrong variant: {err:?}"
+    );
 
     // Registry entry was downgraded.
     let plugin = registry.get("time").expect("still present");
@@ -380,12 +354,10 @@ fn docs_mismatch_downgrades_to_contract_violation() {
 
     let err = invoke_registered_plugin(&registry, "time", "time_now", "{}".to_string())
         .expect_err("docs mismatch must fail");
-    match err {
-        RuntimeError::PluginUnavailable { reason, .. } => {
-            assert_eq!(reason, PluginUnavailableReason::ContractViolation);
-        }
-        other => panic!("wrong variant: {other:?}"),
-    }
+    assert!(
+        matches!(&err, RuntimeError::PluginUnavailable { reason, .. } if *reason == PluginUnavailableReason::ContractViolation),
+        "wrong variant: {err:?}"
+    );
     let plugin = registry.get("time").expect("present");
     assert!(matches!(
         plugin.load_result,
@@ -542,12 +514,10 @@ fn json_artifact_without_execution_is_unsupported() {
 
     let err = invoke_registered_plugin(&registry, "json/noexec", "n", "{}".to_string())
         .expect_err("no execution strategy must fail");
-    match err {
-        RuntimeError::PluginExecutionUnsupported { plugin_path, .. } => {
-            assert_eq!(plugin_path, "json/noexec");
-        }
-        other => panic!("wrong variant: {other:?}"),
-    }
+    assert!(
+        matches!(&err, RuntimeError::PluginExecutionUnsupported { plugin_path, .. } if plugin_path == "json/noexec"),
+        "wrong variant: {err:?}"
+    );
 }
 
 // A relative command is resolved against the artifact's parent directory. We
@@ -622,16 +592,10 @@ fn json_artifact_non_zero_exit_reports_stderr() {
 
     let err = invoke_registered_plugin(&registry, "json/fail", "n", "{}".to_string())
         .expect_err("non-zero exit must fail");
-    match err {
-        RuntimeError::PluginInvocationFailed {
-            plugin_path,
-            message,
-        } => {
-            assert_eq!(plugin_path, "json/fail");
-            assert!(message.contains("boom detail"), "msg={message}");
-        }
-        other => panic!("wrong variant: {other:?}"),
-    }
+    assert!(
+        matches!(&err, RuntimeError::PluginInvocationFailed { plugin_path, message } if plugin_path == "json/fail" && message.contains("boom detail")),
+        "wrong variant: {err:?}"
+    );
 }
 
 // Spawn failure (command does not exist) must surface `PluginInvocationFailed`
@@ -656,16 +620,10 @@ fn json_artifact_spawn_failure_is_reported() {
 
     let err = invoke_registered_plugin(&registry, "json/nospawn", "n", "{}".to_string())
         .expect_err("spawn must fail");
-    match err {
-        RuntimeError::PluginInvocationFailed {
-            plugin_path,
-            message,
-        } => {
-            assert_eq!(plugin_path, "json/nospawn");
-            assert!(message.contains("spawn"), "msg={message}");
-        }
-        other => panic!("wrong variant: {other:?}"),
-    }
+    assert!(
+        matches!(&err, RuntimeError::PluginInvocationFailed { plugin_path, message } if plugin_path == "json/nospawn" && message.contains("spawn")),
+        "wrong variant: {err:?}"
+    );
 }
 
 // Non-zero exit with EMPTY stderr must fall back to a synthesized
@@ -694,19 +652,10 @@ fn json_artifact_non_zero_exit_empty_stderr_synthesizes_message() {
 
     let err = invoke_registered_plugin(&registry, "json/silentfail", "n", "{}".to_string())
         .expect_err("non-zero exit must fail");
-    match err {
-        RuntimeError::PluginInvocationFailed {
-            plugin_path,
-            message,
-        } => {
-            assert_eq!(plugin_path, "json/silentfail");
-            assert!(
-                message.contains("process exited with status"),
-                "msg={message}"
-            );
-        }
-        other => panic!("wrong variant: {other:?}"),
-    }
+    assert!(
+        matches!(&err, RuntimeError::PluginInvocationFailed { plugin_path, message } if plugin_path == "json/silentfail" && message.contains("process exited with status")),
+        "wrong variant: {err:?}"
+    );
 }
 
 // Stdout that is not valid UTF-8 must surface `PluginInvocationFailed` with a
@@ -745,16 +694,10 @@ fn json_artifact_non_utf8_stdout_is_rejected() {
 
     let err = invoke_registered_plugin(&registry, "json/binout", "n", "{}".to_string())
         .expect_err("non-utf8 stdout must fail");
-    match err {
-        RuntimeError::PluginInvocationFailed {
-            plugin_path,
-            message,
-        } => {
-            assert_eq!(plugin_path, "json/binout");
-            assert!(message.contains("not utf-8"), "msg={message}");
-        }
-        other => panic!("wrong variant: {other:?}"),
-    }
+    assert!(
+        matches!(&err, RuntimeError::PluginInvocationFailed { plugin_path, message } if plugin_path == "json/binout" && message.contains("not utf-8")),
+        "wrong variant: {err:?}"
+    );
 }
 
 // A child that exits WITHOUT reading its stdin, combined with a large payload
@@ -826,14 +769,270 @@ fn json_artifact_stdin_write_failure_is_reported() {
 
     let err = invoke_registered_plugin(&registry, "json/nostdin", "n", big)
         .expect_err("stdin write to a closed pipe must fail");
-    match err {
-        RuntimeError::PluginInvocationFailed {
-            plugin_path,
-            message,
-        } => {
-            assert_eq!(plugin_path, "json/nostdin");
-            assert!(message.contains("write stdin failed"), "msg={message}");
-        }
-        other => panic!("wrong variant: {other:?}"),
+    assert!(
+        matches!(&err, RuntimeError::PluginInvocationFailed { plugin_path, message } if plugin_path == "json/nostdin" && message.contains("write stdin failed")),
+        "wrong variant: {err:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// invoke_registered_plugin — Task-node service vtable block (invoke.rs 256-272)
+// ---------------------------------------------------------------------------
+//
+// The service-vtable sub-branch runs only when ALL of these hold:
+//   1. the node is `NodeType::Task` (is_task = true),
+//   2. the dylib exports `_cordis_create_service`, and
+//   3. that function returns a non-null `ServiceVTable`,
+// after which the host calls `(vtable.start)(vtable.data)`.
+//
+// No prebuilt fixture under `fixtures/artifacts/` exports
+// `_cordis_create_service`, so we compile a purpose-built one (`svcmini`) here.
+// It cannot be a rustc-hand-written cdylib: the invoke path first enforces the
+// `cordis_plugin_api_rust_v2` entry symbol, an exact abi_fingerprint match, and
+// an exact docs match (invoke.rs 145-213) before ever reaching the service
+// block, so the dylib must genuinely link `cordis-plugin-sdk` (built from this
+// same repo + toolchain, so `AbiFingerprint::current_build` lines up with the
+// host). `register_loaded_dylib` reads the fingerprint/docs straight out of the
+// compiled dylib, so those two gates pass by construction.
+//
+// `svcmini` declares two Task nodes:
+//   - `svc_task`: `_cordis_create_service` returns a real vtable whose `start`
+//     writes a marker file (via COV_SVC_OUT) → exercises the
+//     `(vtable.start)(vtable.data)` call.
+//   - `svc_null`: `_cordis_create_service` returns null → exercises the
+//     `if !vtable.is_null()` false branch (create called, no start).
+
+/// lib.rs for the `svcmini` service plugin. Kept in the test so the fixture is
+/// self-contained and versioned with the coverage it drives.
+const SVCMINI_LIB_RS: &str = r##"//! svcmini — a minimal Task-node plugin exporting `_cordis_create_service`.
+
+use cordis_plugin_sdk::{
+    export_plugin_api, json_response, service_vtable, task_node_doc, AbiFingerprint,
+    PluginRequest, PluginResponse, ServiceVTable,
+};
+use serde_json::json;
+
+fn svc_start(_data: *mut std::ffi::c_void) -> i32 {
+    if let Ok(path) = std::env::var("COV_SVC_OUT") {
+        let _ = std::fs::write(path, "started");
     }
+    0
+}
+
+fn svc_stop(_data: *mut std::ffi::c_void) -> i32 {
+    0
+}
+
+#[no_mangle]
+pub extern "C" fn _cordis_create_service(
+    node_id: *const std::ffi::c_char,
+) -> *const ServiceVTable {
+    let id = unsafe { std::ffi::CStr::from_ptr(node_id) }
+        .to_string_lossy()
+        .into_owned();
+    // `svc_task` gets a real vtable (drives the `(vtable.start)(...)` call);
+    // any other node id (e.g. `svc_null`) returns null so the host takes the
+    // `if !vtable.is_null()` false branch.
+    if id != "svc_task" {
+        return std::ptr::null();
+    }
+    let vtable = service_vtable! {
+        data = std::ptr::null_mut(),
+        start = svc_start,
+        stop = svc_stop,
+    };
+    Box::into_raw(Box::new(vtable))
+}
+
+fn docs_value() -> cordis_plugin_sdk::PluginDocs {
+    cordis_plugin_sdk::plugin_docs(
+        "svcmini",
+        "svcmini",
+        "0.1.0",
+        None,
+        vec![
+            task_node_doc(
+                "svc_task",
+                "A background service task node.",
+                json!({ "type": "object" }),
+                json!({ "type": "object" }),
+                &[],
+                &[],
+            )
+            .with_agent_accessible(),
+            task_node_doc(
+                "svc_null",
+                "A task node whose create_service returns null.",
+                json!({ "type": "object" }),
+                json!({ "type": "object" }),
+                &[],
+                &[],
+            )
+            .with_agent_accessible(),
+        ],
+        None,
+    )
+}
+
+fn abi_fingerprint_value() -> AbiFingerprint {
+    AbiFingerprint::current_build("crate_svcmini_v1", "api_v2")
+}
+
+fn api_handle(_req: PluginRequest) -> PluginResponse {
+    json_response(&json!({ "ok": true }))
+}
+
+export_plugin_api! {
+    abi_fingerprint = abi_fingerprint_value(),
+    docs = docs_value(),
+    handle = api_handle,
+}
+"##;
+
+/// Repo root (three levels up from this test crate's manifest).
+fn svc_repo_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .expect("repo root")
+}
+
+/// Build the `svcmini` service dylib in a TempDir and return (temp, dylib_path).
+/// The dylib depends on `cordis-plugin-sdk` via a `crates/` symlink back to the
+/// repo, so it is compiled with the same SDK source + toolchain as the host
+/// (making `AbiFingerprint::current_build` match at invoke time). Returns None
+/// if cargo/rustc is unavailable so callers can skip rather than fail.
+fn build_svcmini_dylib() -> Option<(tempfile::TempDir, PathBuf)> {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    let root = temp.path();
+    let plugin_dir = root.join("svcmini");
+    std::fs::create_dir_all(plugin_dir.join("src")).expect("svcmini src");
+
+    std::fs::write(
+        plugin_dir.join("Cargo.toml"),
+        r#"[package]
+name = "svcmini"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["rlib", "dylib"]
+
+[package.metadata.cordis]
+plugin_path = "svcmini"
+abi_kind = "rust"
+
+[package.metadata.cordis.abi_fingerprint]
+crate_hash = "crate_svcmini_v1"
+api_hash = "api_v2"
+
+[dependencies]
+cordis-plugin-sdk = { path = "../crates/cordis-plugin-sdk" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+"#,
+    )
+    .expect("write svcmini manifest");
+    std::fs::write(plugin_dir.join("src/lib.rs"), SVCMINI_LIB_RS).expect("write svcmini lib.rs");
+
+    // The manifest's `../crates/cordis-plugin-sdk` path dependency resolves via
+    // this symlink to the repo `crates/`.
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(svc_repo_root().join("crates"), root.join("crates"))
+        .expect("symlink crates");
+    #[cfg(not(unix))]
+    {
+        return None;
+    }
+
+    // Pin the child cargo's output dir explicitly rather than mutating this
+    // process's CARGO_TARGET_DIR: `std::env::set_var`/`remove_var` are
+    // process-global and would race with sibling tests running in parallel.
+    // `.env(...)` scopes the override to the child only.
+    let target_dir = root.join("svcmini-target");
+    let status = std::process::Command::new("cargo")
+        .arg("build")
+        .current_dir(&plugin_dir)
+        .env("CARGO_TARGET_DIR", &target_dir)
+        .status();
+    let Ok(status) = status else {
+        eprintln!("[skip] cargo not runnable for svcmini build");
+        return None;
+    };
+    if !status.success() {
+        eprintln!("[skip] svcmini build failed");
+        return None;
+    }
+
+    let dylib = target_dir.join("debug").join(format!(
+        "{}svcmini{}",
+        std::env::consts::DLL_PREFIX,
+        std::env::consts::DLL_SUFFIX
+    ));
+    dylib.exists().then_some((temp, dylib))
+}
+
+// The full service path: a Task node whose dylib exports
+// `_cordis_create_service` returning a non-null vtable. Invoking it must reach
+// `(vtable.start)(vtable.data)` — asserted via the marker file the plugin's
+// `start` writes. Also confirms the handle response still round-trips and the
+// keep-alive registration happened (dropped afterwards).
+#[serial_test::serial]
+#[test]
+fn task_service_vtable_start_is_invoked() {
+    let Some((_temp, dylib)) = build_svcmini_dylib() else {
+        return; // skip: toolchain unavailable
+    };
+    let registry = PluginRegistry::default();
+    register_loaded_dylib(&registry, "svcmini", &dylib);
+
+    let marker = _temp.path().join("svc_started.marker");
+    std::env::set_var("COV_SVC_OUT", &marker);
+    let _ = std::fs::remove_file(&marker);
+
+    let resp = invoke_registered_plugin(&registry, "svcmini", "svc_task", "{}".to_string())
+        .expect("svc_task invoke should succeed");
+    let value: serde_json::Value = serde_json::from_str(&resp.payload).expect("json");
+    assert_eq!(value.get("ok").and_then(|v| v.as_bool()), Some(true));
+
+    // The plugin's `start` wrote the marker → the `(vtable.start)(...)` call ran.
+    let written =
+        std::fs::read_to_string(&marker).expect("service start must have written the marker file");
+    assert_eq!(written, "started");
+
+    std::env::remove_var("COV_SVC_OUT");
+    // Release the keep-alive dylib handle registered by the Task invoke.
+    unregister_task_library("svcmini");
+}
+
+// The null-vtable sub-branch: a Task node whose `_cordis_create_service`
+// returns null. The `create_sym` lookup succeeds and `create(...)` is called,
+// but the `if !vtable.is_null()` guard is false, so `start` is never invoked.
+// The invoke still succeeds and the dylib is still kept alive.
+#[serial_test::serial]
+#[test]
+fn task_service_null_vtable_skips_start() {
+    let Some((_temp, dylib)) = build_svcmini_dylib() else {
+        return; // skip: toolchain unavailable
+    };
+    let registry = PluginRegistry::default();
+    register_loaded_dylib(&registry, "svcmini", &dylib);
+
+    let marker = _temp.path().join("null_started.marker");
+    std::env::set_var("COV_SVC_OUT", &marker);
+    let _ = std::fs::remove_file(&marker);
+
+    let resp = invoke_registered_plugin(&registry, "svcmini", "svc_null", "{}".to_string())
+        .expect("svc_null invoke should succeed");
+    let value: serde_json::Value = serde_json::from_str(&resp.payload).expect("json");
+    assert_eq!(value.get("ok").and_then(|v| v.as_bool()), Some(true));
+
+    // create_service returned null → start was NOT called → no marker file.
+    assert!(
+        !marker.exists(),
+        "null vtable must not invoke start (no marker expected)"
+    );
+
+    std::env::remove_var("COV_SVC_OUT");
+    unregister_task_library("svcmini");
 }

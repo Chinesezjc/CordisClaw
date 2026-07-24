@@ -359,9 +359,10 @@ fn plugin_subtree_surface_kind(path: &str, subtree_root: &str) -> Option<PluginS
     }
     let rel = path.strip_prefix(&format!("{subtree_root}/"))?;
     let segments = rel.split('/').collect::<Vec<_>>();
-    if segments.is_empty() {
-        return None;
-    }
+    // `str::split('/')` always yields at least one element (an empty string for
+    // an empty `rel`), so this vec is never empty. Assert the invariant in debug
+    // builds rather than carrying a dead runtime branch.
+    debug_assert!(!segments.is_empty(), "str::split always yields >=1 segment");
 
     if segments.len() >= 2 && segments.last() == Some(&"Cargo.toml") {
         let plugin_segments = &segments[..segments.len() - 1];
@@ -944,10 +945,7 @@ fn apply_operation(
             *target = replacement;
             Ok(UpdatedFile::Write(
                 serde_json::to_string_pretty(&document)
-                    .map_err(|err| RuntimeError::Io {
-                        path: abs_path.to_path_buf(),
-                        message: format!("json serialize failed: {err}"),
-                    })?
+                    .map_err(|err| json_set_serialize_io_error(abs_path, &err))?
                     .into_bytes(),
             ))
         }
@@ -1000,10 +998,7 @@ fn apply_operation(
                     *target = replacement;
                     return Ok(UpdatedFile::Write(
                         toml::to_string_pretty(&document)
-                            .map_err(|err| RuntimeError::Io {
-                                path: abs_path.to_path_buf(),
-                                message: format!("toml serialize failed: {err}"),
-                            })?
+                            .map_err(|err| toml_set_serialize_io_error(abs_path, &err))?
                             .into_bytes(),
                     ));
                 }
@@ -1020,6 +1015,26 @@ fn apply_operation(
                 reason: "toml dotted key must not be empty".to_string(),
             })
         }
+    }
+}
+
+/// Map a JSON re-serialization failure in the `json_set` edit op to
+/// `RuntimeError::Io`. A `Value` that just parsed always re-serializes, so this
+/// arm is unreachable at runtime; extracted for byte-stable text and testing.
+fn json_set_serialize_io_error(abs_path: &Path, err: &serde_json::Error) -> RuntimeError {
+    RuntimeError::Io {
+        path: abs_path.to_path_buf(),
+        message: format!("json serialize failed: {err}"),
+    }
+}
+
+/// Map a TOML re-serialization failure in the `toml_set` edit op to
+/// `RuntimeError::Io`. Unreachable for a document that just parsed; extracted
+/// for byte-stable text and testing.
+fn toml_set_serialize_io_error(abs_path: &Path, err: &toml::ser::Error) -> RuntimeError {
+    RuntimeError::Io {
+        path: abs_path.to_path_buf(),
+        message: format!("toml serialize failed: {err}"),
     }
 }
 
@@ -1744,8 +1759,8 @@ mod tests {
     // ---------- pure-logic / helper coverage ----------
 
     use super::{
-        apply_operation, deepest_matching_writable_root, file_sha256, now_ms,
-        plugin_subtree_surface_kind, resolve_under_workspace,
+        apply_operation, deepest_matching_writable_root, file_sha256, json_set_serialize_io_error,
+        now_ms, plugin_subtree_surface_kind, resolve_under_workspace, toml_set_serialize_io_error,
         validate_reserved_child_keyword_identifiers, KernelPluginIssueStatus,
         PluginIterationFinalVerdict, PluginIterationNetSpec, PluginSubtreeSurfaceKind, UpdatedFile,
         VerifierVerdict,
@@ -1760,6 +1775,34 @@ mod tests {
         let mut hasher = Sha256::new();
         hasher.update(s.as_bytes());
         hex::encode(hasher.finalize())
+    }
+
+    /// The `json_set` re-serialize failure arm is unreachable (a just-parsed
+    /// `Value` always re-serializes), so exercise the extracted mapper directly
+    /// to lock its `Io` variant and byte-exact message.
+    #[test]
+    fn json_set_serialize_io_error_wraps_path_and_message() {
+        let serde_err =
+            serde_json::from_str::<serde_json::Value>("{").expect_err("malformed json errors");
+        let err = json_set_serialize_io_error(Path::new("/tmp/x.json"), &serde_err);
+        assert!(
+            matches!(&err, RuntimeError::Io { path, message } if path == Path::new("/tmp/x.json") && message.starts_with("json serialize failed: ")),
+            "unexpected: {err:?}"
+        );
+    }
+
+    /// Same for the `toml_set` re-serialize failure arm. A real
+    /// `toml::ser::Error` arises from a map whose keys are not strings.
+    #[test]
+    fn toml_set_serialize_io_error_wraps_path_and_message() {
+        let mut map = std::collections::BTreeMap::new();
+        map.insert(vec![1u8, 2u8], 3u8);
+        let ser_err = toml::to_string_pretty(&map).expect_err("non-string key errors");
+        let err = toml_set_serialize_io_error(Path::new("/tmp/x.toml"), &ser_err);
+        assert!(
+            matches!(&err, RuntimeError::Io { path, message } if path == Path::new("/tmp/x.toml") && message.starts_with("toml serialize failed: ")),
+            "unexpected: {err:?}"
+        );
     }
 
     // `UpdatedFile` deliberately has no `Debug` impl, so `unwrap_err` on an

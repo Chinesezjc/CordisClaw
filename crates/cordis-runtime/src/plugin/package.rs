@@ -363,15 +363,13 @@ impl PackageResolver {
 
     fn expected_plugin_path(&self, dir: &Path) -> Result<String, RuntimeError> {
         // Canonical plugin_path is derived from directory relative to plugins_root.
-        let relative =
-            dir.strip_prefix(&self.plugins_root)
-                .map_err(|_| RuntimeError::Invariant {
-                    message: format!(
-                        "plugin dir {} is not under plugins root {}",
-                        dir.display(),
-                        self.plugins_root.display()
-                    ),
-                })?;
+        // Every `dir` reaching here is built as `plugins_root.join(...)` (root
+        // members and `resolve_child_dir` outputs), so `strip_prefix` never
+        // actually fails; the guard is defensive and extracted as a named,
+        // unit-tested mapper.
+        let relative = dir
+            .strip_prefix(&self.plugins_root)
+            .map_err(|_| dir_not_under_plugins_root(dir, &self.plugins_root))?;
 
         let mut segments = Vec::new();
         for component in relative.components() {
@@ -495,6 +493,12 @@ impl PackageResolver {
                         reason: "../ is forbidden".to_string(),
                     });
                 }
+                // Upstream-masked: `child.source` is required to start with
+                // `./` (checked at the top of `resolve_child_dir`), so the
+                // first component is always `CurDir` and a `RootDir`/`Prefix`
+                // can never appear. Retained fail-closed for defense-in-depth
+                // rather than debug_assert-ed away, because this is a
+                // path-traversal boundary that must hold in release too.
                 Component::RootDir | Component::Prefix(_) => {
                     return Err(RuntimeError::InvalidChildSource {
                         parent: parent_plugin_path.to_string(),
@@ -538,6 +542,19 @@ fn synthesized_generated_docs_placeholder(plugin_path: &str, plugin_version: &st
     }
 }
 
+/// Invariant error for a plugin directory that is not under `plugins_root`.
+/// Unreachable through `PackageResolver::resolve` (every visited dir is built
+/// by joining onto `plugins_root`), but kept as a fail-closed guard.
+fn dir_not_under_plugins_root(dir: &Path, plugins_root: &Path) -> RuntimeError {
+    RuntimeError::Invariant {
+        message: format!(
+            "plugin dir {} is not under plugins root {}",
+            dir.display(),
+            plugins_root.display()
+        ),
+    }
+}
+
 pub fn normalize_crate_name(plugin_path: &str) -> String {
     plugin_path
         .chars()
@@ -550,7 +567,21 @@ pub fn normalize_crate_name(plugin_path: &str) -> String {
 
 #[cfg(test)]
 mod normalize_tests {
-    use super::normalize_crate_name;
+    use super::{dir_not_under_plugins_root, normalize_crate_name};
+    use crate::core::error::RuntimeError;
+    use std::path::Path;
+
+    // The defensive Invariant mapper for a dir outside plugins_root.
+    // Unreachable through resolve() (every visited dir is joined onto
+    // plugins_root), but the mapper itself must format both paths.
+    #[test]
+    fn dir_not_under_plugins_root_is_invariant() {
+        let err = dir_not_under_plugins_root(Path::new("/elsewhere/x"), Path::new("/plugins/root"));
+        assert!(
+            matches!(&err, RuntimeError::Invariant { message } if message.contains("is not under plugins root") && message.contains("/elsewhere/x") && message.contains("/plugins/root")),
+            "expected Invariant, got {err:?}"
+        );
+    }
 
     /// P1-49: `normalize_crate_name` collapses `-` `/` `.` to `_`.
     /// This is the transform that motivates the crate-name conflict
@@ -783,12 +814,10 @@ mod resolver_tests {
         b.build(tmp.path());
 
         let err = PackageResolver::new(tmp.path()).resolve().unwrap_err();
-        match err {
-            RuntimeError::Invariant { message } => {
-                assert!(message.contains("crate name collision"), "{message}");
-            }
-            other => panic!("expected Invariant collision, got {other:?}"),
-        }
+        assert!(
+            matches!(&err, RuntimeError::Invariant { message } if message.contains("crate name collision")),
+            "expected Invariant collision, got {err:?}"
+        );
     }
 
     // --- per-plugin manifest errors -----------------------------------------
@@ -908,12 +937,10 @@ mod resolver_tests {
         b.write_interfaces = false;
         b.build(tmp.path());
         let err = PackageResolver::new(tmp.path()).resolve().unwrap_err();
-        match err {
-            RuntimeError::MissingScaffold { missing, .. } => {
-                assert!(missing.iter().any(|m| m == "src"), "{missing:?}");
-            }
-            other => panic!("expected MissingScaffold, got {other:?}"),
-        }
+        assert!(
+            matches!(&err, RuntimeError::MissingScaffold { missing, .. } if missing.iter().any(|m| m == "src")),
+            "expected MissingScaffold, got {err:?}"
+        );
     }
 
     #[test]
@@ -924,12 +951,10 @@ mod resolver_tests {
         b.interfaces_body = Some("{ not valid json".to_string());
         b.build(tmp.path());
         let err = PackageResolver::new(tmp.path()).resolve().unwrap_err();
-        match err {
-            RuntimeError::DocsContract { message, .. } => {
-                assert!(message.contains("parse failed"), "{message}");
-            }
-            other => panic!("expected DocsContract parse, got {other:?}"),
-        }
+        assert!(
+            matches!(&err, RuntimeError::DocsContract { message, .. } if message.contains("parse failed")),
+            "expected DocsContract parse, got {err:?}"
+        );
     }
 
     #[test]
@@ -943,12 +968,10 @@ mod resolver_tests {
         );
         b.build(tmp.path());
         let err = PackageResolver::new(tmp.path()).resolve().unwrap_err();
-        match err {
-            RuntimeError::DocsContract { message, .. } => {
-                assert!(message.contains("plugin_path mismatch"), "{message}");
-            }
-            other => panic!("expected DocsContract mismatch, got {other:?}"),
-        }
+        assert!(
+            matches!(&err, RuntimeError::DocsContract { message, .. } if message.contains("plugin_path mismatch")),
+            "expected DocsContract mismatch, got {err:?}"
+        );
     }
 
     #[test]
@@ -962,12 +985,10 @@ mod resolver_tests {
         ));
         b.build(tmp.path());
         let err = PackageResolver::new(tmp.path()).resolve().unwrap_err();
-        match err {
-            RuntimeError::DocsContract { message, .. } => {
-                assert!(message.contains("duplicated node id"), "{message}");
-            }
-            other => panic!("expected DocsContract duplicate, got {other:?}"),
-        }
+        assert!(
+            matches!(&err, RuntimeError::DocsContract { message, .. } if message.contains("duplicated node id")),
+            "expected DocsContract duplicate, got {err:?}"
+        );
     }
 
     // --- generated docs bypass (allow_generated_docs + dylib) ---------------
@@ -1003,24 +1024,20 @@ mod resolver_tests {
     fn resolve_child_source_must_start_with_dot_slash() {
         let tmp = TempDir::new().unwrap();
         let err = resolver_with_child(&tmp, "beta");
-        match err {
-            RuntimeError::InvalidChildSource { reason, .. } => {
-                assert!(reason.contains("must start with ./"), "{reason}");
-            }
-            other => panic!("expected InvalidChildSource, got {other:?}"),
-        }
+        assert!(
+            matches!(&err, RuntimeError::InvalidChildSource { reason, .. } if reason.contains("must start with ./")),
+            "expected InvalidChildSource, got {err:?}"
+        );
     }
 
     #[test]
     fn resolve_child_source_parent_dir_forbidden() {
         let tmp = TempDir::new().unwrap();
         let err = resolver_with_child(&tmp, "./../beta");
-        match err {
-            RuntimeError::InvalidChildSource { reason, .. } => {
-                assert!(reason.contains("../ is forbidden"), "{reason}");
-            }
-            other => panic!("expected InvalidChildSource parent-dir, got {other:?}"),
-        }
+        assert!(
+            matches!(&err, RuntimeError::InvalidChildSource { reason, .. } if reason.contains("../ is forbidden")),
+            "expected InvalidChildSource parent-dir, got {err:?}"
+        );
     }
 
     #[test]
@@ -1028,12 +1045,10 @@ mod resolver_tests {
         let tmp = TempDir::new().unwrap();
         // Starts with ./ and has no ../, but two normal segments.
         let err = resolver_with_child(&tmp, "./beta/gamma");
-        match err {
-            RuntimeError::InvalidChildSource { reason, .. } => {
-                assert!(reason.contains("direct children"), "{reason}");
-            }
-            other => panic!("expected InvalidChildSource multi-segment, got {other:?}"),
-        }
+        assert!(
+            matches!(&err, RuntimeError::InvalidChildSource { reason, .. } if reason.contains("direct children")),
+            "expected InvalidChildSource multi-segment, got {err:?}"
+        );
     }
 
     #[test]

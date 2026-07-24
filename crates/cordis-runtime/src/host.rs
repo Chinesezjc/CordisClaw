@@ -1057,17 +1057,13 @@ impl crate::soul::SoulProvider for PluginSoulProvider<'_> {
         let response = self
             .host
             .invoke(&self.plugin_path, "soul_get", payload.to_string())?;
-        let value: serde_json::Value =
-            serde_json::from_str(&response.payload).map_err(|e| RuntimeError::InvalidArgument {
-                message: format!("soul_get reply from {} is not JSON: {e}", self.plugin_path),
-            })?;
+        let value: serde_json::Value = serde_json::from_str(&response.payload)
+            .map_err(|e| soul_reply_error(&self.plugin_path, "is not JSON", &e))?;
         match value.get("soul") {
             None | Some(serde_json::Value::Null) => Ok(None),
-            Some(soul) => serde_json::from_value(soul.clone()).map(Some).map_err(|e| {
-                RuntimeError::InvalidArgument {
-                    message: format!("soul_get reply from {} malformed: {e}", self.plugin_path),
-                }
-            }),
+            Some(soul) => serde_json::from_value(soul.clone())
+                .map(Some)
+                .map_err(|e| soul_reply_error(&self.plugin_path, "malformed", &e)),
         }
     }
 
@@ -1195,6 +1191,23 @@ enum ContextFilesScope {
     All,
 }
 
+/// Test-only FFI-panic injection flag for the `iterate_plugins` catch_unwind
+/// guard. When set, the next entry into the iteration body panics so tests can
+/// exercise the emergency-rollback arm without a real plugin fault. Swapped
+/// back to `false` on read so it fires exactly once. Referenced by the
+/// `#[cfg(test)]` arm inside `iterate_plugins` and by `mod tests`.
+#[cfg(test)]
+pub(crate) static TEST_ITERATION_PANIC_INJECTION: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Test-only FFI-panic injection flag for the reload/stop-handler catch_unwind
+/// guard (Task-node `stop` invocation). When set, the next stop invocation
+/// panics so tests can verify the panic is caught and the reload path keeps
+/// running. Swapped back to `false` on read so it fires exactly once.
+#[cfg(test)]
+pub(crate) static TEST_STOP_HANDLER_PANIC_INJECTION: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 impl RuntimeHost {
     pub fn boot(fixtures_root: impl AsRef<Path>) -> Result<Self, RuntimeError> {
         let fixtures_root = fixtures_root.as_ref().to_path_buf();
@@ -1203,10 +1216,8 @@ impl RuntimeHost {
         let snapshot_root = config
             .resolve_snapshot_root(&fixtures_root)
             .unwrap_or_else(|| default_snapshot_root(&fixtures_root));
-        fs::create_dir_all(&snapshot_root).map_err(|e| RuntimeError::Io {
-            path: snapshot_root.clone(),
-            message: e.to_string(),
-        })?;
+        fs::create_dir_all(&snapshot_root)
+            .map_err(|e| host_io_error(snapshot_root.clone(), e.to_string()))?;
         cleanup_stale_snapshot_dirs(&snapshot_root);
         let initial_snapshot = Arc::new(build_snapshot(&loader, &snapshot_root)?);
         let interactive_rollback = Mutex::new(PluginEditRollback::empty(&fixtures_root));
@@ -1867,9 +1878,11 @@ impl RuntimeHost {
 
         // Create directory structure
         let src_dir = plugin_dir.join("src");
-        std::fs::create_dir_all(&src_dir).map_err(|e| RuntimeError::Io {
-            path: src_dir.clone(),
-            message: format!("failed to create plugin src dir: {e}"),
+        std::fs::create_dir_all(&src_dir).map_err(|e| {
+            host_io_error(
+                src_dir.clone(),
+                format!("failed to create plugin src dir: {e}"),
+            )
         })?;
 
         let desc = description.unwrap_or(name);
@@ -1902,10 +1915,10 @@ serde_json = "1"
 "#
         );
         std::fs::write(plugin_dir.join("Cargo.toml"), &cargo_toml).map_err(|e| {
-            RuntimeError::Io {
-                path: plugin_dir.join("Cargo.toml"),
-                message: format!("failed to write Cargo.toml: {e}"),
-            }
+            host_io_error(
+                plugin_dir.join("Cargo.toml"),
+                format!("failed to write Cargo.toml: {e}"),
+            )
         })?;
 
         // Write src/lib.rs skeleton
@@ -1984,9 +1997,11 @@ export_plugin_api! {{
 }}
 "#
         );
-        std::fs::write(src_dir.join("lib.rs"), &lib_rs).map_err(|e| RuntimeError::Io {
-            path: src_dir.join("lib.rs"),
-            message: format!("failed to write lib.rs: {e}"),
+        std::fs::write(src_dir.join("lib.rs"), &lib_rs).map_err(|e| {
+            host_io_error(
+                src_dir.join("lib.rs"),
+                format!("failed to write lib.rs: {e}"),
+            )
         })?;
 
         // Add to workspace members.
@@ -2001,11 +2016,12 @@ export_plugin_api! {{
         let workspace_manifest = self.fixtures_root.join("plugins").join("Cargo.toml");
         let lock_path = workspace_manifest.with_extension("toml.create-lock");
         let _lock = workspace_manifest_lock::acquire(&lock_path);
-        let manifest_text =
-            std::fs::read_to_string(&workspace_manifest).map_err(|e| RuntimeError::Io {
-                path: workspace_manifest.clone(),
-                message: format!("failed to read workspace manifest: {e}"),
-            })?;
+        let manifest_text = std::fs::read_to_string(&workspace_manifest).map_err(|e| {
+            host_io_error(
+                workspace_manifest.clone(),
+                format!("failed to read workspace manifest: {e}"),
+            )
+        })?;
         let mut document: TomlValue =
             toml::from_str(&manifest_text).map_err(|e| RuntimeError::InvalidArgument {
                 message: format!("failed to parse workspace manifest: {e}"),
@@ -2021,15 +2037,17 @@ export_plugin_api! {{
         if !already_member {
             members.push(TomlValue::String(name.to_string()));
         }
-        let new_manifest = toml::to_string_pretty(&document).map_err(|e| RuntimeError::Io {
-            path: workspace_manifest.clone(),
-            message: format!("failed to serialize workspace manifest: {e}"),
+        let new_manifest = toml::to_string_pretty(&document).map_err(|e| {
+            host_io_error(
+                workspace_manifest.clone(),
+                format!("failed to serialize workspace manifest: {e}"),
+            )
         })?;
         atomic_write_bytes(&workspace_manifest, new_manifest.as_bytes()).map_err(|e| {
-            RuntimeError::Io {
-                path: workspace_manifest,
-                message: format!("failed to write workspace manifest: {e}"),
-            }
+            host_io_error(
+                workspace_manifest,
+                format!("failed to write workspace manifest: {e}"),
+            )
         })?;
 
         Ok(serde_json::json!({
@@ -2676,6 +2694,12 @@ export_plugin_api! {{
                         let node_id = parts[1].to_string();
                         let this = self;
                         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            #[cfg(test)]
+                            if TEST_STOP_HANDLER_PANIC_INJECTION
+                                .swap(false, std::sync::atomic::Ordering::SeqCst)
+                            {
+                                panic!("test panic injection: stop handler");
+                            }
                             let _ = this.invoke(&plugin_id, &node_id, payload);
                         }));
                         if let Err(err) = result {
@@ -3084,6 +3108,10 @@ export_plugin_api! {{
         // and perform emergency rollback instead of crashing the server.
         let result: std::thread::Result<Result<KernelPluginIterationResult, RuntimeError>> =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                #[cfg(test)]
+                if TEST_ITERATION_PANIC_INJECTION.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                    panic!("test panic injection: plugin iteration");
+                }
                 let mut state = PluginIterationRunState::new(prepared.clone());
 
                 // Step 1: Run the agent loop — the agent freely decides what to do.
@@ -3513,9 +3541,8 @@ export_plugin_api! {{
             let response = self.invoke_candidate(
                 &sample.plugin_path,
                 &sample.node_id,
-                serde_json::to_string(&sample.payload).map_err(|err| RuntimeError::Invariant {
-                    message: format!("canary payload serialize failed: {err}"),
-                })?,
+                serde_json::to_string(&sample.payload)
+                    .map_err(|err| canary_payload_serialize_error(&err))?,
             )?;
             let actual = parse_response_payload(&response.payload);
             let verdict = if actual == sample.response {
@@ -3625,29 +3652,16 @@ export_plugin_api! {{
         // compare. Any drift → downgrade the verdict to a rollback so we
         // don't promote code we never verified.
         let mut effective_verifier = verifier_verdict;
-        let mut source_drift_reason: Option<String> = None;
-        if verifier_verdict == VerifierVerdict::Pass {
-            if let Some(expected) = state
+        let source_drift_reason = detect_plugin_source_drift(
+            verifier_verdict,
+            state
                 .verification
                 .as_ref()
-                .and_then(|r| r.source_tree_hash.as_deref())
-            {
-                match hash_source_tree(&self.fixtures_root) {
-                    Ok(actual) if actual == expected => {}
-                    Ok(actual) => {
-                        source_drift_reason = Some(format!(
-                            "source tree mutated between verify and promote (expected {expected}, got {actual})"
-                        ));
-                        effective_verifier = VerifierVerdict::Fail;
-                    }
-                    Err(err) => {
-                        source_drift_reason = Some(format!(
-                            "unable to re-hash source tree before promote: {err}"
-                        ));
-                        effective_verifier = VerifierVerdict::Fail;
-                    }
-                }
-            }
+                .and_then(|r| r.source_tree_hash.as_deref()),
+            || hash_source_tree(&self.fixtures_root),
+        );
+        if source_drift_reason.is_some() {
+            effective_verifier = VerifierVerdict::Fail;
         }
         if let Some(reason) = source_drift_reason.as_deref() {
             self.kernel.observe_plugin_issue(
@@ -4516,10 +4530,8 @@ impl<'a> PluginIterationAgentBackend<'a> {
             });
         }
         let abs_path = self.host.fixtures_root.join(&normalized);
-        let content = fs::read_to_string(&abs_path).map_err(|err| RuntimeError::Io {
-            path: abs_path.clone(),
-            message: err.to_string(),
-        })?;
+        let content =
+            fs::read_to_string(&abs_path).map_err(|err| region_io_error(&abs_path, &err))?;
         Ok(json!({
             "path": normalized,
             "sha256": sha256_text(&content),
@@ -4607,17 +4619,11 @@ impl<'a> PluginIterationAgentBackend<'a> {
 
         let parent_manifest_rel = format!("plugins/{}/Cargo.toml", args.parent_plugin_path);
         let parent_manifest_abs = self.host.fixtures_root.join(&parent_manifest_rel);
-        let parent_manifest_text =
-            fs::read_to_string(&parent_manifest_abs).map_err(|err| RuntimeError::Io {
-                path: parent_manifest_abs.clone(),
-                message: err.to_string(),
-            })?;
+        let parent_manifest_text = fs::read_to_string(&parent_manifest_abs)
+            .map_err(|err| region_io_error(&parent_manifest_abs, &err))?;
         let parent_manifest_sha = file_sha256(&parent_manifest_abs)?;
-        let parent_toml: TomlValue =
-            toml::from_str(&parent_manifest_text).map_err(|err| RuntimeError::CargoParse {
-                path: parent_manifest_abs.clone(),
-                message: err.to_string(),
-            })?;
+        let parent_toml: TomlValue = toml::from_str(&parent_manifest_text)
+            .map_err(|err| parent_manifest_parse_error(&parent_manifest_abs, &err))?;
         let mut children = parent_toml
             .get("package")
             .and_then(TomlValue::as_table)
@@ -4757,11 +4763,7 @@ impl<'a> PluginIterationAgentBackend<'a> {
             .arg(&command)
             .current_dir(&self.host.fixtures_root)
             .output()
-            .map_err(|err| RuntimeError::CommandFailed {
-                program: "bash".to_string(),
-                args: vec!["-lc".to_string(), command.clone()],
-                message: err.to_string(),
-            })?;
+            .map_err(|err| checked_command_spawn_error(&command, &err))?;
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
         if output.status.success() {
@@ -5119,6 +5121,62 @@ fn transcript_excerpt(
         .collect::<Vec<_>>();
     excerpt.reverse();
     excerpt
+}
+
+/// A/D seam: serialize failure of a canary replay payload. The invocation
+/// samples are already valid JSON `Value`s, so this only trips on pathological
+/// serializer states; kept as a named mapper for uniform error text.
+fn canary_payload_serialize_error(err: &serde_json::Error) -> RuntimeError {
+    RuntimeError::Invariant {
+        message: format!("canary payload serialize failed: {err}"),
+    }
+}
+
+/// A/D seam: failure to spawn the `bash -lc <command>` verification subprocess.
+fn checked_command_spawn_error(command: &str, err: &std::io::Error) -> RuntimeError {
+    RuntimeError::CommandFailed {
+        program: "bash".to_string(),
+        args: vec!["-lc".to_string(), command.to_string()],
+        message: err.to_string(),
+    }
+}
+
+/// A/D seam: failure to parse the parent plugin's `Cargo.toml` when scaffolding
+/// a child plugin. Preserves the toml error text verbatim.
+fn parent_manifest_parse_error(path: &Path, err: &toml::de::Error) -> RuntimeError {
+    RuntimeError::CargoParse {
+        path: path.to_path_buf(),
+        message: err.to_string(),
+    }
+}
+
+/// P0-3 TOCTOU guard: detect whether the plugin source tree drifted between
+/// the verify phase (which hashed the tree) and the promote phase. Pure over
+/// its inputs — the actual re-hash is injected via `rehash` so the decision
+/// logic is unit-testable without touching the filesystem.
+///
+/// Returns `Some(reason)` when the candidate must be downgraded to a rollback:
+/// either the re-hashed tree diverged from the verified hash, or re-hashing
+/// itself failed. Returns `None` when there is no drift to act on (verdict was
+/// not `Pass`, no baseline hash was recorded, or the hashes matched).
+pub(crate) fn detect_plugin_source_drift(
+    verifier_verdict: VerifierVerdict,
+    expected_source_tree_hash: Option<&str>,
+    rehash: impl FnOnce() -> Result<String, RuntimeError>,
+) -> Option<String> {
+    if verifier_verdict != VerifierVerdict::Pass {
+        return None;
+    }
+    let expected = expected_source_tree_hash?;
+    match rehash() {
+        Ok(actual) if actual == expected => None,
+        Ok(actual) => Some(format!(
+            "source tree mutated between verify and promote (expected {expected}, got {actual})"
+        )),
+        Err(err) => Some(format!(
+            "unable to re-hash source tree before promote: {err}"
+        )),
+    }
 }
 
 fn enrich_plugin_iteration_agent_error(
@@ -5851,10 +5909,8 @@ fn build_snapshot_with_staged_root(
     loader: &Loader,
     staged_artifact_root: PathBuf,
 ) -> Result<RuntimeSnapshot, RuntimeError> {
-    fs::create_dir_all(&staged_artifact_root).map_err(|e| RuntimeError::Io {
-        path: staged_artifact_root.clone(),
-        message: e.to_string(),
-    })?;
+    fs::create_dir_all(&staged_artifact_root)
+        .map_err(|e| region_io_error(&staged_artifact_root, &e))?;
 
     let mut output = match loader.load_with_staging_root(Some(&staged_artifact_root)) {
         Ok(output) => output,
@@ -6283,40 +6339,47 @@ fn insert_context_file_if_exists(
     }
 }
 
+/// A/D seam: wrap a raw `std::io::Error` into `RuntimeError::Io` for a path,
+/// with the error text preserved verbatim (no context prefix). Shared by the
+/// >3500 region's filesystem seams (context reads, manifest reads, scan walk).
+fn region_io_error(path: &Path, err: &std::io::Error) -> RuntimeError {
+    RuntimeError::Io {
+        path: path.to_path_buf(),
+        message: err.to_string(),
+    }
+}
+
+fn context_path_escape_error(path: &Path, workspace_root: &Path) -> RuntimeError {
+    RuntimeError::Invariant {
+        message: format!(
+            "planner context path {} escaped workspace root {}",
+            path.display(),
+            workspace_root.display()
+        ),
+    }
+}
+
 fn collect_context_files_recursive(
     workspace_root: &Path,
     dir: &Path,
     files: &mut BTreeSet<String>,
 ) -> Result<(), RuntimeError> {
-    let entries = fs::read_dir(dir).map_err(|err| RuntimeError::Io {
-        path: dir.to_path_buf(),
-        message: err.to_string(),
-    })?;
+    let entries = fs::read_dir(dir).map_err(|err| region_io_error(dir, &err))?;
     for entry in entries {
-        let entry = entry.map_err(|err| RuntimeError::Io {
-            path: dir.to_path_buf(),
-            message: err.to_string(),
-        })?;
+        let entry = entry.map_err(|err| region_io_error(dir, &err))?;
         let path = entry.path();
-        let file_type = entry.file_type().map_err(|err| RuntimeError::Io {
-            path: path.clone(),
-            message: err.to_string(),
-        })?;
+        let file_type = entry
+            .file_type()
+            .map_err(|err| region_io_error(&path, &err))?;
         if file_type.is_dir() {
             collect_context_files_recursive(workspace_root, &path, files)?;
             continue;
         }
         match path.extension().and_then(|extension| extension.to_str()) {
             Some("rs") | Some("json") | Some("toml") | Some("md") => {
-                let relative =
-                    path.strip_prefix(workspace_root)
-                        .map_err(|_| RuntimeError::Invariant {
-                            message: format!(
-                                "planner context path {} escaped workspace root {}",
-                                path.display(),
-                                workspace_root.display()
-                            ),
-                        })?;
+                let relative = path
+                    .strip_prefix(workspace_root)
+                    .map_err(|_| context_path_escape_error(&path, workspace_root))?;
                 files.insert(relative.to_string_lossy().to_string());
             }
             _ => {}
@@ -6467,6 +6530,25 @@ mod workspace_manifest_lock {
                 }
             }
         }
+    }
+}
+
+/// Test-seam helper (A/D class): build a `RuntimeError::Io` from a path and a
+/// preformatted message. Extracted from inline `.map_err(|e| RuntimeError::Io
+/// { .. })` closures in `create_plugin` / snapshot setup so the mapping is a
+/// single named, unit-testable function. Callers keep formatting the message
+/// (which embeds `e`) so the emitted text stays byte-for-byte identical.
+fn host_io_error(path: PathBuf, message: String) -> RuntimeError {
+    RuntimeError::Io { path, message }
+}
+
+/// Test-seam helper (A class): build the `RuntimeError::InvalidArgument`
+/// returned when a plugin's `soul_get` reply cannot be decoded. `stage` is the
+/// literal middle segment of the message ("is not JSON" or "malformed") so the
+/// emitted text matches the previous inline closures byte-for-byte.
+fn soul_reply_error(plugin_path: &str, stage: &str, e: &dyn std::fmt::Display) -> RuntimeError {
+    RuntimeError::InvalidArgument {
+        message: format!("soul_get reply from {plugin_path} {stage}: {e}"),
     }
 }
 
@@ -7347,4 +7429,705 @@ fn is_source_like_file_name(name: &str) -> bool {
         || lower.ends_with(".ts")
         || lower.ends_with(".html")
         || lower.ends_with(".css")
+}
+
+/// Seam-extraction tests (test-seam batch, >3500 region). Kept in a dedicated
+/// module so concurrent edits to the primary `mod tests` do not collide.
+#[cfg(test)]
+mod seam_extraction_tests {
+    use super::{
+        canary_payload_serialize_error, checked_command_spawn_error, context_path_escape_error,
+        detect_plugin_source_drift, parent_manifest_parse_error, region_io_error,
+    };
+    use crate::core::error::RuntimeError;
+    use crate::kernel::plugin_iteration::VerifierVerdict;
+    use std::path::Path;
+
+    #[test]
+    fn detect_drift_returns_none_when_verdict_not_pass() {
+        // Non-Pass verdict short-circuits before rehashing; the injected
+        // rehash closure must not even run.
+        let reason = detect_plugin_source_drift(VerifierVerdict::Fail, Some("abc"), || {
+            panic!("rehash must not run when verdict is not Pass")
+        });
+        assert!(reason.is_none());
+
+        let reason = detect_plugin_source_drift(VerifierVerdict::Partial, Some("abc"), || {
+            panic!("rehash must not run when verdict is Partial")
+        });
+        assert!(reason.is_none());
+    }
+
+    #[test]
+    fn detect_drift_returns_none_when_no_baseline_hash() {
+        let reason =
+            detect_plugin_source_drift(VerifierVerdict::Pass, None, || Ok("whatever".to_string()));
+        assert!(reason.is_none());
+    }
+
+    #[test]
+    fn detect_drift_returns_none_when_hash_matches() {
+        let reason = detect_plugin_source_drift(VerifierVerdict::Pass, Some("hash-xyz"), || {
+            Ok("hash-xyz".to_string())
+        });
+        assert!(reason.is_none());
+    }
+
+    #[test]
+    fn detect_drift_reports_mutation_when_hash_diverges() {
+        let reason =
+            detect_plugin_source_drift(VerifierVerdict::Pass, Some("expected-hash"), || {
+                Ok("actual-hash".to_string())
+            })
+            .expect("drift must be detected when hashes differ");
+        assert_eq!(
+            reason,
+            "source tree mutated between verify and promote (expected expected-hash, got actual-hash)"
+        );
+    }
+
+    #[test]
+    fn detect_drift_reports_rehash_failure() {
+        let rehash_err = RuntimeError::Invariant {
+            message: "disk gone".to_string(),
+        };
+        let expected = format!("unable to re-hash source tree before promote: {rehash_err}");
+        let reason =
+            detect_plugin_source_drift(VerifierVerdict::Pass, Some("expected-hash"), || {
+                Err(RuntimeError::Invariant {
+                    message: "disk gone".to_string(),
+                })
+            })
+            .expect("rehash failure must be surfaced as drift");
+        assert_eq!(reason, expected);
+    }
+
+    #[test]
+    fn canary_payload_serialize_error_wraps_message() {
+        let json_err = serde_json::from_str::<serde_json::Value>("not json").unwrap_err();
+        let err = canary_payload_serialize_error(&json_err);
+        assert!(
+            matches!(&err, RuntimeError::Invariant { message } if *message == format!("canary payload serialize failed: {json_err}")),
+            "expected Invariant, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn checked_command_spawn_error_preserves_command_and_text() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "no bash");
+        let err = checked_command_spawn_error("cargo test", &io_err);
+        assert!(
+            matches!(&err, RuntimeError::CommandFailed { program, args, message } if program == "bash" && args == &vec!["-lc".to_string(), "cargo test".to_string()] && message == "no bash"),
+            "expected CommandFailed, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn region_io_error_preserves_path_and_text() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
+        let err = region_io_error(Path::new("/tmp/x.rs"), &io_err);
+        assert!(
+            matches!(&err, RuntimeError::Io { path, message } if path == Path::new("/tmp/x.rs") && message == "denied"),
+            "expected Io, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn context_path_escape_error_formats_both_paths() {
+        let err = context_path_escape_error(Path::new("/outside/f.rs"), Path::new("/root"));
+        assert!(
+            matches!(&err, RuntimeError::Invariant { message } if message == "planner context path /outside/f.rs escaped workspace root /root"),
+            "expected Invariant, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn parent_manifest_parse_error_preserves_toml_text() {
+        let toml_err = toml::from_str::<toml::Value>("this = = broken").unwrap_err();
+        let err = parent_manifest_parse_error(Path::new("/root/Cargo.toml"), &toml_err);
+        assert!(
+            matches!(&err, RuntimeError::CargoParse { path, message } if path == Path::new("/root/Cargo.toml") && *message == toml_err.to_string()),
+            "expected CargoParse, got {err:?}"
+        );
+    }
+}
+
+/// C-seam (FFI panic arms): tests for the two `#[cfg(test)]` panic-injection
+/// points wired into the `catch_unwind` guards — `iterate_plugins`' emergency
+/// rollback arm and the reload/stop-handler arm. Kept in a dedicated module so
+/// concurrent edits to the primary `mod tests` do not collide.
+///
+/// Both seams sit as the FIRST statement inside their `catch_unwind` closure,
+/// so a set flag panics before any real plugin work runs. That lets these
+/// tests boot a hermetic, dlopen-free JSON-artifact fixtures tree in a
+/// `TempDir` (near-instant on any host target) instead of the repo fixtures
+/// (whose prebuilt dylibs are platform/toolchain-pinned and slow to dlopen
+/// over a network mount).
+#[cfg(test)]
+mod ffi_panic_seam_tests {
+    use super::{
+        plugin_iteration_journal_path, RuntimeHost, TEST_ITERATION_PANIC_INJECTION,
+        TEST_STOP_HANDLER_PANIC_INJECTION,
+    };
+    use crate::kernel::plugin_iteration::KernelPluginIterationRequest;
+    use cordis_plugin_sdk::{AbiFingerprint, NodeDoc, NodeType, PluginDocs};
+    use serde_json::json;
+    use serial_test::serial;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::atomic::Ordering::SeqCst;
+    use tempfile::TempDir;
+
+    /// A near-instant, cross-platform fixtures tree: `artifacts/index.json`
+    /// with zero entries. `RuntimeHost::boot` registers no plugins and never
+    /// touches a dylib.
+    fn setup_empty_fixture() -> (TempDir, PathBuf) {
+        let temp = TempDir::new().expect("tempdir");
+        let fixtures = temp.path().join("fixtures");
+        let artifacts = fixtures.join("artifacts");
+        fs::create_dir_all(&artifacts).expect("create artifacts dir");
+        fs::write(
+            artifacts.join("index.json"),
+            r#"{
+  "schema_version": 2,
+  "generated_at": "2026-07-24T00:00:00Z",
+  "topo_order": [],
+  "entries": []
+}
+"#,
+        )
+        .expect("write empty artifact index");
+        (temp, fixtures)
+    }
+
+    /// A JSON-artifact plugin `svc` that declares one `Task` node. JSON
+    /// artifacts skip dlopen at load time, so this boots on any host. The
+    /// artifact file's `abi_fingerprint`, `plugin_path`, and `docs` must match
+    /// the index entry (the loader cross-checks all three) and the recorded
+    /// sha256 must match the artifact bytes.
+    fn setup_task_plugin_fixture() -> (TempDir, PathBuf) {
+        let temp = TempDir::new().expect("tempdir");
+        let fixtures = temp.path().join("fixtures");
+        let artifacts = fixtures.join("artifacts");
+        fs::create_dir_all(&artifacts).expect("create artifacts dir");
+
+        let abi = AbiFingerprint::current_build("crate_svc_v1", "api_v2");
+        let node = NodeDoc {
+            id: "svc_serve".to_string(),
+            summary: "background task node for stop-handler seam test".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "required": ["node_id"],
+                "properties": { "node_id": { "type": "string", "const": "svc_serve" } }
+            }),
+            output_schema: json!({ "type": "object" }),
+            side_effects: Vec::new(),
+            failure_modes: vec!["unknown node_id".to_string()],
+            node_type: NodeType::Task,
+            agent_accessible: false,
+        };
+        let docs = PluginDocs {
+            plugin_id: "svc".to_string(),
+            plugin_path: "svc".to_string(),
+            plugin_version: "0.1.0".to_string(),
+            abi_version: 2,
+            command_name: Some("Svc".to_string()),
+            nodes: vec![node],
+            system_hint: None,
+        };
+
+        // The artifact JSON: shape mirrors `PluginArtifact` (plugin_path,
+        // abi_fingerprint, docs, exports, execution).
+        let artifact_value = json!({
+            "plugin_path": "svc",
+            "abi_fingerprint": abi,
+            "docs": docs,
+            "exports": [],
+            "execution": null,
+        });
+        let artifact_bytes =
+            serde_json::to_vec_pretty(&artifact_value).expect("serialize artifact");
+        let artifact_path = artifacts.join("svc.json");
+        fs::write(&artifact_path, &artifact_bytes).expect("write artifact");
+        let sha256 =
+            crate::plugin::artifact::sha256_file(&artifact_path).expect("hash svc artifact");
+
+        let index_value = json!({
+            "schema_version": 2,
+            "generated_at": "2026-07-24T00:00:00Z",
+            "topo_order": ["svc"],
+            "entries": [{
+                "plugin_path": "svc",
+                "version": "0.1.0",
+                "abi_fingerprint": abi,
+                "artifact_path": "svc.json",
+                "sha256": sha256,
+                "built_at": "0",
+                "parent": null,
+                "required": true,
+                "grants_from_parent": [],
+                "docs": docs,
+                "exports": [],
+                "execution": null,
+                "artifact_kind": "json",
+                "build_fingerprint": "bf",
+                "input_probe": { "files": [] },
+                "local_path_deps": []
+            }]
+        });
+        fs::write(
+            artifacts.join("index.json"),
+            serde_json::to_vec_pretty(&index_value).expect("serialize index"),
+        )
+        .expect("write index");
+
+        (temp, fixtures)
+    }
+
+    fn iteration_request() -> KernelPluginIterationRequest {
+        // Root mode (empty targets) so `begin_plugin_iteration` succeeds even
+        // with zero registered plugins.
+        KernelPluginIterationRequest {
+            issue_id: None,
+            target_plugin_paths: Vec::new(),
+            instruction: Some("seam panic injection".to_string()),
+            edit_plan: None,
+            manual_approved: false,
+            tests_command: None,
+            safety_command: None,
+            verify_profile: None,
+            quality_score: None,
+        }
+    }
+
+    // ── C-seam #1: iterate_plugins emergency-rollback arm ────────────────
+    #[test]
+    #[serial]
+    fn iterate_plugins_panic_is_caught_and_rolls_back_candidate_and_clears_journal() {
+        let (_temp, fixtures) = setup_empty_fixture();
+        let host = RuntimeHost::boot(&fixtures).expect("host should boot on empty index");
+
+        // Seed a candidate snapshot so we can prove the panic arm rolls it back.
+        host.reload_candidate().expect("stage candidate");
+        assert!(
+            host.candidate_snapshot().is_some(),
+            "candidate should be staged before the panic"
+        );
+
+        // Seed a rollback journal so we can prove the panic arm clears it. The
+        // journal records the (empty) current bytes of an in-workspace file;
+        // rollback restores those same bytes (a no-op edit), so `restore_
+        // plugin_iteration_workspace` runs cleanly without a cargo rebuild.
+        let marker_rel = "artifacts/seam-marker.txt";
+        let marker_abs = fixtures.join(marker_rel);
+        fs::write(&marker_abs, b"original").expect("seed marker file");
+        let rollback = crate::kernel::plugin_iteration::PluginEditRollback::single_backup(
+            fixtures.clone(),
+            marker_rel,
+            Some(b"original".to_vec()),
+        );
+        let journal_path = plugin_iteration_journal_path(&host.snapshot_root);
+        rollback
+            .persist_journal(&journal_path, "seam-iteration")
+            .expect("persist journal");
+        assert!(journal_path.exists(), "journal should exist before panic");
+
+        // Arm the injection and drive the iteration.
+        TEST_ITERATION_PANIC_INJECTION.store(true, SeqCst);
+        let result = host.iterate_plugins(iteration_request());
+
+        // The panic was caught: iterate_plugins returns an Invariant error
+        // whose message carries the injected panic text.
+        let err = result.expect_err("panic must surface as Err, not unwind");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("test panic injection: plugin iteration"),
+            "error must carry the injected panic message, got: {msg}"
+        );
+        assert!(
+            msg.contains("workspace has been restored"),
+            "error must report the emergency restore, got: {msg}"
+        );
+
+        // The flag was consumed exactly once (swapped back to false).
+        assert!(
+            !TEST_ITERATION_PANIC_INJECTION.load(SeqCst),
+            "injection flag must be reset after firing"
+        );
+        // Candidate was rolled back.
+        assert!(
+            host.candidate_snapshot().is_none(),
+            "candidate must be rolled back by the panic arm"
+        );
+        // Journal was cleared.
+        assert!(
+            !journal_path.exists(),
+            "rollback journal must be cleared by the panic arm"
+        );
+        // The iteration lock was released (finish_plugin_iteration ran before
+        // the match arm), so a subsequent iteration can start. Re-arm the flag
+        // so the follow-up panics at the closure's first line again — this
+        // proves the lock was freed WITHOUT driving a real LLM agent turn (an
+        // unarmed, edit-plan-less iteration would otherwise call out to the
+        // configured LLM endpoint).
+        TEST_ITERATION_PANIC_INJECTION.store(true, SeqCst);
+        let followup = host.iterate_plugins(iteration_request());
+        let followup_msg = followup
+            .expect_err("re-armed follow-up must also surface as Err")
+            .to_string();
+        assert!(
+            followup_msg.contains("test panic injection: plugin iteration"),
+            "follow-up must reach the injection point (lock was released), got: {followup_msg}"
+        );
+        assert!(
+            !TEST_ITERATION_PANIC_INJECTION.load(SeqCst),
+            "injection flag must be reset after the follow-up fires"
+        );
+    }
+
+    // ── C-seam #2: reload/stop-handler catch_unwind arm ──────────────────
+    #[test]
+    #[serial]
+    fn stop_handler_panic_is_caught_and_reload_path_survives() {
+        let (_temp, fixtures) = setup_task_plugin_fixture();
+        let host = RuntimeHost::boot(&fixtures).expect("host should boot on task fixture");
+
+        // The Task node must be registered so the stop-handler loop has a
+        // target to iterate over.
+        let snapshot = host.current_snapshot();
+        let task_fqns = snapshot.node_registry().task_node_fqns();
+        assert!(
+            task_fqns.iter().any(|fqn| fqn == "svc::svc_serve"),
+            "svc::svc_serve Task node must be registered, got: {task_fqns:?}"
+        );
+        drop(snapshot);
+
+        // Arm the stop-handler injection and reload the svc subtree. The panic
+        // fires inside the per-node stop `catch_unwind`; the guard must catch
+        // it and let the reload continue. (Phase 1 then dlopens the JSON
+        // artifact and fails — an expected, caught Err — proving the reload
+        // path kept running past the panic instead of unwinding the thread.)
+        TEST_STOP_HANDLER_PANIC_INJECTION.store(true, SeqCst);
+        let reload_result = host.reload("svc");
+        assert!(
+            !TEST_STOP_HANDLER_PANIC_INJECTION.load(SeqCst),
+            "stop-handler injection flag must be reset after firing"
+        );
+        // The reload_subtree Phase-1 dlopen of a JSON artifact fails, but the
+        // stop-handler panic was already caught by then — the process did not
+        // abort, which is the property under test.
+        assert!(
+            reload_result.is_err(),
+            "reloading a JSON artifact via reload_subtree fails at Phase 1 dlopen"
+        );
+
+        // The host is still usable after the caught panic: a fresh snapshot
+        // read and a second reload attempt both succeed at the API level
+        // (i.e. no poisoned lock / aborted thread).
+        let after = host.current_snapshot();
+        assert!(
+            after
+                .node_registry()
+                .task_node_fqns()
+                .iter()
+                .any(|fqn| fqn == "svc::svc_serve"),
+            "Task node registry must survive the caught panic"
+        );
+        // Second reload without the flag set: still reaches Phase 1 and errs
+        // on the same JSON dlopen, but does not panic — confirms repeatability.
+        let second = host.reload("svc");
+        assert!(
+            second.is_err(),
+            "second reload also fails cleanly at Phase 1 (no panic)"
+        );
+    }
+}
+
+/// F-class coverage: unit tests for pure helper functions in the >3500 region
+/// that were previously exercised only indirectly (or not at all). Kept in a
+/// dedicated module to avoid collision with concurrent edits elsewhere.
+#[cfg(test)]
+mod seam_pure_fn_tests {
+    use super::{
+        extract_response_field, infer_outcome_from_payload, is_warning_block_boundary,
+        parse_response_payload, plugin_change_reasons, plugin_iteration_status_from_history,
+        plugin_relative_depth, select_registered_net_subgraph, strip_rust_span_suffix,
+        truncate_warning_block, warning_cleanup_error_message, warning_path_aliases,
+    };
+    use crate::core::models::NodeOutcome;
+    use crate::kernel::plugin_iteration::{
+        CanaryVerdict, PluginIterationFinalVerdict, PluginIterationHistoryEntry, VerifierVerdict,
+    };
+    use crate::plugin::registry::RegisteredPlugin;
+    use crate::service::graph_registry::{RegisteredNet, RegisteredNetEdge, RegisteredNetEdgeKind};
+    use serde_json::json;
+
+    #[test]
+    fn parse_response_payload_parses_json_or_falls_back_to_string() {
+        assert_eq!(parse_response_payload("{\"a\":1}"), json!({"a": 1}));
+        // Non-JSON input becomes a JSON string verbatim.
+        assert_eq!(parse_response_payload("not json"), json!("not json"));
+    }
+
+    #[test]
+    fn extract_response_field_reads_object_field_only() {
+        let payload = json!({"result": {"ok": true}, "n": 3});
+        assert_eq!(extract_response_field(&payload, "n"), Some(json!(3)));
+        assert_eq!(extract_response_field(&payload, "missing"), None);
+        // Non-object payloads yield None.
+        assert_eq!(extract_response_field(&json!([1, 2]), "n"), None);
+    }
+
+    #[test]
+    fn infer_outcome_from_payload_covers_success_and_failure_arms() {
+        // Non-object -> Success.
+        assert_eq!(
+            infer_outcome_from_payload(&json!("x")),
+            NodeOutcome::Success
+        );
+        // ok:false -> Failure.
+        assert_eq!(
+            infer_outcome_from_payload(&json!({"ok": false})),
+            NodeOutcome::Failure
+        );
+        // Non-empty error string -> Failure.
+        assert_eq!(
+            infer_outcome_from_payload(&json!({"error": "boom"})),
+            NodeOutcome::Failure
+        );
+        // Blank error string is ignored -> Success.
+        assert_eq!(
+            infer_outcome_from_payload(&json!({"error": "   "})),
+            NodeOutcome::Success
+        );
+        // Plain object with no failure markers -> Success.
+        assert_eq!(
+            infer_outcome_from_payload(&json!({"value": 1})),
+            NodeOutcome::Success
+        );
+    }
+
+    #[test]
+    fn strip_rust_span_suffix_strips_line_col_when_present() {
+        assert_eq!(strip_rust_span_suffix("src/lib.rs:12:5"), "src/lib.rs");
+        // Trailing whitespace is trimmed.
+        assert_eq!(strip_rust_span_suffix("  src/core.rs:1:1  "), "src/core.rs");
+        // No numeric span -> returned trimmed as-is.
+        assert_eq!(strip_rust_span_suffix("src/lib.rs"), "src/lib.rs");
+        assert_eq!(
+            strip_rust_span_suffix("src/lib.rs:foo:bar"),
+            "src/lib.rs:foo:bar"
+        );
+    }
+
+    #[test]
+    fn warning_path_aliases_adds_plugins_stripped_alias() {
+        assert_eq!(
+            warning_path_aliases("plugins/foo/src/lib.rs"),
+            vec![
+                "plugins/foo/src/lib.rs".to_string(),
+                "foo/src/lib.rs".to_string()
+            ]
+        );
+        // Paths without the prefix produce a single alias.
+        assert_eq!(
+            warning_path_aliases("foo/src/lib.rs"),
+            vec!["foo/src/lib.rs".to_string()]
+        );
+    }
+
+    #[test]
+    fn is_warning_block_boundary_recognizes_cargo_markers() {
+        for marker in [
+            "error: bad",
+            "Compiling foo",
+            "Checking foo",
+            "Finished dev",
+            "Running tests",
+            "running 3 tests",
+            "test result: ok",
+            "Doc-tests foo",
+        ] {
+            assert!(
+                is_warning_block_boundary(marker),
+                "expected boundary: {marker}"
+            );
+        }
+        assert!(!is_warning_block_boundary("note: something"));
+        assert!(!is_warning_block_boundary("  = help: x"));
+    }
+
+    #[test]
+    fn truncate_warning_block_appends_ellipsis_only_when_truncated() {
+        assert_eq!(truncate_warning_block("short", 10), "short");
+        assert_eq!(truncate_warning_block("abcdef", 3), "abc...");
+    }
+
+    #[test]
+    fn warning_cleanup_error_message_embeds_command_and_capped_excerpt() {
+        let warnings = vec![
+            "warning: one".to_string(),
+            "warning: two".to_string(),
+            "warning: three".to_string(),
+        ];
+        let message = warning_cleanup_error_message("cargo build", &warnings);
+        assert!(message.contains("verification command `cargo build` succeeded"));
+        assert!(message.contains("warning: one"));
+        assert!(message.contains("warning: two"));
+        // Only the first two warnings are included in the excerpt.
+        assert!(!message.contains("warning: three"));
+    }
+
+    #[test]
+    fn plugin_relative_depth_measures_subtree_distance() {
+        assert_eq!(plugin_relative_depth("a/b", "a/b"), Some(0));
+        assert_eq!(plugin_relative_depth("a/b", "a/b/c"), Some(1));
+        assert_eq!(plugin_relative_depth("a/b", "a/b/c/d"), Some(2));
+        // Not under the root.
+        assert_eq!(plugin_relative_depth("a/b", "x/y"), None);
+        // Prefix collision that is not a real path child.
+        assert_eq!(plugin_relative_depth("a/b", "a/bc"), None);
+    }
+
+    #[test]
+    fn select_registered_net_subgraph_walks_upstream_edges() {
+        let edge = |from: &str, to: &str| RegisteredNetEdge {
+            from: from.to_string(),
+            to: to.to_string(),
+            kind: RegisteredNetEdgeKind::Data,
+            label: None,
+        };
+        let net = RegisteredNet {
+            nodes: Vec::new(),
+            edges: vec![edge("a", "b"), edge("b", "c"), edge("x", "y")],
+            diagnostics: Vec::new(),
+        };
+        // Target c pulls in its transitive upstream (b, a) but not the
+        // disconnected x/y component.
+        let selected = select_registered_net_subgraph(&net, "c");
+        let mut got = selected.into_iter().collect::<Vec<_>>();
+        got.sort();
+        assert_eq!(got, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn plugin_change_reasons_reports_each_diff_field() {
+        use crate::core::models::PluginLoadResult;
+        use std::collections::BTreeSet;
+        let base = RegisteredPlugin {
+            plugin_path: "root/child".to_string(),
+            parent: None,
+            required: false,
+            grants_from_parent: BTreeSet::new(),
+            load_result: PluginLoadResult::Loaded,
+            docs: None,
+            artifact_path: None,
+            artifact_kind: None,
+            abi_fingerprint: None,
+            execution: None,
+            fingerprint_diff: Vec::new(),
+        };
+        // No changes -> empty reasons.
+        assert!(plugin_change_reasons(&base, &base).is_empty());
+
+        let mut changed = base.clone();
+        changed.required = !base.required;
+        assert_eq!(
+            plugin_change_reasons(&base, &changed),
+            vec!["required_changed".to_string()]
+        );
+
+        let mut parent_changed = base.clone();
+        parent_changed.parent = Some("root".to_string());
+        assert_eq!(
+            plugin_change_reasons(&base, &parent_changed),
+            vec!["parent_changed".to_string()]
+        );
+    }
+
+    #[test]
+    fn plugin_iteration_status_from_history_copies_fields() {
+        let entry = PluginIterationHistoryEntry {
+            iteration_id: "iter-1".to_string(),
+            issue_id: "issue-1".to_string(),
+            root_plugin_path: "root".to_string(),
+            target_plugin_paths: vec!["root/child".to_string()],
+            source: None,
+            summary: "did work".to_string(),
+            changed_paths: vec!["root/src/lib.rs".to_string()],
+            verifier_verdict: Some(VerifierVerdict::Pass),
+            canary_verdict: Some(CanaryVerdict::Partial),
+            final_verdict: PluginIterationFinalVerdict::Blocked,
+            blocked_reason: Some("canary partial".to_string()),
+            observed_at_ms: 10,
+            completed_at_ms: 20,
+        };
+        let status = plugin_iteration_status_from_history(&entry);
+        assert_eq!(status.iteration_id, "iter-1");
+        assert_eq!(status.issue_id, "issue-1");
+        assert_eq!(status.root_plugin_path, "root");
+        assert_eq!(status.target_plugin_paths, vec!["root/child".to_string()]);
+        assert_eq!(status.summary, "did work");
+        assert_eq!(status.changed_paths, vec!["root/src/lib.rs".to_string()]);
+        assert_eq!(status.verifier_verdict, Some(VerifierVerdict::Pass));
+        assert_eq!(status.canary_verdict, Some(CanaryVerdict::Partial));
+        assert_eq!(status.final_verdict, PluginIterationFinalVerdict::Blocked);
+        assert_eq!(status.blocked_reason, Some("canary partial".to_string()));
+    }
+}
+
+/// Seam-extraction tests (test-seam batch, 1-3500 region). Separate module so
+/// concurrent edits to `mod tests` / `mod seam_extraction_tests` do not
+/// collide. Covers the named error mappers extracted from inline `.map_err`
+/// closures in `create_plugin`, snapshot setup, and the `soul_get` reply path.
+#[cfg(test)]
+mod seam_extraction_tests_low {
+    use super::{host_io_error, soul_reply_error};
+    use crate::core::error::RuntimeError;
+    use std::path::PathBuf;
+
+    #[test]
+    fn host_io_error_carries_path_and_message_verbatim() {
+        let path = PathBuf::from("/root/plugins/foo/src");
+        let err = host_io_error(
+            path.clone(),
+            "failed to create plugin src dir: boom".to_string(),
+        );
+        assert!(
+            matches!(&err, RuntimeError::Io { path: p, message } if p == &path && message == "failed to create plugin src dir: boom"),
+            "expected Io, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn host_io_error_matches_plain_tostring_form() {
+        // Mirrors the snapshot-root create_dir_all closure where message = e.to_string().
+        let io = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
+        let path = PathBuf::from("/snap/root");
+        let err = host_io_error(path.clone(), io.to_string());
+        assert!(
+            matches!(&err, RuntimeError::Io { path: p, message } if p == &path && *message == io.to_string()),
+            "expected Io, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn soul_reply_error_not_json_stage_text_is_byte_exact() {
+        let json_err = serde_json::from_str::<serde_json::Value>("{not json").unwrap_err();
+        let err = soul_reply_error("/soul/plugin", "is not JSON", &json_err);
+        assert!(
+            matches!(&err, RuntimeError::InvalidArgument { message } if *message == format!("soul_get reply from /soul/plugin is not JSON: {json_err}")),
+            "expected InvalidArgument, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn soul_reply_error_malformed_stage_text_is_byte_exact() {
+        let val_err = serde_json::from_value::<u32>(serde_json::json!("not a number")).unwrap_err();
+        let err = soul_reply_error("/soul/plugin", "malformed", &val_err);
+        assert!(
+            matches!(&err, RuntimeError::InvalidArgument { message } if *message == format!("soul_get reply from /soul/plugin malformed: {val_err}")),
+            "expected InvalidArgument, got {err:?}"
+        );
+    }
 }
