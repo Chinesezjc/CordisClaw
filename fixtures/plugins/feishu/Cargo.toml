@@ -36,4 +36,4 @@ cbc = "0.1"
 sha2 = "0.10"
 base64 = "0.22"
 # Long-connection (wss) event mode: sync WebSocket client.
-tungstenite = { version = "0.21", features = ["rustls-tls-webpki-roots"] }
+tungstenite = { version = "0.27", features = ["rustls-tls-webpki-roots"] }
