@@ -522,7 +522,7 @@ fn pump_connection(endpoint: &str, cfg: WsClientConfig) -> Result<(), String> {
     let mut last_ping = Instant::now();
     // Fire an immediate ping so the server learns we're alive.
     let _ = socket.send(tungstenite::Message::Binary(
-        ping_frame(service_id).encode(),
+        ping_frame(service_id).encode().into(),
     ));
 
     loop {
@@ -534,7 +534,7 @@ fn pump_connection(endpoint: &str, cfg: WsClientConfig) -> Result<(), String> {
         if last_ping.elapsed() >= cfg.ping_interval {
             socket
                 .send(tungstenite::Message::Binary(
-                    ping_frame(service_id).encode(),
+                    ping_frame(service_id).encode().into(),
                 ))
                 .map_err(|e| format!("ping: {e}"))?;
             last_ping = Instant::now();
@@ -580,7 +580,7 @@ fn pump_connection(endpoint: &str, cfg: WsClientConfig) -> Result<(), String> {
             METHOD_DATA => {
                 if let Some(ack) = handle_data_frame(frame, &mut reassembler) {
                     socket
-                        .send(tungstenite::Message::Binary(ack))
+                        .send(tungstenite::Message::Binary(ack.into()))
                         .map_err(|e| format!("ack: {e}"))?;
                 }
             }
