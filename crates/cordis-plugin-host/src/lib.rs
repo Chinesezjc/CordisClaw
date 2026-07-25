@@ -811,10 +811,10 @@ mod tests {
         // host (unlike a platform-specific system dylib), so copying it under a
         // `.dylib` name exercises the symbol-lookup-failure branch without any
         // environment skip.
-        let sys = std::env::current_exe().expect("current exe path");
+        let sys = loadable_helper_dylib();
         let tmp = TmpFixtures::with_index("{}"); // placeholder, overwrite below
         let plugin_dylib = tmp.root().join("artifacts/nosym.dylib");
-        fs::copy(&sys, &plugin_dylib).expect("copy current exe");
+        fs::copy(&sys, &plugin_dylib).expect("copy helper cdylib");
         let index = format!(
             r#"{{ "schema_version": 2, "entries": [
                 {{ "plugin_path": "p", "artifact_path": "nosym.dylib", "docs": {}, "execution": null }}
@@ -922,9 +922,46 @@ mod tests {
     /// "keep the module alive" invariant. The running test binary is a valid
     /// Mach-O/ELF image present on every host, so this needs no environment
     /// skip.
+    /// Compile (once per test process) a tiny dependency-free cdylib and
+    /// return its path. Unlike the running test binary — which Linux refuses
+    /// to `dlopen` ("cannot dynamically load position-independent
+    /// executable") — a real cdylib is loadable on every platform, and it
+    /// exports no cordis entry symbol, so it doubles as the
+    /// symbol-lookup-failure fixture.
+    fn loadable_helper_dylib() -> std::path::PathBuf {
+        use std::sync::OnceLock;
+        static HELPER: OnceLock<std::path::PathBuf> = OnceLock::new();
+        HELPER
+            .get_or_init(|| {
+                let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
+                let dir =
+                    std::env::temp_dir().join(format!("cordis-host-live-{}", std::process::id()));
+                let _ = fs::create_dir_all(&dir);
+                let src_path = dir.join("live.rs");
+                let dylib = dir.join(format!("liblive{}", std::env::consts::DLL_SUFFIX));
+                fs::write(
+                    &src_path,
+                    "#[no_mangle]\npub extern \"C\" fn cordis_live_probe() -> u32 { 7 }\n",
+                )
+                .expect("write helper source");
+                let status = std::process::Command::new(&rustc)
+                    .args(["--crate-type", "cdylib", "-o"])
+                    .arg(&dylib)
+                    .arg(&src_path)
+                    .status()
+                    .expect("run rustc for helper cdylib");
+                assert!(
+                    status.success() && dylib.exists(),
+                    "helper cdylib must build"
+                );
+                dylib
+            })
+            .clone()
+    }
+
     fn live_library() -> Library {
-        let exe = std::env::current_exe().expect("current exe path");
-        unsafe { Library::new(&exe) }.expect("load current exe as library")
+        let dylib = loadable_helper_dylib();
+        unsafe { Library::new(&dylib) }.expect("load helper cdylib as library")
     }
 
     /// Build a `CatalogPlugin` whose `library` slot is pre-loaded with a
