@@ -3,6 +3,7 @@ name: coverage
 on:
   push:
     branches: [main]
+  pull_request:
   workflow_dispatch:
 
 concurrency:
@@ -37,11 +38,18 @@ jobs:
       - name: prepare fixture artifacts
         run: cargo run --locked -p cordis-runtime -- prepare-artifacts fixtures
 
-      # 并行执行安全性同 ci.yml：snapshot 清理按 pid 探活。
-      - name: run tests with coverage
+      # 覆盖率门槛：行覆盖 >= 96%（当前基线 96.8%，余量吸收平台差异）。
+      # 排除 main.rs（REPL/signal/exit）与 agent.rs（LLM 流式 I/O）——
+      # 均为进程/网络边界，见 CLAUDE.md 覆盖率规范。
+      # 串行执行：插桩下 host 系集成测试共享 fixtures 工件，并行会因
+      # 中途重建 dylib 触发 HashMismatch 假失败。
+      - name: run tests with coverage (96% line gate)
         run: |
           cargo llvm-cov --locked --workspace \
-            --lcov --output-path lcov.info
+            --fail-under-lines 96 \
+            --ignore-filename-regex 'cordis-runtime/src/(main|agent)\.rs' \
+            --lcov --output-path lcov.info \
+            -- --test-threads=1
 
       - name: coverage summary
         run: |

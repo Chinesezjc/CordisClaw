@@ -2,7 +2,7 @@
 
 ## 1. 判定口径
 
-- 本文基于当前仓库现状整理，最近更新：2026-07-24。
+- 本文基于当前仓库现状整理，最近更新：2026-07-25。
 - 历史规划蓝图已经吸收进 [design-blueprint.md](./design-blueprint.md)，因此本文结论来自三类证据的交叉比对：
   - 设计蓝图：[design-blueprint.md](./design-blueprint.md)
   - 架构文档：[system-overview.md](./system-overview.md)、[contracts-and-loading.md](./contracts-and-loading.md)、[runtime-semantics.md](./runtime-semantics.md)、[maintenance-guide.md](./maintenance-guide.md)
@@ -29,6 +29,20 @@
 | CI | 已完成 | GitHub Actions（`.github/workflows/ci.yml`）：push main + PR 触发，ubuntu-latest 上执行 fmt / clippy `-D warnings` / prepare-artifacts / build / test（并行）；x86_64-linux 门控恒真，dylib 集成测试全量执行，fixture 插件经 `prepare-artifacts` 预构建并由 rust-cache 缓存。并行安全：snapshot 目录名带创建者 pid，boot 的 stale 清理只删已死进程的残留（`cleanup_stale_snapshot_dirs`）；mock LLM server accept 超时 CI 下 900s / 本地 30s（`mock_llm_accept_timeout`，冷缓存 runner 上迭代测试中途 cargo build 远超 30s） |
 
 ## 3. 已完成
+
+### 3.0 覆盖率治理战役（2026-07-23 ~ 07-24）
+
+行覆盖从 32.7% 提升到 **96.8%**（排除 `main.rs`/`agent.rs` 两个进程/网络边界文件），测试从 ~200 增至 **1146**，全绿。CI coverage workflow 落 `--fail-under-lines 96` 门槛（PR 自动跑）。分六批完成：
+
+1. **四波补测**（+570 测试）：按模块并行补齐，含 mock SSE 驱动 LLM 链路、TempDir 最小原生插件树驱动 iterate_plugins 全链、真实 arm64 dylib FFI 路径。
+2. **接缝改造批**（+130 测试）：六类不可达行系统化处置——具名 error-mapper 提取、结构死分支 debug_assert 化（grep 论证不变量）、cfg(test) panic 注入点、测试脚手架死臂改写（单行 let-else / matches!）。
+3. **结构重构批**（+60 测试）：编排函数失败臂 P1 提取（promote 失败聚合、trace/报文构造）、`*_with_runner` 命令执行器参数化、纯数据段提取（edges_to_net_specs）、verifier fixture 门控改能力探测、跨平台 skip 盲区消除（libgmalloc → current_exe）。
+
+4. **覆盖率终局批**（2026-07-25，逐行销账）：把此前归档的"安全边界 fail-closed / serde 不可失败 / fs 中途故障"残留改为可直接命中。手段：安全边界内部函数直接单测（package `visit_plugin` 手工构造 `VisitState` 命中 DuplicatePluginPath/CycleDetected 全臂、`classify_child_component` 提取后命中路径穿越 RootDir 臂）；`#[cfg(test)] PluginRegistry::insert_raw` 构造"Loaded 但缺 docs/kind/fingerprint"条目命中 invoke 三个 Invariant 门；docs-drift 回写逻辑提取为 `heal_write_pretty`（serialize 失败臂用非字符串键 map 直测）；verifier `try_wait` 轮询提取为 `poll_until_exit`（注入闭包命中 Err 臂）、三个 stage `?` 合并为循环消除 static 臂死行；auto_update dotted-key 终态 Err、dynamic null-ptr 臂、resolve_under_workspace 无祖先臂均提取或直测命中；平台/root skip 早退改为条件门控（无死行）。此批新增 31 个测试，8 个目标文件行覆盖升至 96.96%~100%。
+
+5. **tooling.rs fs 写层参数化批**（2026-07-25）：`plugin/tooling.rs` 的 fs 中途故障臂改为可直接命中。手段：新增三个函数指针注入结构（`FsWriteOps` / `LockAcquireOps` / `MetaOps`，各带 `::STD` 默认直通 `std::fs`），`stage_then_rename_file` / `write_pretty_json` / `ArtifactBuildLock::acquire` / `build_input_probe` / `maybe_remove_stale_lock` 各拆 `_with_fs` 变体，公共入口注入 `STD`（默认路径逐字节等价——错误文本、操作顺序、清理逻辑不变）；测试注入单个失败 op 命中 write/sync/rename tmp、lock serialize/write/flush/sync、AlreadyExists 零超时臂、open 非-AlreadyExists Io 臂、mtime 读失败 `now()` 回退、初始 stat 失败臂。`collect_files_recursively` 的 per-entry 处理提取为 `collect_dir_entry`（喂合成 `Err` 命中 iterator-Err 臂、dangling symlink 命中 metadata 臂）。无父/无 filename/缺插件 Invariant 臂以构造态直调内部函数命中（`prepare_artifacts_locked`/`build_dirty_dylib_plugins` 传 `/`、`build_plugin_contexts` 传 topo_order 含图外插件、`write_pretty_json` 传 `..` 结尾路径）。此批新增 23 个测试（tooling.rs lib 测试 77→100），行覆盖 94.7%→96.49%。
+
+剩余不可达为 llvm-cov 大括号/`matches!` 宏展开伪影、`?` 错误传播的 unreachable 分支、root-only skip 的 eprintln（非 root 环境不执行），以及 tooling.rs 需真实 cargo/dylib 子进程失败或进程级 cwd 篡改才能触达的臂（rebuild_plugin_workspace 命令失败、prepare_artifacts_locked 的 remove_dir/create_dir Io、inspect_dylib_contract 解析失败、run_command wait-Err、absolute_path 的 current_dir 失败、lockfile per-entry Io）。归档理由在各测试模块注释。附带修复两个真 flaky：shared_host HashMismatch（boot 前 refresh index）、mock server 非阻塞流 WouldBlock（accept 后切回阻塞）。
 
 ### 3.1 Stage A-E 已经落地到可运行原型
 

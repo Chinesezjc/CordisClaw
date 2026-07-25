@@ -1578,6 +1578,78 @@ mod tests {
         ctx.rollback_overlay("sg").unwrap();
     }
 
+    /// Populate `global_slots` directly (no public writer promotes into it) so
+    /// the global-scope read branch of `lookup_slot_entry` and the global
+    /// branch of `list_by_ns` are exercised. Same-module access is the only way
+    /// to reach these, mirroring `commit_session`'s session-branch coverage.
+    #[test]
+    fn lookup_and_list_read_global_slot_scope() {
+        let ctx = RuntimeContext::default();
+        let k = key("gns", "gval", 1);
+        ctx.global_slots.lock().unwrap().insert(
+            k.clone(),
+            SlotEntry {
+                value: serde_json::json!("g"),
+                meta: slot_meta(),
+            },
+        );
+        // lookup_slot_entry: request/session miss, global hit.
+        let got: serde_json::Value = ctx.get(&k).unwrap().unwrap();
+        assert_eq!(got, serde_json::json!("g"));
+        // list_by_ns: global keys surface for the namespace.
+        assert!(ctx.list_by_ns("gns").contains(&k));
+    }
+
+    /// A stored key whose major version differs from a later request in the
+    /// same namespace/name yields `ContextVersionIncompatible`. Storing in the
+    /// global slot map drives the schema check across the global keys chain.
+    #[test]
+    fn global_slot_major_version_mismatch_is_incompatible() {
+        let ctx = RuntimeContext::default();
+        ctx.global_slots.lock().unwrap().insert(
+            key("gns", "schema", 100),
+            SlotEntry {
+                value: serde_json::json!(1),
+                meta: slot_meta(),
+            },
+        );
+        let err = ctx
+            .get::<serde_json::Value>(&key("gns", "schema", 250))
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            RuntimeError::ContextVersionIncompatible { .. }
+        ));
+    }
+
+    /// `list_by_ns` applies the active overlay on top of the base scopes:
+    /// an overlay write adds a key, and an overlay removal (tombstone) drops a
+    /// base key from the listing.
+    #[test]
+    fn list_by_ns_applies_overlay_writes_and_removals() {
+        let ctx = RuntimeContext::default();
+        let kept = key("ns", "kept", 1);
+        let removed = key("ns", "removed", 1);
+        ctx.put(kept.clone(), serde_json::json!(1), slot_meta())
+            .unwrap();
+        ctx.put(removed.clone(), serde_json::json!(2), slot_meta())
+            .unwrap();
+        ctx.begin_subgraph("sg").unwrap();
+        // Overlay adds a new key and tombstones an existing one.
+        let added = key("ns", "added", 1);
+        ctx.put(added.clone(), serde_json::json!(3), slot_meta())
+            .unwrap();
+        ctx.remove(&removed).unwrap();
+        let listed = ctx.list_by_ns("ns");
+        assert!(listed.contains(&kept), "kept survives: {listed:?}");
+        assert!(listed.contains(&added), "overlay write appears: {listed:?}");
+        assert!(
+            !listed.contains(&removed),
+            "overlay tombstone drops key: {listed:?}"
+        );
+        ctx.rollback_overlay("sg").unwrap();
+    }
+
     #[test]
     fn commit_and_rollback_unknown_subgraph_error() {
         let ctx = RuntimeContext::default();

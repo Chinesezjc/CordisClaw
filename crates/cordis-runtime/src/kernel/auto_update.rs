@@ -422,25 +422,50 @@ fn apply_toml_patch(
             path: patch.path.clone(),
             reason: format!("toml value conversion failed: {err}"),
         })?;
-    let mut document: TomlValue =
+    let document: TomlValue =
         toml::from_str(original).map_err(|err| RuntimeError::AutoUpdatePatchInvalid {
             path: patch.path.clone(),
             reason: format!("toml parse failed: {err}"),
         })?;
 
+    replace_toml_dotted_value(
+        document,
+        dotted_key.split('.').peekable(),
+        &patch.path,
+        dotted_key,
+        replacement,
+        abs_path,
+    )
+}
+
+/// Navigate `document` along the `.`-separated `segments` and overwrite the
+/// terminal value with `replacement`, returning the re-serialized document.
+///
+/// Extracted from [`apply_toml_patch`] so the empty-segments terminal `Err`
+/// (last statement) is directly reachable in a unit test: `str::split('.')`
+/// always yields at least one item, so the `while` loop never falls through
+/// when called from `apply_toml_patch` — feeding an empty iterator is the only
+/// way to exercise the fail-closed "dotted key must not be empty" arm.
+fn replace_toml_dotted_value<'a>(
+    mut document: TomlValue,
+    mut segments: std::iter::Peekable<impl Iterator<Item = &'a str>>,
+    patch_path: &str,
+    dotted_key: &str,
+    replacement: TomlValue,
+    abs_path: &Path,
+) -> Result<String, RuntimeError> {
     let mut cursor = &mut document;
-    let mut segments = dotted_key.split('.').peekable();
     while let Some(segment) = segments.next() {
         let Some(table) = cursor.as_table_mut() else {
             return Err(RuntimeError::AutoUpdatePatchInvalid {
-                path: patch.path.clone(),
+                path: patch_path.to_string(),
                 reason: format!("toml key path is not a table at {segment}"),
             });
         };
         if segments.peek().is_none() {
             let Some(target) = table.get_mut(segment) else {
                 return Err(RuntimeError::AutoUpdatePatchInvalid {
-                    path: patch.path.clone(),
+                    path: patch_path.to_string(),
                     reason: format!("toml dotted key not found: {dotted_key}"),
                 });
             };
@@ -452,13 +477,13 @@ fn apply_toml_patch(
         cursor = table
             .get_mut(segment)
             .ok_or_else(|| RuntimeError::AutoUpdatePatchInvalid {
-                path: patch.path.clone(),
+                path: patch_path.to_string(),
                 reason: format!("toml dotted key not found: {dotted_key}"),
             })?;
     }
 
     Err(RuntimeError::AutoUpdatePatchInvalid {
-        path: patch.path.clone(),
+        path: patch_path.to_string(),
         reason: "toml dotted key must not be empty".to_string(),
     })
 }
@@ -1028,42 +1053,69 @@ mod tests {
         assert!(matches!(err, RuntimeError::Io { .. }));
     }
 
+    // The terminal "dotted key must not be empty" arm of
+    // `replace_toml_dotted_value` is unreachable through `apply_toml_patch`
+    // (`str::split('.')` always yields ≥1 segment), so drive it directly with
+    // an empty segment iterator. The document/replacement are irrelevant since
+    // the loop body never runs.
+    #[test]
+    fn replace_toml_dotted_value_empty_segments_is_patch_invalid() {
+        let doc: TomlValue = toml::from_str("k = 1").unwrap();
+        let empty: std::iter::Peekable<std::vec::IntoIter<&str>> =
+            Vec::<&str>::new().into_iter().peekable();
+        let err = replace_toml_dotted_value(
+            doc,
+            empty,
+            "some/Cargo.toml",
+            "",
+            TomlValue::Integer(9),
+            Path::new("/abs/Cargo.toml"),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, RuntimeError::AutoUpdatePatchInvalid { reason, .. } if reason == "toml dotted key must not be empty"),
+            "unexpected: {err:?}"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn text_patch_write_failure_then_rollback_failure_surfaces_invariant() {
         use std::os::unix::fs::PermissionsExt;
-        // Running as root bypasses file-mode permission checks, so skip.
-        if unsafe { libc::geteuid() } == 0 {
-            eprintln!("[skip] running as root; read-only write would not fail");
-            return;
+        // Running as root bypasses file-mode permission checks: a 0o444 file is
+        // still writable, so the failure this test drives can't occur. Gate the
+        // whole body on non-root rather than an early `return`, so there is no
+        // conditionally-dead skip arm. (euid==0 is not the normal test
+        // environment; under root the assertions simply don't run.)
+        if unsafe { libc::geteuid() } != 0 {
+            // A read-only target: read_to_string succeeds, but the fs::write inside
+            // apply_one fails (covers the write error map). Rollback then tries to
+            // write the original back to the same read-only file and *also* fails,
+            // covering both the rollback write-error map and the
+            // "additionally, patch rollback failed" Invariant path.
+            let ws = TempDir::new().unwrap();
+            let target = ws.path().join("ro.txt");
+            fs::write(&target, "foo bar").unwrap();
+            let mut perms = fs::metadata(&target).unwrap().permissions();
+            perms.set_mode(0o444);
+            fs::set_permissions(&target, perms).unwrap();
+
+            let updater = AutoUpdater::new(ws.path());
+            let err = updater
+                .execute(
+                    plan(vec![FilePatch::text("ro.txt", "foo", "FOO")]),
+                    verify_ok,
+                )
+                .unwrap_err();
+            assert!(
+                matches!(&err, RuntimeError::Invariant { message } if message.contains("rollback failed")),
+                "expected Invariant, got: {err:?}"
+            );
+
+            // Restore perms for TempDir cleanup.
+            let mut perms = fs::metadata(&target).unwrap().permissions();
+            perms.set_mode(0o644);
+            fs::set_permissions(&target, perms).unwrap();
         }
-        // A read-only target: read_to_string succeeds, but the fs::write inside
-        // apply_one fails (covers the write error map). Rollback then tries to
-        // write the original back to the same read-only file and *also* fails,
-        // covering both the rollback write-error map and the
-        // "additionally, patch rollback failed" Invariant path.
-        let ws = TempDir::new().unwrap();
-        let target = ws.path().join("ro.txt");
-        fs::write(&target, "foo bar").unwrap();
-        let mut perms = fs::metadata(&target).unwrap().permissions();
-        perms.set_mode(0o444);
-        fs::set_permissions(&target, perms).unwrap();
-
-        let updater = AutoUpdater::new(ws.path());
-        let err = updater
-            .execute(
-                plan(vec![FilePatch::text("ro.txt", "foo", "FOO")]),
-                verify_ok,
-            )
-            .unwrap_err();
-        assert!(
-            matches!(&err, RuntimeError::Invariant { message } if message.contains("rollback failed")),
-            "expected Invariant, got: {err:?}"
-        );
-
-        // Restore perms for TempDir cleanup.
-        let mut perms = fs::metadata(&target).unwrap().permissions();
-        perms.set_mode(0o644);
-        fs::set_permissions(&target, perms).unwrap();
     }
 }

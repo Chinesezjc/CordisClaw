@@ -177,6 +177,11 @@ fn eval_first_completed(
             continue;
         }
         if let Some(outcome) = outcomes.get(node) {
+            // Archived math-unreachable guard: every current `NodeOutcome`
+            // variant is terminal (see `is_terminal`), so an outcome recorded
+            // in `outcomes` is always terminal and this `continue` never runs.
+            // Kept as a forward guard for a future non-terminal state
+            // (e.g. Running/Pending); it would then skip such upstreams here.
             if !is_terminal(*outcome) {
                 continue;
             }
@@ -241,6 +246,13 @@ fn eval_at_least(
     GateDecision::Wait
 }
 
+/// True when `outcome` is a settled (terminal) node state.
+///
+/// Every current `NodeOutcome` variant is terminal, so this presently returns
+/// `true` for all inputs — the `matches!` false-arm is therefore not coverable
+/// today. The exhaustive variant list is kept deliberately (rather than
+/// collapsed to `true`) so that adding a non-terminal state (e.g. `Running`)
+/// forces a compile-time review of every gate that calls this.
 fn is_terminal(outcome: NodeOutcome) -> bool {
     matches!(
         outcome,
@@ -297,16 +309,35 @@ mod tests {
             // c still pending
         ]);
         let order = vec!["a".to_string(), "b".to_string()];
-        match evaluate_gate(GatePolicy::FirstSuccess, &up, &out, &order) {
+        assert_eq!(
+            evaluate_gate(GatePolicy::FirstSuccess, &up, &out, &order),
             GateDecision::CompleteAndCancel {
-                success,
-                cancel_nodes,
-            } => {
-                assert!(success);
-                assert_eq!(cancel_nodes, vec!["c".to_string()]);
+                success: true,
+                cancel_nodes: vec!["c".to_string()],
             }
-            d => panic!("expected CompleteAndCancel, got {d:?}"),
-        }
+        );
+    }
+
+    /// `eval_first_success`: a node listed in `completion_order` that is
+    /// upstream but has no recorded outcome yet drives the `None` arm of
+    /// `outcomes.get(node)` (the loop skips it), then a later ordered node
+    /// carries the Success. This is the only path that reaches the fall-
+    /// through past the inner `if let Some(outcome)`.
+    #[test]
+    fn first_success_skips_ordered_upstream_without_outcome() {
+        let up = vec!["a".to_string(), "b".to_string()];
+        // `a` is upstream and ordered first but has no outcome; `b` wins.
+        let out = outcomes(&[("b", NodeOutcome::Success)]);
+        let order = vec!["a".to_string(), "b".to_string()];
+        // `a` (upstream, ordered first, no outcome) is skipped in the winner
+        // search; `b` wins, and `a` — still non-terminal — is cancelled.
+        assert_eq!(
+            evaluate_gate(GatePolicy::FirstSuccess, &up, &out, &order),
+            GateDecision::CompleteAndCancel {
+                success: true,
+                cancel_nodes: vec!["a".to_string()],
+            }
+        );
     }
 
     #[test]
@@ -423,16 +454,13 @@ mod tests {
         let up = vec!["a".to_string(), "b".to_string()];
         let out = outcomes(&[("a", NodeOutcome::Failure)]);
         let order = vec!["a".to_string()];
-        match evaluate_gate(GatePolicy::FirstCompleted, &up, &out, &order) {
+        assert_eq!(
+            evaluate_gate(GatePolicy::FirstCompleted, &up, &out, &order),
             GateDecision::CompleteAndCancel {
-                success,
-                cancel_nodes,
-            } => {
-                assert!(!success);
-                assert_eq!(cancel_nodes, vec!["b".to_string()]);
+                success: false,
+                cancel_nodes: vec!["b".to_string()],
             }
-            d => panic!("expected CompleteAndCancel failure, got {d:?}"),
-        }
+        );
     }
 
     // FirstCompleted: Timeout is a terminal non-success the same way — the
@@ -485,16 +513,13 @@ mod tests {
         let up = vec!["a".to_string(), "b".to_string()];
         let out = outcomes(&[("a", NodeOutcome::Success)]);
         let order = vec!["a".to_string()];
-        match evaluate_gate(GatePolicy::FirstCompleted, &up, &out, &order) {
+        assert_eq!(
+            evaluate_gate(GatePolicy::FirstCompleted, &up, &out, &order),
             GateDecision::CompleteAndCancel {
-                success,
-                cancel_nodes,
-            } => {
-                assert!(success);
-                assert_eq!(cancel_nodes, vec!["b".to_string()]);
+                success: true,
+                cancel_nodes: vec!["b".to_string()],
             }
-            d => panic!("expected CompleteAndCancel success, got {d:?}"),
-        }
+        );
     }
 
     // FirstCompleted: a foreign completion_order entry (not upstream) and an
@@ -541,10 +566,13 @@ mod tests {
             ("c", NodeOutcome::Success),
         ]);
         let order = vec!["a".to_string(), "b".to_string(), "c".to_string()];
-        match evaluate_gate(GatePolicy::FirstSuccess, &up, &out, &order) {
-            GateDecision::CompleteAndCancel { success, .. } => assert!(success),
-            d => panic!("expected CompleteAndCancel, got {d:?}"),
-        }
+        assert_eq!(
+            evaluate_gate(GatePolicy::FirstSuccess, &up, &out, &order),
+            GateDecision::CompleteAndCancel {
+                success: true,
+                cancel_nodes: Vec::new(),
+            }
+        );
     }
 
     // AllOf over an empty upstream set is vacuously satisfied → success
@@ -568,16 +596,13 @@ mod tests {
         let out = outcomes(&[("a", NodeOutcome::Success), ("stray", NodeOutcome::Success)]);
         // "stray" precedes "a" in the order but is not an upstream node.
         let order = vec!["stray".to_string(), "a".to_string()];
-        match evaluate_gate(GatePolicy::FirstSuccess, &up, &out, &order) {
+        assert_eq!(
+            evaluate_gate(GatePolicy::FirstSuccess, &up, &out, &order),
             GateDecision::CompleteAndCancel {
-                success,
-                cancel_nodes,
-            } => {
-                assert!(success);
-                assert!(cancel_nodes.is_empty());
+                success: true,
+                cancel_nodes: Vec::new(),
             }
-            d => panic!("expected CompleteAndCancel, got {d:?}"),
-        }
+        );
     }
 
     // FirstCompleted: same guard — an ordered id outside the upstream set is

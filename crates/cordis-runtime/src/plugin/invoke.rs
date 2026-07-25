@@ -413,6 +413,139 @@ fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
     }
 }
 
+// The invoke path carries three fail-closed `Invariant` guards for a `Loaded`
+// registry entry that is missing an artifact-derived field (docs /
+// artifact_kind / abi_fingerprint). The public `PluginRegistry` constructors
+// co-populate those fields, so these states are unconstructible through the
+// normal API; `insert_raw` (a `#[cfg(test)]` door) builds them directly so the
+// guards are covered without weakening the production constructors.
+#[cfg(test)]
+mod loaded_entry_invariant_tests {
+    use super::*;
+    use crate::core::models::{AbiFingerprint, NodeDoc, PluginDocs, PluginLoadResult};
+    use crate::plugin::registry::RegisteredPlugin;
+    use std::collections::BTreeSet;
+
+    fn docs_one_node(plugin_path: &str, node_id: &str) -> PluginDocs {
+        PluginDocs {
+            plugin_id: plugin_path.replace('/', "_"),
+            plugin_path: plugin_path.to_string(),
+            plugin_version: "0.1.0".to_string(),
+            abi_version: 2,
+            command_name: None,
+            nodes: vec![NodeDoc {
+                id: node_id.to_string(),
+                summary: "n".to_string(),
+                input_schema: serde_json::json!({"type": "object"}),
+                output_schema: serde_json::json!({"type": "object"}),
+                side_effects: vec![],
+                failure_modes: vec![],
+                node_type: NodeType::Router,
+                agent_accessible: true,
+            }],
+            system_hint: None,
+        }
+    }
+
+    fn fingerprint() -> AbiFingerprint {
+        AbiFingerprint {
+            rustc_version: "rustc-test".to_string(),
+            target_triple: "test-triple".to_string(),
+            crate_hash: "crate_v1".to_string(),
+            api_hash: "api_v2".to_string(),
+        }
+    }
+
+    /// Base `Loaded` entry with every field populated; individual tests knock
+    /// out exactly one field to reach its invariant arm.
+    fn loaded_base(plugin_path: &str, node_id: &str) -> RegisteredPlugin {
+        RegisteredPlugin {
+            plugin_path: plugin_path.to_string(),
+            parent: None,
+            required: true,
+            grants_from_parent: BTreeSet::new(),
+            load_result: PluginLoadResult::Loaded,
+            docs: Some(docs_one_node(plugin_path, node_id)),
+            artifact_path: Some(PathBuf::from("/tmp/does-not-matter.dylib")),
+            artifact_kind: Some(ArtifactKind::Dylib),
+            abi_fingerprint: Some(fingerprint()),
+            execution: None,
+            fingerprint_diff: Vec::new(),
+        }
+    }
+
+    // Loaded but docs == None → PluginDocsNotFound (invoke.rs docs guard).
+    #[test]
+    fn loaded_missing_docs_is_docs_not_found() {
+        let registry = PluginRegistry::default();
+        let mut entry = loaded_base("inv/nodocs", "n");
+        entry.docs = None;
+        registry.insert_raw(entry);
+        let err = invoke_registered_plugin(&registry, "inv/nodocs", "n", "{}".to_string())
+            .expect_err("missing docs must error");
+        assert!(
+            matches!(&err, RuntimeError::PluginDocsNotFound { plugin_path } if plugin_path == "inv/nodocs"),
+            "wrong variant: {err:?}"
+        );
+    }
+
+    // Loaded, docs present, node present, but artifact_kind == None →
+    // "missing artifact kind" Invariant.
+    #[test]
+    fn loaded_missing_artifact_kind_is_invariant() {
+        let registry = PluginRegistry::default();
+        let mut entry = loaded_base("inv/nokind", "n");
+        entry.artifact_kind = None;
+        registry.insert_raw(entry);
+        let err = invoke_registered_plugin(&registry, "inv/nokind", "n", "{}".to_string())
+            .expect_err("missing artifact kind must error");
+        assert!(
+            matches!(&err, RuntimeError::Invariant { message } if message.contains("missing artifact kind") && message.contains("inv/nokind")),
+            "wrong variant: {err:?}"
+        );
+    }
+
+    // Loaded with a real dylib artifact whose fingerprint gate is reached, but
+    // abi_fingerprint == None → "missing abi_fingerprint" Invariant. This arm
+    // sits after the dylib is opened and its abi_kind checked, so it needs a
+    // genuinely loadable fixture dylib; point at the host-native `time` fixture
+    // and read its real docs so the docs/kind gates pass first.
+    #[test]
+    fn loaded_missing_abi_fingerprint_is_invariant() {
+        let artifact = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/artifacts")
+            .join(format!("time{}", std::env::consts::DLL_SUFFIX));
+        // Gate on fixture loadability so a cross-arch host is a no-op rather
+        // than a failure (no early-return dead line).
+        if let Ok(loaded) = LoadedDylibApi::open(&artifact) {
+            let real_docs: PluginDocs =
+                serde_json::from_str(&(loaded.api().docs)().payload).expect("docs json");
+            let node_id = real_docs.nodes[0].id.clone();
+            let registry = PluginRegistry::default();
+            let entry = RegisteredPlugin {
+                plugin_path: "inv/nofp".to_string(),
+                parent: None,
+                required: true,
+                grants_from_parent: BTreeSet::new(),
+                load_result: PluginLoadResult::Loaded,
+                docs: Some(real_docs),
+                artifact_path: Some(artifact.clone()),
+                artifact_kind: Some(ArtifactKind::Dylib),
+                abi_fingerprint: None,
+                execution: None,
+                fingerprint_diff: Vec::new(),
+            };
+            registry.insert_raw(entry);
+            let err = invoke_registered_plugin(&registry, "inv/nofp", &node_id, "{}".to_string())
+                .expect_err("missing abi_fingerprint must error");
+            assert!(
+                matches!(&err, RuntimeError::Invariant { message } if message.contains("missing abi_fingerprint") && message.contains("inv/nofp")),
+                "wrong variant: {err:?}"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod panic_isolation_tests {
     use super::*;

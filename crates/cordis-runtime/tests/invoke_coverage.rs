@@ -184,6 +184,62 @@ fn loaded_dylib_rejects_non_json_payload() {
     );
 }
 
+// A plugin first registered `Unavailable` (so its artifact_path / artifact_kind
+// / abi_fingerprint are all `None`) and then re-marked `Loaded` via
+// `reload_plugin_entry` (which sets only docs + fingerprint, leaving
+// artifact_path `None`) must surface the artifact-path `Invariant` guard rather
+// than panicking on the `ok_or_else` unwrap. This is the only construction that
+// yields a `Loaded` entry with a missing artifact path (`insert_loaded` always
+// fills every field), so it is the sole door onto invoke.rs' artifact-path
+// invariant arm.
+#[test]
+fn reloaded_entry_missing_artifact_path_is_invariant() {
+    let registry = PluginRegistry::default();
+    registry.insert_unavailable(
+        "reloaded".to_string(),
+        None,
+        true,
+        BTreeSet::new(),
+        PluginUnavailableReason::InitFailed,
+        vec!["initial failure".to_string()],
+    );
+    // reload re-marks it Loaded and sets docs (declaring node "n") + fingerprint
+    // but does NOT populate artifact_path/kind.
+    assert!(registry.reload_plugin_entry(
+        "reloaded",
+        json_docs("reloaded", "n"),
+        any_fingerprint()
+    ));
+
+    let err = invoke_registered_plugin(&registry, "reloaded", "n", "{}".to_string())
+        .expect_err("loaded-but-no-artifact-path must be an invariant error");
+    assert!(
+        matches!(&err, RuntimeError::Invariant { message } if message.contains("missing artifact path") && message.contains("reloaded")),
+        "wrong variant: {err:?}"
+    );
+}
+
+// A valid-JSON but *non-object* payload (a JSON array) parses fine, but
+// `as_object_mut()` returns `None`, so the node_id-injection block is skipped
+// (the `if let Some(obj)` false arm). The payload is forwarded verbatim; the
+// `time` plugin cannot parse an array into its NodeRequest and reports the
+// failure in-band (`ok:false`), so the invoke itself still succeeds.
+#[test]
+fn loaded_dylib_non_object_payload_skips_node_id_injection() {
+    let registry = PluginRegistry::default();
+    register_loaded_dylib(&registry, "time", &time_artifact());
+
+    let resp = invoke_registered_plugin(&registry, "time", "time_now", "[]".to_string())
+        .expect("array payload still invokes; plugin reports parse failure in-band");
+    let value: serde_json::Value = serde_json::from_str(&resp.payload).expect("response json");
+    assert_eq!(
+        value.get("ok").and_then(|v| v.as_bool()),
+        Some(false),
+        "resp={}",
+        resp.payload
+    );
+}
+
 // ---------------------------------------------------------------------------
 // invoke_registered_plugin — dylib success path
 // ---------------------------------------------------------------------------
