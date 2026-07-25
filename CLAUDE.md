@@ -12,9 +12,9 @@ CordisClaw — 基于有色 Petri 网 (CPN) 的契约驱动插件树运行时。
 
 **任何提交必须保持 `cargo clippy --all-targets -- -D warnings` 通过（零 warning 规范）。** 确需豁免时用带理由注释的 `#[expect(lint)]`，禁止裸 `#[allow]`。
 
-**任何提交必须保持 CI coverage 门槛通过（行覆盖 >= 94%，coverage workflow 对 PR 自动跑）。** 新代码必须自带测试做到 100% 行覆盖；不可达分支用本仓已有模式改造为可测（具名 error-mapper / debug_assert 化 / cfg(test) 注入点 / `*_with_runner` 参数化，样例遍布各文件），禁止用降门槛或加文件排除消化缺口。现有排除仅 `main.rs`（REPL/signal/exit）与 `agent.rs`（LLM 流式 I/O），属进程/网络边界。基线 94.7% 与 100% 的差额是已归档的不可达残留（安全边界 fail-closed 分支、fsync 中途故障臂、llvm-cov 大括号伪影等，归档理由在各测试模块注释），清完一类应同步上调门槛。本地跑法：
+**任何提交必须保持 CI coverage 门槛通过（行覆盖 >= 96%，coverage workflow 对 PR 自动跑）。** 新代码必须自带测试做到 100% 行覆盖；不可达分支用本仓已有模式改造为可测（具名 error-mapper / debug_assert 化 / cfg(test) 注入点 / `*_with_runner` 参数化，样例遍布各文件），禁止用降门槛或加文件排除消化缺口。现有排除仅 `main.rs`（REPL/signal/exit）与 `agent.rs`（LLM 流式 I/O），属进程/网络边界。基线 96.8% 与 100% 的差额是已归档的不可达残留（安全边界 fail-closed 分支、fsync 中途故障臂、llvm-cov 大括号伪影等，归档理由在各测试模块注释），清完一类应同步上调门槛。本地跑法：
 ```bash
-cargo llvm-cov --fail-under-lines 94 --ignore-filename-regex 'cordis-runtime/src/(main|agent)\.rs' -- --test-threads=1
+cargo llvm-cov --fail-under-lines 96 --ignore-filename-regex 'cordis-runtime/src/(main|agent)\.rs' -- --test-threads=1
 ```
 
 ## 关键文档

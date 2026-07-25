@@ -32,7 +32,7 @@
 
 ### 3.0 覆盖率治理战役（2026-07-23 ~ 07-24）
 
-行覆盖从 32.7% 提升到 **94.7%**（排除 `main.rs`/`agent.rs` 两个进程/网络边界文件），测试从 ~200 增至 **987**，全绿。CI coverage workflow 落 `--fail-under-lines 94` 门槛（PR 自动跑）。分六批完成：
+行覆盖从 32.7% 提升到 **96.8%**（排除 `main.rs`/`agent.rs` 两个进程/网络边界文件），测试从 ~200 增至 **1146**，全绿。CI coverage workflow 落 `--fail-under-lines 96` 门槛（PR 自动跑）。分六批完成：
 
 1. **四波补测**（+570 测试）：按模块并行补齐，含 mock SSE 驱动 LLM 链路、TempDir 最小原生插件树驱动 iterate_plugins 全链、真实 arm64 dylib FFI 路径。
 2. **接缝改造批**（+130 测试）：六类不可达行系统化处置——具名 error-mapper 提取、结构死分支 debug_assert 化（grep 论证不变量）、cfg(test) panic 注入点、测试脚手架死臂改写（单行 let-else / matches!）。
