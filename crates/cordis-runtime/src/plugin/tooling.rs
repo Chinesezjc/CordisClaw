@@ -15,7 +15,6 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::env::consts::{DLL_EXTENSION, DLL_PREFIX};
 use std::fs::{self, OpenOptions};
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process;
 use std::process::Command;
@@ -150,6 +149,117 @@ impl Drop for ArtifactBuildLock {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.path);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Filesystem injection seams.
+//
+// The durable-write helpers (`stage_then_rename_file`, `write_pretty_json`)
+// and `ArtifactBuildLock::acquire` perform a fixed sequence of `fs` / `File`
+// operations. A subset of the mid-sequence failure arms — `write_all`,
+// `sync_all`, `flush`, `rename` on a handle that opened successfully — cannot
+// be provoked deterministically through the real filesystem, so these structs
+// expose each operation as a function pointer. The public entry points inject
+// the `STD` value, whose fields call `std::fs` / `File` directly; behaviour is
+// byte-for-byte identical to the pre-seam code (same error text, same
+// operation order, same cleanup). Tests inject a struct with one field
+// replaced by a stub that returns an error to reach the corresponding arm.
+
+fn std_fs_create_dir_all(path: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(path)
+}
+
+fn std_fs_write_all(file: &mut fs::File, buf: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    file.write_all(buf)
+}
+
+fn std_fs_sync_all(file: &fs::File) -> std::io::Result<()> {
+    file.sync_all()
+}
+
+fn std_fs_rename(from: &Path, to: &Path) -> std::io::Result<()> {
+    fs::rename(from, to)
+}
+
+/// Injection seam for the two durable-write helpers.
+#[derive(Clone, Copy)]
+struct FsWriteOps {
+    create_dir_all: fn(&Path) -> std::io::Result<()>,
+    write_all: fn(&mut fs::File, &[u8]) -> std::io::Result<()>,
+    sync_all: fn(&fs::File) -> std::io::Result<()>,
+    rename: fn(&Path, &Path) -> std::io::Result<()>,
+}
+
+impl FsWriteOps {
+    const STD: FsWriteOps = FsWriteOps {
+        create_dir_all: std_fs_create_dir_all,
+        write_all: std_fs_write_all,
+        sync_all: std_fs_sync_all,
+        rename: std_fs_rename,
+    };
+}
+
+fn std_lock_open_new(path: &Path) -> std::io::Result<fs::File> {
+    OpenOptions::new().write(true).create_new(true).open(path)
+}
+
+fn std_lock_serialize(state: &ArtifactBuildLockState) -> serde_json::Result<Vec<u8>> {
+    serde_json::to_vec(state)
+}
+
+fn std_fs_flush(file: &mut fs::File) -> std::io::Result<()> {
+    use std::io::Write as _;
+    file.flush()
+}
+
+/// Injection seam for `ArtifactBuildLock::acquire`. Also carries the wait
+/// timeout so the AlreadyExists spin-then-timeout arm can be exercised with a
+/// zero deadline instead of blocking for `BUILD_LOCK_WAIT_TIMEOUT`.
+#[derive(Clone, Copy)]
+struct LockAcquireOps {
+    open_new: fn(&Path) -> std::io::Result<fs::File>,
+    serialize: fn(&ArtifactBuildLockState) -> serde_json::Result<Vec<u8>>,
+    write_all: fn(&mut fs::File, &[u8]) -> std::io::Result<()>,
+    flush: fn(&mut fs::File) -> std::io::Result<()>,
+    sync_all: fn(&fs::File) -> std::io::Result<()>,
+    wait_timeout: Duration,
+}
+
+impl LockAcquireOps {
+    const STD: LockAcquireOps = LockAcquireOps {
+        open_new: std_lock_open_new,
+        serialize: std_lock_serialize,
+        write_all: std_fs_write_all,
+        flush: std_fs_flush,
+        sync_all: std_fs_sync_all,
+        wait_timeout: BUILD_LOCK_WAIT_TIMEOUT,
+    };
+}
+
+fn std_meta_read(path: &Path) -> std::io::Result<fs::Metadata> {
+    fs::metadata(path)
+}
+
+fn std_meta_modified(metadata: &fs::Metadata) -> std::io::Result<SystemTime> {
+    metadata.modified()
+}
+
+/// Injection seam for the mtime-reading paths (`build_input_probe`,
+/// `maybe_remove_stale_lock`). `metadata` covers the initial stat; `modified`
+/// covers the `Metadata::modified()` read whose failure arm falls back to
+/// `SystemTime::now()` after logging.
+#[derive(Clone, Copy)]
+struct MetaOps {
+    metadata: fn(&Path) -> std::io::Result<fs::Metadata>,
+    modified: fn(&fs::Metadata) -> std::io::Result<SystemTime>,
+}
+
+impl MetaOps {
+    const STD: MetaOps = MetaOps {
+        metadata: std_meta_read,
+        modified: std_meta_modified,
+    };
 }
 
 pub fn ensure_fixture_artifacts(fixtures_root: &Path) -> Result<bool, RuntimeError> {
@@ -290,8 +400,21 @@ pub fn rebuild_plugin_workspace(
 /// (C batch, P0-8 / P0-15 style helper — shared between rebuild_plugin_workspace
 /// and materialize_artifact_entry so both stage-swap identically.)
 pub(crate) fn stage_then_rename_file(src: &Path, dst: &Path) -> Result<(), RuntimeError> {
+    stage_then_rename_file_with_fs(src, dst, FsWriteOps::STD)
+}
+
+/// Fs-parameterized core of `stage_then_rename_file`. The public entry injects
+/// `FsWriteOps::STD` (direct `std::fs`/`File` calls). Tests inject a struct
+/// with one op replaced by a failing stub to reach the `write tmp` / `sync tmp`
+/// / `rename ... failed` map_err arms, which cannot be provoked reliably from a
+/// real filesystem once the handle is open. Default behaviour is byte-for-byte
+/// identical.
+fn stage_then_rename_file_with_fs(
+    src: &Path,
+    dst: &Path,
+    ops: FsWriteOps,
+) -> Result<(), RuntimeError> {
     use std::io::Read;
-    use std::io::Write;
     let mut src_file = std::fs::File::open(src).map_err(|e| RuntimeError::Io {
         path: src.to_path_buf(),
         message: format!("open source: {e}"),
@@ -321,11 +444,11 @@ pub(crate) fn stage_then_rename_file(src: &Path, dst: &Path) -> Result<(), Runti
             path: tmp.clone(),
             message: format!("create tmp: {e}"),
         })?;
-        tmp_file.write_all(&buf).map_err(|e| RuntimeError::Io {
+        (ops.write_all)(&mut tmp_file, &buf).map_err(|e| RuntimeError::Io {
             path: tmp.clone(),
             message: format!("write tmp: {e}"),
         })?;
-        tmp_file.sync_all().map_err(|e| RuntimeError::Io {
+        (ops.sync_all)(&tmp_file).map_err(|e| RuntimeError::Io {
             path: tmp.clone(),
             message: format!("sync tmp: {e}"),
         })?;
@@ -340,7 +463,7 @@ pub(crate) fn stage_then_rename_file(src: &Path, dst: &Path) -> Result<(), Runti
             }
         }
     }
-    std::fs::rename(&tmp, dst).map_err(|e| RuntimeError::Io {
+    (ops.rename)(&tmp, dst).map_err(|e| RuntimeError::Io {
         path: dst.to_path_buf(),
         message: format!("rename {} -> {} failed: {e}", tmp.display(), dst.display()),
     })?;
@@ -969,31 +1092,58 @@ fn collect_files_recursively(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), R
         path: dir.to_path_buf(),
         message: e.to_string(),
     })? {
-        let entry = entry.map_err(|e| RuntimeError::Io {
-            path: dir.to_path_buf(),
-            message: e.to_string(),
-        })?;
-        let path = entry.path();
-        let metadata = fs::metadata(&path).map_err(|e| RuntimeError::Io {
-            path: path.clone(),
-            message: e.to_string(),
-        })?;
-        if metadata.is_dir() {
-            if entry.file_name() == "target" {
-                continue;
-            }
-            collect_files_recursively(&path, out)?;
-        } else if metadata.is_file() {
-            out.push(path);
+        collect_dir_entry(dir, entry, out)?;
+    }
+    Ok(())
+}
+
+/// Process a single `read_dir` iteration item. Extracted so the
+/// `entry.map_err` arm — a `DirEntry` iterator yielding `Err`, which the OS
+/// won't produce deterministically for a directory that opened successfully —
+/// can be exercised by feeding a synthetic `Err`. The `fs::metadata` arm is
+/// reachable via a dangling symlink; both map to `Io` with identical text.
+fn collect_dir_entry(
+    dir: &Path,
+    entry: std::io::Result<fs::DirEntry>,
+    out: &mut Vec<PathBuf>,
+) -> Result<(), RuntimeError> {
+    let entry = entry.map_err(|e| RuntimeError::Io {
+        path: dir.to_path_buf(),
+        message: e.to_string(),
+    })?;
+    let path = entry.path();
+    let metadata = fs::metadata(&path).map_err(|e| RuntimeError::Io {
+        path: path.clone(),
+        message: e.to_string(),
+    })?;
+    if metadata.is_dir() {
+        if entry.file_name() == "target" {
+            return Ok(());
         }
+        collect_files_recursively(&path, out)?;
+    } else if metadata.is_file() {
+        out.push(path);
     }
     Ok(())
 }
 
 fn build_input_probe(repo_root: &Path, files: &[PathBuf]) -> Result<InputProbe, RuntimeError> {
+    build_input_probe_with_fs(repo_root, files, MetaOps::STD)
+}
+
+/// Fs-parameterized core of `build_input_probe`. The public entry injects
+/// `MetaOps::STD`. Tests inject a failing `modified` op to reach the mtime
+/// read-failure fallback (`eprintln` + `SystemTime::now()`), which a real
+/// filesystem won't surface on a file that stat'd successfully. Default
+/// behaviour is byte-for-byte identical.
+fn build_input_probe_with_fs(
+    repo_root: &Path,
+    files: &[PathBuf],
+    ops: MetaOps,
+) -> Result<InputProbe, RuntimeError> {
     let mut probe = InputProbe::default();
     for file in files {
-        let metadata = fs::metadata(file).map_err(|e| RuntimeError::Io {
+        let metadata = (ops.metadata)(file).map_err(|e| RuntimeError::Io {
             path: file.clone(),
             message: e.to_string(),
         })?;
@@ -1003,7 +1153,7 @@ fn build_input_probe(repo_root: &Path, files: &[PathBuf]) -> Result<InputProbe, 
         // a filesystem that doesn't support mtime, biasing dirty-tracking
         // in the wrong direction. Log the error so an operator can
         // notice repeat cases.
-        let modified_time = metadata.modified().unwrap_or_else(|err| {
+        let modified_time = (ops.modified)(&metadata).unwrap_or_else(|err| {
             eprintln!(
                 "[tooling] failed to read mtime for {}: {err}; treating as freshly modified",
                 file.display()
@@ -1295,10 +1445,23 @@ fn expected_artifact_name(plugin_path: &str, is_dylib: bool) -> String {
 }
 
 fn write_pretty_json<T: serde::Serialize>(path: &Path, value: &T) -> Result<(), RuntimeError> {
+    write_pretty_json_with_fs(path, value, FsWriteOps::STD)
+}
+
+/// Fs-parameterized core of `write_pretty_json`. The public entry injects
+/// `FsWriteOps::STD`. Tests inject a failing `write_all` / `sync_all` /
+/// `rename` op to reach the mid-write map_err arms (and the `rename`-failure
+/// tmp cleanup) that a real filesystem won't surface once the tmp handle is
+/// open. Default behaviour is byte-for-byte identical.
+fn write_pretty_json_with_fs<T: serde::Serialize>(
+    path: &Path,
+    value: &T,
+    ops: FsWriteOps,
+) -> Result<(), RuntimeError> {
     let parent = path.parent().ok_or_else(|| RuntimeError::Invariant {
         message: format!("json path missing parent: {}", path.display()),
     })?;
-    fs::create_dir_all(parent).map_err(|e| RuntimeError::Io {
+    (ops.create_dir_all)(parent).map_err(|e| RuntimeError::Io {
         path: parent.to_path_buf(),
         message: e.to_string(),
     })?;
@@ -1308,7 +1471,6 @@ fn write_pretty_json<T: serde::Serialize>(path: &Path, value: &T) -> Result<(), 
     // Now: staging tmp + sync_all + rename. Covers `write_pretty_json`'s
     // callers (docs/interfaces.json and artifact/index.json) at 337, 361,
     // 483, 1207.
-    use std::io::Write as _;
     let bytes = pretty_json(value);
     let tmp = match path.file_name() {
         Some(name) => {
@@ -1327,17 +1489,16 @@ fn write_pretty_json<T: serde::Serialize>(path: &Path, value: &T) -> Result<(), 
             path: tmp.clone(),
             message: format!("create tmp: {e}"),
         })?;
-        file.write_all(bytes.as_bytes())
-            .map_err(|e| RuntimeError::Io {
-                path: tmp.clone(),
-                message: format!("write tmp: {e}"),
-            })?;
-        file.sync_all().map_err(|e| RuntimeError::Io {
+        (ops.write_all)(&mut file, bytes.as_bytes()).map_err(|e| RuntimeError::Io {
+            path: tmp.clone(),
+            message: format!("write tmp: {e}"),
+        })?;
+        (ops.sync_all)(&file).map_err(|e| RuntimeError::Io {
             path: tmp.clone(),
             message: format!("sync tmp: {e}"),
         })?;
     }
-    if let Err(e) = fs::rename(&tmp, path) {
+    if let Err(e) = (ops.rename)(&tmp, path) {
         let _ = fs::remove_file(&tmp);
         return Err(RuntimeError::Io {
             path: path.to_path_buf(),
@@ -1349,31 +1510,43 @@ fn write_pretty_json<T: serde::Serialize>(path: &Path, value: &T) -> Result<(), 
 
 impl ArtifactBuildLock {
     fn acquire(fixtures_root: &Path) -> Result<Self, RuntimeError> {
+        Self::acquire_with_fs(fixtures_root, LockAcquireOps::STD)
+    }
+
+    /// Fs-parameterized core of `acquire`. The public entry injects
+    /// `LockAcquireOps::STD`. Tests inject failing `serialize` / `write_all` /
+    /// `flush` / `sync_all` ops to reach the corresponding map_err arms, a
+    /// pre-occupied `open_new` (AlreadyExists) with a zero `wait_timeout` to
+    /// reach the timeout arm, and an `open_new` returning a non-AlreadyExists
+    /// error to reach the final Io arm — none of which a real filesystem
+    /// surfaces deterministically. Default behaviour is byte-for-byte
+    /// identical.
+    fn acquire_with_fs(fixtures_root: &Path, ops: LockAcquireOps) -> Result<Self, RuntimeError> {
         let path = fixtures_root.join(BUILD_LOCK_FILE);
         let started_at = Instant::now();
 
         loop {
-            match OpenOptions::new().write(true).create_new(true).open(&path) {
+            match (ops.open_new)(&path) {
                 Ok(mut file) => {
                     let state = ArtifactBuildLockState {
                         pid: process::id(),
                         created_at_ms: current_epoch_ms(),
                     };
-                    let encoded = serde_json::to_vec(&state).map_err(|err| RuntimeError::Io {
+                    let encoded = (ops.serialize)(&state).map_err(|err| RuntimeError::Io {
                         path: path.clone(),
                         message: format!("lock metadata serialize failed: {err}"),
                     })?;
-                    file.write_all(&encoded).map_err(|err| RuntimeError::Io {
+                    (ops.write_all)(&mut file, &encoded).map_err(|err| RuntimeError::Io {
                         path: path.clone(),
                         message: err.to_string(),
                     })?;
-                    file.flush().map_err(|err| RuntimeError::Io {
+                    (ops.flush)(&mut file).map_err(|err| RuntimeError::Io {
                         path: path.clone(),
                         message: err.to_string(),
                     })?;
                     // P1-17: fsync the lock file so a power loss doesn't
                     // leave a 0-byte file that lock_pid_is_live can't parse.
-                    file.sync_all().map_err(|err| RuntimeError::Io {
+                    (ops.sync_all)(&file).map_err(|err| RuntimeError::Io {
                         path: path.clone(),
                         message: err.to_string(),
                     })?;
@@ -1381,7 +1554,7 @@ impl ArtifactBuildLock {
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
                     maybe_remove_stale_lock(&path)?;
-                    if started_at.elapsed() > BUILD_LOCK_WAIT_TIMEOUT {
+                    if started_at.elapsed() > ops.wait_timeout {
                         return Err(RuntimeError::ArtifactBuildLockTimeout {
                             path,
                             waited_ms: started_at.elapsed().as_millis(),
@@ -1401,7 +1574,16 @@ impl ArtifactBuildLock {
 }
 
 fn maybe_remove_stale_lock(path: &Path) -> Result<(), RuntimeError> {
-    let metadata = match fs::metadata(path) {
+    maybe_remove_stale_lock_with_fs(path, MetaOps::STD)
+}
+
+/// Fs-parameterized core of `maybe_remove_stale_lock`. The public entry
+/// injects `MetaOps::STD`. Tests inject a failing `modified` op to reach the
+/// lock-mtime read-failure fallback (`eprintln` + `SystemTime::now()`), which
+/// a real filesystem won't surface on a lock file that stat'd successfully.
+/// Default behaviour is byte-for-byte identical.
+fn maybe_remove_stale_lock_with_fs(path: &Path, ops: MetaOps) -> Result<(), RuntimeError> {
+    let metadata = match (ops.metadata)(path) {
         Ok(metadata) => metadata,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(err) => {
@@ -1415,7 +1597,7 @@ fn maybe_remove_stale_lock(path: &Path) -> Result<(), RuntimeError> {
     // fallback — mtime read failure -> treat as "just modified" so the
     // lock is considered live. Kept as-is; the comment makes the intent
     // explicit so future refactors don't flip it to UNIX_EPOCH.
-    let modified = metadata.modified().unwrap_or_else(|err| {
+    let modified = (ops.modified)(&metadata).unwrap_or_else(|err| {
         eprintln!(
             "[tooling] lock file mtime read failed for {}: {err}",
             path.display()
@@ -2207,6 +2389,25 @@ exports = ["svc_a", "svc_b"]
         assert!(matches!(err, Err(RuntimeError::Invariant { .. })));
     }
 
+    /// A path that has a parent but no `file_name` (ends in `..`) passes the
+    /// parent check and `create_dir_all`, then trips the tmp-name
+    /// `file_name() == None` Invariant arm. Distinct from the no-parent test
+    /// which fails earlier.
+    #[test]
+    fn write_pretty_json_errors_when_path_has_no_filename() {
+        use super::write_pretty_json;
+        use crate::core::error::RuntimeError;
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        // `<tempdir>/..` -> parent is <tempdir> (exists), file_name is None.
+        let target = dir.path().join("..");
+        let err = write_pretty_json(&target, &serde_json::json!({"k": 1}));
+        assert!(
+            matches!(&err, Err(RuntimeError::Invariant { message }) if message.starts_with("path has no filename: ")),
+            "expected Invariant(no filename), got {err:?}"
+        );
+    }
+
     // ---------- stage_then_rename_file error branch ----------
 
     #[test]
@@ -2842,6 +3043,7 @@ exports = ["svc_a", "svc_b"]
             }
             other => panic!("expected InvalidArgument(spawn), got {other:?}"),
         }
+    }
 
     // ---------- P2 command-executor parameterization ----------
     //
@@ -3073,6 +3275,553 @@ exports = ["svc_a", "svc_b"]
         assert!(
             leftovers.is_empty(),
             "tmp should be removed on rename failure"
+        );
+    }
+
+    // ---------- fs-write injection seams (FsWriteOps) ----------
+    //
+    // The durable-write helpers open a staging tmp then `write_all`,
+    // `sync_all`, `rename`. Once the handle is open, a real filesystem does
+    // not deterministically fail the middle steps, so the `_with_fs` cores
+    // accept an `FsWriteOps` whose fields are function pointers. Each test
+    // starts from `FsWriteOps::STD` and swaps exactly one field for a stub
+    // that returns an error, driving the matching map_err arm. A stubbed op
+    // is never the real one, so these prove only the arm — the default path
+    // remains covered by the byte-identical public entry points.
+
+    fn erroring_write_all(_f: &mut std::fs::File, _b: &[u8]) -> std::io::Result<()> {
+        Err(std::io::Error::other("synthetic write failure"))
+    }
+
+    fn erroring_sync_all(_f: &std::fs::File) -> std::io::Result<()> {
+        Err(std::io::Error::other("synthetic sync failure"))
+    }
+
+    fn erroring_rename(_from: &std::path::Path, _to: &std::path::Path) -> std::io::Result<()> {
+        Err(std::io::Error::other("synthetic rename failure"))
+    }
+
+    /// `stage_then_rename_file_with_fs` maps a `write_all` failure to
+    /// `Io("write tmp: ...")` (lines 325-327 arm).
+    #[test]
+    fn stage_then_rename_with_fs_maps_write_failure() {
+        use super::{stage_then_rename_file_with_fs, FsWriteOps};
+        use crate::core::error::RuntimeError;
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        let src = dir.path().join("src.so");
+        std::fs::write(&src, b"bytes").unwrap();
+        let dst = dir.path().join("out.so");
+        let ops = FsWriteOps {
+            write_all: erroring_write_all,
+            ..FsWriteOps::STD
+        };
+        let err = stage_then_rename_file_with_fs(&src, &dst, ops);
+        assert!(
+            matches!(&err, Err(RuntimeError::Io { message, .. }) if message.starts_with("write tmp: ")),
+            "expected Io(write tmp), got {err:?}"
+        );
+    }
+
+    /// `stage_then_rename_file_with_fs` maps a `sync_all` failure to
+    /// `Io("sync tmp: ...")` (lines 329-331 arm).
+    #[test]
+    fn stage_then_rename_with_fs_maps_sync_failure() {
+        use super::{stage_then_rename_file_with_fs, FsWriteOps};
+        use crate::core::error::RuntimeError;
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        let src = dir.path().join("src.so");
+        std::fs::write(&src, b"bytes").unwrap();
+        let dst = dir.path().join("out.so");
+        let ops = FsWriteOps {
+            sync_all: erroring_sync_all,
+            ..FsWriteOps::STD
+        };
+        let err = stage_then_rename_file_with_fs(&src, &dst, ops);
+        assert!(
+            matches!(&err, Err(RuntimeError::Io { message, .. }) if message.starts_with("sync tmp: ")),
+            "expected Io(sync tmp), got {err:?}"
+        );
+    }
+
+    /// `stage_then_rename_file_with_fs` maps a `rename` failure to
+    /// `Io("rename ... failed: ...")` (the final rename arm) via injection —
+    /// distinct from the real-fs nonempty-dir test which relies on ENOTEMPTY.
+    #[test]
+    fn stage_then_rename_with_fs_maps_rename_failure() {
+        use super::{stage_then_rename_file_with_fs, FsWriteOps};
+        use crate::core::error::RuntimeError;
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        let src = dir.path().join("src.so");
+        std::fs::write(&src, b"bytes").unwrap();
+        let dst = dir.path().join("out.so");
+        let ops = FsWriteOps {
+            rename: erroring_rename,
+            ..FsWriteOps::STD
+        };
+        let err = stage_then_rename_file_with_fs(&src, &dst, ops);
+        assert!(
+            matches!(&err, Err(RuntimeError::Io { message, .. }) if message.contains("rename") && message.contains("failed")),
+            "expected Io(rename failed), got {err:?}"
+        );
+    }
+
+    /// `write_pretty_json_with_fs` maps a `write_all` failure to
+    /// `Io("write tmp: ...")` (lines 1332-1334 arm).
+    #[test]
+    fn write_pretty_json_with_fs_maps_write_failure() {
+        use super::{write_pretty_json_with_fs, FsWriteOps};
+        use crate::core::error::RuntimeError;
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("index.json");
+        let ops = FsWriteOps {
+            write_all: erroring_write_all,
+            ..FsWriteOps::STD
+        };
+        let err = write_pretty_json_with_fs(&target, &serde_json::json!({"k": 1}), ops);
+        assert!(
+            matches!(&err, Err(RuntimeError::Io { message, .. }) if message.starts_with("write tmp: ")),
+            "expected Io(write tmp), got {err:?}"
+        );
+    }
+
+    /// `write_pretty_json_with_fs` maps a `sync_all` failure to
+    /// `Io("sync tmp: ...")` (lines 1336-1338 arm).
+    #[test]
+    fn write_pretty_json_with_fs_maps_sync_failure() {
+        use super::{write_pretty_json_with_fs, FsWriteOps};
+        use crate::core::error::RuntimeError;
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("index.json");
+        let ops = FsWriteOps {
+            sync_all: erroring_sync_all,
+            ..FsWriteOps::STD
+        };
+        let err = write_pretty_json_with_fs(&target, &serde_json::json!({"k": 1}), ops);
+        assert!(
+            matches!(&err, Err(RuntimeError::Io { message, .. }) if message.starts_with("sync tmp: ")),
+            "expected Io(sync tmp), got {err:?}"
+        );
+    }
+
+    /// `write_pretty_json_with_fs` maps a `rename` failure to
+    /// `Io("rename tmp -> target: ...")` and still cleans the staging tmp,
+    /// via injection (the real-fs test uses a nonempty dir).
+    #[test]
+    fn write_pretty_json_with_fs_maps_rename_failure_and_cleans_tmp() {
+        use super::{write_pretty_json_with_fs, FsWriteOps};
+        use crate::core::error::RuntimeError;
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("index.json");
+        let ops = FsWriteOps {
+            rename: erroring_rename,
+            ..FsWriteOps::STD
+        };
+        let err = write_pretty_json_with_fs(&target, &serde_json::json!({"k": 1}), ops);
+        assert!(
+            matches!(&err, Err(RuntimeError::Io { message, .. }) if message.starts_with("rename tmp -> target: ")),
+            "expected Io(rename tmp -> target), got {err:?}"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".cordis-tmp."))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "tmp must be cleaned on rename failure"
+        );
+    }
+
+    // ---------- ArtifactBuildLock::acquire injection seam ----------
+
+    fn erroring_serialize(_s: &super::ArtifactBuildLockState) -> serde_json::Result<Vec<u8>> {
+        // Produce a genuine serde_json error (parsing an invalid number) so
+        // the `map_err` arm sees the same error type the real serializer
+        // would, then return it.
+        let e = serde_json::from_str::<u8>("not-a-number").unwrap_err();
+        Err(e)
+    }
+
+    fn erroring_lock_write_all(_f: &mut std::fs::File, _b: &[u8]) -> std::io::Result<()> {
+        Err(std::io::Error::other("synthetic lock write failure"))
+    }
+
+    fn erroring_flush(_f: &mut std::fs::File) -> std::io::Result<()> {
+        Err(std::io::Error::other("synthetic flush failure"))
+    }
+
+    fn erroring_lock_sync_all(_f: &std::fs::File) -> std::io::Result<()> {
+        Err(std::io::Error::other("synthetic lock sync failure"))
+    }
+
+    /// The lock-metadata serialize failure maps to `Io("lock metadata
+    /// serialize failed: ...")` (lines 1363-1365 arm).
+    #[test]
+    fn acquire_with_fs_maps_serialize_failure() {
+        use super::{ArtifactBuildLock, LockAcquireOps};
+        use crate::core::error::RuntimeError;
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        let ops = LockAcquireOps {
+            serialize: erroring_serialize,
+            ..LockAcquireOps::STD
+        };
+        let err = ArtifactBuildLock::acquire_with_fs(dir.path(), ops);
+        assert!(
+            matches!(&err, Err(RuntimeError::Io { message, .. }) if message.starts_with("lock metadata serialize failed: ")),
+            "expected Io(serialize failed), got {err:?}"
+        );
+    }
+
+    /// The lock `write_all` failure maps to `Io` (lines 1367-1369 arm).
+    #[test]
+    fn acquire_with_fs_maps_write_failure() {
+        use super::{ArtifactBuildLock, LockAcquireOps};
+        use crate::core::error::RuntimeError;
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        let ops = LockAcquireOps {
+            write_all: erroring_lock_write_all,
+            ..LockAcquireOps::STD
+        };
+        let err = ArtifactBuildLock::acquire_with_fs(dir.path(), ops);
+        assert!(
+            matches!(&err, Err(RuntimeError::Io { message, .. }) if message.contains("synthetic lock write failure")),
+            "expected Io(write), got {err:?}"
+        );
+    }
+
+    /// The lock `flush` failure maps to `Io` (lines 1371-1373 arm).
+    #[test]
+    fn acquire_with_fs_maps_flush_failure() {
+        use super::{ArtifactBuildLock, LockAcquireOps};
+        use crate::core::error::RuntimeError;
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        let ops = LockAcquireOps {
+            flush: erroring_flush,
+            ..LockAcquireOps::STD
+        };
+        let err = ArtifactBuildLock::acquire_with_fs(dir.path(), ops);
+        assert!(
+            matches!(&err, Err(RuntimeError::Io { message, .. }) if message.contains("synthetic flush failure")),
+            "expected Io(flush), got {err:?}"
+        );
+    }
+
+    /// The lock `sync_all` failure maps to `Io` (lines 1377-1379 arm).
+    #[test]
+    fn acquire_with_fs_maps_sync_failure() {
+        use super::{ArtifactBuildLock, LockAcquireOps};
+        use crate::core::error::RuntimeError;
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        let ops = LockAcquireOps {
+            sync_all: erroring_lock_sync_all,
+            ..LockAcquireOps::STD
+        };
+        let err = ArtifactBuildLock::acquire_with_fs(dir.path(), ops);
+        assert!(
+            matches!(&err, Err(RuntimeError::Io { message, .. }) if message.contains("synthetic lock sync failure")),
+            "expected Io(sync), got {err:?}"
+        );
+    }
+
+    /// A permanently-occupied lock with a zero wait timeout hits the
+    /// `AlreadyExists` spin arm and then the timeout return
+    /// (`ArtifactBuildLockTimeout`, lines 1385-1388). `open_new` always
+    /// reports AlreadyExists; the live-pid JSON body keeps
+    /// `maybe_remove_stale_lock` from reclaiming it.
+    #[test]
+    fn acquire_with_fs_times_out_when_lock_permanently_held() {
+        use super::{current_epoch_ms, ArtifactBuildLock, ArtifactBuildLockState, LockAcquireOps};
+        use crate::core::error::RuntimeError;
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        // Pre-create a live-pid lock so maybe_remove_stale_lock keeps it.
+        let live = ArtifactBuildLockState {
+            pid: std::process::id(),
+            created_at_ms: current_epoch_ms(),
+        };
+        std::fs::write(
+            dir.path().join(super::BUILD_LOCK_FILE),
+            serde_json::to_vec(&live).unwrap(),
+        )
+        .unwrap();
+        fn always_exists(_p: &std::path::Path) -> std::io::Result<std::fs::File> {
+            Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists))
+        }
+        let ops = LockAcquireOps {
+            open_new: always_exists,
+            wait_timeout: std::time::Duration::ZERO,
+            ..LockAcquireOps::STD
+        };
+        let err = ArtifactBuildLock::acquire_with_fs(dir.path(), ops);
+        assert!(
+            matches!(&err, Err(RuntimeError::ArtifactBuildLockTimeout { .. })),
+            "expected ArtifactBuildLockTimeout, got {err:?}"
+        );
+    }
+
+    /// A non-AlreadyExists `open_new` error hits the final Io arm
+    /// (lines 1392-1396).
+    #[test]
+    fn acquire_with_fs_maps_open_error_to_io() {
+        use super::{ArtifactBuildLock, LockAcquireOps};
+        use crate::core::error::RuntimeError;
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        fn perm_denied(_p: &std::path::Path) -> std::io::Result<std::fs::File> {
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+        }
+        let ops = LockAcquireOps {
+            open_new: perm_denied,
+            ..LockAcquireOps::STD
+        };
+        let err = ArtifactBuildLock::acquire_with_fs(dir.path(), ops);
+        assert!(
+            matches!(&err, Err(RuntimeError::Io { .. })),
+            "expected Io, got {err:?}"
+        );
+    }
+
+    /// The default injected ops acquire the lock successfully, proving the
+    /// happy path of `acquire_with_fs` (mirrors the real `acquire`).
+    #[test]
+    fn acquire_with_fs_std_acquires_lock() {
+        use super::{ArtifactBuildLock, LockAcquireOps};
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        let lock = ArtifactBuildLock::acquire_with_fs(dir.path(), LockAcquireOps::STD)
+            .expect("std ops acquire the lock");
+        assert!(dir.path().join(super::BUILD_LOCK_FILE).exists());
+        drop(lock);
+        assert!(
+            !dir.path().join(super::BUILD_LOCK_FILE).exists(),
+            "Drop removes the lock file"
+        );
+    }
+
+    // ---------- mtime injection seam (MetaOps) ----------
+
+    fn erroring_modified(_m: &std::fs::Metadata) -> std::io::Result<std::time::SystemTime> {
+        Err(std::io::Error::other("synthetic mtime failure"))
+    }
+
+    /// `build_input_probe_with_fs` falls back to `SystemTime::now()` when the
+    /// `modified()` read fails, still producing a probe entry (lines 1006-1012
+    /// fallback arm). The recorded modified_at_ms is non-zero (now, not epoch).
+    #[test]
+    fn build_input_probe_with_fs_falls_back_on_mtime_failure() {
+        use super::{build_input_probe_with_fs, MetaOps};
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("f.rs");
+        std::fs::write(&file, b"x").unwrap();
+        let ops = MetaOps {
+            modified: erroring_modified,
+            ..MetaOps::STD
+        };
+        let probe = build_input_probe_with_fs(dir.path(), &[file], ops)
+            .expect("probe built with mtime fallback");
+        assert_eq!(probe.files.len(), 1);
+        assert!(
+            probe.files[0].modified_at_ms > 0,
+            "fallback to now() should give a nonzero epoch-ms, got {}",
+            probe.files[0].modified_at_ms
+        );
+    }
+
+    /// `maybe_remove_stale_lock_with_fs` falls back to `SystemTime::now()`
+    /// when the lock file's `modified()` read fails, treating the lock as
+    /// just-modified (kept). A live-pid JSON body is retained (lines 1418-1424
+    /// fallback + the JSON keep arm).
+    #[test]
+    fn maybe_remove_stale_lock_with_fs_falls_back_on_mtime_failure() {
+        use super::{
+            current_epoch_ms, maybe_remove_stale_lock_with_fs, ArtifactBuildLockState, MetaOps,
+        };
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("live.lock");
+        let live = ArtifactBuildLockState {
+            pid: std::process::id(),
+            created_at_ms: current_epoch_ms(),
+        };
+        std::fs::write(&path, serde_json::to_vec(&live).unwrap()).unwrap();
+        let ops = MetaOps {
+            modified: erroring_modified,
+            ..MetaOps::STD
+        };
+        // Fallback path executes; live-pid lock is kept (Ok, file still there).
+        maybe_remove_stale_lock_with_fs(&path, ops).expect("stale-lock check ok");
+        assert!(path.exists(), "live-pid lock must be kept");
+    }
+
+    fn erroring_metadata(_p: &std::path::Path) -> std::io::Result<std::fs::Metadata> {
+        Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+    }
+
+    /// `maybe_remove_stale_lock_with_fs` maps a non-NotFound `metadata`
+    /// failure to `Io` (the initial-stat error arm). A PermissionDenied stub
+    /// drives it without needing an OS-level unreadable path.
+    #[test]
+    fn maybe_remove_stale_lock_with_fs_maps_metadata_failure_to_io() {
+        use super::{maybe_remove_stale_lock_with_fs, MetaOps};
+        use crate::core::error::RuntimeError;
+        use std::path::Path;
+        let ops = MetaOps {
+            metadata: erroring_metadata,
+            ..MetaOps::STD
+        };
+        let err = maybe_remove_stale_lock_with_fs(Path::new("/some/lock"), ops);
+        assert!(
+            matches!(&err, Err(RuntimeError::Io { .. })),
+            "expected Io(metadata), got {err:?}"
+        );
+    }
+
+    /// `build_input_probe_with_fs` maps a `metadata` failure to `Io` (the
+    /// per-file stat error arm), driven by a PermissionDenied stub.
+    #[test]
+    fn build_input_probe_with_fs_maps_metadata_failure_to_io() {
+        use super::{build_input_probe_with_fs, MetaOps};
+        use crate::core::error::RuntimeError;
+        use std::path::{Path, PathBuf};
+        let ops = MetaOps {
+            metadata: erroring_metadata,
+            ..MetaOps::STD
+        };
+        let err = build_input_probe_with_fs(Path::new("/repo"), &[PathBuf::from("/repo/x")], ops);
+        assert!(
+            matches!(&err, Err(RuntimeError::Io { .. })),
+            "expected Io(metadata), got {err:?}"
+        );
+    }
+
+    // ---------- collect_dir_entry injected iterator-Err arm ----------
+
+    /// `collect_dir_entry` maps a `DirEntry` iterator `Err` to `Io` — the
+    /// `entry.map_err` arm the OS won't produce for a directory that opened.
+    #[test]
+    fn collect_dir_entry_maps_iterator_error_to_io() {
+        use super::collect_dir_entry;
+        use crate::core::error::RuntimeError;
+        use std::path::Path;
+        let mut out = Vec::new();
+        let synthetic = Err(std::io::Error::other("synthetic dir-entry failure"));
+        let err = collect_dir_entry(Path::new("/some/dir"), synthetic, &mut out);
+        assert!(
+            matches!(&err, Err(RuntimeError::Io { message, .. }) if message.contains("synthetic dir-entry failure")),
+            "expected Io(dir-entry), got {err:?}"
+        );
+        assert!(out.is_empty());
+    }
+
+    /// `collect_dir_entry` maps a `fs::metadata` failure to `Io`: a dangling
+    /// symlink stat's the target (ENOENT) rather than the link itself.
+    #[cfg(unix)]
+    #[test]
+    fn collect_dir_entry_maps_metadata_failure_on_dangling_symlink() {
+        use super::collect_dir_entry;
+        use crate::core::error::RuntimeError;
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        let link = dir.path().join("dangling");
+        std::os::unix::fs::symlink(dir.path().join("no-such-target"), &link).unwrap();
+        // Grab the real DirEntry for the dangling link.
+        let entry = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap())
+            .find(|e| e.file_name() == "dangling")
+            .map(Ok)
+            .unwrap();
+        let mut out = Vec::new();
+        let err = collect_dir_entry(dir.path(), entry, &mut out);
+        assert!(
+            matches!(&err, Err(RuntimeError::Io { .. })),
+            "expected Io(metadata) for dangling symlink, got {err:?}"
+        );
+    }
+
+    // ---------- no-parent / missing-plugin Invariant arms ----------
+    //
+    // These arms guard against a `fixtures_root` with no parent component
+    // (the root path `/`) and a topo_order naming a plugin absent from the
+    // resolved graph. Both are structural invariants that the normal call
+    // path (a real fixtures dir under a repo, a graph built by
+    // PackageResolver) never violates, so they're driven directly with a
+    // constructed root-path / mismatched-graph input.
+
+    fn empty_dependency_snapshot() -> super::DependencySnapshot {
+        use std::collections::{HashMap, HashSet};
+        super::DependencySnapshot {
+            workspace_manifest_path: std::path::PathBuf::from("/plugins/Cargo.toml"),
+            workspace_members: HashSet::new(),
+            target_directory: std::path::PathBuf::from("/target"),
+            local_dep_closure_by_name: HashMap::new(),
+        }
+    }
+
+    /// `build_dirty_dylib_plugins` rejects a `fixtures_root` of `/` (no parent)
+    /// with an Invariant before consulting any context.
+    #[test]
+    fn build_dirty_dylib_plugins_errors_when_fixtures_root_has_no_parent() {
+        use super::build_dirty_dylib_plugins;
+        use crate::core::error::RuntimeError;
+        use std::path::Path;
+        let snapshot = empty_dependency_snapshot();
+        let err = build_dirty_dylib_plugins(Path::new("/"), &snapshot, &[]);
+        assert!(
+            matches!(&err, Err(RuntimeError::Invariant { message }) if message.starts_with("fixtures root missing parent: ")),
+            "expected Invariant(no parent), got {err:?}"
+        );
+    }
+
+    /// `prepare_artifacts_locked` rejects a `fixtures_root` of `/` (no parent)
+    /// with an Invariant before touching the filesystem.
+    #[test]
+    fn prepare_artifacts_locked_errors_when_fixtures_root_has_no_parent() {
+        use super::{prepare_artifacts_locked, PrepareMode};
+        use crate::core::error::RuntimeError;
+        use std::path::Path;
+        let err = prepare_artifacts_locked(Path::new("/"), PrepareMode::Incremental);
+        assert!(
+            matches!(&err, Err(RuntimeError::Invariant { message }) if message.starts_with("fixtures root missing parent: ")),
+            "expected Invariant(no parent), got {err:?}"
+        );
+    }
+
+    /// `build_plugin_contexts` errors with Invariant when `topo_order` names a
+    /// plugin that is absent from the `plugins` map — the graph-consistency
+    /// guard. `repo_root` here is fine; the missing-plugin lookup fires first.
+    #[test]
+    fn build_plugin_contexts_errors_on_plugin_missing_from_graph() {
+        use super::{build_plugin_contexts, ResolvedPluginGraph};
+        use crate::core::error::RuntimeError;
+        use std::collections::BTreeMap;
+        use std::path::Path;
+        let graph = ResolvedPluginGraph {
+            plugins: BTreeMap::new(),
+            children: BTreeMap::new(),
+            topo_order: vec!["/ghost".to_string()],
+        };
+        let snapshot = empty_dependency_snapshot();
+        let err = build_plugin_contexts(
+            Path::new("/repo"),
+            &graph,
+            Path::new("/repo/fixtures/artifacts"),
+            &snapshot,
+        );
+        assert!(
+            matches!(&err, Err(RuntimeError::Invariant { message }) if message.starts_with("missing plugin in resolved graph: ")),
+            "expected Invariant(missing plugin), got {err:?}"
         );
     }
 }

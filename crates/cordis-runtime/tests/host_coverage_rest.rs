@@ -879,3 +879,264 @@ fn walk_code_files_ctl_stops_early() {
     .expect("walk_ctl should succeed");
     assert_eq!(count, 1, "Stop after the first hit must end the walk");
 }
+
+// walk_code_files_ctl: descend into a NON-pruned nested subdirectory
+// (`stack.push` + `continue` arm), skip a non-file / non-dir entry (a symlink
+// whose target is a directory has a file_type that is neither `is_dir` nor
+// `is_file` → the `!ft.is_file()` continue), and survive a subdirectory whose
+// contents cannot be listed (a 0o000 dir makes the popped-dir `read_dir` fail
+// → the `Err(_) => continue` arm). Together these cover the loop's traversal
+// and IO-error branches without a real repo.
+#[cfg(unix)]
+#[test]
+#[serial]
+fn walk_code_files_descends_nested_skips_symlink_and_unreadable_dir() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    let (_temp, _fixtures, host) = boot_on_artifacts_copy();
+    let tree = TempDir::new().expect("walk tree");
+    let root = tree.path();
+
+    // A non-pruned nested subdir with a source file: exercises the
+    // `stack.push(entry.path()); continue;` descent arm and then visits the
+    // buried file on the next stack pop.
+    let nested = root.join("nested");
+    fs::create_dir_all(&nested).expect("mkdir nested");
+    fs::write(nested.join("deep.rs"), "// deep").expect("write deep.rs");
+
+    // A dangling-target-agnostic symlink pointing at a directory: its
+    // `file_type()` reports `is_symlink()` (neither dir nor file), so the walk
+    // takes the `!ft.is_file()` continue and never recurses through it.
+    symlink(&nested, root.join("link_to_dir")).expect("create dir symlink");
+
+    // A directory we then strip all permissions from: when popped off the
+    // stack its `read_dir` fails, driving the `Err(_) => continue` arm.
+    let locked = root.join("locked");
+    fs::create_dir_all(&locked).expect("mkdir locked");
+    fs::write(locked.join("secret.rs"), "// secret").expect("seed locked");
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).expect("chmod 000");
+
+    let mut seen: Vec<String> = Vec::new();
+    let walk = host.walk_code_files(root, &mut |rel, _abs| seen.push(rel.to_string()));
+
+    // Restore permissions so TempDir cleanup can remove the tree.
+    let _ = fs::set_permissions(&locked, fs::Permissions::from_mode(0o755));
+    walk.expect("walk should succeed despite the unreadable subdir");
+
+    assert!(
+        seen.iter().any(|r| r == "nested/deep.rs"),
+        "nested source file must be visited via the descent arm: {seen:?}"
+    );
+    // The symlink-to-dir is not recursed, and the 0o000 dir could not be
+    // listed, so neither of their contents appear.
+    assert!(
+        !seen.iter().any(|r| r.contains("secret.rs")),
+        "contents of an unreadable dir must not surface: {seen:?}"
+    );
+}
+
+// ===========================================================================
+// Group K — reload_subtree Phase-1 strict-comparison error arms. A copied
+// artifacts tree lets us tamper `index.json` so the recorded entry disagrees
+// with what the live dylib reports, driving the docs-drift and ABI-drift
+// mismatch branches (each returns Err + records a Failed attempt).
+// ===========================================================================
+
+// Docs drift: shrink the recorded `docs.nodes` for `expr` so the live dylib's
+// node list no longer matches the index entry → reload_docs_mismatch_error.
+#[test]
+#[serial]
+fn reload_subtree_docs_drift_records_failed_attempt() {
+    let temp = setup_artifacts_only_copy();
+    let host = RuntimeHost::boot(temp.path()).expect("host should boot from artifacts copy");
+
+    let index_path = temp.path().join("artifacts/index.json");
+    let raw = fs::read_to_string(&index_path).expect("read index");
+    let mut index: serde_json::Value = serde_json::from_str(&raw).expect("parse index");
+    let entries = index
+        .get_mut("entries")
+        .and_then(|v| v.as_array_mut())
+        .expect("entries array");
+    for entry in entries.iter_mut() {
+        if entry.get("plugin_path").and_then(|v| v.as_str()) == Some("expr") {
+            // Drop every recorded node so the count (0) differs from the live
+            // dylib's (1). Node-count divergence trips the strict docs check.
+            entry
+                .get_mut("docs")
+                .and_then(|d| d.get_mut("nodes"))
+                .map(|n| *n = serde_json::json!([]))
+                .expect("expr docs.nodes present");
+        }
+    }
+    fs::write(&index_path, serde_json::to_string_pretty(&index).unwrap()).expect("write index");
+
+    let err = host
+        .reload("expr")
+        .expect_err("docs drift must abort the subtree reload");
+    assert!(
+        matches!(&err, RuntimeError::AbiMismatch { .. }),
+        "got {err:?}"
+    );
+    assert!(err.to_string().contains("docs mismatch"));
+    let attempt = host.last_reload_attempt().expect("failed attempt recorded");
+    assert_eq!(attempt.status, ReloadAttemptStatus::Failed);
+    assert!(attempt.failure_summary.is_some());
+}
+
+// ABI drift: rewrite the recorded `abi_fingerprint.crate_hash`/`api_hash` for
+// `expr` so the live dylib's fingerprint no longer matches → the
+// reload_abi_fingerprint_mismatch_error arm. Docs are left intact so the docs
+// check passes first and control reaches the fingerprint comparison.
+#[test]
+#[serial]
+fn reload_subtree_abi_fingerprint_drift_records_failed_attempt() {
+    let temp = setup_artifacts_only_copy();
+    let host = RuntimeHost::boot(temp.path()).expect("host should boot from artifacts copy");
+
+    let index_path = temp.path().join("artifacts/index.json");
+    let raw = fs::read_to_string(&index_path).expect("read index");
+    let mut index: serde_json::Value = serde_json::from_str(&raw).expect("parse index");
+    let entries = index
+        .get_mut("entries")
+        .and_then(|v| v.as_array_mut())
+        .expect("entries array");
+    for entry in entries.iter_mut() {
+        if entry.get("plugin_path").and_then(|v| v.as_str()) == Some("expr") {
+            let fp = entry
+                .get_mut("abi_fingerprint")
+                .and_then(|v| v.as_object_mut())
+                .expect("abi_fingerprint object");
+            fp.insert(
+                "crate_hash".to_string(),
+                serde_json::json!("crate_expr_TAMPERED"),
+            );
+            fp.insert("api_hash".to_string(), serde_json::json!("api_TAMPERED"));
+        }
+    }
+    fs::write(&index_path, serde_json::to_string_pretty(&index).unwrap()).expect("write index");
+
+    let err = host
+        .reload("expr")
+        .expect_err("abi fingerprint drift must abort the subtree reload");
+    assert!(
+        matches!(&err, RuntimeError::AbiMismatch { .. }),
+        "got {err:?}"
+    );
+    assert!(err.to_string().contains("expected crate="));
+    let attempt = host.last_reload_attempt().expect("failed attempt recorded");
+    assert_eq!(attempt.status, ReloadAttemptStatus::Failed);
+    assert!(attempt.failure_summary.is_some());
+}
+
+// ===========================================================================
+// Group L — small public-accessor and per-session error arms that the other
+// coverage groups do not touch: workspace_root / config accessors, the
+// AgentSessionNotFound arms of agent_transcript / agent_send, and
+// check_agent_accessible's not-registered + not-allowed branches.
+// ===========================================================================
+
+#[test]
+#[serial]
+fn host_workspace_root_and_config_accessors_are_live() {
+    let host = shared_host();
+    // config() hands back the live RuntimeConfig (RuntimeHost accessor).
+    let _ = host.config();
+    // workspace_root() is the RuntimeKernel accessor; it points at the
+    // workspace directory (parent of the fixtures root).
+    assert!(host.kernel().workspace_root().is_dir());
+}
+
+#[test]
+#[serial]
+fn agent_transcript_and_send_report_unknown_session() {
+    let host = shared_host();
+    let err = host
+        .agent_transcript("ghost-session")
+        .expect_err("unknown session transcript must error");
+    assert!(matches!(err, RuntimeError::AgentSessionNotFound { .. }));
+
+    let err = host
+        .agent_send("ghost-session", "hi")
+        .expect_err("unknown session send must error");
+    assert!(matches!(err, RuntimeError::AgentSessionNotFound { .. }));
+}
+
+#[test]
+#[serial]
+fn check_agent_accessible_covers_not_registered_and_not_allowed() {
+    let host = shared_host();
+
+    // Agent-accessible node → Ok (the success arm returns before the reject).
+    host.check_agent_accessible("time", "time_now")
+        .expect("time_now is agent-accessible");
+
+    // Unknown plugin path → PluginNotRegistered.
+    let err = host
+        .check_agent_accessible("no_such_plugin", "whatever")
+        .expect_err("unknown plugin must be rejected");
+    assert!(matches!(err, RuntimeError::PluginNotRegistered { .. }));
+
+    // Known plugin but unknown node id → falls through to the not-allowed
+    // InvalidArgument arm (no matching node ⇒ no agent_accessible grant).
+    let err = host
+        .check_agent_accessible("expr", "definitely_not_a_node")
+        .expect_err("unknown node must be rejected");
+    assert!(
+        matches!(&err, RuntimeError::InvalidArgument { message } if message.contains("not allowed")),
+        "got {err:?}"
+    );
+}
+
+// reload_with_diagnostics error arm: a subtree reload of a real plugin whose
+// artifact index has been deleted fails, and reload_with_diagnostics returns a
+// Failed ReloadAttemptReport (the `Err((err, attempt))` branch distinct from
+// the `reload()` wrapper's error arm).
+#[test]
+#[serial]
+fn reload_with_diagnostics_reports_failed_attempt_on_missing_index() {
+    let temp = setup_artifacts_only_copy();
+    let host = RuntimeHost::boot(temp.path()).expect("host should boot");
+
+    let index = temp.path().join("artifacts/index.json");
+    fs::remove_file(&index).expect("remove artifact index");
+
+    let attempt = host.reload_with_diagnostics("expr");
+    assert_eq!(attempt.status, ReloadAttemptStatus::Failed);
+    assert!(attempt.failure_summary.is_some());
+}
+
+// ===========================================================================
+// Group M — kernel plugin_iteration_status resolves a blocked (non-last)
+// iteration through the blocked-map arm. Recording a Blocked outcome and then
+// a DIFFERENT Promoted outcome makes the Promoted one the `last_plugin_
+// iteration` slot, so querying the blocked id skips the last-slot fast path
+// and hits the blocked-map lookup branch.
+// ===========================================================================
+
+#[test]
+fn plugin_iteration_status_reads_blocked_map_when_not_last() {
+    let temp = TempDir::new().expect("tempdir");
+    let config = cordis_runtime::config::RuntimeConfig::default();
+    let kernel = RuntimeKernel::new(temp.path(), &config);
+
+    let blocked = make_result(
+        "iter-blk",
+        "issue-blk",
+        PluginIterationFinalVerdict::Blocked,
+    );
+    kernel.record_plugin_iteration_outcome(&blocked);
+    // A later Promoted iteration takes over the `last_plugin_iteration` slot.
+    let promoted = make_result(
+        "iter-prm",
+        "issue-prm",
+        PluginIterationFinalVerdict::Promoted,
+    );
+    kernel.record_plugin_iteration_outcome(&promoted);
+
+    // Querying the still-blocked id: the last-slot filter rejects it (last is
+    // iter-prm) so the lookup falls through to the blocked-map arm.
+    let status = kernel
+        .plugin_iteration_status("iter-blk")
+        .expect("blocked iteration still queryable via the blocked map");
+    assert_eq!(status.final_verdict, PluginIterationFinalVerdict::Blocked);
+}

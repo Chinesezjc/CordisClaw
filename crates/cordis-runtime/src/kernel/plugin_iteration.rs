@@ -378,12 +378,16 @@ fn plugin_subtree_surface_kind(path: &str, subtree_root: &str) -> Option<PluginS
     let surface_idx = segments
         .iter()
         .position(|segment| matches!(*segment, "src" | "tests" | "docs"))?;
-    if segments[..surface_idx]
-        .iter()
-        .any(|segment| matches!(*segment, "src" | "tests" | "docs"))
-    {
-        return None;
-    }
+    // `position` returns the *first* index whose segment is one of
+    // src/tests/docs, so the prefix `segments[..surface_idx]` can never contain
+    // another such segment. The guard is therefore unreachable; assert the
+    // invariant in debug builds rather than carrying a dead runtime branch.
+    debug_assert!(
+        !segments[..surface_idx]
+            .iter()
+            .any(|segment| matches!(*segment, "src" | "tests" | "docs")),
+        "surface_idx is the first src/tests/docs; no earlier segment can match"
+    );
     match segments[surface_idx] {
         "src" | "tests" if surface_idx + 1 < segments.len() => {
             Some(PluginSubtreeSurfaceKind::WritableOther)
@@ -1453,6 +1457,113 @@ mod tests {
         );
     }
 
+    // execute(): the per-operation `create_dir_all(parent)` fails when a parent
+    // path component is a regular file. A CreateFile op whose parent directory
+    // ("src/afile") is actually a file makes the mkdir fail → the Io error map
+    // at that call site fires (before any write).
+    #[test]
+    fn plugin_edit_executor_create_dir_all_failure_is_io() {
+        use crate::core::error::RuntimeError;
+        let temp = TempDir::new().expect("tempdir");
+        let workspace = temp.path();
+        fs::create_dir_all(workspace.join("plugins/demo/src")).expect("create plugin src");
+        // A regular file where the op wants a directory component.
+        fs::write(workspace.join("plugins/demo/src/afile"), b"x").expect("write blocker file");
+        let mut allowed = BTreeMap::new();
+        allowed.insert("demo".to_string(), "plugins/demo".to_string());
+        let executor = PluginEditExecutor::new(workspace);
+
+        let plan = PluginEditPlan {
+            issue_id: "issue-1".to_string(),
+            patch_id: "patch-1".to_string(),
+            summary: "mkdir-fail".to_string(),
+            operations: vec![PluginEditOperation {
+                // parent "plugins/demo/src/afile" is a file → create_dir_all errs.
+                path: "plugins/demo/src/afile/inner.rs".to_string(),
+                kind: PluginEditOpKind::CreateFile,
+                expected_old_string: Some(String::new()),
+                expected_sha256: None,
+                new_content: Some("pub const X: u32 = 1;\n".to_string()),
+                pointer: None,
+                dotted_key: None,
+                value: None,
+            }],
+        };
+        let err = executor
+            .execute(&PluginIterationPolicy::default(), &allowed, &plan)
+            .expect_err("create_dir_all over a file must fail");
+        assert!(matches!(err, RuntimeError::Io { .. }), "got: {err:?}");
+    }
+
+    // execute(): a DeleteFile op whose `fs::remove_file` fails surfaces the Io
+    // error map at that call site. On Unix, making the parent directory
+    // read-only lets `fs::read` succeed (so the op validates and original is
+    // Some) but blocks the unlink with EACCES. Root ignores mode bits, so gate
+    // on non-root.
+    #[cfg(unix)]
+    #[test]
+    fn plugin_edit_executor_remove_file_failure_is_io() {
+        use crate::core::error::RuntimeError;
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } != 0 {
+            let temp = TempDir::new().expect("tempdir");
+            let workspace = temp.path();
+            let src = workspace.join("plugins/demo/src");
+            fs::create_dir_all(&src).expect("create plugin src");
+            let victim = src.join("gone.rs");
+            fs::write(&victim, b"payload").expect("write victim");
+            let sha = {
+                use sha2::{Digest, Sha256};
+                let mut h = Sha256::new();
+                h.update(b"payload");
+                hex::encode(h.finalize())
+            };
+            // Read-only parent dir: read still works, unlink fails.
+            let mut perms = fs::metadata(&src).unwrap().permissions();
+            perms.set_mode(0o555);
+            fs::set_permissions(&src, perms).unwrap();
+
+            let mut allowed = BTreeMap::new();
+            allowed.insert("demo".to_string(), "plugins/demo".to_string());
+            let executor = PluginEditExecutor::new(workspace);
+            let plan = PluginEditPlan {
+                issue_id: "issue-1".to_string(),
+                patch_id: "patch-1".to_string(),
+                summary: "delete-fail".to_string(),
+                operations: vec![PluginEditOperation {
+                    path: "plugins/demo/src/gone.rs".to_string(),
+                    kind: PluginEditOpKind::DeleteFile,
+                    expected_old_string: None,
+                    expected_sha256: Some(sha),
+                    new_content: None,
+                    pointer: None,
+                    dotted_key: None,
+                    value: None,
+                }],
+            };
+            let result = executor.execute(&PluginIterationPolicy::default(), &allowed, &plan);
+
+            // Restore write perms so the TempDir can be cleaned up.
+            let mut perms = fs::metadata(&src).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&src, perms).unwrap();
+
+            // The remove_file Io error is surfaced (possibly wrapped by the
+            // rollback path into an Invariant if rollback then also fails, but
+            // on a read-only dir the rollback restore of an unchanged file is a
+            // no-op write that also fails — accept either the direct Io or the
+            // Invariant rollback wrapper).
+            let err = result.expect_err("remove_file on read-only dir must fail");
+            assert!(
+                matches!(
+                    err,
+                    RuntimeError::Io { .. } | RuntimeError::Invariant { .. }
+                ),
+                "got: {err:?}"
+            );
+        }
+    }
+
     // ---------- P0-5..P0-8 rollback hardening tests ----------
 
     use super::{atomic_write, PluginEditRollback};
@@ -1492,6 +1603,35 @@ mod tests {
         let target = temp.path().join("afile/inner.json");
         let err = atomic_write(&target, b"data").expect_err("create_dir_all over a file must fail");
         assert!(matches!(err, RuntimeError::Io { .. }), "got: {err:?}");
+    }
+
+    // atomic_write: the staging `File::create(&tmp_path)` fails when the parent
+    // directory exists but is read-only (so create_dir_all is a no-op success,
+    // but the tmp file can't be created) — the tmp-create Io error map.
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_tmp_create_failure_in_readonly_dir() {
+        use crate::core::error::RuntimeError;
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } != 0 {
+            let temp = TempDir::new().unwrap();
+            let dir = temp.path().join("ro");
+            fs::create_dir_all(&dir).unwrap();
+            let target = dir.join("out.json");
+            let mut perms = fs::metadata(&dir).unwrap().permissions();
+            perms.set_mode(0o555); // read+execute, no write → tmp create fails
+            fs::set_permissions(&dir, perms).unwrap();
+
+            let result = atomic_write(&target, b"data");
+
+            // Restore perms for cleanup.
+            let mut perms = fs::metadata(&dir).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&dir, perms).unwrap();
+
+            let err = result.expect_err("tmp create in read-only dir must fail");
+            assert!(matches!(err, RuntimeError::Io { .. }), "got: {err:?}");
+        }
     }
 
     #[test]
@@ -2494,6 +2634,23 @@ mod tests {
         let resolved = resolve_under_workspace(&target).unwrap();
         assert!(resolved.starts_with(&existing));
         assert!(resolved.ends_with("a/b/c.rs"));
+    }
+
+    // resolve_under_workspace: a relative path whose ancestor walk exhausts
+    // without ever finding an existing component reaches the `parent() == None`
+    // arm → AutoUpdateInvalidPath ("no accessible ancestor exists"). A purely
+    // relative, non-existent path like "no_such_root_xyz/a" walks
+    // "no_such_root_xyz/a" → "no_such_root_xyz" → "" (which does not exist and
+    // has no parent).
+    #[test]
+    fn resolve_under_workspace_no_accessible_ancestor_errors() {
+        let target = Path::new("no_such_root_xyz_qzv/a/b.rs");
+        let err = resolve_under_workspace(target)
+            .expect_err("a relative path with no existing ancestor must error");
+        assert!(
+            matches!(&err, RuntimeError::AutoUpdateInvalidPath { reason, .. } if reason == "no accessible ancestor exists"),
+            "wrong variant: {err:?}"
+        );
     }
 
     #[test]

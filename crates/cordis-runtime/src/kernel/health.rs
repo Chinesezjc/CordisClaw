@@ -171,10 +171,13 @@ mod tests {
         // Give the worker a moment to enter the startup sleep, then stop.
         std::thread::sleep(Duration::from_millis(30));
         handle.stop();
+        // Bind the elapsed value before the assert so the message argument is
+        // always evaluated (not only on the panic branch), keeping the
+        // formatted output byte-identical.
+        let elapsed = started.elapsed();
         assert!(
-            started.elapsed() < Duration::from_secs(2),
-            "stop() should join within one poll window, got {:?}",
-            started.elapsed()
+            elapsed < Duration::from_secs(2),
+            "stop() should join within one poll window, got {elapsed:?}"
         );
     }
 
@@ -207,15 +210,16 @@ mod tests {
         handle.stop();
         // The loop must have gotten past the startup delay (proving the
         // post-delay branch executed) and shut down promptly once stopped.
+        // Bind before the asserts so the message arguments are always
+        // evaluated, not only on the panic branch.
+        let elapsed = started.elapsed();
         assert!(
-            started.elapsed() >= Duration::from_secs(10),
-            "startup delay should have elapsed, got {:?}",
-            started.elapsed()
+            elapsed >= Duration::from_secs(10),
+            "startup delay should have elapsed, got {elapsed:?}"
         );
         assert!(
-            started.elapsed() < Duration::from_secs(14),
-            "stop() should join within one poll window after the wait, got {:?}",
-            started.elapsed()
+            elapsed < Duration::from_secs(14),
+            "stop() should join within one poll window after the wait, got {elapsed:?}"
         );
     }
 }

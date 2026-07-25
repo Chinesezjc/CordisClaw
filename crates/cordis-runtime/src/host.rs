@@ -491,6 +491,217 @@ mod sr_host_a_seam_tests {
     }
 }
 
+/// Coverage batch (host.rs lines 1-3500, "cov-fa" seam): internal arms that
+/// need a hand-built [`RuntimeSnapshot`] or a direct call into a private
+/// kernel method, which integration tests (only `pub` surface) cannot reach.
+/// Kept in a dedicated module so concurrent edits to the primary `mod tests`
+/// and the `sr_host_a_seam_tests` module never collide on the same lines.
+#[cfg(test)]
+mod cov_fa_host_1_3500_tests {
+    use super::{runtime_snapshot_from_output, RuntimeKernel, RuntimeSnapshot};
+    use crate::core::error::RuntimeError;
+    use crate::core::models::{ArtifactKind, NodeOutcome};
+    use crate::kernel::plugin_iteration::{
+        KernelPluginIssueSource, KernelPluginIssueStatus, KernelPluginIterationRequest,
+    };
+    use cordis_plugin_sdk::{node_doc, plugin_docs, AbiFingerprint, NodeDoc};
+    use serde_json::json;
+    use std::collections::BTreeSet;
+    use std::path::PathBuf;
+    use tempfile::TempDir;
+
+    // A two-node "producer → consumer" plugin whose registered net carries an
+    // upstream edge, but whose node_registry — handed to the snapshot — is
+    // MISSING the producer node. Executing the consumer therefore fires the
+    // producer transition, whose `node_registry.get(..)` returns None, driving
+    // `execute_registered_target`'s registry-missing arm (missing_registry_trace).
+    fn snapshot_with_ghost_upstream_node() -> RuntimeSnapshot {
+        let plugin_path = "ghostplug".to_string();
+        // Producer emits "shared"; consumer reads "shared" → a data edge
+        // producer→consumer is inferred by the graph builder.
+        let producer: NodeDoc = node_doc(
+            "producer",
+            "emits the shared field",
+            json!({ "type": "object", "properties": {} }),
+            json!({ "type": "object", "properties": { "shared": { "type": "number" } } }),
+            &[],
+            &[],
+        );
+        let consumer: NodeDoc = node_doc(
+            "consumer",
+            "reads the shared field",
+            json!({ "type": "object", "properties": { "shared": { "type": "number" } } }),
+            json!({ "type": "object", "properties": {} }),
+            &[],
+            &[],
+        );
+        let docs = plugin_docs(
+            plugin_path.clone(),
+            plugin_path.clone(),
+            "0.1.0",
+            None,
+            vec![producer.clone(), consumer.clone()],
+            None,
+        );
+
+        let plugin_registry = crate::plugin::registry::PluginRegistry::default();
+        plugin_registry.insert_loaded(
+            plugin_path.clone(),
+            None,
+            true,
+            BTreeSet::new(),
+            docs.clone(),
+            PathBuf::from("/nonexistent/cordis-ghost.dylib"),
+            ArtifactKind::Dylib,
+            AbiFingerprint::current_build("crate_ghost_v1", "api_v2"),
+            None,
+        );
+
+        // FULL node registry (both nodes) drives the graph/net construction so
+        // the net contains the producer→consumer edge.
+        let mut full_nodes = crate::plugin::registry::NodeRegistry::default();
+        full_nodes
+            .register_from_docs(&plugin_path, &docs)
+            .expect("register both nodes for graph build");
+        let graph_registry = crate::service::graph_registry::GraphRegistry::from_registries(
+            &plugin_registry,
+            &full_nodes,
+        );
+
+        // PARTIAL node registry (consumer only) is what the snapshot carries,
+        // so resolving the upstream producer transition fails at runtime.
+        let consumer_only_docs = plugin_docs(
+            plugin_path.clone(),
+            plugin_path.clone(),
+            "0.1.0",
+            None,
+            vec![consumer],
+            None,
+        );
+        let mut partial_nodes = crate::plugin::registry::NodeRegistry::default();
+        partial_nodes
+            .register_from_docs(&plugin_path, &consumer_only_docs)
+            .expect("register consumer only");
+
+        let doc_registry =
+            crate::service::doc_registry::DocRegistry::from_plugin_registry(&plugin_registry);
+
+        runtime_snapshot_from_output(
+            crate::plugin::loader::LoadOutput {
+                execution_id: "snapshot-ghost-upstream".to_string(),
+                plugin_registry,
+                node_registry: partial_nodes,
+                doc_registry,
+                graph_registry,
+                context: crate::context::RuntimeContext::default(),
+                metrics: crate::plugin::loader::LoaderMetrics::default(),
+            },
+            PathBuf::from("/tmp/cordis-ghost-upstream-staged"),
+        )
+    }
+
+    #[test]
+    fn execute_records_missing_registry_trace_for_ghost_upstream_node() {
+        let snapshot = snapshot_with_ghost_upstream_node();
+        let result = snapshot
+            .execute_registered_target("ghostplug::consumer", json!({ "shared": 1 }))
+            .expect("execute returns a result even with a ghost upstream node");
+
+        // The upstream producer transition resolves to no registry node, so
+        // the closure records the blank-plugin missing-registry trace.
+        let trace = result
+            .traces
+            .get("ghostplug::producer")
+            .expect("ghost upstream node should have a trace entry");
+        assert_eq!(trace.outcome, Some(NodeOutcome::Failure));
+        assert_eq!(trace.plugin_path, "");
+        assert_eq!(trace.node_id, "");
+        assert_eq!(
+            trace.error.as_deref(),
+            Some("node missing from registry"),
+            "missing_registry_trace error text must be verbatim"
+        );
+        assert!(trace.request_payload.is_none());
+    }
+
+    // begin_plugin_iteration (private) + select_issue_for_request comparator.
+    // A hermetic kernel with two OPEN issues of different source priority; a
+    // no-issue-id request auto-selects, running the sort comparator, and the
+    // highest-priority issue (LoadFailure=0) is chosen + flipped to Running.
+    #[test]
+    fn begin_plugin_iteration_auto_selects_highest_priority_issue() {
+        let temp = TempDir::new().expect("tempdir");
+        let config = crate::config::RuntimeConfig::default();
+        let kernel = RuntimeKernel::new(temp.path(), &config);
+
+        // Observed in "wrong" order: low-urgency first, high-urgency second.
+        let _invoke =
+            kernel.observe_plugin_issue(KernelPluginIssueSource::InvokeFailure, "expr", "invoke");
+        let load =
+            kernel.observe_plugin_issue(KernelPluginIssueSource::LoadFailure, "shell", "load");
+
+        let snapshot = snapshot_with_ghost_upstream_node();
+        let prepared = kernel
+            .begin_plugin_iteration(
+                &snapshot,
+                &KernelPluginIterationRequest {
+                    issue_id: None,
+                    target_plugin_paths: Vec::new(),
+                    instruction: Some("auto".to_string()),
+                    edit_plan: None,
+                    manual_approved: false,
+                    tests_command: None,
+                    safety_command: None,
+                    verify_profile: None,
+                    quality_score: None,
+                },
+            )
+            .expect("begin should auto-select an issue");
+        // LoadFailure (priority 0) wins the comparator over InvokeFailure (3).
+        assert_eq!(prepared.root_plugin_path, "shell");
+
+        // The selected issue was flipped to Running (the `and_modify` arm).
+        let running = kernel
+            .plugin_issues()
+            .into_iter()
+            .find(|i| i.issue_id == load.issue_id)
+            .expect("load issue present");
+        assert_eq!(running.status, KernelPluginIssueStatus::Running);
+    }
+
+    // begin_plugin_iteration active-guard arm: a second begin while one is
+    // already active returns PluginIterationActive.
+    #[test]
+    fn begin_plugin_iteration_rejects_second_concurrent_iteration() {
+        let temp = TempDir::new().expect("tempdir");
+        let config = crate::config::RuntimeConfig::default();
+        let kernel = RuntimeKernel::new(temp.path(), &config);
+        let snapshot = snapshot_with_ghost_upstream_node();
+
+        let req = |instruction: &str| KernelPluginIterationRequest {
+            issue_id: None,
+            target_plugin_paths: vec!["ghostplug".to_string()],
+            instruction: Some(instruction.to_string()),
+            edit_plan: None,
+            manual_approved: false,
+            tests_command: None,
+            safety_command: None,
+            verify_profile: None,
+            quality_score: None,
+        };
+
+        // First begin succeeds and marks the iteration active.
+        let _first = kernel
+            .begin_plugin_iteration(&snapshot, &req("first"))
+            .expect("first iteration prepares");
+        // Second begin hits the active-guard early return.
+        let err = kernel
+            .begin_plugin_iteration(&snapshot, &req("second"))
+            .expect_err("a second concurrent iteration must be rejected");
+        assert!(matches!(err, RuntimeError::PluginIterationActive { .. }));
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ReloadAttemptStatus {
@@ -8675,5 +8886,2453 @@ mod aggregate_rollback_failure_tests {
             "promote (manual-approved) failed: boom; rollback errors: \
              [candidate rollback: invalid argument: cand kaput, workspace restore: invalid argument: restore kaput]"
         );
+    }
+}
+
+/// Coverage terminal batch (>5500 region): unit tests for pure helper and
+/// data-construction functions that were previously exercised only indirectly
+/// or not at all. Kept in a dedicated EOF module so concurrent edits to the
+/// other `mod *_tests` blocks do not collide. Byte-for-byte error/text
+/// assertions where the emitted string is load-bearing.
+#[cfg(test)]
+mod region_5500_coverage_tests {
+    use super::{
+        artifact_paths_to_backup, atomic_write_bytes, build_execution_net, build_execution_payload,
+        build_snapshot_with_staged_root, cleanup_stale_snapshot_dirs,
+        collect_context_files_recursive, collect_plugin_context_paths, default_snapshot_root,
+        determine_root_plugin_path, extract_warning_blocks, fill_missing_execution_traces,
+        insert_context_file_if_exists, make_snapshot_dir_name, normalize_request_id,
+        normalize_warning_source_path, plugin_change_reasons, plugin_context_priority,
+        plugin_path_from_runtime_error, render_child_plugin_core, render_child_plugin_lib,
+        render_child_plugin_manifest, render_child_plugin_overview, render_child_plugin_test,
+        sanitize_child_plugin_segment, select_registered_net_subgraph, should_track_context_file,
+        validated_verification_command, workspace_manifest_lock, ExecutionInvocationTrace,
+    };
+    use crate::core::error::RuntimeError;
+    use crate::core::models::NodeOutcome;
+    use crate::core::models::PluginUnavailableReason;
+    use crate::execution::engine::{
+        ExecutionMetrics, ExecutionOutput, ExecutionTransitionKind, TriggerInput,
+    };
+    use crate::execution::net::{CorrelationKey, Token, TokenMeta};
+    use crate::service::graph_registry::{
+        RegisteredNet, RegisteredNetEdge, RegisteredNetEdgeKind, RegisteredNetNode,
+    };
+    use cordis_plugin_sdk::NodeType;
+    use serde_json::{json, Map, Value};
+    use std::collections::{BTreeMap, BTreeSet};
+
+    // ── validated_verification_command: default-alias short-circuit (5525) ──
+    #[test]
+    fn validated_verification_command_returns_fallback_for_bare_alias() {
+        // explicit "check" with required_prefix "cargo check" and a fallback:
+        // the alias arm returns the fallback verbatim.
+        let out = validated_verification_command(
+            Some("check".to_string()),
+            Some("cargo check --workspace".to_string()),
+            "cargo check",
+        )
+        .expect("bare alias with fallback resolves to fallback");
+        assert_eq!(out, "cargo check --workspace");
+
+        // "test" alias against "cargo test".
+        let out = validated_verification_command(
+            Some("test".to_string()),
+            Some("cargo test --all".to_string()),
+            "cargo test",
+        )
+        .expect("test alias with fallback resolves to fallback");
+        assert_eq!(out, "cargo test --all");
+    }
+
+    #[test]
+    fn validated_verification_command_trims_and_accepts_prefixed() {
+        let out = validated_verification_command(
+            Some("  cargo check --lib  ".to_string()),
+            None,
+            "cargo check",
+        )
+        .expect("prefixed command accepted");
+        assert_eq!(out, "cargo check --lib");
+    }
+
+    // ── should_track_context_file (5571) ────────────────────────────────
+    #[test]
+    fn should_track_context_file_matches_source_extensions() {
+        assert!(should_track_context_file("plugins/foo/src/lib.rs"));
+        assert!(should_track_context_file("plugins/foo/Cargo.toml"));
+        assert!(should_track_context_file(
+            "plugins/foo/docs/agent/interfaces.json"
+        ));
+        assert!(should_track_context_file(
+            "plugins/foo/docs/human/overview.md"
+        ));
+        // Unknown extension → not tracked.
+        assert!(!should_track_context_file("plugins/foo/artifacts/foo.so"));
+        assert!(!should_track_context_file("plugins/foo/README"));
+    }
+
+    // ── plugin_context_priority: the else/fallback bucket (5600) ─────────
+    #[test]
+    fn plugin_context_priority_orders_by_bucket() {
+        assert_eq!(plugin_context_priority("a/Cargo.toml").0, 0);
+        assert_eq!(plugin_context_priority("a/src/core.rs").0, 1);
+        assert_eq!(plugin_context_priority("a/src/lib.rs").0, 2);
+        assert_eq!(plugin_context_priority("a/tests/it.rs").0, 3);
+        assert_eq!(plugin_context_priority("a/docs/human/x.md").0, 4);
+        assert_eq!(plugin_context_priority("a/docs/agent/x.json").0, 5);
+        assert_eq!(plugin_context_priority("a/src/other.rs").0, 6);
+        // Anything else → the catch-all bucket 7.
+        assert_eq!(plugin_context_priority("a/notes.txt").0, 7);
+    }
+
+    // ── sanitize_child_plugin_segment (5612, 5621) ──────────────────────
+    #[test]
+    fn sanitize_child_plugin_segment_normalizes_and_defaults() {
+        // Non-alphanumeric runs collapse to single dashes and trim.
+        assert_eq!(sanitize_child_plugin_segment("  Foo Bar!! "), "foo-bar");
+        assert_eq!(sanitize_child_plugin_segment("//Multiply//"), "multiply");
+        // All-punctuation input normalizes to empty → "child" default.
+        assert_eq!(sanitize_child_plugin_segment("***"), "child");
+        assert_eq!(sanitize_child_plugin_segment(""), "child");
+    }
+
+    // ── render_child_plugin_* (5632-5683) ───────────────────────────────
+    #[test]
+    fn render_child_plugin_manifest_embeds_names_and_paths() {
+        let manifest = render_child_plugin_manifest("my-child", "root/child", "child_entry");
+        // crate name has dashes replaced with underscores in [package].name.
+        assert!(manifest.contains("name = \"my_child\""));
+        assert!(manifest.contains("plugin_path = \"root/child\""));
+        assert!(manifest.contains("declared_nodes = [\"child_entry\"]"));
+        assert!(manifest.contains("crate_hash = \"crate_my_child_v1\""));
+        assert!(manifest.contains("allow_generated_docs = true"));
+    }
+
+    #[test]
+    fn render_child_plugin_lib_escapes_summary_quotes() {
+        let lib =
+            render_child_plugin_lib("my-child", "root/child", "child_entry", "a \"quoted\" sum");
+        assert!(lib.contains("\"child_entry\""));
+        assert!(lib.contains("crate_my-child_v1"));
+        // Embedded quotes in the summary are backslash-escaped.
+        assert!(lib.contains("a \\\"quoted\\\" sum"));
+    }
+
+    #[test]
+    fn render_child_plugin_core_builds_pascal_type_name() {
+        let core = render_child_plugin_core("binary-multiply");
+        // "binary-multiply" → PascalCase "BinaryMultiply".
+        assert!(core.contains("pub enum BinaryMultiplyError"));
+        assert!(core.contains("pub struct BinaryMultiplyPlugin"));
+        assert!(core.contains("NotImplemented"));
+    }
+
+    #[test]
+    fn render_child_plugin_test_and_overview_embed_identifiers() {
+        let test = render_child_plugin_test("my_child");
+        assert!(test.contains("use my_child::apply;"));
+        assert!(test.contains("scaffold_exports_apply"));
+
+        let overview = render_child_plugin_overview("root/child");
+        assert!(overview.starts_with("# root/child\n"));
+        assert!(overview.contains("Cordis plugin-iteration agent"));
+    }
+
+    // ── extract_warning_blocks: block boundary flush (5838-5840) ─────────
+    #[test]
+    fn extract_warning_blocks_flushes_on_boundary_line() {
+        let text = "\
+warning: unused variable `x`
+  --> src/lib.rs:1:5
+Compiling next-crate v0.1.0
+warning: unused import
+  --> src/lib.rs:2:5";
+        let blocks = extract_warning_blocks(text);
+        // The "Compiling " boundary flushes the first block; a trailing block
+        // is pushed at EOF.
+        assert_eq!(blocks.len(), 2);
+        assert!(blocks[0].starts_with("warning: unused variable `x`"));
+        assert!(!blocks[0].contains("Compiling"));
+        assert!(blocks[1].starts_with("warning: unused import"));
+    }
+
+    // ── select_registered_net_subgraph: multi-hop upstream (5915) ────────
+    #[test]
+    fn select_registered_net_subgraph_visits_each_upstream_once() {
+        // Diamond: a→b, a→c, b→d, c→d. Target d must pull a,b,c,d exactly once.
+        let edge = |from: &str, to: &str| RegisteredNetEdge {
+            from: from.to_string(),
+            to: to.to_string(),
+            kind: RegisteredNetEdgeKind::Data,
+            label: None,
+        };
+        let net = RegisteredNet {
+            nodes: Vec::new(),
+            edges: vec![
+                edge("a", "b"),
+                edge("a", "c"),
+                edge("b", "d"),
+                edge("c", "d"),
+            ],
+            diagnostics: Vec::new(),
+        };
+        let selected = select_registered_net_subgraph(&net, "d");
+        let mut got = selected.into_iter().collect::<Vec<_>>();
+        got.sort();
+        assert_eq!(got, vec!["a", "b", "c", "d"]);
+    }
+
+    // ── build_execution_net (5934-6010) ─────────────────────────────────
+    fn net_node(fqn: &str, node_type: NodeType, topo: usize) -> RegisteredNetNode {
+        RegisteredNetNode {
+            node_fqn: fqn.to_string(),
+            plugin_path: fqn.split("::").next().unwrap_or(fqn).to_string(),
+            node_id: fqn.split("::").nth(1).unwrap_or(fqn).to_string(),
+            consumes: Vec::new(),
+            produces: Vec::new(),
+            topo_level: topo,
+            node_type,
+        }
+    }
+
+    fn registered_node(fqn: &str, node_type: NodeType) -> crate::plugin::registry::RegisteredNode {
+        crate::plugin::registry::RegisteredNode {
+            node_fqn: fqn.to_string(),
+            plugin_path: fqn.split("::").next().unwrap_or(fqn).to_string(),
+            node_id: fqn.split("::").nth(1).unwrap_or(fqn).to_string(),
+            node_type,
+        }
+    }
+
+    #[test]
+    fn build_execution_net_empty_selection_yields_terminal_fallback() {
+        // No net node matches the selected set → single Terminal transition
+        // keyed on the target fqn (5940-5956).
+        let net = RegisteredNet::default();
+        let selected = BTreeSet::from(["missing::node".to_string()]);
+        let fallback = registered_node("missing::node", NodeType::Terminal);
+        let spec = build_execution_net(&net, &selected, "missing::node", &fallback);
+        assert!(spec.places.is_empty());
+        assert!(spec.arcs.is_empty());
+        assert_eq!(spec.transitions.len(), 1);
+        let t = &spec.transitions[0];
+        assert_eq!(t.transition.transition_id, "missing::node");
+        assert!(matches!(t.kind, ExecutionTransitionKind::Terminal));
+        assert_eq!(t.logical_group.as_deref(), Some("execute"));
+        assert!(t.node_type.is_none());
+    }
+
+    #[test]
+    fn build_execution_net_maps_all_node_types_and_join_policy() {
+        // Nodes cover every NodeType arm (5978-5986). Edge a→b makes b's
+        // incoming count 1 (AllOf); the source a has incoming 0 (AnyOf).
+        let net = RegisteredNet {
+            nodes: vec![
+                net_node("p::a", NodeType::Task, 0),
+                net_node("p::b", NodeType::Router, 1),
+                net_node("p::c", NodeType::Gate, 1),
+                net_node("p::d", NodeType::Terminal, 2),
+            ],
+            edges: vec![RegisteredNetEdge {
+                from: "p::a".to_string(),
+                to: "p::b".to_string(),
+                kind: RegisteredNetEdgeKind::Data,
+                label: Some("payload".to_string()),
+            }],
+            diagnostics: Vec::new(),
+        };
+        let selected = BTreeSet::from([
+            "p::a".to_string(),
+            "p::b".to_string(),
+            "p::c".to_string(),
+            "p::d".to_string(),
+        ]);
+        // Target is selected → no fallback terminal appended.
+        let fallback = registered_node("p::a", NodeType::Task);
+        let spec = build_execution_net(&net, &selected, "p::a", &fallback);
+        assert_eq!(spec.transitions.len(), 4);
+        let by_id = |id: &str| {
+            spec.transitions
+                .iter()
+                .find(|t| t.transition.transition_id == id)
+                .expect("transition present")
+        };
+        assert!(matches!(by_id("p::a").kind, ExecutionTransitionKind::Task));
+        assert!(matches!(
+            by_id("p::b").kind,
+            ExecutionTransitionKind::Router { .. }
+        ));
+        assert!(matches!(
+            by_id("p::c").kind,
+            ExecutionTransitionKind::Gate { .. }
+        ));
+        assert!(matches!(
+            by_id("p::d").kind,
+            ExecutionTransitionKind::Terminal
+        ));
+        // a has no incoming selected edge → AnyOf; b has one → AllOf.
+        use crate::execution::net::JoinPolicy;
+        assert!(matches!(
+            by_id("p::a").transition.join_policy,
+            JoinPolicy::AnyOf
+        ));
+        assert!(matches!(
+            by_id("p::b").transition.join_policy,
+            JoinPolicy::AllOf
+        ));
+    }
+
+    #[test]
+    fn build_execution_net_appends_fallback_terminal_when_target_unselected() {
+        // Selected nodes exist, but the requested target fqn is NOT among them
+        // → the extra fallback Terminal transition is appended (5998-6010).
+        let net = RegisteredNet {
+            nodes: vec![net_node("p::a", NodeType::Task, 0)],
+            edges: Vec::new(),
+            diagnostics: Vec::new(),
+        };
+        let selected = BTreeSet::from(["p::a".to_string()]);
+        let fallback = registered_node("p::target", NodeType::Terminal);
+        let spec = build_execution_net(&net, &selected, "p::target", &fallback);
+        assert_eq!(spec.transitions.len(), 2);
+        let fallback_t = spec
+            .transitions
+            .iter()
+            .find(|t| t.transition.transition_id == "p::target")
+            .expect("fallback terminal appended");
+        assert!(matches!(fallback_t.kind, ExecutionTransitionKind::Terminal));
+        assert!(fallback_t.node_type.is_none());
+    }
+
+    // ── build_execution_payload (6077-6084) ─────────────────────────────
+    fn token_with_payload(payload: Value) -> Token {
+        Token {
+            key: CorrelationKey::new(""),
+            payload,
+            meta: TokenMeta {
+                execution_id: "e".to_string(),
+                transition_id: "t".to_string(),
+                logical_group: "g".to_string(),
+                sequence: 0,
+                outcome: NodeOutcome::Success,
+            },
+        }
+    }
+
+    #[test]
+    fn build_execution_payload_merges_labeled_inputs_only() {
+        let mut base = Map::new();
+        base.insert("keep".to_string(), json!(1));
+        let inputs = vec![
+            // Labeled input whose payload has the field → merged in.
+            TriggerInput {
+                place_id: "pl1".to_string(),
+                label: Some("added".to_string()),
+                token: token_with_payload(json!({ "added": 42, "extra": 9 })),
+            },
+            // No label → skipped (6078-6080).
+            TriggerInput {
+                place_id: "pl2".to_string(),
+                label: None,
+                token: token_with_payload(json!({ "ignored": 1 })),
+            },
+            // Labeled but field absent from payload → skipped (6081-6083).
+            TriggerInput {
+                place_id: "pl3".to_string(),
+                label: Some("absent".to_string()),
+                token: token_with_payload(json!({ "other": 1 })),
+            },
+        ];
+        let out = build_execution_payload(&base, &inputs);
+        assert_eq!(out.get("keep"), Some(&json!(1)));
+        assert_eq!(out.get("added"), Some(&json!(42)));
+        // Only the named field is copied, not sibling fields from the token.
+        assert!(out.get("extra").is_none());
+        assert!(out.get("absent").is_none());
+    }
+
+    // ── fill_missing_execution_traces (6126-6134) ───────────────────────
+    #[test]
+    fn fill_missing_execution_traces_inserts_placeholder_and_sets_outcome() {
+        let mut outcomes = BTreeMap::new();
+        outcomes.insert("p::new".to_string(), NodeOutcome::Failure);
+        outcomes.insert("p::existing".to_string(), NodeOutcome::Success);
+        let output = ExecutionOutput {
+            execution_id: "e".to_string(),
+            order: Vec::new(),
+            outcomes,
+            keyed_outcomes: BTreeMap::new(),
+            metrics: ExecutionMetrics::default(),
+        };
+        let mut traces = BTreeMap::new();
+        // Pre-seed one trace with existing data to prove only the outcome is set.
+        traces.insert(
+            "p::existing".to_string(),
+            ExecutionInvocationTrace {
+                node_fqn: "p::existing".to_string(),
+                plugin_path: "p".to_string(),
+                node_id: "existing".to_string(),
+                attempt: 3,
+                outcome: None,
+                request_payload: Some(json!({"r": 1})),
+                response_payload: None,
+                error: None,
+            },
+        );
+        fill_missing_execution_traces(&output, &mut traces);
+        // New fqn gets a default-shaped placeholder trace.
+        let new_trace = traces.get("p::new").expect("placeholder inserted");
+        assert_eq!(new_trace.node_fqn, "p::new");
+        assert_eq!(new_trace.plugin_path, "");
+        assert_eq!(new_trace.attempt, 0);
+        assert_eq!(new_trace.outcome, Some(NodeOutcome::Failure));
+        // Existing trace keeps its fields but gains the outcome.
+        let existing = traces.get("p::existing").expect("existing preserved");
+        assert_eq!(existing.attempt, 3);
+        assert_eq!(existing.request_payload, Some(json!({"r": 1})));
+        assert_eq!(existing.outcome, Some(NodeOutcome::Success));
+    }
+
+    // ── plugin_path_from_runtime_error: every plugin-bearing variant + None
+    //    (6387-6408) ─────────────────────────────────────────────────────
+    #[test]
+    fn plugin_path_from_runtime_error_covers_all_variants() {
+        use crate::core::models::AbiFingerprint;
+        use std::path::PathBuf;
+        let pp = |s: &str| Some(s.to_string());
+
+        assert_eq!(
+            plugin_path_from_runtime_error(&RuntimeError::InvalidChildSource {
+                parent: "root".to_string(),
+                child_source: "c".to_string(),
+                reason: "r".to_string(),
+            }),
+            pp("root")
+        );
+        assert_eq!(
+            plugin_path_from_runtime_error(&RuntimeError::DuplicatePluginPath {
+                plugin_path: "dup".to_string(),
+                first: PathBuf::from("/a"),
+                second: PathBuf::from("/b"),
+            }),
+            pp("dup")
+        );
+        assert_eq!(
+            plugin_path_from_runtime_error(&RuntimeError::MissingScaffold {
+                plugin_path: "ms".to_string(),
+                missing: vec!["x".to_string()],
+            }),
+            pp("ms")
+        );
+        assert_eq!(
+            plugin_path_from_runtime_error(&RuntimeError::DocsContract {
+                plugin_path: "dc".to_string(),
+                message: "m".to_string(),
+            }),
+            pp("dc")
+        );
+        assert_eq!(
+            plugin_path_from_runtime_error(&RuntimeError::ArtifactIndexMissing {
+                plugin_path: "aim".to_string(),
+            }),
+            pp("aim")
+        );
+        assert_eq!(
+            plugin_path_from_runtime_error(&RuntimeError::ArtifactFileMissing {
+                plugin_path: "afm".to_string(),
+                artifact_path: PathBuf::from("/a.so"),
+            }),
+            pp("afm")
+        );
+        assert_eq!(
+            plugin_path_from_runtime_error(&RuntimeError::ArtifactHashMismatch {
+                plugin_path: "ahm".to_string(),
+                expected: "e".to_string(),
+                actual: "a".to_string(),
+            }),
+            pp("ahm")
+        );
+        assert_eq!(
+            plugin_path_from_runtime_error(&RuntimeError::AbiMismatch {
+                plugin_path: "abi".to_string(),
+                expected: Box::new(AbiFingerprint::current_build("c", "a")),
+                actual: Box::new(AbiFingerprint::current_build("c2", "a2")),
+                fingerprint_diff: Vec::new(),
+            }),
+            pp("abi")
+        );
+        assert_eq!(
+            plugin_path_from_runtime_error(&RuntimeError::PluginUnavailable {
+                plugin_path: "pu".to_string(),
+                reason: PluginUnavailableReason::InitFailed,
+                required: true,
+            }),
+            pp("pu")
+        );
+        assert_eq!(
+            plugin_path_from_runtime_error(&RuntimeError::PluginExecutionUnsupported {
+                plugin_path: "peu".to_string(),
+                artifact_path: PathBuf::from("/a"),
+            }),
+            pp("peu")
+        );
+        assert_eq!(
+            plugin_path_from_runtime_error(&RuntimeError::PluginInvocationFailed {
+                plugin_path: "pif".to_string(),
+                message: "m".to_string(),
+            }),
+            pp("pif")
+        );
+        assert_eq!(
+            plugin_path_from_runtime_error(&RuntimeError::PluginDocsNotFound {
+                plugin_path: "pdnf".to_string(),
+            }),
+            pp("pdnf")
+        );
+        assert_eq!(
+            plugin_path_from_runtime_error(&RuntimeError::NodeDocsNotFound {
+                plugin_path: "ndnf".to_string(),
+                node_id: "n".to_string(),
+            }),
+            pp("ndnf")
+        );
+        assert_eq!(
+            plugin_path_from_runtime_error(&RuntimeError::PermissionDenied {
+                plugin_path: "pd".to_string(),
+                service: "s".to_string(),
+            }),
+            pp("pd")
+        );
+        assert_eq!(
+            plugin_path_from_runtime_error(&RuntimeError::ContextPluginUnavailable {
+                plugin_path: "cpu".to_string(),
+            }),
+            pp("cpu")
+        );
+        assert_eq!(
+            plugin_path_from_runtime_error(&RuntimeError::ServiceNotFound {
+                plugin_path: "snf".to_string(),
+                service: "s".to_string(),
+            }),
+            pp("snf")
+        );
+        assert_eq!(
+            plugin_path_from_runtime_error(&RuntimeError::ServiceTypeMismatch {
+                plugin_path: "stm".to_string(),
+                service: "s".to_string(),
+            }),
+            pp("stm")
+        );
+        assert_eq!(
+            plugin_path_from_runtime_error(&RuntimeError::DuplicateService {
+                plugin_path: "ds".to_string(),
+                service: "s".to_string(),
+            }),
+            pp("ds")
+        );
+    }
+
+    // ── determine_root_plugin_path: empty-target error (6417) ────────────
+    fn empty_snapshot() -> super::RuntimeSnapshot {
+        super::runtime_snapshot_from_output(
+            crate::plugin::loader::LoadOutput {
+                execution_id: "snap-empty".to_string(),
+                plugin_registry: crate::plugin::registry::PluginRegistry::default(),
+                node_registry: crate::plugin::registry::NodeRegistry::default(),
+                doc_registry: crate::service::doc_registry::DocRegistry::default(),
+                graph_registry: crate::service::graph_registry::GraphRegistry::default(),
+                context: crate::context::RuntimeContext::default(),
+                metrics: crate::plugin::loader::LoaderMetrics::default(),
+            },
+            std::path::PathBuf::from("/tmp/cordis-empty-staged"),
+        )
+    }
+
+    #[test]
+    fn determine_root_plugin_path_empty_targets_errors_byte_exact() {
+        // The empty target list errors before the snapshot registry is
+        // ever consulted.
+        let snapshot = empty_snapshot();
+        let err =
+            determine_root_plugin_path(&snapshot, &[]).expect_err("empty target list must error");
+        assert!(
+            matches!(&err, RuntimeError::InvalidArgument { message }
+                if message == "plugin iteration requires target_plugin_paths or an observed issue"),
+            "unexpected: {err:?}"
+        );
+    }
+
+    #[test]
+    fn determine_root_plugin_path_errors_when_no_shared_loaded_root() {
+        // Two targets share a common prefix ("root") but that prefix is not in
+        // the (empty) plugin registry, so all candidates pop off and the final
+        // "do not share a loaded subtree root" error fires (6430-6449).
+        let snapshot = empty_snapshot();
+        let err =
+            determine_root_plugin_path(&snapshot, &["root/a".to_string(), "root/b".to_string()])
+                .expect_err("no loaded root must error");
+        assert!(
+            matches!(&err, RuntimeError::InvalidArgument { message }
+                if message == "target plugin paths do not share a loaded subtree root: root/a, root/b"),
+            "unexpected: {err:?}"
+        );
+    }
+
+    // ── normalize_request_id (6628-6629) ────────────────────────────────
+    #[test]
+    fn normalize_request_id_keeps_nonblank_and_generates_for_blank() {
+        assert_eq!(
+            normalize_request_id(Some("given-id".to_string()), "pfx"),
+            "given-id"
+        );
+        // Blank / whitespace / None all fall to the generated branch.
+        let gen1 = normalize_request_id(Some("   ".to_string()), "pfx");
+        assert!(gen1.starts_with("pfx-"));
+        let gen2 = normalize_request_id(None, "pfx");
+        assert!(gen2.starts_with("pfx-"));
+        // The process-local counter keeps successive generated ids distinct.
+        assert_ne!(gen1, gen2);
+    }
+
+    // ── artifact_paths_to_backup (6832-6839) ────────────────────────────
+    #[test]
+    fn artifact_paths_to_backup_handles_empty_missing_and_present() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let fixtures = temp.path();
+        // Empty/whitespace-only path → nothing.
+        assert!(artifact_paths_to_backup(fixtures, "/").is_empty());
+        // Non-empty path but no artifact file on disk → nothing.
+        assert!(artifact_paths_to_backup(fixtures, "root/child").is_empty());
+        // Now create artifacts/root/child.so → returned as (rel, abs).
+        let so = fixtures.join("artifacts/root/child.so");
+        std::fs::create_dir_all(so.parent().unwrap()).unwrap();
+        std::fs::write(&so, b"bytes").unwrap();
+        let out = artifact_paths_to_backup(fixtures, "root/child");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, "artifacts/root/child.so");
+        assert_eq!(out[0].1, so);
+    }
+
+    // ── default_snapshot_root: canonicalize + hash layout (6977) ─────────
+    #[test]
+    fn default_snapshot_root_is_deterministic_under_temp_dir() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let a = default_snapshot_root(temp.path());
+        let b = default_snapshot_root(temp.path());
+        assert_eq!(a, b, "same fixtures root hashes to the same snapshot root");
+        assert!(a.starts_with(std::env::temp_dir().join("cordis-runtime-host")));
+    }
+
+    // ── collect_context_files_recursive + insert_context_file_if_exists +
+    //    collect_plugin_context_paths (filesystem seams,
+    //    6463-6528, 6575, 6611-6621) ─────────────────────────────────────
+    #[test]
+    fn collect_context_files_recursive_walks_tracked_extensions() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        let src = root.join("plugins/foo/src");
+        std::fs::create_dir_all(src.join("nested")).unwrap();
+        std::fs::write(src.join("lib.rs"), b"// rs").unwrap();
+        std::fs::write(src.join("nested/core.rs"), b"// rs").unwrap();
+        // Non-tracked extension is skipped.
+        std::fs::write(src.join("blob.bin"), b"bin").unwrap();
+        let mut files = BTreeSet::new();
+        collect_context_files_recursive(root, &src, &mut files).expect("walk ok");
+        assert!(files.contains("plugins/foo/src/lib.rs"));
+        assert!(files.contains("plugins/foo/src/nested/core.rs"));
+        assert!(!files.iter().any(|p| p.ends_with("blob.bin")));
+    }
+
+    #[test]
+    fn insert_context_file_if_exists_only_inserts_present_paths() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        std::fs::create_dir_all(root.join("plugins/foo")).unwrap();
+        std::fs::write(root.join("plugins/foo/Cargo.toml"), b"[package]").unwrap();
+        let mut files = BTreeSet::new();
+        insert_context_file_if_exists(root, "plugins/foo/Cargo.toml", &mut files);
+        insert_context_file_if_exists(root, "plugins/foo/missing.rs", &mut files);
+        assert!(files.contains("plugins/foo/Cargo.toml"));
+        assert_eq!(files.len(), 1);
+    }
+
+    #[test]
+    fn collect_plugin_context_paths_errors_when_no_files_discovered() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        // No plugins/ tree at all → all_files empty → InvalidArgument.
+        let err = collect_plugin_context_paths(temp.path(), "root", &["root".to_string()])
+            .expect_err("no discovered files must error");
+        assert!(
+            matches!(&err, RuntimeError::InvalidArgument { message }
+                if message == "no planner context files discovered for plugin iteration"),
+            "unexpected: {err:?}"
+        );
+    }
+
+    #[test]
+    fn collect_plugin_context_paths_gathers_all_and_focus_paths() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        let base = root.join("plugins/root");
+        std::fs::create_dir_all(base.join("src")).unwrap();
+        std::fs::create_dir_all(base.join("tests")).unwrap();
+        std::fs::create_dir_all(base.join("docs/human")).unwrap();
+        std::fs::write(base.join("Cargo.toml"), b"[package]").unwrap();
+        std::fs::write(base.join("src/lib.rs"), b"// lib").unwrap();
+        std::fs::write(base.join("src/core.rs"), b"// core").unwrap();
+        std::fs::write(base.join("tests/it.rs"), b"// test").unwrap();
+        std::fs::write(base.join("docs/human/overview.md"), b"# ov").unwrap();
+        let paths = collect_plugin_context_paths(root, "root", &["root".to_string()])
+            .expect("context paths gathered");
+        assert!(paths
+            .all_paths
+            .contains(&"plugins/root/Cargo.toml".to_string()));
+        assert!(paths
+            .all_paths
+            .contains(&"plugins/root/src/lib.rs".to_string()));
+        // Focus paths are a filtered subset of all_paths (root manifest + src).
+        assert!(paths
+            .focus_paths
+            .contains(&"plugins/root/Cargo.toml".to_string()));
+        assert!(paths
+            .focus_paths
+            .iter()
+            .all(|p| paths.all_paths.contains(p)));
+    }
+
+    // ── collect_focus_context_paths: depth 1-2 focus-plugin loop
+    //    (via collect_plugin_context_paths) ──────────────────────────────
+    #[test]
+    fn collect_plugin_context_paths_includes_depth_one_focus_child() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        // Root plugin.
+        let root_dir = root.join("plugins/root");
+        std::fs::create_dir_all(root_dir.join("src")).unwrap();
+        std::fs::write(root_dir.join("Cargo.toml"), b"[package]").unwrap();
+        std::fs::write(root_dir.join("src/lib.rs"), b"// root lib").unwrap();
+        // Depth-1 child plugin (root/child) — exercises the focus_plugins loop
+        // body in collect_focus_context_paths (depth in 1..=2).
+        let child_dir = root.join("plugins/root/child");
+        std::fs::create_dir_all(child_dir.join("src")).unwrap();
+        std::fs::write(child_dir.join("Cargo.toml"), b"[package]").unwrap();
+        std::fs::write(child_dir.join("src/core.rs"), b"// child core").unwrap();
+
+        let paths = collect_plugin_context_paths(
+            root,
+            "root",
+            &["root".to_string(), "root/child".to_string()],
+        )
+        .expect("context paths gathered");
+        // The depth-1 child's source entries land in the focus set.
+        assert!(paths
+            .focus_paths
+            .contains(&"plugins/root/child/Cargo.toml".to_string()));
+        assert!(paths
+            .focus_paths
+            .contains(&"plugins/root/child/src/core.rs".to_string()));
+    }
+
+    // ── cleanup_stale_snapshot_dirs (6669 / current 6878-6905) ──────────
+    #[test]
+    fn cleanup_stale_snapshot_dirs_removes_dead_and_keeps_live() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        // Missing root → early return (read_dir Err), no panic.
+        cleanup_stale_snapshot_dirs(&root.join("does-not-exist"));
+
+        // A directory owned by a dead pid (u32::MAX never a live pid) → removed.
+        let dead = root.join(format!("snapshot-{}-123", u32::MAX));
+        std::fs::create_dir_all(&dead).unwrap();
+        // Old nanos-only format (first segment not a u32 pid) → treated stale.
+        let old_format = root.join("snapshot-9999999999999999999-abc");
+        std::fs::create_dir_all(&old_format).unwrap();
+        // A live-owner dir named with THIS process's pid → kept.
+        let live = root.join(make_snapshot_dir_name());
+        std::fs::create_dir_all(&live).unwrap();
+        // A non-snapshot dir and a plain file → skipped, left intact.
+        let other_dir = root.join("not-a-snapshot");
+        std::fs::create_dir_all(&other_dir).unwrap();
+        let stray_file = root.join("snapshot-1-file");
+        std::fs::write(&stray_file, b"x").unwrap();
+
+        cleanup_stale_snapshot_dirs(root);
+
+        assert!(!dead.exists(), "dead-owner snapshot dir must be removed");
+        assert!(!old_format.exists(), "legacy-format dir must be removed");
+        assert!(live.exists(), "live-owner snapshot dir must be kept");
+        assert!(other_dir.exists(), "non-snapshot dir must be untouched");
+        assert!(
+            stray_file.exists(),
+            "non-dir snapshot entry must be untouched"
+        );
+    }
+
+    // ── workspace_manifest_lock::acquire (6726-6766 / current 6934-6968) ─
+    #[test]
+    fn workspace_manifest_lock_acquire_creates_parent_and_locks() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        // Parent directory does not exist yet → acquire create_dir_all's it,
+        // then opens+flocks the lock file. Guard drop releases the lock.
+        let lock_path = temp.path().join("nested/dir/.workspace-manifest.lock");
+        {
+            let _guard = workspace_manifest_lock::acquire(&lock_path);
+            assert!(lock_path.exists(), "lock file must be created");
+            assert!(lock_path.parent().unwrap().exists());
+        }
+        // Re-acquire after the first guard dropped (lock released) succeeds.
+        let _guard2 = workspace_manifest_lock::acquire(&lock_path);
+        assert!(lock_path.exists());
+    }
+
+    // ── build_snapshot_with_staged_root: PluginUnavailable branch
+    //    (6161-6164 / current 6370-6378) ─────────────────────────────────
+    #[test]
+    fn build_snapshot_errors_when_a_plugin_is_unavailable() {
+        use crate::core::models::{
+            AbiFingerprint, ArtifactIndex, ArtifactIndexEntry, ArtifactKind, LoaderBudget,
+            PluginDocs, ARTIFACT_INDEX_SCHEMA_VERSION,
+        };
+        use crate::plugin::loader::{Loader, LoaderConfig};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        let index_path = root.join("artifacts/index.json");
+        std::fs::create_dir_all(index_path.parent().unwrap()).unwrap();
+
+        // Single plugin whose artifact file does not exist on disk → the loader
+        // marks it Unavailable(ArtifactMissing) rather than aborting, and
+        // build_snapshot_with_staged_root then converts that into a
+        // RuntimeError::PluginUnavailable.
+        let docs = PluginDocs {
+            plugin_id: "lonely".to_string(),
+            plugin_path: "lonely".to_string(),
+            plugin_version: "0.1.0".to_string(),
+            abi_version: 2,
+            command_name: None,
+            nodes: Vec::new(),
+            system_hint: None,
+        };
+        let entry = ArtifactIndexEntry {
+            plugin_path: "lonely".to_string(),
+            version: "0.1.0".to_string(),
+            abi_fingerprint: AbiFingerprint::current_build("crate_lonely_v1", "api_v2"),
+            // Points at a file that will never exist under the temp root.
+            artifact_path: "lonely.json".to_string(),
+            sha256: "0".repeat(64),
+            built_at: "0".to_string(),
+            parent: None,
+            required: false,
+            grants_from_parent: Vec::new(),
+            docs,
+            exports: Vec::new(),
+            execution: None,
+            artifact_kind: ArtifactKind::Json,
+            build_fingerprint: "bf".to_string(),
+            input_probe: Default::default(),
+            local_path_deps: Vec::new(),
+        };
+        let index = ArtifactIndex {
+            schema_version: ARTIFACT_INDEX_SCHEMA_VERSION,
+            generated_at: "now".to_string(),
+            topo_order: vec!["lonely".to_string()],
+            entries: vec![entry],
+        };
+        std::fs::write(&index_path, serde_json::to_string(&index).unwrap()).unwrap();
+
+        let loader = Loader::new(LoaderConfig {
+            plugins_root: root.join("plugins"),
+            artifact_index_path: index_path,
+            budget: LoaderBudget {
+                max_total_plugins: 16,
+                max_total_nodes: 64,
+                load_timeout_ms: 30_000,
+            },
+        });
+        let staged = root.join("staged");
+        let err = build_snapshot_with_staged_root(&loader, staged.clone())
+            .expect_err("unavailable plugin must surface PluginUnavailable");
+        assert!(
+            matches!(&err, RuntimeError::PluginUnavailable { plugin_path, required, .. }
+                if plugin_path == "lonely" && !*required),
+            "unexpected: {err:?}"
+        );
+        // The staged artifact root is cleaned up on the error path.
+        assert!(!staged.exists(), "staged root must be removed on failure");
+    }
+
+    // ── render_child_plugin_core: empty PascalCase part (5874) ──────────
+    #[test]
+    fn render_child_plugin_core_handles_empty_dash_segment() {
+        // A trailing/leading/double dash produces an empty split part, driving
+        // the `None => String::new()` arm of the chars().next() match.
+        let core = render_child_plugin_core("foo--bar");
+        // Empty middle part contributes nothing; result is still "FooBar".
+        assert!(core.contains("pub enum FooBarError"));
+        assert!(core.contains("pub struct FooBarPlugin"));
+    }
+
+    // ── plugin_change_reasons: grants / load_result / fingerprint_diff
+    //    arms (6104, 6107, 6113) ─────────────────────────────────────────
+    #[test]
+    fn plugin_change_reasons_reports_grants_load_result_and_fingerprint() {
+        use crate::core::models::PluginLoadResult;
+        let base = crate::plugin::registry::RegisteredPlugin {
+            plugin_path: "root/child".to_string(),
+            parent: None,
+            required: false,
+            grants_from_parent: BTreeSet::new(),
+            load_result: PluginLoadResult::Loaded,
+            docs: None,
+            artifact_path: None,
+            artifact_kind: None,
+            abi_fingerprint: None,
+            execution: None,
+            fingerprint_diff: Vec::new(),
+        };
+
+        let mut grants = base.clone();
+        grants.grants_from_parent = BTreeSet::from(["fs".to_string()]);
+        assert_eq!(
+            plugin_change_reasons(&base, &grants),
+            vec!["grants_changed".to_string()]
+        );
+
+        let mut load = base.clone();
+        load.load_result =
+            PluginLoadResult::Unavailable(crate::core::models::PluginUnavailableReason::InitFailed);
+        assert_eq!(
+            plugin_change_reasons(&base, &load),
+            vec!["load_result_changed".to_string()]
+        );
+
+        let mut fp = base.clone();
+        fp.fingerprint_diff = vec!["crate_hash".to_string()];
+        assert_eq!(
+            plugin_change_reasons(&base, &fp),
+            vec!["fingerprint_diff_changed".to_string()]
+        );
+    }
+
+    // ── atomic_write_bytes: no-filename error + rename success (7019,
+    //    plus the create_dir_all/write happy path) ──────────────────────
+    #[test]
+    fn atomic_write_bytes_errors_when_target_has_no_filename() {
+        // Root path "/" has no file_name → InvalidInput error (7019-7022).
+        let err = atomic_write_bytes(std::path::Path::new("/"), b"x")
+            .expect_err("root path has no filename");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn atomic_write_bytes_writes_and_replaces_atomically() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        // Nested parent is created on demand; file is written then a second
+        // write replaces it via the rename path.
+        let target = temp.path().join("nested/dir/out.json");
+        atomic_write_bytes(&target, b"first").expect("first write");
+        assert_eq!(std::fs::read(&target).unwrap(), b"first");
+        atomic_write_bytes(&target, b"second").expect("replace write");
+        assert_eq!(std::fs::read(&target).unwrap(), b"second");
+    }
+
+    #[test]
+    fn atomic_write_bytes_cleans_tmp_when_rename_fails() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        // Target is a NON-EMPTY directory: rename(tmp_file -> dir) fails with
+        // ENOTEMPTY/EISDIR, driving the cleanup + error-return arm (7030-7032).
+        let target = temp.path().join("target-dir");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("occupant"), b"x").unwrap();
+
+        let err = atomic_write_bytes(&target, b"payload")
+            .expect_err("rename onto a non-empty dir must fail");
+        // The error is surfaced (kind varies by platform).
+        let _ = err;
+        // The temp sidecar file was removed on the failure path.
+        let tmp = temp
+            .path()
+            .join(format!("target-dir.cordis-tmp.{}", std::process::id()));
+        assert!(
+            !tmp.exists(),
+            "temp sidecar must be cleaned up on rename failure"
+        );
+    }
+
+    // ── workspace_manifest_lock::acquire: open-failure fallback
+    //    (6946-6951) ─────────────────────────────────────────────────────
+    #[test]
+    fn workspace_manifest_lock_acquire_open_failure_returns_fileless_guard() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        // Point the lock path at an existing *directory*: OpenOptions::open
+        // fails (cannot open a dir read/write), so acquire logs and returns a
+        // Guard with `file: None`. create_dir_all(parent) succeeds first.
+        let dir_as_lock = temp.path().join("iam-a-directory");
+        std::fs::create_dir_all(&dir_as_lock).unwrap();
+        // Must not panic; Drop of the fileless guard is a no-op.
+        let _guard = workspace_manifest_lock::acquire(&dir_as_lock);
+    }
+
+    // ── normalize_warning_source_path: RootDir component arm (5998) ─────
+    #[test]
+    fn normalize_warning_source_path_rejects_retained_root_component() {
+        // An empty fixtures_root strips no prefix from an absolute path, so the
+        // leading RootDir component survives into the loop and hits the
+        // `RootDir | Prefix(_) => return None` arm.
+        assert_eq!(
+            normalize_warning_source_path("/abs/foo.rs", std::path::Path::new("")),
+            None
+        );
+    }
+}
+
+/// Coverage batch for host.rs lines 3500-5500 (cov6 numbering; the "seam-100"
+/// terminal batch). These are the `iterate_plugins` orchestration failure arms,
+/// the plugin-iteration agent-tool backend, and the surrounding pure helpers.
+/// Integration tests reach the happy paths through the 200s dylib-rebuilding
+/// walk test; this module drives the private methods and pure functions
+/// directly against near-instant hermetic fixtures (empty `artifacts/index.json`
+/// → no dlopen) or with zero I/O at all. Kept as its own module so concurrent
+/// edits never collide with `mod tests` / the other seam modules.
+#[cfg(test)]
+mod region_3500_5500_seam_tests {
+    use super::{
+        enrich_plugin_iteration_edit_error, format_agent_transcript_excerpt, parse_agent_args,
+        transcript_excerpt, AgentBackend, AgentSessionHandle, AgentSessionKind, InvocationSample,
+        ManagedAgentSession, ManagedAgentState, PluginIterationAgentBackend,
+        PluginIterationAgentState, PluginIterationContextPaths, PluginIterationRunState,
+        PreparedPluginIteration, ReloadReport, ReplaceFilesExactArgs, RetiredSnapshot, RuntimeHost,
+        ScaffoldChildPluginArgs, PLUGIN_AGENT_TOOL_RECORD_ITERATION_SUMMARY,
+        PLUGIN_AGENT_TOOL_REPLACE_FILES_EXACT,
+    };
+    use crate::agent::AgentTranscriptEntry;
+    use crate::core::error::RuntimeError;
+    use crate::core::models::PluginUnavailableReason;
+    use crate::kernel::plugin_iteration::{
+        CanaryVerdict, KernelPluginIssueSource, PluginEditOpKind, PluginEditOperation,
+        PluginIterationFinalVerdict, VerifierVerdict,
+    };
+    use crate::kernel::verifier::VerificationProfile;
+    use cordis_plugin_sdk::{AbiFingerprint, NodeDoc, NodeType, PluginDocs};
+    use serde_json::{json, Value};
+    use serial_test::serial;
+    use std::collections::BTreeMap;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    // ───────────────────────── hermetic fixtures ─────────────────────────
+
+    /// An `artifacts/index.json` with zero entries: `RuntimeHost::boot`
+    /// registers no plugins and never dlopens. Near-instant on any target.
+    fn setup_empty_fixture() -> (TempDir, PathBuf) {
+        let temp = TempDir::new().expect("tempdir");
+        let fixtures = temp.path().join("fixtures");
+        let artifacts = fixtures.join("artifacts");
+        fs::create_dir_all(&artifacts).expect("create artifacts dir");
+        fs::write(
+            artifacts.join("index.json"),
+            r#"{
+  "schema_version": 2,
+  "generated_at": "2026-07-25T00:00:00Z",
+  "topo_order": [],
+  "entries": []
+}
+"#,
+        )
+        .expect("write empty artifact index");
+        (temp, fixtures)
+    }
+
+    fn empty_host() -> (TempDir, RuntimeHost) {
+        let (temp, fixtures) = setup_empty_fixture();
+        let host = RuntimeHost::boot(&fixtures).expect("boot on empty index");
+        (temp, host)
+    }
+
+    fn prepared_for(root: &str, targets: &[&str]) -> PreparedPluginIteration {
+        let target_plugin_paths: Vec<String> = targets.iter().map(|s| (*s).to_string()).collect();
+        let allowed_plugin_roots: BTreeMap<String, String> = target_plugin_paths
+            .iter()
+            .map(|p| (p.clone(), format!("plugins/{p}")))
+            .collect();
+        PreparedPluginIteration {
+            iteration_id: "iter-seam-3500".to_string(),
+            issue_id: "issue-seam-3500".to_string(),
+            root_plugin_path: root.to_string(),
+            target_plugin_paths,
+            source: None,
+            summary: "seam iteration".to_string(),
+            manual_approved: false,
+            tests_command: None,
+            safety_command: None,
+            verify_profile: VerificationProfile::Default,
+            quality_score: None,
+            edit_plan: None,
+            instruction: None,
+            allowed_plugin_roots,
+        }
+    }
+
+    // ───────────────────────── pure functions ────────────────────────────
+
+    #[test]
+    #[serial]
+    fn transcript_excerpt_keeps_tail_in_order() {
+        let entries: Vec<AgentTranscriptEntry> = (0..5)
+            .map(|i| AgentTranscriptEntry::User {
+                content: format!("m{i}"),
+            })
+            .collect();
+        let out = transcript_excerpt(&entries, 3);
+        // Last three, still in chronological order.
+        let contents: Vec<String> = out
+            .iter()
+            .map(|e| match e {
+                AgentTranscriptEntry::User { content } => content.clone(),
+                _ => unreachable!(),
+            })
+            .collect();
+        assert_eq!(contents, vec!["m2", "m3", "m4"]);
+    }
+
+    #[test]
+    #[serial]
+    fn format_agent_transcript_excerpt_renders_all_three_variants() {
+        let entries = vec![
+            AgentTranscriptEntry::User {
+                content: "hello   world".to_string(),
+            },
+            AgentTranscriptEntry::Assistant {
+                content: "an answer".to_string(),
+                response_id: Some("resp-1".to_string()),
+            },
+            AgentTranscriptEntry::Assistant {
+                content: "no id answer".to_string(),
+                response_id: None,
+            },
+            AgentTranscriptEntry::Tool {
+                name: "create_file".to_string(),
+                arguments: json!({}),
+                ok: false,
+                output: None,
+                error: Some("boom happened".to_string()),
+            },
+            AgentTranscriptEntry::Tool {
+                name: "json_set".to_string(),
+                arguments: json!({}),
+                ok: true,
+                output: None,
+                error: None,
+            },
+        ];
+        let rendered = format_agent_transcript_excerpt(&entries);
+        // whitespace is flattened in the user line.
+        assert!(rendered.contains("user: hello world"));
+        assert!(rendered.contains("assistant[resp-1]: an answer"));
+        assert!(rendered.contains("assistant: no id answer"));
+        assert!(rendered.contains("tool create_file ok=false error=boom happened"));
+        assert!(rendered.contains("tool json_set ok=true"));
+        // The ok=true tool line carries no error suffix.
+        let ok_line = rendered
+            .lines()
+            .find(|l| l.starts_with("tool json_set"))
+            .expect("json_set line");
+        assert!(!ok_line.contains("error="));
+    }
+
+    #[test]
+    #[serial]
+    fn parse_agent_args_wraps_deserialize_error_byte_exact() {
+        // `ReplaceFilesExactArgs` requires an `edits` array; a bare string is
+        // the wrong shape → serde error wrapped as InvalidArgument.
+        let out = parse_agent_args::<ReplaceFilesExactArgs>(
+            json!("not an object"),
+            PLUGIN_AGENT_TOOL_REPLACE_FILES_EXACT,
+        );
+        let err = out.expect_err("wrong shape must error");
+        match err {
+            RuntimeError::InvalidArgument { message } => {
+                assert!(
+                    message.starts_with(&format!(
+                        "agent tool {PLUGIN_AGENT_TOOL_REPLACE_FILES_EXACT} received invalid arguments: "
+                    )),
+                    "unexpected message: {message}"
+                );
+            }
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn enrich_edit_error_returns_stale_snippet_hint_for_replace_exact() {
+        let temp = TempDir::new().expect("tempdir");
+        let workspace = temp.path();
+        let rel = "plugins/mini/src/lib.rs";
+        let abs = workspace.join(rel);
+        fs::create_dir_all(abs.parent().unwrap()).expect("mkdir");
+        fs::write(&abs, "current file body\n").expect("write file");
+
+        let operation = PluginEditOperation {
+            path: rel.to_string(),
+            kind: PluginEditOpKind::ReplaceExact,
+            expected_old_string: Some("stale".to_string()),
+            expected_sha256: None,
+            new_content: Some("new".to_string()),
+            pointer: None,
+            dotted_key: None,
+            value: None,
+        };
+        // The base error message must contain the trigger substring.
+        let base = RuntimeError::LlmResponseInvalid {
+            message: "auto update patch pattern not found in file".to_string(),
+        };
+        let enriched = enrich_plugin_iteration_edit_error(&operation, workspace, base);
+        match enriched {
+            RuntimeError::LlmResponseInvalid { message } => {
+                assert!(message.contains("The exact snippet is stale for plugins/mini/src/lib.rs"));
+                assert!(message.contains("current_sha256="));
+                assert!(message.contains("current file body"));
+            }
+            other => panic!("expected LlmResponseInvalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn enrich_edit_error_passes_through_when_not_stale_pattern() {
+        let temp = TempDir::new().expect("tempdir");
+        let operation = PluginEditOperation {
+            path: "plugins/mini/src/lib.rs".to_string(),
+            kind: PluginEditOpKind::ReplaceExact,
+            expected_old_string: Some("x".to_string()),
+            expected_sha256: None,
+            new_content: Some("y".to_string()),
+            pointer: None,
+            dotted_key: None,
+            value: None,
+        };
+        // Message lacks the "auto update patch pattern not found" trigger → the
+        // original error is returned untouched.
+        let base = RuntimeError::InvalidArgument {
+            message: "some other failure".to_string(),
+        };
+        let out = enrich_plugin_iteration_edit_error(&operation, temp.path(), base);
+        assert!(matches!(
+            out,
+            RuntimeError::InvalidArgument { message } if message == "some other failure"
+        ));
+    }
+
+    // ───────────────── record_invocation_sample cap ──────────────────────
+
+    #[test]
+    #[serial]
+    fn record_invocation_sample_caps_deque_at_64() {
+        let (_temp, host) = empty_host();
+        for i in 0..70 {
+            host.record_invocation_sample(
+                "mini",
+                "mini_echo",
+                &json!({ "n": i }).to_string(),
+                &json!({ "ok": true }).to_string(),
+            );
+        }
+        let len = host
+            .invocation_samples
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .len();
+        assert_eq!(len, 64, "deque must be capped at 64 (pop_back on overflow)");
+        // Newest (front) is the last pushed; oldest were evicted from the back.
+        let front = host
+            .invocation_samples
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .front()
+            .cloned()
+            .expect("front sample");
+        assert_eq!(front.payload, json!({ "n": 69 }));
+    }
+
+    // ───────────────── observe_reload_error arms ─────────────────────────
+
+    #[test]
+    #[serial]
+    fn observe_reload_error_maps_docs_contract_to_docs_drift() {
+        let (_temp, host) = empty_host();
+        let err = RuntimeError::DocsContract {
+            plugin_path: "alpha".to_string(),
+            message: "docs mismatch".to_string(),
+        };
+        host.observe_reload_error("reload", &err);
+        let issues = host.kernel().plugin_issues();
+        let issue = issues
+            .iter()
+            .find(|i| i.root_plugin_path == "alpha")
+            .expect("issue recorded for alpha");
+        assert_eq!(issue.source, KernelPluginIssueSource::DocsDrift);
+        assert!(issue.summary.contains("reload failed for alpha"));
+    }
+
+    #[test]
+    #[serial]
+    fn observe_reload_error_maps_contract_violation_unavailable_to_docs_drift() {
+        let (_temp, host) = empty_host();
+        let err = RuntimeError::PluginUnavailable {
+            plugin_path: "beta".to_string(),
+            reason: PluginUnavailableReason::ContractViolation,
+            required: true,
+        };
+        host.observe_reload_error("candidate_reload", &err);
+        let issues = host.kernel().plugin_issues();
+        let issue = issues
+            .iter()
+            .find(|i| i.root_plugin_path == "beta")
+            .expect("issue recorded for beta");
+        assert_eq!(issue.source, KernelPluginIssueSource::DocsDrift);
+    }
+
+    #[test]
+    #[serial]
+    fn observe_reload_error_maps_other_to_load_failure() {
+        let (_temp, host) = empty_host();
+        let err = RuntimeError::PluginUnavailable {
+            plugin_path: "gamma".to_string(),
+            reason: PluginUnavailableReason::ArtifactMissing,
+            required: false,
+        };
+        host.observe_reload_error("reload", &err);
+        let issues = host.kernel().plugin_issues();
+        let issue = issues
+            .iter()
+            .find(|i| i.root_plugin_path == "gamma")
+            .expect("issue recorded for gamma");
+        assert_eq!(issue.source, KernelPluginIssueSource::LoadFailure);
+    }
+
+    #[test]
+    #[serial]
+    fn observe_reload_error_ignores_errors_without_plugin_path() {
+        let (_temp, host) = empty_host();
+        let before = host.kernel().plugin_issues().len();
+        // Invariant carries no plugin path → early return, no issue recorded.
+        host.observe_reload_error(
+            "reload",
+            &RuntimeError::Invariant {
+                message: "no plugin here".to_string(),
+            },
+        );
+        assert_eq!(host.kernel().plugin_issues().len(), before);
+    }
+
+    // ─────────────── observe_snapshot_plugin_issues arms ─────────────────
+
+    /// Build a one-plugin snapshot whose single plugin is `Unavailable`.
+    fn snapshot_with_unavailable_plugin(
+        plugin_path: &str,
+        reason: PluginUnavailableReason,
+    ) -> super::RuntimeSnapshot {
+        let plugin_registry = crate::plugin::registry::PluginRegistry::default();
+        plugin_registry.insert_unavailable(
+            plugin_path.to_string(),
+            None,
+            true,
+            std::collections::BTreeSet::new(),
+            reason,
+            Vec::new(),
+        );
+        let node_registry = crate::plugin::registry::NodeRegistry::default();
+        let doc_registry =
+            crate::service::doc_registry::DocRegistry::from_plugin_registry(&plugin_registry);
+        let graph_registry = crate::service::graph_registry::GraphRegistry::from_registries(
+            &plugin_registry,
+            &node_registry,
+        );
+        super::runtime_snapshot_from_output(
+            crate::plugin::loader::LoadOutput {
+                execution_id: "snap-unavail".to_string(),
+                plugin_registry,
+                node_registry,
+                doc_registry,
+                graph_registry,
+                context: crate::context::RuntimeContext::default(),
+                metrics: crate::plugin::loader::LoaderMetrics::default(),
+            },
+            PathBuf::from("/tmp/cordis-seam-unavail-staged"),
+        )
+    }
+
+    fn empty_reload_report() -> ReloadReport {
+        ReloadReport {
+            from_snapshot_id: "a".to_string(),
+            to_snapshot_id: "b".to_string(),
+            snapshot_root: "/tmp/x".to_string(),
+            staged_artifact_root: "/tmp/x/staged".to_string(),
+            elapsed_ms: 0,
+            added_plugins: Vec::new(),
+            removed_plugins: Vec::new(),
+            changed_plugins: Vec::new(),
+            changed_plugin_reasons: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn observe_snapshot_issues_contract_violation_is_docs_drift() {
+        let (_temp, host) = empty_host();
+        let snapshot =
+            snapshot_with_unavailable_plugin("cv", PluginUnavailableReason::ContractViolation);
+        host.observe_snapshot_plugin_issues(&snapshot, &empty_reload_report(), "reload");
+        let issues = host.kernel().plugin_issues();
+        let issue = issues
+            .iter()
+            .find(|i| i.root_plugin_path == "cv")
+            .expect("cv issue");
+        assert_eq!(issue.source, KernelPluginIssueSource::DocsDrift);
+        assert!(issue
+            .summary
+            .contains("reload observed plugin cv unavailable"));
+    }
+
+    #[test]
+    #[serial]
+    fn observe_snapshot_issues_other_unavailable_is_load_failure() {
+        let (_temp, host) = empty_host();
+        let snapshot =
+            snapshot_with_unavailable_plugin("am", PluginUnavailableReason::ArtifactMissing);
+        host.observe_snapshot_plugin_issues(&snapshot, &empty_reload_report(), "reload");
+        let issues = host.kernel().plugin_issues();
+        let issue = issues
+            .iter()
+            .find(|i| i.root_plugin_path == "am")
+            .expect("am issue");
+        assert_eq!(issue.source, KernelPluginIssueSource::LoadFailure);
+    }
+
+    // ─────────────── cleanup_retired_snapshots cap ───────────────────────
+
+    #[test]
+    #[serial]
+    fn cleanup_retired_snapshots_caps_dead_prefix_and_removes_dirs() {
+        let (temp, host) = empty_host();
+        // Push more than MAX_RETIRED_SNAPSHOTS (64) dead Weak entries, each
+        // pointing at a real (empty) staged dir. cleanup must drop the dead
+        // ones AND remove their dirs.
+        let mut dirs = Vec::new();
+        {
+            let mut guard = host
+                .retired_snapshots
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            for i in 0..70 {
+                let dir = temp.path().join(format!("retired-{i}"));
+                fs::create_dir_all(&dir).expect("mk retired dir");
+                dirs.push(dir.clone());
+                // A Weak that never had a live Arc: upgrade() is always None.
+                guard.push(RetiredSnapshot {
+                    snapshot: std::sync::Weak::<super::RuntimeSnapshot>::new(),
+                    staged_artifact_root: dir,
+                });
+            }
+        }
+        host.cleanup_retired_snapshots();
+        let remaining = host
+            .retired_snapshots
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .len();
+        // All dead entries are swept by the Weak-liveness retain (they upgrade
+        // to None), so nothing remains.
+        assert_eq!(remaining, 0, "all dead Weak entries must be swept");
+        for dir in &dirs {
+            assert!(!dir.exists(), "dead entry's staged dir must be removed");
+        }
+    }
+
+    // ─────────────── ReloadReport::from_snapshots removed arm ────────────
+
+    #[test]
+    #[serial]
+    fn reload_report_from_snapshots_records_removed_plugin() {
+        let previous =
+            snapshot_with_unavailable_plugin("gone", PluginUnavailableReason::InitFailed);
+        // Build a snapshot with a DIFFERENT plugin so `gone` is "removed".
+        let next = snapshot_with_unavailable_plugin("kept", PluginUnavailableReason::InitFailed);
+        let report = ReloadReport::from_snapshots(&previous, &next, Path::new("/tmp/snap"), 7);
+        assert!(report.removed_plugins.contains(&"gone".to_string()));
+        assert!(report.added_plugins.contains(&"kept".to_string()));
+        assert_eq!(report.elapsed_ms, 7);
+    }
+
+    // ─────────────── run_plugin_canary no-evidence path ──────────────────
+
+    #[test]
+    #[serial]
+    fn run_plugin_canary_returns_partial_without_evidence() {
+        let (_temp, host) = empty_host();
+        let state = PluginIterationRunState::new(prepared_for("mini", &["mini"]));
+        let report = host.run_plugin_canary(&state).expect("canary runs");
+        assert_eq!(report.verdict, CanaryVerdict::Partial);
+        assert_eq!(report.mode, "no_canary_evidence");
+        assert!(report.plugin_path.is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn run_plugin_canary_skips_samples_for_other_plugins() {
+        let (_temp, host) = empty_host();
+        // Seed a sample for a plugin NOT in the target set → the `continue`
+        // arm skips it, and with no candidate we fall through to Partial.
+        host.invocation_samples
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push_front(InvocationSample {
+                plugin_path: "other".to_string(),
+                node_id: "n".to_string(),
+                payload: json!({}),
+                response: json!({ "ok": true }),
+                observed_at_ms: 0,
+            });
+        let state = PluginIterationRunState::new(prepared_for("mini", &["mini"]));
+        let report = host.run_plugin_canary(&state).expect("canary runs");
+        assert_eq!(report.verdict, CanaryVerdict::Partial);
+        assert_eq!(report.mode, "no_canary_evidence");
+    }
+
+    // ─────────────── finalize_plugin_iteration arms ──────────────────────
+
+    #[test]
+    #[serial]
+    fn finalize_stage_error_short_circuits_to_rolled_back() {
+        let (_temp, host) = empty_host();
+        let mut state = PluginIterationRunState::new(prepared_for("mini", &["mini"]));
+        state.stage_error = Some("rebuild blew up".to_string());
+        let verdict = host
+            .finalize_plugin_iteration(&mut state)
+            .expect("finalize returns RolledBack for a stage error");
+        assert_eq!(verdict, PluginIterationFinalVerdict::RolledBack);
+        assert_eq!(
+            state.blocked_reason.as_deref(),
+            Some("rebuild blew up"),
+            "no candidate + clean restore → base message verbatim"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn finalize_verifier_fail_rolls_back_without_candidate() {
+        let (_temp, host) = empty_host();
+        let mut state = PluginIterationRunState::new(prepared_for("mini", &["mini"]));
+        state.verifier_verdict = Some(VerifierVerdict::Fail);
+        // A concrete Fail canary (not the Partial default) so the `else`
+        // rollback arm — not the Partial-canary Blocked arm — is selected.
+        state.canary = Some(crate::kernel::plugin_iteration::CanaryReport {
+            verdict: CanaryVerdict::Fail,
+            mode: "recent_successful_invocation_replay".to_string(),
+            plugin_path: Some("mini".to_string()),
+            node_id: Some("mini_echo".to_string()),
+            payload: Some(json!({})),
+            expected_response: Some(json!({ "ok": true })),
+            actual_response: Some(json!({ "ok": false })),
+            message: "diverged".to_string(),
+        });
+        // No candidate staged → the `else` rollback arm runs (candidate cleanup
+        // is a no-op) and the workspace restore succeeds on the empty fixture.
+        let verdict = host
+            .finalize_plugin_iteration(&mut state)
+            .expect("finalize returns RolledBack for a failed verifier");
+        assert_eq!(verdict, PluginIterationFinalVerdict::RolledBack);
+    }
+
+    #[test]
+    #[serial]
+    fn finalize_partial_canary_without_approval_blocks() {
+        let (_temp, host) = empty_host();
+        let mut state = PluginIterationRunState::new(prepared_for("mini", &["mini"]));
+        state.verifier_verdict = Some(VerifierVerdict::Pass);
+        state.canary = Some(crate::kernel::plugin_iteration::CanaryReport {
+            verdict: CanaryVerdict::Partial,
+            mode: "no_canary_evidence".to_string(),
+            plugin_path: None,
+            node_id: None,
+            payload: None,
+            expected_response: None,
+            actual_response: None,
+            message: "no evidence".to_string(),
+        });
+        let verdict = host
+            .finalize_plugin_iteration(&mut state)
+            .expect("finalize returns Blocked when canary is Partial and not approved");
+        assert_eq!(verdict, PluginIterationFinalVerdict::Blocked);
+        assert_eq!(state.blocked_reason.as_deref(), Some("no evidence"));
+    }
+
+    // ─────────────── rollback_candidate_if_staged (no candidate) ─────────
+
+    #[test]
+    #[serial]
+    fn rollback_candidate_if_staged_is_none_without_candidate() {
+        let (_temp, host) = empty_host();
+        assert!(host.rollback_candidate_if_staged().is_none());
+    }
+
+    // ─────────────── PluginIterationAgentBackend methods ─────────────────
+
+    /// A backend bound to a hermetic empty-fixture host. The `mini` plugin dir
+    /// need not exist for exploration/guard tests.
+    fn with_backend<R>(
+        host: &RuntimeHost,
+        f: impl FnOnce(&mut PluginIterationAgentBackend<'_>) -> R,
+    ) -> R {
+        let prepared = prepared_for("mini", &["mini"]);
+        let context_paths = PluginIterationContextPaths {
+            focus_paths: Vec::new(),
+            all_paths: Vec::new(),
+        };
+        let mut state =
+            PluginIterationAgentState::new(prepared, context_paths, &host.fixtures_root);
+        let mut backend = PluginIterationAgentBackend {
+            host,
+            state: &mut state,
+        };
+        f(&mut backend)
+    }
+
+    /// Seed a writable `plugins/mini/src/<name>` file inside the host's fixtures
+    /// tree so edit-tool success arms (which validate paths against the plugin
+    /// subtree and read/write real bytes) can run without a cargo build.
+    fn seed_writable_source(host: &RuntimeHost, name: &str, body: &str) -> String {
+        let rel = format!("plugins/mini/src/{name}");
+        let abs = host.fixtures_root.join(&rel);
+        fs::create_dir_all(abs.parent().expect("parent")).expect("mkdir src");
+        fs::write(&abs, body).expect("seed source");
+        rel
+    }
+
+    #[test]
+    #[serial]
+    fn backend_replace_files_exact_success_arm_applies_batch() {
+        let (_temp, host) = empty_host();
+        let rel = seed_writable_source(&host, "batch_target.rs", "OLD contents\n");
+        with_backend(&host, |backend| {
+            let out = AgentBackend::execute_tool(
+                backend,
+                PLUGIN_AGENT_TOOL_REPLACE_FILES_EXACT,
+                json!({
+                    "edits": [{
+                        "path": rel,
+                        "expected_old_string": "OLD contents\n",
+                        "new_content": "NEW contents\n"
+                    }]
+                }),
+            )
+            .expect("non-empty replace_files_exact batch succeeds");
+            // apply_operations returns a JSON summary; the operation is recorded.
+            assert!(out.is_object() || out.is_array() || out.is_null() || out.is_string());
+            assert_eq!(backend.state.operations.len(), 1);
+        });
+        // The file on disk now carries the new content.
+        assert_eq!(
+            fs::read_to_string(host.fixtures_root.join(&rel)).expect("read edited"),
+            "NEW contents\n"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn backend_run_plugin_check_builds_single_plugin_default_command() {
+        let (_temp, host) = empty_host();
+        with_backend(&host, |backend| {
+            // No explicit command + plugin_path "/mini" → the default builder
+            // produces `cargo check ... -p mini`. We point it at a bogus
+            // manifest so the command runs quickly and fails (exit != 0), but
+            // the default-command construction (the target line) still runs.
+            let out = AgentBackend::execute_tool(
+                backend,
+                "run_plugin_check",
+                json!({ "plugin_path": "/mini" }),
+            )
+            .expect("run_plugin_check returns Ok even when cargo exits nonzero");
+            assert_eq!(out.get("stage").and_then(Value::as_str), Some("check"));
+            let cmd = out.get("command").and_then(Value::as_str).expect("command");
+            assert!(cmd.contains("cargo check"));
+            assert!(cmd.contains("-p mini"), "single-plugin default: {cmd}");
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn backend_run_plugin_check_builds_whole_workspace_default_command() {
+        let (_temp, host) = empty_host();
+        with_backend(&host, |backend| {
+            // plugin_path "/" → whole-workspace default (no `-p`).
+            let out = AgentBackend::execute_tool(
+                backend,
+                "run_plugin_check",
+                json!({ "plugin_path": "/" }),
+            )
+            .expect("run_plugin_check Ok");
+            let cmd = out.get("command").and_then(Value::as_str).expect("command");
+            assert!(cmd.contains("cargo check"));
+            assert!(!cmd.contains("-p "), "whole-workspace default: {cmd}");
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn backend_run_plugin_test_uses_prepared_tests_command_fallback() {
+        let (_temp, host) = empty_host();
+        let prepared = {
+            let mut p = prepared_for("mini", &["mini"]);
+            p.tests_command = Some("cargo test --quiet -p mini --lib".to_string());
+            p
+        };
+        let context_paths = PluginIterationContextPaths {
+            focus_paths: Vec::new(),
+            all_paths: Vec::new(),
+        };
+        let mut state =
+            PluginIterationAgentState::new(prepared, context_paths, &host.fixtures_root);
+        let mut backend = PluginIterationAgentBackend {
+            host: &host,
+            state: &mut state,
+        };
+        // No explicit command → the `.or_else(prepared.tests_command)` fallback
+        // arm supplies the prepared command.
+        let out = AgentBackend::execute_tool(&mut backend, "run_plugin_test", json!({}))
+            .expect("run_plugin_test Ok");
+        let cmd = out.get("command").and_then(Value::as_str).expect("command");
+        assert_eq!(cmd, "cargo test --quiet -p mini --lib");
+    }
+
+    #[test]
+    #[serial]
+    fn backend_phase_reflects_state_progression() {
+        let (_temp, host) = empty_host();
+        with_backend(&host, |backend| {
+            // No operations yet → exploration.
+            assert_eq!(backend.phase(), "exploration");
+            backend.state.operations.push(PluginEditOperation {
+                path: "plugins/mini/src/lib.rs".to_string(),
+                kind: PluginEditOpKind::ReplaceExact,
+                expected_old_string: Some("a".to_string()),
+                expected_sha256: None,
+                new_content: Some("b".to_string()),
+                pointer: None,
+                dotted_key: None,
+                value: None,
+            });
+            // Has ops, no verification attempts → editing.
+            assert_eq!(backend.phase(), "editing");
+            backend.state.verification_attempts = 1;
+            // Attempts but no successes → verification_retry.
+            assert_eq!(backend.phase(), "verification_retry");
+            backend.state.verification_successes = 1;
+            // Successes → verification.
+            assert_eq!(backend.phase(), "verification");
+            backend.state.recorded_summary = Some("done".to_string());
+            // Recorded summary → finalized (highest priority).
+            assert_eq!(backend.phase(), "finalized");
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn backend_tool_scope_label_embeds_phase() {
+        let (_temp, host) = empty_host();
+        with_backend(&host, |backend| {
+            assert_eq!(backend.tool_scope_label(), "plugin_iteration:exploration");
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn backend_host_accessor_returns_bound_host() {
+        let (_temp, host) = empty_host();
+        with_backend(&host, |backend| {
+            // The AgentBackend::host accessor returns the same fixtures root.
+            assert_eq!(
+                AgentBackend::host(backend).fixtures_root,
+                host.fixtures_root
+            );
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn backend_execute_tool_empty_replace_batch_errors() {
+        let (_temp, host) = empty_host();
+        with_backend(&host, |backend| {
+            let out = AgentBackend::execute_tool(
+                backend,
+                PLUGIN_AGENT_TOOL_REPLACE_FILES_EXACT,
+                json!({ "edits": [] }),
+            );
+            assert!(matches!(
+                out,
+                Err(RuntimeError::InvalidArgument { message })
+                    if message == "replace_files_exact requires at least one edit"
+            ));
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn backend_execute_tool_unsupported_name_errors() {
+        let (_temp, host) = empty_host();
+        with_backend(&host, |backend| {
+            let out = AgentBackend::execute_tool(backend, "no_such_tool", json!({}));
+            assert!(matches!(
+                out,
+                Err(RuntimeError::InvalidArgument { message })
+                    if message == "unsupported plugin iteration tool: no_such_tool"
+            ));
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn backend_record_iteration_summary_requires_edits_and_verification() {
+        let (_temp, host) = empty_host();
+        with_backend(&host, |backend| {
+            // No operations + no verification successes → guard error.
+            let out = AgentBackend::execute_tool(
+                backend,
+                PLUGIN_AGENT_TOOL_RECORD_ITERATION_SUMMARY,
+                json!({ "summary": "x" }),
+            );
+            assert!(matches!(
+                out,
+                Err(RuntimeError::InvalidArgument { message })
+                    if message == "record_iteration_summary requires at least one edit and one successful verification step"
+            ));
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn backend_scaffold_child_plugin_rejects_parent_outside_subtree() {
+        let (_temp, host) = empty_host();
+        with_backend(&host, |backend| {
+            let args = ScaffoldChildPluginArgs {
+                parent_plugin_path: "not-a-target".to_string(),
+                child_name: "kid".to_string(),
+                template_plugin_path: None,
+                node_id: None,
+                summary: None,
+            };
+            let out = backend.scaffold_child_plugin(args);
+            assert!(matches!(
+                out,
+                Err(RuntimeError::InvalidArgument { message })
+                    if message == "parent plugin path not-a-target is outside the selected subtree"
+            ));
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn backend_run_checked_command_reports_nonzero_exit_without_success_bump() {
+        let (_temp, host) = empty_host();
+        with_backend(&host, |backend| {
+            let before = backend.state.verification_successes;
+            let out = backend
+                .run_checked_command("check", "false".to_string())
+                .expect("run_checked_command returns Ok even on nonzero exit");
+            assert_eq!(out.get("success").and_then(Value::as_bool), Some(false));
+            assert_eq!(out.get("stage").and_then(Value::as_str), Some("check"));
+            // A failing command increments attempts but not successes.
+            assert_eq!(backend.state.verification_attempts, 1);
+            assert_eq!(backend.state.verification_successes, before);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn backend_run_checked_command_success_bumps_counter() {
+        let (_temp, host) = empty_host();
+        with_backend(&host, |backend| {
+            let out = backend
+                .run_checked_command("test", "true".to_string())
+                .expect("true exits 0");
+            assert_eq!(out.get("success").and_then(Value::as_bool), Some(true));
+            assert_eq!(backend.state.verification_successes, 1);
+        });
+    }
+
+    // ─────────────── ManagedAgentSession::compact_history wrapper ────────
+
+    #[test]
+    #[serial]
+    fn managed_session_compact_history_wrapper_is_noop_below_threshold() {
+        let config = crate::config::LlmApiConfig {
+            provider: "deepseek".to_string(),
+            base_url: "http://127.0.0.1:1/v1".to_string(),
+            api_key: Some("k".to_string()),
+            model: "m".to_string(),
+            ..crate::config::LlmApiConfig::default()
+        };
+        let mut session =
+            crate::agent::AgentSession::new(config, "runtime_shell").expect("build agent session");
+        // Below the compaction threshold: wrapper returns (old, old) unchanged.
+        let mut managed = ManagedAgentSession {
+            handle: AgentSessionHandle {
+                session_id: "s-1".to_string(),
+                kind: AgentSessionKind::RuntimeShell,
+            },
+            session: std::mem::replace(
+                &mut session,
+                crate::agent::AgentSession::new(
+                    crate::config::LlmApiConfig::default(),
+                    "throwaway",
+                )
+                .expect("throwaway session"),
+            ),
+            state: ManagedAgentState::RuntimeShell,
+        };
+        let (old, new) = managed.compact_history();
+        assert_eq!(old, new, "no compaction below threshold");
+    }
+
+    // ─────────────── canary declared-verifier-node (JSON candidate) ──────
+
+    /// Build a JSON-artifact fixture whose `svc` plugin declares a node whose
+    /// id contains "verify" and is backed by a `Process` executor that echoes a
+    /// fixed JSON. Staging it as a candidate lets `run_plugin_canary` take the
+    /// declared-verifier-node branch (host.rs 3803-3832 in cov6 numbering).
+    fn setup_verify_node_json_fixture() -> (TempDir, PathBuf) {
+        let temp = TempDir::new().expect("tempdir");
+        let fixtures = temp.path().join("fixtures");
+        let artifacts = fixtures.join("artifacts");
+        fs::create_dir_all(&artifacts).expect("artifacts dir");
+
+        // A tiny echo executable: a shell script that prints a fixed JSON.
+        let echo = artifacts.join("svc_verify.sh");
+        fs::write(&echo, "#!/bin/sh\ncat >/dev/null\necho '{\"ok\":true}'\n")
+            .expect("write echo script");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&echo).expect("meta").permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&echo, perms).expect("chmod echo");
+        }
+
+        let abi = AbiFingerprint::current_build("crate_svc_v1", "api_v2");
+        let node = NodeDoc {
+            id: "svc_verify".to_string(),
+            summary: "declared verifier node".to_string(),
+            input_schema: json!({ "type": "object" }),
+            output_schema: json!({ "type": "object" }),
+            side_effects: Vec::new(),
+            failure_modes: Vec::new(),
+            node_type: NodeType::Task,
+            agent_accessible: false,
+        };
+        let docs = PluginDocs {
+            plugin_id: "svc".to_string(),
+            plugin_path: "svc".to_string(),
+            plugin_version: "0.1.0".to_string(),
+            abi_version: 2,
+            command_name: Some("Svc".to_string()),
+            nodes: vec![node],
+            system_hint: None,
+        };
+        let execution = json!({ "kind": "process", "command": "svc_verify.sh", "args": [] });
+        let artifact_value = json!({
+            "plugin_path": "svc",
+            "abi_fingerprint": abi,
+            "docs": docs,
+            "exports": [],
+            "execution": execution,
+        });
+        let artifact_path = artifacts.join("svc.json");
+        fs::write(
+            &artifact_path,
+            serde_json::to_vec_pretty(&artifact_value).expect("serialize artifact"),
+        )
+        .expect("write artifact");
+        let sha256 =
+            crate::plugin::artifact::sha256_file(&artifact_path).expect("hash svc artifact");
+        let index_value = json!({
+            "schema_version": 2,
+            "generated_at": "2026-07-25T00:00:00Z",
+            "topo_order": ["svc"],
+            "entries": [{
+                "plugin_path": "svc",
+                "version": "0.1.0",
+                "abi_fingerprint": abi,
+                "artifact_path": "svc.json",
+                "sha256": sha256,
+                "built_at": "0",
+                "parent": null,
+                "required": true,
+                "grants_from_parent": [],
+                "docs": docs,
+                "exports": [],
+                "execution": execution,
+                "artifact_kind": "json",
+                "build_fingerprint": "bf",
+                "input_probe": { "files": [] },
+                "local_path_deps": []
+            }]
+        });
+        fs::write(
+            artifacts.join("index.json"),
+            serde_json::to_vec_pretty(&index_value).expect("serialize index"),
+        )
+        .expect("write index");
+        (temp, fixtures)
+    }
+
+    #[test]
+    #[serial]
+    fn run_plugin_canary_uses_declared_verifier_node_from_candidate() {
+        let (_temp, fixtures) = setup_verify_node_json_fixture();
+        let host = RuntimeHost::boot(&fixtures).expect("boot on svc fixture");
+        // Stage the current tree as a candidate (no source change needed): the
+        // candidate registry then carries the `svc` plugin with the verify node.
+        host.reload_candidate().expect("stage candidate");
+        assert!(host.candidate_snapshot().is_some());
+
+        let state = PluginIterationRunState::new(prepared_for("svc", &["svc"]));
+        let report = host
+            .run_plugin_canary(&state)
+            .expect("canary invokes the declared verify node");
+        assert_eq!(report.verdict, CanaryVerdict::Pass);
+        assert_eq!(report.mode, "declared_plugin_verifier_node");
+        assert_eq!(report.node_id.as_deref(), Some("svc_verify"));
+        let _ = Arc::strong_count(&host.candidate_snapshot().expect("candidate live"));
+    }
+
+    #[test]
+    #[serial]
+    fn run_plugin_canary_replay_divergence_yields_fail() {
+        let (_temp, fixtures) = setup_verify_node_json_fixture();
+        let host = RuntimeHost::boot(&fixtures).expect("boot on svc fixture");
+        host.reload_candidate().expect("stage candidate");
+        // Seed a replay sample for svc/svc_verify whose recorded response does
+        // NOT match what the candidate echoes ({"ok":true}) → divergence Fail.
+        host.invocation_samples
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push_front(InvocationSample {
+                plugin_path: "svc".to_string(),
+                node_id: "svc_verify".to_string(),
+                payload: json!({}),
+                response: json!({ "ok": false }),
+                observed_at_ms: 0,
+            });
+        let state = PluginIterationRunState::new(prepared_for("svc", &["svc"]));
+        let report = host.run_plugin_canary(&state).expect("canary replay runs");
+        assert_eq!(report.verdict, CanaryVerdict::Fail);
+        assert_eq!(report.mode, "recent_successful_invocation_replay");
+        assert!(report
+            .message
+            .contains("candidate replay response diverged from current response"));
+    }
+
+    // ─────────── cleanup_retired_snapshots live-cap prefix drop ──────────
+
+    #[test]
+    #[serial]
+    fn cleanup_retired_snapshots_caps_live_prefix_at_max() {
+        let (temp, host) = empty_host();
+        // Hold >64 LIVE Arcs so the Weak-liveness retain keeps them all, then
+        // the `while len > MAX_RETIRED_SNAPSHOTS` loop drops the oldest prefix.
+        let mut live: Vec<Arc<super::RuntimeSnapshot>> = Vec::new();
+        let mut dirs = Vec::new();
+        {
+            let mut guard = host
+                .retired_snapshots
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            for i in 0..70 {
+                let snap = host.current_snapshot();
+                let dir = temp.path().join(format!("live-retired-{i}"));
+                fs::create_dir_all(&dir).expect("mk dir");
+                dirs.push(dir.clone());
+                guard.push(RetiredSnapshot {
+                    snapshot: Arc::downgrade(&snap),
+                    staged_artifact_root: dir,
+                });
+                live.push(snap);
+            }
+        }
+        host.cleanup_retired_snapshots();
+        let remaining = host
+            .retired_snapshots
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .len();
+        assert_eq!(
+            remaining, 64,
+            "live entries capped at MAX_RETIRED_SNAPSHOTS"
+        );
+        // The 6 oldest prefix dirs were removed by the cap loop.
+        assert!(!dirs[0].exists(), "oldest live-cap prefix dir removed");
+        assert!(dirs[69].exists(), "newest live entry's dir retained");
+        drop(live);
+    }
+
+    // ─────────── finalize promote-failure arms (Pass/Pass) ───────────────
+
+    /// Force `promote_candidate` to fail by making the journal path a
+    /// non-empty directory: `clear_plugin_iteration_journal` → `remove_file`
+    /// on a directory errors, so `promote_candidate` returns Err and the
+    /// finalize promote-failure arm runs.
+    fn wedge_journal_as_dir(host: &RuntimeHost) {
+        let journal = super::plugin_iteration_journal_path(&host.snapshot_root);
+        fs::create_dir_all(&journal).expect("create journal-as-dir");
+        fs::write(journal.join("blocker.txt"), b"x").expect("nonempty dir");
+    }
+
+    #[test]
+    #[serial]
+    fn finalize_promote_failure_pass_pass_arm_returns_err_and_records_reason() {
+        let (_temp, host) = empty_host();
+        host.reload_candidate().expect("stage candidate");
+        wedge_journal_as_dir(&host);
+        let mut state = PluginIterationRunState::new(prepared_for("mini", &["mini"]));
+        state.verifier_verdict = Some(VerifierVerdict::Pass);
+        state.canary = Some(crate::kernel::plugin_iteration::CanaryReport {
+            verdict: CanaryVerdict::Pass,
+            mode: "recent_successful_invocation_replay".to_string(),
+            plugin_path: Some("mini".to_string()),
+            node_id: Some("mini_echo".to_string()),
+            payload: Some(json!({})),
+            expected_response: Some(json!({ "ok": true })),
+            actual_response: Some(json!({ "ok": true })),
+            message: "match".to_string(),
+        });
+        let out = host.finalize_plugin_iteration(&mut state);
+        assert!(out.is_err(), "promote failure must propagate as Err");
+        let reason = state.blocked_reason.expect("blocked reason recorded");
+        assert!(
+            reason.starts_with("promote failed: "),
+            "unexpected reason: {reason}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn finalize_promote_failure_manual_approved_partial_arm_returns_err() {
+        let (_temp, host) = empty_host();
+        host.reload_candidate().expect("stage candidate");
+        wedge_journal_as_dir(&host);
+        let mut prepared = prepared_for("mini", &["mini"]);
+        prepared.manual_approved = true;
+        let mut state = PluginIterationRunState::new(prepared);
+        state.verifier_verdict = Some(VerifierVerdict::Pass);
+        // Partial canary + manual_approved → the manual-approved promote arm.
+        state.canary = Some(crate::kernel::plugin_iteration::CanaryReport {
+            verdict: CanaryVerdict::Partial,
+            mode: "no_canary_evidence".to_string(),
+            plugin_path: None,
+            node_id: None,
+            payload: None,
+            expected_response: None,
+            actual_response: None,
+            message: "no evidence".to_string(),
+        });
+        let out = host.finalize_plugin_iteration(&mut state);
+        assert!(out.is_err(), "manual-approved promote failure propagates");
+        let reason = state.blocked_reason.expect("blocked reason recorded");
+        assert!(
+            reason.starts_with("promote (manual-approved) failed: "),
+            "unexpected reason: {reason}"
+        );
+    }
+
+    // ─────────── finalize TOCTOU source-drift downgrade ──────────────────
+
+    #[test]
+    #[serial]
+    fn finalize_toctou_drift_downgrades_pass_to_rolled_back() {
+        let (_temp, host) = empty_host();
+        let mut state = PluginIterationRunState::new(prepared_for("mini", &["mini"]));
+        state.verifier_verdict = Some(VerifierVerdict::Pass);
+        state.canary = Some(crate::kernel::plugin_iteration::CanaryReport {
+            verdict: CanaryVerdict::Pass,
+            mode: "recent_successful_invocation_replay".to_string(),
+            plugin_path: Some("mini".to_string()),
+            node_id: Some("mini_echo".to_string()),
+            payload: Some(json!({})),
+            expected_response: Some(json!({ "ok": true })),
+            actual_response: Some(json!({ "ok": true })),
+            message: "match".to_string(),
+        });
+        // A verification report whose recorded source-tree hash cannot match the
+        // real re-hash of the empty fixture → detect_plugin_source_drift trips,
+        // downgrading the effective verdict to Fail → RolledBack.
+        state.verification = Some(crate::kernel::verifier::VerificationReport {
+            plan: crate::kernel::verifier::VerificationPlan {
+                profile: VerificationProfile::Default,
+                static_check_command: None,
+                tests_command: None,
+                safety_command: None,
+            },
+            stages: Vec::new(),
+            input: crate::kernel::evaluator::VerificationInput {
+                tests_passed: true,
+                safety_checks_passed: true,
+                quality_score: 100,
+            },
+            tests: None,
+            safety: None,
+            source_tree_hash: Some("stale-hash-that-will-not-match".to_string()),
+        });
+        let verdict = host
+            .finalize_plugin_iteration(&mut state)
+            .expect("TOCTOU drift rolls back cleanly (no candidate staged)");
+        assert_eq!(verdict, PluginIterationFinalVerdict::RolledBack);
+        assert!(state
+            .blocked_reason
+            .as_deref()
+            .expect("drift reason")
+            .contains("source tree mutated between verify and promote"));
+        // The kernel recorded a VerifierFailure TOCTOU issue.
+        let issues = host.kernel().plugin_issues();
+        assert!(issues.iter().any(|i| {
+            i.source == KernelPluginIssueSource::VerifierFailure
+                && i.summary.contains("TOCTOU guard tripped")
+        }));
+    }
+
+    // ─────────── apply_operations partial-batch rollback error ───────────
+
+    #[test]
+    #[serial]
+    fn backend_apply_operations_second_op_failure_enriches_error() {
+        let (_temp, host) = empty_host();
+        // First op targets a real writable file (applies), second op targets a
+        // path OUTSIDE the plugin subtree → policy blocks it, and the partial
+        // batch rolls back the first op. The returned error is the enriched
+        // second-op failure.
+        let good = seed_writable_source(&host, "first_ok.rs", "before\n");
+        with_backend(&host, |backend| {
+            let ops = vec![
+                PluginEditOperation {
+                    path: good.clone(),
+                    kind: PluginEditOpKind::ReplaceExact,
+                    expected_old_string: Some("before\n".to_string()),
+                    expected_sha256: None,
+                    new_content: Some("after\n".to_string()),
+                    pointer: None,
+                    dotted_key: None,
+                    value: None,
+                },
+                PluginEditOperation {
+                    // Outside plugins/mini subtree → policy rejects.
+                    path: "plugins/other/src/x.rs".to_string(),
+                    kind: PluginEditOpKind::CreateFile,
+                    expected_old_string: Some(String::new()),
+                    expected_sha256: None,
+                    new_content: Some("nope".to_string()),
+                    pointer: None,
+                    dotted_key: None,
+                    value: None,
+                },
+            ];
+            let out = backend.apply_operations("batch", ops);
+            assert!(out.is_err(), "second-op policy block must fail the batch");
+        });
+        // The first op was rolled back to its original bytes.
+        assert_eq!(
+            fs::read_to_string(host.fixtures_root.join(&good)).expect("read"),
+            "before\n",
+            "partial-batch rollback must restore the first op"
+        );
+    }
+
+    // ─────────── run_plugin_iteration_agent edit_plan (no LLM) path ──────
+
+    #[test]
+    #[serial]
+    fn run_plugin_iteration_agent_applies_edit_plan_without_llm() {
+        let (_temp, host) = empty_host();
+        let rel = seed_writable_source(&host, "planned.rs", "old body\n");
+        let mut prepared = prepared_for("mini", &["mini"]);
+        prepared.edit_plan = Some(crate::kernel::plugin_iteration::PluginEditPlan {
+            issue_id: "issue-x".to_string(),
+            patch_id: "patch-x".to_string(),
+            summary: "planned edit".to_string(),
+            operations: vec![PluginEditOperation {
+                path: rel.clone(),
+                kind: PluginEditOpKind::ReplaceExact,
+                expected_old_string: Some("old body\n".to_string()),
+                expected_sha256: None,
+                new_content: Some("planned body\n".to_string()),
+                pointer: None,
+                dotted_key: None,
+                value: None,
+            }],
+        });
+        let run = host
+            .run_plugin_iteration_agent(&prepared)
+            .expect("edit-plan path runs without any LLM call");
+        // No agent session in the edit-plan branch.
+        assert!(run.session_id.is_none());
+        assert_eq!(
+            run.snapshot.recorded_summary.as_deref(),
+            Some("planned edit")
+        );
+        assert!(run.snapshot.changed_paths.iter().any(|p| p == &rel));
+        // The planned edit landed on disk.
+        assert_eq!(
+            fs::read_to_string(host.fixtures_root.join(&rel)).expect("read"),
+            "planned body\n"
+        );
+    }
+
+    // ─────────── verify_plugin_iteration wiring (cheap commands) ─────────
+
+    #[test]
+    #[serial]
+    fn verify_plugin_iteration_runs_trivial_commands_and_reports() {
+        let (_temp, host) = empty_host();
+        let mut prepared = prepared_for("mini", &["mini"]);
+        // Trivial shell commands so the verifier's command stages run fast and
+        // pass, exercising the candidate_invoker closure construction and the
+        // CommandVerifier::verify_with_options `?` call site.
+        prepared.tests_command = Some("cargo test --help".to_string());
+        prepared.safety_command = Some("cargo --version".to_string());
+        let state = PluginIterationRunState::new(prepared);
+        let report = host
+            .verify_plugin_iteration(&state)
+            .expect("verify runs the trivial commands");
+        // Both trivial commands exit 0 → tests_passed true.
+        assert!(report.input.tests_passed);
+    }
+
+    #[test]
+    #[serial]
+    fn verify_plugin_iteration_plugin_command_invokes_candidate_closure() {
+        // A staged JSON `svc` candidate + a `plugin:` tests command makes the
+        // verifier route through the `candidate_invoker` closure (the closure
+        // body dispatches into `invoke_candidate`), covering that seam.
+        let (_temp, fixtures) = setup_verify_node_json_fixture();
+        let host = RuntimeHost::boot(&fixtures).expect("boot svc fixture");
+        host.reload_candidate().expect("stage candidate");
+        let mut prepared = prepared_for("svc", &["svc"]);
+        let spec = json!({
+            "plugin_path": "svc",
+            "node_id": "svc_verify",
+            "payload_json": {}
+        });
+        prepared.tests_command = Some(format!("plugin:{spec}"));
+        // Skip the safety stage; keep the run to just the plugin: tests command.
+        prepared.safety_command = None;
+        let state = PluginIterationRunState::new(prepared);
+        let report = host
+            .verify_plugin_iteration(&state)
+            .expect("verify routes the plugin: command through the candidate closure");
+        // The candidate echoes {"ok":true} and exits successfully.
+        assert!(report.input.tests_passed, "plugin: candidate invoke passed");
+    }
+
+    // ─────────── finalize manual-approved promote SUCCESS ────────────────
+
+    #[test]
+    #[serial]
+    fn finalize_manual_approved_partial_promotes_when_candidate_staged() {
+        let (_temp, host) = empty_host();
+        host.reload_candidate().expect("stage candidate");
+        let mut prepared = prepared_for("", &[]);
+        prepared.manual_approved = true;
+        let mut state = PluginIterationRunState::new(prepared);
+        state.verifier_verdict = Some(VerifierVerdict::Pass);
+        state.canary = Some(crate::kernel::plugin_iteration::CanaryReport {
+            verdict: CanaryVerdict::Partial,
+            mode: "no_canary_evidence".to_string(),
+            plugin_path: None,
+            node_id: None,
+            payload: None,
+            expected_response: None,
+            actual_response: None,
+            message: "no evidence".to_string(),
+        });
+        // Pass verifier + Partial canary + manual_approved + a real staged
+        // candidate + clean journal → the manual-approved promote SUCCESS arm
+        // (`Ok(_) => Promoted`) runs.
+        let verdict = host
+            .finalize_plugin_iteration(&mut state)
+            .expect("manual-approved promote succeeds");
+        assert_eq!(verdict, PluginIterationFinalVerdict::Promoted);
+        assert!(host.candidate_snapshot().is_none(), "candidate promoted");
+    }
+
+    #[test]
+    #[serial]
+    fn finalize_pass_pass_promotes_when_candidate_staged() {
+        let (_temp, host) = empty_host();
+        host.reload_candidate().expect("stage candidate");
+        let mut state = PluginIterationRunState::new(prepared_for("", &[]));
+        state.verifier_verdict = Some(VerifierVerdict::Pass);
+        state.canary = Some(crate::kernel::plugin_iteration::CanaryReport {
+            verdict: CanaryVerdict::Pass,
+            mode: "recent_successful_invocation_replay".to_string(),
+            plugin_path: Some("x".to_string()),
+            node_id: Some("n".to_string()),
+            payload: Some(json!({})),
+            expected_response: Some(json!({ "ok": true })),
+            actual_response: Some(json!({ "ok": true })),
+            message: "match".to_string(),
+        });
+        let verdict = host
+            .finalize_plugin_iteration(&mut state)
+            .expect("pass/pass promote succeeds");
+        assert_eq!(verdict, PluginIterationFinalVerdict::Promoted);
+        assert!(host.candidate_snapshot().is_none());
+    }
+
+    // ─────────── reload retire-candidate + double reload_candidate ───────
+
+    #[test]
+    #[serial]
+    fn reload_retires_replaced_candidate_snapshot() {
+        let (_temp, host) = empty_host();
+        // Stage a candidate, then a full reload swaps the live snapshot and
+        // retires the still-staged candidate (reload_internal line 4429).
+        host.reload_candidate().expect("stage candidate");
+        assert!(host.candidate_snapshot().is_some());
+        host.reload("/").expect("full reload");
+        // The replaced candidate was retired (taken) during reload_internal.
+        assert!(
+            host.candidate_snapshot().is_none(),
+            "reload must clear/retire the staged candidate"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn double_reload_candidate_retires_previous_candidate() {
+        let (_temp, host) = empty_host();
+        host.reload_candidate().expect("first candidate");
+        // A second stage replaces the first; the previous candidate is retired
+        // (reload_candidate_internal line 4535).
+        host.reload_candidate()
+            .expect("second candidate replaces first");
+        assert!(host.candidate_snapshot().is_some());
+    }
+
+    // ─────────── run_plugin_canary candidate loop continue arm ───────────
+
+    #[test]
+    #[serial]
+    fn run_plugin_canary_continues_when_candidate_lacks_target_plugin() {
+        let (_temp, host) = empty_host();
+        // Stage an (empty) candidate, then run canary for a target plugin that
+        // is NOT in the candidate registry → the `let Some(plugin) = ... else
+        // { continue }` arm fires, then falls through to Partial.
+        host.reload_candidate().expect("stage empty candidate");
+        let state = PluginIterationRunState::new(prepared_for("ghost", &["ghost"]));
+        let report = host.run_plugin_canary(&state).expect("canary runs");
+        assert_eq!(report.verdict, CanaryVerdict::Partial);
+        assert_eq!(report.mode, "no_canary_evidence");
     }
 }

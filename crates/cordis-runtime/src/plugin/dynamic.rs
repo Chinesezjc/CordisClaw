@@ -28,13 +28,7 @@ impl LoadedDylibApi {
                 }
             })?;
 
-        let api_ptr = *symbol;
-        if api_ptr.is_null() {
-            return Err(RuntimeError::Io {
-                path: path.to_path_buf(),
-                message: "symbol resolved to null pointer".to_string(),
-            });
-        }
+        let api_ptr = reject_null_api_ptr(*symbol, path)?;
 
         Ok(Self { _lib: lib, api_ptr })
     }
@@ -46,6 +40,26 @@ impl LoadedDylibApi {
     pub fn lib(&self) -> &Library {
         &self._lib
     }
+}
+
+/// Reject a null API pointer resolved from a dylib's entry symbol.
+///
+/// Extracted from [`LoadedDylibApi::open`] so the null-pointer fail-closed arm
+/// is directly unit-testable: producing a genuinely null `cordis_plugin_api_rust_v2`
+/// symbol from a real dylib is impractical (the SDK's `export_plugin_api!` macro
+/// always stamps a non-null static), so the guard is exercised by passing a null
+/// pointer to this helper. The `path` is threaded through only to tag the error.
+fn reject_null_api_ptr(
+    api_ptr: *const RustPluginApiV2,
+    path: &Path,
+) -> Result<*const RustPluginApiV2, RuntimeError> {
+    if api_ptr.is_null() {
+        return Err(RuntimeError::Io {
+            path: path.to_path_buf(),
+            message: "symbol resolved to null pointer".to_string(),
+        });
+    }
+    Ok(api_ptr)
 }
 
 pub fn is_dylib_path(path: &Path) -> bool {
@@ -108,6 +122,34 @@ mod tests {
         );
     }
 
+    // --- reject_null_api_ptr -------------------------------------------------
+
+    // A null pointer must map to the tagged Io error. This is the fail-closed
+    // arm inside `open` that a real SDK-built dylib can never hit (the export
+    // macro stamps a non-null static), so it is exercised via the extracted
+    // helper directly.
+    #[test]
+    fn reject_null_api_ptr_rejects_null() {
+        let err = reject_null_api_ptr(std::ptr::null(), Path::new("/some/plugin.dylib"))
+            .expect_err("null pointer must be rejected");
+        assert!(
+            matches!(&err, RuntimeError::Io { path, message } if path == &PathBuf::from("/some/plugin.dylib") && message == "symbol resolved to null pointer"),
+            "wrong variant: {err:?}"
+        );
+    }
+
+    // A non-null pointer passes through unchanged (the Ok arm). Use the address
+    // of a real stack value so the pointer is genuinely non-null (and not a
+    // hand-rolled dangling constant). It is never dereferenced.
+    #[test]
+    fn reject_null_api_ptr_passes_non_null() {
+        let marker: u8 = 0;
+        let dummy = std::ptr::addr_of!(marker) as *const RustPluginApiV2;
+        let out = reject_null_api_ptr(dummy, Path::new("/some/plugin.dylib"))
+            .expect("non-null pointer must pass");
+        assert_eq!(out, dummy);
+    }
+
     // --- LoadedDylibApi::open error branches ---------------------------------
 
     #[test]
@@ -126,49 +168,47 @@ mod tests {
         // `cordis_plugin_api_rust_v2` symbol, exercising the symbol-lookup
         // failure branch. Skip elsewhere.
         let sys = Path::new("/usr/lib/libSystem.B.dylib");
-        if unsafe { Library::new(sys) }.is_err() {
-            return; // libSystem.B.dylib not loadable on this host
+        // Gate the assertion on loadability rather than early-returning, so the
+        // "not loadable" skip is not a conditionally-dead line.
+        if unsafe { Library::new(sys) }.is_ok() {
+            let result = LoadedDylibApi::open(sys);
+            assert!(
+                matches!(&result, Err(RuntimeError::Io { message, .. }) if message.contains("symbol lookup failed")),
+                "expected symbol lookup failure for libSystem"
+            );
         }
-        let result = LoadedDylibApi::open(sys);
-        assert!(
-            matches!(&result, Err(RuntimeError::Io { message, .. }) if message.contains("symbol lookup failed")),
-            "expected symbol lookup failure for libSystem"
-        );
     }
 
     // --- LoadedDylibApi happy path (real fixture dylib) ----------------------
 
     fn host_native_fixture_dylib() -> Option<PathBuf> {
         // Fixture .dylib files match the local host arch (arm64 on this repo's
-        // dev machine); .so files are x86_64-linux. Pick the matching one.
-        let ext = if cfg!(target_os = "macos") {
-            "dylib"
-        } else if cfg!(target_os = "linux") {
-            "so"
-        } else {
-            return None;
-        };
+        // dev machine); .so files are x86_64-linux. `DLL_EXTENSION` yields
+        // exactly the host's dylib extension ("dylib" on macOS, "so" on Linux),
+        // so a single expression selects the matching fixture with no
+        // platform-dead arms. On any host without a matching fixture (or a
+        // different extension), `.exists()` returns None below.
         let candidate = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../fixtures/artifacts")
-            .join(format!("expr.{ext}"));
+            .join(format!("expr.{}", std::env::consts::DLL_EXTENSION));
         candidate.exists().then_some(candidate)
     }
 
     #[test]
     fn open_real_fixture_dylib_exposes_api_and_lib() {
-        let Some(path) = host_native_fixture_dylib() else {
-            return; // no host-native fixture dylib available on this host
-        };
-        // A cross-arch fixture (e.g. arm64 dylib on x86_64) legitimately fails
+        // Gate the body on fixture availability + loadability rather than
+        // early-returning, so neither skip is a conditionally-dead line. A
+        // cross-arch fixture (e.g. arm64 dylib on x86_64) legitimately fails
         // dlopen; treat as skip rather than failure. (No Debug on the handle.)
-        let Ok(loaded) = LoadedDylibApi::open(&path) else {
-            return; // fixture dylib not loadable on this host
-        };
-        // api() dereferences the resolved symbol; docs() must return JSON.
-        let api = loaded.api();
-        let docs_json = (api.docs)().payload;
-        assert!(docs_json.contains("plugin_path"), "docs: {docs_json}");
-        // lib() returns the owned Library handle.
-        let _lib: &Library = loaded.lib();
+        if let Some(path) = host_native_fixture_dylib() {
+            if let Ok(loaded) = LoadedDylibApi::open(&path) {
+                // api() dereferences the resolved symbol; docs() must return JSON.
+                let api = loaded.api();
+                let docs_json = (api.docs)().payload;
+                assert!(docs_json.contains("plugin_path"), "docs: {docs_json}");
+                // lib() returns the owned Library handle.
+                let _lib: &Library = loaded.lib();
+            }
+        }
     }
 }

@@ -495,58 +495,18 @@ impl Loader {
                         continue;
                     }
                 }
-                match serde_json::to_string_pretty(new_docs) {
-                    Ok(json) => match atomic_write_via_staging(&docs_path, &json) {
-                        Ok(()) => {
-                            eprintln!(
-                                "[loader] docs-drift: auto-healed {plugin_path} — \
-                                 interfaces.json refreshed from artifact"
-                            );
-                        }
-                        Err(AtomicWriteError::Write { tmp, err }) => {
-                            eprintln!(
-                                "[loader] docs-drift: failed to write tmp {}: {err}",
-                                tmp.display()
-                            );
-                            continue;
-                        }
-                        Err(AtomicWriteError::Rename { tmp, err }) => {
-                            eprintln!(
-                                "[loader] docs-drift: failed to rename {} → {}: {err}",
-                                tmp.display(),
-                                docs_path.display()
-                            );
-                        }
-                    },
-                    Err(e) => {
-                        eprintln!(
-                            "[loader] docs-drift: failed to serialize docs for {plugin_path}: {e}"
-                        );
-                    }
+                // The serialize/write/rename outcome and all its `eprintln!`
+                // logging live in `heal_write_pretty` so the (unreachable-in-
+                // production) serialize-failure arm is covered by a direct unit
+                // test rather than an uncoverable arm in `load`. A `true` return
+                // means the write failed at the tmp stage → skip to the next
+                // drift item, matching the original `continue`.
+                if heal_write_pretty(new_docs, &docs_path, HealTarget::Docs { plugin_path }) {
+                    continue;
                 }
             }
             // Atomic write-back of the artifact index.
-            match serde_json::to_string_pretty(&index) {
-                Ok(json) => match atomic_write_via_staging(index_path, &json) {
-                    Ok(()) => {}
-                    Err(AtomicWriteError::Write { tmp, err }) => {
-                        eprintln!(
-                            "[loader] docs-drift: failed to write index tmp {}: {err}",
-                            tmp.display()
-                        );
-                    }
-                    Err(AtomicWriteError::Rename { tmp, err }) => {
-                        eprintln!(
-                            "[loader] docs-drift: failed to rename index {} → {}: {err}",
-                            tmp.display(),
-                            index_path.display()
-                        );
-                    }
-                },
-                Err(e) => {
-                    eprintln!("[loader] docs-drift: failed to serialize artifact index: {e}");
-                }
-            }
+            heal_write_pretty(&index, index_path, HealTarget::Index);
         }
 
         let doc_registry = DocRegistry::from_plugin_registry(&plugin_registry);
@@ -665,6 +625,86 @@ fn atomic_write_via_staging(target: &Path, contents: &str) -> Result<(), AtomicW
     Ok(())
 }
 
+/// Which docs-drift auto-heal write is being logged. Selects the exact log
+/// wording so the two call sites keep byte-for-byte identical messages after
+/// the logic was hoisted out of `load`.
+enum HealTarget<'a> {
+    Docs { plugin_path: &'a str },
+    Index,
+}
+
+/// Serialize `value` as pretty JSON and atomically write it to `target`,
+/// emitting the docs-drift auto-heal log lines for every outcome.
+///
+/// Returns `true` only when the write failed at the tmp (staging) stage — the
+/// caller uses that to `continue` to the next drift item, matching the original
+/// inline control flow. All other outcomes (success, serialize failure, rename
+/// failure) return `false`.
+///
+/// Hoisted out of `load` so the serialize-failure arm — unreachable in
+/// production because `PluginDocs` / the artifact index always serialize — is
+/// exercisable by a direct unit test that feeds a value whose `Serialize` impl
+/// fails (a map with non-string keys).
+fn heal_write_pretty<T: serde::Serialize>(value: &T, target: &Path, which: HealTarget<'_>) -> bool {
+    let json = match serde_json::to_string_pretty(value) {
+        Ok(json) => json,
+        Err(e) => {
+            match which {
+                HealTarget::Docs { plugin_path } => eprintln!(
+                    "[loader] docs-drift: failed to serialize docs for {plugin_path}: {e}"
+                ),
+                HealTarget::Index => {
+                    eprintln!("[loader] docs-drift: failed to serialize artifact index: {e}")
+                }
+            }
+            return false;
+        }
+    };
+    match atomic_write_via_staging(target, &json) {
+        Ok(()) => {
+            match which {
+                HealTarget::Docs { plugin_path } => eprintln!(
+                    "[loader] docs-drift: auto-healed {plugin_path} — \
+                     interfaces.json refreshed from artifact"
+                ),
+                HealTarget::Index => {}
+            }
+            false
+        }
+        Err(AtomicWriteError::Write { tmp, err }) => {
+            match which {
+                HealTarget::Docs { .. } => eprintln!(
+                    "[loader] docs-drift: failed to write tmp {}: {err}",
+                    tmp.display()
+                ),
+                HealTarget::Index => eprintln!(
+                    "[loader] docs-drift: failed to write index tmp {}: {err}",
+                    tmp.display()
+                ),
+            }
+            // Only the docs-item write failure drives a `continue`; the index
+            // write is the last statement in the block, so its return value is
+            // ignored either way. Signal the tmp-stage failure uniformly.
+            true
+        }
+        Err(AtomicWriteError::Rename { tmp, err }) => {
+            match which {
+                HealTarget::Docs { .. } => eprintln!(
+                    "[loader] docs-drift: failed to rename {} → {}: {err}",
+                    tmp.display(),
+                    target.display()
+                ),
+                HealTarget::Index => eprintln!(
+                    "[loader] docs-drift: failed to rename index {} → {}: {err}",
+                    tmp.display(),
+                    target.display()
+                ),
+            }
+            false
+        }
+    }
+}
+
 /// P0-14: produce a per-process unique tmp path for atomic write-then-rename.
 /// The old code shared `<file>.tmp` between loaders, so two concurrent auto-
 /// heals raced on the same tmp file.  `<file>.cordis-tmp.<pid>-<seq>-<nanos>`
@@ -690,8 +730,22 @@ fn unique_staging_path(target: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod loader_helper_tests {
-    use super::{atomic_write_via_staging, unique_staging_path, AtomicWriteError};
+    use super::{
+        atomic_write_via_staging, heal_write_pretty, unique_staging_path, AtomicWriteError,
+        HealTarget,
+    };
+    use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
+
+    /// A value whose `Serialize` impl fails: `serde_json` cannot encode a map
+    /// with non-string keys, so `to_string_pretty` returns Err. Used to drive
+    /// the serialize-failure arm that `PluginDocs` / the artifact index can
+    /// never reach in production.
+    fn unserializable() -> BTreeMap<Vec<u8>, i32> {
+        let mut m = BTreeMap::new();
+        m.insert(vec![1u8, 2, 3], 7);
+        m
+    }
 
     #[test]
     fn unique_staging_path_never_collides_within_process() {
@@ -782,6 +836,107 @@ mod loader_helper_tests {
             .filter(|e| e.file_name().to_string_lossy().contains(".cordis-tmp."))
             .collect();
         assert!(leftover.is_empty(), "staging leftover: {leftover:?}");
+    }
+
+    // heal_write_pretty happy path (Docs): serializes and writes; returns false
+    // (no tmp-stage failure) and the file lands on disk.
+    #[test]
+    fn heal_write_pretty_docs_ok_writes_and_returns_false() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target = tmp.path().join("interfaces.json");
+        let value = serde_json::json!({"plugin_path": "p"});
+        let skip = heal_write_pretty(&value, &target, HealTarget::Docs { plugin_path: "p" });
+        assert!(!skip, "successful write must not signal skip");
+        assert!(target.exists());
+    }
+
+    // heal_write_pretty index happy path: writes and returns false.
+    #[test]
+    fn heal_write_pretty_index_ok_writes_and_returns_false() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target = tmp.path().join("index.json");
+        let value = serde_json::json!({"entries": []});
+        let skip = heal_write_pretty(&value, &target, HealTarget::Index);
+        assert!(!skip);
+        assert!(target.exists());
+    }
+
+    // Serialize-failure arm (Docs): an unserializable value returns false (not a
+    // tmp-stage failure) and never touches disk. This is the production-
+    // unreachable arm the extraction exists to cover.
+    #[test]
+    fn heal_write_pretty_docs_serialize_failure_returns_false() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target = tmp.path().join("interfaces.json");
+        let skip = heal_write_pretty(
+            &unserializable(),
+            &target,
+            HealTarget::Docs { plugin_path: "p" },
+        );
+        assert!(!skip, "serialize failure is not a tmp-stage skip");
+        assert!(
+            !target.exists(),
+            "nothing should be written on serialize failure"
+        );
+    }
+
+    // Serialize-failure arm (Index): same, via the Index log branch.
+    #[test]
+    fn heal_write_pretty_index_serialize_failure_returns_false() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target = tmp.path().join("index.json");
+        let skip = heal_write_pretty(&unserializable(), &target, HealTarget::Index);
+        assert!(!skip);
+        assert!(!target.exists());
+    }
+
+    // Write-stage failure (Docs): a blocked staging path makes the tmp write
+    // fail → returns true (signals the caller to `continue`).
+    #[test]
+    fn heal_write_pretty_docs_write_failure_returns_true() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let blocker = tmp.path().join("blocker");
+        std::fs::write(&blocker, b"x").unwrap();
+        let target = blocker.join("sub/interfaces.json");
+        let value = serde_json::json!({"k": 1});
+        let skip = heal_write_pretty(&value, &target, HealTarget::Docs { plugin_path: "p" });
+        assert!(skip, "tmp write failure must signal skip");
+    }
+
+    // Write-stage failure (Index): same blocked-path setup through the Index
+    // log branch; the return value is ignored by the caller but must be true.
+    #[test]
+    fn heal_write_pretty_index_write_failure_returns_true() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let blocker = tmp.path().join("blocker");
+        std::fs::write(&blocker, b"x").unwrap();
+        let target = blocker.join("sub/index.json");
+        let value = serde_json::json!({"entries": []});
+        let skip = heal_write_pretty(&value, &target, HealTarget::Index);
+        assert!(skip);
+    }
+
+    // Rename-stage failure (Docs): target exists as a directory → rename fails;
+    // returns false (rename failure does not drive a skip).
+    #[test]
+    fn heal_write_pretty_docs_rename_failure_returns_false() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target = tmp.path().join("interfaces_dir");
+        std::fs::create_dir_all(&target).unwrap();
+        let value = serde_json::json!({"k": 1});
+        let skip = heal_write_pretty(&value, &target, HealTarget::Docs { plugin_path: "p" });
+        assert!(!skip, "rename failure is not a tmp-stage skip");
+    }
+
+    // Rename-stage failure (Index): same, through the Index log branch.
+    #[test]
+    fn heal_write_pretty_index_rename_failure_returns_false() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target = tmp.path().join("index_dir");
+        std::fs::create_dir_all(&target).unwrap();
+        let value = serde_json::json!({"entries": []});
+        let skip = heal_write_pretty(&value, &target, HealTarget::Index);
+        assert!(!skip);
     }
 }
 
