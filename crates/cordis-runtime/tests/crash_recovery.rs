@@ -266,3 +266,80 @@ fn in_memory_rollback_path_applies_when_no_journal() {
     // Nothing to clean up on disk (no journal was ever written).
     assert!(!journal_path(&snapshot_root).exists());
 }
+
+/// Error propagation from the idempotency guard: when both the journal path
+/// and the `.applied` marker exist but the journal path is a directory,
+/// `journal_generation_id` fails its `fs::read` and the `?` propagates the
+/// `Io` error out of `apply_plugin_iteration_journal` (host.rs:6927).
+#[test]
+fn generation_id_read_failure_propagates_when_journal_is_a_directory() {
+    let (_guard, workspace, snapshot_root) = setup_workspace();
+    // Journal path is a directory → fs::read fails inside journal_generation_id.
+    fs::create_dir_all(journal_path(&snapshot_root)).unwrap();
+    // Marker must also exist so the idempotency block is entered.
+    fs::write(applied_marker_path(&snapshot_root), b"any-id").unwrap();
+
+    let err = apply_plugin_iteration_journal(&workspace, &snapshot_root, None)
+        .expect_err("reading a directory as a journal must surface an Io error");
+    assert!(
+        matches!(err, cordis_runtime::core::error::RuntimeError::Io { .. }),
+        "expected Io error, got {err:?}"
+    );
+}
+
+/// Error propagation from `load_journal`: a syntactically corrupt journal
+/// (valid path, unparseable bytes) makes `load_journal` return
+/// `RuntimeError::Invariant`, and the `?` propagates it out of
+/// `apply_plugin_iteration_journal` (host.rs:6942). The idempotency guard is
+/// skipped because no `.applied` marker exists.
+#[test]
+fn corrupt_journal_load_failure_propagates() {
+    let (_guard, workspace, snapshot_root) = setup_workspace();
+    fs::write(journal_path(&snapshot_root), b"{ not valid json").unwrap();
+
+    let err = apply_plugin_iteration_journal(&workspace, &snapshot_root, None)
+        .expect_err("corrupt journal must surface a parse error");
+    assert!(
+        matches!(
+            err,
+            cordis_runtime::core::error::RuntimeError::Invariant { .. }
+        ),
+        "expected Invariant parse error, got {err:?}"
+    );
+}
+
+/// Applied-marker write failure is logged but non-fatal (host.rs:6952-6960):
+/// when the `.applied` marker path is a *non-empty directory*, `atomic_write`
+/// cannot rename its temp file over it, so the recovery path emits the
+/// `eprintln` warning and still completes the rollback, returning `true`.
+#[test]
+fn applied_marker_write_failure_is_logged_but_rollback_still_succeeds() {
+    let (_guard, workspace, snapshot_root) = setup_workspace();
+    let target = workspace.join("plugins/demo/src/lib.rs");
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    fs::write(&target, b"ORIG").unwrap();
+
+    // Make the marker path a non-empty directory: journal_generation_id
+    // returns Some (valid journal), read_to_string(marker-dir) fails → None,
+    // so the idempotency block falls through to the replay path. Then the
+    // atomic_write of the marker fails to rename over the non-empty dir.
+    let marker = applied_marker_path(&snapshot_root);
+    fs::create_dir_all(&marker).unwrap();
+    fs::write(marker.join("blocker"), b"x").unwrap();
+
+    let rb = PluginEditRollback::single_backup(
+        &workspace,
+        "plugins/demo/src/lib.rs",
+        Some(b"ORIG".to_vec()),
+    );
+    rb.persist_journal(&journal_path(&snapshot_root), "iter-marker-fail")
+        .unwrap();
+    fs::write(&target, b"MUTATED").unwrap();
+
+    let restored = apply_plugin_iteration_journal(&workspace, &snapshot_root, None)
+        .expect("rollback proceeds despite marker write failure");
+    assert!(restored, "rollback must still report success");
+    assert_eq!(fs::read(&target).unwrap(), b"ORIG");
+    // Journal was cleared even though the marker write failed.
+    assert!(!journal_path(&snapshot_root).exists());
+}

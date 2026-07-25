@@ -594,23 +594,20 @@ pub extern "C" fn _cordis_agent_trigger(msg: *const c_char) {
         )
         .expect("write helper source");
 
+        // These tests only ever execute inside a Rust toolchain (the coverage
+        // job runs on a rustc-provisioned CI image), so a missing/failing rustc
+        // is a broken environment, not a case to silently skip — fail loudly
+        // rather than report false coverage on the branches below.
         let status = std::process::Command::new(&rustc)
             .args(["--crate-type", "cdylib", "--edition", "2021", "-o"])
             .arg(&dylib)
             .arg(&src)
-            .status();
-
-        // If rustc is unavailable in this environment, skip rather than fail.
-        let Ok(status) = status else {
-            eprintln!("skipping: rustc not runnable ({rustc})");
-            let _ = std::fs::remove_dir_all(&dir);
-            return;
-        };
-        if !status.success() || !dylib.exists() {
-            eprintln!("skipping: helper cdylib did not build");
-            let _ = std::fs::remove_dir_all(&dir);
-            return;
-        }
+            .status()
+            .expect("rustc must be runnable to compile the trigger helper");
+        assert!(
+            status.success() && dylib.exists(),
+            "trigger helper cdylib must build"
+        );
 
         // The helper reads COV_TRIG_OUT when called. Setting it in-process is
         // fine because the call happens synchronously below.
@@ -675,6 +672,16 @@ pub extern "C" fn _cordis_agent_trigger(msg: *const c_char) {
         assert_eq!(
             guard_service_call("start", std::ptr::null_mut(), null_ok),
             7
+        );
+        // Non-null data falls through the early return to the tail `0`.
+        let mut sentinel: i32 = 0;
+        assert_eq!(
+            guard_service_call(
+                "start",
+                (&mut sentinel as *mut i32) as *mut std::ffi::c_void,
+                null_ok
+            ),
+            0
         );
     }
 
@@ -841,6 +848,12 @@ mod service_panic_isolation_tests {
 
     #[test]
     fn service_vtable_macro_passes_through_success_code() {
+        // Null data drives `ok_start` through its early-return branch.
+        assert_eq!(
+            guard_service_call("start", std::ptr::null_mut(), ok_start),
+            7,
+            "null data returns the early-return sentinel"
+        );
         let mut flag: i32 = 0;
         let vtable = service_vtable! {
             data = (&mut flag as *mut i32) as *mut c_void,

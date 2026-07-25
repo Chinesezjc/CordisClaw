@@ -209,6 +209,24 @@ impl PluginRegistry {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// Insert a fully hand-built [`RegisteredPlugin`], bypassing the field
+    /// invariants the public `insert_*` constructors enforce.
+    ///
+    /// The public constructors always co-populate the artifact-derived fields
+    /// (`insert_loaded` fills every `Some`, `insert_unavailable` clears them),
+    /// so a `Loaded` entry with a *missing* docs / artifact_kind /
+    /// abi_fingerprint is unconstructible through the normal API. The invoke
+    /// path nonetheless carries fail-closed `Invariant` guards for each of
+    /// those "impossible" states; this test-only door lets unit tests drive
+    /// them directly without weakening the production constructors.
+    #[cfg(test)]
+    pub(crate) fn insert_raw(&self, plugin: RegisteredPlugin) {
+        self.plugins
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .insert(plugin.plugin_path.clone(), plugin);
+    }
 }
 
 impl NodeRegistry {

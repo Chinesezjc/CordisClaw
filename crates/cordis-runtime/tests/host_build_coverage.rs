@@ -19,8 +19,8 @@
 
 use cordis_runtime::host::RuntimeHost;
 use cordis_runtime::kernel::plugin_iteration::{
-    CanaryVerdict, KernelPluginIterationRequest, PluginEditOpKind, PluginEditOperation,
-    PluginEditPlan, PluginIterationFinalVerdict, VerifierVerdict,
+    CanaryVerdict, KernelPluginIssueSource, KernelPluginIterationRequest, PluginEditOpKind,
+    PluginEditOperation, PluginEditPlan, PluginIterationFinalVerdict, VerifierVerdict,
 };
 use cordis_runtime::kernel::verifier::VerificationProfile;
 use cordis_runtime::plugin::tooling::{prepare_artifacts, PrepareMode};
@@ -1055,6 +1055,90 @@ fn iterate_plugins_agent_walks_execute_tool_surface_and_promotes() {
     let post = host
         .invoke("mini", "mini_echo", json!({}).to_string())
         .expect("post-promote invoke");
+    let post_value: Value = serde_json::from_str(&post.payload).expect("post json");
+    assert_eq!(
+        post_value.get("value").and_then(|v| v.as_str()),
+        Some("pong")
+    );
+}
+
+// iterate_plugins Step-3 rebuild-failure arm: an edit plan that splices
+// non-compiling Rust into `mini` makes `rebuild_plugin_workspace` return Err.
+// This exercises the `Err(err) => { observe_plugin_iteration_failure(..,
+// "rebuild", ..); stage_error = Some(..) }` arm (host.rs ~3307) WITHOUT any
+// test injection: the real cargo build fails on the broken source. The
+// iteration must roll back (source restored, no candidate, journal cleared,
+// runtime still live) and the kernel must record a `rebuild`-stage LoadFailure.
+#[serial]
+#[test]
+fn iterate_plugins_rolls_back_on_rebuild_failure() {
+    let (_temp, fixtures) = setup_minimal_workspace(MINI_SUMMARY);
+    let host = boot_and_seed(&fixtures);
+    let journal = journal_path(&host.status().snapshot_root);
+    let lib_path = fixtures.join("plugins/mini/src/lib.rs");
+    let original_source = fs::read_to_string(&lib_path).expect("read mini source");
+
+    // Splice a syntax error onto the `mini_echo` value expression. The edit
+    // itself applies (Step 1/2 succeed) but `cargo build -p mini` in Step 3
+    // fails to compile → rebuild_plugin_workspace returns Err.
+    let broken_plan = PluginEditPlan {
+        issue_id: "issue-mini-broken".to_string(),
+        patch_id: "patch-mini-broken".to_string(),
+        summary: "inject a compile error into mini".to_string(),
+        operations: vec![PluginEditOperation {
+            path: "plugins/mini/src/lib.rs".to_string(),
+            kind: PluginEditOpKind::ReplaceExact,
+            expected_old_string: Some("value: \"pong\".to_string(),".to_string()),
+            expected_sha256: None,
+            new_content: Some("value: this_is_not_valid_rust(((,".to_string()),
+            pointer: None,
+            dotted_key: None,
+            value: None,
+        }],
+    };
+
+    let result = host
+        .iterate_plugins(iteration_request(broken_plan))
+        .expect("rebuild-failure iteration still returns a rollback result");
+
+    assert_eq!(
+        result.final_verdict,
+        PluginIterationFinalVerdict::RolledBack,
+        "a rebuild failure must roll back; blocked_reason={:?}",
+        result.blocked_reason
+    );
+    // The rolled-back reason carries the cargo build failure text.
+    let reason = result.blocked_reason.unwrap_or_default();
+    assert!(
+        reason.contains("cargo build -p mini failed"),
+        "blocked_reason must surface the rebuild error, got: {reason}"
+    );
+    // Verify never ran (rebuild short-circuited via stage_error).
+    assert_eq!(result.verifier_verdict, None);
+
+    // Source restored to the pre-iteration bytes; no leftover candidate/journal.
+    assert_eq!(
+        fs::read_to_string(&lib_path).expect("read restored source"),
+        original_source
+    );
+    assert!(host.candidate_snapshot().is_none());
+    assert!(!journal.exists(), "journal cleared after rollback");
+
+    // The kernel observed a rebuild-stage LoadFailure for mini.
+    let issues = host.kernel().plugin_issues();
+    assert!(
+        issues.iter().any(|issue| {
+            issue.source == KernelPluginIssueSource::LoadFailure
+                && issue.summary.contains("rebuild")
+                && issue.summary.contains("mini")
+        }),
+        "expected a rebuild-stage LoadFailure issue, got: {issues:?}"
+    );
+
+    // Runtime still live: original mini_echo still answers pong.
+    let post = host
+        .invoke("mini", "mini_echo", json!({}).to_string())
+        .expect("runtime still usable after rebuild-failure rollback");
     let post_value: Value = serde_json::from_str(&post.payload).expect("post json");
     assert_eq!(
         post_value.get("value").and_then(|v| v.as_str()),

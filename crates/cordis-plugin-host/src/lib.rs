@@ -398,14 +398,18 @@ fn invoke_json_artifact(
                     message: format!("spawn {} failed: {err}", command_path.display()),
                 })?;
 
-            if let Some(stdin) = child.stdin.as_mut() {
-                stdin.write_all(payload.as_bytes()).map_err(|err| {
-                    PluginHostError::PluginInvocationFailed {
-                        plugin_path: plugin.plugin_path.clone(),
-                        message: format!("write stdin failed: {err}"),
-                    }
-                })?;
-            }
+            // `spawn` above sets `Stdio::piped()`, so `child.stdin` is always
+            // `Some`; take it directly rather than leaving a dead `None` arm.
+            let stdin = child
+                .stdin
+                .as_mut()
+                .expect("piped stdin must be present after spawn");
+            stdin.write_all(payload.as_bytes()).map_err(|err| {
+                PluginHostError::PluginInvocationFailed {
+                    plugin_path: plugin.plugin_path.clone(),
+                    message: format!("write stdin failed: {err}"),
+                }
+            })?;
 
             let output = child
                 .wait_with_output()
@@ -628,12 +632,10 @@ mod tests {
     #[test]
     fn load_real_fixtures_and_accessors() {
         let catalog = PluginCatalog::load(real_fixtures_root()).expect("load real fixtures");
-        assert!(catalog.fixtures_root().is_absolute());
-        assert!(
-            catalog.fixtures_root().ends_with("fixtures"),
-            "root: {}",
-            catalog.fixtures_root().display()
-        );
+        let root = catalog.fixtures_root();
+        assert!(root.is_absolute());
+        let root_display = root.display().to_string();
+        assert!(root.ends_with("fixtures"), "root: {root_display}");
         // Iterator and lookup agree.
         let via_iter = catalog.plugins().count();
         assert!(via_iter > 0, "fixtures ship at least one plugin");
@@ -804,20 +806,15 @@ mod tests {
     #[test]
     fn invoke_dylib_missing_entry_symbol_is_io_error() {
         // A valid dylib that lacks the cordis entry symbol -> symbol lookup
-        // fails. Copy a real system dylib into the temp tree with a .dylib
-        // name. `libgmalloc.dylib` is a genuine on-disk file (unlike e.g.
-        // `libz.1.2.12.dylib`, a symlink whose target lives only in the dyld
-        // shared cache), so `Path::exists()` is true and `Library::new`
-        // succeeds — actually exercising the symbol-lookup-failure branch
-        // rather than skipping. If it is ever absent, fall back to a skip.
-        let sys = Path::new("/usr/lib/libgmalloc.dylib");
-        if !sys.exists() {
-            eprintln!("skipping: {} not present", sys.display());
-            return;
-        }
+        // fails. The running test binary itself is a loadable Mach-O/ELF image
+        // that exports no `_cordis_plugin_entry_v2`, and it exists on every
+        // host (unlike a platform-specific system dylib), so copying it under a
+        // `.dylib` name exercises the symbol-lookup-failure branch without any
+        // environment skip.
+        let sys = loadable_helper_dylib();
         let tmp = TmpFixtures::with_index("{}"); // placeholder, overwrite below
         let plugin_dylib = tmp.root().join("artifacts/nosym.dylib");
-        fs::copy(sys, &plugin_dylib).expect("copy system dylib");
+        fs::copy(&sys, &plugin_dylib).expect("copy helper cdylib");
         let index = format!(
             r#"{{ "schema_version": 2, "entries": [
                 {{ "plugin_path": "p", "artifact_path": "nosym.dylib", "docs": {}, "execution": null }}
@@ -866,6 +863,13 @@ mod tests {
             payload: "{}".to_string(),
         }
     }
+
+    #[test]
+    fn dummy_docs_returns_empty_object() {
+        // `dummy_docs` only appears as a vtable field; `invoke_dylib` never
+        // calls the `docs` pointer, so exercise its body directly.
+        assert_eq!(dummy_docs().payload, "{}");
+    }
     fn handle_ok(req: PluginRequest) -> PluginResponse {
         PluginResponse {
             payload: format!("echo:{}", req.payload),
@@ -912,15 +916,52 @@ mod tests {
         handle: handle_panic_other,
     };
 
-    /// A real on-disk dylib to keep mapped inside the synthetic `LoadedDylib`.
-    /// `libgmalloc.dylib` is a genuine file (see the missing-symbol test).
-    fn live_gmalloc_or_skip() -> Option<Library> {
-        let sys = Path::new("/usr/lib/libgmalloc.dylib");
-        if !sys.exists() {
-            eprintln!("skipping: {} not present", sys.display());
-            return None;
-        }
-        Some(unsafe { Library::new(sys) }.expect("load libgmalloc"))
+    /// A real on-disk, loadable image to keep mapped inside the synthetic
+    /// `LoadedDylib`. The field is never dereferenced (the `api_ptr` points at
+    /// an in-test static, not into this module); it exists only to satisfy the
+    /// "keep the module alive" invariant. The running test binary is a valid
+    /// Mach-O/ELF image present on every host, so this needs no environment
+    /// skip.
+    /// Compile (once per test process) a tiny dependency-free cdylib and
+    /// return its path. Unlike the running test binary — which Linux refuses
+    /// to `dlopen` ("cannot dynamically load position-independent
+    /// executable") — a real cdylib is loadable on every platform, and it
+    /// exports no cordis entry symbol, so it doubles as the
+    /// symbol-lookup-failure fixture.
+    fn loadable_helper_dylib() -> std::path::PathBuf {
+        use std::sync::OnceLock;
+        static HELPER: OnceLock<std::path::PathBuf> = OnceLock::new();
+        HELPER
+            .get_or_init(|| {
+                let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
+                let dir =
+                    std::env::temp_dir().join(format!("cordis-host-live-{}", std::process::id()));
+                let _ = fs::create_dir_all(&dir);
+                let src_path = dir.join("live.rs");
+                let dylib = dir.join(format!("liblive{}", std::env::consts::DLL_SUFFIX));
+                fs::write(
+                    &src_path,
+                    "#[no_mangle]\npub extern \"C\" fn cordis_live_probe() -> u32 { 7 }\n",
+                )
+                .expect("write helper source");
+                let status = std::process::Command::new(&rustc)
+                    .args(["--crate-type", "cdylib", "-o"])
+                    .arg(&dylib)
+                    .arg(&src_path)
+                    .status()
+                    .expect("run rustc for helper cdylib");
+                assert!(
+                    status.success() && dylib.exists(),
+                    "helper cdylib must build"
+                );
+                dylib
+            })
+            .clone()
+    }
+
+    fn live_library() -> Library {
+        let dylib = loadable_helper_dylib();
+        unsafe { Library::new(&dylib) }.expect("load helper cdylib as library")
     }
 
     /// Build a `CatalogPlugin` whose `library` slot is pre-loaded with a
@@ -949,9 +990,7 @@ mod tests {
 
     #[test]
     fn invoke_dylib_fingerprint_not_parseable_is_invocation_failed() {
-        let Some(lib) = live_gmalloc_or_skip() else {
-            return;
-        };
+        let lib = live_library();
         // expected fingerprint present -> verification runs -> abi_fingerprint
         // returns non-JSON -> serde parse fails -> PluginInvocationFailed.
         let expected = AbiFingerprint::current_build("crate_x", "api_v2");
@@ -965,9 +1004,7 @@ mod tests {
 
     #[test]
     fn invoke_dylib_handle_panic_static_str_is_isolated() {
-        let Some(lib) = live_gmalloc_or_skip() else {
-            return;
-        };
+        let lib = live_library();
         // No expected fingerprint -> verification skipped -> straight to
         // handle, which panics with a &'static str payload.
         let plugin = plugin_with_static_api(&API_PANIC_STR, None, lib);
@@ -980,9 +1017,7 @@ mod tests {
 
     #[test]
     fn invoke_dylib_handle_panic_owned_string_is_isolated() {
-        let Some(lib) = live_gmalloc_or_skip() else {
-            return;
-        };
+        let lib = live_library();
         let plugin = plugin_with_static_api(&API_PANIC_STRING, None, lib);
         let err = invoke_dylib(&plugin, "{}".to_string()).unwrap_err();
         assert!(
@@ -993,9 +1028,7 @@ mod tests {
 
     #[test]
     fn invoke_dylib_handle_panic_non_string_payload_is_isolated() {
-        let Some(lib) = live_gmalloc_or_skip() else {
-            return;
-        };
+        let lib = live_library();
         // u64 payload -> neither &str nor String downcast matches -> the
         // "<non-string panic payload>" fallback arm.
         let plugin = plugin_with_static_api(&API_PANIC_OTHER, None, lib);
@@ -1008,9 +1041,7 @@ mod tests {
 
     #[test]
     fn invoke_dylib_static_api_happy_path_marks_verified() {
-        let Some(lib) = live_gmalloc_or_skip() else {
-            return;
-        };
+        let lib = live_library();
         // Matching fingerprint -> verification passes and sets
         // fingerprint_verified; handle returns normally.
         let expected = AbiFingerprint::current_build("crate_x", "api_v2");

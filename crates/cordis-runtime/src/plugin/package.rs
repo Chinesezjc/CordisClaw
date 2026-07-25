@@ -483,29 +483,10 @@ impl PackageResolver {
         let child_path = Path::new(&child.source);
         let mut normal_components = Vec::new();
         for component in child_path.components() {
-            match component {
-                Component::CurDir => {}
-                Component::Normal(seg) => normal_components.push(seg.to_string_lossy().to_string()),
-                Component::ParentDir => {
-                    return Err(RuntimeError::InvalidChildSource {
-                        parent: parent_plugin_path.to_string(),
-                        child_source: child.source.clone(),
-                        reason: "../ is forbidden".to_string(),
-                    });
-                }
-                // Upstream-masked: `child.source` is required to start with
-                // `./` (checked at the top of `resolve_child_dir`), so the
-                // first component is always `CurDir` and a `RootDir`/`Prefix`
-                // can never appear. Retained fail-closed for defense-in-depth
-                // rather than debug_assert-ed away, because this is a
-                // path-traversal boundary that must hold in release too.
-                Component::RootDir | Component::Prefix(_) => {
-                    return Err(RuntimeError::InvalidChildSource {
-                        parent: parent_plugin_path.to_string(),
-                        child_source: child.source.clone(),
-                        reason: "absolute path is forbidden".to_string(),
-                    });
-                }
+            if let Some(seg) =
+                classify_child_component(component, parent_plugin_path, &child.source)?
+            {
+                normal_components.push(seg);
             }
         }
 
@@ -527,6 +508,39 @@ impl PackageResolver {
         }
 
         Ok((child_dir, child_component))
+    }
+}
+
+/// Classify one path component of a child source.
+///
+/// Returns `Ok(Some(segment))` for a normal segment, `Ok(None)` for the
+/// leading `./`, and a fail-closed `InvalidChildSource` for `../`, absolute
+/// roots, or Windows prefixes.
+///
+/// Extracted from [`PackageResolver::resolve_child_dir`] so the
+/// `RootDir`/`Prefix` path-traversal arm is directly unit-testable. That arm
+/// is upstream-masked in `resolve_child_dir` (child sources must start with
+/// `./`, so the first component is always `CurDir` and a root/prefix can never
+/// follow), but the fail-closed guard must hold in release too — hence a real
+/// function rather than a `debug_assert`.
+fn classify_child_component(
+    component: Component<'_>,
+    parent_plugin_path: &str,
+    child_source: &str,
+) -> Result<Option<String>, RuntimeError> {
+    match component {
+        Component::CurDir => Ok(None),
+        Component::Normal(seg) => Ok(Some(seg.to_string_lossy().to_string())),
+        Component::ParentDir => Err(RuntimeError::InvalidChildSource {
+            parent: parent_plugin_path.to_string(),
+            child_source: child_source.to_string(),
+            reason: "../ is forbidden".to_string(),
+        }),
+        Component::RootDir | Component::Prefix(_) => Err(RuntimeError::InvalidChildSource {
+            parent: parent_plugin_path.to_string(),
+            child_source: child_source.to_string(),
+            reason: "absolute path is forbidden".to_string(),
+        }),
     }
 }
 
@@ -1123,5 +1137,235 @@ mod resolver_tests {
         );
         // required=false edge recorded on the alpha->beta child edge.
         assert!(!graph.children["alpha"][0].required);
+    }
+
+    // --- security-boundary arms driven via a hand-built VisitState -----------
+    //
+    // The `DuplicatePluginPath` and `CycleDetected` guards in `visit_plugin`
+    // sit *after* the manifest/scaffold/docs validation but require a
+    // pre-populated `VisitState` (a conflicting `dir_by_plugin_path` entry, a
+    // conflicting `parent_of` entry, or the plugin already on the `visiting`
+    // stack). Through the public `resolve()` these states are hard to reach
+    // because directory-derived plugin paths normally guard first. Here we
+    // build a valid `alpha` plugin dir, then seed `VisitState` directly and
+    // invoke the (crate-private) `visit_plugin` so each fail-closed arm is
+    // exercised without weakening `resolve()`.
+
+    fn empty_state() -> VisitState {
+        VisitState {
+            plugins: BTreeMap::new(),
+            children: BTreeMap::new(),
+            dir_by_plugin_path: HashMap::new(),
+            parent_of: HashMap::new(),
+            visiting: HashSet::new(),
+            visit_stack: Vec::new(),
+            topo_order: Vec::new(),
+        }
+    }
+
+    /// Build a valid single `alpha` plugin dir under a fresh temp root and
+    /// return `(tmp, resolver, alpha_dir)`.
+    fn valid_alpha() -> (TempDir, PackageResolver, PathBuf) {
+        let tmp = TempDir::new().unwrap();
+        write_workspace(tmp.path(), &["alpha"]);
+        PluginBuilder::new("alpha").build(tmp.path());
+        let resolver = PackageResolver::new(tmp.path());
+        let alpha_dir = tmp.path().join("alpha");
+        (tmp, resolver, alpha_dir)
+    }
+
+    // dir_by_plugin_path already maps "alpha" to a *different* directory →
+    // DuplicatePluginPath (first branch, lines 269-276).
+    #[test]
+    fn visit_plugin_duplicate_dir_is_duplicate_plugin_path() {
+        let (_tmp, resolver, alpha_dir) = valid_alpha();
+        let mut state = empty_state();
+        state
+            .dir_by_plugin_path
+            .insert("alpha".to_string(), PathBuf::from("/some/other/dir"));
+
+        let err = resolver
+            .visit_plugin(&alpha_dir, None, true, BTreeSet::new(), &mut state)
+            .unwrap_err();
+        assert!(
+            matches!(&err, RuntimeError::DuplicatePluginPath { plugin_path, first, second } if plugin_path == "alpha" && first == &PathBuf::from("/some/other/dir") && second == &alpha_dir),
+            "wrong variant: {err:?}"
+        );
+    }
+
+    // parent_of already records a *different* parent for "alpha" → the
+    // second DuplicatePluginPath branch (lines 279-292), including the
+    // `dir_by_plugin_path.get(existing_parent)` lookup for `first`.
+    #[test]
+    fn visit_plugin_conflicting_parent_is_duplicate_plugin_path() {
+        let (_tmp, resolver, alpha_dir) = valid_alpha();
+        let mut state = empty_state();
+        // Record a different existing parent and give that parent a known dir
+        // so the `first` field resolves through dir_by_plugin_path.
+        state
+            .parent_of
+            .insert("alpha".to_string(), "old_parent".to_string());
+        state
+            .dir_by_plugin_path
+            .insert("old_parent".to_string(), PathBuf::from("/parents/old"));
+
+        let err = resolver
+            .visit_plugin(
+                &alpha_dir,
+                Some("new_parent"),
+                true,
+                BTreeSet::new(),
+                &mut state,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(&err, RuntimeError::DuplicatePluginPath { plugin_path, first, second } if plugin_path == "alpha" && first == &PathBuf::from("/parents/old") && second == &alpha_dir),
+            "wrong variant: {err:?}"
+        );
+    }
+
+    // Conflicting parent, but the existing parent has NO recorded dir → the
+    // `first` field falls back to `PathBuf::from(existing_parent)` (the
+    // `unwrap_or_else` arm) rather than a resolved directory.
+    #[test]
+    fn visit_plugin_conflicting_parent_without_dir_uses_name_fallback() {
+        let (_tmp, resolver, alpha_dir) = valid_alpha();
+        let mut state = empty_state();
+        // Existing parent recorded, but no dir_by_plugin_path entry for it.
+        state
+            .parent_of
+            .insert("alpha".to_string(), "old_parent".to_string());
+
+        let err = resolver
+            .visit_plugin(
+                &alpha_dir,
+                Some("new_parent"),
+                true,
+                BTreeSet::new(),
+                &mut state,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(&err, RuntimeError::DuplicatePluginPath { first, .. } if first == &PathBuf::from("old_parent")),
+            "wrong variant: {err:?}"
+        );
+    }
+
+    // `visiting` already contains "alpha" and the DFS stack holds it → the
+    // cycle guard returns the full loop path (lines 296-303).
+    #[test]
+    fn visit_plugin_on_visiting_stack_is_cycle_detected() {
+        let (_tmp, resolver, alpha_dir) = valid_alpha();
+        let mut state = empty_state();
+        state.visiting.insert("alpha".to_string());
+        state.visit_stack.push("alpha".to_string());
+
+        let err = resolver
+            .visit_plugin(&alpha_dir, None, true, BTreeSet::new(), &mut state)
+            .unwrap_err();
+        assert!(
+            matches!(&err, RuntimeError::CycleDetected { cycle } if cycle == &vec!["alpha".to_string(), "alpha".to_string()]),
+            "wrong variant: {err:?}"
+        );
+    }
+
+    // `visiting` contains "alpha" but the DFS stack does NOT → the
+    // `position(...)` lookup returns None, so the loop-prefix extend is skipped
+    // and the returned cycle holds only the re-entered node (covers the
+    // `if let Some(idx)` false arm).
+    #[test]
+    fn visit_plugin_visiting_without_stack_entry_cycle_has_single_node() {
+        let (_tmp, resolver, alpha_dir) = valid_alpha();
+        let mut state = empty_state();
+        state.visiting.insert("alpha".to_string());
+        // Deliberately leave visit_stack empty.
+
+        let err = resolver
+            .visit_plugin(&alpha_dir, None, true, BTreeSet::new(), &mut state)
+            .unwrap_err();
+        assert!(
+            matches!(&err, RuntimeError::CycleDetected { cycle } if cycle == &vec!["alpha".to_string()]),
+            "wrong variant: {err:?}"
+        );
+    }
+
+    // "alpha" is already fully resolved (present in `state.plugins`) and not on
+    // the visiting stack, with no dir/parent conflict → the "already visited by
+    // another path" early `Ok(())` return (lines 306-307).
+    #[test]
+    fn visit_plugin_already_resolved_returns_ok() {
+        let (_tmp, resolver, alpha_dir) = valid_alpha();
+        let mut state = empty_state();
+        // Same dir recorded (so the dup-dir guard's inner `!=` is false) and the
+        // plugin already in `plugins`.
+        state
+            .dir_by_plugin_path
+            .insert("alpha".to_string(), alpha_dir.clone());
+        state.plugins.insert(
+            "alpha".to_string(),
+            ResolvedPlugin {
+                plugin_path: "alpha".to_string(),
+                crate_name: "alpha".to_string(),
+                dir: alpha_dir.clone(),
+                metadata: CordisMetadata {
+                    plugin_path: "alpha".to_string(),
+                    abi_kind: Default::default(),
+                    abi_fingerprint: crate::core::models::AbiFingerprint {
+                        rustc_version: "rustc".to_string(),
+                        target_triple: "triple".to_string(),
+                        crate_hash: "c".to_string(),
+                        api_hash: "a".to_string(),
+                    },
+                    children: Vec::new(),
+                    declared_nodes: Vec::new(),
+                    allow_generated_docs: false,
+                },
+                docs: synthesized_generated_docs_placeholder("alpha", "0.1.0"),
+                parent: None,
+                required: true,
+                grants_from_parent: BTreeSet::new(),
+            },
+        );
+
+        resolver
+            .visit_plugin(&alpha_dir, None, true, BTreeSet::new(), &mut state)
+            .expect("already-resolved plugin must return Ok(())");
+        // No duplicate insertion.
+        assert_eq!(state.plugins.len(), 1);
+    }
+
+    // classify_child_component: the path-traversal RootDir arm (upstream-masked
+    // in resolve_child_dir) rejects an absolute component.
+    #[test]
+    fn classify_child_component_rejects_root_dir() {
+        // The RootDir component of an absolute path.
+        let comp = Path::new("/abs/x").components().next().unwrap();
+        assert!(matches!(comp, Component::RootDir));
+        let err =
+            classify_child_component(comp, "parent/plugin", "/abs/x").expect_err("root forbidden");
+        assert!(
+            matches!(&err, RuntimeError::InvalidChildSource { reason, .. } if reason == "absolute path is forbidden"),
+            "wrong variant: {err:?}"
+        );
+    }
+
+    // classify_child_component: CurDir yields None, Normal yields the segment,
+    // ParentDir is rejected — the remaining arms, for completeness.
+    #[test]
+    fn classify_child_component_normal_curdir_parentdir() {
+        let mut comps = Path::new("./seg/../x").components();
+        assert!(matches!(
+            classify_child_component(comps.next().unwrap(), "p", "./seg/../x"),
+            Ok(None)
+        )); // CurDir
+        assert_eq!(
+            classify_child_component(comps.next().unwrap(), "p", "./seg/../x").unwrap(),
+            Some("seg".to_string())
+        ); // Normal
+        let err = classify_child_component(comps.next().unwrap(), "p", "./seg/../x").unwrap_err();
+        assert!(
+            matches!(&err, RuntimeError::InvalidChildSource { reason, .. } if reason == "../ is forbidden"),
+            "wrong variant: {err:?}"
+        ); // ParentDir
     }
 }

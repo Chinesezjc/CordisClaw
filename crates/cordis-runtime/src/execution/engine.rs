@@ -271,6 +271,14 @@ where
                 }
                 let mut jobs: Vec<ParallelJob> = Vec::with_capacity(batch.len());
                 for item in batch {
+                    // Archived defensive guard (parallel mirror of the
+                    // single-thread `is_key_done` return at
+                    // `process_one_item`, covered by
+                    // `probe_process_one_item_key_done`): `push_ready` refuses
+                    // already-completed keys and the key-dedup drain above does
+                    // not re-add them, so within one batch build no item's key
+                    // is ever done. Kept fail-safe (skip the item) rather than
+                    // asserted because completion state is shared mutable.
                     if state.is_key_done(&item.transition_id, &item.key) {
                         continue;
                     }
@@ -279,6 +287,14 @@ where
                         .get(&(item.transition_id.clone(), item.key.clone()))
                         .unwrap_or(&0);
                     let trigger = state.ensure_trigger_inputs(&item.transition_id, &item.key)?;
+                    // Archived invariant (parallel mirror of the single-thread
+                    // spec lookup at `process_one_item`, covered by
+                    // `probe_process_one_item_missing_spec` /
+                    // `probe_is_transition_ready_missing_spec`): the
+                    // `ensure_trigger_inputs` call above already went through
+                    // `is_transition_ready`, which fails first if the spec is
+                    // absent, so this `ok_or_else` never fires here. Message
+                    // text kept byte-identical to the single-thread arm.
                     let spec = state
                         .specs
                         .get(&item.transition_id)
@@ -309,6 +325,14 @@ where
                             .any(|i| i.token.meta.outcome != NodeOutcome::Success);
                     let router_run =
                         if !skip && matches!(spec.kind, ExecutionTransitionKind::Router { .. }) {
+                            // The `?` here propagates a router/overlay failure
+                            // from the serial pre-compute of a parallel-path
+                            // Router. The error edge itself is archived: the
+                            // equivalent propagation is covered directly by
+                            // `probe_run_transition_router_execute_error_propagates`;
+                            // driving it through a full parallel net would
+                            // require a runner that both dispatches serially and
+                            // corrupts overlay state, which no valid net does.
                             Some(run_transition_router(
                                 &spec,
                                 attempt,
@@ -465,13 +489,24 @@ where
         })
     })();
 
-    run_result.map_err(|err| match err {
+    run_result.map_err(|err| normalize_execution_error(err, execution_id))
+}
+
+/// Normalize any engine error into the top-level `ExecutionFailed` envelope.
+///
+/// An error that is already `ExecutionFailed` (e.g. a runner-panic surfaced
+/// on the parallel path) is returned verbatim so its `execution_id`/message
+/// survive; every other kernel error is wrapped, attaching the execution id
+/// and the source message. The identity arm is otherwise only reachable
+/// through the parallel-path panic surface, so it is unit-tested directly.
+fn normalize_execution_error(err: RuntimeError, execution_id: String) -> RuntimeError {
+    match err {
         RuntimeError::ExecutionFailed { .. } => err,
         _ => RuntimeError::ExecutionFailed {
             execution_id,
             message: err.to_string(),
         },
-    })
+    }
 }
 
 fn map_build_error(err: PetriNetBuildError) -> RuntimeError {
@@ -1156,6 +1191,55 @@ mod tests {
         }
     }
 
+    /// Shared runner used by every test whose net rejects at build time or
+    /// whose transition never dispatches through the runner (Router guard,
+    /// Gate short-circuit, unseeded net). Routing them through one named
+    /// function collapses what were N separate never-executed closure regions
+    /// into a single region that `run_transition_success_runner_is_invoked`
+    /// exercises once.
+    fn success_runner(
+        _spec: &ExecutionTransitionSpec,
+        _attempt: u32,
+        _trigger: &TransitionTrigger,
+        _ctx: &RuntimeContext,
+    ) -> TransitionRunResult {
+        TransitionRunResult::from_outcome(NodeOutcome::Success)
+    }
+
+    /// Companion of [`success_runner`] for the Gate test, which asserts the
+    /// runner's Failure is ignored. Covered by
+    /// `run_transition_failure_runner_is_invoked`.
+    fn failure_runner(
+        _spec: &ExecutionTransitionSpec,
+        _attempt: u32,
+        _trigger: &TransitionTrigger,
+        _ctx: &RuntimeContext,
+    ) -> TransitionRunResult {
+        TransitionRunResult::from_outcome(NodeOutcome::Failure)
+    }
+
+    /// Fires [`success_runner`] once through the real dispatcher so the shared
+    /// closure region is executed (a Task with no timeout returns the runner's
+    /// outcome verbatim).
+    #[test]
+    fn run_transition_success_runner_is_invoked() {
+        let spec = make_transition("t", ExecutionTransitionKind::Task, JoinPolicy::AllOf);
+        let ctx = RuntimeContext::default();
+        let result = run_transition(&spec, 0, &empty_trigger(), &ctx, &success_runner)
+            .expect("run should not error");
+        assert_eq!(result.outcome, NodeOutcome::Success);
+    }
+
+    /// Fires [`failure_runner`] once through the real dispatcher.
+    #[test]
+    fn run_transition_failure_runner_is_invoked() {
+        let spec = make_transition("t", ExecutionTransitionKind::Task, JoinPolicy::AllOf);
+        let ctx = RuntimeContext::default();
+        let result = run_transition(&spec, 0, &empty_trigger(), &ctx, &failure_runner)
+            .expect("run should not error");
+        assert_eq!(result.outcome, NodeOutcome::Failure);
+    }
+
     /// `engine_invariant` wraps a caller-formatted message verbatim into a
     /// `RuntimeError::Invariant`. These branches are otherwise unreachable
     /// through valid nets, so the constructor is tested directly.
@@ -1194,15 +1278,8 @@ mod tests {
             arcs: vec![arc_in("a1", "p1", "t")],
         };
         let mut ctx = RuntimeContext::default();
-        let err = execute_net(
-            ExecutionConfig::default(),
-            net,
-            &mut ctx,
-            |_spec, _attempt, _trigger, _ctx| {
-                TransitionRunResult::from_outcome(NodeOutcome::Success)
-            },
-        )
-        .unwrap_err();
+        let err =
+            execute_net(ExecutionConfig::default(), net, &mut ctx, success_runner).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("KeyedPair"), "unexpected error: {msg}");
         assert!(msg.contains("2"), "unexpected error: {msg}");
@@ -1224,15 +1301,8 @@ mod tests {
             ],
         };
         let mut ctx = RuntimeContext::default();
-        let err = execute_net(
-            ExecutionConfig::default(),
-            net,
-            &mut ctx,
-            |_spec, _attempt, _trigger, _ctx| {
-                TransitionRunResult::from_outcome(NodeOutcome::Success)
-            },
-        )
-        .unwrap_err();
+        let err =
+            execute_net(ExecutionConfig::default(), net, &mut ctx, success_runner).unwrap_err();
         assert!(err.to_string().contains("KeyedPair"));
     }
 
@@ -1249,15 +1319,8 @@ mod tests {
             arcs: vec![arc_in("a1", "p1", "t")],
         };
         let mut ctx = RuntimeContext::default();
-        let output = execute_net(
-            ExecutionConfig::default(),
-            net,
-            &mut ctx,
-            |_spec, _attempt, _trigger, _ctx| {
-                TransitionRunResult::from_outcome(NodeOutcome::Success)
-            },
-        )
-        .expect("AllOf with 1 input should not be rejected");
+        let output = execute_net(ExecutionConfig::default(), net, &mut ctx, success_runner)
+            .expect("AllOf with 1 input should not be rejected");
         assert!(output.order.is_empty(), "no seeded tokens -> nothing fires");
     }
 
@@ -1327,10 +1390,7 @@ mod tests {
             JoinPolicy::AllOf,
         );
         let ctx = RuntimeContext::default();
-        let err = run_transition(&spec, 0, &empty_trigger(), &ctx, &|_, _, _, _| {
-            TransitionRunResult::from_outcome(NodeOutcome::Success)
-        })
-        .unwrap_err();
+        let err = run_transition(&spec, 0, &empty_trigger(), &ctx, &success_runner).unwrap_err();
         assert!(
             matches!(&err, RuntimeError::Invariant { message } if message.contains("run_transition_router") && message.contains('r')),
             "expected Invariant, got {err:?}"
@@ -1368,10 +1428,8 @@ mod tests {
             JoinPolicy::AllOf,
         );
         let ctx = RuntimeContext::default();
-        let result = run_transition(&spec, 0, &empty_trigger(), &ctx, &|_, _, _, _| {
-            TransitionRunResult::from_outcome(NodeOutcome::Failure)
-        })
-        .expect("run should not error");
+        let result = run_transition(&spec, 0, &empty_trigger(), &ctx, &failure_runner)
+            .expect("run should not error");
         assert_eq!(result.outcome, NodeOutcome::Success);
     }
 
@@ -1388,7 +1446,7 @@ mod tests {
             &empty_trigger(),
             &mut metrics,
             &mut ctx,
-            &|_, _, _, _| TransitionRunResult::from_outcome(NodeOutcome::Success),
+            &success_runner,
         )
         .unwrap_err();
         assert!(
@@ -1515,5 +1573,399 @@ mod tests {
             matches!(&err, RuntimeError::ExecutionFailed { message, .. } if message.contains("runner panic") && message.contains("string boom")),
             "expected ExecutionFailed, got {err:?}"
         );
+    }
+
+    // ---- EngineState invariant / data-flow branch coverage ----
+    // These drive `EngineState`'s fallible methods directly. The engine's
+    // internal invariants (missing spec, missing place bucket, not-ready
+    // transition, key already done) are unreachable through any valid net
+    // build, so they are exercised here at the unit boundary rather than
+    // through `execute_net`. Error message text is asserted structurally where
+    // it matters; the invariant constructor `engine_invariant` keeps the text.
+    fn engine_state_probe_graph() -> PetriNetGraph {
+        build_petri_net(PetriNetSpec {
+            places: vec![place("p")],
+            transitions: vec![TransitionSpec {
+                transition_id: "t".to_string(),
+                priority: 0,
+                join_policy: JoinPolicy::AllOf,
+            }],
+            arcs: vec![arc_in("a1", "p", "t")],
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn engine_push_ready_missing_transition() {
+        let graph = engine_state_probe_graph();
+        let mut state = EngineState::new(
+            "e".into(),
+            BTreeMap::new(),
+            graph,
+            ExecutionMetrics::default(),
+        );
+        let err = state
+            .push_ready("ghost", CorrelationKey(String::new()), false)
+            .unwrap_err();
+        assert!(matches!(err, RuntimeError::Invariant { .. }));
+    }
+
+    #[test]
+    fn engine_is_transition_ready_missing_spec() {
+        let graph = engine_state_probe_graph();
+        let mut state = EngineState::new(
+            "e".into(),
+            BTreeMap::new(),
+            graph,
+            ExecutionMetrics::default(),
+        );
+        let err = state
+            .is_transition_ready("t", &CorrelationKey(String::new()))
+            .unwrap_err();
+        assert!(matches!(err, RuntimeError::Invariant { .. }));
+    }
+
+    #[test]
+    fn engine_is_transition_ready_key_done_early_return() {
+        // 858: is_key_done -> Ok(false) early return.
+        let graph = engine_state_probe_graph();
+        let specs: BTreeMap<String, ExecutionTransitionSpec> = [(
+            "t".to_string(),
+            make_transition("t", ExecutionTransitionKind::Task, JoinPolicy::AllOf),
+        )]
+        .into_iter()
+        .collect();
+        let mut state = EngineState::new("e".into(), specs, graph, ExecutionMetrics::default());
+        let k = CorrelationKey(String::new());
+        state.mark_completed("t", &k, NodeOutcome::Success);
+        assert!(!state.is_transition_ready("t", &k).unwrap());
+    }
+
+    #[test]
+    fn engine_process_one_item_missing_spec() {
+        // 530-534: process_one_item spec lookup invariant.
+        let graph = engine_state_probe_graph();
+        let mut state = EngineState::new(
+            "e".into(),
+            BTreeMap::new(),
+            graph,
+            ExecutionMetrics::default(),
+        );
+        let item = ReadyItem {
+            transition_id: "t".to_string(),
+            key: CorrelationKey(String::new()),
+            topo_level: 0,
+            priority: 0,
+            retry: false,
+        };
+        let mut ctx = RuntimeContext::default();
+        let err = process_one_item(
+            &mut state,
+            item,
+            &mut ctx,
+            &success_runner,
+            &ExecutionConfig::default(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, RuntimeError::Invariant { .. }));
+    }
+
+    #[test]
+    fn engine_consume_inputs_missing_bucket() {
+        // 931-934: consume_inputs_for_key missing place bucket. Build a graph
+        // whose input arc references a place, then drop the place bucket.
+        let graph = engine_state_probe_graph();
+        let mut state = EngineState::new(
+            "e".into(),
+            BTreeMap::new(),
+            graph,
+            ExecutionMetrics::default(),
+        );
+        state.place_tokens.clear();
+        let err = state
+            .consume_inputs_for_key("t", &CorrelationKey(String::new()))
+            .unwrap_err();
+        assert!(matches!(err, RuntimeError::Invariant { .. }));
+    }
+
+    #[test]
+    fn engine_insert_token_missing_place() {
+        // 1031-1033: insert_token unknown place bucket.
+        let graph = engine_state_probe_graph();
+        let mut state = EngineState::new(
+            "e".into(),
+            BTreeMap::new(),
+            graph,
+            ExecutionMetrics::default(),
+        );
+        let tok = Token {
+            key: CorrelationKey(String::new()),
+            payload: Value::Null,
+            meta: TokenMeta {
+                execution_id: "e".into(),
+                transition_id: "t".into(),
+                logical_group: "g".into(),
+                sequence: 0,
+                outcome: NodeOutcome::Success,
+            },
+        };
+        let err = state.insert_token("nonexistent_place", tok).unwrap_err();
+        assert!(matches!(err, RuntimeError::Invariant { .. }));
+    }
+
+    #[test]
+    fn engine_process_one_item_key_done() {
+        // 519-520: process_one_item early return when key already done.
+        let graph = engine_state_probe_graph();
+        let specs: BTreeMap<String, ExecutionTransitionSpec> = [(
+            "t".to_string(),
+            make_transition("t", ExecutionTransitionKind::Task, JoinPolicy::AllOf),
+        )]
+        .into_iter()
+        .collect();
+        let mut state = EngineState::new("e".into(), specs, graph, ExecutionMetrics::default());
+        let k = CorrelationKey(String::new());
+        state.mark_completed("t", &k, NodeOutcome::Success);
+        let item = ReadyItem {
+            transition_id: "t".to_string(),
+            key: k,
+            topo_level: 0,
+            priority: 0,
+            retry: false,
+        };
+        let mut ctx = RuntimeContext::default();
+        let fired = process_one_item(
+            &mut state,
+            item,
+            &mut ctx,
+            &success_runner,
+            &ExecutionConfig::default(),
+        )
+        .unwrap();
+        assert!(!fired);
+    }
+
+    #[test]
+    fn engine_process_one_item_cached_trigger_missing_spec() {
+        // 530-534: cached trigger short-circuits ensure_trigger_inputs, then
+        // the spec lookup at 529 fails -> invariant.
+        let graph = engine_state_probe_graph();
+        let mut state = EngineState::new(
+            "e".into(),
+            BTreeMap::new(),
+            graph,
+            ExecutionMetrics::default(),
+        );
+        let k = CorrelationKey(String::new());
+        state
+            .trigger_inputs_cache
+            .insert(("t".to_string(), k.clone()), Vec::new());
+        let item = ReadyItem {
+            transition_id: "t".to_string(),
+            key: k,
+            topo_level: 0,
+            priority: 0,
+            retry: false,
+        };
+        let mut ctx = RuntimeContext::default();
+        let err = process_one_item(
+            &mut state,
+            item,
+            &mut ctx,
+            &success_runner,
+            &ExecutionConfig::default(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, RuntimeError::Invariant { .. }));
+    }
+
+    #[test]
+    fn engine_ensure_trigger_inputs_became_not_ready() {
+        // 836-839: spec present, transition not ready (required arc empty),
+        // not cached -> "became not-ready" invariant.
+        let graph = build_petri_net(PetriNetSpec {
+            places: vec![place("p")],
+            transitions: vec![TransitionSpec {
+                transition_id: "t".to_string(),
+                priority: 0,
+                join_policy: JoinPolicy::AllOf,
+            }],
+            // required arc means empty place => not ready.
+            arcs: vec![ArcSpec {
+                arc_id: "a1".to_string(),
+                place_id: "p".to_string(),
+                transition_id: "t".to_string(),
+                direction: ArcDirection::PlaceToTransition,
+                label: None,
+                required: true,
+            }],
+        })
+        .unwrap();
+        let specs: BTreeMap<String, ExecutionTransitionSpec> = [(
+            "t".to_string(),
+            make_transition("t", ExecutionTransitionKind::Task, JoinPolicy::AllOf),
+        )]
+        .into_iter()
+        .collect();
+        let mut state = EngineState::new("e".into(), specs, graph, ExecutionMetrics::default());
+        let err = state
+            .ensure_trigger_inputs("t", &CorrelationKey(String::new()))
+            .unwrap_err();
+        assert!(matches!(err, RuntimeError::Invariant { .. }));
+    }
+
+    #[test]
+    fn engine_next_batch_throughput_empty_break() {
+        // 779: next_batch Throughput mode with an empty ready queue breaks out.
+        let graph = engine_state_probe_graph();
+        let mut state = EngineState::new(
+            "e".into(),
+            BTreeMap::new(),
+            graph,
+            ExecutionMetrics::default(),
+        );
+        let config = ExecutionConfig {
+            scheduler: SchedulerConfig {
+                max_parallelism: 4,
+                max_concurrency: 1,
+            },
+            scheduler_mode: SchedulerMode::Deterministic,
+        };
+        assert!(state.next_batch(&config).is_empty());
+    }
+
+    #[test]
+    fn engine_complete_transition_output_place_missing() {
+        // 997: complete_transition -> insert_token error on a missing output
+        // place bucket propagates through the `?`.
+        let graph = build_petri_net(PetriNetSpec {
+            places: vec![place("p_out")],
+            transitions: vec![TransitionSpec {
+                transition_id: "t".to_string(),
+                priority: 0,
+                join_policy: JoinPolicy::AllOf,
+            }],
+            arcs: vec![ArcSpec {
+                arc_id: "a_out".to_string(),
+                place_id: "p_out".to_string(),
+                transition_id: "t".to_string(),
+                direction: ArcDirection::TransitionToPlace,
+                label: None,
+                required: false,
+            }],
+        })
+        .unwrap();
+        let specs: BTreeMap<String, ExecutionTransitionSpec> = [(
+            "t".to_string(),
+            make_transition("t", ExecutionTransitionKind::Task, JoinPolicy::AllOf),
+        )]
+        .into_iter()
+        .collect();
+        let mut state = EngineState::new("e".into(), specs, graph, ExecutionMetrics::default());
+        // Drop the output place bucket so insert_token cannot find it.
+        state.place_tokens.remove("p_out");
+        let mut ctx = RuntimeContext::default();
+        let err = state
+            .complete_transition(
+                "t",
+                &CorrelationKey(String::new()),
+                TransitionRunResult::from_outcome(NodeOutcome::Success),
+                &mut ctx,
+            )
+            .unwrap_err();
+        assert!(matches!(err, RuntimeError::Invariant { .. }));
+    }
+
+    #[test]
+    fn engine_insert_token_success_ok() {
+        // 1044: insert_token success path returns Ok(()). The output-only
+        // place has no consumer transition, so the readiness push is skipped
+        // and the Ok tail runs.
+        let graph = build_petri_net(PetriNetSpec {
+            places: vec![place("p_out")],
+            transitions: vec![TransitionSpec {
+                transition_id: "t".to_string(),
+                priority: 0,
+                join_policy: JoinPolicy::AllOf,
+            }],
+            arcs: vec![ArcSpec {
+                arc_id: "a_out".to_string(),
+                place_id: "p_out".to_string(),
+                transition_id: "t".to_string(),
+                direction: ArcDirection::TransitionToPlace,
+                label: None,
+                required: false,
+            }],
+        })
+        .unwrap();
+        let mut state = EngineState::new(
+            "e".into(),
+            BTreeMap::new(),
+            graph,
+            ExecutionMetrics::default(),
+        );
+        let tok = Token {
+            key: CorrelationKey(String::new()),
+            payload: Value::Null,
+            meta: TokenMeta {
+                execution_id: "e".into(),
+                transition_id: "t".into(),
+                logical_group: "g".into(),
+                sequence: 0,
+                outcome: NodeOutcome::Success,
+            },
+        };
+        state.insert_token("p_out", tok).unwrap();
+    }
+
+    #[test]
+    fn engine_normalize_execution_error_both_arms() {
+        // 468-474: the identity arm preserves an existing ExecutionFailed
+        // (byte-identical), and the wrap arm envelopes any other error.
+        let already = RuntimeError::ExecutionFailed {
+            execution_id: "keep".to_string(),
+            message: "inner".to_string(),
+        };
+        let out = normalize_execution_error(already, "outer".to_string());
+        assert!(
+            matches!(&out, RuntimeError::ExecutionFailed { execution_id, message } if execution_id == "keep" && message == "inner"),
+            "identity arm must preserve the original, got {out:?}"
+        );
+
+        let other = RuntimeError::Invariant {
+            message: "boom".to_string(),
+        };
+        let wrapped = normalize_execution_error(other, "exec-42".to_string());
+        assert!(
+            matches!(&wrapped, RuntimeError::ExecutionFailed { execution_id, message } if execution_id == "exec-42" && message.contains("boom")),
+            "wrap arm must envelope, got {wrapped:?}"
+        );
+    }
+
+    #[test]
+    fn engine_run_transition_router_execute_error_propagates() {
+        // 674: execute_router error (begin_subgraph rejects a second active
+        // subgraph) propagates through the `?`.
+        let spec = make_transition(
+            "r",
+            ExecutionTransitionKind::Router {
+                subgraph_id: "sg".to_string(),
+            },
+            JoinPolicy::AllOf,
+        );
+        use crate::context::ContextTxn;
+        let mut ctx = RuntimeContext::default();
+        ctx.begin_subgraph("already").unwrap();
+        let mut metrics = ExecutionMetrics::default();
+        let err = run_transition_router(
+            &spec,
+            0,
+            &empty_trigger(),
+            &mut metrics,
+            &mut ctx,
+            &success_runner,
+        )
+        .unwrap_err();
+        assert!(matches!(err, RuntimeError::SubgraphAlreadyActive { .. }));
     }
 }
