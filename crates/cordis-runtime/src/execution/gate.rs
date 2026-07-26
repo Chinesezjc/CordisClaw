@@ -182,9 +182,10 @@ fn eval_first_completed(
             // in `outcomes` is always terminal and this `continue` never runs.
             // Kept as a forward guard for a future non-terminal state
             // (e.g. Running/Pending); it would then skip such upstreams here.
-            if !is_terminal(*outcome) {
-                continue;
-            }
+            debug_assert!(
+                is_terminal(*outcome),
+                "NodeOutcome variants are all terminal"
+            );
             let cancel_nodes = upstream_nodes
                 .iter()
                 .filter(|n| {
@@ -254,14 +255,8 @@ fn eval_at_least(
 /// collapsed to `true`) so that adding a non-terminal state (e.g. `Running`)
 /// forces a compile-time review of every gate that calls this.
 fn is_terminal(outcome: NodeOutcome) -> bool {
-    matches!(
-        outcome,
-        NodeOutcome::Success
-            | NodeOutcome::Failure
-            | NodeOutcome::Timeout
-            | NodeOutcome::Cancelled
-            | NodeOutcome::Skipped
-    )
+    use NodeOutcome::{Cancelled, Failure, Skipped, Success, Timeout};
+    matches!(outcome, Success | Failure | Timeout | Cancelled | Skipped)
 }
 
 #[cfg(test)]

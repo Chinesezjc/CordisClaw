@@ -421,10 +421,8 @@ fn build_registered_net(
 
 /// Only data/control edges contribute to topological ordering.
 fn is_dependency_edge(kind: &RegisteredNetEdgeKind) -> bool {
-    matches!(
-        kind,
-        RegisteredNetEdgeKind::Data | RegisteredNetEdgeKind::Control
-    )
+    use RegisteredNetEdgeKind::{Control, Data};
+    matches!(kind, Data | Control)
 }
 
 fn topo_levels(

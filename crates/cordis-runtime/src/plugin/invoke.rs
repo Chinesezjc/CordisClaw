@@ -234,10 +234,7 @@ pub fn invoke_registered_plugin(
         // node_id containing an interior NUL byte silently became empty
         // and the plugin returned the wrong service vtable (or null).
         // Fail closed with a clear error.
-        let c_node =
-            std::ffi::CString::new(node_id).map_err(|err| RuntimeError::InvalidArgument {
-                message: format!("plugin invoke node_id contains NUL byte: {err}"),
-            })?;
+        let c_node = std::ffi::CString::new(node_id).map_err(nul_node_id_error)?;
         let create_sym: Result<
             libloading::Symbol<
                 unsafe extern "C" fn(
@@ -403,6 +400,15 @@ fn call_handle_catch_unwind(
     }
 }
 
+/// `InvalidArgument` for a node id containing an interior NUL byte — kept as
+/// a named fn (directly unit-tested) because no declared fixture node can
+/// produce one through the public invoke path.
+fn nul_node_id_error(err: std::ffi::NulError) -> RuntimeError {
+    RuntimeError::InvalidArgument {
+        message: format!("plugin invoke node_id contains NUL byte: {err}"),
+    }
+}
+
 fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
     if let Some(s) = payload.downcast_ref::<&'static str>() {
         (*s).to_string()
@@ -421,6 +427,16 @@ fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
 // guards are covered without weakening the production constructors.
 #[cfg(test)]
 mod loaded_entry_invariant_tests {
+    #[test]
+    fn nul_node_id_error_names_the_nul() {
+        let nul = std::ffi::CString::new("a\0b").unwrap_err();
+        let err = super::nul_node_id_error(nul);
+        assert!(
+            matches!(&err, crate::core::error::RuntimeError::InvalidArgument { message }
+            if message.starts_with("plugin invoke node_id contains NUL byte: "))
+        );
+    }
+
     use super::*;
     use crate::core::models::{AbiFingerprint, NodeDoc, PluginDocs, PluginLoadResult};
     use crate::plugin::registry::RegisteredPlugin;

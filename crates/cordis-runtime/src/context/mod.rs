@@ -1521,6 +1521,22 @@ mod tests {
     }
 
     #[test]
+    fn list_by_ns_skips_overlay_keys_from_other_namespaces() {
+        let ctx = RuntimeContext::default();
+        ctx.begin_subgraph("sg-ns").unwrap();
+        ctx.put(key("ns_a", "mine", 1), serde_json::json!(1), slot_meta())
+            .unwrap();
+        ctx.put(key("ns_b", "other", 1), serde_json::json!(2), slot_meta())
+            .unwrap();
+        // Listing ns_a while the overlay holds an ns_b entry walks the
+        // namespace-filter continue for the foreign key.
+        let keys = ctx.list_by_ns("ns_a");
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].name, "mine");
+        ctx.rollback_overlay("sg-ns").unwrap();
+    }
+
+    #[test]
     fn overlay_commit_applies_removals() {
         let ctx = RuntimeContext::default();
         let k = key("ns", "base", 1);
