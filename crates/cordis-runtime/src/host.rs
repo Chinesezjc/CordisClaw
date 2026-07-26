@@ -1794,11 +1794,12 @@ impl RuntimeHost {
         // panicking `boot`.
         match restore_plugin_iteration_workspace(&host.fixtures_root, &host.snapshot_root, None) {
             Err(err) => {
-                eprintln!(
-                    "[plugin-iteration-recovery] boot-time restore failed: {err}; \
-                     journal preserved at {}",
-                    plugin_iteration_journal_path(&host.snapshot_root).display()
+                let jp = plugin_iteration_journal_path(&host.snapshot_root);
+                let subject = format!(
+                    "boot-time restore failed: {err}; journal preserved at {}",
+                    jp.display()
                 );
+                eprintln!("[plugin-iteration-recovery] {subject}");
             }
             Ok(true) => {
                 // The initial snapshot above was built from the PRE-restore
@@ -2455,13 +2456,9 @@ serde = {{ version = "1", features = ["derive"] }}
 serde_json = "1"
 "#
         );
-        std::fs::write(plugin_dir.join("Cargo.toml"), &cargo_toml).map_err(|e| {
-            io_ctx(
-                plugin_dir.join("Cargo.toml"),
-                "failed to write Cargo.toml",
-                e,
-            )
-        })?;
+        let manifest_path = plugin_dir.join("Cargo.toml");
+        std::fs::write(&manifest_path, &cargo_toml)
+            .map_err(|e| io_ctx(manifest_path.clone(), "failed to write Cargo.toml", e))?;
 
         // Write src/lib.rs skeleton
         let lib_rs = format!(
