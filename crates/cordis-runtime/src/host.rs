@@ -2044,7 +2044,8 @@ impl RuntimeHost {
             let json = match std::fs::read(&path) {
                 Ok(v) => v,
                 Err(e) => {
-                    eprintln!("[crash-recovery] read failed for {}: {e}", path.display());
+                    let subject = format!("read failed for {}", path.display());
+                    eprintln!("{}", Self::host_io_log_line("crash-recovery", &subject, &e));
                     skipped += 1;
                     continue;
                 }
@@ -2060,10 +2061,8 @@ impl RuntimeHost {
             let session = match AgentSession::from_snapshot(snapshot) {
                 Ok(s) => s,
                 Err(e) => {
-                    eprintln!(
-                        "[crash-recovery] reconstruct failed for {}: {e}",
-                        path.display()
-                    );
+                    let subject = format!("reconstruct failed for {}", path.display());
+                    eprintln!("{}", Self::host_io_log_line("crash-recovery", &subject, &e));
                     skipped += 1;
                     continue;
                 }

@@ -1125,6 +1125,20 @@ fn host_boot_recovers_saved_sessions_from_disk() {
     // Decoys — none should be hydrated.
     fs::write(sessions_dir.join(".staging.json.tmp.7"), "{}").expect("write temp decoy");
     fs::write(sessions_dir.join("notes.txt"), "not a session").expect("write non-json decoy");
+    // Unreadable decoy drives the read-failure skip arm (unix only; root
+    // bypasses permission bits so skip the setup there).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } != 0 {
+            fs::write(sessions_dir.join("unreadable.json"), "{}").expect("write unreadable decoy");
+            fs::set_permissions(
+                sessions_dir.join("unreadable.json"),
+                fs::Permissions::from_mode(0o000),
+            )
+            .expect("chmod 000");
+        }
+    }
     fs::write(sessions_dir.join("corrupt.json"), "{ this is not json")
         .expect("write corrupt decoy");
 
