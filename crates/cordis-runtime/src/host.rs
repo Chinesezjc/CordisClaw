@@ -2576,19 +2576,11 @@ export_plugin_api! {{
         if !already_member {
             members.push(TomlValue::String(name.to_string()));
         }
-        let new_manifest = toml::to_string_pretty(&document).map_err(|e| {
-            io_ctx(
-                workspace_manifest.clone(),
-                "failed to serialize workspace manifest",
-                e,
-            )
-        })?;
-        atomic_write_bytes(&workspace_manifest, new_manifest.as_bytes()).map_err(|e| {
-            host_io_error(
-                workspace_manifest,
-                format!("failed to write workspace manifest: {e}"),
-            )
-        })?;
+        let wm = workspace_manifest;
+        let new_manifest = toml::to_string_pretty(&document)
+            .map_err(|e| io_ctx(wm.clone(), "failed to serialize workspace manifest", e))?;
+        atomic_write_bytes(&wm, new_manifest.as_bytes())
+            .map_err(|e| io_ctx(wm.clone(), "failed to write workspace manifest", e))?;
 
         Ok(serde_json::json!({
             "ok": true,
@@ -7010,11 +7002,7 @@ mod workspace_manifest_lock {
             // SAFETY: fd owned by `file`, kept alive across the syscall.
             let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
             if rc != 0 {
-                eprintln!(
-                    "[create_plugin] flock({}) failed: {}",
-                    path.display(),
-                    std::io::Error::last_os_error()
-                );
+                eprintln!("{}", super::flock_failure_line(path));
             }
         }
         Guard { file: Some(file) }
@@ -7038,6 +7026,16 @@ mod workspace_manifest_lock {
 /// { .. })` closures in `create_plugin` / snapshot setup so the mapping is a
 /// single named, unit-testable function. Callers keep formatting the message
 /// (which embeds `e`) so the emitted text stays byte-for-byte identical.
+/// Message for a failed `flock` on the workspace manifest lock — kept in a
+/// tested helper so the (locally unfailable) call site stays one line.
+fn flock_failure_line(path: &Path) -> String {
+    format!(
+        "[create_plugin] flock({}) failed: {}",
+        path.display(),
+        std::io::Error::last_os_error()
+    )
+}
+
 /// Error for an agent session that ran to completion without ever calling
 /// `record_iteration_summary` — the iteration cannot be finalized without it.
 fn missing_summary_error(session_id: &str) -> RuntimeError {
@@ -8839,6 +8837,12 @@ mod seam_extraction_tests_low {
                 if path == std::path::Path::new("/x") && message == "failed to write Cargo.toml: disk full"),
             "got: {err:?}"
         );
+    }
+
+    #[test]
+    fn flock_failure_line_names_path_and_errno() {
+        let line = super::flock_failure_line(std::path::Path::new("/tmp/x.lock"));
+        assert!(line.starts_with("[create_plugin] flock(/tmp/x.lock) failed: "));
     }
 
     #[test]
