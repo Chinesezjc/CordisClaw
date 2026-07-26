@@ -749,6 +749,36 @@ mod cov_fa_host_1_3500_tests {
     }
 
     #[test]
+    fn backup_artifacts_into_rollback_absorbs_and_rejects_mismatched_root() {
+        use crate::kernel::plugin_iteration::PluginEditRollback;
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let fixtures = temp.path().join("fixtures");
+        let artifacts = fixtures.join("artifacts");
+        fs::create_dir_all(&artifacts).expect("mk artifacts");
+        // artifact_paths_to_backup only collects `artifacts/<name>.so`.
+        fs::write(artifacts.join("demo.so"), b"\x7fELF").expect("write artifact");
+        fs::write(
+            artifacts.join("index.json"),
+            r#"{"schema_version":2,"generated_at":"t","topo_order":["demo"],"entries":[{"plugin_path":"demo","version":"0.1.0","abi_fingerprint":{"crate_hash":"c","api_hash":"a"},"artifact_path":"demo.json","sha256":"x","built_at":"t","parent":null,"required":true,"grants_from_parent":[],"docs":{"plugin_id":"demo","plugin_path":"demo","plugin_version":"0.1.0","abi_version":2,"nodes":[]},"exports":[],"execution":null,"artifact_kind":"json","local_path_deps":[],"input_probe":[],"build_fingerprint":""}]}"#,
+        )
+        .expect("write index");
+
+        // Success: same workspace root absorbs the artifact backups.
+        let mut ok_rb = PluginEditRollback::empty(fixtures.display().to_string());
+        super::backup_artifacts_into_rollback(&fixtures, "demo", &mut ok_rb)
+            .expect("absorb into same-root rollback");
+
+        // Failure: a rollback anchored at a different workspace refuses.
+        let mut bad_rb = PluginEditRollback::empty("/elsewhere".to_string());
+        let err = super::backup_artifacts_into_rollback(&fixtures, "demo", &mut bad_rb)
+            .expect_err("mismatched workspace root must fail absorb");
+        assert!(
+            matches!(err, RuntimeError::Invariant { .. }),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
     fn take_blocked_iteration_unknown_id_is_not_found() {
         let temp = TempDir::new().expect("tempdir");
         let config = crate::config::RuntimeConfig::default();
@@ -3694,22 +3724,13 @@ export_plugin_api! {{
                     // source-code rollback runs but the new `.so` stays on disk,
                     // producing silent behaviour drift on the next run.
                     if let Some(rollback) = state.rollback.as_mut() {
-                        let artifact_backup = artifact_paths_to_backup(
+                        let backed = backup_artifacts_into_rollback(
                             &self.fixtures_root,
                             &state.prepared.root_plugin_path,
+                            rollback,
                         );
-                        for (rel_path, abs_path) in &artifact_backup {
-                            let original = fs::read(abs_path).ok();
-                            let single =
-                                crate::kernel::plugin_iteration::PluginEditRollback::single_backup(
-                                    self.fixtures_root.clone(),
-                                    rel_path,
-                                    original,
-                                );
-                            if let Err(err) = rollback.absorb(single) {
-                                self.fail_stage(&mut state, "rebuild", &err);
-                                break;
-                            }
+                        if let Err(err) = backed {
+                            self.fail_stage(&mut state, "rebuild", &err);
                         }
                     }
                     if state.stage_error.is_none() {
@@ -7079,6 +7100,26 @@ fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     if let Err(err) = fs::rename(&tmp, path) {
         let _ = fs::remove_file(&tmp);
         return Err(err);
+    }
+    Ok(())
+}
+
+/// Fold the current on-disk artifacts for `root_plugin_path` into `rollback`
+/// as single-file backups, so a post-rebuild rollback restores the exact
+/// pre-rebuild artifact bytes. Stops at the first absorb failure.
+fn backup_artifacts_into_rollback(
+    fixtures_root: &Path,
+    root_plugin_path: &str,
+    rollback: &mut crate::kernel::plugin_iteration::PluginEditRollback,
+) -> Result<(), RuntimeError> {
+    for (rel_path, abs_path) in &artifact_paths_to_backup(fixtures_root, root_plugin_path) {
+        let original = fs::read(abs_path).ok();
+        let single = crate::kernel::plugin_iteration::PluginEditRollback::single_backup(
+            fixtures_root.to_path_buf(),
+            rel_path,
+            original,
+        );
+        rollback.absorb(single)?;
     }
     Ok(())
 }
