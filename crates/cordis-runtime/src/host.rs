@@ -3121,6 +3121,18 @@ export_plugin_api! {{
     /// Uses two-phase commit: Phase 1 pre-loads and validates all new dylibs
     /// (no side effects); Phase 2 stops old services and swaps in the new
     /// registry entries.
+    /// Package a reload error together with its recorded failed attempt —
+    /// the shared tail of every error path inside `reload_subtree`.
+    fn fail_reload(
+        &self,
+        previous_snapshot: &Arc<RuntimeSnapshot>,
+        started_at: Instant,
+        err: RuntimeError,
+    ) -> (RuntimeError, Box<ReloadAttemptReport>) {
+        let attempt = self.make_failed_attempt(previous_snapshot, started_at, &err);
+        (err, Box::new(attempt))
+    }
+
     fn reload_subtree(
         &self,
         prefix: &str,
@@ -3253,15 +3265,14 @@ export_plugin_api! {{
         let mut prepared: Vec<Prepared> = Vec::new();
 
         for plugin_path in &targets {
-            let entry = index_map.get(plugin_path).ok_or_else(|| {
-                let err = RuntimeError::PluginUnavailable {
-                    plugin_path: plugin_path.clone(),
-                    reason: PluginUnavailableReason::ArtifactMissing,
-                    required: false,
-                };
-                let attempt = self.make_failed_attempt(&previous_snapshot, started_at, &err);
-                (err, Box::new(attempt))
-            })?;
+            let missing = || RuntimeError::PluginUnavailable {
+                plugin_path: plugin_path.clone(),
+                reason: PluginUnavailableReason::ArtifactMissing,
+                required: false,
+            };
+            let entry = index_map
+                .get(plugin_path)
+                .ok_or_else(|| self.fail_reload(&previous_snapshot, started_at, missing()))?;
 
             let resolved =
                 crate::plugin::artifact::resolve_artifact_path(&index_path, &entry.artifact_path);
@@ -3272,14 +3283,9 @@ export_plugin_api! {{
             let api = dylib.api();
 
             // Strict docs comparison.
-            let new_docs: PluginDocs =
-                serde_json::from_str(&(api.docs)().payload).map_err(|e| {
-                    let err = RuntimeError::Invariant {
-                        message: format!("failed to parse docs for {plugin_path}: {e}"),
-                    };
-                    let attempt = self.make_failed_attempt(&previous_snapshot, started_at, &err);
-                    (err, Box::new(attempt))
-                })?;
+            let new_docs: PluginDocs = serde_json::from_str(&(api.docs)().payload)
+                .map_err(|e| host_invariant(format!("failed to parse docs for {plugin_path}: {e}")))
+                .map_err(|err| self.fail_reload(&previous_snapshot, started_at, err))?;
             if new_docs.nodes != entry.docs.nodes {
                 let err = reload_docs_mismatch_error(
                     plugin_path,
@@ -3293,13 +3299,13 @@ export_plugin_api! {{
 
             // Strict ABI fingerprint comparison.
             let actual_fingerprint: AbiFingerprint =
-                serde_json::from_str(&(api.abi_fingerprint)().payload).map_err(|e| {
-                    let err = RuntimeError::Invariant {
-                        message: format!("failed to parse abi_fingerprint for {plugin_path}: {e}"),
-                    };
-                    let attempt = self.make_failed_attempt(&previous_snapshot, started_at, &err);
-                    (err, Box::new(attempt))
-                })?;
+                serde_json::from_str(&(api.abi_fingerprint)().payload)
+                    .map_err(|e| {
+                        host_invariant(format!(
+                            "failed to parse abi_fingerprint for {plugin_path}: {e}"
+                        ))
+                    })
+                    .map_err(|err| self.fail_reload(&previous_snapshot, started_at, err))?;
             if actual_fingerprint.crate_hash != entry.abi_fingerprint.crate_hash
                 || actual_fingerprint.api_hash != entry.abi_fingerprint.api_hash
             {
@@ -7017,6 +7023,11 @@ mod workspace_manifest_lock {
 /// { .. })` closures in `create_plugin` / snapshot setup so the mapping is a
 /// single named, unit-testable function. Callers keep formatting the message
 /// (which embeds `e`) so the emitted text stays byte-for-byte identical.
+/// Single-line `Invariant` constructor mirroring [`host_io_error`].
+fn host_invariant(message: String) -> RuntimeError {
+    RuntimeError::Invariant { message }
+}
+
 /// `Io` error with a `"{what}: {source}"` message — the short-arg variant
 /// of [`host_io_error`] so call sites fit a single line under rustfmt.
 fn io_ctx(path: PathBuf, what: &str, e: impl std::fmt::Display) -> RuntimeError {
