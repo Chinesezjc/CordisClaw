@@ -151,24 +151,10 @@ impl RuntimeSnapshot {
                 };
 
                 let request_payload = build_execution_payload(&request_seed, &trigger.inputs);
-                let request_text =
-                    match serde_json::to_string(&Value::Object(request_payload.clone())) {
-                        Ok(payload) => payload,
-                        Err(err) => {
-                            traces.lock().unwrap().insert(
-                                transition_id.clone(),
-                                request_serialize_failure_trace(
-                                    transition_id,
-                                    &node.plugin_path,
-                                    &node.node_id,
-                                    attempt,
-                                    request_payload,
-                                    &err,
-                                ),
-                            );
-                            return TransitionRunResult::from_outcome(NodeOutcome::Failure);
-                        }
-                    };
+                // `Display` on `Value` emits the same compact JSON as
+                // `serde_json::to_string` and is infallible for object maps,
+                // so no error arm is needed here.
+                let request_text = Value::Object(request_payload.clone()).to_string();
 
                 match self.invoke(&node.plugin_path, &node.node_id, request_text) {
                     Ok(response) => {
@@ -253,29 +239,6 @@ fn missing_registry_trace(transition_id: &str, attempt: u32) -> ExecutionInvocat
     }
 }
 
-/// Failure trace for the `execute_registered_target` parallel path when the
-/// request payload cannot be serialized to JSON before the plugin invoke.
-/// `request_payload` is moved in because the caller no longer needs it after
-/// the trace is recorded. Extracted for direct unit testing.
-fn request_serialize_failure_trace(
-    transition_id: &str,
-    plugin_path: &str,
-    node_id: &str,
-    attempt: u32,
-    request_payload: Map<String, Value>,
-    err: &serde_json::Error,
-) -> ExecutionInvocationTrace {
-    ExecutionInvocationTrace {
-        node_fqn: transition_id.to_string(),
-        plugin_path: plugin_path.to_string(),
-        node_id: node_id.to_string(),
-        attempt,
-        outcome: Some(NodeOutcome::Failure),
-        request_payload: Some(Value::Object(request_payload)),
-        response_payload: None,
-        error: Some(format!("request serialize failed: {err}")),
-    }
-}
 
 /// Build the `AbiMismatch` error raised by `reload_subtree` Phase 1 when the
 /// candidate dylib's docs disagree with the recorded index entry's node count.
@@ -330,7 +293,7 @@ fn reload_abi_fingerprint_mismatch_error(
 mod sr_host_a_seam_tests {
     use super::{
         missing_registry_trace, reload_abi_fingerprint_mismatch_error, reload_docs_mismatch_error,
-        request_serialize_failure_trace, PendingSessionAction, RuntimeHost,
+        PendingSessionAction, RuntimeHost,
     };
     use crate::core::error::RuntimeError;
     use crate::core::models::NodeOutcome;
@@ -355,32 +318,6 @@ mod sr_host_a_seam_tests {
         assert_eq!(trace.error.as_deref(), Some("node missing from registry"));
     }
 
-    #[test]
-    fn request_serialize_failure_trace_preserves_payload_and_error_text() {
-        let mut payload = Map::new();
-        payload.insert("k".to_string(), json!("v"));
-        // Build a real serde_json error to embed verbatim.
-        let json_err = serde_json::from_str::<Value>("not json").unwrap_err();
-        let trace = request_serialize_failure_trace(
-            "web::fetch",
-            "web",
-            "fetch",
-            3,
-            payload.clone(),
-            &json_err,
-        );
-        assert_eq!(trace.node_fqn, "web::fetch");
-        assert_eq!(trace.plugin_path, "web");
-        assert_eq!(trace.node_id, "fetch");
-        assert_eq!(trace.attempt, 3);
-        assert_eq!(trace.outcome, Some(NodeOutcome::Failure));
-        assert_eq!(trace.request_payload, Some(Value::Object(payload)));
-        assert_eq!(trace.response_payload, None);
-        assert_eq!(
-            trace.error,
-            Some(format!("request serialize failed: {json_err}"))
-        );
-    }
 
     // ── Pure-fn: reload_subtree Phase-1 AbiMismatch reports ──────────────
 
@@ -699,6 +636,58 @@ mod cov_fa_host_1_3500_tests {
             .begin_plugin_iteration(&snapshot, &req("second"))
             .expect_err("a second concurrent iteration must be rejected");
         assert!(matches!(err, RuntimeError::PluginIterationActive { .. }));
+    }
+
+    // begin_plugin_iteration: when the selected issue's root_plugin_path no
+    // longer matches any plugin in the snapshot registry, the subtree filter
+    // yields nothing and the not-found InvalidArgument fires. (Explicit
+    // target paths hit determine_root_plugin_path first, so the issue route
+    // is the reachable way into this arm.)
+    #[test]
+    fn begin_plugin_iteration_rejects_vanished_issue_subtree() {
+        let temp = TempDir::new().expect("tempdir");
+        let config = crate::config::RuntimeConfig::default();
+        let kernel = RuntimeKernel::new(temp.path(), &config);
+        let issue = kernel.observe_plugin_issue(
+            KernelPluginIssueSource::LoadFailure,
+            "vanished-plugin",
+            "plugin was unloaded after the issue was filed",
+        );
+        let snapshot = snapshot_with_ghost_upstream_node();
+        let req = KernelPluginIterationRequest {
+            issue_id: Some(issue.issue_id.clone()),
+            // Non-empty targets keep root_mode off; the issue's vanished
+            // root then filters the registry down to nothing.
+            target_plugin_paths: vec!["ghostplug".to_string()],
+            instruction: Some("noop".to_string()),
+            edit_plan: None,
+            manual_approved: false,
+            tests_command: None,
+            safety_command: None,
+            verify_profile: None,
+            quality_score: None,
+        };
+        let err = kernel
+            .begin_plugin_iteration(&snapshot, &req)
+            .expect_err("vanished issue subtree must be rejected");
+        assert!(
+            matches!(&err, RuntimeError::InvalidArgument { message }
+                if message == "plugin subtree not found for vanished-plugin"),
+            "got: {err:?}"
+        );
+    }
+
+    // take_blocked_iteration: unknown id surfaces StatusNotFound (the only
+    // remaining error path now that the verdict check is an invariant).
+    #[test]
+    fn take_blocked_iteration_unknown_id_is_not_found() {
+        let temp = TempDir::new().expect("tempdir");
+        let config = crate::config::RuntimeConfig::default();
+        let kernel = RuntimeKernel::new(temp.path(), &config);
+        let err = kernel
+            .take_blocked_iteration("nope")
+            .expect_err("missing id must error");
+        assert!(matches!(err, RuntimeError::PluginIterationStatusNotFound { .. }));
     }
 }
 
@@ -1055,11 +1044,9 @@ impl RuntimeKernel {
                 iteration_id: iteration_id.to_string(),
             }
         })?;
-        if result.final_verdict != PluginIterationFinalVerdict::Blocked {
-            return Err(RuntimeError::InvalidArgument {
-                message: format!("iteration {iteration_id} is not blocked"),
-            });
-        }
+        // The blocked map's only writer (`record_plugin_iteration_outcome`)
+        // inserts exclusively `Blocked` verdicts, so this holds by invariant.
+        debug_assert_eq!(result.final_verdict, PluginIterationFinalVerdict::Blocked);
         Ok(result)
     }
 
