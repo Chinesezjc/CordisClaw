@@ -3661,18 +3661,12 @@ export_plugin_api! {{
                         state.tests_command = agent.snapshot.tests_command;
                         state.safety_command = agent.snapshot.safety_command;
                         if agent.snapshot.recorded_summary.is_none() {
-                            let err_msg = format!(
-                            "plugin iteration agent session {} exited without calling record_iteration_summary",
-                            state.agent_session_id.as_deref().unwrap_or("unknown-session")
-                        );
-                            self.observe_plugin_iteration_failure(
-                                &state.prepared,
-                                "agent",
-                                &RuntimeError::LlmResponseInvalid {
-                                    message: err_msg.clone(),
-                                },
-                            );
-                            state.stage_error = Some(err_msg);
+                            let sid = state
+                                .agent_session_id
+                                .as_deref()
+                                .unwrap_or("unknown-session");
+                            let err = missing_summary_error(sid);
+                            self.fail_stage(&mut state, "agent", &err);
                         }
                     }
                     Err(err) => {
@@ -7044,6 +7038,16 @@ mod workspace_manifest_lock {
 /// { .. })` closures in `create_plugin` / snapshot setup so the mapping is a
 /// single named, unit-testable function. Callers keep formatting the message
 /// (which embeds `e`) so the emitted text stays byte-for-byte identical.
+/// Error for an agent session that ran to completion without ever calling
+/// `record_iteration_summary` — the iteration cannot be finalized without it.
+fn missing_summary_error(session_id: &str) -> RuntimeError {
+    RuntimeError::LlmResponseInvalid {
+        message: format!(
+            "plugin iteration agent session {session_id} exited without calling record_iteration_summary"
+        ),
+    }
+}
+
 /// Single-line `Invariant` constructor mirroring [`host_io_error`].
 fn host_invariant(message: String) -> RuntimeError {
     RuntimeError::Invariant { message }
@@ -8833,6 +8837,16 @@ mod seam_extraction_tests_low {
         assert!(
             matches!(&err, crate::core::error::RuntimeError::Io { path, message }
                 if path == std::path::Path::new("/x") && message == "failed to write Cargo.toml: disk full"),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn missing_summary_error_names_the_session() {
+        let err = super::missing_summary_error("sess-9");
+        assert!(
+            matches!(&err, crate::core::error::RuntimeError::LlmResponseInvalid { message }
+                if message == "plugin iteration agent session sess-9 exited without calling record_iteration_summary"),
             "got: {err:?}"
         );
     }
