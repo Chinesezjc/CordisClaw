@@ -262,6 +262,66 @@ impl MetaOps {
     };
 }
 
+// ---------------------------------------------------------------------------
+// Error constructors.
+//
+// Each filesystem / subprocess error arm used to spell out a multi-line
+// `RuntimeError::{Io,Invariant,InvalidArgument}` struct literal at the call
+// site. When the happy path runs, the struct-literal body lines are never
+// executed, so every arm cost 3-4 uncovered lines. Routing through these
+// constructors collapses each arm to a single-line closure/expression, so an
+// unreachable arm costs at most one line. The produced values are byte-for-byte
+// identical to the former inline literals.
+
+fn io_error(path: impl Into<PathBuf>, message: impl std::fmt::Display) -> RuntimeError {
+    RuntimeError::Io {
+        path: path.into(),
+        message: message.to_string(),
+    }
+}
+
+fn invariant(message: impl Into<String>) -> RuntimeError {
+    RuntimeError::Invariant {
+        message: message.into(),
+    }
+}
+
+fn invalid_argument(message: impl Into<String>) -> RuntimeError {
+    RuntimeError::InvalidArgument {
+        message: message.into(),
+    }
+}
+
+/// Refresh `index.json`'s sha256 for a single freshly-staged plugin artifact.
+/// Extracted from `rebuild_plugin_workspace` so the entry-match / hash-update
+/// path is unit-testable against a real temp index without a cargo rebuild.
+fn refresh_artifact_hash_for_plugin(
+    artifact_index_path: &Path,
+    plugin_name: &str,
+) -> Result<(), RuntimeError> {
+    if !artifact_index_path.exists() {
+        return Ok(());
+    }
+    let mut index = load_artifact_index(artifact_index_path)?;
+    let mut updated = false;
+    for entry in &mut index.entries {
+        if entry.plugin_path == plugin_name {
+            let resolved = resolve_artifact_path(artifact_index_path, &entry.artifact_path);
+            let new_hash = sha256_file(&resolved)?;
+            if entry.sha256 != new_hash {
+                entry.sha256 = new_hash;
+                updated = true;
+            }
+            break;
+        }
+    }
+    if updated {
+        index.generated_at = current_build_marker();
+        write_pretty_json(artifact_index_path, &index)?;
+    }
+    Ok(())
+}
+
 pub fn ensure_fixture_artifacts(fixtures_root: &Path) -> Result<bool, RuntimeError> {
     let report = prepare_artifacts(fixtures_root, PrepareMode::Incremental)?;
     Ok(!report.rebuilt.is_empty())
@@ -325,9 +385,9 @@ pub fn rebuild_plugin_workspace(
     let output = run_command_with_timeout(cmd, std::time::Duration::from_secs(timeout_secs))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(RuntimeError::InvalidArgument {
-            message: format!("cargo build -p {name} failed: {stderr}"),
-        });
+        return Err(invalid_argument(format!(
+            "cargo build -p {name} failed: {stderr}"
+        )));
     }
     // P0-9: use platform-native dylib prefix/extension. Previously hardcoded
     // `lib{name}.so` / `{name}.so` — always wrong on macOS (`.dylib`) and
@@ -345,10 +405,8 @@ pub fn rebuild_plugin_workspace(
     let src = target_dir.join(&src_filename);
     let dst = workspace_root.join("artifacts").join(&dst_filename);
     if let Some(parent) = dst.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| RuntimeError::Io {
-            path: parent.to_path_buf(),
-            message: format!("create artifacts dir: {e}"),
-        })?;
+        std::fs::create_dir_all(parent)
+            .map_err(|e| io_error(parent, format!("create artifacts dir: {e}")))?;
     }
     // Stage-then-swap: `fs::copy` over a live-mmap'd `.so` risks SIGSEGV on
     // concurrent readers. Write to `<dst>.cordis-tmp`, fsync, rename over
@@ -366,26 +424,7 @@ pub fn rebuild_plugin_workspace(
     // actually passed tests. See docs/architecture/status-and-open-items.md
     // section 5.2.21 for the observation from the E2E smoke.
     let artifact_index_path = workspace_root.join("artifacts").join("index.json");
-    if artifact_index_path.exists() {
-        let mut index = load_artifact_index(&artifact_index_path)?;
-        let entry_name = name.to_string();
-        let mut updated = false;
-        for entry in &mut index.entries {
-            if entry.plugin_path == entry_name {
-                let resolved = resolve_artifact_path(&artifact_index_path, &entry.artifact_path);
-                let new_hash = sha256_file(&resolved)?;
-                if entry.sha256 != new_hash {
-                    entry.sha256 = new_hash;
-                    updated = true;
-                }
-                break;
-            }
-        }
-        if updated {
-            index.generated_at = current_build_marker();
-            write_pretty_json(&artifact_index_path, &index)?;
-        }
-    }
+    refresh_artifact_hash_for_plugin(&artifact_index_path, name)?;
 
     Ok(vec![(
         name.to_string(),
@@ -499,13 +538,10 @@ pub fn sync_plugin_docs(fixtures_root: &Path) -> Result<Vec<PathBuf>, RuntimeErr
                     .replace('/', std::path::MAIN_SEPARATOR_STR),
             )
             .join("docs/agent/interfaces.json");
-        let docs_dir = docs_path.parent().ok_or_else(|| RuntimeError::Invariant {
-            message: format!("docs path missing parent: {}", docs_path.display()),
-        })?;
-        fs::create_dir_all(docs_dir).map_err(|e| RuntimeError::Io {
-            path: docs_dir.to_path_buf(),
-            message: e.to_string(),
-        })?;
+        let docs_dir = docs_path
+            .parent()
+            .ok_or_else(|| invariant(format!("docs path missing parent: {}", docs_path.display())))?;
+        fs::create_dir_all(docs_dir).map_err(|e| io_error(docs_dir, e))?;
         // P1-17: durable atomic write for interfaces.json.
         write_pretty_json(&docs_path, &entry.docs)?;
         written.push(docs_path);
@@ -535,13 +571,23 @@ pub fn refresh_artifact_index(fixtures_root: &Path) -> Result<Vec<(String, Strin
     Ok(refreshed)
 }
 
+/// Parse a JSON payload emitted by a loaded dylib's exported contract fn.
+/// The dylib-open path can't be exercised without a real `.so`, so the two
+/// call sites (`read_plugin_docs`, `inspect_dylib_contract`) share this mapper;
+/// `what` names the failing contract so the byte-stable message is preserved.
+fn parse_dylib_payload<T: serde::de::DeserializeOwned>(
+    artifact_path: &Path,
+    payload: &str,
+    what: &str,
+) -> Result<T, RuntimeError> {
+    serde_json::from_str(payload)
+        .map_err(|e| io_error(artifact_path, format!("runtime {what} parse failed: {e}")))
+}
+
 pub fn read_plugin_docs(artifact_path: &Path) -> Result<PluginDocs, RuntimeError> {
     if is_dylib_path(artifact_path) {
         let dylib = LoadedDylibApi::open(artifact_path)?;
-        serde_json::from_str(&(dylib.api().docs)().payload).map_err(|e| RuntimeError::Io {
-            path: artifact_path.to_path_buf(),
-            message: format!("runtime docs parse failed: {e}"),
-        })
+        parse_dylib_payload(artifact_path, &(dylib.api().docs)().payload, "docs")
     } else {
         let artifact = load_plugin_artifact(artifact_path)?;
         Ok(artifact.docs)
@@ -552,11 +598,12 @@ fn prepare_artifacts_locked(
     fixtures_root: &Path,
     mode: PrepareMode,
 ) -> Result<PrepareArtifactsReport, RuntimeError> {
-    let repo_root = fixtures_root
-        .parent()
-        .ok_or_else(|| RuntimeError::Invariant {
-            message: format!("fixtures root missing parent: {}", fixtures_root.display()),
-        })?;
+    let repo_root = fixtures_root.parent().ok_or_else(|| {
+        invariant(format!(
+            "fixtures root missing parent: {}",
+            fixtures_root.display()
+        ))
+    })?;
     let plugins_root = fixtures_root.join("plugins");
     let artifacts_dir = fixtures_root.join("artifacts");
     let artifact_index_path = artifacts_dir.join("index.json");
@@ -566,15 +613,9 @@ fn prepare_artifacts_locked(
     let mut full_rebuild = matches!(mode, PrepareMode::Full) || existing_index.is_none();
 
     if full_rebuild && artifacts_dir.exists() {
-        fs::remove_dir_all(&artifacts_dir).map_err(|e| RuntimeError::Io {
-            path: artifacts_dir.clone(),
-            message: e.to_string(),
-        })?;
+        fs::remove_dir_all(&artifacts_dir).map_err(|e| io_error(&artifacts_dir, e))?;
     }
-    fs::create_dir_all(&artifacts_dir).map_err(|e| RuntimeError::Io {
-        path: artifacts_dir.clone(),
-        message: e.to_string(),
-    })?;
+    fs::create_dir_all(&artifacts_dir).map_err(|e| io_error(&artifacts_dir, e))?;
 
     let mut contexts =
         build_plugin_contexts(repo_root, &graph, &artifacts_dir, &dependency_snapshot)?;
@@ -873,17 +914,12 @@ fn inspect_dylib_contract(
 ) -> Result<(PluginDocs, crate::core::models::AbiFingerprint), RuntimeError> {
     let dylib = LoadedDylibApi::open(artifact_path)?;
     let docs: PluginDocs =
-        serde_json::from_str(&(dylib.api().docs)().payload).map_err(|e| RuntimeError::Io {
-            path: artifact_path.to_path_buf(),
-            message: format!("runtime docs parse failed: {e}"),
-        })?;
-    let fingerprint =
-        serde_json::from_str(&(dylib.api().abi_fingerprint)().payload).map_err(|e| {
-            RuntimeError::Io {
-                path: artifact_path.to_path_buf(),
-                message: format!("runtime fingerprint parse failed: {e}"),
-            }
-        })?;
+        parse_dylib_payload(artifact_path, &(dylib.api().docs)().payload, "docs")?;
+    let fingerprint = parse_dylib_payload(
+        artifact_path,
+        &(dylib.api().abi_fingerprint)().payload,
+        "fingerprint",
+    )?;
     Ok((docs, fingerprint))
 }
 

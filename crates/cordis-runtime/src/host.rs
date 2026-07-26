@@ -239,7 +239,6 @@ fn missing_registry_trace(transition_id: &str, attempt: u32) -> ExecutionInvocat
     }
 }
 
-
 /// Build the `AbiMismatch` error raised by `reload_subtree` Phase 1 when the
 /// candidate dylib's docs disagree with the recorded index entry's node count.
 /// The `expected`/`actual` fingerprints are both the index entry's fingerprint
@@ -298,7 +297,6 @@ mod sr_host_a_seam_tests {
     use crate::core::error::RuntimeError;
     use crate::core::models::NodeOutcome;
     use cordis_plugin_sdk::AbiFingerprint;
-    use serde_json::{json, Map, Value};
     use std::fs;
     use std::path::PathBuf;
     use tempfile::TempDir;
@@ -317,7 +315,6 @@ mod sr_host_a_seam_tests {
         assert_eq!(trace.response_payload, None);
         assert_eq!(trace.error.as_deref(), Some("node missing from registry"));
     }
-
 
     // ── Pure-fn: reload_subtree Phase-1 AbiMismatch reports ──────────────
 
@@ -436,7 +433,6 @@ mod sr_host_a_seam_tests {
 #[cfg(test)]
 mod cov_fa_host_1_3500_tests {
     use super::{runtime_snapshot_from_output, RuntimeHost, RuntimeKernel, RuntimeSnapshot};
-    use std::fs;
     use crate::core::error::RuntimeError;
     use crate::core::models::{ArtifactKind, NodeOutcome};
     use crate::kernel::plugin_iteration::{
@@ -445,6 +441,7 @@ mod cov_fa_host_1_3500_tests {
     use cordis_plugin_sdk::{node_doc, plugin_docs, AbiFingerprint, NodeDoc};
     use serde_json::json;
     use std::collections::BTreeSet;
+    use std::fs;
     use std::path::PathBuf;
     use tempfile::TempDir;
 
@@ -685,8 +682,12 @@ mod cov_fa_host_1_3500_tests {
     #[test]
     fn host_io_log_line_formats_stage_subject_and_error() {
         let err = std::io::Error::other("disk gone");
-        let line = RuntimeHost::host_io_log_line("auto-save", "failed to create sessions dir /x", &err);
-        assert_eq!(line, "[auto-save] failed to create sessions dir /x: disk gone");
+        let line =
+            RuntimeHost::host_io_log_line("auto-save", "failed to create sessions dir /x", &err);
+        assert_eq!(
+            line,
+            "[auto-save] failed to create sessions dir /x: disk gone"
+        );
     }
 
     // auto_save_session error arms via fault injection: data/sessions blocked
@@ -756,7 +757,10 @@ mod cov_fa_host_1_3500_tests {
         let err = kernel
             .take_blocked_iteration("nope")
             .expect_err("missing id must error");
-        assert!(matches!(err, RuntimeError::PluginIterationStatusNotFound { .. }));
+        assert!(matches!(
+            err,
+            RuntimeError::PluginIterationStatusNotFound { .. }
+        ));
     }
 }
 
@@ -3642,8 +3646,7 @@ export_plugin_api! {{
                         }
                     }
                     Err(err) => {
-                        self.observe_plugin_iteration_failure(&state.prepared, "agent", &err);
-                        state.stage_error = Some(err.to_string());
+                        self.fail_stage(&mut state, "agent", &err);
                     }
                 }
 
@@ -3655,20 +3658,14 @@ export_plugin_api! {{
                                 &plugin_iteration_journal_path(&self.snapshot_root),
                                 &state.prepared.iteration_id,
                             ) {
-                                self.observe_plugin_iteration_failure(
-                                    &state.prepared,
-                                    "edit",
-                                    &err,
-                                );
-                                state.stage_error = Some(err.to_string());
+                                self.fail_stage(&mut state, "edit", &err);
                             }
                         }
                         None => {
                             let err = RuntimeError::Invariant {
                             message: "plugin iteration rollback journal missing after agent execution".to_string(),
                         };
-                            self.observe_plugin_iteration_failure(&state.prepared, "edit", &err);
-                            state.stage_error = Some(err.to_string());
+                            self.fail_stage(&mut state, "edit", &err);
                         }
                     }
                 }
@@ -3710,12 +3707,7 @@ export_plugin_api! {{
                                     original,
                                 );
                             if let Err(err) = rollback.absorb(single) {
-                                self.observe_plugin_iteration_failure(
-                                    &state.prepared,
-                                    "rebuild",
-                                    &err,
-                                );
-                                state.stage_error = Some(err.to_string());
+                                self.fail_stage(&mut state, "rebuild", &err);
                                 break;
                             }
                         }
@@ -3729,12 +3721,7 @@ export_plugin_api! {{
                                 &plugin_iteration_journal_path(&self.snapshot_root),
                                 &state.prepared.iteration_id,
                             ) {
-                                self.observe_plugin_iteration_failure(
-                                    &state.prepared,
-                                    "rebuild",
-                                    &err,
-                                );
-                                state.stage_error = Some(err.to_string());
+                                self.fail_stage(&mut state, "rebuild", &err);
                             }
                         }
                     }
@@ -3744,12 +3731,7 @@ export_plugin_api! {{
                                 state.rebuilt_artifacts = rebuilt;
                             }
                             Err(err) => {
-                                self.observe_plugin_iteration_failure(
-                                    &state.prepared,
-                                    "rebuild",
-                                    &err,
-                                );
-                                state.stage_error = Some(err.to_string());
+                                self.fail_stage(&mut state, "rebuild", &err);
                             }
                         }
                     }
@@ -3762,12 +3744,7 @@ export_plugin_api! {{
                             state.candidate = Some(candidate);
                         }
                         Err(err) => {
-                            self.observe_plugin_iteration_failure(
-                                &state.prepared,
-                                "stage_candidate",
-                                &err,
-                            );
-                            state.stage_error = Some(err.to_string());
+                            self.fail_stage(&mut state, "stage_candidate", &err);
                         }
                     }
                 }
@@ -3798,8 +3775,7 @@ export_plugin_api! {{
                             state.verifier_verdict = Some(verdict);
                         }
                         Err(err) => {
-                            self.observe_plugin_iteration_failure(&state.prepared, "verify", &err);
-                            state.stage_error = Some(err.to_string());
+                            self.fail_stage(&mut state, "verify", &err);
                         }
                     }
                 }
@@ -3821,8 +3797,7 @@ export_plugin_api! {{
                             state.canary = Some(report);
                         }
                         Err(err) => {
-                            self.observe_plugin_iteration_failure(&state.prepared, "canary", &err);
-                            state.stage_error = Some(err.to_string());
+                            self.fail_stage(&mut state, "canary", &err);
                         }
                     }
                 }
@@ -4294,6 +4269,14 @@ export_plugin_api! {{
         while samples.len() > 64 {
             samples.pop_back();
         }
+    }
+
+    /// Record a stage failure on the iteration state: file a kernel issue via
+    /// `observe_plugin_iteration_failure` and stamp `stage_error` so the run
+    /// short-circuits to rollback. One call site per pipeline stage.
+    fn fail_stage(&self, state: &mut PluginIterationRunState, stage: &str, err: &RuntimeError) {
+        self.observe_plugin_iteration_failure(&state.prepared, stage, err);
+        state.stage_error = Some(err.to_string());
     }
 
     fn observe_plugin_iteration_failure(
