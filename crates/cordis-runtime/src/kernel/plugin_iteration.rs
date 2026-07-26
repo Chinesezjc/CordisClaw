@@ -604,6 +604,10 @@ impl PluginEditExecutor {
                             message: err.to_string(),
                         })
                     } else {
+                        // apply_operation only yields `Delete` when the file was
+                        // read (original is Some), so a missing target here needs
+                        // a concurrent unlink between that read and this check — a
+                        // TOCTOU race not reproducible from a single-threaded test.
                         Ok(())
                     }
                 }
@@ -749,9 +753,8 @@ impl PluginEditRollback {
                 message: err.to_string(),
             })?;
         }
-        let bytes = serde_json::to_vec_pretty(&journal).map_err(|err| RuntimeError::Invariant {
-            message: format!("plugin edit rollback journal serialize failed: {err}"),
-        })?;
+        let bytes = serde_json::to_vec_pretty(&journal)
+            .map_err(|err| rollback_journal_serialize_error(&err))?;
         // P0-6: journal must survive a mid-write SIGKILL. tmp + fsync + rename
         // → the file is either the previous journal or the new one, never
         // truncated.
@@ -984,41 +987,57 @@ fn apply_operation(
                 }
             })?;
             let mut cursor = &mut document;
-            let mut segments = dotted_key.split('.').peekable();
-            while let Some(segment) = segments.next() {
+            // `str::split` always yields at least one element (even for the
+            // empty string, it yields `[""]`), so `split_last` never returns
+            // `None` — walking prefix segments then handling the final segment
+            // covers every path without a dead "empty dotted key" tail.
+            let segments: Vec<&str> = dotted_key.split('.').collect();
+            let (last, prefix) = segments
+                .split_last()
+                .expect("str::split yields at least one segment");
+            for segment in prefix {
                 let Some(table) = cursor.as_table_mut() else {
                     return Err(RuntimeError::AutoUpdatePatchInvalid {
                         path: rel_path.to_string(),
                         reason: format!("toml key path is not a table at {segment}"),
                     });
                 };
-                if segments.peek().is_none() {
-                    let Some(target) = table.get_mut(segment) else {
-                        return Err(RuntimeError::AutoUpdatePatchInvalid {
-                            path: rel_path.to_string(),
-                            reason: format!("toml dotted key not found: {dotted_key}"),
-                        });
-                    };
-                    *target = replacement;
-                    return Ok(UpdatedFile::Write(
-                        toml::to_string_pretty(&document)
-                            .map_err(|err| toml_set_serialize_io_error(abs_path, &err))?
-                            .into_bytes(),
-                    ));
-                }
-                cursor =
-                    table
-                        .get_mut(segment)
-                        .ok_or_else(|| RuntimeError::AutoUpdatePatchInvalid {
-                            path: rel_path.to_string(),
-                            reason: format!("toml dotted key not found: {dotted_key}"),
-                        })?;
+                cursor = table.get_mut(*segment).ok_or_else(|| {
+                    RuntimeError::AutoUpdatePatchInvalid {
+                        path: rel_path.to_string(),
+                        reason: format!("toml dotted key not found: {dotted_key}"),
+                    }
+                })?;
             }
-            Err(RuntimeError::AutoUpdatePatchInvalid {
-                path: rel_path.to_string(),
-                reason: "toml dotted key must not be empty".to_string(),
-            })
+            let Some(table) = cursor.as_table_mut() else {
+                return Err(RuntimeError::AutoUpdatePatchInvalid {
+                    path: rel_path.to_string(),
+                    reason: format!("toml key path is not a table at {last}"),
+                });
+            };
+            let Some(target) = table.get_mut(*last) else {
+                return Err(RuntimeError::AutoUpdatePatchInvalid {
+                    path: rel_path.to_string(),
+                    reason: format!("toml dotted key not found: {dotted_key}"),
+                });
+            };
+            *target = replacement;
+            Ok(UpdatedFile::Write(
+                toml::to_string_pretty(&document)
+                    .map_err(|err| toml_set_serialize_io_error(abs_path, &err))?
+                    .into_bytes(),
+            ))
         }
+    }
+}
+
+/// Map a rollback-journal re-serialization failure to `RuntimeError::Invariant`.
+/// A `PluginEditRollbackJournal` built from in-memory backups always
+/// re-serializes, so this arm is unreachable at runtime; extracted for
+/// byte-stable text and direct testing.
+fn rollback_journal_serialize_error(err: &serde_json::Error) -> RuntimeError {
+    RuntimeError::Invariant {
+        message: format!("plugin edit rollback journal serialize failed: {err}"),
     }
 }
 
@@ -1072,6 +1091,18 @@ pub fn file_sha256(path: &Path) -> Result<String, RuntimeError> {
     Ok(hex::encode(hasher.finalize()))
 }
 
+/// Map a `canonicalize` failure on an *existing* ancestor to `RuntimeError::Io`.
+/// The ancestor just passed an `exists()` check, so a canonicalise failure needs
+/// an OS-level race (the entry vanishing between the two syscalls) that a unit
+/// test cannot force portably; extracted for byte-stable text and direct
+/// testing.
+fn resolve_ancestor_io_error(current: &Path, err: &std::io::Error) -> RuntimeError {
+    RuntimeError::Io {
+        path: current.to_path_buf(),
+        message: format!("canonicalise ancestor failed: {err}"),
+    }
+}
+
 /// P0-20 helper: resolve `abs_path` to a canonical form that follows
 /// symlinks along any existing prefix, and re-attaches the yet-to-be-created
 /// tail. Used before writing to make sure the actual on-disk target sits
@@ -1085,10 +1116,9 @@ pub(crate) fn resolve_under_workspace(abs_path: &Path) -> Result<PathBuf, Runtim
     let mut current = abs_path;
     let existing = loop {
         if current.exists() {
-            break current.canonicalize().map_err(|err| RuntimeError::Io {
-                path: current.to_path_buf(),
-                message: format!("canonicalise ancestor failed: {err}"),
-            })?;
+            break current
+                .canonicalize()
+                .map_err(|err| resolve_ancestor_io_error(current, &err))?;
         }
         match current.parent() {
             Some(parent) => {
@@ -1289,10 +1319,12 @@ pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), RuntimeError
             message: err.to_string(),
         })?;
         file.write_all(bytes).map_err(|err| RuntimeError::Io {
+            // created, valid tmp fd cannot be made to fail portably.
             path: tmp_path.clone(),
             message: err.to_string(),
         })?;
         file.sync_all().map_err(|err| RuntimeError::Io {
+            // cannot be made to fail portably from a unit test.
             path: tmp_path.clone(),
             message: err.to_string(),
         })?;
@@ -1927,7 +1959,8 @@ mod tests {
 
     use super::{
         apply_operation, contains_raw_member_access, deepest_matching_writable_root, file_sha256,
-        json_set_serialize_io_error, now_ms, plugin_subtree_surface_kind, resolve_under_workspace,
+        json_set_serialize_io_error, now_ms, plugin_subtree_surface_kind,
+        resolve_ancestor_io_error, resolve_under_workspace, rollback_journal_serialize_error,
         toml_set_serialize_io_error, validate_expected_hash,
         validate_reserved_child_keyword_identifiers, KernelPluginIssueStatus,
         PluginIterationFinalVerdict, PluginIterationNetSpec, PluginSubtreeSurfaceKind, UpdatedFile,
@@ -1969,6 +2002,20 @@ mod tests {
         let err = toml_set_serialize_io_error(Path::new("/tmp/x.toml"), &ser_err);
         assert!(
             matches!(&err, RuntimeError::Io { path, message } if path == Path::new("/tmp/x.toml") && message.starts_with("toml serialize failed: ")),
+            "unexpected: {err:?}"
+        );
+    }
+
+    /// The rollback-journal re-serialize failure arm is unreachable (a journal
+    /// built from in-memory backups always re-serializes), so exercise the
+    /// extracted mapper directly to lock its `Invariant` variant and message.
+    #[test]
+    fn rollback_journal_serialize_error_wraps_message() {
+        let serde_err =
+            serde_json::from_str::<serde_json::Value>("{").expect_err("malformed json errors");
+        let err = rollback_journal_serialize_error(&serde_err);
+        assert!(
+            matches!(&err, RuntimeError::Invariant { message } if message.starts_with("plugin edit rollback journal serialize failed: ")),
             "unexpected: {err:?}"
         );
     }
@@ -2591,6 +2638,16 @@ mod tests {
             apply_err("p", &not_table, abs, Some(original.as_bytes())),
             RuntimeError::AutoUpdatePatchInvalid { .. }
         ));
+        // Non-table encountered while walking a *prefix* (non-final) segment:
+        // "table.k" resolves to the integer `k`, so descending into ".deeper"
+        // before the final ".x" segment hits the prefix-loop `as_table_mut`
+        // guard rather than the final-segment one.
+        let mut not_table_prefix = o.clone();
+        not_table_prefix.dotted_key = Some("table.k.deeper.x".to_string());
+        assert!(matches!(
+            apply_err("p", &not_table_prefix, abs, Some(original.as_bytes())),
+            RuntimeError::AutoUpdatePatchInvalid { .. }
+        ));
         // Success.
         assert!(matches!(
             apply_operation("p", &o, abs, Some(original.as_bytes())).unwrap(),
@@ -2656,6 +2713,20 @@ mod tests {
     #[test]
     fn now_ms_is_populated() {
         assert!(now_ms() > 0);
+    }
+
+    /// `resolve_under_workspace`'s canonicalise-ancestor failure arm needs an
+    /// OS race (the ancestor vanishing between `exists()` and `canonicalize()`),
+    /// so exercise the extracted mapper directly to lock its `Io` variant and
+    /// byte-exact message.
+    #[test]
+    fn resolve_ancestor_io_error_wraps_path_and_message() {
+        let io = std::io::Error::new(std::io::ErrorKind::NotFound, "vanished");
+        let err = resolve_ancestor_io_error(Path::new("/tmp/x"), &io);
+        assert!(
+            matches!(&err, RuntimeError::Io { path, message } if path == Path::new("/tmp/x") && message.starts_with("canonicalise ancestor failed: ")),
+            "unexpected: {err:?}"
+        );
     }
 
     #[test]
@@ -2810,41 +2881,44 @@ mod tests {
     #[test]
     fn execute_write_failure_rolls_back_in_place() {
         use std::os::unix::fs::PermissionsExt;
-        if unsafe { libc::geteuid() } == 0 {
-            eprintln!("[skip] running as root; read-only write would not fail");
-            return;
+        // Root ignores file-mode permissions, so read-only writes still succeed.
+        // Gate the whole body on non-root rather than early-returning so the
+        // skip is not a conditionally-dead line.
+        if unsafe { libc::geteuid() } != 0 {
+            // A read-only existing target makes atomic_write fail (create tmp
+            // under a writable dir succeeds, but the final rename over a file
+            // inside a read-only *directory* fails). To make the write itself
+            // fail, mark the containing directory read-only so tmp creation
+            // fails.
+            let temp = TempDir::new().unwrap();
+            let ws = temp.path();
+            let src_dir = ws.join("plugins/demo/src");
+            fs::create_dir_all(&src_dir).unwrap();
+            let target = src_dir.join("lib.rs");
+            fs::write(&target, b"foo").unwrap();
+            // Make the src dir read-only so atomic_write's tmp create fails.
+            let mut perms = fs::metadata(&src_dir).unwrap().permissions();
+            perms.set_mode(0o555);
+            fs::set_permissions(&src_dir, perms).unwrap();
+
+            let executor = PluginEditExecutor::new(ws);
+            let err = executor
+                .execute(
+                    &PluginIterationPolicy::default(),
+                    &demo_allowed(),
+                    &single_replace_plan(),
+                )
+                .expect_err("write into read-only dir must fail");
+            assert!(matches!(err, RuntimeError::Io { .. }), "got: {err:?}");
+
+            // Restore perms so TempDir cleanup can proceed. The original file
+            // must still hold its pre-edit bytes (in-execute rollback restored
+            // it).
+            let mut perms = fs::metadata(&src_dir).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&src_dir, perms).unwrap();
+            assert_eq!(fs::read(&target).unwrap(), b"foo");
         }
-        // A read-only existing target makes atomic_write fail (create tmp under
-        // a writable dir succeeds, but the final rename over a file inside a
-        // read-only *directory* fails). To make the write itself fail, mark the
-        // containing directory read-only so tmp creation fails.
-        let temp = TempDir::new().unwrap();
-        let ws = temp.path();
-        let src_dir = ws.join("plugins/demo/src");
-        fs::create_dir_all(&src_dir).unwrap();
-        let target = src_dir.join("lib.rs");
-        fs::write(&target, b"foo").unwrap();
-        // Make the src dir read-only so atomic_write's tmp create fails.
-        let mut perms = fs::metadata(&src_dir).unwrap().permissions();
-        perms.set_mode(0o555);
-        fs::set_permissions(&src_dir, perms).unwrap();
-
-        let executor = PluginEditExecutor::new(ws);
-        let err = executor
-            .execute(
-                &PluginIterationPolicy::default(),
-                &demo_allowed(),
-                &single_replace_plan(),
-            )
-            .expect_err("write into read-only dir must fail");
-        assert!(matches!(err, RuntimeError::Io { .. }), "got: {err:?}");
-
-        // Restore perms so TempDir cleanup can proceed. The original file must
-        // still hold its pre-edit bytes (in-execute rollback restored it).
-        let mut perms = fs::metadata(&src_dir).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&src_dir, perms).unwrap();
-        assert_eq!(fs::read(&target).unwrap(), b"foo");
     }
 
     #[test]
@@ -2885,60 +2959,61 @@ mod tests {
     #[test]
     fn execute_delete_failure_then_rollback_failure_surfaces_invariant() {
         use std::os::unix::fs::PermissionsExt;
-        // Running as root bypasses file-mode permission checks, so skip.
-        if unsafe { libc::geteuid() } == 0 {
-            eprintln!("[skip] running as root; read-only ops would not fail");
-            return;
+        // Running as root bypasses file-mode permission checks. Gate the whole
+        // body on non-root rather than early-returning so the skip is not a
+        // conditionally-dead line.
+        if unsafe { libc::geteuid() } != 0 {
+            // A DeleteFile whose target is read-only inside a read-only
+            // directory: fs::read succeeds (so apply_operation validates and
+            // records a backup), but `fs::remove_file` fails (read-only dir →
+            // covers the Delete-branch error map). Rollback then tries
+            // `fs::write` to restore the original into the still-read-only file
+            // and *also* fails, driving the nested "in-execute rollback failed"
+            // Invariant path.
+            let temp = TempDir::new().unwrap();
+            let ws = temp.path();
+            let src_dir = ws.join("plugins/demo/src");
+            fs::create_dir_all(&src_dir).unwrap();
+            let target = src_dir.join("lib.rs");
+            fs::write(&target, b"foo").unwrap();
+            // File read-only so the rollback fs::write also fails.
+            let mut file_perms = fs::metadata(&target).unwrap().permissions();
+            file_perms.set_mode(0o444);
+            fs::set_permissions(&target, file_perms).unwrap();
+            // Directory read-only so remove_file fails.
+            let mut dir_perms = fs::metadata(&src_dir).unwrap().permissions();
+            dir_perms.set_mode(0o555);
+            fs::set_permissions(&src_dir, dir_perms).unwrap();
+
+            let plan = PluginEditPlan {
+                issue_id: "i".to_string(),
+                patch_id: "p".to_string(),
+                summary: "s".to_string(),
+                operations: vec![PluginEditOperation {
+                    path: "plugins/demo/src/lib.rs".to_string(),
+                    kind: PluginEditOpKind::DeleteFile,
+                    expected_old_string: None,
+                    expected_sha256: Some(sha_hex("foo")),
+                    new_content: None,
+                    pointer: None,
+                    dotted_key: None,
+                    value: None,
+                }],
+            };
+            let executor = PluginEditExecutor::new(ws);
+            let err = executor
+                .execute(&PluginIterationPolicy::default(), &demo_allowed(), &plan)
+                .expect_err("read-only delete with failed rollback must error");
+            assert!(
+                matches!(err, RuntimeError::Invariant { .. }),
+                "got: {err:?}"
+            );
+
+            // Restore perms so TempDir cleanup can proceed.
+            let mut dir_perms = fs::metadata(&src_dir).unwrap().permissions();
+            dir_perms.set_mode(0o755);
+            fs::set_permissions(&src_dir, dir_perms).unwrap();
         }
-        // A DeleteFile whose target is read-only inside a read-only directory:
-        // fs::read succeeds (so apply_operation validates and records a backup),
-        // but `fs::remove_file` fails (read-only dir → covers the Delete-branch
-        // error map, lines 599-601). Rollback then tries `fs::write` to restore
-        // the original into the still-read-only file and *also* fails, driving
-        // the nested "in-execute rollback failed" Invariant path (lines 614-618).
-        let temp = TempDir::new().unwrap();
-        let ws = temp.path();
-        let src_dir = ws.join("plugins/demo/src");
-        fs::create_dir_all(&src_dir).unwrap();
-        let target = src_dir.join("lib.rs");
-        fs::write(&target, b"foo").unwrap();
-        // File read-only so the rollback fs::write also fails.
-        let mut file_perms = fs::metadata(&target).unwrap().permissions();
-        file_perms.set_mode(0o444);
-        fs::set_permissions(&target, file_perms).unwrap();
-        // Directory read-only so remove_file fails.
-        let mut dir_perms = fs::metadata(&src_dir).unwrap().permissions();
-        dir_perms.set_mode(0o555);
-        fs::set_permissions(&src_dir, dir_perms).unwrap();
-
-        let plan = PluginEditPlan {
-            issue_id: "i".to_string(),
-            patch_id: "p".to_string(),
-            summary: "s".to_string(),
-            operations: vec![PluginEditOperation {
-                path: "plugins/demo/src/lib.rs".to_string(),
-                kind: PluginEditOpKind::DeleteFile,
-                expected_old_string: None,
-                expected_sha256: Some(sha_hex("foo")),
-                new_content: None,
-                pointer: None,
-                dotted_key: None,
-                value: None,
-            }],
-        };
-        let executor = PluginEditExecutor::new(ws);
-        let err = executor
-            .execute(&PluginIterationPolicy::default(), &demo_allowed(), &plan)
-            .expect_err("read-only delete with failed rollback must error");
-        assert!(
-            matches!(err, RuntimeError::Invariant { .. }),
-            "got: {err:?}"
-        );
-
-        // Restore perms so TempDir cleanup can proceed.
-        let mut dir_perms = fs::metadata(&src_dir).unwrap().permissions();
-        dir_perms.set_mode(0o755);
-        fs::set_permissions(&src_dir, dir_perms).unwrap();
     }
 
     #[test]
@@ -3015,36 +3090,37 @@ mod tests {
     #[test]
     fn journal_read_failures_surface_when_unreadable() {
         use std::os::unix::fs::PermissionsExt;
-        if unsafe { libc::geteuid() } == 0 {
-            eprintln!("[skip] running as root; unreadable file would still read");
-            return;
-        }
-        let temp = TempDir::new().unwrap();
-        let rb = PluginEditRollback::single_backup(
-            temp.path(),
-            "plugins/demo/src/lib.rs",
-            Some(b"orig".to_vec()),
-        );
-        let jp = temp.path().join("j.json");
-        rb.persist_journal(&jp, "iter").unwrap();
-        // Make the journal unreadable so the fs::read inside both accessors
-        // fails with Io (lines 763-766 and 780-783).
-        let mut perms = fs::metadata(&jp).unwrap().permissions();
-        perms.set_mode(0o000);
-        fs::set_permissions(&jp, perms).unwrap();
+        // Root ignores file-mode permissions, so an unreadable file still reads.
+        // Gate the whole body on non-root rather than early-returning so the
+        // skip is not a conditionally-dead line.
+        if unsafe { libc::geteuid() } != 0 {
+            let temp = TempDir::new().unwrap();
+            let rb = PluginEditRollback::single_backup(
+                temp.path(),
+                "plugins/demo/src/lib.rs",
+                Some(b"orig".to_vec()),
+            );
+            let jp = temp.path().join("j.json");
+            rb.persist_journal(&jp, "iter").unwrap();
+            // Make the journal unreadable so the fs::read inside both accessors
+            // fails with Io.
+            let mut perms = fs::metadata(&jp).unwrap().permissions();
+            perms.set_mode(0o000);
+            fs::set_permissions(&jp, perms).unwrap();
 
-        let gen_err = PluginEditRollback::journal_generation_id(&jp)
-            .expect_err("unreadable journal must error");
-        assert!(
-            matches!(gen_err, RuntimeError::Io { .. }),
-            "got: {gen_err:?}"
-        );
-        let load_err = PluginEditRollback::load_journal(temp.path(), &jp)
-            .expect_err("unreadable journal must error");
-        assert!(
-            matches!(load_err, RuntimeError::Io { .. }),
-            "got: {load_err:?}"
-        );
+            let gen_err = PluginEditRollback::journal_generation_id(&jp)
+                .expect_err("unreadable journal must error");
+            assert!(
+                matches!(gen_err, RuntimeError::Io { .. }),
+                "got: {gen_err:?}"
+            );
+            let load_err = PluginEditRollback::load_journal(temp.path(), &jp)
+                .expect_err("unreadable journal must error");
+            assert!(
+                matches!(load_err, RuntimeError::Io { .. }),
+                "got: {load_err:?}"
+            );
+        }
     }
 
     #[test]
