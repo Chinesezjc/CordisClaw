@@ -316,30 +316,38 @@ mod sr_host_a_seam_tests {
         assert_eq!(trace.error.as_deref(), Some("node missing from registry"));
     }
 
-    // ── Pure-fn: reload_subtree Phase-1 AbiMismatch reports ──────────────
-
-    #[test]
-    fn reload_docs_mismatch_error_uses_entry_fingerprint_for_both_sides() {
-        let fp = AbiFingerprint::current_build("crate_h", "api_h");
-        let err = reload_docs_mismatch_error("qq", &fp, 3, 5);
+    /// Unwrap an `AbiMismatch` error into its fields; panics (with caller
+    /// location) on any other variant. Keeps match tails out of every test.
+    #[track_caller]
+    fn expect_abi_mismatch(
+        err: RuntimeError,
+    ) -> (String, AbiFingerprint, AbiFingerprint, Vec<String>) {
         match err {
             RuntimeError::AbiMismatch {
                 plugin_path,
                 expected,
                 actual,
                 fingerprint_diff,
-            } => {
-                assert_eq!(plugin_path, "qq");
-                // Docs drifted, not the ABI hash → both sides are the entry fp.
-                assert_eq!(*expected, fp);
-                assert_eq!(*actual, fp);
-                assert_eq!(
-                    fingerprint_diff,
-                    vec!["docs mismatch: expected 3 nodes, got 5".to_string()]
-                );
-            }
+            } => (plugin_path, *expected, *actual, fingerprint_diff),
             other => panic!("expected AbiMismatch, got {other:?}"),
         }
+    }
+
+    // ── Pure-fn: reload_subtree Phase-1 AbiMismatch reports ──────────────
+
+    #[test]
+    fn reload_docs_mismatch_error_uses_entry_fingerprint_for_both_sides() {
+        let fp = AbiFingerprint::current_build("crate_h", "api_h");
+        let err = reload_docs_mismatch_error("qq", &fp, 3, 5);
+        let (plugin_path, expected, actual, fingerprint_diff) = expect_abi_mismatch(err);
+        assert_eq!(plugin_path, "qq");
+        // Docs drifted, not the ABI hash → both sides are the entry fp.
+        assert_eq!(expected, fp);
+        assert_eq!(actual, fp);
+        assert_eq!(
+            fingerprint_diff,
+            vec!["docs mismatch: expected 3 nodes, got 5".to_string()]
+        );
     }
 
     #[test]
@@ -347,29 +355,20 @@ mod sr_host_a_seam_tests {
         let expected_fp = AbiFingerprint::current_build("crate_old", "api_old");
         let actual_fp = AbiFingerprint::current_build("crate_new", "api_new");
         let err = reload_abi_fingerprint_mismatch_error("svc", &expected_fp, actual_fp.clone());
-        match err {
-            RuntimeError::AbiMismatch {
-                plugin_path,
-                expected,
-                actual,
-                fingerprint_diff,
-            } => {
-                assert_eq!(plugin_path, "svc");
-                assert_eq!(*expected, expected_fp);
-                assert_eq!(*actual, actual_fp);
-                assert_eq!(
-                    fingerprint_diff,
-                    vec![format!(
-                        "expected crate={} api={}, got crate={} api={}",
-                        expected_fp.crate_hash,
-                        expected_fp.api_hash,
-                        actual_fp.crate_hash,
-                        actual_fp.api_hash,
-                    )]
-                );
-            }
-            other => panic!("expected AbiMismatch, got {other:?}"),
-        }
+        let (plugin_path, expected, actual, fingerprint_diff) = expect_abi_mismatch(err);
+        assert_eq!(plugin_path, "svc");
+        assert_eq!(expected, expected_fp);
+        assert_eq!(actual, actual_fp);
+        assert_eq!(
+            fingerprint_diff,
+            vec![format!(
+                "expected crate={} api={}, got crate={} api={}",
+                expected_fp.crate_hash,
+                expected_fp.api_hash,
+                actual_fp.crate_hash,
+                actual_fp.api_hash,
+            )]
+        );
     }
 
     // ── pub(crate) session-map accessors on a cheap empty-index host ─────
@@ -8787,7 +8786,6 @@ mod seam_extraction_tests_low {
     }
 
     #[test]
-#[test]
     fn host_io_error_carries_path_and_message_verbatim() {
         let path = PathBuf::from("/root/plugins/foo/src");
         let err = host_io_error(
@@ -10108,15 +10106,11 @@ mod region_3500_5500_seam_tests {
         );
         let err = out.expect_err("wrong shape must error");
         match err {
-            RuntimeError::InvalidArgument { message } => {
-                assert!(
-                    message.starts_with(&format!(
-                        "agent tool {PLUGIN_AGENT_TOOL_REPLACE_FILES_EXACT} received invalid arguments: "
-                    )),
-                    "unexpected message: {message}"
-                );
-            }
-            other => panic!("expected InvalidArgument, got {other:?}"),
+            RuntimeError::InvalidArgument { message }
+                if message.starts_with(&format!(
+                "agent tool {PLUGIN_AGENT_TOOL_REPLACE_FILES_EXACT} received invalid arguments: "
+            )) => {}
+            other => panic!("expected prefixed InvalidArgument, got {other:?}"),
         }
     }
 

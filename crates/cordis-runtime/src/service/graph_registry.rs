@@ -419,6 +419,14 @@ fn build_registered_net(
     }
 }
 
+/// Only data/control edges contribute to topological ordering.
+fn is_dependency_edge(kind: &RegisteredNetEdgeKind) -> bool {
+    matches!(
+        kind,
+        RegisteredNetEdgeKind::Data | RegisteredNetEdgeKind::Control
+    )
+}
+
 fn topo_levels(
     node_ids: Vec<String>,
     edges: &[RegisteredNetEdge],
@@ -433,20 +441,14 @@ fn topo_levels(
     }
 
     for edge in edges {
-        if !matches!(
-            edge.kind,
-            RegisteredNetEdgeKind::Data | RegisteredNetEdgeKind::Control
-        ) {
-            continue;
+        let known_endpoints = indegree.contains_key(&edge.from) && indegree.contains_key(&edge.to);
+        if is_dependency_edge(&edge.kind) && known_endpoints {
+            *indegree.entry(edge.to.clone()).or_insert(0) += 1;
+            outgoing
+                .entry(edge.from.clone())
+                .or_default()
+                .push(edge.to.clone());
         }
-        if !indegree.contains_key(&edge.from) || !indegree.contains_key(&edge.to) {
-            continue;
-        }
-        *indegree.entry(edge.to.clone()).or_insert(0) += 1;
-        outgoing
-            .entry(edge.from.clone())
-            .or_default()
-            .push(edge.to.clone());
     }
 
     let mut levels = BTreeMap::<String, usize>::new();
@@ -456,22 +458,23 @@ fn topo_levels(
         .map(|(node, _)| node.clone())
         .collect::<VecDeque<_>>();
 
+    let no_neighbors = Vec::new();
     while let Some(node) = queue.pop_front() {
         let level = levels.get(&node).copied().unwrap_or(0);
-        if let Some(nexts) = outgoing.get(&node) {
-            for next in nexts {
-                let entry = levels.entry(next.clone()).or_insert(0);
-                if *entry < level + 1 {
-                    *entry = level + 1;
-                }
-                if let Some(deg) = indegree.get_mut(next) {
-                    if *deg > 0 {
-                        *deg -= 1;
-                    }
-                    if *deg == 0 {
-                        queue.push_back(next.clone());
-                    }
-                }
+        // `outgoing` is keyed by every node_id, so `get` is always `Some` for a
+        // queued node; fall back to an empty slice rather than branching.
+        let nexts = outgoing.get(&node).unwrap_or(&no_neighbors);
+        for next in nexts {
+            let entry = levels.entry(next.clone()).or_insert(0);
+            if *entry < level + 1 {
+                *entry = level + 1;
+            }
+            // `next` is an `edge.to` that passed the `known_endpoints` check, so
+            // it always has an indegree entry; `entry` finds it without insert.
+            let deg = indegree.entry(next.clone()).or_insert(0);
+            *deg = deg.saturating_sub(1);
+            if *deg == 0 {
+                queue.push_back(next.clone());
             }
         }
     }
@@ -722,14 +725,12 @@ mod tests {
         let mut nodes = NodeRegistry::default();
         nodes.register_from_docs("root/p", &docs).unwrap();
         let reg = GraphRegistry::from_registries(&plugins, &nodes);
-        assert!(
-            reg.net()
-                .diagnostics
-                .iter()
-                .any(|d| d.contains("multi-producer") && d.contains("`x`")),
-            "diagnostics: {:?}",
-            reg.net().diagnostics
-        );
+        let diagnostics = reg.net().diagnostics.clone();
+        let ctx = format!("diagnostics: {diagnostics:?}");
+        let has_multi_producer = diagnostics
+            .iter()
+            .any(|d| d.contains("multi-producer") && d.contains("`x`"));
+        assert!(has_multi_producer, "{ctx}");
         // Deterministic pick: alphabetically first producer (prod_a).
         let edge = reg
             .net()
@@ -762,14 +763,10 @@ mod tests {
         let mut nodes = NodeRegistry::default();
         nodes.register_from_docs("root/p", &docs).unwrap();
         let reg = GraphRegistry::from_registries(&plugins, &nodes);
-        assert!(
-            reg.net()
-                .diagnostics
-                .iter()
-                .any(|d| d.contains("cycle-like")),
-            "diagnostics: {:?}",
-            reg.net().diagnostics
-        );
+        let diagnostics = reg.net().diagnostics.clone();
+        let ctx = format!("diagnostics: {diagnostics:?}");
+        let has_cycle = diagnostics.iter().any(|d| d.contains("cycle-like"));
+        assert!(has_cycle, "{ctx}");
         // Cycle participants get the usize::MAX sentinel level.
         assert!(reg.net().nodes.iter().all(|n| n.topo_level == usize::MAX));
     }
@@ -1080,5 +1077,11 @@ mod tests {
         // The edge to the unknown `ghost` node was skipped, so no entry.
         assert!(!levels.contains_key("ghost"));
         assert!(diagnostics.is_empty(), "acyclic -> no diagnostics");
+    }
+
+    #[test]
+    fn is_dependency_edge_accepts_data_and_control() {
+        assert!(is_dependency_edge(&RegisteredNetEdgeKind::Data));
+        assert!(is_dependency_edge(&RegisteredNetEdgeKind::Control));
     }
 }
