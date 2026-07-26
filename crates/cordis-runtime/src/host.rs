@@ -435,7 +435,8 @@ mod sr_host_a_seam_tests {
 /// and the `sr_host_a_seam_tests` module never collide on the same lines.
 #[cfg(test)]
 mod cov_fa_host_1_3500_tests {
-    use super::{runtime_snapshot_from_output, RuntimeKernel, RuntimeSnapshot};
+    use super::{runtime_snapshot_from_output, RuntimeHost, RuntimeKernel, RuntimeSnapshot};
+    use std::fs;
     use crate::core::error::RuntimeError;
     use crate::core::models::{ArtifactKind, NodeOutcome};
     use crate::kernel::plugin_iteration::{
@@ -679,6 +680,74 @@ mod cov_fa_host_1_3500_tests {
 
     // take_blocked_iteration: unknown id surfaces StatusNotFound (the only
     // remaining error path now that the verdict check is an invariant).
+    // host_io_log_line: the single formatting seam behind every best-effort
+    // I/O failure log in auto-save/shutdown/delete paths.
+    #[test]
+    fn host_io_log_line_formats_stage_subject_and_error() {
+        let err = std::io::Error::other("disk gone");
+        let line = RuntimeHost::host_io_log_line("auto-save", "failed to create sessions dir /x", &err);
+        assert_eq!(line, "[auto-save] failed to create sessions dir /x: disk gone");
+    }
+
+    // auto_save_session error arms via fault injection: data/sessions blocked
+    // by a regular file at data/ makes create_dir_all fail; a read-only
+    // sessions dir makes the tmp write fail; a directory squatting on the
+    // target makes rename fail. All are best-effort (must not panic).
+    #[cfg(unix)]
+    #[test]
+    fn auto_save_and_delete_session_arms_survive_fs_faults() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let fixtures = temp.path().join("fixtures");
+        let artifacts = fixtures.join("artifacts");
+        fs::create_dir_all(&artifacts).expect("create artifacts dir");
+        fs::write(
+            artifacts.join("index.json"),
+            r#"{"schema_version":2,"generated_at":"2026-07-24T00:00:00Z","topo_order":[],"entries":[]}"#,
+        )
+        .expect("write empty index");
+        let host = RuntimeHost::boot(&fixtures).expect("boot on empty index");
+        let config = crate::config::LlmApiConfig {
+            provider: "deepseek".to_string(),
+            base_url: "http://127.0.0.1:1/v1".to_string(),
+            api_key: Some("test".to_string()),
+            model: "m".to_string(),
+            ..crate::config::LlmApiConfig::default()
+        };
+        let session =
+            crate::agent::AgentSession::new(config, "runtime_shell").expect("build session");
+
+        // Arm 1: create_dir_all failure — put a FILE where data/sessions goes.
+        let data_dir = host.data_dir();
+        fs::create_dir_all(&data_dir).unwrap();
+        fs::write(data_dir.join("sessions"), b"squatter").unwrap();
+        host.auto_save_session("s1", &session); // must log-and-return, not panic
+        fs::remove_file(data_dir.join("sessions")).unwrap();
+
+        // Arm 2: tmp write failure — sessions dir exists but is read-only.
+        let sessions_dir = data_dir.join("sessions");
+        fs::create_dir_all(&sessions_dir).unwrap();
+        let ro = fs::Permissions::from_mode(0o555);
+        fs::set_permissions(&sessions_dir, ro).unwrap();
+        if unsafe { libc::geteuid() } != 0 {
+            host.auto_save_session("s2", &session);
+        }
+        fs::set_permissions(&sessions_dir, fs::Permissions::from_mode(0o700)).unwrap();
+
+        // Arm 3: rename failure — a DIRECTORY squats on the target filename.
+        fs::create_dir_all(sessions_dir.join("s3.json")).unwrap();
+        host.auto_save_session("s3", &session);
+        fs::remove_dir(sessions_dir.join("s3.json")).unwrap();
+
+        // Arm 4: delete failure — target exists but parent becomes read-only.
+        fs::write(sessions_dir.join("s4.json"), b"{}").unwrap();
+        fs::set_permissions(&sessions_dir, fs::Permissions::from_mode(0o555)).unwrap();
+        if unsafe { libc::geteuid() } != 0 {
+            host.delete_session_snapshot("s4");
+        }
+        fs::set_permissions(&sessions_dir, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
     #[test]
     fn take_blocked_iteration_unknown_id_is_not_found() {
         let temp = TempDir::new().expect("tempdir");
@@ -1772,10 +1841,8 @@ impl RuntimeHost {
             // next boot would parse-fail on. All other runtime writers use
             // tmp + rename; shutdown is now the same.
             if let Err(err) = atomic_write_bytes(&path, json.as_bytes()) {
-                eprintln!(
-                    "[shutdown] failed to write memory to {}: {err}",
-                    path.display()
-                );
+                let subject = format!("failed to write memory to {}", path.display());
+                eprintln!("{}", Self::host_io_log_line("shutdown", &subject, &err));
             } else {
                 eprintln!("[shutdown] wrote memory to {}", path.display());
             }
@@ -1834,16 +1901,20 @@ impl RuntimeHost {
             .join("data")
     }
 
+    /// Log a best-effort host I/O failure. Centralizing the format keeps the
+    /// call sites single-line and lets the message shape be unit-tested.
+    fn host_io_log_line(stage: &str, subject: &str, err: &dyn std::fmt::Display) -> String {
+        format!("[{stage}] {subject}: {err}")
+    }
+
     /// Best-effort save of a session snapshot to `data/sessions/<id>.json`.
     /// Uses atomic temp-file-then-rename.  Errors are logged but never
     /// propagated — an auto-save failure must not break the agent response.
     fn auto_save_session(&self, session_id: &str, session: &AgentSession) {
         let sessions_dir = self.data_dir().join("sessions");
         if let Err(e) = std::fs::create_dir_all(&sessions_dir) {
-            eprintln!(
-                "[auto-save] failed to create sessions dir {}: {e}",
-                sessions_dir.display()
-            );
+            let subject = format!("failed to create sessions dir {}", sessions_dir.display());
+            eprintln!("{}", Self::host_io_log_line("auto-save", &subject, &e));
             return;
         }
         // P0-25: session snapshots may embed non-secret HTTP config (base_url,
@@ -1895,10 +1966,8 @@ impl RuntimeHost {
             return;
         }
         if let Err(err) = std::fs::remove_file(&path) {
-            eprintln!(
-                "[auto-save] failed to delete session snapshot {}: {err}",
-                path.display()
-            );
+            let subject = format!("failed to delete session snapshot {}", path.display());
+            eprintln!("{}", Self::host_io_log_line("auto-save", &subject, &err));
         }
     }
 
