@@ -2394,12 +2394,8 @@ impl RuntimeHost {
 
         // Create directory structure
         let src_dir = plugin_dir.join("src");
-        std::fs::create_dir_all(&src_dir).map_err(|e| {
-            host_io_error(
-                src_dir.clone(),
-                format!("failed to create plugin src dir: {e}"),
-            )
-        })?;
+        std::fs::create_dir_all(&src_dir)
+            .map_err(|e| io_ctx(src_dir.clone(), "failed to create plugin src dir", e))?;
 
         let desc = description.unwrap_or(name);
         let crate_hash = format!("crate_{name}_v1");
@@ -2431,9 +2427,10 @@ serde_json = "1"
 "#
         );
         std::fs::write(plugin_dir.join("Cargo.toml"), &cargo_toml).map_err(|e| {
-            host_io_error(
+            io_ctx(
                 plugin_dir.join("Cargo.toml"),
-                format!("failed to write Cargo.toml: {e}"),
+                "failed to write Cargo.toml",
+                e,
             )
         })?;
 
@@ -2513,12 +2510,8 @@ export_plugin_api! {{
 }}
 "#
         );
-        std::fs::write(src_dir.join("lib.rs"), &lib_rs).map_err(|e| {
-            host_io_error(
-                src_dir.join("lib.rs"),
-                format!("failed to write lib.rs: {e}"),
-            )
-        })?;
+        std::fs::write(src_dir.join("lib.rs"), &lib_rs)
+            .map_err(|e| io_ctx(src_dir.join("lib.rs"), "failed to write lib.rs", e))?;
 
         // Add to workspace members.
         //
@@ -2533,9 +2526,10 @@ export_plugin_api! {{
         let lock_path = workspace_manifest.with_extension("toml.create-lock");
         let _lock = workspace_manifest_lock::acquire(&lock_path);
         let manifest_text = std::fs::read_to_string(&workspace_manifest).map_err(|e| {
-            host_io_error(
+            io_ctx(
                 workspace_manifest.clone(),
-                format!("failed to read workspace manifest: {e}"),
+                "failed to read workspace manifest",
+                e,
             )
         })?;
         let mut document: TomlValue =
@@ -2554,9 +2548,10 @@ export_plugin_api! {{
             members.push(TomlValue::String(name.to_string()));
         }
         let new_manifest = toml::to_string_pretty(&document).map_err(|e| {
-            host_io_error(
+            io_ctx(
                 workspace_manifest.clone(),
-                format!("failed to serialize workspace manifest: {e}"),
+                "failed to serialize workspace manifest",
+                e,
             )
         })?;
         atomic_write_bytes(&workspace_manifest, new_manifest.as_bytes()).map_err(|e| {
@@ -7023,6 +7018,12 @@ mod workspace_manifest_lock {
 /// { .. })` closures in `create_plugin` / snapshot setup so the mapping is a
 /// single named, unit-testable function. Callers keep formatting the message
 /// (which embeds `e`) so the emitted text stays byte-for-byte identical.
+/// `Io` error with a `"{what}: {source}"` message — the short-arg variant
+/// of [`host_io_error`] so call sites fit a single line under rustfmt.
+fn io_ctx(path: PathBuf, what: &str, e: impl std::fmt::Display) -> RuntimeError {
+    host_io_error(path, format!("{what}: {e}"))
+}
+
 fn host_io_error(path: PathBuf, message: String) -> RuntimeError {
     RuntimeError::Io { path, message }
 }
@@ -8772,6 +8773,21 @@ mod seam_extraction_tests_low {
     use std::path::PathBuf;
 
     #[test]
+    fn io_ctx_appends_source_error_to_context() {
+        let err = super::io_ctx(
+            std::path::PathBuf::from("/x"),
+            "failed to write Cargo.toml",
+            "disk full",
+        );
+        assert!(
+            matches!(&err, crate::core::error::RuntimeError::Io { path, message }
+                if path == std::path::Path::new("/x") && message == "failed to write Cargo.toml: disk full"),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+#[test]
     fn host_io_error_carries_path_and_message_verbatim() {
         let path = PathBuf::from("/root/plugins/foo/src");
         let err = host_io_error(
