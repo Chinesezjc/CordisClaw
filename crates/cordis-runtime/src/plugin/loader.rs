@@ -1782,10 +1782,17 @@ mod loader_flow_tests {
         let iface = plugins_root.join("alpha/docs/agent/interfaces.json");
         assert!(iface.exists(), "interfaces.json should have been written");
         // The on-disk index write-back failed, so index.json is unchanged (still
-        // lacks the healed system_hint).
+        // lacks the healed system_hint). Root ignores the read-only artifacts
+        // dir, so the write-back lands there and the hint IS persisted.
         fs::set_permissions(&artifacts_dir, fs::Permissions::from_mode(0o755)).unwrap();
         let on_disk = load_artifact_index(&index_path).unwrap();
-        assert_eq!(on_disk.entries[0].docs.system_hint, None);
+        // SAFETY: `geteuid` is always safe to call and cannot fail.
+        let enforced = (unsafe { libc::geteuid() }) != 0;
+        let expected_hint = (!enforced).then_some("fresh");
+        assert_eq!(
+            on_disk.entries[0].docs.system_hint.as_deref(),
+            expected_hint
+        );
         // No staging leftover next to the index.
         let leftover: Vec<_> = fs::read_dir(&artifacts_dir)
             .unwrap()

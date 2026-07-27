@@ -1751,6 +1751,17 @@ fn absolute_path(path: &Path) -> Result<PathBuf, RuntimeError> {
 
 #[cfg(test)]
 mod tests {
+    /// `true` when the process can be blocked by file-mode permission bits.
+    /// Root bypasses them, so a "deny write/read then expect an I/O error"
+    /// injection succeeds instead of failing there. Tests below assert both
+    /// directions rather than skipping, so the production path under test runs
+    /// under either euid and leaves no uncovered line.
+    #[cfg(unix)]
+    fn permission_bits_are_enforced() -> bool {
+        // SAFETY: `geteuid` is always safe to call and cannot fail.
+        (unsafe { libc::geteuid() }) != 0
+    }
+
     use super::{cargo_command_prefers_offline, prepare_local_cargo_args};
 
     #[test]
@@ -2818,10 +2829,15 @@ exports = ["svc_a", "svc_b"]
         let err = write_pretty_json(&target, &serde_json::json!({"k": 1}));
         // Restore perms so TempDir cleanup succeeds regardless of outcome.
         std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(
-            matches!(&err, Err(RuntimeError::Io { message, .. }) if message.starts_with("create tmp: ")),
-            "expected Io create-tmp error, got {err:?}"
-        );
+        if permission_bits_are_enforced() {
+            assert!(
+                matches!(&err, Err(RuntimeError::Io { message, .. }) if message.starts_with("create tmp: ")),
+                "expected Io create-tmp error, got {err:?}"
+            );
+        } else {
+            // Root ignores the read-only directory, so staging succeeds.
+            assert!(err.is_ok(), "as root the write must succeed, got {err:?}");
+        }
     }
 
     /// `write_pretty_json` create_dir_all arm: a path whose parent is an
@@ -2860,10 +2876,15 @@ exports = ["svc_a", "svc_b"]
         let dst = ro.join("out.so");
         let err = stage_then_rename_file(&src, &dst);
         std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(
-            matches!(&err, Err(RuntimeError::Io { message, .. }) if message.starts_with("create tmp: ")),
-            "expected Io create-tmp error, got {err:?}"
-        );
+        if permission_bits_are_enforced() {
+            assert!(
+                matches!(&err, Err(RuntimeError::Io { message, .. }) if message.starts_with("create tmp: ")),
+                "expected Io create-tmp error, got {err:?}"
+            );
+        } else {
+            // Root ignores the read-only directory, so staging succeeds.
+            assert!(err.is_ok(), "as root the staging must succeed, got {err:?}");
+        }
     }
 
     /// `collect_files_recursively` read_dir arm: a missing directory makes
@@ -2901,7 +2922,12 @@ exports = ["svc_a", "svc_b"]
         let err = cleanup_fixture_lockfiles(&plugins_root);
         std::env::remove_var("CORDIS_CLEAN_FIXTURE_LOCKFILES");
         std::fs::set_permissions(&plugins_root, std::fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(matches!(err, Err(RuntimeError::Io { .. })));
+        if permission_bits_are_enforced() {
+            assert!(matches!(err, Err(RuntimeError::Io { .. })));
+        } else {
+            // Root reads the mode-000 directory anyway, so the sweep succeeds.
+            assert!(err.is_ok(), "as root the sweep must succeed, got {err:?}");
+        }
     }
 
     /// `remove_lockfiles_recursively` read_dir arm: an unreadable subdirectory
@@ -2919,7 +2945,11 @@ exports = ["svc_a", "svc_b"]
         std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o000)).unwrap();
         let err = remove_lockfiles_recursively(&sub);
         std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(matches!(err, Err(RuntimeError::Io { .. })));
+        if permission_bits_are_enforced() {
+            assert!(matches!(err, Err(RuntimeError::Io { .. })));
+        } else {
+            assert!(err.is_ok(), "as root the sweep must succeed, got {err:?}");
+        }
     }
 
     /// `lock_pid_is_live(0)` short-circuits to `false` (pid 0 is never a
@@ -3023,7 +3053,12 @@ exports = ["svc_a", "svc_b"]
         std::fs::set_permissions(&holder, std::fs::Permissions::from_mode(0o555)).unwrap();
         let err = maybe_remove_stale_lock(&path);
         std::fs::set_permissions(&holder, std::fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(matches!(err, Err(RuntimeError::Io { .. })));
+        if permission_bits_are_enforced() {
+            assert!(matches!(err, Err(RuntimeError::Io { .. })));
+        } else {
+            // Root unlinks inside the read-only directory, so removal succeeds.
+            assert!(err.is_ok(), "as root the unlink must succeed, got {err:?}");
+        }
     }
 
     /// Legacy (non-JSON) stale-lock path: an ancient non-JSON lock is slated
@@ -3050,7 +3085,12 @@ exports = ["svc_a", "svc_b"]
         std::fs::set_permissions(&holder, std::fs::Permissions::from_mode(0o555)).unwrap();
         let err = maybe_remove_stale_lock(&path);
         std::fs::set_permissions(&holder, std::fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(matches!(err, Err(RuntimeError::Io { .. })));
+        if permission_bits_are_enforced() {
+            assert!(matches!(err, Err(RuntimeError::Io { .. })));
+        } else {
+            // Root unlinks inside the read-only directory, so removal succeeds.
+            assert!(err.is_ok(), "as root the unlink must succeed, got {err:?}");
+        }
     }
 
     // ---------- run_command_with_timeout spawn failure ----------
