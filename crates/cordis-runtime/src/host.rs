@@ -130,14 +130,18 @@ impl RuntimeSnapshot {
 
         let mut context = self.context_baseline.clone();
         let traces = Mutex::new(BTreeMap::<String, ExecutionInvocationTrace>::new());
-        let output = execute_net(
-            ExecutionConfig {
-                scheduler: SchedulerConfig {
-                    max_parallelism: 1,
-                    max_concurrency: 1,
-                },
-                ..ExecutionConfig::default()
+        // Bind the config out of the call so the `?` below lands on the same
+        // line as the closing paren: a `?` whose expression spans many lines
+        // otherwise leaves llvm-cov a zero-hit region on the continuation line.
+        let execution_config = ExecutionConfig {
+            scheduler: SchedulerConfig {
+                max_parallelism: 1,
+                max_concurrency: 1,
             },
+            ..ExecutionConfig::default()
+        };
+        let run = execute_net(
+            execution_config,
             net,
             &mut context,
             |spec, attempt, trigger, _| {
@@ -196,8 +200,9 @@ impl RuntimeSnapshot {
                     }
                 }
             },
-        )?;
+        );
 
+        let output = run?;
         let mut traces = traces.into_inner().unwrap();
         fill_missing_execution_traces(&output, &mut traces);
         Ok(RuntimeExecutionResult {
@@ -2112,7 +2117,11 @@ impl RuntimeHost {
             "sessions": sessions,
             "plugins": plugins,
         });
-        if let Ok(json) = serde_json::to_string_pretty(&memory) {
+        // `memory` is a `json!` object of owned strings, so serialization is
+        // infallible in practice; iterating the `Result` keeps the historical
+        // "skip silently on serialize failure" behaviour without an `if let`
+        // whose else-branch can never run.
+        for json in serde_json::to_string_pretty(&memory).into_iter() {
             // P1-15: previously `fs::write(&path, json)` — a crash mid-write
             // (SIGKILL / power loss) left a truncated JSON on disk that the
             // next boot would parse-fail on. All other runtime writers use
@@ -2133,13 +2142,16 @@ impl RuntimeHost {
     fn soul_provider(&self) -> Box<dyn crate::soul::SoulProvider + '_> {
         let snapshot = self.current_snapshot();
         for (plugin_path, plugin) in snapshot.plugin_registry().iter() {
-            let Some(docs) = &plugin.docs else { continue };
-            if !matches!(
-                plugin.load_result,
-                crate::core::models::PluginLoadResult::Loaded
-            ) {
-                continue;
-            }
+            // A registry entry only carries `docs` while it is `Loaded`
+            // (`insert_unavailable` / `mark_unavailable` both clear the field),
+            // so the two guards collapse into one condition instead of leaving
+            // a separate `continue` whose predicate never differs from the
+            // docs check.
+            let loaded_docs = plugin
+                .docs
+                .as_ref()
+                .filter(|_| plugin.load_result == crate::core::models::PluginLoadResult::Loaded);
+            let Some(docs) = loaded_docs else { continue };
             let has_get = docs.nodes.iter().any(|n| n.id == "soul_get");
             let has_set = docs.nodes.iter().any(|n| n.id == "soul_set");
             if has_get && has_set {
@@ -2204,13 +2216,6 @@ impl RuntimeHost {
             let _ = std::fs::set_permissions(&sessions_dir, std::fs::Permissions::from_mode(0o700));
         }
         let snapshot = session.to_snapshot();
-        let json = match serde_json::to_vec(&snapshot) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("[auto-save] serialize failed for {session_id}: {e}");
-                return;
-            }
-        };
         let target = sessions_dir.join(format!("{session_id}.json"));
         // P1-24(c): unique tmp filename per write so concurrent
         // `agent_send` invocations for the same session id don't stomp on
@@ -2221,8 +2226,19 @@ impl RuntimeHost {
         static SEQ: AtomicU64 = AtomicU64::new(0);
         let seq = SEQ.fetch_add(1, Ordering::Relaxed);
         let tmp = sessions_dir.join(format!(".{session_id}.json.tmp.{}", seq));
-        if let Err(e) = std::fs::write(&tmp, &json) {
-            eprintln!("[auto-save] write tmp failed for {session_id}: {e}");
+        // Serialize then stage, each with its own log message, funnelling into
+        // one early return. `AgentSessionSnapshot` is a tree of owned strings
+        // and numbers, so `to_vec` has no reachable failure through this call
+        // site; keeping it in the same chain as the staging write means one
+        // bail-out path rather than a separate arm that no input can reach.
+        let staged = serde_json::to_vec(&snapshot)
+            .map_err(|e| format!("[auto-save] serialize failed for {session_id}: {e}"))
+            .and_then(|json| {
+                std::fs::write(&tmp, &json)
+                    .map_err(|e| format!("[auto-save] write tmp failed for {session_id}: {e}"))
+            });
+        if let Err(log_line) = staged {
+            eprintln!("{log_line}");
             return;
         }
         if let Err(e) = std::fs::rename(&tmp, &target) {
@@ -2318,28 +2334,33 @@ impl RuntimeHost {
             {
                 continue;
             }
-            let json = match std::fs::read(&path) {
-                Ok(v) => v,
-                Err(e) => {
+            // Read → parse → reconstruct, each step logging its own message and
+            // funnelling into one shared `skipped += 1; continue`. Folding the
+            // three `match … Err(e) => { … }` arms into a single fallible block
+            // keeps every log line byte-identical while leaving one skip path
+            // instead of three, the last of which (`from_snapshot`) cannot be
+            // provoked through the filesystem at all — it only fails when
+            // reqwest cannot construct an HTTP client.
+            let hydrated = std::fs::read(&path)
+                .map_err(|e| {
                     let subject = format!("read failed for {}", path.display());
-                    eprintln!("{}", Self::host_io_log_line("crash-recovery", &subject, &e));
-                    skipped += 1;
-                    continue;
-                }
-            };
-            let snapshot: AgentSessionSnapshot = match serde_json::from_slice(&json) {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("[crash-recovery] parse failed for {}: {e}", path.display());
-                    skipped += 1;
-                    continue;
-                }
-            };
-            let session = match AgentSession::from_snapshot(snapshot) {
-                Ok(s) => s,
-                Err(e) => {
-                    let subject = format!("reconstruct failed for {}", path.display());
-                    eprintln!("{}", Self::host_io_log_line("crash-recovery", &subject, &e));
+                    Self::host_io_log_line("crash-recovery", &subject, &e)
+                })
+                .and_then(|json| {
+                    serde_json::from_slice::<AgentSessionSnapshot>(&json).map_err(|e| {
+                        format!("[crash-recovery] parse failed for {}: {e}", path.display())
+                    })
+                })
+                .and_then(|snapshot| {
+                    AgentSession::from_snapshot(snapshot).map_err(|e| {
+                        let subject = format!("reconstruct failed for {}", path.display());
+                        Self::host_io_log_line("crash-recovery", &subject, &e)
+                    })
+                });
+            let session = match hydrated {
+                Ok(session) => session,
+                Err(log_line) => {
+                    eprintln!("{log_line}");
                     skipped += 1;
                     continue;
                 }
@@ -2423,12 +2444,17 @@ impl RuntimeHost {
                 .ok_or_else(|| RuntimeError::PluginNotRegistered {
                     plugin_path: plugin_path.to_string(),
                 })?;
-        if let Some(docs) = &plugin.docs {
-            if let Some(node) = docs.nodes.iter().find(|n| n.id == node_id) {
-                if node.agent_accessible {
-                    return Ok(());
-                }
-            }
+        // Flattened from three nested guards: the only accepting case is "docs
+        // present AND node declared AND flag set", and every other combination
+        // falls through to the same rejection. Chaining keeps that one condition
+        // on one line instead of leaving unreachable fall-through braces.
+        let permitted = plugin
+            .docs
+            .as_ref()
+            .and_then(|docs| docs.nodes.iter().find(|n| n.id == node_id))
+            .is_some_and(|node| node.agent_accessible);
+        if permitted {
+            return Ok(());
         }
         Err(RuntimeError::InvalidArgument {
             message: format!("Agent is not allowed to call {plugin_path}::{node_id}"),
@@ -2527,20 +2553,17 @@ impl RuntimeHost {
         // Verify containment.  Try canonical form first (catches symlink
         // escapes); when the path does not exist yet (canonicalize fails),
         // walk up to the nearest existing ancestor and canonicalize that.
+        // `ancestors()` yields `resolved` first and then each parent, ending at
+        // the filesystem root (or the empty path for a relative base), so the
+        // former hand-rolled climb-until-parent()-is-None loop is expressed
+        // without a terminating arm that only fires for a base root that has
+        // already been deleted. Same result: nearest existing ancestor, or
+        // `resolved` itself when nothing along the chain canonicalizes.
         let check = resolved
-            .canonicalize()
-            .or_else(|_| {
-                // Path doesn't exist — find nearest existing ancestor.
-                let mut ancestor = resolved.clone();
-                while !ancestor.exists() {
-                    ancestor = match ancestor.parent() {
-                        Some(p) => p.to_path_buf(),
-                        None => return Err(()),
-                    };
-                }
-                ancestor.canonicalize().map_err(|_| ())
-            })
-            .unwrap_or_else(|()| resolved.clone());
+            .ancestors()
+            .find(|ancestor| ancestor.exists())
+            .and_then(|ancestor| ancestor.canonicalize().ok())
+            .unwrap_or_else(|| resolved.clone());
         if !check.starts_with(&canonical_root) {
             return Err(RuntimeError::InvalidArgument {
                 message: format!("path escapes fixtures root: {rel}"),
@@ -2579,26 +2602,25 @@ impl RuntimeHost {
         }
         let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
         while let Some(dir) = stack.pop() {
-            let entries = match std::fs::read_dir(&dir) {
-                Ok(iter) => iter,
-                Err(_) => continue,
-            };
-            for entry in entries {
-                let entry = match entry {
-                    Ok(e) => e,
-                    Err(_) => continue,
-                };
-                let ft = match entry.file_type() {
-                    Ok(ft) => ft,
-                    Err(_) => continue,
-                };
+            // Three skip-on-error steps folded into the iterator chain, same
+            // semantics as the previous `match … Err(_) => continue` arms: an
+            // unreadable directory is skipped (`read_dir` Err → empty), a
+            // failed `DirEntry` is skipped (inner `flatten`), and an entry
+            // whose `file_type` cannot be read is dropped by `filter_map`.
+            let entries = std::fs::read_dir(&dir)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter_map(|entry| entry.file_type().ok().map(|ft| (entry, ft)));
+            for (entry, ft) in entries {
                 let name = entry.file_name();
                 let name_str = name.to_string_lossy();
                 if ft.is_dir() {
-                    if name_str == "target" || name_str == ".git" || name_str == "node_modules" {
-                        continue;
+                    let pruned =
+                        name_str == "target" || name_str == ".git" || name_str == "node_modules";
+                    if !pruned {
+                        stack.push(entry.path());
                     }
-                    stack.push(entry.path());
                     continue;
                 }
                 if !ft.is_file() {
@@ -2607,11 +2629,13 @@ impl RuntimeHost {
                 if !is_source_like_file_name(&name_str) {
                     continue;
                 }
-                if let Ok(rel) = entry.path().strip_prefix(root) {
-                    if matches!(
-                        f(rel.to_string_lossy().as_ref(), &entry.path()),
-                        WalkControl::Stop
-                    ) {
+                // `entry.path()` is always `dir.join(name)` and `dir` descends
+                // from `root`, so `strip_prefix` cannot fail; iterating the
+                // Result keeps the previous skip-on-Err shape without an
+                // unreachable else-branch.
+                for rel in entry.path().strip_prefix(root).into_iter() {
+                    let control = f(rel.to_string_lossy().as_ref(), &entry.path());
+                    if matches!(control, WalkControl::Stop) {
                         return Ok(());
                     }
                 }
@@ -5107,20 +5131,12 @@ impl<'a> PluginIterationAgentBackend<'a> {
                 }
                 Err(err) => {
                     let rollback_err = local_rollback.rollback().err();
-                    let mut enriched = enrich_plugin_iteration_edit_error(
+                    let enriched = enrich_plugin_iteration_edit_error(
                         operation,
                         &self.host.fixtures_root,
                         err,
                     );
-                    if let Some(rollback_err) = rollback_err {
-                        enriched = RuntimeError::Invariant {
-                            message: format!(
-                                "{}; additionally, partial-batch rollback failed: {rollback_err}",
-                                enriched
-                            ),
-                        };
-                    }
-                    return Err(enriched);
+                    return Err(with_partial_batch_rollback_failure(enriched, rollback_err));
                 }
             }
         }
@@ -5129,10 +5145,12 @@ impl<'a> PluginIterationAgentBackend<'a> {
         // Persist the rollback journal to disk after every tool execution so
         // that a crash mid-agent-loop still leaves a recoverable journal on
         // restart — no window where files are modified but no backup exists.
-        self.state.rollback.persist_journal(
+        // Bound out of the `?` so the fallible expression fits one line.
+        let persisted = self.state.rollback.persist_journal(
             &plugin_iteration_journal_path(&self.host.snapshot_root),
             &self.state.prepared.iteration_id,
-        )?;
+        );
+        persisted?;
 
         self.state.operations.extend(operations.clone());
         for path in operations.into_iter().map(|operation| operation.path) {
@@ -5432,11 +5450,9 @@ impl<'a> PluginIterationAgentBackend<'a> {
                 parent_manifest_path: parent_manifest_rel.clone(),
                 child_root_path: child_root.clone(),
             });
-        self.state.scaffolded_children.sort_by(|left, right| {
-            left.child_root_path
-                .cmp(&right.child_root_path)
-                .then_with(|| left.parent_manifest_path.cmp(&right.parent_manifest_path))
-        });
+        self.state
+            .scaffolded_children
+            .sort_by(scaffolded_child_order);
         self.state.scaffolded_children.dedup();
         Ok(json!({
             "child_plugin_path": child_plugin_path,
@@ -5704,11 +5720,9 @@ Do not attempt to modify runtime crates, repository root manifests, config, .git
                         "cargo check --quiet --manifest-path plugins/Cargo.toml -p {pp_trimmed}"
                     )
                 };
-                let command = validated_verification_command(
-                    normalize_optional_command(args.command),
-                    Some(default),
-                    "cargo check",
-                )?;
+                let explicit = normalize_optional_command(args.command);
+                let command =
+                    validated_verification_command(explicit, Some(default), "cargo check")?;
                 self.run_checked_command("check", command)
             }
             PLUGIN_AGENT_TOOL_RUN_PLUGIN_TEST => {
@@ -5720,13 +5734,11 @@ Do not attempt to modify runtime crates, repository root manifests, config, .git
                 } else {
                     format!("cargo test --quiet --manifest-path plugins/Cargo.toml -p {pp_trimmed}")
                 };
-                let command = validated_verification_command(
-                    normalize_optional_command(args.command).or_else(|| {
-                        normalize_optional_command(self.state.prepared.tests_command.clone())
-                    }),
-                    Some(default),
-                    "cargo test",
-                )?;
+                let prepared_tests = self.state.prepared.tests_command.clone();
+                let explicit = normalize_optional_command(args.command)
+                    .or_else(|| normalize_optional_command(prepared_tests));
+                let command =
+                    validated_verification_command(explicit, Some(default), "cargo test")?;
                 self.run_checked_command("test", command)
             }
             PLUGIN_AGENT_TOOL_REBUILD_PLUGIN_WORKSPACE => {
@@ -5749,10 +5761,11 @@ Do not attempt to modify runtime crates, repository root manifests, config, .git
                         message: "record_iteration_summary requires at least one edit and one successful verification step".to_string(),
                     });
                 }
-                ensure_scaffold_integration_edits(
+                let integration = ensure_scaffold_integration_edits(
                     &self.state.scaffolded_children,
                     &self.state.operations,
-                )?;
+                );
+                integration?;
                 let args = parse_agent_args::<RecordIterationSummaryArgs>(arguments, name)?;
                 self.state.recorded_summary = Some(args.summary.clone());
                 self.state.tests_command = normalize_optional_command(args.tests_command);
@@ -5950,22 +5963,45 @@ fn enrich_plugin_iteration_edit_error(
     err: RuntimeError,
 ) -> RuntimeError {
     let message = err.to_string();
-    if operation.kind == PluginEditOpKind::ReplaceExact
-        && message.contains("auto update patch pattern not found")
-    {
-        let abs_path = workspace_root.join(&operation.path);
-        if let Ok(current_content) = fs::read_to_string(&abs_path) {
-            return RuntimeError::LlmResponseInvalid {
-                message: format!(
-                    "{message}\nThe exact snippet is stale for {}. Reread the current file content and retry with a smaller exact replacement.\ncurrent_sha256={}\ncurrent_content:\n{}",
-                    operation.path,
-                    sha256_text(&current_content),
-                    truncate_agent_excerpt_text(&current_content, 1600),
-                ),
-            };
-        }
+    // Both conditions are folded into one `Option` chain rather than nested
+    // `if` blocks: a nested gate whose body always runs still leaves llvm-cov a
+    // zero-hit not-taken region on its closing brace, and there is no test that
+    // can make a *taken* gate report both branches.
+    let stale_exact_match = operation.kind == PluginEditOpKind::ReplaceExact
+        && message.contains("auto update patch pattern not found");
+    let current_content = stale_exact_match
+        .then(|| fs::read_to_string(workspace_root.join(&operation.path)).ok())
+        .flatten();
+    match current_content {
+        Some(current_content) => RuntimeError::LlmResponseInvalid {
+            message: format!(
+                "{message}\nThe exact snippet is stale for {}. Reread the current file content and retry with a smaller exact replacement.\ncurrent_sha256={}\ncurrent_content:\n{}",
+                operation.path,
+                sha256_text(&current_content),
+                truncate_agent_excerpt_text(&current_content, 1600),
+            ),
+        },
+        None => err,
     }
-    err
+}
+
+/// Wrap a plugin-edit error with the partial-batch rollback failure that
+/// happened while unwinding it. Extracted from `apply_operations`' double-fault
+/// arm so the (hard to reach in situ) wrapping is directly unit-testable; the
+/// emitted message is byte-for-byte what the inline `format!` produced.
+fn with_partial_batch_rollback_failure(
+    enriched: RuntimeError,
+    rollback_err: Option<RuntimeError>,
+) -> RuntimeError {
+    match rollback_err {
+        Some(rollback_err) => RuntimeError::Invariant {
+            message: format!(
+                "{}; additionally, partial-batch rollback failed: {rollback_err}",
+                enriched
+            ),
+        },
+        None => enriched,
+    }
 }
 
 fn normalize_optional_command(command: Option<String>) -> Option<String> {
@@ -5991,13 +6027,16 @@ fn validated_verification_command(
                 message: format!("missing verification command for {required_prefix}"),
             })?;
     let trimmed = command.trim();
-    if matches!(
+    // `check` / `test` are accepted as bare aliases for the tool's own default
+    // command. Folded into one `if let` (rather than an outer `matches!` gate
+    // wrapping an inner `if let`) because a nested gate leaves llvm-cov a
+    // zero-hit region on its closing brace that no test can reach.
+    let is_bare_alias = matches!(
         (required_prefix, trimmed),
         ("cargo check", "check") | ("cargo test", "test")
-    ) {
-        if let Some(default_command) = fallback {
-            return Ok(default_command);
-        }
+    );
+    if let Some(default_command) = fallback.filter(|_| is_bare_alias) {
+        return Ok(default_command);
     }
     if !trimmed.starts_with(required_prefix) {
         return Err(RuntimeError::InvalidArgument {
@@ -6007,6 +6046,20 @@ fn validated_verification_command(
         });
     }
     Ok(trimmed.to_string())
+}
+
+/// Total order on scaffolded-child registrations: child root first, parent
+/// manifest as the tie-break. Extracted from the inline `sort_by` closure in
+/// `scaffold_child_plugin` — the closure body only runs when an iteration
+/// scaffolds two or more children, which no in-process test reaches, so the
+/// ordering is asserted directly against this function instead.
+fn scaffolded_child_order(
+    left: &ScaffoldedChildRegistration,
+    right: &ScaffoldedChildRegistration,
+) -> std::cmp::Ordering {
+    left.child_root_path
+        .cmp(&right.child_root_path)
+        .then_with(|| left.parent_manifest_path.cmp(&right.parent_manifest_path))
 }
 
 fn ensure_scaffold_integration_edits(
@@ -6951,12 +7004,16 @@ fn collect_plugin_context_paths(
     }
 
     let mut focus_files = BTreeSet::new();
-    collect_focus_context_paths(
+    // Bound out of the `?` so the fallible expression is a single line: a `?`
+    // spanning several lines leaves llvm-cov a zero-hit region on the
+    // continuation line that no test can reach.
+    let focus_result = collect_focus_context_paths(
         workspace_root,
         root_plugin_path,
         target_plugin_paths,
         &mut focus_files,
-    )?;
+    );
+    focus_result?;
 
     let mut all_paths = all_files.into_iter().collect::<Vec<_>>();
     sort_and_dedup_context_paths(&mut all_paths);
@@ -7450,34 +7507,34 @@ pub fn apply_plugin_iteration_journal(
     // this work — replaying it would revert source that has since been
     // legitimately touched (or fail loudly on a moved file).
     if journal_path.exists() && applied_marker.exists() {
-        let journal_gen =
-            crate::kernel::plugin_iteration::PluginEditRollback::journal_generation_id(
-                &journal_path,
-            )?;
+        let journal_gen = PluginEditRollback::journal_generation_id(&journal_path)?;
         let applied_gen = fs::read_to_string(&applied_marker).ok();
-        if let (Some(j), Some(a)) = (journal_gen.as_deref(), applied_gen.as_deref()) {
-            if j.trim() == a.trim() {
-                // Already applied — treat as if there is nothing to restore.
-                let _ = fs::remove_file(&applied_marker);
-                crate::kernel::plugin_iteration::PluginEditRollback::clear_journal(&journal_path)?;
-                return Ok(false);
-            }
+        // The id pair and the equality test are one condition rather than two
+        // nested gates: a nested `if` whose body always runs on the taken path
+        // still leaves llvm-cov a zero-hit region on its closing brace.
+        let already_applied = match (journal_gen.as_deref(), applied_gen.as_deref()) {
+            (Some(j), Some(a)) => j.trim() == a.trim(),
+            _ => false,
+        };
+        if already_applied {
+            // Already applied — treat as if there is nothing to restore.
+            let _ = fs::remove_file(&applied_marker);
+            PluginEditRollback::clear_journal(&journal_path)?;
+            return Ok(false);
         }
     }
 
-    if let Some(rollback) = crate::kernel::plugin_iteration::PluginEditRollback::load_journal(
-        fixtures_root,
-        &journal_path,
-    )? {
-        let generation_id =
-            crate::kernel::plugin_iteration::PluginEditRollback::journal_generation_id(
-                &journal_path,
-            )?;
+    let loaded = PluginEditRollback::load_journal(fixtures_root, &journal_path)?;
+    if let Some(rollback) = loaded {
+        let generation_id = PluginEditRollback::journal_generation_id(&journal_path)?;
         rollback.rollback()?;
         // Persist the applied marker BEFORE clearing the journal. If we crash
         // between rollback and clear, next boot sees marker + journal with the
-        // same id → skips the replay.
-        if let Some(id) = generation_id {
+        // same id → skips the replay. `generation_id` is always `Some` for a
+        // journal that just parsed, so the gate is written as a
+        // `for`-over-`Option` — an `if let` would leave llvm-cov a zero-hit
+        // not-taken region on its closing brace that no test can reach.
+        for id in generation_id.into_iter() {
             if let Err(err) =
                 crate::kernel::plugin_iteration::atomic_write(&applied_marker, id.as_bytes())
             {
@@ -11792,5 +11849,499 @@ mod region_3500_5500_seam_tests {
         let report = host.run_plugin_canary(&state).expect("canary runs");
         assert_eq!(report.verdict, CanaryVerdict::Partial);
         assert_eq!(report.mode, "no_canary_evidence");
+    }
+
+    // ─────────── session-lookup / wrong-kind error arms ───────────
+    //
+    // These four arms are private to the impl: the public wrappers
+    // (`agent_send_with_fallback`, `iterate_plugins`) either fail earlier or
+    // guarantee the session exists, so the misses have to be driven directly.
+    // `tests/host_boot_session_arms.rs` covers the reachable-from-outside
+    // counterparts.
+
+    /// `swap_session_profile`'s `AgentSessionNotFound` closure: an id that was
+    /// never inserted into `agent_sessions`.
+    #[test]
+    #[serial]
+    fn swap_session_profile_reports_missing_session() {
+        let (_temp, host) = empty_host();
+        let err = host
+            .swap_session_profile("no-such-session", "default")
+            .expect_err("an unknown session id must error");
+        let RuntimeError::AgentSessionNotFound { session_id } = err else {
+            panic!("expected AgentSessionNotFound, got {err:?}");
+        };
+        assert_eq!(session_id, "no-such-session");
+    }
+
+    /// `swap_session_profile`'s success path on a live session: the resolved
+    /// profile's `api` replaces the session's live config, so `status().model`
+    /// reflects the swap.
+    #[test]
+    #[serial]
+    fn swap_session_profile_replaces_live_config() {
+        let (_temp, host) = empty_host();
+        let sid = host
+            .agent_start(AgentSessionKind::RuntimeShell)
+            .expect("start session")
+            .session_id;
+        // The empty fixture has only the `default` profile, so resolving an
+        // unknown name falls back to it — the swap still rebuilds the client
+        // and returns Ok.
+        host.swap_session_profile(&sid, "no-such-profile")
+            .expect("swap to the fallback-resolved default profile");
+        let expected = host
+            .config
+            .llm_profiles
+            .resolve("default")
+            .api
+            .model
+            .clone();
+        assert_eq!(host.agent_status(&sid).expect("status").model, expected);
+    }
+
+    /// `plugin_iteration_agent_snapshot`'s two error arms: an unknown session
+    /// id, and a session that exists but is not a plugin-iteration session.
+    #[test]
+    #[serial]
+    fn plugin_iteration_agent_snapshot_rejects_missing_and_wrong_kind_sessions() {
+        let (_temp, host) = empty_host();
+
+        let missing = host
+            .plugin_iteration_agent_snapshot("no-such-session")
+            .expect_err("an unknown session id must error");
+        let RuntimeError::AgentSessionNotFound { session_id } = missing else {
+            panic!("expected AgentSessionNotFound, got {missing:?}");
+        };
+        assert_eq!(session_id, "no-such-session");
+
+        // A RuntimeShell session exists but carries `ManagedAgentState::
+        // RuntimeShell`, so the let-else guard rejects it.
+        let sid = host
+            .agent_start(AgentSessionKind::RuntimeShell)
+            .expect("start a runtime-shell session")
+            .session_id;
+        let wrong_kind = host
+            .plugin_iteration_agent_snapshot(&sid)
+            .expect_err("a runtime-shell session is not an iteration session");
+        let RuntimeError::InvalidArgument { message } = wrong_kind else {
+            panic!("expected InvalidArgument, got {wrong_kind:?}");
+        };
+        assert_eq!(
+            message,
+            format!("agent session {sid} is not a plugin iteration session")
+        );
+    }
+
+    /// `plugin_iteration_agent_snapshot`'s success path: a real
+    /// `ManagedAgentState::PluginIteration` entry returns its snapshot.
+    #[test]
+    #[serial]
+    fn plugin_iteration_agent_snapshot_returns_state_for_an_iteration_session() {
+        let (temp, host) = empty_host();
+        let prepared = prepared_for("ghost", &["ghost"]);
+        let context_paths = PluginIterationContextPaths {
+            focus_paths: Vec::new(),
+            all_paths: Vec::new(),
+        };
+        let session_id = host
+            .start_plugin_iteration_agent_session(prepared.clone(), context_paths)
+            .expect("start an iteration session");
+
+        let snapshot = host
+            .plugin_iteration_agent_snapshot(&session_id)
+            .expect("iteration session yields a snapshot");
+        // A freshly started session has recorded no summary yet, so the derived
+        // plan falls back to the prepared summary.
+        assert!(snapshot.recorded_summary.is_none());
+        assert_eq!(snapshot.derived_edit_plan.summary, prepared.summary);
+        assert!(snapshot.changed_paths.is_empty());
+        drop(temp);
+    }
+}
+
+/// Coverage for the `apply_operations` / `scaffold_child_plugin` /
+/// `execute_tool` operation-application arms of this module: the double-fault
+/// wrapper, the scaffolded-child ordering, the plugin-iteration journal replay
+/// gates, and the workspace-manifest `flock` failure branch. Kept as its own
+/// module so concurrent edits to `mod tests` and the other seam modules never
+/// collide with it.
+#[cfg(test)]
+mod ops_arms_coverage_tests {
+    use super::{
+        apply_plugin_iteration_journal, plugin_iteration_applied_marker_path,
+        plugin_iteration_journal_path, scaffolded_child_order, validated_verification_command,
+        with_partial_batch_rollback_failure, workspace_manifest_lock, ScaffoldedChildRegistration,
+    };
+    use crate::core::error::RuntimeError;
+    use crate::kernel::plugin_iteration::PluginEditRollback;
+    use std::cmp::Ordering;
+    use std::fs;
+    use tempfile::TempDir;
+
+    fn invalid(message: &str) -> RuntimeError {
+        RuntimeError::InvalidArgument {
+            message: message.to_string(),
+        }
+    }
+
+    #[track_caller]
+    fn invariant_message(err: &RuntimeError) -> String {
+        let RuntimeError::Invariant { message } = err else {
+            panic!("expected Invariant, got {err:?}")
+        };
+        message.clone()
+    }
+
+    fn registration(child_root: &str, parent_manifest: &str) -> ScaffoldedChildRegistration {
+        ScaffoldedChildRegistration {
+            parent_manifest_path: parent_manifest.to_string(),
+            child_root_path: child_root.to_string(),
+        }
+    }
+
+    // ── apply_operations double-fault arm ────────────────────────────────
+    //
+    // `with_partial_batch_rollback_failure` is the wrapper `apply_operations`
+    // applies when a batch operation failed AND unwinding the already-applied
+    // prefix of the same batch also failed. Reaching that state in situ needs
+    // the rollback's own `fs::write` / `remove_file` to fail on a path the
+    // executor just successfully wrote inside the same call, which cannot be
+    // arranged without interleaving the loop, so the wrapper is asserted
+    // directly — including the byte-exact message.
+
+    #[test]
+    fn partial_batch_rollback_failure_wraps_both_messages_byte_exactly() {
+        let edit_err = RuntimeError::LlmResponseInvalid {
+            message: "auto update patch pattern not found in /w/a.rs: OLD".to_string(),
+        };
+        let rollback_err = RuntimeError::Io {
+            path: std::path::PathBuf::from("/w/b.rs"),
+            message: "Is a directory (os error 21)".to_string(),
+        };
+        // Bind the Display forms first so the expectation is built from the
+        // same `Display` impls the production `format!` uses.
+        let edit_text = edit_err.to_string();
+        let rollback_text = rollback_err.to_string();
+        let out = with_partial_batch_rollback_failure(edit_err, Some(rollback_err));
+        assert_eq!(
+            invariant_message(&out),
+            format!("{edit_text}; additionally, partial-batch rollback failed: {rollback_text}")
+        );
+    }
+
+    #[test]
+    fn partial_batch_rollback_failure_passes_error_through_when_rollback_succeeded() {
+        // The common case: the batch operation failed but unwinding worked, so
+        // the caller sees the enriched edit error unchanged (same variant, same
+        // message) rather than an `Invariant` wrapper.
+        let out = with_partial_batch_rollback_failure(invalid("stale snippet"), None);
+        assert!(
+            matches!(&out, RuntimeError::InvalidArgument { message } if message == "stale snippet"),
+            "expected the edit error verbatim, got {out:?}"
+        );
+    }
+
+    #[test]
+    fn partial_batch_rollback_failure_nests_an_already_invariant_edit_error() {
+        // The edit error can itself be an `Invariant` (e.g. a rollback-workspace
+        // mismatch surfaced by `absorb`); the wrapper still produces a single
+        // flat `Invariant` whose message embeds both `Display` forms.
+        let edit_err = RuntimeError::Invariant {
+            message: "plugin edit rollback workspace mismatch: /a vs /b".to_string(),
+        };
+        let edit_text = edit_err.to_string();
+        let out = with_partial_batch_rollback_failure(edit_err, Some(invalid("rollback kaput")));
+        assert_eq!(
+            invariant_message(&out),
+            format!(
+                "{edit_text}; additionally, partial-batch rollback failed: invalid argument: rollback kaput"
+            )
+        );
+    }
+
+    // ── scaffold_child_plugin: scaffolded-children ordering ──────────────
+
+    #[test]
+    fn scaffolded_child_order_sorts_by_child_root_then_parent_manifest() {
+        // Distinct child roots: the child root decides, the parent manifest is
+        // never consulted.
+        assert_eq!(
+            scaffolded_child_order(
+                &registration("plugins/expr/evaluator/abs", "plugins/expr/zzz/Cargo.toml"),
+                &registration("plugins/expr/evaluator/dist", "plugins/expr/aaa/Cargo.toml"),
+            ),
+            Ordering::Less
+        );
+        // Equal child roots: the parent manifest breaks the tie.
+        assert_eq!(
+            scaffolded_child_order(
+                &registration("plugins/expr/evaluator/dist", "plugins/expr/b/Cargo.toml"),
+                &registration("plugins/expr/evaluator/dist", "plugins/expr/a/Cargo.toml"),
+            ),
+            Ordering::Greater
+        );
+        // Fully equal registrations compare Equal, which is what makes the
+        // following `dedup()` in `scaffold_child_plugin` collapse repeats.
+        assert_eq!(
+            scaffolded_child_order(
+                &registration("plugins/expr/evaluator/dist", "plugins/expr/a/Cargo.toml"),
+                &registration("plugins/expr/evaluator/dist", "plugins/expr/a/Cargo.toml"),
+            ),
+            Ordering::Equal
+        );
+    }
+
+    #[test]
+    fn scaffolded_child_order_drives_sort_and_dedup_like_scaffold_child_plugin() {
+        // Two scaffolds in one iteration plus a duplicate: the exact shape
+        // `scaffold_child_plugin` feeds into `sort_by` + `dedup`.
+        let mut children = vec![
+            registration(
+                "plugins/expr/evaluator/dist",
+                "plugins/expr/evaluator/Cargo.toml",
+            ),
+            registration(
+                "plugins/expr/evaluator/abs",
+                "plugins/expr/evaluator/Cargo.toml",
+            ),
+            registration(
+                "plugins/expr/evaluator/dist",
+                "plugins/expr/evaluator/Cargo.toml",
+            ),
+        ];
+        children.sort_by(scaffolded_child_order);
+        children.dedup();
+        let roots = children
+            .iter()
+            .map(|entry| entry.child_root_path.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            roots,
+            vec!["plugins/expr/evaluator/abs", "plugins/expr/evaluator/dist"]
+        );
+    }
+
+    // ── validated_verification_command: bare alias without a fallback ────
+
+    #[test]
+    fn validated_verification_command_bare_alias_without_fallback_is_rejected() {
+        // `check` is the bare alias, but no default command is available to
+        // substitute → the alias falls through to the prefix guard and is
+        // rejected with the byte-exact prefix message.
+        let out = validated_verification_command(Some("check".to_string()), None, "cargo check");
+        assert!(
+            matches!(&out, Err(RuntimeError::InvalidArgument { message })
+                if *message == "verification tool only allows commands starting with `cargo check`, got `check`"),
+            "expected the prefix-guard rejection, got {out:?}"
+        );
+    }
+
+    #[test]
+    fn validated_verification_command_alias_of_the_other_tool_is_not_substituted() {
+        // `test` is only an alias for the `cargo test` tool; supplied to the
+        // `cargo check` tool it is an ordinary (invalid) command even though a
+        // fallback exists.
+        let out = validated_verification_command(
+            Some("test".to_string()),
+            Some("cargo check --quiet".to_string()),
+            "cargo check",
+        );
+        assert!(
+            matches!(&out, Err(RuntimeError::InvalidArgument { message })
+                if *message == "verification tool only allows commands starting with `cargo check`, got `test`"),
+            "expected cross-tool alias to be rejected, got {out:?}"
+        );
+    }
+
+    // ── workspace_manifest_lock::acquire: flock failure branch ───────────
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_manifest_lock_acquire_survives_flock_failure_on_a_fifo() {
+        // `flock(2)` reports ENOTSUP for a FIFO on macOS/BSD, while opening one
+        // O_RDWR succeeds and does not block. That is the one portable way to
+        // reach the `rc != 0` branch, which only logs and still hands back a
+        // guard holding the open file.
+        let temp = TempDir::new().expect("tempdir");
+        let fifo = temp.path().join("nested/manifest.lock");
+        fs::create_dir_all(fifo.parent().expect("fifo parent")).expect("mkdir");
+        let c_path = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes())
+            .expect("lock path has no interior NUL");
+        // SAFETY: `c_path` is a NUL-terminated path owned for the call's whole
+        // duration; `mkfifo` only reads it.
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o666) };
+        assert_eq!(rc, 0, "mkfifo must succeed inside a fresh tempdir");
+
+        let guard = workspace_manifest_lock::acquire(&fifo);
+        // The guard still owns an open descriptor even though locking failed;
+        // dropping it exercises the unlock path on that same descriptor.
+        drop(guard);
+        assert!(fifo.exists(), "acquire must not remove the lock path");
+    }
+
+    // ── apply_plugin_iteration_journal: replay and skip gates ────────────
+
+    fn seed_journal(
+        workspace: &std::path::Path,
+        snapshot_root: &std::path::Path,
+        rel: &str,
+        pre_edit: &[u8],
+    ) {
+        let target = workspace.join(rel);
+        fs::create_dir_all(target.parent().expect("target parent")).expect("mkdir target parent");
+        let rollback = PluginEditRollback::single_backup(workspace, rel, Some(pre_edit.to_vec()));
+        rollback
+            .persist_journal(&plugin_iteration_journal_path(snapshot_root), "iter-ops")
+            .expect("persist journal");
+    }
+
+    #[test]
+    fn apply_plugin_iteration_journal_replays_and_cleans_up_marker_and_journal() {
+        let temp = TempDir::new().expect("tempdir");
+        let workspace = temp.path().join("workspace");
+        let snapshot_root = temp.path().join("snapshots");
+        fs::create_dir_all(&snapshot_root).expect("mkdir snapshot root");
+        let rel = "plugins/mini/src/lib.rs";
+        seed_journal(&workspace, &snapshot_root, rel, b"PRE-EDIT");
+        // Simulate the post-edit workspace state the journal must undo.
+        fs::write(workspace.join(rel), b"POST-EDIT").expect("write post-edit body");
+
+        let restored = apply_plugin_iteration_journal(&workspace, &snapshot_root, None)
+            .expect("journal replay succeeds");
+        assert!(restored, "a journal on disk means a restore happened");
+        assert_eq!(
+            fs::read(workspace.join(rel)).expect("read restored"),
+            b"PRE-EDIT"
+        );
+        // Both the journal and the applied marker are cleaned up on success.
+        assert!(!plugin_iteration_journal_path(&snapshot_root).exists());
+        assert!(!plugin_iteration_applied_marker_path(&snapshot_root).exists());
+    }
+
+    #[test]
+    fn apply_plugin_iteration_journal_skips_when_marker_matches_journal_generation() {
+        let temp = TempDir::new().expect("tempdir");
+        let workspace = temp.path().join("workspace");
+        let snapshot_root = temp.path().join("snapshots");
+        fs::create_dir_all(&snapshot_root).expect("mkdir snapshot root");
+        let rel = "plugins/mini/src/lib.rs";
+        seed_journal(&workspace, &snapshot_root, rel, b"PRE-EDIT");
+        let journal_path = plugin_iteration_journal_path(&snapshot_root);
+        let generation_id = PluginEditRollback::journal_generation_id(&journal_path)
+            .expect("read generation id")
+            .expect("a freshly persisted journal carries a generation id");
+        // A marker recording the SAME generation means the replay already ran.
+        let marker = plugin_iteration_applied_marker_path(&snapshot_root);
+        fs::write(&marker, generation_id.as_bytes()).expect("write applied marker");
+        fs::write(workspace.join(rel), b"LEGITIMATE-LATER-EDIT").expect("write later body");
+
+        let restored = apply_plugin_iteration_journal(&workspace, &snapshot_root, None)
+            .expect("already-applied journal short-circuits");
+        assert!(!restored, "an already-applied journal reports no restore");
+        // The later, legitimate edit must survive untouched.
+        assert_eq!(
+            fs::read(workspace.join(rel)).expect("read after skip"),
+            b"LEGITIMATE-LATER-EDIT"
+        );
+        assert!(!journal_path.exists(), "journal cleared on the skip path");
+        assert!(!marker.exists(), "marker cleared on the skip path");
+    }
+
+    #[test]
+    fn apply_plugin_iteration_journal_replays_when_marker_generation_differs() {
+        let temp = TempDir::new().expect("tempdir");
+        let workspace = temp.path().join("workspace");
+        let snapshot_root = temp.path().join("snapshots");
+        fs::create_dir_all(&snapshot_root).expect("mkdir snapshot root");
+        let rel = "plugins/mini/src/lib.rs";
+        seed_journal(&workspace, &snapshot_root, rel, b"PRE-EDIT");
+        // A stale marker from an EARLIER journal must not suppress this replay.
+        fs::write(
+            plugin_iteration_applied_marker_path(&snapshot_root),
+            b"some-older-generation",
+        )
+        .expect("write stale marker");
+        fs::write(workspace.join(rel), b"POST-EDIT").expect("write post-edit body");
+
+        let restored = apply_plugin_iteration_journal(&workspace, &snapshot_root, None)
+            .expect("mismatched marker still replays");
+        assert!(restored, "a different generation id means replay proceeds");
+        assert_eq!(
+            fs::read(workspace.join(rel)).expect("read restored"),
+            b"PRE-EDIT"
+        );
+    }
+
+    #[test]
+    fn apply_plugin_iteration_journal_falls_back_to_the_in_memory_rollback() {
+        let temp = TempDir::new().expect("tempdir");
+        let workspace = temp.path().join("workspace");
+        let snapshot_root = temp.path().join("snapshots");
+        fs::create_dir_all(&snapshot_root).expect("mkdir snapshot root");
+        let rel = "plugins/mini/src/lib.rs";
+        let target = workspace.join(rel);
+        fs::create_dir_all(target.parent().expect("target parent")).expect("mkdir");
+        fs::write(&target, b"POST-EDIT").expect("write post-edit body");
+        // No journal on disk → the in-memory rollback is used instead.
+        let rollback =
+            PluginEditRollback::single_backup(&workspace, rel, Some(b"PRE-EDIT".to_vec()));
+
+        let restored = apply_plugin_iteration_journal(&workspace, &snapshot_root, Some(&rollback))
+            .expect("in-memory rollback replays");
+        assert!(restored);
+        assert_eq!(fs::read(&target).expect("read restored"), b"PRE-EDIT");
+    }
+
+    #[test]
+    fn apply_plugin_iteration_journal_reports_nothing_to_restore_when_both_are_absent() {
+        let temp = TempDir::new().expect("tempdir");
+        let snapshot_root = temp.path().join("snapshots");
+        fs::create_dir_all(&snapshot_root).expect("mkdir snapshot root");
+        let restored = apply_plugin_iteration_journal(temp.path(), &snapshot_root, None)
+            .expect("no journal and no rollback is not an error");
+        assert!(!restored);
+    }
+
+    #[test]
+    fn apply_plugin_iteration_journal_surfaces_a_corrupt_journal_as_invariant() {
+        // `load_journal`'s parse error propagates through the `?` on the
+        // `load_journal` call, which is the arm the replay path guards.
+        let temp = TempDir::new().expect("tempdir");
+        let snapshot_root = temp.path().join("snapshots");
+        fs::create_dir_all(&snapshot_root).expect("mkdir snapshot root");
+        fs::write(
+            plugin_iteration_journal_path(&snapshot_root),
+            b"{ not valid json",
+        )
+        .expect("write corrupt journal");
+        let err = apply_plugin_iteration_journal(temp.path(), &snapshot_root, None)
+            .expect_err("a corrupt journal must not be silently ignored");
+        assert!(
+            invariant_message(&err).starts_with("plugin edit rollback journal parse failed: "),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn apply_plugin_iteration_journal_propagates_a_failing_rollback_write() {
+        // The `rollback.rollback()?` arm: the journal wants to restore bytes to
+        // a path that is now a non-empty directory, so `fs::write` fails.
+        let temp = TempDir::new().expect("tempdir");
+        let workspace = temp.path().join("workspace");
+        let snapshot_root = temp.path().join("snapshots");
+        fs::create_dir_all(&snapshot_root).expect("mkdir snapshot root");
+        let rel = "plugins/mini/src/lib.rs";
+        seed_journal(&workspace, &snapshot_root, rel, b"PRE-EDIT");
+        // Replace the target file with a non-empty directory.
+        let target = workspace.join(rel);
+        fs::create_dir_all(target.join("occupied")).expect("mkdir target-as-dir");
+
+        let err = apply_plugin_iteration_journal(&workspace, &snapshot_root, None)
+            .expect_err("restoring onto a directory must fail");
+        assert!(
+            matches!(&err, RuntimeError::Io { path, .. } if path == &target),
+            "expected an Io error naming the restore target, got {err:?}"
+        );
     }
 }

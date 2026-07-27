@@ -1342,6 +1342,15 @@ pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), RuntimeError
 
 #[cfg(test)]
 mod tests {
+    /// `Some(())` when the process is not root. Root ignores file-mode
+    /// permission bits, so the permission-failure tests below only assert
+    /// under a non-root euid; iterating the `Option` keeps every line of the
+    /// body executable in coverage under both euids.
+    fn probe_not_root() -> Option<()> {
+        // SAFETY: `geteuid` is always safe to call and cannot fail.
+        (unsafe { libc::geteuid() } != 0).then_some(())
+    }
+
     use super::{
         normalize_rel_path, CanaryVerdict, KernelPluginIssueSource, PluginEditExecutor,
         PluginEditOpKind, PluginEditOperation, PluginEditPlan, PluginIterationPolicy,
@@ -1547,9 +1556,9 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         // Single-line guard: no standalone closing brace to leave uncovered.
         // Root bypasses file-mode permission checks, so the failure this test
-        // asserts only occurs as a non-root user. Wrapping the body (instead of
-        // an early return) keeps every line executable under both euids.
-        if unsafe { libc::geteuid() } != 0 {
+        // asserts only occurs as a non-root user. Iterating an `Option` (rather
+        // than an `if` gate) leaves no never-taken edge on the closing brace.
+        for () in probe_not_root().into_iter() {
             let temp = TempDir::new().expect("tempdir");
             let workspace = temp.path();
             let src = workspace.join("plugins/demo/src");
@@ -1721,9 +1730,9 @@ mod tests {
         // Root ignores mode bits, so this only fails as non-root. Single-line
         // guard: no standalone closing brace to leave uncovered.
         // Root bypasses file-mode permission checks, so the failure this test
-        // asserts only occurs as a non-root user. Wrapping the body (instead of
-        // an early return) keeps every line executable under both euids.
-        if unsafe { libc::geteuid() } != 0 {
+        // asserts only occurs as a non-root user. Iterating an `Option` (rather
+        // than an `if` gate) leaves no never-taken edge on the closing brace.
+        for () in probe_not_root().into_iter() {
             let temp = TempDir::new().unwrap();
             let dir = temp.path().join("ro");
             fs::create_dir_all(&dir).unwrap();
@@ -2962,9 +2971,9 @@ mod tests {
         // Root ignores file-mode permissions, so read-only writes still succeed.
         // Single-line guard: no standalone closing brace to leave uncovered.
         // Root bypasses file-mode permission checks, so the failure this test
-        // asserts only occurs as a non-root user. Wrapping the body (instead of
-        // an early return) keeps every line executable under both euids.
-        if unsafe { libc::geteuid() } != 0 {
+        // asserts only occurs as a non-root user. Iterating an `Option` (rather
+        // than an `if` gate) leaves no never-taken edge on the closing brace.
+        for () in probe_not_root().into_iter() {
             // A read-only existing target makes atomic_write fail (create tmp
             // under a writable dir succeeds, but the final rename over a file
             // inside a read-only *directory* fails). To make the write itself
@@ -3042,9 +3051,9 @@ mod tests {
         // Running as root bypasses file-mode permission checks. Single-line
         // guard: no standalone closing brace to leave uncovered.
         // Root bypasses file-mode permission checks, so the failure this test
-        // asserts only occurs as a non-root user. Wrapping the body (instead of
-        // an early return) keeps every line executable under both euids.
-        if unsafe { libc::geteuid() } != 0 {
+        // asserts only occurs as a non-root user. Iterating an `Option` (rather
+        // than an `if` gate) leaves no never-taken edge on the closing brace.
+        for () in probe_not_root().into_iter() {
             // A DeleteFile whose target is read-only inside a read-only
             // directory: fs::read succeeds (so apply_operation validates and
             // records a backup), but `fs::remove_file` fails (read-only dir →
@@ -3175,9 +3184,9 @@ mod tests {
         // Root ignores file-mode permissions, so an unreadable file still reads.
         // Single-line guard: no standalone closing brace to leave uncovered.
         // Root bypasses file-mode permission checks, so the failure this test
-        // asserts only occurs as a non-root user. Wrapping the body (instead of
-        // an early return) keeps every line executable under both euids.
-        if unsafe { libc::geteuid() } != 0 {
+        // asserts only occurs as a non-root user. Iterating an `Option` (rather
+        // than an `if` gate) leaves no never-taken edge on the closing brace.
+        for () in probe_not_root().into_iter() {
             let temp = TempDir::new().unwrap();
             let rb = PluginEditRollback::single_backup(
                 temp.path(),
