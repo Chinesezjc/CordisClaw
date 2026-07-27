@@ -474,7 +474,18 @@ fn sync_plugin_docs_errors_when_docs_dir_cannot_be_created() {
     fs::set_permissions(&plugins, fs::Permissions::from_mode(0o555)).unwrap();
     let err = sync_plugin_docs(temp.path());
     fs::set_permissions(&plugins, fs::Permissions::from_mode(0o755)).unwrap();
-    assert!(matches!(err, Err(RuntimeError::Io { .. })), "err: {err:?}");
+    // Root ignores the read-only mode bits, so the sync succeeds there. Assert
+    // both directions instead of skipping, so `sync_plugin_docs` runs under
+    // either euid.
+    // SAFETY: `geteuid` is always safe to call and cannot fail.
+    if (unsafe { libc::geteuid() }) != 0 {
+        assert!(matches!(err, Err(RuntimeError::Io { .. })), "err: {err:?}");
+    } else {
+        assert!(
+            err.is_ok(),
+            "as root the docs sync must succeed, got {err:?}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

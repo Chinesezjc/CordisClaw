@@ -927,11 +927,20 @@ fn walk_code_files_descends_nested_skips_symlink_and_unreadable_dir() {
         seen.iter().any(|r| r == "nested/deep.rs"),
         "nested source file must be visited via the descent arm: {seen:?}"
     );
-    // The symlink-to-dir is not recursed, and the 0o000 dir could not be
-    // listed, so neither of their contents appear.
+    // The symlink-to-dir is never recursed, so its contents never appear under
+    // the link name regardless of euid.
     assert!(
-        !seen.iter().any(|r| r.contains("secret.rs")),
-        "contents of an unreadable dir must not surface: {seen:?}"
+        !seen.iter().any(|r| r.starts_with("link_to_dir/")),
+        "a directory symlink must not be recursed: {seen:?}"
+    );
+    // The 0o000 dir drives the `Err(_) => continue` arm only when mode bits are
+    // enforced; root reads it anyway and reaches the file inside.
+    // SAFETY: `geteuid` is always safe to call and cannot fail.
+    let enforced = (unsafe { libc::geteuid() }) != 0;
+    assert_eq!(
+        seen.iter().any(|r| r.contains("secret.rs")),
+        !enforced,
+        "unreadable-dir contents must surface only as root (euid_enforced={enforced}): {seen:?}"
     );
 }
 
