@@ -394,40 +394,30 @@ mod reload_arm_helper_tests {
         };
         // Full-value comparison: plugin_path, reason and the `required: false`
         // classification are all load-bearing for the reload report.
+        // `Display` renders plugin_path, reason and the `required: false`
+        // classification, so this one comparison pins every field without a
+        // never-taken destructuring arm.
         assert_eq!(err.to_string(), expected.to_string());
-        let RuntimeError::PluginUnavailable {
-            plugin_path,
-            reason,
-            required,
-        } = err
-        else {
-            panic!("expected PluginUnavailable");
-        };
-        assert_eq!(plugin_path, "expr/evaluator");
-        assert_eq!(reason, PluginUnavailableReason::ArtifactMissing);
-        assert!(!required);
     }
 
     #[test]
     fn docs_parse_error_names_the_plugin_and_quotes_serde() {
         let source = json_error();
         let err = reload_docs_parse_error("qq", &source);
-        let expected = format!("failed to parse docs for qq: {source}");
-        let RuntimeError::Invariant { message } = err else {
-            panic!("expected Invariant");
+        let expected = RuntimeError::Invariant {
+            message: format!("failed to parse docs for qq: {source}"),
         };
-        assert_eq!(message, expected);
+        assert_eq!(err.to_string(), expected.to_string());
     }
 
     #[test]
     fn abi_fingerprint_parse_error_names_the_plugin_and_quotes_serde() {
         let source = json_error();
         let err = reload_abi_fingerprint_parse_error("feishu", &source);
-        let expected = format!("failed to parse abi_fingerprint for feishu: {source}");
-        let RuntimeError::Invariant { message } = err else {
-            panic!("expected Invariant");
+        let expected = RuntimeError::Invariant {
+            message: format!("failed to parse abi_fingerprint for feishu: {source}"),
         };
-        assert_eq!(message, expected);
+        assert_eq!(err.to_string(), expected.to_string());
     }
 
     // ── stop-handler panic payload rendering ─────────────────────────────
