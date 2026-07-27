@@ -249,10 +249,12 @@ fn journal_replay_propagates_a_failing_restore_write() {
 // ───────────── create_plugin's workspace-manifest flock branch ─────────────
 
 /// `create_plugin` takes a `flock` on `plugins/Cargo.toml.lock` before mutating
-/// the workspace manifest. Pre-creating that lock path as a FIFO makes the
-/// `flock` call fail with ENOTSUP while the `O_RDWR` open still succeeds, which
-/// is the only portable way to drive the `rc != 0` logging branch. The failure
-/// is non-fatal: `create_plugin` still runs to completion.
+/// the workspace manifest. Pre-creating that lock path as a FIFO exercises a
+/// lock path that is not a regular file — on BSD/macOS `flock` reports ENOTSUP
+/// there while the `O_RDWR` open still succeeds, on Linux the lock succeeds.
+/// Either way locking is advisory and must not abort the call, which is what
+/// this test pins. (The `rc != 0` logging arm itself is covered platform-
+/// independently by `workspace_manifest_lock::flock_report_tests`.)
 #[cfg(unix)]
 #[test]
 #[serial]

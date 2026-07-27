@@ -174,13 +174,26 @@ mod tests {
         unsafe { Library::new(path) }.ok().map(|_lib| path)
     }
 
+    /// A platform library that `dlopen`s but carries no
+    /// `cordis_plugin_api_rust_v2` symbol. Tried in order so the symbol-lookup
+    /// branch is exercised on macOS (dyld shared cache) and on Linux/CI alike;
+    /// `dlopen_probe` filters to whichever actually loads on this host.
+    fn symbolless_system_library() -> Option<&'static Path> {
+        [
+            "/usr/lib/libSystem.B.dylib",
+            "/lib/x86_64-linux-gnu/libc.so.6",
+            "/lib/aarch64-linux-gnu/libc.so.6",
+            "/usr/lib/x86_64-linux-gnu/libc.so.6",
+            "/usr/lib/aarch64-linux-gnu/libc.so.6",
+            "/lib64/libc.so.6",
+        ]
+        .into_iter()
+        .find_map(|c| dlopen_probe(Path::new(c)))
+    }
+
     #[test]
     fn open_dylib_without_entry_symbol_reports_symbol_lookup() {
-        // libSystem is loadable on macOS via the dyld shared cache but has no
-        // `cordis_plugin_api_rust_v2` symbol, exercising the symbol-lookup
-        // failure branch. Skip elsewhere.
-        let sys = Path::new("/usr/lib/libSystem.B.dylib");
-        for path in dlopen_probe(sys).into_iter() {
+        for path in symbolless_system_library().into_iter() {
             let result = LoadedDylibApi::open(path);
             let is_symbol_lookup = matches!(&result, Err(RuntimeError::Io { message, .. }) if message.contains("symbol lookup failed"));
             assert!(

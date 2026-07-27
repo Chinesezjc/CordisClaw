@@ -38,6 +38,36 @@ jobs:
       - name: prepare fixture artifacts
         run: cargo run --locked -p cordis-runtime -- prepare-artifacts fixtures
 
+      # 若 job 以 root 运行，7 处 `probe_not_root()` 门控的权限失败测试体
+      # 不会执行（root 绕过 file-mode 检查），100% 行覆盖门槛会失败。
+      # GitHub 托管 runner 用非 root 用户 `runner`；显式断言，避免将来
+      # 改用 container（默认 root）时表现为难以定位的覆盖率下降。
+      - name: assert the job is not root
+        run: |
+          if [ "$(id -u)" = "0" ]; then
+            echo "::error::coverage job must not run as root — permission-failure test bodies would be skipped, breaking the 100% line gate"
+            exit 1
+          fi
+          echo "euid=$(id -u) ($(id -un)) — permission-failure tests will run"
+
+      # 若宿主原生 fixture dylib 缺失，dynamic/loader/verifier/invoke 的
+      # dylib 加载测试体（`for … in host_native_fixture_*().into_iter()`）
+      # 不会执行，100% 行覆盖门槛会失败。prepare-artifacts 应已按宿主平台
+      # 生成 `expr.so`；显式断言，把"探针本该命中却没命中"提前暴露。
+      - name: assert host-native fixture artifacts exist
+        run: |
+          set -e
+          for f in expr expr_lexer expr_parser expr_evaluator; do
+            path="fixtures/artifacts/$f.so"
+            if [ ! -f "$path" ]; then
+              echo "::error::missing $path — dylib-loading test bodies would be skipped, breaking the 100% line gate"
+              ls -la fixtures/artifacts/ || true
+              exit 1
+            fi
+          done
+          echo "host-native fixture artifacts present:"
+          ls fixtures/artifacts/*.so | head
+
       # 覆盖率门槛：行覆盖 100%（无排除注释，实测 26497/26497）。
       # 排除 main.rs（REPL/signal/exit）与 agent.rs（LLM 流式 I/O）——
       # 均为进程/网络边界，见 CLAUDE.md 覆盖率规范。

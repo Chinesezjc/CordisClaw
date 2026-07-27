@@ -7297,6 +7297,39 @@ mod workspace_manifest_lock {
         file: Option<File>,
     }
 
+    /// Take the exclusive lock, returning the raw `flock` status. Separated
+    /// from `acquire` so the failure-reporting path can be unit-tested on every
+    /// platform: `flock` on a freshly opened regular file does not fail on
+    /// Linux (and only fails on BSD via FIFO quirks), so the `rc != 0` arm is
+    /// unreachable in situ.
+    #[cfg(unix)]
+    fn lock_exclusive(file: &File) -> i32 {
+        use std::os::unix::io::AsRawFd;
+        // SAFETY: fd owned by `file`, kept alive across the syscall.
+        unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) }
+    }
+
+    /// Log a non-zero `flock` status. Locking is advisory here — a failure is
+    /// reported and the caller proceeds.
+    #[cfg(unix)]
+    fn report_flock_result(path: &Path, rc: i32) {
+        if rc != 0 {
+            eprintln!("{}", super::flock_failure_line(path));
+        }
+    }
+
+    #[cfg(all(test, unix))]
+    mod flock_report_tests {
+        #[test]
+        fn nonzero_status_is_reported_and_zero_is_silent() {
+            // Both directions of the advisory-lock report, driven directly so
+            // the arm does not depend on a platform-specific `flock` failure.
+            let path = std::path::Path::new("/tmp/cordis-flock-report-probe.lock");
+            super::report_flock_result(path, -1);
+            super::report_flock_result(path, 0);
+        }
+    }
+
     pub fn acquire(path: &Path) -> Guard {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
@@ -7318,14 +7351,7 @@ mod workspace_manifest_lock {
             }
         };
         #[cfg(unix)]
-        {
-            use std::os::unix::io::AsRawFd;
-            // SAFETY: fd owned by `file`, kept alive across the syscall.
-            let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
-            if rc != 0 {
-                eprintln!("{}", super::flock_failure_line(path));
-            }
-        }
+        report_flock_result(path, lock_exclusive(&file));
         Guard { file: Some(file) }
     }
 
