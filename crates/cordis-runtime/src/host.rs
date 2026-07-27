@@ -2790,12 +2790,10 @@ export_plugin_api! {{
             .agent_sessions
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        let managed =
-            guard
-                .get_mut(session_id)
-                .ok_or_else(|| RuntimeError::AgentSessionNotFound {
-                    session_id: session_id.to_string(),
-                })?;
+        let not_found = || RuntimeError::AgentSessionNotFound {
+            session_id: session_id.to_string(),
+        };
+        let managed = guard.get_mut(session_id).ok_or_else(not_found)?;
         managed.session.swap_config(api)
     }
 
@@ -2812,12 +2810,10 @@ export_plugin_api! {{
             .agent_sessions
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        let managed =
-            guard
-                .get_mut(session_id)
-                .ok_or_else(|| RuntimeError::AgentSessionNotFound {
-                    session_id: session_id.to_string(),
-                })?;
+        let not_found = || RuntimeError::AgentSessionNotFound {
+            session_id: session_id.to_string(),
+        };
+        let managed = guard.get_mut(session_id).ok_or_else(not_found)?;
         managed.session.set_soul_key(soul_key.to_string());
         Ok(())
     }
@@ -6498,7 +6494,7 @@ fn register_builtin_agent_node(plugin_registry: &PluginRegistry, node_registry: 
 
     // Register nodes.
     if let Err(e) = node_registry.register_from_docs("cordis", &docs) {
-        eprintln!("[builtin] agent_router registration failed: {e}");
+        eprintln!("{}", builtin_registration_failure_line(&e));
     }
 }
 
@@ -7024,6 +7020,13 @@ mod workspace_manifest_lock {
 /// { .. })` closures in `create_plugin` / snapshot setup so the mapping is a
 /// single named, unit-testable function. Callers keep formatting the message
 /// (which embeds `e`) so the emitted text stays byte-for-byte identical.
+/// Log line for a failed builtin-node registration. The builtin docs are a
+/// compile-time constant that always registers cleanly, so the call site is
+/// unreachable in practice; the message itself is unit-tested here.
+fn builtin_registration_failure_line(err: &RuntimeError) -> String {
+    format!("[builtin] agent_router registration failed: {err}")
+}
+
 /// Message for a failed `flock` on the workspace manifest lock — kept in a
 /// tested helper so the (locally unfailable) call site stays one line.
 fn flock_failure_line(path: &Path) -> String {
@@ -8271,6 +8274,72 @@ mod ffi_panic_seam_tests {
             safety_command: None,
             verify_profile: None,
             quality_score: None,
+        }
+    }
+
+    #[test]
+    fn builtin_registration_failure_line_embeds_the_error() {
+        let err = super::host_invariant("docs were rejected".to_string());
+        let line = super::builtin_registration_failure_line(&err);
+        assert!(line.starts_with("[builtin] agent_router registration failed: "));
+        assert!(line.contains("docs were rejected"));
+    }
+
+    // ── plugin_history is capped: the 1025th distinct entry drops the oldest ──
+    #[test]
+    #[serial]
+    fn record_plugin_iteration_outcome_caps_history_at_the_bound() {
+        let (_temp, fixtures) = setup_empty_fixture();
+        let host = RuntimeHost::boot(&fixtures).expect("host should boot on empty index");
+
+        // MAX_PLUGIN_HISTORY is 1024; record one more so the `pop_back` trim
+        // runs. Entries are keyed by iteration_id, so each must be distinct.
+        for i in 0..1025u32 {
+            host.kernel
+                .record_plugin_iteration_outcome(&synthetic_result(&format!("iter-{i}")));
+        }
+        let history = host.kernel.plugin_history();
+        assert_eq!(history.len(), 1024, "history must be trimmed to the bound");
+        // Newest at the front, and the very first entry has been dropped.
+        assert_eq!(history[0].iteration_id, "iter-1024");
+        assert!(
+            !history.iter().any(|e| e.iteration_id == "iter-0"),
+            "the oldest entry must be evicted"
+        );
+    }
+
+    fn synthetic_result(iteration_id: &str) -> crate::host::KernelPluginIterationResult {
+        crate::host::KernelPluginIterationResult {
+            iteration_id: iteration_id.to_string(),
+            issue_id: "issue-cap".to_string(),
+            root_plugin_path: "plugins/mini".to_string(),
+            target_plugin_paths: Vec::new(),
+            source: None,
+            summary: "history cap probe".to_string(),
+            agent_session_id: None,
+            tool_execution_summary: None,
+            derived_edit_plan: crate::kernel::plugin_iteration::PluginEditPlan {
+                issue_id: "issue-cap".to_string(),
+                patch_id: format!("{iteration_id}-empty"),
+                summary: "history cap probe".to_string(),
+                operations: Vec::new(),
+            },
+            transcript_excerpt: Vec::new(),
+            changed_paths: Vec::new(),
+            rebuilt_artifacts: Vec::new(),
+            candidate: None,
+            verification: None,
+            verifier_verdict: None,
+            canary: None,
+            final_verdict: crate::host::PluginIterationFinalVerdict::Blocked,
+            blocked_reason: None,
+            net_output: crate::execution::engine::ExecutionOutput {
+                execution_id: iteration_id.to_string(),
+                order: Vec::new(),
+                outcomes: std::collections::BTreeMap::new(),
+                keyed_outcomes: std::collections::BTreeMap::new(),
+                metrics: crate::execution::engine::ExecutionMetrics::default(),
+            },
         }
     }
 
