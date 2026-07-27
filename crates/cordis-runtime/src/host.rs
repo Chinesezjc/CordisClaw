@@ -937,6 +937,27 @@ mod cov_fa_host_1_3500_tests {
         );
     }
 
+    /// The reconstruct-failure line in `detect_crash_and_recover`'s hydration
+    /// chain. `AgentSession::from_snapshot` only fails when reqwest cannot build
+    /// an HTTP client — no on-disk snapshot can force that (every field
+    /// round-trips and reqwest accepts any timeout, including 0 and u64::MAX) —
+    /// so the message shape is pinned here rather than by a fixture.
+    #[test]
+    fn crash_recovery_reconstruct_log_line_names_the_snapshot_path() {
+        let err = RuntimeError::LlmRequestFailed {
+            message: "failed to rebuild agent HTTP client from snapshot: nope".to_string(),
+        };
+        let line = super::crash_recovery_reconstruct_log_line(
+            std::path::Path::new("/data/sessions/abc.json"),
+            &err,
+        );
+        assert_eq!(
+            line,
+            "[crash-recovery] reconstruct failed for /data/sessions/abc.json: \
+             LLM request failed: failed to rebuild agent HTTP client from snapshot: nope"
+        );
+    }
+
     // auto_save_session error arms via fault injection: data/sessions blocked
     // by a regular file at data/ makes create_dir_all fail; a read-only
     // sessions dir makes the tmp write fail; a directory squatting on the
@@ -2352,10 +2373,8 @@ impl RuntimeHost {
                     })
                 })
                 .and_then(|snapshot| {
-                    AgentSession::from_snapshot(snapshot).map_err(|e| {
-                        let subject = format!("reconstruct failed for {}", path.display());
-                        Self::host_io_log_line("crash-recovery", &subject, &e)
-                    })
+                    AgentSession::from_snapshot(snapshot)
+                        .map_err(|e| crash_recovery_reconstruct_log_line(&path, &e))
                 });
             let session = match hydrated {
                 Ok(session) => session,
@@ -7338,6 +7357,17 @@ fn host_invariant(message: String) -> RuntimeError {
 /// of [`host_io_error`] so call sites fit a single line under rustfmt.
 fn io_ctx(path: PathBuf, what: &str, e: impl std::fmt::Display) -> RuntimeError {
     host_io_error(path, format!("{what}: {e}"))
+}
+
+/// Log line for a session snapshot that parsed but could not be turned back
+/// into an `AgentSession`. `AgentSession::from_snapshot` only fails when
+/// reqwest cannot build an HTTP client from the stored config, which no
+/// on-disk snapshot can force (every field round-trips and reqwest accepts any
+/// timeout), so the message shape is pinned by a unit test instead of by a
+/// fixture. Byte-identical to the inline `format!` it replaces.
+fn crash_recovery_reconstruct_log_line(path: &Path, err: &dyn std::fmt::Display) -> String {
+    let subject = format!("reconstruct failed for {}", path.display());
+    RuntimeHost::host_io_log_line("crash-recovery", &subject, err)
 }
 
 fn host_io_error(path: PathBuf, message: String) -> RuntimeError {
