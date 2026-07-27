@@ -923,9 +923,10 @@ mod tests {
         // artifact index records `abi_fingerprint.target_triple`). Probe the
         // loader instead of hard-coding a triple: run the assertions only when
         // the `expr` fixture actually loaded for this host, and skip cleanly
-        // otherwise via an `if let` gate so the skip is not a conditionally-dead
-        // line. Works on any host whose committed index matches.
-        if let Some(()) = probe_expr_fixture_loadable() {
+        // otherwise. `for`-over-`Option` (rather than `if let`) has no not-taken
+        // arm, so the gate leaves no permanently-uncovered brace on hosts where
+        // the probe succeeds. Works on any host whose committed index matches.
+        for () in probe_expr_fixture_loadable().into_iter() {
             let spec = format!(
                 "plugin:{}",
                 json!({
@@ -956,8 +957,8 @@ mod tests {
 
     /// `Some(())` when the `expr` fixture dylib loads for this host, else `None`.
     /// Single-line `==` check (PluginLoadResult is `PartialEq`) so no multi-line
-    /// `matches!` brace artifact, and an `Option` return so callers gate with
-    /// `if let` (no conditionally-dead bool-gate brace).
+    /// `matches!` brace artifact, and an `Option` return so callers can gate with
+    /// `for`-over-`Option`, which has no not-taken arm to leave uncovered.
     fn probe_expr_fixture_loadable() -> Option<()> {
         let fixtures_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures");
         let invoker = crate::plugin::invoke::PluginInvoker::load(&fixtures_root).ok()?;
@@ -1674,16 +1675,25 @@ mod tests {
         assert!(!check.stderr.is_empty());
     }
 
+    /// `Some(())` when the current euid is not root, else `None`.
+    ///
+    /// Tests that drive a file-mode permission failure need this: root bypasses
+    /// mode bits, so a 0o000 file still reads. Returning an `Option` lets the
+    /// caller gate with `for`-over-`Option`, which — unlike an `if` gate or an
+    /// early `return` — has no not-taken arm to leave permanently uncovered.
+    #[cfg(unix)]
+    fn probe_not_root() -> Option<()> {
+        // SAFETY: `geteuid` is always safe to call and cannot fail.
+        (unsafe { libc::geteuid() } != 0).then_some(())
+    }
+
     #[cfg(unix)]
     #[test]
     fn hash_source_tree_read_failure_surfaces_io() {
         use std::os::unix::fs::PermissionsExt;
-        // Root ignores file-mode permissions, so an unreadable file still reads.
-        // Single-line guard: no standalone closing brace to leave uncovered.
-        // Root bypasses file-mode permission checks, so the failure this test
-        // asserts only occurs as a non-root user. Wrapping the body (instead of
-        // an early return) keeps every line executable under both euids.
-        if unsafe { libc::geteuid() } != 0 {
+        // Root ignores file-mode permissions, so an unreadable file still reads;
+        // the assertions only hold for a non-root euid.
+        for () in probe_not_root().into_iter() {
             let temp = TempDir::new().expect("tempdir");
             let secret = temp.path().join("secret.txt");
             fs::write(&secret, "top secret").unwrap();

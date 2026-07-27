@@ -465,16 +465,13 @@ mod tests {
         let up = vec!["a".to_string(), "b".to_string()];
         let out = outcomes(&[("a", NodeOutcome::Timeout)]);
         let order = vec!["a".to_string()];
-        match evaluate_gate(GatePolicy::FirstCompleted, &up, &out, &order) {
+        assert_eq!(
+            evaluate_gate(GatePolicy::FirstCompleted, &up, &out, &order),
             GateDecision::CompleteAndCancel {
-                success,
-                cancel_nodes,
-            } => {
-                assert!(!success);
-                assert_eq!(cancel_nodes, vec!["b".to_string()]);
+                success: false,
+                cancel_nodes: vec!["b".to_string()],
             }
-            d => panic!("expected CompleteAndCancel failure, got {d:?}"),
-        }
+        );
     }
 
     // FirstCompleted: a lone terminal failure with no pending peers completes
@@ -525,16 +522,13 @@ mod tests {
         let up = vec!["a".to_string(), "b".to_string()];
         let out = outcomes(&[("b", NodeOutcome::Success)]);
         let order = vec!["z".to_string(), "a".to_string(), "b".to_string()];
-        match evaluate_gate(GatePolicy::FirstCompleted, &up, &out, &order) {
+        assert_eq!(
+            evaluate_gate(GatePolicy::FirstCompleted, &up, &out, &order),
             GateDecision::CompleteAndCancel {
-                success,
-                cancel_nodes,
-            } => {
-                assert!(success);
-                assert_eq!(cancel_nodes, vec!["a".to_string()]);
+                success: true,
+                cancel_nodes: vec!["a".to_string()],
             }
-            d => panic!("expected CompleteAndCancel, got {d:?}"),
-        }
+        );
     }
 
     // FirstCompleted: nothing terminal yet → Wait (fallthrough past the loop).

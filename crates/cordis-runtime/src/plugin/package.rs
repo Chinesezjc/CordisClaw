@@ -276,20 +276,26 @@ impl PackageResolver {
             }
         }
 
-        if let Some(p) = parent {
-            if let Some(existing_parent) = state.parent_of.get(&plugin_path) {
-                if existing_parent != p {
-                    return Err(RuntimeError::DuplicatePluginPath {
-                        plugin_path,
-                        first: state
-                            .dir_by_plugin_path
-                            .get(existing_parent)
-                            .cloned()
-                            .unwrap_or_else(|| PathBuf::from(existing_parent)),
-                        second: dir.to_path_buf(),
-                    });
-                }
-            }
+        // Flattened from nested `if let`/`if` guards into one condition: the
+        // innermost mismatch always returns, so the old inner block had no
+        // reachable fall-through. The behaviour is unchanged — a conflict needs a
+        // declared parent, a previously recorded parent, and the two to differ.
+        let conflicting_parent = parent.and_then(|p| {
+            state
+                .parent_of
+                .get(&plugin_path)
+                .filter(|existing| existing.as_str() != p)
+        });
+        if let Some(existing_parent) = conflicting_parent {
+            return Err(RuntimeError::DuplicatePluginPath {
+                first: state
+                    .dir_by_plugin_path
+                    .get(existing_parent)
+                    .cloned()
+                    .unwrap_or_else(|| PathBuf::from(existing_parent)),
+                second: dir.to_path_buf(),
+                plugin_path,
+            });
         }
 
         // Cycle check uses current DFS stack and returns full loop path.
@@ -1103,13 +1109,9 @@ mod resolver_tests {
         // cycle fires first. The dir-derived path for alpha/beta/loop is
         // "alpha/beta/loop" != "alpha", so PluginPathMismatch actually guards
         // first. Accept either as evidence the guard chain works.
-        assert!(
-            matches!(
-                err,
-                RuntimeError::CycleDetected { .. } | RuntimeError::PluginPathMismatch { .. }
-            ),
-            "got {err:?}"
-        );
+        use RuntimeError::{CycleDetected, PluginPathMismatch};
+        let is_guarded = matches!(err, CycleDetected { .. } | PluginPathMismatch { .. });
+        assert!(is_guarded, "got {err:?}");
     }
 
     // --- expected_plugin_path outside root ----------------------------------
@@ -1249,6 +1251,29 @@ mod resolver_tests {
             matches!(&err, RuntimeError::DuplicatePluginPath { first, .. } if first == &PathBuf::from("old_parent")),
             "wrong variant: {err:?}"
         );
+    }
+
+    // parent_of records the *same* parent that is being declared again → the
+    // conflict filter yields None and the visit proceeds (the non-conflicting
+    // direction of the flattened parent guard).
+    #[test]
+    fn visit_plugin_matching_parent_is_accepted() {
+        let (_tmp, resolver, alpha_dir) = valid_alpha();
+        let mut state = empty_state();
+        state
+            .parent_of
+            .insert("alpha".to_string(), "same_parent".to_string());
+
+        resolver
+            .visit_plugin(
+                &alpha_dir,
+                Some("same_parent"),
+                true,
+                BTreeSet::new(),
+                &mut state,
+            )
+            .expect("same parent must not conflict");
+        assert!(state.plugins.contains_key("alpha"));
     }
 
     // `visiting` already contains "alpha" and the DFS stack holds it → the

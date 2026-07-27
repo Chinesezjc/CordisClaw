@@ -1078,17 +1078,24 @@ mod tests {
         );
     }
 
+    /// `Some(())` when the current euid is not root, else `None`.
+    ///
+    /// Root bypasses file-mode permission checks (a 0o444 file is still
+    /// writable), so the failure the caller drives cannot occur there. Returning
+    /// an `Option` lets the caller gate with `for`-over-`Option`, which — unlike
+    /// an `if` gate or an early `return` — has no not-taken arm to leave
+    /// permanently uncovered.
+    #[cfg(unix)]
+    fn probe_not_root() -> Option<()> {
+        // SAFETY: `geteuid` is always safe to call and cannot fail.
+        (unsafe { libc::geteuid() } != 0).then_some(())
+    }
+
     #[cfg(unix)]
     #[test]
     fn text_patch_write_failure_then_rollback_failure_surfaces_invariant() {
         use std::os::unix::fs::PermissionsExt;
-        // Running as root bypasses file-mode permission checks: a 0o444 file is
-        // still writable, so the failure this test drives can't occur.
-        // Single-line guard: no standalone closing brace to leave uncovered.
-        // Root bypasses file-mode permission checks, so the failure this test
-        // asserts only occurs as a non-root user. Wrapping the body (instead of
-        // an early return) keeps every line executable under both euids.
-        if unsafe { libc::geteuid() } != 0 {
+        for () in probe_not_root().into_iter() {
             // A read-only target: read_to_string succeeds, but the fs::write inside
             // apply_one fails (covers the write error map). Rollback then tries to
             // write the original back to the same read-only file and *also* fails,
@@ -1108,10 +1115,8 @@ mod tests {
                     verify_ok,
                 )
                 .unwrap_err();
-            assert!(
-                matches!(&err, RuntimeError::Invariant { message } if message.contains("rollback failed")),
-                "expected Invariant, got: {err:?}"
-            );
+            let is_rollback_invariant = matches!(&err, RuntimeError::Invariant { message } if message.contains("rollback failed"));
+            assert!(is_rollback_invariant, "expected Invariant, got: {err:?}");
 
             // Restore perms for TempDir cleanup.
             let mut perms = fs::metadata(&target).unwrap().permissions();
