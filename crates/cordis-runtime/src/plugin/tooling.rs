@@ -1753,13 +1753,54 @@ fn absolute_path(path: &Path) -> Result<PathBuf, RuntimeError> {
 mod tests {
     /// `true` when the process can be blocked by file-mode permission bits.
     /// Root bypasses them, so a "deny write/read then expect an I/O error"
-    /// injection succeeds instead of failing there. Tests below assert both
-    /// directions rather than skipping, so the production path under test runs
-    /// under either euid and leaves no uncovered line.
+    /// injection succeeds instead of failing there.
     #[cfg(unix)]
     fn permission_bits_are_enforced() -> bool {
         // SAFETY: `geteuid` is always safe to call and cannot fail.
         (unsafe { libc::geteuid() }) != 0
+    }
+
+    /// Verdict for a permission-denied fault injection: when mode bits bind
+    /// (non-root) the call must fail the way `is_expected_error` says; when
+    /// they do not (root) the call must have succeeded instead.
+    ///
+    /// Taking `enforced` as a parameter rather than reading the euid inside
+    /// keeps both directions reachable from a unit test — an inline
+    /// `if enforced { .. } else { .. }` in each test body would leave whichever
+    /// branch the current euid does not take permanently uncovered.
+    #[cfg(unix)]
+    fn permission_fault_holds<T: std::fmt::Debug>(
+        enforced: bool,
+        outcome: &Result<T, crate::core::error::RuntimeError>,
+        is_expected_error: impl FnOnce(&crate::core::error::RuntimeError) -> bool,
+    ) -> bool {
+        match (enforced, outcome) {
+            (true, Err(err)) => is_expected_error(err),
+            (true, Ok(_)) => false,
+            (false, res) => res.is_ok(),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn permission_fault_holds_covers_both_euid_directions() {
+        use crate::core::error::RuntimeError;
+        let io = RuntimeError::Io {
+            path: "/x".into(),
+            message: "create tmp: denied".to_string(),
+        };
+        let is_create_tmp = |e: &RuntimeError| matches!(e, RuntimeError::Io { message, .. } if message.starts_with("create tmp: "));
+        // Enforced: the expected error passes, a mismatched error and an
+        // unexpected success both fail.
+        let denied: Result<(), RuntimeError> = Err(io);
+        assert!(permission_fault_holds(true, &denied, is_create_tmp));
+        let other: Result<(), RuntimeError> = Err(super::invariant("nope".to_string()));
+        assert!(!permission_fault_holds(true, &other, is_create_tmp));
+        let ok: Result<(), RuntimeError> = Ok(());
+        assert!(!permission_fault_holds(true, &ok, is_create_tmp));
+        // Not enforced (root): success is required, failure is not accepted.
+        assert!(permission_fault_holds(false, &ok, is_create_tmp));
+        assert!(!permission_fault_holds(false, &denied, is_create_tmp));
     }
 
     use super::{cargo_command_prefers_offline, prepare_local_cargo_args};
@@ -2829,15 +2870,12 @@ exports = ["svc_a", "svc_b"]
         let err = write_pretty_json(&target, &serde_json::json!({"k": 1}));
         // Restore perms so TempDir cleanup succeeds regardless of outcome.
         std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o755)).unwrap();
-        if permission_bits_are_enforced() {
-            assert!(
-                matches!(&err, Err(RuntimeError::Io { message, .. }) if message.starts_with("create tmp: ")),
-                "expected Io create-tmp error, got {err:?}"
-            );
-        } else {
-            // Root ignores the read-only directory, so staging succeeds.
-            assert!(err.is_ok(), "as root the write must succeed, got {err:?}");
-        }
+        assert!(
+            permission_fault_holds(permission_bits_are_enforced(), &err, |e| {
+                matches!(e, RuntimeError::Io { message, .. } if message.starts_with("create tmp: "))
+            }),
+            "unexpected outcome for a read-only staging dir: {err:?}"
+        );
     }
 
     /// `write_pretty_json` create_dir_all arm: a path whose parent is an
@@ -2876,15 +2914,12 @@ exports = ["svc_a", "svc_b"]
         let dst = ro.join("out.so");
         let err = stage_then_rename_file(&src, &dst);
         std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o755)).unwrap();
-        if permission_bits_are_enforced() {
-            assert!(
-                matches!(&err, Err(RuntimeError::Io { message, .. }) if message.starts_with("create tmp: ")),
-                "expected Io create-tmp error, got {err:?}"
-            );
-        } else {
-            // Root ignores the read-only directory, so staging succeeds.
-            assert!(err.is_ok(), "as root the staging must succeed, got {err:?}");
-        }
+        assert!(
+            permission_fault_holds(permission_bits_are_enforced(), &err, |e| {
+                matches!(e, RuntimeError::Io { message, .. } if message.starts_with("create tmp: "))
+            }),
+            "unexpected outcome for a read-only staging dir: {err:?}"
+        );
     }
 
     /// `collect_files_recursively` read_dir arm: a missing directory makes
@@ -2922,12 +2957,12 @@ exports = ["svc_a", "svc_b"]
         let err = cleanup_fixture_lockfiles(&plugins_root);
         std::env::remove_var("CORDIS_CLEAN_FIXTURE_LOCKFILES");
         std::fs::set_permissions(&plugins_root, std::fs::Permissions::from_mode(0o755)).unwrap();
-        if permission_bits_are_enforced() {
-            assert!(matches!(err, Err(RuntimeError::Io { .. })));
-        } else {
-            // Root reads the mode-000 directory anyway, so the sweep succeeds.
-            assert!(err.is_ok(), "as root the sweep must succeed, got {err:?}");
-        }
+        assert!(
+            permission_fault_holds(permission_bits_are_enforced(), &err, |e| {
+                matches!(e, RuntimeError::Io { .. })
+            }),
+            "unexpected outcome for a permission-denied path: {err:?}"
+        );
     }
 
     /// `remove_lockfiles_recursively` read_dir arm: an unreadable subdirectory
@@ -2945,11 +2980,12 @@ exports = ["svc_a", "svc_b"]
         std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o000)).unwrap();
         let err = remove_lockfiles_recursively(&sub);
         std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
-        if permission_bits_are_enforced() {
-            assert!(matches!(err, Err(RuntimeError::Io { .. })));
-        } else {
-            assert!(err.is_ok(), "as root the sweep must succeed, got {err:?}");
-        }
+        assert!(
+            permission_fault_holds(permission_bits_are_enforced(), &err, |e| {
+                matches!(e, RuntimeError::Io { .. })
+            }),
+            "unexpected outcome for a permission-denied path: {err:?}"
+        );
     }
 
     /// `lock_pid_is_live(0)` short-circuits to `false` (pid 0 is never a
@@ -3053,12 +3089,12 @@ exports = ["svc_a", "svc_b"]
         std::fs::set_permissions(&holder, std::fs::Permissions::from_mode(0o555)).unwrap();
         let err = maybe_remove_stale_lock(&path);
         std::fs::set_permissions(&holder, std::fs::Permissions::from_mode(0o755)).unwrap();
-        if permission_bits_are_enforced() {
-            assert!(matches!(err, Err(RuntimeError::Io { .. })));
-        } else {
-            // Root unlinks inside the read-only directory, so removal succeeds.
-            assert!(err.is_ok(), "as root the unlink must succeed, got {err:?}");
-        }
+        assert!(
+            permission_fault_holds(permission_bits_are_enforced(), &err, |e| {
+                matches!(e, RuntimeError::Io { .. })
+            }),
+            "unexpected outcome for a permission-denied path: {err:?}"
+        );
     }
 
     /// Legacy (non-JSON) stale-lock path: an ancient non-JSON lock is slated
@@ -3085,12 +3121,12 @@ exports = ["svc_a", "svc_b"]
         std::fs::set_permissions(&holder, std::fs::Permissions::from_mode(0o555)).unwrap();
         let err = maybe_remove_stale_lock(&path);
         std::fs::set_permissions(&holder, std::fs::Permissions::from_mode(0o755)).unwrap();
-        if permission_bits_are_enforced() {
-            assert!(matches!(err, Err(RuntimeError::Io { .. })));
-        } else {
-            // Root unlinks inside the read-only directory, so removal succeeds.
-            assert!(err.is_ok(), "as root the unlink must succeed, got {err:?}");
-        }
+        assert!(
+            permission_fault_holds(permission_bits_are_enforced(), &err, |e| {
+                matches!(e, RuntimeError::Io { .. })
+            }),
+            "unexpected outcome for a permission-denied path: {err:?}"
+        );
     }
 
     // ---------- run_command_with_timeout spawn failure ----------
