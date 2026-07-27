@@ -1680,17 +1680,19 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         // Root ignores file-mode permissions, so an unreadable file still reads.
         // Single-line guard: no standalone closing brace to leave uncovered.
-        if unsafe { libc::geteuid() } == 0 {
-            return;
+        // Root bypasses file-mode permission checks, so the failure this test
+        // asserts only occurs as a non-root user. Wrapping the body (instead of
+        // an early return) keeps every line executable under both euids.
+        if unsafe { libc::geteuid() } != 0 {
+            let temp = TempDir::new().expect("tempdir");
+            let secret = temp.path().join("secret.txt");
+            fs::write(&secret, "top secret").unwrap();
+            let mut perms = fs::metadata(&secret).unwrap().permissions();
+            perms.set_mode(0o000);
+            fs::set_permissions(&secret, perms).unwrap();
+            // The walk lists the file, but the read inside hash_source_tree fails.
+            let err = hash_source_tree(temp.path()).expect_err("unreadable file must error");
+            assert!(matches!(err, RuntimeError::Io { .. }), "got: {err:?}");
         }
-        let temp = TempDir::new().expect("tempdir");
-        let secret = temp.path().join("secret.txt");
-        fs::write(&secret, "top secret").unwrap();
-        let mut perms = fs::metadata(&secret).unwrap().permissions();
-        perms.set_mode(0o000);
-        fs::set_permissions(&secret, perms).unwrap();
-        // The walk lists the file, but the read inside hash_source_tree fails.
-        let err = hash_source_tree(temp.path()).expect_err("unreadable file must error");
-        assert!(matches!(err, RuntimeError::Io { .. }), "got: {err:?}");
     }
 }

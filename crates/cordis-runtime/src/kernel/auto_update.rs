@@ -1085,36 +1085,38 @@ mod tests {
         // Running as root bypasses file-mode permission checks: a 0o444 file is
         // still writable, so the failure this test drives can't occur.
         // Single-line guard: no standalone closing brace to leave uncovered.
-        if unsafe { libc::geteuid() } == 0 {
-            return;
+        // Root bypasses file-mode permission checks, so the failure this test
+        // asserts only occurs as a non-root user. Wrapping the body (instead of
+        // an early return) keeps every line executable under both euids.
+        if unsafe { libc::geteuid() } != 0 {
+            // A read-only target: read_to_string succeeds, but the fs::write inside
+            // apply_one fails (covers the write error map). Rollback then tries to
+            // write the original back to the same read-only file and *also* fails,
+            // covering both the rollback write-error map and the
+            // "additionally, patch rollback failed" Invariant path.
+            let ws = TempDir::new().unwrap();
+            let target = ws.path().join("ro.txt");
+            fs::write(&target, "foo bar").unwrap();
+            let mut perms = fs::metadata(&target).unwrap().permissions();
+            perms.set_mode(0o444);
+            fs::set_permissions(&target, perms).unwrap();
+
+            let updater = AutoUpdater::new(ws.path());
+            let err = updater
+                .execute(
+                    plan(vec![FilePatch::text("ro.txt", "foo", "FOO")]),
+                    verify_ok,
+                )
+                .unwrap_err();
+            assert!(
+                matches!(&err, RuntimeError::Invariant { message } if message.contains("rollback failed")),
+                "expected Invariant, got: {err:?}"
+            );
+
+            // Restore perms for TempDir cleanup.
+            let mut perms = fs::metadata(&target).unwrap().permissions();
+            perms.set_mode(0o644);
+            fs::set_permissions(&target, perms).unwrap();
         }
-        // A read-only target: read_to_string succeeds, but the fs::write inside
-        // apply_one fails (covers the write error map). Rollback then tries to
-        // write the original back to the same read-only file and *also* fails,
-        // covering both the rollback write-error map and the
-        // "additionally, patch rollback failed" Invariant path.
-        let ws = TempDir::new().unwrap();
-        let target = ws.path().join("ro.txt");
-        fs::write(&target, "foo bar").unwrap();
-        let mut perms = fs::metadata(&target).unwrap().permissions();
-        perms.set_mode(0o444);
-        fs::set_permissions(&target, perms).unwrap();
-
-        let updater = AutoUpdater::new(ws.path());
-        let err = updater
-            .execute(
-                plan(vec![FilePatch::text("ro.txt", "foo", "FOO")]),
-                verify_ok,
-            )
-            .unwrap_err();
-        assert!(
-            matches!(&err, RuntimeError::Invariant { message } if message.contains("rollback failed")),
-            "expected Invariant, got: {err:?}"
-        );
-
-        // Restore perms for TempDir cleanup.
-        let mut perms = fs::metadata(&target).unwrap().permissions();
-        perms.set_mode(0o644);
-        fs::set_permissions(&target, perms).unwrap();
     }
 }

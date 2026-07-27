@@ -322,15 +322,16 @@ mod sr_host_a_seam_tests {
     fn expect_abi_mismatch(
         err: RuntimeError,
     ) -> (String, AbiFingerprint, AbiFingerprint, Vec<String>) {
-        match err {
-            RuntimeError::AbiMismatch {
-                plugin_path,
-                expected,
-                actual,
-                fingerprint_diff,
-            } => (plugin_path, *expected, *actual, fingerprint_diff),
-            other => panic!("expected AbiMismatch, got {other:?}"),
-        }
+        let RuntimeError::AbiMismatch {
+            plugin_path,
+            expected,
+            actual,
+            fingerprint_diff,
+        } = err
+        else {
+            panic!("expected AbiMismatch, got {err:?}")
+        };
+        (plugin_path, *expected, *actual, fingerprint_diff)
     }
 
     // ── Pure-fn: reload_subtree Phase-1 AbiMismatch reports ──────────────
@@ -8015,15 +8016,20 @@ mod seam_extraction_tests {
     fn detect_drift_returns_none_when_verdict_not_pass() {
         // Non-Pass verdict short-circuits before rehashing; the injected
         // rehash closure must not even run.
+        let ran = std::cell::Cell::new(0u32);
         let reason = detect_plugin_source_drift(VerifierVerdict::Fail, Some("abc"), || {
-            panic!("rehash must not run when verdict is not Pass")
+            ran.set(ran.get() + 1);
+            Ok("unused".to_string())
         });
         assert!(reason.is_none());
+        assert_eq!(ran.get(), 0, "rehash must not run when verdict is not Pass");
 
         let reason = detect_plugin_source_drift(VerifierVerdict::Partial, Some("abc"), || {
-            panic!("rehash must not run when verdict is Partial")
+            ran.set(ran.get() + 1);
+            Ok("unused".to_string())
         });
         assert!(reason.is_none());
+        assert_eq!(ran.get(), 0, "rehash must not run when verdict is Partial");
     }
 
     #[test]
@@ -8266,6 +8272,35 @@ mod ffi_panic_seam_tests {
             verify_profile: None,
             quality_score: None,
         }
+    }
+
+    // ── agent_send drains queued PendingSessionAction::CompactHistory ────
+    #[test]
+    #[serial]
+    fn agent_send_drains_queued_compact_history_action() {
+        let (_temp, fixtures) = setup_empty_fixture();
+        let host = RuntimeHost::boot(&fixtures).expect("host should boot on empty index");
+        let handle = host
+            .agent_start(crate::host::AgentSessionKind::RuntimeShell)
+            .expect("start a runtime-shell session");
+
+        // Queue the action the way `compact_context` does when it cannot reach
+        // the session, then drive `agent_send`. The LLM call fails (no server
+        // configured in the empty fixture), but the pending-action drain runs
+        // unconditionally after `respond`, so the CompactHistory arm executes.
+        host.queue_session_action(
+            &handle.session_id,
+            crate::host::PendingSessionAction::CompactHistory,
+        );
+        let _ = host.agent_send(&handle.session_id, "hello");
+
+        // The queue is consumed exactly once: a second send finds it empty and
+        // the session is still addressable (it was reinserted).
+        let _ = host.agent_send(&handle.session_id, "again");
+        assert!(
+            host.agent_sessions_mut().contains_key(&handle.session_id),
+            "session must be reinserted after draining pending actions"
+        );
     }
 
     // ── C-seam #1: iterate_plugins emergency-rollback arm ────────────────
@@ -10016,6 +10051,26 @@ warning: unused import
 /// edits never collide with `mod tests` / the other seam modules.
 #[cfg(test)]
 mod region_3500_5500_seam_tests {
+    /// Pull the message out of an `InvalidArgument`, panicking at the caller's
+    /// line on any other variant — replaces `match`-with-unreachable-arm in
+    /// assertions so no test arm stays unexecuted.
+    #[track_caller]
+    fn invalid_argument_message(err: &RuntimeError) -> String {
+        let RuntimeError::InvalidArgument { message } = err else {
+            panic!("expected InvalidArgument, got {err:?}")
+        };
+        message.clone()
+    }
+
+    /// Same for `LlmResponseInvalid`.
+    #[track_caller]
+    fn llm_response_invalid_message(err: &RuntimeError) -> String {
+        let RuntimeError::LlmResponseInvalid { message } = err else {
+            panic!("expected LlmResponseInvalid, got {err:?}")
+        };
+        message.clone()
+    }
+
     use super::{
         enrich_plugin_iteration_edit_error, format_agent_transcript_excerpt, parse_agent_args,
         transcript_excerpt, AgentBackend, AgentSessionHandle, AgentSessionKind, InvocationSample,
@@ -10109,9 +10164,9 @@ mod region_3500_5500_seam_tests {
         // Last three, still in chronological order.
         let contents: Vec<String> = out
             .iter()
-            .map(|e| match e {
-                AgentTranscriptEntry::User { content } => content.clone(),
-                _ => unreachable!(),
+            .filter_map(|e| match e {
+                AgentTranscriptEntry::User { content } => Some(content.clone()),
+                _ => None,
             })
             .collect();
         assert_eq!(contents, vec!["m2", "m3", "m4"]);
@@ -10172,13 +10227,11 @@ mod region_3500_5500_seam_tests {
             PLUGIN_AGENT_TOOL_REPLACE_FILES_EXACT,
         );
         let err = out.expect_err("wrong shape must error");
-        match err {
-            RuntimeError::InvalidArgument { message }
-                if message.starts_with(&format!(
-                "agent tool {PLUGIN_AGENT_TOOL_REPLACE_FILES_EXACT} received invalid arguments: "
-            )) => {}
-            other => panic!("expected prefixed InvalidArgument, got {other:?}"),
-        }
+        let expected_prefix = format!(
+            "agent tool {PLUGIN_AGENT_TOOL_REPLACE_FILES_EXACT} received invalid arguments: "
+        );
+        let message = invalid_argument_message(&err);
+        assert!(message.starts_with(&expected_prefix), "got {message}");
     }
 
     #[test]
@@ -10206,14 +10259,10 @@ mod region_3500_5500_seam_tests {
             message: "auto update patch pattern not found in file".to_string(),
         };
         let enriched = enrich_plugin_iteration_edit_error(&operation, workspace, base);
-        match enriched {
-            RuntimeError::LlmResponseInvalid { message } => {
-                assert!(message.contains("The exact snippet is stale for plugins/mini/src/lib.rs"));
-                assert!(message.contains("current_sha256="));
-                assert!(message.contains("current file body"));
-            }
-            other => panic!("expected LlmResponseInvalid, got {other:?}"),
-        }
+        let message = llm_response_invalid_message(&enriched);
+        assert!(message.contains("The exact snippet is stale for plugins/mini/src/lib.rs"));
+        assert!(message.contains("current_sha256="));
+        assert!(message.contains("current file body"));
     }
 
     #[test]
