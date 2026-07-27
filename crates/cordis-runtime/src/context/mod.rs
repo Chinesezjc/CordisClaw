@@ -1784,9 +1784,15 @@ mod tests {
         let registry = ServiceRegistry::new();
 
         // Recovered: a handle that has already finished.
+        // Park until the thread reports finished. `yield_now` runs on every
+        // iteration including the first, so the wait loop has no never-taken
+        // body (a `sleep`-guarded `while` usually exits before entering).
         let finished = std::thread::spawn(|| Ok::<(), String>(()));
-        while !finished.is_finished() {
-            std::thread::sleep(Duration::from_millis(5));
+        loop {
+            if finished.is_finished() {
+                break;
+            }
+            std::thread::yield_now();
         }
 
         // Stuck: a handle blocked on a channel we never signal until the end.

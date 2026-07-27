@@ -571,6 +571,15 @@ mod sr_host_a_seam_tests {
         }
     }
 
+    #[test]
+    fn abi_mismatch_fields_returns_none_for_other_variants() {
+        // Drives the non-`AbiMismatch` arm, which the reload tests never take.
+        let other = RuntimeError::Invariant {
+            message: "not an abi mismatch".to_string(),
+        };
+        assert!(abi_mismatch_fields(other).is_none());
+    }
+
     // ── Pure-fn: reload_subtree Phase-1 AbiMismatch reports ──────────────
 
     #[test]
@@ -6806,11 +6815,8 @@ fn register_builtin_agent_node(plugin_registry: &PluginRegistry, node_registry: 
     // cleanly; iterating the error (rather than an `if let` gate) leaves no
     // never-taken edge on the closing brace. The message itself is unit-tested
     // through `builtin_registration_failure_line`.
-    for e in node_registry
-        .register_from_docs("cordis", &docs)
-        .err()
-        .into_iter()
-    {
+    let registration = node_registry.register_from_docs("cordis", &docs).err();
+    for e in registration.into_iter() {
         eprintln!("{}", builtin_registration_failure_line(&e));
     }
 }
@@ -8394,9 +8400,10 @@ mod seam_extraction_tests {
         // Non-Pass verdict short-circuits before rehashing; the injected
         // rehash closure must not even run.
         let ran = std::cell::Cell::new(0u32);
+        // Single-expression body: `replace` both records the call and yields a
+        // value, so the closure has no multi-line region of its own.
         let rehash = || -> Result<String, RuntimeError> {
-            ran.set(ran.get() + 1);
-            Ok("unused".to_string())
+            Ok(format!("unused after {}", ran.replace(ran.get() + 1)))
         };
         let reason = detect_plugin_source_drift(VerifierVerdict::Fail, Some("abc"), rehash);
         assert!(reason.is_none());
@@ -10506,6 +10513,19 @@ mod region_3500_5500_seam_tests {
         }
     }
 
+    #[test]
+    fn invalid_argument_message_labels_other_variants() {
+        // Drives the fallback arm: callers only ever pass the matching variant,
+        // so without this the arm would never execute.
+        let other = RuntimeError::Invariant {
+            message: "nope".to_string(),
+        };
+        assert_eq!(
+            invalid_argument_message(&other),
+            format!("not InvalidArgument: {other}")
+        );
+    }
+
     /// Same for `LlmResponseInvalid`.
     #[track_caller]
     fn llm_response_invalid_message(err: &RuntimeError) -> String {
@@ -10513,6 +10533,17 @@ mod region_3500_5500_seam_tests {
             RuntimeError::LlmResponseInvalid { message } => message.clone(),
             other => format!("not LlmResponseInvalid: {other}"),
         }
+    }
+
+    #[test]
+    fn llm_response_invalid_message_labels_other_variants() {
+        let other = RuntimeError::Invariant {
+            message: "nope".to_string(),
+        };
+        assert_eq!(
+            llm_response_invalid_message(&other),
+            format!("not LlmResponseInvalid: {other}")
+        );
     }
 
     use super::{
@@ -12024,9 +12055,7 @@ mod region_3500_5500_seam_tests {
         let wrong_kind = host
             .plugin_iteration_agent_snapshot(&sid)
             .expect_err("a runtime-shell session is not an iteration session");
-        let RuntimeError::InvalidArgument { message } = wrong_kind else {
-            panic!("expected InvalidArgument, got {wrong_kind:?}");
-        };
+        let message = invalid_argument_message(&wrong_kind);
         assert_eq!(
             message,
             format!("agent session {sid} is not a plugin iteration session")
@@ -12091,6 +12120,14 @@ mod ops_arms_coverage_tests {
             RuntimeError::Invariant { message } => message.clone(),
             other => format!("not Invariant: {other}"),
         }
+    }
+
+    #[test]
+    fn invariant_message_labels_other_variants() {
+        let other = RuntimeError::InvalidArgument {
+            message: "nope".to_string(),
+        };
+        assert_eq!(invariant_message(&other), format!("not Invariant: {other}"));
     }
 
     fn registration(child_root: &str, parent_manifest: &str) -> ScaffoldedChildRegistration {
