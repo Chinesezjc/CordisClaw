@@ -73,15 +73,47 @@ jobs:
       # 均为进程/网络边界，见 CLAUDE.md 覆盖率规范。
       # 串行执行：插桩下 host 系集成测试共享 fixtures 工件，并行会因
       # 中途重建 dylib 触发 HashMismatch 假失败。
-      - name: run tests with coverage (100% line gate)
+      # 分两步：先无门槛跑出 lcov（保证产物总能上传、失败时能看到缺行），
+      # 再单独判定门槛。cargo-llvm-cov 的 --fail-under-lines 只报一个退出码，
+      # 不打印缺哪几行，排查时看不到任何线索。
+      - name: run tests with coverage
         run: |
           cargo llvm-cov --locked --workspace \
-            --fail-under-lines 100 \
             --ignore-filename-regex 'cordis-runtime/src/(main|agent)\.rs' \
             --lcov --output-path lcov.info \
             -- --test-threads=1
 
+      - name: enforce 100% line gate (with uncovered-line listing)
+        run: |
+          python3 - <<'PY'
+          import collections, sys
+          cur = None
+          missing = collections.defaultdict(list)
+          total = covered = 0
+          for raw in open('lcov.info'):
+              raw = raw.strip()
+              if raw.startswith('SF:'):
+                  cur = raw[3:]
+              elif raw.startswith('DA:') and cur:
+                  ln, hits = raw[3:].split(',')[:2]
+                  total += 1
+                  if int(hits) > 0:
+                      covered += 1
+                  else:
+                      missing[cur].append(int(ln))
+          pct = 100.0 * covered / total if total else 0.0
+          print(f"line coverage: {covered}/{total} = {pct:.4f}%")
+          if not missing:
+              print("all lines covered")
+              sys.exit(0)
+          print(f"::error::line coverage {pct:.4f}% < 100% — {total - covered} uncovered line(s)")
+          for path, nums in sorted(missing.items(), key=lambda kv: -len(kv[1])):
+              print(f"::error file={path}::{len(nums)} uncovered: {sorted(nums)}")
+          sys.exit(1)
+          PY
+
       - name: coverage summary
+        if: always()
         run: |
           echo '## Coverage' >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
@@ -89,6 +121,7 @@ jobs:
           echo '```' >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: lcov
           path: lcov.info
