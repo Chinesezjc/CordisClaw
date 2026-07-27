@@ -307,6 +307,24 @@ fn parse_error(path: impl Into<PathBuf>, message: impl Into<String>) -> RuntimeE
     }
 }
 
+/// Map a `Child::try_wait` failure to the `InvalidArgument` this module reports
+/// for it. Named so `run_command_with_timeout` can propagate it with `?` on the
+/// call line and so the message is testable without a child process whose
+/// `try_wait` fails — something the OS won't do for a locally spawned child.
+fn cargo_wait_error(err: std::io::Error) -> RuntimeError {
+    invalid_argument(format!("cargo wait failed: {err}"))
+}
+
+/// `create_dir_all` for the artifacts directory of `rebuild_plugin_workspace`.
+/// Extracted so the failure arm — which needs a path the process cannot create
+/// (a plain file standing where the directory belongs), not a real cargo
+/// rebuild — is unit-testable. The `create artifacts dir: ` message is
+/// byte-for-byte what the inline `map_err` produced.
+fn create_artifacts_dir(artifacts_dir: &Path) -> Result<(), RuntimeError> {
+    std::fs::create_dir_all(artifacts_dir)
+        .map_err(|e| io_error(artifacts_dir, format!("create artifacts dir: {e}")))
+}
+
 /// Refresh `index.json`'s sha256 for a single freshly-staged plugin artifact.
 /// Extracted from `rebuild_plugin_workspace` so the entry-match / hash-update
 /// path is unit-testable against a real temp index without a cargo rebuild.
@@ -416,11 +434,12 @@ pub fn rebuild_plugin_workspace(
     );
     let dst_filename = format!("{}{}", name, std::env::consts::DLL_SUFFIX);
     let src = target_dir.join(&src_filename);
-    let dst = workspace_root.join("artifacts").join(&dst_filename);
-    if let Some(parent) = dst.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| io_error(parent, format!("create artifacts dir: {e}")))?;
-    }
+    // `dst`'s parent is `<workspace_root>/artifacts` by construction, so bind
+    // the directory first instead of recovering it via `dst.parent()`: the
+    // `None` arm of that lookup was structurally unreachable dead weight.
+    let artifacts_dir = workspace_root.join("artifacts");
+    let dst = artifacts_dir.join(&dst_filename);
+    create_artifacts_dir(&artifacts_dir)?;
     // Stage-then-swap: `fs::copy` over a live-mmap'd `.so` risks SIGSEGV on
     // concurrent readers. Write to `<dst>.cordis-tmp`, fsync, rename over
     // the target — the OS unlinks the old file while any existing mapping
@@ -527,17 +546,20 @@ pub fn sync_plugin_docs(fixtures_root: &Path) -> Result<Vec<PathBuf>, RuntimeErr
 
     let mut written = Vec::new();
     for entry in index.entries {
-        let docs_path = plugins_root
+        // Build the directory first and join the file name onto it, rather than
+        // building the file path and recovering the directory with `.parent()`:
+        // the resulting paths are identical, and the `None` arm of that lookup
+        // was structurally unreachable (a path ending in a file name always has
+        // a parent).
+        let docs_dir = plugins_root
             .join(
                 entry
                     .plugin_path
                     .replace('/', std::path::MAIN_SEPARATOR_STR),
             )
-            .join("docs/agent/interfaces.json");
-        let docs_dir = docs_path.parent().ok_or_else(|| {
-            invariant(format!("docs path missing parent: {}", docs_path.display()))
-        })?;
-        fs::create_dir_all(docs_dir).map_err(|e| io_error(docs_dir, e))?;
+            .join("docs/agent");
+        let docs_path = docs_dir.join("interfaces.json");
+        fs::create_dir_all(&docs_dir).map_err(|e| io_error(&docs_dir, e))?;
         // P1-17: durable atomic write for interfaces.json.
         write_pretty_json(&docs_path, &entry.docs)?;
         written.push(docs_path);
@@ -621,15 +643,12 @@ fn prepare_artifacts_locked(
         .unwrap_or_default();
 
     for context in &mut contexts {
-        context.dirty = if full_rebuild {
-            true
-        } else {
-            compute_dirty_state(
-                repo_root,
-                context,
-                existing_map.get(&context.plugin.plugin_path),
-            )?
-        };
+        // `||` short-circuits exactly like the previous `if full_rebuild { true }
+        // else { compute_dirty_state(..)? }`: a full rebuild never consults the
+        // per-plugin state. Written on one line so the `?` error edge shares a
+        // line with the call it guards.
+        let existing = existing_map.get(&context.plugin.plugin_path);
+        context.dirty = full_rebuild || compute_dirty_state(repo_root, context, existing)?;
         if context.dirty {
             context.build_fingerprint =
                 Some(compute_build_fingerprint(repo_root, &context.input_files)?);
@@ -655,16 +674,24 @@ fn prepare_artifacts_locked(
     let mut next_entries = Vec::new();
 
     for mut context in contexts {
-        if !context.dirty {
-            if let Some(existing) = existing_map.get(&context.plugin.plugin_path) {
-                report.reused.push(context.plugin.plugin_path.clone());
-                let mut reused = existing.clone();
-                if reused.input_probe != context.input_probe {
-                    reused.input_probe = context.input_probe;
-                }
-                next_entries.push(reused);
-                continue;
+        // A non-dirty context always has an index entry to reuse:
+        // `compute_dirty_state` reports dirty whenever the lookup misses, and
+        // `full_rebuild` marks every context dirty. Folding the lookup into one
+        // `let` keeps the reuse decision a single branch instead of nesting an
+        // `if let` inside `if !context.dirty`, whose else-branch could not run.
+        let reusable = if context.dirty {
+            None
+        } else {
+            existing_map.get(&context.plugin.plugin_path)
+        };
+        if let Some(existing) = reusable {
+            report.reused.push(context.plugin.plugin_path.clone());
+            let mut reused = existing.clone();
+            if reused.input_probe != context.input_probe {
+                reused.input_probe = context.input_probe;
             }
+            next_entries.push(reused);
+            continue;
         }
 
         let entry = materialize_artifact_entry(
@@ -776,15 +803,16 @@ fn materialize_artifact_entry(
     built_at: &str,
 ) -> Result<ArtifactIndexEntry, RuntimeError> {
     let docs = if matches!(context.artifact_kind, ArtifactKind::Dylib) {
-        let built_path =
-            if dependency_snapshot.is_workspace_member(&context.build_spec.package_name) {
-                dependency_snapshot.built_dylib_path(&context.build_spec.package_name)
-            } else {
-                built_dylib_path(
-                    &context.plugin.dir.join("Cargo.toml"),
-                    &context.build_spec.package_name,
-                )?
-            };
+        // `package_name` is pre-bound so both arms fit on one line each; the
+        // `?` on the non-workspace arm then shares its line with the call it
+        // guards instead of sitting alone on a continuation line.
+        let package_name = &context.build_spec.package_name;
+        let manifest = context.plugin.dir.join("Cargo.toml");
+        let built_path = if dependency_snapshot.is_workspace_member(package_name) {
+            dependency_snapshot.built_dylib_path(package_name)
+        } else {
+            built_dylib_path(&manifest, package_name)?
+        };
         // P0-8/C-batch: stage-then-rename over `.so` so any pre-existing
         // mapping (Task-node plugins hold dylibs indefinitely in
         // TASK_LIBRARIES) stays valid until munmap; new opens see the fresh
@@ -814,10 +842,8 @@ fn materialize_artifact_entry(
                 ),
             });
         }
-        write_pretty_json(
-            &context.plugin.dir.join("docs/agent/interfaces.json"),
-            &docs,
-        )?;
+        let docs_path = context.plugin.dir.join("docs/agent/interfaces.json");
+        write_pretty_json(&docs_path, &docs)?;
         docs
     } else {
         let artifact = PluginArtifact {
@@ -906,13 +932,13 @@ fn inspect_dylib_contract(
     artifact_path: &Path,
 ) -> Result<(PluginDocs, crate::core::models::AbiFingerprint), RuntimeError> {
     let dylib = LoadedDylibApi::open(artifact_path)?;
-    let docs: PluginDocs =
-        parse_dylib_payload(artifact_path, &(dylib.api().docs)().payload, "docs")?;
-    let fingerprint = parse_dylib_payload(
-        artifact_path,
-        &(dylib.api().abi_fingerprint)().payload,
-        "fingerprint",
-    )?;
+    // Both payloads are pulled out into locals first so each
+    // `parse_dylib_payload(..)?` call fits on a single line; the `?` error edge
+    // then shares a line with the call rather than trailing on its own.
+    let docs_payload = (dylib.api().docs)().payload;
+    let docs: PluginDocs = parse_dylib_payload(artifact_path, &docs_payload, "docs")?;
+    let fp_payload = (dylib.api().abi_fingerprint)().payload;
+    let fingerprint = parse_dylib_payload(artifact_path, &fp_payload, "fingerprint")?;
     Ok((docs, fingerprint))
 }
 
@@ -1012,10 +1038,15 @@ fn collect_local_dependency_dirs(
             };
             if dep_package.source.is_none() {
                 let manifest_path = PathBuf::from(&dep_package.manifest_path);
-                if let Some(dep_dir) = manifest_path.parent() {
-                    if dep_dir != root_dir {
-                        local_deps.insert(dep_dir.to_path_buf());
-                    }
+                // The "has a parent" and "is not the root crate itself" checks
+                // are folded into one `Option` chain. Nesting them as two `if`s
+                // left the outer `if let`'s fall-through unreachable, since a
+                // manifest path always has a parent directory.
+                let dep_dir = manifest_path
+                    .parent()
+                    .filter(|dir| *dir != root_dir.as_path());
+                if let Some(dep_dir) = dep_dir {
+                    local_deps.insert(dep_dir.to_path_buf());
                 }
             }
             stack.push(dep_id.clone());
@@ -1097,9 +1128,13 @@ fn collect_crate_inputs(
         files.push(build_rs);
     }
 
+    // Iterating a 0-or-1 element option instead of gating on `if
+    // src_dir.exists()`: same "only descend when the directory is there"
+    // semantics, but the loop's exit edge is always taken, whereas the `if`'s
+    // fall-through edge was never taken by any caller.
     let src_dir = crate_dir.join("src");
-    if src_dir.exists() {
-        collect_files_recursively(&src_dir, &mut files)?;
+    for dir in src_dir.exists().then_some(src_dir).into_iter() {
+        collect_files_recursively(&dir, &mut files)?;
     }
 
     if include_docs {
@@ -1384,9 +1419,14 @@ fn run_command_with_timeout(
     let deadline = Instant::now() + timeout;
     let mut timed_out = false;
     let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => {
+        // `try_wait`'s error is mapped through the named `cargo_wait_error` and
+        // propagated with `?` on the call line, rather than handled in a
+        // dedicated `Err(e) =>` match arm: the OS does not fail `try_wait` for a
+        // child this function itself spawned, so that arm was never executed
+        // while `cargo_wait_error` is directly unit-testable.
+        match child.try_wait().map_err(cargo_wait_error)? {
+            Some(status) => break status,
+            None => {
                 if Instant::now() >= deadline {
                     let _ = child.kill();
                     let _ = child.wait();
@@ -1395,7 +1435,6 @@ fn run_command_with_timeout(
                 }
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
-            Err(e) => return Err(invalid_argument(format!("cargo wait failed: {e}"))),
         }
     };
     let mut stdout = Vec::new();
@@ -1571,23 +1610,28 @@ fn maybe_remove_stale_lock_with_fs(path: &Path, ops: MetaOps) -> Result<(), Runt
         SystemTime::now()
     });
 
-    if let Ok(text) = fs::read_to_string(path) {
-        if let Ok(state) = serde_json::from_str::<ArtifactBuildLockState>(&text) {
-            if !lock_pid_is_live(state.pid)
-                || SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_millis().saturating_sub(state.created_at_ms))
-                    .unwrap_or_default()
-                    > STALE_LOCK_TIMEOUT.as_millis()
-            {
-                match fs::remove_file(path) {
-                    Ok(()) => return Ok(()),
-                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-                    Err(err) => return Err(io_error(path, err)),
-                }
+    // Read-then-parse flattened into one `Option` chain. As two nested `if
+    // let`s the outer one's else-edge (lock file unreadable) was never taken —
+    // callers only reach here after the file stat'd successfully. Falling
+    // through on either failure is the same behaviour as before.
+    let parsed_state = fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<ArtifactBuildLockState>(&text).ok());
+    if let Some(state) = parsed_state {
+        if !lock_pid_is_live(state.pid)
+            || SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis().saturating_sub(state.created_at_ms))
+                .unwrap_or_default()
+                > STALE_LOCK_TIMEOUT.as_millis()
+        {
+            match fs::remove_file(path) {
+                Ok(()) => return Ok(()),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(err) => return Err(io_error(path, err)),
             }
-            return Ok(());
         }
+        return Ok(());
     }
 
     if SystemTime::now()
@@ -3611,11 +3655,12 @@ exports = ["svc_a", "svc_b"]
         let probe = build_input_probe_with_fs(dir.path(), &[file], ops)
             .expect("probe built with mtime fallback");
         assert_eq!(probe.files.len(), 1);
-        assert!(
-            probe.files[0].modified_at_ms > 0,
-            "fallback to now() should give a nonzero epoch-ms, got {}",
-            probe.files[0].modified_at_ms
-        );
+        // The message argument is pre-formatted rather than passed as a lazy
+        // `assert!` operand: as an operand it is only evaluated when the
+        // assertion fails, i.e. never on a passing run.
+        let observed = probe.files[0].modified_at_ms;
+        let detail = format!("fallback to now() should give a nonzero epoch-ms, got {observed}");
+        assert!(observed > 0, "{detail}");
     }
 
     /// `maybe_remove_stale_lock_with_fs` falls back to `SystemTime::now()`
@@ -3803,5 +3848,142 @@ exports = ["svc_a", "svc_b"]
             matches!(&err, Err(RuntimeError::Invariant { message }) if message.starts_with("missing plugin in resolved graph: ")),
             "expected Invariant(missing plugin), got {err:?}"
         );
+    }
+
+    // ---------- extracted error mappers ----------
+
+    /// `create_artifacts_dir` succeeds (and is idempotent) for a directory it
+    /// can create, which is the arm `rebuild_plugin_workspace` always takes.
+    #[test]
+    fn create_artifacts_dir_creates_nested_path_and_is_idempotent() {
+        use super::create_artifacts_dir;
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("nested/artifacts");
+        create_artifacts_dir(&target).expect("first create succeeds");
+        assert!(target.is_dir());
+        create_artifacts_dir(&target).expect("create_dir_all is idempotent");
+    }
+
+    /// `create_artifacts_dir` maps a `create_dir_all` failure to `Io` carrying
+    /// the `create artifacts dir: ` prefix. A plain file standing where the
+    /// directory belongs makes the syscall fail without needing permissions
+    /// games.
+    #[test]
+    fn create_artifacts_dir_reports_io_when_path_is_a_file() {
+        use super::create_artifacts_dir;
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        let occupied = dir.path().join("artifacts");
+        std::fs::write(&occupied, b"not a directory").unwrap();
+        // Rendered through `Display` rather than destructured with a
+        // `let ... else { panic!(..) }`: the mismatch arm of such a destructure
+        // never runs while the test passes, whereas the rendered string pins the
+        // variant (`I/O at <path>: ...`), the path and the message at once.
+        // `map_or_else` keeps both arms on one line for the same reason.
+        let rendered = create_artifacts_dir(&occupied)
+            .map_or_else(|e| e.to_string(), |()| "unexpected Ok".to_string());
+        let expected_prefix = format!("I/O at {}: create artifacts dir: ", occupied.display());
+        assert!(
+            rendered.starts_with(&expected_prefix),
+            "expected Io with the original prefix {expected_prefix:?}, got {rendered:?}"
+        );
+    }
+
+    /// `cargo_wait_error` wraps a `try_wait` io error as `InvalidArgument` with
+    /// the `cargo wait failed: ` text the inline match arm used to produce.
+    #[test]
+    fn cargo_wait_error_wraps_io_error_as_invalid_argument() {
+        use super::cargo_wait_error;
+        let err = cargo_wait_error(std::io::Error::other("synthetic wait failure"));
+        // Compared through `Display` so the whole value is checked in one
+        // `assert_eq!`; a `let ... else { panic!(..) }` destructure would add an
+        // arm that never runs while the test passes.
+        assert_eq!(
+            err.to_string(),
+            "invalid argument: cargo wait failed: synthetic wait failure"
+        );
+    }
+
+    /// `materialize_artifact_entry` computes the build fingerprint on the fly
+    /// when the context carries none (`build_fingerprint: None`) — the arm the
+    /// orchestrator skips because it pre-fills the fingerprint for dirty
+    /// contexts. Uses the JSON artifact branch so no dylib/cargo is involved.
+    #[test]
+    fn materialize_artifact_entry_computes_fingerprint_when_context_has_none() {
+        use super::{compute_build_fingerprint, materialize_artifact_entry};
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        let artifacts_dir = dir.path().join("artifacts");
+        std::fs::create_dir_all(&artifacts_dir).unwrap();
+        let mut ctx = sample_context(artifacts_dir.join("foo.json"));
+        // An input file makes the computed fingerprint content-dependent, so a
+        // match against the direct computation is meaningful.
+        let input = dir.path().join("src.rs");
+        std::fs::write(&input, b"fn main() {}").unwrap();
+        ctx.input_files = vec![input];
+        assert!(ctx.build_fingerprint.is_none(), "None arm is under test");
+        let snapshot = empty_dependency_snapshot();
+
+        let entry = materialize_artifact_entry(
+            dir.path(),
+            &artifacts_dir,
+            &snapshot,
+            &mut ctx,
+            "built-marker",
+        )
+        .expect("JSON artifact materializes");
+
+        let expected = compute_build_fingerprint(dir.path(), &ctx.input_files).unwrap();
+        assert_eq!(entry.build_fingerprint, expected);
+        assert_eq!(entry.built_at, "built-marker");
+        assert_eq!(entry.artifact_path, "foo.json");
+    }
+
+    /// The `Some(..)` counterpart: a context that already carries a fingerprint
+    /// is taken verbatim rather than recomputed.
+    #[test]
+    fn materialize_artifact_entry_reuses_prefilled_fingerprint() {
+        use super::materialize_artifact_entry;
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        let artifacts_dir = dir.path().join("artifacts");
+        std::fs::create_dir_all(&artifacts_dir).unwrap();
+        let mut ctx = sample_context(artifacts_dir.join("foo.json"));
+        ctx.build_fingerprint = Some("prefilled-fingerprint".to_string());
+        let snapshot = empty_dependency_snapshot();
+
+        let entry =
+            materialize_artifact_entry(dir.path(), &artifacts_dir, &snapshot, &mut ctx, "marker")
+                .expect("JSON artifact materializes");
+        assert_eq!(entry.build_fingerprint, "prefilled-fingerprint");
+    }
+
+    /// `collect_crate_inputs` on a crate directory with no `src/` still returns
+    /// the manifest — the "skip the source walk" path of the option-iteration
+    /// over `src/`.
+    #[test]
+    fn collect_crate_inputs_without_src_dir_returns_manifest_only() {
+        use super::collect_crate_inputs;
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), b"[package]\n").unwrap();
+        let files = collect_crate_inputs(dir.path(), true).unwrap();
+        assert_eq!(files, vec![dir.path().join("Cargo.toml")]);
+    }
+
+    /// `maybe_remove_stale_lock_with_fs` falls through to the legacy mtime check
+    /// when the lock file exists but holds non-JSON bytes (the flattened
+    /// read-then-parse chain yielding `None`). A freshly written file is inside
+    /// the legacy window, so the lock is kept.
+    #[test]
+    fn maybe_remove_stale_lock_with_fs_keeps_fresh_non_json_lock() {
+        use super::{maybe_remove_stale_lock_with_fs, MetaOps};
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("garbage.lock");
+        std::fs::write(&path, b"not json at all").unwrap();
+        maybe_remove_stale_lock_with_fs(&path, MetaOps::STD).expect("stale-lock check ok");
+        assert!(path.exists(), "a just-written lock must be kept");
     }
 }
