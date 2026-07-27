@@ -284,6 +284,248 @@ fn reload_abi_fingerprint_mismatch_error(
     }
 }
 
+/// Log the per-session outcome of the post-reload notice injection.
+///
+/// Extracted from the loop in `notify_sessions_of_reload` so the failure arm is
+/// unit-testable: the loop iterates over session ids read from the live session
+/// map, and `agent_inject` only fails when the id is absent, so a session would
+/// have to be dropped between the id snapshot and the injection for the `Err`
+/// arm to fire in production.
+fn log_session_reload_notify_outcome(session_id: &str, outcome: Result<(), RuntimeError>) {
+    if let Err(e) = outcome {
+        eprintln!("reload: failed to notify session {session_id}: {e}");
+    }
+}
+
+/// The `PluginUnavailable` error raised by `reload_subtree` Phase 1 when a
+/// target plugin present in the live registry has no entry in the artifact
+/// index. `required: false` because the reload is refusing to swap this plugin,
+/// not declaring the runtime unbootable.
+///
+/// Extracted from the `ok_or_else` closure inside `reload_subtree` so the
+/// constructed error is unit-testable: reaching it through `reload_subtree`
+/// needs an index that loads successfully yet omits a plugin the previous
+/// snapshot loaded from that same index.
+fn reload_artifact_missing_error(plugin_path: &str) -> RuntimeError {
+    RuntimeError::PluginUnavailable {
+        plugin_path: plugin_path.to_string(),
+        reason: PluginUnavailableReason::ArtifactMissing,
+        required: false,
+    }
+}
+
+/// The `Invariant` error raised when a candidate dylib's `docs` payload is not
+/// parseable as [`PluginDocs`]. Extracted so the message is unit-testable — a
+/// dylib built with the SDK's `export_plugin_api!` always serializes valid
+/// docs, so this arm is unreachable through a well-formed artifact.
+fn reload_docs_parse_error(plugin_path: &str, err: &serde_json::Error) -> RuntimeError {
+    host_invariant(format!("failed to parse docs for {plugin_path}: {err}"))
+}
+
+/// The `Invariant` error raised when a candidate dylib's `abi_fingerprint`
+/// payload is not parseable as [`AbiFingerprint`]. Same reasoning as
+/// [`reload_docs_parse_error`]: unreachable via the SDK export macro, so the
+/// message is pinned by a direct unit test instead.
+fn reload_abi_fingerprint_parse_error(plugin_path: &str, err: &serde_json::Error) -> RuntimeError {
+    host_invariant(format!(
+        "failed to parse abi_fingerprint for {plugin_path}: {err}"
+    ))
+}
+
+/// Render the payload of a caught stop-handler panic for the `reload_subtree`
+/// diagnostic line.
+///
+/// Extracted from the `catch_unwind` arm inside `reload_subtree` so all three
+/// payload shapes are directly unit-testable. Only the `&'static str` shape is
+/// reachable through the runtime's own injection point (a literal `panic!`);
+/// a plugin's stop handler compiled into a dylib can produce a formatted
+/// `String` or an arbitrary `panic_any` payload, and those two arms were
+/// otherwise unexercisable without shipping a deliberately broken artifact.
+fn reload_stop_handler_panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown".to_string()
+    }
+}
+
+/// Unit coverage for the reload-chain arms extracted out of `reload_subtree`,
+/// `notify_sessions_of_reload` and `RuntimeHost::fail_reload`, plus the
+/// `fail_reload` packaging method itself.
+///
+/// Each helper here sits on an arm that a well-formed artifact and a live
+/// session map cannot reach (unparseable SDK-serialized payloads, a `panic_any`
+/// payload from inside a plugin dylib, a session dropped mid-notify), so the
+/// error text and shape are pinned here rather than left uncovered. The
+/// reachable reload arms are covered end-to-end in
+/// `tests/host_reload_arms.rs`.
+#[cfg(test)]
+mod reload_arm_helper_tests {
+    use super::{
+        log_session_reload_notify_outcome, reload_abi_fingerprint_parse_error,
+        reload_artifact_missing_error, reload_docs_parse_error, reload_stop_handler_panic_message,
+        RuntimeHost,
+    };
+    use crate::core::error::RuntimeError;
+    use crate::core::models::PluginUnavailableReason;
+    use std::any::Any;
+    use std::time::Instant;
+
+    fn json_error() -> serde_json::Error {
+        serde_json::from_str::<serde_json::Value>("{ not json").expect_err("must not parse")
+    }
+
+    // ── reload_subtree Phase-1 error constructors ────────────────────────
+
+    #[test]
+    fn artifact_missing_error_is_non_required_unavailable() {
+        let err = reload_artifact_missing_error("expr/evaluator");
+        let expected = RuntimeError::PluginUnavailable {
+            plugin_path: "expr/evaluator".to_string(),
+            reason: PluginUnavailableReason::ArtifactMissing,
+            required: false,
+        };
+        // Full-value comparison: plugin_path, reason and the `required: false`
+        // classification are all load-bearing for the reload report.
+        assert_eq!(err.to_string(), expected.to_string());
+        let RuntimeError::PluginUnavailable {
+            plugin_path,
+            reason,
+            required,
+        } = err
+        else {
+            panic!("expected PluginUnavailable");
+        };
+        assert_eq!(plugin_path, "expr/evaluator");
+        assert_eq!(reason, PluginUnavailableReason::ArtifactMissing);
+        assert!(!required);
+    }
+
+    #[test]
+    fn docs_parse_error_names_the_plugin_and_quotes_serde() {
+        let source = json_error();
+        let err = reload_docs_parse_error("qq", &source);
+        let expected = format!("failed to parse docs for qq: {source}");
+        let RuntimeError::Invariant { message } = err else {
+            panic!("expected Invariant");
+        };
+        assert_eq!(message, expected);
+    }
+
+    #[test]
+    fn abi_fingerprint_parse_error_names_the_plugin_and_quotes_serde() {
+        let source = json_error();
+        let err = reload_abi_fingerprint_parse_error("feishu", &source);
+        let expected = format!("failed to parse abi_fingerprint for feishu: {source}");
+        let RuntimeError::Invariant { message } = err else {
+            panic!("expected Invariant");
+        };
+        assert_eq!(message, expected);
+    }
+
+    // ── stop-handler panic payload rendering ─────────────────────────────
+
+    // A literal `panic!("...")` yields a `&'static str` payload — the shape the
+    // runtime's own injection point produces.
+    #[test]
+    fn stop_handler_panic_message_reads_static_str_payload() {
+        let payload: Box<dyn Any + Send> = Box::new("literal boom");
+        assert_eq!(
+            reload_stop_handler_panic_message(payload.as_ref()),
+            "literal boom"
+        );
+    }
+
+    // A formatted `panic!("{}", x)` yields an owned `String` payload.
+    #[test]
+    fn stop_handler_panic_message_reads_owned_string_payload() {
+        let payload: Box<dyn Any + Send> = Box::new(String::from("formatted boom"));
+        assert_eq!(
+            reload_stop_handler_panic_message(payload.as_ref()),
+            "formatted boom"
+        );
+    }
+
+    // `panic_any(v)` with a non-string `v` falls through to the placeholder
+    // instead of panicking inside the diagnostic itself.
+    #[test]
+    fn stop_handler_panic_message_falls_back_for_non_string_payload() {
+        let payload: Box<dyn Any + Send> = Box::new(42u32);
+        assert_eq!(
+            reload_stop_handler_panic_message(payload.as_ref()),
+            "unknown"
+        );
+    }
+
+    // The rendering is reached through a real `catch_unwind` of a `panic_any`,
+    // matching how `reload_subtree` calls it.
+    #[test]
+    fn stop_handler_panic_message_renders_a_caught_panic_any() {
+        let caught = std::panic::catch_unwind(|| {
+            std::panic::panic_any(7i64);
+        })
+        .expect_err("panic_any must unwind");
+        assert_eq!(
+            reload_stop_handler_panic_message(caught.as_ref()),
+            "unknown"
+        );
+    }
+
+    // ── notify_sessions_of_reload per-session outcome ─────────────────────
+
+    // The Ok arm is a no-op; the Err arm logs. Both are total, so the assertion
+    // is that neither panics for either outcome.
+    #[test]
+    fn session_notify_outcome_logging_handles_both_arms() {
+        log_session_reload_notify_outcome("sid-ok", Ok(()));
+        log_session_reload_notify_outcome(
+            "sid-gone",
+            Err(RuntimeError::AgentSessionNotFound {
+                session_id: "sid-gone".to_string(),
+            }),
+        );
+    }
+
+    // ── RuntimeHost::fail_reload packaging ───────────────────────────────
+
+    /// `fail_reload` pairs the error with a Failed attempt whose
+    /// `failure_summary` is the error text and whose `to_snapshot_id` is unset.
+    /// Called directly because every `reload_subtree` call site that reaches it
+    /// needs a distinct artifact fault to synthesize.
+    #[test]
+    fn fail_reload_packages_error_with_failed_attempt() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let fixtures = temp.path().join("fixtures");
+        let artifacts = fixtures.join("artifacts");
+        std::fs::create_dir_all(&artifacts).expect("create artifacts dir");
+        std::fs::write(
+            artifacts.join("index.json"),
+            r#"{"schema_version":2,"generated_at":"2026-07-24T00:00:00Z","topo_order":[],"entries":[]}"#,
+        )
+        .expect("write empty index");
+        let host = RuntimeHost::boot(&fixtures).expect("boot on empty index");
+
+        let snapshot = host.current_snapshot();
+        let err = RuntimeError::Invariant {
+            message: "synthetic reload fault".to_string(),
+        };
+        let rendered = err.to_string();
+        let (returned, attempt) = host.fail_reload(&snapshot, Instant::now(), err);
+
+        // The error is handed back unchanged, and the attempt's summary is
+        // exactly its rendered form.
+        assert_eq!(returned.to_string(), rendered);
+        assert_eq!(attempt.status, super::ReloadAttemptStatus::Failed);
+        assert_eq!(attempt.from_snapshot_id, snapshot.snapshot_id());
+        assert_eq!(attempt.to_snapshot_id, None);
+        assert_eq!(attempt.failure_summary, Some(rendered));
+        assert_eq!(attempt.plugin_count, None);
+        assert!(attempt.changed_plugins.is_empty());
+    }
+}
+
 /// Coverage for the execute-path trace constructors and the `reload_subtree`
 /// Phase-1 AbiMismatch report builders extracted above, plus the cheap
 /// `pub(crate)` session-map accessors. Kept in a dedicated module (pre-`impl`
@@ -3223,36 +3465,32 @@ export_plugin_api! {{
             // catch_unwind so a broken stop handler cannot crash the whole
             // reload path.
             let snapshot = self.current_snapshot();
-            for fqn in snapshot.node_registry().task_node_fqns() {
-                if fqn.starts_with(&format!("{}::", plugin_path)) {
-                    let parts: Vec<&str> = fqn.splitn(2, "::").collect();
-                    if parts.len() == 2 {
-                        let payload = serde_json::json!({"action": "stop"}).to_string();
-                        let plugin_id = parts[0].to_string();
-                        let node_id = parts[1].to_string();
-                        let this = self;
-                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            #[cfg(test)]
-                            if TEST_STOP_HANDLER_PANIC_INJECTION
-                                .swap(false, std::sync::atomic::Ordering::SeqCst)
-                            {
-                                panic!("test panic injection: stop handler");
-                            }
-                            let _ = this.invoke(&plugin_id, &node_id, payload);
-                        }));
-                        if let Err(err) = result {
-                            let msg = if let Some(s) = err.downcast_ref::<&'static str>() {
-                                (*s).to_string()
-                            } else if let Some(s) = err.downcast_ref::<String>() {
-                                s.clone()
-                            } else {
-                                "unknown".to_string()
-                            };
-                            eprintln!(
-                                "[reload] stop handler for {plugin_id}::{node_id} panicked: {msg}"
-                            );
-                        }
+            let node_prefix = format!("{}::", plugin_path);
+            let task_fqns = snapshot.node_registry().task_node_fqns();
+            // The prefix match and the `plugin_id::node_id` split are both
+            // expressed as iterator adapters rather than nested `if`s: every
+            // fqn that reaches the body is a Task node of this plugin and is
+            // guaranteed to carry a `::`, so there is no gate whose untaken
+            // side is structurally unreachable.
+            for (plugin_id, node_id) in task_fqns
+                .iter()
+                .filter(|fqn| fqn.starts_with(&node_prefix))
+                .filter_map(|fqn| fqn.split_once("::"))
+            {
+                let payload = serde_json::json!({"action": "stop"}).to_string();
+                let this = self;
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    #[cfg(test)]
+                    if TEST_STOP_HANDLER_PANIC_INJECTION
+                        .swap(false, std::sync::atomic::Ordering::SeqCst)
+                    {
+                        panic!("test panic injection: stop handler");
                     }
+                    let _ = this.invoke(plugin_id, node_id, payload);
+                }));
+                if let Err(err) = result {
+                    let msg = reload_stop_handler_panic_message(err.as_ref());
+                    eprintln!("[reload] stop handler for {plugin_id}::{node_id} panicked: {msg}");
                 }
             }
             // P0-16: drop the keep-alive dylib handle for this plugin path
@@ -3281,14 +3519,10 @@ export_plugin_api! {{
         let mut prepared: Vec<Prepared> = Vec::new();
 
         for plugin_path in &targets {
-            let missing = || RuntimeError::PluginUnavailable {
-                plugin_path: plugin_path.clone(),
-                reason: PluginUnavailableReason::ArtifactMissing,
-                required: false,
-            };
-            let entry = index_map
-                .get(plugin_path)
-                .ok_or_else(|| self.fail_reload(&previous_snapshot, started_at, missing()))?;
+            let entry = index_map.get(plugin_path).ok_or_else(|| {
+                let err = reload_artifact_missing_error(plugin_path);
+                self.fail_reload(&previous_snapshot, started_at, err)
+            })?;
 
             let resolved =
                 crate::plugin::artifact::resolve_artifact_path(&index_path, &entry.artifact_path);
@@ -3300,7 +3534,7 @@ export_plugin_api! {{
 
             // Strict docs comparison.
             let new_docs: PluginDocs = serde_json::from_str(&(api.docs)().payload)
-                .map_err(|e| host_invariant(format!("failed to parse docs for {plugin_path}: {e}")))
+                .map_err(|e| reload_docs_parse_error(plugin_path, &e))
                 .map_err(|err| self.fail_reload(&previous_snapshot, started_at, err))?;
             if new_docs.nodes != entry.docs.nodes {
                 let err = reload_docs_mismatch_error(
@@ -3316,11 +3550,7 @@ export_plugin_api! {{
             // Strict ABI fingerprint comparison.
             let actual_fingerprint: AbiFingerprint =
                 serde_json::from_str(&(api.abi_fingerprint)().payload)
-                    .map_err(|e| {
-                        host_invariant(format!(
-                            "failed to parse abi_fingerprint for {plugin_path}: {e}"
-                        ))
-                    })
+                    .map_err(|e| reload_abi_fingerprint_parse_error(plugin_path, &e))
                     .map_err(|err| self.fail_reload(&previous_snapshot, started_at, err))?;
             if actual_fingerprint.crate_hash != entry.abi_fingerprint.crate_hash
                 || actual_fingerprint.api_hash != entry.abi_fingerprint.api_hash
@@ -3447,9 +3677,8 @@ export_plugin_api! {{
                 .collect()
         };
         for sid in &sids {
-            if let Err(e) = self.agent_inject(sid, &notice, "Acknowledged.") {
-                eprintln!("reload: failed to notify session {sid}: {e}");
-            }
+            let outcome = self.agent_inject(sid, &notice, "Acknowledged.");
+            log_session_reload_notify_outcome(sid, outcome);
         }
     }
 
@@ -4413,25 +4642,21 @@ export_plugin_api! {{
             .iter()
             .map(|(path, _)| path)
             .collect();
-        for plugin_path in &previous_plugins {
-            if !next_plugins.contains(plugin_path) {
-                // Plugin removed — stop its services.
-                self.service_registry.stop_plugin_services(plugin_path);
-            }
+        // Plugins the new snapshot dropped — stop their services.
+        for plugin_path in previous_plugins.difference(&next_plugins) {
+            self.service_registry.stop_plugin_services(plugin_path);
         }
         // Also stop services for plugins whose docs changed (the new snapshot
         // may have different Task nodes).
-        for plugin_path in &next_plugins {
-            if previous_plugins.contains(plugin_path) {
-                let prev_plugin = previous_snapshot.plugin_registry().get(plugin_path);
-                let next_plugin = next_snapshot.plugin_registry().get(plugin_path);
-                let prev_docs = prev_plugin.as_ref().and_then(|p| p.docs.as_ref());
-                let next_docs = next_plugin.as_ref().and_then(|p| p.docs.as_ref());
-                // Compare docs by JSON representation — if they differ, restart
-                // services so the new plugin version's services are used.
-                if prev_docs != next_docs {
-                    self.service_registry.stop_plugin_services(plugin_path);
-                }
+        for plugin_path in next_plugins.intersection(&previous_plugins) {
+            let prev_plugin = previous_snapshot.plugin_registry().get(plugin_path);
+            let next_plugin = next_snapshot.plugin_registry().get(plugin_path);
+            let prev_docs = prev_plugin.as_ref().and_then(|p| p.docs.as_ref());
+            let next_docs = next_plugin.as_ref().and_then(|p| p.docs.as_ref());
+            // Compare docs by JSON representation — if they differ, restart
+            // services so the new plugin version's services are used.
+            if prev_docs != next_docs {
+                self.service_registry.stop_plugin_services(plugin_path);
             }
         }
 
