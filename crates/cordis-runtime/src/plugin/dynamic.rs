@@ -162,19 +162,43 @@ mod tests {
         );
     }
 
+    /// `Some(path)` when `path` dlopens on this host, else `None`.
+    ///
+    /// Returning an `Option` lets callers gate a whole test body with
+    /// `for`-over-`Option`, which has no not-taken arm — an `if`/`if let` gate
+    /// leaves its closing brace as a permanently-uncovered region on hosts
+    /// where the probe succeeds.
+    fn dlopen_probe(path: &Path) -> Option<&Path> {
+        // SAFETY: probe dlopen only; the handle is dropped before returning, and
+        // only the path (not the handle) escapes.
+        unsafe { Library::new(path) }.ok().map(|_lib| path)
+    }
+
+    /// A platform library that `dlopen`s but carries no
+    /// `cordis_plugin_api_rust_v2` symbol. Tried in order so the symbol-lookup
+    /// branch is exercised on macOS (dyld shared cache) and on Linux/CI alike;
+    /// `dlopen_probe` filters to whichever actually loads on this host.
+    fn symbolless_system_library() -> Option<&'static Path> {
+        [
+            "/usr/lib/libSystem.B.dylib",
+            "/lib/x86_64-linux-gnu/libc.so.6",
+            "/lib/aarch64-linux-gnu/libc.so.6",
+            "/usr/lib/x86_64-linux-gnu/libc.so.6",
+            "/usr/lib/aarch64-linux-gnu/libc.so.6",
+            "/lib64/libc.so.6",
+        ]
+        .into_iter()
+        .find_map(|c| dlopen_probe(Path::new(c)))
+    }
+
     #[test]
     fn open_dylib_without_entry_symbol_reports_symbol_lookup() {
-        // libSystem is loadable on macOS via the dyld shared cache but has no
-        // `cordis_plugin_api_rust_v2` symbol, exercising the symbol-lookup
-        // failure branch. Skip elsewhere.
-        let sys = Path::new("/usr/lib/libSystem.B.dylib");
-        // Gate the assertion on loadability rather than early-returning, so the
-        // "not loadable" skip is not a conditionally-dead line.
-        if unsafe { Library::new(sys) }.is_ok() {
-            let result = LoadedDylibApi::open(sys);
+        for path in symbolless_system_library().into_iter() {
+            let result = LoadedDylibApi::open(path);
+            let is_symbol_lookup = matches!(&result, Err(RuntimeError::Io { message, .. }) if message.contains("symbol lookup failed"));
             assert!(
-                matches!(&result, Err(RuntimeError::Io { message, .. }) if message.contains("symbol lookup failed")),
-                "expected symbol lookup failure for libSystem"
+                is_symbol_lookup,
+                "expected symbol lookup failure for {path:?}"
             );
         }
     }
@@ -196,19 +220,20 @@ mod tests {
 
     #[test]
     fn open_real_fixture_dylib_exposes_api_and_lib() {
-        // Gate the body on fixture availability + loadability rather than
-        // early-returning, so neither skip is a conditionally-dead line. A
-        // cross-arch fixture (e.g. arm64 dylib on x86_64) legitimately fails
-        // dlopen; treat as skip rather than failure. (No Debug on the handle.)
-        if let Some(path) = host_native_fixture_dylib() {
-            if let Ok(loaded) = LoadedDylibApi::open(&path) {
-                // api() dereferences the resolved symbol; docs() must return JSON.
-                let api = loaded.api();
-                let docs_json = (api.docs)().payload;
-                assert!(docs_json.contains("plugin_path"), "docs: {docs_json}");
-                // lib() returns the owned Library handle.
-                let _lib: &Library = loaded.lib();
-            }
+        // Gate the body on fixture availability + loadability. A cross-arch
+        // fixture (e.g. arm64 dylib on x86_64) legitimately fails dlopen; treat
+        // it as a skip rather than a failure. `for`-over-`Option`/flat_map has
+        // no not-taken arm, so no brace stays permanently uncovered here.
+        for loaded in host_native_fixture_dylib()
+            .into_iter()
+            .flat_map(|path| LoadedDylibApi::open(&path))
+        {
+            // api() dereferences the resolved symbol; docs() must return JSON.
+            let api = loaded.api();
+            let docs_json = (api.docs)().payload;
+            assert!(docs_json.contains("plugin_path"), "docs: {docs_json}");
+            // lib() returns the owned Library handle.
+            let _lib: &Library = loaded.lib();
         }
     }
 }

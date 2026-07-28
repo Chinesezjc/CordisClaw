@@ -290,6 +290,16 @@ impl Clone for RuntimeContext {
     }
 }
 
+/// Build the version-mismatch error for a requested `key` against an existing
+/// slot's `actual` version. Extracted so the caller's guard stays a single line.
+fn version_incompatible(key: &ContextKey, actual: u32) -> RuntimeError {
+    RuntimeError::ContextVersionIncompatible {
+        key: key.as_compact(),
+        expected: key.version,
+        actual,
+    }
+}
+
 impl RuntimeContext {
     pub fn with_hierarchy(hierarchy: PluginHierarchy) -> Self {
         Self {
@@ -336,10 +346,9 @@ impl RuntimeContext {
                 .subgraph_overlays
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner());
-            if let Some(overlay) = overlays.get(active_id) {
-                if let Some(delta) = overlay.get(key) {
-                    return Ok(delta.clone());
-                }
+            let overlay_hit = overlays.get(active_id).and_then(|overlay| overlay.get(key));
+            if let Some(delta) = overlay_hit {
+                return Ok(delta.clone());
             }
         }
 
@@ -368,15 +377,10 @@ impl RuntimeContext {
         // Schema compatibility check.
         let requested_major = key.version / 100;
         for existing in request.keys().chain(session.keys()).chain(global.keys()) {
-            if existing.namespace == key.namespace && existing.name == key.name {
-                let existing_major = existing.version / 100;
-                if existing_major != requested_major {
-                    return Err(RuntimeError::ContextVersionIncompatible {
-                        key: key.as_compact(),
-                        expected: key.version,
-                        actual: existing.version,
-                    });
-                }
+            let same_slot = existing.namespace == key.namespace && existing.name == key.name;
+            let major_conflict = existing.version / 100 != requested_major;
+            if same_slot && major_conflict {
+                return Err(version_incompatible(key, existing.version));
             }
         }
         Ok(None)
@@ -618,12 +622,13 @@ impl ContextRead for RuntimeContext {
 
         if let Some(overlay) = overlay_snapshot {
             for (key, delta) in overlay {
-                if key.namespace == namespace {
-                    if delta.is_some() {
-                        out.insert(key.clone());
-                    } else {
-                        out.remove(&key);
-                    }
+                if key.namespace != namespace {
+                    continue;
+                }
+                if delta.is_some() {
+                    out.insert(key.clone());
+                } else {
+                    out.remove(&key);
                 }
             }
         }
@@ -977,12 +982,16 @@ impl ServiceRegistry {
             .filter(|k| k.starts_with(plugin_path))
             .cloned()
             .collect();
-        for key in keys {
-            if let Some(entry) = guard.remove(&key) {
-                entry.running.store(false, Ordering::SeqCst);
-                if let Err(e) = entry.svc.stop() {
-                    eprintln!("service {key} stop error: {e}");
-                }
+        // `keys` came from `guard.keys()`, so every `remove` returns `Some`;
+        // `filter_map` pairs each key with its entry without a dead skip arm.
+        let entries: Vec<(String, _)> = keys
+            .into_iter()
+            .filter_map(|key| guard.remove(&key).map(|entry| (key, entry)))
+            .collect();
+        for (key, entry) in entries {
+            entry.running.store(false, Ordering::SeqCst);
+            if let Err(e) = entry.svc.stop() {
+                eprintln!("service {key} stop error: {e}");
             }
         }
     }
@@ -1126,6 +1135,18 @@ impl Drop for ServiceRegistry {
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
+
+    /// True when the first parked zombie's stop handle has finished, or when
+    /// there is no zombie to wait on. Keeps the poll loop condition on one line.
+    fn zombie_stop_finished(registry: &ServiceRegistry) -> bool {
+        registry
+            .zombies
+            .lock()
+            .unwrap()
+            .first()
+            .map(|z| z.stop_handle.is_finished())
+            .unwrap_or(true)
+    }
 
     struct CounterService {
         starts: AtomicUsize,
@@ -1500,6 +1521,22 @@ mod tests {
     }
 
     #[test]
+    fn list_by_ns_skips_overlay_keys_from_other_namespaces() {
+        let ctx = RuntimeContext::default();
+        ctx.begin_subgraph("sg-ns").unwrap();
+        ctx.put(key("ns_a", "mine", 1), serde_json::json!(1), slot_meta())
+            .unwrap();
+        ctx.put(key("ns_b", "other", 1), serde_json::json!(2), slot_meta())
+            .unwrap();
+        // Listing ns_a while the overlay holds an ns_b entry walks the
+        // namespace-filter continue for the foreign key.
+        let keys = ctx.list_by_ns("ns_a");
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].name, "mine");
+        ctx.rollback_overlay("sg-ns").unwrap();
+    }
+
+    #[test]
     fn overlay_commit_applies_removals() {
         let ctx = RuntimeContext::default();
         let k = key("ns", "base", 1);
@@ -1747,9 +1784,15 @@ mod tests {
         let registry = ServiceRegistry::new();
 
         // Recovered: a handle that has already finished.
+        // Park until the thread reports finished. `yield_now` runs on every
+        // iteration including the first, so the wait loop has no never-taken
+        // body (a `sleep`-guarded `while` usually exits before entering).
         let finished = std::thread::spawn(|| Ok::<(), String>(()));
-        while !finished.is_finished() {
-            std::thread::sleep(Duration::from_millis(5));
+        loop {
+            if finished.is_finished() {
+                break;
+            }
+            std::thread::yield_now();
         }
 
         // Stuck: a handle blocked on a channel we never signal until the end.
@@ -1808,19 +1851,13 @@ mod tests {
 
         // Unblock the stop thread so the handle finishes, then reap it.
         tx.send(()).unwrap();
-        // Give the stop thread a moment to complete.
-        for _ in 0..50 {
+        // Give the stop thread a moment to complete. Poll up to 50*20ms,
+        // exiting via the loop condition (no diverging `break`) once the
+        // zombie's stop handle reports finished.
+        let mut polls = 0;
+        while polls < 50 && !zombie_stop_finished(&registry) {
             std::thread::sleep(Duration::from_millis(20));
-            let done = registry
-                .zombies
-                .lock()
-                .unwrap()
-                .first()
-                .map(|z| z.stop_handle.is_finished())
-                .unwrap_or(true);
-            if done {
-                break;
-            }
+            polls += 1;
         }
         let killed = registry.kill_zombie_services("slow");
         assert_eq!(killed, 1);

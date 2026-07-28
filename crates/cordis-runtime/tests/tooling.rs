@@ -474,7 +474,17 @@ fn sync_plugin_docs_errors_when_docs_dir_cannot_be_created() {
     fs::set_permissions(&plugins, fs::Permissions::from_mode(0o555)).unwrap();
     let err = sync_plugin_docs(temp.path());
     fs::set_permissions(&plugins, fs::Permissions::from_mode(0o755)).unwrap();
-    assert!(matches!(err, Err(RuntimeError::Io { .. })), "err: {err:?}");
+    // Root ignores the read-only mode bits, so the sync succeeds there. Compare
+    // a computed expectation instead of branching: a per-euid `if/else` would
+    // leave whichever arm this host does not take permanently uncovered.
+    // SAFETY: `geteuid` is always safe to call and cannot fail.
+    let enforced = (unsafe { libc::geteuid() }) != 0;
+    let denied = matches!(err, Err(RuntimeError::Io { .. }));
+    assert_eq!(
+        denied, enforced,
+        "a read-only plugins/ must deny the sync only when mode bits bind \
+         (euid_enforced={enforced}): {err:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------

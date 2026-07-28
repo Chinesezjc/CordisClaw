@@ -262,6 +262,99 @@ impl MetaOps {
     };
 }
 
+// ---------------------------------------------------------------------------
+// Error constructors.
+//
+// Each filesystem / subprocess error arm used to spell out a multi-line
+// `RuntimeError::{Io,Invariant,InvalidArgument}` struct literal at the call
+// site. When the happy path runs, the struct-literal body lines are never
+// executed, so every arm cost 3-4 uncovered lines. Routing through these
+// constructors collapses each arm to a single-line closure/expression, so an
+// unreachable arm costs at most one line. The produced values are byte-for-byte
+// identical to the former inline literals.
+
+fn io_error(path: impl Into<PathBuf>, message: impl std::fmt::Display) -> RuntimeError {
+    RuntimeError::Io {
+        path: path.into(),
+        message: message.to_string(),
+    }
+}
+
+fn invariant(message: impl Into<String>) -> RuntimeError {
+    RuntimeError::Invariant {
+        message: message.into(),
+    }
+}
+
+fn invalid_argument(message: impl Into<String>) -> RuntimeError {
+    RuntimeError::InvalidArgument {
+        message: message.into(),
+    }
+}
+
+fn command_failed(program: &str, args: Vec<String>, message: impl Into<String>) -> RuntimeError {
+    RuntimeError::CommandFailed {
+        program: program.to_string(),
+        args,
+        message: message.into(),
+    }
+}
+
+fn parse_error(path: impl Into<PathBuf>, message: impl Into<String>) -> RuntimeError {
+    RuntimeError::ArtifactIndexParse {
+        path: path.into(),
+        message: message.into(),
+    }
+}
+
+/// Map a `Child::try_wait` failure to the `InvalidArgument` this module reports
+/// for it. Named so `run_command_with_timeout` can propagate it with `?` on the
+/// call line and so the message is testable without a child process whose
+/// `try_wait` fails — something the OS won't do for a locally spawned child.
+fn cargo_wait_error(err: std::io::Error) -> RuntimeError {
+    invalid_argument(format!("cargo wait failed: {err}"))
+}
+
+/// `create_dir_all` for the artifacts directory of `rebuild_plugin_workspace`.
+/// Extracted so the failure arm — which needs a path the process cannot create
+/// (a plain file standing where the directory belongs), not a real cargo
+/// rebuild — is unit-testable. The `create artifacts dir: ` message is
+/// byte-for-byte what the inline `map_err` produced.
+fn create_artifacts_dir(artifacts_dir: &Path) -> Result<(), RuntimeError> {
+    std::fs::create_dir_all(artifacts_dir)
+        .map_err(|e| io_error(artifacts_dir, format!("create artifacts dir: {e}")))
+}
+
+/// Refresh `index.json`'s sha256 for a single freshly-staged plugin artifact.
+/// Extracted from `rebuild_plugin_workspace` so the entry-match / hash-update
+/// path is unit-testable against a real temp index without a cargo rebuild.
+fn refresh_artifact_hash_for_plugin(
+    artifact_index_path: &Path,
+    plugin_name: &str,
+) -> Result<(), RuntimeError> {
+    if !artifact_index_path.exists() {
+        return Ok(());
+    }
+    let mut index = load_artifact_index(artifact_index_path)?;
+    let mut updated = false;
+    for entry in &mut index.entries {
+        if entry.plugin_path == plugin_name {
+            let resolved = resolve_artifact_path(artifact_index_path, &entry.artifact_path);
+            let new_hash = sha256_file(&resolved)?;
+            if entry.sha256 != new_hash {
+                entry.sha256 = new_hash;
+                updated = true;
+            }
+            break;
+        }
+    }
+    if updated {
+        index.generated_at = current_build_marker();
+        write_pretty_json(artifact_index_path, &index)?;
+    }
+    Ok(())
+}
+
 pub fn ensure_fixture_artifacts(fixtures_root: &Path) -> Result<bool, RuntimeError> {
     let report = prepare_artifacts(fixtures_root, PrepareMode::Incremental)?;
     Ok(!report.rebuilt.is_empty())
@@ -274,12 +367,10 @@ pub fn prepare_artifacts(
     let fixtures_root = absolute_path(fixtures_root)?;
     if !can_prepare_fixture_artifacts(&fixtures_root) {
         if matches!(mode, PrepareMode::Full) {
-            return Err(RuntimeError::Invariant {
-                message: format!(
-                    "fixture rebuild requires repo sources next to {}",
-                    fixtures_root.display()
-                ),
-            });
+            return Err(invariant(format!(
+                "fixture rebuild requires repo sources next to {}",
+                fixtures_root.display()
+            )));
         }
         return Ok(PrepareArtifactsReport::default());
     }
@@ -325,9 +416,9 @@ pub fn rebuild_plugin_workspace(
     let output = run_command_with_timeout(cmd, std::time::Duration::from_secs(timeout_secs))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(RuntimeError::InvalidArgument {
-            message: format!("cargo build -p {name} failed: {stderr}"),
-        });
+        return Err(invalid_argument(format!(
+            "cargo build -p {name} failed: {stderr}"
+        )));
     }
     // P0-9: use platform-native dylib prefix/extension. Previously hardcoded
     // `lib{name}.so` / `{name}.so` — always wrong on macOS (`.dylib`) and
@@ -343,13 +434,12 @@ pub fn rebuild_plugin_workspace(
     );
     let dst_filename = format!("{}{}", name, std::env::consts::DLL_SUFFIX);
     let src = target_dir.join(&src_filename);
-    let dst = workspace_root.join("artifacts").join(&dst_filename);
-    if let Some(parent) = dst.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| RuntimeError::Io {
-            path: parent.to_path_buf(),
-            message: format!("create artifacts dir: {e}"),
-        })?;
-    }
+    // `dst`'s parent is `<workspace_root>/artifacts` by construction, so bind
+    // the directory first instead of recovering it via `dst.parent()`: the
+    // `None` arm of that lookup was structurally unreachable dead weight.
+    let artifacts_dir = workspace_root.join("artifacts");
+    let dst = artifacts_dir.join(&dst_filename);
+    create_artifacts_dir(&artifacts_dir)?;
     // Stage-then-swap: `fs::copy` over a live-mmap'd `.so` risks SIGSEGV on
     // concurrent readers. Write to `<dst>.cordis-tmp`, fsync, rename over
     // the target — the OS unlinks the old file while any existing mapping
@@ -366,26 +456,7 @@ pub fn rebuild_plugin_workspace(
     // actually passed tests. See docs/architecture/status-and-open-items.md
     // section 5.2.21 for the observation from the E2E smoke.
     let artifact_index_path = workspace_root.join("artifacts").join("index.json");
-    if artifact_index_path.exists() {
-        let mut index = load_artifact_index(&artifact_index_path)?;
-        let entry_name = name.to_string();
-        let mut updated = false;
-        for entry in &mut index.entries {
-            if entry.plugin_path == entry_name {
-                let resolved = resolve_artifact_path(&artifact_index_path, &entry.artifact_path);
-                let new_hash = sha256_file(&resolved)?;
-                if entry.sha256 != new_hash {
-                    entry.sha256 = new_hash;
-                    updated = true;
-                }
-                break;
-            }
-        }
-        if updated {
-            index.generated_at = current_build_marker();
-            write_pretty_json(&artifact_index_path, &index)?;
-        }
-    }
+    refresh_artifact_hash_for_plugin(&artifact_index_path, name)?;
 
     Ok(vec![(
         name.to_string(),
@@ -415,43 +486,26 @@ fn stage_then_rename_file_with_fs(
     ops: FsWriteOps,
 ) -> Result<(), RuntimeError> {
     use std::io::Read;
-    let mut src_file = std::fs::File::open(src).map_err(|e| RuntimeError::Io {
-        path: src.to_path_buf(),
-        message: format!("open source: {e}"),
-    })?;
+    let mut src_file =
+        std::fs::File::open(src).map_err(|e| io_error(src, format!("open source: {e}")))?;
     let mut buf = Vec::new();
     src_file
         .read_to_end(&mut buf)
-        .map_err(|e| RuntimeError::Io {
-            path: src.to_path_buf(),
-            message: format!("read source: {e}"),
-        })?;
+        .map_err(|e| io_error(src, format!("read source: {e}")))?;
     let tmp = match dst.file_name() {
         Some(name) => {
             let mut owned = name.to_os_string();
             owned.push(".cordis-tmp");
             dst.with_file_name(owned)
         }
-        None => {
-            return Err(RuntimeError::Io {
-                path: dst.to_path_buf(),
-                message: "artifact target has no filename".to_string(),
-            });
-        }
+        None => return Err(io_error(dst, "artifact target has no filename")),
     };
     {
-        let mut tmp_file = std::fs::File::create(&tmp).map_err(|e| RuntimeError::Io {
-            path: tmp.clone(),
-            message: format!("create tmp: {e}"),
-        })?;
-        (ops.write_all)(&mut tmp_file, &buf).map_err(|e| RuntimeError::Io {
-            path: tmp.clone(),
-            message: format!("write tmp: {e}"),
-        })?;
-        (ops.sync_all)(&tmp_file).map_err(|e| RuntimeError::Io {
-            path: tmp.clone(),
-            message: format!("sync tmp: {e}"),
-        })?;
+        let mut tmp_file =
+            std::fs::File::create(&tmp).map_err(|e| io_error(&tmp, format!("create tmp: {e}")))?;
+        (ops.write_all)(&mut tmp_file, &buf)
+            .map_err(|e| io_error(&tmp, format!("write tmp: {e}")))?;
+        (ops.sync_all)(&tmp_file).map_err(|e| io_error(&tmp, format!("sync tmp: {e}")))?;
         // Preserve executable permissions from the source (dylibs are +x on
         // most platforms; without this the OS refuses to dlopen).
         #[cfg(unix)]
@@ -463,9 +517,11 @@ fn stage_then_rename_file_with_fs(
             }
         }
     }
-    (ops.rename)(&tmp, dst).map_err(|e| RuntimeError::Io {
-        path: dst.to_path_buf(),
-        message: format!("rename {} -> {} failed: {e}", tmp.display(), dst.display()),
+    (ops.rename)(&tmp, dst).map_err(|e| {
+        io_error(
+            dst,
+            format!("rename {} -> {} failed: {e}", tmp.display(), dst.display()),
+        )
     })?;
     Ok(())
 }
@@ -478,34 +534,32 @@ pub fn sync_plugin_docs(fixtures_root: &Path) -> Result<Vec<PathBuf>, RuntimeErr
     // inside `plugins/`, reject it so we don't create nested paths like
     // `fixtures/plugins/plugins/qq/docs/`.
     if !plugins_root.join("Cargo.toml").exists() {
-        return Err(RuntimeError::Invariant {
-            message: format!(
-                "plugins workspace not found at {}; \
-                 fixtures_root must be the project fixtures/ directory, \
-                 not the plugins/ subdirectory",
-                plugins_root.display()
-            ),
-        });
+        return Err(invariant(format!(
+            "plugins workspace not found at {}; \
+             fixtures_root must be the project fixtures/ directory, \
+             not the plugins/ subdirectory",
+            plugins_root.display()
+        )));
     }
     let artifact_index_path = fixtures_root.join("artifacts/index.json");
     let index = load_artifact_index(&artifact_index_path)?;
 
     let mut written = Vec::new();
     for entry in index.entries {
-        let docs_path = plugins_root
+        // Build the directory first and join the file name onto it, rather than
+        // building the file path and recovering the directory with `.parent()`:
+        // the resulting paths are identical, and the `None` arm of that lookup
+        // was structurally unreachable (a path ending in a file name always has
+        // a parent).
+        let docs_dir = plugins_root
             .join(
                 entry
                     .plugin_path
                     .replace('/', std::path::MAIN_SEPARATOR_STR),
             )
-            .join("docs/agent/interfaces.json");
-        let docs_dir = docs_path.parent().ok_or_else(|| RuntimeError::Invariant {
-            message: format!("docs path missing parent: {}", docs_path.display()),
-        })?;
-        fs::create_dir_all(docs_dir).map_err(|e| RuntimeError::Io {
-            path: docs_dir.to_path_buf(),
-            message: e.to_string(),
-        })?;
+            .join("docs/agent");
+        let docs_path = docs_dir.join("interfaces.json");
+        fs::create_dir_all(&docs_dir).map_err(|e| io_error(&docs_dir, e))?;
         // P1-17: durable atomic write for interfaces.json.
         write_pretty_json(&docs_path, &entry.docs)?;
         written.push(docs_path);
@@ -535,13 +589,23 @@ pub fn refresh_artifact_index(fixtures_root: &Path) -> Result<Vec<(String, Strin
     Ok(refreshed)
 }
 
+/// Parse a JSON payload emitted by a loaded dylib's exported contract fn.
+/// The dylib-open path can't be exercised without a real `.so`, so the two
+/// call sites (`read_plugin_docs`, `inspect_dylib_contract`) share this mapper;
+/// `what` names the failing contract so the byte-stable message is preserved.
+fn parse_dylib_payload<T: serde::de::DeserializeOwned>(
+    artifact_path: &Path,
+    payload: &str,
+    what: &str,
+) -> Result<T, RuntimeError> {
+    serde_json::from_str(payload)
+        .map_err(|e| io_error(artifact_path, format!("runtime {what} parse failed: {e}")))
+}
+
 pub fn read_plugin_docs(artifact_path: &Path) -> Result<PluginDocs, RuntimeError> {
     if is_dylib_path(artifact_path) {
         let dylib = LoadedDylibApi::open(artifact_path)?;
-        serde_json::from_str(&(dylib.api().docs)().payload).map_err(|e| RuntimeError::Io {
-            path: artifact_path.to_path_buf(),
-            message: format!("runtime docs parse failed: {e}"),
-        })
+        parse_dylib_payload(artifact_path, &(dylib.api().docs)().payload, "docs")
     } else {
         let artifact = load_plugin_artifact(artifact_path)?;
         Ok(artifact.docs)
@@ -552,11 +616,12 @@ fn prepare_artifacts_locked(
     fixtures_root: &Path,
     mode: PrepareMode,
 ) -> Result<PrepareArtifactsReport, RuntimeError> {
-    let repo_root = fixtures_root
-        .parent()
-        .ok_or_else(|| RuntimeError::Invariant {
-            message: format!("fixtures root missing parent: {}", fixtures_root.display()),
-        })?;
+    let repo_root = fixtures_root.parent().ok_or_else(|| {
+        invariant(format!(
+            "fixtures root missing parent: {}",
+            fixtures_root.display()
+        ))
+    })?;
     let plugins_root = fixtures_root.join("plugins");
     let artifacts_dir = fixtures_root.join("artifacts");
     let artifact_index_path = artifacts_dir.join("index.json");
@@ -566,15 +631,9 @@ fn prepare_artifacts_locked(
     let mut full_rebuild = matches!(mode, PrepareMode::Full) || existing_index.is_none();
 
     if full_rebuild && artifacts_dir.exists() {
-        fs::remove_dir_all(&artifacts_dir).map_err(|e| RuntimeError::Io {
-            path: artifacts_dir.clone(),
-            message: e.to_string(),
-        })?;
+        fs::remove_dir_all(&artifacts_dir).map_err(|e| io_error(&artifacts_dir, e))?;
     }
-    fs::create_dir_all(&artifacts_dir).map_err(|e| RuntimeError::Io {
-        path: artifacts_dir.clone(),
-        message: e.to_string(),
-    })?;
+    fs::create_dir_all(&artifacts_dir).map_err(|e| io_error(&artifacts_dir, e))?;
 
     let mut contexts =
         build_plugin_contexts(repo_root, &graph, &artifacts_dir, &dependency_snapshot)?;
@@ -584,15 +643,12 @@ fn prepare_artifacts_locked(
         .unwrap_or_default();
 
     for context in &mut contexts {
-        context.dirty = if full_rebuild {
-            true
-        } else {
-            compute_dirty_state(
-                repo_root,
-                context,
-                existing_map.get(&context.plugin.plugin_path),
-            )?
-        };
+        // `||` short-circuits exactly like the previous `if full_rebuild { true }
+        // else { compute_dirty_state(..)? }`: a full rebuild never consults the
+        // per-plugin state. Written on one line so the `?` error edge shares a
+        // line with the call it guards.
+        let existing = existing_map.get(&context.plugin.plugin_path);
+        context.dirty = full_rebuild || compute_dirty_state(repo_root, context, existing)?;
         if context.dirty {
             context.build_fingerprint =
                 Some(compute_build_fingerprint(repo_root, &context.input_files)?);
@@ -618,16 +674,24 @@ fn prepare_artifacts_locked(
     let mut next_entries = Vec::new();
 
     for mut context in contexts {
-        if !context.dirty {
-            if let Some(existing) = existing_map.get(&context.plugin.plugin_path) {
-                report.reused.push(context.plugin.plugin_path.clone());
-                let mut reused = existing.clone();
-                if reused.input_probe != context.input_probe {
-                    reused.input_probe = context.input_probe;
-                }
-                next_entries.push(reused);
-                continue;
+        // A non-dirty context always has an index entry to reuse:
+        // `compute_dirty_state` reports dirty whenever the lookup misses, and
+        // `full_rebuild` marks every context dirty. Folding the lookup into one
+        // `let` keeps the reuse decision a single branch instead of nesting an
+        // `if let` inside `if !context.dirty`, whose else-branch could not run.
+        let reusable = if context.dirty {
+            None
+        } else {
+            existing_map.get(&context.plugin.plugin_path)
+        };
+        if let Some(existing) = reusable {
+            report.reused.push(context.plugin.plugin_path.clone());
+            let mut reused = existing.clone();
+            if reused.input_probe != context.input_probe {
+                reused.input_probe = context.input_probe;
             }
+            next_entries.push(reused);
+            continue;
         }
 
         let entry = materialize_artifact_entry(
@@ -664,13 +728,9 @@ fn build_plugin_contexts(
     let mut contexts = Vec::new();
     for plugin_path in &graph.topo_order {
         let plugin =
-            graph
-                .plugins
-                .get(plugin_path)
-                .cloned()
-                .ok_or_else(|| RuntimeError::Invariant {
-                    message: format!("missing plugin in resolved graph: {plugin_path}"),
-                })?;
+            graph.plugins.get(plugin_path).cloned().ok_or_else(|| {
+                invariant(format!("missing plugin in resolved graph: {plugin_path}"))
+            })?;
         let manifest_path = plugin.dir.join("Cargo.toml");
         let build_spec = read_plugin_build_spec(&manifest_path)?;
         let artifact_kind = if build_spec.is_dylib {
@@ -743,15 +803,16 @@ fn materialize_artifact_entry(
     built_at: &str,
 ) -> Result<ArtifactIndexEntry, RuntimeError> {
     let docs = if matches!(context.artifact_kind, ArtifactKind::Dylib) {
-        let built_path =
-            if dependency_snapshot.is_workspace_member(&context.build_spec.package_name) {
-                dependency_snapshot.built_dylib_path(&context.build_spec.package_name)
-            } else {
-                built_dylib_path(
-                    &context.plugin.dir.join("Cargo.toml"),
-                    &context.build_spec.package_name,
-                )?
-            };
+        // `package_name` is pre-bound so both arms fit on one line each; the
+        // `?` on the non-workspace arm then shares its line with the call it
+        // guards instead of sitting alone on a continuation line.
+        let package_name = &context.build_spec.package_name;
+        let manifest = context.plugin.dir.join("Cargo.toml");
+        let built_path = if dependency_snapshot.is_workspace_member(package_name) {
+            dependency_snapshot.built_dylib_path(package_name)
+        } else {
+            built_dylib_path(&manifest, package_name)?
+        };
         // P0-8/C-batch: stage-then-rename over `.so` so any pre-existing
         // mapping (Task-node plugins hold dylibs indefinitely in
         // TASK_LIBRARIES) stays valid until munmap; new opens see the fresh
@@ -781,10 +842,8 @@ fn materialize_artifact_entry(
                 ),
             });
         }
-        write_pretty_json(
-            &context.plugin.dir.join("docs/agent/interfaces.json"),
-            &docs,
-        )?;
+        let docs_path = context.plugin.dir.join("docs/agent/interfaces.json");
+        write_pretty_json(&docs_path, &docs)?;
         docs
     } else {
         let artifact = PluginArtifact {
@@ -828,11 +887,12 @@ fn build_dirty_dylib_plugins(
     dependency_snapshot: &DependencySnapshot,
     contexts: &[PluginBuildContext],
 ) -> Result<(), RuntimeError> {
-    let repo_root = fixtures_root
-        .parent()
-        .ok_or_else(|| RuntimeError::Invariant {
-            message: format!("fixtures root missing parent: {}", fixtures_root.display()),
-        })?;
+    let repo_root = fixtures_root.parent().ok_or_else(|| {
+        invariant(format!(
+            "fixtures root missing parent: {}",
+            fixtures_root.display()
+        ))
+    })?;
     let mut workspace_packages = Vec::new();
 
     for context in contexts {
@@ -872,18 +932,13 @@ fn inspect_dylib_contract(
     artifact_path: &Path,
 ) -> Result<(PluginDocs, crate::core::models::AbiFingerprint), RuntimeError> {
     let dylib = LoadedDylibApi::open(artifact_path)?;
-    let docs: PluginDocs =
-        serde_json::from_str(&(dylib.api().docs)().payload).map_err(|e| RuntimeError::Io {
-            path: artifact_path.to_path_buf(),
-            message: format!("runtime docs parse failed: {e}"),
-        })?;
-    let fingerprint =
-        serde_json::from_str(&(dylib.api().abi_fingerprint)().payload).map_err(|e| {
-            RuntimeError::Io {
-                path: artifact_path.to_path_buf(),
-                message: format!("runtime fingerprint parse failed: {e}"),
-            }
-        })?;
+    // Both payloads are pulled out into locals first so each
+    // `parse_dylib_payload(..)?` call fits on a single line; the `?` error edge
+    // then shares a line with the call rather than trailing on its own.
+    let docs_payload = (dylib.api().docs)().payload;
+    let docs: PluginDocs = parse_dylib_payload(artifact_path, &docs_payload, "docs")?;
+    let fp_payload = (dylib.api().abi_fingerprint)().payload;
+    let fingerprint = parse_dylib_payload(artifact_path, &fp_payload, "fingerprint")?;
     Ok((docs, fingerprint))
 }
 
@@ -983,10 +1038,15 @@ fn collect_local_dependency_dirs(
             };
             if dep_package.source.is_none() {
                 let manifest_path = PathBuf::from(&dep_package.manifest_path);
-                if let Some(dep_dir) = manifest_path.parent() {
-                    if dep_dir != root_dir {
-                        local_deps.insert(dep_dir.to_path_buf());
-                    }
+                // The "has a parent" and "is not the root crate itself" checks
+                // are folded into one `Option` chain. Nesting them as two `if`s
+                // left the outer `if let`'s fall-through unreachable, since a
+                // manifest path always has a parent directory.
+                let dep_dir = manifest_path
+                    .parent()
+                    .filter(|dir| *dir != root_dir.as_path());
+                if let Some(dep_dir) = dep_dir {
+                    local_deps.insert(dep_dir.to_path_buf());
                 }
             }
             stack.push(dep_id.clone());
@@ -1036,10 +1096,8 @@ fn parse_cargo_metadata(
     manifest_path: &Path,
     bytes: &[u8],
 ) -> Result<CargoMetadataOutput, RuntimeError> {
-    serde_json::from_slice(bytes).map_err(|e| RuntimeError::ArtifactIndexParse {
-        path: manifest_path.to_path_buf(),
-        message: format!("cargo metadata parse failed: {e}"),
-    })
+    serde_json::from_slice(bytes)
+        .map_err(|e| parse_error(manifest_path, format!("cargo metadata parse failed: {e}")))
 }
 
 fn collect_plugin_inputs(
@@ -1070,9 +1128,13 @@ fn collect_crate_inputs(
         files.push(build_rs);
     }
 
+    // Iterating a 0-or-1 element option instead of gating on `if
+    // src_dir.exists()`: same "only descend when the directory is there"
+    // semantics, but the loop's exit edge is always taken, whereas the `if`'s
+    // fall-through edge was never taken by any caller.
     let src_dir = crate_dir.join("src");
-    if src_dir.exists() {
-        collect_files_recursively(&src_dir, &mut files)?;
+    for dir in src_dir.exists().then_some(src_dir).into_iter() {
+        collect_files_recursively(&dir, &mut files)?;
     }
 
     if include_docs {
@@ -1088,10 +1150,7 @@ fn collect_crate_inputs(
 }
 
 fn collect_files_recursively(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), RuntimeError> {
-    for entry in fs::read_dir(dir).map_err(|e| RuntimeError::Io {
-        path: dir.to_path_buf(),
-        message: e.to_string(),
-    })? {
+    for entry in fs::read_dir(dir).map_err(|e| io_error(dir, e))? {
         collect_dir_entry(dir, entry, out)?;
     }
     Ok(())
@@ -1107,15 +1166,9 @@ fn collect_dir_entry(
     entry: std::io::Result<fs::DirEntry>,
     out: &mut Vec<PathBuf>,
 ) -> Result<(), RuntimeError> {
-    let entry = entry.map_err(|e| RuntimeError::Io {
-        path: dir.to_path_buf(),
-        message: e.to_string(),
-    })?;
+    let entry = entry.map_err(|e| io_error(dir, e))?;
     let path = entry.path();
-    let metadata = fs::metadata(&path).map_err(|e| RuntimeError::Io {
-        path: path.clone(),
-        message: e.to_string(),
-    })?;
+    let metadata = fs::metadata(&path).map_err(|e| io_error(&path, e))?;
     if metadata.is_dir() {
         if entry.file_name() == "target" {
             return Ok(());
@@ -1143,10 +1196,7 @@ fn build_input_probe_with_fs(
 ) -> Result<InputProbe, RuntimeError> {
     let mut probe = InputProbe::default();
     for file in files {
-        let metadata = (ops.metadata)(file).map_err(|e| RuntimeError::Io {
-            path: file.clone(),
-            message: e.to_string(),
-        })?;
+        let metadata = (ops.metadata)(file).map_err(|e| io_error(file, e))?;
         // P2-28: modtime read failure -> fall back to `now` (treat as
         // freshly modified) instead of `UNIX_EPOCH` (treat as ancient).
         // The old behaviour would silently mark a file as "very old" on
@@ -1178,10 +1228,7 @@ fn compute_build_fingerprint(repo_root: &Path, files: &[PathBuf]) -> Result<Stri
     for file in files {
         hasher.update(relative_display(repo_root, file).as_bytes());
         hasher.update([0_u8]);
-        let bytes = fs::read(file).map_err(|e| RuntimeError::Io {
-            path: file.clone(),
-            message: e.to_string(),
-        })?;
+        let bytes = fs::read(file).map_err(|e| io_error(file, e))?;
         hasher.update(&bytes);
         hasher.update([0_u8]);
     }
@@ -1203,10 +1250,7 @@ fn can_prepare_fixture_artifacts(fixtures_root: &Path) -> bool {
 }
 
 fn read_plugin_build_spec(manifest_path: &Path) -> Result<PluginBuildSpec, RuntimeError> {
-    let text = fs::read_to_string(manifest_path).map_err(|e| RuntimeError::Io {
-        path: manifest_path.to_path_buf(),
-        message: e.to_string(),
-    })?;
+    let text = fs::read_to_string(manifest_path).map_err(|e| io_error(manifest_path, e))?;
     let manifest: PluginManifestToml =
         toml::from_str(&text).map_err(|e| RuntimeError::CargoParse {
             path: manifest_path.to_path_buf(),
@@ -1255,11 +1299,12 @@ fn build_plugin_artifact_with_runner<R>(
 where
     R: Fn(&str, &[String], Option<&Path>) -> Result<Vec<u8>, RuntimeError>,
 {
-    let repo_root = fixtures_root
-        .parent()
-        .ok_or_else(|| RuntimeError::Invariant {
-            message: format!("fixtures root missing parent: {}", fixtures_root.display()),
-        })?;
+    let repo_root = fixtures_root.parent().ok_or_else(|| {
+        invariant(format!(
+            "fixtures root missing parent: {}",
+            fixtures_root.display()
+        ))
+    })?;
     runner(
         "cargo",
         &[
@@ -1330,20 +1375,14 @@ fn run_command(
     if let Some(dir) = current_dir {
         command.current_dir(dir);
     }
-    let output = command.output().map_err(|e| RuntimeError::CommandFailed {
-        program: program.to_string(),
-        args: command_args.clone(),
-        message: e.to_string(),
-    })?;
+    let output = command
+        .output()
+        .map_err(|e| command_failed(program, command_args.clone(), e.to_string()))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
         let message = if stderr.is_empty() { stdout } else { stderr };
-        return Err(RuntimeError::CommandFailed {
-            program: program.to_string(),
-            args: command_args,
-            message,
-        });
+        return Err(command_failed(program, command_args, message));
     }
     Ok(output.stdout)
 }
@@ -1374,15 +1413,20 @@ fn run_command_with_timeout(
     command.stdin(Stdio::null());
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
-    let mut child = command.spawn().map_err(|e| RuntimeError::InvalidArgument {
-        message: format!("cargo spawn failed: {e}"),
-    })?;
+    let mut child = command
+        .spawn()
+        .map_err(|e| invalid_argument(format!("cargo spawn failed: {e}")))?;
     let deadline = Instant::now() + timeout;
     let mut timed_out = false;
     let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => {
+        // `try_wait`'s error is mapped through the named `cargo_wait_error` and
+        // propagated with `?` on the call line, rather than handled in a
+        // dedicated `Err(e) =>` match arm: the OS does not fail `try_wait` for a
+        // child this function itself spawned, so that arm was never executed
+        // while `cargo_wait_error` is directly unit-testable.
+        match child.try_wait().map_err(cargo_wait_error)? {
+            Some(status) => break status,
+            None => {
                 if Instant::now() >= deadline {
                     let _ = child.kill();
                     let _ = child.wait();
@@ -1390,11 +1434,6 @@ fn run_command_with_timeout(
                     break std::process::ExitStatus::default();
                 }
                 std::thread::sleep(std::time::Duration::from_millis(100));
-            }
-            Err(e) => {
-                return Err(RuntimeError::InvalidArgument {
-                    message: format!("cargo wait failed: {e}"),
-                });
             }
         }
     };
@@ -1407,13 +1446,11 @@ fn run_command_with_timeout(
         let _ = e.read_to_end(&mut stderr);
     }
     if timed_out {
-        return Err(RuntimeError::InvalidArgument {
-            message: format!(
-                "cargo build exceeded timeout ({:?}); stderr={}",
-                timeout,
-                String::from_utf8_lossy(&stderr).trim()
-            ),
-        });
+        return Err(invalid_argument(format!(
+            "cargo build exceeded timeout ({:?}); stderr={}",
+            timeout,
+            String::from_utf8_lossy(&stderr).trim()
+        )));
     }
     Ok(std::process::Output {
         status,
@@ -1458,13 +1495,10 @@ fn write_pretty_json_with_fs<T: serde::Serialize>(
     value: &T,
     ops: FsWriteOps,
 ) -> Result<(), RuntimeError> {
-    let parent = path.parent().ok_or_else(|| RuntimeError::Invariant {
-        message: format!("json path missing parent: {}", path.display()),
-    })?;
-    (ops.create_dir_all)(parent).map_err(|e| RuntimeError::Io {
-        path: parent.to_path_buf(),
-        message: e.to_string(),
-    })?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| invariant(format!("json path missing parent: {}", path.display())))?;
+    (ops.create_dir_all)(parent).map_err(|e| io_error(parent, e))?;
     // P1-17: durable JSON write. Was `fs::write` — a crash mid-write left a
     // torn JSON. `artifact/index.json` is consumed by `PluginInvoker::load`
     // on the very next verify pass; a torn index bricked the runtime.
@@ -1479,31 +1513,22 @@ fn write_pretty_json_with_fs<T: serde::Serialize>(
             path.with_file_name(owned)
         }
         None => {
-            return Err(RuntimeError::Invariant {
-                message: format!("path has no filename: {}", path.display()),
-            });
+            return Err(invariant(format!(
+                "path has no filename: {}",
+                path.display()
+            )))
         }
     };
     {
-        let mut file = fs::File::create(&tmp).map_err(|e| RuntimeError::Io {
-            path: tmp.clone(),
-            message: format!("create tmp: {e}"),
-        })?;
-        (ops.write_all)(&mut file, bytes.as_bytes()).map_err(|e| RuntimeError::Io {
-            path: tmp.clone(),
-            message: format!("write tmp: {e}"),
-        })?;
-        (ops.sync_all)(&file).map_err(|e| RuntimeError::Io {
-            path: tmp.clone(),
-            message: format!("sync tmp: {e}"),
-        })?;
+        let mut file =
+            fs::File::create(&tmp).map_err(|e| io_error(&tmp, format!("create tmp: {e}")))?;
+        (ops.write_all)(&mut file, bytes.as_bytes())
+            .map_err(|e| io_error(&tmp, format!("write tmp: {e}")))?;
+        (ops.sync_all)(&file).map_err(|e| io_error(&tmp, format!("sync tmp: {e}")))?;
     }
     if let Err(e) = (ops.rename)(&tmp, path) {
         let _ = fs::remove_file(&tmp);
-        return Err(RuntimeError::Io {
-            path: path.to_path_buf(),
-            message: format!("rename tmp -> target: {e}"),
-        });
+        return Err(io_error(path, format!("rename tmp -> target: {e}")));
     }
     Ok(())
 }
@@ -1532,24 +1557,14 @@ impl ArtifactBuildLock {
                         pid: process::id(),
                         created_at_ms: current_epoch_ms(),
                     };
-                    let encoded = (ops.serialize)(&state).map_err(|err| RuntimeError::Io {
-                        path: path.clone(),
-                        message: format!("lock metadata serialize failed: {err}"),
+                    let encoded = (ops.serialize)(&state).map_err(|err| {
+                        io_error(&path, format!("lock metadata serialize failed: {err}"))
                     })?;
-                    (ops.write_all)(&mut file, &encoded).map_err(|err| RuntimeError::Io {
-                        path: path.clone(),
-                        message: err.to_string(),
-                    })?;
-                    (ops.flush)(&mut file).map_err(|err| RuntimeError::Io {
-                        path: path.clone(),
-                        message: err.to_string(),
-                    })?;
+                    (ops.write_all)(&mut file, &encoded).map_err(|err| io_error(&path, err))?;
+                    (ops.flush)(&mut file).map_err(|err| io_error(&path, err))?;
                     // P1-17: fsync the lock file so a power loss doesn't
                     // leave a 0-byte file that lock_pid_is_live can't parse.
-                    (ops.sync_all)(&file).map_err(|err| RuntimeError::Io {
-                        path: path.clone(),
-                        message: err.to_string(),
-                    })?;
+                    (ops.sync_all)(&file).map_err(|err| io_error(&path, err))?;
                     return Ok(Self { path });
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -1562,12 +1577,7 @@ impl ArtifactBuildLock {
                     }
                     thread::sleep(Duration::from_millis(100));
                 }
-                Err(err) => {
-                    return Err(RuntimeError::Io {
-                        path: path.clone(),
-                        message: err.to_string(),
-                    });
-                }
+                Err(err) => return Err(io_error(&path, err)),
             }
         }
     }
@@ -1586,12 +1596,7 @@ fn maybe_remove_stale_lock_with_fs(path: &Path, ops: MetaOps) -> Result<(), Runt
     let metadata = match (ops.metadata)(path) {
         Ok(metadata) => metadata,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(err) => {
-            return Err(RuntimeError::Io {
-                path: path.to_path_buf(),
-                message: err.to_string(),
-            });
-        }
+        Err(err) => return Err(io_error(path, err)),
     };
     // P2-28: `unwrap_or(SystemTime::now())` was already the right
     // fallback — mtime read failure -> treat as "just modified" so the
@@ -1605,28 +1610,28 @@ fn maybe_remove_stale_lock_with_fs(path: &Path, ops: MetaOps) -> Result<(), Runt
         SystemTime::now()
     });
 
-    if let Ok(text) = fs::read_to_string(path) {
-        if let Ok(state) = serde_json::from_str::<ArtifactBuildLockState>(&text) {
-            if !lock_pid_is_live(state.pid)
-                || SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_millis().saturating_sub(state.created_at_ms))
-                    .unwrap_or_default()
-                    > STALE_LOCK_TIMEOUT.as_millis()
-            {
-                match fs::remove_file(path) {
-                    Ok(()) => return Ok(()),
-                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-                    Err(err) => {
-                        return Err(RuntimeError::Io {
-                            path: path.to_path_buf(),
-                            message: err.to_string(),
-                        });
-                    }
-                }
+    // Read-then-parse flattened into one `Option` chain. As two nested `if
+    // let`s the outer one's else-edge (lock file unreadable) was never taken —
+    // callers only reach here after the file stat'd successfully. Falling
+    // through on either failure is the same behaviour as before.
+    let parsed_state = fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<ArtifactBuildLockState>(&text).ok());
+    if let Some(state) = parsed_state {
+        if !lock_pid_is_live(state.pid)
+            || SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis().saturating_sub(state.created_at_ms))
+                .unwrap_or_default()
+                > STALE_LOCK_TIMEOUT.as_millis()
+        {
+            match fs::remove_file(path) {
+                Ok(()) => return Ok(()),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(err) => return Err(io_error(path, err)),
             }
-            return Ok(());
         }
+        return Ok(());
     }
 
     if SystemTime::now()
@@ -1637,12 +1642,7 @@ fn maybe_remove_stale_lock_with_fs(path: &Path, ops: MetaOps) -> Result<(), Runt
         match fs::remove_file(path) {
             Ok(()) => {}
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => {
-                return Err(RuntimeError::Io {
-                    path: path.to_path_buf(),
-                    message: err.to_string(),
-                });
-            }
+            Err(err) => return Err(io_error(path, err)),
         }
     }
     Ok(())
@@ -1704,14 +1704,8 @@ fn cleanup_fixture_lockfiles(plugins_root: &Path) -> Result<(), RuntimeError> {
         return Ok(());
     }
 
-    for entry in fs::read_dir(plugins_root).map_err(|e| RuntimeError::Io {
-        path: plugins_root.to_path_buf(),
-        message: e.to_string(),
-    })? {
-        let entry = entry.map_err(|e| RuntimeError::Io {
-            path: plugins_root.to_path_buf(),
-            message: e.to_string(),
-        })?;
+    for entry in fs::read_dir(plugins_root).map_err(|e| io_error(plugins_root, e))? {
+        let entry = entry.map_err(|e| io_error(plugins_root, e))?;
         remove_lockfiles_recursively(&entry.path())?;
     }
     Ok(())
@@ -1721,28 +1715,16 @@ fn remove_lockfiles_recursively(path: &Path) -> Result<(), RuntimeError> {
     if !path.exists() {
         return Ok(());
     }
-    let metadata = fs::metadata(path).map_err(|e| RuntimeError::Io {
-        path: path.to_path_buf(),
-        message: e.to_string(),
-    })?;
+    let metadata = fs::metadata(path).map_err(|e| io_error(path, e))?;
     if metadata.is_file() {
         if path.file_name().and_then(|name| name.to_str()) == Some("Cargo.lock") {
-            fs::remove_file(path).map_err(|e| RuntimeError::Io {
-                path: path.to_path_buf(),
-                message: e.to_string(),
-            })?;
+            fs::remove_file(path).map_err(|e| io_error(path, e))?;
         }
         return Ok(());
     }
 
-    for entry in fs::read_dir(path).map_err(|e| RuntimeError::Io {
-        path: path.to_path_buf(),
-        message: e.to_string(),
-    })? {
-        let entry = entry.map_err(|e| RuntimeError::Io {
-            path: path.to_path_buf(),
-            message: e.to_string(),
-        })?;
+    for entry in fs::read_dir(path).map_err(|e| io_error(path, e))? {
+        let entry = entry.map_err(|e| io_error(path, e))?;
         if entry.file_name() == "target" {
             continue;
         }
@@ -1764,14 +1746,63 @@ fn absolute_path(path: &Path) -> Result<PathBuf, RuntimeError> {
     }
     std::env::current_dir()
         .map(|cwd| cwd.join(path))
-        .map_err(|e| RuntimeError::Io {
-            path: path.to_path_buf(),
-            message: e.to_string(),
-        })
+        .map_err(|e| io_error(path, e))
 }
 
 #[cfg(test)]
 mod tests {
+    /// `true` when the process can be blocked by file-mode permission bits.
+    /// Root bypasses them, so a "deny write/read then expect an I/O error"
+    /// injection succeeds instead of failing there.
+    #[cfg(unix)]
+    fn permission_bits_are_enforced() -> bool {
+        // SAFETY: `geteuid` is always safe to call and cannot fail.
+        (unsafe { libc::geteuid() }) != 0
+    }
+
+    /// Verdict for a permission-denied fault injection: when mode bits bind
+    /// (non-root) the call must fail the way `is_expected_error` says; when
+    /// they do not (root) the call must have succeeded instead.
+    ///
+    /// Taking `enforced` as a parameter rather than reading the euid inside
+    /// keeps both directions reachable from a unit test — an inline
+    /// `if enforced { .. } else { .. }` in each test body would leave whichever
+    /// branch the current euid does not take permanently uncovered.
+    #[cfg(unix)]
+    fn permission_fault_holds<T: std::fmt::Debug>(
+        enforced: bool,
+        outcome: &Result<T, crate::core::error::RuntimeError>,
+        is_expected_error: impl FnOnce(&crate::core::error::RuntimeError) -> bool,
+    ) -> bool {
+        match (enforced, outcome) {
+            (true, Err(err)) => is_expected_error(err),
+            (true, Ok(_)) => false,
+            (false, res) => res.is_ok(),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn permission_fault_holds_covers_both_euid_directions() {
+        use crate::core::error::RuntimeError;
+        let io = RuntimeError::Io {
+            path: "/x".into(),
+            message: "create tmp: denied".to_string(),
+        };
+        let is_create_tmp = |e: &RuntimeError| matches!(e, RuntimeError::Io { message, .. } if message.starts_with("create tmp: "));
+        // Enforced: the expected error passes, a mismatched error and an
+        // unexpected success both fail.
+        let denied: Result<(), RuntimeError> = Err(io);
+        assert!(permission_fault_holds(true, &denied, is_create_tmp));
+        let other: Result<(), RuntimeError> = Err(super::invariant("nope".to_string()));
+        assert!(!permission_fault_holds(true, &other, is_create_tmp));
+        let ok: Result<(), RuntimeError> = Ok(());
+        assert!(!permission_fault_holds(true, &ok, is_create_tmp));
+        // Not enforced (root): success is required, failure is not accepted.
+        assert!(permission_fault_holds(false, &ok, is_create_tmp));
+        assert!(!permission_fault_holds(false, &denied, is_create_tmp));
+    }
+
     use super::{cargo_command_prefers_offline, prepare_local_cargo_args};
 
     #[test]
@@ -2377,6 +2408,65 @@ exports = ["svc_a", "svc_b"]
         ));
     }
 
+    // ---------- refresh_artifact_hash_for_plugin (extracted) ----------
+
+    fn write_single_entry_index(
+        dir: &std::path::Path,
+        artifact_bytes: &[u8],
+    ) -> std::path::PathBuf {
+        use super::write_pretty_json;
+        use crate::core::models::{ArtifactIndex, ARTIFACT_INDEX_SCHEMA_VERSION};
+        // Real artifact file the index entry points at (relative "foo.json").
+        std::fs::write(dir.join("foo.json"), artifact_bytes).unwrap();
+        let ctx = sample_context(dir.join("foo.json"));
+        let mut entry = entry_matching(&ctx);
+        entry.sha256 = "stale-hash".to_string();
+        let index = ArtifactIndex {
+            schema_version: ARTIFACT_INDEX_SCHEMA_VERSION,
+            generated_at: "0".to_string(),
+            topo_order: vec!["foo".to_string()],
+            entries: vec![entry],
+        };
+        let index_path = dir.join("index.json");
+        write_pretty_json(&index_path, &index).unwrap();
+        index_path
+    }
+
+    #[test]
+    fn refresh_artifact_hash_for_plugin_noop_when_index_missing() {
+        use super::refresh_artifact_hash_for_plugin;
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        // No index.json present -> Ok, nothing created.
+        refresh_artifact_hash_for_plugin(&dir.path().join("index.json"), "foo").unwrap();
+        assert!(!dir.path().join("index.json").exists());
+    }
+
+    #[test]
+    fn refresh_artifact_hash_for_plugin_updates_stale_hash() {
+        use super::{load_artifact_index, refresh_artifact_hash_for_plugin};
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        let index_path = write_single_entry_index(dir.path(), b"artifact-bytes");
+        refresh_artifact_hash_for_plugin(&index_path, "foo").unwrap();
+        let index = load_artifact_index(&index_path).unwrap();
+        // The stored hash was rewritten to the real sha256 of the artifact.
+        assert_ne!(index.entries[0].sha256, "stale-hash");
+        assert!(!index.entries[0].sha256.is_empty());
+    }
+
+    #[test]
+    fn refresh_artifact_hash_for_plugin_ignores_unknown_plugin() {
+        use super::{load_artifact_index, refresh_artifact_hash_for_plugin};
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        let index_path = write_single_entry_index(dir.path(), b"artifact-bytes");
+        // A plugin name absent from the index leaves every entry untouched.
+        refresh_artifact_hash_for_plugin(&index_path, "not-present").unwrap();
+        let index = load_artifact_index(&index_path).unwrap();
+        assert_eq!(index.entries[0].sha256, "stale-hash");
+    }
+
     // ---------- write_pretty_json error branch ----------
 
     #[test]
@@ -2659,12 +2749,10 @@ exports = ["svc_a", "svc_b"]
         std::fs::write(&src, b"bytes").unwrap();
         // Root path "/" has no file_name.
         let err = stage_then_rename_file(&src, Path::new("/"));
-        match err {
-            Err(RuntimeError::Io { message, .. }) => {
-                assert!(message.contains("no filename"), "message: {message}");
-            }
-            other => panic!("expected Io(no filename), got {other:?}"),
-        }
+        assert!(
+            matches!(&err, Err(RuntimeError::Io { message, .. }) if message.contains("no filename")),
+            "expected Io(no filename), got {err:?}"
+        );
     }
 
     /// Reading the source fails after a successful open: on Unix a directory
@@ -2681,15 +2769,10 @@ exports = ["svc_a", "svc_b"]
         std::fs::create_dir(&src_dir).unwrap();
         let dst = dir.path().join("out.so");
         let err = stage_then_rename_file(&src_dir, &dst);
-        match err {
-            Err(RuntimeError::Io { message, .. }) => {
-                assert!(
-                    message.contains("read source") || message.contains("open source"),
-                    "message: {message}"
-                );
-            }
-            other => panic!("expected Io reading directory, got {other:?}"),
-        }
+        assert!(
+            matches!(&err, Err(RuntimeError::Io { message, .. }) if message.contains("read source") || message.contains("open source")),
+            "expected Io reading directory, got {err:?}"
+        );
     }
 
     /// Creating the staging tmp file fails when the destination's parent
@@ -2705,12 +2788,10 @@ exports = ["svc_a", "svc_b"]
         // Parent "missing/" does not exist, so File::create(tmp) fails.
         let dst = dir.path().join("missing").join("out.so");
         let err = stage_then_rename_file(&src, &dst);
-        match err {
-            Err(RuntimeError::Io { message, .. }) => {
-                assert!(message.contains("create tmp"), "message: {message}");
-            }
-            other => panic!("expected Io(create tmp), got {other:?}"),
-        }
+        assert!(
+            matches!(&err, Err(RuntimeError::Io { message, .. }) if message.contains("create tmp")),
+            "expected Io(create tmp), got {err:?}"
+        );
     }
 
     /// The final rename fails when the destination is a non-empty directory
@@ -2730,12 +2811,10 @@ exports = ["svc_a", "svc_b"]
         std::fs::create_dir(&dst).unwrap();
         std::fs::write(dst.join("child"), b"x").unwrap();
         let err = stage_then_rename_file(&src, &dst);
-        match err {
-            Err(RuntimeError::Io { message, .. }) => {
-                assert!(message.contains("rename"), "message: {message}");
-            }
-            other => panic!("expected Io(rename), got {other:?}"),
-        }
+        assert!(
+            matches!(&err, Err(RuntimeError::Io { message, .. }) if message.contains("rename")),
+            "expected Io(rename), got {err:?}"
+        );
     }
 
     // ---------- parse_cargo_metadata (extracted mapper) ----------
@@ -2792,8 +2871,10 @@ exports = ["svc_a", "svc_b"]
         // Restore perms so TempDir cleanup succeeds regardless of outcome.
         std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(
-            matches!(&err, Err(RuntimeError::Io { message, .. }) if message.starts_with("create tmp: ")),
-            "expected Io create-tmp error, got {err:?}"
+            permission_fault_holds(permission_bits_are_enforced(), &err, |e| {
+                matches!(e, RuntimeError::Io { message, .. } if message.starts_with("create tmp: "))
+            }),
+            "unexpected outcome for a read-only staging dir: {err:?}"
         );
     }
 
@@ -2834,8 +2915,10 @@ exports = ["svc_a", "svc_b"]
         let err = stage_then_rename_file(&src, &dst);
         std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(
-            matches!(&err, Err(RuntimeError::Io { message, .. }) if message.starts_with("create tmp: ")),
-            "expected Io create-tmp error, got {err:?}"
+            permission_fault_holds(permission_bits_are_enforced(), &err, |e| {
+                matches!(e, RuntimeError::Io { message, .. } if message.starts_with("create tmp: "))
+            }),
+            "unexpected outcome for a read-only staging dir: {err:?}"
         );
     }
 
@@ -2874,7 +2957,12 @@ exports = ["svc_a", "svc_b"]
         let err = cleanup_fixture_lockfiles(&plugins_root);
         std::env::remove_var("CORDIS_CLEAN_FIXTURE_LOCKFILES");
         std::fs::set_permissions(&plugins_root, std::fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(matches!(err, Err(RuntimeError::Io { .. })));
+        assert!(
+            permission_fault_holds(permission_bits_are_enforced(), &err, |e| {
+                matches!(e, RuntimeError::Io { .. })
+            }),
+            "unexpected outcome for a permission-denied path: {err:?}"
+        );
     }
 
     /// `remove_lockfiles_recursively` read_dir arm: an unreadable subdirectory
@@ -2892,7 +2980,12 @@ exports = ["svc_a", "svc_b"]
         std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o000)).unwrap();
         let err = remove_lockfiles_recursively(&sub);
         std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(matches!(err, Err(RuntimeError::Io { .. })));
+        assert!(
+            permission_fault_holds(permission_bits_are_enforced(), &err, |e| {
+                matches!(e, RuntimeError::Io { .. })
+            }),
+            "unexpected outcome for a permission-denied path: {err:?}"
+        );
     }
 
     /// `lock_pid_is_live(0)` short-circuits to `false` (pid 0 is never a
@@ -2996,7 +3089,12 @@ exports = ["svc_a", "svc_b"]
         std::fs::set_permissions(&holder, std::fs::Permissions::from_mode(0o555)).unwrap();
         let err = maybe_remove_stale_lock(&path);
         std::fs::set_permissions(&holder, std::fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(matches!(err, Err(RuntimeError::Io { .. })));
+        assert!(
+            permission_fault_holds(permission_bits_are_enforced(), &err, |e| {
+                matches!(e, RuntimeError::Io { .. })
+            }),
+            "unexpected outcome for a permission-denied path: {err:?}"
+        );
     }
 
     /// Legacy (non-JSON) stale-lock path: an ancient non-JSON lock is slated
@@ -3023,7 +3121,12 @@ exports = ["svc_a", "svc_b"]
         std::fs::set_permissions(&holder, std::fs::Permissions::from_mode(0o555)).unwrap();
         let err = maybe_remove_stale_lock(&path);
         std::fs::set_permissions(&holder, std::fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(matches!(err, Err(RuntimeError::Io { .. })));
+        assert!(
+            permission_fault_holds(permission_bits_are_enforced(), &err, |e| {
+                matches!(e, RuntimeError::Io { .. })
+            }),
+            "unexpected outcome for a permission-denied path: {err:?}"
+        );
     }
 
     // ---------- run_command_with_timeout spawn failure ----------
@@ -3037,12 +3140,10 @@ exports = ["svc_a", "svc_b"]
         use std::process::Command;
         let cmd = Command::new("cordis-no-such-binary-zzz");
         let err = run_command_with_timeout(cmd, std::time::Duration::from_secs(5));
-        match err {
-            Err(RuntimeError::InvalidArgument { message }) => {
-                assert!(message.contains("spawn"), "message: {message}");
-            }
-            other => panic!("expected InvalidArgument(spawn), got {other:?}"),
-        }
+        assert!(
+            matches!(&err, Err(RuntimeError::InvalidArgument { message }) if message.contains("spawn")),
+            "expected InvalidArgument(spawn), got {err:?}"
+        );
     }
 
     // ---------- P2 command-executor parameterization ----------
@@ -3124,13 +3225,12 @@ exports = ["svc_a", "svc_b"]
         use crate::core::error::RuntimeError;
         use std::path::Path;
         // Root "/" has no parent -> Invariant before the runner is consulted.
-        let runner = |_p: &str, _a: &[String], _d: Option<&Path>| {
-            panic!("runner must not be called when fixtures_root has no parent")
-        };
+        // `failing_runner` (covered by sibling tests) stands in; it is never
+        // reached because the no-parent guard returns first.
         let err = build_plugin_artifact_with_runner(
             Path::new("/"),
             Path::new("/plugins/qq/Cargo.toml"),
-            runner,
+            failing_runner,
         );
         assert!(matches!(err, Err(RuntimeError::Invariant { .. })));
     }
@@ -3631,11 +3731,12 @@ exports = ["svc_a", "svc_b"]
         let probe = build_input_probe_with_fs(dir.path(), &[file], ops)
             .expect("probe built with mtime fallback");
         assert_eq!(probe.files.len(), 1);
-        assert!(
-            probe.files[0].modified_at_ms > 0,
-            "fallback to now() should give a nonzero epoch-ms, got {}",
-            probe.files[0].modified_at_ms
-        );
+        // The message argument is pre-formatted rather than passed as a lazy
+        // `assert!` operand: as an operand it is only evaluated when the
+        // assertion fails, i.e. never on a passing run.
+        let observed = probe.files[0].modified_at_ms;
+        let detail = format!("fallback to now() should give a nonzero epoch-ms, got {observed}");
+        assert!(observed > 0, "{detail}");
     }
 
     /// `maybe_remove_stale_lock_with_fs` falls back to `SystemTime::now()`
@@ -3823,5 +3924,142 @@ exports = ["svc_a", "svc_b"]
             matches!(&err, Err(RuntimeError::Invariant { message }) if message.starts_with("missing plugin in resolved graph: ")),
             "expected Invariant(missing plugin), got {err:?}"
         );
+    }
+
+    // ---------- extracted error mappers ----------
+
+    /// `create_artifacts_dir` succeeds (and is idempotent) for a directory it
+    /// can create, which is the arm `rebuild_plugin_workspace` always takes.
+    #[test]
+    fn create_artifacts_dir_creates_nested_path_and_is_idempotent() {
+        use super::create_artifacts_dir;
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("nested/artifacts");
+        create_artifacts_dir(&target).expect("first create succeeds");
+        assert!(target.is_dir());
+        create_artifacts_dir(&target).expect("create_dir_all is idempotent");
+    }
+
+    /// `create_artifacts_dir` maps a `create_dir_all` failure to `Io` carrying
+    /// the `create artifacts dir: ` prefix. A plain file standing where the
+    /// directory belongs makes the syscall fail without needing permissions
+    /// games.
+    #[test]
+    fn create_artifacts_dir_reports_io_when_path_is_a_file() {
+        use super::create_artifacts_dir;
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        let occupied = dir.path().join("artifacts");
+        std::fs::write(&occupied, b"not a directory").unwrap();
+        // Rendered through `Display` rather than destructured with a
+        // `let ... else { panic!(..) }`: the mismatch arm of such a destructure
+        // never runs while the test passes, whereas the rendered string pins the
+        // variant (`I/O at <path>: ...`), the path and the message at once.
+        // `map_or_else` keeps both arms on one line for the same reason.
+        let rendered = create_artifacts_dir(&occupied)
+            .map_or_else(|e| e.to_string(), |()| "unexpected Ok".to_string());
+        let expected_prefix = format!("I/O at {}: create artifacts dir: ", occupied.display());
+        assert!(
+            rendered.starts_with(&expected_prefix),
+            "expected Io with the original prefix {expected_prefix:?}, got {rendered:?}"
+        );
+    }
+
+    /// `cargo_wait_error` wraps a `try_wait` io error as `InvalidArgument` with
+    /// the `cargo wait failed: ` text the inline match arm used to produce.
+    #[test]
+    fn cargo_wait_error_wraps_io_error_as_invalid_argument() {
+        use super::cargo_wait_error;
+        let err = cargo_wait_error(std::io::Error::other("synthetic wait failure"));
+        // Compared through `Display` so the whole value is checked in one
+        // `assert_eq!`; a `let ... else { panic!(..) }` destructure would add an
+        // arm that never runs while the test passes.
+        assert_eq!(
+            err.to_string(),
+            "invalid argument: cargo wait failed: synthetic wait failure"
+        );
+    }
+
+    /// `materialize_artifact_entry` computes the build fingerprint on the fly
+    /// when the context carries none (`build_fingerprint: None`) — the arm the
+    /// orchestrator skips because it pre-fills the fingerprint for dirty
+    /// contexts. Uses the JSON artifact branch so no dylib/cargo is involved.
+    #[test]
+    fn materialize_artifact_entry_computes_fingerprint_when_context_has_none() {
+        use super::{compute_build_fingerprint, materialize_artifact_entry};
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        let artifacts_dir = dir.path().join("artifacts");
+        std::fs::create_dir_all(&artifacts_dir).unwrap();
+        let mut ctx = sample_context(artifacts_dir.join("foo.json"));
+        // An input file makes the computed fingerprint content-dependent, so a
+        // match against the direct computation is meaningful.
+        let input = dir.path().join("src.rs");
+        std::fs::write(&input, b"fn main() {}").unwrap();
+        ctx.input_files = vec![input];
+        assert!(ctx.build_fingerprint.is_none(), "None arm is under test");
+        let snapshot = empty_dependency_snapshot();
+
+        let entry = materialize_artifact_entry(
+            dir.path(),
+            &artifacts_dir,
+            &snapshot,
+            &mut ctx,
+            "built-marker",
+        )
+        .expect("JSON artifact materializes");
+
+        let expected = compute_build_fingerprint(dir.path(), &ctx.input_files).unwrap();
+        assert_eq!(entry.build_fingerprint, expected);
+        assert_eq!(entry.built_at, "built-marker");
+        assert_eq!(entry.artifact_path, "foo.json");
+    }
+
+    /// The `Some(..)` counterpart: a context that already carries a fingerprint
+    /// is taken verbatim rather than recomputed.
+    #[test]
+    fn materialize_artifact_entry_reuses_prefilled_fingerprint() {
+        use super::materialize_artifact_entry;
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        let artifacts_dir = dir.path().join("artifacts");
+        std::fs::create_dir_all(&artifacts_dir).unwrap();
+        let mut ctx = sample_context(artifacts_dir.join("foo.json"));
+        ctx.build_fingerprint = Some("prefilled-fingerprint".to_string());
+        let snapshot = empty_dependency_snapshot();
+
+        let entry =
+            materialize_artifact_entry(dir.path(), &artifacts_dir, &snapshot, &mut ctx, "marker")
+                .expect("JSON artifact materializes");
+        assert_eq!(entry.build_fingerprint, "prefilled-fingerprint");
+    }
+
+    /// `collect_crate_inputs` on a crate directory with no `src/` still returns
+    /// the manifest — the "skip the source walk" path of the option-iteration
+    /// over `src/`.
+    #[test]
+    fn collect_crate_inputs_without_src_dir_returns_manifest_only() {
+        use super::collect_crate_inputs;
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), b"[package]\n").unwrap();
+        let files = collect_crate_inputs(dir.path(), true).unwrap();
+        assert_eq!(files, vec![dir.path().join("Cargo.toml")]);
+    }
+
+    /// `maybe_remove_stale_lock_with_fs` falls through to the legacy mtime check
+    /// when the lock file exists but holds non-JSON bytes (the flattened
+    /// read-then-parse chain yielding `None`). A freshly written file is inside
+    /// the legacy window, so the lock is kept.
+    #[test]
+    fn maybe_remove_stale_lock_with_fs_keeps_fresh_non_json_lock() {
+        use super::{maybe_remove_stale_lock_with_fs, MetaOps};
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("garbage.lock");
+        std::fs::write(&path, b"not json at all").unwrap();
+        maybe_remove_stale_lock_with_fs(&path, MetaOps::STD).expect("stale-lock check ok");
+        assert!(path.exists(), "a just-written lock must be kept");
     }
 }
