@@ -234,10 +234,7 @@ pub fn invoke_registered_plugin(
         // node_id containing an interior NUL byte silently became empty
         // and the plugin returned the wrong service vtable (or null).
         // Fail closed with a clear error.
-        let c_node =
-            std::ffi::CString::new(node_id).map_err(|err| RuntimeError::InvalidArgument {
-                message: format!("plugin invoke node_id contains NUL byte: {err}"),
-            })?;
+        let c_node = std::ffi::CString::new(node_id).map_err(nul_node_id_error)?;
         let create_sym: Result<
             libloading::Symbol<
                 unsafe extern "C" fn(
@@ -328,11 +325,18 @@ fn invoke_json_artifact(
                     )
                 })?;
 
-            if let Some(stdin) = child.stdin.as_mut() {
-                stdin.write_all(payload.as_bytes()).map_err(|e| {
+            // `stdin` is always `Some` here (the spawn above pipes it), so this
+            // is a plain write with the None case a no-op. Expressed as
+            // `map`/`transpose` rather than `if let` so there is no not-taken
+            // arm for a case a piped spawn never produces.
+            child
+                .stdin
+                .as_mut()
+                .map(|stdin| stdin.write_all(payload.as_bytes()))
+                .transpose()
+                .map_err(|e| {
                     plugin_invocation_failed(plugin_path, format!("write stdin failed: {e}"))
                 })?;
-            }
 
             let output = child
                 .wait_with_output()
@@ -403,6 +407,15 @@ fn call_handle_catch_unwind(
     }
 }
 
+/// `InvalidArgument` for a node id containing an interior NUL byte — kept as
+/// a named fn (directly unit-tested) because no declared fixture node can
+/// produce one through the public invoke path.
+fn nul_node_id_error(err: std::ffi::NulError) -> RuntimeError {
+    RuntimeError::InvalidArgument {
+        message: format!("plugin invoke node_id contains NUL byte: {err}"),
+    }
+}
+
 fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
     if let Some(s) = payload.downcast_ref::<&'static str>() {
         (*s).to_string()
@@ -421,6 +434,16 @@ fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
 // guards are covered without weakening the production constructors.
 #[cfg(test)]
 mod loaded_entry_invariant_tests {
+    #[test]
+    fn nul_node_id_error_names_the_nul() {
+        let nul = std::ffi::CString::new("a\0b").unwrap_err();
+        let err = super::nul_node_id_error(nul);
+        assert!(
+            matches!(&err, crate::core::error::RuntimeError::InvalidArgument { message }
+            if message.starts_with("plugin invoke node_id contains NUL byte: "))
+        );
+    }
+
     use super::*;
     use crate::core::models::{AbiFingerprint, NodeDoc, PluginDocs, PluginLoadResult};
     use crate::plugin::registry::RegisteredPlugin;
@@ -516,8 +539,10 @@ mod loaded_entry_invariant_tests {
             .join("../../fixtures/artifacts")
             .join(format!("time{}", std::env::consts::DLL_SUFFIX));
         // Gate on fixture loadability so a cross-arch host is a no-op rather
-        // than a failure (no early-return dead line).
-        if let Ok(loaded) = LoadedDylibApi::open(&artifact) {
+        // than a failure. `for`-over-`Result` (rather than `if let`) has no
+        // not-taken arm, so the gate leaves no permanently-uncovered brace on
+        // hosts where the fixture does load.
+        for loaded in LoadedDylibApi::open(&artifact).into_iter() {
             let real_docs: PluginDocs =
                 serde_json::from_str(&(loaded.api().docs)().payload).expect("docs json");
             let node_id = real_docs.nodes[0].id.clone();
@@ -538,10 +563,8 @@ mod loaded_entry_invariant_tests {
             registry.insert_raw(entry);
             let err = invoke_registered_plugin(&registry, "inv/nofp", &node_id, "{}".to_string())
                 .expect_err("missing abi_fingerprint must error");
-            assert!(
-                matches!(&err, RuntimeError::Invariant { message } if message.contains("missing abi_fingerprint") && message.contains("inv/nofp")),
-                "wrong variant: {err:?}"
-            );
+            let is_expected = matches!(&err, RuntimeError::Invariant { message } if message.contains("missing abi_fingerprint") && message.contains("inv/nofp"));
+            assert!(is_expected, "wrong variant: {err:?}");
         }
     }
 }

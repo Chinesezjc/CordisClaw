@@ -257,103 +257,14 @@ where
                 debug_assert!(!batch.is_empty());
 
                 // Pre-compute all inputs (serial phase — needs &mut state).
-                // Router transitions are handled inline here because they
-                // require &mut RuntimeContext for overlay operations.
-                struct ParallelJob {
-                    transition_id: String,
-                    key: CorrelationKey,
-                    spec: ExecutionTransitionSpec,
-                    attempt: u32,
-                    trigger: TransitionTrigger,
-                    skip: bool,
-                    /// Router result pre-computed in the serial phase (None = run in parallel).
-                    router_run: Option<TransitionRunResult>,
-                }
+                // Router transitions are handled inline by `build_parallel_job`
+                // because they require &mut RuntimeContext for overlay
+                // operations.
                 let mut jobs: Vec<ParallelJob> = Vec::with_capacity(batch.len());
                 for item in batch {
-                    // Archived defensive guard (parallel mirror of the
-                    // single-thread `is_key_done` return at
-                    // `process_one_item`, covered by
-                    // `probe_process_one_item_key_done`): `push_ready` refuses
-                    // already-completed keys and the key-dedup drain above does
-                    // not re-add them, so within one batch build no item's key
-                    // is ever done. Kept fail-safe (skip the item) rather than
-                    // asserted because completion state is shared mutable.
-                    if state.is_key_done(&item.transition_id, &item.key) {
-                        continue;
-                    }
-                    let attempt = *state
-                        .attempts
-                        .get(&(item.transition_id.clone(), item.key.clone()))
-                        .unwrap_or(&0);
-                    let trigger = state.ensure_trigger_inputs(&item.transition_id, &item.key)?;
-                    // Archived invariant (parallel mirror of the single-thread
-                    // spec lookup at `process_one_item`, covered by
-                    // `probe_process_one_item_missing_spec` /
-                    // `probe_is_transition_ready_missing_spec`): the
-                    // `ensure_trigger_inputs` call above already went through
-                    // `is_transition_ready`, which fails first if the spec is
-                    // absent, so this `ok_or_else` never fires here. Message
-                    // text kept byte-identical to the single-thread arm.
-                    let spec = state
-                        .specs
-                        .get(&item.transition_id)
-                        .cloned()
-                        .ok_or_else(|| RuntimeError::Invariant {
-                            message: format!(
-                                "ready transition missing spec: {}",
-                                item.transition_id
-                            ),
-                        })?;
-
-                    state.order.push(item.transition_id.clone());
-
-                    // P1-3: compute `skip` from the single-thread rule first
-                    // (AllOf + any-non-success upstream = Skipped) — this
-                    // decision must be identical whether or not we happen to
-                    // dispatch through the parallel path. Only then, if the
-                    // job is NOT to be skipped, do we invoke a Router
-                    // transition (Router needs `&mut context` so it stays
-                    // serial). The previous code always pre-ran Router and
-                    // then forced `skip: skip && router_run.is_none()` —
-                    // effectively "Router is never skipped", which diverged
-                    // from the single-threaded path.
-                    let skip = spec.transition.join_policy == JoinPolicy::AllOf
-                        && trigger
-                            .inputs
-                            .iter()
-                            .any(|i| i.token.meta.outcome != NodeOutcome::Success);
-                    let router_run =
-                        if !skip && matches!(spec.kind, ExecutionTransitionKind::Router { .. }) {
-                            // The `?` here propagates a router/overlay failure
-                            // from the serial pre-compute of a parallel-path
-                            // Router. The error edge itself is archived: the
-                            // equivalent propagation is covered directly by
-                            // `probe_run_transition_router_execute_error_propagates`;
-                            // driving it through a full parallel net would
-                            // require a runner that both dispatches serially and
-                            // corrupts overlay state, which no valid net does.
-                            Some(run_transition_router(
-                                &spec,
-                                attempt,
-                                &trigger,
-                                &mut state.metrics,
-                                context,
-                                &runner,
-                            )?)
-                        } else {
-                            None
-                        };
-
-                    jobs.push(ParallelJob {
-                        transition_id: item.transition_id,
-                        key: item.key,
-                        spec,
-                        attempt,
-                        trigger,
-                        skip,
-                        router_run,
-                    });
+                    // `extend` over the returned Option keeps the skip case
+                    // (already-completed key) branch-free at this call site.
+                    jobs.extend(build_parallel_job(&mut state, item, context, &runner)?);
                 }
 
                 // Invariant: `batch` is non-empty and every batched item names
@@ -513,6 +424,112 @@ fn map_build_error(err: PetriNetBuildError) -> RuntimeError {
     RuntimeError::NetBuild {
         message: err.to_string(),
     }
+}
+
+/// One unit of parallel-path work, fully pre-computed in the serial phase.
+struct ParallelJob {
+    transition_id: String,
+    key: CorrelationKey,
+    spec: ExecutionTransitionSpec,
+    attempt: u32,
+    trigger: TransitionTrigger,
+    skip: bool,
+    /// Router result pre-computed in the serial phase (None = run in parallel).
+    router_run: Option<TransitionRunResult>,
+}
+
+/// Serial pre-compute for one batched ready item on the parallel path.
+///
+/// Returns `Ok(None)` when the item's key already completed (the defensive
+/// mirror of `process_one_item`'s `is_key_done` early return): `push_ready`
+/// refuses already-completed keys and the key-dedup drain does not re-add them,
+/// so within one batch build this is not reachable through a valid net; it is
+/// kept fail-safe rather than asserted because completion state is shared
+/// mutable, and is unit-tested directly.
+///
+/// Router transitions are invoked here (not in the worker threads) because
+/// overlay begin/commit needs `&mut RuntimeContext`.
+fn build_parallel_job<F>(
+    state: &mut EngineState,
+    item: ReadyItem,
+    context: &mut RuntimeContext,
+    runner: &F,
+) -> Result<Option<ParallelJob>, RuntimeError>
+where
+    F: Fn(
+            &ExecutionTransitionSpec,
+            u32,
+            &TransitionTrigger,
+            &RuntimeContext,
+        ) -> TransitionRunResult
+        + Send
+        + Sync,
+{
+    if state.is_key_done(&item.transition_id, &item.key) {
+        return Ok(None);
+    }
+    let attempt = *state
+        .attempts
+        .get(&(item.transition_id.clone(), item.key.clone()))
+        .unwrap_or(&0);
+    let trigger = state.ensure_trigger_inputs(&item.transition_id, &item.key)?;
+    // Parallel mirror of the single-thread spec lookup in `process_one_item`.
+    // `ensure_trigger_inputs` already went through `is_transition_ready`, which
+    // fails first if the spec is absent, so this arm does not fire through a
+    // valid net; the message text is byte-identical to the single-thread arm.
+    let spec = state
+        .specs
+        .get(&item.transition_id)
+        .cloned()
+        .ok_or_else(|| {
+            engine_invariant(&format!(
+                "ready transition missing spec: {}",
+                item.transition_id
+            ))
+        })?;
+
+    state.order.push(item.transition_id.clone());
+
+    // P1-3: compute `skip` from the single-thread rule first (AllOf +
+    // any-non-success upstream = Skipped) — this decision must be identical
+    // whether or not we happen to dispatch through the parallel path. Only
+    // then, if the job is NOT to be skipped, do we invoke a Router transition
+    // (Router needs `&mut context` so it stays serial). The previous code
+    // always pre-ran Router and then forced `skip: skip && router_run.is_none()`
+    // — effectively "Router is never skipped", which diverged from the
+    // single-threaded path.
+    let skip = spec.transition.join_policy == JoinPolicy::AllOf
+        && trigger
+            .inputs
+            .iter()
+            .any(|i| i.token.meta.outcome != NodeOutcome::Success);
+    let run_router = !skip && matches!(spec.kind, ExecutionTransitionKind::Router { .. });
+    // `then` + `map`/`transpose` keeps the router pre-compute (and its error
+    // propagation) a single expression: the `?` edge is the same one covered by
+    // `engine_build_parallel_job_router_error_propagates`, and there is no
+    // separate not-taken arm for the non-Router case.
+    let router_run = run_router
+        .then(|| {
+            run_transition_router(
+                &spec,
+                attempt,
+                &trigger,
+                &mut state.metrics,
+                context,
+                runner,
+            )
+        })
+        .transpose()?;
+
+    Ok(Some(ParallelJob {
+        transition_id: item.transition_id,
+        key: item.key,
+        spec,
+        attempt,
+        trigger,
+        skip,
+        router_run,
+    }))
 }
 
 /// Construct a kernel-invariant `RuntimeError` from a caller-formatted message.
@@ -1940,6 +1957,185 @@ mod tests {
             matches!(&wrapped, RuntimeError::ExecutionFailed { execution_id, message } if execution_id == "exec-42" && message.contains("boom")),
             "wrap arm must envelope, got {wrapped:?}"
         );
+    }
+
+    /// `build_parallel_job` skips (returns `Ok(None)`) an item whose key already
+    /// completed — the parallel mirror of `process_one_item`'s `is_key_done`
+    /// early return. Not reachable through a valid net (`push_ready` refuses
+    /// completed keys), so it is driven at the unit boundary.
+    #[test]
+    fn engine_build_parallel_job_skips_done_key() {
+        let graph = engine_state_probe_graph();
+        let specs: BTreeMap<String, ExecutionTransitionSpec> = [(
+            "t".to_string(),
+            make_transition("t", ExecutionTransitionKind::Task, JoinPolicy::AllOf),
+        )]
+        .into_iter()
+        .collect();
+        let mut state = EngineState::new("e".into(), specs, graph, ExecutionMetrics::default());
+        let k = CorrelationKey(String::new());
+        state.mark_completed("t", &k, NodeOutcome::Success);
+        let item = ReadyItem {
+            transition_id: "t".to_string(),
+            key: k,
+            topo_level: 0,
+            priority: 0,
+            retry: false,
+        };
+        let mut ctx = RuntimeContext::default();
+        let job = build_parallel_job(&mut state, item, &mut ctx, &success_runner).unwrap();
+        assert!(job.is_none(), "done key must not produce a job");
+        // The skipped item must not be recorded in the execution order.
+        assert!(state.order.is_empty());
+    }
+
+    /// `build_parallel_job`'s spec-lookup invariant: a ready item whose spec is
+    /// absent from `state.specs` yields the `ready transition missing spec`
+    /// error with text identical to the single-thread arm. Reached here via a
+    /// pre-seeded trigger cache (which short-circuits `ensure_trigger_inputs`,
+    /// the guard that would otherwise fail first).
+    #[test]
+    fn engine_build_parallel_job_missing_spec() {
+        let graph = engine_state_probe_graph();
+        let mut state = EngineState::new(
+            "e".into(),
+            BTreeMap::new(),
+            graph,
+            ExecutionMetrics::default(),
+        );
+        let k = CorrelationKey(String::new());
+        state
+            .trigger_inputs_cache
+            .insert(("t".to_string(), k.clone()), Vec::new());
+        let item = ReadyItem {
+            transition_id: "t".to_string(),
+            key: k,
+            topo_level: 0,
+            priority: 0,
+            retry: false,
+        };
+        let mut ctx = RuntimeContext::default();
+        // `matches!` on the whole `Result` (rather than `unwrap_err`) keeps
+        // `ParallelJob` free of a `Debug` impl that nothing else would exercise.
+        let outcome = build_parallel_job(&mut state, item, &mut ctx, &success_runner);
+        let shown = outcome
+            .as_ref()
+            .err()
+            .map_or_else(|| "Ok(job)".to_string(), |err| err.to_string());
+        let is_expected = matches!(&outcome, Err(RuntimeError::Invariant { message }) if message == "ready transition missing spec: t");
+        assert!(is_expected, "wrong result: {shown}");
+    }
+
+    /// `build_parallel_job` propagates a Router pre-compute failure: an already
+    /// active subgraph makes `run_transition_router`'s `begin_subgraph` reject,
+    /// and the `?` surfaces it instead of producing a job.
+    #[test]
+    fn engine_build_parallel_job_router_error_propagates() {
+        let graph = engine_state_probe_graph();
+        let specs: BTreeMap<String, ExecutionTransitionSpec> = [(
+            "t".to_string(),
+            make_transition(
+                "t",
+                ExecutionTransitionKind::Router {
+                    subgraph_id: "sg".to_string(),
+                },
+                JoinPolicy::AnyOf,
+            ),
+        )]
+        .into_iter()
+        .collect();
+        let mut state = EngineState::new("e".into(), specs, graph, ExecutionMetrics::default());
+        let k = CorrelationKey(String::new());
+        state
+            .trigger_inputs_cache
+            .insert(("t".to_string(), k.clone()), Vec::new());
+        let item = ReadyItem {
+            transition_id: "t".to_string(),
+            key: k,
+            topo_level: 0,
+            priority: 0,
+            retry: false,
+        };
+        use crate::context::ContextTxn;
+        let mut ctx = RuntimeContext::default();
+        ctx.begin_subgraph("already").unwrap();
+        let outcome = build_parallel_job(&mut state, item, &mut ctx, &success_runner);
+        let is_expected = matches!(&outcome, Err(RuntimeError::SubgraphAlreadyActive { .. }));
+        assert!(is_expected, "router pre-compute must surface the reject");
+    }
+
+    /// `build_parallel_job` Router happy path: the overlay pre-compute runs
+    /// serially and its result is carried on the job (so the worker threads
+    /// never touch a Router).
+    #[test]
+    fn engine_build_parallel_job_router_precomputed() {
+        let graph = engine_state_probe_graph();
+        let specs: BTreeMap<String, ExecutionTransitionSpec> = [(
+            "t".to_string(),
+            make_transition(
+                "t",
+                ExecutionTransitionKind::Router {
+                    subgraph_id: "sg".to_string(),
+                },
+                JoinPolicy::AnyOf,
+            ),
+        )]
+        .into_iter()
+        .collect();
+        let mut state = EngineState::new("e".into(), specs, graph, ExecutionMetrics::default());
+        let k = CorrelationKey(String::new());
+        state
+            .trigger_inputs_cache
+            .insert(("t".to_string(), k.clone()), Vec::new());
+        let item = ReadyItem {
+            transition_id: "t".to_string(),
+            key: k,
+            topo_level: 0,
+            priority: 0,
+            retry: false,
+        };
+        let mut ctx = RuntimeContext::default();
+        let job = build_parallel_job(&mut state, item, &mut ctx, &success_runner)
+            .unwrap()
+            .expect("router job must be built");
+        assert!(!job.skip);
+        assert_eq!(
+            job.router_run.map(|run| run.outcome),
+            Some(NodeOutcome::Success)
+        );
+        assert_eq!(state.order, vec!["t".to_string()]);
+    }
+
+    /// `build_parallel_job` non-Router path leaves `router_run` empty so the
+    /// job dispatches through the worker threads.
+    #[test]
+    fn engine_build_parallel_job_task_defers_to_workers() {
+        let graph = engine_state_probe_graph();
+        let specs: BTreeMap<String, ExecutionTransitionSpec> = [(
+            "t".to_string(),
+            make_transition("t", ExecutionTransitionKind::Task, JoinPolicy::AnyOf),
+        )]
+        .into_iter()
+        .collect();
+        let mut state = EngineState::new("e".into(), specs, graph, ExecutionMetrics::default());
+        let k = CorrelationKey(String::new());
+        state
+            .trigger_inputs_cache
+            .insert(("t".to_string(), k.clone()), Vec::new());
+        let item = ReadyItem {
+            transition_id: "t".to_string(),
+            key: k,
+            topo_level: 0,
+            priority: 0,
+            retry: false,
+        };
+        let mut ctx = RuntimeContext::default();
+        let job = build_parallel_job(&mut state, item, &mut ctx, &success_runner)
+            .unwrap()
+            .expect("task job must be built");
+        assert!(job.router_run.is_none());
+        assert_eq!(job.attempt, 0);
+        assert_eq!(job.transition_id, "t");
     }
 
     #[test]

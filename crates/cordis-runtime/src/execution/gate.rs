@@ -182,9 +182,10 @@ fn eval_first_completed(
             // in `outcomes` is always terminal and this `continue` never runs.
             // Kept as a forward guard for a future non-terminal state
             // (e.g. Running/Pending); it would then skip such upstreams here.
-            if !is_terminal(*outcome) {
-                continue;
-            }
+            debug_assert!(
+                is_terminal(*outcome),
+                "NodeOutcome variants are all terminal"
+            );
             let cancel_nodes = upstream_nodes
                 .iter()
                 .filter(|n| {
@@ -254,14 +255,8 @@ fn eval_at_least(
 /// collapsed to `true`) so that adding a non-terminal state (e.g. `Running`)
 /// forces a compile-time review of every gate that calls this.
 fn is_terminal(outcome: NodeOutcome) -> bool {
-    matches!(
-        outcome,
-        NodeOutcome::Success
-            | NodeOutcome::Failure
-            | NodeOutcome::Timeout
-            | NodeOutcome::Cancelled
-            | NodeOutcome::Skipped
-    )
+    use NodeOutcome::{Cancelled, Failure, Skipped, Success, Timeout};
+    matches!(outcome, Success | Failure | Timeout | Cancelled | Skipped)
 }
 
 #[cfg(test)]
@@ -470,16 +465,13 @@ mod tests {
         let up = vec!["a".to_string(), "b".to_string()];
         let out = outcomes(&[("a", NodeOutcome::Timeout)]);
         let order = vec!["a".to_string()];
-        match evaluate_gate(GatePolicy::FirstCompleted, &up, &out, &order) {
+        assert_eq!(
+            evaluate_gate(GatePolicy::FirstCompleted, &up, &out, &order),
             GateDecision::CompleteAndCancel {
-                success,
-                cancel_nodes,
-            } => {
-                assert!(!success);
-                assert_eq!(cancel_nodes, vec!["b".to_string()]);
+                success: false,
+                cancel_nodes: vec!["b".to_string()],
             }
-            d => panic!("expected CompleteAndCancel failure, got {d:?}"),
-        }
+        );
     }
 
     // FirstCompleted: a lone terminal failure with no pending peers completes
@@ -530,16 +522,13 @@ mod tests {
         let up = vec!["a".to_string(), "b".to_string()];
         let out = outcomes(&[("b", NodeOutcome::Success)]);
         let order = vec!["z".to_string(), "a".to_string(), "b".to_string()];
-        match evaluate_gate(GatePolicy::FirstCompleted, &up, &out, &order) {
+        assert_eq!(
+            evaluate_gate(GatePolicy::FirstCompleted, &up, &out, &order),
             GateDecision::CompleteAndCancel {
-                success,
-                cancel_nodes,
-            } => {
-                assert!(success);
-                assert_eq!(cancel_nodes, vec!["a".to_string()]);
+                success: true,
+                cancel_nodes: vec!["a".to_string()],
             }
-            d => panic!("expected CompleteAndCancel, got {d:?}"),
-        }
+        );
     }
 
     // FirstCompleted: nothing terminal yet → Wait (fallthrough past the loop).

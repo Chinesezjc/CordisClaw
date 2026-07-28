@@ -490,11 +490,13 @@ mod tests {
         }
         assert_eq!(runtime.submitted.len(), 1);
         assert_eq!(runtime.cancel_count, 0);
-        assert!(
-            matches!(&runtime.submitted[0], WaitSpec::Call(spec) if spec.plugin_path == "expr" && spec.node_id == "expr_entry"),
-            "unexpected wait kind: {:?}",
-            runtime.submitted[0]
-        );
+        // Pre-bind the condition (and its failure text) so the assert is a
+        // single line: a multi-line `assert!` evaluates its message arguments
+        // lazily, leaving that argument line permanently uncovered whenever the
+        // assertion holds.
+        let submitted = &runtime.submitted[0];
+        let is_expected_call = matches!(submitted, WaitSpec::Call(spec) if spec.plugin_path == "expr" && spec.node_id == "expr_entry");
+        assert!(is_expected_call, "unexpected wait kind: {submitted:?}");
     }
 
     // The success/timeout paths poll to Ready, so the runtime's `cancel_wait`
