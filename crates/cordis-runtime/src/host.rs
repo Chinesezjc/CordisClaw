@@ -49,7 +49,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex, RwLock, Weak};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use toml::Value as TomlValue;
 
@@ -2035,6 +2035,26 @@ impl RuntimeHost {
         fs::create_dir_all(&snapshot_root)
             .map_err(|e| host_io_error(snapshot_root.clone(), e.to_string()))?;
         cleanup_stale_snapshot_dirs(&snapshot_root);
+        // 兄弟 hash 目录的回收：`cleanup_stale_snapshot_dirs` 只管本 root
+        // 内部，跨 root 的孤儿（fixtures root 已消失、hash 再也不会重现）
+        // 只能在这里扫。默认 root 之外（配置了 runtime.snapshot_root）不做
+        // 跨目录清理，避免动到用户自己指定的目录树。
+        let host_snapshot_dir = default_host_snapshot_dir();
+        if snapshot_root.starts_with(&host_snapshot_dir) {
+            let report = cleanup_orphaned_snapshot_roots(
+                &host_snapshot_dir,
+                config.snapshot_retention(),
+                Some(&snapshot_root),
+                false,
+            );
+            if report.removed > 0 {
+                eprintln!(
+                    "[snapshot-gc] 回收 {} 个孤儿 snapshot root，释放 {:.1} MB",
+                    report.removed,
+                    report.bytes_reclaimed as f64 / (1024.0 * 1024.0)
+                );
+            }
+        }
         let initial_snapshot = Arc::new(build_snapshot(&loader, &snapshot_root)?);
         let interactive_rollback = Mutex::new(PluginEditRollback::empty(&fixtures_root));
         let service_registry = Arc::new(crate::context::ServiceRegistry::new());
@@ -4879,6 +4899,32 @@ export_plugin_api! {{
                 staged_artifact_root,
             });
     }
+
+    /// 删除本进程当前 live snapshot 的 staged root，并回收所有已退休的。
+    ///
+    /// `cleanup_retired_snapshots` 只回收 **reload 时被退休**的快照，live
+    /// 的那一份没有任何路径负责：boot 后不 reload 直接退出的进程会把它原地
+    /// 留下，叠加"hash 目录再也不会重现"即成为永久孤儿。
+    ///
+    /// **幂等**：重复调用安全，供 `Drop` 与信号处理路径共用 —— 信号处理器走
+    /// `std::process::exit(0)`，绕过所有 `Drop`，因此必须显式调一次。
+    pub fn cleanup_live_snapshot(&self) {
+        let staged_root = self.current_snapshot().staged_artifact_root.clone();
+        // 空路径是 `reload_subtree` 的产物（不建目录），不能当路径删。
+        if staged_root.as_os_str().is_empty() {
+            return;
+        }
+        if staged_root.starts_with(&self.snapshot_root) && staged_root != self.snapshot_root {
+            let _ = fs::remove_dir_all(&staged_root);
+        }
+        self.cleanup_retired_snapshots();
+    }
+}
+
+impl Drop for RuntimeHost {
+    fn drop(&mut self) {
+        self.cleanup_live_snapshot();
+    }
 }
 
 impl ReloadReport {
@@ -7248,26 +7294,194 @@ fn cleanup_stale_snapshot_dirs(snapshot_root: &Path) {
     for entry in entries.flatten() {
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
-        let Some(rest) = name_str.strip_prefix("snapshot-") else {
+        if !is_snapshot_dir_name(&name_str) {
             continue;
-        };
+        }
         if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
             continue;
         }
-        let owner_alive = rest
-            .split('-')
-            .next()
-            .and_then(|segment| segment.parse::<u32>().ok())
-            // pid 必须能落进正的 pid_t：`kill(-1, 0)` 语义是"探测所有
-            // 可发信号进程"，恒成功，超出 i32 的值直接判死而不是探活。
-            // 旧格式 `snapshot-{nanos}` 首段是纳秒时间戳，parse u32 失败
-            // → None → 按 stale 清理。
-            .filter(|pid| i32::try_from(*pid).is_ok())
-            .is_some_and(crate::plugin::tooling::lock_pid_is_live);
-        if !owner_alive {
+        if !snapshot_dir_owner_is_alive(&name_str) {
             let _ = fs::remove_dir_all(entry.path());
         }
     }
+}
+
+/// 目录名是否为 staged snapshot（`snapshot-{pid}-{nanos}`，含旧格式
+/// `snapshot-{nanos}`）。
+fn is_snapshot_dir_name(name: &str) -> bool {
+    name.starts_with("snapshot-")
+}
+
+/// 从 `snapshot-{pid}-{nanos}` 目录名解析 pid 并探活。
+///
+/// pid 段解析成功且进程仍存活（`lock_pid_is_live`，同进程恒真）→ true，
+/// 这是某个活 host 的 in-flight staging；进程已死或名字不含合法 pid 段
+/// （含历史 `snapshot-{nanos}` 旧格式）→ false，视为 stale。
+fn snapshot_dir_owner_is_alive(name: &str) -> bool {
+    name.strip_prefix("snapshot-")
+        .and_then(|rest| rest.split('-').next())
+        .and_then(|segment| segment.parse::<u32>().ok())
+        // pid 必须能落进正的 pid_t：`kill(-1, 0)` 语义是"探测所有
+        // 可发信号进程"，恒成功，超出 i32 的值直接判死而不是探活。
+        // 旧格式 `snapshot-{nanos}` 首段是纳秒时间戳，parse u32 失败
+        // → None → 按 stale 处理。
+        .filter(|pid| i32::try_from(*pid).is_ok())
+        .is_some_and(crate::plugin::tooling::lock_pid_is_live)
+}
+
+/// 跨 hash 目录 GC 的统计结果。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SnapshotGcReport {
+    /// 扫描到的 hash 目录总数。
+    pub scanned: usize,
+    /// 已删除（或 dry-run 下判定可删）的 hash 目录数。
+    pub removed: usize,
+    /// 回收的字节数。
+    pub bytes_reclaimed: u64,
+    /// 因含未重放的 rollback journal 而跳过的目录数。
+    pub skipped_journal: usize,
+    /// 因仍有活进程持有 in-flight staging 而跳过的目录数。
+    pub skipped_live: usize,
+    /// 因未到保留期而跳过的目录数。
+    pub skipped_recent: usize,
+}
+
+/// 回收 `{temp_dir}/cordis-runtime-host/` 下已无人认领的 hash 目录。
+///
+/// `cleanup_stale_snapshot_dirs` 只扫描**当次 boot 解析出的那一个** hash
+/// 目录内部，从不遍历兄弟目录；而 hash 是 fixtures root canonical 路径的
+/// sha256，集成测试每次把 fixtures 拷进新 `TempDir` → 路径不同 → 全新 hash
+/// 目录，老目录永远等不到"下次 boot 扫到它"，因为那个 hash 再也不会出现。
+/// 实测本机累积 196 GB / 13200 个 hash 目录。本函数补上这一层回收。
+///
+/// 删除判据（三条**全部**满足）：
+/// 1. 目录内所有 `snapshot-{pid}-*` 的 pid 段均已死（或无合法 pid 段）；
+/// 2. 目录 mtime 已超过 `max_age`；
+/// 3. 目录内无 `plugin-iteration-edit-journal.json`。
+///
+/// 第 3 条是安全红线：journal 是崩溃恢复状态（`restore_plugin_iteration_workspace`
+/// 在 boot 时重放它），而 sha256 单向、无法反推 fixtures root 是否还存在，
+/// 因此含 journal 的目录一律保留并打印路径交人工处置，绝不自动丢弃。
+///
+/// 第 1 条受 **pid 复用**限制：目录名里的 pid 早已随进程退出被 OS 回收、
+/// 可能复用到任意无关进程上，此时 `lock_pid_is_live` 返回 true、目录被判为
+/// "仍在用"而保留（实测 13206 个目录里 67 个如此，持有者是 vscode 里的
+/// 无关进程）。这是保守方向的误判——宁可留下也不误删活 host 正在 staging
+/// 的目录——且第 2 条的 mtime 会限制其累积规模；要精确判定得往目录里写
+/// boot 时间戳或加文件锁，当前不值得为此加复杂度。
+///
+/// 空 hash 目录不受 `max_age` 约束，直接回收（无字节可丢）。
+/// `skip_root` 传入当前进程正在用的 snapshot root，确保永不自删。
+pub fn cleanup_orphaned_snapshot_roots(
+    host_root: &Path,
+    max_age: Duration,
+    skip_root: Option<&Path>,
+    dry_run: bool,
+) -> SnapshotGcReport {
+    let mut report = SnapshotGcReport::default();
+    let Ok(entries) = fs::read_dir(host_root) else {
+        return report;
+    };
+    // 当前 snapshot root 用 canonical 形式比对：调用方传进来的可能是
+    // 未规范化路径（macOS 的 /tmp 是 /private/tmp 的 symlink）。
+    let skip_canonical = skip_root.and_then(|path| path.canonicalize().ok());
+
+    for entry in entries.flatten() {
+        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let path = entry.path();
+        if let Some(skip) = skip_canonical.as_deref() {
+            if path.canonicalize().ok().as_deref() == Some(skip) {
+                continue;
+            }
+        }
+        report.scanned += 1;
+
+        let Ok(children) = fs::read_dir(&path) else {
+            continue;
+        };
+        let mut has_journal = false;
+        let mut owner_alive = false;
+        let mut is_empty = true;
+        for child in children.flatten() {
+            is_empty = false;
+            let child_name = child.file_name();
+            let child_name = child_name.to_string_lossy();
+            if child_name == "plugin-iteration-edit-journal.json" {
+                has_journal = true;
+            }
+            if is_snapshot_dir_name(&child_name) && snapshot_dir_owner_is_alive(&child_name) {
+                owner_alive = true;
+            }
+        }
+
+        if owner_alive {
+            report.skipped_live += 1;
+            continue;
+        }
+        if has_journal {
+            report.skipped_journal += 1;
+            eprintln!(
+                "[snapshot-gc] 保留 {}：含未重放的 plugin-iteration rollback journal",
+                path.display()
+            );
+            continue;
+        }
+        // 空目录没有字节可丢，不必等保留期。
+        if !is_empty && !dir_is_older_than(&path, max_age) {
+            report.skipped_recent += 1;
+            continue;
+        }
+
+        let bytes = dir_size_bytes(&path);
+        if dry_run {
+            report.removed += 1;
+            report.bytes_reclaimed += bytes;
+            continue;
+        }
+        if fs::remove_dir_all(&path).is_ok() {
+            report.removed += 1;
+            report.bytes_reclaimed += bytes;
+        }
+    }
+    report
+}
+
+/// 目录 mtime 是否已早于 `now - max_age`。取不到 mtime 时保守返回 false
+/// （宁可留着也不误删）。
+fn dir_is_older_than(path: &Path, max_age: Duration) -> bool {
+    let Ok(modified) = fs::metadata(path).and_then(|meta| meta.modified()) else {
+        return false;
+    };
+    SystemTime::now()
+        .duration_since(modified)
+        .map(|age| age >= max_age)
+        .unwrap_or(false)
+}
+
+/// 递归累加目录内文件字节数，用于报告回收量。符号链接不跟随（只算链接本身）。
+fn dir_size_bytes(path: &Path) -> u64 {
+    let Ok(entries) = fs::read_dir(path) else {
+        return 0;
+    };
+    let mut total = 0;
+    for entry in entries.flatten() {
+        match entry.file_type() {
+            Ok(ty) if ty.is_dir() => total += dir_size_bytes(&entry.path()),
+            Ok(ty) if ty.is_file() => {
+                total += entry.metadata().map(|meta| meta.len()).unwrap_or(0);
+            }
+            _ => {}
+        }
+    }
+    total
+}
+
+/// 默认的 host 级 snapshot 根目录 `{temp_dir}/cordis-runtime-host`，
+/// 即所有 per-fixtures-root hash 目录的父目录。
+pub fn default_host_snapshot_dir() -> PathBuf {
+    std::env::temp_dir().join("cordis-runtime-host")
 }
 
 fn next_staged_artifact_root(snapshot_root: &Path) -> PathBuf {
@@ -7703,7 +7917,7 @@ fn default_snapshot_root(fixtures_root: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        cleanup_stale_snapshot_dirs, collect_plugin_context_paths,
+        cleanup_orphaned_snapshot_roots, cleanup_stale_snapshot_dirs, collect_plugin_context_paths,
         ensure_scaffold_integration_edits, extract_warning_blocks, render_child_plugin_core,
         render_child_plugin_test, sanitize_child_plugin_segment, sort_plugin_context_paths,
         warning_diagnostics_for_changed_paths, AgentBackend, AgentSessionKind, AgentStartOptions,
@@ -7723,6 +7937,7 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::OnceLock;
+    use std::time::{Duration, SystemTime};
 
     fn repo_fixtures_root() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -7764,6 +7979,167 @@ mod tests {
         assert!(!legacy.exists(), "legacy-format snapshot must be removed");
         assert!(unrelated.exists(), "non-snapshot dirs are untouched");
         assert!(file.exists(), "plain files are untouched");
+    }
+
+    /// 起一个立即退出的子进程并 wait 掉，拿一个确定已死的 pid。
+    fn reaped_dead_pid() -> u32 {
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn short-lived child");
+        let pid = child.id();
+        child.wait().expect("reap child");
+        pid
+    }
+
+    /// 把目录 mtime 往前拨 `secs` 秒，模拟"老目录"。
+    fn backdate_dir(path: &Path, secs: u64) {
+        let past = SystemTime::now() - Duration::from_secs(secs);
+        let times = fs::FileTimes::new().set_modified(past);
+        let dir = fs::File::open(path).expect("open dir for utimes");
+        dir.set_times(times).expect("backdate dir mtime");
+    }
+
+    /// 造一个 hash 目录：内含一个属于 `pid` 的 snapshot 子目录 + 一个占位文件。
+    fn make_hash_dir(root: &Path, name: &str, pid: u32) -> PathBuf {
+        let hash = root.join(name);
+        let snapshot = hash.join(format!("snapshot-{pid}-1"));
+        fs::create_dir_all(&snapshot).expect("create hash/snapshot dir");
+        fs::write(snapshot.join("plugin.so"), b"0123456789").expect("write artifact");
+        hash
+    }
+
+    #[test]
+    fn orphaned_snapshot_root_gc_removes_dead_pid_dirs() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        let dead_pid = reaped_dead_pid();
+
+        // 死 pid + 老 mtime → 删。
+        let orphan = make_hash_dir(root, "aaa", dead_pid);
+        backdate_dir(&orphan, 48 * 3600);
+        // 活 pid（本进程）→ 留，无论多老。
+        let live = make_hash_dir(root, "bbb", std::process::id());
+        backdate_dir(&live, 48 * 3600);
+        // 死 pid 但 mtime 新 → 留（未到保留期）。
+        let recent = make_hash_dir(root, "ccc", dead_pid);
+
+        let report =
+            cleanup_orphaned_snapshot_roots(root, Duration::from_secs(24 * 3600), None, false);
+
+        assert!(!orphan.exists(), "dead-pid aged hash dir must be removed");
+        assert!(live.exists(), "live-pid hash dir must survive");
+        assert!(recent.exists(), "hash dir within retention must survive");
+        assert_eq!(report.removed, 1);
+        assert_eq!(report.skipped_live, 1);
+        assert_eq!(report.skipped_recent, 1);
+        assert_eq!(report.scanned, 3);
+        // 回收字节数覆盖到 snapshot 子目录里的文件。
+        assert_eq!(report.bytes_reclaimed, 10);
+    }
+
+    #[test]
+    fn orphaned_snapshot_root_gc_preserves_journal_dirs() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        let dead_pid = reaped_dead_pid();
+
+        // 死 pid + 老 mtime，但含未重放的 rollback journal → 必须保留。
+        // journal 是崩溃恢复状态，sha256 单向无法反推 fixtures root 还在不在，
+        // 盲删会摧毁回滚记录。
+        let with_journal = make_hash_dir(root, "aaa", dead_pid);
+        fs::write(
+            with_journal.join("plugin-iteration-edit-journal.json"),
+            b"{}",
+        )
+        .expect("write journal");
+        backdate_dir(&with_journal, 48 * 3600);
+
+        let report =
+            cleanup_orphaned_snapshot_roots(root, Duration::from_secs(24 * 3600), None, false);
+
+        assert!(
+            with_journal.exists(),
+            "hash dir holding an unreplayed journal must never be auto-removed"
+        );
+        assert_eq!(report.skipped_journal, 1);
+        assert_eq!(report.removed, 0);
+    }
+
+    #[test]
+    fn orphaned_snapshot_root_gc_removes_empty_hash_dirs_regardless_of_age() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        // 空目录没有字节可丢，不必等保留期。
+        let empty = root.join("aaa");
+        fs::create_dir(&empty).expect("create empty hash dir");
+
+        let report =
+            cleanup_orphaned_snapshot_roots(root, Duration::from_secs(24 * 3600), None, false);
+
+        assert!(!empty.exists(), "empty hash dir is reclaimed immediately");
+        assert_eq!(report.removed, 1);
+        assert_eq!(report.bytes_reclaimed, 0);
+    }
+
+    #[test]
+    fn orphaned_snapshot_root_gc_skips_own_root() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        let dead_pid = reaped_dead_pid();
+        // 即便判据全中（死 pid + 老 mtime），当前进程正在用的 root 也不能自删。
+        let own = make_hash_dir(root, "aaa", dead_pid);
+        backdate_dir(&own, 48 * 3600);
+
+        let report = cleanup_orphaned_snapshot_roots(
+            root,
+            Duration::from_secs(24 * 3600),
+            Some(&own),
+            false,
+        );
+
+        assert!(
+            own.exists(),
+            "the live process's own snapshot root is never removed"
+        );
+        assert_eq!(report.removed, 0);
+        // skip_root 在计数前就被跳过，不计入 scanned。
+        assert_eq!(report.scanned, 0);
+    }
+
+    #[test]
+    fn orphaned_snapshot_root_gc_dry_run_reports_without_deleting() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        let dead_pid = reaped_dead_pid();
+        let orphan = make_hash_dir(root, "aaa", dead_pid);
+        backdate_dir(&orphan, 48 * 3600);
+
+        let report =
+            cleanup_orphaned_snapshot_roots(root, Duration::from_secs(24 * 3600), None, true);
+
+        assert!(orphan.exists(), "dry-run must not delete anything");
+        assert_eq!(
+            report.removed, 1,
+            "dry-run still reports what would be removed"
+        );
+        assert_eq!(report.bytes_reclaimed, 10);
+    }
+
+    #[test]
+    fn orphaned_snapshot_root_gc_zero_max_age_expires_everything() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        let dead_pid = reaped_dead_pid();
+        // 刚建的目录，配合 retention=0（config 的 Some(0) 语义）应立即可回收。
+        let fresh = make_hash_dir(root, "aaa", dead_pid);
+
+        let report = cleanup_orphaned_snapshot_roots(root, Duration::ZERO, None, false);
+
+        assert!(
+            !fresh.exists(),
+            "retention=0 expires even a just-created dir"
+        );
+        assert_eq!(report.removed, 1);
     }
 
     // Shared read-only host against the real fixtures tree. The fixture
@@ -8602,6 +8978,72 @@ mod ffi_panic_seam_tests {
         )
         .expect("write empty artifact index");
         (temp, fixtures)
+    }
+
+    /// 在 fixtures 旁写 `config/runtime.yaml`，把 snapshot staging 钉在
+    /// `TempDir` 内，避免测试往全局 temp 目录堆 staged 工件。
+    /// `discover_config_dir` 对 file_name 为 `fixtures` 的 root 取兄弟
+    /// `../config`。
+    fn pin_snapshot_root_beside_fixtures(
+        fixtures: &std::path::Path,
+        snapshot_root: &std::path::Path,
+    ) {
+        let config_dir = fixtures
+            .parent()
+            .expect("fixtures has a parent")
+            .join("config");
+        fs::create_dir_all(&config_dir).expect("create config dir");
+        fs::write(
+            config_dir.join("runtime.yaml"),
+            format!("runtime:\n  snapshot_root: {}\n", snapshot_root.display()),
+        )
+        .expect("write runtime.yaml");
+    }
+
+    #[test]
+    #[serial]
+    fn host_drop_removes_live_staged_root() {
+        let (temp, fixtures) = setup_empty_fixture();
+        let snapshot_root = temp.path().join("snapshots");
+        pin_snapshot_root_beside_fixtures(&fixtures, &snapshot_root);
+
+        let host = RuntimeHost::boot(&fixtures).expect("host should boot on empty index");
+        let staged = host.current_snapshot().staged_artifact_root.clone();
+        assert!(
+            staged.starts_with(&snapshot_root),
+            "staging must land in the pinned root, got {}",
+            staged.display()
+        );
+        assert!(
+            staged.exists(),
+            "live staged root exists while host is alive"
+        );
+
+        // boot 后不 reload 直接 drop：此前没有任何路径回收 live staged root。
+        drop(host);
+
+        assert!(
+            !staged.exists(),
+            "Drop must reclaim the live snapshot's staged root"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn cleanup_live_snapshot_is_idempotent() {
+        let (temp, fixtures) = setup_empty_fixture();
+        let snapshot_root = temp.path().join("snapshots");
+        pin_snapshot_root_beside_fixtures(&fixtures, &snapshot_root);
+
+        let host = RuntimeHost::boot(&fixtures).expect("host should boot on empty index");
+        let staged = host.current_snapshot().staged_artifact_root.clone();
+
+        // 信号处理路径显式调一次，随后 Drop 还会再调一次：必须幂等。
+        host.cleanup_live_snapshot();
+        assert!(!staged.exists());
+        host.cleanup_live_snapshot();
+        drop(host);
+        assert!(!staged.exists());
     }
 
     /// A JSON-artifact plugin `svc` that declares one `Task` node. JSON
