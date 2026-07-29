@@ -7471,7 +7471,14 @@ pub fn cleanup_orphaned_snapshot_roots(
             is_empty = false;
             let child_name = child.file_name();
             let child_name = child_name.to_string_lossy();
-            if child_name == "plugin-iteration-edit-journal.json" {
+            // 必须是**文件**才算 journal。有测试故意把这个路径造成非空目录来
+            // 迫使 `clear_journal` 的 remove_file 失败
+            // （`clear_journal_remove_failure_when_path_is_nonempty_dir`），
+            // 只按名字判断会把这类测试残渣误当成崩溃恢复状态而永久保留
+            // （实测 338 个同名条目里 229 个是这种目录）。
+            if child_name == "plugin-iteration-edit-journal.json"
+                && child.file_type().map(|t| t.is_file()).unwrap_or(false)
+            {
                 has_journal = true;
             }
             if is_snapshot_dir_name(&child_name) && snapshot_dir_owner_is_alive(&child_name) {
@@ -8126,6 +8133,35 @@ mod tests {
         );
         assert_eq!(report.skipped_journal, 1);
         assert_eq!(report.removed, 0);
+    }
+
+    /// journal **同名目录**不算 journal，必须照常回收。
+    ///
+    /// `clear_journal_remove_failure_when_path_is_nonempty_dir` 之类的测试会
+    /// 故意把 journal 路径造成非空目录以迫使 `remove_file` 失败；早期只按
+    /// 文件名判断的实现把这类残渣误当成崩溃恢复状态而永久保留（实测 338 个
+    /// 同名条目里 229 个是目录，占住 GC 该回收的空间）。
+    #[test]
+    fn orphaned_snapshot_root_gc_ignores_journal_named_directory() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        let dead_pid = reaped_dead_pid();
+
+        let orphan = make_hash_dir(root, "aaa", dead_pid);
+        let journal_as_dir = orphan.join("plugin-iteration-edit-journal.json");
+        fs::create_dir_all(&journal_as_dir).expect("create journal-named dir");
+        fs::write(journal_as_dir.join("blocker.txt"), b"x").expect("write blocker");
+        backdate_dir(&orphan, 48 * 3600);
+
+        let report =
+            cleanup_orphaned_snapshot_roots(root, Duration::from_secs(24 * 3600), None, false);
+
+        assert!(
+            !orphan.exists(),
+            "a journal-named directory is test debris, not recovery state"
+        );
+        assert_eq!(report.skipped_journal, 0);
+        assert_eq!(report.removed, 1);
     }
 
     #[test]
