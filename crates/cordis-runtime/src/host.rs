@@ -1146,6 +1146,10 @@ pub struct KernelStatus {
     pub iteration_total: u64,
     pub iteration_promote_total: u64,
     pub iteration_rollback_total: u64,
+    /// 基础设施故障（磁盘满等）导致的失败次数。与 rollback 分开计数，
+    /// 否则磁盘满会污染"验证失败率"这个指标。
+    #[serde(default)]
+    pub iteration_infrastructure_failure_total: u64,
     pub history_len: usize,
     pub last_change: Option<ChangeRecord>,
     pub plugin_issue_count: usize,
@@ -1216,6 +1220,7 @@ struct KernelIterationMetrics {
     iteration_total: u64,
     iteration_promote_total: u64,
     iteration_rollback_total: u64,
+    iteration_infrastructure_failure_total: u64,
 }
 
 #[derive(Debug)]
@@ -1287,10 +1292,16 @@ impl RuntimeKernel {
             .iteration_metrics
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        let (iteration_total, iteration_promote_total, iteration_rollback_total) = (
+        let (
+            iteration_total,
+            iteration_promote_total,
+            iteration_rollback_total,
+            iteration_infrastructure_failure_total,
+        ) = (
             metrics.iteration_total,
             metrics.iteration_promote_total,
             metrics.iteration_rollback_total,
+            metrics.iteration_infrastructure_failure_total,
         );
         drop(metrics);
         // Single memory lock for both fields — avoids double-futex.
@@ -1312,6 +1323,7 @@ impl RuntimeKernel {
             iteration_total,
             iteration_promote_total,
             iteration_rollback_total,
+            iteration_infrastructure_failure_total,
             history_len,
             last_change,
             plugin_issue_count,
@@ -1664,6 +1676,9 @@ impl RuntimeKernel {
                 PluginIterationFinalVerdict::RolledBack => {
                     metrics.iteration_rollback_total += 1;
                 }
+                PluginIterationFinalVerdict::InfrastructureFailure => {
+                    metrics.iteration_infrastructure_failure_total += 1;
+                }
             }
         }
 
@@ -1702,7 +1717,11 @@ impl RuntimeKernel {
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner());
             match result.final_verdict {
-                PluginIterationFinalVerdict::Blocked => {
+                // 基础设施故障与 Blocked 一样保留：腾出磁盘后可经
+                // approve_blocked_iteration 原样重试；RolledBack 摘除是因为
+                // 那代表插件真的没通过验证，重试同一份代码没有意义。
+                PluginIterationFinalVerdict::Blocked
+                | PluginIterationFinalVerdict::InfrastructureFailure => {
                     blocked.insert(result.iteration_id.clone(), result.clone());
                 }
                 PluginIterationFinalVerdict::Promoted | PluginIterationFinalVerdict::RolledBack => {
@@ -1715,6 +1734,9 @@ impl RuntimeKernel {
             PluginIterationFinalVerdict::Blocked => KernelPluginIssueStatus::Blocked,
             PluginIterationFinalVerdict::Promoted => KernelPluginIssueStatus::Resolved,
             PluginIterationFinalVerdict::RolledBack => KernelPluginIssueStatus::Open,
+            // 不是 Open：Open 读作"插件仍然坏着"，而磁盘满与插件质量无关。
+            // 复用 Blocked（等人处置基础设施后重试），不新增 issue 状态。
+            PluginIterationFinalVerdict::InfrastructureFailure => KernelPluginIssueStatus::Blocked,
         };
         self.update_issue_status(&result.issue_id, status);
     }
@@ -2022,6 +2044,15 @@ pub(crate) static TEST_ITERATION_PANIC_INJECTION: std::sync::atomic::AtomicBool 
 /// running. Swapped back to `false` on read so it fires exactly once.
 #[cfg(test)]
 pub(crate) static TEST_STOP_HANDLER_PANIC_INJECTION: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Test-only ENOSPC injection flag. 置位后 journal persist 阶段返回一个 ENOSPC
+/// 形状的 `RuntimeError::Io`，让测试无需真把盘写满就能覆盖"磁盘满判成
+/// `InfrastructureFailure` 而非 `RolledBack`"。journal 写在 `snapshot_root` 下，
+/// 正是磁盘写满时最先失败的位置之一（真实链路 persist_journal → atomic_write
+/// → `RuntimeError::Io`）。读后置回 `false`，只触发一次。
+#[cfg(test)]
+pub(crate) static TEST_ITERATION_ENOSPC_INJECTION: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 impl RuntimeHost {
@@ -3972,6 +4003,15 @@ export_plugin_api! {{
                         .rollback
                         .as_ref()
                         .map(|rollback| {
+                            #[cfg(test)]
+                            if TEST_ITERATION_ENOSPC_INJECTION
+                                .swap(false, std::sync::atomic::Ordering::SeqCst)
+                            {
+                                return Err(RuntimeError::Io {
+                                    path: plugin_iteration_journal_path(&self.snapshot_root),
+                                    message: "No space left on device (os error 28)".to_string(),
+                                });
+                            }
                             rollback.persist_journal(
                                 &plugin_iteration_journal_path(&self.snapshot_root),
                                 &state.prepared.iteration_id,
@@ -4426,8 +4466,17 @@ export_plugin_api! {{
                 candidate_rollback,
                 workspace_restore,
             ));
-            state.final_verdict = Some(PluginIterationFinalVerdict::RolledBack);
-            return Ok(PluginIterationFinalVerdict::RolledBack);
+            // 基础设施故障（磁盘满等）与"验证失败"分开定级。回滚照常先跑
+            // （上面已执行），回滚自身失败也不改变这个判定——错误文本已由
+            // `aggregate_rollback_failure` 拼进 blocked_reason，journal 留在盘上
+            // 供人工恢复。
+            let verdict = if state.stage_error_is_infrastructure {
+                PluginIterationFinalVerdict::InfrastructureFailure
+            } else {
+                PluginIterationFinalVerdict::RolledBack
+            };
+            state.final_verdict = Some(verdict);
+            return Ok(verdict);
         }
         let verifier_verdict = state.verifier_verdict.unwrap_or(VerifierVerdict::Partial);
         let canary_verdict = state
@@ -4591,6 +4640,10 @@ export_plugin_api! {{
     fn fail_stage(&self, state: &mut PluginIterationRunState, stage: &str, err: &RuntimeError) {
         self.observe_plugin_iteration_failure(&state.prepared, stage, err);
         state.stage_error = Some(err.to_string());
+        // 同时记下这次失败是否为基础设施故障（磁盘满 / 配额耗尽）。所有 stage
+        // 的失败都经本函数，故此处是唯一需要标记的地方；收尾时据此给
+        // `InfrastructureFailure` 而不是把 ENOSPC 误报成"验证失败"。
+        state.stage_error_is_infrastructure = err.is_infrastructure_failure();
     }
 
     fn observe_plugin_iteration_failure(
@@ -4599,6 +4652,12 @@ export_plugin_api! {{
         stage: &str,
         err: &RuntimeError,
     ) {
+        // 基础设施故障（磁盘满等）不是插件的问题：此前 rebuild /
+        // stage_candidate 阶段的任何错误都被记成 LoadFailure 归咎于插件，
+        // 于 ENOSPC 时会凭空产生一条"插件加载失败"的 kernel issue。
+        if err.is_infrastructure_failure() {
+            return;
+        }
         let source = match err {
             RuntimeError::PluginIterationPolicyBlocked { .. } => {
                 Some(KernelPluginIssueSource::PolicyBlocked)
@@ -6899,6 +6958,9 @@ struct PluginIterationRunState {
     canary: Option<CanaryReport>,
     blocked_reason: Option<String>,
     stage_error: Option<String>,
+    /// `stage_error` 是否源自基础设施故障（磁盘满 / 配额耗尽），而非插件缺陷。
+    /// 决定收尾时给 `InfrastructureFailure` 还是 `RolledBack`。
+    stage_error_is_infrastructure: bool,
     final_verdict: Option<PluginIterationFinalVerdict>,
     tests_command: Option<String>,
     safety_command: Option<String>,
@@ -6922,6 +6984,7 @@ impl PluginIterationRunState {
             canary: None,
             blocked_reason: None,
             stage_error: None,
+            stage_error_is_infrastructure: false,
             final_verdict: None,
             tests_command: None,
             safety_command: None,
@@ -8946,10 +9009,12 @@ mod seam_extraction_tests {
 #[cfg(test)]
 mod ffi_panic_seam_tests {
     use super::{
-        plugin_iteration_journal_path, RuntimeHost, TEST_ITERATION_PANIC_INJECTION,
-        TEST_STOP_HANDLER_PANIC_INJECTION,
+        plugin_iteration_journal_path, RuntimeHost, TEST_ITERATION_ENOSPC_INJECTION,
+        TEST_ITERATION_PANIC_INJECTION, TEST_STOP_HANDLER_PANIC_INJECTION,
     };
-    use crate::kernel::plugin_iteration::KernelPluginIterationRequest;
+    use crate::kernel::plugin_iteration::{
+        KernelPluginIssueSource, KernelPluginIterationRequest, PluginIterationFinalVerdict,
+    };
     use cordis_plugin_sdk::{AbiFingerprint, NodeDoc, NodeType, PluginDocs};
     use serde_json::json;
     use serial_test::serial;
@@ -9144,6 +9209,137 @@ mod ffi_panic_seam_tests {
             verify_profile: None,
             quality_score: None,
         }
+    }
+
+    /// 一个空 edit_plan 的请求：带 edit_plan 时 `run_plugin_iteration_agent`
+    /// 走手工执行分支、完全不碰 LLM；operations 为空则不触碰任何文件，从而
+    /// 绕开插件编辑面策略（空 fixture 里没有任何可写的插件子树），让迭代
+    /// 确定性地推进到注入点所在的 journal persist 阶段。
+    fn empty_plan_request() -> KernelPluginIterationRequest {
+        use crate::kernel::plugin_iteration::PluginEditPlan;
+        KernelPluginIterationRequest {
+            issue_id: None,
+            target_plugin_paths: Vec::new(),
+            instruction: Some("enospc injection".to_string()),
+            edit_plan: Some(PluginEditPlan {
+                issue_id: "enospc-issue".to_string(),
+                patch_id: "enospc-patch".to_string(),
+                summary: "no-op plan".to_string(),
+                operations: Vec::new(),
+            }),
+            manual_approved: true,
+            tests_command: None,
+            safety_command: None,
+            verify_profile: None,
+            quality_score: None,
+        }
+    }
+
+    /// 磁盘满必须被判成 `InfrastructureFailure`，而不是 `RolledBack`。
+    ///
+    /// 这是本批修复的核心断言：ENOSPC 此前经 `stage_error: Option<String>`
+    /// 丢掉类型信息，在 `finalize_plugin_iteration` 被降级成"验证失败"，
+    /// 于是污染 rollback 率、把插件 issue 标成 Open、还丢掉重试入口。
+    #[test]
+    #[serial]
+    fn iterate_plugins_reports_infrastructure_failure_on_enospc() {
+        let (_temp, fixtures) = setup_empty_fixture();
+        let host = RuntimeHost::boot(&fixtures).expect("host should boot on empty index");
+
+        let before = host.kernel().status();
+
+        TEST_ITERATION_ENOSPC_INJECTION.store(true, SeqCst);
+        let result = host
+            .iterate_plugins(empty_plan_request())
+            .expect("infrastructure failure is a verdict, not an Err");
+
+        assert_eq!(
+            result.final_verdict,
+            PluginIterationFinalVerdict::InfrastructureFailure,
+            "ENOSPC must not be reported as RolledBack; blocked_reason={:?}",
+            result.blocked_reason
+        );
+        let reason = result.blocked_reason.as_deref().unwrap_or_default();
+        assert!(
+            reason.contains("No space left on device"),
+            "the errno text must survive to blocked_reason, got: {reason}"
+        );
+
+        let after = host.kernel().status();
+        assert_eq!(
+            after.iteration_rollback_total, before.iteration_rollback_total,
+            "infrastructure failures must not inflate the rollback metric"
+        );
+        assert_eq!(
+            after.iteration_infrastructure_failure_total,
+            before.iteration_infrastructure_failure_total + 1,
+            "infrastructure failures get their own counter"
+        );
+
+        // 插件没有被冤枉：不产生 LoadFailure issue。
+        assert!(
+            !host
+                .kernel()
+                .plugin_issues()
+                .iter()
+                .any(|issue| issue.source == KernelPluginIssueSource::LoadFailure),
+            "a full disk must not be recorded as a plugin LoadFailure"
+        );
+
+        // 仍可重试：迭代留在 blocked_iterations 里（RolledBack 会被摘除）。
+        assert!(
+            host.kernel()
+                .blocked_iterations()
+                .iter()
+                .any(|entry| entry.iteration_id == result.iteration_id),
+            "infrastructure failures stay retryable"
+        );
+    }
+
+    /// 回归护栏：真正的 stage 失败仍然是 `RolledBack`，没被新变体抢走。
+    #[test]
+    #[serial]
+    fn genuine_stage_failure_still_rolls_back() {
+        let (_temp, fixtures) = setup_empty_fixture();
+        let host = RuntimeHost::boot(&fixtures).expect("host should boot on empty index");
+
+        // 不注入 ENOSPC；改一个策略禁止的路径（crates/ 属 forbidden_prefixes），
+        // 这是插件侧的真实失败，必须仍判 RolledBack。
+        let mut request = empty_plan_request();
+        if let Some(plan) = request.edit_plan.as_mut() {
+            plan.operations = vec![crate::kernel::plugin_iteration::PluginEditOperation {
+                path: "crates/cordis-runtime/src/lib.rs".to_string(),
+                kind: crate::kernel::plugin_iteration::PluginEditOpKind::ReplaceExact,
+                expected_old_string: Some("pub".to_string()),
+                expected_sha256: None,
+                new_content: Some("mod".to_string()),
+                pointer: None,
+                dotted_key: None,
+                value: None,
+            }];
+        }
+
+        let before = host.kernel().status();
+        let result = host
+            .iterate_plugins(request)
+            .expect("policy block is a verdict, not an Err");
+
+        assert_eq!(
+            result.final_verdict,
+            PluginIterationFinalVerdict::RolledBack,
+            "a genuine policy-blocked edit must remain RolledBack"
+        );
+        let after = host.kernel().status();
+        assert_eq!(
+            after.iteration_infrastructure_failure_total,
+            before.iteration_infrastructure_failure_total,
+            "a genuine failure must not land in the infrastructure counter"
+        );
+        assert_eq!(
+            after.iteration_rollback_total,
+            before.iteration_rollback_total + 1,
+            "a genuine failure still counts as a rollback"
+        );
     }
 
     #[test]

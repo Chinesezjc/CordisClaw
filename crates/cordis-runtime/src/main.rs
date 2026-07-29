@@ -1547,6 +1547,7 @@ fn emit_plugin_iteration_result(
         PluginIterationFinalVerdict::Promoted => "promoted",
         PluginIterationFinalVerdict::RolledBack => "rolled_back",
         PluginIterationFinalVerdict::Blocked => "blocked",
+        PluginIterationFinalVerdict::InfrastructureFailure => "infrastructure_failure",
     };
     let changed = if result.changed_paths.is_empty() {
         "-".to_string()

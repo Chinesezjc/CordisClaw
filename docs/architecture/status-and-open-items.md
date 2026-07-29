@@ -2,7 +2,7 @@
 
 ## 1. 判定口径
 
-- 本文基于当前仓库现状整理，最近更新：2026-07-27。
+- 本文基于当前仓库现状整理，最近更新：2026-07-29。
 - 历史规划蓝图已经吸收进 [design-blueprint.md](./design-blueprint.md)，因此本文结论来自三类证据的交叉比对：
   - 设计蓝图：[design-blueprint.md](./design-blueprint.md)
   - 架构文档：[system-overview.md](./system-overview.md)、[contracts-and-loading.md](./contracts-and-loading.md)、[runtime-semantics.md](./runtime-semantics.md)、[maintenance-guide.md](./maintenance-guide.md)
@@ -237,6 +237,39 @@ Agent 现在可以自主完成：读代码 → 理解结构 → 写/改文件 �
 - [x] **Filesystem / Git 白名单不再静默降级**（P0-19）— `canonicalize` 失败时不再退回未规范化路径。新增 `canonicalise_for_whitelist` / `validate_path_in_root` 的深度 ancestor 解析：路径不存在时 canonicalize 最深的存在祖先再拼 tail；两侧都失败则 fail-closed。`../../etc/shadow` 之类的构造再无绕过。
 - [x] **Plugin iteration symlink 逃逸**（P0-20）— `PluginEditExecutor::execute` 在写入前调用新 helper `resolve_under_workspace`：canonicalize 结果必须仍在 workspace_root 下。plugins 内的 symlink 指向 `/etc/passwd` 之类无法被写入。
 - [x] **Verifier shell 拼接**（P0-21）— 已随 A 批 P0-1 修复。`discover_rust_workspace_manifest` 输出的字符串被 `shell_words` 解析成 argv，空格 / `$` / `;` 无法被解释。
+
+### 5.2.36 snapshot 目录无界增长 + 磁盘满伪装成逻辑错误（2026-07-28）
+
+- [x] **根因 A：staged snapshot 目录跨 hash 目录无人回收。** `default_snapshot_root`（host.rs）取 fixtures root canonical 路径的 sha256 得 `{temp_dir}/cordis-runtime-host/{hash}/`，其下每次 boot / reload / plugin-iteration attempt 建一个 `snapshot-{pid}-{nanos}/` 并 `fs::copy` 一整份插件工件（P0-15 之后不再用 hard_link，是实打实的字节拷贝，单份约 120–250 MB）。回收此前只有两条路径且都盖不住主泄漏源：`cleanup_stale_snapshot_dirs` **只扫当次 boot 解析出的那一个 hash 目录内部**，从不遍历兄弟目录；`cleanup_retired_snapshots` 只管 reload 时被退休的快照（上限 `MAX_RETIRED_SNAPSHOTS = 64`）。而集成测试每次把 fixtures 拷进新 `TempDir` → 路径不同 → 全新 hash 目录，老目录永远等不到"下次 boot 扫到它"，因为那个 hash 再也不会出现。**实测本机 `$TMPDIR/cordis-runtime-host` 累积 196 GB / 13206 个 hash 目录**（macOS 的 `$TMPDIR` 在 `/var/folders/...`，不是 `/tmp`）；远端 Linux 同症状，3 天 66 G 撑满 178 G 盘。
+- [x] **根因 B：`RuntimeHost` 无 `Drop`。** live snapshot 的 staged root 没有任何路径负责，boot 后不 reload 直接退出即原地留下，叠加根因 A 成为永久孤儿。
+- [x] **修复 A：新增 `cleanup_orphaned_snapshot_roots`**（host.rs，boot 时在 `cleanup_stale_snapshot_dirs` 之后调用；仅对默认 host 目录生效，配了 `runtime.snapshot_root` 的不动用户自己的目录树）。删除判据三条**全部**满足才删：目录内所有 `snapshot-{pid}-*` 的 pid 段均已死（复用 `lock_pid_is_live`，pid 探活逻辑抽成共享的 `snapshot_dir_owner_is_alive` / `is_snapshot_dir_name`）、目录 mtime 超过保留期、**且目录内无 `plugin-iteration-edit-journal.json`**。第三条是安全红线：journal 位于 hash 目录层（`snapshot-*` 之上）、是 `restore_plugin_iteration_workspace` 在 boot 时重放的崩溃恢复状态，而 sha256 单向、无法反推 fixtures root 是否还存在，因此含 journal 的目录一律保留并打印路径交人工处置（实测 335 个目录如此）。空目录不受保留期约束直接回收；`skip_root` 保证永不自删。返回 `SnapshotGcReport`（scanned / removed / bytes_reclaimed / 三类 skip）。**已知限制**（注释在案）：pid 会被 OS 复用到无关进程，此时目录被判为"仍在用"而保留（实测 67 个，持有者是 vscode 里的无关进程），属保守方向误判，mtime 条件限制其累积规模。
+- [x] **修复 B：`impl Drop for RuntimeHost` + `cleanup_live_snapshot()`（幂等）。** 信号处理器走 `std::process::exit(0)` 会绕过所有 `Drop`，故 main.rs 的 ctrlc handler 在 `write_shutdown_memory()` 旁显式再调一次。
+- [x] **修复 C：测试 staging 落进各自 `TempDir`。** 新增共享 helper `support::pin_private_snapshot_root`，经真实的 `discover_config_dir` 解析 config 目录并断言结果在 `TempDir` 内，再把 `runtime.snapshot_root` 以 YAML mapping 方式合并进已有 `runtime.yaml`（保留兄弟键）。覆盖 5 个测试文件的 8 个 helper。反向验证：单独回退 `host_llm_coverage.rs` 后 hash 目录数 13200→13206（每次 boot 一个），恢复后不再增长。
+- [x] **修复 D：`gc` 子命令 + 保留期配置。** `cordis-runtime gc [--dry-run] [--max-age-hours=N]` 打印回收字节数与三类跳过原因；`RuntimeSettings.snapshot_retention_hours` + `RuntimeConfig::snapshot_retention()`（`None` → 24h，显式 `Some(0)` → `Duration::ZERO` 立即过期、不回落默认值，因为运维在 gc 场景写 0 就是要让全部目录可回收；极大值 `saturating_mul` 不溢出）。
+- [x] **根因 C：磁盘满被降级成 `RolledBack`。** `PluginIterationRunState.stage_error` 是 `Option<String>`，`iterate_plugins` 的 10 个 stage 全部 `err.to_string()` 存字符串、丢弃类型化 `RuntimeError`，随后 `finalize_plugin_iteration` 把任何 `stage_error` 一律定成 `Ok(RolledBack)`。于是 ENOSPC 与"插件验证失败"在类型层面完全同形——2026-07-27 那次为此误查两轮（先怀疑跨平台差异、再怀疑 dylib 命名）。对比 `promote_candidate` 失败是 `return Err(err)`，只有 promote 之前的 stage 被降级，这个不对称就是修复的先例。
+- [x] **修复 E：errno 保留 + 新 verdict 变体。** `RuntimeError::is_infrastructure_failure()`（core/error.rs）按错误文本识别 ENOSPC / EDQUOT / EFBIG。**判据用文本而非新增字段**：全仓 `RuntimeError::Io` 有 184 处引用 / 175 处结构体字面量构造，加必填字段的改动面不可接受，而 `io::Error::to_string()` 本身已内嵌 errno 描述，那 175 处无需改造即可被识别；cargo/rustc 的 ENOSPC 更是只以 stderr 文本形式存活（`rebuild_plugin_workspace` 把 stderr 塞进 `InvalidArgument.message`），除文本外没有别的信号。另加 `io_error_is_infrastructure()` 供仍持有 `io::Error` 的收口点做精确 raw errno 判定（`ErrorKind::StorageFull` 在 stable 未稳定）。分类结果记在 `PluginIterationRunState.stage_error_is_infrastructure`：main 的 `fail_stage` 已是所有 stage 失败的唯一收口点（`observe_plugin_iteration_failure` + 写 `stage_error`），故只在该函数里多记一次分类即可，无需再引入并行入口。错误文本本身不变，既有 substring 断言不受影响。
+- [x] **修复 F：`PluginIterationFinalVerdict::InfrastructureFailure`**（线格式 `infrastructure_failure`）。各消费点行为：metrics 走新计数器 `iteration_infrastructure_failure_total`，**不**污染 `iteration_rollback_total`；`blocked_iterations` **保留**该迭代（同 Blocked），腾出磁盘后可经 `approve_blocked_iteration` 原样重试（`RolledBack` 会被摘除，因为那代表插件真没通过验证、重试同一份代码无意义）；issue status 给 `Blocked` 而非 `Open`（`Open` 读作"插件仍然坏着"，与磁盘满无关），不新增 `KernelPluginIssueStatus` 变体；`observe_plugin_iteration_failure` 在 infra 故障时直接 return，不再于 rebuild / stage_candidate 阶段凭空产生归咎插件的 `LoadFailure` issue。
+
+**验证**：`cargo test --lib` 629 passed；`clippy --all-targets -D warnings` 零 warning。新增测试 15 项：GC 6 项（死 pid+老 mtime 删 / 活 pid 留 / 未到期留 / journal 目录必留 / 空目录无视 mtime / skip_root 不自删 / dry-run 只报不删 / retention=0 立即过期）、退出回收 2 项（`Drop` 回收 live staged root、`cleanup_live_snapshot` 幂等）、错误分类 4 项（ENOSPC/EDQUOT/EFBIG 文本、大小写无关、cargo stderr 变体、普通编译错与非文本承载变体不误判）、verdict 2 项（经新增 `TEST_ITERATION_ENOSPC_INJECTION` 注入 seam 断言 `InfrastructureFailure` + errno 文本存活 + rollback 计数未增 + 无 LoadFailure issue + 仍可重试；**回归护栏**断言策略拦截这类真实失败仍判 `RolledBack` 且仍计入 rollback）、CLI flag 解析 5 项。
+
+**实测效果**：`gc` 在真实积压上 **196 GB → 249 MB**，保留 335 个含 journal 目录、67 个 pid 复用目录、7 个未到期目录；可用空间 567 GiB → 636 GiB。
+
+**遗留**（未在本批修）：
+- `verifier.rs` 的 `tests_passed` / `safety_checks_passed` 只看 `.success` 布尔，盘满的 `cargo check` 与插件编译错仍同形；`CommandCheckResult` 已结构化保留 stderr，后续可在此加 infra 嗅探。
+- `unregister_task_library` 生产环境只有 `reload_subtree` 一个调用点，`reload_internal` / `promote_candidate` 都不调，Task 节点旧 dylib 会留在进程级 `TASK_LIBRARIES` 里继续跑旧代码、磁盘块要等进程退出才归还。
+
+### 5.2.36 minori 生产分支定向移植（port-minori-fixes 批，2026-07-24）
+
+minori 是 2026-04-17 从主线分叉的生产分支（QQ 线上运营，事件走 Napcat 的 ws 端口）。本批把 minori 上验证过的 6 项能力**定向移植**回主仓库，而非整分支 merge——minori 与主线分叉后各自演进（主线走了 P0-40 安全硬化 + 覆盖率补测两大轮），全量 merge 会引入大量与主线不兼容的历史；因此逐项挑取、在主线当前接口上重新接线。6 项：
+
+- [x] **qq `qq_ws_serve` Task 节点**（qq lib.rs）— 新增 tungstenite WebSocket **服务器**，接收 OneBot v11 事件（线上 Napcat 走 ws 端口而非 HTTP 回调）。`qq_ws_serve` 声明为 Task 节点，start 起监听线程、stop 关 listener 并 join 线程实现优雅停机；bind 竞态处理按 ead1241 语义但更彻底——**同步 bind 成功后把已绑定的 `TcpListener` 直接交给服务线程**（而非释放探测 listener 再由线程重新 bind），从根本上消除检查与服务之间的重绑窗口；bind 失败即返回 Err，`WS_SERVER_RUNNING` 标志仅在 bind 成功后置位，重复 start 幂等（已运行则直接返回 Ok，不重复 bind）。**出站仍走 HTTP API**（`onebot_send_group_msg` 等不变）。新增不消耗 token 的 WS 链路 e2e 脚本 `scripts/qq_ws_e2e_verify.sh`（配套 `scripts/send_onebot_ws_event.sh` 构造并推送 ws 事件帧）。此项闭合了 5.8 里"WebSocket 反向连接（当前仅 HTTP client）"待办——注意主线此前在 P1-40（见 5.2.12）移除的是**未接线的 WS 反连死代码**（`start_ws_server` / `handle_ws_connection` 73 行 + tungstenite 依赖，从未挂到任何节点），本批重新引入的是**完整接线**的版本（挂到 `qq_ws_serve` Task 节点、有 start/stop 生命周期、有 e2e 验证）。
+- [x] **serve inbox 批次边界标记**（main.rs inbox）— 入站批次的正文用**渠道中立**标记 `CURRENT_INCOMING_BATCH_START` / `CURRENT_INCOMING_BATCH_END` 包裹，并附加指令"只把当前批次当作请求；若当前批次不针对你则 suspend"。防止 agent 把历史消息误当当前请求。qq 插件 `system_hint` 并入同一条反幻觉规则。**与 minori 原版的偏离**：minori 用 QQ 专属标记文案，本批改为渠道中立标记，遵循 runtime inbox 不感知具体协议的 Kernel/Plugin 边界原则。包裹只发生在 `agent_send` 发送点；spill / pending 落盘的是**原始未包裹**文本。
+- [x] **serve inbox agent 回复只消费首个 JSON 值**（main.rs inbox）— agent 输出的 JSON 解析从"整串解析"改为经 `serde_json::Deserializer` 只消费**首个** JSON 值，容忍尾随杂质（agent 在 JSON 后追加的解释文本不再导致解析失败）。
+- [x] **内核自省工具不写入跨轮持久化历史**（agent 会话历史）— `get_runtime_status` / `list_plugins` / `list_nodes` / `get_kernel_status` / `get_kernel_issues` 五个内核自省工具的 tool call/result 对不进入跨轮持久化的会话历史。这些是瞬时状态查询，写入历史只会膨胀 token 且对后续轮次无价值。
+- [x] **workspace 启用 serde_json `preserve_order`**（根 Cargo.toml）— 打开 serde_json 的 `preserve_order` feature，JSON 对象的键序与插入序一致（此前 BTreeMap 序）。对外输出的 JSON（interfaces.json / index.json / envelope / agent 工具结果）键序稳定可读。
+- [x] **reload 路径 Task stop 收尾**（host.rs，对应 minori commit `1dfd191`）— Task 节点 stop 返回 `ok=false` 时输出诊断日志（此前静默忽略）；`stop_plugin_services` 三处调用统一为 timed 变体（`stop_plugin_services_timed`，带超时），与 `reload_subtree` 一致，避免行为不一致的未超时停机路径。
+
+**验证**：qq WS 链路经 `scripts/qq_ws_e2e_verify.sh` 分段验证（不消耗 token）；各项配套单测随代码 teammate 落地；主 workspace `cargo build` / `test` / `clippy --all-targets -- -D warnings` 全绿。
 
 ### 5.2.35 飞书媒体消息 + 资源节点扩展 + vision 本地 path（2026-07-23）
 
@@ -703,7 +736,7 @@ cd fixtures/plugins/expr/lexer && cargo test --lib  # excluded, external tests o
 - [x] **`reload_subtree` stop 走 FFI 加 `catch_unwind`**（P1-19）— 每次 Task stop 调用被 `panic::catch_unwind(AssertUnwindSafe(...))` 包裹；插件 stop 处理器 panic 不再跨 C ABI unwind（UB）也不再让整个 reload 崩。panic message 落到 stderr。
 - [x] **Phase-1 pre-loaded dylib 生命周期澄清**（P1-20）— 加显式注释：`_dylib` 是 struct-owned by-value handle，drop 于 fn return（Phase 2 之后）；invoke 路径每次自开 `LoadedDylibApi::open`，registry 不缓存函数指针，无 dangling reference。原 concern 事实上不构成 bug，但注释固化契约。
 - [x] **`reload_subtree` 新 snapshot_id**（P1-21）— `to_snapshot_id` 使用 `make_snapshot_dir_name()` 生成新 id；invocation trace 现在能区分 reload 前后。
-- [x] **`retired_snapshots` 加上限**（P1-22）— 除 Weak-dead 清理外，硬上限 `MAX_RETIRED_SNAPSHOTS = 64`，超出时按 FIFO 丢弃最旧的 `staged_artifact_root` + 目录；长活 agent session pin snapshot 也只能 leak 有限前缀。
+- [x] **`retired_snapshots` 加上限**（P1-22）— 除 Weak-dead 清理外，硬上限 `MAX_RETIRED_SNAPSHOTS = 64`，超出时按 FIFO 丢弃最旧的 `staged_artifact_root` + 目录；长活 agent session pin snapshot 也只能 leak 有限前缀。（2026-07-28 补：这条只覆盖 reload 时被退休的快照；跨 hash 目录的孤儿与 live snapshot 的回收见 5.2.36。）
 - [x] **`plugin_history` 加 eviction**（P1-23）— hard cap `MAX_PLUGIN_HISTORY = 1024`；每次 `push_front` 后 `pop_back` 到上限内。之前 unbounded VecDeque 长运行会 OOM。
 - [x] **Session 若干次要问题**（P1-24）— (a) 新 `delete_session_snapshot(session_id)` API，让 completed/reset 的 session 从磁盘摘除；(b) `detect_crash_and_recover` 用 `session.kind()` 决定 `AgentSessionKind`（`plugin_iteration` 走 PluginIteration 而不是硬编码 RuntimeShell）；(c) auto-save 的 tmp 文件名从共用 `.<id>.json.tmp` 换成 `.<id>.json.tmp.<seq>`（atomic 计数器），并发 `agent_send` 同一 session 不再互踩。
 
