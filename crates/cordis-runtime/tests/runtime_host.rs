@@ -18,7 +18,9 @@ use tempfile::TempDir;
 
 mod support;
 
-use support::{fixtures_root, spawn_chunked_mock_llm_server_sequence, sse_response};
+use support::{
+    fixtures_root, pin_private_snapshot_root, spawn_chunked_mock_llm_server_sequence, sse_response,
+};
 
 fn copy_dir_all(src: &Path, dst: &Path) {
     fs::create_dir_all(dst).expect("create destination");
@@ -40,6 +42,9 @@ fn copy_dir_all(src: &Path, dst: &Path) {
 fn setup_fixture_copy() -> TempDir {
     let temp = TempDir::new().expect("tempdir");
     copy_dir_all(&fixtures_root(), temp.path());
+    // fixtures root 就是 temp.path() 本身，`discover_config_dir` 落到
+    // `temp/config`（同级 `{TMPDIR}/config` 不存在，目录名也不是 "fixtures"）。
+    pin_private_snapshot_root(temp.path(), temp.path());
     temp
 }
 
@@ -64,6 +69,9 @@ fn setup_fixture_workspace_copy() -> TempDir {
         .expect("symlink workspace crates");
     #[cfg(not(unix))]
     copy_dir_all(&repo_root().join("crates"), &temp.path().join("crates"));
+    // fixtures root 目录名是 "fixtures"，`discover_config_dir` 走同级分支 →
+    // `temp/config`（不在 fixtures 目录内部）。
+    pin_private_snapshot_root(temp.path(), &temp_fixtures);
     temp
 }
 

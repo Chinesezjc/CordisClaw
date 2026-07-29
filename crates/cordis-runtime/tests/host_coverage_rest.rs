@@ -34,7 +34,7 @@ use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
 mod support;
-use support::fixtures_root;
+use support::{fixtures_root, pin_private_snapshot_root};
 
 fn copy_dir_all(src: &Path, dst: &Path) {
     fs::create_dir_all(dst).expect("create destination");
@@ -65,6 +65,8 @@ fn setup_artifacts_only_copy() -> TempDir {
             fs::copy(&src, temp.path().join(name)).expect("copy top-level fixture file");
         }
     }
+    // fixtures root 就是 temp.path()，`discover_config_dir` 落到 `temp/config`。
+    pin_private_snapshot_root(temp.path(), temp.path());
     temp
 }
 
@@ -760,6 +762,8 @@ fn boot_on_artifacts_copy() -> (TempDir, PathBuf, RuntimeHost) {
     // against the copied index before booting.
     cordis_runtime::plugin::tooling::refresh_artifact_index(&fixtures)
         .expect("refresh copied artifact index before boot");
+    // fixtures root 就是 temp.path()，`discover_config_dir` 落到 `temp/config`。
+    pin_private_snapshot_root(temp.path(), &fixtures);
     let host = RuntimeHost::boot(&fixtures).expect("host should boot on artifacts-only copy");
     (temp, fixtures, host)
 }
