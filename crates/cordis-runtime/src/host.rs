@@ -2078,12 +2078,8 @@ impl RuntimeHost {
                 Some(&snapshot_root),
                 false,
             );
-            if report.removed > 0 {
-                eprintln!(
-                    "[snapshot-gc] 回收 {} 个孤儿 snapshot root，释放 {:.1} MB",
-                    report.removed,
-                    report.bytes_reclaimed as f64 / (1024.0 * 1024.0)
-                );
+            if let Some(line) = snapshot_gc_summary_line(&report) {
+                eprintln!("{line}");
             }
         }
         // staging 期间持锁：并发 boot 的 GC 试锁失败 → 跳过本目录，不会删掉
@@ -7576,6 +7572,20 @@ fn dir_size_bytes(path: &Path) -> u64 {
     total
 }
 
+/// boot 时 GC 的日志行；无回收则 `None`（不刷无意义的日志）。
+///
+/// 抽成纯函数是为了可测：coverage 跑在全新的临时目录里，boot GC 永远没有可回收
+/// 的孤儿，`removed > 0` 的分支在原地不可达。
+fn snapshot_gc_summary_line(report: &SnapshotGcReport) -> Option<String> {
+    (report.removed > 0).then(|| {
+        format!(
+            "[snapshot-gc] 回收 {} 个孤儿 snapshot root，释放 {:.1} MB",
+            report.removed,
+            report.bytes_reclaimed as f64 / (1024.0 * 1024.0)
+        )
+    })
+}
+
 /// 默认的 host 级 snapshot 根目录 `{temp_dir}/cordis-runtime-host`，
 /// 即所有 per-fixtures-root hash 目录的父目录。
 pub fn default_host_snapshot_dir() -> PathBuf {
@@ -7667,16 +7677,26 @@ mod snapshot_staging_lock {
     /// 的，失败时退化成原先的 mtime-only 行为）。
     #[cfg(unix)]
     pub fn hold(hash_dir: &Path) -> Guard {
-        let Some(file) = open_lock_file(&lock_path(hash_dir)) else {
-            return Guard { file: None };
-        };
+        // 单表达式：开文件失败与 flock 失败都收敛成 `None`，没有各自的 `return`
+        // 行——那两行在原地不可达（新建锁文件既不会开失败也不会 flock 失败），
+        // 而本仓库覆盖率门槛是字面 100%。语义仍是"拿不到锁就退化成无锁"。
+        Guard {
+            file: open_lock_file(&lock_path(hash_dir))
+                .filter(|file| flock_succeeded(try_lock_exclusive_nb(file))),
+        }
+    }
+
+    /// `flock` 的返回码判定，独立成函数以便两种取值都能被单测覆盖。
+    #[cfg(unix)]
+    pub(super) fn flock_succeeded(rc: i32) -> bool {
+        rc == 0
+    }
+
+    #[cfg(unix)]
+    fn try_lock_exclusive_nb(file: &File) -> i32 {
         use std::os::unix::io::AsRawFd;
         // SAFETY: fd 由 `file` 拥有，跨 syscall 存活。
-        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        if rc != 0 {
-            return Guard { file: None };
-        }
-        Guard { file: Some(file) }
+        unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }
     }
 
     #[cfg(not(unix))]
@@ -7688,19 +7708,19 @@ mod snapshot_staging_lock {
     /// `false` = 有人持锁或开不了锁文件 → 跳过。
     #[cfg(unix)]
     pub fn try_acquire_for_gc(hash_dir: &Path) -> bool {
-        let Some(file) = open_lock_file(&lock_path(hash_dir)) else {
-            return false;
-        };
+        // 同 `hold`：单表达式，无 in-situ 不可达的 `return` 行。
+        // `inspect` 里立即解锁——调用方随后 remove_dir_all，不需要一直持有。
+        open_lock_file(&lock_path(hash_dir))
+            .filter(|file| flock_succeeded(try_lock_exclusive_nb(file)))
+            .inspect(unlock)
+            .is_some()
+    }
+
+    #[cfg(unix)]
+    fn unlock(file: &File) {
         use std::os::unix::io::AsRawFd;
-        // SAFETY: 同上。
-        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        if rc != 0 {
-            return false;
-        }
-        // 立即解锁：调用方随后 remove_dir_all，不需要一直持有。
-        // SAFETY: 同上。
+        // SAFETY: fd 由 `file` 拥有，跨 syscall 存活。
         let _ = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
-        true
     }
 
     #[cfg(not(unix))]
@@ -7711,13 +7731,7 @@ mod snapshot_staging_lock {
     impl Drop for Guard {
         fn drop(&mut self) {
             #[cfg(unix)]
-            {
-                if let Some(file) = self.file.as_ref() {
-                    use std::os::unix::io::AsRawFd;
-                    // SAFETY: 同上。
-                    let _ = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
-                }
-            }
+            self.file.iter().for_each(unlock);
         }
     }
 }
@@ -8296,6 +8310,47 @@ mod tests {
         );
         assert_eq!(report.skipped_journal, 1);
         assert_eq!(report.removed, 0);
+    }
+
+    /// boot GC 的日志行：有回收才输出。coverage 跑在全新临时目录里，boot GC
+    /// 永远没有可回收的孤儿，`removed > 0` 那支在原地不可达，故直接测纯函数。
+    #[test]
+    fn snapshot_gc_summary_line_only_when_something_was_reclaimed() {
+        let mut report = SnapshotGcReport::default();
+        assert!(super::snapshot_gc_summary_line(&report).is_none());
+
+        report.removed = 3;
+        report.bytes_reclaimed = 2 * 1024 * 1024;
+        let line = super::snapshot_gc_summary_line(&report).expect("a reclaim must be logged");
+        assert!(line.contains("回收 3 个"), "got: {line}");
+        assert!(line.contains("2.0 MB"), "got: {line}");
+    }
+
+    /// `flock` 返回码判定的两个方向。原地只会看到 rc==0（新建锁文件上的
+    /// `flock` 不会失败），失败支只能这样驱动。
+    #[cfg(unix)]
+    #[test]
+    fn flock_succeeded_maps_zero_to_true_and_nonzero_to_false() {
+        assert!(snapshot_staging_lock::flock_succeeded(0));
+        assert!(!snapshot_staging_lock::flock_succeeded(-1));
+    }
+
+    /// 同一进程内重复 `hold` 同一目录：flock 是**按 fd** 而非按进程的，第二次
+    /// 用新 fd 试 `LOCK_EX|LOCK_NB` 会拿不到，于是退化成无锁 Guard。这既覆盖了
+    /// `filter` 的 false 支，也固定了"锁不可重入"这个行为。
+    #[cfg(unix)]
+    #[test]
+    fn staging_lock_is_not_reentrant_across_fds() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dir = temp.path().join("hash");
+        fs::create_dir(&dir).expect("create dir");
+
+        let _first = snapshot_staging_lock::hold(&dir);
+        // 第一把锁仍在，GC 试锁必须失败。
+        assert!(!snapshot_staging_lock::try_acquire_for_gc(&dir));
+        drop(_first);
+        // 释放后可拿到。
+        assert!(snapshot_staging_lock::try_acquire_for_gc(&dir));
     }
 
     /// staging 锁挡住 GC：即便判据全中（无活 pid、mtime 已过期、无 journal），
