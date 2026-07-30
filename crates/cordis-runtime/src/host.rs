@@ -2086,6 +2086,9 @@ impl RuntimeHost {
                 );
             }
         }
+        // staging 期间持锁：并发 boot 的 GC 试锁失败 → 跳过本目录，不会删掉
+        // 我们刚 mkdir、还没 stage 完的 staging 目录。
+        let _staging_guard = snapshot_staging_lock::hold(&snapshot_root);
         let initial_snapshot = Arc::new(build_snapshot(&loader, &snapshot_root)?);
         let interactive_rollback = Mutex::new(PluginEditRollback::empty(&fixtures_root));
         let service_registry = Arc::new(crate::context::ServiceRegistry::new());
@@ -7465,9 +7468,7 @@ pub fn cleanup_orphaned_snapshot_roots(
         };
         let mut has_journal = false;
         let mut owner_alive = false;
-        let mut is_empty = true;
         for child in children.flatten() {
-            is_empty = false;
             let child_name = child.file_name();
             let child_name = child_name.to_string_lossy();
             // 必须是**文件**才算 journal。有测试故意把这个路径造成非空目录来
@@ -7497,9 +7498,21 @@ pub fn cleanup_orphaned_snapshot_roots(
             );
             continue;
         }
-        // 空目录没有字节可丢，不必等保留期。
-        if !is_empty && !dir_is_older_than(&path, max_age) {
+        // 保留期对空目录同样生效。空目录看似"没字节可丢、删了无害"，但它也可能
+        // 是**另一个正在 boot 的进程刚 mkdir、还没 stage 进任何文件**的 staging
+        // 目录：此刻它既没有 snapshot-{pid}-* 子目录可供探活（owner_alive 为
+        // false），又是空的，一旦跳过保留期就会被立刻删掉，那个进程随后
+        // rename 到该目录时报 "No such file or directory"。CI 上实测到这个竞态
+        // （命中 dispatch_unknown_command_is_reply 的 boot）。mtime 闸门是这里
+        // 唯一能挡住它的东西，因此不能为空目录开后门。
+        if !dir_is_older_than(&path, max_age) {
             report.skipped_recent += 1;
+            continue;
+        }
+        // 最后一道闸门：非阻塞试 staging 锁。有进程正在这个 hash 目录里
+        // staging（哪怕目录还空着、没有 pid 线索、mtime 也已被调老）就跳过。
+        if !snapshot_staging_lock::try_acquire_for_gc(&path) {
+            report.skipped_live += 1;
             continue;
         }
 
@@ -7510,6 +7523,8 @@ pub fn cleanup_orphaned_snapshot_roots(
             continue;
         }
         if fs::remove_dir_all(&path).is_ok() {
+            // 连带清掉同级锁文件，否则 lock 文件会无限累积。
+            let _ = fs::remove_file(snapshot_staging_lock::lock_path(&path));
             report.removed += 1;
             report.bytes_reclaimed += bytes;
         }
@@ -7606,6 +7621,107 @@ fn plugin_iteration_journal_path(snapshot_root: &Path) -> PathBuf {
 /// P1-16 helper module: fcntl advisory file lock around workspace-manifest
 /// edits so two concurrent `create_plugin` invocations don't interleave
 /// their read/modify/write of `plugins/Cargo.toml`.
+/// hash 目录的 staging 锁：boot 期间持排他锁，GC 用**非阻塞**方式试锁，
+/// 拿不到就跳过该目录。
+///
+/// 为什么需要它：GC 判"是否有活主"靠目录内 `snapshot-{pid}-*` 的 pid 探活，
+/// 但目录**刚 mkdir、还没 stage 进任何文件**的那个瞬间没有任何 pid 线索，
+/// 此时只剩 mtime 闸门。mtime 能挡住绝大多数情况（并发窗口是秒级、保留期是
+/// 小时级），但那是概率而非保证——把保留期配成 0（`--max-age-hours=0`，运维
+/// 清盘时的合理用法）就会立刻退化成 CI 上实测到的那个竞态：GC 删掉别人正在
+/// staging 的目录，那边随后 rename 报 ENOENT。锁把它变成确定性排除。
+///
+/// 锁文件放在 hash 目录**同级**（`{hash}.lock`）而不是目录内部：GC 会
+/// `remove_dir_all` 整个目录，锁文件在里面会被一起删掉，持锁进程的 fd 还在
+/// 但文件已 unlink，后续进程开的是新 inode、互斥失效。
+mod snapshot_staging_lock {
+    use std::fs::{File, OpenOptions};
+    use std::path::{Path, PathBuf};
+
+    pub struct Guard {
+        /// 持有 fd 即持有 flock； 里读它来解锁。
+        file: Option<File>,
+    }
+
+    /// `{hash_dir}.lock` —— 与 hash 目录同级，不会被 `remove_dir_all` 带走。
+    pub fn lock_path(hash_dir: &Path) -> PathBuf {
+        let mut name = hash_dir.as_os_str().to_os_string();
+        name.push(".lock");
+        PathBuf::from(name)
+    }
+
+    fn open_lock_file(path: &Path) -> Option<File> {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(path)
+            .ok()
+    }
+
+    /// boot 侧：持排他锁直到 `Guard` drop。拿不到锁不阻塞启动（锁是 advisory
+    /// 的，失败时退化成原先的 mtime-only 行为）。
+    #[cfg(unix)]
+    pub fn hold(hash_dir: &Path) -> Guard {
+        let Some(file) = open_lock_file(&lock_path(hash_dir)) else {
+            return Guard { file: None };
+        };
+        use std::os::unix::io::AsRawFd;
+        // SAFETY: fd 由 `file` 拥有，跨 syscall 存活。
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc != 0 {
+            return Guard { file: None };
+        }
+        Guard { file: Some(file) }
+    }
+
+    #[cfg(not(unix))]
+    pub fn hold(_hash_dir: &Path) -> Guard {
+        Guard { file: None }
+    }
+
+    /// GC 侧：非阻塞试锁。`true` = 拿到了（无人 staging，可安全回收），
+    /// `false` = 有人持锁或开不了锁文件 → 跳过。
+    #[cfg(unix)]
+    pub fn try_acquire_for_gc(hash_dir: &Path) -> bool {
+        let Some(file) = open_lock_file(&lock_path(hash_dir)) else {
+            return false;
+        };
+        use std::os::unix::io::AsRawFd;
+        // SAFETY: 同上。
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc != 0 {
+            return false;
+        }
+        // 立即解锁：调用方随后 remove_dir_all，不需要一直持有。
+        // SAFETY: 同上。
+        let _ = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+        true
+    }
+
+    #[cfg(not(unix))]
+    pub fn try_acquire_for_gc(_hash_dir: &Path) -> bool {
+        true
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            #[cfg(unix)]
+            {
+                if let Some(file) = self.file.as_ref() {
+                    use std::os::unix::io::AsRawFd;
+                    // SAFETY: 同上。
+                    let _ = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+                }
+            }
+        }
+    }
+}
+
 mod workspace_manifest_lock {
     use std::fs::{File, OpenOptions};
     use std::path::Path;
@@ -8024,7 +8140,7 @@ mod tests {
         cleanup_orphaned_snapshot_roots, cleanup_stale_snapshot_dirs, collect_plugin_context_paths,
         dir_is_older_than, dir_size_bytes, ensure_scaffold_integration_edits,
         extract_warning_blocks, render_child_plugin_core, render_child_plugin_test,
-        sanitize_child_plugin_segment, sort_plugin_context_paths,
+        sanitize_child_plugin_segment, snapshot_staging_lock, sort_plugin_context_paths,
         staged_artifact_root_is_removable, warning_diagnostics_for_changed_paths, AgentBackend,
         AgentSessionKind, AgentStartOptions, ContextFilesScope, PluginIterationAgentBackend,
         PluginIterationAgentState, RuntimeHost, ScaffoldedChildRegistration, SnapshotGcReport,
@@ -8182,6 +8298,38 @@ mod tests {
         assert_eq!(report.removed, 0);
     }
 
+    /// staging 锁挡住 GC：即便判据全中（无活 pid、mtime 已过期、无 journal），
+    /// 只要有进程持锁就跳过。这是"目录刚 mkdir、还没 stage 进文件"那个窗口的
+    /// 确定性排除——CI 上实测过 GC 删掉并发 boot 的 staging 目录导致对方
+    /// rename 报 ENOENT。
+    #[test]
+    fn orphaned_snapshot_root_gc_skips_dirs_held_by_staging_lock() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        let dead_pid = reaped_dead_pid();
+        let held = make_hash_dir(root, "aaa", dead_pid);
+        backdate_dir(&held, 48 * 3600);
+
+        // 持锁期间：GC 必须跳过。
+        let guard = snapshot_staging_lock::hold(&held);
+        let report =
+            cleanup_orphaned_snapshot_roots(root, Duration::from_secs(24 * 3600), None, false);
+        assert!(held.exists(), "a lock-held dir must survive GC");
+        assert_eq!(report.skipped_live, 1);
+        assert_eq!(report.removed, 0);
+
+        // 释放后：同一个目录立刻可回收，且同级锁文件一并清掉。
+        drop(guard);
+        let report =
+            cleanup_orphaned_snapshot_roots(root, Duration::from_secs(24 * 3600), None, false);
+        assert!(!held.exists(), "once unlocked the dir is reclaimed");
+        assert_eq!(report.removed, 1);
+        assert!(
+            !snapshot_staging_lock::lock_path(&held).exists(),
+            "the sibling lock file must not accumulate"
+        );
+    }
+
     /// journal **同名目录**不算 journal，必须照常回收。
     ///
     /// `clear_journal_remove_failure_when_path_is_nonempty_dir` 之类的测试会
@@ -8211,18 +8359,33 @@ mod tests {
         assert_eq!(report.removed, 1);
     }
 
+    /// 空 hash 目录**不**能无视保留期删除：它可能是另一个正在 boot 的进程刚
+    /// mkdir、还没 stage 进文件的 staging 目录，此刻既无 `snapshot-{pid}-*`
+    /// 可探活又是空的，立刻删会让那个进程随后 rename 时报 ENOENT。
+    /// CI 上实测过这个竞态（命中 `dispatch_unknown_command_is_reply` 的 boot），
+    /// mtime 闸门是唯一能挡住它的东西。
     #[test]
-    fn orphaned_snapshot_root_gc_removes_empty_hash_dirs_regardless_of_age() {
+    fn orphaned_snapshot_root_gc_keeps_fresh_empty_dirs_but_reaps_aged_ones() {
         let temp = tempfile::tempdir().expect("tempdir");
         let root = temp.path();
-        // 空目录没有字节可丢，不必等保留期。
-        let empty = root.join("aaa");
-        fs::create_dir(&empty).expect("create empty hash dir");
 
+        // 刚建的空目录：可能是并发 boot 的 in-flight staging，必须保留。
+        let fresh = root.join("aaa");
+        fs::create_dir(&fresh).expect("create fresh empty dir");
         let report =
             cleanup_orphaned_snapshot_roots(root, Duration::from_secs(24 * 3600), None, false);
+        assert!(
+            fresh.exists(),
+            "a just-created empty dir may be another process's in-flight staging"
+        );
+        assert_eq!(report.skipped_recent, 1);
+        assert_eq!(report.removed, 0);
 
-        assert!(!empty.exists(), "empty hash dir is reclaimed immediately");
+        // 过了保留期的空目录：确定是残渣，回收。
+        backdate_dir(&fresh, 48 * 3600);
+        let report =
+            cleanup_orphaned_snapshot_roots(root, Duration::from_secs(24 * 3600), None, false);
+        assert!(!fresh.exists(), "an aged empty dir is reclaimed");
         assert_eq!(report.removed, 1);
         assert_eq!(report.bytes_reclaimed, 0);
     }
