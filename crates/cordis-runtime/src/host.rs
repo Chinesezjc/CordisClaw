@@ -4003,18 +4003,21 @@ export_plugin_api! {{
                         .rollback
                         .as_ref()
                         .map(|rollback| {
-                            #[cfg(test)]
-                            if TEST_ITERATION_ENOSPC_INJECTION
-                                .swap(false, std::sync::atomic::Ordering::SeqCst)
-                            {
-                                return Err(RuntimeError::Io {
-                                    path: plugin_iteration_journal_path(&self.snapshot_root),
-                                    message: "No space left on device (os error 28)".to_string(),
-                                });
-                            }
-                            rollback.persist_journal(
-                                &plugin_iteration_journal_path(&self.snapshot_root),
-                                &state.prepared.iteration_id,
+                            // 注入的 ENOSPC 与真实 persist 走同一条表达式：
+                            // `Option::map_or_else` 没有"未走到的臂"，而
+                            // `if { return .. }` 的收尾在 if 不成立时不执行，
+                            // 会在 100% 行覆盖门槛下留一行永久缺口。
+                            injected_journal_enospc(&plugin_iteration_journal_path(
+                                &self.snapshot_root,
+                            ))
+                            .map_or_else(
+                                || {
+                                    rollback.persist_journal(
+                                        &plugin_iteration_journal_path(&self.snapshot_root),
+                                        &state.prepared.iteration_id,
+                                    )
+                                },
+                                Err,
                             )
                         })
                         .unwrap_or_else(|| Err(plugin_iteration_missing_rollback_error()))
@@ -4969,11 +4972,7 @@ export_plugin_api! {{
     /// `std::process::exit(0)`，绕过所有 `Drop`，因此必须显式调一次。
     pub fn cleanup_live_snapshot(&self) {
         let staged_root = self.current_snapshot().staged_artifact_root.clone();
-        // 空路径是 `reload_subtree` 的产物（不建目录），不能当路径删。
-        if staged_root.as_os_str().is_empty() {
-            return;
-        }
-        if staged_root.starts_with(&self.snapshot_root) && staged_root != self.snapshot_root {
+        if staged_artifact_root_is_removable(&staged_root, &self.snapshot_root) {
             let _ = fs::remove_dir_all(&staged_root);
         }
         self.cleanup_retired_snapshots();
@@ -7520,6 +7519,20 @@ pub fn cleanup_orphaned_snapshot_roots(
 
 /// 目录 mtime 是否已早于 `now - max_age`。取不到 mtime 时保守返回 false
 /// （宁可留着也不误删）。
+/// staged root 是否可以安全 `remove_dir_all`。
+///
+/// 两道闸门，都不是理论情况：
+/// - **空路径**是 `reload_subtree` 的产物（它不建 staging 目录，
+///   `staged_artifact_root` 留空），当路径删会打到 CWD。
+/// - **必须真正位于 `snapshot_root` 之下且不等于它本身**，否则会把整个
+///   snapshot root（连带 `plugin-iteration-edit-journal.json` 这类崩溃恢复
+///   状态）一起删掉。
+fn staged_artifact_root_is_removable(staged_root: &Path, snapshot_root: &Path) -> bool {
+    !staged_root.as_os_str().is_empty()
+        && staged_root.starts_with(snapshot_root)
+        && staged_root != snapshot_root
+}
+
 fn dir_is_older_than(path: &Path, max_age: Duration) -> bool {
     let Ok(modified) = fs::metadata(path).and_then(|meta| meta.modified()) else {
         return false;
@@ -7556,6 +7569,27 @@ pub fn default_host_snapshot_dir() -> PathBuf {
 
 fn next_staged_artifact_root(snapshot_root: &Path) -> PathBuf {
     snapshot_root.join(make_snapshot_dir_name())
+}
+
+/// 测试注入的 ENOSPC 错误；非 test 构建恒为 `None`。
+///
+/// 做成返回 `Option` 的函数而不是 `if cfg!(test) { .. }` 内联块：后者在
+/// 注入未触发时会留下不执行的收尾行，破坏 100% 行覆盖门槛。
+fn injected_journal_enospc(journal_path: &Path) -> Option<RuntimeError> {
+    #[cfg(test)]
+    {
+        TEST_ITERATION_ENOSPC_INJECTION
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+            .then(|| RuntimeError::Io {
+                path: journal_path.to_path_buf(),
+                message: "No space left on device (os error 28)".to_string(),
+            })
+    }
+    #[cfg(not(test))]
+    {
+        let _ = journal_path;
+        None
+    }
 }
 
 fn plugin_iteration_journal_path(snapshot_root: &Path) -> PathBuf {
@@ -7988,11 +8022,13 @@ fn default_snapshot_root(fixtures_root: &Path) -> PathBuf {
 mod tests {
     use super::{
         cleanup_orphaned_snapshot_roots, cleanup_stale_snapshot_dirs, collect_plugin_context_paths,
-        ensure_scaffold_integration_edits, extract_warning_blocks, render_child_plugin_core,
-        render_child_plugin_test, sanitize_child_plugin_segment, sort_plugin_context_paths,
-        warning_diagnostics_for_changed_paths, AgentBackend, AgentSessionKind, AgentStartOptions,
-        ContextFilesScope, PluginIterationAgentBackend, PluginIterationAgentState, RuntimeHost,
-        ScaffoldedChildRegistration, PLUGIN_AGENT_TOOL_CREATE_FILE, PLUGIN_AGENT_TOOL_DELETE_FILE,
+        dir_is_older_than, dir_size_bytes, ensure_scaffold_integration_edits,
+        extract_warning_blocks, render_child_plugin_core, render_child_plugin_test,
+        sanitize_child_plugin_segment, sort_plugin_context_paths,
+        staged_artifact_root_is_removable, warning_diagnostics_for_changed_paths, AgentBackend,
+        AgentSessionKind, AgentStartOptions, ContextFilesScope, PluginIterationAgentBackend,
+        PluginIterationAgentState, RuntimeHost, ScaffoldedChildRegistration, SnapshotGcReport,
+        PLUGIN_AGENT_TOOL_CREATE_FILE, PLUGIN_AGENT_TOOL_DELETE_FILE,
         PLUGIN_AGENT_TOOL_INSPECT_PLUGIN_CATALOG, PLUGIN_AGENT_TOOL_JSON_SET,
         PLUGIN_AGENT_TOOL_LIST_CONTEXT_FILES, PLUGIN_AGENT_TOOL_READ_CONTEXT_FILES,
         PLUGIN_AGENT_TOOL_REPLACE_FILES_EXACT, PLUGIN_AGENT_TOOL_REPLACE_FILE_EXACT,
@@ -8049,6 +8085,17 @@ mod tests {
         assert!(!legacy.exists(), "legacy-format snapshot must be removed");
         assert!(unrelated.exists(), "non-snapshot dirs are untouched");
         assert!(file.exists(), "plain files are untouched");
+    }
+
+    /// `Some(())` 当且仅当当前 euid 不是 root。
+    ///
+    /// root 持 `CAP_DAC_OVERRIDE`，内核不对它强制 mode 位，`chmod 000` 之后仍
+    /// 能 read_dir。返回 `Option` 让调用方用 `for`-over-`Option` 门控——不同于
+    /// `if` 或提前 `return`，它没有"未走到的臂"会留下永久无覆盖的行。
+    #[cfg(unix)]
+    fn probe_not_root() -> Option<()> {
+        // SAFETY: `geteuid` 无参数、不写调用方内存、不设 errno。
+        (unsafe { libc::geteuid() } != 0).then_some(())
     }
 
     /// 起一个立即退出的子进程并 wait 掉，拿一个确定已死的 pid。
@@ -8239,6 +8286,105 @@ mod tests {
             "retention=0 expires even a just-created dir"
         );
         assert_eq!(report.removed, 1);
+    }
+
+    /// GC 的三处防御性早退臂：`host_root` 不可 read_dir、hash 目录本身不可
+    /// read_dir、以及目录项不是目录。都不是"不可能发生"——权限变化、并发删除
+    /// 都会走到，且 100% 行覆盖门槛要求它们被执行到。
+    #[cfg(unix)]
+    #[test]
+    fn orphaned_snapshot_root_gc_tolerates_unreadable_and_non_dir_entries() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+
+        // 目录项不是目录：普通文件必须被跳过而不是当 hash 目录处理。
+        fs::write(root.join("stray-file"), b"x").expect("write stray file");
+        let report = cleanup_orphaned_snapshot_roots(root, Duration::ZERO, None, false);
+        assert_eq!(report.scanned, 0, "plain files are not hash dirs");
+        assert!(
+            root.join("stray-file").exists(),
+            "plain files are untouched"
+        );
+
+        // hash 目录不可 read_dir：跳过该目录，不 panic、不误删。root 绕过 mode
+        // 位，故只在非特权用户下有意义；用 for-over-Option 门控而非 `if`——
+        // `if` 会留下当前 euid 不走的那个臂永久无覆盖。
+        for () in probe_not_root().into_iter() {
+            let locked = root.join("locked");
+            fs::create_dir(&locked).expect("create locked dir");
+            fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).expect("chmod 000");
+            let report = cleanup_orphaned_snapshot_roots(root, Duration::ZERO, None, false);
+            fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).expect("restore mode");
+            assert!(locked.exists(), "an unreadable hash dir is left alone");
+            assert_eq!(report.removed, 0);
+        }
+
+        // host_root 整体不可 read_dir：返回空报告。
+        let missing = root.join("does-not-exist");
+        let report = cleanup_orphaned_snapshot_roots(&missing, Duration::ZERO, None, false);
+        assert_eq!(report, SnapshotGcReport::default());
+    }
+
+    /// `dir_is_older_than` 取不到 mtime 时保守返回 false（宁可留着不误删），
+    /// `dir_size_bytes` 对不可 read_dir 的目录返回 0，且不跟随符号链接。
+    #[cfg(unix)]
+    #[test]
+    fn dir_age_and_size_helpers_handle_unreadable_and_symlinks() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+
+        // 不存在的路径拿不到 metadata → 判"不老"，避免误删。
+        assert!(
+            !dir_is_older_than(&root.join("nope"), Duration::ZERO),
+            "missing mtime must not be treated as expired"
+        );
+        // 不存在的路径 size 为 0。
+        assert_eq!(dir_size_bytes(&root.join("nope")), 0);
+
+        // 符号链接不跟随：只算真实文件，不把链接目标的字节数计进来。
+        let real = root.join("real.bin");
+        fs::write(&real, b"0123456789").expect("write real file");
+        let inner = root.join("inner");
+        fs::create_dir(&inner).expect("create inner dir");
+        std::os::unix::fs::symlink(&real, inner.join("link.bin")).expect("symlink");
+        assert_eq!(
+            dir_size_bytes(&inner),
+            0,
+            "symlinks are not followed, so the target's bytes are not counted"
+        );
+        // 真实文件被递归计入。
+        assert_eq!(dir_size_bytes(root), 10);
+    }
+
+    /// `staged_artifact_root_is_removable` 的三条拒绝理由与一条放行。
+    ///
+    /// 空路径是 `reload_subtree` 的产物（它不建 staging 目录），当路径删会打到
+    /// CWD；等于或不在 snapshot_root 之下则会连带删掉
+    /// `plugin-iteration-edit-journal.json` 这类崩溃恢复状态。
+    #[test]
+    fn staged_root_removable_rejects_empty_and_out_of_tree_paths() {
+        let snapshot_root = Path::new("/tmp/snaps");
+        // 正常情况：snapshot_root 下的子目录可删。
+        assert!(staged_artifact_root_is_removable(
+            &snapshot_root.join("snapshot-1-2"),
+            snapshot_root
+        ));
+        // 空路径（reload_subtree）。
+        assert!(!staged_artifact_root_is_removable(
+            Path::new(""),
+            snapshot_root
+        ));
+        // 等于 snapshot_root 本身。
+        assert!(!staged_artifact_root_is_removable(
+            snapshot_root,
+            snapshot_root
+        ));
+        // 完全在别处。
+        assert!(!staged_artifact_root_is_removable(
+            Path::new("/tmp/elsewhere/snapshot-1-2"),
+            snapshot_root
+        ));
     }
 
     // Shared read-only host against the real fixtures tree. The fixture
@@ -9110,11 +9256,9 @@ mod ffi_panic_seam_tests {
 
         let host = RuntimeHost::boot(&fixtures).expect("host should boot on empty index");
         let staged = host.current_snapshot().staged_artifact_root.clone();
-        assert!(
-            staged.starts_with(&snapshot_root),
-            "staging must land in the pinned root, got {}",
-            staged.display()
-        );
+        // 不带格式参数：`staged.display()` 只在断言失败时求值，会留下一行
+        // 永久无覆盖。断言本身已足够定位问题。
+        assert!(staged.starts_with(&snapshot_root));
         assert!(
             staged.exists(),
             "live staged root exists while host is alive"

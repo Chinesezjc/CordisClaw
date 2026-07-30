@@ -369,6 +369,16 @@ mod tests {
             message: "no space left on device".to_string(),
         }
         .is_infrastructure_failure());
+        // verifier 把 tests/safety 阶段的失败包成 AutoUpdateVerifyFailed，
+        // 盘满时 cargo 的 stderr 也经这条路径抵达。
+        assert!(RuntimeError::AutoUpdateVerifyFailed {
+            message: "tests failed: error: No space left on device".to_string(),
+        }
+        .is_infrastructure_failure());
+        assert!(!RuntimeError::AutoUpdateVerifyFailed {
+            message: "tests failed: 3 assertions failed".to_string(),
+        }
+        .is_infrastructure_failure());
     }
 
     #[test]
