@@ -2078,9 +2078,12 @@ impl RuntimeHost {
                 Some(&snapshot_root),
                 false,
             );
-            if let Some(line) = snapshot_gc_summary_line(&report) {
-                eprintln!("{line}");
-            }
+            // `for`-over-`Option` 而非 `if let`：boot GC 在全新的 host 目录下
+            // 永远没有可回收的孤儿，`if let` 的 Some 支在原地不可达，会在字面
+            // 100% 行覆盖门槛下留一行缺口。语义完全相同。
+            snapshot_gc_summary_line(&report)
+                .iter()
+                .for_each(|line| eprintln!("{line}"));
         }
         // staging 期间持锁：并发 boot 的 GC 试锁失败 → 跳过本目录，不会删掉
         // 我们刚 mkdir、还没 stage 完的 staging 目录。
