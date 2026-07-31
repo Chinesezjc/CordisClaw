@@ -35,7 +35,7 @@ use std::sync::{Arc, OnceLock};
 use tempfile::TempDir;
 
 mod support;
-use support::fixtures_root;
+use support::{fixtures_root, pin_private_snapshot_root};
 
 // ---------------------------------------------------------------------------
 // Shared read-only host against the real fixtures tree.
@@ -94,6 +94,8 @@ fn setup_artifacts_only_copy() -> TempDir {
             fs::copy(&src, temp.path().join(name)).expect("copy top-level fixture file");
         }
     }
+    // fixtures root 就是 temp.path()，`discover_config_dir` 落到 `temp/config`。
+    pin_private_snapshot_root(temp.path(), temp.path());
     temp
 }
 
@@ -1047,6 +1049,9 @@ fn setup_nested_artifacts_workspace() -> TempDir {
             fs::copy(&src, fixtures.join(name)).expect("copy top-level fixture file");
         }
     }
+    // fixtures root 目录名是 "fixtures"，`discover_config_dir` 走同级分支 →
+    // `temp/config`。
+    pin_private_snapshot_root(temp.path(), &fixtures);
     temp
 }
 

@@ -33,7 +33,7 @@ use tempfile::TempDir;
 
 mod support;
 
-use support::{spawn_chunked_mock_llm_server_sequence, sse_response};
+use support::{pin_private_snapshot_root, spawn_chunked_mock_llm_server_sequence, sse_response};
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -317,6 +317,10 @@ fn setup_minimal_workspace_with(
 
     // Compile natively — this populates artifacts/index.json + the dylib.
     prepare_artifacts(&fixtures, PrepareMode::Full).expect("prepare mini artifacts");
+
+    // fixtures root 目录名是 "fixtures"，`discover_config_dir` 走同级分支 →
+    // `temp/config`，与 `write_agent_llm_config` 写入的目录一致。
+    pin_private_snapshot_root(temp.path(), &fixtures);
 
     (temp, fixtures)
 }

@@ -323,6 +323,14 @@ fn main() {
         }
         return;
     }
+    if args.first().map(|x| x.as_str()) == Some("gc") {
+        if let Err(err) = run_gc(&args[1..]) {
+            eprintln!("gc failed: {err}");
+            eprintln!("{}", usage());
+            std::process::exit(1);
+        }
+        return;
+    }
     if args.first().map(|x| x.as_str()) == Some("llm-auto-update") {
         if let Err(err) = run_llm_auto_update(&args[1..]) {
             eprintln!("llm-auto-update failed: {err}");
@@ -454,6 +462,9 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             let _ = std::io::stderr().flush();
             save_draft_and_revert(&fixtures_root, "signal");
             shutdown_host.write_shutdown_memory();
+            // `exit` 绕过所有 Drop，`RuntimeHost::drop` 的 staged root 回收
+            // 不会触发，故信号路径必须显式清一次（该方法幂等）。
+            shutdown_host.cleanup_live_snapshot();
             std::process::exit(0);
         })
         .ok();
@@ -1536,6 +1547,7 @@ fn emit_plugin_iteration_result(
         PluginIterationFinalVerdict::Promoted => "promoted",
         PluginIterationFinalVerdict::RolledBack => "rolled_back",
         PluginIterationFinalVerdict::Blocked => "blocked",
+        PluginIterationFinalVerdict::InfrastructureFailure => "infrastructure_failure",
     };
     let changed = if result.changed_paths.is_empty() {
         "-".to_string()
@@ -1758,6 +1770,81 @@ fn parse_verify_profile_flag(
             Err(format!("invalid verify profile: {other} (expected default|rust-workspace)").into())
         }
     }
+}
+
+/// `gc` 子命令的解析结果。
+#[derive(Debug, PartialEq, Eq)]
+struct GcOptions {
+    dry_run: bool,
+    max_age: std::time::Duration,
+}
+
+/// 解析 `gc` 的 flag。`--max-age-hours=0` 合法，表示所有目录立即过期
+/// （与 `RuntimeConfig::snapshot_retention` 的 `Some(0)` 语义一致）。
+fn parse_gc_args(args: &[String]) -> Result<GcOptions, Box<dyn std::error::Error>> {
+    const DEFAULT_MAX_AGE_HOURS: u64 = 24;
+    let mut dry_run = false;
+    let mut max_age_hours = DEFAULT_MAX_AGE_HOURS;
+
+    for token in args {
+        if token == "--dry-run" {
+            dry_run = true;
+            continue;
+        }
+        if let Some(value) = token.strip_prefix("--max-age-hours=") {
+            max_age_hours = value
+                .parse::<u64>()
+                .map_err(|err| format!("invalid --max-age-hours={value}: {err}"))?;
+            continue;
+        }
+        return Err(format!("unknown flag: {token}").into());
+    }
+
+    Ok(GcOptions {
+        dry_run,
+        max_age: std::time::Duration::from_secs(max_age_hours.saturating_mul(3_600)),
+    })
+}
+
+/// 回收 `{temp_dir}/cordis-runtime-host/` 下已无人认领的 snapshot 目录。
+///
+/// 每次 boot / reload / plugin-iteration attempt 都会 stage 一份插件工件
+/// （约 120-250 MB），而回收此前只覆盖"同一 hash 目录内已死进程的残留"与
+/// "reload 时退休的快照"，跨 hash 目录的孤儿无人清理。本命令是运维兜底入口。
+fn run_gc(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let options = parse_gc_args(args)?;
+    let host_root = cordis_runtime::host::default_host_snapshot_dir();
+    if !host_root.exists() {
+        println!("nothing to collect: {} does not exist", host_root.display());
+        return Ok(());
+    }
+
+    let report = cordis_runtime::host::cleanup_orphaned_snapshot_roots(
+        &host_root,
+        options.max_age,
+        None,
+        options.dry_run,
+    );
+
+    let mib = report.bytes_reclaimed as f64 / (1024.0 * 1024.0);
+    let verb = if options.dry_run {
+        "would reclaim"
+    } else {
+        "reclaimed"
+    };
+    println!("snapshot gc at {}", host_root.display());
+    println!("  scanned:         {}", report.scanned);
+    println!("  {verb}: {} dir(s), {mib:.1} MiB", report.removed);
+    println!("  skipped (live):     {}", report.skipped_live);
+    println!("  skipped (journal):  {}", report.skipped_journal);
+    println!("  skipped (recent):   {}", report.skipped_recent);
+    if report.skipped_journal > 0 {
+        println!(
+            "  note: dirs holding an unreplayed plugin-iteration journal are kept \
+             for manual inspection"
+        );
+    }
+    Ok(())
 }
 
 fn run_graph_html(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
@@ -2036,7 +2123,9 @@ fn usage() -> String {
   cargo run -p cordis-runtime -- prepare-artifacts [fixtures_root] [--full]
   cargo run -p cordis-runtime -- sync-plugin-docs [fixtures_root]
   cargo run -p cordis-runtime -- refresh-artifact-index [fixtures_root]
-  cargo run -p cordis-runtime -- rebuild-fixture-artifacts [fixtures_root]"
+  cargo run -p cordis-runtime -- rebuild-fixture-artifacts [fixtures_root]
+  cargo run -p cordis-runtime -- gc [--dry-run] [--max-age-hours=<u64>]
+    reclaims orphaned snapshot staging dirs under {temp_dir}/cordis-runtime-host (default max age 24h; 0 expires everything)"
         .to_string()
 }
 
@@ -2081,6 +2170,51 @@ fn agent_chat_usage() -> &'static str {
   /status  show the current shared agent session status
   /reset   start a fresh shared agent session
   /exit    leave agent chat mode and return to serve commands"
+}
+
+#[cfg(test)]
+mod gc_args_tests {
+    use super::parse_gc_args;
+    use std::time::Duration;
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn defaults_to_24h_without_flags() {
+        let options = parse_gc_args(&args(&[])).unwrap();
+        assert!(!options.dry_run);
+        assert_eq!(options.max_age, Duration::from_secs(24 * 3600));
+    }
+
+    #[test]
+    fn parses_dry_run_and_max_age() {
+        let options = parse_gc_args(&args(&["--dry-run", "--max-age-hours=6"])).unwrap();
+        assert!(options.dry_run);
+        assert_eq!(options.max_age, Duration::from_secs(6 * 3600));
+    }
+
+    #[test]
+    fn zero_max_age_expires_everything() {
+        // 与 config 的 snapshot_retention_hours: 0 语义一致，不回落默认值。
+        let options = parse_gc_args(&args(&["--max-age-hours=0"])).unwrap();
+        assert_eq!(options.max_age, Duration::ZERO);
+    }
+
+    #[test]
+    fn huge_max_age_saturates_without_panic() {
+        let options = parse_gc_args(&args(&["--max-age-hours=18446744073709551615"])).unwrap();
+        assert_eq!(options.max_age, Duration::from_secs(u64::MAX));
+    }
+
+    #[test]
+    fn rejects_unknown_flag_and_non_numeric_age() {
+        assert!(parse_gc_args(&args(&["--nope"])).is_err());
+        assert!(parse_gc_args(&args(&["--max-age-hours=abc"])).is_err());
+        // 位置参数也不接受：gc 不吃 fixtures_root。
+        assert!(parse_gc_args(&args(&["fixtures"])).is_err());
+    }
 }
 
 #[cfg(test)]

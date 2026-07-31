@@ -93,9 +93,10 @@
 
 | 文件 | 职责定位 | 关键入口 |
 |---|---|---|
-| `crates/cordis-runtime/src/lib.rs` | crate 对外模块导出 | `pub mod core/.../kernel` |
-| `crates/cordis-runtime/src/host.rs` | 常驻宿主：持有当前快照、执行原子 `reload`、保留 kernel 状态并清理 retired snapshots | `RuntimeHost::boot()`、`RuntimeHost::reload()` |
-| `crates/cordis-runtime/src/main.rs` | 运行入口示例（加载 fixtures、`serve`、通用 invoke、导出图 HTML、运行 auto-update） | `main()` |
+| `crates/cordis-runtime/src/lib.rs` | crate 对外模块导出 | `pub mod core/.../kernel`、`#[cfg(test)] mod testutil` |
+| `crates/cordis-runtime/src/testutil.rs` | `#[cfg(test)]` 单测公共工具：全 crate 唯一的 euid 特权探测点，root 下声明式跳过文件权限故障注入测试 | `skip_if_root()` |
+| `crates/cordis-runtime/src/host.rs` | 常驻宿主：持有当前快照、执行原子 `reload`、保留 kernel 状态并清理 retired snapshots；snapshot 目录 GC（跨 hash 目录孤儿回收 + 退出时回收 live staged root） | `RuntimeHost::boot()`、`RuntimeHost::reload()`、`cleanup_orphaned_snapshot_roots()`、`RuntimeHost::cleanup_live_snapshot()` |
+| `crates/cordis-runtime/src/main.rs` | 运行入口示例（加载 fixtures、`serve`、通用 invoke、导出图 HTML、运行 auto-update、`gc` 回收 snapshot 目录） | `main()` |
 
 ## 9. Runtime 测试 (`crates/cordis-runtime/tests`)
 

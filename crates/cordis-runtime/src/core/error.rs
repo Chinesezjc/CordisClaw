@@ -278,3 +278,144 @@ pub enum RuntimeError {
     #[error("I/O at {path}: {message}")]
     Io { path: PathBuf, message: String },
 }
+
+/// errno 描述文本，用于把"基础设施故障"从"插件代码有问题"里分出来。
+///
+/// 判据基于错误文本而非 errno 字段：全仓 `RuntimeError::Io` 有 175 处结构体
+/// 字面量构造，加必填字段的改动面不可接受；而 `std::io::Error::to_string()`
+/// 本身就内嵌 errno 描述（"No space left on device (os error 28)"），因此那
+/// 175 处无需改造即可被识别。cargo/rustc 的 ENOSPC 更是只以 stderr 文本形式
+/// 存活（`rebuild_plugin_workspace` 把 stderr 塞进 `InvalidArgument.message`），
+/// 除文本外没有别的信号可用。
+const INFRASTRUCTURE_ERROR_MARKERS: &[&str] = &[
+    // ENOSPC
+    "no space left on device",
+    // EDQUOT
+    "disk quota exceeded",
+    "quota exceeded",
+    // EFBIG
+    "file too large",
+];
+
+impl RuntimeError {
+    /// 是否为基础设施故障（磁盘满 / 配额耗尽 / 文件过大）而非插件自身的缺陷。
+    ///
+    /// plugin-iteration 用它把 ENOSPC 判成 `InfrastructureFailure` 而不是
+    /// `RolledBack`：后者读作"验证失败、插件有问题"，会污染 rollback 率、把
+    /// 插件 issue 标成 Open，并且丢掉重试入口。
+    pub fn is_infrastructure_failure(&self) -> bool {
+        let message = match self {
+            Self::Io { message, .. } => message,
+            Self::InvalidArgument { message } => message,
+            Self::CommandFailed { message, .. } => message,
+            Self::AutoUpdateVerifyFailed { message } => message,
+            _ => return false,
+        };
+        let lowered = message.to_ascii_lowercase();
+        INFRASTRUCTURE_ERROR_MARKERS
+            .iter()
+            .any(|marker| lowered.contains(marker))
+    }
+}
+
+/// 精确 errno 判定，供仍持有 `std::io::Error` 的收口点使用
+/// （`region_io_error` / `host_io_error`）。`ErrorKind::StorageFull` 在 stable
+/// 尚未稳定，故直接比对 raw errno。
+#[cfg(unix)]
+pub fn io_error_is_infrastructure(err: &std::io::Error) -> bool {
+    matches!(
+        err.raw_os_error(),
+        Some(libc::ENOSPC) | Some(libc::EDQUOT) | Some(libc::EFBIG)
+    )
+}
+
+#[cfg(not(unix))]
+pub fn io_error_is_infrastructure(_err: &std::io::Error) -> bool {
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{io_error_is_infrastructure, RuntimeError};
+    use std::path::PathBuf;
+
+    fn io(message: &str) -> RuntimeError {
+        RuntimeError::Io {
+            path: PathBuf::from("/tmp/x"),
+            message: message.to_string(),
+        }
+    }
+
+    #[test]
+    fn is_infrastructure_failure_detects_enospc_text() {
+        // `io::Error::to_string()` 的实际形状。
+        assert!(io("No space left on device (os error 28)").is_infrastructure_failure());
+        // 大小写无关。
+        assert!(io("NO SPACE LEFT ON DEVICE").is_infrastructure_failure());
+        assert!(io("Disk quota exceeded (os error 69)").is_infrastructure_failure());
+        assert!(io("File too large (os error 27)").is_infrastructure_failure());
+    }
+
+    #[test]
+    fn is_infrastructure_failure_covers_cargo_stderr_variants() {
+        // `rebuild_plugin_workspace` 把 cargo stderr 包成 InvalidArgument。
+        assert!(RuntimeError::InvalidArgument {
+            message: "cargo build -p demo failed: error: No space left on device".to_string(),
+        }
+        .is_infrastructure_failure());
+        assert!(RuntimeError::CommandFailed {
+            program: "cargo".to_string(),
+            args: vec!["build".to_string()],
+            message: "no space left on device".to_string(),
+        }
+        .is_infrastructure_failure());
+        // verifier 把 tests/safety 阶段的失败包成 AutoUpdateVerifyFailed，
+        // 盘满时 cargo 的 stderr 也经这条路径抵达。
+        assert!(RuntimeError::AutoUpdateVerifyFailed {
+            message: "tests failed: error: No space left on device".to_string(),
+        }
+        .is_infrastructure_failure());
+        assert!(!RuntimeError::AutoUpdateVerifyFailed {
+            message: "tests failed: 3 assertions failed".to_string(),
+        }
+        .is_infrastructure_failure());
+    }
+
+    #[test]
+    fn is_infrastructure_failure_rejects_genuine_plugin_failures() {
+        // 普通编译错：插件自己的问题，必须仍走 RolledBack。
+        assert!(!RuntimeError::InvalidArgument {
+            message: "cargo build -p demo failed: error[E0308]: mismatched types".to_string(),
+        }
+        .is_infrastructure_failure());
+        assert!(!io("No such file or directory (os error 2)").is_infrastructure_failure());
+        // 非文本承载型变体一律 false。
+        assert!(!RuntimeError::PluginIterationPolicyBlocked {
+            path: "plugins/demo".to_string(),
+            reason: "outside the plugin iteration surface".to_string(),
+        }
+        .is_infrastructure_failure());
+        assert!(!RuntimeError::Invariant {
+            message: "journal missing".to_string(),
+        }
+        .is_infrastructure_failure());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn io_error_is_infrastructure_matches_enospc_errno() {
+        assert!(io_error_is_infrastructure(
+            &std::io::Error::from_raw_os_error(libc::ENOSPC)
+        ));
+        assert!(io_error_is_infrastructure(
+            &std::io::Error::from_raw_os_error(libc::EDQUOT)
+        ));
+        assert!(!io_error_is_infrastructure(
+            &std::io::Error::from_raw_os_error(libc::ENOENT)
+        ));
+        // 没有 raw errno 的合成错误不应被误判。
+        assert!(!io_error_is_infrastructure(&std::io::Error::other(
+            "synthetic"
+        )));
+    }
+}

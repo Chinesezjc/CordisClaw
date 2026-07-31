@@ -436,6 +436,12 @@ pub enum PluginIterationFinalVerdict {
     Promoted,
     RolledBack,
     Blocked,
+    /// 基础设施故障（磁盘满 / 配额耗尽）导致迭代无法完成，**不是**插件缺陷。
+    ///
+    /// 与 `RolledBack` 分开的理由：后者读作"验证失败、插件有问题"，会计入
+    /// rollback 率、把插件 issue 标成 Open、并且从 `blocked_iterations` 里摘除
+    /// 从而失去重试入口。磁盘满时这三件事全是误判——腾出空间后原样重试即可。
+    InfrastructureFailure,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
