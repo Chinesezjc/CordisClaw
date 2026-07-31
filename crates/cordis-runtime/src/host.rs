@@ -49,7 +49,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex, RwLock, Weak};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use toml::Value as TomlValue;
 
@@ -1146,6 +1146,10 @@ pub struct KernelStatus {
     pub iteration_total: u64,
     pub iteration_promote_total: u64,
     pub iteration_rollback_total: u64,
+    /// 基础设施故障（磁盘满等）导致的失败次数。与 rollback 分开计数，
+    /// 否则磁盘满会污染"验证失败率"这个指标。
+    #[serde(default)]
+    pub iteration_infrastructure_failure_total: u64,
     pub history_len: usize,
     pub last_change: Option<ChangeRecord>,
     pub plugin_issue_count: usize,
@@ -1216,6 +1220,7 @@ struct KernelIterationMetrics {
     iteration_total: u64,
     iteration_promote_total: u64,
     iteration_rollback_total: u64,
+    iteration_infrastructure_failure_total: u64,
 }
 
 #[derive(Debug)]
@@ -1287,10 +1292,16 @@ impl RuntimeKernel {
             .iteration_metrics
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        let (iteration_total, iteration_promote_total, iteration_rollback_total) = (
+        let (
+            iteration_total,
+            iteration_promote_total,
+            iteration_rollback_total,
+            iteration_infrastructure_failure_total,
+        ) = (
             metrics.iteration_total,
             metrics.iteration_promote_total,
             metrics.iteration_rollback_total,
+            metrics.iteration_infrastructure_failure_total,
         );
         drop(metrics);
         // Single memory lock for both fields — avoids double-futex.
@@ -1312,6 +1323,7 @@ impl RuntimeKernel {
             iteration_total,
             iteration_promote_total,
             iteration_rollback_total,
+            iteration_infrastructure_failure_total,
             history_len,
             last_change,
             plugin_issue_count,
@@ -1664,6 +1676,9 @@ impl RuntimeKernel {
                 PluginIterationFinalVerdict::RolledBack => {
                     metrics.iteration_rollback_total += 1;
                 }
+                PluginIterationFinalVerdict::InfrastructureFailure => {
+                    metrics.iteration_infrastructure_failure_total += 1;
+                }
             }
         }
 
@@ -1702,7 +1717,11 @@ impl RuntimeKernel {
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner());
             match result.final_verdict {
-                PluginIterationFinalVerdict::Blocked => {
+                // 基础设施故障与 Blocked 一样保留：腾出磁盘后可经
+                // approve_blocked_iteration 原样重试；RolledBack 摘除是因为
+                // 那代表插件真的没通过验证，重试同一份代码没有意义。
+                PluginIterationFinalVerdict::Blocked
+                | PluginIterationFinalVerdict::InfrastructureFailure => {
                     blocked.insert(result.iteration_id.clone(), result.clone());
                 }
                 PluginIterationFinalVerdict::Promoted | PluginIterationFinalVerdict::RolledBack => {
@@ -1715,6 +1734,9 @@ impl RuntimeKernel {
             PluginIterationFinalVerdict::Blocked => KernelPluginIssueStatus::Blocked,
             PluginIterationFinalVerdict::Promoted => KernelPluginIssueStatus::Resolved,
             PluginIterationFinalVerdict::RolledBack => KernelPluginIssueStatus::Open,
+            // 不是 Open：Open 读作"插件仍然坏着"，而磁盘满与插件质量无关。
+            // 复用 Blocked（等人处置基础设施后重试），不新增 issue 状态。
+            PluginIterationFinalVerdict::InfrastructureFailure => KernelPluginIssueStatus::Blocked,
         };
         self.update_issue_status(&result.issue_id, status);
     }
@@ -2024,6 +2046,15 @@ pub(crate) static TEST_ITERATION_PANIC_INJECTION: std::sync::atomic::AtomicBool 
 pub(crate) static TEST_STOP_HANDLER_PANIC_INJECTION: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Test-only ENOSPC injection flag. 置位后 journal persist 阶段返回一个 ENOSPC
+/// 形状的 `RuntimeError::Io`，让测试无需真把盘写满就能覆盖"磁盘满判成
+/// `InfrastructureFailure` 而非 `RolledBack`"。journal 写在 `snapshot_root` 下，
+/// 正是磁盘写满时最先失败的位置之一（真实链路 persist_journal → atomic_write
+/// → `RuntimeError::Io`）。读后置回 `false`，只触发一次。
+#[cfg(test)]
+pub(crate) static TEST_ITERATION_ENOSPC_INJECTION: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 impl RuntimeHost {
     pub fn boot(fixtures_root: impl AsRef<Path>) -> Result<Self, RuntimeError> {
         let fixtures_root = fixtures_root.as_ref().to_path_buf();
@@ -2035,6 +2066,28 @@ impl RuntimeHost {
         fs::create_dir_all(&snapshot_root)
             .map_err(|e| host_io_error(snapshot_root.clone(), e.to_string()))?;
         cleanup_stale_snapshot_dirs(&snapshot_root);
+        // 兄弟 hash 目录的回收：`cleanup_stale_snapshot_dirs` 只管本 root
+        // 内部，跨 root 的孤儿（fixtures root 已消失、hash 再也不会重现）
+        // 只能在这里扫。默认 root 之外（配置了 runtime.snapshot_root）不做
+        // 跨目录清理，避免动到用户自己指定的目录树。
+        let host_snapshot_dir = default_host_snapshot_dir();
+        if snapshot_root.starts_with(&host_snapshot_dir) {
+            let report = cleanup_orphaned_snapshot_roots(
+                &host_snapshot_dir,
+                config.snapshot_retention(),
+                Some(&snapshot_root),
+                false,
+            );
+            // `for`-over-`Option` 而非 `if let`：boot GC 在全新的 host 目录下
+            // 永远没有可回收的孤儿，`if let` 的 Some 支在原地不可达，会在字面
+            // 100% 行覆盖门槛下留一行缺口。语义完全相同。
+            snapshot_gc_summary_line(&report)
+                .iter()
+                .for_each(|line| eprintln!("{line}"));
+        }
+        // staging 期间持锁：并发 boot 的 GC 试锁失败 → 跳过本目录，不会删掉
+        // 我们刚 mkdir、还没 stage 完的 staging 目录。
+        let _staging_guard = snapshot_staging_lock::hold(&snapshot_root);
         let initial_snapshot = Arc::new(build_snapshot(&loader, &snapshot_root)?);
         let interactive_rollback = Mutex::new(PluginEditRollback::empty(&fixtures_root));
         let service_registry = Arc::new(crate::context::ServiceRegistry::new());
@@ -3952,9 +4005,21 @@ export_plugin_api! {{
                         .rollback
                         .as_ref()
                         .map(|rollback| {
-                            rollback.persist_journal(
-                                &plugin_iteration_journal_path(&self.snapshot_root),
-                                &state.prepared.iteration_id,
+                            // 注入的 ENOSPC 与真实 persist 走同一条表达式：
+                            // `Option::map_or_else` 没有"未走到的臂"，而
+                            // `if { return .. }` 的收尾在 if 不成立时不执行，
+                            // 会在 100% 行覆盖门槛下留一行永久缺口。
+                            injected_journal_enospc(&plugin_iteration_journal_path(
+                                &self.snapshot_root,
+                            ))
+                            .map_or_else(
+                                || {
+                                    rollback.persist_journal(
+                                        &plugin_iteration_journal_path(&self.snapshot_root),
+                                        &state.prepared.iteration_id,
+                                    )
+                                },
+                                Err,
                             )
                         })
                         .unwrap_or_else(|| Err(plugin_iteration_missing_rollback_error()))
@@ -4406,8 +4471,17 @@ export_plugin_api! {{
                 candidate_rollback,
                 workspace_restore,
             ));
-            state.final_verdict = Some(PluginIterationFinalVerdict::RolledBack);
-            return Ok(PluginIterationFinalVerdict::RolledBack);
+            // 基础设施故障（磁盘满等）与"验证失败"分开定级。回滚照常先跑
+            // （上面已执行），回滚自身失败也不改变这个判定——错误文本已由
+            // `aggregate_rollback_failure` 拼进 blocked_reason，journal 留在盘上
+            // 供人工恢复。
+            let verdict = if state.stage_error_is_infrastructure {
+                PluginIterationFinalVerdict::InfrastructureFailure
+            } else {
+                PluginIterationFinalVerdict::RolledBack
+            };
+            state.final_verdict = Some(verdict);
+            return Ok(verdict);
         }
         let verifier_verdict = state.verifier_verdict.unwrap_or(VerifierVerdict::Partial);
         let canary_verdict = state
@@ -4571,6 +4645,10 @@ export_plugin_api! {{
     fn fail_stage(&self, state: &mut PluginIterationRunState, stage: &str, err: &RuntimeError) {
         self.observe_plugin_iteration_failure(&state.prepared, stage, err);
         state.stage_error = Some(err.to_string());
+        // 同时记下这次失败是否为基础设施故障（磁盘满 / 配额耗尽）。所有 stage
+        // 的失败都经本函数，故此处是唯一需要标记的地方；收尾时据此给
+        // `InfrastructureFailure` 而不是把 ENOSPC 误报成"验证失败"。
+        state.stage_error_is_infrastructure = err.is_infrastructure_failure();
     }
 
     fn observe_plugin_iteration_failure(
@@ -4579,6 +4657,12 @@ export_plugin_api! {{
         stage: &str,
         err: &RuntimeError,
     ) {
+        // 基础设施故障（磁盘满等）不是插件的问题：此前 rebuild /
+        // stage_candidate 阶段的任何错误都被记成 LoadFailure 归咎于插件，
+        // 于 ENOSPC 时会凭空产生一条"插件加载失败"的 kernel issue。
+        if err.is_infrastructure_failure() {
+            return;
+        }
         let source = match err {
             RuntimeError::PluginIterationPolicyBlocked { .. } => {
                 Some(KernelPluginIssueSource::PolicyBlocked)
@@ -4878,6 +4962,28 @@ export_plugin_api! {{
                 snapshot: retired_weak,
                 staged_artifact_root,
             });
+    }
+
+    /// 删除本进程当前 live snapshot 的 staged root，并回收所有已退休的。
+    ///
+    /// `cleanup_retired_snapshots` 只回收 **reload 时被退休**的快照，live
+    /// 的那一份没有任何路径负责：boot 后不 reload 直接退出的进程会把它原地
+    /// 留下，叠加"hash 目录再也不会重现"即成为永久孤儿。
+    ///
+    /// **幂等**：重复调用安全，供 `Drop` 与信号处理路径共用 —— 信号处理器走
+    /// `std::process::exit(0)`，绕过所有 `Drop`，因此必须显式调一次。
+    pub fn cleanup_live_snapshot(&self) {
+        let staged_root = self.current_snapshot().staged_artifact_root.clone();
+        if staged_artifact_root_is_removable(&staged_root, &self.snapshot_root) {
+            let _ = fs::remove_dir_all(&staged_root);
+        }
+        self.cleanup_retired_snapshots();
+    }
+}
+
+impl Drop for RuntimeHost {
+    fn drop(&mut self) {
+        self.cleanup_live_snapshot();
     }
 }
 
@@ -6853,6 +6959,9 @@ struct PluginIterationRunState {
     canary: Option<CanaryReport>,
     blocked_reason: Option<String>,
     stage_error: Option<String>,
+    /// `stage_error` 是否源自基础设施故障（磁盘满 / 配额耗尽），而非插件缺陷。
+    /// 决定收尾时给 `InfrastructureFailure` 还是 `RolledBack`。
+    stage_error_is_infrastructure: bool,
     final_verdict: Option<PluginIterationFinalVerdict>,
     tests_command: Option<String>,
     safety_command: Option<String>,
@@ -6876,6 +6985,7 @@ impl PluginIterationRunState {
             canary: None,
             blocked_reason: None,
             stage_error: None,
+            stage_error_is_infrastructure: false,
             final_verdict: None,
             tests_command: None,
             safety_command: None,
@@ -7248,30 +7358,266 @@ fn cleanup_stale_snapshot_dirs(snapshot_root: &Path) {
     for entry in entries.flatten() {
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
-        let Some(rest) = name_str.strip_prefix("snapshot-") else {
+        if !is_snapshot_dir_name(&name_str) {
             continue;
-        };
+        }
         if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
             continue;
         }
-        let owner_alive = rest
-            .split('-')
-            .next()
-            .and_then(|segment| segment.parse::<u32>().ok())
-            // pid 必须能落进正的 pid_t：`kill(-1, 0)` 语义是"探测所有
-            // 可发信号进程"，恒成功，超出 i32 的值直接判死而不是探活。
-            // 旧格式 `snapshot-{nanos}` 首段是纳秒时间戳，parse u32 失败
-            // → None → 按 stale 清理。
-            .filter(|pid| i32::try_from(*pid).is_ok())
-            .is_some_and(crate::plugin::tooling::lock_pid_is_live);
-        if !owner_alive {
+        if !snapshot_dir_owner_is_alive(&name_str) {
             let _ = fs::remove_dir_all(entry.path());
         }
     }
 }
 
+/// 目录名是否为 staged snapshot（`snapshot-{pid}-{nanos}`，含旧格式
+/// `snapshot-{nanos}`）。
+fn is_snapshot_dir_name(name: &str) -> bool {
+    name.starts_with("snapshot-")
+}
+
+/// 从 `snapshot-{pid}-{nanos}` 目录名解析 pid 并探活。
+///
+/// pid 段解析成功且进程仍存活（`lock_pid_is_live`，同进程恒真）→ true，
+/// 这是某个活 host 的 in-flight staging；进程已死或名字不含合法 pid 段
+/// （含历史 `snapshot-{nanos}` 旧格式）→ false，视为 stale。
+fn snapshot_dir_owner_is_alive(name: &str) -> bool {
+    name.strip_prefix("snapshot-")
+        .and_then(|rest| rest.split('-').next())
+        .and_then(|segment| segment.parse::<u32>().ok())
+        // pid 必须能落进正的 pid_t：`kill(-1, 0)` 语义是"探测所有
+        // 可发信号进程"，恒成功，超出 i32 的值直接判死而不是探活。
+        // 旧格式 `snapshot-{nanos}` 首段是纳秒时间戳，parse u32 失败
+        // → None → 按 stale 处理。
+        .filter(|pid| i32::try_from(*pid).is_ok())
+        .is_some_and(crate::plugin::tooling::lock_pid_is_live)
+}
+
+/// 跨 hash 目录 GC 的统计结果。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SnapshotGcReport {
+    /// 扫描到的 hash 目录总数。
+    pub scanned: usize,
+    /// 已删除（或 dry-run 下判定可删）的 hash 目录数。
+    pub removed: usize,
+    /// 回收的字节数。
+    pub bytes_reclaimed: u64,
+    /// 因含未重放的 rollback journal 而跳过的目录数。
+    pub skipped_journal: usize,
+    /// 因仍有活进程持有 in-flight staging 而跳过的目录数。
+    pub skipped_live: usize,
+    /// 因未到保留期而跳过的目录数。
+    pub skipped_recent: usize,
+}
+
+/// 回收 `{temp_dir}/cordis-runtime-host/` 下已无人认领的 hash 目录。
+///
+/// `cleanup_stale_snapshot_dirs` 只扫描**当次 boot 解析出的那一个** hash
+/// 目录内部，从不遍历兄弟目录；而 hash 是 fixtures root canonical 路径的
+/// sha256，集成测试每次把 fixtures 拷进新 `TempDir` → 路径不同 → 全新 hash
+/// 目录，老目录永远等不到"下次 boot 扫到它"，因为那个 hash 再也不会出现。
+/// 实测本机累积 196 GB / 13200 个 hash 目录。本函数补上这一层回收。
+///
+/// 删除判据（三条**全部**满足）：
+/// 1. 目录内所有 `snapshot-{pid}-*` 的 pid 段均已死（或无合法 pid 段）；
+/// 2. 目录 mtime 已超过 `max_age`；
+/// 3. 目录内无 `plugin-iteration-edit-journal.json`。
+///
+/// 第 3 条是安全红线：journal 是崩溃恢复状态（`restore_plugin_iteration_workspace`
+/// 在 boot 时重放它），而 sha256 单向、无法反推 fixtures root 是否还存在，
+/// 因此含 journal 的目录一律保留并打印路径交人工处置，绝不自动丢弃。
+///
+/// 第 1 条受 **pid 复用**限制：目录名里的 pid 早已随进程退出被 OS 回收、
+/// 可能复用到任意无关进程上，此时 `lock_pid_is_live` 返回 true、目录被判为
+/// "仍在用"而保留（实测 13206 个目录里 67 个如此，持有者是 vscode 里的
+/// 无关进程）。这是保守方向的误判——宁可留下也不误删活 host 正在 staging
+/// 的目录——且第 2 条的 mtime 会限制其累积规模；要精确判定得往目录里写
+/// boot 时间戳或加文件锁，当前不值得为此加复杂度。
+///
+/// 空 hash 目录不受 `max_age` 约束，直接回收（无字节可丢）。
+/// `skip_root` 传入当前进程正在用的 snapshot root，确保永不自删。
+pub fn cleanup_orphaned_snapshot_roots(
+    host_root: &Path,
+    max_age: Duration,
+    skip_root: Option<&Path>,
+    dry_run: bool,
+) -> SnapshotGcReport {
+    let mut report = SnapshotGcReport::default();
+    let Ok(entries) = fs::read_dir(host_root) else {
+        return report;
+    };
+    // 当前 snapshot root 用 canonical 形式比对：调用方传进来的可能是
+    // 未规范化路径（macOS 的 /tmp 是 /private/tmp 的 symlink）。
+    let skip_canonical = skip_root.and_then(|path| path.canonicalize().ok());
+
+    for entry in entries.flatten() {
+        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let path = entry.path();
+        if let Some(skip) = skip_canonical.as_deref() {
+            if path.canonicalize().ok().as_deref() == Some(skip) {
+                continue;
+            }
+        }
+        report.scanned += 1;
+
+        let Ok(children) = fs::read_dir(&path) else {
+            continue;
+        };
+        let mut has_journal = false;
+        let mut owner_alive = false;
+        for child in children.flatten() {
+            let child_name = child.file_name();
+            let child_name = child_name.to_string_lossy();
+            // 必须是**文件**才算 journal。有测试故意把这个路径造成非空目录来
+            // 迫使 `clear_journal` 的 remove_file 失败
+            // （`clear_journal_remove_failure_when_path_is_nonempty_dir`），
+            // 只按名字判断会把这类测试残渣误当成崩溃恢复状态而永久保留
+            // （实测 338 个同名条目里 229 个是这种目录）。
+            if child_name == "plugin-iteration-edit-journal.json"
+                && child.file_type().map(|t| t.is_file()).unwrap_or(false)
+            {
+                has_journal = true;
+            }
+            if is_snapshot_dir_name(&child_name) && snapshot_dir_owner_is_alive(&child_name) {
+                owner_alive = true;
+            }
+        }
+
+        if owner_alive {
+            report.skipped_live += 1;
+            continue;
+        }
+        if has_journal {
+            report.skipped_journal += 1;
+            eprintln!(
+                "[snapshot-gc] 保留 {}：含未重放的 plugin-iteration rollback journal",
+                path.display()
+            );
+            continue;
+        }
+        // 保留期对空目录同样生效。空目录看似"没字节可丢、删了无害"，但它也可能
+        // 是**另一个正在 boot 的进程刚 mkdir、还没 stage 进任何文件**的 staging
+        // 目录：此刻它既没有 snapshot-{pid}-* 子目录可供探活（owner_alive 为
+        // false），又是空的，一旦跳过保留期就会被立刻删掉，那个进程随后
+        // rename 到该目录时报 "No such file or directory"。CI 上实测到这个竞态
+        // （命中 dispatch_unknown_command_is_reply 的 boot）。mtime 闸门是这里
+        // 唯一能挡住它的东西，因此不能为空目录开后门。
+        if !dir_is_older_than(&path, max_age) {
+            report.skipped_recent += 1;
+            continue;
+        }
+        // 最后一道闸门：非阻塞试 staging 锁。有进程正在这个 hash 目录里
+        // staging（哪怕目录还空着、没有 pid 线索、mtime 也已被调老）就跳过。
+        if !snapshot_staging_lock::try_acquire_for_gc(&path) {
+            report.skipped_live += 1;
+            continue;
+        }
+
+        let bytes = dir_size_bytes(&path);
+        if dry_run {
+            report.removed += 1;
+            report.bytes_reclaimed += bytes;
+            continue;
+        }
+        if fs::remove_dir_all(&path).is_ok() {
+            // 连带清掉同级锁文件，否则 lock 文件会无限累积。
+            let _ = fs::remove_file(snapshot_staging_lock::lock_path(&path));
+            report.removed += 1;
+            report.bytes_reclaimed += bytes;
+        }
+    }
+    report
+}
+
+/// 目录 mtime 是否已早于 `now - max_age`。取不到 mtime 时保守返回 false
+/// （宁可留着也不误删）。
+/// staged root 是否可以安全 `remove_dir_all`。
+///
+/// 两道闸门，都不是理论情况：
+/// - **空路径**是 `reload_subtree` 的产物（它不建 staging 目录，
+///   `staged_artifact_root` 留空），当路径删会打到 CWD。
+/// - **必须真正位于 `snapshot_root` 之下且不等于它本身**，否则会把整个
+///   snapshot root（连带 `plugin-iteration-edit-journal.json` 这类崩溃恢复
+///   状态）一起删掉。
+fn staged_artifact_root_is_removable(staged_root: &Path, snapshot_root: &Path) -> bool {
+    !staged_root.as_os_str().is_empty()
+        && staged_root.starts_with(snapshot_root)
+        && staged_root != snapshot_root
+}
+
+fn dir_is_older_than(path: &Path, max_age: Duration) -> bool {
+    let Ok(modified) = fs::metadata(path).and_then(|meta| meta.modified()) else {
+        return false;
+    };
+    SystemTime::now()
+        .duration_since(modified)
+        .map(|age| age >= max_age)
+        .unwrap_or(false)
+}
+
+/// 递归累加目录内文件字节数，用于报告回收量。符号链接不跟随（只算链接本身）。
+fn dir_size_bytes(path: &Path) -> u64 {
+    let Ok(entries) = fs::read_dir(path) else {
+        return 0;
+    };
+    let mut total = 0;
+    for entry in entries.flatten() {
+        match entry.file_type() {
+            Ok(ty) if ty.is_dir() => total += dir_size_bytes(&entry.path()),
+            Ok(ty) if ty.is_file() => {
+                total += entry.metadata().map(|meta| meta.len()).unwrap_or(0);
+            }
+            _ => {}
+        }
+    }
+    total
+}
+
+/// boot 时 GC 的日志行；无回收则 `None`（不刷无意义的日志）。
+///
+/// 抽成纯函数是为了可测：coverage 跑在全新的临时目录里，boot GC 永远没有可回收
+/// 的孤儿，`removed > 0` 的分支在原地不可达。
+fn snapshot_gc_summary_line(report: &SnapshotGcReport) -> Option<String> {
+    (report.removed > 0).then(|| {
+        format!(
+            "[snapshot-gc] 回收 {} 个孤儿 snapshot root，释放 {:.1} MB",
+            report.removed,
+            report.bytes_reclaimed as f64 / (1024.0 * 1024.0)
+        )
+    })
+}
+
+/// 默认的 host 级 snapshot 根目录 `{temp_dir}/cordis-runtime-host`，
+/// 即所有 per-fixtures-root hash 目录的父目录。
+pub fn default_host_snapshot_dir() -> PathBuf {
+    std::env::temp_dir().join("cordis-runtime-host")
+}
+
 fn next_staged_artifact_root(snapshot_root: &Path) -> PathBuf {
     snapshot_root.join(make_snapshot_dir_name())
+}
+
+/// 测试注入的 ENOSPC 错误；非 test 构建恒为 `None`。
+///
+/// 做成返回 `Option` 的函数而不是 `if cfg!(test) { .. }` 内联块：后者在
+/// 注入未触发时会留下不执行的收尾行，破坏 100% 行覆盖门槛。
+fn injected_journal_enospc(journal_path: &Path) -> Option<RuntimeError> {
+    #[cfg(test)]
+    {
+        TEST_ITERATION_ENOSPC_INJECTION
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+            .then(|| RuntimeError::Io {
+                path: journal_path.to_path_buf(),
+                message: "No space left on device (os error 28)".to_string(),
+            })
+    }
+    #[cfg(not(test))]
+    {
+        let _ = journal_path;
+        None
+    }
 }
 
 fn plugin_iteration_journal_path(snapshot_root: &Path) -> PathBuf {
@@ -7288,6 +7634,111 @@ fn plugin_iteration_journal_path(snapshot_root: &Path) -> PathBuf {
 /// P1-16 helper module: fcntl advisory file lock around workspace-manifest
 /// edits so two concurrent `create_plugin` invocations don't interleave
 /// their read/modify/write of `plugins/Cargo.toml`.
+/// hash 目录的 staging 锁：boot 期间持排他锁，GC 用**非阻塞**方式试锁，
+/// 拿不到就跳过该目录。
+///
+/// 为什么需要它：GC 判"是否有活主"靠目录内 `snapshot-{pid}-*` 的 pid 探活，
+/// 但目录**刚 mkdir、还没 stage 进任何文件**的那个瞬间没有任何 pid 线索，
+/// 此时只剩 mtime 闸门。mtime 能挡住绝大多数情况（并发窗口是秒级、保留期是
+/// 小时级），但那是概率而非保证——把保留期配成 0（`--max-age-hours=0`，运维
+/// 清盘时的合理用法）就会立刻退化成 CI 上实测到的那个竞态：GC 删掉别人正在
+/// staging 的目录，那边随后 rename 报 ENOENT。锁把它变成确定性排除。
+///
+/// 锁文件放在 hash 目录**同级**（`{hash}.lock`）而不是目录内部：GC 会
+/// `remove_dir_all` 整个目录，锁文件在里面会被一起删掉，持锁进程的 fd 还在
+/// 但文件已 unlink，后续进程开的是新 inode、互斥失效。
+mod snapshot_staging_lock {
+    use std::fs::{File, OpenOptions};
+    use std::path::{Path, PathBuf};
+
+    pub struct Guard {
+        /// 持有 fd 即持有 flock； 里读它来解锁。
+        file: Option<File>,
+    }
+
+    /// `{hash_dir}.lock` —— 与 hash 目录同级，不会被 `remove_dir_all` 带走。
+    pub fn lock_path(hash_dir: &Path) -> PathBuf {
+        let mut name = hash_dir.as_os_str().to_os_string();
+        name.push(".lock");
+        PathBuf::from(name)
+    }
+
+    fn open_lock_file(path: &Path) -> Option<File> {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(path)
+            .ok()
+    }
+
+    /// boot 侧：持排他锁直到 `Guard` drop。拿不到锁不阻塞启动（锁是 advisory
+    /// 的，失败时退化成原先的 mtime-only 行为）。
+    #[cfg(unix)]
+    pub fn hold(hash_dir: &Path) -> Guard {
+        // 单表达式：开文件失败与 flock 失败都收敛成 `None`，没有各自的 `return`
+        // 行——那两行在原地不可达（新建锁文件既不会开失败也不会 flock 失败），
+        // 而本仓库覆盖率门槛是字面 100%。语义仍是"拿不到锁就退化成无锁"。
+        Guard {
+            file: open_lock_file(&lock_path(hash_dir))
+                .filter(|file| flock_succeeded(try_lock_exclusive_nb(file))),
+        }
+    }
+
+    /// `flock` 的返回码判定，独立成函数以便两种取值都能被单测覆盖。
+    #[cfg(unix)]
+    pub(super) fn flock_succeeded(rc: i32) -> bool {
+        rc == 0
+    }
+
+    #[cfg(unix)]
+    fn try_lock_exclusive_nb(file: &File) -> i32 {
+        use std::os::unix::io::AsRawFd;
+        // SAFETY: fd 由 `file` 拥有，跨 syscall 存活。
+        unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }
+    }
+
+    #[cfg(not(unix))]
+    pub fn hold(_hash_dir: &Path) -> Guard {
+        Guard { file: None }
+    }
+
+    /// GC 侧：非阻塞试锁。`true` = 拿到了（无人 staging，可安全回收），
+    /// `false` = 有人持锁或开不了锁文件 → 跳过。
+    #[cfg(unix)]
+    pub fn try_acquire_for_gc(hash_dir: &Path) -> bool {
+        // 同 `hold`：单表达式，无 in-situ 不可达的 `return` 行。
+        // `inspect` 里立即解锁——调用方随后 remove_dir_all，不需要一直持有。
+        open_lock_file(&lock_path(hash_dir))
+            .filter(|file| flock_succeeded(try_lock_exclusive_nb(file)))
+            .inspect(unlock)
+            .is_some()
+    }
+
+    #[cfg(unix)]
+    fn unlock(file: &File) {
+        use std::os::unix::io::AsRawFd;
+        // SAFETY: fd 由 `file` 拥有，跨 syscall 存活。
+        let _ = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+    }
+
+    #[cfg(not(unix))]
+    pub fn try_acquire_for_gc(_hash_dir: &Path) -> bool {
+        true
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            #[cfg(unix)]
+            self.file.iter().for_each(unlock);
+        }
+    }
+}
+
 mod workspace_manifest_lock {
     use std::fs::{File, OpenOptions};
     use std::path::Path;
@@ -7703,12 +8154,14 @@ fn default_snapshot_root(fixtures_root: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        cleanup_stale_snapshot_dirs, collect_plugin_context_paths,
-        ensure_scaffold_integration_edits, extract_warning_blocks, render_child_plugin_core,
-        render_child_plugin_test, sanitize_child_plugin_segment, sort_plugin_context_paths,
-        warning_diagnostics_for_changed_paths, AgentBackend, AgentSessionKind, AgentStartOptions,
-        ContextFilesScope, PluginIterationAgentBackend, PluginIterationAgentState, RuntimeHost,
-        ScaffoldedChildRegistration, PLUGIN_AGENT_TOOL_CREATE_FILE, PLUGIN_AGENT_TOOL_DELETE_FILE,
+        cleanup_orphaned_snapshot_roots, cleanup_stale_snapshot_dirs, collect_plugin_context_paths,
+        dir_is_older_than, dir_size_bytes, ensure_scaffold_integration_edits,
+        extract_warning_blocks, render_child_plugin_core, render_child_plugin_test,
+        sanitize_child_plugin_segment, snapshot_staging_lock, sort_plugin_context_paths,
+        staged_artifact_root_is_removable, warning_diagnostics_for_changed_paths, AgentBackend,
+        AgentSessionKind, AgentStartOptions, ContextFilesScope, PluginIterationAgentBackend,
+        PluginIterationAgentState, RuntimeHost, ScaffoldedChildRegistration, SnapshotGcReport,
+        PLUGIN_AGENT_TOOL_CREATE_FILE, PLUGIN_AGENT_TOOL_DELETE_FILE,
         PLUGIN_AGENT_TOOL_INSPECT_PLUGIN_CATALOG, PLUGIN_AGENT_TOOL_JSON_SET,
         PLUGIN_AGENT_TOOL_LIST_CONTEXT_FILES, PLUGIN_AGENT_TOOL_READ_CONTEXT_FILES,
         PLUGIN_AGENT_TOOL_REPLACE_FILES_EXACT, PLUGIN_AGENT_TOOL_REPLACE_FILE_EXACT,
@@ -7723,6 +8176,7 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::OnceLock;
+    use std::time::{Duration, SystemTime};
 
     fn repo_fixtures_root() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -7764,6 +8218,394 @@ mod tests {
         assert!(!legacy.exists(), "legacy-format snapshot must be removed");
         assert!(unrelated.exists(), "non-snapshot dirs are untouched");
         assert!(file.exists(), "plain files are untouched");
+    }
+
+    /// `Some(())` 当且仅当当前 euid 不是 root。
+    ///
+    /// root 持 `CAP_DAC_OVERRIDE`，内核不对它强制 mode 位，`chmod 000` 之后仍
+    /// 能 read_dir。返回 `Option` 让调用方用 `for`-over-`Option` 门控——不同于
+    /// `if` 或提前 `return`，它没有"未走到的臂"会留下永久无覆盖的行。
+    #[cfg(unix)]
+    fn probe_not_root() -> Option<()> {
+        // SAFETY: `geteuid` 无参数、不写调用方内存、不设 errno。
+        (unsafe { libc::geteuid() } != 0).then_some(())
+    }
+
+    /// 起一个立即退出的子进程并 wait 掉，拿一个确定已死的 pid。
+    fn reaped_dead_pid() -> u32 {
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn short-lived child");
+        let pid = child.id();
+        child.wait().expect("reap child");
+        pid
+    }
+
+    /// 把目录 mtime 往前拨 `secs` 秒，模拟"老目录"。
+    fn backdate_dir(path: &Path, secs: u64) {
+        let past = SystemTime::now() - Duration::from_secs(secs);
+        let times = fs::FileTimes::new().set_modified(past);
+        let dir = fs::File::open(path).expect("open dir for utimes");
+        dir.set_times(times).expect("backdate dir mtime");
+    }
+
+    /// 造一个 hash 目录：内含一个属于 `pid` 的 snapshot 子目录 + 一个占位文件。
+    fn make_hash_dir(root: &Path, name: &str, pid: u32) -> PathBuf {
+        let hash = root.join(name);
+        let snapshot = hash.join(format!("snapshot-{pid}-1"));
+        fs::create_dir_all(&snapshot).expect("create hash/snapshot dir");
+        fs::write(snapshot.join("plugin.so"), b"0123456789").expect("write artifact");
+        hash
+    }
+
+    #[test]
+    fn orphaned_snapshot_root_gc_removes_dead_pid_dirs() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        let dead_pid = reaped_dead_pid();
+
+        // 死 pid + 老 mtime → 删。
+        let orphan = make_hash_dir(root, "aaa", dead_pid);
+        backdate_dir(&orphan, 48 * 3600);
+        // 活 pid（本进程）→ 留，无论多老。
+        let live = make_hash_dir(root, "bbb", std::process::id());
+        backdate_dir(&live, 48 * 3600);
+        // 死 pid 但 mtime 新 → 留（未到保留期）。
+        let recent = make_hash_dir(root, "ccc", dead_pid);
+
+        let report =
+            cleanup_orphaned_snapshot_roots(root, Duration::from_secs(24 * 3600), None, false);
+
+        assert!(!orphan.exists(), "dead-pid aged hash dir must be removed");
+        assert!(live.exists(), "live-pid hash dir must survive");
+        assert!(recent.exists(), "hash dir within retention must survive");
+        assert_eq!(report.removed, 1);
+        assert_eq!(report.skipped_live, 1);
+        assert_eq!(report.skipped_recent, 1);
+        assert_eq!(report.scanned, 3);
+        // 回收字节数覆盖到 snapshot 子目录里的文件。
+        assert_eq!(report.bytes_reclaimed, 10);
+    }
+
+    #[test]
+    fn orphaned_snapshot_root_gc_preserves_journal_dirs() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        let dead_pid = reaped_dead_pid();
+
+        // 死 pid + 老 mtime，但含未重放的 rollback journal → 必须保留。
+        // journal 是崩溃恢复状态，sha256 单向无法反推 fixtures root 还在不在，
+        // 盲删会摧毁回滚记录。
+        let with_journal = make_hash_dir(root, "aaa", dead_pid);
+        fs::write(
+            with_journal.join("plugin-iteration-edit-journal.json"),
+            b"{}",
+        )
+        .expect("write journal");
+        backdate_dir(&with_journal, 48 * 3600);
+
+        let report =
+            cleanup_orphaned_snapshot_roots(root, Duration::from_secs(24 * 3600), None, false);
+
+        assert!(
+            with_journal.exists(),
+            "hash dir holding an unreplayed journal must never be auto-removed"
+        );
+        assert_eq!(report.skipped_journal, 1);
+        assert_eq!(report.removed, 0);
+    }
+
+    /// boot GC 的日志行：有回收才输出。coverage 跑在全新临时目录里，boot GC
+    /// 永远没有可回收的孤儿，`removed > 0` 那支在原地不可达，故直接测纯函数。
+    #[test]
+    fn snapshot_gc_summary_line_only_when_something_was_reclaimed() {
+        let mut report = SnapshotGcReport::default();
+        assert!(super::snapshot_gc_summary_line(&report).is_none());
+
+        report.removed = 3;
+        report.bytes_reclaimed = 2 * 1024 * 1024;
+        let line = super::snapshot_gc_summary_line(&report).expect("a reclaim must be logged");
+        assert!(line.contains("回收 3 个"), "got: {line}");
+        assert!(line.contains("2.0 MB"), "got: {line}");
+    }
+
+    /// `flock` 返回码判定的两个方向。原地只会看到 rc==0（新建锁文件上的
+    /// `flock` 不会失败），失败支只能这样驱动。
+    #[cfg(unix)]
+    #[test]
+    fn flock_succeeded_maps_zero_to_true_and_nonzero_to_false() {
+        assert!(snapshot_staging_lock::flock_succeeded(0));
+        assert!(!snapshot_staging_lock::flock_succeeded(-1));
+    }
+
+    /// 同一进程内重复 `hold` 同一目录：flock 是**按 fd** 而非按进程的，第二次
+    /// 用新 fd 试 `LOCK_EX|LOCK_NB` 会拿不到，于是退化成无锁 Guard。这既覆盖了
+    /// `filter` 的 false 支，也固定了"锁不可重入"这个行为。
+    #[cfg(unix)]
+    #[test]
+    fn staging_lock_is_not_reentrant_across_fds() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dir = temp.path().join("hash");
+        fs::create_dir(&dir).expect("create dir");
+
+        let _first = snapshot_staging_lock::hold(&dir);
+        // 第一把锁仍在，GC 试锁必须失败。
+        assert!(!snapshot_staging_lock::try_acquire_for_gc(&dir));
+        drop(_first);
+        // 释放后可拿到。
+        assert!(snapshot_staging_lock::try_acquire_for_gc(&dir));
+    }
+
+    /// staging 锁挡住 GC：即便判据全中（无活 pid、mtime 已过期、无 journal），
+    /// 只要有进程持锁就跳过。这是"目录刚 mkdir、还没 stage 进文件"那个窗口的
+    /// 确定性排除——CI 上实测过 GC 删掉并发 boot 的 staging 目录导致对方
+    /// rename 报 ENOENT。
+    #[test]
+    fn orphaned_snapshot_root_gc_skips_dirs_held_by_staging_lock() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        let dead_pid = reaped_dead_pid();
+        let held = make_hash_dir(root, "aaa", dead_pid);
+        backdate_dir(&held, 48 * 3600);
+
+        // 持锁期间：GC 必须跳过。
+        let guard = snapshot_staging_lock::hold(&held);
+        let report =
+            cleanup_orphaned_snapshot_roots(root, Duration::from_secs(24 * 3600), None, false);
+        assert!(held.exists(), "a lock-held dir must survive GC");
+        assert_eq!(report.skipped_live, 1);
+        assert_eq!(report.removed, 0);
+
+        // 释放后：同一个目录立刻可回收，且同级锁文件一并清掉。
+        drop(guard);
+        let report =
+            cleanup_orphaned_snapshot_roots(root, Duration::from_secs(24 * 3600), None, false);
+        assert!(!held.exists(), "once unlocked the dir is reclaimed");
+        assert_eq!(report.removed, 1);
+        assert!(
+            !snapshot_staging_lock::lock_path(&held).exists(),
+            "the sibling lock file must not accumulate"
+        );
+    }
+
+    /// journal **同名目录**不算 journal，必须照常回收。
+    ///
+    /// `clear_journal_remove_failure_when_path_is_nonempty_dir` 之类的测试会
+    /// 故意把 journal 路径造成非空目录以迫使 `remove_file` 失败；早期只按
+    /// 文件名判断的实现把这类残渣误当成崩溃恢复状态而永久保留（实测 338 个
+    /// 同名条目里 229 个是目录，占住 GC 该回收的空间）。
+    #[test]
+    fn orphaned_snapshot_root_gc_ignores_journal_named_directory() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        let dead_pid = reaped_dead_pid();
+
+        let orphan = make_hash_dir(root, "aaa", dead_pid);
+        let journal_as_dir = orphan.join("plugin-iteration-edit-journal.json");
+        fs::create_dir_all(&journal_as_dir).expect("create journal-named dir");
+        fs::write(journal_as_dir.join("blocker.txt"), b"x").expect("write blocker");
+        backdate_dir(&orphan, 48 * 3600);
+
+        let report =
+            cleanup_orphaned_snapshot_roots(root, Duration::from_secs(24 * 3600), None, false);
+
+        assert!(
+            !orphan.exists(),
+            "a journal-named directory is test debris, not recovery state"
+        );
+        assert_eq!(report.skipped_journal, 0);
+        assert_eq!(report.removed, 1);
+    }
+
+    /// 空 hash 目录**不**能无视保留期删除：它可能是另一个正在 boot 的进程刚
+    /// mkdir、还没 stage 进文件的 staging 目录，此刻既无 `snapshot-{pid}-*`
+    /// 可探活又是空的，立刻删会让那个进程随后 rename 时报 ENOENT。
+    /// CI 上实测过这个竞态（命中 `dispatch_unknown_command_is_reply` 的 boot），
+    /// mtime 闸门是唯一能挡住它的东西。
+    #[test]
+    fn orphaned_snapshot_root_gc_keeps_fresh_empty_dirs_but_reaps_aged_ones() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+
+        // 刚建的空目录：可能是并发 boot 的 in-flight staging，必须保留。
+        let fresh = root.join("aaa");
+        fs::create_dir(&fresh).expect("create fresh empty dir");
+        let report =
+            cleanup_orphaned_snapshot_roots(root, Duration::from_secs(24 * 3600), None, false);
+        assert!(
+            fresh.exists(),
+            "a just-created empty dir may be another process's in-flight staging"
+        );
+        assert_eq!(report.skipped_recent, 1);
+        assert_eq!(report.removed, 0);
+
+        // 过了保留期的空目录：确定是残渣，回收。
+        backdate_dir(&fresh, 48 * 3600);
+        let report =
+            cleanup_orphaned_snapshot_roots(root, Duration::from_secs(24 * 3600), None, false);
+        assert!(!fresh.exists(), "an aged empty dir is reclaimed");
+        assert_eq!(report.removed, 1);
+        assert_eq!(report.bytes_reclaimed, 0);
+    }
+
+    #[test]
+    fn orphaned_snapshot_root_gc_skips_own_root() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        let dead_pid = reaped_dead_pid();
+        // 即便判据全中（死 pid + 老 mtime），当前进程正在用的 root 也不能自删。
+        let own = make_hash_dir(root, "aaa", dead_pid);
+        backdate_dir(&own, 48 * 3600);
+
+        let report = cleanup_orphaned_snapshot_roots(
+            root,
+            Duration::from_secs(24 * 3600),
+            Some(&own),
+            false,
+        );
+
+        assert!(
+            own.exists(),
+            "the live process's own snapshot root is never removed"
+        );
+        assert_eq!(report.removed, 0);
+        // skip_root 在计数前就被跳过，不计入 scanned。
+        assert_eq!(report.scanned, 0);
+    }
+
+    #[test]
+    fn orphaned_snapshot_root_gc_dry_run_reports_without_deleting() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        let dead_pid = reaped_dead_pid();
+        let orphan = make_hash_dir(root, "aaa", dead_pid);
+        backdate_dir(&orphan, 48 * 3600);
+
+        let report =
+            cleanup_orphaned_snapshot_roots(root, Duration::from_secs(24 * 3600), None, true);
+
+        assert!(orphan.exists(), "dry-run must not delete anything");
+        assert_eq!(
+            report.removed, 1,
+            "dry-run still reports what would be removed"
+        );
+        assert_eq!(report.bytes_reclaimed, 10);
+    }
+
+    #[test]
+    fn orphaned_snapshot_root_gc_zero_max_age_expires_everything() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        let dead_pid = reaped_dead_pid();
+        // 刚建的目录，配合 retention=0（config 的 Some(0) 语义）应立即可回收。
+        let fresh = make_hash_dir(root, "aaa", dead_pid);
+
+        let report = cleanup_orphaned_snapshot_roots(root, Duration::ZERO, None, false);
+
+        assert!(
+            !fresh.exists(),
+            "retention=0 expires even a just-created dir"
+        );
+        assert_eq!(report.removed, 1);
+    }
+
+    /// GC 的三处防御性早退臂：`host_root` 不可 read_dir、hash 目录本身不可
+    /// read_dir、以及目录项不是目录。都不是"不可能发生"——权限变化、并发删除
+    /// 都会走到，且 100% 行覆盖门槛要求它们被执行到。
+    #[cfg(unix)]
+    #[test]
+    fn orphaned_snapshot_root_gc_tolerates_unreadable_and_non_dir_entries() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+
+        // 目录项不是目录：普通文件必须被跳过而不是当 hash 目录处理。
+        fs::write(root.join("stray-file"), b"x").expect("write stray file");
+        let report = cleanup_orphaned_snapshot_roots(root, Duration::ZERO, None, false);
+        assert_eq!(report.scanned, 0, "plain files are not hash dirs");
+        assert!(
+            root.join("stray-file").exists(),
+            "plain files are untouched"
+        );
+
+        // hash 目录不可 read_dir：跳过该目录，不 panic、不误删。root 绕过 mode
+        // 位，故只在非特权用户下有意义；用 for-over-Option 门控而非 `if`——
+        // `if` 会留下当前 euid 不走的那个臂永久无覆盖。
+        for () in probe_not_root().into_iter() {
+            let locked = root.join("locked");
+            fs::create_dir(&locked).expect("create locked dir");
+            fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).expect("chmod 000");
+            let report = cleanup_orphaned_snapshot_roots(root, Duration::ZERO, None, false);
+            fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).expect("restore mode");
+            assert!(locked.exists(), "an unreadable hash dir is left alone");
+            assert_eq!(report.removed, 0);
+        }
+
+        // host_root 整体不可 read_dir：返回空报告。
+        let missing = root.join("does-not-exist");
+        let report = cleanup_orphaned_snapshot_roots(&missing, Duration::ZERO, None, false);
+        assert_eq!(report, SnapshotGcReport::default());
+    }
+
+    /// `dir_is_older_than` 取不到 mtime 时保守返回 false（宁可留着不误删），
+    /// `dir_size_bytes` 对不可 read_dir 的目录返回 0，且不跟随符号链接。
+    #[cfg(unix)]
+    #[test]
+    fn dir_age_and_size_helpers_handle_unreadable_and_symlinks() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+
+        // 不存在的路径拿不到 metadata → 判"不老"，避免误删。
+        assert!(
+            !dir_is_older_than(&root.join("nope"), Duration::ZERO),
+            "missing mtime must not be treated as expired"
+        );
+        // 不存在的路径 size 为 0。
+        assert_eq!(dir_size_bytes(&root.join("nope")), 0);
+
+        // 符号链接不跟随：只算真实文件，不把链接目标的字节数计进来。
+        let real = root.join("real.bin");
+        fs::write(&real, b"0123456789").expect("write real file");
+        let inner = root.join("inner");
+        fs::create_dir(&inner).expect("create inner dir");
+        std::os::unix::fs::symlink(&real, inner.join("link.bin")).expect("symlink");
+        assert_eq!(
+            dir_size_bytes(&inner),
+            0,
+            "symlinks are not followed, so the target's bytes are not counted"
+        );
+        // 真实文件被递归计入。
+        assert_eq!(dir_size_bytes(root), 10);
+    }
+
+    /// `staged_artifact_root_is_removable` 的三条拒绝理由与一条放行。
+    ///
+    /// 空路径是 `reload_subtree` 的产物（它不建 staging 目录），当路径删会打到
+    /// CWD；等于或不在 snapshot_root 之下则会连带删掉
+    /// `plugin-iteration-edit-journal.json` 这类崩溃恢复状态。
+    #[test]
+    fn staged_root_removable_rejects_empty_and_out_of_tree_paths() {
+        let snapshot_root = Path::new("/tmp/snaps");
+        // 正常情况：snapshot_root 下的子目录可删。
+        assert!(staged_artifact_root_is_removable(
+            &snapshot_root.join("snapshot-1-2"),
+            snapshot_root
+        ));
+        // 空路径（reload_subtree）。
+        assert!(!staged_artifact_root_is_removable(
+            Path::new(""),
+            snapshot_root
+        ));
+        // 等于 snapshot_root 本身。
+        assert!(!staged_artifact_root_is_removable(
+            snapshot_root,
+            snapshot_root
+        ));
+        // 完全在别处。
+        assert!(!staged_artifact_root_is_removable(
+            Path::new("/tmp/elsewhere/snapshot-1-2"),
+            snapshot_root
+        ));
     }
 
     // Shared read-only host against the real fixtures tree. The fixture
@@ -8570,10 +9412,12 @@ mod seam_extraction_tests {
 #[cfg(test)]
 mod ffi_panic_seam_tests {
     use super::{
-        plugin_iteration_journal_path, RuntimeHost, TEST_ITERATION_PANIC_INJECTION,
-        TEST_STOP_HANDLER_PANIC_INJECTION,
+        plugin_iteration_journal_path, RuntimeHost, TEST_ITERATION_ENOSPC_INJECTION,
+        TEST_ITERATION_PANIC_INJECTION, TEST_STOP_HANDLER_PANIC_INJECTION,
     };
-    use crate::kernel::plugin_iteration::KernelPluginIterationRequest;
+    use crate::kernel::plugin_iteration::{
+        KernelPluginIssueSource, KernelPluginIterationRequest, PluginIterationFinalVerdict,
+    };
     use cordis_plugin_sdk::{AbiFingerprint, NodeDoc, NodeType, PluginDocs};
     use serde_json::json;
     use serial_test::serial;
@@ -8602,6 +9446,70 @@ mod ffi_panic_seam_tests {
         )
         .expect("write empty artifact index");
         (temp, fixtures)
+    }
+
+    /// 在 fixtures 旁写 `config/runtime.yaml`，把 snapshot staging 钉在
+    /// `TempDir` 内，避免测试往全局 temp 目录堆 staged 工件。
+    /// `discover_config_dir` 对 file_name 为 `fixtures` 的 root 取兄弟
+    /// `../config`。
+    fn pin_snapshot_root_beside_fixtures(
+        fixtures: &std::path::Path,
+        snapshot_root: &std::path::Path,
+    ) {
+        let config_dir = fixtures
+            .parent()
+            .expect("fixtures has a parent")
+            .join("config");
+        fs::create_dir_all(&config_dir).expect("create config dir");
+        fs::write(
+            config_dir.join("runtime.yaml"),
+            format!("runtime:\n  snapshot_root: {}\n", snapshot_root.display()),
+        )
+        .expect("write runtime.yaml");
+    }
+
+    #[test]
+    #[serial]
+    fn host_drop_removes_live_staged_root() {
+        let (temp, fixtures) = setup_empty_fixture();
+        let snapshot_root = temp.path().join("snapshots");
+        pin_snapshot_root_beside_fixtures(&fixtures, &snapshot_root);
+
+        let host = RuntimeHost::boot(&fixtures).expect("host should boot on empty index");
+        let staged = host.current_snapshot().staged_artifact_root.clone();
+        // 不带格式参数：`staged.display()` 只在断言失败时求值，会留下一行
+        // 永久无覆盖。断言本身已足够定位问题。
+        assert!(staged.starts_with(&snapshot_root));
+        assert!(
+            staged.exists(),
+            "live staged root exists while host is alive"
+        );
+
+        // boot 后不 reload 直接 drop：此前没有任何路径回收 live staged root。
+        drop(host);
+
+        assert!(
+            !staged.exists(),
+            "Drop must reclaim the live snapshot's staged root"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn cleanup_live_snapshot_is_idempotent() {
+        let (temp, fixtures) = setup_empty_fixture();
+        let snapshot_root = temp.path().join("snapshots");
+        pin_snapshot_root_beside_fixtures(&fixtures, &snapshot_root);
+
+        let host = RuntimeHost::boot(&fixtures).expect("host should boot on empty index");
+        let staged = host.current_snapshot().staged_artifact_root.clone();
+
+        // 信号处理路径显式调一次，随后 Drop 还会再调一次：必须幂等。
+        host.cleanup_live_snapshot();
+        assert!(!staged.exists());
+        host.cleanup_live_snapshot();
+        drop(host);
+        assert!(!staged.exists());
     }
 
     /// A JSON-artifact plugin `svc` that declares one `Task` node. JSON
@@ -8702,6 +9610,137 @@ mod ffi_panic_seam_tests {
             verify_profile: None,
             quality_score: None,
         }
+    }
+
+    /// 一个空 edit_plan 的请求：带 edit_plan 时 `run_plugin_iteration_agent`
+    /// 走手工执行分支、完全不碰 LLM；operations 为空则不触碰任何文件，从而
+    /// 绕开插件编辑面策略（空 fixture 里没有任何可写的插件子树），让迭代
+    /// 确定性地推进到注入点所在的 journal persist 阶段。
+    fn empty_plan_request() -> KernelPluginIterationRequest {
+        use crate::kernel::plugin_iteration::PluginEditPlan;
+        KernelPluginIterationRequest {
+            issue_id: None,
+            target_plugin_paths: Vec::new(),
+            instruction: Some("enospc injection".to_string()),
+            edit_plan: Some(PluginEditPlan {
+                issue_id: "enospc-issue".to_string(),
+                patch_id: "enospc-patch".to_string(),
+                summary: "no-op plan".to_string(),
+                operations: Vec::new(),
+            }),
+            manual_approved: true,
+            tests_command: None,
+            safety_command: None,
+            verify_profile: None,
+            quality_score: None,
+        }
+    }
+
+    /// 磁盘满必须被判成 `InfrastructureFailure`，而不是 `RolledBack`。
+    ///
+    /// 这是本批修复的核心断言：ENOSPC 此前经 `stage_error: Option<String>`
+    /// 丢掉类型信息，在 `finalize_plugin_iteration` 被降级成"验证失败"，
+    /// 于是污染 rollback 率、把插件 issue 标成 Open、还丢掉重试入口。
+    #[test]
+    #[serial]
+    fn iterate_plugins_reports_infrastructure_failure_on_enospc() {
+        let (_temp, fixtures) = setup_empty_fixture();
+        let host = RuntimeHost::boot(&fixtures).expect("host should boot on empty index");
+
+        let before = host.kernel().status();
+
+        TEST_ITERATION_ENOSPC_INJECTION.store(true, SeqCst);
+        let result = host
+            .iterate_plugins(empty_plan_request())
+            .expect("infrastructure failure is a verdict, not an Err");
+
+        assert_eq!(
+            result.final_verdict,
+            PluginIterationFinalVerdict::InfrastructureFailure,
+            "ENOSPC must not be reported as RolledBack; blocked_reason={:?}",
+            result.blocked_reason
+        );
+        let reason = result.blocked_reason.as_deref().unwrap_or_default();
+        assert!(
+            reason.contains("No space left on device"),
+            "the errno text must survive to blocked_reason, got: {reason}"
+        );
+
+        let after = host.kernel().status();
+        assert_eq!(
+            after.iteration_rollback_total, before.iteration_rollback_total,
+            "infrastructure failures must not inflate the rollback metric"
+        );
+        assert_eq!(
+            after.iteration_infrastructure_failure_total,
+            before.iteration_infrastructure_failure_total + 1,
+            "infrastructure failures get their own counter"
+        );
+
+        // 插件没有被冤枉：不产生 LoadFailure issue。
+        assert!(
+            !host
+                .kernel()
+                .plugin_issues()
+                .iter()
+                .any(|issue| issue.source == KernelPluginIssueSource::LoadFailure),
+            "a full disk must not be recorded as a plugin LoadFailure"
+        );
+
+        // 仍可重试：迭代留在 blocked_iterations 里（RolledBack 会被摘除）。
+        assert!(
+            host.kernel()
+                .blocked_iterations()
+                .iter()
+                .any(|entry| entry.iteration_id == result.iteration_id),
+            "infrastructure failures stay retryable"
+        );
+    }
+
+    /// 回归护栏：真正的 stage 失败仍然是 `RolledBack`，没被新变体抢走。
+    #[test]
+    #[serial]
+    fn genuine_stage_failure_still_rolls_back() {
+        let (_temp, fixtures) = setup_empty_fixture();
+        let host = RuntimeHost::boot(&fixtures).expect("host should boot on empty index");
+
+        // 不注入 ENOSPC；改一个策略禁止的路径（crates/ 属 forbidden_prefixes），
+        // 这是插件侧的真实失败，必须仍判 RolledBack。
+        let mut request = empty_plan_request();
+        if let Some(plan) = request.edit_plan.as_mut() {
+            plan.operations = vec![crate::kernel::plugin_iteration::PluginEditOperation {
+                path: "crates/cordis-runtime/src/lib.rs".to_string(),
+                kind: crate::kernel::plugin_iteration::PluginEditOpKind::ReplaceExact,
+                expected_old_string: Some("pub".to_string()),
+                expected_sha256: None,
+                new_content: Some("mod".to_string()),
+                pointer: None,
+                dotted_key: None,
+                value: None,
+            }];
+        }
+
+        let before = host.kernel().status();
+        let result = host
+            .iterate_plugins(request)
+            .expect("policy block is a verdict, not an Err");
+
+        assert_eq!(
+            result.final_verdict,
+            PluginIterationFinalVerdict::RolledBack,
+            "a genuine policy-blocked edit must remain RolledBack"
+        );
+        let after = host.kernel().status();
+        assert_eq!(
+            after.iteration_infrastructure_failure_total,
+            before.iteration_infrastructure_failure_total,
+            "a genuine failure must not land in the infrastructure counter"
+        );
+        assert_eq!(
+            after.iteration_rollback_total,
+            before.iteration_rollback_total + 1,
+            "a genuine failure still counts as a rollback"
+        );
     }
 
     #[test]

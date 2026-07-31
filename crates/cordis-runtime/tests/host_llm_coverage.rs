@@ -25,7 +25,7 @@ use tempfile::TempDir;
 
 mod support;
 
-use support::{spawn_chunked_mock_llm_server_sequence, sse_response};
+use support::{pin_private_snapshot_root, spawn_chunked_mock_llm_server_sequence, sse_response};
 
 /// Build a minimal fixtures tree that boots with zero plugins. `boot` reads
 /// `artifacts/index.json` (schema_version 2, empty entries), so the loader
@@ -46,6 +46,9 @@ fn setup_empty_fixture() -> TempDir {
 "#,
     )
     .expect("write empty artifact index");
+    // fixtures root 目录名是 "fixtures"，`discover_config_dir` 走同级分支 →
+    // `temp/config`，与本文件写 llm_api.yaml 的目录一致。
+    pin_private_snapshot_root(temp.path(), &fixtures);
     temp
 }
 

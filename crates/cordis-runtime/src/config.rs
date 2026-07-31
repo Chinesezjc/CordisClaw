@@ -186,6 +186,23 @@ impl RuntimeConfig {
             fixtures_root.join(path)
         })
     }
+
+    /// snapshot 目录的保留时长；未配置时返回默认 24 小时。
+    /// GC（`cleanup_orphaned_snapshot_roots`）据此判断 hash 目录是否已过期。
+    ///
+    /// 语义约定：
+    /// - `None`（键缺省）→ 24 小时。
+    /// - `Some(0)` → `Duration::ZERO`，即所有目录立即过期；不回落到默认值，
+    ///   因为运维在 gc 场景显式写 0 就是要让全部目录可回收。
+    /// - 极大值经 `saturating_mul` 收敛到 `u64::MAX` 秒，不会溢出 panic。
+    pub fn snapshot_retention(&self) -> std::time::Duration {
+        const DEFAULT_RETENTION_HOURS: u64 = 24;
+        let hours = self
+            .runtime
+            .snapshot_retention_hours
+            .unwrap_or(DEFAULT_RETENTION_HOURS);
+        std::time::Duration::from_secs(hours.saturating_mul(3_600))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -200,6 +217,10 @@ struct RuntimeFile {
 pub struct RuntimeSettings {
     #[serde(default)]
     pub snapshot_root: Option<String>,
+    /// snapshot 目录的保留时长，单位小时。缺省（`None`）时使用 24 小时默认值；
+    /// 显式配 `0` 表示立即过期。
+    #[serde(default)]
+    pub snapshot_retention_hours: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -577,7 +598,7 @@ mod load_tests {
         let dir = TempDir::new().unwrap();
         fs::write(
             dir.path().join("runtime.yaml"),
-            "runtime:\n  snapshot_root: snaps\nkernel:\n  change_history_limit: 7\n  min_quality_score: 55\n",
+            "runtime:\n  snapshot_root: snaps\n  snapshot_retention_hours: 6\nkernel:\n  change_history_limit: 7\n  min_quality_score: 55\n",
         )
         .unwrap();
         let _g = ConfigDirGuard::set(dir.path());
@@ -585,6 +606,12 @@ mod load_tests {
         assert_eq!(cfg.kernel.change_history_limit, 7);
         assert_eq!(cfg.kernel.min_quality_score, 55);
         assert_eq!(cfg.runtime.snapshot_root.as_deref(), Some("snaps"));
+        // `RuntimeFile.runtime` 整体反序列化 `RuntimeSettings`，新键无需额外解析逻辑。
+        assert_eq!(cfg.runtime.snapshot_retention_hours, Some(6));
+        assert_eq!(
+            cfg.snapshot_retention(),
+            std::time::Duration::from_secs(6 * 3_600)
+        );
     }
 
     #[test]
@@ -760,6 +787,47 @@ mod load_tests {
         assert_eq!(
             cfg.resolve_snapshot_root(Path::new("/fx")).unwrap(),
             PathBuf::from("/fx/rel")
+        );
+    }
+
+    // ---------- snapshot_retention ----------
+
+    #[test]
+    fn snapshot_retention_defaults_to_24h() {
+        let cfg = RuntimeConfig::default();
+        assert_eq!(cfg.runtime.snapshot_retention_hours, None);
+        assert_eq!(
+            cfg.snapshot_retention(),
+            std::time::Duration::from_secs(24 * 3_600)
+        );
+    }
+
+    #[test]
+    fn snapshot_retention_honours_explicit_value() {
+        let mut cfg = RuntimeConfig::default();
+        cfg.runtime.snapshot_retention_hours = Some(1);
+        assert_eq!(
+            cfg.snapshot_retention(),
+            std::time::Duration::from_secs(3_600)
+        );
+    }
+
+    // 显式 0 表示立即过期，不能回落到 24 小时默认值。
+    #[test]
+    fn snapshot_retention_zero_expires_immediately() {
+        let mut cfg = RuntimeConfig::default();
+        cfg.runtime.snapshot_retention_hours = Some(0);
+        assert_eq!(cfg.snapshot_retention(), std::time::Duration::ZERO);
+    }
+
+    // hours * 3600 会溢出 u64，saturating 后收敛到 u64::MAX 秒而非 panic。
+    #[test]
+    fn snapshot_retention_saturates_on_overflow() {
+        let mut cfg = RuntimeConfig::default();
+        cfg.runtime.snapshot_retention_hours = Some(u64::MAX);
+        assert_eq!(
+            cfg.snapshot_retention(),
+            std::time::Duration::from_secs(u64::MAX)
         );
     }
 
