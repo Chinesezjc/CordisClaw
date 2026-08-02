@@ -1001,6 +1001,43 @@ pub trait AgentBackend {
     }
 }
 
+/// 增量 token 的去向。
+///
+/// 拆分前是传输层自己 `print!`，这让 inbox/serve 路径无法关掉流式输出——
+/// 展示策略被埋在网络代码里。拆分后由调用方决定：REPL 给一个写 stdout 的
+/// 实现，inbox/serve 传 `None` 静默累积。
+///
+/// C2 只立契约：内建传输仍自己打印增量，生产路径此刻恒传 `None`，故方法目前
+/// 只有测试实现（`RecordingTokenSink`）会调用——非测试构建下 trait 是空的，
+/// 避免"永不被调用的方法"触发 dead_code。C4 接上 host 侧 sink listener 与
+/// REPL 的 stdout 实现后，两个 cfg 分支合并成一个。
+#[cfg(test)]
+pub(crate) trait TokenSink: Send + Sync {
+    fn on_reasoning(&self, delta: &str);
+    fn on_content(&self, delta: &str);
+}
+
+/// 非测试构建下的占位：C2 阶段生产路径恒传 `None`，没有任何实现者，但
+/// `LlmProvider::complete` 的签名必须在两种构建下一致。
+#[cfg(not(test))]
+pub(crate) trait TokenSink: Send + Sync {}
+
+/// 一次模型补全的执行者。
+///
+/// 这是 agent 循环（机制）与供应商传输（可覆写）之间的接缝。循环只要求拿回
+/// **结构化的** `tool_calls`——它在本轮中途就要据此分派工具，因此只回文本的
+/// provider 无法驱动工具调用。
+pub(crate) trait LlmProvider {
+    /// `sink` 为 `Some` 时 provider **可以**逐段推送增量；忽略它也必须正确工作，
+    /// 权威结果始终是本函数的返回值。
+    fn complete(
+        &self,
+        endpoint: &str,
+        body: Value,
+        sink: Option<&dyn TokenSink>,
+    ) -> Result<(ChatMessage, Option<String>, Option<String>), RuntimeError>;
+}
+
 #[derive(Debug, Clone)]
 pub struct AgentSession {
     kind: String,
@@ -1158,7 +1195,11 @@ impl AgentSession {
         user_input: &str,
     ) -> Result<AgentReply, RuntimeError> {
         let transcript_len_before = self.transcript.len();
-        let result = self.respond_inner(backend, user_input);
+        // 过渡期：内建 HTTP 传输仍是默认 provider（C5 删除它之后改由 host 从
+        // 插件解析后传入）。provider 持有自己的配置与 client 副本，这样
+        // `respond_inner` 仍能拿 `&mut self` 而不与之借用冲突。
+        let provider = DirectHttpProvider::from_session(self);
+        let result = self.respond_inner(backend, user_input, &provider, None);
         // P2-31: on error path, if we pushed a User transcript entry but
         // never got to push a matching Assistant entry, insert an
         // Assistant placeholder describing the error. Otherwise a retry
@@ -1187,10 +1228,17 @@ impl AgentSession {
         result
     }
 
+    /// `provider` 承担这一轮所有的模型调用；`sink` 决定增量 token 去哪。
+    ///
+    /// 两者都作为参数传入而非存进 `AgentSession`：该结构体 derive 了
+    /// `Debug + Clone` 并会被快照序列化，塞 `dyn Trait` 会同时破坏这三者。
+    /// 这也与既有的 `backend` 参数保持一致。
     fn respond_inner<B: AgentBackend + ?Sized>(
         &mut self,
         backend: &mut B,
         user_input: &str,
+        provider: &dyn LlmProvider,
+        sink: Option<&dyn TokenSink>,
     ) -> Result<AgentReply, RuntimeError> {
         let trimmed = user_input.trim();
         if trimmed.is_empty() {
@@ -1199,8 +1247,10 @@ impl AgentSession {
             });
         }
 
-        let provider = self.config.provider.trim().to_ascii_lowercase();
-        if provider != "deepseek" && provider != "openai" {
+        // 供应商白名单闸门。注意它只是个字符串校验，全仓没有一处按它分支
+        // wire format——C4 接入 provider 解析后本段整体移除。
+        let configured_provider = self.config.provider.trim().to_ascii_lowercase();
+        if configured_provider != "deepseek" && configured_provider != "openai" {
             return Err(RuntimeError::UnsupportedLlmProvider {
                 provider: self.config.provider.clone(),
             });
@@ -1368,7 +1418,7 @@ impl AgentSession {
                 "response_format": {"type": "json_object"},
             });
             let (message, response_id, finish_reason) =
-                self.send_chat_request(endpoint.clone(), request_body)?;
+                provider.complete(&endpoint, request_body, sink)?;
 
             emit_agent_diagnostic(format!(
                 "agent_turn_result kind={} turn={} response_id={} tool_calls={} content_chars={} reasoning_chars={} finish_reason={}",
@@ -1939,6 +1989,14 @@ impl AgentSession {
         })
     }
 
+    /// 供 [`DirectHttpProvider`] 复用的会话副本构造点。
+    ///
+    /// 克隆的是配置与 reqwest client 句柄（`Client` 内部是 `Arc`，克隆很廉价），
+    /// 不含历史等会话状态——provider 只需要传输能力。
+    fn transport_clone(&self) -> Self {
+        self.clone()
+    }
+
     /// Create a serializable snapshot of the current session state.
     pub fn to_snapshot(&self) -> AgentSessionSnapshot {
         AgentSessionSnapshot {
@@ -2025,14 +2083,44 @@ impl ShellAgentSession {
     }
 }
 
+/// 过渡期的内建 provider：直接复用 kernel 里既有的 OpenAI HTTP+SSE 传输。
+///
+/// C3 建好 `llm_openai` 插件、C4 接好解析之后，C5 会连同 `send_chat_request`
+/// 一起删掉本结构体。它的存在让"引入接缝"与"搬走实现"成为两个独立可验证的
+/// 步骤——接缝落地时行为逐字节不变。
+struct DirectHttpProvider {
+    session: AgentSession,
+}
+
+impl DirectHttpProvider {
+    fn from_session(session: &AgentSession) -> Self {
+        Self {
+            session: session.transport_clone(),
+        }
+    }
+}
+
+impl LlmProvider for DirectHttpProvider {
+    fn complete(
+        &self,
+        endpoint: &str,
+        body: Value,
+        _sink: Option<&dyn TokenSink>,
+    ) -> Result<(ChatMessage, Option<String>, Option<String>), RuntimeError> {
+        // 内建传输自己 print! 增量（read_chat_stream 内联），故此处忽略 sink；
+        // 展示策略上移到 TokenSink 是插件化之后的事（C4）。
+        self.session.send_chat_request(endpoint.to_string(), body)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-struct ToolFunctionCall {
+pub(crate) struct ToolFunctionCall {
     name: String,
     arguments: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-struct ToolCall {
+pub(crate) struct ToolCall {
     id: String,
     #[serde(rename = "type")]
     call_type: String,
@@ -2040,7 +2128,7 @@ struct ToolCall {
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Default)]
-struct ChatMessage {
+pub(crate) struct ChatMessage {
     #[serde(default)]
     content: Option<String>,
     #[serde(default)]
@@ -3427,6 +3515,151 @@ mod tests {
 
     const TEST_TOOL_RECORD: &str = "record_summary";
     const TEST_TOOL_READ: &str = "read_context";
+
+    /// 按脚本回放补全的假 provider：让机制测试（工具分派、历史、计数）不再需要
+    /// 起 TCP mock server 与解析 SSE。
+    ///
+    /// 每次 `complete` 弹出一条预置回复；`sink` 非空时按 `stream_as` 逐段推增量，
+    /// 用于验证"展示由调用方决定"这条契约。
+    struct FakeLlmProvider {
+        replies: std::sync::Mutex<std::collections::VecDeque<ChatMessage>>,
+        /// 依次推给 sink 的 (是否推理, 文本) 增量。
+        stream_as: Vec<(bool, String)>,
+        /// 记录收到的请求体，供断言。
+        seen_bodies: std::sync::Mutex<Vec<Value>>,
+    }
+
+    impl FakeLlmProvider {
+        fn new(replies: Vec<ChatMessage>) -> Self {
+            Self {
+                replies: std::sync::Mutex::new(replies.into()),
+                stream_as: Vec::new(),
+                seen_bodies: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn streaming(replies: Vec<ChatMessage>, stream_as: Vec<(bool, String)>) -> Self {
+            Self {
+                stream_as,
+                ..Self::new(replies)
+            }
+        }
+    }
+
+    impl LlmProvider for FakeLlmProvider {
+        fn complete(
+            &self,
+            _endpoint: &str,
+            body: Value,
+            sink: Option<&dyn TokenSink>,
+        ) -> Result<(ChatMessage, Option<String>, Option<String>), RuntimeError> {
+            self.seen_bodies.lock().expect("seen_bodies").push(body);
+            if let Some(sink) = sink {
+                for (is_reasoning, text) in &self.stream_as {
+                    if *is_reasoning {
+                        sink.on_reasoning(text);
+                    } else {
+                        sink.on_content(text);
+                    }
+                }
+            }
+            let message = self
+                .replies
+                .lock()
+                .expect("replies")
+                .pop_front()
+                .ok_or_else(|| RuntimeError::LlmRequestFailed {
+                    message: "fake provider ran out of scripted replies".to_string(),
+                })?;
+            let finish = if message.tool_calls.is_empty() {
+                "stop"
+            } else {
+                "tool_calls"
+            };
+            Ok((message, Some("resp-fake".to_string()), Some(finish.into())))
+        }
+    }
+
+    /// 记录增量的 sink，用于断言顺序与分类。
+    #[derive(Default)]
+    struct RecordingTokenSink {
+        events: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl TokenSink for RecordingTokenSink {
+        fn on_reasoning(&self, delta: &str) {
+            self.events
+                .lock()
+                .expect("events")
+                .push(format!("r:{delta}"));
+        }
+        fn on_content(&self, delta: &str) {
+            self.events
+                .lock()
+                .expect("events")
+                .push(format!("c:{delta}"));
+        }
+    }
+
+    fn assistant_reply(content: &str) -> ChatMessage {
+        ChatMessage {
+            content: Some(content.to_string()),
+            ..ChatMessage::default()
+        }
+    }
+
+    /// 接缝契约：provider 拿到 kernel 构造的请求体，其返回值即权威结果；
+    /// sink 只是旁路，忽略它也必须得到同样的回复。
+    #[test]
+    fn provider_seam_returns_reply_and_sink_is_optional() {
+        let provider = FakeLlmProvider::new(vec![assistant_reply("hello")]);
+        let (message, response_id, finish) = provider
+            .complete("http://x/v1/chat/completions", json!({"model": "m"}), None)
+            .expect("complete");
+        assert_eq!(message.content.as_deref(), Some("hello"));
+        assert_eq!(response_id.as_deref(), Some("resp-fake"));
+        assert_eq!(finish.as_deref(), Some("stop"));
+        // kernel 构造的 body 原样抵达 provider。
+        let bodies = provider.seen_bodies.lock().expect("bodies");
+        assert_eq!(bodies.len(), 1);
+        assert_eq!(bodies[0].get("model").and_then(|v| v.as_str()), Some("m"));
+    }
+
+    /// 有 sink 时增量按序抵达，且**完整内容仍在返回值里**——REPL 靠增量显示，
+    /// inbox/serve 靠返回值，两条路径读的是同一次补全。
+    #[test]
+    fn provider_seam_streams_deltas_to_sink_in_order() {
+        let provider = FakeLlmProvider::streaming(
+            vec![assistant_reply("done")],
+            vec![
+                (true, "thinking".to_string()),
+                (false, "par".to_string()),
+                (false, "tial".to_string()),
+            ],
+        );
+        let sink = RecordingTokenSink::default();
+        let (message, _, _) = provider
+            .complete("http://x", json!({}), Some(&sink))
+            .expect("complete");
+        assert_eq!(
+            *sink.events.lock().expect("events"),
+            vec!["r:thinking", "c:par", "c:tial"]
+        );
+        assert_eq!(message.content.as_deref(), Some("done"));
+    }
+
+    /// provider 用尽脚本回复时报错，而不是静默返回空消息。
+    #[test]
+    fn provider_seam_surfaces_exhausted_script_as_error() {
+        let provider = FakeLlmProvider::new(Vec::new());
+        let err = provider
+            .complete("http://x", json!({}), None)
+            .expect_err("must fail");
+        assert!(
+            matches!(err, RuntimeError::LlmRequestFailed { .. }),
+            "{err:?}"
+        );
+    }
 
     #[derive(Default)]
     struct FakeHost;
