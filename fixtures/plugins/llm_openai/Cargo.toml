@@ -1,0 +1,29 @@
+[package]
+name = "llm_openai"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["rlib", "dylib"]
+
+[package.metadata.cordis]
+plugin_path = "llm_openai"
+abi_kind = "rust"
+declared_nodes = ["llm_complete"]
+children = []
+
+[package.metadata.cordis.abi_fingerprint]
+crate_hash = "crate_llm_openai_v1"
+api_hash = "api_v2"
+
+[dependencies]
+cordis-plugin-sdk = { path = "../../../crates/cordis-plugin-sdk" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# 与 kernel / web 插件同一套特性组合：blocking（本 runtime 无 async 运行时）、
+# rustls-tls（不依赖系统 OpenSSL）。
+reqwest = { version = "0.12", default-features = false, features = [
+  "blocking",
+  "json",
+  "rustls-tls",
+] }
