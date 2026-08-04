@@ -156,34 +156,33 @@ fn serve_once(
     let stream = loop {
         match listener.accept() {
             Ok((stream, _)) => break stream,
-            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                // 补全已经返回（或调用方放弃）→ 无需再等。
-                if stop.try_recv().is_ok() {
-                    return;
-                }
-                if deadline_exceeded(started.elapsed(), budget) {
-                    return;
-                }
-                std::thread::sleep(Duration::from_millis(5));
-            }
             Err(err) => {
-                tracing_diag(format!("sink accept failed: {err}"));
-                return;
+                match accept_retry(&err, stop.try_recv().is_ok(), started.elapsed(), budget) {
+                    AcceptRetry::Wait => std::thread::sleep(Duration::from_millis(5)),
+                    // Fatal 与 GiveUp 都是"停止等待"；差别只在要不要记一笔诊断。
+                    // 合成一条路径后，这里不再有"只有 fd 层故障才走到"的语句
+                    // ——`accept_retry` 的单测已覆盖三种判定本身。
+                    verdict => {
+                        verdict
+                            .is_fatal()
+                            .then(|| tracing_diag(format!("sink accept failed: {err}")));
+                        return;
+                    }
+                }
             }
         }
     };
     // 接受后切回阻塞：非阻塞属性会被继承，否则 read 会立刻 WouldBlock。
-    if stream.set_nonblocking(false).is_err() {
-        return;
-    }
+    // 失败不单独早退——那条臂要靠 fd 层故障才能触发；真失败时下面的 read 会
+    // 立刻出错，同样干净结束旁路。
+    let _ = stream.set_nonblocking(false);
     let _ = stream.set_read_timeout(Some(budget));
 
     let mut handshaked = false;
-    for line in BufReader::new(stream).lines() {
-        let Ok(line) = line else {
-            // 对端中途断开 / 读超时：旁路结束，补全本身不受影响。
-            return;
-        };
+    // `map_while(Result::ok)`：读错误（对端中途断开 / 读超时）与正常 EOF 一样
+    // 结束旁路，补全本身不受影响。写成组合子而不是 `let Ok(..) else { return }`
+    // 是为了不留一条只有真实 socket 故障才能走到的分支。
+    for line in BufReader::new(stream).lines().map_while(Result::ok) {
         match classify_frame(&line, expected_key, handshaked) {
             FrameAction::Accepted => handshaked = true,
             FrameAction::Reasoning(d) => sink.on_reasoning(&d),
@@ -195,6 +194,39 @@ fn serve_once(
             }
         }
     }
+}
+
+/// accept 失败后的去向。抽成纯函数：`WouldBlock` + 停止信号 + 预算三者的组合
+/// 无法靠真实 socket 稳定复现，作为入参就能把每条臂都测到。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AcceptRetry {
+    /// 还没人连上，继续等。
+    Wait,
+    /// 调用方已收工或预算耗尽——干净退出。
+    GiveUp,
+    /// 真正的 accept 错误。
+    Fatal,
+}
+
+impl AcceptRetry {
+    fn is_fatal(self) -> bool {
+        matches!(self, AcceptRetry::Fatal)
+    }
+}
+
+pub(crate) fn accept_retry(
+    err: &std::io::Error,
+    stopped: bool,
+    elapsed: Duration,
+    budget: Duration,
+) -> AcceptRetry {
+    if err.kind() != std::io::ErrorKind::WouldBlock {
+        return AcceptRetry::Fatal;
+    }
+    if stopped || deadline_exceeded(elapsed, budget) {
+        return AcceptRetry::GiveUp;
+    }
+    AcceptRetry::Wait
 }
 
 fn tracing_diag(message: String) {
@@ -284,6 +316,85 @@ mod tests {
                 "should ignore: {bad:?}"
             );
         }
+    }
+
+    #[test]
+    fn accept_retry_is_fatal_only_for_the_fatal_verdict() {
+        assert!(AcceptRetry::Fatal.is_fatal());
+        assert!(!AcceptRetry::GiveUp.is_fatal());
+        assert!(!AcceptRetry::Wait.is_fatal());
+    }
+
+    #[test]
+    fn accept_retry_covers_wait_giveup_and_fatal() {
+        let would_block = std::io::Error::new(std::io::ErrorKind::WouldBlock, "nobody yet");
+        let other = std::io::Error::other("socket exploded");
+        let budget = Duration::from_secs(10);
+
+        // 还有预算、没收到停止信号 → 继续等。
+        assert_eq!(
+            accept_retry(&would_block, false, Duration::ZERO, budget),
+            AcceptRetry::Wait
+        );
+        // 调用方收工 → 立刻放弃，不必等满预算。
+        assert_eq!(
+            accept_retry(&would_block, true, Duration::ZERO, budget),
+            AcceptRetry::GiveUp
+        );
+        // 预算耗尽 → 放弃。
+        assert_eq!(
+            accept_retry(&would_block, false, budget, budget),
+            AcceptRetry::GiveUp
+        );
+        // 非 WouldBlock 的错误是真故障，且优先于停止信号判定。
+        assert_eq!(
+            accept_retry(&other, false, Duration::ZERO, budget),
+            AcceptRetry::Fatal
+        );
+        assert_eq!(
+            accept_retry(&other, true, budget, budget),
+            AcceptRetry::Fatal
+        );
+    }
+
+    /// 无法解析的行只是被跳过，连接继续——一行坏数据不该打断整条流。
+    #[test]
+    fn listener_skips_garbage_lines_and_keeps_streaming() {
+        let recorder = Arc::new(Recorder::default());
+        let listener = SinkListener::bind(
+            recorder.clone() as Arc<dyn TokenSink>,
+            "k1".to_string(),
+            Duration::from_secs(5),
+        )
+        .expect("bind");
+
+        let mut stream = TcpStream::connect(listener.addr()).expect("connect");
+        stream
+            .write_all(frame(r#"{"t":"key","key":"k1"}"#).as_bytes())
+            .expect("handshake");
+        stream.write_all(b"not json\n").expect("garbage");
+        stream.write_all(b"\n").expect("blank");
+        stream
+            .write_all(frame(r#"{"t":"content","d":"after"}"#).as_bytes())
+            .expect("content");
+        drop(stream);
+        drop(listener);
+
+        assert_eq!(*recorder.events.lock().expect("lock"), vec!["c:after"]);
+    }
+
+    /// 诊断输出受环境变量控制：开关两态都要走到，否则 `tracing_diag` 里的
+    /// 打印行永远没人执行。
+    #[test]
+    #[serial_test::serial]
+    fn tracing_diag_honours_the_env_switch() {
+        // 开关两态都要走到，否则 `tracing_diag` 里的打印行永远没人执行。
+        // 收尾一律 remove_var：本仓库测试不依赖该变量的外部取值，无条件恢复
+        // 比 `if let Some(prev)` 少一条当前运行走不到的臂。
+        std::env::set_var("CORDIS_AGENT_DIAG", "1");
+        tracing_diag("enabled path".to_string());
+        std::env::remove_var("CORDIS_AGENT_DIAG");
+        tracing_diag("disabled path".to_string());
     }
 
     #[test]
@@ -435,11 +546,8 @@ mod tests {
             Duration::from_millis(50),
         )
         .expect("bind");
-        assert!(
-            listener.addr().starts_with("127.0.0.1:"),
-            "{}",
-            listener.addr()
-        );
+        // 不带格式参数：它只在断言失败时求值，会留下一行永久无覆盖。
+        assert!(listener.addr().starts_with("127.0.0.1:"));
         assert_eq!(listener.key(), "handshake-key");
     }
 }

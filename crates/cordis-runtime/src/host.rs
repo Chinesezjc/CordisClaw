@@ -1947,10 +1947,10 @@ impl crate::agent::LlmProvider for PluginLlmProvider<'_> {
             "body": body,
             "transport": transport,
         });
-        if let Some(listener) = listener.as_ref() {
-            payload["sink_addr"] = serde_json::Value::String(listener.addr());
-            payload["sink_key"] = serde_json::Value::String(listener.key().to_string());
-        }
+        attach_sink_fields(
+            &mut payload,
+            listener.as_ref().map(|l| (l.addr(), l.key().to_string())),
+        );
 
         let response = self
             .host
@@ -1959,6 +1959,17 @@ impl crate::agent::LlmProvider for PluginLlmProvider<'_> {
         drop(listener);
         parse_llm_reply(&self.plugin_path, &response.payload)
     }
+}
+
+/// 把 sink 坐标写进调用 payload；`None` 表示调用方不要流式，两个字段整个不出现
+/// （插件据此走非流式）。
+///
+/// 抽成纯函数：起一个真监听器只为了拼两个字段太重，而"带/不带 sink"两条路径都
+/// 必须被测到。
+pub(crate) fn attach_sink_fields(payload: &mut serde_json::Value, sink: Option<(String, String)>) {
+    let Some((addr, key)) = sink else { return };
+    payload["sink_addr"] = serde_json::Value::String(addr);
+    payload["sink_key"] = serde_json::Value::String(key);
 }
 
 /// 解析 provider 插件的回复。
@@ -5323,37 +5334,27 @@ impl ManagedAgentSession {
     }
 
     fn respond(&mut self, host: &RuntimeHost, input: &str) -> Result<AgentReply, RuntimeError> {
-        // 优先走 provider 插件；插件缺席时暂时回落到内建传输（C5 删除该回落，
-        // 届时直接 `NoLlmProvider`）。
-        let plugin_path = host.llm_provider_plugin();
-        match (&mut self.state, plugin_path) {
-            (ManagedAgentState::RuntimeShell, Some(plugin_path)) => {
-                let provider = PluginLlmProvider { host, plugin_path };
-                self.session.respond_with_runtime_host_via(
-                    host,
-                    &self.handle.session_id,
-                    input,
-                    &provider,
-                    None,
-                )
-            }
-            (ManagedAgentState::RuntimeShell, None) => {
-                self.session
-                    .respond_with_runtime_host(host, &self.handle.session_id, input)
-            }
-            (ManagedAgentState::PluginIteration(state), plugin_path) => {
+        // 无 provider 插件时两种 state 的结论相同（都只能报 NoLlmProvider），
+        // 所以先统一判定，省掉两条各自的 None 分支。
+        let Some(plugin_path) = host.llm_provider_plugin() else {
+            return Err(RuntimeError::NoLlmProvider);
+        };
+        let provider = PluginLlmProvider { host, plugin_path };
+        match &mut self.state {
+            ManagedAgentState::RuntimeShell => self.session.respond_with_runtime_host_via(
+                host,
+                &self.handle.session_id,
+                input,
+                &provider,
+                None,
+            ),
+            ManagedAgentState::PluginIteration(state) => {
                 let mut backend = PluginIterationAgentBackend {
                     host,
                     state: state.as_mut(),
                 };
-                match plugin_path {
-                    Some(plugin_path) => {
-                        let provider = PluginLlmProvider { host, plugin_path };
-                        self.session
-                            .respond_with_provider(&mut backend, input, &provider, None)
-                    }
-                    None => self.session.respond(&mut backend, input),
-                }
+                self.session
+                    .respond_with_provider(&mut backend, input, &provider, None)
             }
         }
     }
@@ -8574,6 +8575,34 @@ mod tests {
         let err = super::parse_llm_reply("p", r#"{"ok":true,"message":"a string"}"#)
             .expect_err("must fail");
         assert!(err.to_string().contains("malformed message"), "{err}");
+    }
+
+    /// 带 sink 时两个字段出现；不带时整个不出现——插件据此判定走非流式。
+    #[test]
+    fn attach_sink_fields_is_all_or_nothing() {
+        let mut with = serde_json::json!({"node_id": "llm_complete"});
+        super::attach_sink_fields(
+            &mut with,
+            Some(("127.0.0.1:5300".to_string(), "k1".to_string())),
+        );
+        assert_eq!(with["sink_addr"], serde_json::json!("127.0.0.1:5300"));
+        assert_eq!(with["sink_key"], serde_json::json!("k1"));
+
+        let mut without = serde_json::json!({"node_id": "llm_complete"});
+        super::attach_sink_fields(&mut without, None);
+        assert!(without.get("sink_addr").is_none());
+        assert!(without.get("sink_key").is_none());
+    }
+
+    /// 摘要截断：超长加省略号，不超长原样返回。
+    #[test]
+    fn truncate_agent_excerpt_text_adds_ellipsis_only_when_cut() {
+        // 空白被压平成单空格。
+        assert_eq!(super::truncate_agent_excerpt_text("a   b\n c", 32), "a b c");
+        // 恰好等于上限：不加省略号。
+        assert_eq!(super::truncate_agent_excerpt_text("abcde", 5), "abcde");
+        // 超出：截断并加省略号。
+        assert_eq!(super::truncate_agent_excerpt_text("abcdef", 5), "abcde...");
     }
 
     /// sink key 每次调用都不同——端口本就一调用一换，key 是并发下拒绝串台
