@@ -1933,13 +1933,10 @@ pub(crate) struct PluginLlmProvider<'a> {
 impl crate::agent::LlmProvider for PluginLlmProvider<'_> {
     fn complete(
         &self,
-        endpoint: &str,
         body: serde_json::Value,
         sink: Option<std::sync::Arc<dyn crate::llm_sink::TokenSink>>,
         transport: cordis_plugin_sdk::llm::LlmTransportConfig,
     ) -> Result<crate::agent::LlmCompletionParts, RuntimeError> {
-        // endpoint 由插件按 base_url 自行拼装；这里只做诊断用途的记录。
-        let _ = endpoint;
         // 流式预算沿用配置里的每块超时，与拆分前的语义一致。
         let budget = std::time::Duration::from_secs(transport.stream_timeout_secs.max(1));
         let listener =
