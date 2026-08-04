@@ -76,12 +76,14 @@ fn setup_fixture_workspace_copy() -> TempDir {
 }
 
 fn write_llm_api_config(root: &Path, base_url: &str, timeout_ms: u64) {
+    // provider 插件在请求时从环境读 key（契约类型不带明文 key）。
+    std::env::set_var("CORDIS_TEST_LLM_KEY", "test-key");
     let config_dir = root.join("config");
     fs::create_dir_all(&config_dir).expect("create config dir");
     fs::write(
         config_dir.join("llm_api.yaml"),
         format!(
-            "provider: deepseek\nbase_url: {base_url}\napi_key: test-key\nmodel: deepseek-reasoner\ntemperature: 0.0\nmax_tokens: 4096\ntimeout_ms: {timeout_ms}\n"
+            "provider: deepseek\nbase_url: {base_url}\napi_key_env: CORDIS_TEST_LLM_KEY\nmodel: deepseek-reasoner\ntemperature: 0.0\nmax_tokens: 4096\ntimeout_ms: {timeout_ms}\n"
         ),
     )
     .expect("write llm api config");
@@ -2138,12 +2140,14 @@ fn serve_mode_supports_candidate_control_plane() {
 // L批: LLM profile fallback 状态机。default 指向死端口 → 自动切 fallback
 // 'fast'（mock server）并记录 kernel issue；default 恢复后乐观探测切回。
 fn write_llm_profiles_config(root: &Path, default_url: &str, fast_url: &str) {
+    // provider 插件在请求时从环境读 key（契约类型不带明文 key）。
+    std::env::set_var("CORDIS_TEST_LLM_KEY", "test-key");
     let config_dir = root.join("config");
     fs::create_dir_all(&config_dir).expect("create config dir");
     fs::write(
         config_dir.join("llm_api.yaml"),
         format!(
-            "profiles:\n  default:\n    provider: deepseek\n    base_url: {default_url}\n    api_key: test-key\n    model: deepseek-reasoner\n    timeout_ms: 10000\n    fallback: fast\n  fast:\n    provider: deepseek\n    base_url: {fast_url}\n    api_key: test-key\n    model: deepseek-chat\n    timeout_ms: 10000\n"
+            "profiles:\n  default:\n    provider: deepseek\n    base_url: {default_url}\n    api_key_env: CORDIS_TEST_LLM_KEY\n    model: deepseek-reasoner\n    timeout_ms: 10000\n    fallback: fast\n  fast:\n    provider: deepseek\n    base_url: {fast_url}\n    api_key_env: CORDIS_TEST_LLM_KEY\n    model: deepseek-chat\n    timeout_ms: 10000\n"
         ),
     )
     .expect("write llm profiles config");
