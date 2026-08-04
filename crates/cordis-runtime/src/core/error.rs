@@ -266,6 +266,15 @@ pub enum RuntimeError {
     #[error("LLM provider unsupported: {provider}")]
     UnsupportedLlmProvider { provider: String },
 
+    /// 没有任何已加载插件声明 `llm_complete` 能力节点。
+    ///
+    /// 与 `UnsupportedLlmProvider` 区分：那个是"配置里的 provider 字符串不认识"，
+    /// 这个是"根本没装 provider 插件"。混用会让诊断把人引向改配置，而实际要装插件。
+    #[error(
+        "no LLM provider plugin loaded: install a plugin declaring the 'llm_complete' node (e.g. llm_openai)"
+    )]
+    NoLlmProvider,
+
     #[error("LLM request failed: {message}")]
     LlmRequestFailed { message: String },
 
@@ -344,6 +353,18 @@ mod tests {
             path: PathBuf::from("/tmp/x"),
             message: message.to_string(),
         }
+    }
+
+    /// `NoLlmProvider` 的文案必须指向"装插件"而不是"改配置"——它与
+    /// `UnsupportedLlmProvider`（provider 字符串不认识）是两回事，混淆会把
+    /// 排查引向错误方向。
+    #[test]
+    fn no_llm_provider_message_points_at_installing_a_plugin() {
+        let text = RuntimeError::NoLlmProvider.to_string();
+        assert!(text.contains("llm_complete"), "{text}");
+        assert!(text.contains("llm_openai"), "{text}");
+        // 不是基础设施故障：磁盘满之类才是，缺插件是配置/部署问题。
+        assert!(!RuntimeError::NoLlmProvider.is_infrastructure_failure());
     }
 
     #[test]

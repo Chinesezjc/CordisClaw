@@ -1001,27 +1001,6 @@ pub trait AgentBackend {
     }
 }
 
-/// 增量 token 的去向。
-///
-/// 拆分前是传输层自己 `print!`，这让 inbox/serve 路径无法关掉流式输出——
-/// 展示策略被埋在网络代码里。拆分后由调用方决定：REPL 给一个写 stdout 的
-/// 实现，inbox/serve 传 `None` 静默累积。
-///
-/// C2 只立契约：内建传输仍自己打印增量，生产路径此刻恒传 `None`，故方法目前
-/// 只有测试实现（`RecordingTokenSink`）会调用——非测试构建下 trait 是空的，
-/// 避免"永不被调用的方法"触发 dead_code。C4 接上 host 侧 sink listener 与
-/// REPL 的 stdout 实现后，两个 cfg 分支合并成一个。
-#[cfg(test)]
-pub(crate) trait TokenSink: Send + Sync {
-    fn on_reasoning(&self, delta: &str);
-    fn on_content(&self, delta: &str);
-}
-
-/// 非测试构建下的占位：C2 阶段生产路径恒传 `None`，没有任何实现者，但
-/// `LlmProvider::complete` 的签名必须在两种构建下一致。
-#[cfg(not(test))]
-pub(crate) trait TokenSink: Send + Sync {}
-
 /// 一次模型补全的执行者。
 ///
 /// 这是 agent 循环（机制）与供应商传输（可覆写）之间的接缝。循环只要求拿回
@@ -1034,8 +1013,18 @@ pub(crate) trait LlmProvider {
         &self,
         endpoint: &str,
         body: Value,
-        sink: Option<&dyn TokenSink>,
-    ) -> Result<(ChatMessage, Option<String>, Option<String>), RuntimeError>;
+        sink: Option<std::sync::Arc<dyn crate::llm_sink::TokenSink>>,
+        transport: cordis_plugin_sdk::llm::LlmTransportConfig,
+    ) -> Result<LlmCompletionParts, RuntimeError>;
+}
+
+/// 一次补全的返回三件套。具名结构体而非裸元组：它要跨 `agent`/`host` 两个模块
+/// 使用，字段名比位置更经得起演进。
+#[derive(Debug)]
+pub(crate) struct LlmCompletionParts {
+    pub(crate) message: cordis_plugin_sdk::llm::LlmMessage,
+    pub(crate) response_id: Option<String>,
+    pub(crate) finish_reason: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1200,32 +1189,35 @@ impl AgentSession {
         // `respond_inner` 仍能拿 `&mut self` 而不与之借用冲突。
         let provider = DirectHttpProvider::from_session(self);
         let result = self.respond_inner(backend, user_input, &provider, None);
-        // P2-31: on error path, if we pushed a User transcript entry but
-        // never got to push a matching Assistant entry, insert an
-        // Assistant placeholder describing the error. Otherwise a retry
-        // with the same session id sees an orphan User (and the LLM
-        // double-records the prompt on the next round).
-        if result.is_err() {
-            let has_user_without_assistant = self
+        self.repair_transcript_on_error(transcript_len_before, &result);
+        result
+    }
+
+    /// P2-31: 出错时若只推了 User 而没有对应的 Assistant，补一条描述错误的
+    /// Assistant 占位。否则同一 session id 重试会看到孤立的 User，模型下一轮
+    /// 会把提示词重复记一遍。
+    fn repair_transcript_on_error(
+        &mut self,
+        transcript_len_before: usize,
+        result: &Result<AgentReply, RuntimeError>,
+    ) {
+        let Err(err) = result else { return };
+        let has_user_without_assistant = self
+            .transcript
+            .iter()
+            .skip(transcript_len_before)
+            .any(|e| matches!(e, AgentTranscriptEntry::User { .. }))
+            && !self
                 .transcript
                 .iter()
                 .skip(transcript_len_before)
-                .any(|e| matches!(e, AgentTranscriptEntry::User { .. }))
-                && !self
-                    .transcript
-                    .iter()
-                    .skip(transcript_len_before)
-                    .any(|e| matches!(e, AgentTranscriptEntry::Assistant { .. }));
-            if has_user_without_assistant {
-                if let Err(err) = &result {
-                    self.transcript.push(AgentTranscriptEntry::Assistant {
-                        content: format!("[error] {}", err),
-                        response_id: None,
-                    });
-                }
-            }
+                .any(|e| matches!(e, AgentTranscriptEntry::Assistant { .. }));
+        if has_user_without_assistant {
+            self.transcript.push(AgentTranscriptEntry::Assistant {
+                content: format!("[error] {err}"),
+                response_id: None,
+            });
         }
-        result
     }
 
     /// `provider` 承担这一轮所有的模型调用；`sink` 决定增量 token 去哪。
@@ -1238,7 +1230,7 @@ impl AgentSession {
         backend: &mut B,
         user_input: &str,
         provider: &dyn LlmProvider,
-        sink: Option<&dyn TokenSink>,
+        sink: Option<std::sync::Arc<dyn crate::llm_sink::TokenSink>>,
     ) -> Result<AgentReply, RuntimeError> {
         let trimmed = user_input.trim();
         if trimmed.is_empty() {
@@ -1417,8 +1409,14 @@ impl AgentSession {
                 "tool_choice": "auto",
                 "response_format": {"type": "json_object"},
             });
+            let parts = provider.complete(
+                &endpoint,
+                request_body,
+                sink.clone(),
+                self.config.to_transport(),
+            )?;
             let (message, response_id, finish_reason) =
-                provider.complete(&endpoint, request_body, sink)?;
+                (parts.message, parts.response_id, parts.finish_reason);
 
             emit_agent_diagnostic(format!(
                 "agent_turn_result kind={} turn={} response_id={} tool_calls={} content_chars={} reasoning_chars={} finish_reason={}",
@@ -1446,12 +1444,12 @@ impl AgentSession {
                     .partition(|tc| available_tools.contains(&tc.function.name));
                 // Push assistant message with only valid tool_calls (if any).
                 if !valid_calls.is_empty() {
-                    let filtered = ChatMessage {
+                    let filtered = cordis_plugin_sdk::llm::LlmMessage {
                         content: message.content.clone(),
                         reasoning_content: message.reasoning_content.clone(),
                         tool_calls: valid_calls.iter().map(|&tc| tc.clone()).collect(),
                     };
-                    messages.push(filtered.to_request_message());
+                    messages.push(llm_message_to_request(&filtered));
                 }
                 // Inject errors for unknown tools BEFORE any assistant message.
                 for tool_call in &unknown_calls {
@@ -1637,7 +1635,7 @@ impl AgentSession {
                 .as_deref()
                 .is_some_and(|value| !value.trim().is_empty())
             {
-                messages.push(message.to_request_message());
+                messages.push(llm_message_to_request(&message));
                 self.reasoning_only_strikes += 1;
                 if self.reasoning_only_strikes >= 3 {
                     backend.host().agent_send_warning_to_test_groups(
@@ -1688,6 +1686,23 @@ impl AgentSession {
         })
     }
 
+    /// 用调用方给定的 provider 跑一轮。
+    ///
+    /// `respond` 是过渡期的便利入口（内建传输）；C5 删掉内建实现后只剩本函数。
+    /// `sink` 为 `Some` 时 provider 可逐段推增量，忽略它也必须正确工作。
+    pub(crate) fn respond_with_provider<B: AgentBackend + ?Sized>(
+        &mut self,
+        backend: &mut B,
+        user_input: &str,
+        provider: &dyn LlmProvider,
+        sink: Option<std::sync::Arc<dyn crate::llm_sink::TokenSink>>,
+    ) -> Result<AgentReply, RuntimeError> {
+        let transcript_len_before = self.transcript.len();
+        let result = self.respond_inner(backend, user_input, provider, sink);
+        self.repair_transcript_on_error(transcript_len_before, &result);
+        result
+    }
+
     pub fn respond_with_runtime_host<H: AgentToolHost + ?Sized>(
         &mut self,
         host: &H,
@@ -1701,6 +1716,27 @@ impl AgentSession {
             soul_key,
         };
         self.respond(&mut backend, user_input)
+    }
+
+    /// 同上，但由调用方提供 provider（走 LLM 插件时用）。
+    ///
+    /// backend 的构造留在本模块：`RuntimeShellAgentBackend` 是私有类型，
+    /// 让 host 去拼装它会迫使它变 public 且暴露内部字段。
+    pub(crate) fn respond_with_runtime_host_via<H: AgentToolHost + ?Sized>(
+        &mut self,
+        host: &H,
+        session_id: &str,
+        user_input: &str,
+        provider: &dyn LlmProvider,
+        sink: Option<std::sync::Arc<dyn crate::llm_sink::TokenSink>>,
+    ) -> Result<AgentReply, RuntimeError> {
+        let soul_key = self.soul_key.clone();
+        let mut backend = RuntimeShellAgentBackend {
+            host,
+            session_id,
+            soul_key,
+        };
+        self.respond_with_provider(&mut backend, user_input, provider, sink)
     }
 
     pub fn history_len(&self) -> usize {
@@ -2083,6 +2119,65 @@ impl ShellAgentSession {
     }
 }
 
+/// 把一条助手消息序列化回请求里的 message 对象。
+///
+/// 由 `ChatMessage::to_request_message` 原样迁来——它只做 JSON 拼装、不含
+/// wire 解析，因此随契约类型留在 kernel（构造请求体是 kernel 的职责）。
+fn llm_message_to_request(message: &cordis_plugin_sdk::llm::LlmMessage) -> Value {
+    let mut out = Map::new();
+    out.insert("role".to_string(), Value::String("assistant".to_string()));
+    let content_value = message
+        .content
+        .as_ref()
+        .map(|content| Value::String(content.clone()))
+        .unwrap_or_else(|| {
+            if message.reasoning_content.is_some() || !message.tool_calls.is_empty() {
+                Value::String(String::new())
+            } else {
+                Value::Null
+            }
+        });
+    out.insert("content".to_string(), content_value);
+    if let Some(reasoning_content) = message.reasoning_content.as_ref() {
+        if !reasoning_content.trim().is_empty() {
+            out.insert(
+                "reasoning_content".to_string(),
+                Value::String(reasoning_content.clone()),
+            );
+        }
+    }
+    if !message.tool_calls.is_empty() {
+        out.insert(
+            "tool_calls".to_string(),
+            serde_json::to_value(&message.tool_calls).unwrap_or(Value::Array(Vec::new())),
+        );
+    }
+    Value::Object(out)
+}
+
+/// 把内建传输的 `ChatMessage` 转成契约类型。
+///
+/// 只为过渡期的 `DirectHttpProvider` 存在——C5 删掉内建传输后，循环全程只见
+/// `LlmMessage`，本函数与 `ChatMessage` 一并消失。
+fn chat_message_to_llm(message: ChatMessage) -> cordis_plugin_sdk::llm::LlmMessage {
+    cordis_plugin_sdk::llm::LlmMessage {
+        content: message.content,
+        reasoning_content: message.reasoning_content,
+        tool_calls: message
+            .tool_calls
+            .into_iter()
+            .map(|call| cordis_plugin_sdk::llm::LlmToolCall {
+                id: call.id,
+                call_type: call.call_type,
+                function: cordis_plugin_sdk::llm::LlmToolFunction {
+                    name: call.function.name,
+                    arguments: call.function.arguments,
+                },
+            })
+            .collect(),
+    }
+}
+
 /// 过渡期的内建 provider：直接复用 kernel 里既有的 OpenAI HTTP+SSE 传输。
 ///
 /// C3 建好 `llm_openai` 插件、C4 接好解析之后，C5 会连同 `send_chat_request`
@@ -2105,11 +2200,18 @@ impl LlmProvider for DirectHttpProvider {
         &self,
         endpoint: &str,
         body: Value,
-        _sink: Option<&dyn TokenSink>,
-    ) -> Result<(ChatMessage, Option<String>, Option<String>), RuntimeError> {
-        // 内建传输自己 print! 增量（read_chat_stream 内联），故此处忽略 sink；
-        // 展示策略上移到 TokenSink 是插件化之后的事（C4）。
-        self.session.send_chat_request(endpoint.to_string(), body)
+        _sink: Option<std::sync::Arc<dyn crate::llm_sink::TokenSink>>,
+        _transport: cordis_plugin_sdk::llm::LlmTransportConfig,
+    ) -> Result<LlmCompletionParts, RuntimeError> {
+        // 过渡实现：内建传输自带配置且自己打印增量，故忽略 sink 与 transport。
+        // C5 删除它之后，只剩走插件的 PluginLlmProvider。
+        let (message, response_id, finish_reason) =
+            self.session.send_chat_request(endpoint.to_string(), body)?;
+        Ok(LlmCompletionParts {
+            message: chat_message_to_llm(message),
+            response_id,
+            finish_reason,
+        })
     }
 }
 
@@ -2135,40 +2237,6 @@ pub(crate) struct ChatMessage {
     reasoning_content: Option<String>,
     #[serde(default)]
     tool_calls: Vec<ToolCall>,
-}
-
-impl ChatMessage {
-    fn to_request_message(&self) -> Value {
-        let mut message = Map::new();
-        message.insert("role".to_string(), Value::String("assistant".to_string()));
-        let content_value = self
-            .content
-            .as_ref()
-            .map(|content| Value::String(content.clone()))
-            .unwrap_or_else(|| {
-                if self.reasoning_content.is_some() || !self.tool_calls.is_empty() {
-                    Value::String(String::new())
-                } else {
-                    Value::Null
-                }
-            });
-        message.insert("content".to_string(), content_value);
-        if let Some(reasoning_content) = self.reasoning_content.as_ref() {
-            if !reasoning_content.trim().is_empty() {
-                message.insert(
-                    "reasoning_content".to_string(),
-                    Value::String(reasoning_content.clone()),
-                );
-            }
-        }
-        if !self.tool_calls.is_empty() {
-            message.insert(
-                "tool_calls".to_string(),
-                serde_json::to_value(&self.tool_calls).unwrap_or(Value::Array(Vec::new())),
-            );
-        }
-        Value::Object(message)
-    }
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Default)]
@@ -2470,7 +2538,7 @@ fn execute_agent_tool_call<B: AgentBackend + ?Sized>(
     backend: &mut B,
     available_tools: &BTreeSet<String>,
     session_kind: &str,
-    tool_call: &ToolCall,
+    tool_call: &cordis_plugin_sdk::llm::LlmToolCall,
     unknown_tool_strikes: &mut usize,
 ) -> (AgentToolEvent, String) {
     let tool_name = tool_call.function.name.clone();
@@ -3551,10 +3619,11 @@ mod tests {
             &self,
             _endpoint: &str,
             body: Value,
-            sink: Option<&dyn TokenSink>,
-        ) -> Result<(ChatMessage, Option<String>, Option<String>), RuntimeError> {
+            sink: Option<std::sync::Arc<dyn crate::llm_sink::TokenSink>>,
+            _transport: cordis_plugin_sdk::llm::LlmTransportConfig,
+        ) -> Result<LlmCompletionParts, RuntimeError> {
             self.seen_bodies.lock().expect("seen_bodies").push(body);
-            if let Some(sink) = sink {
+            if let Some(sink) = sink.as_ref() {
                 for (is_reasoning, text) in &self.stream_as {
                     if *is_reasoning {
                         sink.on_reasoning(text);
@@ -3576,7 +3645,11 @@ mod tests {
             } else {
                 "tool_calls"
             };
-            Ok((message, Some("resp-fake".to_string()), Some(finish.into())))
+            Ok(LlmCompletionParts {
+                message: chat_message_to_llm(message),
+                response_id: Some("resp-fake".to_string()),
+                finish_reason: Some(finish.into()),
+            })
         }
     }
 
@@ -3586,7 +3659,7 @@ mod tests {
         events: std::sync::Mutex<Vec<String>>,
     }
 
-    impl TokenSink for RecordingTokenSink {
+    impl crate::llm_sink::TokenSink for RecordingTokenSink {
         fn on_reasoning(&self, delta: &str) {
             self.events
                 .lock()
@@ -3613,9 +3686,16 @@ mod tests {
     #[test]
     fn provider_seam_returns_reply_and_sink_is_optional() {
         let provider = FakeLlmProvider::new(vec![assistant_reply("hello")]);
-        let (message, response_id, finish) = provider
-            .complete("http://x/v1/chat/completions", json!({"model": "m"}), None)
+        let parts = provider
+            .complete(
+                "http://x/v1/chat/completions",
+                json!({"model": "m"}),
+                None,
+                Default::default(),
+            )
             .expect("complete");
+        let (message, response_id, finish) =
+            (parts.message, parts.response_id, parts.finish_reason);
         assert_eq!(message.content.as_deref(), Some("hello"));
         assert_eq!(response_id.as_deref(), Some("resp-fake"));
         assert_eq!(finish.as_deref(), Some("stop"));
@@ -3637,15 +3717,20 @@ mod tests {
                 (false, "tial".to_string()),
             ],
         );
-        let sink = RecordingTokenSink::default();
-        let (message, _, _) = provider
-            .complete("http://x", json!({}), Some(&sink))
+        let sink = std::sync::Arc::new(RecordingTokenSink::default());
+        let parts = provider
+            .complete(
+                "http://x",
+                json!({}),
+                Some(sink.clone() as std::sync::Arc<dyn crate::llm_sink::TokenSink>),
+                Default::default(),
+            )
             .expect("complete");
         assert_eq!(
             *sink.events.lock().expect("events"),
             vec!["r:thinking", "c:par", "c:tial"]
         );
-        assert_eq!(message.content.as_deref(), Some("done"));
+        assert_eq!(parts.message.content.as_deref(), Some("done"));
     }
 
     /// provider 用尽脚本回复时报错，而不是静默返回空消息。
@@ -3653,7 +3738,7 @@ mod tests {
     fn provider_seam_surfaces_exhausted_script_as_error() {
         let provider = FakeLlmProvider::new(Vec::new());
         let err = provider
-            .complete("http://x", json!({}), None)
+            .complete("http://x", json!({}), None, Default::default())
             .expect_err("must fail");
         assert!(
             matches!(err, RuntimeError::LlmRequestFailed { .. }),
@@ -3876,12 +3961,12 @@ mod tests {
 
     #[test]
     fn reasoning_only_request_message_uses_empty_content() {
-        let message = ChatMessage {
+        let message = cordis_plugin_sdk::llm::LlmMessage {
             content: None,
             reasoning_content: Some("Need another reasoning pass".to_string()),
             tool_calls: Vec::new(),
         };
-        let request = message.to_request_message();
+        let request = llm_message_to_request(&message);
         assert_eq!(
             request.get("role").and_then(Value::as_str),
             Some("assistant")
