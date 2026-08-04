@@ -68,7 +68,9 @@ cargo llvm-cov --fail-under-lines 100 --ignore-filename-regex 'cordis-runtime/sr
 - Plugin Loader / Registry — 发现、解析、加载插件的引导机制
 - Context 系统（依赖注入、作用域、slot）— 跨插件的状态传递基础设施
 - Service trait + ServiceRegistry — 后台服务生命周期契约的定义方
-- Agent 对话管理（LLM 调用循环、工具分发、历史管理）— Agent 本身是"机制"
+- Agent 对话管理（**循环编排**、工具分发、历史管理/压缩、会话快照）— Agent 循环本身是"机制"。
+  注意**不含 LLM 传输**：与供应商对话的 HTTP/SSE、鉴权、重试、wire format 已整体移出，
+  见下方"可以做成 Plugin 的"。kernel 只构造请求体、消费结构化的 `tool_calls`。
 - **内核自省工具**（`get_runtime_status`、`list_plugins`、`list_nodes`、`get_kernel_status`、`get_kernel_issues`、`reload_runtime`）— 内核状态的查询入口
 - **Agent 基础工具**（`read_file` / `write_file` / `search_code` / `run_command` 等）— agent 干活的最小必需集，Kernel 保留一份默认实现避免"没插件就不能启动"
 - Plugin 调用入口（`invoke_plugin`、`execute_target`）— 这是 Kernel 暴露给 Agent 的"万能手柄"
@@ -79,11 +81,24 @@ cargo llvm-cov --fail-under-lines 100 --ignore-filename-regex 'cordis-runtime/sr
 - **Web 访问**（web_search/web_fetch）— `web` 插件（切换搜索源）
 - **Git 操作**（git_diff/log/status/commit）— `git` 插件（切换 git 后端）
 - **外部协议适配**（QQ/OneBot 等）— 各自独立插件
+- **LLM provider**（与模型对话的传输层）— `llm_openai` 等插件。声明 `llm_complete`
+  能力节点即接管（同 soul 的 `soul_get`/`soul_set` 约定）。**kernel 不留内建实现**：
+  没装 provider 插件时 `agent_send` 报 `NoLlmProvider`，而 boot / REPL /
+  `command_router`（`/status`、`/help`）照常工作。这是本项目里唯一一个
+  "kernel 无兜底"的覆写点——因为传输天然是供应商专有的，留一份 OpenAI 实现在
+  kernel 里既不通用、又会让 `provider` 字段继续名存实亡。
 - 任何**新能力**默认做成插件，除非它属于"agent 最小可用集"或"内核机制"
 
 ### 判断标准
 - **"去掉这个功能后 agent 还能启动、看到自己的代码、跑测试吗？"** —— 不能 → 必须在 Kernel。
 - **"能替换实现从而变换体验吗？"** —— 能 → 值得做成插件（即使 kernel 也有一份默认）。
+
+**LLM 传输是第一条的一个刻意例外**，理由记在这里以免下次被当成违规改回去：
+去掉 provider 插件后 agent **能启动、能看代码、能跑测试**，只是不能跟模型说话——
+第一条问的三件事都仍然成立，所以它不属于"必须在 Kernel"。而它高度供应商专有
+（OpenAI 与 Anthropic 的 wire format 不兼容），留一份内建实现既不通用，又会让
+配置里的 `provider` 字段继续名存实亡（拆分前全仓无一处按它分支 wire format，
+只当白名单闸门用）。因此这是唯一一个 **kernel 不留兜底**的覆写点。
 
 ### 为什么
 - Kernel 内建工具保证冷启动可用性（没插件 agent 也能干活）

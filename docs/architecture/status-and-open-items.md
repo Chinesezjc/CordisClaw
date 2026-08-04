@@ -2,7 +2,7 @@
 
 ## 1. 判定口径
 
-- 本文基于当前仓库现状整理，最近更新：2026-07-29。
+- 本文基于当前仓库现状整理，最近更新：2026-08-05。
 - 历史规划蓝图已经吸收进 [design-blueprint.md](./design-blueprint.md)，因此本文结论来自三类证据的交叉比对：
   - 设计蓝图：[design-blueprint.md](./design-blueprint.md)
   - 架构文档：[system-overview.md](./system-overview.md)、[contracts-and-loading.md](./contracts-and-loading.md)、[runtime-semantics.md](./runtime-semantics.md)、[maintenance-guide.md](./maintenance-guide.md)
@@ -237,6 +237,74 @@ Agent 现在可以自主完成：读代码 → 理解结构 → 写/改文件 �
 - [x] **Filesystem / Git 白名单不再静默降级**（P0-19）— `canonicalize` 失败时不再退回未规范化路径。新增 `canonicalise_for_whitelist` / `validate_path_in_root` 的深度 ancestor 解析：路径不存在时 canonicalize 最深的存在祖先再拼 tail；两侧都失败则 fail-closed。`../../etc/shadow` 之类的构造再无绕过。
 - [x] **Plugin iteration symlink 逃逸**（P0-20）— `PluginEditExecutor::execute` 在写入前调用新 helper `resolve_under_workspace`：canonicalize 结果必须仍在 workspace_root 下。plugins 内的 symlink 指向 `/etc/passwd` 之类无法被写入。
 - [x] **Verifier shell 拼接**（P0-21）— 已随 A 批 P0-1 修复。`discover_rust_workspace_manifest` 输出的字符串被 `shell_words` 解析成 argv，空格 / `$` / `;` 无法被解释。
+
+### 5.2.38 LLM 传输层拆出 kernel（2026-08-05）
+
+**动机**：配置里有 `provider: openai|deepseek`，但**全仓没有一处按它分支 wire format**
+（只在 `agent.rs` 当白名单闸门用）——所谓 DeepSeek 支持就是同一套 OpenAI 格式换个
+`base_url`。要接 Anthropic（wire format 不兼容）或本地模型无处下手。拆完之后换
+provider = 写一个插件，`provider` 字段第一次真正有意义。
+
+- [x] **SDK 新增 `llm` 契约模块**（C1）— `LlmCompletionRequest` / `LlmCompletion` /
+  `LlmMessage` / `LlmToolCall` / `LlmStreamFrame` / `LlmTransportConfig`。这些类型
+  **只以 JSON 穿过 `PluginRequest/PluginResponse.payload`**，从不作为裸结构体跨 FFI，
+  因此 vtable 布局不变、`api_hash` 保持 `api_v2`、既有插件无需重建。
+  `LlmCompletionRequest.body` 是不透明 `Value`：kernel 保留唯一一份请求体构造逻辑，
+  wire format 差异完全封在插件内部。`LlmMessage.tool_calls` 必须结构化返回——agent
+  循环在**本轮中途**就要据此分派工具，只回文本的 provider 驱动不了工具调用。
+- [x] **`LlmProvider` 接缝**（C2）— `respond_inner` 从直调 `send_chat_request` 改为经
+  trait。provider/sink 作**参数**而非 `AgentSession` 字段：该结构体 derive 了
+  `Debug + Clone` 且会被快照序列化，塞 `dyn Trait` 会同时破坏这三者。本步行为逐字节
+  不变（`DirectHttpProvider` 原样转调），把"引入接缝"与"搬走实现"拆成两个可独立
+  验证的步骤。
+- [x] **`llm_openai` 插件**（C3）— 传输整体搬入 `fixtures/plugins/llm_openai`。
+  搬运按大括号配平精确切块、每块自检、改写只用断言过出现次数的定点替换；第一次用
+  宽松正则批量改写吃掉了 `format!` 的 `{}` 占位符并破坏块边界，已推倒重来。
+  三处非纯搬运的实质调整：(a) **传输层不再打印任何东西**——拆分前逐 token 的 stdout
+  输出内联在 SSE 读取里，这正是 inbox/serve 关不掉流式的根因；(b) **API key 只从
+  环境变量读**，契约类型刻意不带明文 key（它要序列化进 payload）；(c) 错误类型
+  `RuntimeError` → `String`，插件不依赖 kernel 的错误枚举。
+- [x] **kernel 接线 + token 旁路**（C4）— `llm_provider_plugin()` 照 `soul_provider()`
+  扫描声明 `llm_complete` 的已加载插件；`PluginLlmProvider` 照 `PluginSoulProvider`
+  构造 payload → invoke → 解析。新增 `llm_sink` 模块做 host 侧监听：TCP 回环 +
+  行分隔 JSON，首帧 `{"key":...}` 握手。**这些新代码进受门槛的文件并真补到 100%**，
+  没有蹭 `agent.rs` 的既有豁免——做法是把判定抽成纯函数
+  （`classify_frame(line, expected_key, handshaked)`，`handshaked` 作**入参**而非内部
+  状态，两种取值的所有分支都能被单测驱动；`deadline_exceeded(elapsed, budget)` 同理
+  不依赖真实时钟）。
+- [x] **删除内建传输**（C5）— 807 行整体删除，kernel 里 `reqwest::` /
+  `chat/completions` / `Bearer` 引用归零。`AgentSession` 去掉 `client` 字段，连带
+  `new`/`swap_config`/`from_snapshot` 各少一条错误臂。无插件时 `respond` 直接返回
+  `NoLlmProvider`。
+
+**为什么 kernel 不留兜底**：见 CLAUDE.md 判断标准里那条"刻意例外"——去掉 provider
+插件后 agent 仍能启动、看代码、跑测试，只是不能跟模型说话；而传输高度供应商专有，
+留一份 OpenAI 实现既不通用又会让 `provider` 继续名存实亡。
+
+**为什么流式不用 dlsym 回调**（最初设想，已否决）：仓库自己的 SDK 测试
+（`agent_trigger_success_branch_via_dlopened_provider` 一带）已记录
+**测试二进制与 macOS 下 `dlsym(RTLD_DEFAULT)` 拿不到宿主符号**，且
+`.cargo/config.toml` 的 `-Wl,-E` 只配了 `x86_64-unknown-linux-gnu`、只作用于可执行
+文件（`_cordis_agent_trigger` 定义在 `main.rs`）。`agent_trigger` 在符号缺失时静默
+no-op——对"可选消息注入"可接受，对流式则意味着 REPL 在测试里永远静默且不报错。
+其 C 签名 `fn(*const c_char)` 也无法区分并发会话。TCP 回环没有这些问题，且本就是
+仓库既有手法（mock LLM server）。
+
+**踩到的坑：`dlopen` 下 segfault（exit=139）**。端到端跑 `invoke llm_openai
+llm_complete` 直接段错误，而同样代码进程内测试 9/9 全过。gdb 回溯显示崩在
+`__GI___call_tls_dtors` → `__run_exit_handlers` → `std::process::exit`：reqwest 的
+blocking client 在插件 dylib 里注册了 TLS 析构函数，而 `LoadedDylibApi` 持有
+`Library`、invoke 一返回就 `dlclose` → 代码段 unmap，进程退出时那些析构指针已失效。
+排除过程：不是重试逻辑（进程内连发 3 次失败请求正常）、不是 `env::var`、不是 client
+构造、也不是"插件里做 HTTP"本身（`web` 同样 reqwest+rustls+dlopen 且真发请求不崩，
+差别在于它没让 reqwest 运行时注册 TLS 析构）。**修法**：`llm_complete` 改用
+`task_node_doc`——`TASK_LIBRARIES` 对 `NodeType::Task` 的插件保持 dylib 常驻
+（qq/feishu 已靠它 spawn 长期线程），dylib 不再被 dlclose。同源另修一个真 bug：
+SSE 读取线程原本**故意不 join**（kernel 里原注释称其"有界且自清理"），该前提在
+插件里不成立，改为外层包一圈、所有返回路径无条件 join。
+
+**遗留**：`docs/agent/interfaces.json` 必须与 dylib 内嵌 docs 逐字段一致（loader
+交叉校验），故由 `examples/dump_docs.rs` 从 `docs_value()` 单一来源生成，不手写。
 
 ### 5.2.37 snapshot 目录无界增长 + 磁盘满伪装成逻辑错误（2026-07-28）
 
