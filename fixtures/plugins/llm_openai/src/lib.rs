@@ -31,7 +31,7 @@ use cordis_plugin_sdk::llm::{
     LlmTransportConfig,
 };
 use cordis_plugin_sdk::{
-    export_plugin_api, json_response, node_doc, plugin_docs, AbiFingerprint, PluginDocs,
+    export_plugin_api, json_response, plugin_docs, task_node_doc, AbiFingerprint, PluginDocs,
     PluginRequest, PluginResponse,
 };
 use reqwest::blocking::{Client, Response};
@@ -937,6 +937,14 @@ fn api_handle(request: PluginRequest) -> PluginResponse {
 /// 集成测试入口：直接喂 payload 字符串、拿回复字符串，绕过 dylib 加载。
 ///
 /// 传输测试关心的是 HTTP/SSE 行为，不该为此走一遍 dlopen 与工件索引。
+/// 导出 docs 供生成 docs/agent/interfaces.json —— 该文件必须与 dylib 内嵌
+/// docs 逐字段一致（loader 交叉校验并在漂移时 auto-heal），故由 docs_value()
+/// 单一来源导出，不手写。见 examples/dump_docs.rs。
+#[doc(hidden)]
+pub fn __test_docs() -> PluginDocs {
+    docs_value()
+}
+
 #[doc(hidden)]
 pub fn __test_handle(payload: String) -> String {
     api_handle(PluginRequest { payload }).payload
@@ -952,7 +960,7 @@ fn docs_value() -> PluginDocs {
         "llm_openai",
         "0.1.0",
         None,
-        vec![node_doc(
+        vec![task_node_doc(
             "llm_complete",
             "Execute one chat completion against an OpenAI-compatible endpoint.",
             json!({
