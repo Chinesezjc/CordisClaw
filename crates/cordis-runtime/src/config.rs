@@ -213,6 +213,25 @@ struct RuntimeFile {
     kernel: Option<KernelConfig>,
 }
 
+impl LlmApiConfig {
+    /// 投影出 provider 插件需要的传输参数。
+    ///
+    /// 刻意**不含** `model`/`temperature`/`max_tokens`——那些属于请求体，由
+    /// kernel 构造；也**不含明文 api_key**：该结构体会被序列化进插件调用的
+    /// payload，带上密钥等于扩大日志与崩溃快照的泄露面，插件按 `api_key_env`
+    /// 在请求时自行从环境读取。
+    pub fn to_transport(&self) -> cordis_plugin_sdk::llm::LlmTransportConfig {
+        cordis_plugin_sdk::llm::LlmTransportConfig {
+            base_url: self.base_url.clone(),
+            api_key_env: self.api_key_env.clone(),
+            organization: self.organization.clone(),
+            project: self.project.clone(),
+            timeout_ms: self.timeout_ms,
+            stream_timeout_secs: self.stream_timeout_secs,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct RuntimeSettings {
     #[serde(default)]

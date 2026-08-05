@@ -30,22 +30,178 @@ use support::{pin_private_snapshot_root, spawn_chunked_mock_llm_server_sequence,
 /// Build a minimal fixtures tree that boots with zero plugins. `boot` reads
 /// `artifacts/index.json` (schema_version 2, empty entries), so the loader
 /// registers no plugins and never touches a dylib — cross-platform safe.
+/// 转发型假 provider 的执行脚本：读 payload 里的 `transport.base_url`，用
+/// urllib 打过去，把 SSE 增量拼成一条补全。保留真实 HTTP 语义（503 会经
+/// HTTPError 变成失败回复），这样 kernel 侧的重试/降级逻辑仍被真正驱动。
+fn write_proxy_llm_script(path: &Path) {
+    let body = r#"#!/bin/sh
+payload=$(cat)
+python3 - "$payload" <<'PY'
+import json, sys, urllib.request, urllib.error
+req = json.loads(sys.argv[1])
+url = req["transport"]["base_url"].rstrip("/") + "/chat/completions"
+body = dict(req["body"]); body["stream"] = True
+# profile 内的 5xx 重试属于**传输层**，拆分后归 provider 插件管
+# （真插件 llm_openai 里是 AGENT_REQUEST_MAX_ATTEMPTS 那段）。这里照做，
+# 否则 kernel 侧的"重试后恢复"用例会因为假 provider 一撞 503 就放弃而失败。
+def fetch():
+    r = urllib.request.Request(url, data=json.dumps(body).encode(),
+                               headers={"Content-Type": "application/json"})
+    return urllib.request.urlopen(r, timeout=30)
+
+try:
+    content, reasoning, calls, rid, finish = "", "", {}, None, None
+    last = None
+    resp = None
+    for _ in range(3):
+        try:
+            resp = fetch()
+            break
+        except urllib.error.HTTPError as e:
+            last = e
+            if e.code < 500:      # 4xx 是永久错误，不重试
+                raise
+        except Exception as e:
+            last = e
+    if resp is None:
+        raise last
+    with resp:
+        for raw in resp:
+            line = raw.decode("utf-8", "replace").strip()
+            if not line.startswith("data:"):
+                continue
+            chunk = line[5:].strip()
+            if chunk == "[DONE]":
+                break
+            try:
+                ev = json.loads(chunk)
+            except Exception:
+                continue
+            rid = rid or ev.get("id")
+            for ch in ev.get("choices", []):
+                d = ch.get("delta", {})
+                content += d.get("content") or ""
+                reasoning += d.get("reasoning_content") or ""
+                finish = ch.get("finish_reason") or finish
+                for tc in d.get("tool_calls", []):
+                    slot = calls.setdefault(tc.get("index", 0),
+                                            {"id": "", "type": "function",
+                                             "function": {"name": "", "arguments": ""}})
+                    if tc.get("id"):
+                        slot["id"] = tc["id"]
+                    fn = tc.get("function") or {}
+                    if fn.get("name"):
+                        slot["function"]["name"] = fn["name"]
+                    slot["function"]["arguments"] += fn.get("arguments") or ""
+    msg = {"content": content or None, "reasoning_content": reasoning or None,
+           "tool_calls": [calls[k] for k in sorted(calls)]}
+    print(json.dumps({"ok": True, "message": msg,
+                      "response_id": rid, "finish_reason": finish}))
+except Exception as e:
+    print(json.dumps({"ok": False, "error": "upstream failed: %s" % e}))
+PY
+"#;
+    fs::write(path, body).expect("write proxy script");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).expect("chmod script");
+    }
+}
+
+fn abi_fingerprint_value() -> serde_json::Value {
+    serde_json::to_value(cordis_plugin_sdk::AbiFingerprint::current_build(
+        "crate_proxyllm_v1",
+        "api_v2",
+    ))
+    .expect("serialize fingerprint")
+}
+
+fn proxy_llm_docs() -> serde_json::Value {
+    serde_json::json!({
+        "plugin_id": "proxyllm",
+        "plugin_path": "proxyllm",
+        "plugin_version": "0.1.0",
+        "abi_version": 2,
+        "command_name": null,
+        "nodes": [{
+            "id": "llm_complete",
+            "summary": "proxy completion to the per-test mock upstream",
+            "input_schema": {"type": "object"},
+            "output_schema": {"type": "object"},
+            "side_effects": [],
+            "failure_modes": [],
+            "node_type": "task",
+            "agent_accessible": false
+        }],
+        "system_hint": null
+    })
+}
+
+fn sha256_of(path: &Path) -> String {
+    use sha2::{Digest, Sha256};
+    let bytes = fs::read(path).expect("read artifact");
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    hex::encode(hasher.finalize())
+}
+
 fn setup_empty_fixture() -> TempDir {
     let temp = TempDir::new().expect("tempdir");
     let fixtures = temp.path().join("fixtures");
     let artifacts = fixtures.join("artifacts");
     fs::create_dir_all(&artifacts).expect("create artifacts dir");
+
+    // 拆分后 kernel 不自带 LLM 传输，`agent_send` 需要有插件声明 `llm_complete`。
+    // 本文件的用例考的是 kernel 侧的重试/降级/auto-save，仍需要真实 HTTP 语义
+    // （503 重试、端点不可达），所以给一个把请求转发到各用例自己那个 mock server
+    // 的最小 provider：JSON 工件 + Process 执行，脚本读 payload 里的 base_url。
+    let script = temp.path().join("proxyllm.sh");
+    write_proxy_llm_script(&script);
+    let artifact = artifacts.join("proxyllm.json");
+    let docs = proxy_llm_docs();
+    fs::write(
+        &artifact,
+        serde_json::to_string_pretty(&serde_json::json!({
+            "plugin_path": "proxyllm",
+            "abi_fingerprint": abi_fingerprint_value(),
+            "docs": docs,
+            "exports": [],
+            "execution": {"kind": "process", "command": script.display().to_string(), "args": []},
+        }))
+        .expect("serialize artifact"),
+    )
+    .expect("write proxy artifact");
+    let sha = sha256_of(&artifact);
+
     fs::write(
         artifacts.join("index.json"),
-        r#"{
-  "schema_version": 2,
-  "generated_at": "2026-07-23T00:00:00Z",
-  "topo_order": [],
-  "entries": []
-}
-"#,
+        serde_json::to_string_pretty(&serde_json::json!({
+            "schema_version": 2,
+            "generated_at": "2026-07-23T00:00:00Z",
+            "topo_order": ["proxyllm"],
+            "entries": [{
+                "plugin_path": "proxyllm",
+                "version": "0.1.0",
+                "abi_fingerprint": abi_fingerprint_value(),
+                "artifact_path": "proxyllm.json",
+                "sha256": sha,
+                "built_at": "0",
+                "parent": null,
+                "required": false,
+                "grants_from_parent": [],
+                "docs": docs,
+                "exports": [],
+                "execution": {"kind": "process", "command": script.display().to_string(), "args": []},
+                "artifact_kind": "json",
+                "build_fingerprint": "bf-proxyllm",
+                "input_probe": {"files": []},
+                "local_path_deps": []
+            }]
+        }))
+        .expect("serialize index"),
     )
-    .expect("write empty artifact index");
+    .expect("write artifact index");
     // fixtures root 目录名是 "fixtures"，`discover_config_dir` 走同级分支 →
     // `temp/config`，与本文件写 llm_api.yaml 的目录一致。
     pin_private_snapshot_root(temp.path(), &fixtures);

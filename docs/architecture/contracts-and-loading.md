@@ -191,6 +191,41 @@ required 子插件失败后，`Loader::propagate_parent_failure()` 会沿着 req
 
 kernel 默认实现：`FileSoulProvider`（`data/souls/{sanitized_key}.json`）。覆写样例：`fixtures/plugins/soul_store`（rusqlite bundled，`data/souls.db`）。
 
+### 4.3 LLM provider（`llm_complete`，2026-08-05）
+
+声明 `llm_complete` 的已加载插件即成为 LLM 传输层。**这是唯一一个 kernel 不留内建
+默认的能力**：没有 provider 插件时 `agent_send` 返回 `NoLlmProvider`，而 boot / REPL /
+指令路由（`/status`、`/help`）照常工作。理由见 CLAUDE.md 判断标准里的"刻意例外"。
+
+- 入参 payload：
+  - `body`: object — **供应商请求体，由 kernel 构造后原样透传**（消息拼装、工具规格、
+    温度/长度上限都在 kernel 侧完成）。插件负责把它送出去。
+  - `transport`: `{ base_url, api_key_env, organization?, project?, timeout_ms,
+    stream_timeout_secs }` — 端点与超时。**不含明文 api_key**：该结构体会被序列化进
+    调用 payload，带上密钥等于扩大日志与崩溃快照的泄露面；插件按 `api_key_env` 在
+    请求时自行从进程环境读取。端点路径（如 `/chat/completions`）由插件按 `base_url`
+    自己拼——kernel 不知道任何供应商专有的 URL 形状。
+  - `sink_addr?` / `sink_key?`: string — token 流式旁路，见下。
+- 出参：`{ ok: true, message: LlmMessage, response_id?, finish_reason? }`
+  或 `{ ok: false, error: string }`。
+  `LlmMessage.tool_calls` **必须结构化返回**——agent 循环在本轮中途就要据此分派工具，
+  只回文本的 provider 驱动不了工具调用。
+
+**token 流式旁路**：`sink_addr` 存在时，插件可边读上游边把增量写到该 TCP 回环地址，
+行分隔 JSON，首帧必须是 `{"t":"key","key":"<sink_key>"}` 握手，随后
+`{"t":"reasoning","d":"…"}` / `{"t":"content","d":"…"}`。**这是纯旁路**：连不上、
+写失败、或整个忽略 `sink_addr` 都不影响结果——权威补全始终由本次调用的返回值给出，
+host 侧监听器在预算内超时后自行收工。`sink_key` 用于并发下拒绝串台连接
+（invoke 不持锁、`handle` 可被多会话并发进入）。
+
+**实现约束**：provider 插件应把节点声明为 `NodeType::Task`（`task_node_doc`）。
+Router 节点每次 invoke 后会 `dlclose`，而 HTTP 客户端（reqwest 等）会在 dylib 里注册
+TLS 析构函数，进程退出时那些指针已随 unmap 失效 → segfault。`TASK_LIBRARIES` 对 Task
+节点保持 dylib 常驻，规避该问题。同理，插件在 `handle` 里 spawn 的任何线程都必须在
+返回前 join。
+
+样例：`fixtures/plugins/llm_openai`（OpenAI 兼容，含 SSE 解析与 5xx 重试）。
+
 ### 4.2 指令入口（`command_name` + `command_entry`）
 
 插件 docs 声明 `command_name` 且暴露 `command_entry` 节点时，`/{command_name} <args>` 由指令路由器（不经 LLM）分发到该节点，payload：`{ args, session_key, sender_id, conversation_kind }`；回复取响应 JSON 的 `message` 字段（缺失则用原始 payload 文本）。

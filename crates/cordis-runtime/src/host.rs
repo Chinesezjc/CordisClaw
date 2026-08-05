@@ -1920,6 +1920,112 @@ impl crate::soul::SoulProvider for PluginSoulProvider<'_> {
     }
 }
 
+/// 经插件执行补全的 [`LlmProvider`](crate::agent::LlmProvider) 实现。
+///
+/// 形状照 `PluginSoulProvider`：构造 payload → `host.invoke` → 解析回复。
+/// 差别在于多一条 token 旁路——存在 sink 时先绑一个回环监听器，把地址与握手
+/// key 一并放进 payload，插件边读上游边把增量写回来。
+pub(crate) struct PluginLlmProvider<'a> {
+    pub(crate) host: &'a RuntimeHost,
+    pub(crate) plugin_path: String,
+}
+
+impl crate::agent::LlmProvider for PluginLlmProvider<'_> {
+    fn complete(
+        &self,
+        body: serde_json::Value,
+        sink: Option<std::sync::Arc<dyn crate::llm_sink::TokenSink>>,
+        transport: cordis_plugin_sdk::llm::LlmTransportConfig,
+    ) -> Result<crate::agent::LlmCompletionParts, RuntimeError> {
+        // 流式预算沿用配置里的每块超时，与拆分前的语义一致。
+        let budget = std::time::Duration::from_secs(transport.stream_timeout_secs.max(1));
+        let listener =
+            sink.and_then(|sink| crate::llm_sink::SinkListener::bind(sink, new_sink_key(), budget));
+
+        let mut payload = serde_json::json!({
+            "node_id": "llm_complete",
+            "body": body,
+            "transport": transport,
+        });
+        attach_sink_fields(
+            &mut payload,
+            listener.as_ref().map(|l| (l.addr(), l.key().to_string())),
+        );
+
+        let response = self
+            .host
+            .invoke(&self.plugin_path, "llm_complete", payload.to_string())?;
+        // 监听器在此 drop：补全已返回，旁路无需再等。
+        drop(listener);
+        parse_llm_reply(&self.plugin_path, &response.payload)
+    }
+}
+
+/// 把 sink 坐标写进调用 payload；`None` 表示调用方不要流式，两个字段整个不出现
+/// （插件据此走非流式）。
+///
+/// 抽成纯函数：起一个真监听器只为了拼两个字段太重，而"带/不带 sink"两条路径都
+/// 必须被测到。
+pub(crate) fn attach_sink_fields(payload: &mut serde_json::Value, sink: Option<(String, String)>) {
+    let Some((addr, key)) = sink else { return };
+    payload["sink_addr"] = serde_json::Value::String(addr);
+    payload["sink_key"] = serde_json::Value::String(key);
+}
+
+/// 解析 provider 插件的回复。
+///
+/// 抽成自由函数以便直接单测每条失败路径（非 JSON / ok=false / 缺 message），
+/// 不必真起一个插件。
+pub(crate) fn parse_llm_reply(
+    plugin_path: &str,
+    raw: &str,
+) -> Result<crate::agent::LlmCompletionParts, RuntimeError> {
+    let value: serde_json::Value =
+        serde_json::from_str(raw).map_err(|e| RuntimeError::InvalidArgument {
+            message: format!("llm_complete reply from {plugin_path} is not JSON: {e}"),
+        })?;
+    if value.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+        let detail = value
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("provider reported failure without an error message");
+        return Err(RuntimeError::LlmRequestFailed {
+            message: format!("{plugin_path}: {detail}"),
+        });
+    }
+    let message = value
+        .get("message")
+        .cloned()
+        .ok_or_else(|| RuntimeError::InvalidArgument {
+            message: format!("llm_complete reply from {plugin_path} has no message field"),
+        })?;
+    let message = serde_json::from_value(message).map_err(|e| RuntimeError::InvalidArgument {
+        message: format!("llm_complete reply from {plugin_path} has a malformed message: {e}"),
+    })?;
+    Ok(crate::agent::LlmCompletionParts {
+        message,
+        response_id: value
+            .get("response_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        finish_reason: value
+            .get("finish_reason")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+    })
+}
+
+/// 每次调用一个新 key。端口本就一调用一换，key 是并发下拒绝串台连接的第二道闸。
+fn new_sink_key() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    format!(
+        "sink-{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
 #[derive(Debug)]
 pub(crate) struct ManagedAgentSession {
     #[allow(dead_code)]
@@ -2237,6 +2343,29 @@ impl RuntimeHost {
             }
         }
         Box::new(crate::soul::FileSoulProvider::new(&self.data_dir()))
+    }
+
+    /// 找出承担 LLM 补全的插件。
+    ///
+    /// 与 `soul_provider` 同一套能力节点约定：任何已加载且声明 `llm_complete`
+    /// 节点的插件即成为 provider。**没有内建兜底**——LLM 传输已整体移出 kernel，
+    /// 无插件时返回 `None`，调用方据此给 `NoLlmProvider`。
+    ///
+    /// 这不影响冷启动：boot / REPL / `command_router` 都不经此路径，无插件时
+    /// 它们照常工作，只有 `agent_send` 会失败（与今天"LLM 不可达"同构）。
+    pub(crate) fn llm_provider_plugin(&self) -> Option<String> {
+        let snapshot = self.current_snapshot();
+        for (plugin_path, plugin) in snapshot.plugin_registry().iter() {
+            let loaded_docs = plugin
+                .docs
+                .as_ref()
+                .filter(|_| plugin.load_result == crate::core::models::PluginLoadResult::Loaded);
+            let Some(docs) = loaded_docs else { continue };
+            if docs.nodes.iter().any(|n| n.id == "llm_complete") {
+                return Some(plugin_path);
+            }
+        }
+        None
     }
 
     pub fn get_soul(&self, soul_key: &str) -> Result<Option<crate::soul::Soul>, RuntimeError> {
@@ -5205,17 +5334,27 @@ impl ManagedAgentSession {
     }
 
     fn respond(&mut self, host: &RuntimeHost, input: &str) -> Result<AgentReply, RuntimeError> {
+        // 无 provider 插件时两种 state 的结论相同（都只能报 NoLlmProvider），
+        // 所以先统一判定，省掉两条各自的 None 分支。
+        let Some(plugin_path) = host.llm_provider_plugin() else {
+            return Err(RuntimeError::NoLlmProvider);
+        };
+        let provider = PluginLlmProvider { host, plugin_path };
         match &mut self.state {
-            ManagedAgentState::RuntimeShell => {
-                self.session
-                    .respond_with_runtime_host(host, &self.handle.session_id, input)
-            }
+            ManagedAgentState::RuntimeShell => self.session.respond_with_runtime_host_via(
+                host,
+                &self.handle.session_id,
+                input,
+                &provider,
+                None,
+            ),
             ManagedAgentState::PluginIteration(state) => {
                 let mut backend = PluginIterationAgentBackend {
                     host,
                     state: state.as_mut(),
                 };
-                self.session.respond(&mut backend, input)
+                self.session
+                    .respond_with_provider(&mut backend, input, &provider, None)
             }
         }
     }
@@ -8386,6 +8525,94 @@ mod tests {
             !snapshot_staging_lock::lock_path(&held).exists(),
             "the sibling lock file must not accumulate"
         );
+    }
+
+    /// provider 插件回复的解析：成功与三类失败。
+    ///
+    /// 抽成自由函数就是为了这个——每条失败路径直接喂字符串即可覆盖，不必真起
+    /// 一个会返回畸形数据的插件。
+    #[test]
+    fn parse_llm_reply_accepts_a_well_formed_completion() {
+        let parts = super::parse_llm_reply(
+            "llm_openai",
+            r#"{"ok":true,"message":{"content":"hi","tool_calls":[]},
+                "response_id":"r1","finish_reason":"stop"}"#,
+        )
+        .expect("well-formed reply");
+        assert_eq!(parts.message.content.as_deref(), Some("hi"));
+        assert_eq!(parts.response_id.as_deref(), Some("r1"));
+        assert_eq!(parts.finish_reason.as_deref(), Some("stop"));
+    }
+
+    #[test]
+    fn parse_llm_reply_surfaces_provider_reported_failure() {
+        let err = super::parse_llm_reply("llm_openai", r#"{"ok":false,"error":"upstream 500"}"#)
+            .expect_err("ok=false must fail");
+        let text = err.to_string();
+        assert!(text.contains("upstream 500"), "{text}");
+        assert!(
+            text.contains("llm_openai"),
+            "should name the plugin: {text}"
+        );
+
+        // ok=false 但没给 error：仍要失败，且给出可读的兜底说明。
+        let err = super::parse_llm_reply("p", r#"{"ok":false}"#).expect_err("must fail");
+        assert!(
+            err.to_string().contains("without an error message"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn parse_llm_reply_rejects_malformed_payloads() {
+        // 非 JSON。
+        let err = super::parse_llm_reply("p", "not json").expect_err("must fail");
+        assert!(err.to_string().contains("is not JSON"), "{err}");
+        // ok=true 但缺 message。
+        let err = super::parse_llm_reply("p", r#"{"ok":true}"#).expect_err("must fail");
+        assert!(err.to_string().contains("no message field"), "{err}");
+        // message 结构不对。
+        let err = super::parse_llm_reply("p", r#"{"ok":true,"message":"a string"}"#)
+            .expect_err("must fail");
+        assert!(err.to_string().contains("malformed message"), "{err}");
+    }
+
+    /// 带 sink 时两个字段出现；不带时整个不出现——插件据此判定走非流式。
+    #[test]
+    fn attach_sink_fields_is_all_or_nothing() {
+        let mut with = serde_json::json!({"node_id": "llm_complete"});
+        super::attach_sink_fields(
+            &mut with,
+            Some(("127.0.0.1:5300".to_string(), "k1".to_string())),
+        );
+        assert_eq!(with["sink_addr"], serde_json::json!("127.0.0.1:5300"));
+        assert_eq!(with["sink_key"], serde_json::json!("k1"));
+
+        let mut without = serde_json::json!({"node_id": "llm_complete"});
+        super::attach_sink_fields(&mut without, None);
+        assert!(without.get("sink_addr").is_none());
+        assert!(without.get("sink_key").is_none());
+    }
+
+    /// 摘要截断：超长加省略号，不超长原样返回。
+    #[test]
+    fn truncate_agent_excerpt_text_adds_ellipsis_only_when_cut() {
+        // 空白被压平成单空格。
+        assert_eq!(super::truncate_agent_excerpt_text("a   b\n c", 32), "a b c");
+        // 恰好等于上限：不加省略号。
+        assert_eq!(super::truncate_agent_excerpt_text("abcde", 5), "abcde");
+        // 超出：截断并加省略号。
+        assert_eq!(super::truncate_agent_excerpt_text("abcdef", 5), "abcde...");
+    }
+
+    /// sink key 每次调用都不同——端口本就一调用一换，key 是并发下拒绝串台
+    /// 连接的第二道闸，重复就失去意义。
+    #[test]
+    fn sink_keys_are_unique_per_call() {
+        let a = super::new_sink_key();
+        let b = super::new_sink_key();
+        assert_ne!(a, b);
+        assert!(a.starts_with("sink-"), "{a}");
     }
 
     /// journal **同名目录**不算 journal，必须照常回收。

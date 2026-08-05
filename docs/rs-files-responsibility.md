@@ -7,6 +7,7 @@
 | 文件 | 职责定位 | 关键入口 |
 |---|---|---|
 | `crates/cordis-plugin-sdk/src/lib.rs` | shell/expr 等外部 dylib 插件共用的 Rust ABI、docs helper 与导出宏 | `RustPluginApiV2`、`plugin_docs()`、`node_doc()`、`export_plugin_api!` |
+| `crates/cordis-plugin-sdk/src/llm.rs` | kernel↔provider 插件的 LLM 契约类型；只以 JSON 过 payload，不改 vtable 布局故无需 ABI bump | `LlmCompletionRequest`、`LlmCompletion`、`LlmMessage`、`LlmStreamFrame` |
 | `crates/cordis-plugin-sdk/src/workflow.rs` | 非宏 async workflow 作者接口：受控 await 原语、wait 句柄、runtime 提交/轮询/取消边界 | `WorkflowRuntime`、`WorkflowSession`、`WaitSpec`、`WaitFuture` |
 
 ## 2. Core 层 (`crates/cordis-runtime/src/core`)
@@ -69,6 +70,10 @@
 
 ## 6b. Agent 层 (`crates/cordis-runtime/src/agent.rs`)
 
+> **不含 LLM 传输**：与供应商对话的 HTTP/SSE、鉴权、重试、wire format 已整体
+> 移出到 `fixtures/plugins/llm_openai`（2026-08-05）。本层只构造请求体、经
+> `LlmProvider` trait 拿回结构化补全，并负责轮次编排/工具分发/历史压缩。
+
 | 职责定位 | 关键入口 |
 |---|---|
 | 统一的 LLM agent 会话：SSE 流解析、tool-calling loop（最多 96 轮，overflow 保留 partial history P1-31）、重试/超时管理（4xx 不重试 P1-35，budget 合并 P1-37）、消息历史（compact 后重算 estimated_tokens P1-32、UTF-8 char/byte 一致 P1-33）、orphan-User cleanup（P2-31）；两个后端：`RuntimeShellAgentBackend`（20 个交互式工具；P2-1 边界收敛待做）和 `PluginIterationAgentBackend`（scaffold/edit/verify 工具集） | `AgentSession::respond` / `respond_inner`、`ShellAgentSession`、`AgentToolHost` trait、`PendingSessionAction`（P1-25 self-lookup 侧信道） |
@@ -95,6 +100,7 @@
 |---|---|---|
 | `crates/cordis-runtime/src/lib.rs` | crate 对外模块导出 | `pub mod core/.../kernel`、`#[cfg(test)] mod testutil` |
 | `crates/cordis-runtime/src/testutil.rs` | `#[cfg(test)]` 单测公共工具：全 crate 唯一的 euid 特权探测点，root 下声明式跳过文件权限故障注入测试 | `skip_if_root()` |
+| `crates/cordis-runtime/src/llm_sink.rs` | token 流式旁路的 host 侧：TCP 回环监听、行分隔 JSON 帧解析、握手校验。帧判定与超时判定抽成纯函数以便全覆盖 | `SinkListener::bind()`、`classify_frame()`、`TokenSink` |
 | `crates/cordis-runtime/src/host.rs` | 常驻宿主：持有当前快照、执行原子 `reload`、保留 kernel 状态并清理 retired snapshots；snapshot 目录 GC（跨 hash 目录孤儿回收 + 退出时回收 live staged root） | `RuntimeHost::boot()`、`RuntimeHost::reload()`、`cleanup_orphaned_snapshot_roots()`、`RuntimeHost::cleanup_live_snapshot()` |
 | `crates/cordis-runtime/src/main.rs` | 运行入口示例（加载 fixtures、`serve`、通用 invoke、导出图 HTML、运行 auto-update、`gc` 回收 snapshot 目录） | `main()` |
 
@@ -198,7 +204,7 @@
 2. `core/models.rs` + `core/error.rs`（runtime 专属契约与错误语义）。
 3. `plugin/package.rs` + `plugin/loader.rs`（发现/解析/实例化主流程）。
 4. `context/mod.rs`（注入链、overlay、CAS、Service 生命周期）。
-5. `agent.rs`（LLM agent 会话、工具执行、流式输出）。
+5. `agent.rs`（agent 会话、工具执行、轮次编排；传输已移出至 provider 插件）。
 6. `host.rs`（常驻宿主、iterate_plugins、自迭代 agent loop、回退安全网）。
 7. `execution/net.rs` + `execution/gate.rs` + `execution/actor.rs`（执行语义骨架）。
 8. `execution/engine.rs` + `execution/router.rs`（CPN 运行时集成与子图边界）。

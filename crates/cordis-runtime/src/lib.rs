@@ -6,6 +6,7 @@ pub mod core;
 pub mod execution;
 pub mod host;
 pub mod kernel;
+mod llm_sink;
 pub mod plugin;
 pub mod service;
 pub mod soul;

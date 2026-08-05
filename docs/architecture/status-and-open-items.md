@@ -2,7 +2,7 @@
 
 ## 1. 判定口径
 
-- 本文基于当前仓库现状整理，最近更新：2026-07-29。
+- 本文基于当前仓库现状整理，最近更新：2026-08-05。
 - 历史规划蓝图已经吸收进 [design-blueprint.md](./design-blueprint.md)，因此本文结论来自三类证据的交叉比对：
   - 设计蓝图：[design-blueprint.md](./design-blueprint.md)
   - 架构文档：[system-overview.md](./system-overview.md)、[contracts-and-loading.md](./contracts-and-loading.md)、[runtime-semantics.md](./runtime-semantics.md)、[maintenance-guide.md](./maintenance-guide.md)
@@ -238,7 +238,75 @@ Agent 现在可以自主完成：读代码 → 理解结构 → 写/改文件 �
 - [x] **Plugin iteration symlink 逃逸**（P0-20）— `PluginEditExecutor::execute` 在写入前调用新 helper `resolve_under_workspace`：canonicalize 结果必须仍在 workspace_root 下。plugins 内的 symlink 指向 `/etc/passwd` 之类无法被写入。
 - [x] **Verifier shell 拼接**（P0-21）— 已随 A 批 P0-1 修复。`discover_rust_workspace_manifest` 输出的字符串被 `shell_words` 解析成 argv，空格 / `$` / `;` 无法被解释。
 
-### 5.2.36 snapshot 目录无界增长 + 磁盘满伪装成逻辑错误（2026-07-28）
+### 5.2.38 LLM 传输层拆出 kernel（2026-08-05）
+
+**动机**：配置里有 `provider: openai|deepseek`，但**全仓没有一处按它分支 wire format**
+（只在 `agent.rs` 当白名单闸门用）——所谓 DeepSeek 支持就是同一套 OpenAI 格式换个
+`base_url`。要接 Anthropic（wire format 不兼容）或本地模型无处下手。拆完之后换
+provider = 写一个插件，`provider` 字段第一次真正有意义。
+
+- [x] **SDK 新增 `llm` 契约模块**（C1）— `LlmCompletionRequest` / `LlmCompletion` /
+  `LlmMessage` / `LlmToolCall` / `LlmStreamFrame` / `LlmTransportConfig`。这些类型
+  **只以 JSON 穿过 `PluginRequest/PluginResponse.payload`**，从不作为裸结构体跨 FFI，
+  因此 vtable 布局不变、`api_hash` 保持 `api_v2`、既有插件无需重建。
+  `LlmCompletionRequest.body` 是不透明 `Value`：kernel 保留唯一一份请求体构造逻辑，
+  wire format 差异完全封在插件内部。`LlmMessage.tool_calls` 必须结构化返回——agent
+  循环在**本轮中途**就要据此分派工具，只回文本的 provider 驱动不了工具调用。
+- [x] **`LlmProvider` 接缝**（C2）— `respond_inner` 从直调 `send_chat_request` 改为经
+  trait。provider/sink 作**参数**而非 `AgentSession` 字段：该结构体 derive 了
+  `Debug + Clone` 且会被快照序列化，塞 `dyn Trait` 会同时破坏这三者。本步行为逐字节
+  不变（`DirectHttpProvider` 原样转调），把"引入接缝"与"搬走实现"拆成两个可独立
+  验证的步骤。
+- [x] **`llm_openai` 插件**（C3）— 传输整体搬入 `fixtures/plugins/llm_openai`。
+  搬运按大括号配平精确切块、每块自检、改写只用断言过出现次数的定点替换；第一次用
+  宽松正则批量改写吃掉了 `format!` 的 `{}` 占位符并破坏块边界，已推倒重来。
+  三处非纯搬运的实质调整：(a) **传输层不再打印任何东西**——拆分前逐 token 的 stdout
+  输出内联在 SSE 读取里，这正是 inbox/serve 关不掉流式的根因；(b) **API key 只从
+  环境变量读**，契约类型刻意不带明文 key（它要序列化进 payload）；(c) 错误类型
+  `RuntimeError` → `String`，插件不依赖 kernel 的错误枚举。
+- [x] **kernel 接线 + token 旁路**（C4）— `llm_provider_plugin()` 照 `soul_provider()`
+  扫描声明 `llm_complete` 的已加载插件；`PluginLlmProvider` 照 `PluginSoulProvider`
+  构造 payload → invoke → 解析。新增 `llm_sink` 模块做 host 侧监听：TCP 回环 +
+  行分隔 JSON，首帧 `{"key":...}` 握手。**这些新代码进受门槛的文件并真补到 100%**，
+  没有蹭 `agent.rs` 的既有豁免——做法是把判定抽成纯函数
+  （`classify_frame(line, expected_key, handshaked)`，`handshaked` 作**入参**而非内部
+  状态，两种取值的所有分支都能被单测驱动；`deadline_exceeded(elapsed, budget)` 同理
+  不依赖真实时钟）。
+- [x] **删除内建传输**（C5）— 807 行整体删除，kernel 里 `reqwest::` /
+  `chat/completions` / `Bearer` 引用归零。`AgentSession` 去掉 `client` 字段，连带
+  `new`/`swap_config`/`from_snapshot` 各少一条错误臂。无插件时 `respond` 直接返回
+  `NoLlmProvider`。
+
+**为什么 kernel 不留兜底**：见 CLAUDE.md 判断标准里那条"刻意例外"——去掉 provider
+插件后 agent 仍能启动、看代码、跑测试，只是不能跟模型说话；而传输高度供应商专有，
+留一份 OpenAI 实现既不通用又会让 `provider` 继续名存实亡。
+
+**为什么流式不用 dlsym 回调**（最初设想，已否决）：仓库自己的 SDK 测试
+（`agent_trigger_success_branch_via_dlopened_provider` 一带）已记录
+**测试二进制与 macOS 下 `dlsym(RTLD_DEFAULT)` 拿不到宿主符号**，且
+`.cargo/config.toml` 的 `-Wl,-E` 只配了 `x86_64-unknown-linux-gnu`、只作用于可执行
+文件（`_cordis_agent_trigger` 定义在 `main.rs`）。`agent_trigger` 在符号缺失时静默
+no-op——对"可选消息注入"可接受，对流式则意味着 REPL 在测试里永远静默且不报错。
+其 C 签名 `fn(*const c_char)` 也无法区分并发会话。TCP 回环没有这些问题，且本就是
+仓库既有手法（mock LLM server）。
+
+**踩到的坑：`dlopen` 下 segfault（exit=139）**。端到端跑 `invoke llm_openai
+llm_complete` 直接段错误，而同样代码进程内测试 9/9 全过。gdb 回溯显示崩在
+`__GI___call_tls_dtors` → `__run_exit_handlers` → `std::process::exit`：reqwest 的
+blocking client 在插件 dylib 里注册了 TLS 析构函数，而 `LoadedDylibApi` 持有
+`Library`、invoke 一返回就 `dlclose` → 代码段 unmap，进程退出时那些析构指针已失效。
+排除过程：不是重试逻辑（进程内连发 3 次失败请求正常）、不是 `env::var`、不是 client
+构造、也不是"插件里做 HTTP"本身（`web` 同样 reqwest+rustls+dlopen 且真发请求不崩，
+差别在于它没让 reqwest 运行时注册 TLS 析构）。**修法**：`llm_complete` 改用
+`task_node_doc`——`TASK_LIBRARIES` 对 `NodeType::Task` 的插件保持 dylib 常驻
+（qq/feishu 已靠它 spawn 长期线程），dylib 不再被 dlclose。同源另修一个真 bug：
+SSE 读取线程原本**故意不 join**（kernel 里原注释称其"有界且自清理"），该前提在
+插件里不成立，改为外层包一圈、所有返回路径无条件 join。
+
+**遗留**：`docs/agent/interfaces.json` 必须与 dylib 内嵌 docs 逐字段一致（loader
+交叉校验），故由 `examples/dump_docs.rs` 从 `docs_value()` 单一来源生成，不手写。
+
+### 5.2.37 snapshot 目录无界增长 + 磁盘满伪装成逻辑错误（2026-07-28）
 
 - [x] **根因 A：staged snapshot 目录跨 hash 目录无人回收。** `default_snapshot_root`（host.rs）取 fixtures root canonical 路径的 sha256 得 `{temp_dir}/cordis-runtime-host/{hash}/`，其下每次 boot / reload / plugin-iteration attempt 建一个 `snapshot-{pid}-{nanos}/` 并 `fs::copy` 一整份插件工件（P0-15 之后不再用 hard_link，是实打实的字节拷贝，单份约 120–250 MB）。回收此前只有两条路径且都盖不住主泄漏源：`cleanup_stale_snapshot_dirs` **只扫当次 boot 解析出的那一个 hash 目录内部**，从不遍历兄弟目录；`cleanup_retired_snapshots` 只管 reload 时被退休的快照（上限 `MAX_RETIRED_SNAPSHOTS = 64`）。而集成测试每次把 fixtures 拷进新 `TempDir` → 路径不同 → 全新 hash 目录，老目录永远等不到"下次 boot 扫到它"，因为那个 hash 再也不会出现。**实测本机 `$TMPDIR/cordis-runtime-host` 累积 196 GB / 13206 个 hash 目录**（macOS 的 `$TMPDIR` 在 `/var/folders/...`，不是 `/tmp`）；远端 Linux 同症状，3 天 66 G 撑满 178 G 盘。
 - [x] **根因 B：`RuntimeHost` 无 `Drop`。** live snapshot 的 staged root 没有任何路径负责，boot 后不 reload 直接退出即原地留下，叠加根因 A 成为永久孤儿。
@@ -738,7 +806,7 @@ cd fixtures/plugins/expr/lexer && cargo test --lib  # excluded, external tests o
 - [x] **`reload_subtree` stop 走 FFI 加 `catch_unwind`**（P1-19）— 每次 Task stop 调用被 `panic::catch_unwind(AssertUnwindSafe(...))` 包裹；插件 stop 处理器 panic 不再跨 C ABI unwind（UB）也不再让整个 reload 崩。panic message 落到 stderr。
 - [x] **Phase-1 pre-loaded dylib 生命周期澄清**（P1-20）— 加显式注释：`_dylib` 是 struct-owned by-value handle，drop 于 fn return（Phase 2 之后）；invoke 路径每次自开 `LoadedDylibApi::open`，registry 不缓存函数指针，无 dangling reference。原 concern 事实上不构成 bug，但注释固化契约。
 - [x] **`reload_subtree` 新 snapshot_id**（P1-21）— `to_snapshot_id` 使用 `make_snapshot_dir_name()` 生成新 id；invocation trace 现在能区分 reload 前后。
-- [x] **`retired_snapshots` 加上限**（P1-22）— 除 Weak-dead 清理外，硬上限 `MAX_RETIRED_SNAPSHOTS = 64`，超出时按 FIFO 丢弃最旧的 `staged_artifact_root` + 目录；长活 agent session pin snapshot 也只能 leak 有限前缀。（2026-07-28 补：这条只覆盖 reload 时被退休的快照；跨 hash 目录的孤儿与 live snapshot 的回收见 5.2.36。）
+- [x] **`retired_snapshots` 加上限**（P1-22）— 除 Weak-dead 清理外，硬上限 `MAX_RETIRED_SNAPSHOTS = 64`，超出时按 FIFO 丢弃最旧的 `staged_artifact_root` + 目录；长活 agent session pin snapshot 也只能 leak 有限前缀。（2026-07-28 补：这条只覆盖 reload 时被退休的快照；跨 hash 目录的孤儿与 live snapshot 的回收见 5.2.37。）
 - [x] **`plugin_history` 加 eviction**（P1-23）— hard cap `MAX_PLUGIN_HISTORY = 1024`；每次 `push_front` 后 `pop_back` 到上限内。之前 unbounded VecDeque 长运行会 OOM。
 - [x] **Session 若干次要问题**（P1-24）— (a) 新 `delete_session_snapshot(session_id)` API，让 completed/reset 的 session 从磁盘摘除；(b) `detect_crash_and_recover` 用 `session.kind()` 决定 `AgentSessionKind`（`plugin_iteration` 走 PluginIteration 而不是硬编码 RuntimeShell）；(c) auto-save 的 tmp 文件名从共用 `.<id>.json.tmp` 换成 `.<id>.json.tmp.<seq>`（atomic 计数器），并发 `agent_send` 同一 session 不再互踩。
 
@@ -825,6 +893,41 @@ cd fixtures/plugins/expr/lexer && cargo test --lib  # excluded, external tests o
 - [ ] `cdylib` — 跨版本稳定 ABI
 - [ ] `WASM` — 第三方插件沙盒
 - [ ] `external process` — 不可信插件隔离
+
+### 5.6.1 覆盖率文件级豁免清理（2026-08-03 实测，待开工）
+
+`coverage.yml` 的 `--ignore-filename-regex 'cordis-runtime/src/(main|agent)\.rs'` 声称理由是
+"进程/网络边界"，但**实测该理由对绝大部分内容并不成立**——去掉排除后跑一次全量覆盖：
+
+```
+29564/31950 = 92.5321%，未覆盖 2386 行（agent.rs 1201 / main.rs 1185）
+```
+
+按性质分类后，真正的边界代码只占极小部分：
+
+| 类别 | agent.rs | main.rs |
+|---|---|---|
+| 真·网络边界（reqwest / SSE） | 6 | 0 |
+| 真·进程/信号/REPL（`process::exit`/`ctrlc`/`sigaction`） | 0 | 22 |
+| stdout 打印 | 30 | 135 |
+| 错误臂 | 57 | 42 |
+| 花括号/空行 | 234 | 206 |
+| **其它（普通可测逻辑）** | **874** | **780** |
+
+`agent.rs` 最大的未覆盖块是 `agent_read_file` / `agent_run_command` / `agent_delete_file` /
+`agent_list_directory` / `execute_agent_tool_call`，即 `AgentToolHost` 的 ~35 个工具方法体；
+抽样内容是文件大小上限判断与 argv 分词这类纯逻辑，与网络无关。**整文件排除顺带免测了
+1600+ 行普通逻辑，排除范围远超其自称理由。**
+
+两个文件性质不同，工作量不可一概而论：
+- **`agent.rs`**：基本是纯补测，可测性无障碍。
+- **`main.rs`**：最大块是 `fn main`（75 行）与 `run_llm_auto_update` / `run_auto_update` /
+  `run_execute` 等 CLI 入口，要覆盖需把 argv 分发抽成可测函数——是**重构**而非补测；
+  另有 `serve_usage` 34 行纯字符串，以及 22 行确实碰不到的 `process::exit`/信号安装。
+
+**为什么单独成批**：与 LLM 拆分批（正在移动 `agent.rs` 内容）同时进行会制造冲突，且
+混合后的 PR（1600 行补测 + 架构重构）无法有效 review。待 LLM 拆分落地、`agent.rs`
+体量稳定后再开。
 
 ### 5.7 服务边界稳定化
 

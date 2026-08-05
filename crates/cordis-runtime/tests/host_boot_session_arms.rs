@@ -162,18 +162,138 @@ api_hash = "api_v2"
 }
 
 /// Build the workspace and materialize `artifacts/` from the plugin sources.
+/// 写一个"假 LLM provider"插件：JSON 工件 + `Process` 执行，用一段 shell 脚本
+/// 把请求原样吞掉、回一条固定补全。
+///
+/// 拆分后 kernel 不再自带传输，`agent_send` 需要有插件声明 `llm_complete` 才能
+/// 工作。这些用例考的是 auto-save 与 profile fallback（kernel 侧逻辑），不是
+/// wire，因此用最轻的假 provider 而不是拖进真的 `llm_openai` + mock HTTP。
+///
+/// `reply` 为空串表示"总是失败"，用于 fallback 的失败分支。
+fn write_fake_llm_plugin(plugins_root: &Path, name: &str) {
+    let dir = plugins_root.join(name);
+    for sub in ["src", "tests", "docs/human", "docs/agent"] {
+        fs::create_dir_all(dir.join(sub)).expect("create plugin scaffold dir");
+    }
+    fs::write(
+        dir.join("Cargo.toml"),
+        format!(
+            r#"[package]
+name = "{name}"
+version = "0.1.0"
+edition = "2021"
+
+[package.metadata.cordis]
+plugin_path = "{name}"
+abi_kind = "rust"
+declared_nodes = ["llm_complete"]
+children = []
+
+[package.metadata.cordis.abi_fingerprint]
+crate_hash = "crate_{name}_v1"
+api_hash = "api_v2"
+
+# JSON 工件 + Process 执行：无需编译 dylib，脚本即 provider。
+[package.metadata.cordis.artifact.execution]
+kind = "process"
+command = "{name}_fake.sh"
+args = []
+"#
+        ),
+    )
+    .expect("write plugin manifest");
+    fs::write(dir.join("src/lib.rs"), "pub fn stub() {}\n").expect("write plugin source");
+    fs::write(dir.join("tests/smoke.rs"), "fn main() {}\n").expect("write plugin test");
+    fs::write(dir.join("docs/human/overview.md"), "# fake llm\n").expect("write human doc");
+    fs::write(
+        dir.join("docs/agent/interfaces.json"),
+        r#"{
+  "plugin_id": "PLUGIN",
+  "plugin_path": "PLUGIN",
+  "plugin_version": "0.1.0",
+  "abi_version": 2,
+  "command_name": null,
+  "nodes": [
+    {
+      "id": "llm_complete",
+      "summary": "fake completion",
+      "input_schema": { "type": "object" },
+      "output_schema": { "type": "object" },
+      "side_effects": [],
+      "failure_modes": [],
+      "node_type": "task",
+      "agent_accessible": false
+    }
+  ],
+  "system_hint": null
+}
+"#
+        .replace("PLUGIN", name),
+    )
+    .expect("write agent doc");
+}
+
+/// 落盘假 provider 的执行脚本。
+///
+/// 必须在 `prepare_artifacts` **之后**调用：`PrepareMode::Full` 会清空
+/// `fixtures/artifacts/`。脚本放该目录下并以裸文件名引用——命令路径相对 artifact
+/// 目录解析，且会被 stage 进 snapshot root，相对路径一旦逃出该根
+/// （如 `../../plugins/...`）会被安全检查拒绝。
+fn write_fake_llm_script(fixtures_root: &Path, name: &str, reply: &str) {
+    let artifacts = fixtures_root.join("artifacts");
+    fs::create_dir_all(&artifacts).expect("create artifacts dir");
+    let script = artifacts.join(format!("{name}_fake.sh"));
+    // 先读完 stdin，否则 host 侧写管道会拿到 EPIPE。
+    let body = if reply.is_empty() {
+        "cat >/dev/null\nprintf '%s' '{\"ok\":false,\"error\":\"fake provider is down\"}'\n"
+            .to_string()
+    } else {
+        format!(
+            "cat >/dev/null\nprintf '%s' '{{\"ok\":true,\"message\":{{\"content\":\"{reply}\"}},\"response_id\":\"fake-1\",\"finish_reason\":\"stop\"}}'\n"
+        )
+    };
+    fs::write(&script, format!("#!/bin/sh\n{body}")).expect("write fake llm script");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("chmod script");
+    }
+}
+
 fn setup_workspace() -> Workspace {
+    setup_workspace_with_llm(&[])
+}
+
+/// `llm` 给出要额外生成的假 provider 插件（`(plugin_name, reply)`；`reply` 为空
+/// 串表示该 provider 总是失败）。
+///
+/// 拆分后 kernel 不自带 LLM 传输，凡是要走通 `agent_send` 的用例都必须有一个声明
+/// `llm_complete` 的插件在场。
+fn setup_workspace_with_llm(llm: &[(&str, &str)]) -> Workspace {
     let temp = TempDir::new().expect("tempdir");
     let root = temp.path().to_path_buf();
     let plugins_root = root.join("fixtures/plugins");
     fs::create_dir_all(&plugins_root).expect("create plugins root");
+    let mut members = vec!["demo".to_string()];
+    members.extend(llm.iter().map(|(name, _)| (*name).to_string()));
+    let members_list = members
+        .iter()
+        .map(|m| format!("\"{m}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
     fs::write(
         plugins_root.join("Cargo.toml"),
-        "[workspace]\nmembers = [\"demo\"]\nresolver = \"2\"\n",
+        format!("[workspace]\nmembers = [{members_list}]\nresolver = \"2\"\n"),
     )
     .expect("write workspace manifest");
     write_demo_plugin(&plugins_root);
+    for (name, _reply) in llm {
+        write_fake_llm_plugin(&plugins_root, name);
+    }
     prepare_artifacts(&root.join("fixtures"), PrepareMode::Full).expect("materialize artifacts");
+    for (name, reply) in llm {
+        write_fake_llm_script(&root.join("fixtures"), name, reply);
+    }
     Workspace { _temp: temp, root }
 }
 
@@ -556,7 +676,7 @@ fn write_llm_config(workspace: &Workspace, url: &str) {
 #[test]
 #[serial]
 fn auto_save_session_writes_snapshot_atomically_on_a_successful_send() {
-    let workspace = setup_workspace();
+    let workspace = setup_workspace_with_llm(&[("fakellm", "stored")]);
     let (url, requests_rx, handle) =
         spawn_chunked_mock_llm_server_sequence(vec![assistant_turn("save-ok", "stored")]);
     write_llm_config(&workspace, &url);
@@ -593,7 +713,7 @@ fn auto_save_session_writes_snapshot_atomically_on_a_successful_send() {
 #[test]
 #[serial]
 fn auto_save_session_logs_when_sessions_dir_cannot_be_created() {
-    let workspace = setup_workspace();
+    let workspace = setup_workspace_with_llm(&[("fakellm", "answered anyway")]);
     // Written before boot so nothing has created `data/` as a directory yet.
     fs::write(workspace.data_dir(), b"not a directory").expect("write data as a file");
     let (url, requests_rx, handle) =
@@ -630,7 +750,7 @@ fn auto_save_session_logs_when_sessions_dir_cannot_be_created() {
 #[test]
 #[serial]
 fn auto_save_session_logs_when_tmp_write_fails() {
-    let workspace = setup_workspace();
+    let workspace = setup_workspace_with_llm(&[("fakellm", "unsavable")]);
     let sessions_dir = workspace.sessions_dir();
     fs::create_dir_all(&sessions_dir).expect("create sessions dir");
 
@@ -695,7 +815,7 @@ fn auto_save_session_logs_when_tmp_write_fails() {
 #[test]
 #[serial]
 fn auto_save_session_cleans_tmp_when_rename_fails() {
-    let workspace = setup_workspace();
+    let workspace = setup_workspace_with_llm(&[("fakellm", "answered")]);
     let (url, requests_rx, handle) =
         spawn_chunked_mock_llm_server_sequence(vec![assistant_turn("rename-fail", "answered")]);
     write_llm_config(&workspace, &url);
@@ -1037,7 +1157,7 @@ fn walk_code_files_ctl_stops_early_and_ignores_non_directory_root() {
 #[test]
 #[serial]
 fn agent_send_with_fallback_returns_primary_error_without_a_fallback_profile() {
-    let workspace = setup_workspace();
+    let workspace = setup_workspace_with_llm(&[("fakellm", "")]);
     // Single-profile config with no `fallback:` pointer, aimed at a closed
     // loopback port so the request fails fast and deterministically.
     let config_dir = workspace.root.join("config");
@@ -1120,7 +1240,7 @@ fn agent_send_with_fallback_without_entry_is_plain_send() {
 #[test]
 #[serial]
 fn agent_send_with_fallback_restores_desired_profile_when_both_are_down() {
-    let workspace = setup_workspace();
+    let workspace = setup_workspace_with_llm(&[("fakellm", "")]);
     let config_dir = workspace.root.join("config");
     fs::create_dir_all(&config_dir).expect("create config dir");
     let dead_port = {

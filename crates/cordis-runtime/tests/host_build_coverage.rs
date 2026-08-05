@@ -751,6 +751,150 @@ fn one_tool_turn(response_id: &str, call_id: &str, name: &str, args: Value) -> V
 
 /// Write the single-profile `config/llm_api.yaml` next to the temp `fixtures`
 /// dir (the sibling-`config` layout `discover_config_dir` resolves).
+/// 生成一个"转发型"假 provider 插件：JSON 工件 + `Process` 执行，脚本用 curl 把
+/// 请求打到 `transport.base_url` 指向的 mock SSE server，再把流解析成一条补全。
+///
+/// 拆分后 kernel 不自带传输，而本用例要的是**按脚本走满 17 轮**的多轮对话——固定
+/// 回复的假 provider 撑不起来，所以保留原有 mock server 当上游，只在中间补一个
+/// 最小 provider。脚本落在 `fixtures/artifacts/` 下并以裸文件名引用：命令路径相对
+/// artifact 目录解析且会被 stage 进 snapshot root，相对路径逃出该根会被安全检查拒绝。
+fn write_proxy_llm_plugin(fixtures_root: &Path, script_path: &Path) {
+    let plugins_root = fixtures_root.join("plugins");
+    let dir = plugins_root.join("proxyllm");
+    for sub in ["src", "tests", "docs/human", "docs/agent"] {
+        fs::create_dir_all(dir.join(sub)).expect("create plugin scaffold dir");
+    }
+    fs::write(
+        dir.join("Cargo.toml"),
+        r#"[package]
+name = "proxyllm"
+version = "0.1.0"
+edition = "2021"
+
+[package.metadata.cordis]
+plugin_path = "proxyllm"
+abi_kind = "rust"
+declared_nodes = ["llm_complete"]
+children = []
+
+[package.metadata.cordis.abi_fingerprint]
+crate_hash = "crate_proxyllm_v1"
+api_hash = "api_v2"
+
+[package.metadata.cordis.artifact.execution]
+kind = "process"
+command = "PROXY_SCRIPT_PATH"
+args = []
+"#
+        .replace("PROXY_SCRIPT_PATH", &script_path.display().to_string()),
+    )
+    .expect("write plugin manifest");
+    fs::write(dir.join("src/lib.rs"), "pub fn stub() {}\n").expect("write plugin source");
+    fs::write(dir.join("tests/smoke.rs"), "fn main() {}\n").expect("write plugin test");
+    fs::write(dir.join("docs/human/overview.md"), "# proxy llm\n").expect("write human doc");
+    fs::write(
+        dir.join("docs/agent/interfaces.json"),
+        r#"{
+  "plugin_id": "proxyllm",
+  "plugin_path": "proxyllm",
+  "plugin_version": "0.1.0",
+  "abi_version": 2,
+  "command_name": null,
+  "nodes": [
+    {
+      "id": "llm_complete",
+      "summary": "proxy completion to the mock upstream",
+      "input_schema": { "type": "object" },
+      "output_schema": { "type": "object" },
+      "side_effects": [],
+      "failure_modes": [],
+      "node_type": "task",
+      "agent_accessible": false
+    }
+  ],
+  "system_hint": null
+}
+"#,
+    )
+    .expect("write agent doc");
+
+    // 把 workspace members 补上，prepare_artifacts 才会收录它。
+    let manifest = plugins_root.join("Cargo.toml");
+    let text = fs::read_to_string(&manifest).expect("read plugins manifest");
+    if !text.contains("proxyllm") {
+        fs::write(
+            &manifest,
+            text.replace("members = [", "members = [\"proxyllm\", "),
+        )
+        .expect("add proxyllm to members");
+    }
+}
+
+/// 落盘转发脚本，返回其绝对路径。
+///
+/// **不放 `fixtures/artifacts/`**：本用例的迭代会改 manifest，触发
+/// `rebuild_fixture_artifacts` → `PrepareMode::Full`，那会清空该目录、把脚本一起
+/// 删掉。绝对路径的 process 命令被 `stage_process_command` 直接放行、不参与 stage，
+/// 因此也不受 snapshot 逃逸检查约束。
+fn write_proxy_llm_script(dir: &Path) -> PathBuf {
+    fs::create_dir_all(dir).expect("create script dir");
+    let script = dir.join("proxyllm.sh");
+    // 读入 payload → 取 base_url 与 body → curl 打到 mock server → 把 SSE 增量
+    // 拼成一条 message。只需覆盖本用例用到的 content / tool_calls 两类增量。
+    let body = r#"#!/bin/sh
+payload=$(cat)
+python3 - "$payload" <<'PY'
+import json, sys, urllib.request
+req = json.loads(sys.argv[1])
+url = req["transport"]["base_url"].rstrip("/") + "/chat/completions"
+body = dict(req["body"]); body["stream"] = True
+data = json.dumps(body).encode()
+r = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+content, reasoning, calls, rid, finish = "", "", {}, None, None
+with urllib.request.urlopen(r, timeout=60) as resp:
+    for raw in resp:
+        line = raw.decode("utf-8", "replace").strip()
+        if not line.startswith("data:"):
+            continue
+        chunk = line[5:].strip()
+        if chunk == "[DONE]":
+            break
+        try:
+            ev = json.loads(chunk)
+        except Exception:
+            continue
+        rid = rid or ev.get("id")
+        for ch in ev.get("choices", []):
+            d = ch.get("delta", {})
+            content += d.get("content") or ""
+            reasoning += d.get("reasoning_content") or ""
+            finish = ch.get("finish_reason") or finish
+            for tc in d.get("tool_calls", []):
+                slot = calls.setdefault(tc.get("index", 0),
+                                        {"id": "", "type": "function",
+                                         "function": {"name": "", "arguments": ""}})
+                if tc.get("id"):
+                    slot["id"] = tc["id"]
+                fn = tc.get("function") or {}
+                if fn.get("name"):
+                    slot["function"]["name"] = fn["name"]
+                slot["function"]["arguments"] += fn.get("arguments") or ""
+msg = {"content": content or None,
+       "reasoning_content": reasoning or None,
+       "tool_calls": [calls[k] for k in sorted(calls)]}
+print(json.dumps({"ok": True, "message": msg,
+                  "response_id": rid, "finish_reason": finish}))
+PY
+"#;
+    fs::write(&script, body).expect("write proxy script");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("chmod script");
+    }
+    script
+}
+
 fn write_agent_llm_config(fixtures_root: &Path, url: &str) {
     let config_dir = fixtures_root
         .parent()
@@ -803,6 +947,17 @@ fn agent_iteration_request() -> KernelPluginIterationRequest {
 #[test]
 fn iterate_plugins_agent_walks_execute_tool_surface_and_promotes() {
     let (_temp, fixtures) = setup_minimal_workspace(MINI_SUMMARY);
+    // 拆分后 kernel 不自带 LLM 传输：补一个把请求转发到下面那个 mock server 的
+    // provider 插件，17 轮脚本化对话仍由 mock server 驱动。
+    // 脚本放在 fixtures 之外并用绝对路径引用——迭代中途的 Full rebuild 会清空
+    // fixtures/artifacts/。
+    let script_dir = fixtures
+        .parent()
+        .expect("fixtures parent")
+        .join("llm-proxy");
+    let script_path = write_proxy_llm_script(&script_dir);
+    write_proxy_llm_plugin(&fixtures, &script_path);
+    prepare_artifacts(&fixtures, PrepareMode::Incremental).expect("re-materialize with proxy llm");
 
     // Content used by the create_file / json_set / delete_file chain. The file
     // lives under the writable `src/` surface so the edit policy accepts it.
