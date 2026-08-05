@@ -34,18 +34,14 @@ fn time_now_returns_positive_current_year_timestamp() {
         "node_id": "time_now"
     });
     let response_json = time::__test_call_handle(req.to_string());
-    let response: Value =
-        serde_json::from_str(&response_json).expect("plugin returned valid JSON");
+    let response: Value = serde_json::from_str(&response_json).expect("plugin returned valid JSON");
 
     let ts = response
         .get("timestamp")
         .and_then(Value::as_i64)
         .expect("plugin response must include an integer `timestamp`");
 
-    assert!(
-        ts > 0,
-        "time_now timestamp must be positive, got {ts}"
-    );
+    assert!(ts > 0, "time_now timestamp must be positive, got {ts}");
     // Allow +/- 1 day drift vs. our reference clock.
     let delta = (ts - ref_now).abs();
     assert!(

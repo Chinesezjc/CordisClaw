@@ -1,5 +1,5 @@
-use std::process::Command;
 use std::fs;
+use std::process::Command;
 
 fn main() {
     let src = "/root/CordisClaw/fixtures/plugins/target/debug/libgacha.so";
@@ -10,13 +10,31 @@ fn main() {
 
     let hash = if let Ok(o) = Command::new("sha256sum").arg(dst).output() {
         if o.status.success() {
-            String::from_utf8_lossy(&o.stdout).split_whitespace().next().unwrap_or("").to_string()
-        } else { return; }
-    } else { return; };
+            String::from_utf8_lossy(&o.stdout)
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .to_string()
+        } else {
+            return;
+        }
+    } else {
+        return;
+    };
 
-    let data = match fs::read_to_string(index_path) { Ok(d) => d, Err(_) => return };
-    let mut val: serde_json::Value = match serde_json::from_str(&data) { Ok(v) => v, Err(_) => return };
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs().to_string();
+    let data = match fs::read_to_string(index_path) {
+        Ok(d) => d,
+        Err(_) => return,
+    };
+    let mut val: serde_json::Value = match serde_json::from_str(&data) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        .to_string();
 
     // Add to topo_order
     if let Some(arr) = val["topo_order"].as_array_mut() {
@@ -27,7 +45,9 @@ fn main() {
 
     // Find or create gacha entry
     let entries = val["entries"].as_array_mut();
-    if entries.is_none() { return; }
+    if entries.is_none() {
+        return;
+    }
     let entries = entries.unwrap();
     let mut found = false;
     for e in entries.iter_mut() {

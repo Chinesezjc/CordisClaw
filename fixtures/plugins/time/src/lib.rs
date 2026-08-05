@@ -4,8 +4,8 @@
 //! - `time_now` — returns the current system time in a human-readable format.
 
 use cordis_plugin_sdk::{
-    export_plugin_api, json_response, node_doc, plugin_docs, AbiFingerprint,
-    PluginRequest, PluginResponse,
+    export_plugin_api, json_response, node_doc, plugin_docs, AbiFingerprint, PluginRequest,
+    PluginResponse,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -40,7 +40,10 @@ struct NodeResponse {
 // Handlers
 // ---------------------------------------------------------------------------
 
-fn handle_time_now(_format: Option<&str>, tz_offset_hours: Option<i64>) -> Result<NodeResponse, String> {
+fn handle_time_now(
+    _format: Option<&str>,
+    tz_offset_hours: Option<i64>,
+) -> Result<NodeResponse, String> {
     let dur = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|e| format!("system time error: {e}"))?;
@@ -52,15 +55,37 @@ fn handle_time_now(_format: Option<&str>, tz_offset_hours: Option<i64>) -> Resul
     let mut y = 1970i64;
     let mut d = days_since_epoch;
     loop {
-        let days_in_year = if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 { 366 } else { 365 };
-        if d < days_in_year { break; }
+        let days_in_year = if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 {
+            366
+        } else {
+            365
+        };
+        if d < days_in_year {
+            break;
+        }
         d -= days_in_year;
         y += 1;
     }
     let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
-    let mdays = [31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let mdays = [
+        31,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
     let mut m = 0usize;
-    while m < 12 && d >= mdays[m] as i64 { d -= mdays[m] as i64; m += 1; }
+    while m < 12 && d >= mdays[m] as i64 {
+        d -= mdays[m] as i64;
+        m += 1;
+    }
     let day = d + 1;
     let month = m + 1;
     let offset_hours = tz_offset_hours.unwrap_or(0);

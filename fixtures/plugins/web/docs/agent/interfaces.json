@@ -9,42 +9,42 @@
       "id": "web_search",
       "summary": "Search the web using DeepSeek Anthropic-compatible API. Returns structured results (title + URL per result) plus an AI summary. Use web_fetch to verify specific pages.",
       "input_schema": {
-        "properties": {
-          "node_id": {
-            "const": "web_search",
-            "type": "string"
-          },
-          "query": {
-            "description": "Search query",
-            "type": "string"
-          }
-        },
+        "type": "object",
         "required": [
           "node_id",
           "query"
         ],
-        "type": "object"
+        "properties": {
+          "node_id": {
+            "type": "string",
+            "const": "web_search"
+          },
+          "query": {
+            "type": "string",
+            "description": "Search query"
+          }
+        }
       },
       "output_schema": {
+        "type": "object",
         "properties": {
+          "ok": {
+            "type": "boolean"
+          },
+          "text": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Structured search results (numbered list with titles + URLs) + AI summary"
+          },
           "error": {
             "type": [
               "string",
               "null"
             ]
-          },
-          "ok": {
-            "type": "boolean"
-          },
-          "text": {
-            "description": "Structured search results (numbered list with titles + URLs) + AI summary",
-            "type": [
-              "string",
-              "null"
-            ]
           }
-        },
-        "type": "object"
+        }
       },
       "side_effects": [
         "makes HTTP request to DeepSeek Anthropic-compatible endpoint with native web_search tool"
@@ -61,30 +61,25 @@
       "id": "web_fetch",
       "summary": "Fetch a web page and return plain-text content (HTML tags stripped). Max 8000 chars. Only http/https allowed.",
       "input_schema": {
-        "properties": {
-          "node_id": {
-            "const": "web_fetch",
-            "type": "string"
-          },
-          "url": {
-            "description": "URL to fetch",
-            "type": "string"
-          }
-        },
+        "type": "object",
         "required": [
           "node_id",
           "url"
         ],
-        "type": "object"
+        "properties": {
+          "node_id": {
+            "type": "string",
+            "const": "web_fetch"
+          },
+          "url": {
+            "type": "string",
+            "description": "URL to fetch"
+          }
+        }
       },
       "output_schema": {
+        "type": "object",
         "properties": {
-          "error": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
           "ok": {
             "type": "boolean"
           },
@@ -96,9 +91,14 @@
           },
           "truncated": {
             "type": "boolean"
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
           }
-        },
-        "type": "object"
+        }
       },
       "side_effects": [
         "makes HTTP GET request to the target URL"

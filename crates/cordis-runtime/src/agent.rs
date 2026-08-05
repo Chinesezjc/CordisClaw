@@ -53,6 +53,113 @@ const AGENT_TOOL_LIST_NODES: &str = "list_nodes";
 const AGENT_TOOL_GET_KERNEL_STATUS: &str = "get_kernel_status";
 const AGENT_TOOL_GET_KERNEL_ISSUES: &str = "get_kernel_issues";
 const AGENT_TOOL_RELOAD_RUNTIME: &str = "reload_runtime";
+
+/// Kernel introspection tools — their output describes the agent's own
+/// internal state (plugin counts, snapshot ids, kernel counters), not
+/// conversational content. Their tool call/result pairs are stripped by
+/// [`filter_kernel_introspection_messages`] before persisting to cross-turn
+/// history so they don't teach the LLM to imitate diagnostic call patterns on
+/// later turns.
+const KERNEL_INTROSPECTION_TOOLS: &[&str] = &[
+    AGENT_TOOL_GET_RUNTIME_STATUS,
+    AGENT_TOOL_LIST_PLUGINS,
+    AGENT_TOOL_LIST_NODES,
+    AGENT_TOOL_GET_KERNEL_STATUS,
+    AGENT_TOOL_GET_KERNEL_ISSUES,
+];
+
+/// Returns true if `name` is one of the kernel introspection tools.
+fn is_kernel_introspection(name: &str) -> bool {
+    KERNEL_INTROSPECTION_TOOLS.contains(&name)
+}
+
+/// Strip kernel-introspection tool call/result pairs from a slice of chat
+/// messages before they are persisted to cross-turn history.
+///
+/// Kernel introspection tools (see [`KERNEL_INTROSPECTION_TOOLS`]) report the
+/// agent's own internal state rather than conversational content; persisting
+/// their call/result pairs would teach the LLM to imitate diagnostic call
+/// patterns on later turns. The tool_calls chain is kept valid throughout:
+///
+/// - An `assistant` message with no introspection `tool_calls` passes through
+///   unchanged.
+/// - For an `assistant` message that references introspection tools, every
+///   introspection call id is recorded so its matching `tool` result is
+///   dropped. The `tool_calls` array is shrunk to the non-introspection
+///   subset. If nothing remains and the message has no textual content, the
+///   whole message is dropped; if text remains, the `tool_calls` field is
+///   removed so the surviving message keeps a valid chain.
+/// - Any `tool` result message whose `tool_call_id` matches a dropped
+///   introspection call is removed.
+/// - All other messages pass through unchanged.
+fn filter_kernel_introspection_messages(messages: &[Value]) -> Vec<Value> {
+    let mut skip_tool_ids: Vec<String> = Vec::new();
+    let mut out: Vec<Value> = Vec::with_capacity(messages.len());
+    for msg in messages {
+        let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("");
+        if role == "assistant" {
+            if let Some(tc_arr) = msg.get("tool_calls").and_then(|v| v.as_array()) {
+                if !tc_arr.is_empty() {
+                    let (kernel_calls, other_calls): (Vec<&Value>, Vec<&Value>) =
+                        tc_arr.iter().partition(|tc| {
+                            tc.get("function")
+                                .and_then(|f| f.get("name"))
+                                .and_then(|n| n.as_str())
+                                .is_some_and(is_kernel_introspection)
+                        });
+                    if kernel_calls.is_empty() {
+                        out.push(msg.clone());
+                        continue;
+                    }
+                    // Record introspection call ids so their results drop.
+                    for tc in &kernel_calls {
+                        if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
+                            skip_tool_ids.push(id.to_string());
+                        }
+                    }
+                    if other_calls.is_empty() {
+                        // Purely introspection: keep only if textual content
+                        // remains, and strip the now-dangling tool_calls.
+                        let has_text = msg
+                            .get("content")
+                            .and_then(|v| v.as_str())
+                            .is_some_and(|c| !c.trim().is_empty());
+                        if !has_text {
+                            continue;
+                        }
+                        let mut stripped = msg.clone();
+                        if let Some(obj) = stripped.as_object_mut() {
+                            obj.remove("tool_calls");
+                        }
+                        out.push(stripped);
+                        continue;
+                    }
+                    // Mixed: keep only the non-introspection tool_calls.
+                    let mut shrunk = msg.clone();
+                    if let Some(obj) = shrunk.as_object_mut() {
+                        obj.insert(
+                            "tool_calls".to_string(),
+                            Value::Array(other_calls.into_iter().cloned().collect()),
+                        );
+                    }
+                    out.push(shrunk);
+                    continue;
+                }
+            }
+            out.push(msg.clone());
+            continue;
+        }
+        if role == "tool" {
+            if let Some(tid) = msg.get("tool_call_id").and_then(|v| v.as_str()) {
+                if skip_tool_ids.iter().any(|id| id == tid) {
+                    continue;
+                }
+            }
+        }
+        out.push(msg.clone());
+    }
+    out
+}
 const AGENT_TOOL_BUILD_PLUGINS: &str = "build_plugins";
 const AGENT_TOOL_INVOKE_PLUGIN: &str = "invoke_plugin";
 const AGENT_TOOL_EXECUTE_TARGET: &str = "execute_target";
@@ -1647,6 +1754,11 @@ impl AgentSession {
                 .skip(self.history.len())
                 .cloned()
                 .collect();
+            // Kernel introspection tool call/result pairs describe the
+            // agent's own internal state; drop them before they reach
+            // cross-turn history (and, via `to_snapshot`, on-disk recovery
+            // snapshots) so the LLM doesn't imitate diagnostic call patterns.
+            let recovered = filter_kernel_introspection_messages(&recovered);
             for msg in &recovered {
                 let content_est = msg
                     .get("content")
@@ -3315,5 +3427,120 @@ mod tests {
         let small = estimate_tokens("hello world");
         let large = estimate_tokens(&"hello world ".repeat(100));
         assert!(large > small * 50, "large={large} small={small}");
+    }
+
+    /// A turn consisting solely of a kernel introspection call and its
+    /// result must leave no trace in persisted history.
+    #[test]
+    fn filter_drops_pure_introspection_turn() {
+        let turn = vec![
+            json!({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": { "name": AGENT_TOOL_GET_RUNTIME_STATUS, "arguments": "{}" }
+                    }
+                ]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "content": "{\"plugin_count\":3}"
+            }),
+        ];
+        let filtered = filter_kernel_introspection_messages(&turn);
+        assert!(
+            filtered.is_empty(),
+            "pure introspection turn should be fully dropped, got {filtered:?}"
+        );
+    }
+
+    /// A turn mixing an introspection call with a conversational tool call
+    /// must drop only the introspection call/result: the assistant message
+    /// survives with its tool_calls array shrunk to the conversational call,
+    /// and the conversational tool result is preserved.
+    #[test]
+    fn filter_shrinks_mixed_turn() {
+        let turn = vec![
+            json!({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_kernel",
+                        "type": "function",
+                        "function": { "name": AGENT_TOOL_LIST_PLUGINS, "arguments": "{}" }
+                    },
+                    {
+                        "id": "call_read",
+                        "type": "function",
+                        "function": { "name": AGENT_TOOL_READ_FILE, "arguments": "{\"path\":\"a\"}" }
+                    }
+                ]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_kernel",
+                "content": "{\"plugins\":[]}"
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_read",
+                "content": "file body"
+            }),
+        ];
+        let filtered = filter_kernel_introspection_messages(&turn);
+        assert_eq!(
+            filtered.len(),
+            2,
+            "expected assistant + read result: {filtered:?}"
+        );
+        let tool_calls = filtered[0]
+            .get("tool_calls")
+            .and_then(|v| v.as_array())
+            .expect("assistant message retains tool_calls");
+        assert_eq!(tool_calls.len(), 1, "tool_calls array should shrink to 1");
+        assert_eq!(
+            tool_calls[0]
+                .get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(|n| n.as_str()),
+            Some(AGENT_TOOL_READ_FILE),
+        );
+        assert_eq!(
+            filtered[1].get("tool_call_id").and_then(|v| v.as_str()),
+            Some("call_read"),
+            "conversational tool result must be preserved"
+        );
+    }
+
+    /// A turn with no kernel introspection tools must pass through the filter
+    /// byte-for-byte unchanged.
+    #[test]
+    fn filter_preserves_ordinary_turn() {
+        let turn = vec![
+            json!({
+                "role": "assistant",
+                "content": "reading now",
+                "tool_calls": [
+                    {
+                        "id": "call_read",
+                        "type": "function",
+                        "function": { "name": AGENT_TOOL_READ_FILE, "arguments": "{\"path\":\"a\"}" }
+                    }
+                ]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_read",
+                "content": "file body"
+            }),
+            json!({ "role": "user", "content": "follow-up" }),
+        ];
+        let filtered = filter_kernel_introspection_messages(&turn);
+        assert_eq!(filtered, turn, "ordinary turn must be unchanged");
     }
 }

@@ -985,7 +985,7 @@ api_hash = "api_v2"
 [dependencies]
 cordis-plugin-sdk = { path = "../crates/cordis-plugin-sdk" }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["preserve_order"] }
 "#,
     )
     .expect("write svcmini manifest");
