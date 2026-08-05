@@ -94,7 +94,9 @@ fn first_accept_uses_the_short_budget() {
         TINY,
         HUGE,
     );
-    handle.join().expect_err("must time out on the first accept");
+    handle
+        .join()
+        .expect_err("must time out on the first accept");
 
     let elapsed = started.elapsed();
     assert!(
@@ -136,7 +138,9 @@ fn later_accept_timeout_names_the_missing_request() {
 
     dial(&url);
 
-    let payload = handle.join().expect_err("the second turn was never dialled");
+    let payload = handle
+        .join()
+        .expect_err("the second turn was never dialled");
     let message = payload
         .downcast_ref::<String>()
         .map(String::as_str)
