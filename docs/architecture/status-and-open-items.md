@@ -239,6 +239,40 @@ Agent 现在可以自主完成：读代码 → 理解结构 → 写/改文件 �
 - [x] **Plugin iteration symlink 逃逸**（P0-20）— `PluginEditExecutor::execute` 在写入前调用新 helper `resolve_under_workspace`：canonicalize 结果必须仍在 workspace_root 下。plugins 内的 symlink 指向 `/etc/passwd` 之类无法被写入。
 - [x] **Verifier shell 拼接**（P0-21）— 已随 A 批 P0-1 修复。`discover_rust_workspace_manifest` 输出的字符串被 `shell_words` 解析成 argv，空格 / `$` / `;` 无法被解释。
 
+### 5.2.39 mock LLM server 空转导致 CI 4 倍变慢（2026-08-05）
+
+**症状**：CI 从稳定的 20–23 分钟涨到 84 分钟，跳变点精确落在 5.2.38 的合并提交
+`bf23d11`。
+
+**定位**：耗时全在 `test` 一步（82 分钟里的 79 分钟；rustfmt/clippy/build 合计不到
+2 分钟），其中 `tests/host_boot_session_arms.rs` 单个 suite 就占 3602.41 秒。与拆分
+前的 `4bc118c` 逐 suite 对照：该 suite 4.75 秒 → 3602.41 秒，其余 suite 耗时不变
+（semantics 743→648、host_coverage 87→77、host_iterate_stages 153→176），+3597 秒
+完全解释了 CI 的 +61 分钟。
+
+**根因**：5.2.38 之后 kernel 不再自带 HTTP 传输，这四个 `auto_save_*` 用例改由
+`write_fake_llm_plugin` 造的假 provider 插件（Process 执行的 shell 脚本）应答，全程
+不产生 HTTP 请求；但用例里的 HTTP mock server 被原样留下，成了没人拨的死脚手架。
+server 线程在 accept 上空转满 CI 预算（900 秒），四个用例又都带 `#[serial]`，串行
+合计 3600 秒。
+
+**为什么一直是绿的**：超时臂静默送出一个部分（此处为空）的请求向量冒充正常结果，
+而调用点写的是 `let _ = requests_rx.recv()`，把"一个请求都没抓到"这个证据丢掉。
+本地也看不出来——本地 accept 预算是 30 秒而非 900 秒，suite 表现为 120 秒而不是
+一小时，只像"有点慢"。
+
+- [x] 删掉四个用例里的死 mock，`base_url` 改用具名常量 `UNUSED_LLM_BASE_URL` 占位；
+  连带清理失效的 `assistant_turn` 与两个导入，并修正已与事实不符的 expect 文案
+- [x] 超时臂改为 panic，消息指明缺的是第几个请求、已捕获多少、以及"可能是死脚手架"
+- [x] 首次 accept 独立短预算（CI 120 秒 / 本地 30 秒）——900 秒是为"响应序列中途插入
+  fixture `cargo build`"加的，那只可能发生在第 2 次及以后的 accept
+- [x] 幸存的两处 `let _ = recv()` 改为断言捕获数量
+- [x] 新增 `tests/mock_llm_server.rs`（4 个用例，注入毫秒级预算直接钉住超时臂与
+  首次/后续预算的划分，不必真等 2 分钟）
+
+**副产品**：超时改 panic 之后，"脚本了却没人拨的响应"会让测试直接失败，因此全量跑绿
+本身就等于把仓库里全部 13 处 mock 用法审计了一遍，不需要再逐处人工核对。
+
 ### 5.2.38 LLM 传输层拆出 kernel（2026-08-05）
 
 **动机**：配置里有 `provider: openai|deepseek`，但**全仓没有一处按它分支 wire format**
