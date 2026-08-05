@@ -1,0 +1,78 @@
+{
+  "plugin_id": "llm_openai",
+  "plugin_path": "llm_openai",
+  "plugin_version": "0.1.0",
+  "abi_version": 2,
+  "command_name": null,
+  "nodes": [
+    {
+      "id": "llm_complete",
+      "summary": "Execute one chat completion against an OpenAI-compatible endpoint.",
+      "input_schema": {
+        "properties": {
+          "body": {
+            "type": "object"
+          },
+          "node_id": {
+            "const": "llm_complete"
+          },
+          "sink_addr": {
+            "type": "string"
+          },
+          "sink_key": {
+            "type": "string"
+          },
+          "transport": {
+            "type": "object"
+          }
+        },
+        "required": [
+          "node_id",
+          "body",
+          "transport"
+        ],
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "error": {
+            "type": "string"
+          },
+          "finish_reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "message": {
+            "type": "object"
+          },
+          "ok": {
+            "type": "boolean"
+          },
+          "response_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "ok"
+        ],
+        "type": "object"
+      },
+      "side_effects": [
+        "performs an outbound HTTPS request to the configured endpoint"
+      ],
+      "failure_modes": [
+        "upstream 5xx or timeout after retries",
+        "missing or empty API key env var",
+        "malformed SSE stream"
+      ],
+      "node_type": "task",
+      "agent_accessible": false
+    }
+  ],
+  "system_hint": null
+}

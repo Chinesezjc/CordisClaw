@@ -2,17 +2,13 @@ use crate::config::LlmApiConfig;
 use crate::core::error::RuntimeError;
 use crate::host::RuntimeHost;
 use chrono::Local;
-use reqwest::blocking::{Client, Response};
-use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeSet, VecDeque};
 use std::env;
-use std::io::{BufReader, Read, Write};
-use std::sync::mpsc::{sync_channel, RecvTimeoutError};
+use std::io::Write;
 use std::sync::{Arc, Mutex};
-use std::thread;
 use std::time::{Duration, Instant};
 
 /// Shared queue for Agent message injection.  The inbox thread pushes new
@@ -50,9 +46,7 @@ fn drain_inject_queue() -> Vec<String> {
 
 const AGENT_HISTORY_MESSAGE_LIMIT: usize = 8192;
 const AGENT_MAX_TOOL_TURNS: usize = 96;
-const AGENT_REQUEST_MAX_ATTEMPTS: usize = 3;
 const UNKNOWN_TOOL_STRIKE_LIMIT: usize = 1;
-const AGENT_REQUEST_RETRY_BACKOFF_MS: u64 = 500;
 const AGENT_TOOL_GET_RUNTIME_STATUS: &str = "get_runtime_status";
 const AGENT_TOOL_LIST_PLUGINS: &str = "list_plugins";
 const AGENT_TOOL_LIST_NODES: &str = "list_nodes";
@@ -1001,11 +995,35 @@ pub trait AgentBackend {
     }
 }
 
+/// 一次模型补全的执行者。
+///
+/// 这是 agent 循环（机制）与供应商传输（可覆写）之间的接缝。循环只要求拿回
+/// **结构化的** `tool_calls`——它在本轮中途就要据此分派工具，因此只回文本的
+/// provider 无法驱动工具调用。
+pub(crate) trait LlmProvider {
+    /// `sink` 为 `Some` 时 provider **可以**逐段推送增量；忽略它也必须正确工作，
+    /// 权威结果始终是本函数的返回值。
+    fn complete(
+        &self,
+        body: Value,
+        sink: Option<std::sync::Arc<dyn crate::llm_sink::TokenSink>>,
+        transport: cordis_plugin_sdk::llm::LlmTransportConfig,
+    ) -> Result<LlmCompletionParts, RuntimeError>;
+}
+
+/// 一次补全的返回三件套。具名结构体而非裸元组：它要跨 `agent`/`host` 两个模块
+/// 使用，字段名比位置更经得起演进。
+#[derive(Debug)]
+pub(crate) struct LlmCompletionParts {
+    pub(crate) message: cordis_plugin_sdk::llm::LlmMessage,
+    pub(crate) response_id: Option<String>,
+    pub(crate) finish_reason: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct AgentSession {
     kind: String,
     config: LlmApiConfig,
-    client: Client,
     history: Vec<Value>,
     transcript: Vec<AgentTranscriptEntry>,
     completed_turns: usize,
@@ -1022,7 +1040,7 @@ pub struct AgentSession {
 
 /// Serializable snapshot of an AgentSession for crash recovery.
 /// Captures everything needed to reconstruct the session except the
-/// reqwest::Client, which is recreated from the stored config.
+/// LLM 传输（已移出 kernel，见 fixtures/plugins/llm_openai）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentSessionSnapshot {
     pub kind: String,
@@ -1053,17 +1071,13 @@ fn estimate_tokens(s: &str) -> usize {
 }
 
 impl AgentSession {
+    /// 仍返回 `Result` 以保持调用方签名不变：拆分前这里会构造 reqwest client
+    /// 因而可能失败，现在传输在插件里、本函数不再有失败路径，但把 ~20 处调用
+    /// 点一起改签名不属于本批范围。
     pub fn new(config: LlmApiConfig, kind: impl Into<String>) -> Result<Self, RuntimeError> {
-        let client = Client::builder()
-            .timeout(Duration::from_millis(config.timeout_ms))
-            .build()
-            .map_err(|err| RuntimeError::LlmRequestFailed {
-                message: format!("failed to build agent HTTP client: {err}"),
-            })?;
         Ok(Self {
             kind: kind.into(),
             config,
-            client,
             history: Vec::new(),
             transcript: Vec::new(),
             completed_turns: 0,
@@ -1090,18 +1104,15 @@ impl AgentSession {
         self.completed_turns = 0;
     }
 
-    /// Swap the LLM config (profile fallback switching). Rebuilds the
-    /// HTTP client for the new timeout; history/transcript are untouched
-    /// so the conversation continues seamlessly on the other endpoint.
+    /// Swap the LLM config (profile fallback switching). history/transcript
+    /// are untouched so the conversation continues seamlessly on the other
+    /// endpoint.
+    ///
+    /// 拆分前这里要重建 reqwest client（新的 timeout），因而有一条失败臂；
+    /// 现在 timeout 随 `to_transport()` 投影在每次调用时传给插件，本函数只是
+    /// 换个配置结构体。`Result` 保留是为了不动 fallback 链路的调用点。
     pub fn swap_config(&mut self, config: LlmApiConfig) -> Result<(), RuntimeError> {
-        let client = Client::builder()
-            .timeout(Duration::from_millis(config.timeout_ms))
-            .build()
-            .map_err(|err| RuntimeError::LlmRequestFailed {
-                message: format!("failed to build agent HTTP client: {err}"),
-            })?;
         self.config = config;
-        self.client = client;
         Ok(())
     }
 
@@ -1152,45 +1163,61 @@ impl AgentSession {
         }
     }
 
+    /// 无 provider 可用时的入口：直接报 [`RuntimeError::NoLlmProvider`]。
+    ///
+    /// LLM 传输已整体移出 kernel（见 `fixtures/plugins/llm_openai`），没有内建
+    /// 兜底。保留本函数是为了让"没装 provider 插件"这件事在调用点就有明确
+    /// 报错，而不是让每个调用方各自处理 `Option<provider>`。
+    ///
+    /// 冷启动不受影响：boot / REPL / `command_router` 都不经这里，无插件时
+    /// `/status`、`/help` 等照常工作，只有真的要跟模型说话才会失败——与拆分前
+    /// "LLM 不可达"的状态同构。
     pub fn respond<B: AgentBackend + ?Sized>(
         &mut self,
-        backend: &mut B,
-        user_input: &str,
+        _backend: &mut B,
+        _user_input: &str,
     ) -> Result<AgentReply, RuntimeError> {
-        let transcript_len_before = self.transcript.len();
-        let result = self.respond_inner(backend, user_input);
-        // P2-31: on error path, if we pushed a User transcript entry but
-        // never got to push a matching Assistant entry, insert an
-        // Assistant placeholder describing the error. Otherwise a retry
-        // with the same session id sees an orphan User (and the LLM
-        // double-records the prompt on the next round).
-        if result.is_err() {
-            let has_user_without_assistant = self
+        Err(RuntimeError::NoLlmProvider)
+    }
+
+    /// P2-31: 出错时若只推了 User 而没有对应的 Assistant，补一条描述错误的
+    /// Assistant 占位。否则同一 session id 重试会看到孤立的 User，模型下一轮
+    /// 会把提示词重复记一遍。
+    fn repair_transcript_on_error(
+        &mut self,
+        transcript_len_before: usize,
+        result: &Result<AgentReply, RuntimeError>,
+    ) {
+        let Err(err) = result else { return };
+        let has_user_without_assistant = self
+            .transcript
+            .iter()
+            .skip(transcript_len_before)
+            .any(|e| matches!(e, AgentTranscriptEntry::User { .. }))
+            && !self
                 .transcript
                 .iter()
                 .skip(transcript_len_before)
-                .any(|e| matches!(e, AgentTranscriptEntry::User { .. }))
-                && !self
-                    .transcript
-                    .iter()
-                    .skip(transcript_len_before)
-                    .any(|e| matches!(e, AgentTranscriptEntry::Assistant { .. }));
-            if has_user_without_assistant {
-                if let Err(err) = &result {
-                    self.transcript.push(AgentTranscriptEntry::Assistant {
-                        content: format!("[error] {}", err),
-                        response_id: None,
-                    });
-                }
-            }
+                .any(|e| matches!(e, AgentTranscriptEntry::Assistant { .. }));
+        if has_user_without_assistant {
+            self.transcript.push(AgentTranscriptEntry::Assistant {
+                content: format!("[error] {err}"),
+                response_id: None,
+            });
         }
-        result
     }
 
+    /// `provider` 承担这一轮所有的模型调用；`sink` 决定增量 token 去哪。
+    ///
+    /// 两者都作为参数传入而非存进 `AgentSession`：该结构体 derive 了
+    /// `Debug + Clone` 并会被快照序列化，塞 `dyn Trait` 会同时破坏这三者。
+    /// 这也与既有的 `backend` 参数保持一致。
     fn respond_inner<B: AgentBackend + ?Sized>(
         &mut self,
         backend: &mut B,
         user_input: &str,
+        provider: &dyn LlmProvider,
+        sink: Option<std::sync::Arc<dyn crate::llm_sink::TokenSink>>,
     ) -> Result<AgentReply, RuntimeError> {
         let trimmed = user_input.trim();
         if trimmed.is_empty() {
@@ -1199,8 +1226,10 @@ impl AgentSession {
             });
         }
 
-        let provider = self.config.provider.trim().to_ascii_lowercase();
-        if provider != "deepseek" && provider != "openai" {
+        // 供应商白名单闸门。注意它只是个字符串校验，全仓没有一处按它分支
+        // wire format——C4 接入 provider 解析后本段整体移除。
+        let configured_provider = self.config.provider.trim().to_ascii_lowercase();
+        if configured_provider != "deepseek" && configured_provider != "openai" {
             return Err(RuntimeError::UnsupportedLlmProvider {
                 provider: self.config.provider.clone(),
             });
@@ -1211,10 +1240,6 @@ impl AgentSession {
             let _ = self.compact_history();
         }
 
-        let endpoint = format!(
-            "{}/chat/completions",
-            self.config.base_url.trim_end_matches('/')
-        );
         let mut messages = Vec::with_capacity(self.history.len() + 3);
         messages.push(json!({
             "role": "system",
@@ -1367,8 +1392,10 @@ impl AgentSession {
                 "tool_choice": "auto",
                 "response_format": {"type": "json_object"},
             });
+            let parts =
+                provider.complete(request_body, sink.clone(), self.config.to_transport())?;
             let (message, response_id, finish_reason) =
-                self.send_chat_request(endpoint.clone(), request_body)?;
+                (parts.message, parts.response_id, parts.finish_reason);
 
             emit_agent_diagnostic(format!(
                 "agent_turn_result kind={} turn={} response_id={} tool_calls={} content_chars={} reasoning_chars={} finish_reason={}",
@@ -1396,12 +1423,12 @@ impl AgentSession {
                     .partition(|tc| available_tools.contains(&tc.function.name));
                 // Push assistant message with only valid tool_calls (if any).
                 if !valid_calls.is_empty() {
-                    let filtered = ChatMessage {
+                    let filtered = cordis_plugin_sdk::llm::LlmMessage {
                         content: message.content.clone(),
                         reasoning_content: message.reasoning_content.clone(),
                         tool_calls: valid_calls.iter().map(|&tc| tc.clone()).collect(),
                     };
-                    messages.push(filtered.to_request_message());
+                    messages.push(llm_message_to_request(&filtered));
                 }
                 // Inject errors for unknown tools BEFORE any assistant message.
                 for tool_call in &unknown_calls {
@@ -1587,7 +1614,7 @@ impl AgentSession {
                 .as_deref()
                 .is_some_and(|value| !value.trim().is_empty())
             {
-                messages.push(message.to_request_message());
+                messages.push(llm_message_to_request(&message));
                 self.reasoning_only_strikes += 1;
                 if self.reasoning_only_strikes >= 3 {
                     backend.host().agent_send_warning_to_test_groups(
@@ -1638,6 +1665,23 @@ impl AgentSession {
         })
     }
 
+    /// 用调用方给定的 provider 跑一轮。
+    ///
+    /// `respond` 是过渡期的便利入口（内建传输）；C5 删掉内建实现后只剩本函数。
+    /// `sink` 为 `Some` 时 provider 可逐段推增量，忽略它也必须正确工作。
+    pub(crate) fn respond_with_provider<B: AgentBackend + ?Sized>(
+        &mut self,
+        backend: &mut B,
+        user_input: &str,
+        provider: &dyn LlmProvider,
+        sink: Option<std::sync::Arc<dyn crate::llm_sink::TokenSink>>,
+    ) -> Result<AgentReply, RuntimeError> {
+        let transcript_len_before = self.transcript.len();
+        let result = self.respond_inner(backend, user_input, provider, sink);
+        self.repair_transcript_on_error(transcript_len_before, &result);
+        result
+    }
+
     pub fn respond_with_runtime_host<H: AgentToolHost + ?Sized>(
         &mut self,
         host: &H,
@@ -1651,6 +1695,27 @@ impl AgentSession {
             soul_key,
         };
         self.respond(&mut backend, user_input)
+    }
+
+    /// 同上，但由调用方提供 provider（走 LLM 插件时用）。
+    ///
+    /// backend 的构造留在本模块：`RuntimeShellAgentBackend` 是私有类型，
+    /// 让 host 去拼装它会迫使它变 public 且暴露内部字段。
+    pub(crate) fn respond_with_runtime_host_via<H: AgentToolHost + ?Sized>(
+        &mut self,
+        host: &H,
+        session_id: &str,
+        user_input: &str,
+        provider: &dyn LlmProvider,
+        sink: Option<std::sync::Arc<dyn crate::llm_sink::TokenSink>>,
+    ) -> Result<AgentReply, RuntimeError> {
+        let soul_key = self.soul_key.clone();
+        let mut backend = RuntimeShellAgentBackend {
+            host,
+            session_id,
+            soul_key,
+        };
+        self.respond_with_provider(&mut backend, user_input, provider, sink)
     }
 
     pub fn history_len(&self) -> usize {
@@ -1773,172 +1838,6 @@ impl AgentSession {
         });
     }
 
-    fn send_chat_request(
-        &self,
-        endpoint: String,
-        mut request_body: Value,
-    ) -> Result<(ChatMessage, Option<String>, Option<String>), RuntimeError> {
-        request_body["stream"] = Value::Bool(true);
-        let api_key = resolve_api_key(&self.config)?;
-        let request_summary = summarize_request(&endpoint, &request_body, self.config.timeout_ms);
-        let overall_started = Instant::now();
-
-        emit_agent_diagnostic(format!(
-            "agent_request_start attempts={} {}",
-            AGENT_REQUEST_MAX_ATTEMPTS, request_summary
-        ));
-
-        for attempt in 1..=AGENT_REQUEST_MAX_ATTEMPTS {
-            let attempt_started = Instant::now();
-            let mut http_request = self
-                .client
-                .post(endpoint.clone())
-                .header(CONTENT_TYPE, "application/json")
-                .header(AUTHORIZATION, format!("Bearer {api_key}"));
-            if let Some(org) = &self.config.organization {
-                if !org.trim().is_empty() {
-                    http_request = http_request.header("OpenAI-Organization", org);
-                }
-            }
-            if let Some(project) = &self.config.project {
-                if !project.trim().is_empty() {
-                    http_request = http_request.header("OpenAI-Project", project);
-                }
-            }
-
-            let response = match http_request.json(&request_body).send() {
-                Ok(response) => response,
-                Err(err) => {
-                    let message = format!(
-                        "shell agent request failed: attempt={attempt}/{AGENT_REQUEST_MAX_ATTEMPTS} phase=send elapsed_ms={} total_elapsed_ms={} {} detail={}",
-                        attempt_started.elapsed().as_millis(),
-                        overall_started.elapsed().as_millis(),
-                        request_summary,
-                        format_transport_error(&err, self.config.timeout_ms),
-                    );
-                    if attempt < AGENT_REQUEST_MAX_ATTEMPTS {
-                        emit_agent_diagnostic(format!(
-                            "{message} retry_backoff_ms={AGENT_REQUEST_RETRY_BACKOFF_MS}"
-                        ));
-                        thread::sleep(Duration::from_millis(AGENT_REQUEST_RETRY_BACKOFF_MS));
-                        continue;
-                    }
-                    return Err(RuntimeError::LlmRequestFailed { message });
-                }
-            };
-
-            let status = response.status();
-            if !status.is_success() {
-                let raw_body = match response.text() {
-                    Ok(body) => body,
-                    Err(err) => {
-                        let message = format!(
-                            "shell agent request failed: attempt={attempt}/{AGENT_REQUEST_MAX_ATTEMPTS} phase=read_error_body elapsed_ms={} total_elapsed_ms={} {} detail={}",
-                            attempt_started.elapsed().as_millis(),
-                            overall_started.elapsed().as_millis(),
-                            request_summary,
-                            format_transport_error(&err, self.config.timeout_ms),
-                        );
-                        if attempt < AGENT_REQUEST_MAX_ATTEMPTS {
-                            emit_agent_diagnostic(format!(
-                                "{message} retry_backoff_ms={AGENT_REQUEST_RETRY_BACKOFF_MS}"
-                            ));
-                            thread::sleep(Duration::from_millis(AGENT_REQUEST_RETRY_BACKOFF_MS));
-                            continue;
-                        }
-                        return Err(RuntimeError::LlmRequestFailed { message });
-                    }
-                };
-
-                let message = format!(
-                    "shell agent request failed: attempt={attempt}/{AGENT_REQUEST_MAX_ATTEMPTS} phase=http_status status={} elapsed_ms={} total_elapsed_ms={} {} error={} body_preview={}",
-                    status.as_u16(),
-                    attempt_started.elapsed().as_millis(),
-                    overall_started.elapsed().as_millis(),
-                    request_summary,
-                    extract_error_message(&raw_body)
-                        .unwrap_or_else(|| format!("status={} body={}", status, raw_body.trim())),
-                    truncate_for_error(&raw_body, 400),
-                );
-                if attempt < AGENT_REQUEST_MAX_ATTEMPTS {
-                    // P1-35: don't retry permanent-failure client errors
-                    // (4xx except 408 / 429). Bad API key, invalid model,
-                    // quota exhausted, permission denied — retrying just
-                    // burns network round trips and can trigger rate-
-                    // limit escalation.
-                    let code = status.as_u16();
-                    let is_permanent_4xx = (400..500).contains(&code) && code != 408 && code != 429;
-                    if is_permanent_4xx {
-                        emit_agent_diagnostic(format!("{message} not-retrying (permanent 4xx)"));
-                        return Err(RuntimeError::LlmRequestFailed { message });
-                    }
-                    emit_agent_diagnostic(format!(
-                        "{message} retry_backoff_ms={AGENT_REQUEST_RETRY_BACKOFF_MS}"
-                    ));
-                    thread::sleep(Duration::from_millis(AGENT_REQUEST_RETRY_BACKOFF_MS));
-                    continue;
-                }
-                return Err(RuntimeError::LlmRequestFailed { message });
-            }
-
-            let stream_timeout = Duration::from_secs(self.config.stream_timeout_secs);
-            let streamed = match read_chat_stream(
-                response,
-                &request_summary,
-                attempt,
-                stream_timeout,
-            ) {
-                Ok(streamed) => streamed,
-                Err(ChatStreamReadError::Io(err)) => {
-                    let message = format!(
-                        "shell agent request failed: attempt={attempt}/{AGENT_REQUEST_MAX_ATTEMPTS} phase=read_stream elapsed_ms={} total_elapsed_ms={} {} detail={}",
-                        attempt_started.elapsed().as_millis(),
-                        overall_started.elapsed().as_millis(),
-                        request_summary,
-                        format_stream_error(&err, self.config.timeout_ms),
-                    );
-                    if attempt < AGENT_REQUEST_MAX_ATTEMPTS {
-                        emit_agent_diagnostic(format!(
-                            "{message} retry_backoff_ms={AGENT_REQUEST_RETRY_BACKOFF_MS}"
-                        ));
-                        thread::sleep(Duration::from_millis(AGENT_REQUEST_RETRY_BACKOFF_MS));
-                        continue;
-                    }
-                    return Err(RuntimeError::LlmRequestFailed { message });
-                }
-                Err(ChatStreamReadError::InvalidResponse(message)) => {
-                    return Err(RuntimeError::LlmResponseInvalid { message });
-                }
-            };
-
-            emit_agent_diagnostic(format!(
-                "agent_request_success attempt={attempt}/{AGENT_REQUEST_MAX_ATTEMPTS} status={} elapsed_ms={} total_elapsed_ms={} response_bytes={} stream_events={} stream_done={} content_chars={} finish_reason={} {}",
-                status.as_u16(),
-                attempt_started.elapsed().as_millis(),
-                overall_started.elapsed().as_millis(),
-                streamed.raw_bytes,
-                streamed.event_count,
-                streamed.saw_done,
-                streamed.message.content.as_ref().map(|c| c.len()).unwrap_or(0),
-                streamed.finish_reason.as_deref().unwrap_or("-"),
-                request_summary,
-            ));
-
-            return Ok((
-                streamed.message,
-                streamed.response_id,
-                streamed.finish_reason,
-            ));
-        }
-
-        Err(RuntimeError::LlmRequestFailed {
-            message: format!(
-                "shell agent request exhausted retries without returning a streamed response: {}",
-                request_summary
-            ),
-        })
-    }
-
     /// Create a serializable snapshot of the current session state.
     pub fn to_snapshot(&self) -> AgentSessionSnapshot {
         AgentSessionSnapshot {
@@ -1955,24 +1854,18 @@ impl AgentSession {
     }
 
     /// Reconstruct an AgentSession from a snapshot.
-    /// The reqwest::Client is freshly created from the stored config.
+    ///
+    /// 磁盘 schema 未变：快照本就不存 HTTP client（拆分前是从 config 重建，
+    /// 现在传输在插件里、连重建都不需要了）。
+    ///
+    /// P2-33 + P0-25: `api_key` is `#[serde(skip_serializing)]`, so a
+    /// recovered snapshot arrives with `config.api_key = None`. 保持 None——
+    /// provider 插件在请求时按 `api_key_env` 从环境读，恢复出来的会话因此拿到
+    /// 本次启动的密钥，而不是烧在磁盘文件里的旧值。
     pub fn from_snapshot(snapshot: AgentSessionSnapshot) -> Result<Self, RuntimeError> {
-        // P2-33 + P0-25: `api_key` is `#[serde(skip_serializing)]`, so a
-        // recovered snapshot arrives with `config.api_key = None`. Leave
-        // it None here — `resolve_api_key` (send path) reads
-        // `config.api_key_env` from the environment at request time, so
-        // the recovered session picks up whatever key the operator has
-        // configured on this boot, not one baked into the on-disk file.
-        let client = Client::builder()
-            .timeout(Duration::from_millis(snapshot.config.timeout_ms))
-            .build()
-            .map_err(|err| RuntimeError::LlmRequestFailed {
-                message: format!("failed to rebuild agent HTTP client from snapshot: {err}"),
-            })?;
         Ok(Self {
             kind: snapshot.kind,
             config: snapshot.config,
-            client,
             history: snapshot.history,
             transcript: snapshot.transcript,
             completed_turns: snapshot.completed_turns,
@@ -2017,6 +1910,23 @@ impl ShellAgentSession {
             .respond_with_runtime_host(host, session_id, user_input)
     }
 
+    /// 测试入口：用给定 provider 跑一轮。
+    ///
+    /// 机制测试（工具分派、终止工具排序、历史）考的是循环本身，不是 wire——
+    /// 拆分后传输在插件里，这些测试改用 `FakeLlmProvider` 直接喂补全，不再起
+    /// mock HTTP server 与解析 SSE。
+    #[cfg(test)]
+    fn respond_via<H: AgentToolHost + ?Sized>(
+        &mut self,
+        host: &H,
+        session_id: &str,
+        user_input: &str,
+        provider: &dyn LlmProvider,
+    ) -> Result<ShellAgentReply, RuntimeError> {
+        self.inner
+            .respond_with_runtime_host_via(host, session_id, user_input, provider, None)
+    }
+
     #[cfg(test)]
     fn remember_exchange(&mut self, user_input: &str, assistant_output: &str) {
         self.inner
@@ -2025,241 +1935,40 @@ impl ShellAgentSession {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-struct ToolFunctionCall {
-    name: String,
-    arguments: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-struct ToolCall {
-    id: String,
-    #[serde(rename = "type")]
-    call_type: String,
-    function: ToolFunctionCall,
-}
-
-#[derive(Debug, Clone, Deserialize, PartialEq, Default)]
-struct ChatMessage {
-    #[serde(default)]
-    content: Option<String>,
-    #[serde(default)]
-    reasoning_content: Option<String>,
-    #[serde(default)]
-    tool_calls: Vec<ToolCall>,
-}
-
-impl ChatMessage {
-    fn to_request_message(&self) -> Value {
-        let mut message = Map::new();
-        message.insert("role".to_string(), Value::String("assistant".to_string()));
-        let content_value = self
-            .content
-            .as_ref()
-            .map(|content| Value::String(content.clone()))
-            .unwrap_or_else(|| {
-                if self.reasoning_content.is_some() || !self.tool_calls.is_empty() {
-                    Value::String(String::new())
-                } else {
-                    Value::Null
-                }
-            });
-        message.insert("content".to_string(), content_value);
-        if let Some(reasoning_content) = self.reasoning_content.as_ref() {
-            if !reasoning_content.trim().is_empty() {
-                message.insert(
-                    "reasoning_content".to_string(),
-                    Value::String(reasoning_content.clone()),
-                );
+/// 把一条助手消息序列化回请求里的 message 对象。
+///
+/// 由 `ChatMessage::to_request_message` 原样迁来——它只做 JSON 拼装、不含
+/// wire 解析，因此随契约类型留在 kernel（构造请求体是 kernel 的职责）。
+fn llm_message_to_request(message: &cordis_plugin_sdk::llm::LlmMessage) -> Value {
+    let mut out = Map::new();
+    out.insert("role".to_string(), Value::String("assistant".to_string()));
+    let content_value = message
+        .content
+        .as_ref()
+        .map(|content| Value::String(content.clone()))
+        .unwrap_or_else(|| {
+            if message.reasoning_content.is_some() || !message.tool_calls.is_empty() {
+                Value::String(String::new())
+            } else {
+                Value::Null
             }
-        }
-        if !self.tool_calls.is_empty() {
-            message.insert(
-                "tool_calls".to_string(),
-                serde_json::to_value(&self.tool_calls).unwrap_or(Value::Array(Vec::new())),
+        });
+    out.insert("content".to_string(), content_value);
+    if let Some(reasoning_content) = message.reasoning_content.as_ref() {
+        if !reasoning_content.trim().is_empty() {
+            out.insert(
+                "reasoning_content".to_string(),
+                Value::String(reasoning_content.clone()),
             );
         }
-        Value::Object(message)
     }
-}
-
-#[derive(Debug, Clone, Deserialize, PartialEq, Default)]
-struct ChatChunk {
-    #[serde(default)]
-    id: Option<String>,
-    #[serde(default)]
-    choices: Vec<ChatChunkChoice>,
-}
-
-#[derive(Debug, Clone, Deserialize, PartialEq, Default)]
-struct ChatChunkChoice {
-    #[serde(default)]
-    delta: ChatChunkDelta,
-    #[serde(default)]
-    finish_reason: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize, PartialEq, Default)]
-struct ChatChunkDelta {
-    #[serde(default)]
-    content: Option<String>,
-    #[serde(default)]
-    reasoning_content: Option<String>,
-    #[serde(default)]
-    tool_calls: Vec<ToolCallDelta>,
-}
-
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
-struct ToolCallDelta {
-    #[serde(default)]
-    index: usize,
-    #[serde(default)]
-    id: Option<String>,
-    #[serde(rename = "type", default)]
-    call_type: Option<String>,
-    #[serde(default)]
-    function: Option<ToolFunctionCallDelta>,
-}
-
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
-struct ToolFunctionCallDelta {
-    #[serde(default)]
-    name: Option<String>,
-    #[serde(default)]
-    arguments: Option<String>,
-}
-
-#[derive(Debug, Default)]
-struct ChatMessageAccumulator {
-    response_id: Option<String>,
-    content: String,
-    reasoning_content: String,
-    tool_calls: Vec<ToolCallAccumulator>,
-}
-
-#[derive(Debug, Default)]
-struct ToolCallAccumulator {
-    id: String,
-    call_type: String,
-    name: String,
-    arguments: String,
-}
-
-#[derive(Debug, Default)]
-struct StreamEventSummary {
-    delta_reasoning_chars: usize,
-    delta_content_chars: usize,
-    delta_tool_call_count: usize,
-    finish_reason: Option<String>,
-}
-
-#[derive(Debug)]
-struct ChatStreamReadResult {
-    response_id: Option<String>,
-    message: ChatMessage,
-    raw_bytes: usize,
-    event_count: usize,
-    saw_done: bool,
-    finish_reason: Option<String>,
-}
-
-#[derive(Debug)]
-enum ChatStreamReadError {
-    Io(std::io::Error),
-    InvalidResponse(String),
-}
-
-impl ChatMessageAccumulator {
-    fn apply_chunk(&mut self, chunk: ChatChunk) -> Result<StreamEventSummary, RuntimeError> {
-        if self.response_id.is_none() {
-            self.response_id = chunk.id;
-        }
-
-        let mut summary = StreamEventSummary::default();
-        for choice in chunk.choices {
-            if let Some(content) = choice.delta.content {
-                summary.delta_content_chars += content.chars().count();
-                self.content.push_str(&content);
-            }
-            if let Some(reasoning_content) = choice.delta.reasoning_content {
-                summary.delta_reasoning_chars += reasoning_content.chars().count();
-                self.reasoning_content.push_str(&reasoning_content);
-            }
-            for tool_call in choice.delta.tool_calls {
-                summary.delta_tool_call_count += 1;
-                while self.tool_calls.len() <= tool_call.index {
-                    self.tool_calls.push(ToolCallAccumulator::default());
-                }
-                let slot = &mut self.tool_calls[tool_call.index];
-                if let Some(id) = tool_call.id {
-                    merge_stream_field(&mut slot.id, &id, false);
-                }
-                if let Some(call_type) = tool_call.call_type {
-                    merge_stream_field(&mut slot.call_type, &call_type, false);
-                }
-                if let Some(function) = tool_call.function {
-                    if let Some(name) = function.name {
-                        merge_stream_field(&mut slot.name, &name, false);
-                    }
-                    if let Some(arguments) = function.arguments {
-                        merge_stream_field(&mut slot.arguments, &arguments, true);
-                    }
-                }
-            }
-            if choice.finish_reason.is_some() {
-                summary.finish_reason = choice.finish_reason;
-            }
-        }
-
-        Ok(summary)
+    if !message.tool_calls.is_empty() {
+        out.insert(
+            "tool_calls".to_string(),
+            serde_json::to_value(&message.tool_calls).unwrap_or(Value::Array(Vec::new())),
+        );
     }
-
-    fn finish(self) -> Result<(ChatMessage, Option<String>), RuntimeError> {
-        let tool_calls = self
-            .tool_calls
-            .into_iter()
-            .filter(|tool| {
-                !(tool.id.is_empty()
-                    && tool.call_type.is_empty()
-                    && tool.name.is_empty()
-                    && tool.arguments.is_empty())
-            })
-            .map(|tool| {
-                if tool.id.is_empty()
-                    || tool.call_type.is_empty()
-                    || tool.name.is_empty()
-                    || tool.arguments.is_empty()
-                {
-                    return Err(RuntimeError::LlmResponseInvalid {
-                        message: format!(
-                            "streamed shell agent tool call was incomplete: id_present={} type_present={} name_present={} arguments_present={}",
-                            !tool.id.is_empty(),
-                            !tool.call_type.is_empty(),
-                            !tool.name.is_empty(),
-                            !tool.arguments.is_empty(),
-                        ),
-                    });
-                }
-                Ok(ToolCall {
-                    id: tool.id,
-                    call_type: tool.call_type,
-                    function: ToolFunctionCall {
-                        name: tool.name,
-                        arguments: tool.arguments,
-                    },
-                })
-            })
-            .collect::<Result<Vec<_>, RuntimeError>>()?;
-
-        Ok((
-            ChatMessage {
-                content: normalize_streamed_optional_text(self.content),
-                reasoning_content: normalize_streamed_optional_text(self.reasoning_content),
-                tool_calls,
-            },
-            self.response_id,
-        ))
-    }
+    Value::Object(out)
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
@@ -2382,7 +2091,7 @@ fn execute_agent_tool_call<B: AgentBackend + ?Sized>(
     backend: &mut B,
     available_tools: &BTreeSet<String>,
     session_kind: &str,
-    tool_call: &ToolCall,
+    tool_call: &cordis_plugin_sdk::llm::LlmToolCall,
     unknown_tool_strikes: &mut usize,
 ) -> (AgentToolEvent, String) {
     let tool_name = tool_call.function.name.clone();
@@ -2507,303 +2216,6 @@ fn execute_agent_tool_call<B: AgentBackend + ?Sized>(
             )
         }
     }
-}
-
-fn read_chat_stream(
-    response: Response,
-    request_summary: &str,
-    attempt: usize,
-    timeout: Duration,
-) -> Result<ChatStreamReadResult, ChatStreamReadError> {
-    // Channel capacity: 8 chunks of 8 KiB each — enough to smooth out
-    // network jitter without buffering the entire response in memory.
-    let (tx, rx) = sync_channel::<std::io::Result<Vec<u8>>>(8);
-
-    // Read the response body in a background thread so the main loop can
-    // enforce a per-read timeout via recv_timeout.  This prevents the
-    // agent from hanging indefinitely when the server stalls mid-stream.
-    //
-    // P1-34: `reader.read()` blocks on the underlying TCP socket, and the
-    // reader-thread has no explicit stop signal — if the main loop
-    // returns early (e.g. InvalidResponse), the thread would only exit
-    // when the next `read()` completes. That is bounded by the
-    // reqwest::Client `timeout(...)` set at construction (see
-    // `AgentSession::new` / `from_snapshot`), which caps the total time
-    // a `read()` can block. When the client timeout eventually fires,
-    // the thread hits an Io error, sees `tx.send(Err(e))` fail (rx has
-    // been dropped) and exits. Not zero-cost — one temporarily-alive
-    // reader thread per failed attempt — but bounded and self-cleaning.
-    let _reader_thread = thread::spawn(move || {
-        let mut reader = BufReader::new(response);
-        loop {
-            let mut buf = vec![0u8; 8192];
-            match reader.read(&mut buf) {
-                Ok(0) => {
-                    // EOF — send empty marker.
-                    let _ = tx.send(Ok(Vec::new()));
-                    break;
-                }
-                Ok(n) => {
-                    buf.truncate(n);
-                    if tx.send(Ok(buf)).is_err() {
-                        break; // receiver hung up (timeout / error)
-                    }
-                }
-                Err(e) => {
-                    let _ = tx.send(Err(e));
-                    break;
-                }
-            }
-        }
-    });
-
-    let mut raw_bytes = 0usize;
-    let mut event_count = 0usize;
-    let mut saw_done = false;
-    let mut finish_reason = None;
-    let mut pending_data_lines = Vec::new();
-    let mut accumulator = ChatMessageAccumulator::default();
-    let mut flushed_content_len = 0usize;
-    let mut flushed_reasoning_len = 0usize;
-
-    // Line buffer: accumulated raw bytes that haven't yielded a complete line yet.
-    let mut line_buf: Vec<u8> = Vec::new();
-
-    /// Drain complete lines from `line_buf`, returning each terminated line
-    /// (including the `\n`) as a String.  Leftover bytes (incomplete line)
-    /// stay in `line_buf`.
-    fn drain_lines(line_buf: &mut Vec<u8>) -> Vec<String> {
-        let mut lines = Vec::new();
-        while let Some(pos) = line_buf.iter().position(|&b| b == b'\n') {
-            let line_bytes: Vec<u8> = line_buf.drain(..=pos).collect();
-            lines.push(String::from_utf8_lossy(&line_bytes).to_string());
-        }
-        lines
-    }
-
-    let stream_started = Instant::now();
-    let overall_deadline = timeout * 5;
-
-    loop {
-        // Overall deadline: if the stream takes way longer than expected,
-        // the server is hung — don't wait for per-chunk timeouts.
-        if stream_started.elapsed() > overall_deadline {
-            return Err(ChatStreamReadError::Io(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                format!(
-                    "stream overall deadline exceeded after {:?} (received {} bytes, {} events, timeout {:?})",
-                    overall_deadline, raw_bytes, event_count, timeout,
-                ),
-            )));
-        }
-
-        // Wait for the next chunk with a timeout.  Each chunk gets its own
-        // timeout window so we don't fail just because the total response
-        // takes longer than the budget — we only fail when the server goes
-        // silent for too long.
-        let chunk = match rx.recv_timeout(timeout) {
-            Ok(Ok(chunk)) => chunk,
-            Ok(Err(e)) => return Err(ChatStreamReadError::Io(e)),
-            Err(RecvTimeoutError::Timeout) => {
-                return Err(ChatStreamReadError::Io(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    format!(
-                        "stream read timed out after {:?} (received {} bytes, {} events so far, elapsed {:?})",
-                        timeout,
-                        raw_bytes,
-                        event_count,
-                        stream_started.elapsed(),
-                    ),
-                )));
-            }
-            Err(RecvTimeoutError::Disconnected) => {
-                // Reader thread exited — flush any remaining data then break.
-                if !line_buf.is_empty() {
-                    // Treat leftover bytes as a final (incomplete) line.
-                    let leftover = std::mem::take(&mut line_buf);
-                    let line = String::from_utf8_lossy(&leftover).to_string();
-                    raw_bytes += line.len();
-                    if !pending_data_lines.is_empty() {
-                        saw_done = process_stream_event(
-                            &pending_data_lines.join("\n"),
-                            &mut accumulator,
-                            &mut event_count,
-                            &mut finish_reason,
-                            request_summary,
-                            attempt,
-                        )?;
-                    }
-                    // Also try to process the leftover as its own event.
-                    if !line.trim().is_empty() {
-                        if let Some(data) = line.trim().strip_prefix("data:") {
-                            pending_data_lines.push(data.trim_start().to_string());
-                        }
-                    }
-                    if !pending_data_lines.is_empty() {
-                        saw_done = process_stream_event(
-                            &pending_data_lines.join("\n"),
-                            &mut accumulator,
-                            &mut event_count,
-                            &mut finish_reason,
-                            request_summary,
-                            attempt,
-                        )?;
-                    }
-                }
-                break;
-            }
-        };
-
-        if chunk.is_empty() {
-            // EOF from reader thread.
-            if !pending_data_lines.is_empty() {
-                saw_done = process_stream_event(
-                    &pending_data_lines.join("\n"),
-                    &mut accumulator,
-                    &mut event_count,
-                    &mut finish_reason,
-                    request_summary,
-                    attempt,
-                )?;
-            }
-            break;
-        }
-
-        raw_bytes += chunk.len();
-        line_buf.extend_from_slice(&chunk);
-
-        for line in drain_lines(&mut line_buf) {
-            let trimmed = line.trim_end_matches(['\r', '\n']);
-            if trimmed.is_empty() {
-                if pending_data_lines.is_empty() {
-                    continue;
-                }
-                let event_payload = pending_data_lines.join("\n");
-                pending_data_lines.clear();
-                if process_stream_event(
-                    &event_payload,
-                    &mut accumulator,
-                    &mut event_count,
-                    &mut finish_reason,
-                    request_summary,
-                    attempt,
-                )? {
-                    saw_done = true;
-                    break;
-                }
-                // Stream new reasoning — prefix every line with 💭.
-                let new_reasoning = &accumulator.reasoning_content[flushed_reasoning_len..];
-                if !new_reasoning.is_empty() {
-                    if flushed_reasoning_len == 0 {
-                        let _ = write!(std::io::stdout(), "\x1b[2m💭 ");
-                    }
-                    let formatted = new_reasoning.replace('\n', "\n💭 ");
-                    let _ = write!(std::io::stdout(), "{formatted}");
-                    let _ = std::io::stdout().flush();
-                    flushed_reasoning_len = accumulator.reasoning_content.len();
-                }
-                let new_content = &accumulator.content[flushed_content_len..];
-                if !new_content.is_empty() {
-                    if flushed_reasoning_len > 0 && flushed_content_len == 0 {
-                        let _ = writeln!(std::io::stdout(), "\x1b[0m");
-                    }
-                    print!("{new_content}");
-                    let _ = std::io::stdout().flush();
-                    flushed_content_len = accumulator.content.len();
-                }
-                continue;
-            }
-
-            if let Some(data) = trimmed.strip_prefix("data:") {
-                pending_data_lines.push(data.trim_start().to_string());
-            }
-        }
-
-        if saw_done {
-            break;
-        }
-    }
-
-    // Final flush: print any remaining unprinted content.
-    let new_reasoning = &accumulator.reasoning_content[flushed_reasoning_len..];
-    if !new_reasoning.is_empty() {
-        if flushed_reasoning_len == 0 {
-            let _ = write!(std::io::stdout(), "\x1b[2m💭 ");
-        }
-        let _ = write!(std::io::stdout(), "{new_reasoning}");
-        let _ = std::io::stdout().flush();
-    }
-    let new_content = &accumulator.content[flushed_content_len..];
-    if !new_content.is_empty() {
-        if flushed_reasoning_len > 0 && flushed_content_len == 0 {
-            let _ = writeln!(std::io::stdout(), "\x1b[0m");
-        }
-        print!("{new_content}");
-        let _ = std::io::stdout().flush();
-    } else if flushed_reasoning_len > 0 {
-        // Reasoning-only response (no content): close the dim span.
-        let _ = writeln!(std::io::stdout(), "\x1b[0m");
-    }
-
-    let (message, response_id) = accumulator
-        .finish()
-        .map_err(|err| ChatStreamReadError::InvalidResponse(err.to_string()))?;
-    Ok(ChatStreamReadResult {
-        response_id,
-        message,
-        raw_bytes,
-        event_count,
-        saw_done,
-        finish_reason,
-    })
-}
-
-fn process_stream_event(
-    payload: &str,
-    accumulator: &mut ChatMessageAccumulator,
-    event_count: &mut usize,
-    finish_reason: &mut Option<String>,
-    request_summary: &str,
-    attempt: usize,
-) -> Result<bool, ChatStreamReadError> {
-    let trimmed = payload.trim();
-    if trimmed.is_empty() {
-        return Ok(false);
-    }
-    if trimmed == "[DONE]" {
-        emit_agent_diagnostic(format!(
-            "agent_stream_done attempt={} events={} {}",
-            attempt, *event_count, request_summary
-        ));
-        return Ok(true);
-    }
-
-    let chunk: ChatChunk = serde_json::from_str(trimmed).map_err(|err| {
-        ChatStreamReadError::InvalidResponse(format!(
-            "invalid streamed shell agent chunk JSON: {err}; body_preview={}",
-            truncate_for_error(trimmed, 800)
-        ))
-    })?;
-    let summary = accumulator
-        .apply_chunk(chunk)
-        .map_err(|err| ChatStreamReadError::InvalidResponse(err.to_string()))?;
-    if let Some(reason) = summary.finish_reason.clone() {
-        *finish_reason = Some(reason);
-    }
-    *event_count += 1;
-    emit_agent_diagnostic(format!(
-        "agent_stream_event attempt={} event={} delta_reasoning_chars={} delta_content_chars={} delta_tool_calls={} finish_reason={} total_reasoning_chars={} total_content_chars={} {}",
-        attempt,
-        *event_count,
-        summary.delta_reasoning_chars,
-        summary.delta_content_chars,
-        summary.delta_tool_call_count,
-        summary.finish_reason.as_deref().unwrap_or("-"),
-        accumulator.reasoning_content.chars().count(),
-        accumulator.content.chars().count(),
-        request_summary,
-    ));
-    Ok(false)
 }
 
 struct RuntimeShellAgentBackend<'a, H: AgentToolHost + ?Sized> {
@@ -3288,113 +2700,9 @@ For plugin node calls: always use invoke_plugin(plugin_path, node_id, payload_js
     prompt
 }
 
-fn resolve_api_key(config: &LlmApiConfig) -> Result<String, RuntimeError> {
-    if let Some(api_key) = &config.api_key {
-        if !api_key.trim().is_empty() {
-            return Ok(api_key.clone());
-        }
-    }
-    if api_key_env_looks_like_secret(&config.api_key_env) {
-        return Err(RuntimeError::InvalidArgument {
-            message: "llm_api.api_key_env must be an environment variable name like OPENAI_API_KEY, not the API key value itself".to_string(),
-        });
-    }
-    env::var(&config.api_key_env).map_err(|_| RuntimeError::MissingLlmApiKey {
-        env_name: config.api_key_env.clone(),
-    })
-}
-
-fn api_key_env_looks_like_secret(value: &str) -> bool {
-    let trimmed = value.trim();
-    trimmed.starts_with("sk-") || trimmed.starts_with("sk_")
-}
-
 fn emit_agent_diagnostic(message: String) {
     if env::var(LLM_DEBUG_ENV).ok().as_deref() == Some("1") {
         eprintln!("{message}");
-    }
-}
-
-fn summarize_request(endpoint: &str, request_body: &Value, timeout_ms: u64) -> String {
-    let model = request_body
-        .get("model")
-        .and_then(Value::as_str)
-        .unwrap_or("-");
-    let messages = request_body
-        .get("messages")
-        .and_then(Value::as_array)
-        .map(|items| items.len())
-        .unwrap_or(0);
-    let tools = request_body
-        .get("tools")
-        .and_then(Value::as_array)
-        .map(|items| items.len())
-        .unwrap_or(0);
-    let tool_choice = request_body
-        .get("tool_choice")
-        .and_then(Value::as_str)
-        .unwrap_or("-");
-    let stream = request_body
-        .get("stream")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    format!(
-        "endpoint={} model={} timeout_ms={} messages={} tools={} tool_choice={} stream={}",
-        endpoint, model, timeout_ms, messages, tools, tool_choice, stream
-    )
-}
-
-fn format_transport_error(err: &reqwest::Error, timeout_ms: u64) -> String {
-    if err.is_timeout() {
-        format!("request timed out after timeout_ms={timeout_ms}: {err}")
-    } else {
-        err.to_string()
-    }
-}
-
-fn format_stream_error(err: &std::io::Error, timeout_ms: u64) -> String {
-    if err.kind() == std::io::ErrorKind::TimedOut {
-        format!("stream read timed out after timeout_ms={timeout_ms}: {err}")
-    } else {
-        err.to_string()
-    }
-}
-
-fn extract_error_message(raw_body: &str) -> Option<String> {
-    let json: Value = serde_json::from_str(raw_body).ok()?;
-    json.get("error")
-        .and_then(|value| value.get("message"))
-        .and_then(Value::as_str)
-        .map(ToString::to_string)
-        .or_else(|| {
-            json.get("detail")
-                .and_then(Value::as_str)
-                .map(ToString::to_string)
-        })
-}
-
-fn truncate_for_error(text: &str, max_chars: usize) -> String {
-    let mut chars = text.chars();
-    let truncated = chars.by_ref().take(max_chars).collect::<String>();
-    if chars.next().is_some() {
-        format!("{truncated}...")
-    } else {
-        truncated
-    }
-}
-
-fn normalize_streamed_optional_text(value: String) -> Option<String> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.to_string())
-    }
-}
-
-fn merge_stream_field(target: &mut String, delta: &str, append: bool) {
-    if append || target.is_empty() {
-        target.push_str(delta);
     }
 }
 
@@ -3420,55 +2728,170 @@ fn to_json_value<T: Serialize>(label: &str, value: T) -> Result<Value, RuntimeEr
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{BufRead, BufReader, Read, Write};
-    use std::net::TcpListener;
-    use std::sync::mpsc;
-    use std::thread;
 
     const TEST_TOOL_RECORD: &str = "record_summary";
     const TEST_TOOL_READ: &str = "read_context";
 
+    /// 按脚本回放补全的假 provider：让机制测试（工具分派、历史、计数）不再需要
+    /// 起 TCP mock server 与解析 SSE。
+    ///
+    /// 每次 `complete` 弹出一条预置回复；`sink` 非空时按 `stream_as` 逐段推增量，
+    /// 用于验证"展示由调用方决定"这条契约。
+    struct FakeLlmProvider {
+        replies: std::sync::Mutex<std::collections::VecDeque<cordis_plugin_sdk::llm::LlmMessage>>,
+        /// 依次推给 sink 的 (是否推理, 文本) 增量。
+        stream_as: Vec<(bool, String)>,
+        /// 记录收到的请求体，供断言。
+        seen_bodies: std::sync::Mutex<Vec<Value>>,
+    }
+
+    impl FakeLlmProvider {
+        fn new(replies: Vec<cordis_plugin_sdk::llm::LlmMessage>) -> Self {
+            Self {
+                replies: std::sync::Mutex::new(replies.into()),
+                stream_as: Vec::new(),
+                seen_bodies: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn streaming(
+            replies: Vec<cordis_plugin_sdk::llm::LlmMessage>,
+            stream_as: Vec<(bool, String)>,
+        ) -> Self {
+            Self {
+                stream_as,
+                ..Self::new(replies)
+            }
+        }
+    }
+
+    impl LlmProvider for FakeLlmProvider {
+        fn complete(
+            &self,
+            body: Value,
+            sink: Option<std::sync::Arc<dyn crate::llm_sink::TokenSink>>,
+            _transport: cordis_plugin_sdk::llm::LlmTransportConfig,
+        ) -> Result<LlmCompletionParts, RuntimeError> {
+            self.seen_bodies.lock().expect("seen_bodies").push(body);
+            if let Some(sink) = sink.as_ref() {
+                for (is_reasoning, text) in &self.stream_as {
+                    if *is_reasoning {
+                        sink.on_reasoning(text);
+                    } else {
+                        sink.on_content(text);
+                    }
+                }
+            }
+            let message = self
+                .replies
+                .lock()
+                .expect("replies")
+                .pop_front()
+                .ok_or_else(|| RuntimeError::LlmRequestFailed {
+                    message: "fake provider ran out of scripted replies".to_string(),
+                })?;
+            let finish = if message.tool_calls.is_empty() {
+                "stop"
+            } else {
+                "tool_calls"
+            };
+            Ok(LlmCompletionParts {
+                message,
+                response_id: Some("resp-fake".to_string()),
+                finish_reason: Some(finish.into()),
+            })
+        }
+    }
+
+    /// 记录增量的 sink，用于断言顺序与分类。
+    #[derive(Default)]
+    struct RecordingTokenSink {
+        events: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl crate::llm_sink::TokenSink for RecordingTokenSink {
+        fn on_reasoning(&self, delta: &str) {
+            self.events
+                .lock()
+                .expect("events")
+                .push(format!("r:{delta}"));
+        }
+        fn on_content(&self, delta: &str) {
+            self.events
+                .lock()
+                .expect("events")
+                .push(format!("c:{delta}"));
+        }
+    }
+
+    fn assistant_reply(content: &str) -> cordis_plugin_sdk::llm::LlmMessage {
+        cordis_plugin_sdk::llm::LlmMessage {
+            content: Some(content.to_string()),
+            ..Default::default()
+        }
+    }
+
+    /// 接缝契约：provider 拿到 kernel 构造的请求体，其返回值即权威结果；
+    /// sink 只是旁路，忽略它也必须得到同样的回复。
+    #[test]
+    fn provider_seam_returns_reply_and_sink_is_optional() {
+        let provider = FakeLlmProvider::new(vec![assistant_reply("hello")]);
+        let parts = provider
+            .complete(json!({"model": "m"}), None, Default::default())
+            .expect("complete");
+        let (message, response_id, finish) =
+            (parts.message, parts.response_id, parts.finish_reason);
+        assert_eq!(message.content.as_deref(), Some("hello"));
+        assert_eq!(response_id.as_deref(), Some("resp-fake"));
+        assert_eq!(finish.as_deref(), Some("stop"));
+        // kernel 构造的 body 原样抵达 provider。
+        let bodies = provider.seen_bodies.lock().expect("bodies");
+        assert_eq!(bodies.len(), 1);
+        assert_eq!(bodies[0].get("model").and_then(|v| v.as_str()), Some("m"));
+    }
+
+    /// 有 sink 时增量按序抵达，且**完整内容仍在返回值里**——REPL 靠增量显示，
+    /// inbox/serve 靠返回值，两条路径读的是同一次补全。
+    #[test]
+    fn provider_seam_streams_deltas_to_sink_in_order() {
+        let provider = FakeLlmProvider::streaming(
+            vec![assistant_reply("done")],
+            vec![
+                (true, "thinking".to_string()),
+                (false, "par".to_string()),
+                (false, "tial".to_string()),
+            ],
+        );
+        let sink = std::sync::Arc::new(RecordingTokenSink::default());
+        let parts = provider
+            .complete(
+                json!({}),
+                Some(sink.clone() as std::sync::Arc<dyn crate::llm_sink::TokenSink>),
+                Default::default(),
+            )
+            .expect("complete");
+        assert_eq!(
+            *sink.events.lock().expect("events"),
+            vec!["r:thinking", "c:par", "c:tial"]
+        );
+        assert_eq!(parts.message.content.as_deref(), Some("done"));
+    }
+
+    /// provider 用尽脚本回复时报错，而不是静默返回空消息。
+    #[test]
+    fn provider_seam_surfaces_exhausted_script_as_error() {
+        let provider = FakeLlmProvider::new(Vec::new());
+        let err = provider
+            .complete(json!({}), None, Default::default())
+            .expect_err("must fail");
+        assert!(
+            matches!(err, RuntimeError::LlmRequestFailed { .. }),
+            "{err:?}"
+        );
+    }
+
     #[derive(Default)]
     struct FakeHost;
-
-    #[derive(Default)]
-    struct TerminalTestBackend {
-        executed_tools: Vec<String>,
-    }
-
-    impl AgentBackend for TerminalTestBackend {
-        type Host = FakeHost;
-        fn host(&self) -> &FakeHost {
-            &FakeHost
-        }
-        fn system_prompt(&self) -> String {
-            "test backend".to_string()
-        }
-
-        fn tool_specs(&self) -> Vec<AgentToolSpec> {
-            vec![
-                AgentToolSpec {
-                    name: TEST_TOOL_RECORD,
-                    description: "Record a terminal summary.",
-                    parameters: json!({"type":"object","properties":{},"additionalProperties":false}),
-                },
-                AgentToolSpec {
-                    name: TEST_TOOL_READ,
-                    description: "Read extra context.",
-                    parameters: json!({"type":"object","properties":{},"additionalProperties":false}),
-                },
-            ]
-        }
-
-        fn execute_tool(&mut self, name: &str, _arguments: Value) -> Result<Value, RuntimeError> {
-            self.executed_tools.push(name.to_string());
-            Ok(json!({ "tool": name }))
-        }
-
-        fn terminal_tool_reply(&self, name: &str, _output: &Value) -> Option<String> {
-            (name == TEST_TOOL_RECORD).then_some("Terminal summary recorded.".to_string())
-        }
-    }
 
     impl AgentToolHost for FakeHost {
         fn agent_runtime_status(&self) -> Result<Value, RuntimeError> {
@@ -3643,12 +3066,12 @@ mod tests {
 
     #[test]
     fn reasoning_only_request_message_uses_empty_content() {
-        let message = ChatMessage {
+        let message = cordis_plugin_sdk::llm::LlmMessage {
             content: None,
             reasoning_content: Some("Need another reasoning pass".to_string()),
             tool_calls: Vec::new(),
         };
-        let request = message.to_request_message();
+        let request = llm_message_to_request(&message);
         assert_eq!(
             request.get("role").and_then(Value::as_str),
             Some("assistant")
@@ -3677,67 +3100,69 @@ mod tests {
         assert_eq!(session.status().stored_messages, 0);
     }
 
+    struct TerminalTestBackend {
+        executed_tools: Vec<String>,
+    }
+
+    impl AgentBackend for TerminalTestBackend {
+        type Host = FakeHost;
+        fn host(&self) -> &FakeHost {
+            &FakeHost
+        }
+        fn system_prompt(&self) -> String {
+            "test backend".to_string()
+        }
+
+        fn tool_specs(&self) -> Vec<AgentToolSpec> {
+            vec![
+                AgentToolSpec {
+                    name: TEST_TOOL_RECORD,
+                    description: "Record a terminal summary.",
+                    parameters: json!({"type":"object","properties":{},"additionalProperties":false}),
+                },
+                AgentToolSpec {
+                    name: TEST_TOOL_READ,
+                    description: "Read extra context.",
+                    parameters: json!({"type":"object","properties":{},"additionalProperties":false}),
+                },
+            ]
+        }
+
+        fn execute_tool(&mut self, name: &str, _arguments: Value) -> Result<Value, RuntimeError> {
+            self.executed_tools.push(name.to_string());
+            Ok(json!({ "tool": name }))
+        }
+
+        fn terminal_tool_reply(&self, name: &str, _output: &Value) -> Option<String> {
+            (name == TEST_TOOL_RECORD).then_some("Terminal summary recorded.".to_string())
+        }
+    }
+
+    /// 循环会分派工具、把结果并回历史，并在下一轮拿到最终答复。
+    /// 拆分后不再需要 mock HTTP：`FakeLlmProvider` 直接按脚本给补全。
     #[test]
     fn shell_agent_uses_runtime_tool_and_keeps_history() {
-        let first_response = sse_response(vec![
-            json!({
-                "id": "chatcmpl_agent_1",
-                "choices": [{
-                    "delta": {
-                        "tool_calls": [{
-                            "index": 0,
-                            "id": "call_runtime_status",
-                            "type": "function",
-                            "function": {
-                                "name": AGENT_TOOL_GET_RUNTIME_STATUS,
-                                "arguments": "{}"
-                            }
-                        }]
-                    }
-                }]
-            }),
-            json!({
-                "id": "chatcmpl_agent_1",
-                "choices": [{
-                    "delta": {},
-                    "finish_reason": "tool_calls"
-                }]
-            }),
+        let provider = FakeLlmProvider::new(vec![
+            cordis_plugin_sdk::llm::LlmMessage {
+                tool_calls: vec![cordis_plugin_sdk::llm::LlmToolCall {
+                    id: "call_status".to_string(),
+                    call_type: "function".to_string(),
+                    function: cordis_plugin_sdk::llm::LlmToolFunction {
+                        name: AGENT_TOOL_GET_RUNTIME_STATUS.to_string(),
+                        arguments: "{}".to_string(),
+                    },
+                }],
+                ..Default::default()
+            },
+            assistant_reply("Runtime is healthy and loaded."),
         ]);
-        let second_response = sse_response(vec![
-            json!({
-                "id": "chatcmpl_agent_2",
-                "choices": [{
-                    "delta": {
-                        "content": "Runtime is healthy and loaded."
-                    }
-                }]
-            }),
-            json!({
-                "id": "chatcmpl_agent_2",
-                "choices": [{
-                    "delta": {},
-                    "finish_reason": "stop"
-                }]
-            }),
-        ]);
-        let (base_url, requests_rx, handle) =
-            spawn_chunked_mock_llm_server_sequence(vec![first_response, second_response]);
-
-        let config = LlmApiConfig {
-            provider: "deepseek".to_string(),
-            base_url,
-            api_key: Some("test-key".to_string()),
-            model: "deepseek-reasoner".to_string(),
-            timeout_ms: 30_000,
-            ..LlmApiConfig::default()
-        };
-        let mut session = ShellAgentSession::new(config).expect("build session");
+        let mut session = ShellAgentSession::new(LlmApiConfig::default()).expect("build session");
         let reply = session
-            .respond(
+            .respond_via(
                 &FakeHost,
                 "test-session-1",
                 "What is the runtime status right now?",
+                &provider,
             )
             .expect("agent reply");
 
@@ -3746,197 +3171,89 @@ mod tests {
         assert_eq!(reply.tool_events[0].name, AGENT_TOOL_GET_RUNTIME_STATUS);
         assert_eq!(session.status().completed_turns, 1);
 
-        let requests = requests_rx.recv().expect("captured requests");
-        handle.join().expect("join mock server");
-        assert_eq!(requests.len(), 2);
-        assert!(requests[0].contains("\"tools\""));
-        assert!(requests[1].contains("snapshot-demo"));
+        // 第一轮请求带工具规格；第二轮把工具结果并回了历史。
+        let bodies = provider.seen_bodies.lock().expect("bodies");
+        assert_eq!(bodies.len(), 2);
+        assert!(
+            bodies[0].get("tools").is_some(),
+            "first turn must offer tools"
+        );
+        assert!(
+            bodies[1].to_string().contains("snapshot-demo"),
+            "second turn must carry the tool result back"
+        );
     }
 
+    /// 终止工具（`terminal_tool_reply` 返回 Some）一出现就结束会话，
+    /// 不再向模型多要一轮。
     #[test]
     fn terminal_tool_reply_ends_agent_session_without_extra_turn() {
-        let response = sse_response(vec![
-            json!({
-                "id": "chatcmpl_agent_terminal",
-                "choices": [{
-                    "delta": {
-                        "tool_calls": [{
-                            "index": 0,
-                            "id": "call_record_summary",
-                            "type": "function",
-                            "function": {
-                                "name": TEST_TOOL_RECORD,
-                                "arguments": "{}"
-                            }
-                        }]
-                    }
-                }]
-            }),
-            json!({
-                "id": "chatcmpl_agent_terminal",
-                "choices": [{
-                    "delta": {},
-                    "finish_reason": "tool_calls"
-                }]
-            }),
-        ]);
-        let (base_url, requests_rx, handle) =
-            spawn_chunked_mock_llm_server_sequence(vec![response]);
-
-        let config = LlmApiConfig {
-            provider: "deepseek".to_string(),
-            base_url,
-            api_key: Some("test-key".to_string()),
-            model: "deepseek-reasoner".to_string(),
-            timeout_ms: 30_000,
-            ..LlmApiConfig::default()
+        let provider = FakeLlmProvider::new(vec![cordis_plugin_sdk::llm::LlmMessage {
+            tool_calls: vec![cordis_plugin_sdk::llm::LlmToolCall {
+                id: "call_record_summary".to_string(),
+                call_type: "function".to_string(),
+                function: cordis_plugin_sdk::llm::LlmToolFunction {
+                    name: TEST_TOOL_RECORD.to_string(),
+                    arguments: "{}".to_string(),
+                },
+            }],
+            ..Default::default()
+        }]);
+        let mut backend = TerminalTestBackend {
+            executed_tools: Vec::new(),
         };
-        let mut session = AgentSession::new(config, "plugin_iteration").expect("build session");
-        let mut backend = TerminalTestBackend::default();
-
+        let mut session =
+            AgentSession::new(LlmApiConfig::default(), "test").expect("build session");
         let reply = session
-            .respond(&mut backend, "Finish the iteration")
-            .expect("terminal tool should end session");
-
-        let requests = requests_rx.recv().expect("captured requests");
-        handle.join().expect("join mock server");
+            .respond_with_provider(&mut backend, "Finish the iteration", &provider, None)
+            .expect("agent reply");
 
         assert_eq!(reply.content, "Terminal summary recorded.");
-        assert_eq!(reply.tool_events.len(), 1);
         assert_eq!(backend.executed_tools, vec![TEST_TOOL_RECORD.to_string()]);
-        assert_eq!(requests.len(), 1);
+        // 关键：只发了一次补全请求——终止工具没有触发第二轮。
+        assert_eq!(provider.seen_bodies.lock().expect("bodies").len(), 1);
     }
 
+    /// 终止工具必须是本轮最后一个 tool_call：排在它后面的调用不执行，
+    /// 否则会话已结束却还在动工具。
     #[test]
     fn terminal_tool_must_be_last_tool_call_in_turn() {
-        let response = sse_response(vec![
-            json!({
-                "id": "chatcmpl_agent_bad_terminal",
-                "choices": [{
-                    "delta": {
-                        "tool_calls": [
-                            {
-                                "index": 0,
-                                "id": "call_record_summary",
-                                "type": "function",
-                                "function": {
-                                    "name": TEST_TOOL_RECORD,
-                                    "arguments": "{}"
-                                }
-                            },
-                            {
-                                "index": 1,
-                                "id": "call_read_context",
-                                "type": "function",
-                                "function": {
-                                    "name": TEST_TOOL_READ,
-                                    "arguments": "{}"
-                                }
-                            }
-                        ]
-                    }
-                }]
-            }),
-            json!({
-                "id": "chatcmpl_agent_bad_terminal",
-                "choices": [{
-                    "delta": {},
-                    "finish_reason": "tool_calls"
-                }]
-            }),
-        ]);
-        let (base_url, _requests_rx, handle) =
-            spawn_chunked_mock_llm_server_sequence(vec![response]);
-
-        let config = LlmApiConfig {
-            provider: "deepseek".to_string(),
-            base_url,
-            api_key: Some("test-key".to_string()),
-            model: "deepseek-reasoner".to_string(),
-            timeout_ms: 30_000,
-            ..LlmApiConfig::default()
+        let provider = FakeLlmProvider::new(vec![cordis_plugin_sdk::llm::LlmMessage {
+            tool_calls: vec![
+                cordis_plugin_sdk::llm::LlmToolCall {
+                    id: "call_record_summary".to_string(),
+                    call_type: "function".to_string(),
+                    function: cordis_plugin_sdk::llm::LlmToolFunction {
+                        name: TEST_TOOL_RECORD.to_string(),
+                        arguments: "{}".to_string(),
+                    },
+                },
+                cordis_plugin_sdk::llm::LlmToolCall {
+                    id: "call_read_context".to_string(),
+                    call_type: "function".to_string(),
+                    function: cordis_plugin_sdk::llm::LlmToolFunction {
+                        name: TEST_TOOL_READ.to_string(),
+                        arguments: "{}".to_string(),
+                    },
+                },
+            ],
+            ..Default::default()
+        }]);
+        let mut backend = TerminalTestBackend {
+            executed_tools: Vec::new(),
         };
-        let mut session = AgentSession::new(config, "plugin_iteration").expect("build session");
-        let mut backend = TerminalTestBackend::default();
-
+        let mut session =
+            AgentSession::new(LlmApiConfig::default(), "test").expect("build session");
         let err = session
-            .respond(&mut backend, "Bad terminal ordering")
-            .expect_err("terminal tool should be last");
-        handle.join().expect("join mock server");
+            .respond_with_provider(&mut backend, "Bad terminal ordering", &provider, None)
+            .expect_err("a terminal tool followed by another call must be rejected");
 
-        assert!(err
-            .to_string()
-            .contains("terminal agent tool record_summary must be the last tool call"));
-        assert_eq!(backend.executed_tools, vec![TEST_TOOL_RECORD.to_string()]);
-    }
-
-    fn spawn_chunked_mock_llm_server_sequence(
-        responses: Vec<Vec<(u64, String)>>,
-    ) -> (String, mpsc::Receiver<Vec<String>>, thread::JoinHandle<()>) {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
-        let address = listener.local_addr().expect("listener addr");
-        let (sender, receiver) = mpsc::channel();
-
-        let handle = thread::spawn(move || {
-            let mut requests = Vec::new();
-            for chunks in responses {
-                let (mut stream, _) = listener.accept().expect("accept request");
-                let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
-                let mut request = String::new();
-
-                let mut first_line = String::new();
-                reader
-                    .read_line(&mut first_line)
-                    .expect("read request line");
-                request.push_str(&first_line);
-
-                let mut content_length = 0usize;
-                loop {
-                    let mut line = String::new();
-                    reader.read_line(&mut line).expect("read header line");
-                    request.push_str(&line);
-                    if line == "\r\n" {
-                        break;
-                    }
-                    let lowercase = line.to_ascii_lowercase();
-                    if let Some(value) = lowercase.strip_prefix("content-length:") {
-                        content_length = value.trim().parse::<usize>().expect("content length");
-                    }
-                }
-
-                let mut body = vec![0_u8; content_length];
-                reader.read_exact(&mut body).expect("read request body");
-                request.push_str(&String::from_utf8_lossy(&body));
-                requests.push(request);
-
-                write!(
-                    stream,
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
-                )
-                .expect("write response headers");
-                stream.flush().expect("flush response headers");
-
-                for (delay_ms, chunk) in chunks {
-                    thread::sleep(Duration::from_millis(delay_ms));
-                    write!(stream, "{:X}\r\n{}\r\n", chunk.len(), chunk).expect("write chunk");
-                    stream.flush().expect("flush chunk");
-                }
-                write!(stream, "0\r\n\r\n").expect("finish chunked response");
-                stream.flush().expect("flush chunked end");
-            }
-            sender.send(requests).expect("send captured requests");
-        });
-
-        (format!("http://{}/v1", address), receiver, handle)
-    }
-
-    fn sse_response(events: Vec<Value>) -> Vec<(u64, String)> {
-        let mut chunks = events
-            .into_iter()
-            .map(|event| (0, format!("data: {}\n\n", event)))
-            .collect::<Vec<_>>();
-        chunks.push((0, "data: [DONE]\n\n".to_string()));
-        chunks
+        // 运行时拒绝整轮而不是"执行前半段"——半执行的轮次会让会话状态含糊。
+        assert!(
+            matches!(&err, RuntimeError::LlmResponseInvalid { message }
+                if message.contains("must be the last tool call")),
+            "unexpected error: {err:?}"
+        );
     }
 
     fn test_config() -> LlmApiConfig {

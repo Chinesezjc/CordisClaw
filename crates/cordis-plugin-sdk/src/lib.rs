@@ -1,7 +1,12 @@
 use serde::{Deserialize, Serialize};
 
+pub mod llm;
 pub mod workflow;
 
+pub use llm::{
+    LlmCompletion, LlmCompletionRequest, LlmMessage, LlmStreamFrame, LlmToolCall, LlmToolFunction,
+    LlmTransportConfig,
+};
 pub use workflow::{
     session, AskUserSpec, CallSpec, EventSpec, JoinPolicy, JoinSpec, RacePolicy, RaceSpec,
     SleepSpec, WaitFuture, WaitHandle, WaitKind, WaitOutcome, WaitSpec, WorkflowError,
