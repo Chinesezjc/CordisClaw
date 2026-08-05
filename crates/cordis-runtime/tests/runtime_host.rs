@@ -2477,7 +2477,12 @@ fn drop_session_evicts_memory_and_disk() {
     // Send one turn each so each session lands a disk snapshot.
     host.agent_send(&s1, "hello one").expect("send s1");
     host.agent_send(&s2, "hello two").expect("send s2");
-    let _ = requests_rx.recv().expect("captured requests");
+    let captured = requests_rx.recv().expect("captured requests");
+    assert_eq!(
+        captured.len(),
+        2,
+        "both scripted responses must have been dialled"
+    );
     handle.join().expect("join mock server");
 
     // agent_sessions=2, pending_session_actions=0, profile_fallback=2.

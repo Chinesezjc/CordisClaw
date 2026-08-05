@@ -424,7 +424,12 @@ fn fallback_wrapper_without_fallback_pointer_is_plain_send() {
         .expect("plain send should succeed");
     assert_eq!(reply.content, "served directly");
 
-    let _ = requests_rx.recv().expect("captured requests");
+    let captured = requests_rx.recv().expect("captured requests");
+    assert_eq!(
+        captured.len(),
+        1,
+        "the single scripted response must have been dialled"
+    );
     handle.join().expect("join mock server");
 
     // No degradation happened → no /llm-profile issue recorded.

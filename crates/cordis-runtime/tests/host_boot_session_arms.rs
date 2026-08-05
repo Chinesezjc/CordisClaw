@@ -36,21 +36,16 @@ use serial_test::serial;
 use tempfile::TempDir;
 
 mod support;
-use support::{spawn_chunked_mock_llm_server_sequence, sse_response};
 
-/// One-turn assistant SSE reply (content only, `finish_reason=stop`).
-fn assistant_turn(response_id: &str, content: &str) -> Vec<(u64, String)> {
-    sse_response(vec![
-        serde_json::json!({
-            "id": response_id,
-            "choices": [{ "delta": { "content": content } }]
-        }),
-        serde_json::json!({
-            "id": response_id,
-            "choices": [{ "delta": {}, "finish_reason": "stop" }]
-        }),
-    ])
-}
+/// `llm_api.yaml` 需要一个 `base_url` 字段，但本文件里没有任何用例会拨它：
+/// 应答一律由 `write_fake_llm_plugin` 造的假 provider 插件（Process 执行的
+/// shell 脚本）给出，全程不产生 HTTP 请求。
+///
+/// 这里放一个显式的占位地址，而不是再起一个 mock server——起了也没人连，
+/// 只会让 server 线程空等满 accept 预算。历史上正是如此：拆分前 kernel 自带
+/// HTTP 传输、mock 真被连上；改由假插件应答后 mock 沦为死脚手架，四个用例
+/// 各自空转 15 分钟，CI 从 23 分钟涨到 84 分钟。
+const UNUSED_LLM_BASE_URL: &str = "http://127.0.0.1:1/v1";
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -677,9 +672,7 @@ fn write_llm_config(workspace: &Workspace, url: &str) {
 #[serial]
 fn auto_save_session_writes_snapshot_atomically_on_a_successful_send() {
     let workspace = setup_workspace_with_llm(&[("fakellm", "stored")]);
-    let (url, requests_rx, handle) =
-        spawn_chunked_mock_llm_server_sequence(vec![assistant_turn("save-ok", "stored")]);
-    write_llm_config(&workspace, &url);
+    write_llm_config(&workspace, UNUSED_LLM_BASE_URL);
 
     let host = RuntimeHost::boot(workspace.fixtures()).expect("boot");
     let sid = host
@@ -688,10 +681,8 @@ fn auto_save_session_writes_snapshot_atomically_on_a_successful_send() {
         .session_id;
     let reply = host
         .agent_send(&sid, "hi")
-        .expect("the mock server answers one turn");
+        .expect("the fake provider plugin answers one turn");
     assert_eq!(reply.content, "stored");
-    let _ = requests_rx.recv().expect("captured requests");
-    handle.join().expect("join mock server");
 
     let snapshot = workspace.sessions_dir().join(format!("{sid}.json"));
     assert!(
@@ -716,9 +707,7 @@ fn auto_save_session_logs_when_sessions_dir_cannot_be_created() {
     let workspace = setup_workspace_with_llm(&[("fakellm", "answered anyway")]);
     // Written before boot so nothing has created `data/` as a directory yet.
     fs::write(workspace.data_dir(), b"not a directory").expect("write data as a file");
-    let (url, requests_rx, handle) =
-        spawn_chunked_mock_llm_server_sequence(vec![assistant_turn("nodir", "answered anyway")]);
-    write_llm_config(&workspace, &url);
+    write_llm_config(&workspace, UNUSED_LLM_BASE_URL);
 
     let host = RuntimeHost::boot(workspace.fixtures()).expect("boot");
     let sid = host
@@ -729,8 +718,6 @@ fn auto_save_session_logs_when_sessions_dir_cannot_be_created() {
         .agent_send(&sid, "hi")
         .expect("an auto-save failure must not fail the send");
     assert_eq!(reply.content, "answered anyway");
-    let _ = requests_rx.recv().expect("captured requests");
-    handle.join().expect("join mock server");
 
     assert!(
         workspace.data_dir().is_file(),
@@ -745,8 +732,9 @@ fn auto_save_session_logs_when_sessions_dir_cannot_be_created() {
 ///
 /// A crash-recovered session is the only way to hand `auto_save_session` a
 /// caller-chosen id (it is taken from the file stem), and the recovered session
-/// rebuilds its HTTP config from the snapshot — so the mock endpoint is baked
-/// into the seeded snapshot rather than into `config/llm_api.yaml`.
+/// rebuilds its LLM config from the snapshot — so the endpoint is baked into the
+/// seeded snapshot rather than into `config/llm_api.yaml`. It stays unused
+/// either way: the fake provider plugin answers (see `UNUSED_LLM_BASE_URL`).
 #[test]
 #[serial]
 fn auto_save_session_logs_when_tmp_write_fails() {
@@ -761,11 +749,9 @@ fn auto_save_session_logs_when_tmp_write_fails() {
         .expect_err("the tmp filename must exceed NAME_MAX");
     assert_eq!(tmp_err.kind(), std::io::ErrorKind::InvalidFilename);
 
-    let (url, requests_rx, handle) =
-        spawn_chunked_mock_llm_server_sequence(vec![assistant_turn("long-id", "unsavable")]);
     let mut snapshot: serde_json::Value =
         serde_json::from_str(&session_snapshot_json("runtime_shell")).expect("parse template");
-    snapshot["config"]["base_url"] = serde_json::json!(url);
+    snapshot["config"]["base_url"] = serde_json::json!(UNUSED_LLM_BASE_URL);
     snapshot["config"]["api_key_env"] = serde_json::json!("CORDIS_TEST_LONG_ID_KEY");
     fs::write(
         sessions_dir.join(format!("{long_id}.json")),
@@ -784,8 +770,6 @@ fn auto_save_session_logs_when_tmp_write_fails() {
         .agent_send(&long_id, "hi")
         .expect("a tmp-write failure must not fail the send");
     assert_eq!(reply.content, "unsavable");
-    let _ = requests_rx.recv().expect("captured requests");
-    handle.join().expect("join mock server");
     std::env::remove_var("CORDIS_TEST_LONG_ID_KEY");
 
     // The pre-existing `{long_id}.json` placeholder is still the 2-byte `{}`:
@@ -816,9 +800,7 @@ fn auto_save_session_logs_when_tmp_write_fails() {
 #[serial]
 fn auto_save_session_cleans_tmp_when_rename_fails() {
     let workspace = setup_workspace_with_llm(&[("fakellm", "answered")]);
-    let (url, requests_rx, handle) =
-        spawn_chunked_mock_llm_server_sequence(vec![assistant_turn("rename-fail", "answered")]);
-    write_llm_config(&workspace, &url);
+    write_llm_config(&workspace, UNUSED_LLM_BASE_URL);
 
     let host = RuntimeHost::boot(workspace.fixtures()).expect("boot");
     let sid = host
@@ -836,8 +818,6 @@ fn auto_save_session_cleans_tmp_when_rename_fails() {
         .agent_send(&sid, "hi")
         .expect("a rename failure must not fail the send");
     assert_eq!(reply.content, "answered");
-    let _ = requests_rx.recv().expect("captured requests");
-    handle.join().expect("join mock server");
 
     assert!(blocker.is_dir(), "the blocking directory must survive");
     let strays: Vec<String> = fs::read_dir(&sessions_dir)
