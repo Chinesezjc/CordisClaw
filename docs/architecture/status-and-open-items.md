@@ -21,6 +21,7 @@
 | Agent 错误恢复 | 已完成 | JSON 解析失败反馈到 agent 自修复、LLM 请求失败 notify 到群、所有 HTTP 错误重试、unknown-tool guard（strike=1 立即停止）、tool_calls 链诊断日志 |
 | 优雅退出 + data/ 持久化 | 已完成 | SIGTERM→SIGINT 转发优雅退出、`data/memory/shutdown.json` 退出快照、`data/` 沙箱扩展（agent 可访问 workspace 根级目录） |
 | QQ 插件消息解析 | 已完成 | JSON 卡片透传、合并转发 ID 提取、回复 msg_id 提示 |
+| QQ 入站传输 | 已完成 | HTTP webhook（`qq_serve`）+ WebSocket 服务器（`qq_ws_serve` Task 节点，接收线上 Napcat ws 端口的 OneBot v11 事件，优雅停机）；出站走 HTTP API |
 | Agent 安全加固 | 已完成 | secret 不可见（token 不进入 prompt）、移除 `run_command`、敏感路径黑名单、工具防火墙（`agent_accessible`）、按群隔离 session、`build_plugins` 白名单命令、工具失败自动告警 |
 | Service 生命周期 | 部分完成 | `Service` trait + `ServiceRegistry` + `NodeType::Task` 已实现；plugin load 时自动 start 尚未接入 |
 | 插件封装形态蓝图 | 部分完成 | `dylib` + JSON artifact + process 已落地；`cdylib` / `WASM` 未实现 |
@@ -937,9 +938,9 @@ cd fixtures/plugins/expr/lexer && cargo test --lib  # excluded, external tests o
 
 ### 5.8 QQ adapter 接入真实 NoneBot 协议
 
-- [ ] WebSocket 反向连接（当前仅 HTTP client）
-- [ ] 事件订阅（当前仅主动调用）
-- [ ] 作为 Service 常驻运行（`NodeType::Task`）
+- [x] WebSocket 事件接收（5.2.36 移植 `qq_ws_serve` Task 节点：tungstenite WS 服务器接收线上 Napcat ws 端口的 OneBot v11 事件；出站仍走 HTTP API）
+- [x] 事件订阅 / 常驻运行（`qq_ws_serve` 作为 `NodeType::Task` 长驻，start/stop 生命周期 + 优雅停机）
+- [ ] 出站也走 WS（当前出站仍是 HTTP client）
 
 ## 6. 建议优先级
 

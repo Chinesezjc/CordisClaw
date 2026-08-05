@@ -9,50 +9,50 @@
       "id": "qq_entry",
       "summary": "QQ adapter using the NoneBot (OneBot v11) protocol. Connect to a OneBot-compatible QQ client for sending messages. Actions: configure, send, status, call, block, unblock, allow, disallow.",
       "input_schema": {
-        "properties": {
-          "action": {
-            "description": "configure | send | status | call | block | unblock | allow | disallow",
-            "type": "string"
-          },
-          "message": {
-            "description": "Message text (for send)",
-            "type": "string"
-          },
-          "payload": {
-            "description": "Raw API call payload (for call)",
-            "type": "object"
-          },
-          "target": {
-            "description": "group:<id> or private:<id>",
-            "type": "string"
-          },
-          "url": {
-            "description": "OneBot HTTP API base URL (for configure)",
-            "type": "string"
-          }
-        },
+        "type": "object",
         "required": [
           "action"
         ],
-        "type": "object"
+        "properties": {
+          "action": {
+            "type": "string",
+            "description": "configure | send | status | call | block | unblock | allow | disallow"
+          },
+          "url": {
+            "type": "string",
+            "description": "OneBot HTTP API base URL (for configure)"
+          },
+          "target": {
+            "type": "string",
+            "description": "group:<id> or private:<id>"
+          },
+          "message": {
+            "type": "string",
+            "description": "Message text (for send)"
+          },
+          "payload": {
+            "type": "object",
+            "description": "Raw API call payload (for call)"
+          }
+        }
       },
       "output_schema": {
+        "type": "object",
         "properties": {
+          "ok": {
+            "type": "boolean"
+          },
           "action": {
             "type": "string"
           },
-          "data": {},
           "message": {
             "type": [
               "string",
               "null"
             ]
           },
-          "ok": {
-            "type": "boolean"
-          }
-        },
-        "type": "object"
+          "data": {}
+        }
       },
       "side_effects": [
         "requires OneBot HTTP server running"
@@ -71,48 +71,46 @@
       "id": "qq_serve",
       "summary": "Start an HTTP server to receive OneBot v11 message events. Configure your OneBot client to POST events to http://<host>:<port>/onebot/event. Supports grayscale group whitelist.",
       "input_schema": {
-        "properties": {
-          "agent_session_id": {
-            "description": "Optional: agent session ID for message routing",
-            "type": "string"
-          },
-          "node_id": {
-            "const": "qq_serve",
-            "type": "string"
-          },
-          "payload": {
-            "properties": {
-              "allow_groups": {
-                "description": "Group whitelist for grayscale testing",
-                "items": {
-                  "type": "string"
-                },
-                "type": "array"
-              },
-              "onebot_url": {
-                "description": "OneBot HTTP API URL",
-                "type": "string"
-              },
-              "port": {
-                "description": "HTTP listen port (default 8080)",
-                "type": "integer"
-              }
-            },
-            "type": "object"
-          }
-        },
+        "type": "object",
         "required": [
           "node_id"
         ],
-        "type": "object"
+        "properties": {
+          "node_id": {
+            "type": "string",
+            "const": "qq_serve"
+          },
+          "payload": {
+            "type": "object",
+            "properties": {
+              "port": {
+                "type": "integer",
+                "description": "HTTP listen port (default 8080)"
+              },
+              "onebot_url": {
+                "type": "string",
+                "description": "OneBot HTTP API URL"
+              },
+              "allow_groups": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Group whitelist for grayscale testing"
+              }
+            }
+          },
+          "agent_session_id": {
+            "type": "string",
+            "description": "Optional: agent session ID for message routing"
+          }
+        }
       },
       "output_schema": {
+        "type": "object",
         "properties": {
-          "error": {
-            "type": [
-              "string",
-              "null"
-            ]
+          "ok": {
+            "type": "boolean"
           },
           "message": {
             "type": [
@@ -120,11 +118,13 @@
               "null"
             ]
           },
-          "ok": {
-            "type": "boolean"
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
           }
-        },
-        "type": "object"
+        }
       },
       "side_effects": [
         "starts an HTTP server thread",
@@ -138,39 +138,102 @@
       "agent_accessible": true
     },
     {
-      "id": "qq_fetch_messages",
-      "summary": "Fetch queued incoming QQ messages received by qq_serve. Returns all messages and drains the queue. Agent should poll this periodically.",
+      "id": "qq_ws_serve",
+      "summary": "Start a WebSocket server to receive OneBot v11 message events via reverse WS connection. Configure your OneBot client (e.g. Napcat) to connect as a WebSocket client to ws://<host>:<port>/. Supports the same grayscale group whitelist as qq_serve.",
       "input_schema": {
-        "properties": {
-          "node_id": {
-            "const": "qq_fetch_messages",
-            "type": "string"
-          }
-        },
+        "type": "object",
         "required": [
           "node_id"
         ],
-        "type": "object"
+        "properties": {
+          "node_id": {
+            "type": "string",
+            "const": "qq_ws_serve"
+          },
+          "action": {
+            "type": "string",
+            "description": "Set to \"stop\" to shut down the WebSocket server and release the port"
+          },
+          "payload": {
+            "type": "object",
+            "properties": {
+              "port": {
+                "type": "integer",
+                "description": "WebSocket listen port (default 8002)"
+              }
+            }
+          },
+          "agent_session_id": {
+            "type": "string",
+            "description": "Optional: agent session ID for message routing"
+          }
+        }
       },
       "output_schema": {
+        "type": "object",
         "properties": {
-          "error": {
+          "ok": {
+            "type": "boolean"
+          },
+          "message": {
             "type": [
               "string",
               "null"
             ]
           },
-          "messages": {
-            "items": {
-              "type": "object"
-            },
-            "type": "array"
-          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "side_effects": [
+        "starts a WebSocket server thread",
+        "listens on configured port for OneBot WS client connections"
+      ],
+      "failure_modes": [
+        "port already in use",
+        "OneBot WS client not configured to connect"
+      ],
+      "node_type": "task",
+      "agent_accessible": false
+    },
+    {
+      "id": "qq_fetch_messages",
+      "summary": "Fetch queued incoming QQ messages received by qq_serve. Returns all messages and drains the queue. Agent should poll this periodically.",
+      "input_schema": {
+        "type": "object",
+        "required": [
+          "node_id"
+        ],
+        "properties": {
+          "node_id": {
+            "type": "string",
+            "const": "qq_fetch_messages"
+          }
+        }
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
           "ok": {
             "type": "boolean"
+          },
+          "messages": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
           }
-        },
-        "type": "object"
+        }
       },
       "side_effects": [
         "drains the message queue"
@@ -183,38 +246,36 @@
       "id": "qq_send",
       "summary": "Send a message to a QQ group or private chat via OneBot v11 HTTP API. Supports reply/quote via reply_to.",
       "input_schema": {
-        "properties": {
-          "message": {
-            "description": "Message text to send",
-            "type": "string"
-          },
-          "node_id": {
-            "const": "qq_send",
-            "type": "string"
-          },
-          "reply_to": {
-            "description": "Optional message_id to reply/quote",
-            "type": "integer"
-          },
-          "target": {
-            "description": "group:<id> or private:<id>",
-            "type": "string"
-          }
-        },
+        "type": "object",
         "required": [
           "node_id",
           "target",
           "message"
         ],
-        "type": "object"
+        "properties": {
+          "node_id": {
+            "type": "string",
+            "const": "qq_send"
+          },
+          "target": {
+            "type": "string",
+            "description": "group:<id> or private:<id>"
+          },
+          "message": {
+            "type": "string",
+            "description": "Message text to send"
+          },
+          "reply_to": {
+            "type": "integer",
+            "description": "Optional message_id to reply/quote"
+          }
+        }
       },
       "output_schema": {
+        "type": "object",
         "properties": {
-          "error": {
-            "type": [
-              "string",
-              "null"
-            ]
+          "ok": {
+            "type": "boolean"
           },
           "message": {
             "type": [
@@ -222,11 +283,13 @@
               "null"
             ]
           },
-          "ok": {
-            "type": "boolean"
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
           }
-        },
-        "type": "object"
+        }
       },
       "side_effects": [
         "sends HTTP request to OneBot API"
@@ -243,33 +306,27 @@
       "id": "qq_get_group_info",
       "summary": "Get group information (name, member count, etc.) via OneBot v11 get_group_info API.",
       "input_schema": {
-        "properties": {
-          "node_id": {
-            "const": "qq_get_group_info",
-            "type": "string"
-          },
-          "target": {
-            "description": "group:<id>",
-            "type": "string"
-          }
-        },
+        "type": "object",
         "required": [
           "node_id",
           "target"
         ],
-        "type": "object"
+        "properties": {
+          "node_id": {
+            "type": "string",
+            "const": "qq_get_group_info"
+          },
+          "target": {
+            "type": "string",
+            "description": "group:<id>"
+          }
+        }
       },
       "output_schema": {
+        "type": "object",
         "properties": {
-          "data": {
-            "description": "Raw OneBot get_group_info response",
-            "type": "object"
-          },
-          "error": {
-            "type": [
-              "string",
-              "null"
-            ]
+          "ok": {
+            "type": "boolean"
           },
           "message": {
             "type": [
@@ -277,11 +334,17 @@
               "null"
             ]
           },
-          "ok": {
-            "type": "boolean"
+          "data": {
+            "type": "object",
+            "description": "Raw OneBot get_group_info response"
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
           }
-        },
-        "type": "object"
+        }
       },
       "side_effects": [
         "calls OneBot get_group_info API"
@@ -298,41 +361,41 @@
       "id": "qq_system_notify",
       "summary": "Kernel notification handler — receives system messages and forwards to configured test groups.",
       "input_schema": {
-        "properties": {
-          "message": {
-            "description": "Notification text",
-            "type": "string"
-          },
-          "node_id": {
-            "const": "qq_system_notify",
-            "type": "string"
-          }
-        },
+        "type": "object",
         "required": [
           "node_id",
           "message"
         ],
-        "type": "object"
+        "properties": {
+          "node_id": {
+            "type": "string",
+            "const": "qq_system_notify"
+          },
+          "message": {
+            "type": "string",
+            "description": "Notification text"
+          }
+        }
       },
       "output_schema": {
+        "type": "object",
         "properties": {
+          "ok": {
+            "type": "boolean"
+          },
+          "message": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "error": {
             "type": [
               "string",
               "null"
             ]
-          },
-          "message": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "ok": {
-            "type": "boolean"
           }
-        },
-        "type": "object"
+        }
       },
       "side_effects": [
         "sends QQ message to all configured test_groups"
@@ -345,5 +408,5 @@
       "agent_accessible": false
     }
   ],
-  "system_hint": "QQ GROUP CHAT MODE — you are running in a QQ group. Messages may be casual chat NOT directed at you.\nCRITICAL: Always decide whether the message is actually talking to YOU before responding.\nA message IS directed at you ONLY if: contains @[id=3832224285] (explicit @mention of bot); or starts with \"bot\" or \"Bot\" or \"机器人\".\nA message is NOT directed at you if: general group discussion; questions not explicitly addressed to bot; casual chat; emoji/sticker; talking about someone else. When in doubt, suspend.\nIf NOT directed at you: use {\"action\":\"suspend\"}.\nIf directed at you: invoke_plugin(qq, qq_send, ...) to send your reply, then output {\"action\":\"suspend\"}.\nIMPORTANT: NEVER use {\"action\":\"respond\"} — it will cause duplicate messages. Always send via qq_send and finish with {\"action\":\"suspend\"}.\n\nANTI-HALLUCINATION rules:\n- If a question is ambiguous or you lack context, ask for clarification — do NOT guess.\n- If web search fails to yield a clear answer after 2 attempts, stop and tell the user what you found (or didn't find). Ask them to clarify.\n- Pay attention to the group's recent conversation. The topic may be group-specific and not searchable on the web.\n- A short honest \"not sure, can you clarify?\" is always better than a long wrong answer.\n\nTo send a progress update or proactive message to the group you're talking to:\ninvoke_plugin(qq, qq_send, {\"node_id\":\"qq_send\",\"target\":\"group:<group_id>\",\"message\":\"<your message>\"})\nReplace <group_id> with the actual group ID from the incoming message.\nSend a brief progress message BEFORE any tool that may take more than a moment (build, test, search, etc.), and a follow-up when the tool completes.\n\nTo query group members: invoke_plugin(qq, qq_get_group_members, {\"node_id\":\"qq_get_group_members\",\"target\":\"group:<id>\"})\nTo proactively send to a group: invoke_plugin(qq, qq_send, {\"node_id\":\"qq_send\",\"target\":\"group:<id>\",\"message\":\"<text>\"})"
+  "system_hint": "QQ GROUP CHAT MODE — you are running in a QQ group. Messages may be casual chat NOT directed at you.\nCRITICAL: Always decide whether the message is actually talking to YOU before responding.\nA message IS directed at you ONLY if: contains @[id=3832224285] (explicit @mention of bot); or starts with \"bot\" or \"Bot\" or \"机器人\".\nA message is NOT directed at you if: general group discussion; questions not explicitly addressed to bot; casual chat; emoji/sticker; talking about someone else. When in doubt, suspend.\nIf NOT directed at you: use {\"action\":\"suspend\"}.\nIf directed at you: invoke_plugin(qq, qq_send, ...) to send your reply, then output {\"action\":\"suspend\"}.\nIMPORTANT: NEVER use {\"action\":\"respond\"} — it will cause duplicate messages. Always send via qq_send and finish with {\"action\":\"suspend\"}.\n\nANTI-HALLUCINATION rules:\n- If a question is ambiguous or you lack context, ask for clarification — do NOT guess.\n- If web search fails to yield a clear answer after 2 attempts, stop and tell the user what you found (or didn't find). Ask them to clarify.\n- Pay attention to the group's recent conversation. The topic may be group-specific and not searchable on the web.\n- A short honest \"not sure, can you clarify?\" is always better than a long wrong answer.\n\nKERNEL TOOL usage in QQ chat:\n- Kernel introspection tools (get_runtime_status, list_plugins, list_nodes, get_kernel_status, get_kernel_issues) are for internal diagnostics only.\n- Only call them when a user @mentions you with an explicit question about bot/runtime/plugin status.\n- For images, stickers, casual chat, or ambiguous messages: suspend immediately — do NOT call any kernel tool.\n\nTo send a progress update or proactive message to the group you're talking to:\ninvoke_plugin(qq, qq_send, {\"node_id\":\"qq_send\",\"target\":\"group:<group_id>\",\"message\":\"<your message>\"})\nReplace <group_id> with the actual group ID from the incoming message.\nSend a brief progress message BEFORE any tool that may take more than a moment (build, test, search, etc.), and a follow-up when the tool completes.\n\nTo query group members: invoke_plugin(qq, qq_get_group_members, {\"node_id\":\"qq_get_group_members\",\"target\":\"group:<id>\"})\nTo proactively send to a group: invoke_plugin(qq, qq_send, {\"node_id\":\"qq_send\",\"target\":\"group:<id>\",\"message\":\"<text>\"})"
 }

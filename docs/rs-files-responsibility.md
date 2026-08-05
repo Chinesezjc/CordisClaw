@@ -76,7 +76,7 @@
 
 | 职责定位 | 关键入口 |
 |---|---|
-| 统一的 LLM agent 会话：SSE 流解析、tool-calling loop（最多 96 轮，overflow 保留 partial history P1-31）、重试/超时管理（4xx 不重试 P1-35，budget 合并 P1-37）、消息历史（compact 后重算 estimated_tokens P1-32、UTF-8 char/byte 一致 P1-33）、orphan-User cleanup（P2-31）；两个后端：`RuntimeShellAgentBackend`（20 个交互式工具；P2-1 边界收敛待做）和 `PluginIterationAgentBackend`（scaffold/edit/verify 工具集） | `AgentSession::respond` / `respond_inner`、`ShellAgentSession`、`AgentToolHost` trait、`PendingSessionAction`（P1-25 self-lookup 侧信道） |
+| 统一的 LLM agent 会话：SSE 流解析、tool-calling loop（最多 96 轮，overflow 保留 partial history P1-31）、重试/超时管理（4xx 不重试 P1-35，budget 合并 P1-37）、消息历史（compact 后重算 estimated_tokens P1-32、UTF-8 char/byte 一致 P1-33）、orphan-User cleanup（P2-31）、内核自省工具（get_runtime_status/list_plugins/list_nodes/get_kernel_status/get_kernel_issues）的 tool call/result 不写入跨轮持久化历史（5.2.36）；两个后端：`RuntimeShellAgentBackend`（20 个交互式工具；P2-1 边界收敛待做）和 `PluginIterationAgentBackend`（scaffold/edit/verify 工具集） | `AgentSession::respond` / `respond_inner`、`ShellAgentSession`、`AgentToolHost` trait、`PendingSessionAction`（P1-25 self-lookup 侧信道） |
 
 ## 6c. Soul 与指令路由（`crates/cordis-runtime/src/soul.rs`、`command_router.rs`）
 
@@ -178,7 +178,7 @@
 
 | 文件 | 职责定位 | 关键入口 |
 |---|---|---|
-| `fixtures/plugins/qq/src/lib.rs` | QQ 适配器 dylib：OneBot v11 协议 HTTP 客户端，支持 configure/send/status/call | `onebot_call()`、`parse_target()` |
+| `fixtures/plugins/qq/src/lib.rs` | QQ 适配器 dylib：OneBot v11 协议。入站事件接收走 HTTP webhook（`qq_serve`）+ WebSocket 服务器（`qq_ws_serve` Task 节点，tungstenite 接收线上 Napcat ws 端口事件，bind 竞态修复 + stop 关 listener/join 线程优雅停机）；出站走 HTTP API，支持 configure/send/status/call | `onebot_call()`、`parse_target()`、`handle_qq_ws_serve()`、`start_ws_server()` |
 | `fixtures/plugins/qq/tests/test_parse.rs` | QQ 适配器测试：target 字符串解析 | `test_parse_target` |
 
 ## 13.1 Feishu Adapter 插件 (`fixtures/plugins/feishu`)

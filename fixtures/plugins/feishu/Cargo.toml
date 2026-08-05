@@ -20,12 +20,12 @@ crate_hash = "crate_feishu_v1"
 api_hash = "api_v2"
 
 [build-dependencies]
-serde_json = "1"
+serde_json = { version = "1", features = ["preserve_order"] }
 
 [dependencies]
 cordis-plugin-sdk = { path = "../../../crates/cordis-plugin-sdk" }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["preserve_order"] }
 tiny_http = "0.12"
 # TLS feature is required — unlike qq (which only talks to a local OneBot
 # over http), feishu sends HTTPS to open.feishu.cn.

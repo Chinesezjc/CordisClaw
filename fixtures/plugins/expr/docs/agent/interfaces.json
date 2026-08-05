@@ -9,26 +9,26 @@
       "id": "expr_entry",
       "summary": "Evaluate one arithmetic expression and return a numeric value.",
       "input_schema": {
+        "type": "object",
+        "required": [
+          "expression"
+        ],
         "properties": {
           "expression": {
             "type": "string"
           }
-        },
-        "required": [
-          "expression"
-        ],
-        "type": "object"
+        }
       },
       "output_schema": {
+        "type": "object",
         "properties": {
-          "error": {
-            "type": "string"
-          },
           "value": {
             "type": "number"
+          },
+          "error": {
+            "type": "string"
           }
-        },
-        "type": "object"
+        }
       },
       "side_effects": [],
       "failure_modes": [

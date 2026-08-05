@@ -40,7 +40,7 @@
 - `root` / `root/child`：JSON 工件样例，主要用于校验 metadata、exports 和 grants。
 - `shell`：Rust dylib 外部插件，提供内建 shell 与命令路由。
 - `expr`：Rust dylib 外部插件树，负责表达式解析与计算。
-- `qq`：OneBot v11 QQ 适配器，HTTP 事件接收 + 消息发送。
+- `qq`：OneBot v11 QQ 适配器，事件接收（HTTP webhook `qq_serve` + WebSocket 服务器 `qq_ws_serve` Task 节点）+ 消息发送（HTTP API）。
 - `gacha`：原神抽卡模拟器，保底概率模型 + JSON 文件持久化。
 - `web`：网页搜索（DeepSeek Anthropic API）+ 网页抓取。
 - `git`：Git 操作（diff/log/status/commit/amend）。

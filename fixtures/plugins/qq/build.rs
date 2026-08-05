@@ -1,5 +1,5 @@
-use std::process::Command;
 use std::fs;
+use std::process::Command;
 
 fn main() {
     let src = "/root/CordisClaw/fixtures/plugins/target/debug/libqq.so";
@@ -7,9 +7,7 @@ fn main() {
     let index_path = "/root/CordisClaw/fixtures/artifacts/index.json";
 
     // Copy the .so file
-    let status = Command::new("cp")
-        .args([src, dst])
-        .status();
+    let status = Command::new("cp").args([src, dst]).status();
     match status {
         Ok(s) if s.success() => println!("cargo:warning=Copied libqq.so to artifacts/"),
         Ok(s) => println!("cargo:warning=cp exited with {}", s),
@@ -17,9 +15,7 @@ fn main() {
     }
 
     // Compute sha256 of the new .so
-    let hash_output = Command::new("sha256sum")
-        .arg(dst)
-        .output();
+    let hash_output = Command::new("sha256sum").arg(dst).output();
     if let Ok(output) = hash_output {
         if output.status.success() {
             let hash_str = String::from_utf8_lossy(&output.stdout);
@@ -41,7 +37,7 @@ fn main() {
                                             .duration_since(std::time::UNIX_EPOCH)
                                             .unwrap()
                                             .as_secs()
-                                            .to_string()
+                                            .to_string(),
                                     );
                                     // Also update generated_at
                                     json_val["generated_at"] = serde_json::Value::String(
@@ -49,7 +45,7 @@ fn main() {
                                             .duration_since(std::time::UNIX_EPOCH)
                                             .unwrap()
                                             .as_secs()
-                                            .to_string()
+                                            .to_string(),
                                     );
                                     break;
                                 }

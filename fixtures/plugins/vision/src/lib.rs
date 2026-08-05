@@ -6,11 +6,11 @@
 //!
 //! Safety: only http/https URLs are allowed; localhost and private IPs blocked.
 
+use base64::Engine;
 use cordis_plugin_sdk::{
     export_plugin_api, json_response, plugin_docs, task_node_doc, AbiFingerprint, PluginRequest,
     PluginResponse,
 };
-use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::io::Read;
@@ -130,8 +130,7 @@ fn download_image(url_str: &str) -> Result<Vec<u8>, String> {
 /// On macOS both `/tmp` and `/var/folders/...` are symlinks, so the requested
 /// path and the temp-dir prefix are each canonicalized before comparison.
 fn read_local_image(path: &str) -> Result<Vec<u8>, String> {
-    let real = std::fs::canonicalize(path)
-        .map_err(|e| format!("resolve path {path}: {e}"))?;
+    let real = std::fs::canonicalize(path).map_err(|e| format!("resolve path {path}: {e}"))?;
 
     let temp_root = std::fs::canonicalize(std::env::temp_dir())
         .map_err(|e| format!("resolve temp dir: {e}"))?;
@@ -144,8 +143,7 @@ fn read_local_image(path: &str) -> Result<Vec<u8>, String> {
         ));
     }
 
-    let meta = std::fs::metadata(&real)
-        .map_err(|e| format!("stat {}: {e}", real.display()))?;
+    let meta = std::fs::metadata(&real).map_err(|e| format!("stat {}: {e}", real.display()))?;
     if meta.len() > MAX_IMAGE_BYTES as u64 {
         return Err(format!(
             "image too large: {} bytes (max {MAX_IMAGE_BYTES})",
@@ -163,9 +161,7 @@ fn load_source(url: Option<&str>, path: Option<&str>) -> Result<Vec<u8>, String>
     let url = url.map(str::trim).filter(|s| !s.is_empty());
     let path = path.map(str::trim).filter(|s| !s.is_empty());
     match (url, path) {
-        (Some(_), Some(_)) => {
-            Err("provide either url or path, not both".to_string())
-        }
+        (Some(_), Some(_)) => Err("provide either url or path, not both".to_string()),
         (Some(u), None) => download_image(u),
         (None, Some(p)) => read_local_image(p),
         (None, None) => Err("either url or path is required".to_string()),
@@ -181,7 +177,11 @@ fn guess_mime(data: &[u8]) -> &'static str {
         "png"
     } else if data.len() >= 3 && &data[..3] == b"\xFF\xD8\xFF" {
         "jpg"
-    } else if data.len() >= 4 && &data[..4] == b"RIFF" && data.len() >= 12 && &data[8..12] == b"WEBP" {
+    } else if data.len() >= 4
+        && &data[..4] == b"RIFF"
+        && data.len() >= 12
+        && &data[8..12] == b"WEBP"
+    {
         "webp"
     } else if data.len() >= 3 && &data[..3] == b"GIF" {
         "gif"
@@ -213,8 +213,7 @@ fn vision_ocr(url: Option<&str>, path: Option<&str>, lang: &str) -> Result<Strin
         "cordis_ocr_{}_{seq:x}_{nanos:x}.{ext}",
         std::process::id()
     ));
-    std::fs::write(&tmp_path, &data)
-        .map_err(|e| format!("write temp file: {e}"))?;
+    std::fs::write(&tmp_path, &data).map_err(|e| format!("write temp file: {e}"))?;
 
     // Run tesseract
     let child = Command::new("tesseract")
@@ -239,12 +238,13 @@ fn vision_ocr(url: Option<&str>, path: Option<&str>, lang: &str) -> Result<Strin
         return Err(format!("tesseract failed: {stderr}"));
     }
 
-    let text = String::from_utf8_lossy(&output.stdout)
-        .trim()
-        .to_string();
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
 
     if text.is_empty() {
-        return Err("tesseract returned no text (maybe no text in image, or language pack missing)".to_string());
+        return Err(
+            "tesseract returned no text (maybe no text in image, or language pack missing)"
+                .to_string(),
+        );
     }
 
     Ok(text)
@@ -261,16 +261,13 @@ fn vision_describe(
 ) -> Result<(String, String), String> {
     let api_key = std::env::var("OPENAI_API_KEY")
         .or_else(|_| std::env::var("VISION_API_KEY"))
-        .map_err(|_| {
-            "OPENAI_API_KEY or VISION_API_KEY environment variable not set".to_string()
-        })?;
+        .map_err(|_| "OPENAI_API_KEY or VISION_API_KEY environment variable not set".to_string())?;
 
     let base_url = std::env::var("OPENAI_BASE_URL")
         .or_else(|_| std::env::var("VISION_BASE_URL"))
         .unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
 
-    let model = std::env::var("VISION_MODEL")
-        .unwrap_or_else(|_| "gpt-4o-mini".to_string());
+    let model = std::env::var("VISION_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string());
 
     let data = load_source(url, path)?;
     let mime = guess_mime(&data);
@@ -303,8 +300,7 @@ fn vision_describe(
         "max_tokens": 1024
     });
 
-    let body_str = serde_json::to_string(&body)
-        .map_err(|e| format!("serialize request: {e}"))?;
+    let body_str = serde_json::to_string(&body).map_err(|e| format!("serialize request: {e}"))?;
 
     let resp = ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(TIMEOUT_SECS))
@@ -538,8 +534,7 @@ mod tests {
 
     #[test]
     fn load_source_rejects_both_url_and_path() {
-        let err = load_source(Some("https://example.com/a.png"), Some("/tmp/x.png"))
-            .unwrap_err();
+        let err = load_source(Some("https://example.com/a.png"), Some("/tmp/x.png")).unwrap_err();
         assert_eq!(err, "provide either url or path, not both");
     }
 

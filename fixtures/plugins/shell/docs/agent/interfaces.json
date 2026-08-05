@@ -9,8 +9,15 @@
       "id": "shell_entry",
       "summary": "Start the CordisClaw terminal in interactive or scripted mode.",
       "input_schema": {
+        "type": "object",
+        "required": [
+          "action"
+        ],
         "properties": {
           "action": {
+            "type": "string"
+          },
+          "shell": {
             "type": "string"
           },
           "command": {
@@ -21,20 +28,23 @@
           },
           "fixtures_root": {
             "type": "string"
-          },
-          "shell": {
-            "type": "string"
           }
-        },
-        "required": [
-          "action"
-        ],
-        "type": "object"
+        }
       },
       "output_schema": {
+        "type": "object",
         "properties": {
+          "ok": {
+            "type": "boolean"
+          },
           "action": {
             "type": "string"
+          },
+          "shell": {
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "exit_code": {
             "type": [
@@ -45,23 +55,13 @@
           "message": {
             "type": "string"
           },
-          "ok": {
-            "type": "boolean"
-          },
           "output": {
             "type": [
               "string",
               "null"
             ]
-          },
-          "shell": {
-            "type": [
-              "string",
-              "null"
-            ]
           }
-        },
-        "type": "object"
+        }
       },
       "side_effects": [
         "reads stdin",

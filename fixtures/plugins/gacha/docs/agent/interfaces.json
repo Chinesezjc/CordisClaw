@@ -9,35 +9,36 @@
       "id": "gacha_entry",
       "summary": "原神抽卡模拟器。支持自定义UP池，完整角色库，精准保底与50/50机制。\n命令: pull [N] | status | banner | setbanner <5星> <4星> <4星> <4星> | list | reset",
       "input_schema": {
-        "properties": {
-          "args": {
-            "description": "setbanner参数: [5星, 4星1, 4星2, 4星3]",
-            "items": {
-              "type": "string"
-            },
-            "type": "array"
-          },
-          "cmd": {
-            "description": "pull | status | banner | setbanner | list | reset",
-            "type": "string"
-          },
-          "count": {
-            "description": "抽数 1-100, 默认1",
-            "type": "integer"
-          }
-        },
+        "type": "object",
         "required": [
           "cmd"
         ],
-        "type": "object"
+        "properties": {
+          "cmd": {
+            "type": "string",
+            "description": "pull | status | banner | setbanner | list | reset"
+          },
+          "count": {
+            "type": "integer",
+            "description": "抽数 1-100, 默认1"
+          },
+          "args": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "setbanner参数: [5星, 4星1, 4星2, 4星3]"
+          }
+        }
       },
       "output_schema": {
+        "type": "object",
         "properties": {
+          "ok": {
+            "type": "boolean"
+          },
           "action": {
             "type": "string"
-          },
-          "guaranteed": {
-            "type": "boolean"
           },
           "message": {
             "type": [
@@ -45,23 +46,22 @@
               "null"
             ]
           },
-          "ok": {
-            "type": "boolean"
-          },
-          "pity_4": {
-            "type": "integer"
+          "results": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
           },
           "pity_5": {
             "type": "integer"
           },
-          "results": {
-            "items": {
-              "type": "object"
-            },
-            "type": "array"
+          "pity_4": {
+            "type": "integer"
+          },
+          "guaranteed": {
+            "type": "boolean"
           }
-        },
-        "type": "object"
+        }
       },
       "side_effects": [
         "accurate Genshin pity model",
@@ -81,20 +81,21 @@
       "id": "gacha_status",
       "summary": "查看当前保底计数、UP池信息及抽卡统计。",
       "input_schema": {
-        "properties": {
-          "cmd": {
-            "const": "status",
-            "type": "string"
-          }
-        },
+        "type": "object",
         "required": [
           "cmd"
         ],
-        "type": "object"
+        "properties": {
+          "cmd": {
+            "type": "string",
+            "const": "status"
+          }
+        }
       },
       "output_schema": {
+        "type": "object",
         "properties": {
-          "guaranteed": {
+          "ok": {
             "type": "boolean"
           },
           "message": {
@@ -103,17 +104,16 @@
               "null"
             ]
           },
-          "ok": {
-            "type": "boolean"
+          "pity_5": {
+            "type": "integer"
           },
           "pity_4": {
             "type": "integer"
           },
-          "pity_5": {
-            "type": "integer"
+          "guaranteed": {
+            "type": "boolean"
           }
-        },
-        "type": "object"
+        }
       },
       "side_effects": [
         "reads current pity + banner state"

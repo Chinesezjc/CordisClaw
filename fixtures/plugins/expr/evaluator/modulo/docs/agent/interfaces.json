@@ -9,6 +9,11 @@
       "id": "expr_modulo",
       "summary": "Compute lhs modulo rhs with zero protection.",
       "input_schema": {
+        "type": "object",
+        "required": [
+          "lhs",
+          "rhs"
+        ],
         "properties": {
           "lhs": {
             "type": "number"
@@ -16,23 +21,18 @@
           "rhs": {
             "type": "number"
           }
-        },
-        "required": [
-          "lhs",
-          "rhs"
-        ],
-        "type": "object"
+        }
       },
       "output_schema": {
+        "type": "object",
         "properties": {
-          "error": {
-            "type": "string"
-          },
           "value": {
             "type": "number"
+          },
+          "error": {
+            "type": "string"
           }
-        },
-        "type": "object"
+        }
       },
       "side_effects": [],
       "failure_modes": [

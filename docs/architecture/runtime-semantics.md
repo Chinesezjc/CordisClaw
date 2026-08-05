@@ -195,6 +195,8 @@ inbox 一次可取到一批消息（同一渠道多条堆积）。批处理不�
 - **soul 随最近发言者刷新**：群聊里一条 session 服务多个发言者。每批 send 前，inbox 把 session 的 `soul_key` 刷成**最近发言者**的（`refresh_session_soul`），persona overlay 每轮从 `session.soul_key` 重建，因此发言者切换后 system prompt 立即换成对应的人格。**profile（LLM 端点）保持 session 起点不随刷新变**——换 profile 需 `/reset` 起新会话。
 - **多 sender 批的妥协**：一批里若有多个发言者，persona 取**最后一个发言者**（last）的；该批内非 last 成员的 `set_soul` 意图也会落到 last 的 soul。这是"一 session 多用户"下的已知取舍，phase 2 若需按发言者分裂 session 再议。
 - **纯命令批不碰 pending**：整批都是命令时不触发 pending spill / 重放（命令本就不经 LLM，无"打穿"可言）。
+- **批次边界标记**（5.2.36）：普通消息 batch 送 agent 时，正文用渠道中立标记 `CURRENT_INCOMING_BATCH_START` / `CURRENT_INCOMING_BATCH_END` 包裹，并附"只把当前批次当请求，不针对则 suspend"指令，防止 agent 把历史消息误当当前请求。包裹只发生在 `agent_send` 发送点；spill / pending 落盘的是原始未包裹文本。
+- **agent 回复只取首个 JSON 值**（5.2.36）：agent 输出经 `serde_json::Deserializer` 只消费首个 JSON 值（suspend / respond），容忍尾随杂质，agent 在 JSON 后追加的解释文本不再导致解析失败。
 
 soul_key 越权防护：H2 的 `drop_session` 幂等，重复 drop 不 panic；`command_router` 的 `/soul` 在 `ctx.soul_key` 为空（无身份会话）时回"无身份"提示而非泄漏任何其他作用域的 persona。
 

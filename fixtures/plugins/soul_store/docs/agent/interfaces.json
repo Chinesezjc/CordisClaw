@@ -9,28 +9,29 @@
       "id": "soul_get",
       "summary": "Fetch the stored soul (persona + LLM profile reference) for a scope key. Capability node: its presence (with soul_set) overrides the kernel's file-based soul storage.",
       "input_schema": {
+        "type": "object",
+        "required": [
+          "node_id"
+        ],
         "properties": {
           "node_id": {
             "const": "soul_get"
           },
           "payload": {
+            "type": "object",
+            "required": [
+              "soul_key"
+            ],
             "properties": {
               "soul_key": {
                 "type": "string"
               }
-            },
-            "required": [
-              "soul_key"
-            ],
-            "type": "object"
+            }
           }
-        },
-        "required": [
-          "node_id"
-        ],
-        "type": "object"
+        }
       },
       "output_schema": {
+        "type": "object",
         "properties": {
           "ok": {
             "type": "boolean"
@@ -41,8 +42,7 @@
               "null"
             ]
           }
-        },
-        "type": "object"
+        }
       },
       "side_effects": [
         "reads data/souls.db"
@@ -57,38 +57,38 @@
       "id": "soul_set",
       "summary": "Upsert the soul for a scope key. Capability node paired with soul_get.",
       "input_schema": {
+        "type": "object",
+        "required": [
+          "node_id"
+        ],
         "properties": {
           "node_id": {
             "const": "soul_set"
           },
           "payload": {
-            "properties": {
-              "soul": {
-                "type": "object"
-              },
-              "soul_key": {
-                "type": "string"
-              }
-            },
+            "type": "object",
             "required": [
               "soul_key",
               "soul"
             ],
-            "type": "object"
+            "properties": {
+              "soul_key": {
+                "type": "string"
+              },
+              "soul": {
+                "type": "object"
+              }
+            }
           }
-        },
-        "required": [
-          "node_id"
-        ],
-        "type": "object"
+        }
       },
       "output_schema": {
+        "type": "object",
         "properties": {
           "ok": {
             "type": "boolean"
           }
-        },
-        "type": "object"
+        }
       },
       "side_effects": [
         "writes data/souls.db"

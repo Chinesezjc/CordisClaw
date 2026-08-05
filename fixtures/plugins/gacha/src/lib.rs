@@ -5,8 +5,8 @@
 //! - gacha_status — check current pity counters
 
 use cordis_plugin_sdk::{
-    export_plugin_api, json_response, node_doc, plugin_docs,
-    AbiFingerprint, PluginRequest, PluginResponse,
+    export_plugin_api, json_response, node_doc, plugin_docs, AbiFingerprint, PluginRequest,
+    PluginResponse,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -98,8 +98,7 @@ fn load_store() -> Store {
 /// P1-44: sticky flag set when a load failure would otherwise be masked;
 /// prevents save_store from clobbering the on-disk file until an operator
 /// intervenes.
-static SAVE_BLOCKED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static SAVE_BLOCKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// P1-44: process-wide lock around read-modify-write of the gacha state.
 /// Concurrent pull invocations used to interleave `load → mutate → save`,
@@ -156,44 +155,144 @@ impl Default for Store {
 
 // Standard banner 5★ (常驻)
 const STANDARD_5: &[&str] = &[
-    "迪卢克","琴","莫娜","七七","刻晴","提纳里","迪希雅","梦见月瑞希",
+    "迪卢克",
+    "琴",
+    "莫娜",
+    "七七",
+    "刻晴",
+    "提纳里",
+    "迪希雅",
+    "梦见月瑞希",
 ];
 // Limited 5★ (限定)
 const LIMITED_5: &[&str] = &[
-    "温迪","可莉","达达利亚","钟离","阿贝多","甘雨","魈","胡桃","优菈",
-    "万叶","神里绫华","宵宫","雷电将军","珊瑚宫心海","荒泷一斗","申鹤",
-    "八重神子","神里绫人","夜兰","赛诺","妮露","纳西妲","流浪者",
-    "艾尔海森","白术","林尼","那维莱特","莱欧斯利","芙宁娜","娜维娅",
-    "闲云","千织","阿蕾奇诺","克洛琳德","希格雯","艾梅莉埃",
-    "玛拉妮","基尼奇","希诺宁","恰斯卡","玛薇卡","茜特菈莉","瓦蕾莎","爱可菲","丝柯克",
+    "温迪",
+    "可莉",
+    "达达利亚",
+    "钟离",
+    "阿贝多",
+    "甘雨",
+    "魈",
+    "胡桃",
+    "优菈",
+    "万叶",
+    "神里绫华",
+    "宵宫",
+    "雷电将军",
+    "珊瑚宫心海",
+    "荒泷一斗",
+    "申鹤",
+    "八重神子",
+    "神里绫人",
+    "夜兰",
+    "赛诺",
+    "妮露",
+    "纳西妲",
+    "流浪者",
+    "艾尔海森",
+    "白术",
+    "林尼",
+    "那维莱特",
+    "莱欧斯利",
+    "芙宁娜",
+    "娜维娅",
+    "闲云",
+    "千织",
+    "阿蕾奇诺",
+    "克洛琳德",
+    "希格雯",
+    "艾梅莉埃",
+    "玛拉妮",
+    "基尼奇",
+    "希诺宁",
+    "恰斯卡",
+    "玛薇卡",
+    "茜特菈莉",
+    "瓦蕾莎",
+    "爱可菲",
+    "丝柯克",
 ];
 // All 4★ (全四星)
 const ALL_4: &[&str] = &[
-    "安柏","凯亚","丽莎","芭芭拉","雷泽","香菱","行秋","北斗","凝光",
-    "菲谢尔","班尼特","诺艾尔","砂糖","迪奥娜","辛焱","罗莎莉亚","烟绯",
-    "早柚","九条裟罗","托马","五郎","云堇","久岐忍","鹿野院平藏",
-    "柯莱","多莉","坎蒂丝","莱依拉","珐露珊","瑶瑶","米卡","绮良良",
-    "卡维","琳妮特","菲米尼","夏洛蒂","夏沃蕾","嘉明","卡齐娜",
-    "欧洛伦","伊安珊","伊法","蓝砚","重云",
+    "安柏",
+    "凯亚",
+    "丽莎",
+    "芭芭拉",
+    "雷泽",
+    "香菱",
+    "行秋",
+    "北斗",
+    "凝光",
+    "菲谢尔",
+    "班尼特",
+    "诺艾尔",
+    "砂糖",
+    "迪奥娜",
+    "辛焱",
+    "罗莎莉亚",
+    "烟绯",
+    "早柚",
+    "九条裟罗",
+    "托马",
+    "五郎",
+    "云堇",
+    "久岐忍",
+    "鹿野院平藏",
+    "柯莱",
+    "多莉",
+    "坎蒂丝",
+    "莱依拉",
+    "珐露珊",
+    "瑶瑶",
+    "米卡",
+    "绮良良",
+    "卡维",
+    "琳妮特",
+    "菲米尼",
+    "夏洛蒂",
+    "夏沃蕾",
+    "嘉明",
+    "卡齐娜",
+    "欧洛伦",
+    "伊安珊",
+    "伊法",
+    "蓝砚",
+    "重云",
 ];
 // 3★ weapons
-const CHAR_3: &[&str] = &["弹弓","飞天御剑","黑缨枪","铁影阔剑","魔导绪论","讨龙英杰谭","黎明神剑"];
+const CHAR_3: &[&str] = &[
+    "弹弓",
+    "飞天御剑",
+    "黑缨枪",
+    "铁影阔剑",
+    "魔导绪论",
+    "讨龙英杰谭",
+    "黎明神剑",
+];
 
-fn rand_f64() -> f64 { rand::random::<f64>() }
+fn rand_f64() -> f64 {
+    rand::random::<f64>()
+}
 
 fn char_5_star_rate(pity: u32) -> f64 {
-    if pity < 73 { 0.006 }
-    else { (0.006 + (pity - 72) as f64 * 0.06).min(1.0) }
+    if pity < 73 {
+        0.006
+    } else {
+        (0.006 + (pity - 72) as f64 * 0.06).min(1.0)
+    }
 }
 
 fn char_4_star_rate(pity: u32) -> f64 {
-    if pity < 8 { 0.051 }
-    else { (0.051 + (pity - 7) as f64 * 0.51).min(1.0) }
+    if pity < 8 {
+        0.051
+    } else {
+        (0.051 + (pity - 7) as f64 * 0.51).min(1.0)
+    }
 }
 
 fn pick<T: Copy>(arr: &[T]) -> T {
     let idx = (rand_f64() * arr.len() as f64) as usize;
-    arr[idx.min(arr.len()-1)]
+    arr[idx.min(arr.len() - 1)]
 }
 
 // ── request / response types ───────────────────────────────────────────
@@ -263,7 +362,11 @@ fn pull_char_banner(state: &mut GachaState, banner: &BannerConfig) -> GachaResul
         };
         state.char_pity_5 = 0;
         state.char_pity_4 = 0; // 5★ pull also resets 4★ pity
-        return GachaResult { name, stars: 5, is_featured: is_feat };
+        return GachaResult {
+            name,
+            stars: 5,
+            is_featured: is_feat,
+        };
     }
 
     // 4★: 50% rate-up 4★ with guarantee system
@@ -274,7 +377,10 @@ fn pull_char_banner(state: &mut GachaState, banner: &BannerConfig) -> GachaResul
             if state.char_4_guaranteed || rand_f64() < 0.5 {
                 state.char_4_guaranteed = false;
                 let idx = (rand_f64() * banner.featured_4.len() as f64) as usize;
-                (banner.featured_4[idx.min(banner.featured_4.len()-1)].clone(), true)
+                (
+                    banner.featured_4[idx.min(banner.featured_4.len() - 1)].clone(),
+                    true,
+                )
             } else {
                 state.char_4_guaranteed = true;
                 (pick(ALL_4).to_string(), false)
@@ -283,16 +389,26 @@ fn pull_char_banner(state: &mut GachaState, banner: &BannerConfig) -> GachaResul
             (pick(ALL_4).to_string(), false)
         };
         state.char_pity_4 = 0;
-        return GachaResult { name, stars: 4, is_featured: is_feat };
+        return GachaResult {
+            name,
+            stars: 4,
+            is_featured: is_feat,
+        };
     }
 
-    GachaResult { name: pick(CHAR_3).to_string(), stars: 3, is_featured: false }
+    GachaResult {
+        name: pick(CHAR_3).to_string(),
+        stars: 3,
+        is_featured: false,
+    }
 }
 
 // ── handlers ───────────────────────────────────────────────────────────
 
 fn handle_pull(count: u32) -> Result<GachaResponse, String> {
-    if count == 0 || count > 100 { return Err("count must be 1-100".into()); }
+    if count == 0 || count > 100 {
+        return Err("count must be 1-100".into());
+    }
 
     // P1-44: hold STATE_LOCK across the whole read-modify-write so
     // concurrent pulls don't lose pity or duplicate results.
@@ -321,8 +437,10 @@ fn handle_status() -> Result<GachaResponse, String> {
     let banner_info = if has_banner {
         format!(
             " | UP5★: {} | UP4★: {} / {} / {}",
-            store.banner.featured_5, store.banner.featured_4[0],
-            store.banner.featured_4[1], store.banner.featured_4[2]
+            store.banner.featured_5,
+            store.banner.featured_4[0],
+            store.banner.featured_4[1],
+            store.banner.featured_4[2]
         )
     } else {
         " | 未设置UP池 (用 setbanner 设置)".to_string()
@@ -332,13 +450,17 @@ fn handle_status() -> Result<GachaResponse, String> {
         action: "status".into(),
         message: Some(format!(
             "5★ pity: {}, 4★ pity: {}, 5★保底: {}, 4★保底: {}, total pulls: {}, avg 5★: {:.1}{}",
-            store.state.char_pity_5, store.state.char_pity_4,
-            store.state.char_guaranteed, store.state.char_4_guaranteed,
+            store.state.char_pity_5,
+            store.state.char_pity_4,
+            store.state.char_guaranteed,
+            store.state.char_4_guaranteed,
             store.state.char_total_pulls,
             // P2-39: correct average is total_pulls / count_of_5star.
             if store.state.char_5_star_count > 0 {
                 store.state.char_total_pulls as f64 / store.state.char_5_star_count as f64
-            } else { 0.0 },
+            } else {
+                0.0
+            },
             banner_info,
         )),
         results: None,
@@ -352,19 +474,31 @@ fn handle_banner() -> Result<GachaResponse, String> {
     let store = load_store();
     if store.banner.featured_5.is_empty() {
         Ok(GachaResponse {
-            ok: true, action: "banner".into(),
-            message: Some("当前未设置UP池。使用 setbanner <5星> <4星1> <4星2> <4星3> 来设置".into()),
-            results: None, pity_5: None, pity_4: None, guaranteed: None,
+            ok: true,
+            action: "banner".into(),
+            message: Some(
+                "当前未设置UP池。使用 setbanner <5星> <4星1> <4星2> <4星3> 来设置".into(),
+            ),
+            results: None,
+            pity_5: None,
+            pity_4: None,
+            guaranteed: None,
         })
     } else {
         Ok(GachaResponse {
-            ok: true, action: "banner".into(),
+            ok: true,
+            action: "banner".into(),
             message: Some(format!(
                 "UP5★: {} | UP4★: {} / {} / {}",
-                store.banner.featured_5, store.banner.featured_4[0],
-                store.banner.featured_4[1], store.banner.featured_4[2]
+                store.banner.featured_5,
+                store.banner.featured_4[0],
+                store.banner.featured_4[1],
+                store.banner.featured_4[2]
             )),
-            results: None, pity_5: None, pity_4: None, guaranteed: None,
+            results: None,
+            pity_5: None,
+            pity_4: None,
+            guaranteed: None,
         })
     }
 }
@@ -372,14 +506,18 @@ fn handle_banner() -> Result<GachaResponse, String> {
 fn resolve_5star(name: &str) -> Option<&'static str> {
     if LIMITED_5.contains(&name) || STANDARD_5.contains(&name) {
         for c in LIMITED_5.iter().chain(STANDARD_5.iter()) {
-            if *c == name { return Some(c); }
+            if *c == name {
+                return Some(c);
+            }
         }
     }
     // Strip prefix before and including "·" (e.g. "火神·玛薇卡" → "玛薇卡")
     if let Some(pos) = name.find('·') {
         let stripped: &str = &name[pos + '·'.len_utf8()..];
         for c in LIMITED_5.iter().chain(STANDARD_5.iter()) {
-            if *c == stripped { return Some(c); }
+            if *c == stripped {
+                return Some(c);
+            }
         }
     }
     None
@@ -388,13 +526,17 @@ fn resolve_5star(name: &str) -> Option<&'static str> {
 fn resolve_4star(name: &str) -> Option<&'static str> {
     if ALL_4.contains(&name) {
         for c in ALL_4.iter() {
-            if *c == name { return Some(c); }
+            if *c == name {
+                return Some(c);
+            }
         }
     }
     if let Some(pos) = name.find('·') {
         let stripped: &str = &name[pos + '·'.len_utf8()..];
         for c in ALL_4.iter() {
-            if *c == stripped { return Some(c); }
+            if *c == stripped {
+                return Some(c);
+            }
         }
     }
     None
@@ -429,23 +571,43 @@ fn handle_setbanner(args: &[String]) -> Result<GachaResponse, String> {
     save_store(&store);
 
     Ok(GachaResponse {
-        ok: true, action: "setbanner".into(),
-        message: Some(format!("UP池已设置: 5★ {} | 4★ {} / {} / {}", f5, f4_0, f4_1, f4_2)),
-        results: None, pity_5: None, pity_4: None, guaranteed: None,
+        ok: true,
+        action: "setbanner".into(),
+        message: Some(format!(
+            "UP池已设置: 5★ {} | 4★ {} / {} / {}",
+            f5, f4_0, f4_1, f4_2
+        )),
+        results: None,
+        pity_5: None,
+        pity_4: None,
+        guaranteed: None,
     })
 }
 
 fn handle_list() -> Result<GachaResponse, String> {
     let mut msg = String::from("【5星常驻】");
-    for c in STANDARD_5 { msg.push_str(c); msg.push(' '); }
+    for c in STANDARD_5 {
+        msg.push_str(c);
+        msg.push(' ');
+    }
     msg.push_str("\n【5星限定】");
-    for c in LIMITED_5 { msg.push_str(c); msg.push(' '); }
+    for c in LIMITED_5 {
+        msg.push_str(c);
+        msg.push(' ');
+    }
     msg.push_str("\n【4星全角色】");
-    for c in ALL_4 { msg.push_str(c); msg.push(' '); }
+    for c in ALL_4 {
+        msg.push_str(c);
+        msg.push(' ');
+    }
     Ok(GachaResponse {
-        ok: true, action: "list".into(),
+        ok: true,
+        action: "list".into(),
         message: Some(msg),
-        results: None, pity_5: None, pity_4: None, guaranteed: None,
+        results: None,
+        pity_5: None,
+        pity_4: None,
+        guaranteed: None,
     })
 }
 
@@ -453,14 +615,23 @@ fn handle_reset() -> Result<GachaResponse, String> {
     let _guard = STATE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let mut store = load_store();
     store.state = GachaState {
-        char_pity_5: 0, char_pity_4: 0, char_guaranteed: false, char_4_guaranteed: false,
-        char_pity_5_total: 0, char_total_pulls: 0, char_5_star_count: 0,
+        char_pity_5: 0,
+        char_pity_4: 0,
+        char_guaranteed: false,
+        char_4_guaranteed: false,
+        char_pity_5_total: 0,
+        char_total_pulls: 0,
+        char_5_star_count: 0,
     };
     save_store(&store);
     Ok(GachaResponse {
-        ok: true, action: "reset".into(),
+        ok: true,
+        action: "reset".into(),
         message: Some("保底数据已重置".into()),
-        results: None, pity_5: Some(0), pity_4: Some(0), guaranteed: Some(false),
+        results: None,
+        pity_5: Some(0),
+        pity_4: Some(0),
+        guaranteed: Some(false),
     })
 }
 
@@ -493,7 +664,9 @@ fn handle(req: GachaRequest) -> Result<GachaResponse, String> {
         }
         "list" => handle_list(),
         "reset" => handle_reset(),
-        other => Err(format!("未知命令: {other}。可用: pull, status, banner, setbanner, list, reset")),
+        other => Err(format!(
+            "未知命令: {other}。可用: pull, status, banner, setbanner, list, reset"
+        )),
     }
 }
 
@@ -549,9 +722,13 @@ fn api_handle(req: PluginRequest) -> PluginResponse {
     {
         Ok(resp) => json_response(&resp),
         Err(e) => json_response(&GachaResponse {
-            ok: false, action: "error".into(),
-            message: Some(e), results: None,
-            pity_5: None, pity_4: None, guaranteed: None,
+            ok: false,
+            action: "error".into(),
+            message: Some(e),
+            results: None,
+            pity_5: None,
+            pity_4: None,
+            guaranteed: None,
         }),
     }
 }
@@ -602,10 +779,7 @@ mod tests {
             // node-id whitelist error path even if the state file
             // isn't present (they default state).
             if let Err(e) = &r {
-                assert!(
-                    !e.contains("gacha_status only supports"),
-                    "cmd={cmd}: {e}"
-                );
+                assert!(!e.contains("gacha_status only supports"), "cmd={cmd}: {e}");
             }
         }
     }

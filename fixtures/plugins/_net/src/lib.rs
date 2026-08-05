@@ -86,8 +86,7 @@ pub fn ip_is_forbidden(ip: IpAddr) -> Option<&'static str> {
 ///
 /// Returns `Err(reason)` when the URL should be rejected.
 pub fn check_url_safety(url_str: &str) -> Result<(), String> {
-    let parsed =
-        ::url::Url::parse(url_str).map_err(|_| format!("invalid URL: {url_str}"))?;
+    let parsed = ::url::Url::parse(url_str).map_err(|_| format!("invalid URL: {url_str}"))?;
     let scheme = parsed.scheme();
     if scheme != "http" && scheme != "https" {
         return Err(format!("only http/https allowed, got: {scheme}"));
@@ -139,12 +138,8 @@ mod tests {
     #[test]
     fn ipv6_loopback_ula_linklocal_are_blocked() {
         assert!(ip_is_forbidden(IpAddr::V6(Ipv6Addr::LOCALHOST)).is_some());
-        assert!(
-            ip_is_forbidden(IpAddr::V6(Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 1))).is_some()
-        );
-        assert!(
-            ip_is_forbidden(IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1))).is_some()
-        );
+        assert!(ip_is_forbidden(IpAddr::V6(Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 1))).is_some());
+        assert!(ip_is_forbidden(IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1))).is_some());
         assert!(
             ip_is_forbidden(IpAddr::V6("::ffff:127.0.0.1".parse().unwrap())).is_some(),
             "IPv4-mapped loopback must round-trip"

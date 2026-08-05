@@ -2922,7 +2922,7 @@ api_hash = "api_v2"
 [dependencies]
 cordis-plugin-sdk = {{ path = "../../../crates/cordis-plugin-sdk" }}
 serde = {{ version = "1", features = ["derive"] }}
-serde_json = "1"
+serde_json = {{ version = "1", features = ["preserve_order"] }}
 "#
         );
         let manifest_path = plugin_dir.join("Cargo.toml");
@@ -3681,7 +3681,8 @@ export_plugin_api! {{
 
         // Stop background services + Task node threads before .so is dlclose'd.
         for plugin_path in &targets {
-            self.service_registry.stop_plugin_services(plugin_path);
+            self.service_registry
+                .stop_plugin_services_timed(plugin_path);
             // Also invoke stop action for Task nodes (plugins that don't
             // implement the Service trait call stop via node invocation).
             //
@@ -3705,6 +3706,7 @@ export_plugin_api! {{
             {
                 let payload = serde_json::json!({"action": "stop"}).to_string();
                 let this = self;
+                let fqn = format!("{plugin_id}::{node_id}");
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     #[cfg(test)]
                     if TEST_STOP_HANDLER_PANIC_INJECTION
@@ -3712,7 +3714,12 @@ export_plugin_api! {{
                     {
                         panic!("test panic injection: stop handler");
                     }
-                    let _ = this.invoke(plugin_id, node_id, payload);
+                    // 检查 stop 的返回值：handler 报 ok=false 或 invoke 出错时
+                    // 给出诊断，而不是静默丢弃。
+                    let outcome = this.invoke(plugin_id, node_id, payload);
+                    if let Some(diag) = stop_result_diagnostic(&fqn, &outcome) {
+                        eprintln!("{diag}");
+                    }
                 }));
                 if let Err(err) = result {
                     let msg = reload_stop_handler_panic_message(err.as_ref());
@@ -4920,8 +4927,10 @@ export_plugin_api! {{
             .map(|(path, _)| path)
             .collect();
         // Plugins the new snapshot dropped — stop their services.
+        // 用 `_timed` 变体：stop 卡住时有上限，不会把 reload 拖死。
         for plugin_path in previous_plugins.difference(&next_plugins) {
-            self.service_registry.stop_plugin_services(plugin_path);
+            self.service_registry
+                .stop_plugin_services_timed(plugin_path);
         }
         // Also stop services for plugins whose docs changed (the new snapshot
         // may have different Task nodes).
@@ -4933,7 +4942,8 @@ export_plugin_api! {{
             // Compare docs by JSON representation — if they differ, restart
             // services so the new plugin version's services are used.
             if prev_docs != next_docs {
-                self.service_registry.stop_plugin_services(plugin_path);
+                self.service_registry
+                    .stop_plugin_services_timed(plugin_path);
             }
         }
 
@@ -6908,6 +6918,36 @@ fn extract_response_field(response_payload: &Value, field: &str) -> Option<Value
 
 fn parse_response_payload(raw_payload: &str) -> Value {
     serde_json::from_str(raw_payload).unwrap_or_else(|_| Value::String(raw_payload.to_string()))
+}
+
+/// Build the reload-path diagnostic line for a Task node `stop` invocation, or
+/// `None` when the stop reported success. A stop is treated as successful only
+/// when the response body is a JSON object whose `ok` field is `true`; any
+/// other payload (missing `ok`, `ok=false`, non-object, unparseable) or an
+/// invoke `Err` yields a diagnostic line for the caller to log. Kept as a pure
+/// function so the two message formats stay unit-testable without capturing
+/// `eprintln!` output.
+fn stop_result_diagnostic(
+    fqn: &str,
+    outcome: &Result<PluginResponse, RuntimeError>,
+) -> Option<String> {
+    match outcome {
+        Ok(resp) => {
+            let body: Value = serde_json::from_str(&resp.payload).unwrap_or_default();
+            if body.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+                None
+            } else {
+                let message = body
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("(no message)");
+                Some(format!(
+                    "[reload] Task node {fqn} stop returned ok=false: {message}"
+                ))
+            }
+        }
+        Err(e) => Some(format!("[reload] Task node {fqn} stop invoke failed: {e}")),
+    }
 }
 
 fn infer_outcome_from_payload(payload: &Value) -> NodeOutcome {
@@ -10216,6 +10256,65 @@ mod ffi_panic_seam_tests {
             "second reload also fails cleanly at Phase 1 (no panic)"
         );
     }
+
+    // ── C-seam #2b: reload stop-loop tolerates a failing stop invoke ──────
+    #[test]
+    #[serial]
+    fn reload_stop_loop_survives_failing_stop_invoke() {
+        // No panic injection this time: the reload stop-loop performs a real
+        // `stop` invoke against the JSON Task node. That node has
+        // `execution: null`, so `invoke` returns Err(PluginExecutionUnsupported)
+        // — the invoke-error diagnostic branch. The property under test is that
+        // this failing/diagnostic-producing stop does NOT abort the reload: the
+        // reload still proceeds to Phase 1 (where the JSON dlopen fails, an
+        // expected caught Err) and the host stays usable afterwards.
+        //
+        // The diagnostic itself is written via `eprintln!` from inside the
+        // per-node `catch_unwind` closure, which is not straightforward to
+        // capture in-process; the exact message content is asserted directly
+        // against the pure `stop_result_diagnostic` helper in
+        // `seam_pure_fn_tests`. Here we only confirm the reload flow completes.
+        let (_temp, fixtures) = setup_task_plugin_fixture();
+        let host = RuntimeHost::boot(&fixtures).expect("host should boot on task fixture");
+
+        // Sanity: the Task node the stop-loop iterates over is registered.
+        let snapshot = host.current_snapshot();
+        assert!(
+            snapshot
+                .node_registry()
+                .task_node_fqns()
+                .iter()
+                .any(|fqn| fqn == "svc::svc_serve"),
+            "svc::svc_serve Task node must be registered"
+        );
+        drop(snapshot);
+
+        // Flag is NOT set: the stop-loop runs a real (failing) stop invoke.
+        assert!(
+            !TEST_STOP_HANDLER_PANIC_INJECTION.load(SeqCst),
+            "panic injection must be off for this test"
+        );
+        let reload_result = host.reload("svc");
+        // The reload still fails at Phase 1's JSON dlopen — but it reached
+        // Phase 1, which means the failing stop invoke in the earlier stop-loop
+        // did not interrupt the reload path.
+        assert!(
+            reload_result.is_err(),
+            "reloading a JSON artifact fails at Phase 1 dlopen"
+        );
+
+        // Host remains usable: the Task node registry survived and a second
+        // reload still runs the same clean path.
+        let after = host.current_snapshot();
+        assert!(
+            after
+                .node_registry()
+                .task_node_fqns()
+                .iter()
+                .any(|fqn| fqn == "svc::svc_serve"),
+            "Task node registry must survive the failing stop invoke"
+        );
+    }
 }
 
 /// F-class coverage: unit tests for pure helper functions in the >3500 region
@@ -10228,8 +10327,8 @@ mod seam_pure_fn_tests {
         is_warning_block_boundary, normalize_warning_source_path, parse_response_payload,
         plugin_change_reasons, plugin_iteration_status_from_history,
         plugin_path_from_runtime_error, plugin_relative_depth, select_registered_net_subgraph,
-        strip_rust_span_suffix, truncate_warning_block, warning_cleanup_error_message,
-        warning_path_aliases,
+        stop_result_diagnostic, strip_rust_span_suffix, truncate_warning_block,
+        warning_cleanup_error_message, warning_path_aliases,
     };
     use crate::core::error::RuntimeError;
     use crate::core::models::NodeOutcome;
@@ -10237,6 +10336,7 @@ mod seam_pure_fn_tests {
     use crate::kernel::plugin_iteration::{
         CanaryVerdict, PluginIterationFinalVerdict, PluginIterationHistoryEntry, VerifierVerdict,
     };
+    use crate::plugin::abi::PluginResponse;
     use crate::plugin::registry::RegisteredPlugin;
     use crate::service::graph_registry::{RegisteredNet, RegisteredNetEdge, RegisteredNetEdgeKind};
     use serde_json::json;
@@ -10248,6 +10348,90 @@ mod seam_pure_fn_tests {
         assert_eq!(parse_response_payload("{\"a\":1}"), json!({"a": 1}));
         // Non-JSON input becomes a JSON string verbatim.
         assert_eq!(parse_response_payload("not json"), json!("not json"));
+    }
+
+    #[test]
+    fn stop_result_diagnostic_ok_true_is_silent() {
+        // A stop that reports ok=true produces no diagnostic.
+        let resp = Ok(PluginResponse {
+            payload: r#"{"ok": true}"#.to_string(),
+        });
+        assert_eq!(stop_result_diagnostic("svc::svc_serve", &resp), None);
+    }
+
+    #[test]
+    fn stop_result_diagnostic_ok_false_reports_message() {
+        // ok=false with a message surfaces the patch-format diagnostic.
+        let resp = Ok(PluginResponse {
+            payload: r#"{"ok": false, "message": "threads still alive"}"#.to_string(),
+        });
+        assert_eq!(
+            stop_result_diagnostic("svc::svc_serve", &resp),
+            Some(
+                "[reload] Task node svc::svc_serve stop returned ok=false: threads still alive"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn stop_result_diagnostic_ok_false_without_message_uses_placeholder() {
+        // ok=false with no message field falls back to "(no message)".
+        let resp = Ok(PluginResponse {
+            payload: r#"{"ok": false}"#.to_string(),
+        });
+        assert_eq!(
+            stop_result_diagnostic("svc::svc_serve", &resp),
+            Some(
+                "[reload] Task node svc::svc_serve stop returned ok=false: (no message)"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn stop_result_diagnostic_missing_ok_or_unparseable_reports() {
+        // A payload with no `ok` field is treated as failure.
+        let missing_ok = Ok(PluginResponse {
+            payload: r#"{"status": "done"}"#.to_string(),
+        });
+        assert_eq!(
+            stop_result_diagnostic("svc::svc_serve", &missing_ok),
+            Some(
+                "[reload] Task node svc::svc_serve stop returned ok=false: (no message)"
+                    .to_string()
+            )
+        );
+        // Unparseable payload -> Value::default() (Null) -> failure.
+        let garbage = Ok(PluginResponse {
+            payload: "not json at all".to_string(),
+        });
+        assert_eq!(
+            stop_result_diagnostic("svc::svc_serve", &garbage),
+            Some(
+                "[reload] Task node svc::svc_serve stop returned ok=false: (no message)"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn stop_result_diagnostic_invoke_error_reports_error() {
+        // An invoke Err surfaces the invoke-failed diagnostic carrying the
+        // error text.
+        let err: Result<PluginResponse, RuntimeError> = Err(RuntimeError::InvalidArgument {
+            message: "boom".to_string(),
+        });
+        let diag = stop_result_diagnostic("svc::svc_serve", &err)
+            .expect("invoke error must produce a diagnostic");
+        assert!(
+            diag.starts_with("[reload] Task node svc::svc_serve stop invoke failed: "),
+            "unexpected diagnostic: {diag}"
+        );
+        assert!(
+            diag.contains("boom"),
+            "diagnostic must carry the error text, got: {diag}"
+        );
     }
 
     #[test]
