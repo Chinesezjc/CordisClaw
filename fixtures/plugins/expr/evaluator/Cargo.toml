@@ -31,3 +31,10 @@ serde_json = { version = "1", features = ["preserve_order"] }
 thiserror = "2"
 
 [workspace]
+
+# 本 crate 末尾的空 [workspace] 使它成为独立 workspace 根，因此
+# fixtures/plugins/Cargo.toml 的 [profile.dev] 够不着它（它在那份清单的
+# exclude 列表里）。不在这里重复一份，产出的 .so 就会带上完整调试信息与
+# 符号表——实测每个约 9 MB，其中 5.9 MB 是调试段。
+[profile.dev]
+strip = "symbols"
