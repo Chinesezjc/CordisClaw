@@ -2,7 +2,7 @@
 
 ## 1. 判定口径
 
-- 本文基于当前仓库现状整理，最近更新：2026-08-05。
+- 本文基于当前仓库现状整理，最近更新：2026-08-06。
 - 历史规划蓝图已经吸收进 [design-blueprint.md](./design-blueprint.md)，因此本文结论来自三类证据的交叉比对：
   - 设计蓝图：[design-blueprint.md](./design-blueprint.md)
   - 架构文档：[system-overview.md](./system-overview.md)、[contracts-and-loading.md](./contracts-and-loading.md)、[runtime-semantics.md](./runtime-semantics.md)、[maintenance-guide.md](./maintenance-guide.md)
@@ -238,6 +238,37 @@ Agent 现在可以自主完成：读代码 → 理解结构 → 写/改文件 �
 - [x] **Filesystem / Git 白名单不再静默降级**（P0-19）— `canonicalize` 失败时不再退回未规范化路径。新增 `canonicalise_for_whitelist` / `validate_path_in_root` 的深度 ancestor 解析：路径不存在时 canonicalize 最深的存在祖先再拼 tail；两侧都失败则 fail-closed。`../../etc/shadow` 之类的构造再无绕过。
 - [x] **Plugin iteration symlink 逃逸**（P0-20）— `PluginEditExecutor::execute` 在写入前调用新 helper `resolve_under_workspace`：canonicalize 结果必须仍在 workspace_root 下。plugins 内的 symlink 指向 `/etc/passwd` 之类无法被写入。
 - [x] **Verifier shell 拼接**（P0-21）— 已随 A 批 P0-1 修复。`discover_rust_workspace_manifest` 输出的字符串被 `shell_words` 解析成 argv，空格 / `$` / `;` 无法被解释。
+
+### 5.2.40 插件工件体积：exclude 清单里的插件收不到 strip profile（2026-08-06）
+
+**背景**：22 个 `.so` 合计 234 MB，dlopen 全加载时这些体积同时进内存。
+
+**定位**：`61f69ef`（2026-06-12）给 `fixtures/plugins/Cargo.toml` 加过
+`[profile.dev] strip = "debuginfo"`，对 workspace 成员确实生效——实测
+`llm_openai.so`、`time.so` 的调试段均为 0。但 `expr/*` 的 10 个插件与 `_net`
+列在同一份清单的 `exclude` 里，且各自 `Cargo.toml` 末尾有一个空 `[workspace]`
+使其成为**独立 workspace 根**，因此父级 profile 完全够不着它们：
+`expr_evaluator_add.so` 8.95 MB 里有 5.9 MB 是调试段。一个只做加法的插件
+和 `llm_openai` 处在同一量级，信号本身就很清楚。
+
+**改动**：给这 10 个产出工件的 excluded 插件各自补上 `[profile.dev]`；同时把
+父 workspace 从 `strip = "debuginfo"` 升到 `strip = "symbols"`（后者额外去掉
+`.symtab`）。`_net` 不需要——它是 rlib、不产出工件，作为 path 依赖时随
+消费方（`web` / `vision`）的 profile 一起构建。
+
+**为什么 `strip = "symbols"` 不会破坏插件加载**：dlopen/dlsym 走的是 `.dynsym`，
+strip 只删 `.symtab`。实测 `expr_evaluator_add.so` 剥后仍保留 204 个 cordis
+动态符号，architecture 套件 17 项全过。
+
+**结果**：234 MB → 142 MB（−92 MB，−39%）；`expr` 系列每个 8.95 → 2.33 MB。
+剩余大头是四个网络插件各自静态链接的 reqwest + rustls（llm_openai 18.7、
+web 18.1、feishu 17.0、qq 16.4、vision 12.3 MB），属后续阶段。
+
+**遗留**：插件仍各自静态链接 Rust std 与 serde/serde_json/SDK（`ldd` 只显示
+libc/libgcc）。已实测：`-C prefer-dynamic` 加上把 SDK 做成 dylib 后，平凡插件
+可降到 0.20 MB，但需要宿主同步改造、解决 `libstd-<hash>.so` 的运行时查找，
+并补 `rust-toolchain.toml`——当前 ABI 用 Rust `fn` 指针与按值 `String`，
+本就与 rustc 版本硬耦合却没有锁定。
 
 ### 5.2.39 mock LLM server 空转导致 CI 4 倍变慢（2026-08-05）
 
