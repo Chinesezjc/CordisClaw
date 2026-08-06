@@ -127,11 +127,43 @@ fn mock_llm_accept_timeout() -> Duration {
     }
 }
 
+/// **首次** accept 的上限，独立于后续 accept 的 15 分钟预算。
+///
+/// 上面那 15 分钟是为"响应序列中途插入 fixture `cargo build`"加的，那种等待
+/// 只可能出现在第 2 次及以后的 accept：客户端在 `agent_send` 一执行就会拨号，
+/// 首次连接前只隔着 boot。因此首次单独设短预算——一个根本没人拨的 mock
+/// （例如用例改用假 provider 插件应答后，HTTP mock 变成死脚手架）能在 2 分钟内
+/// 暴露，而不是烧满 15 分钟。
+///
+/// 本地与后续预算同为 30 秒；CI 给 120 秒，是本地值的 4 倍余量，覆盖冷 runner
+/// 上首个请求之前的 boot。
+fn mock_llm_first_accept_timeout() -> Duration {
+    if std::env::var_os("CI").is_some() {
+        Duration::from_secs(120)
+    } else {
+        Duration::from_secs(30)
+    }
+}
+
 #[allow(dead_code)]
 pub fn spawn_chunked_mock_llm_server_sequence(
     responses: Vec<Vec<(u64, String)>>,
 ) -> (String, mpsc::Receiver<Vec<String>>, thread::JoinHandle<()>) {
-    let accept_timeout = mock_llm_accept_timeout();
+    spawn_chunked_mock_llm_server_sequence_with_timeouts(
+        responses,
+        mock_llm_first_accept_timeout(),
+        mock_llm_accept_timeout(),
+    )
+}
+
+/// 显式给定两个 accept 预算的变体，供直接测试超时臂使用
+/// （见 `tests/mock_llm_server.rs`：真等 2 分钟不可行，注入毫秒级预算即可）。
+#[allow(dead_code)]
+pub fn spawn_chunked_mock_llm_server_sequence_with_timeouts(
+    responses: Vec<Vec<(u64, String)>>,
+    first_accept_timeout: Duration,
+    accept_timeout: Duration,
+) -> (String, mpsc::Receiver<Vec<String>>, thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
     listener
         .set_nonblocking(true)
@@ -141,16 +173,30 @@ pub fn spawn_chunked_mock_llm_server_sequence(
 
     let handle = thread::spawn(move || {
         let mut requests = Vec::new();
-        for chunks in responses {
+        let total = responses.len();
+        for (index, chunks) in responses.into_iter().enumerate() {
+            // 首次连接与后续连接用不同预算，理由见 mock_llm_first_accept_timeout。
+            let budget = if index == 0 {
+                first_accept_timeout
+            } else {
+                accept_timeout
+            };
             let accept_started = std::time::Instant::now();
             let (mut stream, _) = loop {
                 match listener.accept() {
                     Ok(stream) => break stream,
                     Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                        if accept_started.elapsed() >= accept_timeout {
-                            sender.send(requests).expect("send captured requests");
-                            return;
-                        }
+                        assert!(
+                            accept_started.elapsed() < budget,
+                            "mock LLM server timed out after {budget:?} waiting for request \
+                             {}/{total} (captured {} so far). A response was scripted that \
+                             nothing ever dialled: either the code under test no longer issues \
+                             this request, or the case answers via a fake provider plugin and \
+                             this HTTP mock is dead scaffolding — drop it rather than letting \
+                             it idle.",
+                            index + 1,
+                            requests.len(),
+                        );
                         thread::sleep(Duration::from_millis(10));
                     }
                     Err(err) => panic!("accept request: {err}"),
