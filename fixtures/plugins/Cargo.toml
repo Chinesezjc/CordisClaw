@@ -22,4 +22,4 @@ exclude = [
 resolver = "2"
 
 [profile.dev]
-strip = "debuginfo"
+strip = "symbols"
