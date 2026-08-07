@@ -2,7 +2,7 @@
 
 ## 1. 判定口径
 
-- 本文基于当前仓库现状整理，最近更新：2026-08-06。
+- 本文基于当前仓库现状整理，最近更新：2026-08-07。
 - 历史规划蓝图已经吸收进 [design-blueprint.md](./design-blueprint.md)，因此本文结论来自三类证据的交叉比对：
   - 设计蓝图：[design-blueprint.md](./design-blueprint.md)
   - 架构文档：[system-overview.md](./system-overview.md)、[contracts-and-loading.md](./contracts-and-loading.md)、[runtime-semantics.md](./runtime-semantics.md)、[maintenance-guide.md](./maintenance-guide.md)
@@ -238,6 +238,74 @@ Agent 现在可以自主完成：读代码 → 理解结构 → 写/改文件 �
 - [x] **Filesystem / Git 白名单不再静默降级**（P0-19）— `canonicalize` 失败时不再退回未规范化路径。新增 `canonicalise_for_whitelist` / `validate_path_in_root` 的深度 ancestor 解析：路径不存在时 canonicalize 最深的存在祖先再拼 tail；两侧都失败则 fail-closed。`../../etc/shadow` 之类的构造再无绕过。
 - [x] **Plugin iteration symlink 逃逸**（P0-20）— `PluginEditExecutor::execute` 在写入前调用新 helper `resolve_under_workspace`：canonicalize 结果必须仍在 workspace_root 下。plugins 内的 symlink 指向 `/etc/passwd` 之类无法被写入。
 - [x] **Verifier shell 拼接**（P0-21）— 已随 A 批 P0-1 修复。`discover_rust_workspace_manifest` 输出的字符串被 `shell_words` 解析成 argv，空格 / `$` / `;` 无法被解释。
+
+### 5.2.41 插件工件按 size 优化编译；Rust dylib 共享此路不通（2026-08-07）
+
+**背景**：5.2.40 补齐 strip 后工件仍有 142 MB，dlopen 时全部进内存。
+
+#### 已落地：`opt-level = "z"`
+
+工件此前是**无优化**的 dev 构建——没有内联、没有死代码消除。给 11 个
+`[profile.dev]`（父 workspace + 10 个 `exclude` 插件，后者是独立 workspace 根，
+收不到父级配置，同 5.2.40）各加 `opt-level = "z"`：
+
+| | 工件合计 | 全量构建 |
+|---|---|---|
+| 优化前 | 142 MB | 65 s |
+| 优化后 | **79 MB（−44%）** | 135 s |
+
+大插件降幅最明显：llm_openai 18.74 → 8.70、web 18.11 → 8.32、feishu 16.96 →
+7.71、qq 16.37 → 7.49、vision 12.26 → 5.96 MB。
+
+**为什么优化放 dev 档而不是切 release**：`plugin iteration` 对插件跑
+`cargo test`（dev 档）。若工件用 release，插件会被编两遍（两个 profile 各一份），
+构建时间与磁盘都翻倍。dev 档承载优化则共用一份，且 `debug_assertions` 仍开启，
+插件测试语义不变。release + strip 实测 65 MB，只比 dev+opt-level=z 小 10 MB，
+不值那份复杂度。
+
+#### 已否决：把 std / SDK / serde 做成共享 dylib
+
+动机是"22 个插件各带一份 std 与 serde"。实测结论：**共享 Rust 泛型代码不可行**，
+且原因是结构性的，不是配置问题。
+
+- **只共享 libstd 可行**：SDK 保持 rlib，插件加 `-C prefer-dynamic`，宿主以
+  `RTLD_GLOBAL` 预加载 libstd 后 22 个插件全部正常加载。但收益只有
+  142 → 126 MB（−11%），换来一整套预加载与共享目录分发机制，不成比例。
+- **共享 SDK（连带 serde）不可行**：SDK 改 `crate-type = ["rlib", "dylib"]`、
+  全部插件用同一个 `CARGO_TARGET_DIR` 构建、预加载与插件链接的**同一个**
+  SDK dylib 文件后，**22 个插件只有 3 个能加载**。19 个失败，缺的符号各不相同：
+  `core::ptr::drop_glue::<serde_json 类型>`、`alloc::slice::to_vec_in::<u8,…>`、
+  `<Result<(), serde_json::Error> as Try>::from_output`、`serde_core::de::impls::…`。
+
+**根因**：泛型在 Rust 里按实例化单态化编译。`serde_json::from_str::<T>()` 在选定
+`T` 之前不是代码；每个插件的 `#[derive(Deserialize)]` 类型生成各自的机器码。
+所以"22 份 serde 副本"是个误称——那是 **22 份不同的特化**，只在 `Cargo.toml`
+里看起来是同一个依赖。符号统计印证：llm_openai 里 serde 相关代码只有 0.35 MB。
+rustc 在上游以 dylib 形式存在时把这些实例记作"上游提供"、不在本地生成，dylib
+里没有就成了 undefined symbol；而"枚举全部插件可能用到的实例"不是有限任务。
+
+**libstd 为何例外**：由工具链构建分发，rustc 对它有特殊处理，缺的实例会在本地
+生成。这就是"共享 libstd 可行、共享用户 crate 不可行"的分界。
+
+**`dylib` 与 `cdylib`**：只有 `dylib` 能被别的 Rust crate 依赖、从而共享 Rust
+依赖，但代价正是携带元数据与上述单态化记账；`cdylib` 导出纯 C ABI、把全部
+Rust 依赖静态吞入，定义上就无法共享。**不存在"既能共享 serde 又可靠"的
+crate-type**。附带一条现状观察：本仓库插件声明的是 `dylib`，但用法是 `cdylib`
+的场景（dlopen + dlsym 取单一入口、之后只交换 JSON）；`RustPluginApiV2` 虽标
+`#[repr(C)]`，`handle` 却是 Rust ABI 的 `fn` 指针、`PluginRequest.payload` 按值
+传 `String`——这就是"宿主与插件必须同一 rustc 编译"这一隐含约束的来源，而仓库
+尚无 `rust-toolchain.toml` 锁定。
+
+#### 剩余杠杆
+
+- **`llm_openai` / `web` 从 reqwest 换 ureq**：两者用法是纯阻塞，但 reqwest 的
+  blocking 模式仍拉起 tokio 运行时，连带 hyper / hyper-rustls / hyper-util /
+  mio / tokio-rustls 共 10 个异步栈 crate（依赖数 96，而用 ureq 的 vision 是
+  63）。llm_openai 里 tokio/hyper 代码占 1.43 MB。不推翻任何既有决策。
+- **rustls → native-tls（已否决）**：rustls + ring 占 llm_openai 代码的
+  2.82 MB，是单态的密码学与协议代码，换系统 OpenSSL 可经 C ABI 在 5 个网络插件
+  与系统之间真正共享。但这推翻 `llm_openai/Cargo.toml` 里"不依赖系统 OpenSSL"
+  的既有选择，且需要构建机具备 pkg-config 与 OpenSSL 开发包。不做。
 
 ### 5.2.40 插件工件体积：exclude 清单里的插件收不到 strip profile（2026-08-06）
 
