@@ -37,4 +37,9 @@ thiserror = "2"
 # exclude 列表里）。不在这里重复一份，产出的 .so 就会带上完整调试信息与
 # 符号表——实测每个约 9 MB，其中 5.9 MB 是调试段。
 [profile.dev]
+# 为体积优化：插件工件按 size 优化编译。dev（而非 release）档承载优化，
+# 使工件与 plugin iteration 跑的 cargo test 共用同一个 profile——两个 profile
+# 会让插件被编两遍。debug_assertions 仍开启，插件测试语义不变。
+# 实测全部工件 141 MB -> 75 MB，代价是全量构建 65s -> 135s。
+opt-level = "z"
 strip = "symbols"
