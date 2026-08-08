@@ -893,14 +893,36 @@ impl AgentToolHost for RuntimeHost {
         let cmd = command
             .map(|c| c.to_string())
             .unwrap_or_else(|| "cargo test --quiet --manifest-path plugins/Cargo.toml".to_string());
-        let output = std::process::Command::new("bash")
-            .arg("-lc")
-            .arg(&cmd)
+        self.check_sensitive_command(&cmd)?;
+        // P0-17: previously `bash -lc <cmd>` — the whole string went through a
+        // shell, so `; rm -rf ~`, `$(...)`, pipes and redirections all executed.
+        // Tokenise via shell_words (POSIX quoting, no expansion) and dispatch
+        // argv[0] directly, mirroring agent_run_command: shell-meta fragments
+        // survive as literal argv elements that the target program either
+        // rejects or treats as data. (A command that is *itself* an interpreter
+        // invocation, e.g. `bash -lc ...`, can still reach that interpreter via
+        // argv — the sensitive-command gate is the kernel's guard for that.)
+        use std::process::Command;
+        let argv = shell_words::split(&cmd).map_err(|err| RuntimeError::InvalidArgument {
+            message: format!("run_plugin_test tokenisation failed: {err}"),
+        })?;
+        let (program, args) = argv
+            .split_first()
+            .ok_or_else(|| RuntimeError::InvalidArgument {
+                message: "run_plugin_test received an empty command string".to_string(),
+            })?;
+        if program.is_empty() {
+            return Err(RuntimeError::InvalidArgument {
+                message: "run_plugin_test program was empty after tokenisation".to_string(),
+            });
+        }
+        let output = Command::new(program)
+            .args(args)
             .current_dir(self.fixtures_root())
             .output()
             .map_err(|err| RuntimeError::CommandFailed {
-                program: "bash".to_string(),
-                args: vec!["-lc".to_string(), cmd.clone()],
+                program: program.to_string(),
+                args: args.to_vec(),
                 message: err.to_string(),
             })?;
         Ok(json!({

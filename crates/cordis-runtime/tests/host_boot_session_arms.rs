@@ -10,8 +10,9 @@
 //!   - `detect_crash_and_recover`'s per-file skip arms (unreadable, corrupt,
 //!     and semantically unreconstructable snapshots);
 //!   - `check_agent_accessible`'s three rejection shapes;
-//!   - `resolve_sandboxed_path`'s traversal / absolute / symlink-escape arms
-//!     plus the filesystem-root ancestor walk;
+//!   - `resolve_sandboxed_path`'s traversal / absolute / symlink-escape /
+//!     dangling-symlink / in-root-symlink arms plus the filesystem-root
+//!     ancestor walk;
 //!   - `walk_code_files_ctl`'s unreadable-directory `continue` and the
 //!     `WalkControl::Stop` early return;
 //!   - `agent_send_with_fallback`'s no-fallback-configured arm;
@@ -1027,6 +1028,103 @@ fn resolve_sandboxed_path_rejects_symlink_escape() {
         panic!("expected InvalidArgument, got {err:?}");
     };
     assert_eq!(message, "path escapes fixtures root: escape/secret.txt");
+    // The same symlinked ancestor with a not-yet-existing final component
+    // must be rejected by the nearest-existing-ancestor walk, not just the
+    // full-path canonicalisation.
+    let err = host
+        .resolve_sandboxed_path("escape/brand-new.txt")
+        .expect_err("an escaping symlinked ancestor is rejected for new paths too");
+    let RuntimeError::InvalidArgument { message } = err else {
+        panic!("expected InvalidArgument, got {err:?}");
+    };
+    assert_eq!(message, "path escapes fixtures root: escape/brand-new.txt");
+}
+
+/// The dangling-symlink arm: a final component that is a symlink whose target
+/// does not exist. The old nearest-existing-ancestor walk skipped it (the
+/// symlink itself `exists()` is false) and let the caller's `fs::write`
+/// follow the link to create the file outside the sandbox. Now the link
+/// target is resolved explicitly and a missing target is rejected.
+#[cfg(unix)]
+#[test]
+#[serial]
+fn resolve_sandboxed_path_rejects_dangling_symlink_final_component() {
+    let workspace = setup_workspace();
+    // Absolute dangling target outside the sandbox.
+    let outside = TempDir::new().expect("outside tempdir");
+    let missing_outside = outside.path().join("not-created.txt");
+    std::os::unix::fs::symlink(&missing_outside, workspace.fixtures().join("dangling-abs"))
+        .expect("create absolute dangling symlink");
+    // Relative dangling target pointing at a path that does not exist either.
+    std::os::unix::fs::symlink("missing/outside.txt", workspace.fixtures().join("dangling-rel"))
+        .expect("create relative dangling symlink");
+
+    let host = RuntimeHost::boot(workspace.fixtures()).expect("boot");
+    for rel in ["dangling-abs", "dangling-rel"] {
+        let err = host
+            .resolve_sandboxed_path(rel)
+            .expect_err("a dangling symlink final component must be rejected");
+        let RuntimeError::InvalidArgument { message } = err else {
+            panic!("expected InvalidArgument for {rel}, got {err:?}");
+        };
+        assert_eq!(message, format!("path is a dangling symlink: {rel}"));
+    }
+    // The dangling symlink itself is untouched by resolution.
+    assert!(
+        !missing_outside.exists(),
+        "resolution must never create the dangling target"
+    );
+}
+
+/// Symlinks whose target stays inside the root keep the existing semantics:
+/// the resolved path is returned as-is and reads/writes through the link land
+/// inside the sandbox.
+#[cfg(unix)]
+#[test]
+#[serial]
+fn resolve_sandboxed_path_allows_symlink_to_target_inside_root() {
+    let workspace = setup_workspace();
+    fs::write(workspace.demo_lib(), b"pub fn inside() {}\n").expect("write target file");
+    // Relative link inside the root…
+    std::os::unix::fs::symlink("plugins/demo/src/lib.rs", workspace.fixtures().join("inside-link"))
+        .expect("create inside symlink");
+    // …and an absolute link inside the root.
+    std::os::unix::fs::symlink(workspace.demo_lib(), workspace.fixtures().join("inside-abs"))
+        .expect("create inside absolute symlink");
+
+    let host = RuntimeHost::boot(workspace.fixtures()).expect("boot");
+    for rel in ["inside-link", "inside-abs"] {
+        let resolved = host
+            .resolve_sandboxed_path(rel)
+            .expect("a symlink to an in-root target is allowed");
+        assert_eq!(resolved, workspace.fixtures().join(rel));
+        assert_eq!(
+            fs::read_to_string(&resolved).expect("read through the link"),
+            "pub fn inside() {}\n"
+        );
+    }
+}
+
+/// The final component itself being a symlink to an *existing* out-of-root
+/// target is rejected with the same escape message as the ancestor case.
+#[cfg(unix)]
+#[test]
+#[serial]
+fn resolve_sandboxed_path_rejects_symlink_to_existing_external_target() {
+    let workspace = setup_workspace();
+    let escape_target = TempDir::new().expect("escape tempdir");
+    fs::write(escape_target.path().join("secret.txt"), b"outside").expect("write escape target");
+    std::os::unix::fs::symlink(escape_target.path(), workspace.fixtures().join("ext-link"))
+        .expect("create external symlink");
+
+    let host = RuntimeHost::boot(workspace.fixtures()).expect("boot");
+    let err = host
+        .resolve_sandboxed_path("ext-link")
+        .expect_err("a symlink to an existing external target must be rejected");
+    let RuntimeError::InvalidArgument { message } = err else {
+        panic!("expected InvalidArgument, got {err:?}");
+    };
+    assert_eq!(message, "path escapes fixtures root: ext-link");
 }
 
 /// The nearest-existing-ancestor walk, for a path whose components do not exist

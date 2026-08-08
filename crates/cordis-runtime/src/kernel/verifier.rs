@@ -3,7 +3,6 @@
 use crate::core::error::RuntimeError;
 use crate::kernel::evaluator::VerificationInput;
 use crate::plugin::abi::PluginResponse;
-use crate::plugin::invoke::PluginInvoker;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
@@ -93,12 +92,18 @@ pub struct VerificationReport {
     /// Sha256 of the source tree at verification time. Used by the caller to
     /// detect concurrent mutation between verify and promote (P0-3 TOCTOU).
     pub source_tree_hash: Option<String>,
+    /// When `source_tree_hash` is `None` because the baseline hash itself
+    /// failed (unreadable file, dangling symlink, permission denied), this
+    /// carries the failure message instead of silently dropping it. The
+    /// caller must not promote a `Pass` verdict while this is set — same
+    /// policy as a re-hash failure before promote. `None` when hashing
+    /// succeeded or was never attempted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hash_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 struct PluginCommandSpec {
-    #[serde(default)]
-    fixtures_root: Option<String>,
     plugin_path: String,
     node_id: String,
     #[serde(default = "default_plugin_payload_json")]
@@ -253,7 +258,12 @@ impl CommandVerifier {
 
         // P0-3: hash the source tree AFTER commands ran; caller compares this
         // against a re-hash right before promote to detect mid-flight edits.
-        let source_tree_hash = hash_source_tree(workspace_root).ok();
+        // A baseline-hash failure is recorded (not silently swallowed) so the
+        // caller can refuse to promote — the same policy as a re-hash failure.
+        let (source_tree_hash, hash_error) = match hash_source_tree(workspace_root) {
+            Ok(hash) => (Some(hash), None),
+            Err(err) => (None, Some(err.to_string())),
+        };
 
         Ok(VerificationReport {
             plan,
@@ -266,6 +276,7 @@ impl CommandVerifier {
             tests: tests.check,
             safety: safety.check,
             source_tree_hash,
+            hash_error,
         })
     }
 }
@@ -352,7 +363,7 @@ fn run_check_command(
     timeout: Duration,
 ) -> Result<CommandCheckResult, RuntimeError> {
     if let Some(spec_json) = command.strip_prefix(PLUGIN_COMMAND_PREFIX) {
-        return run_plugin_command(command, spec_json, current_dir, options);
+        return run_plugin_command(command, spec_json, options);
     }
     run_shell_command(command, current_dir, timeout)
 }
@@ -371,7 +382,6 @@ fn payload_not_serializable(err: serde_json::Error) -> RuntimeError {
 fn run_plugin_command(
     original_command: &str,
     spec_json: &str,
-    current_dir: &Path,
     options: &VerifyOptions<'_>,
 ) -> Result<CommandCheckResult, RuntimeError> {
     let spec: PluginCommandSpec =
@@ -380,48 +390,27 @@ fn run_plugin_command(
         })?;
     let payload = serde_json::to_string(&spec.payload_json).map_err(payload_not_serializable)?;
 
-    // P0-4: route through the caller-supplied candidate invoker when present.
-    // Falling back to `PluginInvoker::load` would verify the currently-running
-    // plugins — the exact bug this option exists to fix.
-    let response = if let Some(invoker) = options.candidate_invoker {
-        match invoker(&spec.plugin_path, &spec.node_id, payload) {
-            Ok(response) => response,
-            Err(err) => {
-                return Ok(CommandCheckResult {
-                    command: original_command.to_string(),
-                    runner: VerificationRunner::Plugin,
-                    success: false,
-                    stdout: String::new(),
-                    stderr: err.to_string(),
-                });
-            }
-        }
-    } else {
-        let fixtures_root =
-            resolve_plugin_fixtures_root(current_dir, spec.fixtures_root.as_deref());
-        let invoker = match PluginInvoker::load(&fixtures_root) {
-            Ok(invoker) => invoker,
-            Err(err) => {
-                return Ok(CommandCheckResult {
-                    command: original_command.to_string(),
-                    runner: VerificationRunner::Plugin,
-                    success: false,
-                    stdout: String::new(),
-                    stderr: err.to_string(),
-                });
-            }
-        };
-        match invoker.invoke(&spec.plugin_path, &spec.node_id, payload) {
-            Ok(response) => response,
-            Err(err) => {
-                return Ok(CommandCheckResult {
-                    command: original_command.to_string(),
-                    runner: VerificationRunner::Plugin,
-                    success: false,
-                    stdout: String::new(),
-                    stderr: err.to_string(),
-                });
-            }
+    // P0-4: a `plugin:` verifier command must exercise the staged candidate
+    // snapshot — never the currently-running plugins. Without a caller-supplied
+    // candidate invoker there is no way to verify the candidate, so refuse
+    // loudly instead of silently verifying the wrong code (the historical
+    // fallback loaded a live `PluginInvoker` from the fixtures root).
+    let Some(invoker) = options.candidate_invoker else {
+        return Err(RuntimeError::InvalidArgument {
+            message: "verification requires a candidate plugin invoker when plugin: commands are present"
+                .to_string(),
+        });
+    };
+    let response = match invoker(&spec.plugin_path, &spec.node_id, payload) {
+        Ok(response) => response,
+        Err(err) => {
+            return Ok(CommandCheckResult {
+                command: original_command.to_string(),
+                runner: VerificationRunner::Plugin,
+                success: false,
+                stdout: String::new(),
+                stderr: err.to_string(),
+            });
         }
     };
 
@@ -458,37 +447,6 @@ fn run_plugin_command(
         stdout: response.payload,
         stderr,
     })
-}
-
-fn resolve_plugin_fixtures_root(current_dir: &Path, requested_root: Option<&str>) -> PathBuf {
-    if let Some(root) = requested_root {
-        let path = Path::new(root);
-        return if path.is_absolute() {
-            path.to_path_buf()
-        } else if current_dir.ends_with(path) {
-            current_dir.to_path_buf()
-        } else if let Some(parent) = current_dir.parent() {
-            let sibling = parent.join(path);
-            if sibling.join("plugins").exists() {
-                sibling
-            } else {
-                current_dir.join(path)
-            }
-        } else {
-            current_dir.join(path)
-        };
-    }
-
-    if current_dir.join("plugins").exists() {
-        return current_dir.to_path_buf();
-    }
-
-    let nested_fixtures = current_dir.join("fixtures");
-    if nested_fixtures.join("plugins").exists() {
-        return nested_fixtures;
-    }
-
-    current_dir.to_path_buf()
 }
 
 /// Wrap a `Child::try_wait` failure into the `CommandFailed` error returned by
@@ -733,9 +691,9 @@ mod tests {
     use super::{
         collect_source_tree, command_wait_error, discover_rust_workspace_manifest, drain_stream,
         hash_source_tree, normalize_optional_command, payload_not_serializable, poll_until_exit,
-        resolve_plugin_fixtures_root, run_shell_command, shell_quote, CommandVerifier,
-        PluginResponse, RuntimeError, VerificationProfile, VerificationRunner,
-        VerificationStageKind, VerificationStageStatus, VerifyOptions,
+        run_shell_command, shell_quote, CommandVerifier, PluginResponse, RuntimeError,
+        VerificationProfile, VerificationRunner, VerificationStageKind, VerificationStageStatus,
+        VerifyOptions,
     };
     use serde_json::json;
     use std::collections::BTreeMap;
@@ -926,7 +884,20 @@ mod tests {
         // otherwise. `for`-over-`Option` (rather than `if let`) has no not-taken
         // arm, so the gate leaves no permanently-uncovered brace on hosts where
         // the probe succeeds. Works on any host whose committed index matches.
-        for () in probe_expr_fixture_loadable().into_iter() {
+        for invoker in probe_expr_fixture_loadable().into_iter() {
+            // P0-4: the `plugin:` command must go through the candidate
+            // invoker; here the test supplies one wrapping the real fixture
+            // invoker (the equivalent of host.rs dispatching into the staged
+            // candidate snapshot). `fixtures_root` in the spec is a legacy
+            // field that serde ignores — kept to prove old specs still parse.
+            let candidate_invoker =
+                |plugin_path: &str, node_id: &str, payload: String| {
+                    invoker.invoke(plugin_path, node_id, payload)
+                };
+            let options = VerifyOptions {
+                candidate_invoker: Some(&candidate_invoker),
+                command_timeout: None,
+            };
             let spec = format!(
                 "plugin:{}",
                 json!({
@@ -939,12 +910,13 @@ mod tests {
                     "expect_substring": "\"value\":7.0"
                 })
             );
-            let report = CommandVerifier::verify(
+            let report = CommandVerifier::verify_with_options(
                 Path::new(env!("CARGO_MANIFEST_DIR")),
                 VerificationProfile::Default,
                 Some(&spec),
                 None,
                 None,
+                &options,
             )
             .expect("plugin verification should succeed");
             assert!(report.input.tests_passed, "report: {report:?}");
@@ -955,21 +927,16 @@ mod tests {
         }
     }
 
-    /// `Some(())` when the `expr` fixture dylib loads for this host, else `None`.
-    /// Single-line `==` check (PluginLoadResult is `PartialEq`) so no multi-line
-    /// `matches!` brace artifact, and an `Option` return so callers can gate with
-    /// `for`-over-`Option`, which has no not-taken arm to leave uncovered.
-    fn probe_expr_fixture_loadable() -> Option<()> {
+    /// `Some(PluginInvoker)` when the `expr` fixture dylib loads for this host,
+    /// else `None`. Single-line `==` check (PluginLoadResult is `PartialEq`) so
+    /// no multi-line `matches!` brace artifact, and an `Option` return so
+    /// callers can gate with `for`-over-`Option`, which has no not-taken arm to
+    /// leave uncovered.
+    fn probe_expr_fixture_loadable() -> Option<crate::plugin::invoke::PluginInvoker> {
         let fixtures_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures");
         let invoker = crate::plugin::invoke::PluginInvoker::load(&fixtures_root).ok()?;
         let plugin = invoker.plugin_registry().get("expr")?;
-        (plugin.load_result == crate::core::models::PluginLoadResult::Loaded).then_some(())
-    }
-
-    #[test]
-    fn resolve_plugin_fixtures_root_uses_current_fixtures_dir_without_duplication() {
-        let resolved = resolve_plugin_fixtures_root(Path::new("fixtures"), Some("fixtures"));
-        assert_eq!(resolved, Path::new("fixtures"));
+        (plugin.load_result == crate::core::models::PluginLoadResult::Loaded).then_some(invoker)
     }
 
     #[test]
@@ -1037,6 +1004,9 @@ mod tests {
         assert_eq!(report.input.quality_score, 90);
         assert_eq!(report.stages[1].kind, VerificationStageKind::Tests);
         assert_eq!(report.stages[1].status, VerificationStageStatus::Passed);
+        // A hashable tree records the baseline hash with no hash error.
+        assert!(report.source_tree_hash.is_some(), "report: {report:?}");
+        assert!(report.hash_error.is_none(), "report: {report:?}");
     }
 
     #[test]
@@ -1405,95 +1375,25 @@ mod tests {
     }
 
     #[test]
-    fn plugin_command_without_candidate_loads_invoker_and_reports_failure() {
-        // No candidate_invoker → the fallback path builds a real
-        // PluginInvoker from the resolved fixtures root. Point it at an empty
-        // artifact index so the load succeeds but the invoke of an unknown
-        // plugin fails, surfacing as a failed (not errored) check.
-        let temp = TempDir::new().expect("tempdir");
-        let artifacts = temp.path().join("artifacts");
-        fs::create_dir_all(&artifacts).expect("artifacts dir");
-        fs::write(
-            artifacts.join("index.json"),
-            r#"{"generated_at":"1970-01-01T00:00:00Z","topo_order":[],"entries":[]}"#,
-        )
-        .expect("write empty index");
-
+    fn plugin_command_without_candidate_invoker_is_an_error() {
+        // P0-4: a `plugin:` command with no candidate_invoker used to fall
+        // back to verifying the live plugin registry — the exact bug the
+        // option exists to fix. It must now refuse loudly instead.
         let options = VerifyOptions::default();
         let spec = format!("plugin:{}", json!({"plugin_path": "ghost", "node_id": "n"}));
-        let report = CommandVerifier::verify_with_options(
-            temp.path(),
+        let err = CommandVerifier::verify_with_options(
+            Path::new("."),
             VerificationProfile::Default,
             Some(&spec),
             None,
             None,
             &options,
         )
-        .expect("report");
-        let check = report.tests.as_ref().expect("tests check present");
-        assert_eq!(check.runner, VerificationRunner::Plugin);
-        assert!(!check.success, "unknown plugin invoke should fail");
-        assert!(!check.stderr.is_empty());
-    }
-
-    #[test]
-    fn resolve_plugin_fixtures_root_absolute_requested_returned_as_is() {
-        // Use a compile-time platform split rather than a runtime `if
-        // cfg!(windows)`, so the non-selected arm is not counted as a dead
-        // runtime line by coverage.
-        #[cfg(windows)]
-        let abs = PathBuf::from("C:/abs/root");
-        #[cfg(not(windows))]
-        let abs = PathBuf::from("/abs/root");
-        let resolved =
-            resolve_plugin_fixtures_root(Path::new("current"), Some(&abs.to_string_lossy()));
-        assert_eq!(resolved, abs);
-    }
-
-    #[test]
-    fn resolve_plugin_fixtures_root_sibling_with_plugins_wins() {
-        // parent/<requested>/plugins exists → sibling path selected.
-        let temp = TempDir::new().expect("tempdir");
-        let parent = temp.path();
-        fs::create_dir_all(parent.join("shared/plugins")).expect("sibling plugins");
-        let current = parent.join("workdir");
-        fs::create_dir_all(&current).expect("current dir");
-        let resolved = resolve_plugin_fixtures_root(&current, Some("shared"));
-        assert_eq!(resolved, parent.join("shared"));
-    }
-
-    #[test]
-    fn resolve_plugin_fixtures_root_falls_back_to_current_join_when_no_sibling() {
-        let temp = TempDir::new().expect("tempdir");
-        let current = temp.path().join("workdir");
-        fs::create_dir_all(&current).expect("current dir");
-        // No sibling `shared/plugins` exists, so it joins under current.
-        let resolved = resolve_plugin_fixtures_root(&current, Some("shared"));
-        assert_eq!(resolved, current.join("shared"));
-    }
-
-    #[test]
-    fn resolve_plugin_fixtures_root_none_prefers_current_plugins_dir() {
-        let temp = TempDir::new().expect("tempdir");
-        fs::create_dir_all(temp.path().join("plugins")).expect("plugins");
-        let resolved = resolve_plugin_fixtures_root(temp.path(), None);
-        assert_eq!(resolved, temp.path());
-    }
-
-    #[test]
-    fn resolve_plugin_fixtures_root_none_falls_back_to_nested_fixtures() {
-        let temp = TempDir::new().expect("tempdir");
-        fs::create_dir_all(temp.path().join("fixtures/plugins")).expect("nested fixtures");
-        let resolved = resolve_plugin_fixtures_root(temp.path(), None);
-        assert_eq!(resolved, temp.path().join("fixtures"));
-    }
-
-    #[test]
-    fn resolve_plugin_fixtures_root_none_defaults_to_current_dir() {
-        let temp = TempDir::new().expect("tempdir");
-        // Neither plugins/ nor fixtures/plugins present → current dir.
-        let resolved = resolve_plugin_fixtures_root(temp.path(), None);
-        assert_eq!(resolved, temp.path());
+        .expect_err("missing candidate invoker must error");
+        assert_eq!(
+            err.to_string(),
+            "invalid argument: verification requires a candidate plugin invoker when plugin: commands are present"
+        );
     }
 
     #[test]
@@ -1598,17 +1498,6 @@ mod tests {
     }
 
     #[test]
-    fn resolve_plugin_fixtures_root_root_dir_without_parent_joins() {
-        // "/" has no parent and does not end_with the relative request, so the
-        // final `else` joins under it. `/` has no parent on every supported
-        // platform, so assert unconditionally — no gate brace to leave dead.
-        let root = Path::new("/");
-        assert!(root.parent().is_none());
-        let resolved = resolve_plugin_fixtures_root(root, Some("shared"));
-        assert_eq!(resolved, root.join("shared"));
-    }
-
-    #[test]
     fn run_shell_command_captures_stderr_on_success() {
         // `sh -c 'echo err >&2'` runs sh as a real program (argv, no injection)
         // and writes to stderr while exiting 0 — covers the stderr read path.
@@ -1648,31 +1537,23 @@ mod tests {
     }
 
     #[test]
-    fn plugin_command_fallback_load_failure_reports_failed_check() {
-        // No candidate_invoker and a fixtures root that has no artifact index
-        // → PluginInvoker::load itself fails (not the invoke), covering the
-        // load-error arm that returns a failed (not errored) check.
-        let temp = TempDir::new().expect("tempdir");
-        // current_dir with neither plugins/ nor fixtures/plugins → resolves to
-        // itself, and load finds no artifacts/index.json.
+    fn plugin_command_without_candidate_invoker_errors_before_running() {
+        // Second guard: even with a fully valid spec (parseable, no
+        // expect_substring), the missing candidate invoker must surface as
+        // the explicit InvalidArgument — nothing runs against live plugins.
         let options = VerifyOptions::default();
         let spec = format!("plugin:{}", json!({"plugin_path": "p", "node_id": "n"}));
-        let report = CommandVerifier::verify_with_options(
-            temp.path(),
-            VerificationProfile::Default,
-            Some(&spec),
-            None,
-            None,
+        let err = super::run_check_command(
+            &spec,
+            Path::new("."),
             &options,
+            Duration::from_secs(5),
         )
-        .expect("report");
-        let check = report.tests.as_ref().expect("tests check present");
-        assert_eq!(check.runner, VerificationRunner::Plugin);
-        assert!(
-            !check.success,
-            "missing artifact index should fail the load"
+        .expect_err("missing candidate invoker must error");
+        assert_eq!(
+            err.to_string(),
+            "invalid argument: verification requires a candidate plugin invoker when plugin: commands are present"
         );
-        assert!(!check.stderr.is_empty());
     }
 
     /// `Some(())` when the current euid is not root, else `None`.
@@ -1703,6 +1584,67 @@ mod tests {
             // The walk lists the file, but the read inside hash_source_tree fails.
             let err = hash_source_tree(temp.path()).expect_err("unreadable file must error");
             assert!(matches!(err, RuntimeError::Io { .. }), "got: {err:?}");
+        }
+    }
+
+    /// A dangling symlink makes the walk collect the entry but `fs::read`
+    /// fail — the baseline hash must be recorded as an explicit `hash_error`
+    /// rather than silently dropped, so the caller can refuse to promote.
+    #[cfg(unix)]
+    #[test]
+    fn verify_records_hash_error_when_source_tree_has_dangling_symlink() {
+        let temp = TempDir::new().expect("tempdir");
+        std::os::unix::fs::symlink(temp.path().join("missing-target"), temp.path().join("dangling"))
+            .expect("create dangling symlink");
+        let report = CommandVerifier::verify(
+            temp.path(),
+            VerificationProfile::Default,
+            Some("true"),
+            Some("true"),
+            None,
+        )
+        .expect("verify still returns a report when hashing fails");
+        assert!(report.input.tests_passed);
+        assert!(report.source_tree_hash.is_none(), "report: {report:?}");
+        let reason = report
+            .hash_error
+            .expect("hash_error must record the baseline hash failure");
+        assert!(
+            reason.contains("hash_source_tree read failed"),
+            "unexpected reason: {reason}"
+        );
+    }
+
+    /// The 0o000 variant of the same guarantee, gated on a non-root euid
+    /// (root bypasses file-mode bits and would read the file anyway).
+    #[cfg(unix)]
+    #[test]
+    fn verify_records_hash_error_when_source_tree_has_unreadable_file() {
+        use std::os::unix::fs::PermissionsExt;
+        for () in probe_not_root().into_iter() {
+            let temp = TempDir::new().expect("tempdir");
+            let secret = temp.path().join("secret.txt");
+            fs::write(&secret, "top secret").unwrap();
+            let mut perms = fs::metadata(&secret).unwrap().permissions();
+            perms.set_mode(0o000);
+            fs::set_permissions(&secret, perms).unwrap();
+            let report = CommandVerifier::verify(
+                temp.path(),
+                VerificationProfile::Default,
+                Some("true"),
+                Some("true"),
+                None,
+            )
+            .expect("verify still returns a report when hashing fails");
+            assert!(report.input.tests_passed);
+            assert!(report.source_tree_hash.is_none(), "report: {report:?}");
+            let reason = report
+                .hash_error
+                .expect("hash_error must record the baseline hash failure");
+            assert!(
+                reason.contains("hash_source_tree read failed"),
+                "unexpected reason: {reason}"
+            );
         }
     }
 }
