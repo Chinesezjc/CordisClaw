@@ -478,8 +478,9 @@ fn host_promote_without_candidate_errors() {
 #[serial]
 fn host_security_checks_flag_sensitive_paths_and_commands() {
     let host = shared_host();
-    // Sensitive path keywords are rejected.
-    for bad in [".ssh/id_rsa", "config/credentials", "/etc/passwd", "a.env"] {
+    // Sensitive path keywords are rejected (component-prefix matching, so a
+    // bare `a.env` file is not swept up while `.env` under any directory is).
+    for bad in [".ssh/id_rsa", "config/credentials", "/etc/passwd", "config/.env"] {
         assert!(
             host.check_sensitive_path(bad).is_err(),
             "expected {bad} to be rejected"
@@ -494,6 +495,98 @@ fn host_security_checks_flag_sensitive_paths_and_commands() {
         );
     }
     assert!(host.check_sensitive_command("cargo build").is_ok());
+}
+
+#[test]
+#[serial]
+fn agent_run_plugin_test_direct_argv_never_goes_through_shell() {
+    let host = shared_host();
+    // `;` and `$(...)` are shell-meta only if a shell sees them: shell_words
+    // tokenises on whitespace (POSIX quoting, no expansion), so the whole
+    // fragment arrives as literal argv and `echo` prints it verbatim — no
+    // command splitting, no `$HOME` expansion, no `rm` execution.
+    let out = host
+        .agent_run_plugin_test(Some("echo hi; rm -rf $HOME"))
+        .expect("echo should run");
+    assert_eq!(out["command"], "echo hi; rm -rf $HOME");
+    assert_eq!(out["success"], true);
+    assert_eq!(out["exit_code"], 0);
+    assert_eq!(out["stdout"], "hi; rm -rf $HOME\n");
+    assert_eq!(out["stderr"], "");
+
+    let out = host
+        .agent_run_plugin_test(Some("echo $(date)"))
+        .expect("echo should run");
+    assert_eq!(out["stdout"], "$(date)\n");
+
+    // cargo receives the trailing `; rm -rf ~/...` tokens as literal args —
+    // the --manifest-path value keeps its trailing `;`, so cargo cannot find
+    // that manifest and fails; the `rm` never executes.
+    let evil = "cargo test --quiet --manifest-path plugins/expr/Cargo.toml; rm -rf ~/cordis-run-plugin-test-marker";
+    let out = host
+        .agent_run_plugin_test(Some(evil))
+        .expect("cargo should run");
+    assert_eq!(out["command"], evil);
+    assert_eq!(out["success"], false);
+    assert_ne!(out["exit_code"], 0);
+    let stderr = out["stderr"].as_str().expect("stderr");
+    assert!(!stderr.is_empty());
+}
+
+#[test]
+#[serial]
+fn agent_run_plugin_test_rejects_sensitive_commands() {
+    let host = shared_host();
+    for bad in [
+        "cat /etc/passwd",
+        "cat /etc/shadow",
+        "cat ~/.ssh/id_rsa",
+        "bash -lc 'cat /etc/passwd'",
+        "sh -c 'echo $(cat /etc/shadow)'",
+        "export SECRET=1",
+        "python -c 'import os; os.system(\"cat /etc/passwd\")'",
+    ] {
+        let err = host
+            .agent_run_plugin_test(Some(bad))
+            .expect_err("sensitive command must be rejected");
+        let blocked = err
+            .to_string()
+            .contains("blocked: command references sensitive operation");
+        assert!(blocked, "unexpected error for {bad}: {err}");
+    }
+}
+
+#[test]
+#[serial]
+fn agent_run_plugin_test_invalid_command_strings_are_rejected() {
+    let host = shared_host();
+    let err = host
+        .agent_run_plugin_test(Some(""))
+        .expect_err("empty command must be rejected");
+    assert_eq!(err.to_string(), "invalid argument: run_plugin_test received an empty command string");
+    let err = host
+        .agent_run_plugin_test(Some("''"))
+        .expect_err("empty program must be rejected");
+    assert_eq!(err.to_string(), "invalid argument: run_plugin_test program was empty after tokenisation");
+    let err = host
+        .agent_run_plugin_test(Some("'unbalanced"))
+        .expect_err("unbalanced quotes must be rejected");
+    let tokenised = err.to_string().contains("run_plugin_test tokenisation failed");
+    assert!(tokenised, "unexpected error: {err}");
+}
+
+#[test]
+#[serial]
+fn agent_run_plugin_test_default_runs_all_plugin_tests() {
+    let host = shared_host();
+    let out = host
+        .agent_run_plugin_test(None)
+        .expect("default command should run");
+    assert_eq!(out["command"], "cargo test --quiet --manifest-path plugins/Cargo.toml");
+    assert_eq!(out["success"], true);
+    assert_eq!(out["exit_code"], 0);
+    assert!(out["stdout"].is_string());
+    assert!(out["stderr"].is_string());
 }
 
 #[test]

@@ -403,9 +403,16 @@ impl RuntimeContext {
         plugin_path: &str,
         id: &str,
     ) -> Result<Option<Arc<T>>, RuntimeError> {
-        // Walk Local(current) -> Local(parent...) and enforce grants at each parent hop.
+        // Walk Local(current) -> Local(parent...) and enforce grants at each
+        // ancestor hit. Authorization ALWAYS uses the original requester's own
+        // grant set: `grants_from_parent[plugin_path]` is the grant written on
+        // the requester's parent edge, and the same set gates every ancestor
+        // hop. So a depth-1 lookup checks the requester's parent edge (the
+        // child_for_grant behavior was already == plugin_path there), and a
+        // depth>=2 lookup (c -> b -> a) requires requester c itself to hold
+        // the grant on its own c -> b edge — a grant on an intermediate edge
+        // (b -> a) never authorizes c.
         let mut current = Some(plugin_path.to_string());
-        let mut child_for_grant = plugin_path.to_string();
 
         while let Some(path) = current {
             if matches!(
@@ -419,11 +426,12 @@ impl RuntimeContext {
             if let Some(scope) = self.local.get(&path) {
                 if let Some(raw) = scope.get(id) {
                     if path != plugin_path {
-                        // Accessing parent local service requires explicit grant on edge.
+                        // Accessing an ancestor local service requires an
+                        // explicit grant on the requester's own parent edge.
                         let allowed = self
                             .hierarchy
                             .grants_from_parent
-                            .get(&child_for_grant)
+                            .get(plugin_path)
                             .map(|x| x.contains(id))
                             .unwrap_or(false);
                         if !allowed {
@@ -438,7 +446,6 @@ impl RuntimeContext {
             }
 
             current = self.hierarchy.parent_of.get(&path).cloned();
-            child_for_grant = path;
         }
 
         Ok(None)
@@ -1391,6 +1398,57 @@ mod tests {
         ctx.provide(ContextScope::Local, Some("parent"), "shared", 9u32)
             .unwrap();
         assert_eq!(*ctx.inject::<u32>("child", "shared").unwrap(), 9);
+    }
+
+    #[test]
+    fn inject_grandparent_local_requires_requester_own_grant() {
+        // Chain a <- b <- c: b holds a grant for a's service on the b -> a
+        // edge, but c has no grant on its own c -> b edge. c must NOT inject
+        // a's local service: authorization checks the original requester's
+        // grant set, never the intermediate node's grants.
+        let mut hierarchy = PluginHierarchy::default();
+        hierarchy
+            .parent_of
+            .insert("b".to_string(), "a".to_string());
+        hierarchy
+            .parent_of
+            .insert("c".to_string(), "b".to_string());
+        let mut b_grants = BTreeSet::new();
+        b_grants.insert("shared".to_string());
+        hierarchy
+            .grants_from_parent
+            .insert("b".to_string(), b_grants);
+        let mut ctx = RuntimeContext::with_hierarchy(hierarchy);
+        ctx.provide(ContextScope::Local, Some("a"), "shared", 9u32)
+            .unwrap();
+
+        let err = ctx.inject::<u32>("c", "shared").unwrap_err();
+        assert!(matches!(err, RuntimeError::PermissionDenied { .. }));
+    }
+
+    #[test]
+    fn inject_grandparent_local_with_requester_grant_succeeds() {
+        // Chain a <- b <- c: c holds the grant for a's service on its own
+        // c -> b edge, so injecting a's local service succeeds. Same grant
+        // lookup as the depth-1 case (requester's own parent edge), so the
+        // depth-1-with-grant behavior is preserved at every ancestor hop.
+        let mut hierarchy = PluginHierarchy::default();
+        hierarchy
+            .parent_of
+            .insert("b".to_string(), "a".to_string());
+        hierarchy
+            .parent_of
+            .insert("c".to_string(), "b".to_string());
+        let mut c_grants = BTreeSet::new();
+        c_grants.insert("shared".to_string());
+        hierarchy
+            .grants_from_parent
+            .insert("c".to_string(), c_grants);
+        let mut ctx = RuntimeContext::with_hierarchy(hierarchy);
+        ctx.provide(ContextScope::Local, Some("a"), "shared", 9u32)
+            .unwrap();
+
+        assert_eq!(*ctx.inject::<u32>("c", "shared").unwrap(), 9);
     }
 
     #[test]

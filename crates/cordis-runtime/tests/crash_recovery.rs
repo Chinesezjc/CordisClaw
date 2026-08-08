@@ -343,3 +343,81 @@ fn applied_marker_write_failure_is_logged_but_rollback_still_succeeds() {
     // Journal was cleared even though the marker write failed.
     assert!(!journal_path(&snapshot_root).exists());
 }
+
+// ---------------------------------------------------------------------------
+// P0-20 parity: journal rel_path validation at boot-replay time
+// ---------------------------------------------------------------------------
+
+/// A journal whose backup rel_path walks up with `..` must refuse replay:
+/// the journal is disk state a crash left behind, and a traversal entry would
+/// redirect boot recovery outside the workspace. `load_journal` reports
+/// `Invariant`, which `apply_plugin_iteration_journal` propagates.
+#[test]
+fn journal_with_parent_dir_rel_path_refuses_replay() {
+    let (_guard, workspace, snapshot_root) = setup_workspace();
+    let rb = PluginEditRollback::single_backup(&workspace, "../escape.txt", Some(b"PRE".to_vec()));
+    rb.persist_journal(&journal_path(&snapshot_root), "iter-evil")
+        .unwrap();
+    let err = apply_plugin_iteration_journal(&workspace, &snapshot_root, None)
+        .expect_err("traversal rel_path must refuse replay");
+    assert!(
+        matches!(
+            err,
+            cordis_runtime::core::error::RuntimeError::Invariant { .. }
+        ),
+        "expected Invariant, got {err:?}"
+    );
+}
+
+/// Same for an absolute rel_path in the journal.
+#[test]
+fn journal_with_absolute_rel_path_refuses_replay() {
+    let (_guard, workspace, snapshot_root) = setup_workspace();
+    let rb = PluginEditRollback::single_backup(&workspace, "/etc/passwd", Some(b"PRE".to_vec()));
+    rb.persist_journal(&journal_path(&snapshot_root), "iter-abs")
+        .unwrap();
+    let err = apply_plugin_iteration_journal(&workspace, &snapshot_root, None)
+        .expect_err("absolute rel_path must refuse replay");
+    assert!(
+        matches!(
+            err,
+            cordis_runtime::core::error::RuntimeError::Invariant { .. }
+        ),
+        "expected Invariant, got {err:?}"
+    );
+}
+
+/// Symlink-escape regression at the boot-replay level: a journal backup that
+/// resolves (through a planted symlink) outside the workspace must refuse
+/// replay with `Invariant` and leave the outside target untouched.
+#[cfg(unix)]
+#[test]
+fn journal_with_symlink_escape_rel_path_refuses_replay() {
+    let outside_temp = tempfile::tempdir().expect("tempdir");
+    let outside_target = outside_temp.path().join("pwned");
+    fs::write(&outside_target, b"outside").unwrap();
+
+    let (_guard, workspace, snapshot_root) = setup_workspace();
+    let plugin_src = workspace.join("plugins/demo/src");
+    fs::create_dir_all(&plugin_src).unwrap();
+    let symlink_at = plugin_src.join("evil");
+    std::os::unix::fs::symlink(&outside_target, &symlink_at).unwrap();
+
+    let rb = PluginEditRollback::single_backup(
+        &workspace,
+        "plugins/demo/src/evil",
+        Some(b"PRE".to_vec()),
+    );
+    rb.persist_journal(&journal_path(&snapshot_root), "iter-symlink")
+        .unwrap();
+    let err = apply_plugin_iteration_journal(&workspace, &snapshot_root, None)
+        .expect_err("symlink-escape rel_path must refuse replay");
+    assert!(
+        matches!(
+            err,
+            cordis_runtime::core::error::RuntimeError::Invariant { .. }
+        ),
+        "expected Invariant, got {err:?}"
+    );
+    assert_eq!(fs::read(&outside_target).unwrap(), b"outside");
+}
