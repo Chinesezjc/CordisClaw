@@ -275,10 +275,11 @@ impl Default for RuntimeContext {
 /// 归一为 `(None, 空)`，避免克隆体后续 put/remove/commit 触发
 /// "active subgraph overlay must exist" 断言崩溃。提取为纯函数以便直接
 /// 单测撕裂输入。
+type SubgraphOverlayMap = BTreeMap<String, BTreeMap<ContextKey, Option<SlotEntry>>>;
 fn repaired_subgraph_state(
     active: Option<String>,
-    overlays: BTreeMap<String, BTreeMap<ContextKey, Option<SlotEntry>>>,
-) -> (Option<String>, BTreeMap<String, BTreeMap<ContextKey, Option<SlotEntry>>>) {
+    overlays: SubgraphOverlayMap,
+) -> (Option<String>, SubgraphOverlayMap) {
     let Some(id) = active else {
         return (None, BTreeMap::new());
     };
@@ -2546,7 +2547,7 @@ mod tests {
         let handle_a = std::thread::spawn(move || reg_a.start_service("p", "dup", svc_a));
         let handle_b = std::thread::spawn(move || reg_b.start_service("p", "dup", svc_b));
         barrier.wait();
-        let results = vec![handle_a.join().unwrap(), handle_b.join().unwrap()];
+        let results = [handle_a.join().unwrap(), handle_b.join().unwrap()];
         let oks = results.iter().filter(|r| r.is_ok()).count();
         let errs = results.iter().filter(|r| r.is_err()).count();
         assert_eq!(oks, 1);

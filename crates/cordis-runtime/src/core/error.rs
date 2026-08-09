@@ -189,6 +189,12 @@ pub enum RuntimeError {
     #[error("agent session not found: {session_id}")]
     AgentSessionNotFound { session_id: String },
 
+    /// 该会话当前正被另一个 `agent_send` 的 turn 处理（已从
+    /// `agent_sessions` 摘除、处于 in-flight 状态）。与 `AgentSessionNotFound`
+    /// 区分：会话存在，只是忙——并发第二次 send 不该被误报成"不存在"。
+    #[error("agent session busy: {session_id}")]
+    AgentSessionBusy { session_id: String },
+
     #[error("service not found in context for plugin {plugin_path}: {service}")]
     ServiceNotFound {
         plugin_path: String,
