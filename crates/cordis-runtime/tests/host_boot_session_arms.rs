@@ -1056,8 +1056,11 @@ fn resolve_sandboxed_path_rejects_dangling_symlink_final_component() {
     std::os::unix::fs::symlink(&missing_outside, workspace.fixtures().join("dangling-abs"))
         .expect("create absolute dangling symlink");
     // Relative dangling target pointing at a path that does not exist either.
-    std::os::unix::fs::symlink("missing/outside.txt", workspace.fixtures().join("dangling-rel"))
-        .expect("create relative dangling symlink");
+    std::os::unix::fs::symlink(
+        "missing/outside.txt",
+        workspace.fixtures().join("dangling-rel"),
+    )
+    .expect("create relative dangling symlink");
 
     let host = RuntimeHost::boot(workspace.fixtures()).expect("boot");
     for rel in ["dangling-abs", "dangling-rel"] {
@@ -1086,11 +1089,17 @@ fn resolve_sandboxed_path_allows_symlink_to_target_inside_root() {
     let workspace = setup_workspace();
     fs::write(workspace.demo_lib(), b"pub fn inside() {}\n").expect("write target file");
     // Relative link inside the root…
-    std::os::unix::fs::symlink("plugins/demo/src/lib.rs", workspace.fixtures().join("inside-link"))
-        .expect("create inside symlink");
+    std::os::unix::fs::symlink(
+        "plugins/demo/src/lib.rs",
+        workspace.fixtures().join("inside-link"),
+    )
+    .expect("create inside symlink");
     // …and an absolute link inside the root.
-    std::os::unix::fs::symlink(workspace.demo_lib(), workspace.fixtures().join("inside-abs"))
-        .expect("create inside absolute symlink");
+    std::os::unix::fs::symlink(
+        workspace.demo_lib(),
+        workspace.fixtures().join("inside-abs"),
+    )
+    .expect("create inside absolute symlink");
 
     let host = RuntimeHost::boot(workspace.fixtures()).expect("boot");
     for rel in ["inside-link", "inside-abs"] {

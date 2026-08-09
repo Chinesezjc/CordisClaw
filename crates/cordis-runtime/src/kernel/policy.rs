@@ -104,9 +104,9 @@ impl IterationPolicy {
             if escapes_above_root(&normalized) {
                 return false;
             }
-            self.path_allowlist
-                .iter()
-                .any(|prefix| path_starts_with_component(&normalized, &normalize_path_lexically(prefix)))
+            self.path_allowlist.iter().any(|prefix| {
+                path_starts_with_component(&normalized, &normalize_path_lexically(prefix))
+            })
         })
     }
 
@@ -129,9 +129,9 @@ impl IterationPolicy {
             if escapes_above_root(&normalized) {
                 return false;
             }
-            self.sensitive_path_prefixes
-                .iter()
-                .any(|prefix| path_starts_with_component(&normalized, &normalize_path_lexically(prefix)))
+            self.sensitive_path_prefixes.iter().any(|prefix| {
+                path_starts_with_component(&normalized, &normalize_path_lexically(prefix))
+            })
         })
     }
 
@@ -182,9 +182,15 @@ mod tests {
     #[test]
     fn normalize_path_lexically_resolves_dot_segments() {
         assert_eq!(normalize_path_lexically("crates/x/../y.rs"), "crates/y.rs");
-        assert_eq!(normalize_path_lexically("crates//x/./y.rs"), "crates/x/y.rs");
+        assert_eq!(
+            normalize_path_lexically("crates//x/./y.rs"),
+            "crates/x/y.rs"
+        );
         assert_eq!(normalize_path_lexically("crates/"), "crates");
-        assert_eq!(normalize_path_lexically("/crates/../docs//x.md"), "docs/x.md");
+        assert_eq!(
+            normalize_path_lexically("/crates/../docs//x.md"),
+            "docs/x.md"
+        );
         assert_eq!(normalize_path_lexically("."), "");
         assert_eq!(normalize_path_lexically(""), "");
         // ".." with nothing regular to pop is kept, marking an escape.
@@ -237,9 +243,8 @@ mod tests {
             "crates/cordis-runtime/src/plugin/../core/models.rs"
         ])));
         // A ".." path that resolves outside every sensitive prefix is not.
-        assert!(!policy.touches_sensitive_paths(&paths(&[
-            "crates/cordis-runtime/src/plugin/../other/x.rs"
-        ])));
+        assert!(!policy
+            .touches_sensitive_paths(&paths(&["crates/cordis-runtime/src/plugin/../other/x.rs"])));
         // Escape-above-root paths are never sensitive.
         assert!(!policy.touches_sensitive_paths(&paths(&["../../etc/passwd"])));
         // Paths shorter than the prefix cannot match (component count check).

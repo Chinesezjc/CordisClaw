@@ -480,7 +480,12 @@ fn host_security_checks_flag_sensitive_paths_and_commands() {
     let host = shared_host();
     // Sensitive path keywords are rejected (component-prefix matching, so a
     // bare `a.env` file is not swept up while `.env` under any directory is).
-    for bad in [".ssh/id_rsa", "config/credentials", "/etc/passwd", "config/.env"] {
+    for bad in [
+        ".ssh/id_rsa",
+        "config/credentials",
+        "/etc/passwd",
+        "config/.env",
+    ] {
         assert!(
             host.check_sensitive_path(bad).is_err(),
             "expected {bad} to be rejected"
@@ -563,15 +568,23 @@ fn agent_run_plugin_test_invalid_command_strings_are_rejected() {
     let err = host
         .agent_run_plugin_test(Some(""))
         .expect_err("empty command must be rejected");
-    assert_eq!(err.to_string(), "invalid argument: run_plugin_test received an empty command string");
+    assert_eq!(
+        err.to_string(),
+        "invalid argument: run_plugin_test received an empty command string"
+    );
     let err = host
         .agent_run_plugin_test(Some("''"))
         .expect_err("empty program must be rejected");
-    assert_eq!(err.to_string(), "invalid argument: run_plugin_test program was empty after tokenisation");
+    assert_eq!(
+        err.to_string(),
+        "invalid argument: run_plugin_test program was empty after tokenisation"
+    );
     let err = host
         .agent_run_plugin_test(Some("'unbalanced"))
         .expect_err("unbalanced quotes must be rejected");
-    let tokenised = err.to_string().contains("run_plugin_test tokenisation failed");
+    let tokenised = err
+        .to_string()
+        .contains("run_plugin_test tokenisation failed");
     assert!(tokenised, "unexpected error: {err}");
 }
 
@@ -582,7 +595,10 @@ fn agent_run_plugin_test_default_runs_all_plugin_tests() {
     let out = host
         .agent_run_plugin_test(None)
         .expect("default command should run");
-    assert_eq!(out["command"], "cargo test --quiet --manifest-path plugins/Cargo.toml");
+    assert_eq!(
+        out["command"],
+        "cargo test --quiet --manifest-path plugins/Cargo.toml"
+    );
     assert_eq!(out["success"], true);
     assert_eq!(out["exit_code"], 0);
     assert!(out["stdout"].is_string());
