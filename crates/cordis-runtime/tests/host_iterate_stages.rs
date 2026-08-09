@@ -719,7 +719,10 @@ fn approve_blocked_iteration_rejects_replaced_candidate() {
     assert_eq!(host.kernel().blocked_iterations().len(), 1);
     let staged_before = host.candidate_status().expect("candidate staged");
     assert_eq!(
-        result.candidate.as_ref().map(|c| c.candidate_snapshot_id.as_str()),
+        result
+            .candidate
+            .as_ref()
+            .map(|c| c.candidate_snapshot_id.as_str()),
         Some(staged_before.candidate_snapshot_id.as_str()),
         "the blocked result must record the staged candidate's identity"
     );
@@ -736,7 +739,8 @@ fn approve_blocked_iteration_rejects_replaced_candidate() {
         .approve_blocked_iteration(&result.iteration_id)
         .expect_err("approving a replaced candidate must be rejected");
     assert!(
-        err.to_string().contains("candidate snapshot replaced during plugin iteration"),
+        err.to_string()
+            .contains("candidate snapshot replaced during plugin iteration"),
         "unexpected error: {err}"
     );
     // blocked 条目保留（可重试），被替换的候选仍 staged，未 promote。

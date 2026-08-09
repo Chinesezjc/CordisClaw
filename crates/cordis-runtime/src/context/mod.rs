@@ -2472,8 +2472,7 @@ mod tests {
         ctx.provide(ContextScope::Local, Some("p"), "s", 1u32)
             .unwrap();
         assert!(ctx.local.contains_key("p"));
-        ctx.dispose(ContextScope::Local, Some("p"), "s")
-            .unwrap();
+        ctx.dispose(ContextScope::Local, Some("p"), "s").unwrap();
         assert!(!ctx.local.contains_key("p"));
     }
 
@@ -2485,8 +2484,7 @@ mod tests {
             .unwrap();
         ctx.provide(ContextScope::Local, Some("p"), "b", 2u32)
             .unwrap();
-        ctx.dispose(ContextScope::Local, Some("p"), "a")
-            .unwrap();
+        ctx.dispose(ContextScope::Local, Some("p"), "a").unwrap();
         assert!(ctx.local.contains_key("p"));
         assert_eq!(*ctx.inject::<u32>("p", "b").unwrap(), 2);
     }

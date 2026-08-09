@@ -2665,7 +2665,10 @@ exports = ["svc_a", "svc_b"]
             std::fs::write(&lock_path, serde_json::to_vec(&other).unwrap()).unwrap();
             drop(lock);
         }
-        assert!(lock_path.exists(), "a taken-over lock must survive our drop");
+        assert!(
+            lock_path.exists(),
+            "a taken-over lock must survive our drop"
+        );
     }
 
     #[test]

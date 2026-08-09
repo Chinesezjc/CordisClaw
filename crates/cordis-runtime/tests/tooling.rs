@@ -1039,7 +1039,10 @@ fn rebuild_plugin_workspace_holds_build_lock_while_building() {
         if let Some(state) = parsed {
             break state;
         }
-        assert!(Instant::now() < deadline, "rebuild never surfaced the build lock file");
+        assert!(
+            Instant::now() < deadline,
+            "rebuild never surfaced the build lock file"
+        );
         thread::sleep(Duration::from_millis(1));
     };
     assert_eq!(

@@ -2680,12 +2680,7 @@ fn spawn_blocking_mock_llm_server(
         write!(stream, "0\r\n\r\n").expect("chunked end");
         stream.flush().expect("flush");
     });
-    (
-        format!("http://{addr}/v1"),
-        started_rx,
-        release_tx,
-        handle,
-    )
+    (format!("http://{addr}/v1"), started_rx, release_tx, handle)
 }
 
 /// R1(b): respond 期间 drop_session —— 会话在 map 里已不存在（被摘除），
@@ -2741,8 +2736,14 @@ fn agent_send_drop_during_turn_does_not_resurrect_session_or_snapshot() {
         "session must not be resurrected after drop-during-turn"
     );
     // 快照没有被 auto_save 重写（turn 是成功的——若复活逻辑漏了就会重写）。
-    let snapshot = temp.path().join("data/sessions").join(format!("{sid}.json"));
-    assert!(!snapshot.exists(), "snapshot must not be rewritten after drop");
+    let snapshot = temp
+        .path()
+        .join("data/sessions")
+        .join(format!("{sid}.json"));
+    assert!(
+        !snapshot.exists(),
+        "snapshot must not be rewritten after drop"
+    );
     // drop_session 的既有语义：三张 per-session map 全清。
     assert_eq!(host.debug_session_map_sizes(), (0, 0, 0));
     handle.join().expect("join mock server");
@@ -2796,6 +2797,9 @@ fn agent_send_concurrent_second_send_returns_busy_not_not_found() {
         .expect("join send thread")
         .expect("first send succeeds");
     assert!(reply.content.contains("ok"), "content: {}", reply.content);
-    assert!(host.agent_status(&sid).is_ok(), "session must still be live");
+    assert!(
+        host.agent_status(&sid).is_ok(),
+        "session must still be live"
+    );
     handle.join().expect("join mock server");
 }

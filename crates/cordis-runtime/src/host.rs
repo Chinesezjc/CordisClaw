@@ -2055,7 +2055,9 @@ fn mark_dropped_if_inflight(
     dropped_during_turn: &Mutex<BTreeSet<String>>,
     session_id: &str,
 ) {
-    let guard = inflight_sessions.lock().unwrap_or_else(|poison| poison.into_inner());
+    let guard = inflight_sessions
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
     if guard.contains(session_id) {
         dropped_during_turn
             .lock()
@@ -3327,7 +3329,11 @@ export_plugin_api! {{
         // R1: 防御性标记——若同 id 仍有一个 in-flight turn（当前 id 由
         // `normalize_request_id` 生成、不会撞车），旧 turn 收尾不得插回
         // 覆盖本新会话。
-        mark_dropped_if_inflight(&self.inflight_sessions, &self.dropped_during_turn, &handle.session_id);
+        mark_dropped_if_inflight(
+            &self.inflight_sessions,
+            &self.dropped_during_turn,
+            &handle.session_id,
+        );
         self.agent_sessions
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
@@ -4284,7 +4290,9 @@ export_plugin_api! {{
                 .candidate_snapshot
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner());
-            let staged = guard.as_ref().ok_or(RuntimeError::CandidateSnapshotMissing)?;
+            let staged = guard
+                .as_ref()
+                .ok_or(RuntimeError::CandidateSnapshotMissing)?;
             if let Some(expected) = expected_candidate_snapshot_id {
                 let actual = staged.snapshot.snapshot_id();
                 if actual != expected {
@@ -4336,7 +4344,9 @@ export_plugin_api! {{
                 .candidate_snapshot
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner());
-            let staged = guard.as_ref().ok_or(RuntimeError::CandidateSnapshotMissing)?;
+            let staged = guard
+                .as_ref()
+                .ok_or(RuntimeError::CandidateSnapshotMissing)?;
             if let Some(expected) = expected_candidate_snapshot_id {
                 let actual = staged.snapshot.snapshot_id();
                 if actual != expected {
@@ -5015,8 +5025,7 @@ export_plugin_api! {{
             match self.promote_candidate_matching(staged_candidate_id) {
                 Ok(_) => PluginIterationFinalVerdict::Promoted,
                 Err(err) => {
-                    let candidate_rollback =
-                        self.rollback_candidate_if_staged(staged_candidate_id);
+                    let candidate_rollback = self.rollback_candidate_if_staged(staged_candidate_id);
                     let workspace_restore = restore_plugin_iteration_workspace(
                         &self.fixtures_root,
                         &self.snapshot_root,
@@ -5040,8 +5049,7 @@ export_plugin_api! {{
             match self.promote_candidate_matching(staged_candidate_id) {
                 Ok(_) => PluginIterationFinalVerdict::Promoted,
                 Err(err) => {
-                    let candidate_rollback =
-                        self.rollback_candidate_if_staged(staged_candidate_id);
+                    let candidate_rollback = self.rollback_candidate_if_staged(staged_candidate_id);
                     let workspace_restore = restore_plugin_iteration_workspace(
                         &self.fixtures_root,
                         &self.snapshot_root,
@@ -5725,10 +5733,13 @@ impl ManagedAgentSession {
         // `agent_send` 用 catch_unwind 包住本函数，panic 也必须走完收尾、
         // 会话不得丢失。
         #[cfg(test)]
-        let respond_panic_injected = TEST_AGENT_RESPOND_PANIC_INJECTION
-            .swap(false, std::sync::atomic::Ordering::SeqCst);
+        let respond_panic_injected =
+            TEST_AGENT_RESPOND_PANIC_INJECTION.swap(false, std::sync::atomic::Ordering::SeqCst);
         #[cfg(test)]
-        assert!(!respond_panic_injected, "test panic injection: agent respond");
+        assert!(
+            !respond_panic_injected,
+            "test panic injection: agent respond"
+        );
         // 无 provider 插件时两种 state 的结论相同（都只能报 NoLlmProvider），
         // 所以先统一判定，省掉两条各自的 None 分支。
         let Some(plugin_path) = host.llm_provider_plugin() else {
@@ -9073,10 +9084,7 @@ mod tests {
         drop(gc_guard);
         // SAFETY: 同上。
         let released_rc = unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        assert_eq!(
-            released_rc, 0,
-            "once the guard drops, the lock is released"
-        );
+        assert_eq!(released_rc, 0, "once the guard drops, the lock is released");
         // SAFETY: 释放探测 fd 上的锁，避免影响后续测试。
         let _ = unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_UN) };
     }
@@ -14433,7 +14441,10 @@ mod region_3500_5500_seam_tests {
             "error must name the actual staged snapshot: {text}"
         );
         // 未 promote：新候选仍在，current 未变。
-        assert!(host.candidate_snapshot().is_some(), "candidate must stay staged");
+        assert!(
+            host.candidate_snapshot().is_some(),
+            "candidate must stay staged"
+        );
         assert_eq!(
             host.current_snapshot().snapshot_id(),
             second.from_snapshot_id,
@@ -14453,10 +14464,14 @@ mod region_3500_5500_seam_tests {
             .rollback_candidate_matching(Some(&first.candidate_snapshot_id))
             .expect_err("a replaced candidate must be rejected");
         assert!(
-            err.to_string().contains("candidate snapshot replaced during plugin iteration"),
+            err.to_string()
+                .contains("candidate snapshot replaced during plugin iteration"),
             "unexpected error: {err}"
         );
-        assert!(host.candidate_snapshot().is_some(), "candidate must stay staged");
+        assert!(
+            host.candidate_snapshot().is_some(),
+            "candidate must stay staged"
+        );
     }
 
     /// R3: finalize 的 Pass/Pass promote 路径把 Step 4 记录的身份传下去——
