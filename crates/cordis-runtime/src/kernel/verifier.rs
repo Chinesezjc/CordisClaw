@@ -397,8 +397,9 @@ fn run_plugin_command(
     // fallback loaded a live `PluginInvoker` from the fixtures root).
     let Some(invoker) = options.candidate_invoker else {
         return Err(RuntimeError::InvalidArgument {
-            message: "verification requires a candidate plugin invoker when plugin: commands are present"
-                .to_string(),
+            message:
+                "verification requires a candidate plugin invoker when plugin: commands are present"
+                    .to_string(),
         });
     };
     let response = match invoker(&spec.plugin_path, &spec.node_id, payload) {
@@ -890,10 +891,9 @@ mod tests {
             // invoker (the equivalent of host.rs dispatching into the staged
             // candidate snapshot). `fixtures_root` in the spec is a legacy
             // field that serde ignores — kept to prove old specs still parse.
-            let candidate_invoker =
-                |plugin_path: &str, node_id: &str, payload: String| {
-                    invoker.invoke(plugin_path, node_id, payload)
-                };
+            let candidate_invoker = |plugin_path: &str, node_id: &str, payload: String| {
+                invoker.invoke(plugin_path, node_id, payload)
+            };
             let options = VerifyOptions {
                 candidate_invoker: Some(&candidate_invoker),
                 command_timeout: None,
@@ -1543,13 +1543,8 @@ mod tests {
         // the explicit InvalidArgument — nothing runs against live plugins.
         let options = VerifyOptions::default();
         let spec = format!("plugin:{}", json!({"plugin_path": "p", "node_id": "n"}));
-        let err = super::run_check_command(
-            &spec,
-            Path::new("."),
-            &options,
-            Duration::from_secs(5),
-        )
-        .expect_err("missing candidate invoker must error");
+        let err = super::run_check_command(&spec, Path::new("."), &options, Duration::from_secs(5))
+            .expect_err("missing candidate invoker must error");
         assert_eq!(
             err.to_string(),
             "invalid argument: verification requires a candidate plugin invoker when plugin: commands are present"
@@ -1594,8 +1589,11 @@ mod tests {
     #[test]
     fn verify_records_hash_error_when_source_tree_has_dangling_symlink() {
         let temp = TempDir::new().expect("tempdir");
-        std::os::unix::fs::symlink(temp.path().join("missing-target"), temp.path().join("dangling"))
-            .expect("create dangling symlink");
+        std::os::unix::fs::symlink(
+            temp.path().join("missing-target"),
+            temp.path().join("dangling"),
+        )
+        .expect("create dangling symlink");
         let report = CommandVerifier::verify(
             temp.path(),
             VerificationProfile::Default,

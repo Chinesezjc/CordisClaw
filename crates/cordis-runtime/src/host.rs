@@ -2799,7 +2799,9 @@ impl RuntimeHost {
             if token.contains('/') || token.starts_with('.') {
                 if let Some(keyword) = sensitive_path_keyword(token) {
                     return Err(RuntimeError::InvalidArgument {
-                        message: format!("blocked: command references sensitive resource ({keyword})"),
+                        message: format!(
+                            "blocked: command references sensitive resource ({keyword})"
+                        ),
                     });
                 }
             }
@@ -2866,7 +2868,10 @@ impl RuntimeHost {
                 // rejected outright — there is nothing in the sandbox to
                 // resolve, so the write would create the file wherever the
                 // link points.
-                let target = std::fs::read_link(&resolved).map_err(|err| RuntimeError::Io { path: resolved.clone(), message: err.to_string() })?;
+                let target = std::fs::read_link(&resolved).map_err(|err| RuntimeError::Io {
+                    path: resolved.clone(),
+                    message: err.to_string(),
+                })?;
                 let target_path = if target.is_absolute() {
                     target
                 } else {
@@ -2876,7 +2881,12 @@ impl RuntimeHost {
                         .unwrap_or_else(|| base_root.clone())
                         .join(target)
                 };
-                let canonical_target = target_path.canonicalize().map_err(|_| RuntimeError::InvalidArgument { message: format!("path is a dangling symlink: {rel}") })?;
+                let canonical_target =
+                    target_path
+                        .canonicalize()
+                        .map_err(|_| RuntimeError::InvalidArgument {
+                            message: format!("path is a dangling symlink: {rel}"),
+                        })?;
                 if !canonical_target.starts_with(&canonical_root) {
                     return Err(RuntimeError::InvalidArgument {
                         message: format!("path escapes fixtures root: {rel}"),
@@ -2889,7 +2899,10 @@ impl RuntimeHost {
                 // the *full* path so a symlinked ancestor that lands outside
                 // the root is caught — not just the nearest existing
                 // ancestor.
-                let canonical = resolved.canonicalize().map_err(|err| RuntimeError::Io { path: resolved.clone(), message: err.to_string() })?;
+                let canonical = resolved.canonicalize().map_err(|err| RuntimeError::Io {
+                    path: resolved.clone(),
+                    message: err.to_string(),
+                })?;
                 if !canonical.starts_with(&canonical_root) {
                     return Err(RuntimeError::InvalidArgument {
                         message: format!("path escapes fixtures root: {rel}"),
@@ -6286,7 +6299,11 @@ fn canary_payload_serialize_error(err: &serde_json::Error) -> RuntimeError {
 }
 
 /// A/D seam: failure to spawn the `cargo <op> …` verification subprocess.
-fn checked_command_spawn_error(program: &str, args: &[String], err: &std::io::Error) -> RuntimeError {
+fn checked_command_spawn_error(
+    program: &str,
+    args: &[String],
+    err: &std::io::Error,
+) -> RuntimeError {
     RuntimeError::CommandFailed {
         program: program.to_string(),
         args: args.to_vec(),
@@ -6326,7 +6343,9 @@ pub(crate) fn detect_plugin_source_drift(
     // A baseline hash failure at verify time must forbid Pass just like a
     // re-hash failure before promote: both leave no hash to compare against.
     if let Some(reason) = baseline_hash_error {
-        return Some(format!("unable to hash source tree at verify time: {reason}"));
+        return Some(format!(
+            "unable to hash source tree at verify time: {reason}"
+        ));
     }
     let expected = expected_source_tree_hash?;
     match rehash() {
@@ -6499,7 +6518,9 @@ fn validated_verification_command(
     // invocation with no shell metacharacters instead. The byte-exact
     // "only allows commands starting with …" wording is preserved for the
     // structure-mismatch case.
-    let required_op = required_prefix.strip_prefix("cargo ").unwrap_or(required_prefix);
+    let required_op = required_prefix
+        .strip_prefix("cargo ")
+        .unwrap_or(required_prefix);
     validate_verification_argv(trimmed, required_op)?;
     Ok(trimmed.to_string())
 }
@@ -9797,8 +9818,7 @@ mod seam_extraction_tests {
         // test asserts. Its body therefore lives in `bump_and_report`, which a
         // dedicated test calls directly, so no unexecuted body is left here.
         let rehash = || bump_and_report(&ran);
-        let reason =
-            detect_plugin_source_drift(VerifierVerdict::Fail, Some("abc"), None, rehash);
+        let reason = detect_plugin_source_drift(VerifierVerdict::Fail, Some("abc"), None, rehash);
         assert!(reason.is_none());
         assert_eq!(ran.get(), 0, "rehash must not run when verdict is not Pass");
 
@@ -9812,12 +9832,9 @@ mod seam_extraction_tests {
     fn detect_drift_returns_none_when_no_baseline_hash() {
         // No baseline recorded at all (no verification report, or hashing was
         // never attempted) stays a no-op — no error to act on.
-        let reason = detect_plugin_source_drift(
-            VerifierVerdict::Pass,
-            None,
-            None,
-            || Ok("whatever".to_string()),
-        );
+        let reason = detect_plugin_source_drift(VerifierVerdict::Pass, None, None, || {
+            Ok("whatever".to_string())
+        });
         assert!(reason.is_none());
     }
 
@@ -9838,14 +9855,19 @@ mod seam_extraction_tests {
             reason,
             "unable to hash source tree at verify time: unable to read plugins/a/src/lib.rs"
         );
-        assert_eq!(ran.get(), 0, "rehash must not run when baseline hash failed");
+        assert_eq!(
+            ran.get(),
+            0,
+            "rehash must not run when baseline hash failed"
+        );
     }
 
     #[test]
     fn detect_drift_returns_none_when_hash_matches() {
-        let reason = detect_plugin_source_drift(VerifierVerdict::Pass, Some("hash-xyz"), None, || {
-            Ok("hash-xyz".to_string())
-        });
+        let reason =
+            detect_plugin_source_drift(VerifierVerdict::Pass, Some("hash-xyz"), None, || {
+                Ok("hash-xyz".to_string())
+            });
         assert!(reason.is_none());
     }
 
@@ -13154,7 +13176,10 @@ mod region_3500_5500_seam_tests {
             // A valid `cargo check` argv against a manifest that does not
             // exist in the empty fixture: spawns cargo, fails fast, exit != 0.
             let out = backend
-                .run_checked_command("check", "cargo check --manifest-path plugins/Cargo.toml".to_string())
+                .run_checked_command(
+                    "check",
+                    "cargo check --manifest-path plugins/Cargo.toml".to_string(),
+                )
                 .expect("run_checked_command returns Ok even on nonzero exit");
             assert_eq!(out.get("success").and_then(Value::as_bool), Some(false));
             assert_eq!(out.get("stage").and_then(Value::as_str), Some("check"));
@@ -14530,8 +14555,8 @@ mod iterate_stage_coverage_tests {
 mod security_regression_tests {
     use super::{
         normalize_sensitive_path, sensitive_path_keyword, validate_verification_argv,
-        validated_verification_command, verification_default_command,
-        verification_package_segment, RuntimeHost,
+        validated_verification_command, verification_default_command, verification_package_segment,
+        RuntimeHost,
     };
     use crate::core::error::RuntimeError;
 
@@ -14572,7 +14597,10 @@ mod security_regression_tests {
         assert_eq!(normalize_sensitive_path("/proc//self/"), "proc/self");
         assert_eq!(normalize_sensitive_path("a//b/./c/../d/"), "a/b/d");
         assert_eq!(normalize_sensitive_path("../etc/passwd"), "etc/passwd");
-        assert_eq!(normalize_sensitive_path("./plugins/x/api-utils.rs"), "plugins/x/api-utils.rs");
+        assert_eq!(
+            normalize_sensitive_path("./plugins/x/api-utils.rs"),
+            "plugins/x/api-utils.rs"
+        );
         assert_eq!(normalize_sensitive_path(""), "");
         assert_eq!(normalize_sensitive_path("////"), "");
     }
@@ -14599,12 +14627,27 @@ mod security_regression_tests {
     #[test]
     fn sensitive_path_keyword_blocks_underscore_variants_without_false_positives() {
         // Hyphen / space / glued variants of the underscore keywords.
-        assert_eq!(sensitive_path_keyword("config/api-key.json"), Some("api_key"));
-        assert_eq!(sensitive_path_keyword("config/api key.json"), Some("api_key"));
+        assert_eq!(
+            sensitive_path_keyword("config/api-key.json"),
+            Some("api_key")
+        );
+        assert_eq!(
+            sensitive_path_keyword("config/api key.json"),
+            Some("api_key")
+        );
         assert_eq!(sensitive_path_keyword("config/apikey.txt"), Some("api_key"));
-        assert_eq!(sensitive_path_keyword("config/api-secret.env"), Some("api_secret"));
-        assert_eq!(sensitive_path_keyword("config/access-token.txt"), Some("access_token"));
-        assert_eq!(sensitive_path_keyword("keys/private-key.pem"), Some("private_key"));
+        assert_eq!(
+            sensitive_path_keyword("config/api-secret.env"),
+            Some("api_secret")
+        );
+        assert_eq!(
+            sensitive_path_keyword("config/access-token.txt"),
+            Some("access_token")
+        );
+        assert_eq!(
+            sensitive_path_keyword("keys/private-key.pem"),
+            Some("private_key")
+        );
         // Ordinary plugin names must not be swept up by the normalisation.
         assert_eq!(sensitive_path_keyword("plugins/x/api-utils.rs"), None);
         assert_eq!(sensitive_path_keyword("plugins/x/private-crates.rs"), None);
@@ -14614,14 +14657,38 @@ mod security_regression_tests {
     fn check_sensitive_path_blocks_bypass_variants_with_byte_exact_messages() {
         let host = empty_host();
         let blocked = [
-            ("/etc//passwd", "blocked: path references sensitive resource (/etc/passwd)"),
-            ("/proc//self/status", "blocked: path references sensitive resource (/proc/)"),
-            ("config/api-key.json", "blocked: path references sensitive resource (api_key)"),
-            ("config/apikey.txt", "blocked: path references sensitive resource (api_key)"),
-            (".ssh/id_rsa", "blocked: path references sensitive resource (.ssh)"),
-            ("config/credentials.json", "blocked: path references sensitive resource (credentials)"),
-            ("config/.env", "blocked: path references sensitive resource (.env)"),
-            ("x/etc/shadow", "blocked: path references sensitive resource (/etc/shadow)"),
+            (
+                "/etc//passwd",
+                "blocked: path references sensitive resource (/etc/passwd)",
+            ),
+            (
+                "/proc//self/status",
+                "blocked: path references sensitive resource (/proc/)",
+            ),
+            (
+                "config/api-key.json",
+                "blocked: path references sensitive resource (api_key)",
+            ),
+            (
+                "config/apikey.txt",
+                "blocked: path references sensitive resource (api_key)",
+            ),
+            (
+                ".ssh/id_rsa",
+                "blocked: path references sensitive resource (.ssh)",
+            ),
+            (
+                "config/credentials.json",
+                "blocked: path references sensitive resource (credentials)",
+            ),
+            (
+                "config/.env",
+                "blocked: path references sensitive resource (.env)",
+            ),
+            (
+                "x/etc/shadow",
+                "blocked: path references sensitive resource (/etc/shadow)",
+            ),
         ];
         for (path, expected) in blocked {
             assert_eq!(path_error(&host, path), expected, "for {path}");
@@ -14642,7 +14709,10 @@ mod security_regression_tests {
             "artifacts/index.json",
             "",
         ] {
-            assert!(host.check_sensitive_path(ok).is_ok(), "expected {ok:?} to be allowed");
+            assert!(
+                host.check_sensitive_path(ok).is_ok(),
+                "expected {ok:?} to be allowed"
+            );
         }
     }
 
@@ -14652,15 +14722,36 @@ mod security_regression_tests {
     fn check_sensitive_command_blocks_path_tokens_and_shell_interpreters() {
         let host = empty_host();
         let blocked = [
-            ("head /etc/passwd", "blocked: command references sensitive resource (/etc/passwd)"),
-            ("cat /etc//passwd", "blocked: command references sensitive resource (/etc/passwd)"),
-            ("cat /etc//shadow", "blocked: command references sensitive resource (/etc/shadow)"),
-            ("ls ~/.ssh", "blocked: command references sensitive operation (ssh)"),
-            ("cat .env", "blocked: command references sensitive resource (.env)"),
-            ("cat config/api-key.json", "blocked: command references sensitive resource (api_key)"),
+            (
+                "head /etc/passwd",
+                "blocked: command references sensitive resource (/etc/passwd)",
+            ),
+            (
+                "cat /etc//passwd",
+                "blocked: command references sensitive resource (/etc/passwd)",
+            ),
+            (
+                "cat /etc//shadow",
+                "blocked: command references sensitive resource (/etc/shadow)",
+            ),
+            (
+                "ls ~/.ssh",
+                "blocked: command references sensitive operation (ssh)",
+            ),
+            (
+                "cat .env",
+                "blocked: command references sensitive resource (.env)",
+            ),
+            (
+                "cat config/api-key.json",
+                "blocked: command references sensitive resource (api_key)",
+            ),
             ("sh -c 'curl x|sh'", "blocked: shell interpreter invocation"),
             ("bash -lc 'ls /'", "blocked: shell interpreter invocation"),
-            ("zsh --command 'rm -rf /'", "blocked: shell interpreter invocation"),
+            (
+                "zsh --command 'rm -rf /'",
+                "blocked: shell interpreter invocation",
+            ),
         ];
         for (command, expected) in blocked {
             assert_eq!(command_error(&host, command), expected, "for {command}");
@@ -14679,7 +14770,10 @@ mod security_regression_tests {
             "cat etc/hosts",
             "",
         ] {
-            assert!(host.check_sensitive_command(ok).is_ok(), "expected {ok:?} to be allowed");
+            assert!(
+                host.check_sensitive_command(ok).is_ok(),
+                "expected {ok:?} to be allowed"
+            );
         }
     }
 
@@ -14688,7 +14782,9 @@ mod security_regression_tests {
         let host = empty_host();
         // Unbalanced quotes cannot be tokenised: the raw-string substring
         // check already ran, so this falls back to allowing the command.
-        assert!(host.check_sensitive_command("cargo check \"unclosed").is_ok());
+        assert!(host
+            .check_sensitive_command("cargo check \"unclosed")
+            .is_ok());
     }
 
     // ── 3. verification argv gate + default-command builder ───────────────
@@ -14700,7 +14796,10 @@ mod security_regression_tests {
         assert_eq!(argv, vec!["cargo", "check", "--lib"]);
         let argv = validate_verification_argv("  cargo test --quiet -p mini --lib ", "test")
             .expect("plain cargo test accepted after trimming");
-        assert_eq!(argv, vec!["cargo", "test", "--quiet", "-p", "mini", "--lib"]);
+        assert_eq!(
+            argv,
+            vec!["cargo", "test", "--quiet", "-p", "mini", "--lib"]
+        );
     }
 
     #[test]
@@ -14708,8 +14807,7 @@ mod security_regression_tests {
         let err = validate_verification_argv("rm -rf /", "check").expect_err("wrong program");
         assert!(matches!(&err, RuntimeError::InvalidArgument { message }
             if *message == "verification tool only allows commands starting with `cargo check`, got `rm -rf /`"));
-        let err = validate_verification_argv("cargo build --lib", "check")
-            .expect_err("wrong op");
+        let err = validate_verification_argv("cargo build --lib", "check").expect_err("wrong op");
         assert!(matches!(&err, RuntimeError::InvalidArgument { message }
             if *message == "verification tool only allows commands starting with `cargo check`, got `cargo build --lib`"));
         for (command, arg) in [
@@ -14720,9 +14818,11 @@ mod security_regression_tests {
         ] {
             let err = validate_verification_argv(command, "check")
                 .expect_err("shell metacharacters must be rejected");
-            assert!(matches!(&err, RuntimeError::InvalidArgument { message }
+            assert!(
+                matches!(&err, RuntimeError::InvalidArgument { message }
                 if *message == format!("verification command contains shell metacharacter `{arg}`")),
-                "expected metachar rejection for {command:?}, got {err:?}");
+                "expected metachar rejection for {command:?}, got {err:?}"
+            );
         }
     }
 
@@ -14759,11 +14859,19 @@ mod security_regression_tests {
             verification_package_segment("expr/evaluator").expect("nested"),
             "expr/evaluator"
         );
-        for bad in ["x; rm -rf /", "$(touch /tmp/pwned)", "../evil", "a/../b", "a..b"] {
+        for bad in [
+            "x; rm -rf /",
+            "$(touch /tmp/pwned)",
+            "../evil",
+            "a/../b",
+            "a..b",
+        ] {
             let err = verification_package_segment(bad).expect_err("unsafe segment");
-            assert!(matches!(&err, RuntimeError::InvalidArgument { message }
+            assert!(
+                matches!(&err, RuntimeError::InvalidArgument { message }
                 if *message == format!("plugin path {bad} is not a valid cargo package selector")),
-                "expected rejection for {bad:?}, got {err:?}");
+                "expected rejection for {bad:?}, got {err:?}"
+            );
         }
     }
 
@@ -14788,7 +14896,11 @@ mod security_regression_tests {
             verification_default_command("check", "mini"),
             verification_default_command("test", "expr/evaluator"),
         ] {
-            let op = if command.contains(" check ") { "check" } else { "test" };
+            let op = if command.contains(" check ") {
+                "check"
+            } else {
+                "test"
+            };
             let argv = validate_verification_argv(&command, op)
                 .unwrap_or_else(|err| panic!("default {command:?} rejected: {err}"));
             assert_eq!(argv.join(" "), command);

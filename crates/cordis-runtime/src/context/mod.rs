@@ -1407,12 +1407,8 @@ mod tests {
         // a's local service: authorization checks the original requester's
         // grant set, never the intermediate node's grants.
         let mut hierarchy = PluginHierarchy::default();
-        hierarchy
-            .parent_of
-            .insert("b".to_string(), "a".to_string());
-        hierarchy
-            .parent_of
-            .insert("c".to_string(), "b".to_string());
+        hierarchy.parent_of.insert("b".to_string(), "a".to_string());
+        hierarchy.parent_of.insert("c".to_string(), "b".to_string());
         let mut b_grants = BTreeSet::new();
         b_grants.insert("shared".to_string());
         hierarchy
@@ -1433,12 +1429,8 @@ mod tests {
         // lookup as the depth-1 case (requester's own parent edge), so the
         // depth-1-with-grant behavior is preserved at every ancestor hop.
         let mut hierarchy = PluginHierarchy::default();
-        hierarchy
-            .parent_of
-            .insert("b".to_string(), "a".to_string());
-        hierarchy
-            .parent_of
-            .insert("c".to_string(), "b".to_string());
+        hierarchy.parent_of.insert("b".to_string(), "a".to_string());
+        hierarchy.parent_of.insert("c".to_string(), "b".to_string());
         let mut c_grants = BTreeSet::new();
         c_grants.insert("shared".to_string());
         hierarchy

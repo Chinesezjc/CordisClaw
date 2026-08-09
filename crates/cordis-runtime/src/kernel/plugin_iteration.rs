@@ -1145,8 +1145,7 @@ pub(crate) fn resolve_under_workspace(abs_path: &Path) -> Result<PathBuf, Runtim
         if is_dangling_symlink(current) {
             return Err(RuntimeError::AutoUpdateInvalidPath {
                 path: abs_path.display().to_string(),
-                reason: "a symlink in the path cannot be resolved inside the workspace"
-                    .to_string(),
+                reason: "a symlink in the path cannot be resolved inside the workspace".to_string(),
             });
         }
         if current.exists() {
@@ -1193,10 +1192,12 @@ fn is_dangling_symlink(path: &Path) -> bool {
 /// so every write and restore keeps the same boundary. Error text is
 /// byte-identical to the original inline closure.
 pub(crate) fn canonical_workspace_root(workspace_root: &Path) -> Result<PathBuf, RuntimeError> {
-    workspace_root.canonicalize().map_err(|err| RuntimeError::Io {
-        path: workspace_root.to_path_buf(),
-        message: format!("workspace root not accessible: {err}"),
-    })
+    workspace_root
+        .canonicalize()
+        .map_err(|err| RuntimeError::Io {
+            path: workspace_root.to_path_buf(),
+            message: format!("workspace root not accessible: {err}"),
+        })
 }
 
 /// P0-20: reject `abs_path` when its canonical on-disk target escapes
@@ -2203,13 +2204,19 @@ mod tests {
         let err = traversal
             .rollback()
             .expect_err("parent traversal must be rejected");
-        assert!(err.to_string().contains("invalid rel_path"), "unexpected: {err}");
+        assert!(
+            err.to_string().contains("invalid rel_path"),
+            "unexpected: {err}"
+        );
         let absolute =
             PluginEditRollback::single_backup(workspace.path(), "/etc/passwd", Some(b"x".to_vec()));
         let err = absolute
             .rollback()
             .expect_err("absolute rel_path must be rejected");
-        assert!(err.to_string().contains("invalid rel_path"), "unexpected: {err}");
+        assert!(
+            err.to_string().contains("invalid rel_path"),
+            "unexpected: {err}"
+        );
     }
 
     /// The canonicalise-workspace-root gate runs even for an empty rollback:
@@ -2236,7 +2243,10 @@ mod tests {
             .unwrap();
         let err = PluginEditRollback::load_journal(workspace.path(), &jp)
             .expect_err("a traversal rel_path must refuse replay");
-        assert!(err.to_string().contains("invalid rel_path"), "unexpected: {err}");
+        assert!(
+            err.to_string().contains("invalid rel_path"),
+            "unexpected: {err}"
+        );
     }
 
     #[test]
@@ -2248,7 +2258,10 @@ mod tests {
             .unwrap();
         let err = PluginEditRollback::load_journal(workspace.path(), &jp)
             .expect_err("an absolute rel_path must refuse replay");
-        assert!(err.to_string().contains("invalid rel_path"), "unexpected: {err}");
+        assert!(
+            err.to_string().contains("invalid rel_path"),
+            "unexpected: {err}"
+        );
     }
 
     /// Symlink-escape regression at journal-load time: a backup rel_path that
@@ -3070,8 +3083,7 @@ mod tests {
         let link = src.join("evil");
         std::os::unix::fs::symlink(temp.path().join("no-such-outside"), &link).unwrap();
         let target = link.join("new.txt");
-        let err =
-            resolve_under_workspace(&target).expect_err("dangling ancestor must be rejected");
+        let err = resolve_under_workspace(&target).expect_err("dangling ancestor must be rejected");
         assert!(
             matches!(&err, RuntimeError::AutoUpdateInvalidPath { reason, .. } if reason.contains("symlink in the path")),
             "wrong variant: {err:?}"
