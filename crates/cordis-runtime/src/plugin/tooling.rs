@@ -22,7 +22,12 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const BUILD_LOCK_FILE: &str = ".artifacts-build.lock";
-const STALE_LOCK_TIMEOUT: Duration = Duration::from_secs(300);
+// R6: the JSON lock path no longer uses an age gate — a lock whose pid is
+// still live is never reclaimed, no matter how old. The 300s gate was removed
+// because a live holder may legitimately build for longer (default build
+// timeout is 20min); see `maybe_remove_stale_lock_with_fs` for the pid-reuse
+// tradeoff this accepts. Only the legacy (non-JSON / unparsable) mtime path
+// keeps a timeout, below.
 const LEGACY_STALE_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 const BUILD_LOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -137,6 +142,10 @@ struct CargoMetadataNode {
 #[derive(Debug)]
 struct ArtifactBuildLock {
     path: PathBuf,
+    /// The pid that acquired this lock. `Drop` only removes the lock file if
+    /// it still records this pid, so a lock that was taken over by another
+    /// holder is left alone (R6).
+    pid: u32,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -147,7 +156,35 @@ struct ArtifactBuildLockState {
 
 impl Drop for ArtifactBuildLock {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        // R6: the old code unconditionally unlinked `self.path`, so a holder
+        // whose lock had been reclaimed mid-build deleted the newcomer's lock
+        // out from under it on drop. Now we read the file back and only remove
+        // it when it still records *our* pid: a matching pid means we still
+        // own it; a different pid means someone else took over and we must not
+        // delete their lock; a missing file means it is already gone. Read or
+        // parse failure is handled conservatively — refusing to delete (a
+        // delete here could destroy another holder's lock) with an eprintln
+        // diagnostic; a leftover unparsable file is eventually reclaimed by
+        // the legacy mtime path in `maybe_remove_stale_lock_with_fs`.
+        match fs::read_to_string(&self.path) {
+            Ok(text) => match serde_json::from_str::<ArtifactBuildLockState>(&text) {
+                Ok(state) if state.pid == self.pid => {
+                    let _ = fs::remove_file(&self.path);
+                }
+                // Lock file now records another pid -> taken over; leave it.
+                Ok(_) => {}
+                Err(err) => eprintln!(
+                    "[tooling] refusing to remove unparsable lock file {}: {err}",
+                    self.path.display()
+                ),
+            },
+            // File already gone (reclaimed earlier); nothing to clean up.
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => eprintln!(
+                "[tooling] refusing to remove unreadable lock file {}: {err}",
+                self.path.display()
+            ),
+        }
     }
 }
 
@@ -392,8 +429,22 @@ pub fn rebuild_plugin_workspace(
     // "/" means all plugins; "/qq" means just qq.
     let name = plugin_path.trim_start_matches('/');
     if name.is_empty() {
+        // "/" delegates to rebuild_fixture_artifacts -> prepare_artifacts,
+        // which acquires the same ArtifactBuildLock itself. Acquiring it here
+        // as well would re-acquire the lock this process already holds
+        // (create_new -> AlreadyExists -> own live pid -> spin -> timeout), so
+        // the delegation path must not take the lock (R7; call-graph note:
+        // prepare_artifacts never calls back into rebuild_plugin_workspace).
         return rebuild_fixture_artifacts(workspace_root);
     }
+    // R7: hold the same ArtifactBuildLock `prepare_artifacts` uses (same lock
+    // file under the fixtures root) for the whole rebuild. Without it this
+    // path staged dylibs and did load-modify-rewrite on index.json while a
+    // concurrent prepare_artifacts did the same — losing updates to the shared
+    // artifacts dir and index, and racing a full_rebuild remove_dir_all. Held
+    // until the function returns (scope-bound `_lock`); a busy lock surfaces
+    // as ArtifactBuildLockTimeout like prepare_artifacts.
+    let _lock = ArtifactBuildLock::acquire(workspace_root)?;
     let mut cmd = std::process::Command::new("cargo");
     cmd.arg("build")
         .arg("--manifest-path")
@@ -1565,7 +1616,10 @@ impl ArtifactBuildLock {
                     // P1-17: fsync the lock file so a power loss doesn't
                     // leave a 0-byte file that lock_pid_is_live can't parse.
                     (ops.sync_all)(&file).map_err(|err| io_error(&path, err))?;
-                    return Ok(Self { path });
+                    return Ok(Self {
+                        path,
+                        pid: process::id(),
+                    });
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
                     maybe_remove_stale_lock(&path)?;
@@ -1618,16 +1672,19 @@ fn maybe_remove_stale_lock_with_fs(path: &Path, ops: MetaOps) -> Result<(), Runt
         .ok()
         .and_then(|text| serde_json::from_str::<ArtifactBuildLockState>(&text).ok());
     if let Some(state) = parsed_state {
-        if !lock_pid_is_live(state.pid)
-            || SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_millis().saturating_sub(state.created_at_ms))
-                .unwrap_or_default()
-                > STALE_LOCK_TIMEOUT.as_millis()
-        {
+        // R6: a parsable JSON lock is reclaimed only when its pid is dead. The
+        // old 300s age gate is gone: a live holder may legitimately build for
+        // longer, and unilaterally unlinking its lock would let a newcomer
+        // clobber artifacts/index.json mid-write. Tradeoff: a dead holder whose
+        // pid got recycled to an unrelated process keeps the lock file around
+        // until that pid dies — an intentional availability-vs-safety choice
+        // in favour of safety (a recreated lock is refused for at most the
+        // newcomer's wait timeout, never stolen from a live builder). Legacy /
+        // unparsable files still fall back to the mtime window below.
+        if !lock_pid_is_live(state.pid) {
             match fs::remove_file(path) {
-                Ok(()) => return Ok(()),
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
                 Err(err) => return Err(io_error(path, err)),
             }
         }
@@ -2588,6 +2645,80 @@ exports = ["svc_a", "svc_b"]
     }
 
     #[test]
+    fn artifact_build_lock_drop_keeps_lock_taken_over_by_other_pid() {
+        use super::{ArtifactBuildLock, ArtifactBuildLockState, BUILD_LOCK_FILE};
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        let lock_path = dir.path().join(BUILD_LOCK_FILE);
+        {
+            let lock = ArtifactBuildLock {
+                path: lock_path.clone(),
+                pid: std::process::id(),
+            };
+            // The lock file now records a *different* pid: another holder took
+            // it over while we were alive (R6). Drop must leave their lock
+            // alone — the old code would have unlinked it out from under them.
+            let other = ArtifactBuildLockState {
+                pid: std::process::id().wrapping_add(7),
+                created_at_ms: 0,
+            };
+            std::fs::write(&lock_path, serde_json::to_vec(&other).unwrap()).unwrap();
+            drop(lock);
+        }
+        assert!(lock_path.exists(), "a taken-over lock must survive our drop");
+    }
+
+    #[test]
+    fn artifact_build_lock_drop_keeps_unparsable_lock_file() {
+        use super::{ArtifactBuildLock, BUILD_LOCK_FILE};
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        let lock_path = dir.path().join(BUILD_LOCK_FILE);
+        let lock = ArtifactBuildLock {
+            path: lock_path.clone(),
+            pid: std::process::id(),
+        };
+        // Corrupt the lock body: unparsable -> conservative, refuse to delete
+        // (a delete here could destroy another holder's lock).
+        std::fs::write(&lock_path, b"not json at all").unwrap();
+        drop(lock);
+        assert!(lock_path.exists(), "an unparsable lock must not be deleted");
+    }
+
+    #[test]
+    fn artifact_build_lock_drop_noop_when_file_already_missing() {
+        use super::{ArtifactBuildLock, BUILD_LOCK_FILE};
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        let lock_path = dir.path().join(BUILD_LOCK_FILE);
+        // Lock file already gone (reclaimed earlier): Drop must be a silent
+        // no-op, not a panic and not a resurrection attempt.
+        let lock = ArtifactBuildLock {
+            path: lock_path,
+            pid: std::process::id(),
+        };
+        drop(lock);
+    }
+
+    #[test]
+    fn artifact_build_lock_drop_keeps_unreadable_lock_file() {
+        use super::{ArtifactBuildLock, BUILD_LOCK_FILE};
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        let lock_path = dir.path().join(BUILD_LOCK_FILE);
+        // A directory where the lock file should be: `read_to_string` fails
+        // with a non-NotFound io error (EISDIR) -> conservative, refuse to
+        // delete.
+        std::fs::create_dir(&lock_path).unwrap();
+        let lock = ArtifactBuildLock {
+            path: lock_path.clone(),
+            pid: std::process::id(),
+        };
+        drop(lock);
+        assert!(lock_path.exists(), "an unreadable lock must not be deleted");
+    }
+
+    #[test]
     fn artifact_build_lock_reclaims_dead_pid_lock() {
         use super::current_epoch_ms;
         use super::{ArtifactBuildLock, ArtifactBuildLockState, BUILD_LOCK_FILE};
@@ -2630,6 +2761,29 @@ exports = ["svc_a", "svc_b"]
         std::fs::write(&path, serde_json::to_vec(&live).unwrap()).unwrap();
         maybe_remove_stale_lock(&path).unwrap();
         assert!(path.exists(), "a live-pid, fresh lock must be preserved");
+    }
+
+    #[test]
+    fn maybe_remove_stale_lock_keeps_live_pid_but_overaged_json_lock() {
+        use super::current_epoch_ms;
+        use super::{maybe_remove_stale_lock, ArtifactBuildLockState};
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("overage.lock");
+        // R6 regression: a live holder whose build has run far past the old
+        // 300s gate (default build timeout is 20min) must NOT have its lock
+        // reclaimed. The JSON path keys on pid liveness alone; age is
+        // irrelevant for parsable locks.
+        let overage = ArtifactBuildLockState {
+            pid: std::process::id(),
+            created_at_ms: current_epoch_ms() - 10 * 60 * 1000, // 10min > old 300s
+        };
+        std::fs::write(&path, serde_json::to_vec(&overage).unwrap()).unwrap();
+        maybe_remove_stale_lock(&path).unwrap();
+        assert!(
+            path.exists(),
+            "a live-pid lock must be preserved regardless of age"
+        );
     }
 
     #[test]
