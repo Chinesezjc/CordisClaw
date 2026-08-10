@@ -3,6 +3,9 @@
 
 use crate::core::error::RuntimeError;
 use crate::kernel::evaluator::VerificationInput;
+use crate::kernel::plugin_iteration::{
+    canonical_workspace_root, ensure_restore_contained, ensure_under_workspace,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeSet;
@@ -215,6 +218,14 @@ impl AutoUpdater {
         let mut backups = Vec::new();
         let mut changed_paths = BTreeSet::new();
 
+        // P0-20 parity: canonicalise the workspace root once, then confirm each
+        // patch target still resolves inside it before reading/writing. A
+        // symlink inside the workspace pointing outside (e.g.
+        // `plugins/demo/conf.toml -> /etc/...`) must not give an LLM-supplied
+        // patch a write handle beyond the workspace. `resolve_patch_path`
+        // alone only rejects `..` / absolute paths, not symlink-based escape.
+        let canonical_workspace_root = canonical_workspace_root(&self.workspace_root)?;
+
         // P1-18: helper closure that runs one patch. On any per-patch error
         // we roll back what has been applied so far before propagating. The
         // previous implementation used `?` in this loop, leaving files
@@ -226,6 +237,7 @@ impl AutoUpdater {
          -> Result<(), RuntimeError> {
             patch.validate_shape()?;
             let abs_path = self.resolve_patch_path(&patch.path)?;
+            ensure_under_workspace(&abs_path, &canonical_workspace_root, &patch.path)?;
             let original = fs::read_to_string(&abs_path).map_err(|e| RuntimeError::Io {
                 path: abs_path.clone(),
                 message: e.to_string(),
@@ -314,7 +326,13 @@ impl AutoUpdater {
     }
 
     fn rollback(&self, backups: &[AppliedBackup]) -> Result<(), RuntimeError> {
+        // P0-20 parity for the write-back path: re-confirm each backup target
+        // still resolves inside the workspace before restoring bytes, so a
+        // symlink swapped in between apply and rollback cannot redirect the
+        // restore write outside the workspace.
+        let canonical_root = canonical_workspace_root(&self.workspace_root)?;
         for backup in backups.iter().rev() {
+            ensure_restore_contained(&backup.abs_path, &canonical_root, &backup.abs_path)?;
             fs::write(&backup.abs_path, &backup.original).map_err(|e| RuntimeError::Io {
                 path: backup.abs_path.clone(),
                 message: e.to_string(),
@@ -1050,6 +1068,98 @@ mod tests {
             original: "restore".to_string(),
         }];
         let err = updater.rollback(&backups).unwrap_err();
+        assert!(matches!(err, RuntimeError::Io { .. }));
+    }
+
+    // ---------- P0-20 parity: symlink-escape containment ----------
+
+    /// A symlink inside the workspace pointing outside (e.g.
+    /// `plugins/demo/conf.toml -> /etc/passwd`) must not give an
+    /// LLM-supplied patch a write handle beyond the workspace.
+    #[cfg(unix)]
+    #[test]
+    fn apply_rejects_symlink_escape_out_of_workspace() {
+        let outside = TempDir::new().unwrap();
+        let outside_target = outside.path().join("pwned");
+        fs::write(&outside_target, "outside").unwrap();
+
+        let ws = TempDir::new().unwrap();
+        let link = ws.path().join("conf.toml");
+        std::os::unix::fs::symlink(&outside_target, &link).unwrap();
+
+        let updater = AutoUpdater::new(ws.path());
+        let err = updater
+            .execute(
+                plan(vec![FilePatch::text("conf.toml", "outside", "pwned")]),
+                verify_ok,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(&err, RuntimeError::AutoUpdateInvalidPath { reason, .. } if reason.contains("escapes workspace root")),
+            "unexpected: {err:?}"
+        );
+        assert_eq!(fs::read_to_string(&outside_target).unwrap(), "outside");
+    }
+
+    /// A dangling symlink (target does not exist yet) must be rejected too:
+    /// writing through it would create bytes at its target, which may sit
+    /// outside the workspace.
+    #[cfg(unix)]
+    #[test]
+    fn apply_rejects_dangling_symlink() {
+        let ws = TempDir::new().unwrap();
+        let link = ws.path().join("conf.toml");
+        std::os::unix::fs::symlink(ws.path().join("no-such-outside"), &link).unwrap();
+
+        let updater = AutoUpdater::new(ws.path());
+        let err = updater
+            .execute(
+                plan(vec![FilePatch::text("conf.toml", "x", "y")]),
+                verify_ok,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(&err, RuntimeError::AutoUpdateInvalidPath { reason, .. } if reason.contains("symlink in the path")),
+            "unexpected: {err:?}"
+        );
+    }
+
+    /// The rollback write-back path re-checks containment: a symlink swapped
+    /// in between apply and rollback must not redirect the restore write
+    /// outside the workspace.
+    #[cfg(unix)]
+    #[test]
+    fn rollback_rejects_symlink_escape_out_of_workspace() {
+        let outside = TempDir::new().unwrap();
+        let outside_target = outside.path().join("pwned");
+        fs::write(&outside_target, "outside").unwrap();
+
+        let ws = TempDir::new().unwrap();
+        let link = ws.path().join("conf.toml");
+        std::os::unix::fs::symlink(&outside_target, &link).unwrap();
+
+        let updater = AutoUpdater::new(ws.path());
+        let backups = vec![AppliedBackup {
+            abs_path: link.clone(),
+            original: "restore".to_string(),
+        }];
+        let err = updater.rollback(&backups).unwrap_err();
+        assert!(
+            matches!(&err, RuntimeError::Invariant { message } if message.contains("escapes workspace root")),
+            "unexpected: {err:?}"
+        );
+        assert_eq!(fs::read_to_string(&outside_target).unwrap(), "outside");
+    }
+
+    /// The workspace root is canonicalised at the start of `execute`; a
+    /// missing root surfaces as an Io error before any patch is touched.
+    #[test]
+    fn execute_errors_when_workspace_root_missing() {
+        let ws = TempDir::new().unwrap();
+        let updater = AutoUpdater::new(ws.path().join("ghost"));
+        let err = updater
+            .execute(plan(vec![FilePatch::text("a.txt", "x", "y")]), verify_ok)
+            .unwrap_err();
         assert!(matches!(err, RuntimeError::Io { .. }));
     }
 
