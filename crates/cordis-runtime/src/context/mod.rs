@@ -269,20 +269,77 @@ impl Default for RuntimeContext {
     }
 }
 
+/// 一致性修复：快照 `(active, overlays)` 必须满足不变量
+/// `active == Some(id) ⟹ overlays 含 id`。clone 在两个互斥量上的读取之间若
+/// 被并发事务撕裂（如 commit 已删 overlay 而未清 active），把不一致状态
+/// 归一为 `(None, 空)`，避免克隆体后续 put/remove/commit 触发
+/// "active subgraph overlay must exist" 断言崩溃。提取为纯函数以便直接
+/// 单测撕裂输入。
+type SubgraphOverlayMap = BTreeMap<String, BTreeMap<ContextKey, Option<SlotEntry>>>;
+fn repaired_subgraph_state(
+    active: Option<String>,
+    overlays: SubgraphOverlayMap,
+) -> (Option<String>, SubgraphOverlayMap) {
+    let Some(id) = active else {
+        return (None, BTreeMap::new());
+    };
+    let Some(overlay) = overlays.get(&id).cloned() else {
+        return (None, BTreeMap::new());
+    };
+    let mut keep = BTreeMap::new();
+    keep.insert(id, overlay);
+    (keep.keys().next().cloned(), keep)
+}
+
 impl Clone for RuntimeContext {
     fn clone(&self) -> Self {
+        // 快照 subgraph 状态时按事务同序（active → overlays）加锁并做一致性
+        // 修复：此前按 overlays → active 反序加锁（可与 begin/commit/put/
+        // remove 互相死锁）且两次加锁间存在撕裂窗口（可克隆出 active=Some
+        // 而 overlay 缺失的快照，随后 put/remove 触发 expect 崩溃）。
+        let (active_subgraph, subgraph_overlays) = {
+            let active = self
+                .active_subgraph
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            let overlays = self
+                .subgraph_overlays
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            repaired_subgraph_state(active.clone(), overlays.clone())
+        };
         Self {
             global: self.global.clone(),
             session: self.session.clone(),
             request: self.request.clone(),
             local: self.local.clone(),
-            global_slots: Arc::new(Mutex::new(self.global_slots.lock().unwrap().clone())),
-            session_slots: Arc::new(Mutex::new(self.session_slots.lock().unwrap().clone())),
-            request_slots: Arc::new(Mutex::new(self.request_slots.lock().unwrap().clone())),
-            subgraph_overlays: Arc::new(Mutex::new(self.subgraph_overlays.lock().unwrap().clone())),
-            active_subgraph: Arc::new(Mutex::new(self.active_subgraph.lock().unwrap().clone())),
+            global_slots: Arc::new(Mutex::new(
+                self.global_slots
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .clone(),
+            )),
+            session_slots: Arc::new(Mutex::new(
+                self.session_slots
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .clone(),
+            )),
+            request_slots: Arc::new(Mutex::new(
+                self.request_slots
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .clone(),
+            )),
+            subgraph_overlays: Arc::new(Mutex::new(subgraph_overlays)),
+            active_subgraph: Arc::new(Mutex::new(active_subgraph)),
             session_version: AtomicU64::new(self.session_version.load(Ordering::SeqCst)),
-            skipped_nodes: Arc::new(Mutex::new(self.skipped_nodes.lock().unwrap().clone())),
+            skipped_nodes: Arc::new(Mutex::new(
+                self.skipped_nodes
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .clone(),
+            )),
             hierarchy: self.hierarchy.clone(),
             plugin_state: self.plugin_state.clone(),
             metrics: self.metrics.clone(),
@@ -301,6 +358,24 @@ fn version_incompatible(key: &ContextKey, actual: u32) -> RuntimeError {
 }
 
 impl RuntimeContext {
+    /// 从 request → session → global 整条查找链删除 `key`（与 lookup 同序
+    /// 加锁，避免死锁）。此前只删 request 层：commit_session 会把 request
+    /// 提升进 session，仅删 request 会让 session/global 承载的键"复活"。
+    fn remove_slot_across_layers(&self, key: &ContextKey) {
+        self.request_slots
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .remove(key);
+        self.session_slots
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .remove(key);
+        self.global_slots
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .remove(key);
+    }
+
     pub fn with_hierarchy(hierarchy: PluginHierarchy) -> Self {
         Self {
             hierarchy,
@@ -534,10 +609,23 @@ impl ContextRegistry for RuntimeContext {
                 let path = plugin_path.ok_or_else(|| RuntimeError::Invariant {
                     message: "local scope dispose requires plugin_path".to_string(),
                 })?;
-                self.local
+                let removed = self
+                    .local
                     .get_mut(path)
                     .map(|x| x.remove(id))
-                    .unwrap_or(false)
+                    .unwrap_or(false);
+                // 空作用域即回收：否则插件反复加载/卸载后空 ScopeStore 在
+                // local map 里无限累积。
+                if removed
+                    && self
+                        .local
+                        .get(path)
+                        .map(|x| x.services.is_empty())
+                        .unwrap_or(false)
+                {
+                    self.local.remove(path);
+                }
+                removed
             }
         };
 
@@ -694,10 +782,7 @@ impl ContextWrite for RuntimeContext {
                 .expect("active subgraph overlay must exist");
             overlay.insert(key.clone(), None);
         } else {
-            self.request_slots
-                .lock()
-                .unwrap_or_else(|poison| poison.into_inner())
-                .remove(key);
+            self.remove_slot_across_layers(key);
         }
         Ok(())
     }
@@ -775,6 +860,7 @@ impl ContextTxn for RuntimeContext {
             .request_slots
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
+        let mut tombstones = Vec::new();
         for (key, delta) in overlay {
             match delta {
                 Some(entry) => {
@@ -782,7 +868,25 @@ impl ContextTxn for RuntimeContext {
                 }
                 None => {
                     request.remove(&key);
+                    tombstones.push(key);
                 }
+            }
+        }
+        drop(request);
+        // 墓碑删除须覆盖 session/global 层：commit_session 会把 request
+        // 提升进 session，仅删 request 会让已提交的键"复活"。
+        if !tombstones.is_empty() {
+            let mut session = self
+                .session_slots
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            let mut global = self
+                .global_slots
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            for key in tombstones {
+                session.remove(&key);
+                global.remove(&key);
             }
         }
         Ok(())
@@ -918,6 +1022,13 @@ pub struct ServiceRegistry {
     zombies: Mutex<Vec<ZombieEntry>>,
 }
 
+/// 判定服务 key（"{plugin_path}::{node_id}"）是否属于给定插件（含其子孙
+/// 子树）。用 `::` 或 `/` 边界匹配而非裸前缀：插件路径互为前缀时（如
+/// "root" 与 "root2"），裸 `starts_with("root")` 会误停兄弟插件的服务。
+fn service_key_belongs_to(key: &str, plugin_path: &str) -> bool {
+    key.starts_with(&format!("{plugin_path}::")) || key.starts_with(&format!("{plugin_path}/"))
+}
+
 impl std::fmt::Debug for ServiceRegistry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let len = self.len();
@@ -949,6 +1060,20 @@ impl ServiceRegistry {
         svc: Box<dyn Service>,
     ) -> Result<(), RuntimeError> {
         let key = format!("{plugin_path}::{node_id}");
+        // 先查重再启动：此前先 svc.start() 后查重，重复注册时已启动的实例
+        // 随 drop 丢失且从不 stop()，后台线程成为无法停止的孤儿。
+        {
+            let guard = self
+                .entries
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            if guard.contains_key(&key) {
+                return Err(RuntimeError::DuplicateService {
+                    plugin_path: plugin_path.to_string(),
+                    service: key,
+                });
+            }
+        }
         let entry = ServiceEntry {
             name: node_id.to_string(),
             plugin_path: plugin_path.to_string(),
@@ -961,11 +1086,14 @@ impl ServiceRegistry {
             });
         }
         entry.running.store(true, Ordering::SeqCst);
+        // 二次查重：start 期间另一线程可能已注册同 key。命中则 stop 掉刚
+        // 启动的实例再返回 DuplicateService，避免泄漏后台 worker。
         let mut guard = self
             .entries
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         if guard.contains_key(&key) {
+            let _ = entry.svc.stop();
             return Err(RuntimeError::DuplicateService {
                 plugin_path: plugin_path.to_string(),
                 service: key,
@@ -980,21 +1108,23 @@ impl ServiceRegistry {
     /// Services that time out are moved to the zombie list for later
     /// forced cleanup via [`kill_zombie_services`].
     pub fn stop_plugin_services(&self, plugin_path: &str) {
-        let mut guard = self
-            .entries
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        let keys: Vec<String> = guard
-            .keys()
-            .filter(|k| k.starts_with(plugin_path))
-            .cloned()
-            .collect();
-        // `keys` came from `guard.keys()`, so every `remove` returns `Some`;
-        // `filter_map` pairs each key with its entry without a dead skip arm.
-        let entries: Vec<(String, _)> = keys
-            .into_iter()
-            .filter_map(|key| guard.remove(&key).map(|entry| (key, entry)))
-            .collect();
+        // 锁内只摘取条目，锁外执行 stop()：用户 stop 代码持锁调用会自死锁
+        // （stop 内回调 len/start_service 时 Mutex 不可重入），慢 stop 也会
+        // 阻塞整个注册表与 reload。
+        let entries: Vec<(String, _)> = {
+            let mut guard = self
+                .entries
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            guard
+                .keys()
+                .filter(|k| service_key_belongs_to(k, plugin_path))
+                .cloned()
+                .collect::<Vec<_>>()
+                .into_iter()
+                .filter_map(|key| guard.remove(&key).map(|entry| (key, entry)))
+                .collect()
+        };
         for (key, entry) in entries {
             entry.running.store(false, Ordering::SeqCst);
             if let Err(e) = entry.svc.stop() {
@@ -1015,7 +1145,7 @@ impl ServiceRegistry {
                 .unwrap_or_else(|poison| poison.into_inner());
             let keys: Vec<String> = guard
                 .keys()
-                .filter(|k| k.starts_with(plugin_path))
+                .filter(|k| service_key_belongs_to(k, plugin_path))
                 .cloned()
                 .collect();
             keys.iter()
@@ -1074,7 +1204,7 @@ impl ServiceRegistry {
         let mut zombies = self.zombies.lock().unwrap_or_else(|p| p.into_inner());
         let (matched, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut *zombies)
             .into_iter()
-            .partition(|z| z.key.starts_with(plugin_path));
+            .partition(|z| service_key_belongs_to(&z.key, plugin_path));
 
         let killed = matched.len();
         for z in matched {
@@ -1106,11 +1236,15 @@ impl ServiceRegistry {
 
     /// Stop and remove all registered services.
     pub fn stop_all(&self) {
-        let mut guard = self
-            .entries
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        let drained: BTreeMap<_, _> = std::mem::take(&mut *guard);
+        // 锁内只摘取条目、锁外执行 stop()：与 stop_plugin_services 一致，
+        // 避免用户 stop 代码在持锁回调时自死锁（Drop 路径同样受益）。
+        let drained: BTreeMap<_, _> = {
+            let mut guard = self
+                .entries
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            std::mem::take(&mut *guard)
+        };
         for (key, entry) in drained {
             entry.running.store(false, Ordering::SeqCst);
             if let Err(e) = entry.svc.stop() {
@@ -2240,5 +2374,184 @@ mod tests {
         let killed = registry.kill_zombie_services("plug");
         assert_eq!(killed, 2);
         assert_eq!(registry.zombie_count(), 0);
+    }
+
+    // ---------- P0 regression: clone / remove / stop-boundary ----------
+
+    /// `repaired_subgraph_state` 把撕裂快照归一为不变量满足的状态：
+    /// active=None → (None, 空)；active 有 overlay → 保留；active 无 overlay
+    /// （撕裂）→ (None, 空)。
+    #[test]
+    fn repaired_subgraph_state_normalizes_torn_snapshots() {
+        let empty: BTreeMap<String, BTreeMap<ContextKey, Option<SlotEntry>>> = BTreeMap::new();
+        let (a, o) = repaired_subgraph_state(None, empty.clone());
+        assert!(a.is_none() && o.is_empty());
+
+        let mut delta = BTreeMap::new();
+        delta.insert(key("ns", "x", 1), None);
+        let mut overlays: BTreeMap<String, BTreeMap<ContextKey, Option<SlotEntry>>> =
+            BTreeMap::new();
+        overlays.insert("sg".to_string(), delta);
+
+        let (a, o) = repaired_subgraph_state(Some("sg".to_string()), overlays.clone());
+        assert_eq!(a.as_deref(), Some("sg"));
+        assert!(o.contains_key("sg"));
+
+        let (a, o) = repaired_subgraph_state(Some("ghost".to_string()), overlays);
+        assert!(a.is_none() && o.is_empty());
+    }
+
+    /// clone 在活动子图期间必须保留一致的 subgraph 状态：克隆体可见 overlay
+    /// 内容并可独立 commit，原上下文不受影响。
+    #[test]
+    fn clone_preserves_active_subgraph_consistently() {
+        let ctx = RuntimeContext::default();
+        ctx.begin_subgraph("sg-clone").unwrap();
+        let k = key("ns", "in_overlay", 1);
+        ctx.put(k.clone(), serde_json::json!("v"), slot_meta())
+            .unwrap();
+        let cloned = ctx.clone();
+        let got: serde_json::Value = cloned.get(&k).unwrap().unwrap();
+        assert_eq!(got, serde_json::json!("v"));
+        cloned.commit_overlay("sg-clone").unwrap();
+        assert!(cloned.contains(&k));
+        // 原上下文仍处于活动子图，可独立回滚。
+        assert!(ctx.contains(&k));
+        ctx.rollback_overlay("sg-clone").unwrap();
+    }
+
+    /// remove 必须贯穿整条查找链：commit_session 已把键提升进 session、
+    /// global_slots 直接承载的键，remove 后都必须消失（此前只删 request
+    /// 层，已提交键"复活"）。
+    #[test]
+    fn slot_remove_reaches_session_and_global_layers() {
+        let ctx = RuntimeContext::default();
+        let k = key("ns", "promoted", 1);
+        ctx.put(k.clone(), serde_json::json!(1), slot_meta())
+            .unwrap();
+        ctx.commit_session("s", 0).unwrap();
+        assert!(ctx.contains(&k));
+        ctx.remove(&k).unwrap();
+        assert!(!ctx.contains(&k));
+
+        let g = key("ns", "glob", 1);
+        ctx.global_slots
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .insert(
+                g.clone(),
+                SlotEntry {
+                    value: serde_json::json!(9),
+                    meta: slot_meta(),
+                },
+            );
+        assert!(ctx.contains(&g));
+        ctx.remove(&g).unwrap();
+        assert!(!ctx.contains(&g));
+    }
+
+    /// 子图墓碑提交后必须删除 session 层承载的键（commit_session 提升后仅
+    /// 删 request 会让键复活）。
+    #[test]
+    fn overlay_commit_tombstone_reaches_session_layer() {
+        let ctx = RuntimeContext::default();
+        let k = key("ns", "base", 1);
+        ctx.put(k.clone(), serde_json::json!(1), slot_meta())
+            .unwrap();
+        ctx.commit_session("s", 0).unwrap();
+        ctx.begin_subgraph("sg").unwrap();
+        ctx.remove(&k).unwrap();
+        ctx.commit_overlay("sg").unwrap();
+        assert!(!ctx.contains(&k));
+    }
+
+    /// dispose 最后一个 local 服务后，空作用域条目应从 local map 回收。
+    #[test]
+    fn dispose_local_removes_empty_scope_entry() {
+        let mut ctx = RuntimeContext::default();
+        ctx.provide(ContextScope::Local, Some("p"), "s", 1u32)
+            .unwrap();
+        assert!(ctx.local.contains_key("p"));
+        ctx.dispose(ContextScope::Local, Some("p"), "s").unwrap();
+        assert!(!ctx.local.contains_key("p"));
+    }
+
+    /// 还有其它服务时 dispose 不回收作用域。
+    #[test]
+    fn dispose_local_keeps_scope_when_services_remain() {
+        let mut ctx = RuntimeContext::default();
+        ctx.provide(ContextScope::Local, Some("p"), "a", 1u32)
+            .unwrap();
+        ctx.provide(ContextScope::Local, Some("p"), "b", 2u32)
+            .unwrap();
+        ctx.dispose(ContextScope::Local, Some("p"), "a").unwrap();
+        assert!(ctx.local.contains_key("p"));
+        assert_eq!(*ctx.inject::<u32>("p", "b").unwrap(), 2);
+    }
+
+    /// 服务 key 前缀必须按 `::`/`/` 边界匹配：停止 "root" 不得误停
+    /// "root2"（前缀重叠的兄弟插件）的服务，但 "root/child" 子孙仍被停。
+    #[test]
+    fn stop_plugin_services_respects_key_boundary() {
+        let registry = ServiceRegistry::new();
+        registry
+            .start_service("root", "svc_a", Box::new(CounterService::new()))
+            .expect("start");
+        registry
+            .start_service("root2", "svc_b", Box::new(CounterService::new()))
+            .expect("start");
+        registry
+            .start_service("root/child", "svc_c", Box::new(CounterService::new()))
+            .expect("start");
+        assert_eq!(registry.len(), 3);
+        registry.stop_plugin_services("root");
+        assert_eq!(registry.len(), 1);
+    }
+
+    /// 并发注册同 key：两个线程都通过前置查重并各自 start 后，只有一个能
+    /// insert；另一个在二次查重处命中，必须 stop 掉自己刚启动的实例（避免
+    /// 泄漏后台 worker）并返回 DuplicateService。
+    #[test]
+    fn start_service_concurrent_duplicate_stops_new_instance() {
+        use std::sync::Barrier;
+        struct GatedService {
+            barrier: Arc<Barrier>,
+            stops: Arc<AtomicUsize>,
+        }
+        impl Service for GatedService {
+            fn start(&self) -> Result<(), String> {
+                self.barrier.wait();
+                Ok(())
+            }
+            fn stop(&self) -> Result<(), String> {
+                self.stops.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let registry = Arc::new(ServiceRegistry::new());
+        let barrier = Arc::new(Barrier::new(3));
+        let stops = Arc::new(AtomicUsize::new(0));
+        let svc_a = Box::new(GatedService {
+            barrier: barrier.clone(),
+            stops: stops.clone(),
+        }) as Box<dyn Service>;
+        let svc_b = Box::new(GatedService {
+            barrier: barrier.clone(),
+            stops: stops.clone(),
+        }) as Box<dyn Service>;
+        let reg_a = registry.clone();
+        let reg_b = registry.clone();
+        let handle_a = std::thread::spawn(move || reg_a.start_service("p", "dup", svc_a));
+        let handle_b = std::thread::spawn(move || reg_b.start_service("p", "dup", svc_b));
+        barrier.wait();
+        let results = [handle_a.join().unwrap(), handle_b.join().unwrap()];
+        let oks = results.iter().filter(|r| r.is_ok()).count();
+        let errs = results.iter().filter(|r| r.is_err()).count();
+        assert_eq!(oks, 1);
+        assert_eq!(errs, 1);
+        // 败者 stop 掉自己刚启动的实例：恰好一次 stop。
+        assert_eq!(stops.load(Ordering::SeqCst), 1);
+        assert_eq!(registry.len(), 1);
     }
 }
