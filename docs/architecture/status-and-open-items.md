@@ -2,7 +2,7 @@
 
 ## 1. 判定口径
 
-- 本文基于当前仓库现状整理，最近更新：2026-08-09。
+- 本文基于当前仓库现状整理，最近更新：2026-08-10。
 - 历史规划蓝图已经吸收进 [design-blueprint.md](./design-blueprint.md)，因此本文结论来自三类证据的交叉比对：
   - 设计蓝图：[design-blueprint.md](./design-blueprint.md)
   - 架构文档：[system-overview.md](./system-overview.md)、[contracts-and-loading.md](./contracts-and-loading.md)、[runtime-semantics.md](./runtime-semantics.md)、[maintenance-guide.md](./maintenance-guide.md)
@@ -769,6 +769,10 @@ cd fixtures/plugins/expr/lexer && cargo test --lib  # excluded, external tests o
 - [x] **P2-28 modtime 失败取 now**（非 UNIX_EPOCH）— dirty-tracking 不再把无法读 mtime 的文件误判为"极老"；log stderr 提示。
 - [x] **P2-29 rebuild_plugin_workspace 加 strip_proxy_envs** — 与 `run_command` 对齐；企业代理下不再挂起。
 - [x] **P2-30 rebuild 加 build timeout** — 新 helper `run_command_with_timeout` (20min 默认，`CORDIS_BUILD_TIMEOUT_SECS` 覆盖) + poll-based kill+wait；死循环 build.rs 不再挂死 iteration 管道。
+- [x] **PR3-P1 tooling 子进程管道并发排空** — `run_command_with_timeout` spawn 后立即把 stdout/stderr 各交给 reader 线程 drain（同 `std::Command::output` 内部做法），轮询循环不变；此前管道要等循环退出才读，>64KiB 输出会阻塞子进程 write，健康构建被 deadline 误杀。kill 失败（注入可测）时记录并跳过 wait，避免无限等待。
+- [x] **PR3-P3 prepare 路径全量超时** — `prepare_artifacts` 链路的 `cargo metadata`（`load_workspace_metadata` / `built_dylib_path`）与 `cargo build`（`build_plugin_artifact` / `build_dirty_dylib_plugins`）全部切换到带超时执行器 `run_command_timed`（复用 `run_command_with_timeout` + `CORDIS_BUILD_TIMEOUT_SECS`，非零退出的错误文本与原 `run_command` 逐字节一致）；原未超时的 `run_command` 已无生产调用点，移除以防"无超时旁路"重新引入。
+- [x] **PR3-P2 verifier 命令管道并发排空 + 进程组击杀** — `run_shell_command` spawn 后立即并发 drain 两条管道（防大输出被误杀）；Unix 上 spawn 前 `process_group(0)`，超时时 `kill(-pid, SIGKILL)` 连孙进程一起杀防孤儿；进程组已消失（ESRCH）时记录并跳过 wait。`poll_until_exit` 注入式测试结构不变。
+- [x] **PR3-P6 输入收集不跟随符号链接 / 防环** — `collect_dir_entry` 改用 `entry.file_type()`（lstat，不跟随）判目录并跳过全部符号链接：crate 内目录链接指向外部时不再把无关文件纳入 `input_probe`/指纹（新增越界回归测试），指向祖先的链接不再无界递归（旧行为 ENAMETOOLONG）；真实目录经共享 `visited` 集合保证至多进入一次。
 - [x] **P2-12 QQ 硬编码路径**（部分修）— 新 `runtime_config_path()` 从 `$CORDIS_FIXTURES_ROOT` 派生；env 未设置时回退到历史 `/root/CordisClaw/...`。
 - [x] **serve 加 `--no-startup-invoke`（本地测试劫持线上流量修复，2026-07-22）** — serve 启动段原先无条件执行 `startup_invoke.json`（起 qq HTTP 8099 + 连真实飞书 WSS）；本地落地测试实例与线上 bot 共用渠道凭证，测试期间飞书把用户消息推给测试实例，实例发出"思考中"两段式占位卡片后被测试脚本 exit 杀掉，内存 `PENDING_CARDS` 丢失，用户侧卡片永久停留（已实际发生）。新增 `--no-startup-invoke` flag + `CORDIS_NO_STARTUP_INVOKE` 环境变量：跳过启动段全部自动 invoke 并打印明确日志，插件加载 / invoke / execute / REPL 不受影响。`parse_root_and_runtime_only` 重构为 `parse_serve_args`（env 读取在外壳，内层纯函数可测），main.rs 补 4 个参数解析单测。约定：本地落地测试一律带该开关。
 - [x] **P2-13 fingerprint per-build**（fixture 迁移完成）— 21 个 fixture 插件的 `abi_fingerprint_value()` 全部从硬编码 `AbiFingerprint { rustc_version: "1.85.1", target_triple: "x86_64-unknown-linux-gnu", ... }` 迁移到 `AbiFingerprint::current_build(crate_hash, api_hash)`；Cargo.toml 的 `[package.metadata.cordis.abi_fingerprint]` 删除 rustc_version/target_triple 两行（SDK 的 `AbiFingerprint` 加 serde default，缺省时填当前工具链值，显式声明仍生效）；host.rs 两处插件脚手架模板与 agent.rs 的插件创建 prompt 同步。修复动机：硬编码 linux triple 导致 macOS 等非 linux-x86 宿主上所有 dylib 插件被 target_triple 预检拒载（`Unavailable(AbiMismatch)`），serve 无法冷启动。SDK 补 serde-default 单测；macOS (aarch64-apple-darwin) 实机 serve + invoke 验证通过。
