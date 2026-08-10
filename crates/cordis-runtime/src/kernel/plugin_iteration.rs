@@ -555,32 +555,16 @@ impl PluginEditExecutor {
         // confirm the resolved path is still inside it. `normalize_rel_path`
         // only rejects `..` and absolute paths — it cannot detect
         // symlink-based escape (`plugins/demo/src/evil -> /etc/passwd` etc.).
-        // With the guard below, any operation whose canonical target lands
-        // outside workspace_root is rejected before touching disk.
-        let canonical_workspace_root =
-            self.workspace_root
-                .canonicalize()
-                .map_err(|err| RuntimeError::Io {
-                    path: self.workspace_root.clone(),
-                    message: format!("workspace root not accessible: {err}"),
-                })?;
+        // `ensure_under_workspace` (shared with `AutoUpdater` and the
+        // rollback/journal recovery paths) follows symlinks along any existing
+        // prefix, rejects dangling symlinks, and refuses any operation whose
+        // canonical target lands outside workspace_root before touching disk.
+        let canonical_workspace_root = canonical_workspace_root(&self.workspace_root)?;
         for operation in &plan.operations {
             let normalized = normalize_rel_path(&operation.path)?;
             policy.validate_path(allowed_plugin_roots, &normalized)?;
             let abs_path = self.workspace_root.join(&normalized);
-            // Resolve the final on-disk target, following symlinks along any
-            // existing prefix. Reject if it escapes the workspace.
-            let resolved_for_check = resolve_under_workspace(&abs_path)?;
-            if !resolved_for_check.starts_with(&canonical_workspace_root) {
-                return Err(RuntimeError::AutoUpdateInvalidPath {
-                    path: operation.path.clone(),
-                    reason: format!(
-                        "resolved path escapes workspace root ({} not under {})",
-                        resolved_for_check.display(),
-                        canonical_workspace_root.display()
-                    ),
-                });
-            }
+            ensure_under_workspace(&abs_path, &canonical_workspace_root, &operation.path)?;
             let original = fs::read(&abs_path).ok();
             let updated = apply_operation(&normalized, operation, &abs_path, original.as_deref())?;
 
@@ -690,8 +674,18 @@ impl PluginEditRollback {
     }
 
     pub fn rollback(&self) -> Result<(), RuntimeError> {
+        // P0-20 parity for the write-back path: the workspace root is
+        // canonicalised once, then every backup target must still be a
+        // normalized rel_path that resolves inside it. A symlink planted (or
+        // swapped) between the edit and the rollback would otherwise redirect
+        // the restore write — or the created-file removal — outside the
+        // workspace.
+        let canonical_root = canonical_workspace_root(&self.workspace_root)?;
         for backup in self.backups.iter().rev() {
-            let abs_path = self.workspace_root.join(&backup.rel_path);
+            let rel_path = normalize_rel_path(&backup.rel_path)
+                .map_err(|err| rollback_rel_path_error(&backup.rel_path, &err))?;
+            let abs_path = self.workspace_root.join(&rel_path);
+            ensure_restore_contained(&abs_path, &canonical_root, Path::new(&rel_path))?;
             match &backup.original {
                 Some(original) => {
                     ensure_parent_dir(&abs_path)?;
@@ -766,10 +760,27 @@ impl PluginEditRollback {
             serde_json::from_slice(&bytes).map_err(|err| RuntimeError::Invariant {
                 message: format!("plugin edit rollback journal parse failed: {err}"),
             })?;
+        let workspace_root = workspace_root.into();
+        // P0-20 parity: a journal is replayed only if every backup target is a
+        // normalized rel_path that still resolves inside the workspace.
+        // `normalize_rel_path` rejects `..` / absolute paths lexically; the
+        // containment check follows symlinks along any existing prefix (and
+        // rejects dangling symlinks), so a planted
+        // `plugins/demo/conf.toml -> /etc/...` link cannot redirect boot
+        // recovery outside the workspace. An illegal entry refuses the whole
+        // replay with `Invariant` — the journal is disk state, not input.
+        let canonical_workspace_root = canonical_workspace_root(&workspace_root)?;
         let backups = journal
             .backups
             .into_iter()
             .map(|backup| {
+                let rel_path = normalize_rel_path(&backup.rel_path)
+                    .map_err(|err| journal_rel_path_error(&backup.rel_path, &err))?;
+                ensure_restore_contained(
+                    &workspace_root.join(&rel_path),
+                    &canonical_workspace_root,
+                    Path::new(&rel_path),
+                )?;
                 let original = backup
                     .original_hex
                     .map(|value| {
@@ -781,14 +792,11 @@ impl PluginEditRollback {
                         })
                     })
                     .transpose()?;
-                Ok(AppliedEditBackup {
-                    rel_path: backup.rel_path,
-                    original,
-                })
+                Ok(AppliedEditBackup { rel_path, original })
             })
             .collect::<Result<Vec<_>, RuntimeError>>()?;
         Ok(Some(Self {
-            workspace_root: workspace_root.into(),
+            workspace_root,
             backups,
         }))
     }
@@ -1123,7 +1131,10 @@ fn ensure_parent_dir(target: &Path) -> Result<(), RuntimeError> {
 /// symlinks along any existing prefix, and re-attaches the yet-to-be-created
 /// tail. Used before writing to make sure the actual on-disk target sits
 /// under the workspace root — `normalize_rel_path` alone only catches
-/// `..` / absolute paths, not symlink-based escape.
+/// `..` / absolute paths, not symlink-based escape. A symlink component that
+/// `canonicalize` cannot follow (a dangling link) is rejected rather than
+/// re-attached: a write through it would create bytes at the link's target,
+/// which may sit outside the workspace.
 pub(crate) fn resolve_under_workspace(abs_path: &Path) -> Result<PathBuf, RuntimeError> {
     if let Ok(canonical) = abs_path.canonicalize() {
         return Ok(canonical);
@@ -1131,6 +1142,12 @@ pub(crate) fn resolve_under_workspace(abs_path: &Path) -> Result<PathBuf, Runtim
     let mut ancestors: Vec<&Path> = Vec::new();
     let mut current = abs_path;
     let existing = loop {
+        if is_dangling_symlink(current) {
+            return Err(RuntimeError::AutoUpdateInvalidPath {
+                path: abs_path.display().to_string(),
+                reason: "a symlink in the path cannot be resolved inside the workspace".to_string(),
+            });
+        }
         if current.exists() {
             break current
                 .canonicalize()
@@ -1156,6 +1173,101 @@ pub(crate) fn resolve_under_workspace(abs_path: &Path) -> Result<PathBuf, Runtim
         }
     }
     Ok(resolved)
+}
+
+/// True when `path` is a symlink that cannot be followed (its target does not
+/// exist). By the time the ancestor walk in [`resolve_under_workspace`] runs,
+/// `canonicalize` has already failed for the full path, so any symlink reached
+/// here is dangling; `symlink_metadata` (which does not follow links) is what
+/// distinguishes a dangling link from a merely-absent path component.
+fn is_dangling_symlink(path: &Path) -> bool {
+    fs::symlink_metadata(path)
+        .map(|meta| meta.file_type().is_symlink())
+        .unwrap_or(false)
+}
+
+/// Canonicalise `workspace_root` once so per-path containment checks compare
+/// against a symlink-free anchor. Extracted from `PluginEditExecutor::execute`
+/// (P0-20); shared with `AutoUpdater` and the rollback/journal recovery paths
+/// so every write and restore keeps the same boundary. Error text is
+/// byte-identical to the original inline closure.
+pub(crate) fn canonical_workspace_root(workspace_root: &Path) -> Result<PathBuf, RuntimeError> {
+    workspace_root
+        .canonicalize()
+        .map_err(|err| RuntimeError::Io {
+            path: workspace_root.to_path_buf(),
+            message: format!("workspace root not accessible: {err}"),
+        })
+}
+
+/// P0-20: reject `abs_path` when its canonical on-disk target escapes
+/// `canonical_workspace_root`. `display_path` names the caller-facing path in
+/// the error. Uses [`resolve_under_workspace`], which follows symlinks along
+/// any existing prefix, re-attaches a yet-to-be-created tail, and rejects
+/// dangling symlinks — so a planted `plugins/demo/conf.toml -> /etc/...` link
+/// cannot redirect a write outside the workspace. Error text is byte-identical
+/// to the original inline executor check.
+pub(crate) fn ensure_under_workspace(
+    abs_path: &Path,
+    canonical_workspace_root: &Path,
+    display_path: &str,
+) -> Result<(), RuntimeError> {
+    let resolved = resolve_under_workspace(abs_path)?;
+    if resolved.starts_with(canonical_workspace_root) {
+        return Ok(());
+    }
+    Err(RuntimeError::AutoUpdateInvalidPath {
+        path: display_path.to_string(),
+        reason: format!(
+            "resolved path escapes workspace root ({} not under {})",
+            resolved.display(),
+            canonical_workspace_root.display()
+        ),
+    })
+}
+
+/// Reject a rollback/journal restore target whose canonical location escapes
+/// the workspace root. Backups are validated when recorded or loaded, so an
+/// escape at restore time means a symlink was planted or swapped concurrently
+/// — an invariant violation rather than bad input. Unlike
+/// [`ensure_under_workspace`] this surfaces `RuntimeError::Invariant` because
+/// the rel_path is internal state, not user input.
+pub(crate) fn ensure_restore_contained(
+    abs_path: &Path,
+    canonical_root: &Path,
+    display_path: &Path,
+) -> Result<(), RuntimeError> {
+    let resolved = resolve_under_workspace(abs_path)?;
+    if resolved.starts_with(canonical_root) {
+        return Ok(());
+    }
+    Err(RuntimeError::Invariant {
+        message: format!(
+            "rollback target {} escapes workspace root ({} not under {})",
+            display_path.display(),
+            resolved.display(),
+            canonical_root.display()
+        ),
+    })
+}
+
+/// Map a `normalize_rel_path` rejection in [`PluginEditRollback::rollback`] to
+/// `RuntimeError::Invariant`: backups recorded by the executor are already
+/// normalized, so an illegal rel_path here is internal-state corruption.
+fn rollback_rel_path_error(rel_path: &str, err: &RuntimeError) -> RuntimeError {
+    RuntimeError::Invariant {
+        message: format!("plugin edit rollback invalid rel_path {rel_path}: {err}"),
+    }
+}
+
+/// Map a `normalize_rel_path` rejection in [`PluginEditRollback::load_journal`]
+/// to `RuntimeError::Invariant`, refusing to replay a journal that names a
+/// path outside the workspace (`..` / absolute). The journal is disk state a
+/// crash left behind; a malformed entry must stop recovery, not redirect it.
+fn journal_rel_path_error(rel_path: &str, err: &RuntimeError) -> RuntimeError {
+    RuntimeError::Invariant {
+        message: format!("plugin edit rollback journal invalid rel_path {rel_path}: {err}"),
+    }
 }
 
 pub fn normalize_rel_path(path: &str) -> Result<String, RuntimeError> {
@@ -2048,6 +2160,142 @@ mod tests {
         );
     }
 
+    // ---------- P0-20 parity: rollback / journal rel_path validation ----------
+
+    /// A symlink planted inside the workspace (or swapped in after the edit)
+    /// must not redirect the rollback restore write outside the workspace.
+    #[cfg(unix)]
+    #[test]
+    fn rollback_rejects_symlink_escape_out_of_workspace() {
+        let outside = TempDir::new().unwrap();
+        let outside_target = outside.path().join("pwned");
+        fs::write(&outside_target, b"outside").unwrap();
+
+        let workspace = TempDir::new().unwrap();
+        let plugin_src = workspace.path().join("plugins/demo/src");
+        fs::create_dir_all(&plugin_src).unwrap();
+        let symlink_at = plugin_src.join("evil");
+        std::os::unix::fs::symlink(&outside_target, &symlink_at).unwrap();
+
+        let rollback = PluginEditRollback::single_backup(
+            workspace.path(),
+            "plugins/demo/src/evil",
+            Some(b"restore-bytes".to_vec()),
+        );
+        let err = rollback.rollback().expect_err("escape must be rejected");
+        assert!(
+            err.to_string().contains("escapes workspace root"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(fs::read(&outside_target).unwrap(), b"outside");
+    }
+
+    /// Lexical validation in rollback: a backup rel_path that walks up with
+    /// `..` or is absolute is internal-state corruption and must be rejected
+    /// with `Invariant` before any disk write.
+    #[test]
+    fn rollback_rejects_parent_dir_and_absolute_rel_paths() {
+        let workspace = TempDir::new().unwrap();
+        let traversal = PluginEditRollback::single_backup(
+            workspace.path(),
+            "../escape.txt",
+            Some(b"x".to_vec()),
+        );
+        let err = traversal
+            .rollback()
+            .expect_err("parent traversal must be rejected");
+        assert!(
+            err.to_string().contains("invalid rel_path"),
+            "unexpected: {err}"
+        );
+        let absolute =
+            PluginEditRollback::single_backup(workspace.path(), "/etc/passwd", Some(b"x".to_vec()));
+        let err = absolute
+            .rollback()
+            .expect_err("absolute rel_path must be rejected");
+        assert!(
+            err.to_string().contains("invalid rel_path"),
+            "unexpected: {err}"
+        );
+    }
+
+    /// The canonicalise-workspace-root gate runs even for an empty rollback:
+    /// a missing workspace root is an Io error, not a silent no-op.
+    #[test]
+    fn rollback_errors_when_workspace_root_missing() {
+        let temp = TempDir::new().unwrap();
+        let ghost = temp.path().join("no-such-root");
+        let err = PluginEditRollback::empty(&ghost)
+            .rollback()
+            .expect_err("a missing workspace root must error");
+        assert!(matches!(err, RuntimeError::Io { .. }), "got: {err:?}");
+    }
+
+    /// A journal whose backup rel_path walks up with `..` must refuse replay:
+    /// the journal is disk state a crash left behind, and a traversal entry
+    /// would redirect boot recovery outside the workspace.
+    #[test]
+    fn load_journal_rejects_parent_dir_rel_path() {
+        let workspace = TempDir::new().unwrap();
+        let jp = workspace.path().join("evil-journal.json");
+        PluginEditRollback::single_backup(workspace.path(), "../escape.txt", Some(b"x".to_vec()))
+            .persist_journal(&jp, "iter")
+            .unwrap();
+        let err = PluginEditRollback::load_journal(workspace.path(), &jp)
+            .expect_err("a traversal rel_path must refuse replay");
+        assert!(
+            err.to_string().contains("invalid rel_path"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn load_journal_rejects_absolute_rel_path() {
+        let workspace = TempDir::new().unwrap();
+        let jp = workspace.path().join("evil-journal.json");
+        PluginEditRollback::single_backup(workspace.path(), "/etc/passwd", Some(b"x".to_vec()))
+            .persist_journal(&jp, "iter")
+            .unwrap();
+        let err = PluginEditRollback::load_journal(workspace.path(), &jp)
+            .expect_err("an absolute rel_path must refuse replay");
+        assert!(
+            err.to_string().contains("invalid rel_path"),
+            "unexpected: {err}"
+        );
+    }
+
+    /// Symlink-escape regression at journal-load time: a backup rel_path that
+    /// resolves (through a planted symlink) outside the workspace must refuse
+    /// replay with `Invariant`, leaving the outside target untouched.
+    #[cfg(unix)]
+    #[test]
+    fn load_journal_rejects_symlink_escape_rel_path() {
+        let outside = TempDir::new().unwrap();
+        let outside_target = outside.path().join("pwned");
+        fs::write(&outside_target, b"outside").unwrap();
+
+        let workspace = TempDir::new().unwrap();
+        let plugin_src = workspace.path().join("plugins/demo/src");
+        fs::create_dir_all(&plugin_src).unwrap();
+        let symlink_at = plugin_src.join("evil");
+        std::os::unix::fs::symlink(&outside_target, &symlink_at).unwrap();
+
+        let jp = workspace.path().join("evil-journal.json");
+        PluginEditRollback::single_backup(
+            workspace.path(),
+            "plugins/demo/src/evil",
+            Some(b"x".to_vec()),
+        )
+        .persist_journal(&jp, "iter")
+        .unwrap();
+        let err = PluginEditRollback::load_journal(workspace.path(), &jp)
+            .expect_err("a symlink-escape rel_path must refuse replay");
+        assert!(
+            err.to_string().contains("escapes workspace root"),
+            "unexpected: {err}"
+        );
+    }
+
     // ---------- pure-logic / helper coverage ----------
 
     use super::{
@@ -2799,6 +3047,45 @@ mod tests {
             .expect_err("a relative path with no existing ancestor must error");
         assert!(
             matches!(&err, RuntimeError::AutoUpdateInvalidPath { reason, .. } if reason == "no accessible ancestor exists"),
+            "wrong variant: {err:?}"
+        );
+    }
+
+    /// A dangling symlink at the final component must be rejected, not
+    /// re-attached as an ordinary missing tail: a write through it would
+    /// create bytes at the link's target, which may sit outside the workspace
+    /// (e.g. `conf.toml -> /etc/...` where the target does not exist yet).
+    #[cfg(unix)]
+    #[test]
+    fn resolve_under_workspace_rejects_dangling_symlink() {
+        let temp = TempDir::new().unwrap();
+        let src = temp.path().join("src");
+        fs::create_dir_all(&src).unwrap();
+        // Target does not exist → the link cannot be followed.
+        let link = src.join("evil");
+        std::os::unix::fs::symlink(temp.path().join("no-such-outside"), &link).unwrap();
+        let err = resolve_under_workspace(&link).expect_err("dangling symlink must be rejected");
+        assert!(
+            matches!(&err, RuntimeError::AutoUpdateInvalidPath { reason, .. } if reason.contains("symlink in the path")),
+            "wrong variant: {err:?}"
+        );
+    }
+
+    /// A dangling symlink as an *intermediate* component must also be
+    /// rejected: re-attaching the tail would write through the link into its
+    /// (outside) destination once it materialises.
+    #[cfg(unix)]
+    #[test]
+    fn resolve_under_workspace_rejects_dangling_symlink_ancestor() {
+        let temp = TempDir::new().unwrap();
+        let src = temp.path().join("src");
+        fs::create_dir_all(&src).unwrap();
+        let link = src.join("evil");
+        std::os::unix::fs::symlink(temp.path().join("no-such-outside"), &link).unwrap();
+        let target = link.join("new.txt");
+        let err = resolve_under_workspace(&target).expect_err("dangling ancestor must be rejected");
+        assert!(
+            matches!(&err, RuntimeError::AutoUpdateInvalidPath { reason, .. } if reason.contains("symlink in the path")),
             "wrong variant: {err:?}"
         );
     }
