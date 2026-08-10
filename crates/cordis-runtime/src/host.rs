@@ -1723,6 +1723,16 @@ impl RuntimeKernel {
                 PluginIterationFinalVerdict::Blocked
                 | PluginIterationFinalVerdict::InfrastructureFailure => {
                     blocked.insert(result.iteration_id.clone(), result.clone());
+                    // R9: blocked 保留无上限会随每次唯一的 iteration_id
+                    // 无界增长（只有 approve 或后续同 id 结局才摘除）。与
+                    // plugin_history / invocation_samples 的上限一致，保留
+                    // 最近 64 条：BTreeMap 按 key 有序（iteration_id 由
+                    // normalize_request_id 生成、前缀带毫秒时间戳），首条
+                    // 即最旧，插一条最多超限 1 → pop_first 淘汰之。
+                    const MAX_BLOCKED_ITERATIONS: usize = 64;
+                    if blocked.len() > MAX_BLOCKED_ITERATIONS {
+                        let _ = blocked.pop_first();
+                    }
                 }
                 PluginIterationFinalVerdict::Promoted | PluginIterationFinalVerdict::RolledBack => {
                     blocked.remove(&result.iteration_id);
@@ -1802,6 +1812,15 @@ pub struct RuntimeHost {
     last_reload_attempt: Mutex<Option<ReloadAttemptReport>>,
     last_candidate_reload_attempt: Mutex<Option<ReloadAttemptReport>>,
     agent_sessions: Mutex<BTreeMap<String, ManagedAgentSession>>,
+    /// R1: 正被 `agent_send` 处理（已从 `agent_sessions` 摘除、`respond`
+    /// 进行中）的会话 id。id 在摘除时刻插入、turn 收尾时刻摘除；并发
+    /// 第二个 `agent_send` 据此判 `AgentSessionBusy` 而不是误报
+    /// `AgentSessionNotFound`。
+    inflight_sessions: Mutex<BTreeSet<String>>,
+    /// R1: turn 进行期间被 `drop_session` 标记为"丢弃"的会话 id。turn 收尾
+    /// 消费该标记：标记过的 id 不再插回 map、不再 auto_save（会话随局部
+    /// 变量销毁），防止 drop 之后被复活并重写快照。
+    dropped_during_turn: Mutex<BTreeSet<String>>,
     /// P1-25: side-channel for tool calls that need to mutate their own
     /// active `AgentSession`. During `agent_send` the session is removed
     /// from `agent_sessions` for the duration of `respond`; tools like
@@ -2026,6 +2045,27 @@ fn new_sink_key() -> String {
     )
 }
 
+/// R1: 若 `session_id` 当前有一个 in-flight turn（同一 id 正被并发
+/// `agent_send` 处理，旧 turn 收尾会把会话插回 map），标记
+/// `dropped_during_turn`，让旧 turn 收尾不再复活本会话。当前
+/// `agent_start_with` 的 id 由 `normalize_request_id` 生成、不可能撞车，
+/// 此检查是防御性的；具名函数便于直接单测双臂。
+fn mark_dropped_if_inflight(
+    inflight_sessions: &Mutex<BTreeSet<String>>,
+    dropped_during_turn: &Mutex<BTreeSet<String>>,
+    session_id: &str,
+) {
+    let guard = inflight_sessions
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    if guard.contains(session_id) {
+        dropped_during_turn
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .insert(session_id.to_string());
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct ManagedAgentSession {
     #[allow(dead_code)]
@@ -2142,6 +2182,15 @@ enum ContextFilesScope {
 /// `#[cfg(test)]` arm inside `iterate_plugins` and by `mod tests`.
 #[cfg(test)]
 pub(crate) static TEST_ITERATION_PANIC_INJECTION: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// R1: test-only panic injection for `ManagedAgentSession::respond`. When
+/// set, the next `respond` panics (as if an agent-loop assert fired
+/// mid-turn) so tests can verify `agent_send`'s `catch_unwind` cleanup still
+/// reinserts the session instead of losing it. Swapped back to `false` on
+/// read so it fires exactly once.
+#[cfg(test)]
+pub(crate) static TEST_AGENT_RESPOND_PANIC_INJECTION: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 /// Test-only FFI-panic injection flag for the reload/stop-handler catch_unwind
@@ -2295,6 +2344,8 @@ impl RuntimeHost {
             last_reload_attempt: Mutex::new(None),
             last_candidate_reload_attempt: Mutex::new(None),
             agent_sessions: Mutex::new(BTreeMap::new()),
+            inflight_sessions: Mutex::new(BTreeSet::new()),
+            dropped_during_turn: Mutex::new(BTreeSet::new()),
             pending_session_actions: Mutex::new(BTreeMap::new()),
             profile_fallback: Mutex::new(BTreeMap::new()),
             service_registry,
@@ -2560,6 +2611,24 @@ impl RuntimeHost {
     /// Idempotent — dropping an unknown session id is a no-op (no panic, no
     /// error).
     pub fn drop_session(&self, session_id: &str) {
+        // R1: 若该会话正有一个 in-flight turn（`agent_send` 已把它移出
+        // `agent_sessions`），下面的 map remove 会落空、只删到快照，turn
+        // 结束后会话仍会被收尾插回并 auto_save 重写快照。此时标记
+        // `dropped_during_turn`：检查与标记在 inflight 锁下原子完成，而
+        // turn 收尾也持同一把锁做消费，二者互斥，不会出现"标记晚了"的
+        // 复活竞态。
+        {
+            let inflight = self
+                .inflight_sessions
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            if inflight.contains(session_id) {
+                self.dropped_during_turn
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .insert(session_id.to_string());
+            }
+        }
         self.agent_sessions
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
@@ -3257,6 +3326,14 @@ export_plugin_api! {{
                     degraded: false,
                 },
             );
+        // R1: 防御性标记——若同 id 仍有一个 in-flight turn（当前 id 由
+        // `normalize_request_id` 生成、不会撞车），旧 turn 收尾不得插回
+        // 覆盖本新会话。
+        mark_dropped_if_inflight(
+            &self.inflight_sessions,
+            &self.dropped_during_turn,
+            &handle.session_id,
+        );
         self.agent_sessions
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
@@ -3272,18 +3349,40 @@ export_plugin_api! {{
     }
 
     pub fn agent_send(&self, session_id: &str, input: &str) -> Result<AgentReply, RuntimeError> {
+        // R1: 摘除与 inflight 标记在同一把锁下原子完成（规范锁序
+        // inflight → agent_sessions，见 `drop_session` / 收尾段）。并发
+        // 第二个 `agent_send` 要么看到 map 里的会话、要么看到 inflight
+        // 标记，不再有"已 remove 但未标记"的窗口，因此 in-flight 会话
+        // 不会再被误报成 `AgentSessionNotFound`，而是 `AgentSessionBusy`。
         let mut session = {
+            let mut inflight = self
+                .inflight_sessions
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
             let mut guard = self
                 .agent_sessions
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner());
-            guard
-                .remove(session_id)
-                .ok_or_else(|| RuntimeError::AgentSessionNotFound {
-                    session_id: session_id.to_string(),
-                })?
+            let Some(session) = guard.remove(session_id) else {
+                return if inflight.contains(session_id) {
+                    Err(RuntimeError::AgentSessionBusy {
+                        session_id: session_id.to_string(),
+                    })
+                } else {
+                    Err(RuntimeError::AgentSessionNotFound {
+                        session_id: session_id.to_string(),
+                    })
+                };
+            };
+            inflight.insert(session_id.to_string());
+            session
         };
-        let result = session.respond(self, input);
+        // R1: respond 期间可能 panic（agent 循环内的 assert、越界等）。
+        // 用 catch_unwind 包住：panic 也继续走收尾，会话数据不丢失，
+        // 返回值换成 Invariant 错误。
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            session.respond(self, input)
+        }));
         // P1-25: drain any pending actions queued by tools that couldn't
         // reach the session during `respond` (compact_context et al) and
         // apply them here, before reinserting into the map. Errors are
@@ -3308,15 +3407,38 @@ export_plugin_api! {{
                 }
             }
         }
-        // Auto-save on success for RuntimeShell sessions so that
-        // session context survives crashes and restarts.
-        if result.is_ok() && matches!(session.state, ManagedAgentState::RuntimeShell) {
-            self.auto_save_session(session_id, &session.session);
-        }
-        self.agent_sessions
+        // R1: 收尾。检查 dropped → auto_save → 插回 → 摘除 inflight 标记
+        // 全程持 inflight 锁，与 `drop_session` 的标记互斥：不会出现
+        // "drop 已执行、会话仍被复活并重写快照"的竞态。
+        let mut inflight = self
+            .inflight_sessions
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let dropped = self
+            .dropped_during_turn
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
-            .insert(session_id.to_string(), session);
+            .remove(session_id);
+        let result = match outcome {
+            Ok(result) => result,
+            Err(payload) => {
+                let err = agent_respond_panicked_error(&payload);
+                eprintln!("[agent-send] session {session_id} respond panicked: {err}");
+                Err(err)
+            }
+        };
+        if !dropped {
+            // Auto-save on success for RuntimeShell sessions so that
+            // session context survives crashes and restarts.
+            if result.is_ok() && matches!(session.state, ManagedAgentState::RuntimeShell) {
+                self.auto_save_session(session_id, &session.session);
+            }
+            self.agent_sessions
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .insert(session_id.to_string(), session);
+        }
+        inflight.remove(session_id);
         result
     }
 
@@ -4144,17 +4266,41 @@ export_plugin_api! {{
     }
 
     pub fn promote_candidate(&self) -> Result<ReloadReport, RuntimeError> {
+        self.promote_candidate_matching(None)
+    }
+
+    /// R3: promote 前校验 staged 候选的 snapshot_id 与迭代暂存时记录的一致。
+    /// `expected` 为 `None` 时不校验（REPL / 手动路径：promote 的就是当前
+    /// staged 那份，没有历史身份可比对）。校验在 take 的同一把锁内原子
+    /// 完成，候选被替换时既不取走也不 promote，只返回
+    /// `candidate_replaced_error`。`reload_candidate` 是公开 API、内核定时
+    /// 器自动迭代也可触发，Step 4 与 Step 7 之间候选可能被并发替换——
+    /// 不校验就会 promote 一份从未验证的快照。
+    fn promote_candidate_matching(
+        &self,
+        expected_candidate_snapshot_id: Option<&str>,
+    ) -> Result<ReloadReport, RuntimeError> {
         if self.candidate_snapshot().is_none() {
             return Err(RuntimeError::CandidateSnapshotMissing);
         }
         clear_plugin_iteration_journal(&self.snapshot_root)?;
         let previous_snapshot = self.current_snapshot();
-        let candidate = self
-            .candidate_snapshot
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .take()
-            .ok_or(RuntimeError::CandidateSnapshotMissing)?;
+        let candidate = {
+            let mut guard = self
+                .candidate_snapshot
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            let staged = guard
+                .as_ref()
+                .ok_or(RuntimeError::CandidateSnapshotMissing)?;
+            if let Some(expected) = expected_candidate_snapshot_id {
+                let actual = staged.snapshot.snapshot_id();
+                if actual != expected {
+                    return Err(candidate_replaced_error(expected, actual));
+                }
+            }
+            guard.take().ok_or(RuntimeError::CandidateSnapshotMissing)?
+        };
         let next_snapshot = candidate.snapshot;
         {
             let mut guard = self
@@ -4180,8 +4326,33 @@ export_plugin_api! {{
     }
 
     pub fn rollback_candidate(&self) -> Result<CandidateSnapshotStatus, RuntimeError> {
+        self.rollback_candidate_matching(None)
+    }
+
+    /// R3: 同 `promote_candidate_matching`——执行前校验 staged 候选身份，
+    /// 候选被替换时既不 restore 也不 take（不产生副作用），返回
+    /// `candidate_replaced_error`。
+    fn rollback_candidate_matching(
+        &self,
+        expected_candidate_snapshot_id: Option<&str>,
+    ) -> Result<CandidateSnapshotStatus, RuntimeError> {
         if self.candidate_snapshot().is_none() {
             return Err(RuntimeError::CandidateSnapshotMissing);
+        }
+        {
+            let guard = self
+                .candidate_snapshot
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            let staged = guard
+                .as_ref()
+                .ok_or(RuntimeError::CandidateSnapshotMissing)?;
+            if let Some(expected) = expected_candidate_snapshot_id {
+                let actual = staged.snapshot.snapshot_id();
+                if actual != expected {
+                    return Err(candidate_replaced_error(expected, actual));
+                }
+            }
         }
         restore_plugin_iteration_workspace(&self.fixtures_root, &self.snapshot_root, None)?;
         let candidate = self
@@ -4205,7 +4376,16 @@ export_plugin_api! {{
         iteration_id: &str,
     ) -> Result<KernelPluginIterationResult, RuntimeError> {
         let mut result = self.kernel.take_blocked_iteration(iteration_id)?;
-        let report = match self.promote_candidate() {
+        // R3: 校验 blocked 结果里记录的候选（暂存时的 snapshot_id）与当前
+        // staged 候选一致。`reload_candidate` 是公开 API 且内核定时器自动
+        // 迭代可触发，blocked 之后候选可能已被替换——approve 不得 promote
+        // 一份从未验证的快照。不一致时保留 blocked 条目并报错（promote 的
+        // Err 分支做插回），让操作者可以重试。
+        let expected_candidate_snapshot_id = result
+            .candidate
+            .as_ref()
+            .map(|candidate| candidate.candidate_snapshot_id.as_str());
+        let report = match self.promote_candidate_matching(expected_candidate_snapshot_id) {
             Ok(report) => report,
             Err(err) => {
                 self.kernel
@@ -4741,9 +4921,19 @@ export_plugin_api! {{
     /// there is nothing to roll back, otherwise the rollback `Result` mapped to
     /// `()`. Kept separate from `finalize_plugin_iteration` so the failure
     /// aggregation feeds off a plain `Option<Result<(), _>>`.
-    fn rollback_candidate_if_staged(&self) -> Option<Result<(), RuntimeError>> {
+    ///
+    /// R3: `expected_candidate_snapshot_id` 是迭代暂存时记录的身份；`Some`
+    /// 时回滚会校验 staged 候选未被并发替换，`None` 时不校验（回滚任何
+    /// 残留候选，用于"本迭代从未成功暂存、只想清场"的路径）。
+    fn rollback_candidate_if_staged(
+        &self,
+        expected_candidate_snapshot_id: Option<&str>,
+    ) -> Option<Result<(), RuntimeError>> {
         if self.candidate_snapshot().is_some() {
-            Some(self.rollback_candidate().map(|_| ()))
+            Some(
+                self.rollback_candidate_matching(expected_candidate_snapshot_id)
+                    .map(|_| ()),
+            )
         } else {
             None
         }
@@ -4753,8 +4943,15 @@ export_plugin_api! {{
         &self,
         state: &mut PluginIterationRunState,
     ) -> Result<PluginIterationFinalVerdict, RuntimeError> {
+        // R3: 本迭代 Step 4 暂存候选时记录的身份。promote / rollback 用它
+        // 校验 staged 候选没被并发 `reload_candidate` 替换；候选从未暂存
+        // （stage 失败）时为 None → 不校验（回滚路径仍清理任何残留候选）。
+        let staged_candidate_id = state
+            .candidate
+            .as_ref()
+            .map(|candidate| candidate.candidate_snapshot_id.as_str());
         if let Some(stage_error) = state.stage_error.clone() {
-            let candidate_rollback = self.rollback_candidate_if_staged();
+            let candidate_rollback = self.rollback_candidate_if_staged(staged_candidate_id);
             let workspace_restore = restore_plugin_iteration_workspace(
                 &self.fixtures_root,
                 &self.snapshot_root,
@@ -4825,10 +5022,10 @@ export_plugin_api! {{
             // for normal Err). Now: on promote failure, run rollback
             // + restore explicitly before propagating the promote
             // error so the workspace is clean.
-            match self.promote_candidate() {
+            match self.promote_candidate_matching(staged_candidate_id) {
                 Ok(_) => PluginIterationFinalVerdict::Promoted,
                 Err(err) => {
-                    let candidate_rollback = self.rollback_candidate_if_staged();
+                    let candidate_rollback = self.rollback_candidate_if_staged(staged_candidate_id);
                     let workspace_restore = restore_plugin_iteration_workspace(
                         &self.fixtures_root,
                         &self.snapshot_root,
@@ -4849,10 +5046,10 @@ export_plugin_api! {{
         {
             // When the user explicitly approves, allow promotion without canary evidence.
             // Same rollback-on-promote-failure guard as above.
-            match self.promote_candidate() {
+            match self.promote_candidate_matching(staged_candidate_id) {
                 Ok(_) => PluginIterationFinalVerdict::Promoted,
                 Err(err) => {
-                    let candidate_rollback = self.rollback_candidate_if_staged();
+                    let candidate_rollback = self.rollback_candidate_if_staged(staged_candidate_id);
                     let workspace_restore = restore_plugin_iteration_workspace(
                         &self.fixtures_root,
                         &self.snapshot_root,
@@ -4893,7 +5090,7 @@ export_plugin_api! {{
             // the error text is built by a single chained expression instead of
             // an `if`-inside-`if` whose inner arm needs its own gate.
             let candidate_error = self
-                .rollback_candidate_if_staged()
+                .rollback_candidate_if_staged(staged_candidate_id)
                 .and_then(|outcome| outcome.err())
                 .map(|err| verdict_rollback_partial_cleanup_reason(&err));
             let restored = restore_plugin_iteration_workspace(
@@ -5172,7 +5369,6 @@ export_plugin_api! {{
         // Weak-liveness sweep we now cap the retained count at
         // `MAX_RETIRED_SNAPSHOTS` and drop the oldest entries first, so a
         // pathologically long-lived pin can only leak a bounded prefix.
-        const MAX_RETIRED_SNAPSHOTS: usize = 64;
         let mut retired = self
             .retired_snapshots
             .lock()
@@ -5184,10 +5380,11 @@ export_plugin_api! {{
             let _ = fs::remove_dir_all(&entry.staged_artifact_root);
             false
         });
-        while retired.len() > MAX_RETIRED_SNAPSHOTS {
-            let dropped = retired.remove(0);
-            let _ = fs::remove_dir_all(&dropped.staged_artifact_root);
-        }
+        // R2: 上限驱逐交给具名函数（两臂各自直接单测）。关键语义：被
+        // in-flight 会话强 Arc pin 的活条目即使最旧也不删目录，只删已死
+        // 条目——删了 pin 住的目录，该快照上的 Process 插件 invoke 会
+        // 全部 spawn failed。
+        evict_retired_snapshots(&mut retired);
     }
 
     fn reload_candidate_internal(
@@ -5286,6 +5483,31 @@ export_plugin_api! {{
 impl Drop for RuntimeHost {
     fn drop(&mut self) {
         self.cleanup_live_snapshot();
+    }
+}
+
+/// 退休快照的保留上限。与 `plugin_history` / `invocation_samples` 的上限
+/// 一致，防止长期运行的 host 上 `retired_snapshots` 无界增长。
+const MAX_RETIRED_SNAPSHOTS: usize = 64;
+
+/// R2: 上限驱逐。从最旧条目开始：已死（Weak 无强引用，retain 之后才死的
+/// 竞态窗口）的删目录并移除；**活条目（被 in-flight 会话的强 Arc pin 住）
+/// 立即停止**——最旧 N 条全是活的就是 pin 造成的积压，保留并记一条诊断
+/// 日志，而不是删掉正在使用的快照目录（删了之后该快照上的 Process 插件
+/// invoke 会全部 spawn failed）。具名函数使"删死条目"与"活条目停止"两臂
+/// 都能被直接单测。
+fn evict_retired_snapshots(retired: &mut Vec<RetiredSnapshot>) {
+    while retired.len() > MAX_RETIRED_SNAPSHOTS {
+        let first = &retired[0];
+        if first.snapshot.upgrade().is_some() {
+            eprintln!(
+                "[snapshot-retire] {} retired snapshots pinned by live sessions; keeping backlog",
+                retired.len()
+            );
+            break;
+        }
+        let dropped = retired.remove(0);
+        let _ = fs::remove_dir_all(&dropped.staged_artifact_root);
     }
 }
 
@@ -5507,6 +5729,17 @@ impl ManagedAgentSession {
     }
 
     fn respond(&mut self, host: &RuntimeHost, input: &str) -> Result<AgentReply, RuntimeError> {
+        // R1 测试注入：模拟 respond 内部 panic（agent 循环内的 assert 等）。
+        // `agent_send` 用 catch_unwind 包住本函数，panic 也必须走完收尾、
+        // 会话不得丢失。
+        #[cfg(test)]
+        let respond_panic_injected =
+            TEST_AGENT_RESPOND_PANIC_INJECTION.swap(false, std::sync::atomic::Ordering::SeqCst);
+        #[cfg(test)]
+        assert!(
+            !respond_panic_injected,
+            "test panic injection: agent respond"
+        );
         // 无 provider 插件时两种 state 的结论相同（都只能报 NoLlmProvider），
         // 所以先统一判定，省掉两条各自的 None 分支。
         let Some(plugin_path) = host.llm_provider_plugin() else {
@@ -7942,10 +8175,13 @@ pub fn cleanup_orphaned_snapshot_roots(
         }
         // 最后一道闸门：非阻塞试 staging 锁。有进程正在这个 hash 目录里
         // staging（哪怕目录还空着、没有 pid 线索、mtime 也已被调老）就跳过。
-        if !snapshot_staging_lock::try_acquire_for_gc(&path) {
+        // 拿到锁后**持有到删除完成**（Guard drop 才释放）：`dir_size_bytes`
+        // 与 `remove_dir_all` 全程持锁，试锁→删除之间并发 boot 开始 staging
+        // 的窗口被彻底关闭（旧实现试锁即解锁，窗口只是缩小未关闭）。
+        let Some(_gc_guard) = snapshot_staging_lock::try_acquire_for_gc(&path) else {
             report.skipped_live += 1;
             continue;
-        }
+        };
 
         let bytes = dir_size_bytes(&path);
         if dry_run {
@@ -8139,16 +8375,22 @@ mod snapshot_staging_lock {
         Guard { file: None }
     }
 
-    /// GC 侧：非阻塞试锁。`true` = 拿到了（无人 staging，可安全回收），
-    /// `false` = 有人持锁或开不了锁文件 → 跳过。
+    /// GC 侧：非阻塞试锁。`Some(Guard)` = 拿到了（无人 staging，可安全
+    /// 回收），返回的 Guard 持有 flock 直到 drop；`None` = 有人持锁或开不了
+    /// 锁文件 → 跳过。
+    ///
+    /// 旧实现 `inspect` 里立即解锁、只把锁当探针用，试锁→解锁→删除之间
+    /// 仍会被并发 boot 插进一个 staging 窗口（CI 实测过 GC 删掉对方刚
+    /// mkdir 的目录）。现在把持有锁的 Guard 交出去，由调用方持锁跨越
+    /// `dir_size_bytes` 与 `remove_dir_all` 全程，删除完成后 Guard drop 才
+    /// 释放。同进程 boot 的 `hold` 非阻塞试锁失败时本就退化为 mtime-only
+    /// 行为，不会死锁。
     #[cfg(unix)]
-    pub fn try_acquire_for_gc(hash_dir: &Path) -> bool {
+    pub fn try_acquire_for_gc(hash_dir: &Path) -> Option<Guard> {
         // 同 `hold`：单表达式，无 in-situ 不可达的 `return` 行。
-        // `inspect` 里立即解锁——调用方随后 remove_dir_all，不需要一直持有。
         open_lock_file(&lock_path(hash_dir))
             .filter(|file| flock_succeeded(try_lock_exclusive_nb(file)))
-            .inspect(unlock)
-            .is_some()
+            .map(|file| Guard { file: Some(file) })
     }
 
     #[cfg(unix)]
@@ -8159,8 +8401,8 @@ mod snapshot_staging_lock {
     }
 
     #[cfg(not(unix))]
-    pub fn try_acquire_for_gc(_hash_dir: &Path) -> bool {
-        true
+    pub fn try_acquire_for_gc(_hash_dir: &Path) -> Option<Guard> {
+        Some(Guard { file: None })
     }
 
     impl Drop for Guard {
@@ -8408,6 +8650,32 @@ fn plugin_iteration_panic_error(payload: &Box<dyn std::any::Any + Send>) -> Runt
     RuntimeError::Invariant {
         message: format!(
             "plugin iteration panicked at an unexpected point; workspace has been restored: {msg}"
+        ),
+    }
+}
+
+/// R1: `agent_send` 把 respond 的 panic 还原为 Err 时的错误。panic 载荷是
+/// `Box<dyn Any>`，提取为具名函数以固定文本并直接单测（含 `&str` 与
+/// `String` 两种常见载荷）。
+fn agent_respond_panicked_error(payload: &Box<dyn std::any::Any + Send>) -> RuntimeError {
+    let msg = payload
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "unknown panic payload".to_string());
+    RuntimeError::Invariant {
+        message: format!("agent respond panicked: {msg}"),
+    }
+}
+
+/// R3: 候选快照在暂存（Step 4 reload_candidate）与 promote/rollback/approve
+/// 之间被并发替换时的错误。`expected` 是迭代暂存时记录的 snapshot_id，
+/// `actual` 是当前 staged 条目的。文本风格与 `Invariant` 一致；具名函数
+/// 便于逐字节单测。
+fn candidate_replaced_error(expected: &str, actual: &str) -> RuntimeError {
+    RuntimeError::Invariant {
+        message: format!(
+            "candidate snapshot replaced during plugin iteration: expected {expected}, got {actual}"
         ),
     }
 }
@@ -8781,11 +9049,44 @@ mod tests {
         fs::create_dir(&dir).expect("create dir");
 
         let _first = snapshot_staging_lock::hold(&dir);
-        // 第一把锁仍在，GC 试锁必须失败。
-        assert!(!snapshot_staging_lock::try_acquire_for_gc(&dir));
+        // 第一把锁仍在，GC 试锁必须失败（拿不到 Guard）。
+        assert!(snapshot_staging_lock::try_acquire_for_gc(&dir).is_none());
         drop(_first);
-        // 释放后可拿到。
-        assert!(snapshot_staging_lock::try_acquire_for_gc(&dir));
+        // 释放后可拿到（Guard 随即 drop 释放）。
+        assert!(snapshot_staging_lock::try_acquire_for_gc(&dir).is_some());
+    }
+
+    /// R8: GC Guard 持有 flock 直到 drop。持锁期间用锁文件路径直接 flock
+    /// 验证并发 hold 无法取锁；Guard drop 后同一 fd 立刻可取。这正是
+    /// "试锁→解锁→删除"窗口被关闭的机制——旧实现试锁即解锁，删除前并发
+    /// boot 可以插进 staging。
+    #[cfg(unix)]
+    #[test]
+    fn gc_guard_holds_lock_until_dropped() {
+        use std::os::unix::io::AsRawFd;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dir = temp.path().join("hash");
+        fs::create_dir(&dir).expect("create dir");
+
+        let gc_guard = snapshot_staging_lock::try_acquire_for_gc(&dir).expect("gc acquires lock");
+        let lock_path = snapshot_staging_lock::lock_path(&dir);
+        let probe = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .expect("open lock file");
+        // SAFETY: fd 由 `probe` 拥有，跨 syscall 存活。
+        let held_rc = unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        assert_ne!(
+            held_rc, 0,
+            "a concurrent flock must fail while the GC guard holds the lock"
+        );
+        drop(gc_guard);
+        // SAFETY: 同上。
+        let released_rc = unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        assert_eq!(released_rc, 0, "once the guard drops, the lock is released");
+        // SAFETY: 释放探测 fd 上的锁，避免影响后续测试。
+        let _ = unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_UN) };
     }
 
     /// staging 锁挡住 GC：即便判据全中（无活 pid、mtime 已过期、无 journal），
@@ -9967,15 +10268,18 @@ mod seam_extraction_tests {
 #[cfg(test)]
 mod ffi_panic_seam_tests {
     use super::{
-        plugin_iteration_journal_path, RuntimeHost, TEST_ITERATION_ENOSPC_INJECTION,
-        TEST_ITERATION_PANIC_INJECTION, TEST_STOP_HANDLER_PANIC_INJECTION,
+        plugin_iteration_journal_path, RuntimeHost, TEST_AGENT_RESPOND_PANIC_INJECTION,
+        TEST_ITERATION_ENOSPC_INJECTION, TEST_ITERATION_PANIC_INJECTION,
+        TEST_STOP_HANDLER_PANIC_INJECTION,
     };
+    use crate::core::error::RuntimeError;
     use crate::kernel::plugin_iteration::{
         KernelPluginIssueSource, KernelPluginIterationRequest, PluginIterationFinalVerdict,
     };
     use cordis_plugin_sdk::{AbiFingerprint, NodeDoc, NodeType, PluginDocs};
     use serde_json::json;
     use serial_test::serial;
+    use std::collections::BTreeSet;
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::Ordering::SeqCst;
@@ -10339,6 +10643,31 @@ mod ffi_panic_seam_tests {
         );
     }
 
+    // ── R9: blocked_iterations 有上限：第 65 条 Blocked 淘汰最旧一条 ──
+    #[test]
+    #[serial]
+    fn blocked_iterations_capped_at_max_evicts_oldest() {
+        let (_temp, fixtures) = setup_empty_fixture();
+        let host = RuntimeHost::boot(&fixtures).expect("host should boot on empty index");
+
+        // `synthetic_result` 的 final_verdict 是 Blocked，且 iteration_id 每
+        // 次唯一 → 反复插入会无界增长；上限 64 条，插 65 条必须淘汰最旧。
+        for i in 0..65u32 {
+            host.kernel
+                .record_plugin_iteration_outcome(&synthetic_result(&format!("iter-{i:03}")));
+        }
+        let blocked = host.kernel.blocked_iterations();
+        assert_eq!(blocked.len(), 64, "blocked must be capped at the bound");
+        assert!(
+            !blocked.iter().any(|entry| entry.iteration_id == "iter-000"),
+            "the oldest blocked entry must be evicted"
+        );
+        assert!(
+            blocked.iter().any(|entry| entry.iteration_id == "iter-064"),
+            "the newest blocked entry must be retained"
+        );
+    }
+
     fn synthetic_result(iteration_id: &str) -> crate::host::KernelPluginIterationResult {
         crate::host::KernelPluginIterationResult {
             iteration_id: iteration_id.to_string(),
@@ -10401,6 +10730,88 @@ mod ffi_panic_seam_tests {
             host.agent_sessions_mut().contains_key(&handle.session_id),
             "session must be reinserted after draining pending actions"
         );
+    }
+
+    // ── R1: respond panic 收尾仍把会话插回（不再永久丢失）──────────────
+    #[test]
+    #[serial]
+    fn agent_send_respond_panic_preserves_session_and_returns_invariant() {
+        let (_temp, fixtures) = setup_empty_fixture();
+        let host = RuntimeHost::boot(&fixtures).expect("host should boot on empty index");
+        let handle = host
+            .agent_start(crate::host::AgentSessionKind::RuntimeShell)
+            .expect("start a runtime-shell session");
+        let sid = handle.session_id.clone();
+
+        // 注入：下一次 respond 直接 panic（等价于 agent 循环内 assert 炸掉）。
+        TEST_AGENT_RESPOND_PANIC_INJECTION.store(true, std::sync::atomic::Ordering::SeqCst);
+        let err = host
+            .agent_send(&sid, "hello")
+            .expect_err("a respond panic must surface as Err, not unwind");
+        let text = err.to_string();
+        assert!(
+            text.contains("agent respond panicked"),
+            "error must name the panicked respond: {text}"
+        );
+        assert!(
+            text.contains("test panic injection: agent respond"),
+            "error must carry the injected panic text: {text}"
+        );
+        // 标记被消费且只消费一次。
+        assert!(
+            !TEST_AGENT_RESPOND_PANIC_INJECTION.load(std::sync::atomic::Ordering::SeqCst),
+            "injection flag must reset after firing"
+        );
+
+        // 会话没有随 panic 丢失：收尾把它插回了 map。
+        assert!(
+            host.agent_status(&sid).is_ok(),
+            "session must survive a respond panic"
+        );
+        // 且仍可继续使用：第二次 send 走正常路径（空 fixtures 无 provider
+        // 插件 → NoLlmProvider，是普通 Err 而不是 panic）。
+        let err2 = host
+            .agent_send(&sid, "again")
+            .expect_err("second send runs the normal path");
+        assert!(
+            matches!(err2, RuntimeError::NoLlmProvider),
+            "unexpected second-send error: {err2:?}"
+        );
+    }
+
+    /// `agent_respond_panicked_error` 的文本：三种 panic 载荷（&str、String、
+    /// 其它）各给稳定、可读的错误信息。
+    #[test]
+    fn agent_respond_panicked_error_formats_all_payload_kinds() {
+        let str_payload: Box<dyn std::any::Any + Send> = Box::new("boom");
+        let from_str = super::agent_respond_panicked_error(&str_payload);
+        assert_eq!(
+            from_str.to_string(),
+            "internal invariant broken: agent respond panicked: boom"
+        );
+        let string_payload: Box<dyn std::any::Any + Send> = Box::new("boom".to_string());
+        let from_string = super::agent_respond_panicked_error(&string_payload);
+        assert_eq!(
+            from_string.to_string(),
+            "internal invariant broken: agent respond panicked: boom"
+        );
+        let other_payload: Box<dyn std::any::Any + Send> = Box::new(42_u32);
+        let from_other = super::agent_respond_panicked_error(&other_payload);
+        assert_eq!(
+            from_other.to_string(),
+            "internal invariant broken: agent respond panicked: unknown panic payload"
+        );
+    }
+
+    /// `mark_dropped_if_inflight` 的两臂：in-flight 时标记，否则不动。
+    #[test]
+    fn mark_dropped_if_inflight_marks_only_inflight_ids() {
+        let inflight = std::sync::Mutex::new(BTreeSet::from(["s1".to_string()]));
+        let dropped = std::sync::Mutex::new(BTreeSet::new());
+        super::mark_dropped_if_inflight(&inflight, &dropped, "s1");
+        assert!(dropped.lock().unwrap().contains("s1"));
+        super::mark_dropped_if_inflight(&inflight, &dropped, "s2");
+        assert!(!dropped.lock().unwrap().contains("s2"));
     }
 
     // ── C-seam #1: iterate_plugins emergency-rollback arm ────────────────
@@ -12913,7 +13324,7 @@ mod region_3500_5500_seam_tests {
     #[serial]
     fn rollback_candidate_if_staged_is_none_without_candidate() {
         let (_temp, host) = empty_host();
-        assert!(host.rollback_candidate_if_staged().is_none());
+        assert!(host.rollback_candidate_if_staged(None).is_none());
     }
 
     // ─────────────── PluginIterationAgentBackend methods ─────────────────
@@ -13491,14 +13902,15 @@ mod region_3500_5500_seam_tests {
             .contains("candidate replay response diverged from current response"));
     }
 
-    // ─────────── cleanup_retired_snapshots live-cap prefix drop ──────────
+    // ─────────── R2: cleanup_retired_snapshots pinned-snapshot eviction ──
 
+    /// R2: 上限驱逐不得删被 pin 的活条目。Hold >64 LIVE Arcs（模拟
+    /// in-flight 会话 pin 住旧快照）——Weak-liveness retain 全保留，上限
+    /// 循环看到最旧条目仍活着就停止，**不删任何目录**，积压保留。
     #[test]
     #[serial]
-    fn cleanup_retired_snapshots_caps_live_prefix_at_max() {
+    fn cleanup_retired_snapshots_keeps_pinned_backlog_beyond_max() {
         let (temp, host) = empty_host();
-        // Hold >64 LIVE Arcs so the Weak-liveness retain keeps them all, then
-        // the `while len > MAX_RETIRED_SNAPSHOTS` loop drops the oldest prefix.
         let mut live: Vec<Arc<super::RuntimeSnapshot>> = Vec::new();
         let mut dirs = Vec::new();
         {
@@ -13525,13 +13937,96 @@ mod region_3500_5500_seam_tests {
             .unwrap_or_else(|p| p.into_inner())
             .len();
         assert_eq!(
-            remaining, 64,
-            "live entries capped at MAX_RETIRED_SNAPSHOTS"
+            remaining, 70,
+            "pinned entries are kept even beyond MAX_RETIRED_SNAPSHOTS"
         );
-        // The 6 oldest prefix dirs were removed by the cap loop.
-        assert!(!dirs[0].exists(), "oldest live-cap prefix dir removed");
-        assert!(dirs[69].exists(), "newest live entry's dir retained");
+        // 旧行为会删掉最旧 6 条的目录（→ 被 pin 快照上的 Process 插件
+        // invoke spawn failed）；现在一条都不能删。
+        assert!(dirs[0].exists(), "oldest pinned entry's dir must survive");
+        assert!(dirs[69].exists(), "newest pinned entry's dir retained");
         drop(live);
+    }
+
+    /// R2: 混合场景——未 pin 的照删（retain 扫掉并删目录），pin 住的超过
+    /// 上限也保留。构造 70 个 pinned + 10 个 dead（Weak::new，从未有强
+    /// 引用）的条目。
+    #[test]
+    #[serial]
+    fn cleanup_retired_snapshots_removes_dead_and_keeps_pinned() {
+        let (temp, host) = empty_host();
+        let mut live: Vec<Arc<super::RuntimeSnapshot>> = Vec::new();
+        let mut pinned_dirs = Vec::new();
+        let mut dead_dirs = Vec::new();
+        {
+            let mut guard = host
+                .retired_snapshots
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            for i in 0..70 {
+                let snap = host.current_snapshot();
+                let dir = temp.path().join(format!("pinned-{i}"));
+                fs::create_dir_all(&dir).expect("mk pinned dir");
+                pinned_dirs.push(dir.clone());
+                guard.push(RetiredSnapshot {
+                    snapshot: Arc::downgrade(&snap),
+                    staged_artifact_root: dir,
+                });
+                live.push(snap);
+            }
+            for i in 0..10 {
+                let dir = temp.path().join(format!("dead-{i}"));
+                fs::create_dir_all(&dir).expect("mk dead dir");
+                dead_dirs.push(dir.clone());
+                guard.push(RetiredSnapshot {
+                    snapshot: std::sync::Weak::<super::RuntimeSnapshot>::new(),
+                    staged_artifact_root: dir,
+                });
+            }
+        }
+        host.cleanup_retired_snapshots();
+        let remaining = host
+            .retired_snapshots
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .len();
+        // 10 条 dead 被 retain 扫掉；70 条 pinned 全保留（超上限也不驱逐）。
+        assert_eq!(remaining, 70, "only dead entries are swept");
+        for dir in &pinned_dirs {
+            assert!(dir.exists(), "pinned entry's dir must survive: {dir:?}");
+        }
+        for dir in &dead_dirs {
+            assert!(!dir.exists(), "dead entry's dir must be removed: {dir:?}");
+        }
+        drop(live);
+    }
+
+    /// `evict_retired_snapshots` 的"删死条目"臂：最旧条目在 retain 之后才
+    /// 死（竞态窗口）时，上限循环必须删它的目录。retain 已把所有 dead
+    /// 扫掉，这个臂只能经纯函数直测。
+    #[test]
+    #[serial]
+    fn evict_retired_snapshots_removes_dead_prefix_entries() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut retired: Vec<RetiredSnapshot> = Vec::new();
+        // 第一条是死的：上限循环先删它，然后撞上活条目停止。
+        let dead_dir = temp.path().join("dead-0");
+        fs::create_dir_all(&dead_dir).expect("mk dead dir");
+        retired.push(RetiredSnapshot {
+            snapshot: std::sync::Weak::<super::RuntimeSnapshot>::new(),
+            staged_artifact_root: dead_dir.clone(),
+        });
+        for i in 1..65 {
+            let dir = temp.path().join(format!("live-{i}"));
+            fs::create_dir_all(&dir).expect("mk live dir");
+            retired.push(RetiredSnapshot {
+                snapshot: std::sync::Weak::<super::RuntimeSnapshot>::new(),
+                staged_artifact_root: dir,
+            });
+        }
+        // 65 条（1 dead + 64 live）> 64：删掉 dead 后恰好回到上限。
+        super::evict_retired_snapshots(&mut retired);
+        assert_eq!(retired.len(), 64);
+        assert!(!dead_dir.exists(), "the dead prefix entry's dir is removed");
     }
 
     // ─────────── finalize promote-failure arms (Pass/Pass) ───────────────
@@ -13901,6 +14396,112 @@ mod region_3500_5500_seam_tests {
             .expect("pass/pass promote succeeds");
         assert_eq!(verdict, PluginIterationFinalVerdict::Promoted);
         assert!(host.candidate_snapshot().is_none());
+    }
+
+    // ─────────── R3: promote/rollback/approve 候选身份校验 ──────────────
+
+    /// `candidate_replaced_error` 的文本逐字节稳定。
+    #[test]
+    fn candidate_replaced_error_text_is_stable() {
+        let err = super::candidate_replaced_error("snap-a", "snap-b");
+        assert_eq!(
+            err.to_string(),
+            "internal invariant broken: candidate snapshot replaced during plugin \
+             iteration: expected snap-a, got snap-b"
+        );
+    }
+
+    /// R3: 候选在暂存后（Step 4 与 Step 7 之间）被并发 `reload_candidate`
+    /// 替换时，promote 必须拒绝且**不取走**新候选、不 promote。
+    #[test]
+    #[serial]
+    fn promote_candidate_rejects_replaced_candidate() {
+        let (_temp, host) = empty_host();
+        let first = host.reload_candidate().expect("stage candidate #1");
+        let second = host.reload_candidate().expect("replace candidate #2");
+        assert_ne!(
+            first.candidate_snapshot_id, second.candidate_snapshot_id,
+            "two reloads must produce distinct snapshot ids"
+        );
+
+        let err = host
+            .promote_candidate_matching(Some(&first.candidate_snapshot_id))
+            .expect_err("a replaced candidate must be rejected");
+        let text = err.to_string();
+        assert!(
+            text.contains("candidate snapshot replaced during plugin iteration"),
+            "unexpected error: {text}"
+        );
+        assert!(
+            text.contains(first.candidate_snapshot_id.as_str()),
+            "error must name the expected snapshot: {text}"
+        );
+        assert!(
+            text.contains(second.candidate_snapshot_id.as_str()),
+            "error must name the actual staged snapshot: {text}"
+        );
+        // 未 promote：新候选仍在，current 未变。
+        assert!(
+            host.candidate_snapshot().is_some(),
+            "candidate must stay staged"
+        );
+        assert_eq!(
+            host.current_snapshot().snapshot_id(),
+            second.from_snapshot_id,
+            "current snapshot must be untouched"
+        );
+    }
+
+    /// R3: rollback 同样拒绝被替换的候选——不 restore、不 retire。
+    #[test]
+    #[serial]
+    fn rollback_candidate_rejects_replaced_candidate() {
+        let (_temp, host) = empty_host();
+        let first = host.reload_candidate().expect("stage candidate #1");
+        let _second = host.reload_candidate().expect("replace candidate #2");
+
+        let err = host
+            .rollback_candidate_matching(Some(&first.candidate_snapshot_id))
+            .expect_err("a replaced candidate must be rejected");
+        assert!(
+            err.to_string()
+                .contains("candidate snapshot replaced during plugin iteration"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            host.candidate_snapshot().is_some(),
+            "candidate must stay staged"
+        );
+    }
+
+    /// R3: finalize 的 Pass/Pass promote 路径把 Step 4 记录的身份传下去——
+    /// 候选被替换时 finalize 返回 Err 且候选仍 staged。
+    #[test]
+    #[serial]
+    fn finalize_rejects_promote_of_replaced_candidate() {
+        let (_temp, host) = empty_host();
+        let first = host.reload_candidate().expect("stage candidate #1");
+        host.reload_candidate().expect("replace candidate #2");
+        let mut state = PluginIterationRunState::new(prepared_for("", &[]));
+        // Step 4 记录的候选是 first；当前 staged 已被替换成 second。
+        state.candidate = Some(first);
+        state.verifier_verdict = Some(VerifierVerdict::Pass);
+        state.canary = Some(crate::kernel::plugin_iteration::CanaryReport {
+            verdict: CanaryVerdict::Pass,
+            mode: "recent_successful_invocation_replay".to_string(),
+            plugin_path: Some("x".to_string()),
+            node_id: Some("n".to_string()),
+            payload: Some(json!({})),
+            expected_response: Some(json!({ "ok": true })),
+            actual_response: Some(json!({ "ok": true })),
+            message: "match".to_string(),
+        });
+        let out = host.finalize_plugin_iteration(&mut state);
+        assert!(out.is_err(), "promote of a replaced candidate must fail");
+        assert!(
+            host.candidate_snapshot().is_some(),
+            "the (replaced) candidate must remain staged"
+        );
     }
 
     // ─────────── reload retire-candidate + double reload_candidate ───────

@@ -975,6 +975,91 @@ fn rebuild_plugin_workspace_unknown_plugin_errors() {
     assert!(matches!(err, Err(RuntimeError::InvalidArgument { .. })));
 }
 
+#[test]
+#[serial_test::serial]
+fn rebuild_plugin_workspace_reclaims_stale_lock_before_building() {
+    let temp = dylib_plugin_fixtures("demo", "demo");
+    let target = scoped_target_dir(&temp);
+    let _guard = TargetDirGuard::set(&target);
+
+    prepare_artifacts(temp.path(), PrepareMode::Full).expect("seed index");
+
+    // Plant a lock owned by a dead pid at the shared lock path the named
+    // rebuild is expected to use (BUILD_LOCK_FILE in tooling.rs). If
+    // rebuild_plugin_workspace goes through ArtifactBuildLock::acquire it
+    // reclaims the stale lock and re-creates it with our pid; if the rebuild
+    // path never touched the lock, the planted file would survive untouched.
+    let lock_path = temp.path().join(".artifacts-build.lock");
+    let dead_pid = u32::MAX - 1;
+    let stale = serde_json::json!({ "pid": dead_pid, "created_at_ms": 0u64 });
+    fs::write(&lock_path, serde_json::to_vec(&stale).unwrap()).unwrap();
+
+    let built = rebuild_plugin_workspace(temp.path(), "/demo").expect("named rebuild");
+    assert_eq!(built.len(), 1);
+    assert_eq!(built[0].0, "demo");
+    let leftover = fs::read_to_string(&lock_path).unwrap_or_default();
+    assert!(
+        !lock_path.exists(),
+        "acquire must reclaim the stale lock and Drop must remove our own (leftover: {leftover:?})"
+    );
+}
+
+#[test]
+#[serial_test::serial]
+fn rebuild_plugin_workspace_holds_build_lock_while_building() {
+    use std::thread;
+    use std::time::{Duration, Instant};
+    let temp = dylib_plugin_fixtures("demo", "demo");
+    let target = scoped_target_dir(&temp);
+    let _guard = TargetDirGuard::set(&target);
+
+    prepare_artifacts(temp.path(), PrepareMode::Full).expect("seed index");
+
+    // Touch the source so the named rebuild recompiles and the lock is held
+    // for a measurable window while we probe it from this thread.
+    let lib = temp.path().join("plugins/demo/src/lib.rs");
+    let mut src = fs::read_to_string(&lib).unwrap();
+    src.push_str("\n// touch to invalidate fingerprint\n");
+    fs::write(&lib, src).unwrap();
+
+    let lock_path = temp.path().join(".artifacts-build.lock");
+    let worker_root = temp.path().to_path_buf();
+    let handle = thread::spawn(move || {
+        rebuild_plugin_workspace(&worker_root, "/demo").expect("named rebuild")
+    });
+
+    // R7: while the rebuild runs, the shared ArtifactBuildLock file must exist
+    // and record *our* pid (acquired at entry, held until the function
+    // returns). Poll until it appears, then assert ownership.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let observed = loop {
+        let parsed = fs::read_to_string(&lock_path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok());
+        if let Some(state) = parsed {
+            break state;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "rebuild never surfaced the build lock file"
+        );
+        thread::sleep(Duration::from_millis(1));
+    };
+    assert_eq!(
+        observed["pid"].as_u64(),
+        Some(std::process::id() as u64),
+        "rebuild must hold the lock with our pid while building"
+    );
+
+    let built = handle.join().expect("rebuild thread panicked");
+    assert_eq!(built.len(), 1);
+    assert_eq!(built[0].0, "demo");
+    assert!(
+        !lock_path.exists(),
+        "lock must be released (file removed) after the rebuild returns"
+    );
+}
+
 /// Fixtures with a workspace-member parent dylib plugin and a *non*-member
 /// child dylib plugin (the child carries its own `[workspace]` marker, so
 /// `DependencySnapshot::is_workspace_member` returns false for it). This routes

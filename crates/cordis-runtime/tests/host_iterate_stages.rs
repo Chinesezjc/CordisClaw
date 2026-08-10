@@ -693,3 +693,64 @@ fn approve_blocked_iteration_reinserts_the_result_when_promote_fails() {
     assert!(host.kernel().blocked_iterations().is_empty());
     assert!(host.candidate_snapshot().is_none());
 }
+
+// ---------------------------------------------------------------------------
+// approve_blocked_iteration — 候选被并发替换时拒绝（R3）
+// ---------------------------------------------------------------------------
+
+// Blocked 之后、approve 之前，候选可能被公开 API `reload_candidate` 或内核
+// 定时器自动迭代替换。approve 必须校验 blocked 结果里记录的 candidate 与
+// 当前 staged 候选一致，否则会 promote 一份从未验证的快照：不一致时保留
+// blocked 条目并报错，不 promote。
+#[serial]
+#[test]
+fn approve_blocked_iteration_rejects_replaced_candidate() {
+    let workspace = setup_workspace("demo_echo", Responder::Absolute);
+    let host = boot(&workspace);
+
+    let result = host
+        .iterate_plugins(request_with(manifest_touch_plan(&workspace, "blocked")))
+        .expect("iteration completes");
+    assert_eq!(
+        result.final_verdict,
+        PluginIterationFinalVerdict::Blocked,
+        "the no-canary-evidence path must Block so a candidate stays staged"
+    );
+    assert_eq!(host.kernel().blocked_iterations().len(), 1);
+    let staged_before = host.candidate_status().expect("candidate staged");
+    assert_eq!(
+        result
+            .candidate
+            .as_ref()
+            .map(|c| c.candidate_snapshot_id.as_str()),
+        Some(staged_before.candidate_snapshot_id.as_str()),
+        "the blocked result must record the staged candidate's identity"
+    );
+
+    // 模拟两步之间的并发替换：公开 API 直接再 reload 一份新候选。
+    host.reload_candidate().expect("replace the candidate");
+    let staged_after = host.candidate_status().expect("replacement staged");
+    assert_ne!(
+        staged_before.candidate_snapshot_id, staged_after.candidate_snapshot_id,
+        "a replacement reload must produce a distinct snapshot id"
+    );
+
+    let err = host
+        .approve_blocked_iteration(&result.iteration_id)
+        .expect_err("approving a replaced candidate must be rejected");
+    assert!(
+        err.to_string()
+            .contains("candidate snapshot replaced during plugin iteration"),
+        "unexpected error: {err}"
+    );
+    // blocked 条目保留（可重试），被替换的候选仍 staged，未 promote。
+    assert_eq!(
+        host.kernel().blocked_iterations().len(),
+        1,
+        "a rejected approve must keep the blocked iteration"
+    );
+    assert!(
+        host.candidate_snapshot().is_some(),
+        "the replacement candidate must remain staged"
+    );
+}
