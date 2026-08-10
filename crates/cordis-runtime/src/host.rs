@@ -3898,6 +3898,61 @@ export_plugin_api! {{
         (err, Box::new(attempt))
     }
 
+    /// Stop a plugin's background services and Task-node stop handlers during
+    /// reload. Runs only after Phase-1 validation of ALL targets has succeeded,
+    /// so a validation failure never touches running plugins (L8). Exactly one
+    /// stop pass per target.
+    ///
+    /// P1-19: a plugin's stop handler runs inside the plugin's own dylib; a
+    /// panic there would unwind across the FFI boundary (UB in the general
+    /// case). Each invocation is wrapped in `catch_unwind` so a broken stop
+    /// handler cannot crash the whole reload path.
+    fn stop_plugin_for_reload(&self, plugin_path: &str) {
+        self.service_registry
+            .stop_plugin_services_timed(plugin_path);
+        // Also invoke stop action for Task nodes (plugins that don't implement
+        // the Service trait call stop via node invocation).
+        let snapshot = self.current_snapshot();
+        let node_prefix = format!("{}::", plugin_path);
+        let task_fqns = snapshot.node_registry().task_node_fqns();
+        // The prefix match and the `plugin_id::node_id` split are both
+        // expressed as iterator adapters rather than nested `if`s: every
+        // fqn that reaches the body is a Task node of this plugin and is
+        // guaranteed to carry a `::`, so there is no gate whose untaken
+        // side is structurally unreachable.
+        for (plugin_id, node_id) in task_fqns
+            .iter()
+            .filter(|fqn| fqn.starts_with(&node_prefix))
+            .filter_map(|fqn| fqn.split_once("::"))
+        {
+            let payload = serde_json::json!({"action": "stop"}).to_string();
+            let this = self;
+            let fqn = format!("{plugin_id}::{node_id}");
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                #[cfg(test)]
+                if TEST_STOP_HANDLER_PANIC_INJECTION
+                    .swap(false, std::sync::atomic::Ordering::SeqCst)
+                {
+                    panic!("test panic injection: stop handler");
+                }
+                // 检查 stop 的返回值：handler 报 ok=false 或 invoke 出错时
+                // 给出诊断，而不是静默丢弃。
+                let outcome = this.invoke(plugin_id, node_id, payload);
+                if let Some(diag) = stop_result_diagnostic(&fqn, &outcome) {
+                    eprintln!("{diag}");
+                }
+            }));
+            if let Err(err) = result {
+                let msg = reload_stop_handler_panic_message(err.as_ref());
+                eprintln!("[reload] stop handler for {plugin_id}::{node_id} panicked: {msg}");
+            }
+        }
+        // P0-16: drop the keep-alive dylib handle for this plugin path so the
+        // OS can unmap the old .so once the new one is loaded. Without this,
+        // every reload leaks a mapping.
+        crate::plugin::invoke::unregister_task_library(plugin_path);
+    }
+
     fn reload_subtree(
         &self,
         prefix: &str,
@@ -4045,55 +4100,7 @@ export_plugin_api! {{
         // plugins. Exactly one stop pass (the Phase-2 loop used to stop again,
         // which was harmless but redundant).
         for plugin_path in &targets {
-            self.service_registry
-                .stop_plugin_services_timed(plugin_path);
-            // Also invoke stop action for Task nodes (plugins that don't
-            // implement the Service trait call stop via node invocation).
-            //
-            // P1-19: a plugin's stop handler runs inside the plugin's own
-            // dylib; a panic there would unwind across the FFI boundary
-            // (UB in the general case). Wrap each invocation in
-            // catch_unwind so a broken stop handler cannot crash the whole
-            // reload path.
-            let snapshot = self.current_snapshot();
-            let node_prefix = format!("{}::", plugin_path);
-            let task_fqns = snapshot.node_registry().task_node_fqns();
-            // The prefix match and the `plugin_id::node_id` split are both
-            // expressed as iterator adapters rather than nested `if`s: every
-            // fqn that reaches the body is a Task node of this plugin and is
-            // guaranteed to carry a `::`, so there is no gate whose untaken
-            // side is structurally unreachable.
-            for (plugin_id, node_id) in task_fqns
-                .iter()
-                .filter(|fqn| fqn.starts_with(&node_prefix))
-                .filter_map(|fqn| fqn.split_once("::"))
-            {
-                let payload = serde_json::json!({"action": "stop"}).to_string();
-                let this = self;
-                let fqn = format!("{plugin_id}::{node_id}");
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    #[cfg(test)]
-                    if TEST_STOP_HANDLER_PANIC_INJECTION
-                        .swap(false, std::sync::atomic::Ordering::SeqCst)
-                    {
-                        panic!("test panic injection: stop handler");
-                    }
-                    // 检查 stop 的返回值：handler 报 ok=false 或 invoke 出错时
-                    // 给出诊断，而不是静默丢弃。
-                    let outcome = this.invoke(plugin_id, node_id, payload);
-                    if let Some(diag) = stop_result_diagnostic(&fqn, &outcome) {
-                        eprintln!("{diag}");
-                    }
-                }));
-                if let Err(err) = result {
-                    let msg = reload_stop_handler_panic_message(err.as_ref());
-                    eprintln!("[reload] stop handler for {plugin_id}::{node_id} panicked: {msg}");
-                }
-            }
-            // P0-16: drop the keep-alive dylib handle for this plugin path
-            // so the OS can unmap the old .so once the new one is loaded.
-            // Without this, every reload leaks a mapping.
-            crate::plugin::invoke::unregister_task_library(plugin_path);
+            self.stop_plugin_for_reload(plugin_path);
         }
 
         // ── Phase 2: update registry ───────────
@@ -10931,23 +10938,31 @@ mod ffi_panic_seam_tests {
         );
         drop(snapshot);
 
-        // Arm the stop-handler injection and reload the svc subtree. The panic
-        // fires inside the per-node stop `catch_unwind`; the guard must catch
-        // it and let the reload continue. (Phase 1 then dlopens the JSON
-        // artifact and fails — an expected, caught Err — proving the reload
-        // path kept running past the panic instead of unwinding the thread.)
+        // L8: `reload_subtree` runs the stop loop only AFTER Phase-1 validation
+        // of every target succeeds. A JSON artifact fails that dlopen, so the
+        // reload returns Err BEFORE any stop runs — the injection flag must
+        // survive untouched (no service was stopped, no stop handler fired).
         TEST_STOP_HANDLER_PANIC_INJECTION.store(true, SeqCst);
         let reload_result = host.reload("svc");
         assert!(
-            !TEST_STOP_HANDLER_PANIC_INJECTION.load(SeqCst),
-            "stop-handler injection flag must be reset after firing"
-        );
-        // The reload_subtree Phase-1 dlopen of a JSON artifact fails, but the
-        // stop-handler panic was already caught by then — the process did not
-        // abort, which is the property under test.
-        assert!(
             reload_result.is_err(),
             "reloading a JSON artifact via reload_subtree fails at Phase 1 dlopen"
+        );
+        assert!(
+            TEST_STOP_HANDLER_PANIC_INJECTION.load(SeqCst),
+            "L8: Phase-1 validation failure must not run any stop handler"
+        );
+        TEST_STOP_HANDLER_PANIC_INJECTION.store(false, SeqCst);
+
+        // The stop-handler panic path itself is exercised directly: arm the
+        // injection and call `stop_plugin_for_reload`. The panic fires inside
+        // the per-node `catch_unwind`; the guard catches it, resets the flag
+        // and the host stays usable (no unwinding across the FFI boundary).
+        TEST_STOP_HANDLER_PANIC_INJECTION.store(true, SeqCst);
+        host.stop_plugin_for_reload("svc");
+        assert!(
+            !TEST_STOP_HANDLER_PANIC_INJECTION.load(SeqCst),
+            "stop-handler injection flag must be reset after firing"
         );
 
         // The host is still usable after the caught panic: a fresh snapshot
@@ -10975,19 +10990,18 @@ mod ffi_panic_seam_tests {
     #[test]
     #[serial]
     fn reload_stop_loop_survives_failing_stop_invoke() {
-        // No panic injection this time: the reload stop-loop performs a real
-        // `stop` invoke against the JSON Task node. That node has
-        // `execution: null`, so `invoke` returns Err(PluginExecutionUnsupported)
-        // — the invoke-error diagnostic branch. The property under test is that
-        // this failing/diagnostic-producing stop does NOT abort the reload: the
-        // reload still proceeds to Phase 1 (where the JSON dlopen fails, an
-        // expected caught Err) and the host stays usable afterwards.
+        // No panic injection: `stop_plugin_for_reload` performs a real `stop`
+        // invoke against the JSON Task node. That node has `execution: null`,
+        // so `invoke` returns Err(PluginExecutionUnsupported) — the
+        // invoke-error diagnostic branch. The property under test is that this
+        // failing/diagnostic-producing stop does NOT abort the stop loop, and
+        // the host stays usable afterwards.
         //
         // The diagnostic itself is written via `eprintln!` from inside the
         // per-node `catch_unwind` closure, which is not straightforward to
         // capture in-process; the exact message content is asserted directly
         // against the pure `stop_result_diagnostic` helper in
-        // `seam_pure_fn_tests`. Here we only confirm the reload flow completes.
+        // `seam_pure_fn_tests`. Here we only confirm the stop loop completes.
         let (_temp, fixtures) = setup_task_plugin_fixture();
         let host = RuntimeHost::boot(&fixtures).expect("host should boot on task fixture");
 
@@ -11003,22 +11017,16 @@ mod ffi_panic_seam_tests {
         );
         drop(snapshot);
 
-        // Flag is NOT set: the stop-loop runs a real (failing) stop invoke.
+        // Flag is NOT set: the stop loop runs a real (failing) stop invoke.
         assert!(
             !TEST_STOP_HANDLER_PANIC_INJECTION.load(SeqCst),
             "panic injection must be off for this test"
         );
-        let reload_result = host.reload("svc");
-        // The reload still fails at Phase 1's JSON dlopen — but it reached
-        // Phase 1, which means the failing stop invoke in the earlier stop-loop
-        // did not interrupt the reload path.
-        assert!(
-            reload_result.is_err(),
-            "reloading a JSON artifact fails at Phase 1 dlopen"
-        );
+        host.stop_plugin_for_reload("svc");
 
-        // Host remains usable: the Task node registry survived and a second
-        // reload still runs the same clean path.
+        // Host remains usable: the Task node registry survived the failing
+        // stop invoke, and a reload still fails cleanly at Phase 1's dlopen
+        // (the L8 flow — validation precedes any stop).
         let after = host.current_snapshot();
         assert!(
             after
@@ -11027,6 +11035,11 @@ mod ffi_panic_seam_tests {
                 .iter()
                 .any(|fqn| fqn == "svc::svc_serve"),
             "Task node registry must survive the failing stop invoke"
+        );
+        let reload_result = host.reload("svc");
+        assert!(
+            reload_result.is_err(),
+            "reloading a JSON artifact fails at Phase 1 dlopen"
         );
     }
 }
