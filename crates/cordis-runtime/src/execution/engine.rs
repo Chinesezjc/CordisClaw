@@ -225,35 +225,59 @@ where
                 }
             } else {
                 // ---- parallel key-sharded path ----
-                // P1-4: drain the ready queue but dedup by correlation key,
-                // then sort by `cmp_ready` (topo_level → priority → ids)
-                // before taking `max_concurrency`. The previous version used
-                // `BTreeMap::into_values().take(N)`, which returned items in
-                // correlation-key sort order regardless of priority — a
-                // higher-priority ready transition could be starved by a
-                // lower-priority one just because its key sorted later.
-                let mut key_items: BTreeMap<CorrelationKey, ReadyItem> = BTreeMap::new();
+                // P1-4: drain the ready queue, sort by `cmp_ready`
+                // (topo_level → priority → ids) and select the batch. The
+                // batch holds at most `max_concurrency` items AND at most one
+                // item per correlation key — two same-key transitions in one
+                // batch would race over the key's input tokens, so the winner
+                // is the one that sorts first per `cmp_ready`. The previous
+                // version used `BTreeMap::into_values().take(N)`, which
+                // returned items in correlation-key sort order regardless of
+                // priority — a higher-priority ready transition could be
+                // starved by a lower-priority one just because its key sorted
+                // later.
+                let mut all_items: Vec<ReadyItem> = Vec::new();
                 while let Some(item) = state.ready.pop_front() {
-                    let key = item.key.clone();
-                    let ready_key = (item.transition_id.clone(), key.clone());
+                    let ready_key = (item.transition_id.clone(), item.key.clone());
                     state.ready_set.remove(&ready_key);
-                    key_items.entry(key).or_insert(item);
+                    all_items.push(item);
                 }
 
-                let mut sorted_items: Vec<ReadyItem> = key_items.into_values().collect();
-                sorted_items.sort_by(cmp_ready);
-                let batch: Vec<ReadyItem> = sorted_items
-                    .into_iter()
-                    .take(config.scheduler.max_concurrency)
-                    .collect();
+                all_items.sort_by(cmp_ready);
+
+                let mut batch: Vec<ReadyItem> =
+                    Vec::with_capacity(config.scheduler.max_concurrency);
+                let mut claimed_keys: BTreeSet<CorrelationKey> = BTreeSet::new();
+                let mut requeue: Vec<ReadyItem> = Vec::new();
+                for item in all_items {
+                    if batch.len() < config.scheduler.max_concurrency
+                        && claimed_keys.insert(item.key.clone())
+                    {
+                        batch.push(item);
+                    } else {
+                        requeue.push(item);
+                    }
+                }
+                // Requeue everything the batch did not take — the same-key
+                // losers and the tail beyond `max_concurrency`. The previous
+                // version dropped those items outright, so a ready transition
+                // could be lost forever (token stuck, outcome missing) while
+                // `execute_net` returned Ok. `push_ready` refuses keys that
+                // are already queued or already completed, so the drain-time
+                // `ready_set` removal above makes this re-insertion safe, and
+                // the `retry` flag survives the round trip to keep
+                // `cmp_ready`'s retry tie-break stable.
+                for item in requeue {
+                    state.push_ready(&item.transition_id, item.key, item.retry)?;
+                }
 
                 // Invariant: the enclosing `while !state.ready.is_empty()`
                 // guarantees the drain loop above popped at least one item, so
-                // `key_items` has at least one entry and (with
-                // `max_concurrency >= 2` on this path) `batch` is non-empty.
-                // If the invariant were ever violated the fall-through is still
-                // safe: an empty batch drives the loops below through zero
-                // iterations.
+                // `all_items` is non-empty and the first sorted item claims
+                // its key (with `max_concurrency >= 2` on this path) — `batch`
+                // is non-empty. If the invariant were ever violated the
+                // fall-through is still safe: an empty batch drives the loops
+                // below through zero iterations.
                 debug_assert!(!batch.is_empty());
 
                 // Pre-compute all inputs (serial phase — needs &mut state).
@@ -1280,6 +1304,17 @@ mod tests {
         }
     }
 
+    fn arc_out(arc_id: &str, transition: &str, place: &str) -> ArcSpec {
+        ArcSpec {
+            arc_id: arc_id.to_string(),
+            place_id: place.to_string(),
+            transition_id: transition.to_string(),
+            direction: ArcDirection::TransitionToPlace,
+            label: None,
+            required: false,
+        }
+    }
+
     /// P1-6: `KeyedPair` demands exactly two input places. The engine
     /// used to silently never fire on arity != 2; now it must reject at
     /// `execute_net` entry with `RuntimeError::Invariant`.
@@ -1590,6 +1625,87 @@ mod tests {
             matches!(&err, RuntimeError::ExecutionFailed { message, .. } if message.contains("runner panic") && message.contains("string boom")),
             "expected ExecutionFailed, got {err:?}"
         );
+    }
+
+    /// P4-2 fan-out regression: one producer writing two output places (both
+    /// tokens carry the SAME correlation key) makes two consumers ready with
+    /// the same key. The parallel path's batch selection must not drop the
+    /// second consumer (`or_insert`-style key dedup used to discard it
+    /// outright); the loser is requeued and runs on the next batch, so both
+    /// consumers end up in `outcomes`.
+    #[test]
+    fn parallel_fan_out_runs_both_same_key_consumers() {
+        let net = ExecutionNetSpec {
+            places: vec![place("p1"), place("p2")],
+            transitions: vec![
+                make_transition("prod", ExecutionTransitionKind::Task, JoinPolicy::AllOf),
+                make_transition("cons_a", ExecutionTransitionKind::Task, JoinPolicy::AllOf),
+                make_transition("cons_b", ExecutionTransitionKind::Task, JoinPolicy::AllOf),
+            ],
+            arcs: vec![
+                arc_out("o1", "prod", "p1"),
+                arc_out("o2", "prod", "p2"),
+                arc_in("a1", "p1", "cons_a"),
+                arc_in("a2", "p2", "cons_b"),
+            ],
+        };
+        let mut ctx = RuntimeContext::default();
+        let output = execute_net(
+            ExecutionConfig {
+                scheduler: SchedulerConfig {
+                    max_parallelism: 1,
+                    max_concurrency: 4,
+                },
+                scheduler_mode: SchedulerMode::Deterministic,
+            },
+            net,
+            &mut ctx,
+            |_, _, _, _| TransitionRunResult::from_outcome(NodeOutcome::Success),
+        )
+        .expect("engine run should pass");
+
+        assert_eq!(output.outcomes.get("prod"), Some(&NodeOutcome::Success));
+        assert_eq!(output.outcomes.get("cons_a"), Some(&NodeOutcome::Success));
+        assert_eq!(output.outcomes.get("cons_b"), Some(&NodeOutcome::Success));
+    }
+
+    /// P4-2 truncation regression: four root transitions ready at once with a
+    /// `max_concurrency` of 2. The parallel path must not drop the two items
+    /// beyond the cap — they are requeued and complete on a later batch.
+    #[test]
+    fn parallel_max_concurrency_requeues_truncated_items() {
+        let net = ExecutionNetSpec {
+            places: vec![],
+            transitions: vec![
+                make_transition("t1", ExecutionTransitionKind::Task, JoinPolicy::AllOf),
+                make_transition("t2", ExecutionTransitionKind::Task, JoinPolicy::AllOf),
+                make_transition("t3", ExecutionTransitionKind::Task, JoinPolicy::AllOf),
+                make_transition("t4", ExecutionTransitionKind::Task, JoinPolicy::AllOf),
+            ],
+            arcs: vec![],
+        };
+        let mut ctx = RuntimeContext::default();
+        let output = execute_net(
+            ExecutionConfig {
+                scheduler: SchedulerConfig {
+                    max_parallelism: 1,
+                    max_concurrency: 2,
+                },
+                scheduler_mode: SchedulerMode::Deterministic,
+            },
+            net,
+            &mut ctx,
+            |_, _, _, _| TransitionRunResult::from_outcome(NodeOutcome::Success),
+        )
+        .expect("engine run should pass");
+
+        for id in ["t1", "t2", "t3", "t4"] {
+            assert_eq!(
+                output.outcomes.get(id),
+                Some(&NodeOutcome::Success),
+                "truncated item {id} must still run via requeue"
+            );
+        }
     }
 
     // ---- EngineState invariant / data-flow branch coverage ----

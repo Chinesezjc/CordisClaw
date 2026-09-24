@@ -262,6 +262,41 @@ fn reload_subtree_target_absent_from_index_reports_artifact_missing() {
     assert_eq!(attempt.failure_summary, Some(expected.to_string()));
 }
 
+/// P4-5 regression: `reload_subtree` used to stop the old services, invoke the
+/// Task `stop` actions and release the keep-alive dylib handles BEFORE
+/// Phase-1 validation, so a validation failure (here: the target's dylib
+/// cannot be opened) left the old plugin half-stopped while the registry still
+/// served it. After the fix all side effects run only once every target has
+/// validated, so a failed reload must leave the old plugin's services running.
+#[test]
+#[serial]
+fn reload_failure_keeps_old_plugin_services_running() {
+    let (_temp, fixtures) = json_fixture(&["alpha"]);
+    let host = RuntimeHost::boot(&fixtures).expect("boot on json fixture");
+    host.service_registry
+        .start_service("alpha", "alpha_entry", Box::new(NoopService))
+        .expect("register a service for the reload target");
+    assert_eq!(host.service_registry.len(), 1);
+
+    // A JSON artifact cannot be dlopen'd, so Phase-1 validation of the target
+    // fails with an Io error — before the fix this error path had already
+    // stopped the service.
+    let err = host
+        .reload("alpha")
+        .expect_err("a target whose dylib cannot open must abort the reload");
+    assert!(
+        matches!(&err, RuntimeError::Io { .. }),
+        "expected the Phase-1 dylib-open Io failure, got {err:?}"
+    );
+    assert_eq!(
+        host.service_registry.len(),
+        1,
+        "a failed reload must not stop the old plugin's services"
+    );
+    let attempt = host.last_reload_attempt().expect("failed attempt recorded");
+    assert_eq!(attempt.status, ReloadAttemptStatus::Failed);
+}
+
 // ===========================================================================
 // reload_internal — the two service-stop loops around the snapshot swap.
 // ===========================================================================
@@ -447,8 +482,9 @@ fn reload_candidate_error_arm_records_attempt_and_returns_err() {
 /// subtree then takes the `zombie_count > 0` arm.
 ///
 /// The zombie is parked under its own plugin path, not under the reload target:
-/// the target's services go through the *untimed* `stop_plugin_services` at the
-/// top of `reload_subtree`, which would block the reload rather than time out.
+/// the target's services go through `stop_plugin_services_timed` inside
+/// `reload_subtree` (after Phase-1 validation), which would move the stuck
+/// service to the zombie list rather than block the reload forever.
 #[test]
 #[serial]
 fn reload_subtree_reports_leftover_zombie_services() {
