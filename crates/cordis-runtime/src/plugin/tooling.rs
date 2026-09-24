@@ -453,18 +453,17 @@ pub fn rebuild_plugin_workspace(
         .arg(name);
     // P2-29: strip HTTP proxy env vars so cargo doesn't try to
     // contact a corporate proxy for the offline / local-path deps that
-    // fixtures use. `run_command` (the other cargo path in this file)
+    // fixtures use. `run_command_timed` (the other cargo path in this file)
     // already does this; the imbalance was itself the bug.
     strip_proxy_envs(&mut cmd);
-    // P2-30: enforce a build timeout so an infinite-loop `build.rs`
-    // can't hang the whole iteration pipeline. 20 minutes is generous
-    // for a from-cold fixture rebuild; anything longer is almost
-    // certainly a bug. Override via CORDIS_BUILD_TIMEOUT_SECS.
-    let timeout_secs = std::env::var("CORDIS_BUILD_TIMEOUT_SECS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(20 * 60);
-    let output = run_command_with_timeout(cmd, std::time::Duration::from_secs(timeout_secs))?;
+    // P2-30/PR3-P3: enforce a wall-clock timeout on every cargo subprocess in
+    // this module — `prepare_artifacts`'s `cargo metadata` / `cargo build`
+    // calls (via `run_command_timed`) and this named build — so an
+    // infinite-loop `build.rs` (or a hung metadata resolve) can't hang the
+    // whole pipeline. 20 minutes is generous for a from-cold fixture rebuild;
+    // anything longer is almost certainly a bug. Override via
+    // CORDIS_BUILD_TIMEOUT_SECS.
+    let output = run_command_with_timeout(cmd, cargo_command_timeout())?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(invalid_argument(format!(
@@ -975,7 +974,9 @@ fn build_dirty_dylib_plugins(
         args.push("-p".to_string());
         args.push(package_name);
     }
-    run_command("cargo", &args, Some(repo_root))?;
+    // PR3-P3: the workspace `cargo build` runs under the same wall-clock
+    // timeout as every other prepare-path cargo subprocess.
+    run_command_timed("cargo", &args, Some(repo_root), cargo_command_timeout())?;
     Ok(())
 }
 
@@ -1110,14 +1111,17 @@ fn collect_local_dependency_dirs(
 fn load_workspace_metadata(
     workspace_manifest_path: &Path,
 ) -> Result<CargoMetadataOutput, RuntimeError> {
-    load_workspace_metadata_with_runner(workspace_manifest_path, run_command)
+    // PR3-P3: `cargo metadata` runs under the wall-clock timeout too.
+    load_workspace_metadata_with_runner(workspace_manifest_path, |program, args, dir| {
+        run_command_timed(program, args, dir, cargo_command_timeout())
+    })
 }
 
 /// Runner-parameterized core of `load_workspace_metadata`. The public entry
-/// point injects the real `run_command`; tests inject a runner that fails or
-/// returns synthetic bytes so the subprocess-failure and parse arms can be
-/// exercised without spawning `cargo`. Argument order, timing, and error text
-/// are identical to the direct implementation.
+/// point injects the timed executor `run_command_timed`; tests inject a
+/// runner that fails or returns synthetic bytes so the subprocess-failure and
+/// parse arms can be exercised without spawning `cargo`. Argument order,
+/// timing, and error text are identical to the direct implementation.
 fn load_workspace_metadata_with_runner<R>(
     workspace_manifest_path: &Path,
     runner: R,
@@ -1201,8 +1205,23 @@ fn collect_crate_inputs(
 }
 
 fn collect_files_recursively(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), RuntimeError> {
+    let mut visited = HashSet::new();
+    visited.insert(dir.to_path_buf());
+    collect_files_recursively_inner(dir, &mut visited, out)
+}
+
+/// `collect_files_recursively` with a shared `visited` set threaded through
+/// the recursion so no directory is ever descended twice (PR3-P6). Symlinks
+/// are never followed (see `collect_dir_entry`), so link cycles cannot even
+/// start; the set is defence in depth against filesystem oddities such as
+/// bind mounts re-exposing a directory under a second name.
+fn collect_files_recursively_inner(
+    dir: &Path,
+    visited: &mut HashSet<PathBuf>,
+    out: &mut Vec<PathBuf>,
+) -> Result<(), RuntimeError> {
     for entry in fs::read_dir(dir).map_err(|e| io_error(dir, e))? {
-        collect_dir_entry(dir, entry, out)?;
+        collect_dir_entry(dir, entry, visited, out)?;
     }
     Ok(())
 }
@@ -1210,23 +1229,36 @@ fn collect_files_recursively(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), R
 /// Process a single `read_dir` iteration item. Extracted so the
 /// `entry.map_err` arm — a `DirEntry` iterator yielding `Err`, which the OS
 /// won't produce deterministically for a directory that opened successfully —
-/// can be exercised by feeding a synthetic `Err`. The `fs::metadata` arm is
-/// reachable via a dangling symlink; both map to `Io` with identical text.
+/// can be exercised by feeding a synthetic `Err`.
+///
+/// PR3-P6: directory-ness is decided from the entry's own `file_type` (an
+/// lstat that never follows links) instead of `fs::metadata`, which followed
+/// symlinks: a directory link inside the crate could point outside the crate
+/// (dragging unrelated files into `input_probe` / fingerprints) or form a
+/// cycle with an ancestor (unbounded recursion, historically surfacing as
+/// ENAMETOOLONG). Symlinks are therefore skipped outright, and a real
+/// directory is descended at most once via `visited`.
 fn collect_dir_entry(
     dir: &Path,
     entry: std::io::Result<fs::DirEntry>,
+    visited: &mut HashSet<PathBuf>,
     out: &mut Vec<PathBuf>,
 ) -> Result<(), RuntimeError> {
     let entry = entry.map_err(|e| io_error(dir, e))?;
-    let path = entry.path();
-    let metadata = fs::metadata(&path).map_err(|e| io_error(&path, e))?;
-    if metadata.is_dir() {
+    let file_type = entry.file_type().map_err(|e| io_error(entry.path(), e))?;
+    if file_type.is_symlink() {
+        return Ok(());
+    }
+    if file_type.is_dir() {
         if entry.file_name() == "target" {
             return Ok(());
         }
-        collect_files_recursively(&path, out)?;
-    } else if metadata.is_file() {
-        out.push(path);
+        let path = entry.path();
+        for path in visited.insert(path.clone()).then_some(path).into_iter() {
+            collect_files_recursively_inner(&path, visited, out)?;
+        }
+    } else if file_type.is_file() {
+        out.push(entry.path());
     }
     Ok(())
 }
@@ -1334,14 +1366,17 @@ fn read_plugin_build_spec(manifest_path: &Path) -> Result<PluginBuildSpec, Runti
 }
 
 fn build_plugin_artifact(fixtures_root: &Path, manifest_path: &Path) -> Result<(), RuntimeError> {
-    build_plugin_artifact_with_runner(fixtures_root, manifest_path, run_command)
+    // PR3-P3: the per-manifest `cargo build` runs under the wall-clock timeout.
+    build_plugin_artifact_with_runner(fixtures_root, manifest_path, |program, args, dir| {
+        run_command_timed(program, args, dir, cargo_command_timeout())
+    })
 }
 
 /// Runner-parameterized core of `build_plugin_artifact`. The public entry
-/// point injects the real `run_command`; tests inject a failing runner to hit
-/// the `cargo build` failure arm without spawning a subprocess. The
-/// missing-parent invariant and command arguments are identical to the direct
-/// implementation.
+/// point injects the timed executor `run_command_timed`; tests inject a
+/// failing runner to hit the `cargo build` failure arm without spawning a
+/// subprocess. The missing-parent invariant and command arguments are
+/// identical to the direct implementation.
 fn build_plugin_artifact_with_runner<R>(
     fixtures_root: &Path,
     manifest_path: &Path,
@@ -1369,14 +1404,18 @@ where
 }
 
 fn built_dylib_path(manifest_path: &Path, package_name: &str) -> Result<PathBuf, RuntimeError> {
-    built_dylib_path_with_runner(manifest_path, package_name, run_command)
+    // PR3-P3: the metadata subprocess runs under the wall-clock timeout.
+    built_dylib_path_with_runner(manifest_path, package_name, |program, args, dir| {
+        run_command_timed(program, args, dir, cargo_command_timeout())
+    })
 }
 
 /// Runner-parameterized core of `built_dylib_path`. The public entry point
-/// injects the real `run_command`; tests inject a failing runner (metadata
-/// subprocess failure arm) or a runner returning synthetic metadata bytes
-/// (parse + path-composition arm) without spawning `cargo`. Command arguments
-/// and the resulting path layout are identical to the direct implementation.
+/// injects the timed executor `run_command_timed`; tests inject a failing
+/// runner (metadata subprocess failure arm) or a runner returning synthetic
+/// metadata bytes (parse + path-composition arm) without spawning `cargo`.
+/// Command arguments and the resulting path layout are identical to the
+/// direct implementation.
 fn built_dylib_path_with_runner<R>(
     manifest_path: &Path,
     package_name: &str,
@@ -1408,11 +1447,14 @@ where
         .join(dylib_name))
 }
 
-fn run_command(
+/// `run_command`'s command-construction half, shared with `run_command_timed`
+/// so the two executors cannot drift apart: offline-arg prepending and proxy-
+/// env stripping are identical by construction on both paths.
+fn build_cargo_command(
     program: &str,
     args: &[String],
     current_dir: Option<&Path>,
-) -> Result<Vec<u8>, RuntimeError> {
+) -> (Command, Vec<String>) {
     let command_args = if program == "cargo" {
         prepare_local_cargo_args(args)
     } else {
@@ -1426,9 +1468,17 @@ fn run_command(
     if let Some(dir) = current_dir {
         command.current_dir(dir);
     }
-    let output = command
-        .output()
-        .map_err(|e| command_failed(program, command_args.clone(), e.to_string()))?;
+    (command, command_args)
+}
+
+/// `run_command`'s output half, shared with `run_command_timed`: a non-zero
+/// exit maps to `CommandFailed` carrying the (stderr-preferred, trimmed)
+/// message; a successful exit yields stdout bytes.
+fn map_command_output(
+    program: &str,
+    command_args: Vec<String>,
+    output: std::process::Output,
+) -> Result<Vec<u8>, RuntimeError> {
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -1436,6 +1486,21 @@ fn run_command(
         return Err(command_failed(program, command_args, message));
     }
     Ok(output.stdout)
+}
+
+/// PR3-P3: every production cargo subprocess runs through this timed executor;
+/// the former untimed `run_command` was removed once all four of its call
+/// sites (metadata / build on the prepare path) moved here, so the timeout
+/// cannot be accidentally bypassed by an untimed sibling.
+fn run_command_timed(
+    program: &str,
+    args: &[String],
+    current_dir: Option<&Path>,
+    timeout: std::time::Duration,
+) -> Result<Vec<u8>, RuntimeError> {
+    let (command, command_args) = build_cargo_command(program, args, current_dir);
+    let output = run_command_with_timeout(command, timeout)?;
+    map_command_output(program, command_args, output)
 }
 
 fn prepare_local_cargo_args(args: &[String]) -> Vec<String> {
@@ -1450,15 +1515,75 @@ fn cargo_command_prefers_offline(args: &[String]) -> bool {
     matches!(args.first().map(String::as_str), Some("metadata"))
 }
 
-/// P2-30: run `command` with a wall-clock timeout. On expiry, kill + wait
-/// so we return promptly with an error rather than blocking indefinitely
+/// Wall-clock timeout applied to every cargo subprocess this module spawns —
+/// `cargo metadata` / `cargo build` on the `prepare_artifacts` path (PR3-P3)
+/// and the named build in `rebuild_plugin_workspace` (P2-30). 20 minutes is
+/// generous for a from-cold fixture rebuild; anything longer is almost
+/// certainly a bug. Override via `CORDIS_BUILD_TIMEOUT_SECS`.
+fn cargo_command_timeout() -> std::time::Duration {
+    let secs = std::env::var("CORDIS_BUILD_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(20 * 60);
+    std::time::Duration::from_secs(secs)
+}
+
+/// Move a captured child pipe to a background thread that drains it to EOF —
+/// the same scheme `std::Command::output` uses internally (PR3-P1). Without
+/// this, a child emitting more than the pipe buffer (~64KiB) blocks on
+/// `write` while the poll loop sees it as still running and mis-kills it at
+/// the deadline. Returns `None` when there was no pipe to drain (never the
+/// case here, where both streams are always piped).
+fn drain_pipe_in_background<R: std::io::Read + Send + 'static>(
+    pipe: Option<R>,
+) -> Option<thread::JoinHandle<Vec<u8>>> {
+    pipe.map(|mut pipe| {
+        thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = pipe.read_to_end(&mut buf);
+            buf
+        })
+    })
+}
+
+/// Collect the buffer produced by a background drain thread; an absent handle
+/// (no pipe) or a panicked thread — impossible here — yields an empty buffer.
+fn join_pipe_drain(handle: Option<thread::JoinHandle<Vec<u8>>>) -> Vec<u8> {
+    handle
+        .map(|handle| handle.join().unwrap_or_default())
+        .unwrap_or_default()
+}
+
+/// Kill a child that exceeded its deadline, then reap it. The kill is
+/// injected — production passes `std::process::Child::kill` — so the failure
+/// arm is unit-testable: `Child::kill` cannot be made to fail for a child
+/// this process itself spawned (std reports success even once the pid is
+/// gone). If the kill fails, log and skip the reap rather than `wait()` on a
+/// child we failed to signal, which could block forever; the caller reports a
+/// timeout error either way (PR3-P1).
+fn kill_timed_out_child(
+    child: &mut std::process::Child,
+    mut kill: impl FnMut(&mut std::process::Child) -> std::io::Result<()>,
+) {
+    match kill(child) {
+        Ok(()) => {
+            let _ = child.wait();
+        }
+        Err(err) => {
+            eprintln!("[tooling] failed to kill timed-out cargo child: {err}");
+        }
+    }
+}
+
+/// P2-30/PR3-P1: run `command` with a wall-clock timeout. On expiry, kill +
+/// wait so we return promptly with an error rather than blocking indefinitely
 /// on `Command::output()`. Poll interval is 100ms; overhead is trivial
-/// compared to a cargo build.
+/// compared to a cargo build. Both pipes are drained on reader threads from
+/// spawn time (see `drain_pipe_in_background`).
 fn run_command_with_timeout(
     mut command: Command,
     timeout: std::time::Duration,
 ) -> Result<std::process::Output, RuntimeError> {
-    use std::io::Read;
     use std::process::Stdio;
     use std::time::Instant;
     command.stdin(Stdio::null());
@@ -1467,6 +1592,8 @@ fn run_command_with_timeout(
     let mut child = command
         .spawn()
         .map_err(|e| invalid_argument(format!("cargo spawn failed: {e}")))?;
+    let stdout_handle = drain_pipe_in_background(child.stdout.take());
+    let stderr_handle = drain_pipe_in_background(child.stderr.take());
     let deadline = Instant::now() + timeout;
     let mut timed_out = false;
     let status = loop {
@@ -1479,8 +1606,7 @@ fn run_command_with_timeout(
             Some(status) => break status,
             None => {
                 if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    kill_timed_out_child(&mut child, std::process::Child::kill);
                     timed_out = true;
                     break std::process::ExitStatus::default();
                 }
@@ -1488,14 +1614,8 @@ fn run_command_with_timeout(
             }
         }
     };
-    let mut stdout = Vec::new();
-    let mut stderr = Vec::new();
-    if let Some(mut o) = child.stdout.take() {
-        let _ = o.read_to_end(&mut stdout);
-    }
-    if let Some(mut e) = child.stderr.take() {
-        let _ = e.read_to_end(&mut stderr);
-    }
+    let stdout = join_pipe_drain(stdout_handle);
+    let stderr = join_pipe_drain(stderr_handle);
     if timed_out {
         return Err(invalid_argument(format!(
             "cargo build exceeded timeout ({:?}); stderr={}",
@@ -2571,31 +2691,92 @@ exports = ["svc_a", "svc_b"]
         ));
     }
 
-    // ---------- run_command ----------
+    // ---------- run_command_timed ----------
+    //
+    // PR3-P3: `run_command` was the sole untimed executor; every production
+    // cargo subprocess now goes through `run_command_timed`, so its success /
+    // non-zero-exit / spawn-failure behaviour is exercised here directly. The
+    // non-zero-exit mapping (stderr-preferred `CommandFailed`) is identical to
+    // the old `run_command`; spawn failure surfaces as `InvalidArgument`
+    // (`cargo spawn failed: ..`) from `run_command_with_timeout`.
 
     #[test]
-    fn run_command_returns_stdout_on_success() {
-        use super::run_command;
-        let out = run_command("echo", &["hello".to_string()], None).unwrap();
+    fn run_command_timed_returns_stdout_on_success() {
+        use super::run_command_timed;
+        let out = run_command_timed(
+            "echo",
+            &["hello".to_string()],
+            None,
+            std::time::Duration::from_secs(5),
+        )
+        .unwrap();
         assert_eq!(String::from_utf8_lossy(&out).trim(), "hello");
     }
 
     #[test]
-    fn run_command_maps_nonzero_exit_to_command_failed() {
-        use super::run_command;
+    fn run_command_timed_maps_nonzero_exit_to_command_failed() {
+        use super::run_command_timed;
         use crate::core::error::RuntimeError;
         assert!(matches!(
-            run_command("false", &[], None),
+            run_command_timed("false", &[], None, std::time::Duration::from_secs(5)),
             Err(RuntimeError::CommandFailed { .. })
         ));
     }
 
     #[test]
-    fn run_command_maps_spawn_failure_to_command_failed() {
-        use super::run_command;
+    fn run_command_timed_maps_spawn_failure_to_invalid_argument() {
+        use super::run_command_timed;
         use crate::core::error::RuntimeError;
-        let err = run_command("cordis-no-such-program-xyz", &[], None);
-        assert!(matches!(err, Err(RuntimeError::CommandFailed { .. })));
+        let err = run_command_timed(
+            "cordis-no-such-program-xyz",
+            &[],
+            None,
+            std::time::Duration::from_secs(5),
+        );
+        assert!(matches!(err, Err(RuntimeError::InvalidArgument { .. })));
+    }
+
+    /// PR3-P3 regression: the prepare-path executor kills a hanging command at
+    /// the deadline instead of blocking forever. `cargo metadata` / `cargo
+    /// build` route through `run_command_timed`, so this is the exact executor
+    /// those paths use.
+    #[test]
+    fn run_command_timed_kills_hanging_command_at_timeout() {
+        use super::run_command_timed;
+        use crate::core::error::RuntimeError;
+        let err = run_command_timed(
+            "sleep",
+            &["30".to_string()],
+            None,
+            std::time::Duration::from_millis(150),
+        );
+        assert!(
+            matches!(&err, Err(RuntimeError::InvalidArgument { message }) if message.contains("timeout")),
+            "expected timeout error, got {err:?}"
+        );
+    }
+
+    // ---------- cargo_command_timeout ----------
+
+    #[test]
+    #[serial_test::serial]
+    fn cargo_command_timeout_defaults_to_twenty_minutes() {
+        use super::cargo_command_timeout;
+        std::env::remove_var("CORDIS_BUILD_TIMEOUT_SECS");
+        assert_eq!(
+            cargo_command_timeout(),
+            std::time::Duration::from_secs(20 * 60)
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn cargo_command_timeout_honors_override_env() {
+        use super::cargo_command_timeout;
+        std::env::set_var("CORDIS_BUILD_TIMEOUT_SECS", "42");
+        let result = cargo_command_timeout();
+        std::env::remove_var("CORDIS_BUILD_TIMEOUT_SECS");
+        assert_eq!(result, std::time::Duration::from_secs(42));
     }
 
     // ---------- run_command_with_timeout ----------
@@ -2623,6 +2804,56 @@ exports = ["svc_a", "svc_b"]
             matches!(&err, Err(RuntimeError::InvalidArgument { message }) if message.contains("timeout")),
             "expected timeout error, got {err:?}"
         );
+    }
+
+    /// PR3-P1 regression: a child emitting more than the pipe buffer (~64KiB)
+    /// on *both* pipes must run to completion. The reader threads drain
+    /// stdout/stderr from spawn time, so the child never blocks on `write` and
+    /// the poll loop never mis-kills it at the deadline (previously the pipes
+    /// were only read after the poll loop, so a healthy build was killed).
+    #[test]
+    fn run_command_with_timeout_drains_large_output_without_mis_kill() {
+        use super::run_command_with_timeout;
+        use std::process::Command;
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg(
+            "i=0; while [ $i -lt 7000 ]; do printf '%010d' $i; printf '%010d' $i 1>&2; i=$((i+1)); done",
+        );
+        let output = run_command_with_timeout(cmd, std::time::Duration::from_secs(10))
+            .expect("large output should complete normally");
+        assert!(output.status.success());
+        assert_eq!(output.stdout.len(), 70000);
+        assert_eq!(output.stderr.len(), 70000);
+    }
+
+    // ---------- kill_timed_out_child ----------
+
+    /// The production kill (`Child::kill`) cannot be forced to fail for a
+    /// child this process itself spawned — std reports success even once the
+    /// pid is gone — so the kill is injected. A failing kill must log and
+    /// skip the reap rather than `wait()` on a child we failed to signal.
+    #[test]
+    fn kill_timed_out_child_skips_wait_when_kill_fails() {
+        use super::kill_timed_out_child;
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn true");
+        kill_timed_out_child(&mut child, |_| {
+            Err(std::io::Error::other("synthetic kill failure"))
+        });
+        // The real child was never signalled; reap it so no zombie is left.
+        let _ = child.wait();
+    }
+
+    /// The success arm kills and reaps the child.
+    #[test]
+    fn kill_timed_out_child_reaps_on_successful_kill() {
+        use super::kill_timed_out_child;
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        kill_timed_out_child(&mut child, std::process::Child::kill);
     }
 
     // ---------- lock lifecycle ----------
@@ -3307,10 +3538,11 @@ exports = ["svc_a", "svc_b"]
     //
     // The cargo-subprocess orchestration helpers (`load_workspace_metadata`,
     // `build_plugin_artifact`, `built_dylib_path`) are factored into
-    // `*_with_runner` cores. The public entry points inject the real
-    // `run_command`; these tests inject a runner closure so the subprocess
-    // failure / synthetic-metadata arms run without spawning `cargo`. Argument
-    // order and error text are identical to the direct path.
+    // `*_with_runner` cores. The public entry points inject the timed
+    // executor `run_command_timed` (PR3-P3); these tests inject a runner
+    // closure so the subprocess failure / synthetic-metadata arms run without
+    // spawning `cargo`. Argument order and error text are identical to the
+    // direct path.
 
     /// A runner that always fails, mimicking a `cargo` subprocess that exited
     /// non-zero. Used to drive the `?` early-return of each orchestration core.
@@ -3971,10 +4203,16 @@ exports = ["svc_a", "svc_b"]
     fn collect_dir_entry_maps_iterator_error_to_io() {
         use super::collect_dir_entry;
         use crate::core::error::RuntimeError;
+        use std::collections::HashSet;
         use std::path::Path;
         let mut out = Vec::new();
         let synthetic = Err(std::io::Error::other("synthetic dir-entry failure"));
-        let err = collect_dir_entry(Path::new("/some/dir"), synthetic, &mut out);
+        let err = collect_dir_entry(
+            Path::new("/some/dir"),
+            synthetic,
+            &mut HashSet::new(),
+            &mut out,
+        );
         assert!(
             matches!(&err, Err(RuntimeError::Io { message, .. }) if message.contains("synthetic dir-entry failure")),
             "expected Io(dir-entry), got {err:?}"
@@ -3982,13 +4220,15 @@ exports = ["svc_a", "svc_b"]
         assert!(out.is_empty());
     }
 
-    /// `collect_dir_entry` maps a `fs::metadata` failure to `Io`: a dangling
-    /// symlink stat's the target (ENOENT) rather than the link itself.
+    /// PR3-P6: a dangling symlink is skipped without error — `file_type` is
+    /// the entry's own (lstat), so the missing target is never consulted.
+    /// (Previously `fs::metadata` followed the link, surfaced ENOENT, and
+    /// failed the whole input collection.)
     #[cfg(unix)]
     #[test]
-    fn collect_dir_entry_maps_metadata_failure_on_dangling_symlink() {
+    fn collect_dir_entry_skips_dangling_symlink() {
         use super::collect_dir_entry;
-        use crate::core::error::RuntimeError;
+        use std::collections::HashSet;
         use tempfile::TempDir;
         let dir = TempDir::new().unwrap();
         let link = dir.path().join("dangling");
@@ -4001,10 +4241,56 @@ exports = ["svc_a", "svc_b"]
             .map(Ok)
             .unwrap();
         let mut out = Vec::new();
-        let err = collect_dir_entry(dir.path(), entry, &mut out);
+        collect_dir_entry(dir.path(), entry, &mut HashSet::new(), &mut out)
+            .expect("dangling symlink is skipped, not an error");
+        assert!(out.is_empty());
+    }
+
+    /// PR3-P6: a self-referential directory symlink must not recurse
+    /// unboundedly (historically `fs::metadata` followed the link until the
+    /// path grew past PATH_MAX / ENAMETOOLONG). Symlinks are skipped, so this
+    /// is a plain no-op descent.
+    #[cfg(unix)]
+    #[test]
+    fn collect_files_recursively_skips_self_referential_symlink() {
+        use super::collect_files_recursively;
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::os::unix::fs::symlink(dir.path(), sub.join("loop")).unwrap();
+        let mut out = Vec::new();
+        collect_files_recursively(dir.path(), &mut out).expect("symlink cycle must not error");
+        assert!(out.is_empty(), "no real files under the temp dir");
+    }
+
+    /// PR3-P6 regression: a directory symlink inside the crate pointing
+    /// outside it must not drag external files into the input set (which
+    /// feeds `input_probe` and build fingerprints).
+    #[cfg(unix)]
+    #[test]
+    fn collect_crate_inputs_does_not_follow_symlink_out_of_crate() {
+        use super::collect_crate_inputs;
+        use tempfile::TempDir;
+        let temp = TempDir::new().unwrap();
+        let external = temp.path().join("external");
+        std::fs::create_dir_all(&external).unwrap();
+        std::fs::write(external.join("secret.rs"), "x").unwrap();
+        let crate_dir = temp.path().join("crate");
+        std::fs::create_dir_all(crate_dir.join("src")).unwrap();
+        std::fs::write(crate_dir.join("Cargo.toml"), "[package]\n").unwrap();
+        std::fs::write(crate_dir.join("src/lib.rs"), "x").unwrap();
+        std::os::unix::fs::symlink(&external, crate_dir.join("src/leak")).unwrap();
+        let files = collect_crate_inputs(&crate_dir, false).unwrap();
         assert!(
-            matches!(&err, Err(RuntimeError::Io { .. })),
-            "expected Io(metadata) for dangling symlink, got {err:?}"
+            files.iter().all(|p| p.starts_with(&crate_dir)),
+            "input set escaped the crate: {files:?}"
+        );
+        assert!(
+            !files
+                .iter()
+                .any(|p| p.to_string_lossy().contains("secret.rs")),
+            "external file must not be collected: {files:?}"
         );
     }
 

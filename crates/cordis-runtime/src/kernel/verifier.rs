@@ -505,6 +505,61 @@ fn drain_stream<R: std::io::Read>(stream: Option<R>) -> Vec<u8> {
     buf
 }
 
+/// Spawn a background thread that drains `stream` to EOF, mirroring
+/// `std::Command::output`'s internal reader threads (see `run_shell_command`
+/// for why this matters — PR3-P2). Returns `None` when there was no stream to
+/// drain.
+fn spawn_stream_drain<R: std::io::Read + Send + 'static>(
+    stream: Option<R>,
+) -> Option<thread::JoinHandle<Vec<u8>>> {
+    stream.map(|stream| thread::spawn(move || drain_stream(Some(stream))))
+}
+
+/// Collect the buffer produced by a background drain thread; an absent handle
+/// (no stream) or a panicked thread — impossible here — yields an empty
+/// buffer.
+fn join_stream_drain(handle: Option<thread::JoinHandle<Vec<u8>>>) -> Vec<u8> {
+    handle
+        .map(|handle| handle.join().unwrap_or_default())
+        .unwrap_or_default()
+}
+
+/// Kill a timed-out command and reap it. On Unix the child was spawned as the
+/// leader of its own process group (`process_group(0)`), so SIGKILL goes to
+/// the whole group — including any grandchildren the command spawned — rather
+/// than leaving them as orphans (PR3-P2). If the group is already gone (the
+/// child exited between the last poll and this signal, ESRCH), log and skip
+/// the reap instead of `wait()`ing on a process we failed to signal.
+#[cfg(unix)]
+fn kill_process_group(child: &mut std::process::Child) {
+    let pid = child.id() as i32;
+    // SAFETY: the child was spawned with `process_group(0)`, so `-pid` is the
+    // process group it leads and no other group can be signalled; SIGKILL to a
+    // group that is already gone returns ESRCH and is harmless.
+    if unsafe { libc::kill(-pid, libc::SIGKILL) } == 0 {
+        let _ = child.wait();
+    } else {
+        eprintln!(
+            "[verifier] failed to kill timed-out command process group: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+}
+
+/// Non-Unix fallback: no process groups, so kill just the direct child and
+/// reap it.
+#[cfg(not(unix))]
+fn kill_process_group(child: &mut std::process::Child) {
+    match child.kill() {
+        Ok(()) => {
+            let _ = child.wait();
+        }
+        Err(err) => {
+            eprintln!("[verifier] failed to kill timed-out command: {err}");
+        }
+    }
+}
+
 /// P0-1: run the command as a real argv, NEVER through `bash -lc`.
 /// The command string is split via `shell_words` (POSIX-shell tokenisation
 /// with quoting, no expansion of `$VAR` / backticks / `$()`), then dispatched
@@ -550,22 +605,39 @@ fn run_shell_command(
         });
     }
 
-    let mut child = Command::new(program)
+    let mut process = Command::new(program);
+    process
         .args(args)
         .current_dir(current_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|err| RuntimeError::CommandFailed {
-            program: program.clone(),
-            args: args.to_vec(),
-            message: err.to_string(),
-        })?;
+        .stderr(Stdio::piped());
+    // PR3-P2: give the child its own process group so a timeout can SIGKILL
+    // the whole tree — grandchildren the command spawned included — instead of
+    // leaving them as orphans holding the pipes open.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        process.process_group(0);
+    }
+    let mut child = process.spawn().map_err(|err| RuntimeError::CommandFailed {
+        program: program.clone(),
+        args: args.to_vec(),
+        message: err.to_string(),
+    })?;
 
-    // Poll for exit up to `timeout`. On expiry, kill + reap. The poll decision
-    // is delegated to `poll_until_exit` so the (OS-only) `try_wait` failure arm
-    // is unit-testable via an injected closure.
+    // PR3-P2: drain both pipes on reader threads from the instant we spawn
+    // (the scheme `std::Command::output` uses internally). The old code only
+    // read them after the poll loop, so a command emitting more than the
+    // ~64KiB pipe capacity blocked on `write`, `try_wait` stayed `None`, and
+    // it was mis-killed at the deadline.
+    let stdout_handle = spawn_stream_drain(child.stdout.take());
+    let stderr_handle = spawn_stream_drain(child.stderr.take());
+
+    // Poll for exit up to `timeout`. On expiry, kill the process group +
+    // reap. The poll decision is delegated to `poll_until_exit` so the
+    // (OS-only) `try_wait` failure arm is unit-testable via an injected
+    // closure.
     let deadline = Instant::now() + timeout;
     // Bind the Result first so the `?` sits on a line that also carries the
     // (covered) destructuring — the Err arm here is OS-only and is tested
@@ -579,12 +651,11 @@ fn run_shell_command(
     );
     let (status, timed_out) = poll?;
     if timed_out {
-        let _ = child.kill();
-        let _ = child.wait();
+        kill_process_group(&mut child);
     }
 
-    let stdout_buf = drain_stream(child.stdout.take());
-    let stderr_buf = drain_stream(child.stderr.take());
+    let stdout_buf = join_stream_drain(stdout_handle);
+    let stderr_buf = join_stream_drain(stderr_handle);
 
     let success = !timed_out && status.success();
     let stderr = if timed_out {
@@ -691,10 +762,10 @@ fn collect_source_tree(
 mod tests {
     use super::{
         collect_source_tree, command_wait_error, discover_rust_workspace_manifest, drain_stream,
-        hash_source_tree, normalize_optional_command, payload_not_serializable, poll_until_exit,
-        run_shell_command, shell_quote, CommandVerifier, PluginResponse, RuntimeError,
-        VerificationProfile, VerificationRunner, VerificationStageKind, VerificationStageStatus,
-        VerifyOptions,
+        hash_source_tree, kill_process_group, normalize_optional_command, payload_not_serializable,
+        poll_until_exit, run_shell_command, shell_quote, CommandVerifier, PluginResponse,
+        RuntimeError, VerificationProfile, VerificationRunner, VerificationStageKind,
+        VerificationStageStatus, VerifyOptions,
     };
     use serde_json::json;
     use std::collections::BTreeMap;
@@ -1534,6 +1605,37 @@ mod tests {
             "captured stderr should be folded in: {}",
             result.stderr
         );
+    }
+
+    /// PR3-P2 regression: a command emitting more than the pipe buffer
+    /// (~64KiB) on stdout must run to completion. The reader threads drain the
+    /// pipes from spawn time, so the child never blocks on `write` and the
+    /// poll loop never mis-kills it at the deadline (previously the pipes were
+    /// only drained after the poll loop).
+    #[test]
+    fn run_shell_command_handles_large_output_without_mis_kill() {
+        let temp = TempDir::new().expect("tempdir");
+        let result = run_shell_command(
+            "sh -c 'i=0; while [ $i -lt 7000 ]; do printf \"%010d\" $i; i=$((i+1)); done'",
+            temp.path(),
+            Duration::from_secs(10),
+        )
+        .expect("large output should complete normally");
+        assert!(result.success);
+        assert_eq!(result.stdout.len(), 70000);
+    }
+
+    /// PR3-P2: killing a timed-out command whose process group is already gone
+    /// (the child exited between the last poll and the signal) must log and
+    /// skip the reap rather than hang on `wait()`.
+    #[cfg(unix)]
+    #[test]
+    fn kill_process_group_skips_wait_when_group_gone() {
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn true");
+        let _ = child.wait(); // reap -> the process group no longer exists
+        kill_process_group(&mut child); // must not hang or panic
     }
 
     #[test]
