@@ -9,34 +9,47 @@
       "id": "llm_complete",
       "summary": "Execute one chat completion against an OpenAI-compatible endpoint.",
       "input_schema": {
+        "type": "object",
+        "required": [
+          "node_id",
+          "body",
+          "transport"
+        ],
         "properties": {
+          "node_id": {
+            "const": "llm_complete"
+          },
           "body": {
             "type": "object"
           },
-          "node_id": {
-            "const": "llm_complete"
+          "transport": {
+            "type": "object"
           },
           "sink_addr": {
             "type": "string"
           },
           "sink_key": {
             "type": "string"
-          },
-          "transport": {
-            "type": "object"
           }
-        },
-        "required": [
-          "node_id",
-          "body",
-          "transport"
-        ],
-        "type": "object"
+        }
       },
       "output_schema": {
+        "type": "object",
+        "required": [
+          "ok"
+        ],
         "properties": {
-          "error": {
-            "type": "string"
+          "ok": {
+            "type": "boolean"
+          },
+          "message": {
+            "type": "object"
+          },
+          "response_id": {
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "finish_reason": {
             "type": [
@@ -44,23 +57,10 @@
               "null"
             ]
           },
-          "message": {
-            "type": "object"
-          },
-          "ok": {
-            "type": "boolean"
-          },
-          "response_id": {
-            "type": [
-              "string",
-              "null"
-            ]
+          "error": {
+            "type": "string"
           }
-        },
-        "required": [
-          "ok"
-        ],
-        "type": "object"
+        }
       },
       "side_effects": [
         "performs an outbound HTTPS request to the configured endpoint"

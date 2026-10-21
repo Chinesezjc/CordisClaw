@@ -1,4 +1,5 @@
 pub mod agent;
+pub(crate) mod agent_toolchain;
 pub mod command_router;
 pub mod config;
 pub mod context;

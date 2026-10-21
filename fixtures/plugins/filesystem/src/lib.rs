@@ -20,9 +20,16 @@ use std::path::{Path, PathBuf};
 
 fn base_dir() -> PathBuf {
     // Use CORDIS_FIXTURES_ROOT if set, otherwise default to the process cwd.
+    //
+    // The fallback used to be a hard-coded `/root/CordisClaw`, which meant a
+    // runtime started from any other checkout resolved relative paths (and
+    // `write_root()`) against a *different* checkout's tree — the live service
+    // runs from `/root/CordisClaw-minori`, so a write aimed at `plugins/x`
+    // would land in the other repo. `serve <root>` runs with the repo root as
+    // cwd, so that is the honest fallback.
     std::env::var("CORDIS_FIXTURES_ROOT")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/root/CordisClaw"))
+        .unwrap_or_else(|_| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
 }
 
 /// Allowed roots for reading.

@@ -31,6 +31,29 @@ pub struct RegisteredNode {
     pub node_type: NodeType,
 }
 
+/// Normalise a plugin path as spelled by an external caller (in practice: the
+/// model behind `invoke_plugin`, which happily emits directory-looking
+/// spellings like `"/qq"`).
+///
+/// The registry is keyed by the canonical `plugin_path` recorded in the plugin
+/// docs, so a slash-prefixed or slash-suffixed spelling of the same path used to
+/// miss the map and fail the whole agent turn with
+/// `plugin not registered: /qq`. Every lookup normalises first: trim
+/// surrounding whitespace, squeeze each run of `/` into a single separator, and
+/// drop leading/trailing separators. Case is deliberately **not** folded —
+/// plugin paths are case-sensitive.
+///
+/// This is a pure function on purpose: it is the one place the spelling rules
+/// live, so the invoke path and the host's `check_agent_accessible` gate can
+/// never drift apart.
+pub fn normalize_plugin_path(raw: &str) -> String {
+    raw.trim()
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 /// Registry of all discovered plugins, indexed by plugin path.
 ///
 /// Wraps the inner map in `Arc<RwLock<>>` for two reasons:
@@ -74,6 +97,11 @@ impl PluginRegistry {
         abi_fingerprint: AbiFingerprint,
         execution: Option<PluginExecution>,
     ) {
+        // Store under the canonical spelling too: a `get` for `/qq` now hits,
+        // and a later `mark_runtime_unavailable("/qq")` must be able to find
+        // the same row. Keeping the raw spelling in the key would bring the
+        // miss back through the mutator door.
+        let plugin_path = normalize_plugin_path(&plugin_path);
         self.plugins
             .write()
             .unwrap_or_else(|poison| poison.into_inner())
@@ -104,6 +132,7 @@ impl PluginRegistry {
         reason: PluginUnavailableReason,
         fingerprint_diff: Vec<String>,
     ) {
+        let plugin_path = normalize_plugin_path(&plugin_path);
         self.plugins
             .write()
             .unwrap_or_else(|poison| poison.into_inner())
@@ -126,11 +155,12 @@ impl PluginRegistry {
     }
 
     pub fn mark_unavailable(&self, plugin_path: &str, reason: PluginUnavailableReason) {
+        let normalized = normalize_plugin_path(plugin_path);
         if let Some(plugin) = self
             .plugins
             .write()
             .unwrap_or_else(|poison| poison.into_inner())
-            .get_mut(plugin_path)
+            .get_mut(&normalized)
         {
             plugin.load_result = PluginLoadResult::Unavailable(reason);
             plugin.docs = None;
@@ -148,11 +178,12 @@ impl PluginRegistry {
         reason: PluginUnavailableReason,
         fingerprint_diff: Vec<String>,
     ) {
+        let normalized = normalize_plugin_path(plugin_path);
         if let Some(plugin) = self
             .plugins
             .write()
             .unwrap_or_else(|poison| poison.into_inner())
-            .get_mut(plugin_path)
+            .get_mut(&normalized)
         {
             plugin.load_result = PluginLoadResult::Unavailable(reason);
             plugin.fingerprint_diff = fingerprint_diff;
@@ -166,11 +197,12 @@ impl PluginRegistry {
         docs: PluginDocs,
         abi_fingerprint: AbiFingerprint,
     ) -> bool {
+        let normalized = normalize_plugin_path(plugin_path);
         let mut guard = self
             .plugins
             .write()
             .unwrap_or_else(|poison| poison.into_inner());
-        if let Some(plugin) = guard.get_mut(plugin_path) {
+        if let Some(plugin) = guard.get_mut(&normalized) {
             plugin.load_result = PluginLoadResult::Loaded;
             plugin.docs = Some(docs);
             plugin.abi_fingerprint = Some(abi_fingerprint);
@@ -181,11 +213,21 @@ impl PluginRegistry {
         }
     }
 
+    /// Look up a plugin by path, tolerating the caller's spelling: the query is
+    /// run through [`normalize_plugin_path`] first, so `"/qq"`, `"qq/"` and
+    /// `"//qq"` all resolve to the entry registered as `"qq"`.
+    ///
+    /// Normalisation lives here — the single choke point every path lookup goes
+    /// through — rather than at each call site, so `invoke_registered_plugin`
+    /// and `RuntimeHost::check_agent_accessible` both benefit. A miss still
+    /// returns `None`; call sites keep building their error text from the
+    /// *original* (un-normalised) argument.
     pub fn get(&self, plugin_path: &str) -> Option<RegisteredPlugin> {
+        let normalized = normalize_plugin_path(plugin_path);
         self.plugins
             .read()
             .unwrap_or_else(|poison| poison.into_inner())
-            .get(plugin_path)
+            .get(&normalized)
             .cloned()
     }
 
@@ -221,7 +263,8 @@ impl PluginRegistry {
     /// those "impossible" states; this test-only door lets unit tests drive
     /// them directly without weakening the production constructors.
     #[cfg(test)]
-    pub(crate) fn insert_raw(&self, plugin: RegisteredPlugin) {
+    pub(crate) fn insert_raw(&self, mut plugin: RegisteredPlugin) {
+        plugin.plugin_path = normalize_plugin_path(&plugin.plugin_path);
         self.plugins
             .write()
             .unwrap_or_else(|poison| poison.into_inner())
@@ -296,6 +339,7 @@ impl NodeRegistry {
 mod tests {
     use super::*;
     use crate::core::models::AbiFingerprint;
+    use crate::plugin::invoke::invoke_registered_plugin;
     use cordis_plugin_sdk::{NodeDoc, PluginDocs};
 
     fn sample_docs(plugin_path: &str) -> PluginDocs {
@@ -508,6 +552,65 @@ mod tests {
         assert!(registry.is_empty());
     }
 
+    // The eight spelling shapes the invoke path actually receives from the
+    // model: slash-prefixed, slash-suffixed, doubled slashes, whitespace-only,
+    // already-canonical, empty, bare slash, and non-ASCII with padding.
+    #[test]
+    fn normalize_plugin_path_cases() {
+        let cases = [
+            ("/qq", "qq"),
+            ("qq/", "qq"),
+            ("//expr//lexer/", "expr/lexer"),
+            ("  ", ""),
+            ("expr/lexer", "expr/lexer"),
+            ("", ""),
+            ("/", ""),
+            ("  配置/插件  ", "配置/插件"),
+        ];
+        for (raw, expected) in cases {
+            assert_eq!(normalize_plugin_path(raw), expected, "raw input {raw:?}");
+        }
+    }
+
+    // `get` is the single choke point: every slash spelling of a registered
+    // path must resolve to the same entry, and an unknown path must still miss
+    // (so call sites can build their error text from the original argument).
+    #[test]
+    fn get_tolerates_slash_spellings_of_registered_path() {
+        let registry = PluginRegistry::default();
+        insert_sample_loaded(&registry, "qq");
+
+        for spelling in ["/qq", "qq/", "//qq", "/qq/", "  qq  "] {
+            let hit = registry.get(spelling).is_some();
+            assert!(hit, "expected {spelling:?} to resolve the qq entry");
+        }
+        let miss = registry.get("/nope");
+        assert!(miss.is_none());
+    }
+
+    // End-to-end proof for the incident at the invoke entry: a slash-prefixed
+    // path must reach the registered entry (a registered-but-unavailable plugin
+    // reports `PluginUnavailable`, never `PluginNotRegistered`), and the error
+    // still echoes the caller's *original* spelling verbatim.
+    #[test]
+    fn invoke_with_slash_prefixed_path_reaches_registry_entry() {
+        let registry = PluginRegistry::default();
+        registry.insert_unavailable(
+            "qq".to_string(),
+            None,
+            true,
+            BTreeSet::new(),
+            PluginUnavailableReason::ArtifactMissing,
+            Vec::new(),
+        );
+        let err = invoke_registered_plugin(&registry, "/qq", "qq_send", "{}".to_string())
+            .expect_err("unavailable plugin must error");
+        assert_eq!(
+            err.to_string(),
+            "plugin unavailable: /qq, reason=ArtifactMissing, required=true"
+        );
+    }
+
     #[test]
     fn node_registry_is_empty_reflects_len() {
         let mut registry = NodeRegistry::default();
@@ -652,5 +755,258 @@ mod tests {
             sample_docs("after/poison"),
             sample_fingerprint(),
         ));
+    }
+}
+
+/// Registry-level normalisation alone already makes `PluginRegistry::get`
+/// tolerant, but the incident's *first* gate is
+/// `RuntimeHost::check_agent_accessible`, which resolves through a snapshot's
+/// registry. This module drives that host-level entry point with a
+/// slash-prefixed path to prove the whole chain benefits — kept in its own
+/// module (rather than inside `mod tests`) so concurrent edits to the primary
+/// test module never collide.
+#[cfg(test)]
+mod host_check_normalizes_plugin_path_tests {
+    use super::*;
+    use crate::host::RuntimeHost;
+    use cordis_plugin_sdk::NodeDoc;
+    use serial_test::serial;
+    use std::fs;
+    use tempfile::TempDir;
+
+    fn fingerprint() -> AbiFingerprint {
+        AbiFingerprint {
+            rustc_version: "rustc-test".to_string(),
+            target_triple: "test-triple".to_string(),
+            crate_hash: "crate_test_v1".to_string(),
+            api_hash: "api_v2".to_string(),
+        }
+    }
+
+    /// An `artifacts/index.json` with zero entries: `RuntimeHost::boot`
+    /// registers no plugins and never touches a dylib, so booting is
+    /// near-instant on any host target.
+    const EMPTY_ARTIFACT_INDEX: &str = r#"{
+  "schema_version": 2,
+  "generated_at": "2026-07-24T00:00:00Z",
+  "topo_order": [],
+  "entries": []
+}
+"#;
+
+    /// Build a throwaway fixtures tree, with `config/runtime.yaml` pinning the
+    /// snapshot staging root inside the `TempDir` (`discover_config_dir` looks
+    /// for the sibling `config` dir of a root named `fixtures`).
+    fn empty_fixtures() -> (TempDir, PathBuf) {
+        let temp = TempDir::new().expect("tempdir");
+        let fixtures = temp.path().join("fixtures");
+        let artifacts = fixtures.join("artifacts");
+        fs::create_dir_all(&artifacts).expect("create artifacts dir");
+        fs::write(artifacts.join("index.json"), EMPTY_ARTIFACT_INDEX)
+            .expect("write empty artifact index");
+        let config_dir = temp.path().join("config");
+        fs::create_dir_all(&config_dir).expect("create config dir");
+        fs::write(
+            config_dir.join("runtime.yaml"),
+            format!(
+                "runtime:\n  snapshot_root: {}\n",
+                temp.path().join("snapshots").display()
+            ),
+        )
+        .expect("write runtime.yaml");
+        (temp, fixtures)
+    }
+
+    fn docs_with_node(plugin_path: &str, node_id: &str) -> PluginDocs {
+        PluginDocs {
+            plugin_id: plugin_path.replace('/', "_"),
+            plugin_path: plugin_path.to_string(),
+            plugin_version: "0.1.0".to_string(),
+            abi_version: 1,
+            command_name: None,
+            nodes: vec![NodeDoc {
+                id: node_id.to_string(),
+                summary: "test node".to_string(),
+                input_schema: serde_json::json!({"type": "object"}),
+                output_schema: serde_json::json!({"type": "object"}),
+                side_effects: vec![],
+                failure_modes: vec![],
+                node_type: NodeType::Task,
+                agent_accessible: true,
+            }],
+            system_hint: None,
+        }
+    }
+
+    // The incident, replayed at the host gate: the model called
+    // `invoke_plugin("plugin_path": "/qq", "node_id": "qq_send")`, and
+    // `check_agent_accessible` rejected the turn with
+    // `plugin not registered: /qq`. A registered `qq` must now be reachable
+    // through the slash-prefixed spelling: a permitted node resolves (`Ok`), a
+    // node-level rejection stays `InvalidArgument`, and only a genuinely
+    // unregistered path is `PluginNotRegistered` — carrying the caller's
+    // original spelling so existing `plugin not registered: /nope` assertions
+    // keep passing.
+    #[test]
+    #[serial]
+    fn host_check_agent_accessible_accepts_slash_prefixed_plugin_path() {
+        let (_temp, fixtures) = empty_fixtures();
+        let host = RuntimeHost::boot(&fixtures).expect("host should boot on an empty index");
+        host.current_snapshot().plugin_registry().insert_loaded(
+            "qq".to_string(),
+            None,
+            true,
+            BTreeSet::new(),
+            docs_with_node("qq", "qq_send"),
+            PathBuf::from("/tmp/qq.dylib"),
+            ArtifactKind::Dylib,
+            fingerprint(),
+            None,
+        );
+
+        let allowed = host.check_agent_accessible("/qq", "qq_send");
+        let permitted = allowed.is_ok();
+        assert!(permitted, "slash-prefixed path must resolve: {allowed:?}");
+
+        let err = host
+            .check_agent_accessible("/qq", "not_a_node")
+            .expect_err("undeclared node must be rejected");
+        let not_registered = matches!(&err, RuntimeError::PluginNotRegistered { .. });
+        assert!(!not_registered, "plugin is registered: {err:?}");
+
+        let err = host
+            .check_agent_accessible("/nope", "qq_send")
+            .expect_err("unregistered plugin must be rejected");
+        assert_eq!(err.to_string(), "plugin not registered: /nope");
+    }
+}
+
+/// Mutator-side normalisation: `get` alone would still let a slash-prefixed
+/// spelling miss every *write* path, which is how `invoke_plugin("/qq", …)`
+/// could resolve the entry, fail to open the dylib, and then have
+/// `mark_runtime_unavailable("/qq", …)` silently no-op — leaving a broken
+/// plugin stamped `Loaded` and the failure invisible to later lookups.
+#[cfg(test)]
+mod mutator_normalization_tests {
+    use super::*;
+    use cordis_plugin_sdk::{NodeDoc, PluginDocs};
+
+    // Self-contained copies: `mod tests` keeps its helpers private, and these
+    // cases only need one accessible node plus a placeholder fingerprint.
+    fn sample_docs(plugin_path: &str) -> PluginDocs {
+        PluginDocs {
+            plugin_id: plugin_path.replace('/', "_"),
+            plugin_path: plugin_path.to_string(),
+            plugin_version: "0.1.0".to_string(),
+            abi_version: 1,
+            command_name: None,
+            nodes: vec![NodeDoc {
+                id: "n0".to_string(),
+                summary: "test node".to_string(),
+                input_schema: serde_json::json!({"type": "object"}),
+                output_schema: serde_json::json!({"type": "object"}),
+                side_effects: vec![],
+                failure_modes: vec![],
+                node_type: NodeType::Router,
+                agent_accessible: true,
+            }],
+            system_hint: None,
+        }
+    }
+
+    fn sample_fingerprint() -> AbiFingerprint {
+        AbiFingerprint {
+            rustc_version: "rustc-test".to_string(),
+            target_triple: "test-triple".to_string(),
+            crate_hash: "crate_test_v1".to_string(),
+            api_hash: "api_v2".to_string(),
+        }
+    }
+
+    #[test]
+    fn insert_loaded_stores_the_canonical_spelling() {
+        let registry = PluginRegistry::default();
+        registry.insert_loaded(
+            "/qq/".to_string(),
+            None,
+            true,
+            BTreeSet::new(),
+            sample_docs("qq"),
+            PathBuf::from("/tmp/qq.dylib"),
+            ArtifactKind::Dylib,
+            sample_fingerprint(),
+            None,
+        );
+        let stored = registry.get("qq").expect("canonical lookup");
+        assert_eq!(stored.plugin_path, "qq");
+        let slash = registry.get("/qq").is_some();
+        assert!(slash);
+    }
+
+    #[test]
+    fn mark_runtime_unavailable_accepts_a_slash_spelling() {
+        let registry = PluginRegistry::default();
+        registry.insert_loaded(
+            "qq".to_string(),
+            None,
+            true,
+            BTreeSet::new(),
+            sample_docs("qq"),
+            PathBuf::from("/tmp/qq.dylib"),
+            ArtifactKind::Dylib,
+            sample_fingerprint(),
+            None,
+        );
+        registry.mark_runtime_unavailable(
+            "/qq",
+            PluginUnavailableReason::SymbolMissing,
+            vec!["diff".to_string()],
+        );
+        let after = registry.get("qq").expect("entry survives the mark");
+        let unavailable = matches!(after.load_result, PluginLoadResult::Unavailable(_));
+        assert!(unavailable, "mark must land on the canonical row");
+        assert_eq!(after.fingerprint_diff, vec!["diff".to_string()]);
+    }
+
+    #[test]
+    fn reload_entry_accepts_a_slash_spelling() {
+        let registry = PluginRegistry::default();
+        registry.insert_unavailable(
+            "qq".to_string(),
+            None,
+            true,
+            BTreeSet::new(),
+            PluginUnavailableReason::ArtifactMissing,
+            Vec::new(),
+        );
+        let reloaded = registry.reload_plugin_entry(
+            "/qq",
+            sample_docs("qq"),
+            sample_fingerprint(),
+        );
+        assert!(reloaded);
+        let entry = registry.get("qq").expect("entry after reload");
+        let loaded = matches!(entry.load_result, PluginLoadResult::Loaded);
+        assert!(loaded);
+    }
+
+    #[test]
+    fn insert_raw_stores_the_canonical_spelling() {
+        let registry = PluginRegistry::default();
+        registry.insert_raw(RegisteredPlugin {
+            plugin_path: "//qq/".to_string(),
+            parent: None,
+            required: true,
+            grants_from_parent: BTreeSet::new(),
+            load_result: PluginLoadResult::Unavailable(PluginUnavailableReason::ArtifactMissing),
+            docs: None,
+            artifact_path: None,
+            artifact_kind: None,
+            abi_fingerprint: None,
+            execution: None,
+            fingerprint_diff: Vec::new(),
+        });
+        let entry = registry.get("qq").expect("canonical lookup after insert_raw");
+        assert_eq!(entry.plugin_path, "qq");
     }
 }

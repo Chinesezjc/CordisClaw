@@ -19,12 +19,13 @@ use cordis_runtime::plugin::tooling::{
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 /// Structured message envelope carried over `agent_trigger`.
 ///
@@ -109,6 +110,15 @@ impl AgentEnvelope {
 mod pending {
     use serde::{Deserialize, Serialize};
     use std::path::{Path, PathBuf};
+    use std::time::{Duration, SystemTime};
+
+    /// WS-3: a spill older than this is treated as non-existent when it
+    /// would be replayed — a message from weeks ago must never be answered
+    /// as if it were current. The file is NOT deleted: `archive_stale`
+    /// relocates it out of the live `pending/` directory at startup.
+    pub const MAX_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+    const MS_PER_DAY: u64 = 24 * 60 * 60 * 1000;
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct PendingMessage {
@@ -134,6 +144,18 @@ mod pending {
         data_dir
             .join("pending")
             .join(format!("{}.json", sanitize(session_key)))
+    }
+
+    /// Wall-clock milliseconds since the Unix epoch — the on-disk timestamp
+    /// unit for `enqueued_at_ms`. 0 if the clock sits before the epoch.
+    pub fn now_ms() -> u64 {
+        to_ms(SystemTime::now())
+    }
+
+    fn to_ms(at: SystemTime) -> u64 {
+        at.duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
     }
 
     pub fn save(data_dir: &Path, msg: &PendingMessage) {
@@ -165,16 +187,150 @@ mod pending {
         };
         if let Err(e) = std::fs::write(&tmp, &bytes).and_then(|_| std::fs::rename(&tmp, &path)) {
             eprintln!("pending: write failed: {e}");
+            return;
         }
+        // WS-3: a spill used to be invisible in the logs — the 10-20 outage
+        // left 700+ dead letters nobody knew about. Log every successful one
+        // (chars = what actually landed on disk, i.e. after merge).
+        eprintln!(
+            "pending: spilled session={} chars={} path={}",
+            merged.session_key,
+            merged.combined.chars().count(),
+            path.display()
+        );
     }
 
+    /// Load the pending spill for `session_key`.
+    ///
+    /// WS-3: a spill older than [`MAX_AGE`] is reported as absent (and
+    /// logged) so a long-dead message can never be replayed into a fresh
+    /// turn. The file is left on disk untouched — `archive_stale` owns
+    /// relocation, this function never deletes.
     pub fn load(data_dir: &Path, session_key: &str) -> Option<PendingMessage> {
         let text = std::fs::read_to_string(path_for(data_dir, session_key)).ok()?;
-        serde_json::from_str(&text).ok()
+        let msg: PendingMessage = serde_json::from_str(&text).ok()?;
+        let age_ms = now_ms().saturating_sub(msg.enqueued_at_ms);
+        if age_ms > MAX_AGE.as_millis() as u64 {
+            eprintln!(
+                "pending: ignoring stale spill session={} age_days={}",
+                session_key,
+                age_ms / MS_PER_DAY
+            );
+            return None;
+        }
+        Some(msg)
     }
 
     pub fn clear(data_dir: &Path, session_key: &str) {
-        let _ = std::fs::remove_file(path_for(data_dir, session_key));
+        // Only a real removal logs: a successful turn with no spill in place
+        // (the common case) hits NotFound and stays silent.
+        if std::fs::remove_file(path_for(data_dir, session_key)).is_ok() {
+            eprintln!("pending: cleared session={session_key}");
+        }
+    }
+
+    /// WS-3: relocate dead letters out of the live `pending/` directory.
+    ///
+    /// Every `pending/*.json` whose `enqueued_at_ms` is older than
+    /// `now - max_age` — plus every entry whose JSON cannot be parsed, since
+    /// its age is unknowable — is `fs::rename`d into `data/pending.archive/`
+    /// (created on first use). **Nothing is ever deleted**: a file whose
+    /// rename fails is logged and left where it is.
+    ///
+    /// Destination collisions are resolved by appending a numeric suffix
+    /// (`x.json` → `x.1.json` → `x.2.json` …) instead of the implicit
+    /// overwrite `rename(2)` performs on Unix, so an already-archived dead
+    /// letter is never displaced by a newer one.
+    ///
+    /// Returns the number of files archived.
+    pub fn archive_stale(data_dir: &Path, max_age: Duration, now: SystemTime) -> usize {
+        let pending_dir = data_dir.join("pending");
+        let archive_dir = data_dir.join("pending.archive");
+        let cutoff = to_ms(now).saturating_sub(max_age.as_millis() as u64);
+        let entries = match std::fs::read_dir(&pending_dir) {
+            Ok(entries) => entries,
+            // No spill directory yet: nothing to archive.
+            Err(_) => return 0,
+        };
+        let mut archive_dir_ready = false;
+        let mut archived = 0usize;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() || path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                continue;
+            }
+            let stale = match std::fs::read_to_string(&path) {
+                Ok(text) => match serde_json::from_str::<PendingMessage>(&text) {
+                    Ok(msg) => msg.enqueued_at_ms < cutoff,
+                    // Unparseable spill: age is unknowable, archive it.
+                    Err(_) => true,
+                },
+                // Unreadable spill: archive it rather than delete it.
+                Err(_) => true,
+            };
+            if !stale {
+                continue;
+            }
+            if !archive_dir_ready {
+                match std::fs::create_dir_all(&archive_dir) {
+                    Ok(()) => archive_dir_ready = true,
+                    Err(e) => {
+                        eprintln!("pending: create archive dir failed: {e}");
+                        break;
+                    }
+                }
+            }
+            let Some(dest) = unique_dest(&archive_dir, &path) else {
+                eprintln!("pending: no free archive name for {}", path.display());
+                continue;
+            };
+            match std::fs::rename(&path, &dest) {
+                Ok(()) => archived += 1,
+                Err(e) => eprintln!("pending: archive {} failed: {e}", path.display()),
+            }
+        }
+        archived
+    }
+
+    /// First non-existing destination name for `src` inside `archive_dir`.
+    /// `None` when even the numeric-suffix fallbacks are all taken.
+    fn unique_dest(archive_dir: &Path, src: &Path) -> Option<PathBuf> {
+        let direct = archive_dir.join(src.file_name()?);
+        if !direct.exists() {
+            return Some(direct);
+        }
+        let stem = src.file_stem()?.to_string_lossy().into_owned();
+        (1..=1000)
+            .map(|n| archive_dir.join(format!("{stem}.{n}.json")))
+            .find(|candidate| !candidate.exists())
+    }
+}
+
+/// WS-3: fixed-template notice sent to the batch's origin after an LLM
+/// failure has spilled the message. Deliberately LLM-free — this is the one
+/// path that must still work when the model does not.
+const OUTAGE_NOTICE: &str = "我这边刚才调用模型失败了，你的消息我记下了，稍后会自动重试。";
+
+/// WS-3: at most one outage notice per session per window — a flapping
+/// provider must not turn a burst of user messages into a burst of replies.
+const OUTAGE_NOTIFY_WINDOW: Duration = Duration::from_secs(10 * 60);
+
+/// WS-3: rate-limit gate for [`OUTAGE_NOTICE`]. Returns `true` when `key`
+/// has not been notified inside `window` before `now`, recording `now` so
+/// later calls inside the window are throttled. Pure apart from the map, so
+/// the throttle policy is unit-testable without an inbox.
+fn should_notify(
+    last_notified: &mut HashMap<String, Instant>,
+    key: &str,
+    now: Instant,
+    window: Duration,
+) -> bool {
+    match last_notified.get(key) {
+        Some(prev) if now.duration_since(*prev) < window => false,
+        _ => {
+            last_notified.insert(key.to_string(), now);
+            true
+        }
     }
 }
 
@@ -562,6 +718,18 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     // they were spawned as detached threads during startup invocations.
     if runtime_only {
         eprintln!("runtime-only: inbox started");
+        // WS-3: one-shot sweep of dead letters left behind by earlier
+        // outages (the 10-20 incident left 700+ files, oldest from
+        // September). Never deletes: stale — and unparseable — spills move
+        // to `data/pending.archive/`, where they are kept but never replayed.
+        let archived = pending::archive_stale(
+            &host.data_dir(),
+            pending::MAX_AGE,
+            std::time::SystemTime::now(),
+        );
+        if archived > 0 {
+            eprintln!("pending: archived {archived} stale spill(s)");
+        }
         let (tx, rx) = std::sync::mpsc::sync_channel::<String>(AGENT_TRIGGER_CAPACITY);
         let inject_queue = std::sync::Arc::new(std::sync::Mutex::new(
             std::collections::VecDeque::<String>::new(),
@@ -574,6 +742,9 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         let park_host = std::sync::Arc::clone(&host);
         let mut sessions: BTreeMap<String, String> = BTreeMap::new();
         std::thread::spawn(move || {
+            // WS-3: per-session outage-notice throttle. The inbox loop is
+            // single-threaded, so a plain HashMap needs no lock.
+            let mut outage_notified: HashMap<String, Instant> = HashMap::new();
             loop {
                 let mut msgs: Vec<String> = Vec::new();
                 match rx.recv() {
@@ -844,6 +1015,36 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
                     };
+                    // WS-3: single sink for EVERY LLM failure exit of this
+                    // batch. Spill the user's text first (it must survive the
+                    // outage), then tell the batch's origin through the same
+                    // no-LLM fixed-template path as command replies — throttled
+                    // to one notice per session per OUTAGE_NOTIFY_WINDOW. A
+                    // failed notice only logs inside send_via and never changes
+                    // the outcome. Only the NORMAL messages are spilled:
+                    // commands were already handled above the LLM call.
+                    let spill_and_notify = |notified: &mut HashMap<String, Instant>| {
+                        pending::save(
+                            &data_dir,
+                            &pending::PendingMessage {
+                                session_key: session_key.clone(),
+                                combined: normals
+                                    .iter()
+                                    .map(|e| e.display.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join("\n"),
+                                enqueued_at_ms: pending::now_ms(),
+                            },
+                        );
+                        if should_notify(
+                            notified,
+                            session_key,
+                            Instant::now(),
+                            OUTAGE_NOTIFY_WINDOW,
+                        ) {
+                            send_via(&route, OUTAGE_NOTICE);
+                        }
+                    };
                     // Wrap the FINAL combined batch (spill already prepended)
                     // in START/END markers at the send site only. The raw
                     // `combined` remains unwrapped for the spill/log paths
@@ -854,49 +1055,25 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                             pending::clear(&data_dir, session_key);
                             let feedback = process(reply.content.trim().to_string(), "inbox");
                             if let Some(fb) = feedback {
-                                if let Ok(reply2) = host.agent_send_with_fallback(sid, &fb) {
-                                    process(reply2.content.trim().to_string(), "retry");
+                                // WS-3: failure exit #2 — the retry after a
+                                // format/unknown-action feedback failed. Same
+                                // sink, so this turn cannot vanish silently.
+                                match host.agent_send_with_fallback(sid, &fb) {
+                                    Ok(reply2) => {
+                                        process(reply2.content.trim().to_string(), "retry");
+                                    }
+                                    Err(e) => {
+                                        eprintln!("inbox: retry send failed: {e}");
+                                        spill_and_notify(&mut outage_notified);
+                                    }
                                 }
                             }
                         }
                         Err(e) => {
                             eprintln!("inbox: {e}");
-                            // M批: the message must survive the outage. Spill
-                            // it to disk (replayed on the next inbound batch)
-                            // and tell the user via a FIXED template — this
-                            // receipt path must never depend on the LLM.
-                            // Only the NORMAL messages are spilled: commands
-                            // were already handled above the LLM call.
-                            let batch_only = normals
-                                .iter()
-                                .map(|e| e.display.as_str())
-                                .collect::<Vec<_>>()
-                                .join("\n");
-                            pending::save(
-                                &data_dir,
-                                &pending::PendingMessage {
-                                    session_key: session_key.clone(),
-                                    combined: batch_only,
-                                    enqueued_at_ms: std::time::SystemTime::now()
-                                        .duration_since(std::time::UNIX_EPOCH)
-                                        .map(|d| d.as_millis() as u64)
-                                        .unwrap_or(0),
-                                },
-                            );
-                            if route.can_reply() {
-                                let payload = serde_json::json!({
-                                    "node_id": route.reply_node,
-                                    "target": route.reply_target,
-                                    "message": "我暂时无法思考（模型服务不可用），你的消息已收到，恢复后会回复你。",
-                                });
-                                if let Err(re) = host.invoke(
-                                    &route.source_plugin,
-                                    &route.reply_node,
-                                    payload.to_string(),
-                                ) {
-                                    eprintln!("inbox: outage receipt failed: {re}");
-                                }
-                            }
+                            // WS-3: failure exit #1 — the first send failed
+                            // (provider exhausted retries + profile fallback).
+                            spill_and_notify(&mut outage_notified);
                             cordis_runtime::kernel::notify::send(
                                 &host,
                                 &format!(
@@ -2347,36 +2524,89 @@ mod envelope_tests {
 #[cfg(test)]
 mod pending_tests {
     use super::pending;
+    use std::path::{Path, PathBuf};
+    use std::time::{Duration, SystemTime};
+
+    /// Unique per-test temp dir that removes itself on drop (tests run in
+    /// parallel inside one process, so the pid alone is not unique).
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let nanos = SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let path = std::env::temp_dir().join(format!(
+                "cordis-pending-{tag}-{}-{seq}-{nanos}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&path);
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Forge a spill file directly so tests can control content + timestamp.
+    fn write_spill(data_dir: &Path, name: &str, body: &str) {
+        let dir = data_dir.join("pending");
+        std::fs::create_dir_all(&dir).expect("create pending dir");
+        std::fs::write(dir.join(name), body).expect("write spill");
+    }
+
+    fn spill_json(key: &str, combined: &str, enqueued_at_ms: u64) -> String {
+        serde_json::json!({
+            "session_key": key,
+            "combined": combined,
+            "enqueued_at_ms": enqueued_at_ms,
+        })
+        .to_string()
+    }
+
+    const WEEK: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+    const DAY_MS: u64 = 24 * 60 * 60 * 1000;
 
     // spill → load → clear 往返；连续失败合并不覆盖。
     #[test]
     fn pending_roundtrip_and_merge() {
-        let temp = std::env::temp_dir().join(format!("cordis-pending-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp);
+        let temp = TempDir::new("roundtrip");
         let key = "feishu:chat:oc_x";
-        assert!(pending::load(&temp, key).is_none());
+        // WS-3 made `load` age-aware, so the forged timestamps must be
+        // fresh: a 1970-era `enqueued_at_ms` now counts as a stale spill.
+        let first = pending::now_ms();
+        assert!(pending::load(temp.path(), key).is_none());
         pending::save(
-            &temp,
+            temp.path(),
             &pending::PendingMessage {
                 session_key: key.to_string(),
                 combined: "第一条".to_string(),
-                enqueued_at_ms: 100,
+                enqueued_at_ms: first,
             },
         );
         pending::save(
-            &temp,
+            temp.path(),
             &pending::PendingMessage {
                 session_key: key.to_string(),
                 combined: "第二条".to_string(),
-                enqueued_at_ms: 200,
+                enqueued_at_ms: first + 200,
             },
         );
-        let loaded = pending::load(&temp, key).expect("pending should exist");
+        let loaded = pending::load(temp.path(), key).expect("pending should exist");
         assert_eq!(loaded.combined, "第一条\n第二条");
-        assert_eq!(loaded.enqueued_at_ms, 100, "保留最早时间戳");
-        pending::clear(&temp, key);
-        assert!(pending::load(&temp, key).is_none());
-        let _ = std::fs::remove_dir_all(&temp);
+        assert_eq!(loaded.enqueued_at_ms, first, "保留最早时间戳");
+        pending::clear(temp.path(), key);
+        assert!(pending::load(temp.path(), key).is_none());
     }
 
     // session_key 含特殊字符不能逃出 pending 目录。
@@ -2386,6 +2616,159 @@ mod pending_tests {
         let p = pending::path_for(dir, "../../etc/passwd");
         assert!(p.starts_with("/data/pending/"), "path: {}", p.display());
         assert!(!p.to_string_lossy().contains(".."), "path: {}", p.display());
+    }
+
+    // archive_stale：过期 → 移入 archive、新鲜 → 原地保留、坏 JSON → 也移入
+    // （不删），archive 目录在首次归档时由该调用创建，非 .json 不动。
+    #[test]
+    fn archive_stale_moves_old_and_unparseable() {
+        let temp = TempDir::new("archive-mixed");
+        let now_ms = pending::now_ms();
+        write_spill(
+            temp.path(),
+            "fresh.json",
+            &spill_json("fresh", "新", now_ms),
+        );
+        write_spill(
+            temp.path(),
+            "stale.json",
+            &spill_json("stale", "旧", now_ms.saturating_sub(8 * DAY_MS)),
+        );
+        write_spill(temp.path(), "broken.json", "{ this is not json");
+        write_spill(temp.path(), "keep.txt", "not a spill");
+        assert!(!temp.path().join("pending.archive").exists());
+
+        let archived = pending::archive_stale(temp.path(), WEEK, SystemTime::now());
+        assert_eq!(archived, 2);
+        // Fresh spill stays live.
+        assert!(temp.path().join("pending/fresh.json").exists());
+        // Stale + unparseable spill moved out of the live directory, kept.
+        assert!(!temp.path().join("pending/stale.json").exists());
+        assert!(!temp.path().join("pending/broken.json").exists());
+        assert!(temp.path().join("pending.archive/stale.json").exists());
+        assert!(temp.path().join("pending.archive/broken.json").exists());
+        // Archive dir created on first use; non-json files untouched.
+        assert!(temp.path().join("pending.archive").is_dir());
+        assert!(temp.path().join("pending/keep.txt").exists());
+        // Byte-identical move: the bad payload is preserved, not deleted.
+        let kept = std::fs::read_to_string(temp.path().join("pending.archive/broken.json"))
+            .expect("archived broken spill is readable");
+        assert_eq!(kept, "{ this is not json");
+    }
+
+    // archive 目标同名已存在 → 追加数字后缀，绝不覆盖已归档的死信。
+    #[test]
+    fn archive_stale_never_clobbers_existing_entry() {
+        let temp = TempDir::new("archive-collision");
+        let stale = pending::now_ms().saturating_sub(30 * DAY_MS);
+        write_spill(temp.path(), "dup.json", &spill_json("dup", "旧", stale));
+        let archive_dir = temp.path().join("pending.archive");
+        std::fs::create_dir_all(&archive_dir).expect("create archive dir");
+        std::fs::write(archive_dir.join("dup.json"), "archived-earlier").expect("seed archive");
+
+        let archived = pending::archive_stale(temp.path(), WEEK, SystemTime::now());
+        assert_eq!(archived, 1);
+        // The older archive entry is intact and the new one landed beside it.
+        assert_eq!(
+            std::fs::read_to_string(archive_dir.join("dup.json")).ok(),
+            Some("archived-earlier".to_string())
+        );
+        assert!(archive_dir.join("dup.1.json").exists());
+        assert!(!temp.path().join("pending/dup.json").exists());
+    }
+
+    // 没有 pending 目录（从未发生 spill）→ 0，且不创建 archive 目录。
+    #[test]
+    fn archive_stale_without_pending_dir_is_noop() {
+        let temp = TempDir::new("archive-missing");
+        let archived = pending::archive_stale(temp.path(), WEEK, SystemTime::now());
+        assert_eq!(archived, 0);
+        assert!(!temp.path().join("pending.archive").exists());
+    }
+
+    // load：超过 7 天的 spill 视为不存在（文件保留，留给 archive_stale），
+    // 新鲜的仍能读回。
+    #[test]
+    fn load_ignores_stale_spill() {
+        let temp = TempDir::new("load-age");
+        let key = "feishu:chat:oc_old";
+        pending::save(
+            temp.path(),
+            &pending::PendingMessage {
+                session_key: key.to_string(),
+                combined: "陈年死信".to_string(),
+                enqueued_at_ms: pending::now_ms().saturating_sub(8 * DAY_MS),
+            },
+        );
+        assert!(pending::load(temp.path(), key).is_none());
+        assert!(
+            pending::path_for(temp.path(), key).exists(),
+            "过期 spill 只能忽略，不能删除"
+        );
+
+        pending::save(
+            temp.path(),
+            &pending::PendingMessage {
+                session_key: key.to_string(),
+                combined: "新鲜的".to_string(),
+                enqueued_at_ms: pending::now_ms(),
+            },
+        );
+        let loaded = pending::load(temp.path(), key).expect("fresh spill loads");
+        assert_eq!(loaded.combined, "新鲜的");
+    }
+}
+
+#[cfg(test)]
+mod notify_tests {
+    use super::should_notify;
+    use std::collections::HashMap;
+    use std::time::{Duration, Instant};
+
+    const WINDOW: Duration = Duration::from_secs(10 * 60);
+
+    // 窗口内第二次被限流，窗口边界（满 10 分钟）重新放行。
+    #[test]
+    fn should_notify_throttles_within_window() {
+        let mut last = HashMap::new();
+        let t0 = Instant::now();
+        assert!(should_notify(&mut last, "k", t0, WINDOW));
+        assert!(!should_notify(
+            &mut last,
+            "k",
+            t0 + Duration::from_secs(1),
+            WINDOW
+        ));
+        assert!(!should_notify(
+            &mut last,
+            "k",
+            t0 + WINDOW - Duration::from_secs(1),
+            WINDOW
+        ));
+        assert!(should_notify(&mut last, "k", t0 + WINDOW, WINDOW));
+    }
+
+    // 不同 session_key 各计各的，互不影响。
+    #[test]
+    fn should_notify_is_per_key() {
+        let mut last = HashMap::new();
+        let t0 = Instant::now();
+        assert!(should_notify(&mut last, "a", t0, WINDOW));
+        assert!(should_notify(&mut last, "b", t0, WINDOW));
+        assert!(!should_notify(
+            &mut last,
+            "a",
+            t0 + Duration::from_secs(60),
+            WINDOW
+        ));
+        assert!(!should_notify(
+            &mut last,
+            "b",
+            t0 + Duration::from_secs(60),
+            WINDOW
+        ));
+        // A brand-new session is never throttled by other sessions' notices.
+        assert!(should_notify(&mut last, "c", t0, WINDOW));
     }
 }
 

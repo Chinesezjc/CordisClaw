@@ -1420,74 +1420,17 @@ impl AgentSession {
                 tool_specs.len(),
             ));
 
-            // Repair broken tool_calls chains: if an assistant message has
-            // tool_calls without matching tool results, filter the tool_calls
-            // array so the remaining chain is valid for DeepSeek.
-            let mut repair_indices: Vec<(usize, Vec<Value>)> = Vec::new();
-            for (idx, msg) in messages.iter().enumerate() {
-                if msg.get("role").and_then(|v| v.as_str()) == Some("assistant") {
-                    if let Some(tc_arr) = msg.get("tool_calls").and_then(|v| v.as_array()) {
-                        let expected: Vec<&str> = tc_arr
-                            .iter()
-                            .filter_map(|tc| tc.get("id").and_then(|v| v.as_str()))
-                            .collect();
-                        let mut found: Vec<&str> = Vec::new();
-                        for next in messages.iter().skip(idx + 1) {
-                            match next.get("role").and_then(|v| v.as_str()) {
-                                Some("tool") => {
-                                    if let Some(tid) =
-                                        next.get("tool_call_id").and_then(|v| v.as_str())
-                                    {
-                                        found.push(tid);
-                                    }
-                                }
-                                Some("assistant") | Some("user") => break,
-                                _ => {}
-                            }
-                        }
-                        if found.len() < expected.len() {
-                            eprintln!(
-                                "[tool_calls repair] turn={} msg_idx={} expected={:?} found={:?}",
-                                turn + 1,
-                                idx,
-                                expected,
-                                found,
-                            );
-                            // Keep only tool_calls that have matching tool messages.
-                            let repaired: Vec<Value> = tc_arr
-                                .iter()
-                                .filter(|tc| {
-                                    tc.get("id")
-                                        .and_then(|v| v.as_str())
-                                        .is_some_and(|id| found.contains(&id))
-                                })
-                                .cloned()
-                                .collect();
-                            if repaired.is_empty() {
-                                // No tool calls have results — remove the entire
-                                // assistant message from the array (we'll do this
-                                // after the scan).
-                                repair_indices.push((idx, repaired));
-                            } else if repaired.len() < tc_arr.len() {
-                                repair_indices.push((idx, repaired));
-                            }
-                        }
-                    }
-                }
-            }
-            // Apply repairs in reverse order so earlier indices stay valid.
-            for (idx, repaired) in repair_indices.into_iter().rev() {
-                if repaired.is_empty() {
-                    messages.remove(idx);
-                    eprintln!("[tool_calls repair] removed orphan assistant at index {idx}");
-                } else {
-                    if let Some(msg) = messages.get_mut(idx) {
-                        if let Some(obj) = msg.as_object_mut() {
-                            obj.insert("tool_calls".to_string(), Value::Array(repaired));
-                            eprintln!("[tool_calls repair] filtered tool_calls at index {idx}");
-                        }
-                    }
-                }
+            // Repair broken tool_calls chains before the request goes out.
+            // 链破形有两种方向（assistant 的 call 没应答 / tool 消息成孤儿），
+            // 两者都会让 DeepSeek 整轮 400，见 `agent_toolchain` 模块文档。
+            let repair = crate::agent_toolchain::sanitize_tool_chains(&mut messages);
+            if repair.changed() {
+                eprintln!(
+                    "[tool_calls repair] dropped_calls={} dropped_tool_messages={} dropped_assistant_messages={}",
+                    repair.dropped_calls,
+                    repair.dropped_tool_messages,
+                    repair.dropped_assistant_messages,
+                );
             }
 
             let request_body = json!({
@@ -1523,7 +1466,8 @@ impl AgentSession {
                 // Separate valid and unknown tool calls.
                 // Unknown tools are NOT added to the tool_calls chain
                 // (avoids DeepSeek tool_call_id mismatch errors).
-                // Instead they're injected as user-message errors.
+                // Instead they end up in the turn's single prompt message,
+                // after every tool result (see `tool_failure_prompts` below).
                 let (valid_calls, unknown_calls): (Vec<_>, Vec<_>) = message
                     .tool_calls
                     .iter()
@@ -1537,7 +1481,13 @@ impl AgentSession {
                     };
                     messages.push(llm_message_to_request(&filtered));
                 }
-                // Inject errors for unknown tools BEFORE any assistant message.
+                // Errors for unknown tools are COLLECTED, not pushed here: a
+                // user message sitting between the assistant's tool_calls and
+                // its tool results breaks the chain (this is how a mixed
+                // "one unknown + one valid" turn used to earn a DeepSeek 400).
+                // They are merged with the failed-tool warnings and flushed
+                // once, after every tool result of this turn.
+                let mut tool_failure_prompts: Vec<String> = Vec::new();
                 for tool_call in &unknown_calls {
                     let tool_name = &tool_call.function.name;
                     self.unknown_tool_strikes += 1;
@@ -1564,12 +1514,15 @@ impl AgentSession {
                         tool_name
                     );
                     let _ = std::io::stdout().flush();
-                    messages.push(json!({"role": "user", "content": err_msg}));
+                    tool_failure_prompts.push(err_msg);
                 }
                 // One blank line before the tool call block.
                 if !valid_calls.is_empty() {
                     let _ = writeln!(std::io::stdout());
                 }
+                // Failed-tool warnings join the same buffer (declared above) so
+                // that both kinds of turn-local prompt leave in ONE user
+                // message, after every tool result.
                 for tool_call in &valid_calls {
                     // Announce tool execution in real-time.
                     let tool_args_preview: String =
@@ -1625,18 +1578,16 @@ impl AgentSession {
                         "tool_call_id": tool_call.id,
                         "content": tool_output,
                     }));
-                    // Inject a prominent warning when tools fail so the Agent
-                    // cannot silently continue after an error.
+                    // Collect a prominent warning when tools fail so the Agent
+                    // cannot silently continue after an error. Flushed as one
+                    // user message once the whole chain has been pushed.
                     if !tool_ok {
                         let err = tool_err.as_deref().unwrap_or("unknown error");
-                        messages.push(json!({
-                            "role": "user",
-                            "content": format!(
-                                "🔴 TOOL '{event_name}' FAILED: {err}\n\
-                                 Do NOT proceed as if it succeeded. Fix the cause \
-                                 and retry, or use a different approach."
-                            ),
-                        }));
+                        tool_failure_prompts.push(format!(
+                            "🔴 TOOL '{event_name}' FAILED: {err}\n\
+                             Do NOT proceed as if it succeeded. Fix the cause \
+                             and retry, or use a different approach."
+                        ));
                     }
                     if let Some(reply_content) = terminal_reply {
                         if message
@@ -1654,6 +1605,9 @@ impl AgentSession {
                         // Check for late-arriving messages before replying.
                         let new_msgs = drain_inject_queue();
                         if !new_msgs.is_empty() {
+                            // Flush before continuing: this exit skips the
+                            // post-loop flush, so the warnings would be lost.
+                            flush_tool_failure_prompts(&mut messages, &mut tool_failure_prompts);
                             for m in new_msgs {
                                 if m.trim().is_empty() {
                                     continue;
@@ -1681,6 +1635,11 @@ impl AgentSession {
                         });
                     }
                 }
+                // Every tool result of this turn is pushed: merge the collected
+                // failure warnings into one user message (a user message before
+                // this point would sit between two tool results of the same
+                // assistant and break the chain).
+                flush_tool_failure_prompts(&mut messages, &mut tool_failure_prompts);
                 continue;
             }
 
@@ -2045,6 +2004,24 @@ impl ShellAgentSession {
             .remember_exchange(user_input, assistant_output, None);
         self.inner.completed_turns += 1;
     }
+}
+
+/// 把本轮收集到的提示（失败的 tool、不存在的 tool）合并成**一条** user 消息
+/// 追加到 `messages`。
+///
+/// 必须在「本轮全部 tool 结果都已 push」之后调用：供应商要求 `role=="tool"`
+/// 的结果紧跟在它所属的 assistant `tool_calls` 之后，任何插在中间的 user
+/// 消息都会让整轮请求 400。多条提示用空行连接，保持各自措辞逐字节不变。
+/// 没有收集到提示时是 no-op（调用点因此可以在所有出口无条件调用）。
+fn flush_tool_failure_prompts(messages: &mut Vec<Value>, prompts: &mut Vec<String>) {
+    if prompts.is_empty() {
+        return;
+    }
+    messages.push(json!({
+        "role": "user",
+        "content": prompts.join("\n\n"),
+    }));
+    prompts.clear();
 }
 
 /// 把一条助手消息序列化回请求里的 message 对象。

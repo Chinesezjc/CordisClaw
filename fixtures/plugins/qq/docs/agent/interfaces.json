@@ -358,6 +358,249 @@
       "agent_accessible": true
     },
     {
+      "id": "qq_get_group_members",
+      "summary": "Get the raw OneBot member list for a group (get_group_member_list). Each entry carries user_id, nickname, card and role (owner/admin/member).",
+      "input_schema": {
+        "type": "object",
+        "required": [
+          "node_id",
+          "target"
+        ],
+        "properties": {
+          "node_id": {
+            "type": "string",
+            "const": "qq_get_group_members"
+          },
+          "target": {
+            "type": "string",
+            "description": "group:<id>"
+          }
+        }
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "ok": {
+            "type": "boolean"
+          },
+          "message": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "data": {
+            "type": "object",
+            "description": "Raw OneBot get_group_member_list response"
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "side_effects": [
+        "calls OneBot get_group_member_list API"
+      ],
+      "failure_modes": [
+        "no OneBot URL configured",
+        "target must be group:<id>"
+      ],
+      "node_type": "router",
+      "agent_accessible": true
+    },
+    {
+      "id": "qq_get_group_roles",
+      "summary": "Answer 'who is the group owner / who are the admins?'. Aggregates get_group_member_list by role, and falls back to get_group_info_ex (data.extInfo.groupOwnerId.memberUin) when the member list has no role field. source tells you which path was used.",
+      "input_schema": {
+        "type": "object",
+        "required": [
+          "node_id",
+          "target"
+        ],
+        "properties": {
+          "node_id": {
+            "type": "string",
+            "const": "qq_get_group_roles"
+          },
+          "target": {
+            "type": "string",
+            "description": "group:<id>"
+          },
+          "payload": {
+            "type": "object",
+            "properties": {
+              "onebot_url": {
+                "type": "string",
+                "description": "Optional OneBot HTTP API URL override (defaults to STATE / runtime config)"
+              },
+              "access_token": {
+                "type": "string",
+                "description": "Optional OneBot access token override (defaults to STATE / runtime config)"
+              }
+            }
+          }
+        }
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "ok": {
+            "type": "boolean"
+          },
+          "message": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "data": {
+            "type": "object",
+            "properties": {
+              "owner": {
+                "type": [
+                  "object",
+                  "null"
+                ],
+                "description": "{user_id, nickname, card} or null"
+              },
+              "admins": {
+                "type": "array",
+                "items": {
+                  "type": "object"
+                }
+              },
+              "member_count": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "source": {
+                "type": "string",
+                "description": "member_list | group_info_ex"
+              }
+            }
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "side_effects": [
+        "calls OneBot get_group_member_list, then get_group_info_ex when the owner is missing"
+      ],
+      "failure_modes": [
+        "no OneBot URL configured",
+        "invalid target format",
+        "OneBot API error"
+      ],
+      "node_type": "router",
+      "agent_accessible": true
+    },
+    {
+      "id": "qq_get_reply_policy",
+      "summary": "Read the persisted reply policy — the rule the bot follows to decide whether an incoming QQ message is addressed to it. is_default=true means no policy has been stored yet.",
+      "input_schema": {
+        "type": "object",
+        "required": [
+          "node_id"
+        ],
+        "properties": {
+          "node_id": {
+            "type": "string",
+            "const": "qq_get_reply_policy"
+          },
+          "data_dir": {
+            "type": "string",
+            "description": "Optional data directory override"
+          }
+        }
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "ok": {
+            "type": "boolean"
+          },
+          "data": {
+            "type": "object",
+            "properties": {
+              "policy": {
+                "type": "string"
+              },
+              "is_default": {
+                "type": "boolean"
+              }
+            }
+          }
+        }
+      },
+      "side_effects": [
+        "reads data/qq_reply_policy.json"
+      ],
+      "failure_modes": [],
+      "node_type": "router",
+      "agent_accessible": true
+    },
+    {
+      "id": "qq_set_reply_policy",
+      "summary": "Persist the reply policy: the rule the bot follows when deciding whether an incoming message is addressed to it. It is shipped to the model as the first line of every message, so it takes effect on the NEXT message — no rebuild and no restart.",
+      "input_schema": {
+        "type": "object",
+        "required": [
+          "node_id",
+          "policy"
+        ],
+        "properties": {
+          "node_id": {
+            "type": "string",
+            "const": "qq_set_reply_policy"
+          },
+          "policy": {
+            "type": "string",
+            "description": "New reply rule text (English; shown to the model verbatim)"
+          },
+          "data_dir": {
+            "type": "string",
+            "description": "Optional data directory override"
+          }
+        }
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "ok": {
+            "type": "boolean"
+          },
+          "data": {
+            "type": "object",
+            "properties": {
+              "policy": {
+                "type": "string"
+              },
+              "path": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "side_effects": [
+        "writes data/qq_reply_policy.json"
+      ],
+      "failure_modes": [
+        "policy must not be empty"
+      ],
+      "node_type": "router",
+      "agent_accessible": true
+    },
+    {
       "id": "qq_system_notify",
       "summary": "Kernel notification handler — receives system messages and forwards to configured test groups.",
       "input_schema": {
@@ -408,5 +651,5 @@
       "agent_accessible": false
     }
   ],
-  "system_hint": "QQ GROUP CHAT MODE — you are running in a QQ group. Messages may be casual chat NOT directed at you.\nCRITICAL: Always decide whether the message is actually talking to YOU before responding.\nA message IS directed at you ONLY if: contains @[id=3832224285] (explicit @mention of bot); or starts with \"bot\" or \"Bot\" or \"机器人\".\nA message is NOT directed at you if: general group discussion; questions not explicitly addressed to bot; casual chat; emoji/sticker; talking about someone else. When in doubt, suspend.\nIf NOT directed at you: use {\"action\":\"suspend\"}.\nIf directed at you: invoke_plugin(qq, qq_send, ...) to send your reply, then output {\"action\":\"suspend\"}.\nIMPORTANT: NEVER use {\"action\":\"respond\"} — it will cause duplicate messages. Always send via qq_send and finish with {\"action\":\"suspend\"}.\n\nANTI-HALLUCINATION rules:\n- If a question is ambiguous or you lack context, ask for clarification — do NOT guess.\n- If web search fails to yield a clear answer after 2 attempts, stop and tell the user what you found (or didn't find). Ask them to clarify.\n- Pay attention to the group's recent conversation. The topic may be group-specific and not searchable on the web.\n- A short honest \"not sure, can you clarify?\" is always better than a long wrong answer.\n\nKERNEL TOOL usage in QQ chat:\n- Kernel introspection tools (get_runtime_status, list_plugins, list_nodes, get_kernel_status, get_kernel_issues) are for internal diagnostics only.\n- Only call them when a user @mentions you with an explicit question about bot/runtime/plugin status.\n- For images, stickers, casual chat, or ambiguous messages: suspend immediately — do NOT call any kernel tool.\n\nTo send a progress update or proactive message to the group you're talking to:\ninvoke_plugin(qq, qq_send, {\"node_id\":\"qq_send\",\"target\":\"group:<group_id>\",\"message\":\"<your message>\"})\nReplace <group_id> with the actual group ID from the incoming message.\nSend a brief progress message BEFORE any tool that may take more than a moment (build, test, search, etc.), and a follow-up when the tool completes.\n\nTo query group members: invoke_plugin(qq, qq_get_group_members, {\"node_id\":\"qq_get_group_members\",\"target\":\"group:<id>\"})\nTo proactively send to a group: invoke_plugin(qq, qq_send, {\"node_id\":\"qq_send\",\"target\":\"group:<id>\",\"message\":\"<text>\"})"
+  "system_hint": "QQ GROUP CHAT MODE — you are running in a QQ group. Messages may be casual chat NOT directed at you.\nCRITICAL: Always decide whether the message is actually talking to YOU before responding.\nREPLY POLICY — the authority on whether to answer: every incoming message begins with a line `[reply policy: ...]`. That line IS the rule; follow it exactly. It may be more permissive than you expect (e.g. \"reply whenever someone seems to want an answer\"), so do not apply a stricter rule of your own.\nIf a message has NO `[reply policy: ...]` line, fall back to the conservative default: answer ONLY when the message @mentions you or addresses you by name (\"bot\", \"Bot\", \"机器人\"); otherwise suspend.\nA message is NOT directed at you if: general group discussion; questions not explicitly addressed to you under the policy above; casual chat; emoji/sticker; talking about someone else.\nIf NOT directed at you: use {\"action\":\"suspend\"}.\nIf directed at you: invoke_plugin(qq, qq_send, ...) to send your reply, then output {\"action\":\"suspend\"}.\nIMPORTANT: NEVER use {\"action\":\"respond\"} — it will cause duplicate messages. Always send via qq_send and finish with {\"action\":\"suspend\"}.\nIf the user asks you to change the reply rule (e.g. \"reply to everything I say\", \"stop answering so often\"), persist it: invoke_plugin(qq, qq_set_reply_policy, {\"node_id\":\"qq_set_reply_policy\",\"policy\":\"<new rule text>\"}), then tell the user it is already in effect — the next message uses the new policy, no restart needed.\n\nANTI-HALLUCINATION rules:\n- If a question is ambiguous or you lack context, ask for clarification — do NOT guess.\n- If web search fails to yield a clear answer after 2 attempts, stop and tell the user what you found (or didn't find). Ask them to clarify.\n- Pay attention to the group's recent conversation. The topic may be group-specific and not searchable on the web.\n- A short honest \"not sure, can you clarify?\" is always better than a long wrong answer.\n- Never claim a tool or permission is unavailable without actually invoking it first: every node listed in this plugin's interfaces is callable by you.\n\nKERNEL TOOL usage in QQ chat:\n- Kernel introspection tools (get_runtime_status, list_plugins, list_nodes, get_kernel_status, get_kernel_issues) are for internal diagnostics only.\n- Only call them when a user @mentions you with an explicit question about bot/runtime/plugin status.\n- For images, stickers, casual chat, or ambiguous messages: suspend immediately — do NOT call any kernel tool.\n\nTo send a progress update or proactive message to the group you're talking to:\ninvoke_plugin(qq, qq_send, {\"node_id\":\"qq_send\",\"target\":\"group:<group_id>\",\"message\":\"<your message>\"})\nReplace <group_id> with the actual group ID from the incoming message.\nSend a brief progress message BEFORE any tool that may take more than a moment (build, test, search, etc.), and a follow-up when the tool completes.\n\nTo query group members: invoke_plugin(qq, qq_get_group_members, {\"node_id\":\"qq_get_group_members\",\"target\":\"group:<id>\"})\nYou CAN query group members/roles: invoke_plugin(qq, qq_get_group_roles, {\"node_id\":\"qq_get_group_roles\",\"target\":\"group:<id>\"}). Use it when asked who the group owner or admins are — never guess a name or claim you lack permission.\nTo proactively send to a group: invoke_plugin(qq, qq_send, {\"node_id\":\"qq_send\",\"target\":\"group:<id>\",\"message\":\"<text>\"})"
 }

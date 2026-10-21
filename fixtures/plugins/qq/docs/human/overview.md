@@ -70,14 +70,38 @@ CordisClaw 不知道消息经过了 LunaBot — 它看到的就是普通 QQ 群�
 }
 ```
 
+### `qq_get_group_members`
+Raw `get_group_member_list` passthrough for `target: group:<id>`. Agent-accessible
+since 5.2.38 — before that the node had no node_doc at all, so the tool firewall
+answered `Agent is not allowed to call qq::qq_get_group_members` and the model
+used to report it as "this API is closed to me".
+
+### `qq_get_group_roles`
+Compact role summary for `target: group:<id>`: `{owner, admins, member_count,
+source}`. Aggregates `get_group_member_list` (`role` = `owner`/`admin`/`member`);
+when the member list carries no owner it falls back to `get_group_info_ex`
+(`extInfo.groupOwnerId.memberUin`).
+
+### `qq_get_reply_policy` / `qq_set_reply_policy`
+Read/persist the **reply gate** used for every inbound message. The policy lives
+in `data/qq_reply_policy.json` (explicit `data_dir` payload →
+`$CORDIS_FIXTURES_ROOT/../data` → cwd-relative `data/`) and is shipped to the
+model as a `[reply policy: …]` first line on every message. Changing it takes
+effect on the next message — no rebuild, no restart. An empty policy is rejected.
+
 ## Agent 意图判断规则
 
-Agent 通过 LLM 自行判断消息是否对它说的。以下情况会触发响应：
-- 显式提到机器人名称、"Cordis"、"bot"、"机器人"
-- 直接提问或命令语气
-- 包含疑问词（how、why、what、怎么、为什么、帮我）
+门控规则的**唯一权威**是每条入站消息首行的 `[reply policy: …]`（5.2.38 之前是
+插件 `system_hint` 里硬编码的 `IS directed at you ONLY if …`）。没有该行时退回
+保守默认：显式 @ / 点名 "bot"、"Bot"、"机器人" 才响应；其余一律 suspend。
 
-以下情况返回 suspend（会话挂起）：
+默认策略（可在群里让 bot 用 `qq_set_reply_policy` 改）：
+
+> Reply when the message is clearly addressed to you (contains "bot"/"Bot"/"机器人",
+> an @mention of you, or the sender explicitly asks you to answer). Otherwise stay
+> silent.
+
+以下情况默认返回 suspend（会话挂起）：
 - 群友之间的闲聊
 - 表情、贴纸、单字回复
 - 不涉及机器人的陈述

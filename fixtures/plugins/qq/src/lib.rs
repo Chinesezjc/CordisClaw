@@ -204,6 +204,15 @@ struct NodeRequest {
     url: Option<String>,
     #[serde(default)]
     target: Option<String>,
+    /// Reply-policy text as a top-level field (WS-4). Accepted in addition to
+    /// `payload.policy` so `qq_set_reply_policy` works both through the
+    /// kernel's payload convention and via a direct top-level invoke.
+    #[serde(default)]
+    policy: Option<String>,
+    /// Explicit data directory as a top-level field (alternative to
+    /// `payload.data_dir`), same dual-accept rationale as `policy`.
+    #[serde(default)]
+    data_dir: Option<String>,
     #[serde(default)]
     message: Option<String>,
     /// Accepts both i64 (legacy direct invoke) and string (runtime inbox
@@ -1080,16 +1089,106 @@ fn should_process(text: &str) -> bool {
     text.len() > 2
 }
 
+// ---------------------------------------------------------------------------
+// Reply policy (WS-4) — runtime-configurable reply gating
+// ---------------------------------------------------------------------------
+//
+// The gating rule ("is this message addressed to me?") used to be hard-coded
+// in this plugin's `system_hint`, so letting the bot be chattier required
+// editing Rust and rebuilding the artifact. It is data now:
+// `data/qq_reply_policy.json`, shipped to the model as a `[reply policy: ...]`
+// line at the top of every incoming message.
+
+/// Conservative default, used whenever no usable policy file exists. Kept in
+/// English because the model reads it verbatim.
+const DEFAULT_REPLY_POLICY: &str = "Reply when the message is clearly addressed to you (contains \"bot\"/\"Bot\"/\"机器人\", an @mention of you, or the sender explicitly asks you to answer). Otherwise stay silent.";
+
+/// On-disk shape of `data/qq_reply_policy.json`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ReplyPolicyRecord {
+    policy: String,
+    #[serde(default)]
+    updated_at_ms: u64,
+    #[serde(default)]
+    updated_by: String,
+}
+
+/// Resolve the reply-policy file location. Preference order is exactly
+/// soul_store's `db_path()`: explicit `data_dir` from the payload (the kernel
+/// knows the workspace root), then `$CORDIS_FIXTURES_ROOT/../data`, then a
+/// cwd-relative `data/`.
+fn reply_policy_path(data_dir: Option<&str>) -> std::path::PathBuf {
+    if let Some(dir) = data_dir {
+        if !dir.is_empty() {
+            return std::path::PathBuf::from(dir).join("qq_reply_policy.json");
+        }
+    }
+    if let Ok(root) = std::env::var("CORDIS_FIXTURES_ROOT") {
+        let ws = std::path::PathBuf::from(&root)
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::path::PathBuf::from(&root));
+        return ws.join("data/qq_reply_policy.json");
+    }
+    std::path::PathBuf::from("data/qq_reply_policy.json")
+}
+
+/// Read the persisted policy. `None` means "no usable file" — missing,
+/// unreadable, malformed, or blank — and every caller falls back to the
+/// default rather than failing.
+fn read_reply_policy_file(data_dir: Option<&str>) -> Option<String> {
+    let path = reply_policy_path(data_dir);
+    let raw = std::fs::read_to_string(&path).ok()?;
+    let record = serde_json::from_str::<ReplyPolicyRecord>(&raw).ok()?;
+    Some(record.policy.trim().to_string()).filter(|p| !p.is_empty())
+}
+
+/// Effective policy for this message. NEVER fails: a missing or broken file
+/// yields `DEFAULT_REPLY_POLICY`, so envelope construction cannot break.
+fn current_reply_policy(data_dir: Option<&str>) -> String {
+    read_reply_policy_file(data_dir).unwrap_or_else(|| DEFAULT_REPLY_POLICY.to_string())
+}
+
+/// Node arguments may arrive inside `payload` (kernel convention) or as a
+/// top-level request field (direct invoke); the payload wins when both exist.
+fn node_str_arg(payload: Option<&Value>, top_level: Option<&str>, key: &str) -> Option<String> {
+    let from_payload = payload.and_then(|p| p.get(key)).and_then(Value::as_str);
+    match from_payload {
+        Some(v) => Some(v.to_string()),
+        None => top_level.map(str::to_string),
+    }
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or_default()
+}
+
+/// Create the policy file's parent directory. `path` is always a join of a
+/// data dir and the file name, so a parent exists; if it somehow does not,
+/// creating the path itself is the closest honest fallback.
+fn ensure_policy_parent_dir(path: &std::path::Path) -> Result<(), String> {
+    let parent = path.parent().unwrap_or(path);
+    std::fs::create_dir_all(parent).map_err(|e| format!("create data dir: {e}"))
+}
+
 /// Build the runtime routing envelope (mirrors feishu's build_envelope).
 /// sender_id is "group:<gid>" or "private:<uid>"; the actual person is
 /// user_id, so identity is "qq:<user_id>".
 fn build_envelope(msg: &IncomingMessage) -> String {
+    // WS-4: every inbound message carries the current reply policy as its
+    // first line. Unreadable/missing policy file → DEFAULT_REPLY_POLICY, so
+    // this can never fail envelope construction.
+    let reply_policy = current_reply_policy(None);
     let reply_target = format!("{}:{}", msg.message_type, msg.sender_id);
     let session_key = format!("qq:{reply_target}");
     let display = format!(
-        "[QQ {} from {} (user {})]: {}",
+        "[reply policy: {reply_policy}]\n[QQ {} from {} (user {})]: {}",
         msg.message_type, msg.sender_id, msg.user_id, msg.message
     );
+
     let mut env = json!({
         "source_plugin": "qq",
         "reply_node": "qq_send",
@@ -1313,16 +1412,21 @@ fn handle_qq_fetch_messages() -> Result<NodeResponse, String> {
 }
 
 /// P2-12: resolve the QQ runtime-config path relative to
-/// `$CORDIS_FIXTURES_ROOT` (falling back to the historical hard-coded
-/// `/root/CordisClaw/fixtures/...` when the env is missing). The
-/// filesystem plugin already reads this env var; this makes QQ portable
-/// across environments and testing setups.
+/// `$CORDIS_FIXTURES_ROOT`. The filesystem plugin already reads this env var;
+/// this makes QQ portable across environments and testing setups.
+///
+/// The env-missing fallback used to be the absolute
+/// `/root/CordisClaw/fixtures/…`, i.e. a *different* checkout on this box: a
+/// runtime started from `/root/CordisClaw-minori` silently read (and, through
+/// `save_runtime_config`, wrote) the other repo's drafts file. `serve <root>`
+/// runs with the repo root as cwd, so the honest fallback is the cwd-relative
+/// `fixtures/.cordis-drafts/…`.
 fn runtime_config_path() -> std::path::PathBuf {
     match std::env::var("CORDIS_FIXTURES_ROOT") {
         Ok(root) => std::path::PathBuf::from(root).join(".cordis-drafts/qq_runtime_config.json"),
-        Err(_) => std::path::PathBuf::from(
-            "/root/CordisClaw/fixtures/.cordis-drafts/qq_runtime_config.json",
-        ),
+        Err(_) => std::env::current_dir()
+            .unwrap_or_else(|_| std::path::PathBuf::from("."))
+            .join("fixtures/.cordis-drafts/qq_runtime_config.json"),
     }
 }
 
@@ -1442,6 +1546,179 @@ fn handle_qq_get_group_members(req: &NodeRequest) -> Result<NodeResponse, String
         messages: None,
         message: Some(format!("group {} member list", id)),
         data: Some(data),
+        error: None,
+    })
+}
+
+/// Extract one `{user_id, nickname, card}` entry from a OneBot member object.
+/// `None` when the object carries no `user_id` — nothing to identify it by.
+/// Missing/empty `nickname` or `card` degrade to null instead of dropping the
+/// entry (real NapCat payloads omit `card` for members without a group card).
+fn group_role_entry(member: &Value) -> Option<Value> {
+    let user_id = member.get("user_id")?;
+    let nickname = member
+        .get("nickname")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty());
+    let card = member
+        .get("card")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty());
+    Some(json!({"user_id": user_id, "nickname": nickname, "card": card}))
+}
+
+/// Pure aggregation of a `get_group_member_list` response into
+/// `{owner, admins, member_count, source}`. Accepts either the full OneBot
+/// envelope (`{"data":[..]}`) or the bare member array. An absent `owner` is
+/// left null on purpose: the caller then falls back to `get_group_info_ex`.
+fn summarize_group_roles(members: &Value) -> Value {
+    let list = members.get("data").unwrap_or(members);
+    let entries = list.as_array().map_or(&[][..], Vec::as_slice);
+    let mut owner: Option<Value> = None;
+    let mut admins: Vec<Value> = Vec::new();
+    for entry in entries {
+        let role = entry.get("role").and_then(Value::as_str).unwrap_or("");
+        // `.into_iter()` on the Option keeps the "no user_id" skip in one
+        // place without an `if let` whose implicit else edge never runs.
+        for role_entry in group_role_entry(entry).into_iter() {
+            match role {
+                "owner" => owner = Some(role_entry),
+                "admin" => admins.push(role_entry),
+                _ => {}
+            }
+        }
+    }
+    json!({
+        "owner": owner,
+        "admins": admins,
+        "member_count": entries.len(),
+        "source": "member_list",
+    })
+}
+
+/// Owner entry from `get_group_info_ex`'s
+/// `data.extInfo.groupOwnerId.memberUin`. This is the fallback for OneBot
+/// backends whose member list omits `role`; only the uid is available, so
+/// nickname/card stay null.
+fn owner_from_group_info_ex(info: &Value) -> Option<Value> {
+    let uin = info.pointer("/data/extInfo/groupOwnerId/memberUin")?;
+    Some(json!({"user_id": uin, "nickname": null, "card": null}))
+}
+
+/// WS-4: answer "who is the group owner / who are the admins?" WITHOUT the
+/// model having to invent a permission error. Aggregates the member list by
+/// `role`, and falls back to `get_group_info_ex` when the backend omits it.
+fn handle_qq_get_group_roles(req: &NodeRequest) -> Result<NodeResponse, String> {
+    let target = req.target.as_deref().unwrap_or("").trim();
+    if target.is_empty() {
+        return Err("target is required for qq_get_group_roles (group:<id>)".to_string());
+    }
+    let (kind, id) = parse_target(target)?;
+    if kind != TargetKind::Group {
+        return Err("target must be group:<id> for qq_get_group_roles".to_string());
+    }
+
+    // Same resolution order as handle_qq_get_group_members:
+    // payload → global STATE → persisted runtime config.
+    let base_url = req
+        .payload
+        .as_ref()
+        .and_then(|p| p.get("onebot_url"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| STATE.lock().ok().and_then(|s| s.onebot_url.clone()))
+        .or_else(|| {
+            load_runtime_config().and_then(|c| c.get("onebot_url")?.as_str().map(|s| s.to_string()))
+        })
+        .ok_or("no OneBot URL configured")?;
+
+    let token = req
+        .payload
+        .as_ref()
+        .and_then(|p| p.get("access_token"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| STATE.lock().ok().and_then(|s| s.access_token.clone()))
+        .or_else(|| {
+            load_runtime_config()
+                .and_then(|c| c.get("access_token")?.as_str().map(|s| s.to_string()))
+        });
+
+    let params = json!({ "group_id": id });
+    let members = onebot_call(
+        &base_url,
+        "get_group_member_list",
+        &params,
+        token.as_deref(),
+    )?;
+    let summary = summarize_group_roles(&members);
+    let roles = if summary["owner"].is_null() {
+        // Member list carries no `role` for the owner: ask get_group_info_ex.
+        let info = onebot_call(&base_url, "get_group_info_ex", &params, token.as_deref())?;
+        json!({
+            "owner": owner_from_group_info_ex(&info),
+            "admins": [],
+            "member_count": Value::Null,
+            "source": "group_info_ex",
+        })
+    } else {
+        summary
+    };
+
+    Ok(NodeResponse {
+        ok: true,
+        node_id: "qq_get_group_roles".to_string(),
+        messages: None,
+        message: Some(format!("group {} roles", id)),
+        data: Some(roles),
+        error: None,
+    })
+}
+
+/// WS-4: persist the reply policy so the next inbound message already uses it
+/// (build_envelope reads the file per message — no restart, no rebuild).
+fn handle_qq_set_reply_policy(req: &NodeRequest) -> Result<NodeResponse, String> {
+    let raw =
+        node_str_arg(req.payload.as_ref(), req.policy.as_deref(), "policy").unwrap_or_default();
+    let policy = raw.trim().to_string();
+    if policy.is_empty() {
+        return Err("policy must not be empty".to_string());
+    }
+    let data_dir = node_str_arg(req.payload.as_ref(), req.data_dir.as_deref(), "data_dir");
+    let path = reply_policy_path(data_dir.as_deref());
+    ensure_policy_parent_dir(&path)?;
+    let record = ReplyPolicyRecord {
+        policy: policy.clone(),
+        updated_at_ms: now_ms(),
+        updated_by: "agent".to_string(),
+    };
+    let body =
+        serde_json::to_string_pretty(&record).map_err(|e| format!("encode reply policy: {e}"))?;
+    std::fs::write(&path, &body).map_err(|e| format!("write reply policy: {e}"))?;
+    Ok(NodeResponse {
+        ok: true,
+        node_id: "qq_set_reply_policy".to_string(),
+        messages: None,
+        message: Some(format!("reply policy updated at {}", path.display())),
+        data: Some(json!({"policy": policy, "path": path.display().to_string()})),
+        error: None,
+    })
+}
+
+/// WS-4: read the persisted reply policy (`is_default` = nothing stored yet).
+fn handle_qq_get_reply_policy(req: &NodeRequest) -> Result<NodeResponse, String> {
+    let data_dir = node_str_arg(req.payload.as_ref(), req.data_dir.as_deref(), "data_dir");
+    let stored = read_reply_policy_file(data_dir.as_deref());
+    let is_default = stored.is_none();
+    Ok(NodeResponse {
+        ok: true,
+        node_id: "qq_get_reply_policy".to_string(),
+        messages: None,
+        message: None,
+        data: Some(json!({
+            "policy": stored.unwrap_or_else(|| DEFAULT_REPLY_POLICY.to_string()),
+            "is_default": is_default,
+        })),
         error: None,
     })
 }
@@ -1700,6 +1977,9 @@ fn handle(req: &NodeRequest) -> Result<NodeResponse, String> {
         "qq_fetch_messages" => handle_qq_fetch_messages(),
         "qq_send" => handle_qq_send(req),
         "qq_get_group_members" => handle_qq_get_group_members(req),
+        "qq_get_group_roles" => handle_qq_get_group_roles(req),
+        "qq_get_reply_policy" => handle_qq_get_reply_policy(req),
+        "qq_set_reply_policy" => handle_qq_set_reply_policy(req),
         "qq_system_notify" => handle_qq_system_notify(req),
         "qq_get_group_info" => handle_qq_get_group_info(req),
         // For qq_entry, delegate to legacy handler.
@@ -1893,6 +2173,118 @@ fn docs_value() -> cordis_plugin_sdk::PluginDocs {
                 &["no OneBot URL configured", "invalid target format", "group not found"],
             ).with_agent_accessible(),
             node_doc(
+                "qq_get_group_members",
+                "Get the raw OneBot member list for a group (get_group_member_list). Each entry carries user_id, nickname, card and role (owner/admin/member).",
+                json!({
+                    "type": "object", "required": ["node_id", "target"],
+                    "properties": {
+                        "node_id": { "type": "string", "const": "qq_get_group_members" },
+                        "target": { "type": "string", "description": "group:<id>" }
+                    }
+                }),
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "ok": { "type": "boolean" },
+                        "message": { "type": ["string", "null"] },
+                        "data": { "type": "object", "description": "Raw OneBot get_group_member_list response" },
+                        "error": { "type": ["string", "null"] }
+                    }
+                }),
+                &["calls OneBot get_group_member_list API"],
+                &["no OneBot URL configured", "target must be group:<id>"],
+            ).with_agent_accessible(),
+            node_doc(
+                "qq_get_group_roles",
+                "Answer 'who is the group owner / who are the admins?'. Aggregates get_group_member_list by role, and falls back to get_group_info_ex (data.extInfo.groupOwnerId.memberUin) when the member list has no role field. source tells you which path was used.",
+                json!({
+                    "type": "object", "required": ["node_id", "target"],
+                    "properties": {
+                        "node_id": { "type": "string", "const": "qq_get_group_roles" },
+                        "target": { "type": "string", "description": "group:<id>" },
+                        "payload": {
+                            "type": "object",
+                            "properties": {
+                                "onebot_url": { "type": "string", "description": "Optional OneBot HTTP API URL override (defaults to STATE / runtime config)" },
+                                "access_token": { "type": "string", "description": "Optional OneBot access token override (defaults to STATE / runtime config)" }
+                            }
+                        }
+                    }
+                }),
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "ok": { "type": "boolean" },
+                        "message": { "type": ["string", "null"] },
+                        "data": {
+                            "type": "object",
+                            "properties": {
+                                "owner": { "type": ["object", "null"], "description": "{user_id, nickname, card} or null" },
+                                "admins": { "type": "array", "items": { "type": "object" } },
+                                "member_count": { "type": ["integer", "null"] },
+                                "source": { "type": "string", "description": "member_list | group_info_ex" }
+                            }
+                        },
+                        "error": { "type": ["string", "null"] }
+                    }
+                }),
+                &["calls OneBot get_group_member_list, then get_group_info_ex when the owner is missing"],
+                &["no OneBot URL configured", "invalid target format", "OneBot API error"],
+            ).with_agent_accessible(),
+            node_doc(
+                "qq_get_reply_policy",
+                "Read the persisted reply policy — the rule the bot follows to decide whether an incoming QQ message is addressed to it. is_default=true means no policy has been stored yet.",
+                json!({
+                    "type": "object", "required": ["node_id"],
+                    "properties": {
+                        "node_id": { "type": "string", "const": "qq_get_reply_policy" },
+                        "data_dir": { "type": "string", "description": "Optional data directory override" }
+                    }
+                }),
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "ok": { "type": "boolean" },
+                        "data": {
+                            "type": "object",
+                            "properties": {
+                                "policy": { "type": "string" },
+                                "is_default": { "type": "boolean" }
+                            }
+                        }
+                    }
+                }),
+                &["reads data/qq_reply_policy.json"],
+                &[],
+            ).with_agent_accessible(),
+            node_doc(
+                "qq_set_reply_policy",
+                "Persist the reply policy: the rule the bot follows when deciding whether an incoming message is addressed to it. It is shipped to the model as the first line of every message, so it takes effect on the NEXT message — no rebuild and no restart.",
+                json!({
+                    "type": "object", "required": ["node_id", "policy"],
+                    "properties": {
+                        "node_id": { "type": "string", "const": "qq_set_reply_policy" },
+                        "policy": { "type": "string", "description": "New reply rule text (English; shown to the model verbatim)" },
+                        "data_dir": { "type": "string", "description": "Optional data directory override" }
+                    }
+                }),
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "ok": { "type": "boolean" },
+                        "data": {
+                            "type": "object",
+                            "properties": {
+                                "policy": { "type": "string" },
+                                "path": { "type": "string" }
+                            }
+                        }
+                    }
+                }),
+                &["writes data/qq_reply_policy.json"],
+                &["policy must not be empty"],
+            ).with_agent_accessible(),
+            node_doc(
                 "qq_system_notify",
                 "Kernel notification handler — receives system messages and forwards to configured test groups.",
                 json!({
@@ -1917,17 +2309,20 @@ fn docs_value() -> cordis_plugin_sdk::PluginDocs {
     Some("\
 QQ GROUP CHAT MODE — you are running in a QQ group. Messages may be casual chat NOT directed at you.\n\
 CRITICAL: Always decide whether the message is actually talking to YOU before responding.\n\
-A message IS directed at you ONLY if: contains @[id=3832224285] (explicit @mention of bot); or starts with \"bot\" or \"Bot\" or \"机器人\".\n\
-A message is NOT directed at you if: general group discussion; questions not explicitly addressed to bot; casual chat; emoji/sticker; talking about someone else. When in doubt, suspend.\n\
+REPLY POLICY — the authority on whether to answer: every incoming message begins with a line `[reply policy: ...]`. That line IS the rule; follow it exactly. It may be more permissive than you expect (e.g. \"reply whenever someone seems to want an answer\"), so do not apply a stricter rule of your own.\n\
+If a message has NO `[reply policy: ...]` line, fall back to the conservative default: answer ONLY when the message @mentions you or addresses you by name (\"bot\", \"Bot\", \"机器人\"); otherwise suspend.\n\
+A message is NOT directed at you if: general group discussion; questions not explicitly addressed to you under the policy above; casual chat; emoji/sticker; talking about someone else.\n\
 If NOT directed at you: use {\"action\":\"suspend\"}.\n\
 If directed at you: invoke_plugin(qq, qq_send, ...) to send your reply, then output {\"action\":\"suspend\"}.\n\
 IMPORTANT: NEVER use {\"action\":\"respond\"} — it will cause duplicate messages. Always send via qq_send and finish with {\"action\":\"suspend\"}.\n\
+If the user asks you to change the reply rule (e.g. \"reply to everything I say\", \"stop answering so often\"), persist it: invoke_plugin(qq, qq_set_reply_policy, {\"node_id\":\"qq_set_reply_policy\",\"policy\":\"<new rule text>\"}), then tell the user it is already in effect — the next message uses the new policy, no restart needed.\n\
 \n\
 ANTI-HALLUCINATION rules:\n\
 - If a question is ambiguous or you lack context, ask for clarification — do NOT guess.\n\
 - If web search fails to yield a clear answer after 2 attempts, stop and tell the user what you found (or didn't find). Ask them to clarify.\n\
 - Pay attention to the group's recent conversation. The topic may be group-specific and not searchable on the web.\n\
 - A short honest \"not sure, can you clarify?\" is always better than a long wrong answer.\n\
+- Never claim a tool or permission is unavailable without actually invoking it first: every node listed in this plugin's interfaces is callable by you.\n\
 \n\
 KERNEL TOOL usage in QQ chat:\n\
 - Kernel introspection tools (get_runtime_status, list_plugins, list_nodes, get_kernel_status, get_kernel_issues) are for internal diagnostics only.\n\
@@ -1940,6 +2335,7 @@ Replace <group_id> with the actual group ID from the incoming message.
 Send a brief progress message BEFORE any tool that may take more than a moment (build, test, search, etc.), and a follow-up when the tool completes.
 
 To query group members: invoke_plugin(qq, qq_get_group_members, {\"node_id\":\"qq_get_group_members\",\"target\":\"group:<id>\"})\n\
+You CAN query group members/roles: invoke_plugin(qq, qq_get_group_roles, {\"node_id\":\"qq_get_group_roles\",\"target\":\"group:<id>\"}). Use it when asked who the group owner or admins are — never guess a name or claim you lack permission.\n\
 To proactively send to a group: invoke_plugin(qq, qq_send, {\"node_id\":\"qq_send\",\"target\":\"group:<id>\",\"message\":\"<text>\"})")
     )
 }
@@ -2297,5 +2693,659 @@ mod ws_tests {
 
         // 清理，避免影响其它 test / 泄漏线程占用端口。
         let _ = handle_qq_ws_serve(&stop_req());
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// WS-4 测试支撑：`CORDIS_FIXTURES_ROOT` 是进程级全局量，凡依赖「env 路径
+// 解析」的用例都在这个锁下、用私有 fixtures root 跑；能显式传 `data_dir`
+// 的用例就不用 env（避免并行 test 之间的 race）。
+// ═══════════════════════════════════════════════════════════════════════
+#[cfg(test)]
+mod test_support {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+
+    fn seq() -> u64 {
+        SEQ.fetch_add(1, Ordering::SeqCst)
+    }
+
+    /// 在 `CORDIS_FIXTURES_ROOT=<temp>/fixtures` 下执行 `f`，于是
+    /// `$CORDIS_FIXTURES_ROOT/../data` 落在 `<temp>/data`。
+    pub fn with_isolated_fixtures<T>(f: impl FnOnce(&std::path::Path) -> T) -> T {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let root = std::env::temp_dir().join(format!("qq-ws4-{}-{}", std::process::id(), seq()));
+        let fixtures = root.join("fixtures");
+        std::fs::create_dir_all(&fixtures).expect("create temp fixtures root");
+        std::env::set_var("CORDIS_FIXTURES_ROOT", &fixtures);
+        let out = f(&root);
+        std::env::remove_var("CORDIS_FIXTURES_ROOT");
+        let _ = std::fs::remove_dir_all(&root);
+        out
+    }
+
+    /// 唯一的、已创建的空临时目录（用例自己负责清理）。
+    pub fn temp_dir() -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("qq-ws4-data-{}-{}", std::process::id(), seq()));
+        std::fs::create_dir_all(&dir).expect("create temp data dir");
+        dir
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// WS-4 (A)：回复策略读写 + build_envelope 下发 `[reply policy: ...]` 行。
+// ═══════════════════════════════════════════════════════════════════════
+#[cfg(test)]
+mod reply_policy_tests {
+    use super::test_support::{temp_dir, with_isolated_fixtures};
+    use super::*;
+
+    fn req(value: Value) -> NodeRequest {
+        serde_json::from_value(value).expect("well-formed NodeRequest")
+    }
+
+    fn policy_req(node_id: &str, data_dir: &std::path::Path) -> NodeRequest {
+        req(json!({
+            "node_id": node_id,
+            "payload": {"data_dir": data_dir.to_str().unwrap()}
+        }))
+    }
+
+    fn set_req(policy: &str, data_dir: &std::path::Path) -> NodeRequest {
+        req(json!({
+            "node_id": "qq_set_reply_policy",
+            "payload": {"policy": policy, "data_dir": data_dir.to_str().unwrap()}
+        }))
+    }
+
+    fn sample_msg() -> IncomingMessage {
+        IncomingMessage {
+            message_type: "group".to_string(),
+            sender_id: "123456".to_string(),
+            user_id: "789".to_string(),
+            message: "hello".to_string(),
+            message_id: Some(42),
+            reply_to_msg_id: None,
+            raw_event: None,
+        }
+    }
+
+    fn display_of(envelope_json: &str) -> String {
+        let env: Value = serde_json::from_str(envelope_json).expect("envelope json");
+        env["display"]
+            .as_str()
+            .expect("display must be a string")
+            .to_string()
+    }
+
+    // 路径解析顺序与 soul_store::db_path 完全一致：
+    // 显式 data_dir → $CORDIS_FIXTURES_ROOT/../data → cwd 相对 data/。
+    #[test]
+    fn reply_policy_path_resolution_order() {
+        with_isolated_fixtures(|root| {
+            // 1) payload 的 data_dir 最优先。
+            let explicit = reply_policy_path(Some("/tmp/ws4-explicit"));
+            assert_eq!(
+                explicit,
+                std::path::PathBuf::from("/tmp/ws4-explicit/qq_reply_policy.json")
+            );
+            // 2) 空 data_dir 视作未给 → 走 $CORDIS_FIXTURES_ROOT/../data。
+            let from_env = reply_policy_path(Some(""));
+            assert_eq!(from_env, root.join("data").join("qq_reply_policy.json"));
+            // 3) fixtures root 无父目录时退回 root 自身。
+            std::env::set_var("CORDIS_FIXTURES_ROOT", "/");
+            let root_self = reply_policy_path(None);
+            assert_eq!(
+                root_self,
+                std::path::PathBuf::from("/data/qq_reply_policy.json")
+            );
+            // 4) 无 env → cwd 相对的 data/。
+            std::env::remove_var("CORDIS_FIXTURES_ROOT");
+            let cwd_relative = reply_policy_path(None);
+            assert_eq!(
+                cwd_relative,
+                std::path::PathBuf::from("data/qq_reply_policy.json")
+            );
+        });
+    }
+
+    // 未设置 → 默认策略 + is_default=true；set 之后 get 返回同一文本且
+    // is_default=false，落盘格式含 updated_by="agent"。
+    #[test]
+    fn get_returns_default_then_roundtrips_set_policy() {
+        let dir = temp_dir();
+        let before = handle_qq_get_reply_policy(&policy_req("qq_get_reply_policy", &dir))
+            .expect("get without a file must not fail");
+        let before_data = before.data.expect("data");
+        assert_eq!(before_data["policy"], DEFAULT_REPLY_POLICY);
+        assert_eq!(before_data["is_default"], true);
+
+        let set = handle_qq_set_reply_policy(&set_req(
+            "Reply whenever someone seems to want an answer.",
+            &dir,
+        ))
+        .expect("set must succeed");
+        let set_data = set.data.expect("data");
+        assert_eq!(
+            set_data["policy"],
+            "Reply whenever someone seems to want an answer."
+        );
+        assert_eq!(
+            set_data["path"],
+            dir.join("qq_reply_policy.json").to_str().unwrap()
+        );
+
+        let raw = std::fs::read_to_string(dir.join("qq_reply_policy.json")).expect("policy file");
+        let record: ReplyPolicyRecord = serde_json::from_str(&raw).expect("policy json");
+        assert_eq!(record.updated_by, "agent");
+        assert_eq!(
+            record.policy,
+            "Reply whenever someone seems to want an answer."
+        );
+
+        let after = handle_qq_get_reply_policy(&policy_req("qq_get_reply_policy", &dir))
+            .expect("get after set");
+        let after_data = after.data.expect("data");
+        assert_eq!(
+            after_data["policy"],
+            "Reply whenever someone seems to want an answer."
+        );
+        assert_eq!(after_data["is_default"], false);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // top-level 字段形式（不经 payload）也接受：policy / data_dir。
+    #[test]
+    fn set_accepts_top_level_policy_and_data_dir() {
+        let dir = temp_dir();
+        let top_level_set = req(json!({
+            "node_id": "qq_set_reply_policy",
+            "policy": "Only answer when @mentioned.",
+            "data_dir": dir.to_str().unwrap()
+        }));
+        handle_qq_set_reply_policy(&top_level_set).expect("top-level set");
+        let get = req(json!({
+            "node_id": "qq_get_reply_policy",
+            "data_dir": dir.to_str().unwrap()
+        }));
+        let resp = handle_qq_get_reply_policy(&get).expect("top-level get");
+        assert_eq!(
+            resp.data.expect("data")["policy"],
+            "Only answer when @mentioned."
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // 两个策略节点必须进 handle() 分发（kernel 只经 handle() 调插件）。
+    #[test]
+    fn handle_dispatches_policy_nodes() {
+        let dir = temp_dir();
+        let set = req(json!({
+            "node_id": "qq_set_reply_policy",
+            "payload": {"policy": "Dispatched through handle().", "data_dir": dir.to_str().unwrap()}
+        }));
+        let resp = handle(&set).expect("set through handle");
+        assert!(resp.ok);
+        assert_eq!(resp.node_id, "qq_set_reply_policy");
+        let get = req(json!({
+            "node_id": "qq_get_reply_policy",
+            "payload": {"data_dir": dir.to_str().unwrap()}
+        }));
+        let resp = handle(&get).expect("get through handle");
+        let data = resp.data.expect("data");
+        assert_eq!(data["policy"], "Dispatched through handle().");
+        assert_eq!(data["is_default"], false);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // 空 / 全空白 / 缺省 policy → 明确错误，且不落盘。
+    #[test]
+    fn set_rejects_empty_policy() {
+        let dir = temp_dir();
+        for bad in ["", "   \n\t "] {
+            let err = handle_qq_set_reply_policy(&set_req(bad, &dir))
+                .expect_err("empty policy must be rejected");
+            assert_eq!(err, "policy must not be empty");
+        }
+        let missing_field = req(json!({
+            "node_id": "qq_set_reply_policy",
+            "payload": {"data_dir": dir.to_str().unwrap()}
+        }));
+        let err = handle_qq_set_reply_policy(&missing_field)
+            .expect_err("missing policy must be rejected");
+        assert_eq!(err, "policy must not be empty");
+        let untouched = !dir.join("qq_reply_policy.json").exists();
+        assert!(untouched, "a rejected set must not create the file");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // I/O 故障注入：数据目录父路径是普通文件 → create_dir_all 失败臂。
+    #[test]
+    fn set_reports_data_dir_creation_failure() {
+        let dir = temp_dir();
+        let blocker = dir.join("blocker");
+        std::fs::write(&blocker, b"not a directory").expect("write blocker file");
+        let unreachable = blocker.join("sub");
+        let err = handle_qq_set_reply_policy(&set_req("whatever", &unreachable))
+            .expect_err("create_dir_all under a regular file must fail");
+        let is_create_error = err.starts_with("create data dir:");
+        assert!(is_create_error, "err: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // I/O 故障注入：目标位置被目录占住 → fs::write 失败臂。
+    #[test]
+    fn set_reports_write_failure() {
+        let dir = temp_dir();
+        std::fs::create_dir_all(dir.join("qq_reply_policy.json")).expect("occupy target path");
+        let err = handle_qq_set_reply_policy(&set_req("whatever", &dir))
+            .expect_err("writing over a directory must fail");
+        let is_write_error = err.starts_with("write reply policy:");
+        assert!(is_write_error, "err: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // 文件损坏 / 空白 → 视作未配置，回落默认策略（绝不让读失败上浮）。
+    #[test]
+    fn malformed_or_blank_file_falls_back_to_default() {
+        let dir = temp_dir();
+        let path = dir.join("qq_reply_policy.json");
+        let data_dir = dir.to_str().unwrap();
+        std::fs::write(&path, b"{not json").expect("write malformed");
+        assert!(read_reply_policy_file(Some(data_dir)).is_none());
+        std::fs::write(&path, br#"{"policy":"   "}"#).expect("write blank");
+        assert!(read_reply_policy_file(Some(data_dir)).is_none());
+        assert_eq!(current_reply_policy(Some(data_dir)), DEFAULT_REPLY_POLICY);
+        std::fs::write(
+            &path,
+            br#"{"policy":"  custom rule  ","updated_by":"agent"}"#,
+        )
+        .expect("write custom");
+        assert_eq!(
+            read_reply_policy_file(Some(data_dir)).as_deref(),
+            Some("custom rule")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // 未设置策略 → display 首行是默认策略行；原始 [QQ group from ...] 仍完整。
+    #[test]
+    fn build_envelope_uses_default_policy_line() {
+        with_isolated_fixtures(|_root| {
+            let display = display_of(&build_envelope(&sample_msg()));
+            let expected = format!("[reply policy: {DEFAULT_REPLY_POLICY}]");
+            assert_eq!(display.lines().next(), Some(expected.as_str()));
+            let has_original = display.contains("[QQ group from 123456 (user 789)]: hello");
+            assert!(has_original, "display: {display}");
+        });
+    }
+
+    // 已设置策略（env 解析到同一 data 目录）→ 首行是配置的策略。
+    #[test]
+    fn build_envelope_uses_configured_policy_line() {
+        with_isolated_fixtures(|root| {
+            let data_dir = root.join("data");
+            std::fs::create_dir_all(&data_dir).expect("create data dir");
+            handle_qq_set_reply_policy(&set_req("Reply to every message in the group.", &data_dir))
+                .expect("set policy");
+            let display = display_of(&build_envelope(&sample_msg()));
+            assert_eq!(
+                display.lines().next(),
+                Some("[reply policy: Reply to every message in the group.]")
+            );
+            let has_original = display.contains("[QQ group from 123456 (user 789)]: hello");
+            assert!(has_original, "display: {display}");
+            // 运行时用 rsplit_once("]: ") 取用户文本（命令路由），
+            // 策略行不能破坏它。
+            let user_text = display.rsplit_once("]: ").map(|(_, t)| t).unwrap_or("");
+            assert_eq!(user_text, "hello");
+        });
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// WS-4 (B)：群主 / 管理员查询 —— 纯函数聚合 + 真回退路径（本地 OneBot stub）。
+// ═══════════════════════════════════════════════════════════════════════
+#[cfg(test)]
+mod role_tests {
+    use super::test_support::with_isolated_fixtures;
+    use super::*;
+
+    fn req(value: Value) -> NodeRequest {
+        serde_json::from_value(value).expect("well-formed NodeRequest")
+    }
+
+    fn roles_req(onebot_url: &str, target: &str) -> NodeRequest {
+        req(json!({
+            "node_id": "qq_get_group_roles",
+            "target": target,
+            "payload": {"onebot_url": onebot_url}
+        }))
+    }
+
+    /// 极简 OneBot HTTP stub：按 group_id / endpoint 回假数据，回满
+    /// `requests` 次后线程退出。仅监听 127.0.0.1，不碰真网。
+    fn spawn_fake_onebot(requests: usize) -> String {
+        let server = tiny_http::Server::http("127.0.0.1:0").expect("bind fake OneBot server");
+        let port = server
+            .server_addr()
+            .to_ip()
+            .expect("fake server must listen on an IP socket")
+            .port();
+        thread::spawn(move || {
+            // `incoming_requests()` yields only successful reads, so the loop
+            // needs no error arm of its own.
+            for mut request in server.incoming_requests().take(requests) {
+                let mut body = String::new();
+                let _ = request.as_reader().read_to_string(&mut body);
+                let params: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+                let gid = params.get("group_id").and_then(Value::as_i64).unwrap_or(0);
+                let reply = fake_onebot_reply(request.url(), gid);
+                let header =
+                    tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
+                        .expect("static header is valid");
+                let response =
+                    tiny_http::Response::from_string(reply.to_string()).with_header(header);
+                let _ = request.respond(response);
+            }
+        });
+        format!("http://127.0.0.1:{port}")
+    }
+
+    fn fake_onebot_reply(url: &str, gid: i64) -> Value {
+        if url.ends_with("/get_group_member_list") {
+            match gid {
+                // 后端带 role：owner/admin 都在成员列表里。
+                100 => json!({"status":"ok","retcode":0,"data":[
+                    {"user_id":1751557948,"nickname":"群主","card":"群主","role":"owner"},
+                    {"user_id":2001,"nickname":"AdminA","card":"","role":"admin"},
+                    {"user_id":2002,"nickname":"AdminB","role":"admin"},
+                    {"user_id":3001,"nickname":"Member","role":"member"}
+                ]}),
+                // 后端不带 role：owner 只能从 get_group_info_ex 拿。
+                200 => json!({"status":"ok","retcode":0,"data":[
+                    {"user_id":2001,"nickname":"AdminA","role":"admin"},
+                    {"user_id":3001,"nickname":"Member","role":"member"}
+                ]}),
+                _ => json!({"status":"ok","retcode":0,"data":[
+                    {"user_id":3001,"nickname":"Member","role":"member"}
+                ]}),
+            }
+        } else if gid == 200 {
+            json!({"status":"ok","retcode":0,
+                "data":{"extInfo":{"groupOwnerId":{"memberUin":1751557948}}}})
+        } else {
+            // 300: get_group_info_ex 也没有 extInfo → owner 保持 null。
+            json!({"status":"ok","retcode":0,"data":{}})
+        }
+    }
+
+    // 纯函数：1 owner + 2 admin + n member。
+    #[test]
+    fn summarize_group_roles_aggregates_owner_admins_and_count() {
+        let members = json!({"status":"ok","retcode":0,"data":[
+            {"user_id":1751557948,"nickname":"群主","card":"群主","role":"owner"},
+            {"user_id":2001,"nickname":"AdminA","card":"","role":"admin"},
+            {"user_id":2002,"nickname":"AdminB","role":"admin"},
+            {"user_id":3001,"nickname":"Member","card":"","role":"member"},
+            {"user_id":3002,"nickname":"Member2","role":"member"}
+        ]});
+        let v = summarize_group_roles(&members);
+        assert_eq!(v["owner"]["user_id"], 1751557948);
+        assert_eq!(v["owner"]["nickname"], "群主");
+        assert_eq!(v["owner"]["card"], "群主");
+        let admins = v["admins"].as_array().expect("admins must be an array");
+        assert_eq!(admins.len(), 2);
+        assert_eq!(admins[0]["user_id"], 2001);
+        assert_eq!(admins[1]["user_id"], 2002);
+        assert_eq!(v["member_count"], 5);
+        assert_eq!(v["source"], "member_list");
+    }
+
+    // owner 缺失 → owner 为 null（交给回退路径）；缺 role / 缺 nickname /
+    // 缺 user_id 的元素都要容错；裸数组输入也要接受。
+    #[test]
+    fn summarize_group_roles_tolerates_missing_fields() {
+        let members = json!([
+            {"user_id":2001,"nickname":"AdminA","role":"admin"},
+            {"user_id":2002,"role":"admin"},
+            {"nickname":"no user id","role":"admin"},
+            {"user_id":3001,"nickname":"Member"}
+        ]);
+        let v = summarize_group_roles(&members);
+        assert!(v["owner"].is_null());
+        let admins = v["admins"].as_array().expect("admins must be an array");
+        assert_eq!(admins.len(), 2);
+        assert!(admins[1]["nickname"].is_null());
+        assert!(admins[1]["card"].is_null());
+        assert_eq!(v["member_count"], 4);
+    }
+
+    // 空数组 / 非数组响应都不能炸。
+    #[test]
+    fn summarize_group_roles_handles_empty_and_non_array() {
+        let empty = summarize_group_roles(&json!({"status":"ok","data":[]}));
+        assert!(empty["owner"].is_null());
+        assert_eq!(empty["admins"].as_array().map(Vec::len), Some(0));
+        assert_eq!(empty["member_count"], 0);
+        let not_array = summarize_group_roles(&json!({"status":"failed"}));
+        assert_eq!(not_array["member_count"], 0);
+    }
+
+    // 成员列表带 role → 直接从 member_list 聚合，不发第二枪。
+    #[test]
+    fn group_roles_reads_owner_and_admins_from_member_list() {
+        let url = spawn_fake_onebot(1);
+        let resp = handle_qq_get_group_roles(&roles_req(&url, "group:100")).expect("roles");
+        let data = resp.data.expect("data");
+        assert_eq!(data["source"], "member_list");
+        assert_eq!(data["owner"]["user_id"], 1751557948);
+        assert_eq!(data["admins"].as_array().map(Vec::len), Some(2));
+        assert_eq!(data["member_count"], 4);
+    }
+
+    // 成员列表没 owner → 回退 get_group_info_ex（只拿到 uid）；
+    // 连 extInfo 都没有 → owner 保持 null，不编造。
+    #[test]
+    fn group_roles_falls_back_to_group_info_ex() {
+        let url = spawn_fake_onebot(4);
+        let resp = handle_qq_get_group_roles(&roles_req(&url, "group:200")).expect("roles");
+        let data = resp.data.expect("data");
+        assert_eq!(data["source"], "group_info_ex");
+        assert_eq!(data["owner"]["user_id"], 1751557948);
+        assert!(data["owner"]["nickname"].is_null());
+        assert!(data["owner"]["card"].is_null());
+        assert_eq!(data["admins"].as_array().map(Vec::len), Some(0));
+        assert!(data["member_count"].is_null());
+
+        let no_ext = handle_qq_get_group_roles(&roles_req(&url, "group:300")).expect("roles");
+        let data = no_ext.data.expect("data");
+        assert_eq!(data["source"], "group_info_ex");
+        assert!(data["owner"].is_null());
+    }
+
+    // WS-4 只给 qq_get_group_members 加了 agent_accessible 标记：输出必须仍是
+    // 原始 OneBot 响应，逐字节行为不变。
+    #[test]
+    fn group_members_output_stays_raw_onebot_response() {
+        let url = spawn_fake_onebot(1);
+        let r = req(json!({
+            "node_id": "qq_get_group_members",
+            "target": "group:100",
+            "payload": {"onebot_url": url}
+        }));
+        let resp = handle_qq_get_group_members(&r).expect("members");
+        let data = resp.data.expect("data");
+        assert_eq!(data["status"], "ok");
+        let members = data["data"].as_array().expect("raw member array");
+        assert_eq!(members.len(), 4);
+        assert_eq!(members[0]["role"], "owner");
+        assert_eq!(members[0]["user_id"], 1751557948);
+    }
+
+    // qq_get_group_roles 必须进 handle() 分发（kernel 只经 handle() 调插件）。
+    #[test]
+    fn handle_dispatches_group_roles() {
+        let url = spawn_fake_onebot(1);
+        let resp = handle(&roles_req(&url, "group:100")).expect("roles through handle");
+        assert_eq!(resp.node_id, "qq_get_group_roles");
+        assert_eq!(resp.data.expect("data")["source"], "member_list");
+    }
+
+    // target 缺省 / 空白 / private / 非法 id 都拒绝。
+    #[test]
+    fn group_roles_requires_target_and_group_kind() {
+        with_isolated_fixtures(|_root| {
+            let absent = req(json!({"node_id":"qq_get_group_roles"}));
+            let err = handle_qq_get_group_roles(&absent).expect_err("absent target");
+            assert!(err.contains("target is required for qq_get_group_roles"));
+
+            let blank = req(json!({"node_id":"qq_get_group_roles","target":"   "}));
+            let err = handle_qq_get_group_roles(&blank).expect_err("blank target");
+            assert!(err.contains("target is required for qq_get_group_roles"));
+
+            let private = req(json!({"node_id":"qq_get_group_roles","target":"private:1"}));
+            let err = handle_qq_get_group_roles(&private).expect_err("private target");
+            assert!(err.contains("target must be group:<id>"));
+
+            let malformed = req(json!({"node_id":"qq_get_group_roles","target":"group:abc"}));
+            let err = handle_qq_get_group_roles(&malformed).expect_err("bad group id");
+            assert!(err.contains("invalid target id"));
+        });
+    }
+
+    // payload / STATE / runtime config 三级都没有 URL → 明确报错。
+    #[test]
+    fn group_roles_without_onebot_url_is_an_error() {
+        with_isolated_fixtures(|_root| {
+            {
+                let mut state = STATE.lock().unwrap_or_else(|p| p.into_inner());
+                state.onebot_url = None;
+                state.access_token = None;
+            }
+            let r = req(json!({"node_id":"qq_get_group_roles","target":"group:100"}));
+            let err = handle_qq_get_group_roles(&r).expect_err("no url configured");
+            assert_eq!(err, "no OneBot URL configured");
+        });
+    }
+
+    // 传输失败要快速失败（本机无监听端口），不依赖真网。
+    #[test]
+    fn group_roles_reports_transport_failure() {
+        let r = roles_req("http://127.0.0.1:1", "group:100");
+        let err = handle_qq_get_group_roles(&r).expect_err("transport failure");
+        let is_transport_error = err.contains("HTTP POST");
+        assert!(is_transport_error, "err: {err}");
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// WS-4 文档表回归：kernel 的 `check_agent_accessible` 只认 docs 里的
+// `agent_accessible` 标志（declared_nodes 不参与该判断），所以节点必须同时
+// 出现在 docs 且带标志，否则 agent 又被拒成 "not allowed to call ..."。
+// ═══════════════════════════════════════════════════════════════════════
+#[cfg(test)]
+mod docs_tests {
+    use super::*;
+
+    fn accessible_ids() -> Vec<String> {
+        let mut ids: Vec<String> = Vec::new();
+        for node in docs_value().nodes.iter().filter(|n| n.agent_accessible) {
+            ids.push(node.id.clone());
+        }
+        ids
+    }
+
+    // 群主/管理员与回复策略节点必须对 agent 开放。
+    #[test]
+    fn docs_mark_new_nodes_agent_accessible() {
+        let ids = accessible_ids();
+        for expected in [
+            "qq_get_group_members",
+            "qq_get_group_roles",
+            "qq_get_reply_policy",
+            "qq_set_reply_policy",
+        ] {
+            let found = ids.iter().any(|id| id == expected);
+            assert!(
+                found,
+                "node {expected} must be agent_accessible, have {ids:?}"
+            );
+        }
+    }
+
+    // 门控语义的回归保护：hint 不再硬编码 ONLY-if / When-in-doubt，
+    // 而是让模型按每条消息首行的 `[reply policy: ...]` 判断；同时保留
+    // 「必须用 qq_send、绝不用 respond、最后 suspend」的既有约束。
+    #[test]
+    fn system_hint_defers_to_reply_policy_line() {
+        let hint = docs_value()
+            .system_hint
+            .expect("qq must ship a system hint");
+        let hardcoded_mention_gate = hint.contains("ONLY if: contains @[id=3832224285]");
+        assert!(
+            !hardcoded_mention_gate,
+            "mention gate must not be hard-coded"
+        );
+        let hardcoded_doubt_rule = hint.contains("When in doubt, suspend");
+        assert!(
+            !hardcoded_doubt_rule,
+            "'when in doubt' must not be hard-coded"
+        );
+        let points_at_policy = hint.contains("[reply policy: ...]");
+        assert!(
+            points_at_policy,
+            "hint must point at the per-message policy line"
+        );
+        let advertises_setter = hint.contains("qq_set_reply_policy");
+        assert!(
+            advertises_setter,
+            "hint must tell the model how to persist a new rule"
+        );
+        let advertises_roles = hint.contains("qq_get_group_roles");
+        assert!(advertises_roles, "hint must advertise the roles node");
+        let keeps_respond_ban = hint.contains("NEVER use {\"action\":\"respond\"}");
+        assert!(keeps_respond_ban, "the respond ban must stay verbatim");
+        let keeps_suspend = hint.contains("then output {\"action\":\"suspend\"}");
+        assert!(keeps_suspend, "the suspend requirement must stay verbatim");
+        let keeps_send = hint.contains("invoke_plugin(qq, qq_send, ...) to send your reply");
+        assert!(keeps_send, "the qq_send requirement must stay verbatim");
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// P2-12 回归：runtime-config 路径解析。
+//
+// `$CORDIS_FIXTURES_ROOT` 仍优先；env 缺失时的回落原先写死成
+// `/root/CordisClaw/fixtures/...`，而那在本机是**另一个 checkout**——从
+// /root/CordisClaw-minori 起的 runtime 会读写 /root/CordisClaw 的草稿文件。
+// 现在回落是 cwd 相对的 `fixtures/.cordis-drafts/...`。
+// ═══════════════════════════════════════════════════════════════════════
+#[cfg(test)]
+mod runtime_config_path_tests {
+    use super::test_support::with_isolated_fixtures;
+    use super::*;
+
+    #[test]
+    fn fixtures_root_env_selects_the_drafts_file() {
+        with_isolated_fixtures(|root| {
+            let expected = root
+                .join("fixtures")
+                .join(".cordis-drafts/qq_runtime_config.json");
+            assert_eq!(runtime_config_path(), expected);
+        });
+    }
+
+    #[test]
+    fn env_root_path_is_never_the_foreign_checkout() {
+        with_isolated_fixtures(|_root| {
+            let resolved = runtime_config_path();
+            let foreign = resolved.starts_with("/root/CordisClaw/");
+            assert!(!foreign, "resolved={}", resolved.display());
+        });
     }
 }

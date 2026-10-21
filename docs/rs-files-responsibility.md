@@ -68,7 +68,7 @@
 
 > **已删除**: `kernel/loop.rs`（9 阶段 Petri Net 替换为 agent loop）、`kernel/planner.rs`（独立 LLM 路径合并到 AgentSession）
 
-## 6b. Agent 层 (`crates/cordis-runtime/src/agent.rs`)
+## 6b. Agent 层 (`crates/cordis-runtime/src/agent.rs`、`agent_toolchain.rs`)
 
 > **不含 LLM 传输**：与供应商对话的 HTTP/SSE、鉴权、重试、wire format 已整体
 > 移出到 `fixtures/plugins/llm_openai`（2026-08-05）。本层只构造请求体、经
@@ -77,6 +77,7 @@
 | 职责定位 | 关键入口 |
 |---|---|
 | 统一的 LLM agent 会话：SSE 流解析、tool-calling loop（最多 96 轮，overflow 保留 partial history P1-31）、重试/超时管理（4xx 不重试 P1-35，budget 合并 P1-37）、消息历史（compact 后重算 estimated_tokens P1-32、UTF-8 char/byte 一致 P1-33）、orphan-User cleanup（P2-31）、内核自省工具（get_runtime_status/list_plugins/list_nodes/get_kernel_status/get_kernel_issues）的 tool call/result 不写入跨轮持久化历史（5.2.36）；两个后端：`RuntimeShellAgentBackend`（20 个交互式工具；P2-1 边界收敛待做）和 `PluginIterationAgentBackend`（scaffold/edit/verify 工具集） | `AgentSession::respond` / `respond_inner`、`ShellAgentSession`、`AgentToolHost` trait、`PendingSessionAction`（P1-25 self-lookup 侧信道） |
+| `agent_toolchain.rs`：请求前的 tool_calls 链**整形**（纯函数，无 I/O）。两遍：先按「紧跟其后的连续 `tool` 消息」过滤 assistant 的 `tool_calls`、整条删除一个结果都没有的 assistant；再删除 `tool_call_id` 已无人引用的孤儿 `tool` 消息。幂等，返回 `RepairStats` 供 `[tool_calls repair]` 诊断行使用（5.2.38：链破形会让 DeepSeek 整轮 400） | `sanitize_tool_chains()`、`RepairStats` |
 
 ## 6c. Soul 与指令路由（`crates/cordis-runtime/src/soul.rs`、`command_router.rs`）
 
