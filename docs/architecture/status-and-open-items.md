@@ -18,11 +18,11 @@
 | Execution engine | 部分完成 | 语义与库实现已完成，`execute` / `serve execute` 入口可用；仍缺更真实的数据面验证 |
 | 自迭代（Agent Loop） | 已完成基础 | 固定 9 阶段 Petri Net 已替换为 open-ended agent loop；agent 可读代码、写文件、跑编译测试并验证 |
 | 交互式 Agent 对话 | 已完成 | 流式输出、18 个工具（含 run_plugin_test、append_file）、readline 编辑、Ctrl+C draft 安全、`/捷径`、工具调用结果日志 |
-| Agent 错误恢复 | 已完成 | JSON 解析失败反馈到 agent 自修复、LLM 请求失败 notify 到群、所有 HTTP 错误重试、unknown-tool guard（strike=1 立即停止）、tool_calls 链**整形**（`agent_toolchain::sanitize_tool_chains`，5.2.38 取代只打日志的旧修复臂） |
+| Agent 错误恢复 | 已完成 | JSON 解析失败反馈到 agent 自修复、LLM 请求失败 notify 到群、所有 HTTP 错误重试、unknown-tool guard（strike=1 立即停止）、tool_calls 链**整形**（`agent_toolchain::sanitize_tool_chains`，5.2.40 取代只打日志的旧修复臂） |
 | 优雅退出 + data/ 持久化 | 已完成 | SIGTERM→SIGINT 转发优雅退出、`data/memory/shutdown.json` 退出快照、`data/` 沙箱扩展（agent 可访问 workspace 根级目录） |
 | QQ 插件消息解析 | 已完成 | JSON 卡片透传、合并转发 ID 提取、回复 msg_id 提示 |
 | QQ 入站传输 | 已完成 | HTTP webhook（`qq_serve`）+ WebSocket 服务器（`qq_ws_serve` Task 节点，接收线上 Napcat ws 端口的 OneBot v11 事件，优雅停机）；出站走 HTTP API |
-| QQ 回复门控 / 群角色 / 死信治理 | 已完成 | 门控策略外置为 `data/qq_reply_policy.json` 并逐条下发 `[reply policy: …]` 行（`qq_get/set_reply_policy`，改规则不用重编插件）；`qq_get_group_roles` 直接给出群主/管理员；spill 7 天 TTL + 归档、失败出口限流提示（5.2.38） |
+| QQ 回复门控 / 群角色 / 死信治理 | 已完成 | 门控策略外置为 `data/qq_reply_policy.json` 并逐条下发 `[reply policy: …]` 行（`qq_get/set_reply_policy`，改规则不用重编插件）；`qq_get_group_roles` 直接给出群主/管理员；spill 7 天 TTL + 归档、失败出口限流提示（5.2.40） |
 | Agent 安全加固 | 已完成 | secret 不可见（token 不进入 prompt）、移除 `run_command`、敏感路径黑名单、工具防火墙（`agent_accessible`）、按群隔离 session、`build_plugins` 白名单命令、工具失败自动告警 |
 | Service 生命周期 | 部分完成 | `Service` trait + `ServiceRegistry` + `NodeType::Task` 已实现；plugin load 时自动 start 尚未接入 |
 | 插件封装形态蓝图 | 部分完成 | `dylib` + JSON artifact + process 已落地；`cdylib` / `WASM` 未实现 |
@@ -240,6 +240,24 @@ Agent 现在可以自主完成：读代码 → 理解结构 → 写/改文件 �
 - [x] **Plugin iteration symlink 逃逸**（P0-20）— `PluginEditExecutor::execute` 在写入前调用新 helper `resolve_under_workspace`：canonicalize 结果必须仍在 workspace_root 下。plugins 内的 symlink 指向 `/etc/passwd` 之类无法被写入。
 - [x] **Verifier shell 拼接**（P0-21）— 已随 A 批 P0-1 修复。`discover_rust_workspace_manifest` 输出的字符串被 `shell_words` 解析成 argv，空格 / `$` / `;` 无法被解释。
 
+### 5.2.40 QQ 通道止血：会话身份 / tool_calls 链完整性 / 死信治理（2026-10-21）
+
+线上事故复盘：10-20 23:39 群里发 `bot，写个插件…` 之后 bot 再无回应，用户以为它已经死掉。systemd 日志显示 runtime 全程存活——三个独立故障叠加：
+
+- [x] **会话身份丢失（每句话一个新会话）。** 线上 `fixtures/artifacts/qq.so` 是 9-02 的旧构建，`build_envelope` 还是纯文本 trigger，不带 `session_key`/`sender_id`/`conversation_kind`（`strings qq.so | grep -c session_key` = 0），kernel 因此回落到 `AgentEnvelope::soul_key()` 的原文兜底——`inbox: [[QQ group from …]: 死了]` 里的 session_key 就是消息正文。后果：**没有跨消息记忆**、soul/persona 永远命中不到（只有同一句话才同一个 key）、pending 重放按原文 key 匹配基本靠撞、`data/sessions` 涨到 780 个文件、boot 时 `crash-recovery recovered 661 session(s)`。修法不是改代码而是**重建工件**：当前源码的 envelope 已带完整身份，`prepare-artifacts fixtures` 重建 qq 工件后会话 key 变成 `qq:group:<gid>`（`--runtime-only` 启动会跳过 prepare，这正是旧工件一直没被刷新的原因）。
+- [x] **tool_calls 链破形 → DeepSeek 400 → 整轮丢弃。** 两处成因：① 失败提示就地 `push` 成 user 消息，正好落在**同一个 assistant 的两条 tool 结果之间**；② unknown-tool 的错误消息同样插在 assistant(tool_calls) 与 tool 结果之间。旧 `[tool_calls repair]` 扫到 user 就 `break`，只裁 assistant 的 `tool_calls`，留下的 `tool` 结果变孤儿，请求依旧非法 → `400 Messages with role 'tool' must be a response to a preceding message with 'tool_calls'`，且 400 不重试，用户消息只落进 pending。修法：新增纯函数模块 `agent_toolchain.rs`（两遍整形：先按「紧跟其后的连续 tool 消息」过滤 assistant 的 `tool_calls`、整条删除无结果的 assistant；再删 id 已无人引用的孤儿 `tool` 消息，幂等），并把两类提示都收集进 `tool_failure_prompts`，在**本轮全部 tool 结果 push 完之后**由 `flush_tool_failure_prompts()` 合并成一条 user 消息（措辞逐字节不变）。
+- [x] **静默失败 + 死信坟场。** 失败只写 pending、无日志、无群内提示；`data/pending` 堆了 4599 个 7 天以上的死信（20 MB），而 `pending::load` 只按原文 key 命中，09:59 那次重放的其实是一条 10-12 的陈年消息。修法：`pending: spilled/cleared/ignoring stale spill` 日志；失败后经 `send_via` 发固定文案，并**按 session 10 分钟限流**（`should_notify` 纯函数）；`pending::archive_stale` 在启动时把 7 天以上（含坏 JSON）死信 `rename` 进 `data/pending.archive/`（**绝不删除**，重名追加数字后缀）；`load` 对超龄 spill 返回 None。第二个失败出口（格式反馈后的重试 `agent_send_with_fallback`）原先 `if let Ok` 把 Err 静默吞掉，现同样落 `spill_and_notify`。
+- [x] **`invoke_plugin` 的拼写容错。** 模型把 plugin_path 写成 `"/qq"` 时整轮直接失败。新增 `normalize_plugin_path`（trim / 折叠 `//` / 去首尾 `/`），在唯一咽喉 `PluginRegistry::get` 生效，`check_agent_accessible` 同时受益；`insert_*` / `mark_*` / `reload_plugin_entry` 这些写路径也一并归一，否则 `mark_runtime_unavailable("/qq")` 会静默 no-op，把坏插件继续标成 `Loaded`。错误文本仍回显调用方的原始拼写。
+- [x] **回复门控可配 + 群角色节点。** 门控规则从插件 `system_hint` 里硬编码的 `IS directed at you ONLY if … When in doubt, suspend` 改为**运行时策略**：`data/qq_reply_policy.json`（`qq_get/set_reply_policy`，路径解析复用 soul_store 的 `$CORDIS_FIXTURES_ROOT/../data` → cwd 相对 `data/`），每条入站消息首行下发 `[reply policy: …]`，hint 只负责「按那一行判断」。新增 `qq_get_group_roles`（`get_group_member_list` 聚合 owner/admins/member_count，owner 缺失回退 `get_group_info_ex` 的 `extInfo.groupOwnerId.memberUin`），并给 `qq_get_group_members` 补上 node_doc 且标 `agent_accessible`——10-20 那句「接口对我没开放权限」的真身是 `Agent is not allowed to call qq::qq_get_group_members`。
+- [x] **构建管线去硬编码。** `fixtures/plugins/{qq,feishu,gacha,soul_store}/build.rs` 曾把 `target/debug/lib<name>.so` `cp` 到写死的 `/root/CordisClaw/fixtures/artifacts/` 并手改 index.json——在 minori checkout 里 `cargo build -p qq` 会覆盖**另一个仓库**的工件与索引。现四个 build.rs 只留 `rerun-if-changed`，工件暂存统一由 `prepare_artifacts` 负责。同类硬编码另清两处：filesystem 插件的 `base_dir()` 回落（原 `/root/CordisClaw`，注释却写「default to the process cwd」）与 qq 的 `runtime_config_path()` 回落。
+
+**验证**：`cargo build` 零 warning；`cargo clippy --all-targets -- -D warnings` 干净；`cargo test` 全绿；行覆盖 100%（`main.rs`/`agent.rs` 文件级排除不变，新模块 `agent_toolchain.rs` 每行由 8 个单测覆盖）。新增测试：`agent_toolchain` 8 项 + 集成 `agent_toolchain_400` 2 项（含修复前必失败的反向验证）、plugin registry 22 项（含 host 层 `check_agent_accessible("/qq")`）、inbox/pending 8 项、qq 插件 22 项（含 OneBot stub 的 `group_info_ex` 回退与 transport 失败臂）。
+
+**运维注意事项（本批踩过）**：`serve` 的 SIGTERM handler 会调 `save_draft_and_revert`——把 `fixtures/` 下 `git diff -- plugins/` 存成 `.cordis-drafts/draft-<ts>-signal.patch`，然后**回滚 `fixtures/plugins/` 里全部未提交改动**（这是为了把 agent 自迭代改坏的插件拉回干净树）。所以：
+
+1. 重启前必须**先提交**插件侧改动，否则 `systemctl restart` 会把它们收进 draft 补丁并从工作树抹掉（本批在 14:40 的重启中真实丢过一次 qq 插件源码，靠 draft 补丁恢复）。
+2. 回滚只覆盖 `plugins/`，`fixtures/artifacts/`（gitignored）不受影响——于是出现过"源码回滚了、工件还是新的"的错位：下次 `prepare-artifacts` 会用回滚后的源码重建出**旧**工件。源码恢复后要重跑 `prepare-artifacts fixtures` 再重启。
+
 ### 5.2.39 mock LLM server 空转导致 CI 4 倍变慢（2026-08-05）
 
 **症状**：CI 从稳定的 20–23 分钟涨到 84 分钟，跳变点精确落在 5.2.38 的合并提交
@@ -342,19 +360,6 @@ SSE 读取线程原本**故意不 join**（kernel 里原注释称其"有界且�
 **遗留**：`docs/agent/interfaces.json` 必须与 dylib 内嵌 docs 逐字段一致（loader
 交叉校验），故由 `examples/dump_docs.rs` 从 `docs_value()` 单一来源生成，不手写。
 
-### 5.2.38 QQ 通道止血：会话身份 / tool_calls 链完整性 / 死信治理（2026-10-21）
-
-线上事故复盘：10-20 23:39 群里发 `bot，写个插件…` 之后 bot 再无回应，用户以为它已经死掉。systemd 日志显示 runtime 全程存活——三个独立故障叠加：
-
-- [x] **会话身份丢失（每句话一个新会话）。** 线上 `fixtures/artifacts/qq.so` 是 9-02 的旧构建，`build_envelope` 还是纯文本 trigger，不带 `session_key`/`sender_id`/`conversation_kind`（`strings qq.so | grep -c session_key` = 0），kernel 因此回落到 `AgentEnvelope::soul_key()` 的原文兜底——`inbox: [[QQ group from …]: 死了]` 里的 session_key 就是消息正文。后果：**没有跨消息记忆**、soul/persona 永远命中不到（只有同一句话才同一个 key）、pending 重放按原文 key 匹配基本靠撞、`data/sessions` 涨到 780 个文件、boot 时 `crash-recovery recovered 661 session(s)`。修法不是改代码而是**重建工件**：当前源码的 envelope 已带完整身份，`prepare-artifacts fixtures` 重建 qq 工件后会话 key 变成 `qq:group:<gid>`（`--runtime-only` 启动会跳过 prepare，这正是旧工件一直没被刷新的原因）。
-- [x] **tool_calls 链破形 → DeepSeek 400 → 整轮丢弃。** 两处成因：① 失败提示就地 `push` 成 user 消息，正好落在**同一个 assistant 的两条 tool 结果之间**；② unknown-tool 的错误消息同样插在 assistant(tool_calls) 与 tool 结果之间。旧 `[tool_calls repair]` 扫到 user 就 `break`，只裁 assistant 的 `tool_calls`，留下的 `tool` 结果变孤儿，请求依旧非法 → `400 Messages with role 'tool' must be a response to a preceding message with 'tool_calls'`，且 400 不重试，用户消息只落进 pending。修法：新增纯函数模块 `agent_toolchain.rs`（两遍整形：先按「紧跟其后的连续 tool 消息」过滤 assistant 的 `tool_calls`、整条删除无结果的 assistant；再删 id 已无人引用的孤儿 `tool` 消息，幂等），并把两类提示都收集进 `tool_failure_prompts`，在**本轮全部 tool 结果 push 完之后**由 `flush_tool_failure_prompts()` 合并成一条 user 消息（措辞逐字节不变）。
-- [x] **静默失败 + 死信坟场。** 失败只写 pending、无日志、无群内提示；`data/pending` 堆了 4599 个 7 天以上的死信（20 MB），而 `pending::load` 只按原文 key 命中，09:59 那次重放的其实是一条 10-12 的陈年消息。修法：`pending: spilled/cleared/ignoring stale spill` 日志；失败后经 `send_via` 发固定文案，并**按 session 10 分钟限流**（`should_notify` 纯函数）；`pending::archive_stale` 在启动时把 7 天以上（含坏 JSON）死信 `rename` 进 `data/pending.archive/`（**绝不删除**，重名追加数字后缀）；`load` 对超龄 spill 返回 None。第二个失败出口（格式反馈后的重试 `agent_send_with_fallback`）原先 `if let Ok` 把 Err 静默吞掉，现同样落 `spill_and_notify`。
-- [x] **`invoke_plugin` 的拼写容错。** 模型把 plugin_path 写成 `"/qq"` 时整轮直接失败。新增 `normalize_plugin_path`（trim / 折叠 `//` / 去首尾 `/`），在唯一咽喉 `PluginRegistry::get` 生效，`check_agent_accessible` 同时受益；`insert_*` / `mark_*` / `reload_plugin_entry` 这些写路径也一并归一，否则 `mark_runtime_unavailable("/qq")` 会静默 no-op，把坏插件继续标成 `Loaded`。错误文本仍回显调用方的原始拼写。
-- [x] **回复门控可配 + 群角色节点。** 门控规则从插件 `system_hint` 里硬编码的 `IS directed at you ONLY if … When in doubt, suspend` 改为**运行时策略**：`data/qq_reply_policy.json`（`qq_get/set_reply_policy`，路径解析复用 soul_store 的 `$CORDIS_FIXTURES_ROOT/../data` → cwd 相对 `data/`），每条入站消息首行下发 `[reply policy: …]`，hint 只负责「按那一行判断」。新增 `qq_get_group_roles`（`get_group_member_list` 聚合 owner/admins/member_count，owner 缺失回退 `get_group_info_ex` 的 `extInfo.groupOwnerId.memberUin`），并给 `qq_get_group_members` 补上 node_doc 且标 `agent_accessible`——10-20 那句「接口对我没开放权限」的真身是 `Agent is not allowed to call qq::qq_get_group_members`。
-- [x] **构建管线去硬编码。** `fixtures/plugins/{qq,feishu,gacha,soul_store}/build.rs` 曾把 `target/debug/lib<name>.so` `cp` 到写死的 `/root/CordisClaw/fixtures/artifacts/` 并手改 index.json——在 minori checkout 里 `cargo build -p qq` 会覆盖**另一个仓库**的工件与索引。现四个 build.rs 只留 `rerun-if-changed`，工件暂存统一由 `prepare_artifacts` 负责。同类硬编码另清两处：filesystem 插件的 `base_dir()` 回落（原 `/root/CordisClaw`，注释却写「default to the process cwd」）与 qq 的 `runtime_config_path()` 回落。
-
-**验证**：`cargo build` 零 warning；`cargo clippy --all-targets -- -D warnings` 干净；`cargo test` 全绿；行覆盖 100%（`main.rs`/`agent.rs` 文件级排除不变，新模块 `agent_toolchain.rs` 每行由 8 个单测覆盖）。新增测试：`agent_toolchain` 8 项 + 集成 `agent_toolchain_400` 2 项（含修复前必失败的反向验证）、plugin registry 22 项（含 host 层 `check_agent_accessible("/qq")`）、inbox/pending 8 项、qq 插件 22 项（含 OneBot stub 的 `group_info_ex` 回退与 transport 失败臂）。
-
 ### 5.2.37 snapshot 目录无界增长 + 磁盘满伪装成逻辑错误（2026-07-28）
 
 - [x] **根因 A：staged snapshot 目录跨 hash 目录无人回收。** `default_snapshot_root`（host.rs）取 fixtures root canonical 路径的 sha256 得 `{temp_dir}/cordis-runtime-host/{hash}/`，其下每次 boot / reload / plugin-iteration attempt 建一个 `snapshot-{pid}-{nanos}/` 并 `fs::copy` 一整份插件工件（P0-15 之后不再用 hard_link，是实打实的字节拷贝，单份约 120–250 MB）。回收此前只有两条路径且都盖不住主泄漏源：`cleanup_stale_snapshot_dirs` **只扫当次 boot 解析出的那一个 hash 目录内部**，从不遍历兄弟目录；`cleanup_retired_snapshots` 只管 reload 时被退休的快照（上限 `MAX_RETIRED_SNAPSHOTS = 64`）。而集成测试每次把 fixtures 拷进新 `TempDir` → 路径不同 → 全新 hash 目录，老目录永远等不到"下次 boot 扫到它"，因为那个 hash 再也不会出现。**实测本机 `$TMPDIR/cordis-runtime-host` 累积 196 GB / 13206 个 hash 目录**（macOS 的 `$TMPDIR` 在 `/var/folders/...`，不是 `/tmp`）；远端 Linux 同症状，3 天 66 G 撑满 178 G 盘。
@@ -448,7 +453,7 @@ Review 交叉验证发现 loader 对 dylib 工件的两处静默失效，本批�
 - 指令 admin 白名单层（当前 = 渠道 policy）。
 - fallback 探测冷却（当前每次 send 都探测，降级期吞吐减半）。
 - 用户自助 soul 编辑指令（当前走 agent 工具，涉及提示词注入面需单独评估）。
-- ~~pending spill 的容量上限与过期清理~~ → 5.2.38 已闭合（7 天 TTL + `data/pending.archive/` 归档，仍无容量上限）。
+- ~~pending spill 的容量上限与过期清理~~ → 5.2.40 已闭合（7 天 TTL + `data/pending.archive/` 归档，仍无容量上限）。
 
 ### 5.2.31 飞书 WSS 长连接 + openclaw 风格策略面 + 卡片两段式（I 批，2026-07-21）
 

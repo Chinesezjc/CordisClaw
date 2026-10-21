@@ -72,7 +72,7 @@ CordisClaw 不知道消息经过了 LunaBot — 它看到的就是普通 QQ 群�
 
 ### `qq_get_group_members`
 Raw `get_group_member_list` passthrough for `target: group:<id>`. Agent-accessible
-since 5.2.38 — before that the node had no node_doc at all, so the tool firewall
+since 5.2.40 — before that the node had no node_doc at all, so the tool firewall
 answered `Agent is not allowed to call qq::qq_get_group_members` and the model
 used to report it as "this API is closed to me".
 
@@ -91,7 +91,7 @@ effect on the next message — no rebuild, no restart. An empty policy is reject
 
 ## Agent 意图判断规则
 
-门控规则的**唯一权威**是每条入站消息首行的 `[reply policy: …]`（5.2.38 之前是
+门控规则的**唯一权威**是每条入站消息首行的 `[reply policy: …]`（5.2.40 之前是
 插件 `system_hint` 里硬编码的 `IS directed at you ONLY if …`）。没有该行时退回
 保守默认：显式 @ / 点名 "bot"、"Bot"、"机器人" 才响应；其余一律 suspend。
 
