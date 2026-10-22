@@ -979,11 +979,7 @@ mod mutator_normalization_tests {
             PluginUnavailableReason::ArtifactMissing,
             Vec::new(),
         );
-        let reloaded = registry.reload_plugin_entry(
-            "/qq",
-            sample_docs("qq"),
-            sample_fingerprint(),
-        );
+        let reloaded = registry.reload_plugin_entry("/qq", sample_docs("qq"), sample_fingerprint());
         assert!(reloaded);
         let entry = registry.get("qq").expect("entry after reload");
         let loaded = matches!(entry.load_result, PluginLoadResult::Loaded);
@@ -1006,7 +1002,9 @@ mod mutator_normalization_tests {
             execution: None,
             fingerprint_diff: Vec::new(),
         });
-        let entry = registry.get("qq").expect("canonical lookup after insert_raw");
+        let entry = registry
+            .get("qq")
+            .expect("canonical lookup after insert_raw");
         assert_eq!(entry.plugin_path, "qq");
     }
 }

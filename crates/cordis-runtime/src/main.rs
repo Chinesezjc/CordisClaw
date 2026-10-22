@@ -65,6 +65,11 @@ struct AgentEnvelope {
     /// Conversation dimension: "private" | "group". Empty = unknown.
     #[serde(default)]
     conversation_kind: String,
+    /// 本批消息里带的图片地址（渠道中立）。kernel 自己下载并内联成
+    /// `image_url` content part（见 `crate::image_input`），所以插件只需
+    /// 把图片 URL 原样交出来，不必理解多模态 wire format。
+    #[serde(default)]
+    images: Vec<String>,
 }
 
 impl AgentEnvelope {
@@ -83,6 +88,7 @@ impl AgentEnvelope {
                 reply_to: None,
                 sender_id: String::new(),
                 conversation_kind: String::new(),
+                images: Vec::new(),
             },
         }
     }
@@ -1050,7 +1056,13 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     // `combined` remains unwrapped for the spill/log paths
                     // below, so a replayed message is wrapped exactly once.
                     let agent_input = wrap_inbox_batch(&combined);
-                    match host.agent_send_with_fallback(sid, &agent_input) {
+                    // 图片只属于本批：合并各条 normal 消息里的图片地址，
+                    // 由 host 按 runtime.images 预算下载 + 内联。
+                    let batch_images: Vec<String> = normals
+                        .iter()
+                        .flat_map(|e| e.images.iter().cloned())
+                        .collect();
+                    match host.agent_send_with_fallback_images(sid, &agent_input, &batch_images) {
                         Ok(reply) => {
                             pending::clear(&data_dir, session_key);
                             let feedback = process(reply.content.trim().to_string(), "inbox");
@@ -1058,7 +1070,7 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                                 // WS-3: failure exit #2 — the retry after a
                                 // format/unknown-action feedback failed. Same
                                 // sink, so this turn cannot vanish silently.
-                                match host.agent_send_with_fallback(sid, &fb) {
+                                match host.agent_send_with_fallback_images(sid, &fb, &[]) {
                                     Ok(reply2) => {
                                         process(reply2.content.trim().to_string(), "retry");
                                     }
@@ -2509,6 +2521,22 @@ mod envelope_tests {
         let env = AgentEnvelope::parse(raw);
         assert_eq!(env.sender_id, "feishu:ou_abc");
         assert_eq!(env.soul_key(), "feishu:ou_abc#private");
+    }
+
+    // 入站图片：envelope 的 images 原样带出，交给 host 下载 + 内联。
+    #[test]
+    fn envelope_parse_reads_image_urls() {
+        let raw = r#"{"session_key":"qq:group:1","display":"看 [image: https://a/1.png]","images":["https://a/1.png"]}"#;
+        let env = AgentEnvelope::parse(raw);
+        assert_eq!(env.images, vec!["https://a/1.png".to_string()]);
+    }
+
+    // 老 envelope 没有 images 字段：解析成空 vec（不能因此丢掉整条消息）。
+    #[test]
+    fn envelope_parse_defaults_images_to_empty() {
+        let raw = r#"{"session_key":"qq:group:1","display":"hi"}"#;
+        let env = AgentEnvelope::parse(raw);
+        assert!(env.images.is_empty());
     }
 
     // 非 JSON 的 legacy 纯文本仍能进 agent（无路由、soul_key = 原文）。

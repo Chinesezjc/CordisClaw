@@ -6,6 +6,7 @@ pub mod context;
 pub mod core;
 pub mod execution;
 pub mod host;
+pub mod image_input;
 pub mod kernel;
 mod llm_sink;
 pub mod plugin;

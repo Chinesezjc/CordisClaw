@@ -81,8 +81,10 @@ pub(crate) fn sanitize_tool_chains(messages: &mut Vec<Value>) -> RepairStats {
     }
     // 先按原下标过滤（不受删除影响），再按逆序删除整条消息。
     for (index, kept) in filtered_calls {
-        if let Some(object) = messages[index].as_object_mut() {
-            object.insert("tool_calls".to_string(), Value::Array(kept));
+        // `for … in option.into_iter()` 而不是 `if let Some`：后者会在这一行
+        // 留下一个永远不会执行的隐式 else，把整行拖成零计数。
+        for object in messages[index].as_object_mut().into_iter() {
+            object.insert("tool_calls".to_string(), Value::Array(kept.clone()));
         }
     }
     for index in remove_assistants.into_iter().rev() {

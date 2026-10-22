@@ -77,6 +77,7 @@
 | 职责定位 | 关键入口 |
 |---|---|
 | 统一的 LLM agent 会话：SSE 流解析、tool-calling loop（最多 96 轮，overflow 保留 partial history P1-31）、重试/超时管理（4xx 不重试 P1-35，budget 合并 P1-37）、消息历史（compact 后重算 estimated_tokens P1-32、UTF-8 char/byte 一致 P1-33）、orphan-User cleanup（P2-31）、内核自省工具（get_runtime_status/list_plugins/list_nodes/get_kernel_status/get_kernel_issues）的 tool call/result 不写入跨轮持久化历史（5.2.36）；两个后端：`RuntimeShellAgentBackend`（20 个交互式工具；P2-1 边界收敛待做）和 `PluginIterationAgentBackend`（scaffold/edit/verify 工具集） | `AgentSession::respond` / `respond_inner`、`ShellAgentSession`、`AgentToolHost` trait、`PendingSessionAction`（P1-25 self-lookup 侧信道） |
+| `image_input.rs`：入站图片 → 多模态 content part（纯逻辑 + 注入式 fetch）。魔数嗅探 png/jpeg/webp/gif、base64 内联、按 `runtime.images` 预算做张数/字节/超时裁剪并把跳过原因交给调用方打日志；`user_content_with_images` 在无图时返回纯字符串，保证既有请求体形状不变（5.2.41） | `plan_image_parts()`、`plan_for_settings()`、`user_content_with_images()`、`fetch_http()` |
 | `agent_toolchain.rs`：请求前的 tool_calls 链**整形**（纯函数，无 I/O）。两遍：先按「紧跟其后的连续 `tool` 消息」过滤 assistant 的 `tool_calls`、整条删除一个结果都没有的 assistant；再删除 `tool_call_id` 已无人引用的孤儿 `tool` 消息。幂等，返回 `RepairStats` 供 `[tool_calls repair]` 诊断行使用（5.2.40：链破形会让 DeepSeek 整轮 400） | `sanitize_tool_chains()`、`RepairStats` |
 
 ## 6c. Soul 与指令路由（`crates/cordis-runtime/src/soul.rs`、`command_router.rs`）

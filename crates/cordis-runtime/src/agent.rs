@@ -1323,6 +1323,7 @@ impl AgentSession {
         &mut self,
         backend: &mut B,
         user_input: &str,
+        images: &[Value],
         provider: &dyn LlmProvider,
         sink: Option<std::sync::Arc<dyn crate::llm_sink::TokenSink>>,
     ) -> Result<AgentReply, RuntimeError> {
@@ -1353,9 +1354,11 @@ impl AgentSession {
             "content": backend.system_prompt(),
         }));
         messages.extend(self.history.clone());
+        // 图片只随这一条新消息进请求：history 里只留文本占位符，
+        // 否则每一轮都会重发同一张图。
         messages.push(json!({
             "role": "user",
-            "content": trimmed,
+            "content": crate::image_input::user_content_with_images(trimmed, images),
         }));
         self.transcript.push(AgentTranscriptEntry::User {
             content: trimmed.to_string(),
@@ -1740,6 +1743,7 @@ impl AgentSession {
     ///
     /// `respond` 是过渡期的便利入口（内建传输）；C5 删掉内建实现后只剩本函数。
     /// `sink` 为 `Some` 时 provider 可逐段推增量，忽略它也必须正确工作。
+    #[cfg(test)]
     pub(crate) fn respond_with_provider<B: AgentBackend + ?Sized>(
         &mut self,
         backend: &mut B,
@@ -1747,8 +1751,21 @@ impl AgentSession {
         provider: &dyn LlmProvider,
         sink: Option<std::sync::Arc<dyn crate::llm_sink::TokenSink>>,
     ) -> Result<AgentReply, RuntimeError> {
+        self.respond_with_provider_images(backend, user_input, &[], provider, sink)
+    }
+
+    /// [`respond_with_provider`] 的多模态入口：`images` 是已经拼好的
+    /// `image_url` content part（见 `crate::image_input`）。空切片等价于纯文本。
+    pub(crate) fn respond_with_provider_images<B: AgentBackend + ?Sized>(
+        &mut self,
+        backend: &mut B,
+        user_input: &str,
+        images: &[Value],
+        provider: &dyn LlmProvider,
+        sink: Option<std::sync::Arc<dyn crate::llm_sink::TokenSink>>,
+    ) -> Result<AgentReply, RuntimeError> {
         let transcript_len_before = self.transcript.len();
-        let result = self.respond_inner(backend, user_input, provider, sink);
+        let result = self.respond_inner(backend, user_input, images, provider, sink);
         self.repair_transcript_on_error(transcript_len_before, &result);
         result
     }
@@ -1772,6 +1789,7 @@ impl AgentSession {
     ///
     /// backend 的构造留在本模块：`RuntimeShellAgentBackend` 是私有类型，
     /// 让 host 去拼装它会迫使它变 public 且暴露内部字段。
+    #[cfg(test)]
     pub(crate) fn respond_with_runtime_host_via<H: AgentToolHost + ?Sized>(
         &mut self,
         host: &H,
@@ -1787,6 +1805,26 @@ impl AgentSession {
             soul_key,
         };
         self.respond_with_provider(&mut backend, user_input, provider, sink)
+    }
+
+    /// 同 [`respond_with_runtime_host_via`]，但这次用户消息带图片
+    /// （`images` 是 `image_url` content part，空切片等价于纯文本）。
+    pub(crate) fn respond_with_runtime_host_via_images<H: AgentToolHost + ?Sized>(
+        &mut self,
+        host: &H,
+        session_id: &str,
+        user_input: &str,
+        images: &[Value],
+        provider: &dyn LlmProvider,
+        sink: Option<std::sync::Arc<dyn crate::llm_sink::TokenSink>>,
+    ) -> Result<AgentReply, RuntimeError> {
+        let soul_key = self.soul_key.clone();
+        let mut backend = RuntimeShellAgentBackend {
+            host,
+            session_id,
+            soul_key,
+        };
+        self.respond_with_provider_images(&mut backend, user_input, images, provider, sink)
     }
 
     pub fn history_len(&self) -> usize {

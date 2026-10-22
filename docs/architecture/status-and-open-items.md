@@ -2,7 +2,7 @@
 
 ## 1. 判定口径
 
-- 本文基于当前仓库现状整理，最近更新：2026-10-21。
+- 本文基于当前仓库现状整理，最近更新：2026-10-22。
 - 历史规划蓝图已经吸收进 [design-blueprint.md](./design-blueprint.md)，因此本文结论来自三类证据的交叉比对：
   - 设计蓝图：[design-blueprint.md](./design-blueprint.md)
   - 架构文档：[system-overview.md](./system-overview.md)、[contracts-and-loading.md](./contracts-and-loading.md)、[runtime-semantics.md](./runtime-semantics.md)、[maintenance-guide.md](./maintenance-guide.md)
@@ -239,6 +239,28 @@ Agent 现在可以自主完成：读代码 → 理解结构 → 写/改文件 �
 - [x] **Filesystem / Git 白名单不再静默降级**（P0-19）— `canonicalize` 失败时不再退回未规范化路径。新增 `canonicalise_for_whitelist` / `validate_path_in_root` 的深度 ancestor 解析：路径不存在时 canonicalize 最深的存在祖先再拼 tail；两侧都失败则 fail-closed。`../../etc/shadow` 之类的构造再无绕过。
 - [x] **Plugin iteration symlink 逃逸**（P0-20）— `PluginEditExecutor::execute` 在写入前调用新 helper `resolve_under_workspace`：canonicalize 结果必须仍在 workspace_root 下。plugins 内的 symlink 指向 `/etc/passwd` 之类无法被写入。
 - [x] **Verifier shell 拼接**（P0-21）— 已随 A 批 P0-1 修复。`discover_rust_workspace_manifest` 输出的字符串被 `shell_words` 解析成 argv，空格 / `$` / `;` 无法被解释。
+
+### 5.2.41 入站图片走多模态 provider（不走 vision 插件）+ 回复策略改为语境判断（2026-10-21）
+
+**动机**：群里有人发图问 bot，bot 答"我这边也没有图像识别节点"——这句在当时是**真的**（`vision_ocr`/`vision_describe` 都是 `agent_accessible: false`），但绕开它的正确办法不是打开 vision 插件，而是让 agent 自己"看"：现在 `deepseek-flash` 原生支持多模态输入。
+
+**实测前提**（对 `https://api.deepseek.com/beta/chat/completions`）：
+- `content: [{"type":"text"},{"type":"image_url"}]` 形状被接受；
+- `image_url.url` 用 base64 `data:image/png;base64,…` → **200**，模型确实在图里找信息；
+- 用远程 URL 也可，但**由供应商侧下载**：实测一张 wikimedia 图直接 `400 Failed to download image`。QQ 图片是 `multimedia.nt.qq.com.cn/...&rkey=...` 这种带时效地址，所以必须**我方下载后内联**。
+
+**改动**：
+- [x] **qq 插件**：正文里的 `[image: <url>]` 保持占位符，同时 `collect_image_urls` 把 URL 放进 envelope 的 `images` 数组（渠道中立字段，插件不碰多模态 wire format）。
+- [x] **envelope**：`AgentEnvelope.images`（`serde(default)`，旧包无此字段照样解析）；inbox 合并本批图片后走新的 `agent_send_with_fallback_images`。
+- [x] **kernel/`image_input.rs`**（新模块）：魔数嗅探 png/jpeg/webp/gif、自写 base64（不新增依赖）、`plan_for_settings` 按 `runtime.images` 预算裁剪，跳过原因（张数/字节/下载失败/非图片）交给调用方打 `image_input: skip …`；**只降级不失败**。
+- [x] **host**：`image_parts_for_batch()` 读 `runtime.images` + 真实 `fetch_http`（reqwest，8s 超时）；`agent_send` / `agent_send_with_fallback` 保持原签名（委派空图，行为逐字节不变），新增 `*_with_images` 变体。
+- [x] **agent**：新 user 消息的 `content` 由 `user_content_with_images` 组装——**无图仍是纯字符串**（既有请求体形状不变），有图是 `[{"type":"text"},{"type":"image_url"}…]`；图片只进当前这一轮，`history` 里只留文本占位符，避免每轮重发。
+- [x] **配置**：`runtime.images`（`enabled=true` / `max_bytes=4 MiB` / `max_per_batch=2` / `timeout_ms=8000`）。
+- [x] **回复策略默认值改为语境判断**：插件里的 `DEFAULT_REPLY_POLICY` 从"必须喊 bot / @ / 明确要你回答"的清单式改成"你自己按对话语境判断是否需要回答"，并保留"拿不准就沉默、不抢别人的话头"。线上已经先通过 `qq_set_reply_policy` 把同一条策略写进 `data/qq_reply_policy.json`（改运行时策略不需要重编），本批把它变成缺省值，免得文件被删就退回旧行为。
+
+**验证**：`cargo build` 零 warning；`cargo clippy --all-targets -- -D warnings` 干净；新增单测 `image_input` 12 项（4 种 mime + 未知类型 + 超字节 + 超张数 + 下载失败 + 禁用 + base64 三种 chunk 长度 + 无图纯字符串 + text-first 数组 + transport 失败臂）、envelope 2 项、集成 2 项（`inbound_image_is_inlined_as_a_multimodal_content_part` 断言请求体里是 `data:image/png;base64,` 的数组；`no_images_keeps_the_plain_string_content` 钉住无图仍是字符串）、qq 插件 6 项。线上以真实群图片复核（见部署记录）。
+
+**未做/后续**：`vision_ocr` / `vision_describe` 仍是 `agent_accessible: false`（原生看图已经覆盖主路径，OCR 只在需要抽文字时才有价值；要开的话是 vision 插件一行 flag + 重编，并依赖 `OPENAI_API_KEY`/`tesseract`）。
 
 ### 5.2.40 QQ 通道止血：会话身份 / tool_calls 链完整性 / 死信治理（2026-10-21）
 

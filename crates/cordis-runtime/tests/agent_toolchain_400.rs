@@ -476,3 +476,122 @@ fn unknown_tool_error_does_not_break_the_tool_call_chain() {
         .collect();
     assert!(dangling.is_empty(), "dangling tool_calls: {dangling:?}");
 }
+
+// ───────────────────────────────────────────────────────────────────────
+// 多模态：入站图片 → `image_url` content part。
+// 证明 kernel 真的把图片（自己下载 + base64 内联）塞进了请求体，
+// 而不是只留一个 `[image: url]` 文本占位符。
+// ───────────────────────────────────────────────────────────────────────
+
+/// 1×1 红色 PNG（够 `sniff_mime` 认出 image/png，也够供应商解码）。
+const RED_PNG: &[u8] = &[
+    0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00, 0x00, 0x90, 0x77, 0x53,
+    0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54, 0x08, 0xD7, 0x63, 0xF8, 0xCF, 0xC0, 0x00,
+    0x00, 0x03, 0x01, 0x01, 0x00, 0x18, 0xDD, 0x8D, 0xB0, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E,
+    0x44, 0xAE, 0x42, 0x60, 0x82,
+];
+
+/// 起一个只服务一次请求的最小 HTTP 图片服务器，返回图片 URL。
+fn serve_png_once() -> String {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind png server");
+    let addr = listener.local_addr().expect("addr");
+    std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf);
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                RED_PNG.len()
+            );
+            let _ = stream.write_all(header.as_bytes());
+            let _ = stream.write_all(RED_PNG);
+            let _ = stream.flush();
+        }
+    });
+    format!("http://{addr}/red.png")
+}
+
+fn user_message_with_array_content(messages: &[Value]) -> &Value {
+    messages
+        .iter()
+        .find(|message| {
+            role(message) == Some("user") && message.get("content").is_some_and(Value::is_array)
+        })
+        .expect("the user message must carry multimodal content")
+}
+
+#[test]
+fn inbound_image_is_inlined_as_a_multimodal_content_part() {
+    let temp = setup_empty_fixture();
+    let fixtures = fixtures_dir(&temp);
+    let final_json = r#"{"ok":true}"#;
+    let (url, requests_rx, handle) =
+        spawn_chunked_mock_llm_server_sequence(vec![assistant_response("turn1", final_json)]);
+    write_llm_config(&fixtures, &url);
+    let png_url = serve_png_once();
+
+    let host = RuntimeHost::boot(&fixtures).expect("host should boot on empty index");
+    let sid = host
+        .agent_start(AgentSessionKind::RuntimeShell)
+        .expect("agent start")
+        .session_id;
+    let reply = host
+        .agent_send_with_images(&sid, "看这张图", &[png_url])
+        .expect("a batch with an image must still complete");
+    assert_eq!(reply.content, final_json);
+
+    let requests = requests_rx.recv().expect("captured requests");
+    handle.join().expect("join mock server");
+    let body = request_body(&requests[0]);
+    let messages = body
+        .get("messages")
+        .and_then(Value::as_array)
+        .expect("request body carries messages");
+    let content = user_message_with_array_content(messages)
+        .get("content")
+        .and_then(Value::as_array)
+        .expect("array content");
+    assert_eq!(content.len(), 2, "文本 + 一张图: {content:?}");
+    assert_eq!(content[0]["type"], "text");
+    assert_eq!(content[0]["text"], "看这张图");
+    assert_eq!(content[1]["type"], "image_url");
+    let uri = content[1]["image_url"]["url"].as_str().expect("data uri");
+    let is_png_data_uri = uri.starts_with("data:image/png;base64,");
+    assert!(is_png_data_uri, "uri={uri}");
+}
+
+#[test]
+fn no_images_keeps_the_plain_string_content() {
+    let temp = setup_empty_fixture();
+    let fixtures = fixtures_dir(&temp);
+    let final_json = r#"{"ok":true}"#;
+    let (url, requests_rx, handle) =
+        spawn_chunked_mock_llm_server_sequence(vec![assistant_response("turn1", final_json)]);
+    write_llm_config(&fixtures, &url);
+
+    let host = RuntimeHost::boot(&fixtures).expect("host should boot on empty index");
+    let sid = host
+        .agent_start(AgentSessionKind::RuntimeShell)
+        .expect("agent start")
+        .session_id;
+    host.agent_send_with_images(&sid, "纯文字", &[])
+        .expect("plain send");
+
+    let requests = requests_rx.recv().expect("captured requests");
+    handle.join().expect("join mock server");
+    let body = request_body(&requests[0]);
+    let messages = body
+        .get("messages")
+        .and_then(Value::as_array)
+        .expect("messages");
+    let last_user = messages
+        .iter()
+        .rev()
+        .find(|message| role(message) == Some("user"))
+        .expect("a user message");
+    assert_eq!(content_of(last_user), Some("纯文字"));
+}

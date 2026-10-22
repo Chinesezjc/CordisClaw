@@ -3113,6 +3113,40 @@ export_plugin_api! {{
     }
 
     pub fn agent_send(&self, session_id: &str, input: &str) -> Result<AgentReply, RuntimeError> {
+        self.agent_send_with_images(session_id, input, &[])
+    }
+
+    /// 把本批的图片地址按 `runtime.images` 预算转成 `image_url` content part。
+    ///
+    /// 全程只降级：关掉 / 下载失败 / 超字节 / 超张数 / 非图片 → 记日志并跳过，
+    /// 纯文本照常发。绝不让一张图毁掉整轮。
+    pub fn image_parts_for_batch(&self, image_urls: &[String]) -> Vec<serde_json::Value> {
+        let (parts, skips) = crate::image_input::plan_for_settings(
+            &self.config.runtime.images,
+            image_urls,
+            &crate::image_input::fetch_http,
+        );
+        for skip in &skips {
+            eprintln!("image_input: skip url={} reason={}", skip.url, skip.reason);
+        }
+        eprintln!(
+            "image_input: batch={} attached={} skipped={}",
+            image_urls.len(),
+            parts.len(),
+            skips.len()
+        );
+        parts
+    }
+
+    /// `agent_send` 的多模态入口：`image_urls` 是本批消息里的图片地址，
+    /// 由 [`RuntimeHost::image_parts_for_batch`] 按 `runtime.images` 预算
+    /// 下载 + 内联成 `image_url` content part。空切片等价于纯文本。
+    pub fn agent_send_with_images(
+        &self,
+        session_id: &str,
+        input: &str,
+        image_urls: &[String],
+    ) -> Result<AgentReply, RuntimeError> {
         let mut session = {
             let mut guard = self
                 .agent_sessions
@@ -3124,7 +3158,8 @@ export_plugin_api! {{
                     session_id: session_id.to_string(),
                 })?
         };
-        let result = session.respond(self, input);
+        let images = self.image_parts_for_batch(image_urls);
+        let result = session.respond_with_images(self, input, &images);
         // P1-25: drain any pending actions queued by tools that couldn't
         // reach the session during `respond` (compact_context et al) and
         // apply them here, before reinserting into the map. Errors are
@@ -3174,6 +3209,16 @@ export_plugin_api! {{
         session_id: &str,
         input: &str,
     ) -> Result<AgentReply, RuntimeError> {
+        self.agent_send_with_fallback_images(session_id, input, &[])
+    }
+
+    /// [`agent_send_with_fallback`] 的多模态版本（图片预算同 `agent_send_with_images`）。
+    pub fn agent_send_with_fallback_images(
+        &self,
+        session_id: &str,
+        input: &str,
+        image_urls: &[String],
+    ) -> Result<AgentReply, RuntimeError> {
         let entry = {
             let guard = self
                 .profile_fallback
@@ -3185,7 +3230,7 @@ export_plugin_api! {{
             // Sessions started via plain agent_start (REPL, tests) have no
             // fallback entry under a non-default registry only if created
             // before this map existed; treat as plain send.
-            return self.agent_send(session_id, input);
+            return self.agent_send_with_images(session_id, input, image_urls);
         };
 
         // Recovery probe: while degraded, put the desired profile back
@@ -3195,7 +3240,7 @@ export_plugin_api! {{
             self.swap_session_profile(session_id, &entry.desired)?;
         }
 
-        match self.agent_send(session_id, input) {
+        match self.agent_send_with_images(session_id, input, image_urls) {
             Ok(reply) => {
                 if entry.degraded {
                     self.set_degraded(session_id, false);
@@ -3214,7 +3259,7 @@ export_plugin_api! {{
                 };
                 let fallback = fallback.to_string();
                 self.swap_session_profile(session_id, &fallback)?;
-                match self.agent_send(session_id, input) {
+                match self.agent_send_with_images(session_id, input, image_urls) {
                     Ok(reply) => {
                         self.set_degraded(session_id, true);
                         let msg = format!(
@@ -5343,7 +5388,12 @@ impl ManagedAgentSession {
         (old, self.session.history_len())
     }
 
-    fn respond(&mut self, host: &RuntimeHost, input: &str) -> Result<AgentReply, RuntimeError> {
+    fn respond_with_images(
+        &mut self,
+        host: &RuntimeHost,
+        input: &str,
+        images: &[serde_json::Value],
+    ) -> Result<AgentReply, RuntimeError> {
         // 无 provider 插件时两种 state 的结论相同（都只能报 NoLlmProvider），
         // 所以先统一判定，省掉两条各自的 None 分支。
         let Some(plugin_path) = host.llm_provider_plugin() else {
@@ -5351,10 +5401,11 @@ impl ManagedAgentSession {
         };
         let provider = PluginLlmProvider { host, plugin_path };
         match &mut self.state {
-            ManagedAgentState::RuntimeShell => self.session.respond_with_runtime_host_via(
+            ManagedAgentState::RuntimeShell => self.session.respond_with_runtime_host_via_images(
                 host,
                 &self.handle.session_id,
                 input,
+                images,
                 &provider,
                 None,
             ),
@@ -5363,8 +5414,13 @@ impl ManagedAgentSession {
                     host,
                     state: state.as_mut(),
                 };
-                self.session
-                    .respond_with_provider(&mut backend, input, &provider, None)
+                self.session.respond_with_provider_images(
+                    &mut backend,
+                    input,
+                    images,
+                    &provider,
+                    None,
+                )
             }
         }
     }

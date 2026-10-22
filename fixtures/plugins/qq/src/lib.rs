@@ -1101,7 +1101,7 @@ fn should_process(text: &str) -> bool {
 
 /// Conservative default, used whenever no usable policy file exists. Kept in
 /// English because the model reads it verbatim.
-const DEFAULT_REPLY_POLICY: &str = "Reply when the message is clearly addressed to you (contains \"bot\"/\"Bot\"/\"机器人\", an @mention of you, or the sender explicitly asks you to answer). Otherwise stay silent.";
+const DEFAULT_REPLY_POLICY: &str = "Decide for yourself, from the conversation context, whether this message needs an answer from you. Answer when it is addressed to you (\"bot\"/\"Bot\"/\"机器人\", or an @mention), AND ALSO when the context makes it clear the sender is talking to you: it continues a thread you are part of, asks you to do or explain something, or someone in the group explicitly wants your answer — even without naming you. Stay silent for conversation between other people, memes/stickers, and statements that do not involve you; do not hijack someone else's thread. If it is genuinely ambiguous, prefer silence.";
 
 /// On-disk shape of `data/qq_reply_policy.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1177,6 +1177,27 @@ fn ensure_policy_parent_dir(path: &std::path::Path) -> Result<(), String> {
 /// Build the runtime routing envelope (mirrors feishu's build_envelope).
 /// sender_id is "group:<gid>" or "private:<uid>"; the actual person is
 /// user_id, so identity is "qq:<user_id>".
+/// 从渲染后的正文里按顺序收集 `[image: <url>]` 里的 URL。
+///
+/// 只认 `[image: `（不是 `[image file: `）——后者是没有 URL 的占位符，
+/// 交出去也没法下载。收集到的地址随 envelope 的 `images` 字段交给 kernel，
+/// 由 kernel 下载 + 内联成多模态 content part。
+fn collect_image_urls(text: &str) -> Vec<String> {
+    let mut urls = Vec::new();
+    let mut rest = text;
+    let marker = "[image: ";
+    while let Some(start) = rest.find(marker) {
+        let after = &rest[start + marker.len()..];
+        let Some(end) = after.find(']') else { break };
+        let url = after[..end].trim();
+        if !url.is_empty() {
+            urls.push(url.to_string());
+        }
+        rest = &after[end..];
+    }
+    urls
+}
+
 fn build_envelope(msg: &IncomingMessage) -> String {
     // WS-4: every inbound message carries the current reply policy as its
     // first line. Unreadable/missing policy file → DEFAULT_REPLY_POLICY, so
@@ -1197,6 +1218,8 @@ fn build_envelope(msg: &IncomingMessage) -> String {
         "reply_target": reply_target,
         "sender_id": format!("qq:{}", msg.user_id),
         "conversation_kind": msg.message_type,
+        // 图片地址交给 kernel 处理（下载 + 内联），插件不碰多模态 wire format。
+        "images": collect_image_urls(&msg.message),
     });
     if let Some(mid) = msg.message_id {
         env["reply_to"] = json!(mid.to_string());
@@ -3347,5 +3370,77 @@ mod runtime_config_path_tests {
             let foreign = resolved.starts_with("/root/CordisClaw/");
             assert!(!foreign, "resolved={}", resolved.display());
         });
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// 图片入站：正文里的 `[image: url]` 要原样交给 kernel（多模态 content part）。
+// ═══════════════════════════════════════════════════════════════════════
+#[cfg(test)]
+mod image_url_tests {
+    use super::*;
+
+    fn msg(text: &str) -> IncomingMessage {
+        IncomingMessage {
+            message_type: "group".to_string(),
+            sender_id: "123456".to_string(),
+            user_id: "789".to_string(),
+            message: text.to_string(),
+            message_id: Some(1),
+            reply_to_msg_id: None,
+            raw_event: None,
+        }
+    }
+
+    #[test]
+    fn collect_returns_urls_in_order() {
+        let urls = collect_image_urls("前 [image: https://a/1.png] 中 [image: https://a/2.jpg] 后");
+        assert_eq!(urls, vec!["https://a/1.png", "https://a/2.jpg"]);
+    }
+
+    #[test]
+    fn collect_ignores_placeholders_without_url() {
+        let urls = collect_image_urls("[image file: abc.image] [image] [sticker]");
+        assert!(urls.is_empty());
+    }
+
+    #[test]
+    fn collect_tolerates_unterminated_and_empty_markers() {
+        assert!(collect_image_urls("[image: https://a/1.png").is_empty());
+        assert!(collect_image_urls("[image:   ]").is_empty());
+        assert!(collect_image_urls("没有图").is_empty());
+    }
+
+    // 图片地址必须随 envelope 一起交出去，否则 kernel 根本不知道有图。
+    #[test]
+    fn build_envelope_carries_image_urls() {
+        let env: Value = serde_json::from_str(&build_envelope(&msg(
+            "看这个 [image: https://a/1.png]",
+        )))
+        .unwrap();
+        let urls = env["images"].as_array().expect("images array");
+        assert_eq!(urls.len(), 1);
+        assert_eq!(urls[0], "https://a/1.png");
+        let display = env["display"].as_str().unwrap_or_default();
+        assert!(display.contains("[image: https://a/1.png]"), "{display}");
+    }
+
+    #[test]
+    fn build_envelope_without_images_still_has_the_field() {
+        let env: Value = serde_json::from_str(&build_envelope(&msg("纯文字"))).unwrap();
+        let urls = env["images"].as_array().expect("images array");
+        assert!(urls.is_empty());
+    }
+
+    // 默认策略必须是"按语境判断"，而不是旧的清单式 ONLY if。
+    #[test]
+    fn default_policy_is_context_based() {
+        let policy = DEFAULT_REPLY_POLICY;
+        assert!(policy.contains("conversation context"), "{policy}");
+        assert!(policy.contains("even without naming you"), "{policy}");
+        assert!(
+            !policy.contains("Otherwise stay silent."),
+            "旧清单式收尾不应再出现: {policy}"
+        );
     }
 }

@@ -97,14 +97,30 @@ effect on the next message — no rebuild, no restart. An empty policy is reject
 
 默认策略（可在群里让 bot 用 `qq_set_reply_policy` 改）：
 
-> Reply when the message is clearly addressed to you (contains "bot"/"Bot"/"机器人",
-> an @mention of you, or the sender explicitly asks you to answer). Otherwise stay
-> silent.
+> Decide for yourself, from the conversation context, whether this message needs an
+> answer from you. Answer when it is addressed to you ("bot"/"Bot"/"机器人", or an
+> @mention), AND ALSO when the context makes it clear the sender is talking to you:
+> it continues a thread you are part of, asks you to do or explain something, or
+> someone in the group explicitly wants your answer — even without naming you. Stay
+> silent for conversation between other people, memes/stickers, and statements that
+> do not involve you; do not hijack someone else's thread. If it is genuinely
+> ambiguous, prefer silence.
 
 以下情况默认返回 suspend（会话挂起）：
 - 群友之间的闲聊
 - 表情、贴纸、单字回复
 - 不涉及机器人的陈述
+
+## 入站图片（多模态）
+
+图片消息在正文里留 `[image: <url>]` 占位符，同时把 URL 放进 envelope 的
+`images` 数组。kernel 负责下载、嗅探类型（png/jpeg/webp/gif）、base64 内联成
+`image_url` content part，再随**本批** user 消息发给 provider —— 模型因此能直接
+看到图，不需要 vision 插件。历史里只保留文本占位符，不会每轮重发。
+
+预算（`config/runtime.yaml` 的 `runtime.images`，缺省即下列值）：
+`enabled: true` / `max_bytes: 4194304` / `max_per_batch: 2` / `timeout_ms: 8000`。
+超限或下载失败的图只记一行 `image_input: skip url=… reason=…`，本轮照常用文本继续。
 
 ## ⚠ 关键代码依赖
 
