@@ -391,20 +391,20 @@ impl AgentToolHost for RuntimeHost {
 
     fn agent_plugin_hints(&self) -> Vec<String> {
         let snapshot = self.current_snapshot();
-        // Build a concise catalog of available plugins and their nodes.
-        let mut catalog = String::from("Loaded plugins:\n");
+        // 目录直接由各插件的 node 文档渲染：id + 摘要 + 入参 + 出参。
+        // 模型因此知道 `qq_get_group_info` 返回 `member_count` 之类的事实，
+        // 插件不必在 system_hint 里再手写一遍（写过的会和实现漂移）。
+        let mut catalog = String::from(crate::plugin::node_catalog::CATALOG_HEADER);
         for (path, plugin) in snapshot.plugin_registry().iter() {
-            if let Some(ref docs) = plugin.docs {
-                let agent_nodes: Vec<&str> = docs
-                    .nodes
-                    .iter()
-                    .filter(|n| n.agent_accessible)
-                    .map(|n| n.id.as_str())
-                    .collect();
-                if !agent_nodes.is_empty() {
-                    catalog.push_str(&format!("  {} → {}\n", path, agent_nodes.join(", ")));
-                }
-            }
+            let Some(docs) = plugin.docs.as_ref() else {
+                continue;
+            };
+            let nodes: Vec<&cordis_plugin_sdk::NodeDoc> = docs
+                .nodes
+                .iter()
+                .filter(|node| node.agent_accessible)
+                .collect();
+            crate::plugin::node_catalog::push_plugin(&mut catalog, &path, &nodes);
         }
         let mut hints = vec![catalog];
         hints.extend(

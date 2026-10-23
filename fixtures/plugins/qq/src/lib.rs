@@ -2472,7 +2472,7 @@ fn docs_value() -> cordis_plugin_sdk::PluginDocs {
     ).with_agent_accessible(),
             node_doc(
                 "qq_get_group_info",
-                "Get group information (name, member count, etc.) via OneBot v11 get_group_info API.",
+                "Get a group's name and size (member_count / max_member_count) — use it to tell a two-person group from a busy one. Returns the raw OneBot response, so the fields sit at data.data.",
                 json!({
                     "type": "object", "required": ["node_id", "target"],
                     "properties": {
@@ -2485,7 +2485,23 @@ fn docs_value() -> cordis_plugin_sdk::PluginDocs {
                     "properties": {
                         "ok": { "type": "boolean" },
                         "message": { "type": ["string", "null"] },
-                        "data": { "type": "object", "description": "Raw OneBot get_group_info response" },
+                        "data": {
+                            "type": "object",
+                            "description": "Raw OneBot get_group_info response",
+                            "properties": {
+                                "status": { "type": "string" },
+                                "retcode": { "type": "integer" },
+                                "data": {
+                                    "type": "object",
+                                    "properties": {
+                                        "group_id": { "type": "integer" },
+                                        "group_name": { "type": "string" },
+                                        "member_count": { "type": "integer" },
+                                        "max_member_count": { "type": "integer" }
+                                    }
+                                }
+                            }
+                        },
                         "error": { "type": ["string", "null"] }
                     }
                 }),
@@ -2699,10 +2715,10 @@ REPLY POLICY — the authority on whether to answer. Every incoming message star
   balanced   — judge from the conversation: answer when it is addressed to you or clearly wants your answer; stay out of threads between other people.\n\
   chatty     — this group WANTS you to participate: answer questions you can help with, add a short remark when it fits, take a joke. Never hijack a thread between two others.\n\
   one_on_one — treat it as a direct chat: answer every message meant for you; do not go silent just because it is technically a group.\n\
-SMALL GROUPS — a group that is effectively private (only you and one or two people) should behave like a direct chat. When you are unsure how big a group is, check it ONCE: invoke_plugin(qq, qq_get_group_info, {\"node_id\":\"qq_get_group_info\",\"target\":\"group:<gid>\"}) and read `data.member_count`. If it is <= 2, persist the decision: invoke_plugin(qq, qq_set_reply_policy, {\"node_id\":\"qq_set_reply_policy\",\"group\":\"<gid>\",\"mode\":\"one_on_one\"}) and note it in [group memory]. Do not re-check on every message — decide once per group, and if you already have the answer from memory do not call the API again.\n\
+SMALL GROUPS — a group that is effectively private (you and one or two people) should behave like a direct chat. If you are not sure how big a group is, look it up once with `qq_get_group_info` (its docs are in the plugin catalog below) and, when member_count <= 2, set this group's mode to one_on_one with `qq_set_reply_policy` and remember it. Decide once per group — never probe on every message.\n\
 HOW TO JUDGE — use the conversation history, not just this one message: who is talking to whom, whether the last few lines are a thread you are part of, whether someone asked a question nobody answered. A message that continues a thread you are already in is addressed to you even without naming you.\n\
 [group memory: ...] — this is YOUR OWN memo about this group (how talkative it wants you, its standing topics, what it told you off for). Follow it. If the line is absent you have written nothing yet.\n\
-WRITING MEMORY — when you learn something DURABLE about a group (it wants you quiet, it wants you chatty, its standing topic, a joke that landed badly), persist it: invoke_plugin(qq, qq_set_group_memory, {\"node_id\":\"qq_set_group_memory\",\"group\":\"<gid>\",\"memory\":\"<1-3 sentences>\"}). Do NOT write on every message — only durable preferences, and never guess one from a single message. To change how talkative you are in a group: invoke_plugin(qq, qq_set_reply_policy, {\"node_id\":\"qq_set_reply_policy\",\"group\":\"<gid>\",\"mode\":\"quiet|balanced|chatty|one_on_one\"}). Both take effect on the next message.\n\
+WRITING MEMORY — when you learn something DURABLE about a group (it wants you quiet, it wants you chatty, its standing topic, a joke that landed badly), persist it with `qq_set_group_memory` (see the catalog for its arguments). Do NOT write on every message — only durable preferences, and never guess one from a single message. To change how talkative you are, use `qq_set_reply_policy` with one of the four modes. Both take effect on the next message.\n\
 If the message is NOT for you: use {\"action\":\"suspend\"}.\n\
 If it IS for you: invoke_plugin(qq, qq_send, ...) to send your reply, then output {\"action\":\"suspend\"}.\n\
 IMPORTANT: NEVER use {\"action\":\"respond\"} — it will cause duplicate messages. Always send via qq_send and finish with {\"action\":\"suspend\"}.\n\
@@ -3816,6 +3832,27 @@ mod docs_tests {
         }
     }
 
+    // B：`qq_get_group_info` 的 output schema 必须声明真实字段（含
+    // OneBot 的 `data.data` 嵌套）——否则即使文档进了 prompt，模型也不知道
+    // 该读 `data.data.member_count`。
+    #[test]
+    fn group_info_documents_its_output_fields() {
+        let docs = docs_value();
+        let node = docs
+            .nodes
+            .iter()
+            .find(|n| n.id == "qq_get_group_info")
+            .expect("qq_get_group_info must be documented");
+        let data = &node.output_schema["properties"]["data"]["properties"];
+        let has_nested = data["data"]["properties"].as_object().is_some();
+        assert!(has_nested, "data.data must be typed: {data}");
+        let inner = &data["data"]["properties"];
+        for field in ["group_name", "member_count", "max_member_count"] {
+            let declared = inner.get(field).is_some();
+            assert!(declared, "data.data.{field} must be declared: {inner}");
+        }
+    }
+
     // 门控语义的回归保护：hint 不再硬编码 ONLY-if / When-in-doubt，
     // 而是让模型按每条消息首行的 `[reply policy: ...]` 判断；同时保留
     // 「必须用 qq_send、绝不用 respond、最后 suspend」的既有约束。
@@ -3996,13 +4033,12 @@ mod hint_silence_bias_tests {
         assert!(mentions_size_probe, "hint must point at data.member_count");
         let names_the_probe_node = hint.contains("qq_get_group_info");
         assert!(names_the_probe_node, "hint must name the probe node");
-        let says_check_once = hint.contains("check it ONCE");
-        assert!(
-            says_check_once,
-            "hint must say: check once, not per message"
-        );
-        let persists_decision = hint.contains(r#""mode":"one_on_one""#);
-        assert!(persists_decision, "hint must show how to persist the mode");
+        let says_once_per_group = hint.contains("Decide once per group");
+        assert!(says_once_per_group, "hint must say: decide once per group");
+        let persists_decision = hint.contains("one_on_one");
+        assert!(persists_decision, "hint must name the one_on_one mode");
+        let points_at_catalog = hint.contains("plugin catalog");
+        assert!(points_at_catalog, "hint must defer to the catalog for docs");
     }
 
     // 每群策略与记忆：hint 必须讲清四种模式、记忆行的含义、以及"只在学到

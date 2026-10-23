@@ -240,6 +240,25 @@ Agent 现在可以自主完成：读代码 → 理解结构 → 写/改文件 �
 - [x] **Plugin iteration symlink 逃逸**（P0-20）— `PluginEditExecutor::execute` 在写入前调用新 helper `resolve_under_workspace`：canonicalize 结果必须仍在 workspace_root 下。plugins 内的 symlink 指向 `/etc/passwd` 之类无法被写入。
 - [x] **Verifier shell 拼接**（P0-21）— 已随 A 批 P0-1 修复。`discover_rust_workspace_manifest` 输出的字符串被 `shell_words` 解析成 argv，空格 / `$` / `;` 无法被解释。
 
+### 5.2.46 把 node 文档真正喂进 prompt（工具文档此前没进上下文，2026-10-23）
+
+**诊断**（用户提出，查证属实）：`docs.nodes[].summary / input_schema / output_schema` 早在工件里，但 kernel 拼插件目录时**只列 node id**：
+
+```
+Loaded plugins:
+  qq → qq_entry, qq_send, qq_get_group_info, qq_get_group_roles, …
+```
+
+于是模型知道"有个节点叫 `qq_get_group_info`"，却不知道它返回 `member_count` —— 插件只能在 `system_hint` 里手写一遍同样的事实（还会和实现漂移）。这是提示词问题，但也有一半是文档问题：`qq_get_group_info` 的 `output_schema.data` 当时是个空 object，连字段名都没声明。
+
+**改动**：
+- [x] **新模块 `plugin/node_catalog.rs`**：把 agent 可见节点渲染成一行一个——`id — summary (in: required…) → out: ok,data{field,…}`；摘要截断 160 字符，每层最多列 8 个字段，嵌套对象展开两层（`data{…data{…}}`，正好覆盖 OneBot 的 `data.data.member_count`）。目录头明说"本目录由工件文档生成，是各节点参数/返回值的唯一事实来源"。
+- [x] `agent_plugin_hints` 改用该渲染器（原本只拼 id 列表）。实测 34 个 agent 可见节点、摘要合计 5 KB ≈ 1.3k token——可以接受（5.2.44 刚用 notes 省掉 ~150 KB）。
+- [x] **补齐 `qq_get_group_info` 的 output schema**：`data{status,retcode,data{group_id,group_name,member_count,max_member_count}}`，摘要也写明"字段在 data.data"。
+- [x] **hint 反向瘦身**：`SMALL GROUPS` 与 `WRITING MEMORY` 两段里手写的 JSON payload 例子删掉，改成"参数照目录里的 schema 来"。文档进 prompt 后这些就是重复信息，而且容易与实现不一致。
+
+**验证**：`node_catalog` 7 单测（摘要截断、in/out 渲染、两层展开、无摘要只剩 id、required 回退 properties、目录头、字段数上限）；qq 插件 52 单测（新增 `group_info_documents_its_output_fields` 断言 `data.data.{group_name,member_count,max_member_count}` 已声明；`hint_says_how_to_detect_a_small_group` 改为断言"指向 plugin catalog + one_on_one"）；kernel lib 全绿；`clippy -D warnings` 与 `fmt --check` 干净。
+
 ### 5.2.45 小群自动降级为私聊：交给 agent 自己判断（B 方案，2026-10-23）
 
 **问题**：`one_on_one` 模式早就存在，但没有任何东西告诉模型"这个群其实只有两个人"。插件不下发群规模，hint 里 `member_count` 一次都没出现——所以小群永远不会自动变成私聊。
