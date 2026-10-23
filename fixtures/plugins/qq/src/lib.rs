@@ -116,6 +116,10 @@ struct IncomingMessage {
     /// Quoted message_id if this message is a reply to another message
     #[serde(skip_serializing_if = "Option::is_none")]
     reply_to_msg_id: Option<i64>,
+    /// Sanitized display name for the speaker: group card first, nickname as
+    /// fallback. Sanitized before it can reach model-visible text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sender_name: Option<String>,
     /// Raw OneBot event for debugging
     #[serde(skip_serializing_if = "Option::is_none")]
     raw_event: Option<Value>,
@@ -147,6 +151,12 @@ struct OneBotEvent {
 struct OneBotSender {
     #[serde(default)]
     nickname: Option<String>,
+    /// Group card (群名片) — preferred display name in group chats.
+    #[serde(default)]
+    card: Option<String>,
+    /// Group role (owner/admin/member) — carried through, not consumed here.
+    #[serde(default)]
+    role: Option<String>,
     #[serde(default)]
     user_id: Option<Value>,
 }
@@ -842,6 +852,13 @@ fn handle_onebot_event(event: &OneBotEvent) {
         _ => None,
     });
 
+    // 群名片优先、昵称回落；清洗后再进模型可见文本（昵称是用户可控输入）。
+    let sender_name = event
+        .sender
+        .as_ref()
+        .and_then(|s| s.card.as_deref().or(s.nickname.as_deref()))
+        .and_then(sanitize_display_name);
+
     let msg = IncomingMessage {
         message_type: msg_type,
         sender_id,
@@ -849,6 +866,7 @@ fn handle_onebot_event(event: &OneBotEvent) {
         message: message_text,
         message_id,
         reply_to_msg_id,
+        sender_name,
         raw_event: Some(serde_json::to_value(event).unwrap_or_default()),
     };
 
@@ -1080,16 +1098,50 @@ fn should_process(text: &str) -> bool {
     text.len() > 2
 }
 
+/// Sanitize a user-controlled display name before it enters model-visible text.
+///
+/// Control characters and the quoting/bracketing set `[`, `]`, `"`, `` ` ``,
+/// `'` become spaces (so a nickname cannot forge envelope markup or escape a
+/// quoted field), runs of whitespace collapse, the result is truncated to 24
+/// *chars* (not bytes — CJK names must not be split mid-codepoint), and a blank
+/// result degrades to `None` (caller then emits the name-less form).
+fn sanitize_display_name(raw: &str) -> Option<String> {
+    let cleaned: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_control() || matches!(c, '[' | ']' | '"' | '`' | '\'') {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect();
+    let collapsed = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+    let truncated: String = collapsed.chars().take(24).collect();
+    let trimmed = truncated.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
 /// Build the runtime routing envelope (mirrors feishu's build_envelope).
 /// sender_id is "group:<gid>" or "private:<uid>"; the actual person is
 /// user_id, so identity is "qq:<user_id>".
 fn build_envelope(msg: &IncomingMessage) -> String {
     let reply_target = format!("{}:{}", msg.message_type, msg.sender_id);
     let session_key = format!("qq:{reply_target}");
-    let display = format!(
-        "[QQ {} from {} (user {})]: {}",
-        msg.message_type, msg.sender_id, msg.user_id, msg.message
-    );
+    let display = match msg.sender_name.as_deref() {
+        Some(name) => format!(
+            "[QQ {} from {} (user {}, name \"{}\")]: {}",
+            msg.message_type, msg.sender_id, msg.user_id, name, msg.message
+        ),
+        None => format!(
+            "[QQ {} from {} (user {})]: {}",
+            msg.message_type, msg.sender_id, msg.user_id, msg.message
+        ),
+    };
     let mut env = json!({
         "source_plugin": "qq",
         "reply_node": "qq_send",
@@ -2177,6 +2229,7 @@ mod chain_tests {
             message: "hello".to_string(),
             message_id: Some(42),
             reply_to_msg_id: None,
+            sender_name: None,
             raw_event: None,
         };
         let env: Value = serde_json::from_str(&build_envelope(&msg)).unwrap();
@@ -2187,6 +2240,82 @@ mod chain_tests {
         assert_eq!(env["sender_id"], "qq:789");
         assert_eq!(env["conversation_kind"], "group");
         assert_eq!(env["reply_to"], "42");
+        // 无名字时 display 保持旧格式，不出现 name 字段片段。
+        assert_eq!(
+            env["display"],
+            "[QQ group from 123456 (user 789)]: hello".to_string()
+        );
+        assert!(
+            !env["display"].as_str().unwrap().contains("name \""),
+            "无 sender_name 时 display 不应含 name 片段"
+        );
+    }
+
+    // 有 sender_name 时 display 带上发言人展示名，其余路由字段不变。
+    #[test]
+    fn build_envelope_carries_speaker_name() {
+        let msg = IncomingMessage {
+            message_type: "group".to_string(),
+            sender_id: "123456".to_string(),
+            user_id: "789".to_string(),
+            message: "hello".to_string(),
+            message_id: Some(42),
+            reply_to_msg_id: Some(7),
+            sender_name: Some("小明".to_string()),
+            raw_event: None,
+        };
+        let env: Value = serde_json::from_str(&build_envelope(&msg)).unwrap();
+        let display = env["display"].as_str().unwrap();
+        assert!(
+            display.contains("(user 789, name \"小明\")"),
+            "display 应精确包含发言人片段，实际: {display}"
+        );
+        assert_eq!(
+            display,
+            "[QQ group from 123456 (user 789, name \"小明\")]: hello"
+        );
+        assert_eq!(env["source_plugin"], "qq");
+        assert_eq!(env["reply_node"], "qq_send");
+        assert_eq!(env["session_key"], "qq:group:123456");
+        assert_eq!(env["reply_target"], "group:123456");
+        assert_eq!(env["sender_id"], "qq:789");
+        assert_eq!(env["conversation_kind"], "group");
+        assert_eq!(env["reply_to"], "42");
+    }
+
+    // 清洗：控制字符与 [ ] " ` ' 变空格，空白折叠，截断到 24 字符。
+    // 输入 "  小\n明\t[name]\"" → 替换后 "  小 明  name  " →
+    // 折叠为 "小 明 name"（9 字符，未超 24），结果为 Some("小 明 name")。
+    #[test]
+    fn sanitize_display_name_strips_control_and_wrapping() {
+        assert_eq!(
+            sanitize_display_name("  小\n明\t[name]\""),
+            Some("小 明 name".to_string())
+        );
+        assert_eq!(
+            sanitize_display_name("'`\"]["),
+            None,
+            "全是过滤字符应清洗为空"
+        );
+    }
+
+    // 空白 / 全过滤字符的输入降级为 None。
+    #[test]
+    fn sanitize_display_name_rejects_blank() {
+        assert_eq!(sanitize_display_name(""), None);
+        assert_eq!(sanitize_display_name("   "), None);
+        assert_eq!(sanitize_display_name("\n\t"), None);
+        assert_eq!(sanitize_display_name("[ ] \" ` '"), None);
+    }
+
+    // 按字符（非字节）截断到 24 个 char，CJK 不被拆坏。
+    #[test]
+    fn sanitize_display_name_truncates_to_24_chars() {
+        let input = format!("{}{}", "一".repeat(15), "a".repeat(16));
+        assert_eq!(input.chars().count(), 31);
+        let out = sanitize_display_name(&input).unwrap();
+        assert_eq!(out.chars().count(), 24);
+        assert_eq!(out, format!("{}{}", "一".repeat(15), "a".repeat(9)));
     }
 
     // reply_to 双类型解析：i64（legacy）与字符串（inbox 路由）都接受。
