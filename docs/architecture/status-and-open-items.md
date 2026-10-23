@@ -240,6 +240,20 @@ Agent 现在可以自主完成：读代码 → 理解结构 → 写/改文件 �
 - [x] **Plugin iteration symlink 逃逸**（P0-20）— `PluginEditExecutor::execute` 在写入前调用新 helper `resolve_under_workspace`：canonicalize 结果必须仍在 workspace_root 下。plugins 内的 symlink 指向 `/etc/passwd` 之类无法被写入。
 - [x] **Verifier shell 拼接**（P0-21）— 已随 A 批 P0-1 修复。`discover_rust_workspace_manifest` 输出的字符串被 `shell_words` 解析成 argv，空格 / `$` / `;` 无法被解释。
 
+### 5.2.45 小群自动降级为私聊：交给 agent 自己判断（B 方案，2026-10-23）
+
+**问题**：`one_on_one` 模式早就存在，但没有任何东西告诉模型"这个群其实只有两个人"。插件不下发群规模，hint 里 `member_count` 一次都没出现——所以小群永远不会自动变成私聊。
+
+**选了 B（纯自主）**，理由是用户明确要"由 agent 自己总结"而不是插件贴硬规则：hint 里加一段 `SMALL GROUPS` 指引——
+
+- 不确定群多大时，**查一次** `qq_get_group_info`（agent 可调，返回 `data.member_count`）；
+- `member_count <= 2` → 用 `qq_set_reply_policy {group, mode:"one_on_one"}` 落盘，并写进 `[group memory]`；
+- **不要每条消息都查**：每个群决定一次，记忆里已有答案就别再调接口。
+
+**没做的**（有意为之）：插件侧不缓存人数、不在 poller 线程里同步请求 `get_group_info`（`onebot_call` 用的 ureq 默认超时，同步查一次可能把整个消息队列堵住），也不存在"≤2 强制 one_on_one"的硬规则。代价是**不保证**它一定会去查——只有它觉得需要时才查。
+
+**验证**：qq 插件 51 单测（新增 `hint_says_how_to_detect_a_small_group`：hint 必须含 `member_count`、`qq_get_group_info`、"check it ONCE"、以及 `"mode":"one_on_one"` 的落盘写法）；clippy/fmt 干净。
+
 ### 5.2.44 一次性上下文（notes）与"按历史判断"的批包裹（2026-10-23）
 
 **问题**：5.2.43 把策略/记忆行放进 envelope 的 `display`，而 `display` 会随每条消息写进 `history`。实测一个群的会话快照有 **254 条**历史，每条都带着 594 字符的策略行——十几万字节纯噪声，把真正的对话挤淡；同时批包裹里还留着 `If the current batch is not directed at you, output exactly {"action":"suspend"}`，等于命令模型"判断不了就闭嘴"，与"按语境判断"直接冲突。

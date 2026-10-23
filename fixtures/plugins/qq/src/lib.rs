@@ -2699,6 +2699,7 @@ REPLY POLICY — the authority on whether to answer. Every incoming message star
   balanced   — judge from the conversation: answer when it is addressed to you or clearly wants your answer; stay out of threads between other people.\n\
   chatty     — this group WANTS you to participate: answer questions you can help with, add a short remark when it fits, take a joke. Never hijack a thread between two others.\n\
   one_on_one — treat it as a direct chat: answer every message meant for you; do not go silent just because it is technically a group.\n\
+SMALL GROUPS — a group that is effectively private (only you and one or two people) should behave like a direct chat. When you are unsure how big a group is, check it ONCE: invoke_plugin(qq, qq_get_group_info, {\"node_id\":\"qq_get_group_info\",\"target\":\"group:<gid>\"}) and read `data.member_count`. If it is <= 2, persist the decision: invoke_plugin(qq, qq_set_reply_policy, {\"node_id\":\"qq_set_reply_policy\",\"group\":\"<gid>\",\"mode\":\"one_on_one\"}) and note it in [group memory]. Do not re-check on every message — decide once per group, and if you already have the answer from memory do not call the API again.\n\
 HOW TO JUDGE — use the conversation history, not just this one message: who is talking to whom, whether the last few lines are a thread you are part of, whether someone asked a question nobody answered. A message that continues a thread you are already in is addressed to you even without naming you.\n\
 [group memory: ...] — this is YOUR OWN memo about this group (how talkative it wants you, its standing topics, what it told you off for). Follow it. If the line is absent you have written nothing yet.\n\
 WRITING MEMORY — when you learn something DURABLE about a group (it wants you quiet, it wants you chatty, its standing topic, a joke that landed badly), persist it: invoke_plugin(qq, qq_set_group_memory, {\"node_id\":\"qq_set_group_memory\",\"group\":\"<gid>\",\"memory\":\"<1-3 sentences>\"}). Do NOT write on every message — only durable preferences, and never guess one from a single message. To change how talkative you are in a group: invoke_plugin(qq, qq_set_reply_policy, {\"node_id\":\"qq_set_reply_policy\",\"group\":\"<gid>\",\"mode\":\"quiet|balanced|chatty|one_on_one\"}). Both take effect on the next message.\n\
@@ -3982,6 +3983,26 @@ mod hint_silence_bias_tests {
         );
         let keeps_tool_guard = hint.contains("do NOT call any kernel introspection tool");
         assert!(keeps_tool_guard, "图片/表情/闲聊仍然不该触发内核自省工具");
+    }
+
+    // 小群：hint 必须告诉它"去查 member_count、<=2 就设 one_on_one、只查一次"，
+    // 否则它没有任何理由主动去查群规模（B 方案：自动化靠提示词引导，不加硬规则）。
+    #[test]
+    fn hint_says_how_to_detect_a_small_group() {
+        let hint = docs_value()
+            .system_hint
+            .expect("qq must ship a system hint");
+        let mentions_size_probe = hint.contains("member_count");
+        assert!(mentions_size_probe, "hint must point at data.member_count");
+        let names_the_probe_node = hint.contains("qq_get_group_info");
+        assert!(names_the_probe_node, "hint must name the probe node");
+        let says_check_once = hint.contains("check it ONCE");
+        assert!(
+            says_check_once,
+            "hint must say: check once, not per message"
+        );
+        let persists_decision = hint.contains(r#""mode":"one_on_one""#);
+        assert!(persists_decision, "hint must show how to persist the mode");
     }
 
     // 每群策略与记忆：hint 必须讲清四种模式、记忆行的含义、以及"只在学到
