@@ -1,3 +1,16 @@
+//! Build system for CordisClaw plugin artifacts.
+//!
+//! Building is **not** a runtime mechanism: a bare `cordis-runtime` only has to
+//! read artifacts that already exist. Everything that needs `cargo`, source
+//! trees, dirty fingerprints, build locks or an artifact index rewrite lives
+//! here, and the runtime reaches it only through
+//! `cordis_runtime::plugin::builder::PluginBuilder`. `cordis-cli` installs
+//! [`CargoBuilder`] at start-up, which is the production wiring.
+//!
+//! Dependency direction: `cordis-tooling` → `cordis-runtime` (models, package
+//! resolution, dylib types). The runtime never depends on this crate, so the
+//! graph stays acyclic.
+
 use cordis_plugin_sdk::pretty_json;
 use cordis_runtime::core::error::RuntimeError;
 use cordis_runtime::core::models::{

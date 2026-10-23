@@ -337,18 +337,25 @@ package 换成 `cordis-cli`；`default-members` 同步加了两个新 crate，�
 **覆盖率排除路径变化**：`main.rs` 现在在 `crates/cordis-cli/src/main.rs`，
 `coverage.yml` / `CLAUDE.md` 的正则从
 `'cordis-runtime/src/(main|agent)\.rs'` 改为
-`'.*crates/cordis-(runtime|cli)/src/(main|agent)\.rs'`（llvm-cov 对完整路径做
-正则 search；前置 `.*` 让它在"整路径匹配"实现下也成立），同时仍排除
+`'cordis-(runtime|cli)/src/(main|agent)\.rs'`（llvm-cov 对完整路径做正则
+search，绝对路径与 crate 相对路径两种上报形态都能命中），同时仍排除
 `cordis-runtime/src/agent.rs`。CI 里 `cargo run -p cordis-runtime --
 prepare-artifacts` / `cargo build -p cordis-runtime` 统一改成 `-p cordis-cli`
 （package 变了，产物路径 `target/{debug,release}/cordis-runtime` 不变）。
 
 **验证**：`cargo build` 零 warning；`cargo clippy --all-targets -- -D warnings`
-干净；`cargo fmt --all --check` 干净；`cargo test -p cordis-runtime --lib`
-**889** 通过；`cargo test -p cordis-tooling`（构建链 29 例 + lib 单测）通过；
-`cargo test -p cordis-cli` **35** 通过；runtime 集成套件中 `architecture`、
-`host_build_coverage`、`host_iterate_stages`、`host_boot_session_arms`、
-`runtime_host` 等重跑通过。
+干净；`cargo fmt --all --check` 干净；`cargo test -p cordis-runtime --lib` **890**
+通过；`cargo test -p cordis-tooling` **111** 个 lib 单测 + **29** 个构建链集成用例
+全绿；`cargo test -p cordis-cli` **35** 通过；runtime 集成套件
+`architecture`(17)、`host_iterate_stages`(9)、`host_boot_session_arms`(22)、
+`host_build_coverage`(8)、`shell_plugin`(8)、`host_coverage`(38)、
+`host_coverage_rest`(34)、`crash_recovery`(9)、`host_ops_arms`(7) 全绿；
+`runtime_host` 30/31 —— 唯一失败项
+`runtime_host_iterate_plugins_agent_retries_on_warning_and_promotes` 是本地
+mock-LLM 的 accept 预算（本地 30s / CI 900s）短于冷缓存下 iterate 中途的
+fixture `cargo test`（本次实测 ~197s），`CI=1` 时 207s 通过；该用例本身与本次
+拆分无关（文件未改）。覆盖率抽检（lib 单测）：`plugin/builder.rs` 71 行、
+`plugin/artifact.rs` 641 行、`CargoBuilder` 新增段均无未覆盖行。
 
 ### 5.2.47 策略/记忆写权限：kernel 只转交身份，规则在插件（2026-10-23）
 
