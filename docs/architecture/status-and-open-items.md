@@ -260,6 +260,12 @@ Agent 现在可以自主完成：读代码 → 理解结构 → 写/改文件 �
   - 审计行带 actor：`qq policy: … by=<actor> …` / `qq memory: … by=<actor>`。
 - [x] 白名单 `data/qq_operators.json` 已按当前群主 QQ 号播种（`1751557948`）。
 
+**上线时踩到的两个接缝**（都已补测试钉住）：
+1. `AgentToolHost::inject_turn_meta` 在 **trait** 上有 no-op 默认实现，`RuntimeHost` 的 trait impl 必须显式转发到真实方法——漏了转发，插件收不到 `__meta`，鉴权会**静默退化成"当作 CLI 操作员放行"**（线上第一次验证就是这样被放行的，审计行 `by=operator-cli`）；
+2. kernel 把 `__meta` 塞在 payload 对象的**顶层**，所以插件必须从 `NodeRequest.__meta`（`#[serde(rename = "__meta")]`）读，而不是 `payload.__meta`——读错位置同样表现为"永远 operator-cli"。
+
+两处都有回归测试：集成 `trusted_turn_meta_reaches_the_plugin_payload`（回显型 process 插件把 payload 原样回给模型，断言 `__meta`/actor 到达；**去掉转发后该用例必失败**，已反向验证）、单测 `meta_is_read_from_the_top_level_and_from_payload`（顶层与嵌套两种形状都认）。
+
 **验证**：kernel lib **993** + bin 35 全绿（新增 `turn_meta_tests` 三例：对象注入、**覆盖伪造的 `__meta`**、非对象 payload 包进 `value`）；qq 插件 **59** 单测（新增 7 例：CLI 放行、owner/admin 放行、普通群员拒绝且不落盘、未知角色 fail closed、跨群改写被拒、全局 default 需白名单、记忆写同样受控）；`clippy -D warnings` 与 `fmt --check` 干净。
 
 ### 5.2.46 把 node 文档真正喂进 prompt（工具文档此前没进上下文，2026-10-23）

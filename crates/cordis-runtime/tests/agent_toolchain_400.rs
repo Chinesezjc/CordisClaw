@@ -687,3 +687,161 @@ fn one_shot_notes_reach_the_request_but_not_the_history() {
         "history must not carry one-shot notes: {polluted:?}"
     );
 }
+
+// ───────────────────────────────────────────────────────────────────────
+// 可信元数据：`__meta` 必须由 kernel 注入到**每次** invoke 的 payload。
+//
+// 这条链路有一个很容易漏的接缝：`AgentToolHost::inject_turn_meta` 在 trait 上
+// 有 no-op 默认实现，`RuntimeHost` 的 trait impl 必须转发到真实方法——漏了转发
+// 的话，插件收不到 __meta，鉴权会静默退化成"当作 CLI 操作员放行"（线上踩过）。
+// 这里用一个回显型 process 插件把 payload 原样回给模型，再从第二个请求里读回来。
+// ───────────────────────────────────────────────────────────────────────
+
+/// 回显插件：把收到的 payload 原样打印成工具结果。
+fn write_echo_plugin(fixtures: &Path) -> Value {
+    let artifacts = fixtures.join("artifacts");
+    let script = fixtures.join("echo_probe.sh");
+    fs::write(
+        &script,
+        "#!/bin/sh\npayload=$(cat)\nprintf '{\"ok\":true,\"node_id\":\"echo_probe\",\"data\":%s}\\n' \"$payload\"\n",
+    )
+    .expect("write echo script");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("chmod");
+    }
+    let execution = json!({
+        "kind": "process",
+        "command": script.display().to_string(),
+        "args": [],
+    });
+    let docs = json!({
+        "plugin_id": "echoprobe",
+        "plugin_path": "echoprobe",
+        "plugin_version": "0.1.0",
+        "abi_version": 2,
+        "command_name": null,
+        "nodes": [{
+            "id": "echo_probe",
+            "summary": "echo the payload back",
+            "input_schema": {"type": "object"},
+            "output_schema": {"type": "object"},
+            "side_effects": [],
+            "failure_modes": [],
+            "node_type": "router",
+            "agent_accessible": true
+        }],
+        "system_hint": null
+    });
+    let artifact = artifacts.join("echoprobe.json");
+    fs::write(
+        &artifact,
+        serde_json::to_string_pretty(&json!({
+            "plugin_path": "echoprobe",
+            "abi_fingerprint": abi_fingerprint_value(),
+            "docs": docs,
+            "exports": [],
+            "execution": execution,
+        }))
+        .expect("serialize"),
+    )
+    .expect("write echo artifact");
+    let sha = sha256_of(&artifact);
+    let entry = json!({
+        "plugin_path": "echoprobe",
+        "version": "0.1.0",
+        "abi_fingerprint": abi_fingerprint_value(),
+        "artifact_path": "echoprobe.json",
+        "sha256": sha,
+        "built_at": "0",
+        "parent": null,
+        "required": false,
+        "grants_from_parent": [],
+        "docs": docs,
+        "exports": [],
+        "execution": execution,
+        "artifact_kind": "json",
+        "build_fingerprint": "bf-echoprobe",
+        "input_probe": {"files": []},
+        "local_path_deps": []
+    });
+    entry
+}
+
+#[test]
+fn trusted_turn_meta_reaches_the_plugin_payload() {
+    let temp = setup_empty_fixture();
+    let fixtures = fixtures_dir(&temp);
+    let echo_entry = write_echo_plugin(&fixtures);
+
+    // 把 echoprobe 追加进 artifacts/index.json。
+    let index_path = fixtures.join("artifacts").join("index.json");
+    let mut index: Value =
+        serde_json::from_str(&fs::read_to_string(&index_path).expect("index")).expect("json");
+    if let Some(entries) = index.get_mut("entries").and_then(Value::as_array_mut) {
+        entries.push(echo_entry);
+    }
+    if let Some(order) = index.get_mut("topo_order").and_then(Value::as_array_mut) {
+        order.push(json!("echoprobe"));
+    }
+    fs::write(
+        &index_path,
+        serde_json::to_string_pretty(&index).expect("ser"),
+    )
+    .expect("write index");
+
+    let final_json = r#"{"ok":true}"#;
+    let (url, requests_rx, handle) = spawn_chunked_mock_llm_server_sequence(vec![
+        tool_call_response(
+            "turn1",
+            vec![(
+                "call_echo",
+                "invoke_plugin",
+                json!({
+                    "plugin_path": "echoprobe",
+                    "node_id": "echo_probe",
+                    "payload_json": {"probe": "hello"}
+                }),
+            )],
+        ),
+        assistant_response("turn2", final_json),
+    ]);
+    write_llm_config(&fixtures, &url);
+    let host = RuntimeHost::boot(&fixtures).expect("boot");
+    let sid = host
+        .agent_start(AgentSessionKind::RuntimeShell)
+        .expect("agent start")
+        .session_id;
+
+    let mut meta = std::collections::BTreeMap::new();
+    meta.insert("actor".to_string(), "qq:1751557948".to_string());
+    meta.insert("target".to_string(), "group:999999".to_string());
+    host.agent_send_with_turn_meta(&sid, "probe", &[], "", &meta)
+        .expect("send");
+
+    let requests = requests_rx.recv().expect("requests");
+    handle.join().expect("join mock");
+
+    let second = request_body(&requests[1]);
+    let messages = second
+        .get("messages")
+        .and_then(Value::as_array)
+        .expect("messages");
+    let tool_result = messages
+        .iter()
+        .filter(|message| role(message) == Some("tool"))
+        .filter_map(|message| content_of(message))
+        .find(|content| content.contains("echo_probe"))
+        .expect("the echo tool result must be in the second request");
+    let has_meta = tool_result.contains("__meta");
+    assert!(has_meta, "plugin must receive __meta: {tool_result}");
+    let actor_ok = tool_result.contains("qq:1751557948");
+    assert!(
+        actor_ok,
+        "actor must survive into the payload: {tool_result}"
+    );
+    // 注入后清理干净。
+    let leaked = host.debug_turn_meta_len();
+    assert_eq!(leaked, 0, "turn meta must be cleared after the send");
+}

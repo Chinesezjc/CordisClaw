@@ -268,6 +268,12 @@ pub trait AgentToolHost {
 }
 
 impl AgentToolHost for RuntimeHost {
+    /// 转发到 host 的真实实现。**少了这个转发，trait 的默认 no-op 会被调用**
+    /// ——插件就再也收不到 `__meta`，鉴权会静默退化成"当作 CLI 操作员放行"。
+    fn inject_turn_meta(&self, session_id: &str, payload: Value) -> Value {
+        RuntimeHost::inject_turn_meta(self, session_id, payload)
+    }
+
     fn agent_runtime_status(&self) -> Result<Value, RuntimeError> {
         to_json_value("runtime status", self.status())
     }
