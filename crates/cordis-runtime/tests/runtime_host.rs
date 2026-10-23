@@ -2357,9 +2357,14 @@ fn soul_store_plugin_overrides_file_provider() {
     );
 }
 
-// H1: 群聊 soul 错位修复。session 的 soul_key 由 inbox 随最近发言者刷新
+// H1: host 层的 soul 重绑能力契约。session 的 soul_key 可被显式刷新
 // (refresh_session_soul);persona overlay 每轮从 session.soul_key 重建,
 // 刷新后 system prompt 立刻对齐新的人。
+//
+// 注意作用域是私聊: 群聊的人格已在 envelope 层固定为房间级 key
+// (`soul_key()` 群聊返回 session_key),不会随发言人切人格——见
+// `group_persona_is_stable_across_speakers`。这里用私聊 key 验证的是
+// host 仍然具备重绑能力,而不是群聊语义。
 #[test]
 #[serial]
 fn refresh_session_soul_switches_persona_scope() {
@@ -2384,10 +2389,10 @@ fn refresh_session_soul_switches_persona_scope() {
 
     let host = RuntimeHost::boot(&fixtures).expect("host should boot");
 
-    // Two distinct souls in the same group scope.
-    host.agent_set_soul("userA#group", Some("A 的人格"), None)
+    // Two distinct souls in private (per-user) scope.
+    host.agent_set_soul("userA#private", Some("A 的人格"), None)
         .expect("set soul A");
-    host.agent_set_soul("userB#group", Some("B 的人格"), None)
+    host.agent_set_soul("userB#private", Some("B 的人格"), None)
         .expect("set soul B");
 
     // Session starts bound to A's soul scope.
@@ -2396,7 +2401,7 @@ fn refresh_session_soul_switches_persona_scope() {
             AgentSessionKind::RuntimeShell,
             AgentStartOptions {
                 profile: None,
-                soul_key: "userA#group".to_string(),
+                soul_key: "userA#private".to_string(),
             },
         )
         .expect("agent start");
@@ -2405,8 +2410,8 @@ fn refresh_session_soul_switches_persona_scope() {
     // Turn 1: persona overlay should be A's.
     host.agent_send(&sid, "hi from A").expect("first send");
 
-    // Inbox refreshes the session soul to the latest speaker (B).
-    host.refresh_session_soul(&sid, "userB#group")
+    // Host-level rebind: the session soul is explicitly switched to B.
+    host.refresh_session_soul(&sid, "userB#private")
         .expect("refresh to B");
 
     // Turn 2: persona overlay rebuilt from the new soul_key → B's.
@@ -2434,10 +2439,89 @@ fn refresh_session_soul_switches_persona_scope() {
 
     // Unknown session id must error, not silently no-op.
     assert!(
-        host.refresh_session_soul("no-such-sid", "userA#group")
+        host.refresh_session_soul("no-such-sid", "userA#private")
             .is_err(),
         "refresh on unknown session must be an error"
     );
+}
+
+// 群聊人格按房间作用域: 同一 session_key 下不同发言人共用一个人格,
+// inbox 每批调 refresh_session_soul 刷新成房间 key 是幂等 no-op,
+// 两轮请求体都必须带同一个人格。
+#[test]
+#[serial]
+fn group_persona_is_stable_across_speakers() {
+    if !support::linux_dylib_artifacts_available() {
+        eprintln!("[skip] fixture dylibs are x86_64-linux only; skipping on this host");
+        return;
+    }
+    use cordis_runtime::agent::AgentToolHost;
+    use cordis_runtime::host::{AgentSessionKind, AgentStartOptions};
+
+    let temp = setup_fixture_workspace_copy();
+    let fixtures = temp.path().join("fixtures");
+
+    let (default_url, requests_rx, handle) = spawn_chunked_mock_llm_server_sequence(vec![
+        assistant_response("group_stable_1", "回复给 A"),
+        assistant_response("group_stable_2", "回复给 B"),
+    ]);
+    write_llm_profiles_config(temp.path(), &default_url, "http://127.0.0.1:2/v1");
+
+    let host = RuntimeHost::boot(&fixtures).expect("host should boot");
+
+    // 房间级人格, 加上两个"发言人级"人格用来证明它们不会被选中。
+    host.agent_set_soul("qq:group:777", Some("群人格"), None)
+        .expect("set group soul");
+    host.agent_set_soul("A#group", Some("A 的人格"), None)
+        .expect("set soul A");
+    host.agent_set_soul("B#group", Some("B 的人格"), None)
+        .expect("set soul B");
+
+    let handle_session = host
+        .agent_start_with(
+            AgentSessionKind::RuntimeShell,
+            AgentStartOptions {
+                profile: None,
+                soul_key: "qq:group:777".to_string(),
+            },
+        )
+        .expect("agent start");
+    let sid = handle_session.session_id.clone();
+
+    // Turn 1: speaker A.
+    host.agent_send(&sid, "hi from A").expect("first send");
+
+    // Inbox 每批刷新 —— 群聊房间 key 下是幂等 no-op。
+    host.refresh_session_soul(&sid, "qq:group:777")
+        .expect("refresh is idempotent for group rooms");
+
+    // Turn 2: speaker B.
+    host.agent_send(&sid, "hi from B").expect("second send");
+
+    let requests = requests_rx.recv().expect("captured requests");
+    handle.join().expect("join mock server");
+
+    assert_eq!(requests.len(), 2, "expected exactly two turns");
+    for (i, body) in requests.iter().enumerate() {
+        assert!(
+            body.contains("群人格"),
+            "turn {} should carry the room persona: {}",
+            i,
+            body
+        );
+        assert!(
+            !body.contains("A 的人格"),
+            "turn {} must not carry a per-speaker persona: {}",
+            i,
+            body
+        );
+        assert!(
+            !body.contains("B 的人格"),
+            "turn {} must not carry a per-speaker persona: {}",
+            i,
+            body
+        );
+    }
 }
 
 // H2: session 内存/磁盘终结清理。drop_session 清 agent_sessions /
