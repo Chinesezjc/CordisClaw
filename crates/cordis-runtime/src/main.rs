@@ -70,6 +70,11 @@ struct AgentEnvelope {
     /// 把图片 URL 原样交出来，不必理解多模态 wire format。
     #[serde(default)]
     images: Vec<String>,
+    /// 渠道给的**一次性**上下文（如 qq 的 `[reply policy: …]` /
+    /// `[group memory: …]` 行）。只随本次请求发给模型，**不进 history**：
+    /// 每轮重发同一份会白烧几十万字节上下文，还会盖住真正的对话。
+    #[serde(default)]
+    notes: String,
 }
 
 impl AgentEnvelope {
@@ -89,6 +94,7 @@ impl AgentEnvelope {
                 sender_id: String::new(),
                 conversation_kind: String::new(),
                 images: Vec::new(),
+                notes: String::new(),
             },
         }
     }
@@ -390,10 +396,13 @@ fn partition_batch(envs: Vec<AgentEnvelope>) -> Vec<BatchItem> {
 fn wrap_inbox_batch(combined: &str) -> String {
     format!(
         "CURRENT_INCOMING_BATCH_START\n{combined}\nCURRENT_INCOMING_BATCH_END\n\n\
-         The messages between START and END are the only new events for this turn. \
-         Older chat history is context only; do not treat it as a current request. \
-         Do not claim someone is asking you a question unless that question appears in this current batch. \
-         If the current batch is not directed at you, output exactly {{\"action\":\"suspend\"}}."
+         The messages between START and END are the new events for this turn. \
+         Use the earlier conversation as the basis for judging them: who has been talking to whom, \
+         whether this continues a thread you are part of, and whether a reply would actually help. \
+         Do not re-answer an older message as if it were a new request, \
+         and do not claim someone is asking you a question unless the question is in this batch or in the thread it continues. \
+         Whether to answer is decided by the `[reply policy: ...]` line (see the plugin instructions) plus that context — \
+         if the message is clearly between other people, output exactly {{\"action\":\"suspend\"}}."
     )
 }
 
@@ -1062,7 +1071,14 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                         .iter()
                         .flat_map(|e| e.images.iter().cloned())
                         .collect();
-                    match host.agent_send_with_fallback_images(sid, &agent_input, &batch_images) {
+                    // 一次性上下文只取最后一条（策略/记忆是按群的，整批一致）。
+                    let batch_notes = normals.last().map(|e| e.notes.clone()).unwrap_or_default();
+                    match host.agent_send_with_fallback_turn_context(
+                        sid,
+                        &agent_input,
+                        &batch_images,
+                        &batch_notes,
+                    ) {
                         Ok(reply) => {
                             pending::clear(&data_dir, session_key);
                             let feedback = process(reply.content.trim().to_string(), "inbox");
@@ -1070,7 +1086,8 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                                 // WS-3: failure exit #2 — the retry after a
                                 // format/unknown-action feedback failed. Same
                                 // sink, so this turn cannot vanish silently.
-                                match host.agent_send_with_fallback_images(sid, &fb, &[]) {
+                                match host.agent_send_with_fallback_turn_context(sid, &fb, &[], "")
+                                {
                                     Ok(reply2) => {
                                         process(reply2.content.trim().to_string(), "retry");
                                     }
@@ -2523,6 +2540,18 @@ mod envelope_tests {
         assert_eq!(env.soul_key(), "feishu:ou_abc#private");
     }
 
+    // 一次性上下文（策略/记忆行）在 notes 里；缺省是空串。
+    #[test]
+    fn envelope_parse_reads_one_shot_notes() {
+        let raw =
+            r#"{"session_key":"qq:group:1","display":"hi","notes":"[reply policy: quiet — x]"}"#;
+        let env = AgentEnvelope::parse(raw);
+        assert_eq!(env.notes, "[reply policy: quiet — x]");
+        let raw = r#"{"session_key":"qq:group:1","display":"hi"}"#;
+        let env = AgentEnvelope::parse(raw);
+        assert!(env.notes.is_empty());
+    }
+
     // 入站图片：envelope 的 images 原样带出，交给 host 下载 + 内联。
     #[test]
     fn envelope_parse_reads_image_urls() {
@@ -2921,6 +2950,22 @@ mod inbox_framing_tests {
         // Channel-neutral: no protocol name leaks into runtime framing.
         assert!(!wrapped.contains("QQ"));
         assert!(!wrapped.contains("Feishu"));
+    }
+
+    // 判断是否接话必须以对话历史为依据；不能再有"不是对你说的就 suspend"这种
+    // 无条件沉默指令（5.2.44）。
+    #[test]
+    fn wrap_tells_the_model_to_judge_from_history() {
+        let wrapped = wrap_inbox_batch("[user A]: 你好");
+        let tells_to_use_history = wrapped.contains("Use the earlier conversation as the basis");
+        assert!(tells_to_use_history, "{wrapped}");
+        let orders_silence = wrapped.contains("Not directed at you");
+        assert!(!orders_silence, "must not order silence: {wrapped}");
+        let defers_to_policy = wrapped.contains("[reply policy:");
+        assert!(defers_to_policy, "{wrapped}");
+        let keeps_anti_hallucination =
+            wrapped.contains("do not claim someone is asking you a question");
+        assert!(keeps_anti_hallucination, "{wrapped}");
     }
 
     // A multi-line combined batch (outage spill prepended to fresh messages)

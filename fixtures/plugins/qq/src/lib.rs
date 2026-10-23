@@ -1366,15 +1366,17 @@ fn build_envelope(msg: &IncomingMessage) -> String {
     // 回落到内置默认，所以这里永远构造成功（envelope 失败会丢整条消息）。
     let group = (msg.message_type == "group").then_some(msg.sender_id.as_str());
     let (mode, policy, _source) = effective_policy(None, group);
-    let mut header = format!("[reply policy: {mode} — {policy}]");
+    // 策略/记忆放进 `notes`：kernel 只把它们随**本次**请求发给模型，
+    // 不写进 history（否则每条历史都带着这份噪声，几十万字节白烧）。
+    let mut notes = format!("[reply policy: {mode} — {policy}]");
     if let Some(memory) = group_memory(None, group) {
-        header.push('\n');
-        header.push_str(&format!("[group memory: {memory}]"));
+        notes.push('\n');
+        notes.push_str(&format!("[group memory: {memory}]"));
     }
     let reply_target = format!("{}:{}", msg.message_type, msg.sender_id);
     let session_key = format!("qq:{reply_target}");
     let display = format!(
-        "{header}\n[QQ {} from {} (user {})]: {}",
+        "[QQ {} from {} (user {})]: {}",
         msg.message_type, msg.sender_id, msg.user_id, msg.message
     );
 
@@ -1388,6 +1390,8 @@ fn build_envelope(msg: &IncomingMessage) -> String {
         "conversation_kind": msg.message_type,
         // 图片地址交给 kernel 处理（下载 + 内联），插件不碰多模态 wire format。
         "images": collect_image_urls(&msg.message),
+        // 一次性上下文：策略行 + 记忆行，只进本次请求。
+        "notes": notes,
     });
     if let Some(mid) = msg.message_id {
         env["reply_to"] = json!(mid.to_string());
@@ -3418,16 +3422,18 @@ mod reply_policy_tests {
     fn envelope_carries_mode_and_memory_lines() {
         with_isolated_fixtures(|root| {
             let data_dir = root.join("data");
+            // 策略/记忆放在 envelope 的 `notes` 里（kernel 只随本次请求下发，
+            // 不写进 history），display 保持干净，只有真正的那条消息。
+            let env: Value = serde_json::from_str(&build_envelope(&sample_msg())).expect("env");
+            let notes = env["notes"].as_str().unwrap_or_default().to_string();
+            assert!(
+                notes.starts_with(&format!("[reply policy: {DEFAULT_MODE} — ")),
+                "notes: {notes}"
+            );
+            assert!(!notes.contains("[group memory:"), "no memory yet: {notes}");
             let display = display_of(&build_envelope(&sample_msg()));
-            let first = display.lines().next().unwrap_or_default().to_string();
-            assert!(
-                first.starts_with(&format!("[reply policy: {DEFAULT_MODE} — ")),
-                "first line: {first}"
-            );
-            assert!(
-                !display.contains("[group memory:"),
-                "no memory yet: {display}"
-            );
+            let clean = !display.contains("[reply policy");
+            assert!(clean, "display must stay clean: {display}");
             let user_text = display.rsplit_once("]: ").map(|(_, t)| t).unwrap_or("");
             assert_eq!(user_text, "hello");
 
@@ -3446,11 +3452,11 @@ mod reply_policy_tests {
             ))
             .expect("set memory");
 
-            let display = display_of(&build_envelope(&sample_msg()));
-            let first = display.lines().next().unwrap_or_default().to_string();
-            assert!(first.starts_with("[reply policy: chatty — "), "{first}");
-            let has_memory = display.contains("[group memory: 喜欢玩笑]");
-            assert!(has_memory, "{display}");
+            let env: Value = serde_json::from_str(&build_envelope(&sample_msg())).expect("env");
+            let notes = env["notes"].as_str().unwrap_or_default().to_string();
+            assert!(notes.starts_with("[reply policy: chatty — "), "{notes}");
+            let has_memory = notes.contains("[group memory: 喜欢玩笑]");
+            assert!(has_memory, "{notes}");
         });
     }
 

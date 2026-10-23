@@ -240,6 +240,18 @@ Agent 现在可以自主完成：读代码 → 理解结构 → 写/改文件 �
 - [x] **Plugin iteration symlink 逃逸**（P0-20）— `PluginEditExecutor::execute` 在写入前调用新 helper `resolve_under_workspace`：canonicalize 结果必须仍在 workspace_root 下。plugins 内的 symlink 指向 `/etc/passwd` 之类无法被写入。
 - [x] **Verifier shell 拼接**（P0-21）— 已随 A 批 P0-1 修复。`discover_rust_workspace_manifest` 输出的字符串被 `shell_words` 解析成 argv，空格 / `$` / `;` 无法被解释。
 
+### 5.2.44 一次性上下文（notes）与"按历史判断"的批包裹（2026-10-23）
+
+**问题**：5.2.43 把策略/记忆行放进 envelope 的 `display`，而 `display` 会随每条消息写进 `history`。实测一个群的会话快照有 **254 条**历史，每条都带着 594 字符的策略行——十几万字节纯噪声，把真正的对话挤淡；同时批包裹里还留着 `If the current batch is not directed at you, output exactly {"action":"suspend"}`，等于命令模型"判断不了就闭嘴"，与"按语境判断"直接冲突。
+
+**改动**：
+- [x] **envelope 新增 `notes`**（渠道中立的一次性上下文）：qq 插件把 `[reply policy: …]` / `[group memory: …]` 从 `display` 移到 `notes`，`display` 恢复成干净的一条消息（`[QQ group from …]: 正文`）。
+- [x] **kernel 只把 `notes` 随本次请求下发**：`respond_inner` 用 `{notes}\n{input}` 组请求正文，但 `remember_exchange` 仍只记 `input`。于是历史里不再有策略行，当前这一轮照样能看到。
+- [x] **批包裹改写**：`Older chat history is context only; do not treat it as a current request` + 无条件的 `not directed → suspend` 换成"**用前面的对话作为判断依据**（谁在跟谁说话、是不是你已经在的线程、回了有没有用）"，沉默条件改成"策略 + 上下文都表明这是别人之间的对话"；保留反幻觉那条（不许把旧消息当成新提问）。
+- [x] **host 新增 `agent_send_with_turn_context` / `agent_send_with_fallback_turn_context`**（带 `notes`），原 `agent_send*` 保持签名并委派空 notes。
+
+**验证**：kernel `cargo test` 983 lib + 35 bin 全绿；新增 `wrap_tells_the_model_to_judge_from_history`（包裹必须提"用历史判断"、不得再有 `Not directed at you`、仍保留 `{"action":"suspend"}` 与反幻觉句）、`envelope_parse_reads_one_shot_notes`、以及集成测试 `one_shot_notes_reach_the_request_but_not_the_history`（第一次请求的 user content 含 notes 与记忆行，而落盘 session 快照的 history 里一条都不许有）。qq 插件 50 单测同步更新（策略/记忆断言改到 `notes`，并钉住 `display` 不含 `[reply policy`）。
+
 ### 5.2.43 每群策略 + 每群记忆：调整行为不再需要改代码（2026-10-23）
 
 **问题**：5.2.41/5.2.42 之后，"让它在某个群多说/少说"仍要改 Rust 重编工件；而群的性质本来就各不相同（有的群希望它接话，有的嫌它插嘴）。用户的要求是**agent 自己从消息记录里总结**，所以判断所需的输入必须落成运行时数据。

@@ -595,3 +595,95 @@ fn no_images_keeps_the_plain_string_content() {
         .expect("a user message");
     assert_eq!(content_of(last_user), Some("纯文字"));
 }
+
+// ───────────────────────────────────────────────────────────────────────
+// 一次性上下文（notes）：只进本次请求，绝不进 history。
+//
+// 渠道插件（QQ）每条消息都会下发 `[reply policy: …]`（约 600 字符）和
+// `[group memory: …]`；如果这些也写进 history，254 条历史就是十几万字节的
+// 纯噪声，会把真正的对话挤淡。这里同时断言两件事：
+//   1) 第一次请求的 user content 里有 notes；
+//   2) 落盘的 session 快照 history 里没有 notes。
+// ───────────────────────────────────────────────────────────────────────
+fn session_history_from_disk(fixtures: &Path) -> Vec<Value> {
+    let sessions = fixtures
+        .parent()
+        .expect("fixtures parent")
+        .join("data")
+        .join("sessions");
+    let mut newest: Option<(std::time::SystemTime, Value)> = None;
+    for entry in std::fs::read_dir(&sessions).expect("sessions dir") {
+        let path = entry.expect("dir entry").path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let modified = std::fs::metadata(&path)
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        let parsed: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap_or_default())
+                .unwrap_or(Value::Null);
+        if newest.as_ref().is_none_or(|(t, _)| modified >= *t) {
+            newest = Some((modified, parsed));
+        }
+    }
+    let (_, snapshot) = newest.expect("a session snapshot must be written");
+    snapshot
+        .get("history")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+}
+
+#[test]
+fn one_shot_notes_reach_the_request_but_not_the_history() {
+    let temp = setup_empty_fixture();
+    let fixtures = fixtures_dir(&temp);
+    let final_json = r#"{"ok":true}"#;
+    let (url, requests_rx, handle) =
+        spawn_chunked_mock_llm_server_sequence(vec![assistant_response("turn1", final_json)]);
+    write_llm_config(&fixtures, &url);
+
+    let host = RuntimeHost::boot(&fixtures).expect("host should boot on empty index");
+    let sid = host
+        .agent_start(AgentSessionKind::RuntimeShell)
+        .expect("agent start")
+        .session_id;
+    let notes = "[reply policy: quiet — only when named]\n[group memory: 这个群偏安静]";
+    host.agent_send_with_turn_context(&sid, "纯文字", &[], notes)
+        .expect("send with notes");
+
+    let requests = requests_rx.recv().expect("captured requests");
+    handle.join().expect("join mock server");
+    let body = request_body(&requests[0]);
+    let messages = body
+        .get("messages")
+        .and_then(Value::as_array)
+        .expect("messages");
+    let last_user = messages
+        .iter()
+        .rev()
+        .find(|message| role(message) == Some("user"))
+        .expect("a user message");
+    let content = content_of(last_user).expect("string content");
+    let has_notes = content.contains("[reply policy: quiet");
+    assert!(has_notes, "notes must reach the model: {content}");
+    let has_memory = content.contains("[group memory: 这个群偏安静]");
+    assert!(has_memory, "memory line must reach the model: {content}");
+    let has_input = content.ends_with("纯文字");
+    assert!(has_input, "the user text must be there: {content}");
+
+    // 落盘快照里：history 不能带 notes。
+    let history = session_history_from_disk(&fixtures);
+    assert!(!history.is_empty(), "history must be persisted");
+    let polluted: Vec<&Value> = history
+        .iter()
+        .filter(|message| {
+            content_of(message).is_some_and(|text| text.contains("[reply policy: quiet"))
+        })
+        .collect();
+    assert!(
+        polluted.is_empty(),
+        "history must not carry one-shot notes: {polluted:?}"
+    );
+}

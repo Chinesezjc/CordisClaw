@@ -1324,6 +1324,9 @@ impl AgentSession {
         backend: &mut B,
         user_input: &str,
         images: &[Value],
+        // 一次性上下文（渠道给的策略/记忆行）：只随本次请求发给模型，
+        // 绝不写进 history —— 每轮重发同一份会白烧几十万字节上下文。
+        notes: &str,
         provider: &dyn LlmProvider,
         sink: Option<std::sync::Arc<dyn crate::llm_sink::TokenSink>>,
     ) -> Result<AgentReply, RuntimeError> {
@@ -1354,11 +1357,16 @@ impl AgentSession {
             "content": backend.system_prompt(),
         }));
         messages.extend(self.history.clone());
-        // 图片只随这一条新消息进请求：history 里只留文本占位符，
-        // 否则每一轮都会重发同一张图。
+        // 一次性上下文（策略/记忆行）与图片都只随这一条新消息进请求；
+        // history 里只留纯文本，否则每一轮都会重发同一份噪声。
+        let request_text = if notes.trim().is_empty() {
+            trimmed.to_string()
+        } else {
+            format!("{}\n{}", notes.trim(), trimmed)
+        };
         messages.push(json!({
             "role": "user",
-            "content": crate::image_input::user_content_with_images(trimmed, images),
+            "content": crate::image_input::user_content_with_images(&request_text, images),
         }));
         self.transcript.push(AgentTranscriptEntry::User {
             content: trimmed.to_string(),
@@ -1751,7 +1759,7 @@ impl AgentSession {
         provider: &dyn LlmProvider,
         sink: Option<std::sync::Arc<dyn crate::llm_sink::TokenSink>>,
     ) -> Result<AgentReply, RuntimeError> {
-        self.respond_with_provider_images(backend, user_input, &[], provider, sink)
+        self.respond_with_provider_images(backend, user_input, &[], "", provider, sink)
     }
 
     /// [`respond_with_provider`] 的多模态入口：`images` 是已经拼好的
@@ -1761,11 +1769,12 @@ impl AgentSession {
         backend: &mut B,
         user_input: &str,
         images: &[Value],
+        notes: &str,
         provider: &dyn LlmProvider,
         sink: Option<std::sync::Arc<dyn crate::llm_sink::TokenSink>>,
     ) -> Result<AgentReply, RuntimeError> {
         let transcript_len_before = self.transcript.len();
-        let result = self.respond_inner(backend, user_input, images, provider, sink);
+        let result = self.respond_inner(backend, user_input, images, notes, provider, sink);
         self.repair_transcript_on_error(transcript_len_before, &result);
         result
     }
@@ -1809,12 +1818,16 @@ impl AgentSession {
 
     /// 同 [`respond_with_runtime_host_via`]，但这次用户消息带图片
     /// （`images` 是 `image_url` content part，空切片等价于纯文本）。
+    // 8 个参数都是"这一轮发给模型的输入"，拆成结构体只是把参数换成字段，
+    // 不减少任何耦合（与 registry::insert_loaded 同一判断）。
+    #[expect(clippy::too_many_arguments)]
     pub(crate) fn respond_with_runtime_host_via_images<H: AgentToolHost + ?Sized>(
         &mut self,
         host: &H,
         session_id: &str,
         user_input: &str,
         images: &[Value],
+        notes: &str,
         provider: &dyn LlmProvider,
         sink: Option<std::sync::Arc<dyn crate::llm_sink::TokenSink>>,
     ) -> Result<AgentReply, RuntimeError> {
@@ -1824,7 +1837,7 @@ impl AgentSession {
             session_id,
             soul_key,
         };
-        self.respond_with_provider_images(&mut backend, user_input, images, provider, sink)
+        self.respond_with_provider_images(&mut backend, user_input, images, notes, provider, sink)
     }
 
     pub fn history_len(&self) -> usize {

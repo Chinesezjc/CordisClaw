@@ -3147,6 +3147,20 @@ export_plugin_api! {{
         input: &str,
         image_urls: &[String],
     ) -> Result<AgentReply, RuntimeError> {
+        self.agent_send_with_turn_context(session_id, input, image_urls, "")
+    }
+
+    /// `agent_send_with_images` plus channel-supplied **one-shot** context
+    /// (`notes`: e.g. the qq plugin's `[reply policy: …]` / `[group memory: …]`
+    /// lines). The notes are sent to the model with this request only — they
+    /// are deliberately NOT written to the session history.
+    pub fn agent_send_with_turn_context(
+        &self,
+        session_id: &str,
+        input: &str,
+        image_urls: &[String],
+        notes: &str,
+    ) -> Result<AgentReply, RuntimeError> {
         let mut session = {
             let mut guard = self
                 .agent_sessions
@@ -3159,7 +3173,7 @@ export_plugin_api! {{
                 })?
         };
         let images = self.image_parts_for_batch(image_urls);
-        let result = session.respond_with_images(self, input, &images);
+        let result = session.respond_with_images(self, input, &images, notes);
         // P1-25: drain any pending actions queued by tools that couldn't
         // reach the session during `respond` (compact_context et al) and
         // apply them here, before reinserting into the map. Errors are
@@ -3219,6 +3233,18 @@ export_plugin_api! {{
         input: &str,
         image_urls: &[String],
     ) -> Result<AgentReply, RuntimeError> {
+        self.agent_send_with_fallback_turn_context(session_id, input, image_urls, "")
+    }
+
+    /// [`agent_send_with_fallback_images`] plus one-shot `notes`
+    /// (see [`RuntimeHost::agent_send_with_turn_context`]).
+    pub fn agent_send_with_fallback_turn_context(
+        &self,
+        session_id: &str,
+        input: &str,
+        image_urls: &[String],
+        notes: &str,
+    ) -> Result<AgentReply, RuntimeError> {
         let entry = {
             let guard = self
                 .profile_fallback
@@ -3230,7 +3256,7 @@ export_plugin_api! {{
             // Sessions started via plain agent_start (REPL, tests) have no
             // fallback entry under a non-default registry only if created
             // before this map existed; treat as plain send.
-            return self.agent_send_with_images(session_id, input, image_urls);
+            return self.agent_send_with_turn_context(session_id, input, image_urls, notes);
         };
 
         // Recovery probe: while degraded, put the desired profile back
@@ -3240,7 +3266,7 @@ export_plugin_api! {{
             self.swap_session_profile(session_id, &entry.desired)?;
         }
 
-        match self.agent_send_with_images(session_id, input, image_urls) {
+        match self.agent_send_with_turn_context(session_id, input, image_urls, notes) {
             Ok(reply) => {
                 if entry.degraded {
                     self.set_degraded(session_id, false);
@@ -3259,7 +3285,7 @@ export_plugin_api! {{
                 };
                 let fallback = fallback.to_string();
                 self.swap_session_profile(session_id, &fallback)?;
-                match self.agent_send_with_images(session_id, input, image_urls) {
+                match self.agent_send_with_turn_context(session_id, input, image_urls, notes) {
                     Ok(reply) => {
                         self.set_degraded(session_id, true);
                         let msg = format!(
@@ -5393,6 +5419,7 @@ impl ManagedAgentSession {
         host: &RuntimeHost,
         input: &str,
         images: &[serde_json::Value],
+        notes: &str,
     ) -> Result<AgentReply, RuntimeError> {
         // 无 provider 插件时两种 state 的结论相同（都只能报 NoLlmProvider），
         // 所以先统一判定，省掉两条各自的 None 分支。
@@ -5406,6 +5433,7 @@ impl ManagedAgentSession {
                 &self.handle.session_id,
                 input,
                 images,
+                notes,
                 &provider,
                 None,
             ),
@@ -5418,6 +5446,7 @@ impl ManagedAgentSession {
                     &mut backend,
                     input,
                     images,
+                    notes,
                     &provider,
                     None,
                 )
