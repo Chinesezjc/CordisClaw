@@ -240,6 +240,23 @@ Agent 现在可以自主完成：读代码 → 理解结构 → 写/改文件 �
 - [x] **Plugin iteration symlink 逃逸**（P0-20）— `PluginEditExecutor::execute` 在写入前调用新 helper `resolve_under_workspace`：canonicalize 结果必须仍在 workspace_root 下。plugins 内的 symlink 指向 `/etc/passwd` 之类无法被写入。
 - [x] **Verifier shell 拼接**（P0-21）— 已随 A 批 P0-1 修复。`discover_rust_workspace_manifest` 输出的字符串被 `shell_words` 解析成 argv，空格 / `$` / `;` 无法被解释。
 
+### 5.2.42 去掉 hint 里的"沉默默认"（2026-10-23）
+
+**症状**：5.2.41 把回复策略改成语境判断后，线上仍然"像只会 @bot 才回"。真实流量统计（Oct 22 19:00 → Oct 23 12:00，113 回合）：明确 @ 的 3 次回 2 次、含 bot/机器人的 10 次回 9 次、普通聊天 100 次只回 3 次；再往前一天（8 小时窗口）8 次 @ 只回 3 次，漏答的那几条都是 **1.5 秒内直接 `{"action":"suspend"}`、零工具调用**。
+
+**根因**：门控已经不看 @ 了（喊 "bot" 就回，13/13），但 hint 里同时留着两句"偏沉默"的话，而且都在策略段**之后**（越靠后越强势）：
+
+- `A message is NOT directed at you if: … casual chat; …`（表述太宽）
+- `For images, stickers, casual chat, or ambiguous messages: suspend immediately — do NOT call any kernel tool.`
+
+模型因此把"沉默"当成默认动作——连 @ 都被吞。
+
+**本批只做前半段**（用户确认）：把第二条改成
+`For images, stickers, or casual chat: do NOT call any kernel introspection tool. Whether to reply is still the reply policy's call — silence is allowed there, but it is NOT the default.`
+——保留"这类消息别调内核自省工具"的护栏，去掉"立即挂起"的命令。`A message is NOT directed…` 那条与 `[directed:]` 结构化标记留待下一批（会明显提高插话率，需单独决定）。
+
+**验证**：qq 插件 45 单测（新增 `hint_does_not_treat_silence_as_the_default` 断言 hint 不含 `suspend immediately`、含 `NOT the default`、且仍保留内核工具护栏；`hint_still_points_at_the_reply_policy` 钉住策略行仍是唯一权威）。
+
 ### 5.2.41 入站图片走多模态 provider（不走 vision 插件）+ 回复策略改为语境判断（2026-10-21）
 
 **动机**：群里有人发图问 bot，bot 答"我这边也没有图像识别节点"——这句在当时是**真的**（`vision_ocr`/`vision_describe` 都是 `agent_accessible: false`），但绕开它的正确办法不是打开 vision 插件，而是让 agent 自己"看"：现在 `deepseek-flash` 原生支持多模态输入。

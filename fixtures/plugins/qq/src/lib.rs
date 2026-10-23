@@ -2350,7 +2350,7 @@ ANTI-HALLUCINATION rules:\n\
 KERNEL TOOL usage in QQ chat:\n\
 - Kernel introspection tools (get_runtime_status, list_plugins, list_nodes, get_kernel_status, get_kernel_issues) are for internal diagnostics only.\n\
 - Only call them when a user @mentions you with an explicit question about bot/runtime/plugin status.\n\
-- For images, stickers, casual chat, or ambiguous messages: suspend immediately — do NOT call any kernel tool.\n\
+- For images, stickers, or casual chat: do NOT call any kernel introspection tool. Whether to reply is still the reply policy's call — silence is allowed there, but it is NOT the default.\n\
 \n\
 To send a progress update or proactive message to the group you're talking to:\n\
   invoke_plugin(qq, qq_send, {\"node_id\":\"qq_send\",\"target\":\"group:<group_id>\",\"message\":\"<your message>\"})
@@ -3442,5 +3442,46 @@ mod image_url_tests {
             !policy.contains("Otherwise stay silent."),
             "旧清单式收尾不应再出现: {policy}"
         );
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// B 前半段：hint 不许再把"沉默"当默认。
+//
+// 线上实测：改了策略之后，普通群聊 100 个回合只回 3 次，连 @ 都会漏答
+// （8 次 @ 里 5 次 1.5 秒内直接 suspend、零工具调用）。原因是 hint 里还留着
+// "For images, stickers, casual chat, or ambiguous messages: suspend immediately
+// — do NOT call any kernel tool"，而它排在策略段之后（越靠后越强势）。
+// 现在只保留"这类消息不要调用内核自省工具"，是否回复交给策略行。
+// ═══════════════════════════════════════════════════════════════════════
+#[cfg(test)]
+mod hint_silence_bias_tests {
+    use super::*;
+
+    #[test]
+    fn hint_does_not_treat_silence_as_the_default() {
+        let hint = docs_value().system_hint.expect("qq must ship a system hint");
+        let still_orders_immediate_silence = hint.contains("suspend immediately");
+        assert!(
+            !still_orders_immediate_silence,
+            "hint 不应再命令'立即挂起'（模型会把它当默认）"
+        );
+        let says_silence_is_not_default = hint.contains("NOT the default");
+        assert!(
+            says_silence_is_not_default,
+            "hint 必须明确：沉默不是默认"
+        );
+        let keeps_tool_guard = hint.contains("do NOT call any kernel introspection tool");
+        assert!(
+            keeps_tool_guard,
+            "图片/表情/闲聊仍然不该触发内核自省工具"
+        );
+    }
+
+    #[test]
+    fn hint_still_points_at_the_reply_policy() {
+        let hint = docs_value().system_hint.expect("qq must ship a system hint");
+        let points_at_policy = hint.contains("[reply policy: ...]");
+        assert!(points_at_policy, "策略行仍是唯一权威");
     }
 }

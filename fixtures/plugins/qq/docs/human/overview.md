@@ -111,6 +111,12 @@ effect on the next message — no rebuild, no restart. An empty policy is reject
 - 表情、贴纸、单字回复
 - 不涉及机器人的陈述
 
+## 沉默不是默认
+
+门控的唯一权威是每条消息首行的 `[reply policy: …]`。hint 里显式写明：图片、表情、
+闲聊**不是**"立即挂起"的理由——这类消息只是不许调用内核自省工具，是否回复仍按策略判断。
+（2026-10-23 之前 hint 里有一条 `… suspend immediately …`，模型据此把沉默当默认，连 @ 都会漏答。）
+
 ## 入站图片（多模态）
 
 图片消息在正文里留 `[image: <url>]` 占位符，同时把 URL 放进 envelope 的
