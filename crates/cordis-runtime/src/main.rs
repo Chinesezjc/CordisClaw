@@ -90,15 +90,26 @@ impl AgentEnvelope {
         !self.source_plugin.is_empty() && !self.reply_node.is_empty()
     }
 
-    /// Soul scope key: `{sender_id}#{conversation_kind}` so the same user
-    /// can carry different personas in private vs group chats. Envelopes
-    /// without identity (legacy callers) scope by session_key instead.
+    /// Soul scope key. Private chats are per-user: `{sender_id}#private`.
+    /// Group chats are per-room: the whole `session_key`, so every speaker
+    /// in one room meets the same persona. Envelopes without identity
+    /// (legacy callers) fall back to `session_key`.
+    ///
+    /// A group room has one bot character, not one per member: keying by
+    /// `{sender_id}#group` made the persona flip with whoever spoke last,
+    /// which is exactly the online bad case this scope closes.
     fn soul_key(&self) -> String {
         if self.sender_id.is_empty() {
-            self.session_key.clone()
-        } else {
-            format!("{}#{}", self.sender_id, self.conversation_kind)
+            return self.session_key.clone();
         }
+        // Group chats are one room, so the persona is room-scoped: a
+        // per-speaker overlay would flip the bot's character every time
+        // someone else talks (H1's per-batch refresh then becomes an
+        // idempotent no-op instead of switching personas).
+        if self.conversation_kind == "group" && !self.session_key.is_empty() {
+            return self.session_key.clone();
+        }
+        format!("{}#{}", self.sender_id, self.conversation_kind)
     }
 }
 
@@ -2471,8 +2482,9 @@ mod batch_tests {
         assert_eq!(extract_user_text("/help"), "/help");
     }
 
-    // 混合批过滤 Normal 后 last 的 soul_key() 是最后一条普通消息发送者的
-    // （直接对 partition 结果断言，不经 host）。
+    // 混合批过滤 Normal 后 last 的 sender 是最后一条普通消息的发送者；
+    // 但 soul_key() 是群聊房间级 key，与发言人无关（直接对 partition 结果
+    // 断言，不经 host）。
     #[test]
     fn batch_route_is_last_normal_sender() {
         let batch = vec![
@@ -2490,7 +2502,59 @@ mod batch_tests {
         let route = normals.last().expect("at least one normal");
         // Last normal is C (the command B trails but is filtered out).
         assert_eq!(route.sender_id, "C");
-        assert_eq!(route.soul_key(), "C#group");
+        // 群聊房间级 key，与发言人无关（env() 的 session_key）。
+        assert_eq!(route.soul_key(), "feishu:chat:oc_x");
+    }
+
+    // 同一房间里的不同发言人共用一个人格：soul_key 都等于 session_key。
+    #[test]
+    fn group_soul_key_is_shared_by_speakers() {
+        let a = env("[feishu (user A)]: 你好", "A");
+        let b = env("[feishu (user B)]: 在吗", "B");
+        assert_eq!(a.sender_id, "A");
+        assert_eq!(b.sender_id, "B");
+        assert_eq!(a.soul_key(), "feishu:chat:oc_x");
+        assert_eq!(b.soul_key(), "feishu:chat:oc_x");
+        assert_eq!(a.soul_key(), b.soul_key());
+    }
+
+    // 群聊但没有 session_key 时回落成 per-speaker key，不能塌成空串。
+    #[test]
+    fn group_soul_key_falls_back_without_session_key() {
+        // display 非空 → parse 走 JSON 成功臂（空 session_key 也保留）。
+        let raw = serde_json::json!({
+            "session_key": "",
+            "display": "hi",
+            "sender_id": "A",
+            "conversation_kind": "group",
+        })
+        .to_string();
+        let env = AgentEnvelope::parse(&raw);
+        assert_eq!(env.session_key, "");
+        assert_eq!(env.soul_key(), "A#group");
+    }
+
+    // 私聊仍按人作用域：不同发送者各自 `{id}#private`。
+    #[test]
+    fn private_soul_key_stays_per_user() {
+        let envelope = |sender: &str| {
+            let raw = serde_json::json!({
+                "session_key": "feishu:ou_abc",
+                "display": "hi",
+                "sender_id": sender,
+                "conversation_kind": "private",
+            })
+            .to_string();
+            AgentEnvelope::parse(&raw)
+        };
+        assert_eq!(
+            envelope("feishu:ou_abc").soul_key(),
+            "feishu:ou_abc#private"
+        );
+        assert_eq!(
+            envelope("feishu:ou_xyz").soul_key(),
+            "feishu:ou_xyz#private"
+        );
     }
 }
 
