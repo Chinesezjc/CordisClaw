@@ -12,7 +12,7 @@ CordisClaw — 基于有色 Petri 网 (CPN) 的契约驱动插件树运行时。
 
 **任何提交必须保持 `cargo clippy --all-targets -- -D warnings` 通过（零 warning 规范）。** 确需豁免时用带理由注释的 `#[expect(lint)]`，禁止裸 `#[allow]`。
 
-**任何提交必须保持 CI coverage 门槛通过（行覆盖 100%，coverage workflow 对 PR 自动跑）。** 全仓已达 100%（26497/26497），**不使用任何覆盖率排除注释**（无 `COV_EXCL` / `#[coverage(off)]`）。文件级排除仅 `main.rs`（REPL/signal/exit）与 `agent.rs`（LLM 流式 I/O），属进程/网络边界。禁止用降门槛、加排除注释或加文件排除消化缺口。
+**任何提交必须保持 CI coverage 门槛通过（行覆盖 100%，coverage workflow 对 PR 自动跑）。** 全仓已达 100%（26497/26497），**不使用任何覆盖率排除注释**（无 `COV_EXCL` / `#[coverage(off)]`）。文件级排除仅 `main.rs`（REPL/signal/exit）与 `agent.rs`（LLM 流式 I/O），属进程/网络边界。**`main.rs` 现在位于 `crates/cordis-cli/src/main.rs`**（二进制随 `cordis-cli` 拆出，crate 名仍是 `cordis-cli`、二进制名仍是 `cordis-runtime`），所以排除正则要同时覆盖 `cordis-runtime` 与 `cordis-cli` 两个 crate。禁止用降门槛、加排除注释或加文件排除消化缺口。
 
 新代码必须自带测试做到 100% 行覆盖。遇到"覆盖不到的行"先判性质——lcov 每行计数取该行起始的所有 region 的最大值，所以一行显示未覆盖有两种成因：
 
@@ -34,7 +34,7 @@ CordisClaw — 基于有色 Petri 网 (CPN) 的契约驱动插件树运行时。
 
 本地跑法：
 ```bash
-cargo llvm-cov --fail-under-lines 100 --ignore-filename-regex 'cordis-runtime/src/(main|agent)\.rs' -- --test-threads=1
+cargo llvm-cov --fail-under-lines 100 --ignore-filename-regex 'cordis-(runtime|cli)/src/(main|agent)\.rs' -- --test-threads=1
 ```
 
 ## 关键文档
@@ -111,11 +111,19 @@ cargo llvm-cov --fail-under-lines 100 --ignore-filename-regex 'cordis-runtime/sr
 ```
 crates/
   cordis-plugin-sdk/     — 插件 ABI、文档类型、导出宏
-  cordis-runtime/        — 核心运行时：loader、引擎、agent、host
+  cordis-runtime/        — 核心运行时：loader、引擎、agent、host（**不含构建系统**）
+  cordis-tooling/        — 构建系统：prepare/rebuild 工件、artifact index 刷新、docs 回写
+  cordis-cli/            — 进程入口（二进制名仍是 `cordis-runtime`）：serve/invoke/auto-update/...
   cordis-plugin-host/    — 插件宿主抽象
 fixtures/                — 测试 fixtures（插件样例、工件索引）
 docs/                    — 架构文档
 ```
+
+依赖方向（不能成环）：`cordis-cli -> {cordis-runtime, cordis-tooling}`、`cordis-tooling -> cordis-runtime`；
+`cordis-runtime` 不依赖 `cordis-tooling`（仅 dev-dependency，供测试构建 fixture 工件）。
+运行时通过 `plugin::builder::PluginBuilder` 这一个 trait 接缝调用构建系统，实现由 `cordis-cli` 在
+`main()` 启动时 `install_plugin_builder` 注入；没装时统一报
+`no plugin builder installed (this build has no build tooling)`。
 
 ## 测试
 

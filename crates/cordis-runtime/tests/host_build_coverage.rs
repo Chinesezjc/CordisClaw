@@ -23,7 +23,7 @@ use cordis_runtime::kernel::plugin_iteration::{
     PluginEditOperation, PluginEditPlan, PluginIterationFinalVerdict, VerifierVerdict,
 };
 use cordis_runtime::kernel::verifier::VerificationProfile;
-use cordis_runtime::plugin::tooling::{prepare_artifacts, PrepareMode};
+use cordis_tooling::{prepare_artifacts, PrepareMode};
 use serde_json::{json, Value};
 use serial_test::serial;
 use sha2::{Digest, Sha256};

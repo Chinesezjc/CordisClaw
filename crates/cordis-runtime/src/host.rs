@@ -31,10 +31,10 @@ use crate::kernel::verifier::{
     hash_source_tree, CommandVerifier, VerificationProfile, VerificationReport, VerifyOptions,
 };
 use crate::plugin::abi::PluginResponse;
+use crate::plugin::builder::{missing_builder_error, plugin_builder};
 use crate::plugin::invoke::invoke_registered_plugin;
 use crate::plugin::loader::{default_loader_config, LoadOutput, Loader};
 use crate::plugin::registry::{NodeRegistry, PluginRegistry, RegisteredPlugin};
-use crate::plugin::tooling::rebuild_plugin_workspace;
 use crate::service::doc_registry::DocRegistry;
 use crate::service::graph_registry::{
     GraphRegistry, RegisteredNet, RegisteredNetEdge, RegisteredNetEdgeKind,
@@ -4373,7 +4373,10 @@ export_plugin_api! {{
                             .and_then(|()| rollback.persist_journal(&journal, &iteration_id))
                         })
                         .unwrap_or_else(|| Err(plugin_iteration_missing_rollback_error()))
-                        .and_then(|()| rebuild_plugin_workspace(&self.fixtures_root, &plugin_path));
+                        .and_then(|()| {
+                            let builder = plugin_builder().ok_or_else(missing_builder_error)?;
+                            builder.rebuild_plugin(&self.fixtures_root, &plugin_path)
+                        });
                     match rebuilt {
                         Ok(artifacts) => {
                             state.rebuilt_artifacts = artifacts;
@@ -6217,7 +6220,9 @@ Do not attempt to modify runtime crates, repository root manifests, config, .git
                     .get("plugin_path")
                     .and_then(|v| v.as_str())
                     .unwrap_or("/");
-                let rebuilt = rebuild_plugin_workspace(&self.host.fixtures_root, pp)?;
+                let rebuilt = plugin_builder()
+                    .ok_or_else(missing_builder_error)?
+                    .rebuild_plugin(&self.host.fixtures_root, pp)?;
                 Ok(json!({
                     "rebuilt_count": rebuilt.len(),
                     "rebuilt": rebuilt,
@@ -7743,7 +7748,7 @@ fn snapshot_dir_owner_is_alive(name: &str) -> bool {
         // 旧格式 `snapshot-{nanos}` 首段是纳秒时间戳，parse u32 失败
         // → None → 按 stale 处理。
         .filter(|pid| i32::try_from(*pid).is_ok())
-        .is_some_and(crate::plugin::tooling::lock_pid_is_live)
+        .is_some_and(crate::plugin::artifact::lock_pid_is_live)
 }
 
 /// 跨 hash 目录 GC 的统计结果。
@@ -8414,7 +8419,9 @@ fn restore_plugin_iteration_workspace(
     let restored =
         apply_plugin_iteration_journal(fixtures_root, snapshot_root, in_memory_rollback)?;
     if restored {
-        rebuild_plugin_workspace(fixtures_root, "/")?;
+        plugin_builder()
+            .ok_or_else(missing_builder_error)?
+            .rebuild_plugin(fixtures_root, "/")?;
     }
     Ok(restored)
 }
@@ -9128,7 +9135,7 @@ mod tests {
     fn shared_host() -> &'static RuntimeHost {
         SHARED_HOST.get_or_init(|| {
             let root = repo_fixtures_root();
-            crate::plugin::tooling::refresh_artifact_index(&root)
+            cordis_tooling::refresh_artifact_index(&root)
                 .expect("refresh artifact index before shared boot");
             RuntimeHost::boot(&root).expect("host should boot")
         })
@@ -9412,7 +9419,7 @@ mod tests {
     #[test]
     #[serial]
     fn plugin_iteration_tool_surface_and_context_reads_expand_from_focus_to_all() {
-        crate::plugin::tooling::refresh_artifact_index(&repo_fixtures_root())
+        cordis_tooling::refresh_artifact_index(&repo_fixtures_root())
             .expect("refresh artifact index before boot");
         let fixtures_root = repo_fixtures_root();
         let host = RuntimeHost::boot(&fixtures_root).expect("host should boot");

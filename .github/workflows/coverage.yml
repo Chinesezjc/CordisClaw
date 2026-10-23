@@ -36,7 +36,7 @@ jobs:
         run: cargo fetch --manifest-path fixtures/plugins/Cargo.toml
 
       - name: prepare fixture artifacts
-        run: cargo run --locked -p cordis-runtime -- prepare-artifacts fixtures
+        run: cargo run --locked -p cordis-cli -- prepare-artifacts fixtures
 
       # 若 job 以 root 运行，7 处 `probe_not_root()` 门控的权限失败测试体
       # 不会执行（root 绕过 file-mode 检查），100% 行覆盖门槛会失败。
@@ -69,8 +69,10 @@ jobs:
           ls fixtures/artifacts/*.so | head
 
       # 覆盖率门槛：行覆盖 100%（无排除注释，实测 26497/26497）。
-      # 排除 main.rs（REPL/signal/exit）与 agent.rs（LLM 流式 I/O）——
-      # 均为进程/网络边界，见 CLAUDE.md 覆盖率规范。
+      # 排除 main.rs（REPL/signal/exit，现位于 cordis-cli）与 agent.rs
+      # （LLM 流式 I/O）——均为进程/网络边界，见 CLAUDE.md 覆盖率规范。
+      # 匹配是"路径包含"语义（llvm-cov 对完整路径做正则 search），
+      # 前置 `.*` 让它在"整路径匹配"实现下同样成立；两个 crate 一并排除。
       # 串行执行：插桩下 host 系集成测试共享 fixtures 工件，并行会因
       # 中途重建 dylib 触发 HashMismatch 假失败。
       # 分两步：先无门槛跑出 lcov（保证产物总能上传、失败时能看到缺行），
@@ -79,7 +81,7 @@ jobs:
       - name: run tests with coverage
         run: |
           cargo llvm-cov --locked --workspace \
-            --ignore-filename-regex 'cordis-runtime/src/(main|agent)\.rs' \
+            --ignore-filename-regex 'cordis-(runtime|cli)/src/(main|agent)\.rs' \
             --lcov --output-path lcov.info \
             -- --test-threads=1
 

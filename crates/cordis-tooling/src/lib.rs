@@ -1,15 +1,16 @@
-use crate::core::error::RuntimeError;
-use crate::core::models::{
+use cordis_plugin_sdk::pretty_json;
+use cordis_runtime::core::error::RuntimeError;
+use cordis_runtime::core::models::{
     ArtifactIndex, ArtifactIndexEntry, ArtifactKind, InputProbe, InputProbeFile, PluginArtifact,
     PluginDocs, PluginExecution, ARTIFACT_INDEX_SCHEMA_VERSION,
 };
-use crate::plugin::artifact::{
-    artifact_index_map, load_artifact_index, load_plugin_artifact, resolve_artifact_path,
-    sha256_file,
+use cordis_runtime::plugin::artifact::{
+    artifact_index_map, load_artifact_index, lock_pid_is_live, parse_dylib_payload,
+    resolve_artifact_path, sha256_file,
 };
-use crate::plugin::dynamic::{is_dylib_path, LoadedDylibApi};
-use crate::plugin::package::{PackageResolver, ResolvedPlugin, ResolvedPluginGraph};
-use cordis_plugin_sdk::pretty_json;
+use cordis_runtime::plugin::builder::{PluginBuilder, PreparedArtifacts};
+use cordis_runtime::plugin::dynamic::LoadedDylibApi;
+use cordis_runtime::plugin::package::{PackageResolver, ResolvedPlugin, ResolvedPluginGraph};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -589,29 +590,6 @@ pub fn refresh_artifact_index(fixtures_root: &Path) -> Result<Vec<(String, Strin
     Ok(refreshed)
 }
 
-/// Parse a JSON payload emitted by a loaded dylib's exported contract fn.
-/// The dylib-open path can't be exercised without a real `.so`, so the two
-/// call sites (`read_plugin_docs`, `inspect_dylib_contract`) share this mapper;
-/// `what` names the failing contract so the byte-stable message is preserved.
-fn parse_dylib_payload<T: serde::de::DeserializeOwned>(
-    artifact_path: &Path,
-    payload: &str,
-    what: &str,
-) -> Result<T, RuntimeError> {
-    serde_json::from_str(payload)
-        .map_err(|e| io_error(artifact_path, format!("runtime {what} parse failed: {e}")))
-}
-
-pub fn read_plugin_docs(artifact_path: &Path) -> Result<PluginDocs, RuntimeError> {
-    if is_dylib_path(artifact_path) {
-        let dylib = LoadedDylibApi::open(artifact_path)?;
-        parse_dylib_payload(artifact_path, &(dylib.api().docs)().payload, "docs")
-    } else {
-        let artifact = load_plugin_artifact(artifact_path)?;
-        Ok(artifact.docs)
-    }
-}
-
 fn prepare_artifacts_locked(
     fixtures_root: &Path,
     mode: PrepareMode,
@@ -930,7 +908,7 @@ fn build_dirty_dylib_plugins(
 
 fn inspect_dylib_contract(
     artifact_path: &Path,
-) -> Result<(PluginDocs, crate::core::models::AbiFingerprint), RuntimeError> {
+) -> Result<(PluginDocs, cordis_runtime::core::models::AbiFingerprint), RuntimeError> {
     let dylib = LoadedDylibApi::open(artifact_path)?;
     // Both payloads are pulled out into locals first so each
     // `parse_dylib_payload(..)?` call fits on a single line; the `?` error edge
@@ -1648,37 +1626,6 @@ fn maybe_remove_stale_lock_with_fs(path: &Path, ops: MetaOps) -> Result<(), Runt
     Ok(())
 }
 
-/// P0-10: on macOS/BSD `/proc` does not exist, so the previous implementation
-/// always returned false → every live lock was declared dead the moment the
-/// staleness timer expired, letting two concurrent `prepare_artifacts` calls
-/// clobber each other. Fix: use `kill(pid, 0)`, which is portable across all
-/// Unix platforms and returns EPERM (still alive, other uid) or ESRCH (dead)
-/// without actually delivering a signal.
-#[cfg(unix)]
-pub(crate) fn lock_pid_is_live(pid: u32) -> bool {
-    if pid == 0 {
-        return false;
-    }
-    // SAFETY: `kill(pid, 0)` is signal-safe and side-effect free; it only
-    // checks whether the caller *could* deliver a signal to `pid`.
-    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
-    if rc == 0 {
-        return true;
-    }
-    // errno is thread-local; if the syscall returned an error, distinguish
-    // "no such process" (ESRCH → dead) from "permission denied" (EPERM →
-    // alive, owned by another user).
-    let err = std::io::Error::last_os_error();
-    !matches!(err.raw_os_error(), Some(libc::ESRCH))
-}
-
-#[cfg(not(unix))]
-pub(crate) fn lock_pid_is_live(_pid: u32) -> bool {
-    // Non-Unix: no portable liveness probe, so be conservative and assume
-    // still alive; the staleness timer eventually reclaims true zombies.
-    true
-}
-
 fn current_epoch_ms() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1771,8 +1718,8 @@ mod tests {
     #[cfg(unix)]
     fn permission_fault_holds<T: std::fmt::Debug>(
         enforced: bool,
-        outcome: &Result<T, crate::core::error::RuntimeError>,
-        is_expected_error: impl FnOnce(&crate::core::error::RuntimeError) -> bool,
+        outcome: &Result<T, cordis_runtime::core::error::RuntimeError>,
+        is_expected_error: impl FnOnce(&cordis_runtime::core::error::RuntimeError) -> bool,
     ) -> bool {
         match (enforced, outcome) {
             (true, Err(err)) => is_expected_error(err),
@@ -1784,7 +1731,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn permission_fault_holds_covers_both_euid_directions() {
-        use crate::core::error::RuntimeError;
+        use cordis_runtime::core::error::RuntimeError;
         let io = RuntimeError::Io {
             path: "/x".into(),
             message: "create tmp: denied".to_string(),
@@ -1856,25 +1803,6 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().ends_with(".cordis-tmp"))
             .collect();
         assert!(leftovers.is_empty(), "no leftover tmp file expected");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn lock_pid_liveness_recognises_current_process_as_alive() {
-        // P0-10: previously used `/proc/{pid}` and returned false on macOS/BSD
-        // for every live pid. `kill(pid, 0)` is portable; the running process
-        // must always be observed as alive.
-        use super::lock_pid_is_live;
-        assert!(lock_pid_is_live(std::process::id()));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn lock_pid_liveness_reports_dead_pid_as_dead() {
-        use super::lock_pid_is_live;
-        // A pid we're extremely unlikely to have — u32::MAX is above the
-        // maximum kernel-allowed pid on all common systems.
-        assert!(!lock_pid_is_live(u32::MAX - 1));
     }
 
     /// P1-17: `write_pretty_json` is the durable writer for
@@ -2056,7 +1984,7 @@ exports = ["svc_a", "svc_b"]
     #[test]
     fn read_plugin_build_spec_rejects_missing_package_and_bad_toml() {
         use super::read_plugin_build_spec;
-        use crate::core::error::RuntimeError;
+        use cordis_runtime::core::error::RuntimeError;
         use tempfile::TempDir;
         let dir = TempDir::new().unwrap();
 
@@ -2176,7 +2104,7 @@ exports = ["svc_a", "svc_b"]
     #[test]
     fn build_input_probe_errors_on_missing_file() {
         use super::build_input_probe;
-        use crate::core::error::RuntimeError;
+        use cordis_runtime::core::error::RuntimeError;
         use tempfile::TempDir;
         let dir = TempDir::new().unwrap();
         let missing = dir.path().join("ghost.rs");
@@ -2206,7 +2134,7 @@ exports = ["svc_a", "svc_b"]
     #[test]
     fn compute_build_fingerprint_errors_on_missing_file() {
         use super::compute_build_fingerprint;
-        use crate::core::error::RuntimeError;
+        use cordis_runtime::core::error::RuntimeError;
         use tempfile::TempDir;
         let dir = TempDir::new().unwrap();
         assert!(matches!(
@@ -2217,8 +2145,8 @@ exports = ["svc_a", "svc_b"]
 
     // ---------- compute_dirty_state ----------
 
-    fn sample_abi() -> crate::core::models::AbiFingerprint {
-        crate::core::models::AbiFingerprint {
+    fn sample_abi() -> cordis_runtime::core::models::AbiFingerprint {
+        cordis_runtime::core::models::AbiFingerprint {
             rustc_version: "rustc".to_string(),
             target_triple: "triple".to_string(),
             crate_hash: "crate_v1".to_string(),
@@ -2228,9 +2156,9 @@ exports = ["svc_a", "svc_b"]
 
     fn sample_context(artifact_path: std::path::PathBuf) -> super::PluginBuildContext {
         use super::{PluginBuildContext, PluginBuildSpec, SourceArtifactConfig};
-        use crate::core::models::{ArtifactKind, CordisMetadata, InputProbe};
-        use crate::plugin::package::ResolvedPlugin;
         use cordis_plugin_sdk::plugin_docs;
+        use cordis_runtime::core::models::{ArtifactKind, CordisMetadata, InputProbe};
+        use cordis_runtime::plugin::package::ResolvedPlugin;
         use std::collections::BTreeSet;
         let plugin = ResolvedPlugin {
             plugin_path: "foo".to_string(),
@@ -2268,8 +2196,10 @@ exports = ["svc_a", "svc_b"]
         }
     }
 
-    fn entry_matching(ctx: &super::PluginBuildContext) -> crate::core::models::ArtifactIndexEntry {
-        crate::core::models::ArtifactIndexEntry {
+    fn entry_matching(
+        ctx: &super::PluginBuildContext,
+    ) -> cordis_runtime::core::models::ArtifactIndexEntry {
+        cordis_runtime::core::models::ArtifactIndexEntry {
             plugin_path: ctx.plugin.plugin_path.clone(),
             version: ctx.build_spec.version.clone(),
             abi_fingerprint: ctx.plugin.metadata.abi_fingerprint.clone(),
@@ -2340,7 +2270,7 @@ exports = ["svc_a", "svc_b"]
     #[test]
     fn compute_dirty_state_uses_fingerprint_when_probe_differs() {
         use super::{compute_build_fingerprint, compute_dirty_state};
-        use crate::core::models::{InputProbe, InputProbeFile};
+        use cordis_runtime::core::models::{InputProbe, InputProbeFile};
         use tempfile::TempDir;
         let dir = TempDir::new().unwrap();
         let artifact = dir.path().join("foo.json");
@@ -2370,44 +2300,6 @@ exports = ["svc_a", "svc_b"]
         assert!(compute_dirty_state(dir.path(), &ctx, Some(&diff_fp)).unwrap());
     }
 
-    // ---------- read_plugin_docs (JSON artifact path) ----------
-
-    #[test]
-    fn read_plugin_docs_reads_json_artifact() {
-        use super::read_plugin_docs;
-        use crate::core::models::PluginArtifact;
-        use cordis_plugin_sdk::{plugin_docs, pretty_json};
-        use tempfile::TempDir;
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("plug.json");
-        let artifact = PluginArtifact {
-            plugin_path: "foo".to_string(),
-            abi_fingerprint: sample_abi(),
-            docs: plugin_docs("foo", "foo", "0.1.0", Some("Foo"), Vec::new(), None),
-            exports: Vec::new(),
-            execution: None,
-        };
-        std::fs::write(&path, pretty_json(&artifact)).unwrap();
-
-        let docs = read_plugin_docs(&path).unwrap();
-        assert_eq!(docs.plugin_path, "foo");
-        assert_eq!(docs.command_name.as_deref(), Some("Foo"));
-    }
-
-    #[test]
-    fn read_plugin_docs_errors_on_bad_json_artifact() {
-        use super::read_plugin_docs;
-        use crate::core::error::RuntimeError;
-        use tempfile::TempDir;
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("plug.json");
-        std::fs::write(&path, "{ not valid").unwrap();
-        assert!(matches!(
-            read_plugin_docs(&path),
-            Err(RuntimeError::ArtifactIndexParse { .. })
-        ));
-    }
-
     // ---------- refresh_artifact_hash_for_plugin (extracted) ----------
 
     fn write_single_entry_index(
@@ -2415,7 +2307,7 @@ exports = ["svc_a", "svc_b"]
         artifact_bytes: &[u8],
     ) -> std::path::PathBuf {
         use super::write_pretty_json;
-        use crate::core::models::{ArtifactIndex, ARTIFACT_INDEX_SCHEMA_VERSION};
+        use cordis_runtime::core::models::{ArtifactIndex, ARTIFACT_INDEX_SCHEMA_VERSION};
         // Real artifact file the index entry points at (relative "foo.json").
         std::fs::write(dir.join("foo.json"), artifact_bytes).unwrap();
         let ctx = sample_context(dir.join("foo.json"));
@@ -2472,7 +2364,7 @@ exports = ["svc_a", "svc_b"]
     #[test]
     fn write_pretty_json_errors_when_path_has_no_parent() {
         use super::write_pretty_json;
-        use crate::core::error::RuntimeError;
+        use cordis_runtime::core::error::RuntimeError;
         use std::path::Path;
         // Root path has no parent directory.
         let err = write_pretty_json(Path::new("/"), &serde_json::json!({"k": 1}));
@@ -2486,7 +2378,7 @@ exports = ["svc_a", "svc_b"]
     #[test]
     fn write_pretty_json_errors_when_path_has_no_filename() {
         use super::write_pretty_json;
-        use crate::core::error::RuntimeError;
+        use cordis_runtime::core::error::RuntimeError;
         use tempfile::TempDir;
         let dir = TempDir::new().unwrap();
         // `<tempdir>/..` -> parent is <tempdir> (exists), file_name is None.
@@ -2503,7 +2395,7 @@ exports = ["svc_a", "svc_b"]
     #[test]
     fn stage_then_rename_errors_when_source_missing() {
         use super::stage_then_rename_file;
-        use crate::core::error::RuntimeError;
+        use cordis_runtime::core::error::RuntimeError;
         use tempfile::TempDir;
         let dir = TempDir::new().unwrap();
         let src = dir.path().join("nope.so");
@@ -2526,7 +2418,7 @@ exports = ["svc_a", "svc_b"]
     #[test]
     fn run_command_maps_nonzero_exit_to_command_failed() {
         use super::run_command;
-        use crate::core::error::RuntimeError;
+        use cordis_runtime::core::error::RuntimeError;
         assert!(matches!(
             run_command("false", &[], None),
             Err(RuntimeError::CommandFailed { .. })
@@ -2536,7 +2428,7 @@ exports = ["svc_a", "svc_b"]
     #[test]
     fn run_command_maps_spawn_failure_to_command_failed() {
         use super::run_command;
-        use crate::core::error::RuntimeError;
+        use cordis_runtime::core::error::RuntimeError;
         let err = run_command("cordis-no-such-program-xyz", &[], None);
         assert!(matches!(err, Err(RuntimeError::CommandFailed { .. })));
     }
@@ -2557,7 +2449,7 @@ exports = ["svc_a", "svc_b"]
     #[test]
     fn run_command_with_timeout_kills_and_errors_on_expiry() {
         use super::run_command_with_timeout;
-        use crate::core::error::RuntimeError;
+        use cordis_runtime::core::error::RuntimeError;
         use std::process::Command;
         let mut cmd = Command::new("sleep");
         cmd.arg("30");
@@ -2741,7 +2633,7 @@ exports = ["svc_a", "svc_b"]
     #[test]
     fn stage_then_rename_errors_when_dst_has_no_filename() {
         use super::stage_then_rename_file;
-        use crate::core::error::RuntimeError;
+        use cordis_runtime::core::error::RuntimeError;
         use std::path::Path;
         use tempfile::TempDir;
         let dir = TempDir::new().unwrap();
@@ -2762,7 +2654,7 @@ exports = ["svc_a", "svc_b"]
     #[test]
     fn stage_then_rename_errors_when_source_is_a_directory() {
         use super::stage_then_rename_file;
-        use crate::core::error::RuntimeError;
+        use cordis_runtime::core::error::RuntimeError;
         use tempfile::TempDir;
         let dir = TempDir::new().unwrap();
         let src_dir = dir.path().join("src_is_dir");
@@ -2780,7 +2672,7 @@ exports = ["svc_a", "svc_b"]
     #[test]
     fn stage_then_rename_errors_when_tmp_parent_missing() {
         use super::stage_then_rename_file;
-        use crate::core::error::RuntimeError;
+        use cordis_runtime::core::error::RuntimeError;
         use tempfile::TempDir;
         let dir = TempDir::new().unwrap();
         let src = dir.path().join("src.so");
@@ -2800,7 +2692,7 @@ exports = ["svc_a", "svc_b"]
     #[test]
     fn stage_then_rename_errors_when_dst_is_nonempty_dir() {
         use super::stage_then_rename_file;
-        use crate::core::error::RuntimeError;
+        use cordis_runtime::core::error::RuntimeError;
         use tempfile::TempDir;
         let dir = TempDir::new().unwrap();
         let src = dir.path().join("src.so");
@@ -2839,7 +2731,7 @@ exports = ["svc_a", "svc_b"]
     #[test]
     fn parse_cargo_metadata_maps_bad_json_to_artifact_index_parse() {
         use super::parse_cargo_metadata;
-        use crate::core::error::RuntimeError;
+        use cordis_runtime::core::error::RuntimeError;
         use std::path::Path;
         let manifest = Path::new("/repo/plugins/Cargo.toml");
         let result = parse_cargo_metadata(manifest, b"{ not json");
@@ -2857,7 +2749,7 @@ exports = ["svc_a", "svc_b"]
     #[test]
     fn write_pretty_json_errors_when_tmp_create_fails_in_readonly_dir() {
         use super::write_pretty_json;
-        use crate::core::error::RuntimeError;
+        use cordis_runtime::core::error::RuntimeError;
         use std::os::unix::fs::PermissionsExt;
         use tempfile::TempDir;
         let dir = TempDir::new().unwrap();
@@ -2883,7 +2775,7 @@ exports = ["svc_a", "svc_b"]
     #[test]
     fn write_pretty_json_errors_when_parent_is_a_file() {
         use super::write_pretty_json;
-        use crate::core::error::RuntimeError;
+        use cordis_runtime::core::error::RuntimeError;
         use tempfile::TempDir;
         let dir = TempDir::new().unwrap();
         let file = dir.path().join("afile");
@@ -2902,7 +2794,7 @@ exports = ["svc_a", "svc_b"]
     #[test]
     fn stage_then_rename_errors_when_tmp_create_fails_in_readonly_dir() {
         use super::stage_then_rename_file;
-        use crate::core::error::RuntimeError;
+        use cordis_runtime::core::error::RuntimeError;
         use std::os::unix::fs::PermissionsExt;
         use tempfile::TempDir;
         let dir = TempDir::new().unwrap();
@@ -2927,7 +2819,7 @@ exports = ["svc_a", "svc_b"]
     #[test]
     fn collect_files_recursively_errors_when_dir_unreadable() {
         use super::collect_files_recursively;
-        use crate::core::error::RuntimeError;
+        use cordis_runtime::core::error::RuntimeError;
         use tempfile::TempDir;
         let dir = TempDir::new().unwrap();
         let missing = dir.path().join("nope");
@@ -2945,7 +2837,7 @@ exports = ["svc_a", "svc_b"]
     #[serial_test::serial]
     fn cleanup_fixture_lockfiles_errors_when_root_unreadable() {
         use super::cleanup_fixture_lockfiles;
-        use crate::core::error::RuntimeError;
+        use cordis_runtime::core::error::RuntimeError;
         use std::os::unix::fs::PermissionsExt;
         use tempfile::TempDir;
         let dir = TempDir::new().unwrap();
@@ -2971,7 +2863,7 @@ exports = ["svc_a", "svc_b"]
     #[test]
     fn remove_lockfiles_recursively_errors_when_subdir_unreadable() {
         use super::remove_lockfiles_recursively;
-        use crate::core::error::RuntimeError;
+        use cordis_runtime::core::error::RuntimeError;
         use std::os::unix::fs::PermissionsExt;
         use tempfile::TempDir;
         let dir = TempDir::new().unwrap();
@@ -2986,15 +2878,6 @@ exports = ["svc_a", "svc_b"]
             }),
             "unexpected outcome for a permission-denied path: {err:?}"
         );
-    }
-
-    /// `lock_pid_is_live(0)` short-circuits to `false` (pid 0 is never a
-    /// live process the caller could own).
-    #[cfg(unix)]
-    #[test]
-    fn lock_pid_is_live_returns_false_for_pid_zero() {
-        use super::lock_pid_is_live;
-        assert!(!lock_pid_is_live(0));
     }
 
     // ---------- collect_local_dependency_dirs (pure resolve walk) ----------
@@ -3073,7 +2956,7 @@ exports = ["svc_a", "svc_b"]
     fn maybe_remove_stale_lock_json_remove_failure_maps_to_io() {
         use super::current_epoch_ms;
         use super::{maybe_remove_stale_lock, ArtifactBuildLockState};
-        use crate::core::error::RuntimeError;
+        use cordis_runtime::core::error::RuntimeError;
         use std::os::unix::fs::PermissionsExt;
         use tempfile::TempDir;
         let dir = TempDir::new().unwrap();
@@ -3104,7 +2987,7 @@ exports = ["svc_a", "svc_b"]
     #[test]
     fn maybe_remove_stale_lock_legacy_remove_failure_maps_to_io() {
         use super::maybe_remove_stale_lock;
-        use crate::core::error::RuntimeError;
+        use cordis_runtime::core::error::RuntimeError;
         use std::os::unix::fs::PermissionsExt;
         use std::time::{Duration, SystemTime};
         use tempfile::TempDir;
@@ -3136,7 +3019,7 @@ exports = ["svc_a", "svc_b"]
     #[test]
     fn run_command_with_timeout_maps_spawn_failure() {
         use super::run_command_with_timeout;
-        use crate::core::error::RuntimeError;
+        use cordis_runtime::core::error::RuntimeError;
         use std::process::Command;
         let cmd = Command::new("cordis-no-such-binary-zzz");
         let err = run_command_with_timeout(cmd, std::time::Duration::from_secs(5));
@@ -3172,7 +3055,7 @@ exports = ["svc_a", "svc_b"]
     #[test]
     fn load_workspace_metadata_with_runner_propagates_subprocess_failure() {
         use super::load_workspace_metadata_with_runner;
-        use crate::core::error::RuntimeError;
+        use cordis_runtime::core::error::RuntimeError;
         use std::path::Path;
         let err = load_workspace_metadata_with_runner(
             Path::new("/repo/plugins/Cargo.toml"),
@@ -3198,7 +3081,7 @@ exports = ["svc_a", "svc_b"]
     #[test]
     fn load_workspace_metadata_with_runner_maps_bad_bytes_to_parse_error() {
         use super::load_workspace_metadata_with_runner;
-        use crate::core::error::RuntimeError;
+        use cordis_runtime::core::error::RuntimeError;
         use std::path::Path;
         let runner = |_p: &str, _a: &[String], _d: Option<&Path>| Ok(b"{ not json".to_vec());
         let err = load_workspace_metadata_with_runner(Path::new("/repo/Cargo.toml"), runner);
@@ -3208,7 +3091,7 @@ exports = ["svc_a", "svc_b"]
     #[test]
     fn build_plugin_artifact_with_runner_propagates_subprocess_failure() {
         use super::build_plugin_artifact_with_runner;
-        use crate::core::error::RuntimeError;
+        use cordis_runtime::core::error::RuntimeError;
         use std::path::Path;
         // fixtures_root has a parent, so we reach the runner call.
         let err = build_plugin_artifact_with_runner(
@@ -3222,7 +3105,7 @@ exports = ["svc_a", "svc_b"]
     #[test]
     fn build_plugin_artifact_with_runner_errors_when_fixtures_root_has_no_parent() {
         use super::build_plugin_artifact_with_runner;
-        use crate::core::error::RuntimeError;
+        use cordis_runtime::core::error::RuntimeError;
         use std::path::Path;
         // Root "/" has no parent -> Invariant before the runner is consulted.
         // `failing_runner` (covered by sibling tests) stands in; it is never
@@ -3251,7 +3134,7 @@ exports = ["svc_a", "svc_b"]
     #[test]
     fn built_dylib_path_with_runner_propagates_subprocess_failure() {
         use super::built_dylib_path_with_runner;
-        use crate::core::error::RuntimeError;
+        use cordis_runtime::core::error::RuntimeError;
         use std::path::Path;
         let err = built_dylib_path_with_runner(
             Path::new("/repo/plugins/qq/Cargo.toml"),
@@ -3284,7 +3167,7 @@ exports = ["svc_a", "svc_b"]
     #[test]
     fn built_dylib_path_with_runner_maps_bad_bytes_to_parse_error() {
         use super::built_dylib_path_with_runner;
-        use crate::core::error::RuntimeError;
+        use cordis_runtime::core::error::RuntimeError;
         use std::path::Path;
         let runner = |_p: &str, _a: &[String], _d: Option<&Path>| Ok(b"{ not json".to_vec());
         let err =
@@ -3354,7 +3237,7 @@ exports = ["svc_a", "svc_b"]
     #[test]
     fn write_pretty_json_errors_and_cleans_tmp_when_rename_fails() {
         use super::write_pretty_json;
-        use crate::core::error::RuntimeError;
+        use cordis_runtime::core::error::RuntimeError;
         use tempfile::TempDir;
         let dir = TempDir::new().unwrap();
         // Target path is itself a non-empty directory; rename over it fails.
@@ -3406,7 +3289,7 @@ exports = ["svc_a", "svc_b"]
     #[test]
     fn stage_then_rename_with_fs_maps_write_failure() {
         use super::{stage_then_rename_file_with_fs, FsWriteOps};
-        use crate::core::error::RuntimeError;
+        use cordis_runtime::core::error::RuntimeError;
         use tempfile::TempDir;
         let dir = TempDir::new().unwrap();
         let src = dir.path().join("src.so");
@@ -3428,7 +3311,7 @@ exports = ["svc_a", "svc_b"]
     #[test]
     fn stage_then_rename_with_fs_maps_sync_failure() {
         use super::{stage_then_rename_file_with_fs, FsWriteOps};
-        use crate::core::error::RuntimeError;
+        use cordis_runtime::core::error::RuntimeError;
         use tempfile::TempDir;
         let dir = TempDir::new().unwrap();
         let src = dir.path().join("src.so");
@@ -3451,7 +3334,7 @@ exports = ["svc_a", "svc_b"]
     #[test]
     fn stage_then_rename_with_fs_maps_rename_failure() {
         use super::{stage_then_rename_file_with_fs, FsWriteOps};
-        use crate::core::error::RuntimeError;
+        use cordis_runtime::core::error::RuntimeError;
         use tempfile::TempDir;
         let dir = TempDir::new().unwrap();
         let src = dir.path().join("src.so");
@@ -3473,7 +3356,7 @@ exports = ["svc_a", "svc_b"]
     #[test]
     fn write_pretty_json_with_fs_maps_write_failure() {
         use super::{write_pretty_json_with_fs, FsWriteOps};
-        use crate::core::error::RuntimeError;
+        use cordis_runtime::core::error::RuntimeError;
         use tempfile::TempDir;
         let dir = TempDir::new().unwrap();
         let target = dir.path().join("index.json");
@@ -3493,7 +3376,7 @@ exports = ["svc_a", "svc_b"]
     #[test]
     fn write_pretty_json_with_fs_maps_sync_failure() {
         use super::{write_pretty_json_with_fs, FsWriteOps};
-        use crate::core::error::RuntimeError;
+        use cordis_runtime::core::error::RuntimeError;
         use tempfile::TempDir;
         let dir = TempDir::new().unwrap();
         let target = dir.path().join("index.json");
@@ -3514,7 +3397,7 @@ exports = ["svc_a", "svc_b"]
     #[test]
     fn write_pretty_json_with_fs_maps_rename_failure_and_cleans_tmp() {
         use super::{write_pretty_json_with_fs, FsWriteOps};
-        use crate::core::error::RuntimeError;
+        use cordis_runtime::core::error::RuntimeError;
         use tempfile::TempDir;
         let dir = TempDir::new().unwrap();
         let target = dir.path().join("index.json");
@@ -3565,7 +3448,7 @@ exports = ["svc_a", "svc_b"]
     #[test]
     fn acquire_with_fs_maps_serialize_failure() {
         use super::{ArtifactBuildLock, LockAcquireOps};
-        use crate::core::error::RuntimeError;
+        use cordis_runtime::core::error::RuntimeError;
         use tempfile::TempDir;
         let dir = TempDir::new().unwrap();
         let ops = LockAcquireOps {
@@ -3583,7 +3466,7 @@ exports = ["svc_a", "svc_b"]
     #[test]
     fn acquire_with_fs_maps_write_failure() {
         use super::{ArtifactBuildLock, LockAcquireOps};
-        use crate::core::error::RuntimeError;
+        use cordis_runtime::core::error::RuntimeError;
         use tempfile::TempDir;
         let dir = TempDir::new().unwrap();
         let ops = LockAcquireOps {
@@ -3601,7 +3484,7 @@ exports = ["svc_a", "svc_b"]
     #[test]
     fn acquire_with_fs_maps_flush_failure() {
         use super::{ArtifactBuildLock, LockAcquireOps};
-        use crate::core::error::RuntimeError;
+        use cordis_runtime::core::error::RuntimeError;
         use tempfile::TempDir;
         let dir = TempDir::new().unwrap();
         let ops = LockAcquireOps {
@@ -3619,7 +3502,7 @@ exports = ["svc_a", "svc_b"]
     #[test]
     fn acquire_with_fs_maps_sync_failure() {
         use super::{ArtifactBuildLock, LockAcquireOps};
-        use crate::core::error::RuntimeError;
+        use cordis_runtime::core::error::RuntimeError;
         use tempfile::TempDir;
         let dir = TempDir::new().unwrap();
         let ops = LockAcquireOps {
@@ -3641,7 +3524,7 @@ exports = ["svc_a", "svc_b"]
     #[test]
     fn acquire_with_fs_times_out_when_lock_permanently_held() {
         use super::{current_epoch_ms, ArtifactBuildLock, ArtifactBuildLockState, LockAcquireOps};
-        use crate::core::error::RuntimeError;
+        use cordis_runtime::core::error::RuntimeError;
         use tempfile::TempDir;
         let dir = TempDir::new().unwrap();
         // Pre-create a live-pid lock so maybe_remove_stale_lock keeps it.
@@ -3674,7 +3557,7 @@ exports = ["svc_a", "svc_b"]
     #[test]
     fn acquire_with_fs_maps_open_error_to_io() {
         use super::{ArtifactBuildLock, LockAcquireOps};
-        use crate::core::error::RuntimeError;
+        use cordis_runtime::core::error::RuntimeError;
         use tempfile::TempDir;
         let dir = TempDir::new().unwrap();
         fn perm_denied(_p: &std::path::Path) -> std::io::Result<std::fs::File> {
@@ -3775,7 +3658,7 @@ exports = ["svc_a", "svc_b"]
     #[test]
     fn maybe_remove_stale_lock_with_fs_maps_metadata_failure_to_io() {
         use super::{maybe_remove_stale_lock_with_fs, MetaOps};
-        use crate::core::error::RuntimeError;
+        use cordis_runtime::core::error::RuntimeError;
         use std::path::Path;
         let ops = MetaOps {
             metadata: erroring_metadata,
@@ -3793,7 +3676,7 @@ exports = ["svc_a", "svc_b"]
     #[test]
     fn build_input_probe_with_fs_maps_metadata_failure_to_io() {
         use super::{build_input_probe_with_fs, MetaOps};
-        use crate::core::error::RuntimeError;
+        use cordis_runtime::core::error::RuntimeError;
         use std::path::{Path, PathBuf};
         let ops = MetaOps {
             metadata: erroring_metadata,
@@ -3813,7 +3696,7 @@ exports = ["svc_a", "svc_b"]
     #[test]
     fn collect_dir_entry_maps_iterator_error_to_io() {
         use super::collect_dir_entry;
-        use crate::core::error::RuntimeError;
+        use cordis_runtime::core::error::RuntimeError;
         use std::path::Path;
         let mut out = Vec::new();
         let synthetic = Err(std::io::Error::other("synthetic dir-entry failure"));
@@ -3831,7 +3714,7 @@ exports = ["svc_a", "svc_b"]
     #[test]
     fn collect_dir_entry_maps_metadata_failure_on_dangling_symlink() {
         use super::collect_dir_entry;
-        use crate::core::error::RuntimeError;
+        use cordis_runtime::core::error::RuntimeError;
         use tempfile::TempDir;
         let dir = TempDir::new().unwrap();
         let link = dir.path().join("dangling");
@@ -3875,7 +3758,7 @@ exports = ["svc_a", "svc_b"]
     #[test]
     fn build_dirty_dylib_plugins_errors_when_fixtures_root_has_no_parent() {
         use super::build_dirty_dylib_plugins;
-        use crate::core::error::RuntimeError;
+        use cordis_runtime::core::error::RuntimeError;
         use std::path::Path;
         let snapshot = empty_dependency_snapshot();
         let err = build_dirty_dylib_plugins(Path::new("/"), &snapshot, &[]);
@@ -3890,7 +3773,7 @@ exports = ["svc_a", "svc_b"]
     #[test]
     fn prepare_artifacts_locked_errors_when_fixtures_root_has_no_parent() {
         use super::{prepare_artifacts_locked, PrepareMode};
-        use crate::core::error::RuntimeError;
+        use cordis_runtime::core::error::RuntimeError;
         use std::path::Path;
         let err = prepare_artifacts_locked(Path::new("/"), PrepareMode::Incremental);
         assert!(
@@ -3905,7 +3788,7 @@ exports = ["svc_a", "svc_b"]
     #[test]
     fn build_plugin_contexts_errors_on_plugin_missing_from_graph() {
         use super::{build_plugin_contexts, ResolvedPluginGraph};
-        use crate::core::error::RuntimeError;
+        use cordis_runtime::core::error::RuntimeError;
         use std::collections::BTreeMap;
         use std::path::Path;
         let graph = ResolvedPluginGraph {
@@ -4061,5 +3944,110 @@ exports = ["svc_a", "svc_b"]
         std::fs::write(&path, b"not json at all").unwrap();
         maybe_remove_stale_lock_with_fs(&path, MetaOps::STD).expect("stale-lock check ok");
         assert!(path.exists(), "a just-written lock must be kept");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Runtime seam: the `PluginBuilder` implementation the CLI installs.
+// ---------------------------------------------------------------------------
+
+/// The production [`PluginBuilder`]: forwards every build entry point to this
+/// crate's functions.
+///
+/// `cordis-cli` installs one at start-up, which is what keeps the runtime's
+/// build paths (iteration stage 3, the `rebuild_plugin_workspace` agent tool,
+/// the crash-recovery restore) behaving exactly as they did when this module
+/// lived inside `cordis-runtime`.
+pub struct CargoBuilder;
+
+impl PluginBuilder for CargoBuilder {
+    fn prepare(&self, fixtures_root: &Path, full: bool) -> Result<PreparedArtifacts, RuntimeError> {
+        let mode = if full {
+            PrepareMode::Full
+        } else {
+            PrepareMode::Incremental
+        };
+        let report = prepare_artifacts(fixtures_root, mode)?;
+        Ok(PreparedArtifacts {
+            rebuilt: report.rebuilt,
+            reused: report.reused,
+            full_rebuild: report.full_rebuild,
+        })
+    }
+
+    fn rebuild_all(&self, fixtures_root: &Path) -> Result<Vec<(String, String)>, RuntimeError> {
+        rebuild_fixture_artifacts(fixtures_root)
+    }
+
+    fn rebuild_plugin(
+        &self,
+        workspace_root: &Path,
+        plugin_path: &str,
+    ) -> Result<Vec<(String, String)>, RuntimeError> {
+        rebuild_plugin_workspace(workspace_root, plugin_path)
+    }
+}
+
+#[cfg(test)]
+mod cargo_builder_tests {
+    use super::{CargoBuilder, RuntimeError};
+    use cordis_runtime::plugin::builder::{PluginBuilder, PreparedArtifacts};
+    use std::path::Path;
+    use tempfile::TempDir;
+
+    /// A tree with a `plugins/` workspace sibling is required for a real
+    /// build; a bare temp dir takes the "no repo sources" early return, which
+    /// is exactly the seam worth pinning here (the heavy paths are covered by
+    /// `tests/tooling.rs` through the very functions these methods forward to).
+
+    #[test]
+    fn prepare_incremental_without_repo_sources_is_a_noop() {
+        let dir = TempDir::new().unwrap();
+        let report = CargoBuilder.prepare(dir.path(), false).unwrap();
+        assert_eq!(report, PreparedArtifacts::default());
+    }
+
+    /// The single "no repo sources next to fixtures" invariant, shared by all
+    /// three entry points (full prepare, rebuild-all, and `rebuild_plugin("/")`).
+    fn assert_missing_repo_sources(err: &RuntimeError) {
+        let expected = "fixture rebuild requires repo sources next to";
+        let carries =
+            matches!(err, RuntimeError::Invariant { message } if message.starts_with(expected));
+        assert!(carries, "expected Invariant, got {err:?}");
+    }
+
+    #[test]
+    fn prepare_full_without_repo_sources_is_an_invariant() {
+        let dir = TempDir::new().unwrap();
+        let err = CargoBuilder.prepare(dir.path(), true).unwrap_err();
+        assert_missing_repo_sources(&err);
+    }
+
+    #[test]
+    fn rebuild_all_without_repo_sources_is_an_invariant() {
+        let dir = TempDir::new().unwrap();
+        let err = CargoBuilder.rebuild_all(dir.path()).unwrap_err();
+        assert_missing_repo_sources(&err);
+    }
+
+    /// `/` means "all plugins" and takes the full-rebuild path.
+    #[test]
+    fn rebuild_plugin_root_slash_rebuilds_everything() {
+        let dir = TempDir::new().unwrap();
+        let err = CargoBuilder.rebuild_plugin(dir.path(), "/").unwrap_err();
+        assert_missing_repo_sources(&err);
+    }
+
+    /// A named plugin shells out to `cargo`; with no workspace manifest that
+    /// build fails and its stderr is surfaced verbatim — byte-for-byte the
+    /// message the pre-split runtime produced.
+    #[test]
+    fn rebuild_plugin_named_plugin_reports_cargo_failure() {
+        let dir = TempDir::new().unwrap();
+        let err = CargoBuilder
+            .rebuild_plugin(Path::new(dir.path()), "/no_such_plugin")
+            .unwrap_err();
+        let carries = matches!(&err, RuntimeError::InvalidArgument { message } if message.starts_with("cargo build -p no_such_plugin failed: "));
+        assert!(carries, "expected cargo failure, got {err:?}");
     }
 }

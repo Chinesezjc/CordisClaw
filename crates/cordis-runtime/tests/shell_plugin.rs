@@ -144,7 +144,7 @@ fn invoke_cli_shell_repl_refuses_non_tty_stdin() {
     // with a clear diagnostic rather than block or pretend to run a session.
     // (Was `invoke_cli_runs_interactive_shell_session`, which asserted the
     // pre-P2-37 behaviour of driving the REPL over a pipe — impossible now.)
-    let bin = env!("CARGO_BIN_EXE_cordis-runtime");
+    let bin = support::cli_binary();
     let mut child = Command::new(bin)
         .args([
             "invoke",

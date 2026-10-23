@@ -97,7 +97,7 @@ expr
 
 ### 2.1 CLI 能力
 
-[crates/cordis-runtime/src/main.rs](../../crates/cordis-runtime/src/main.rs) 当前暴露的 CLI 命令包括：
+[crates/cordis-cli/src/main.rs](../../crates/cordis-cli/src/main.rs) 当前暴露的 CLI 命令包括：
 
 - `cargo run -p cordis-runtime -- fixtures`
   - 加载 fixtures 并打印插件、节点和指标

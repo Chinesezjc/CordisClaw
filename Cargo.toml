@@ -1,13 +1,20 @@
 [workspace]
 members = [
+  "crates/cordis-cli",
   "crates/cordis-plugin-host",
   "crates/cordis-plugin-sdk",
   "crates/cordis-runtime",
+  "crates/cordis-tooling",
 ]
+# The CLI crate is a default member on purpose: `cargo build` must keep
+# producing `target/debug/cordis-runtime` (systemd / ops scripts invoke it by
+# that path) even though the binary now lives in its own package.
 default-members = [
+  "crates/cordis-cli",
   "crates/cordis-plugin-host",
   "crates/cordis-plugin-sdk",
   "crates/cordis-runtime",
+  "crates/cordis-tooling",
 ]
 resolver = "2"
 

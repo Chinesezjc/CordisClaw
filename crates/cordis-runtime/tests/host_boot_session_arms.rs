@@ -31,7 +31,7 @@ use cordis_runtime::config::RuntimeConfig;
 use cordis_runtime::core::error::RuntimeError;
 use cordis_runtime::host::{AgentSessionKind, AgentStartOptions, RuntimeHost, WalkControl};
 use cordis_runtime::kernel::plugin_iteration::PluginEditRollback;
-use cordis_runtime::plugin::tooling::{prepare_artifacts, PrepareMode};
+use cordis_tooling::{prepare_artifacts, PrepareMode};
 use serial_test::serial;
 use tempfile::TempDir;
 
@@ -265,6 +265,10 @@ fn setup_workspace() -> Workspace {
 /// 拆分后 kernel 不自带 LLM 传输，凡是要走通 `agent_send` 的用例都必须有一个声明
 /// `llm_complete` 的插件在场。
 fn setup_workspace_with_llm(llm: &[(&str, &str)]) -> Workspace {
+    // 构建系统已拆到 `cordis-tooling`：runtime 只留 `PluginBuilder` 接缝，
+    // 宿主（cordis-cli）启动时安装实现。这些用例会在 boot 时 replay journal
+    // 并重建工件，必须和 CLI 一样先装 `CargoBuilder`。
+    support::install_cargo_builder();
     let temp = TempDir::new().expect("tempdir");
     let root = temp.path().to_path_buf();
     let plugins_root = root.join("fixtures/plugins");

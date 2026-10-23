@@ -391,7 +391,7 @@ impl Loader {
             // instead. The Ok path keeps the docs-drift auto-heal: a
             // readable dylib's docs are ground truth over the cache.
             if !matches!(entry.artifact_kind, ArtifactKind::Json) {
-                match crate::plugin::tooling::read_plugin_docs(&artifact_path) {
+                match crate::plugin::artifact::read_plugin_docs(&artifact_path) {
                     Ok(dylib_docs) => {
                         if dylib_docs != entry.docs {
                             docs_drift.push((plugin_path.clone(), dylib_docs.clone()));
@@ -2033,7 +2033,7 @@ mod loader_flow_tests {
     /// on hosts where the probe succeeds.
     fn host_native_fixture_docs(name: &str) -> Option<(PathBuf, PluginDocs)> {
         let (src, _) = host_native_fixture(name)?;
-        let docs = crate::plugin::tooling::read_plugin_docs(&src).ok()?;
+        let docs = crate::plugin::artifact::read_plugin_docs(&src).ok()?;
         Some((src, docs))
     }
 

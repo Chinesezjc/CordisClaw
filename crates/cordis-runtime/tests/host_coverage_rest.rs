@@ -82,7 +82,7 @@ static SHARED_HOST: OnceLock<RuntimeHost> = OnceLock::new();
 fn shared_host() -> &'static RuntimeHost {
     SHARED_HOST.get_or_init(|| {
         let root = fixtures_root();
-        cordis_runtime::plugin::tooling::refresh_artifact_index(&root)
+        cordis_tooling::refresh_artifact_index(&root)
             .expect("refresh artifact index before shared boot");
         RuntimeHost::boot(root).expect("host should boot")
     })
@@ -760,7 +760,7 @@ fn boot_on_artifacts_copy() -> (TempDir, PathBuf, RuntimeHost) {
     // sha256 can be stale relative to the copied `.so`. A boot would then fail
     // with `PluginUnavailable { HashMismatch }`. Re-hash the copied artifacts
     // against the copied index before booting.
-    cordis_runtime::plugin::tooling::refresh_artifact_index(&fixtures)
+    cordis_tooling::refresh_artifact_index(&fixtures)
         .expect("refresh copied artifact index before boot");
     // fixtures root 就是 temp.path()，`discover_config_dir` 落到 `temp/config`。
     pin_private_snapshot_root(temp.path(), &fixtures);

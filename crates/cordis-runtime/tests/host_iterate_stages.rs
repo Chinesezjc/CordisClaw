@@ -48,10 +48,12 @@ use cordis_runtime::kernel::plugin_iteration::{
     PluginEditOperation, PluginEditPlan, PluginIterationFinalVerdict, VerifierVerdict,
 };
 use cordis_runtime::kernel::verifier::VerificationProfile;
-use cordis_runtime::plugin::tooling::{prepare_artifacts, PrepareMode};
+use cordis_tooling::{prepare_artifacts, PrepareMode};
 use serde_json::json;
 use serial_test::serial;
 use tempfile::TempDir;
+
+mod support;
 
 // ---------------------------------------------------------------------------
 // Fixture
@@ -120,6 +122,11 @@ impl Workspace {
 /// Build `<temp>/fixtures/{plugins,artifacts}` holding one JSON-artifact
 /// `demo` plugin whose single node is `node_id`.
 fn setup_workspace(node_id: &str, responder: Responder) -> Workspace {
+    // 构建系统已拆到 `cordis-tooling`：runtime 只留 `PluginBuilder` 接缝，
+    // 宿主（cordis-cli）启动时安装实现。本文件驱动完整 iteration 管线
+    // （step 3 rebuild + rollback 的 workspace restore），必须和 CLI 一样
+    // 先装 `CargoBuilder`，否则只会拿到 missing-builder 错误。
+    support::install_cargo_builder();
     let temp = TempDir::new().expect("tempdir");
     let root = temp.path().to_path_buf();
     let fixtures = root.join("fixtures");

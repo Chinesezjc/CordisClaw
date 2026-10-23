@@ -4,9 +4,10 @@ use cordis_runtime::core::models::{
     ArtifactIndex, ArtifactIndexEntry, ArtifactKind, InputProbe, PluginArtifact,
     ARTIFACT_INDEX_SCHEMA_VERSION,
 };
+use cordis_runtime::plugin::artifact::read_plugin_docs;
 use cordis_runtime::plugin::package::PackageResolver;
-use cordis_runtime::plugin::tooling::{
-    ensure_fixture_artifacts, prepare_artifacts, read_plugin_docs, rebuild_fixture_artifacts,
+use cordis_tooling::{
+    ensure_fixture_artifacts, prepare_artifacts, rebuild_fixture_artifacts,
     rebuild_plugin_workspace, refresh_artifact_index, sync_plugin_docs, PrepareMode,
 };
 use serde_json::Value;

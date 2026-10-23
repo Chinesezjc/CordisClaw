@@ -304,7 +304,7 @@
     },
     {
       "id": "qq_get_group_info",
-      "summary": "Get group information (name, member count, etc.) via OneBot v11 get_group_info API.",
+      "summary": "Get a group's name and size (member_count / max_member_count) — use it to tell a two-person group from a busy one. Returns the raw OneBot response, so the fields sit at data.data.",
       "input_schema": {
         "type": "object",
         "required": [
@@ -336,7 +336,32 @@
           },
           "data": {
             "type": "object",
-            "description": "Raw OneBot get_group_info response"
+            "description": "Raw OneBot get_group_info response",
+            "properties": {
+              "status": {
+                "type": "string"
+              },
+              "retcode": {
+                "type": "integer"
+              },
+              "data": {
+                "type": "object",
+                "properties": {
+                  "group_id": {
+                    "type": "integer"
+                  },
+                  "group_name": {
+                    "type": "string"
+                  },
+                  "member_count": {
+                    "type": "integer"
+                  },
+                  "max_member_count": {
+                    "type": "integer"
+                  }
+                }
+              }
+            }
           },
           "error": {
             "type": [
@@ -505,7 +530,7 @@
     },
     {
       "id": "qq_get_reply_policy",
-      "summary": "Read the persisted reply policy — the rule the bot follows to decide whether an incoming QQ message is addressed to it. is_default=true means no policy has been stored yet.",
+      "summary": "Read the reply policy that is EFFECTIVE for a group (omit `group` to read the shared default). Returns the mode (quiet | balanced | chatty | one_on_one), the policy text actually shipped to the model, and where it came from (group | default | builtin).",
       "input_schema": {
         "type": "object",
         "required": [
@@ -515,6 +540,10 @@
           "node_id": {
             "type": "string",
             "const": "qq_get_reply_policy"
+          },
+          "group": {
+            "type": "string",
+            "description": "QQ group id; omit for the shared default"
           },
           "data_dir": {
             "type": "string",
@@ -531,8 +560,21 @@
           "data": {
             "type": "object",
             "properties": {
+              "group": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "mode": {
+                "type": "string"
+              },
               "policy": {
                 "type": "string"
+              },
+              "source": {
+                "type": "string",
+                "description": "group | default | builtin"
               },
               "is_default": {
                 "type": "boolean"
@@ -542,7 +584,7 @@
         }
       },
       "side_effects": [
-        "reads data/qq_reply_policy.json"
+        "reads data/qq_reply_policies.json"
       ],
       "failure_modes": [],
       "node_type": "router",
@@ -550,21 +592,33 @@
     },
     {
       "id": "qq_set_reply_policy",
-      "summary": "Persist the reply policy: the rule the bot follows when deciding whether an incoming message is addressed to it. It is shipped to the model as the first line of every message, so it takes effect on the NEXT message — no rebuild and no restart.",
+      "summary": "Persist the reply policy for ONE group (or the shared default when `group` is omitted). Two ways to set it: `mode` picks a preset (quiet = only when named/@; balanced = judge by context; chatty = join in actively; one_on_one = treat as a direct chat), `policy` overrides the preset with free text. Takes effect on the NEXT message — no rebuild, no restart.",
       "input_schema": {
         "type": "object",
         "required": [
-          "node_id",
-          "policy"
+          "node_id"
         ],
         "properties": {
           "node_id": {
             "type": "string",
             "const": "qq_set_reply_policy"
           },
+          "group": {
+            "type": "string",
+            "description": "QQ group id; omit to change the shared default"
+          },
+          "mode": {
+            "type": "string",
+            "enum": [
+              "quiet",
+              "balanced",
+              "chatty",
+              "one_on_one"
+            ]
+          },
           "policy": {
             "type": "string",
-            "description": "New reply rule text (English; shown to the model verbatim)"
+            "description": "Optional free-text override (English; shown verbatim)"
           },
           "data_dir": {
             "type": "string",
@@ -592,10 +646,140 @@
         }
       },
       "side_effects": [
-        "writes data/qq_reply_policy.json"
+        "writes data/qq_reply_policies.json"
       ],
       "failure_modes": [
-        "policy must not be empty"
+        "mode or policy is required",
+        "unknown mode"
+      ],
+      "node_type": "router",
+      "agent_accessible": true
+    },
+    {
+      "id": "qq_get_group_memory",
+      "summary": "Read the memo you wrote about this group: how talkative it wants you, its standing topics, what it already rejected. memory=null means you have not written anything for this group yet.",
+      "input_schema": {
+        "type": "object",
+        "required": [
+          "node_id",
+          "group"
+        ],
+        "properties": {
+          "node_id": {
+            "type": "string",
+            "const": "qq_get_group_memory"
+          },
+          "group": {
+            "type": "string",
+            "description": "QQ group id"
+          },
+          "data_dir": {
+            "type": "string",
+            "description": "Optional data directory override"
+          }
+        }
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "ok": {
+            "type": "boolean"
+          },
+          "data": {
+            "type": "object",
+            "properties": {
+              "group": {
+                "type": "string"
+              },
+              "memory": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "updated_at_ms": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "updated_by": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            }
+          }
+        }
+      },
+      "side_effects": [
+        "reads data/qq_group_memory.json"
+      ],
+      "failure_modes": [
+        "group is required for qq_get_group_memory"
+      ],
+      "node_type": "router",
+      "agent_accessible": true
+    },
+    {
+      "id": "qq_set_group_memory",
+      "summary": "Write the memo about a group, in your own words: does it want you talkative or quiet, what it talks about, what you already tried and got told off for. Shipped as a `[group memory: ...]` line on every message from that group, so write only what is DURABLE (not something you read from one message). Blank `memory` deletes the entry. Capped at 800 characters.",
+      "input_schema": {
+        "type": "object",
+        "required": [
+          "node_id",
+          "group"
+        ],
+        "properties": {
+          "node_id": {
+            "type": "string",
+            "const": "qq_set_group_memory"
+          },
+          "group": {
+            "type": "string",
+            "description": "QQ group id"
+          },
+          "memory": {
+            "type": "string",
+            "description": "Memo text; empty string deletes it"
+          },
+          "data_dir": {
+            "type": "string",
+            "description": "Optional data directory override"
+          }
+        }
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "ok": {
+            "type": "boolean"
+          },
+          "data": {
+            "type": "object",
+            "properties": {
+              "group": {
+                "type": "string"
+              },
+              "memory": {
+                "type": "string"
+              },
+              "dropped_chars": {
+                "type": "integer"
+              },
+              "path": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "side_effects": [
+        "writes data/qq_group_memory.json"
+      ],
+      "failure_modes": [
+        "group is required for qq_set_group_memory"
       ],
       "node_type": "router",
       "agent_accessible": true
@@ -651,5 +835,5 @@
       "agent_accessible": false
     }
   ],
-  "system_hint": "QQ GROUP CHAT MODE — you are running in a QQ group. Messages may be casual chat NOT directed at you.\nCRITICAL: Always decide whether the message is actually talking to YOU before responding.\nREPLY POLICY — the authority on whether to answer: every incoming message begins with a line `[reply policy: ...]`. That line IS the rule; follow it exactly. It may be more permissive than you expect (e.g. \"reply whenever someone seems to want an answer\"), so do not apply a stricter rule of your own.\nIf a message has NO `[reply policy: ...]` line, fall back to the conservative default: answer ONLY when the message @mentions you or addresses you by name (\"bot\", \"Bot\", \"机器人\"); otherwise suspend.\nA message is NOT directed at you if: general group discussion; questions not explicitly addressed to you under the policy above; casual chat; emoji/sticker; talking about someone else.\nIf NOT directed at you: use {\"action\":\"suspend\"}.\nIf directed at you: invoke_plugin(qq, qq_send, ...) to send your reply, then output {\"action\":\"suspend\"}.\nIMPORTANT: NEVER use {\"action\":\"respond\"} — it will cause duplicate messages. Always send via qq_send and finish with {\"action\":\"suspend\"}.\nIf the user asks you to change the reply rule (e.g. \"reply to everything I say\", \"stop answering so often\"), persist it: invoke_plugin(qq, qq_set_reply_policy, {\"node_id\":\"qq_set_reply_policy\",\"policy\":\"<new rule text>\"}), then tell the user it is already in effect — the next message uses the new policy, no restart needed.\n\nANTI-HALLUCINATION rules:\n- If a question is ambiguous or you lack context, ask for clarification — do NOT guess.\n- If web search fails to yield a clear answer after 2 attempts, stop and tell the user what you found (or didn't find). Ask them to clarify.\n- Pay attention to the group's recent conversation. The topic may be group-specific and not searchable on the web.\n- A short honest \"not sure, can you clarify?\" is always better than a long wrong answer.\n- Never claim a tool or permission is unavailable without actually invoking it first: every node listed in this plugin's interfaces is callable by you.\n\nKERNEL TOOL usage in QQ chat:\n- Kernel introspection tools (get_runtime_status, list_plugins, list_nodes, get_kernel_status, get_kernel_issues) are for internal diagnostics only.\n- Only call them when a user @mentions you with an explicit question about bot/runtime/plugin status.\n- For images, stickers, casual chat, or ambiguous messages: suspend immediately — do NOT call any kernel tool.\n\nTo send a progress update or proactive message to the group you're talking to:\ninvoke_plugin(qq, qq_send, {\"node_id\":\"qq_send\",\"target\":\"group:<group_id>\",\"message\":\"<your message>\"})\nReplace <group_id> with the actual group ID from the incoming message.\nSend a brief progress message BEFORE any tool that may take more than a moment (build, test, search, etc.), and a follow-up when the tool completes.\n\nTo query group members: invoke_plugin(qq, qq_get_group_members, {\"node_id\":\"qq_get_group_members\",\"target\":\"group:<id>\"})\nYou CAN query group members/roles: invoke_plugin(qq, qq_get_group_roles, {\"node_id\":\"qq_get_group_roles\",\"target\":\"group:<id>\"}). Use it when asked who the group owner or admins are — never guess a name or claim you lack permission.\nTo proactively send to a group: invoke_plugin(qq, qq_send, {\"node_id\":\"qq_send\",\"target\":\"group:<id>\",\"message\":\"<text>\"})"
+  "system_hint": "QQ GROUP CHAT MODE — you are running in a QQ group. Messages may be casual chat NOT directed at you.\nCRITICAL: Always decide whether the message is actually talking to YOU before responding.\nREPLY POLICY — the authority on whether to answer. Every incoming message starts with `[reply policy: <mode> — <text>]`. That line IS the rule for this group; follow it exactly and do not substitute a stricter rule of your own.\nquiet      — answer only when @mentioned or addressed by name.\nbalanced   — judge from the conversation: answer when it is addressed to you or clearly wants your answer; stay out of threads between other people.\nchatty     — this group WANTS you to participate: answer questions you can help with, add a short remark when it fits, take a joke. Never hijack a thread between two others.\none_on_one — treat it as a direct chat: answer every message meant for you; do not go silent just because it is technically a group.\nSMALL GROUPS — a group that is effectively private (you and one or two people) should behave like a direct chat. If you are not sure how big a group is, look it up once with `qq_get_group_info` (its docs are in the plugin catalog below) and, when member_count <= 2, set this group's mode to one_on_one with `qq_set_reply_policy` and remember it. Decide once per group — never probe on every message.\nHOW TO JUDGE — use the conversation history, not just this one message: who is talking to whom, whether the last few lines are a thread you are part of, whether someone asked a question nobody answered. A message that continues a thread you are already in is addressed to you even without naming you.\n[group memory: ...] — this is YOUR OWN memo about this group (how talkative it wants you, its standing topics, what it told you off for). Follow it. If the line is absent you have written nothing yet.\nWRITING MEMORY — when you learn something DURABLE about a group (it wants you quiet, it wants you chatty, its standing topic, a joke that landed badly), persist it with `qq_set_group_memory` (see the catalog for its arguments). Do NOT write on every message — only durable preferences, and never guess one from a single message. To change how talkative you are, use `qq_set_reply_policy` with one of the four modes. Both take effect on the next message.\nIf the message is NOT for you: use {\"action\":\"suspend\"}.\nIf it IS for you: invoke_plugin(qq, qq_send, ...) to send your reply, then output {\"action\":\"suspend\"}.\nIMPORTANT: NEVER use {\"action\":\"respond\"} — it will cause duplicate messages. Always send via qq_send and finish with {\"action\":\"suspend\"}.\nIf the user asks you to change the reply rule (e.g. \"reply to everything I say\", \"stop answering so often\"), persist it: invoke_plugin(qq, qq_set_reply_policy, {\"node_id\":\"qq_set_reply_policy\",\"policy\":\"<new rule text>\"}), then tell the user it is already in effect — the next message uses the new policy, no restart needed.\n\nANTI-HALLUCINATION rules:\n- If a question is ambiguous or you lack context, ask for clarification — do NOT guess.\n- If web search fails to yield a clear answer after 2 attempts, stop and tell the user what you found (or didn't find). Ask them to clarify.\n- Pay attention to the group's recent conversation. The topic may be group-specific and not searchable on the web.\n- A short honest \"not sure, can you clarify?\" is always better than a long wrong answer.\n- Never claim a tool or permission is unavailable without actually invoking it first: every node listed in this plugin's interfaces is callable by you.\n\nKERNEL TOOL usage in QQ chat:\n- Kernel introspection tools (get_runtime_status, list_plugins, list_nodes, get_kernel_status, get_kernel_issues) are for internal diagnostics only.\n- Only call them when a user @mentions you with an explicit question about bot/runtime/plugin status.\n- For images, stickers, or casual chat: do NOT call any kernel introspection tool. Whether to reply is still the reply policy's call — silence is allowed there, but it is NOT the default.\n\nTo send a progress update or proactive message to the group you're talking to:\ninvoke_plugin(qq, qq_send, {\"node_id\":\"qq_send\",\"target\":\"group:<group_id>\",\"message\":\"<your message>\"})\nReplace <group_id> with the actual group ID from the incoming message.\nSend a brief progress message BEFORE any tool that may take more than a moment (build, test, search, etc.), and a follow-up when the tool completes.\n\nTo query group members: invoke_plugin(qq, qq_get_group_members, {\"node_id\":\"qq_get_group_members\",\"target\":\"group:<id>\"})\nYou CAN query group members/roles: invoke_plugin(qq, qq_get_group_roles, {\"node_id\":\"qq_get_group_roles\",\"target\":\"group:<id>\"}). Use it when asked who the group owner or admins are — never guess a name or claim you lack permission.\nTo proactively send to a group: invoke_plugin(qq, qq_send, {\"node_id\":\"qq_send\",\"target\":\"group:<id>\",\"message\":\"<text>\"})"
 }

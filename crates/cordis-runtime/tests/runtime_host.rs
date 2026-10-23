@@ -6,7 +6,7 @@ use cordis_runtime::kernel::plugin_iteration::{
     PluginEditOperation, PluginEditPlan, PluginIterationFinalVerdict, VerifierVerdict,
 };
 use cordis_runtime::kernel::verifier::VerificationProfile;
-use cordis_runtime::plugin::tooling::refresh_artifact_index;
+use cordis_tooling::refresh_artifact_index;
 use serde_json::{json, Value};
 use serial_test::serial;
 use std::fs;
@@ -2041,7 +2041,7 @@ fn serve_mode_supports_plugins_reload_and_kernel_status() {
     }
     let temp = setup_fixture_workspace_copy();
     let fixtures = temp.path().join("fixtures");
-    let bin = env!("CARGO_BIN_EXE_cordis-runtime");
+    let bin = support::cli_binary();
     let mut child = Command::new(bin)
         .args(["serve", fixtures.to_str().expect("temp path utf-8")])
         .stdin(Stdio::piped())
@@ -2091,7 +2091,7 @@ fn serve_mode_supports_candidate_control_plane() {
     let temp = setup_fixture_workspace_copy();
     let fixtures = temp.path().join("fixtures");
 
-    let bin = env!("CARGO_BIN_EXE_cordis-runtime");
+    let bin = support::cli_binary();
     let mut child = Command::new(bin)
         .args(["serve", fixtures.to_str().expect("temp path utf-8")])
         .stdin(Stdio::piped())

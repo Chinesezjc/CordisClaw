@@ -16,12 +16,15 @@ libloading.workspace = true
 libc = "0.2"
 chrono = "0.4"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
-ctrlc = "3"
-rustyline = "15"
 shell-words = "1"
 
 [dev-dependencies]
 cordis-plugin-sdk = { path = "../cordis-plugin-sdk" }
+# Dev-only dependency on the extracted build tooling: the runtime never links a
+# build backend, but its tests build fixture artifacts and install
+# `cordis_tooling::CargoBuilder` into `plugin::builder` the way `cordis-cli`
+# does. Cargo permits this dev-dependency cycle (tooling → runtime).
+cordis-tooling = { path = "../cordis-tooling" }
 serial_test = "3"
 tempfile = "3"
 sha2.workspace = true

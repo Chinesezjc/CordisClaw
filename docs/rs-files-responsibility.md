@@ -10,6 +10,16 @@
 | `crates/cordis-plugin-sdk/src/llm.rs` | kernel↔provider 插件的 LLM 契约类型；只以 JSON 过 payload，不改 vtable 布局故无需 ABI bump | `LlmCompletionRequest`、`LlmCompletion`、`LlmMessage`、`LlmStreamFrame` |
 | `crates/cordis-plugin-sdk/src/workflow.rs` | 非宏 async workflow 作者接口：受控 await 原语、wait 句柄、runtime 提交/轮询/取消边界 | `WorkflowRuntime`、`WorkflowSession`、`WaitSpec`、`WaitFuture` |
 
+## 1b. 构建系统 (`crates/cordis-tooling`)
+
+构建逻辑已整体移出 runtime（5.2.48）：runtime 只保留加载期要用的 artifact 读取与 `PluginBuilder` 接缝，本 crate 由 `cordis-cli` 在启动时注入。
+
+| 文件 | 职责定位 | 关键入口 |
+|---|---|---|
+| `crates/cordis-tooling/src/lib.rs` | 构建系统全部实现（原 `cordis-runtime/src/plugin/tooling.rs`）：manifest/metadata 解析、dirty 指纹与 input probe、构建锁、`cargo` 子进程（超时/offline/proxy 清理）、`artifacts/index.json` 生成、`interfaces.json` 回写、dylib 工件构建；并通过 `CargoBuilder` 实现 runtime 的 `PluginBuilder` 接缝 | `prepare_artifacts()`、`rebuild_fixture_artifacts()`、`rebuild_plugin_workspace()`、`sync_plugin_docs()`、`refresh_artifact_index()`、`CargoBuilder` |
+| `crates/cordis-tooling/tests/tooling.rs` | 构建系统验收（原 `crates/cordis-runtime/tests/tooling.rs`）：docs 回写、artifact index 刷新、dirty/增量/全量重建、构建锁、cargo 失败臂 | `sync_plugin_docs_*`、`refresh_artifact_index_*`、`prepare_artifacts_*` |
+| `crates/cordis-tooling/tests/support/mod.rs` | 本 crate 集成测试的 fixtures 根与宿主原生 dylib 探针 | `fixtures_root()`、`linux_dylib_artifacts_available()` |
+
 ## 2. Core 层 (`crates/cordis-runtime/src/core`)
 
 | 文件 | 职责定位 | 关键入口 |
@@ -24,12 +34,12 @@
 | 文件 | 职责定位 | 关键入口 |
 |---|---|---|
 | `crates/cordis-runtime/src/plugin/abi.rs` | runtime 侧 ABI 聚合：重导出共享函数表契约，并保留 host 本地元数据/trait | `RustPluginApiV2` |
-| `crates/cordis-runtime/src/plugin/artifact.rs` | 预构建工件索引读取与哈希计算 | `load_artifact_index()`、`sha256_file()` |
+| `crates/cordis-runtime/src/plugin/artifact.rs` | 预构建工件索引读取与哈希计算；加载期 docs 读取（dylib `docs()` / JSON artifact）与进程存活探活 | `load_artifact_index()`、`sha256_file()`、`read_plugin_docs()`、`lock_pid_is_live()` |
+| `crates/cordis-runtime/src/plugin/builder.rs` | 构建系统的唯一 trait 接缝：runtime 只调用、嵌入方注入实现；未安装时的统一错误文本 | `PluginBuilder`、`PreparedArtifacts`、`install_plugin_builder()`、`plugin_builder()`、`missing_builder_error()` |
 | `crates/cordis-runtime/src/plugin/dynamic.rs` | 动态库加载与固定符号解析 | `LoadedDylibApi::open()` |
 | `crates/cordis-runtime/src/plugin/package.rs` | Phase A：按 direct-children metadata 递归发现并做 fail-fast 校验 | `PackageResolver::resolve()` |
 | `crates/cordis-runtime/src/plugin/loader.rs` | Phase B：实例化、注册、required/optional 传播与禁回退策略；dylib 在 dlopen 前做宿主 target_triple 预检（不匹配 → AbiMismatch），docs 读取失败 → SymbolMissing 不回落；shell 与整棵 expr 子树现在都走 dylib 路径 | `Loader::load()` |
 | `crates/cordis-runtime/src/plugin/invoke.rs` | 运行时插件调用桥：按统一入口执行 dylib 或外部进程插件 | `PluginInvoker::invoke()` |
-| `crates/cordis-runtime/src/plugin/tooling.rs` | 工具化命令：从 dylib `docs()` 回写 `interfaces.json`，并刷新 artifact index 的哈希 | `sync_plugin_docs()`、`refresh_artifact_index()` |
 | `crates/cordis-runtime/src/plugin/registry.rs` | 插件/节点注册中心，维护唯一性与状态 | `PluginRegistry`、`NodeRegistry` |
 | `crates/cordis-runtime/src/plugin/mod.rs` | Plugin 模块导出聚合 | `pub mod abi/artifact/...` |
 
@@ -104,7 +114,13 @@
 | `crates/cordis-runtime/src/testutil.rs` | `#[cfg(test)]` 单测公共工具：全 crate 唯一的 euid 特权探测点，root 下声明式跳过文件权限故障注入测试 | `skip_if_root()` |
 | `crates/cordis-runtime/src/llm_sink.rs` | token 流式旁路的 host 侧：TCP 回环监听、行分隔 JSON 帧解析、握手校验。帧判定与超时判定抽成纯函数以便全覆盖 | `SinkListener::bind()`、`classify_frame()`、`TokenSink` |
 | `crates/cordis-runtime/src/host.rs` | 常驻宿主：持有当前快照、执行原子 `reload`、保留 kernel 状态并清理 retired snapshots；snapshot 目录 GC（跨 hash 目录孤儿回收 + 退出时回收 live staged root） | `RuntimeHost::boot()`、`RuntimeHost::reload()`、`cleanup_orphaned_snapshot_roots()`、`RuntimeHost::cleanup_live_snapshot()` |
-| `crates/cordis-runtime/src/main.rs` | 运行入口示例（加载 fixtures、`serve`、通用 invoke、导出图 HTML、运行 auto-update、`gc` 回收 snapshot 目录） | `main()` |
+| `crates/cordis-cli/src/main.rs` | 进程入口（原 `crates/cordis-runtime/src/main.rs`）：加载 fixtures、`serve`、通用 invoke、导出图 HTML、运行 auto-update、`gc` 回收 snapshot 目录、prepare/sync/refresh 构建命令；`main()` 一开始把 `cordis_tooling::CargoBuilder` 注入 runtime 的 `PluginBuilder` 接缝 | `main()` |
+
+## 8b. CLI crate (`crates/cordis-cli`)
+
+| 文件 | 职责定位 | 关键入口 |
+|---|---|---|
+| `crates/cordis-cli/Cargo.toml` | 二进制 crate：`[[bin]] name = "cordis-runtime"`（**二进制名保持不变**，systemd / `scripts/*.sh` 仍按 `target/debug/cordis-runtime` 调用）；依赖 `cordis-runtime` + `cordis-tooling` | — |
 
 ## 9. Runtime 测试 (`crates/cordis-runtime/tests`)
 
@@ -115,7 +131,7 @@
 | `crates/cordis-runtime/tests/actor_executor.rs` | Actor 执行批次和并发上限行为 | `actor_executor_respects_parallel_limit_and_order` |
 | `crates/cordis-runtime/tests/auto_update.rs` | 自动更新行为验收：应用成功保留、验证失败回滚、路径越界拒绝 | `auto_update_*` |
 | `crates/cordis-runtime/tests/shell_plugin.rs` | 外部 shell 插件验收：loader 注册、generic invoke、交互 REPL、Expr 分发 | `shell_plugin_*` |
-| `crates/cordis-runtime/tests/tooling.rs` | 工具链验收：自动回写 `interfaces.json` 与自动刷新 artifact index 哈希 | `sync_plugin_docs_*`、`refresh_artifact_index_*` |
+| `crates/cordis-tooling/tests/tooling.rs` | 工具链验收（5.2.48 起随构建系统搬到 `cordis-tooling`）：自动回写 `interfaces.json` 与自动刷新 artifact index 哈希 | `sync_plugin_docs_*`、`refresh_artifact_index_*` |
 | `crates/cordis-runtime/tests/runtime_host.rs` | RuntimeHost 验收：boot/invoke、reload、旧快照隔离、agent 迭代、rollback、canary、serve CLI、YAML config | `runtime_host_*`、`serve_mode_*` |
 
 > **已删除**: `tests/kernel.rs`（测试已删除的 SelfIterationKernel）、`tests/llm_auto_update.rs`（测试已删除的 LlmPatchPlanner）

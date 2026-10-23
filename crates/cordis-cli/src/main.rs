@@ -13,7 +13,7 @@ use cordis_runtime::kernel::plugin_iteration::{
 use cordis_runtime::kernel::verifier::VerificationProfile;
 use cordis_runtime::plugin::invoke::PluginInvoker;
 use cordis_runtime::plugin::loader::{default_loader_config, Loader};
-use cordis_runtime::plugin::tooling::{
+use cordis_tooling::{
     prepare_artifacts, rebuild_fixture_artifacts, refresh_artifact_index, sync_plugin_docs,
     PrepareMode,
 };
@@ -66,7 +66,7 @@ struct AgentEnvelope {
     #[serde(default)]
     conversation_kind: String,
     /// 本批消息里带的图片地址（渠道中立）。kernel 自己下载并内联成
-    /// `image_url` content part（见 `crate::image_input`），所以插件只需
+    /// `image_url` content part（见 `cordis_runtime::image_input`），所以插件只需
     /// 把图片 URL 原样交出来，不必理解多模态 wire format。
     #[serde(default)]
     images: Vec<String>,
@@ -496,6 +496,17 @@ fn install_sigterm_handler() {
 
 fn main() {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
+
+    // Install the build backend before anything boots. The runtime only holds
+    // the `PluginBuilder` seam (`runtime` does not link build tooling), while
+    // `serve` / `auto-update` reach that seam at any time: iteration stage 3,
+    // the `rebuild_plugin_workspace` agent tool, and crash-recovery restore.
+    // `--runtime-only` installs too — self-iteration may need it later. A
+    // duplicate install only returns `false`, never a failure, so ignore it.
+    let _ = cordis_runtime::plugin::builder::install_plugin_builder(Box::new(
+        cordis_tooling::CargoBuilder,
+    ));
+
     if args.first().map(|x| x.as_str()) == Some("auto-update") {
         if let Err(err) = run_auto_update(&args[1..]) {
             eprintln!("auto-update failed: {err}");

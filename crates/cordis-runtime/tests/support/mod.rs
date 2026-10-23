@@ -1,15 +1,37 @@
-use cordis_runtime::plugin::tooling::ensure_fixture_artifacts;
+use cordis_tooling::ensure_fixture_artifacts;
 use serde_json::Value;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
+use std::sync::Once;
 use std::sync::OnceLock;
 use std::thread;
 use std::time::Duration;
 
 #[allow(dead_code)]
 static FIXTURES_ROOT: OnceLock<PathBuf> = OnceLock::new();
+
+/// Install the cargo build backend into the runtime, exactly as `cordis-cli`
+/// does at start-up.
+///
+/// Building is no longer a runtime mechanism: a bare `cordis-runtime` reports
+/// `no plugin builder installed (this build has no build tooling)`. Every
+/// integration test that drives a build path (iteration stage 3, the
+/// `rebuild_plugin_workspace` agent tool, crash-recovery restore) must install
+/// the backend first, and tests get it through this helper. Idempotent, so it
+/// is safe to call from several helpers within one binary.
+#[allow(dead_code)]
+pub fn install_cargo_builder() {
+    static INSTALL: Once = Once::new();
+    INSTALL.call_once(|| {
+        // A second install in the same process only reports `false`; the first
+        // installation is already in place, so the result is not interesting.
+        let _ = cordis_runtime::plugin::builder::install_plugin_builder(Box::new(
+            cordis_tooling::CargoBuilder,
+        ));
+    });
+}
 
 /// The pre-built `.so` artifacts under `fixtures/artifacts/` are all
 /// `x86_64-unknown-linux-gnu` ELF binaries (their target triple is recorded
@@ -28,8 +50,27 @@ pub fn linux_dylib_artifacts_available() -> bool {
     cordis_plugin_sdk::CORDIS_TARGET == "x86_64-unknown-linux-gnu"
 }
 
+/// Path to the `cordis-runtime` CLI binary (now built by the `cordis-cli`
+/// package, under the same name — systemd and the ops scripts invoke it).
+///
+/// `CARGO_BIN_EXE_<name>` is only exported to tests of the package that
+/// declares the bin, so these tests can no longer `env!` it. Integration test
+/// binaries live in `<target>/<profile>/deps/`, so the CLI sits two directories
+/// up. The binary is a default workspace member: `cargo build` /
+/// `cargo test` (workspace) / CI build it before tests run.
+#[allow(dead_code)]
+pub fn cli_binary() -> PathBuf {
+    let mut path = std::env::current_exe().expect("integration test binary path");
+    path.pop(); // <target>/<profile>/deps
+    path.pop(); // <target>/<profile>
+    let binary = path.join(format!("cordis-runtime{}", std::env::consts::EXE_SUFFIX));
+    assert!(binary.exists(), "build the workspace first: `cargo build`");
+    binary
+}
+
 #[allow(dead_code)]
 pub fn fixtures_root() -> PathBuf {
+    install_cargo_builder();
     FIXTURES_ROOT
         .get_or_init(|| {
             let root = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -69,6 +110,7 @@ pub fn fixtures_root() -> PathBuf {
 // 发 lint"报警。与本文件其余 helper 保持一致。
 #[allow(dead_code)]
 pub fn pin_private_snapshot_root(temp_root: &Path, fixtures_root: &Path) -> PathBuf {
+    install_cargo_builder();
     let config_dir = cordis_runtime::config::discover_config_dir(fixtures_root);
     assert!(
         config_dir.starts_with(temp_root),

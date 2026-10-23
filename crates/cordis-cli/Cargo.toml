@@ -1,0 +1,19 @@
+[package]
+name = "cordis-cli"
+version = "0.1.0"
+edition = "2021"
+
+# Binary name is part of the deployment contract: systemd and the ops scripts
+# invoke `target/debug/cordis-runtime`, so it must not follow the package name.
+[[bin]]
+name = "cordis-runtime"
+path = "src/main.rs"
+
+[dependencies]
+cordis-runtime = { path = "../cordis-runtime" }
+cordis-tooling = { path = "../cordis-tooling" }
+serde.workspace = true
+serde_json.workspace = true
+libc = "0.2"
+ctrlc = "3"
+rustyline = "15"

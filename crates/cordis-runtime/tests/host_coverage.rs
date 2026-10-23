@@ -57,7 +57,7 @@ fn shared_host() -> &'static RuntimeHost {
         // fails with `PluginUnavailable { HashMismatch }`. Re-hash every
         // staged artifact and rewrite the index right before booting so the
         // shared host always sees a consistent index.
-        cordis_runtime::plugin::tooling::refresh_artifact_index(&root)
+        cordis_tooling::refresh_artifact_index(&root)
             .expect("refresh artifact index before shared boot");
         RuntimeHost::boot(root).expect("host should boot")
     })
@@ -1180,7 +1180,7 @@ fn host_reload_with_diagnostics_noop_reports_reloaded() {
     // succeed, keeping the assertion strength.
     let mut attempt = host.reload_with_diagnostics("expr");
     if attempt.status != ReloadAttemptStatus::Reloaded {
-        cordis_runtime::plugin::tooling::refresh_artifact_index(&fixtures_root())
+        cordis_tooling::refresh_artifact_index(&fixtures_root())
             .expect("refresh artifact index after stale-hash reload failure");
         attempt = host.reload_with_diagnostics("expr");
     }
@@ -1211,8 +1211,7 @@ fn host_iterate_plugins_agent_failure_surfaces_enriched_error() {
     let fixtures = fixtures_root();
     // Keep the fixtures artifact index consistent with the on-disk dylibs
     // (other tests may have rebuilt them mid-suite).
-    cordis_runtime::plugin::tooling::refresh_artifact_index(&fixtures)
-        .expect("refresh artifact index before boot");
+    cordis_tooling::refresh_artifact_index(&fixtures).expect("refresh artifact index before boot");
 
     // Reserve then release a loopback port so a connection there is refused
     // immediately — a deterministic, fast LLM failure.

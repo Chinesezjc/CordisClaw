@@ -2,7 +2,7 @@
 
 ## 1. 判定口径
 
-- 本文基于当前仓库现状整理，最近更新：2026-10-22。
+- 本文基于当前仓库现状整理，最近更新：2026-10-23。
 - 历史规划蓝图已经吸收进 [design-blueprint.md](./design-blueprint.md)，因此本文结论来自三类证据的交叉比对：
   - 设计蓝图：[design-blueprint.md](./design-blueprint.md)
   - 架构文档：[system-overview.md](./system-overview.md)、[contracts-and-loading.md](./contracts-and-loading.md)、[runtime-semantics.md](./runtime-semantics.md)、[maintenance-guide.md](./maintenance-guide.md)
@@ -204,7 +204,7 @@ Agent 现在可以自主完成：读代码 → 理解结构 → 写/改文件 �
 
 ### 5.1.1 lib 单测 snapshot root 共享导致并行互踩（2026-07-23 发现，2026-07-24 已闭合）
 
-- [x] 根因：共享 repo fixtures 的测试派生同一 `default_snapshot_root`，boot 无条件删除目录下所有 `snapshot-*`，并行 boot 互删对方 in-flight staging（`rename staging -> target failed`，x86_64-linux 实测 5 例）。修复：snapshot 目录名改为 `snapshot-{pid}-{nanos}`，boot 清理抽为 `cleanup_stale_snapshot_dirs`，按目录名 pid 段经 `lock_pid_is_live`（tooling.rs，`kill(pid,0)` 探活，改 `pub(crate)` 复用）只删已死进程的残留；同进程并行测试线程共享活 pid 不再互删，旧格式 `snapshot-{nanos}` 视为 stale。配套单测 `stale_snapshot_cleanup_keeps_live_pid_dirs`（活 pid 保留 / 已死子进程 pid 删除 / 旧格式删除 / 非 snapshot 目录与普通文件不动）。CI 的 `--test-threads=1` 串行开关随之移除。
+- [x] 根因：共享 repo fixtures 的测试派生同一 `default_snapshot_root`，boot 无条件删除目录下所有 `snapshot-*`，并行 boot 互删对方 in-flight staging（`rename staging -> target failed`，x86_64-linux 实测 5 例）。修复：snapshot 目录名改为 `snapshot-{pid}-{nanos}`，boot 清理抽为 `cleanup_stale_snapshot_dirs`，按目录名 pid 段经 `lock_pid_is_live`（现 `plugin/artifact.rs`，`kill(pid,0)` 探活；5.2.48 拆出 tooling 后由 `pub(crate)` 放宽为 `pub`，供 `cordis-tooling` 复用）只删已死进程的残留；同进程并行测试线程共享活 pid 不再互删，旧格式 `snapshot-{nanos}` 视为 stale。配套单测 `stale_snapshot_cleanup_keeps_live_pid_dirs`（活 pid 保留 / 已死子进程 pid 删除 / 旧格式删除 / 非 snapshot 目录与普通文件不动）。CI 的 `--test-threads=1` 串行开关随之移除。
 
 ### 5.2 执行引擎缺口闭合（2026-06-05 大部分已闭合）
 
@@ -239,6 +239,116 @@ Agent 现在可以自主完成：读代码 → 理解结构 → 写/改文件 �
 - [x] **Filesystem / Git 白名单不再静默降级**（P0-19）— `canonicalize` 失败时不再退回未规范化路径。新增 `canonicalise_for_whitelist` / `validate_path_in_root` 的深度 ancestor 解析：路径不存在时 canonicalize 最深的存在祖先再拼 tail；两侧都失败则 fail-closed。`../../etc/shadow` 之类的构造再无绕过。
 - [x] **Plugin iteration symlink 逃逸**（P0-20）— `PluginEditExecutor::execute` 在写入前调用新 helper `resolve_under_workspace`：canonicalize 结果必须仍在 workspace_root 下。plugins 内的 symlink 指向 `/etc/passwd` 之类无法被写入。
 - [x] **Verifier shell 拼接**（P0-21）— 已随 A 批 P0-1 修复。`discover_rust_workspace_manifest` 输出的字符串被 `shell_words` 解析成 argv，空格 / `$` / `;` 无法被解释。
+
+### 5.2.48 拆出 cordis-tooling / cordis-cli（2026-10-23）
+
+**动机**：构建系统（`prepare_artifacts` / `rebuild_fixture_artifacts` /
+`rebuild_plugin_workspace` / `sync_plugin_docs` / `refresh_artifact_index`，连同
+dirty 指纹、input probe、构建锁、`cargo` 子进程）一直长在 `cordis-runtime` 的
+`plugin/tooling.rs` 里，可它**不是运行时机制**：runtime 只需要读已经存在的工件。
+把它留在 lib 里，等于让"只读运行时"隐含地依赖 `cargo`、可写的 fixtures 源码树和
+构建期临时目录。这次是**纯搬运式重构**：除"没装 builder 时的报错"这一处新接缝，
+所有对外签名 / 错误文本 / 文件路径 / 日志文本逐字节不变。
+
+**结构**
+
+```
+crates/
+  cordis-plugin-sdk/   不变
+  cordis-runtime/      lib：加载期 artifact 读取 + PluginBuilder 接缝，无构建逻辑
+  cordis-tooling/      构建系统（原 plugin/tooling.rs 的构建部分 + 它的 111 个单测）
+  cordis-cli/          二进制入口（[[bin]] name = "cordis-runtime" 保持不变）
+```
+
+依赖方向（无环）：`cordis-cli -> {cordis-runtime, cordis-tooling}`、
+`cordis-tooling -> cordis-runtime`；`cordis-runtime` **不依赖** `cordis-tooling`
+（只在 `[dev-dependencies]` 里依赖它，供测试构建 fixture 工件并安装真实 builder；
+Cargo 允许这种 dev-dep 环）。
+
+**留在 runtime 的少数加载期函数**（`crates/cordis-runtime/src/plugin/artifact.rs`）：
+
+- `read_plugin_docs()` — loader 在 dlopen 之后/读 JSON 工件时都要用；
+- `lock_pid_is_live()` — host 判断 `snapshot-{pid}-{nanos}` 目录属主是否存活；
+- `parse_dylib_payload()` — 上面两个 + tooling 的 `inspect_dylib_contract` 共用的
+  docs/fingerprint 解析与错误文本（`runtime {what} parse failed: …`）。
+
+**trait 接缝**（`crates/cordis-runtime/src/plugin/builder.rs`，构建系统的唯一入口）：
+
+```rust
+pub trait PluginBuilder: Send + Sync {
+    fn prepare(&self, fixtures_root: &Path, full: bool) -> Result<PreparedArtifacts, RuntimeError>;
+    fn rebuild_all(&self, fixtures_root: &Path) -> Result<Vec<(String, String)>, RuntimeError>;
+    fn rebuild_plugin(&self, workspace_root: &Path, plugin_path: &str) -> Result<Vec<(String, String)>, RuntimeError>;
+}
+```
+
+- 全局 `OnceLock<Box<dyn PluginBuilder>>` + `install_plugin_builder()`（幂等，
+  第二次返回 `false`）/ `plugin_builder()`（未安装 → `None`）；
+- 未安装时统一错误 `missing_builder_error()`：
+  `internal invariant broken: no plugin builder installed (this build has no build tooling)`
+  （测试逐字节断言 message 与 Display 两种形态）；
+- `cordis-tooling::CargoBuilder` 实现该 trait，三个方法分别转调
+  `prepare_artifacts(.., PrepareMode::Full/Incremental)`、`rebuild_fixture_artifacts`、
+  `rebuild_plugin_workspace`；
+- host 的三个调用点（iteration step 3、`rebuild_plugin_workspace` agent tool、
+  crash-recovery `restore_plugin_iteration_workspace`）从直接调 tooling 改成
+  `plugin_builder().ok_or_else(missing_builder_error)?.rebuild_plugin(..)`，
+  `workspace_root` / `plugin_path` 语义（`/` = 全部插件、`/qq` = 只重建 qq）不变。
+
+**嵌入方（cordis-cli）**：`main()` 在参数收集之后、任何 boot 之前安装一次
+`install_plugin_builder(Box::new(cordis_tooling::CargoBuilder))`；`--runtime-only`
+同样安装（自迭代随时可能要用）。二进制名仍是 `cordis-runtime`（systemd
+`ExecStart` / `scripts/*.sh` 按 `target/debug/cordis-runtime` 调用），只是产它的
+package 换成 `cordis-cli`；`default-members` 同步加了两个新 crate，保证
+`cargo build` 仍然产出这个路径。
+
+**可见性放宽清单**（仅两处，都是"tooling 需要 runtime 的加载期 helper"）：
+
+| 项 | 原 | 现 | 理由 |
+|---|---|---|---|
+| `plugin::artifact::lock_pid_is_live` | `pub(crate)` | `pub` | tooling 的构建锁 stale 判定也要用它，避免 `kill(pid,0)` 逻辑复制一份 |
+| `plugin::artifact::parse_dylib_payload` | private | `pub` | `read_plugin_docs` 搬进 runtime 后，tooling 的 `inspect_dylib_contract` 仍需同一解析器/错误文本 |
+
+其余项（模型、`PackageResolver`、`load_artifact_index` / `sha256_file` /
+`load_plugin_artifact` / `resolve_artifact_path` / `artifact_index_map`、
+`LoadedDylibApi`、`is_dylib_path`）在拆分前就已经是 `pub`，没有额外放宽。
+
+**测试侧改动**（不改生产行为）：
+
+- `crates/cordis-runtime/tests/tooling.rs`（1282 行，30 个集成用例）整体搬到
+  `crates/cordis-tooling/tests/tooling.rs`，import 改 `cordis_tooling::…`，
+  `read_plugin_docs` 改 `cordis_runtime::plugin::artifact::…`；配套新建最小
+  `crates/cordis-tooling/tests/support/mod.rs`（fixtures 根 + 宿主 dylib 探针）；
+- runtime 集成测试里原先 `use cordis_runtime::plugin::tooling::…` 的地方全部改成
+  `cordis_tooling::…`（`support/mod.rs` 的 `ensure_fixture_artifacts` 同样）；
+- runtime 测试要驱动构建路径时必须装 builder：`tests/support/mod.rs` 新增
+  `install_cargo_builder()`（`Once` 幂等），由 `fixtures_root()` 与
+  `pin_private_snapshot_root()` 调用——这两个 helper 覆盖了所有会 iteration /
+  restore / 重建的用例；
+- 三个 `env!("CARGO_BIN_EXE_cordis-runtime")` 用例（`runtime_host.rs` ×2、
+  `shell_plugin.rs` ×1）改为 `support::cli_binary()`：`CARGO_BIN_EXE_*` 只提供给
+  "声明该 bin 的 package" 的测试，二进制搬走后要从测试可执行文件上两级
+  （`<target>/<profile>/`）找，找不到时给出"先 `cargo build`"的明确报错；
+- runtime lib 单测里的 builder registry 测试用**本地** `TestBuilder` 而非
+  `cordis_tooling::CargoBuilder`：dev-dep 环会让 `cordis-tooling` 链到
+  **非 cfg(test)** 的 runtime，trait 不是同一个（真实 `CargoBuilder` 的装配由
+  集成测试覆盖）。
+
+**覆盖率排除路径变化**：`main.rs` 现在在 `crates/cordis-cli/src/main.rs`，
+`coverage.yml` / `CLAUDE.md` 的正则从
+`'cordis-runtime/src/(main|agent)\.rs'` 改为
+`'.*crates/cordis-(runtime|cli)/src/(main|agent)\.rs'`（llvm-cov 对完整路径做
+正则 search；前置 `.*` 让它在"整路径匹配"实现下也成立），同时仍排除
+`cordis-runtime/src/agent.rs`。CI 里 `cargo run -p cordis-runtime --
+prepare-artifacts` / `cargo build -p cordis-runtime` 统一改成 `-p cordis-cli`
+（package 变了，产物路径 `target/{debug,release}/cordis-runtime` 不变）。
+
+**验证**：`cargo build` 零 warning；`cargo clippy --all-targets -- -D warnings`
+干净；`cargo fmt --all --check` 干净；`cargo test -p cordis-runtime --lib`
+**889** 通过；`cargo test -p cordis-tooling`（构建链 29 例 + lib 单测）通过；
+`cargo test -p cordis-cli` **35** 通过；runtime 集成套件中 `architecture`、
+`host_build_coverage`、`host_iterate_stages`、`host_boot_session_arms`、
+`runtime_host` 等重跑通过。
 
 ### 5.2.47 策略/记忆写权限：kernel 只转交身份，规则在插件（2026-10-23）
 
@@ -634,8 +744,8 @@ H 批的 feishu 插件源码曾因 sshfs 静默丢失事故从 checkout 消失�
 D 批（QQ 对话链路 E2E 验证，5.2.25）记录、移交给 runtime 的三个问题，全部修完：
 
 1. **`CORDIS_CONFIG_DIR` 显式覆盖**（[config.rs `discover_config_dir`](../../crates/cordis-runtime/src/config.rs)）：原逻辑靠 `fixtures_root.parent()/config` 的兄弟目录启发式定位 `llm_api.yaml`，但 fixtures 被拷到临时目录（测试、`config/` 被 gitignore 的 git worktree）时失效。新增环境变量优先级最高，空值忽略。已验证 `CORDIS_CONFIG_DIR=/tmp/altconfig` 下 invoke 正常。
-2. **inbox 背压**（[main.rs `AGENT_TRIGGER_TX`](../../crates/cordis-runtime/src/main.rs)）：inbox 消费者阻塞在 LLM 往返上，原 unbounded `mpsc::channel` 在 DeepSeek 慢于消息速率时无限增长。改为 `sync_channel(256)` 有界通道；溢出时 `try_send` 失败，丢**最新**消息并计数（qq 插件上游已去重+批处理，持续过载下有界丢失优于无限内存增长）；前 5 次 + 之后每 50 次打一条 stderr。
-3. **`_cordis_agent_trigger` 调试残留移除**（[main.rs](../../crates/cordis-runtime/src/main.rs)）：每次 trigger 都 `fs::write("/tmp/trigger_called.txt", ...)`，多实例互相覆盖、生产环境无意义。直接删除。
+2. **inbox 背压**（[main.rs `AGENT_TRIGGER_TX`](../../crates/cordis-cli/src/main.rs)）：inbox 消费者阻塞在 LLM 往返上，原 unbounded `mpsc::channel` 在 DeepSeek 慢于消息速率时无限增长。改为 `sync_channel(256)` 有界通道；溢出时 `try_send` 失败，丢**最新**消息并计数（qq 插件上游已去重+批处理，持续过载下有界丢失优于无限内存增长）；前 5 次 + 之后每 50 次打一条 stderr。
+3. **`_cordis_agent_trigger` 调试残留移除**（[main.rs](../../crates/cordis-cli/src/main.rs)）：每次 trigger 都 `fs::write("/tmp/trigger_called.txt", ...)`，多实例互相覆盖、生产环境无意义。直接删除。
 
 `cargo build` + lib 89 测试全绿；runtime-only serve 冒烟正常。
 
@@ -669,7 +779,7 @@ D 批修掉 `tests/architecture.rs` 的编译错误后暴露的 11 项运行失�
 
 ### 5.2.24 REPL / serve 收尾正确性（E 批任务 C，2026-07-20）
 
-批处理式 `cat cmds | cordis-runtime serve fixtures` 时，`kernel iterate-plugins` 的最终结果 JSON 会被后面排队的 `quit` 打断（5.2.22 E2E 二轮复验里 run log 停在第二次 reload 的 `[snapshot] detected`，`final_verdict` 缺失）。改动仅限 [crates/cordis-runtime/src/main.rs](../../crates/cordis-runtime/src/main.rs)：
+批处理式 `cat cmds | cordis-runtime serve fixtures` 时，`kernel iterate-plugins` 的最终结果 JSON 会被后面排队的 `quit` 打断（5.2.22 E2E 二轮复验里 run log 停在第二次 reload 的 `[snapshot] detected`，`final_verdict` 缺失）。改动仅限 [crates/cordis-cli/src/main.rs](../../crates/cordis-cli/src/main.rs)：
 
 - **根因**：serve 主循环里，每条命令的 stdout flush 只发生在 `handle_serve_command` 内部末尾（`io::stdout().flush()`）与主循环的 `Err` 分支；而 `quit`/`exit` 走 `Ok(false) => return Ok(false)`，在到达那个 flush **之前**就 `break` 出循环。批处理模式下 stdout 连到 pipe（全缓冲，非行缓冲），`iterate-plugins` 那一坨大 JSON 还躺在用户态缓冲区里没落地，`quit` 一 break、`run_serve` 返回、进程退出，缓冲区内容随之丢失 → 输出截断。（并非 stdin 并发消费，也非内部 reload 调 `process::exit`——排查过 `iterate_plugins` 全链路：rebuild 子进程用 `Stdio::null()` 接 stdin，两次 reload 与 promote/rollback 都不碰 `process::exit`。）
 - **修法**：把主循环尾部改成"先算 `keep_going`，**无条件 `io::stdout().flush()?`，再决定是否 break**"。这样退出路径（`Ok(false)`）与正常路径、错误路径统一都在读下一条 stdin 前 flush 完；命令处理中途不允许 `process::exit`（现状本就没有）。
@@ -758,7 +868,7 @@ D 批修掉 `tests/architecture.rs` 的编译错误后暴露的 11 项运行失�
 
 紧跟 5.2.21 E2E smoke 的两条 finding，一次修完：
 
-- **`rebuild_plugin_workspace` 后同步 `index.json` 里 `entry.sha256`**（[plugin/tooling.rs:246-278](../../crates/cordis-runtime/src/plugin/tooling.rs#L246-L278)）：stage-swap 完 `.so` 后，直接读回新文件 sha256，只更新受本次 rebuild 影响的 entry（避免对未 build 的 entry 也刷新，从而误 unlock 一些"stale 但 required"的检测）。原子写回 `index.json`。这条修复消除了 5.2.21 里 verifier 判 `HashMismatch → rolled_back` 的假失败。
+- **`rebuild_plugin_workspace` 后同步 `index.json` 里 `entry.sha256`**（[plugin/tooling.rs（现 `cordis-tooling/src/lib.rs`）](../../crates/cordis-tooling/src/lib.rs)）：stage-swap 完 `.so` 后，直接读回新文件 sha256，只更新受本次 rebuild 影响的 entry（避免对未 build 的 entry 也刷新，从而误 unlock 一些"stale 但 required"的检测）。原子写回 `index.json`。这条修复消除了 5.2.21 里 verifier 判 `HashMismatch → rolled_back` 的假失败。
 - **插件 `handle` panic 隔离**（[plugin/invoke.rs:230, 350-425](../../crates/cordis-runtime/src/plugin/invoke.rs#L230)、[cordis-plugin-host/src/lib.rs:347-370](../../crates/cordis-plugin-host/src/lib.rs#L347-L370)）：`api.handle` 是普通 `fn`（不是 `extern "C"`），Rust 允许 panic 跨帧 unwind，直接把 runtime 撕成 corrupted 状态。两处调用点都包 `catch_unwind(AssertUnwindSafe(...))`，捕获后转 `RuntimeError::InvalidArgument` / `PluginHostError::PluginInvocationFailed`，plugin_path 一并带出。**Service `start`/`stop`（`extern "C" fn`）不在此覆盖范围**：modern rustc 会在任何 panic 尝试 unwind 过 C ABI 时自动 `abort()`，runtime 侧的 `catch_unwind` 拦不住；后续要做 SDK 侧的服务包装。lib.rs 里 code comment 已注明这条边界。
 
 新增单测：`plugin::invoke::panic_isolation_tests` +2（handle panic 转 Err、正常 handle 透传）。lib 测试 87 → 89，全 pass。
@@ -1080,7 +1190,7 @@ cd fixtures/plugins/expr/lexer && cargo test --lib  # excluded, external tests o
 
 ### 5.6.1 覆盖率文件级豁免清理（2026-08-03 实测，待开工）
 
-`coverage.yml` 的 `--ignore-filename-regex 'cordis-runtime/src/(main|agent)\.rs'` 声称理由是
+`coverage.yml` 的 `--ignore-filename-regex 'cordis-runtime/src/(main|agent)\.rs'`（5.2.48 后为 `'.*crates/cordis-(runtime|cli)/src/(main|agent)\.rs'`，因为 `main.rs` 随二进制搬到了 `cordis-cli`）声称理由是
 "进程/网络边界"，但**实测该理由对绝大部分内容并不成立**——去掉排除后跑一次全量覆盖：
 
 ```
