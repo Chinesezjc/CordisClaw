@@ -147,7 +147,7 @@ fn help_text(host: &RuntimeHost) -> String {
         "可用指令（不经 LLM，直接执行）:".to_string(),
         "/status — 运行时状态".to_string(),
         "/reset — 重置当前会话历史".to_string(),
-        "/soul — 查看当前会话的人格设置".to_string(),
+        "/soul — 查看当前会话的人格设置（群聊为本群人格）".to_string(),
         "/help — 本列表".to_string(),
     ];
     for (cmd, plugin_path) in plugin_commands(host) {

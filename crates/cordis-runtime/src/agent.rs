@@ -2727,7 +2727,7 @@ fn shell_agent_tools() -> Vec<AgentToolSpec> {
         },
         AgentToolSpec {
             name: AGENT_TOOL_SET_SOUL,
-            description: "Update the persona (soul) and/or LLM profile for the CURRENT user's current conversation scope. Use when the user asks to change your personality, tone, role, or which model profile serves them. persona: full replacement persona text (omit to keep). profile: named LLM profile like \"default\" or \"fast\" (omit to keep; empty string clears back to default). Changes take effect in NEW sessions (after /reset). You can never edit another user's soul — the scope is bound to this session.",
+            description: "Update the persona (soul) and/or LLM profile for the CURRENT conversation scope. Private chats are per-user; group chats are per-room, so in a group this changes the persona every member sees. Use when the user asks to change your personality, tone, role, or which model profile serves them. persona: full replacement persona text (omit to keep). profile: named LLM profile like \"default\" or \"fast\" (omit to keep; empty string clears back to default). A new persona applies from the next turn; a new profile only applies to sessions started after /reset. You can never edit another scope's soul — the scope is bound to this session.",
             parameters: json!({
                 "type": "object",
                 "properties": {

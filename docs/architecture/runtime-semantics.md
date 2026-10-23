@@ -174,26 +174,27 @@ Local(当前插件 -> 祖先插件中被 grants 明确允许的服务)
 
 serve 启动段会执行 `fixtures/startup_invoke.json` 里的全部调用（拉起 qq HTTP、feishu WSS 等外部协议服务）。`--no-startup-invoke` flag 或 `CORDIS_NO_STARTUP_INVOKE` 环境变量（非空）跳过这一段：插件照常加载、invoke/execute/REPL 全部可用，只是不连外部协议——本地落地测试必须带该开关，否则测试实例会与线上实例共用渠道凭证抢走真实用户消息（并在退出时丢弃 feishu 两段式回复的 pending 卡片，用户侧永远停在"思考中"）。
 
-`--runtime-only` 模式下，渠道插件（feishu/qq）经 `agent_trigger` FFI 投递 JSON envelope，单 inbox 线程串行消费。envelope 携带回复路由（source_plugin/reply_node/reply_target）与**身份**（`sender_id`、`conversation_kind`）；soul 作用域键 = `{sender_id}#{conversation_kind}`（无身份的 legacy 调用回落 session_key）。
+`--runtime-only` 模式下，渠道插件（feishu/qq）经 `agent_trigger` FFI 投递 JSON envelope，单 inbox 线程串行消费。envelope 携带回复路由（source_plugin/reply_node/reply_target）与**身份**（`sender_id`、`conversation_kind`）；soul 作用域键私聊为 `{sender_id}#private`，群聊为**房间级** `session_key`（一房间一角色；无身份的 legacy 调用回落 session_key）。qq 的 `display` 还携带说话人展示名（群名片优先、昵称回落，已清洗），模型不必查成员列表即可识别"谁在说话"。
 
 一条消息的处理顺序：
 
 1. **pending 重放**（M批）：`data/pending/{key}.json` 存在则前置拼接（LLM 恢复后旧消息不丢）。
 2. **指令拦截**（N批）：正文以 `/` 开头 → `command_router::dispatch`，不经 LLM，经 envelope 回复通路直接返回。`/status /help /reset /soul` 内建；插件经 docs `command_name` + `command_entry` 节点注册。这是 LLM 全挂时仍可用的管理面。
-3. **会话创建**（O批）：首条消息按 soul 记录的 `profile` 名选 LLM 配置（`agent_start_with`），soul 的 `persona` 作为 system prompt 第二段（base + soul overlay + plugin hints 三段式）。soul 变更只影响新会话（/reset 后生效）。
+3. **会话创建**（O批）：首条消息按 soul 记录的 `profile` 名选 LLM 配置（`agent_start_with`），soul 的 `persona` 进 system prompt 第二段。prompt 四段式：base → persona（前置免责声明：只影响语气、不授权）→ **conduct 硬边界契约**（kernel 级、所有渠道生效、压过 persona）→ plugin hints（渠道机制留最末保 recency）。persona 变更从下一轮生效；`profile` 变更只影响新会话（/reset 后生效）。
 4. **发送与降级**（L批）：`agent_send_with_fallback` — 打穿后切 profile 声明的 `fallback` 重试一次；降级期每次先乐观探测原 profile；切换/恢复记 kernel issue + notify，绝不静默。
 5. **彻底失败**（M批）：消息落盘 pending、渠道收到固定模板回执（不经 LLM）、notify 告警。
 
 soul 存储：kernel 内建 `FileSoulProvider`（`data/souls/`），插件同时声明 `soul_get`+`soul_set` 节点即覆写（样例 `fixtures/plugins/soul_store`，SQLite）。写路径是 agent 工具 `set_soul`（soul_key 由 host 绑定当前会话，不可越权）。
 
-#### 3.5.1 批处理与群聊身份语义（5.2.34 修正，2026-07-22）
+#### 3.5.1 批处理与群聊身份语义（5.2.34 修正，2026-07-22；5.2.42 群聊人格改房间级，2026-10-23）
 
 inbox 一次可取到一批消息（同一渠道多条堆积）。批处理不是"整批走同一条路"，而是**逐条划分**：
 
 - **命令 vs 普通消息逐条切分**：批内每条按正文是否 `/` 前缀分类。命令**逐条 dispatch**，各自用**自己 envelope 的 ctx**（身份 = 各自发送者，不是整批统一身份）；普通消息重组成一个 batch 送 agent。命令先于普通消息处理。
 - **`/reset` 的同批语义**：`/reset` 走 `drop_session`（清 `agent_sessions` / `pending_session_actions` / `profile_fallback` 三张 map + 删磁盘快照，幂等）。同一批里 `/reset` 之后到来的普通消息进入**新 session**。
-- **soul 随最近发言者刷新**：群聊里一条 session 服务多个发言者。每批 send 前，inbox 把 session 的 `soul_key` 刷成**最近发言者**的（`refresh_session_soul`），persona overlay 每轮从 `session.soul_key` 重建，因此发言者切换后 system prompt 立即换成对应的人格。**profile（LLM 端点）保持 session 起点不随刷新变**——换 profile 需 `/reset` 起新会话。
-- **多 sender 批的妥协**：一批里若有多个发言者，persona 取**最后一个发言者**（last）的；该批内非 last 成员的 `set_soul` 意图也会落到 last 的 soul。这是"一 session 多用户"下的已知取舍，phase 2 若需按发言者分裂 session 再议。
+- **人格作用域：私聊按人、群聊按房间**（5.2.42 修正）：`AgentEnvelope::soul_key()` 私聊返回 `{sender_id}#private`，群聊返回**房间** `session_key`——一个群只有一个人格，不随发言人切换。inbox 每批 send 前的 `refresh_session_soul` 在群聊里因此退化为**幂等 no-op**（host 能力保留，私聊仍可显式重绑）。**profile（LLM 端点）仍保持 session 起点**，换 profile 需 `/reset` 起新会话。
+- **群聊里的 `set_soul` / `/soul`**：作用域是**本群房间**，任何成员改人格 = 改全群看到的角色（当前无管理员校验，见 5.2.42 待办）。私聊仍是"只改自己的"。
+- **说话人标识**（5.2.42）：qq 的 envelope `display` 形如 `[QQ group from <gid> (user <uid>, name "<display>")]: <text>`，名字在入口清洗（控制字符/引号/括号过滤 + 24 字符截断），防昵称注入与伪造 envelope 标记。
 - **纯命令批不碰 pending**：整批都是命令时不触发 pending spill / 重放（命令本就不经 LLM，无"打穿"可言）。
 - **批次边界标记**（5.2.36）：普通消息 batch 送 agent 时，正文用渠道中立标记 `CURRENT_INCOMING_BATCH_START` / `CURRENT_INCOMING_BATCH_END` 包裹，并附"只把当前批次当请求，不针对则 suspend"指令，防止 agent 把历史消息误当当前请求。包裹只发生在 `agent_send` 发送点；spill / pending 落盘的是原始未包裹文本。
 - **agent 回复只取首个 JSON 值**（5.2.36）：agent 输出经 `serde_json::Deserializer` 只消费首个 JSON 值（suspend / respond），容忍尾随杂质，agent 在 JSON 后追加的解释文本不再导致解析失败。

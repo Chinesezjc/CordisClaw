@@ -3546,10 +3546,14 @@ export_plugin_api! {{
         managed.session.swap_config(api)
     }
 
-    /// H1: rebind an existing session's soul scope key. Unlike `agent_start`
-    /// (which sets `soul_key` once at creation), group chats route several
-    /// senders through one session and must re-scope the persona overlay per
-    /// turn. Returns `AgentSessionNotFound` if the session is gone.
+    /// H1: rebind an existing session's soul scope key. `agent_start` pins
+    /// `soul_key` once at creation; this rebinds it afterwards.
+    ///
+    /// Private chats are per-user, so the inbox can pin one session to one
+    /// sender's scope. Group chats are room-scoped (`AgentEnvelope::soul_key`
+    /// returns the room's `session_key`), so the inbox's per-batch refresh is
+    /// an idempotent no-op there — the persona no longer flips with whoever
+    /// spoke last. Returns `AgentSessionNotFound` if the session is gone.
     pub fn refresh_session_soul(
         &self,
         session_id: &str,

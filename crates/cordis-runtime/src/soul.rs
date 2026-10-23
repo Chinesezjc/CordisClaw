@@ -13,9 +13,10 @@
 //! - `soul_set`  payload `{node_id, payload: {soul_key, soul}}` → reply
 //!   JSON containing `{"ok": true}`
 //!
-//! The soul scope key is `{sender_id}#{conversation_kind}` (same user may
-//! run different personas in private vs group chats). Credentials never
-//! live here — `profile` is only a NAME referencing `llm_profiles`.
+//! The soul scope key is `{sender_id}#{conversation_kind}` for private chats;
+//! group chats are scoped to the room (`session_key`) so one room has one bot
+//! character, not one character per member. Credentials never live here —
+//! `profile` is only a NAME referencing `llm_profiles`.
 
 use crate::core::error::RuntimeError;
 use serde::{Deserialize, Serialize};

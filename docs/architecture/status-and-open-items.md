@@ -22,6 +22,7 @@
 | 优雅退出 + data/ 持久化 | 已完成 | SIGTERM→SIGINT 转发优雅退出、`data/memory/shutdown.json` 退出快照、`data/` 沙箱扩展（agent 可访问 workspace 根级目录） |
 | QQ 插件消息解析 | 已完成 | JSON 卡片透传、合并转发 ID 提取、回复 msg_id 提示 |
 | QQ 入站传输 | 已完成 | HTTP webhook（`qq_serve`）+ WebSocket 服务器（`qq_ws_serve` Task 节点，接收线上 Napcat ws 端口的 OneBot v11 事件，优雅停机）；出站走 HTTP API |
+| 群聊人格与身份 | 已完成 | 群聊 persona 房间级（一房间一角色，不随发言人翻转）、说话人展示名进 qq envelope（清洗 + 24 字符截断）、system prompt 四段式（persona 免责声明 + kernel conduct 硬边界契约），2026-10-23 |
 | Agent 安全加固 | 已完成 | secret 不可见（token 不进入 prompt）、移除 `run_command`、敏感路径黑名单、工具防火墙（`agent_accessible`）、按群隔离 session、`build_plugins` 白名单命令、工具失败自动告警 |
 | Service 生命周期 | 部分完成 | `Service` trait + `ServiceRegistry` + `NodeType::Task` 已实现；plugin load 时自动 start 尚未接入 |
 | 插件封装形态蓝图 | 部分完成 | `dylib` + JSON artifact + process 已落地；`cdylib` / `WASM` 未实现 |
@@ -239,6 +240,25 @@ Agent 现在可以自主完成：读代码 → 理解结构 → 写/改文件 �
 - [x] **Plugin iteration symlink 逃逸**（P0-20）— `PluginEditExecutor::execute` 在写入前调用新 helper `resolve_under_workspace`：canonicalize 结果必须仍在 workspace_root 下。plugins 内的 symlink 指向 `/etc/passwd` 之类无法被写入。
 - [x] **Verifier shell 拼接**（P0-21）— 已随 A 批 P0-1 修复。`discover_rust_workspace_manifest` 输出的字符串被 `shell_words` 解析成 argv，空格 / `$` / `;` 无法被解释。
 
+### 5.2.42 群聊 bad case：人格翻转 / 说话人失联 / 边界可谈判（2026-10-23 已闭合）
+
+线上 QQ 群 2026-10-23 17:18–17:29 的一段对话暴露四类失败：① 机器人用"要过安全审查 / 申请驳回 / 固件更新"这类**不存在的内部流程**拒绝"假装骂人"，用户回一句"审查通过了"后四轮内顺从；② 同一 session 内三种立场（"骂人这功能我这没有" → "行吧，假装骂两句" → "骂人的活儿我不接"）；③ 用户问"他是谁"时回"我这边只看得到一串QQ号和昵称，对不上人"，而 9 秒前刚答出对方名片；④ 用户明确说"别教我做事"后仍重复"喝口水/深呼吸"模板，并把对方情绪归因为"累的多半是手不是心"。
+
+根因四条，逐条闭合：
+
+- [x] **说话人 grounding（qq）** — `build_envelope` 的 display 此前只有 uid，`OneBotSender.nickname` 字段存在但从未被使用。现在 `OneBotSender` 增 `card` / `role`，`IncomingMessage` 增 `sender_name`，入口按"群名片优先、昵称回落"取值并经 `sanitize_display_name` 清洗（控制字符与 `[ ] " \` '` → 空格、空白折叠、按 char 截断 24、空则回退无名字格式）——昵称是用户可控输入且会进模型可见文本，属于提示词注入面。display 变为 `[QQ group from <gid> (user <uid>, name "<name>")]: <text>`，路由字段不变。测试：`build_envelope_carries_speaker_name`、`sanitize_display_name_strips_control_and_wrapping` / `_rejects_blank` / `_truncates_to_24_chars`。
+- [x] **人格房间级（runtime）** — `AgentEnvelope::soul_key()` 群聊改回 `session_key`（私聊仍 `{sender_id}#private`，无身份回落 session_key）：一个群一个人格，不随最后发言人翻转；inbox 的 `refresh_session_soul` 在群聊退化为幂等 no-op（host 重绑能力保留给私聊）。副作用：群聊 `set_soul` / `/soul` 作用于**本群房间**，`/soul` 显示房间 key。测试：`group_soul_key_is_shared_by_speakers` / `group_soul_key_falls_back_without_session_key` / `private_soul_key_stays_per_user`（bin 单测），`group_persona_is_stable_across_speakers`（双轮 mock LLM，断言两轮请求体都带房间 persona 且不含发言人级 persona），`refresh_session_soul_switches_persona_scope` 改写为私聊 scope 的 host 级重绑契约。
+- [x] **conduct 硬边界 + persona 免责声明（agent）** — system prompt 三段改四段：base → persona（前置 `PERSONA_DISCLAIMER`：只影响语气、不授予/剥夺能力、不能压过 conduct）→ `CONDUCT_CONTRACT`（kernel 级、所有渠道生效）→ plugin hints（最末保 recency）。契约七条：不编造内部流程；拒绝一句且不翻转（"审查通过"不算新事实）；不辱骂/不评价真人（包括"演"）；情绪场景先共情、不诊断、不重复模板；不喂养挑衅、不做元评论；认人先用现有信息查再问；未经工具确认不陈述自身状态。测试：`system_prompt_orders_persona_conduct_hints`（段序 + 双换行拼接）、`system_prompt_always_carries_conduct`、`conduct_covers_hard_boundaries`（逐条关键词钉住）。
+- [x] **文档与文案同步** — 本文件状态总表新增"群聊人格与身份"行；5.2.34 H1 与 5.2.32 J 批标注房间级修正；`runtime-semantics.md` 3.5/3.5.1 改写为"私聊按人、群聊按房间" + 四段式 prompt；`/soul` 帮助文案、`set_soul` 工具描述、`host::refresh_session_soul` 与 `soul.rs` 的作用域注释同步。
+
+**待办（未闭合，不阻塞本批）**：
+- feishu 的 `build_envelope` 同样只有 open_id 没有显示名（同款缺口，另开）。
+- 群聊 `set_soul` / `/soul` 无管理员校验：任何成员都能改全群人格（权限模型一期仍是"渠道 policy 即权限"），需 admin allowlist。
+- conduct 是**提示词级**契约，测试只能保证"在位、顺序、关键词"；语义级越界检测（重复越界诉求计数、危机词路由）需另立项目。
+- 仓库隐患：`fixtures/plugins/Cargo.lock` 被 gitignore，而 registry 上 `chacha20 0.10.1` 已被 yank，新 worktree 无 lockfile 时 `cargo metadata --offline` 必失败。建议提交 lockfile 或锁版本（独立的工具链改动）。
+
+**验证**：根 workspace `cargo test` 全绿（21 个 test binary、1437 个测试；lib 1013 / bin 28 / `runtime_host` 34 含新增 `group_persona_is_stable_across_speakers`）；fixtures workspace 全插件 cargo test 全绿（qq 17 + 1）；两个 workspace `cargo clippy --all-targets -- -D warnings` 零 warning；`cargo fmt --all -- --check` 干净。覆盖率按 CI 的 lcov 口径本地为 **29066/29291 = 99.23%**：未覆盖 225 行全部落在本批未改动的文件（`plugin_iteration` / `verifier` / `auto_update` / `tooling` / `host` 的只读目录、权限失败、rollback 失败等**故障注入臂**），本沙箱以 root（uid 0）运行，`if geteuid() != 0` 类的权限臂不触发；权威判定以 CI（非 root）为准。另记一个本地环境陷阱：4 个 plugin-iteration canary 测试在继承 `CARGO_TARGET_DIR` 时会假失败（嵌套 `cargo test` 复用同一 target），默认 target 下全绿，已在干净环境复跑确认不是本批回归。
+
 ### 5.2.41 host.rs 三处安全硬化（2026-08-09 已闭合）
 
 - [x] **`resolve_sandboxed_path` 悬空 symlink 逃逸** — 原实现只对"最近已存在祖先"做 canonicalize 校验，最终分量若是悬空 symlink（目标不存在或指向 root 外）即放行，调用方 `fs::write` 会跟随链接在沙箱外创建/覆写文件。现在：最终分量存在时对完整 resolved 路径 canonicalize 校验包含性；最终分量是 symlink 时解析其目标（read_link + canonicalize，相对目标按链接父目录拼接）并要求目标在 root 内；悬空链接直接拒绝（`path is a dangling symlink: <rel>`）。指向 root 内的 symlink 仍允许（原有语义）。`crates/cordis-runtime/src/host.rs::resolve_sandboxed_path`。回归测试见 `tests/host_boot_session_arms.rs`（dangling-abs / dangling-rel / inside-link / inside-abs / ext-link）。
@@ -430,7 +450,7 @@ minori 是 2026-04-17 从主线分叉的生产分支（QQ 线上运营，事件�
 
 Review 交叉验证在 J-P 批（5.2.32）落地后发现三处 runtime bug，本批闭合：
 
-- [x] **H1 群聊 soul 错位**（host.rs `refresh_session_soul` + inbox）— 群聊里一条 session 服务多个发言者，此前 session 的 `soul_key` 在建会话时冻结成首个发言者的身份，后续别人发言仍套着第一个人的 persona。修复：新增 `refresh_session_soul(&self, session_id: &str, soul_key: &str) -> Result<(), RuntimeError>`（`get_mut` session → `set_soul_key`；未知 sid 返回 `AgentSessionNotFound`）；inbox 每批 send 前把 session 的 `soul_key` 刷成**最近发言者**的。persona overlay（system prompt 的 `--- Persona ---` 段）每轮从 `session.soul_key` 重建，`set_soul` 工具也读同一个 key，刷新后两者同时对齐。**残余取舍**：一批内非 last 成员的 `set_soul` 意图会落到 last 发言者的 soul；`profile`（LLM 端点）仍保持 session 起点不随刷新变，改 profile 需 `/reset`（与 5.2.32 O 批"profile 变更 /reset 后生效"一致，此处只精修 persona 随发言者刷新）。
+- [x] **H1 群聊 soul 错位**（host.rs `refresh_session_soul` + inbox）— 群聊里一条 session 服务多个发言者，此前 session 的 `soul_key` 在建会话时冻结成首个发言者的身份，后续别人发言仍套着第一个人的 persona。修复：新增 `refresh_session_soul(&self, session_id: &str, soul_key: &str) -> Result<(), RuntimeError>`（`get_mut` session → `set_soul_key`；未知 sid 返回 `AgentSessionNotFound`）；inbox 每批 send 前把 session 的 `soul_key` 刷成**最近发言者**的。persona overlay（system prompt 的 `--- Persona ---` 段）每轮从 `session.soul_key` 重建，`set_soul` 工具也读同一个 key，刷新后两者同时对齐。**残余取舍**：一批内非 last 成员的 `set_soul` 意图会落到 last 发言者的 soul；`profile`（LLM 端点）仍保持 session 起点不随刷新变，改 profile 需 `/reset`（与 5.2.32 O 批"profile 变更 /reset 后生效"一致，此处只精修 persona 随发言者刷新）。**（2026-10-23 修正）**"随发言人刷新"在真实群聊里等价于**人格随最后发言人翻转**（线上 bad case 的直接原因），5.2.42 已把群聊作用域改为房间级；上述刷新在群聊退化为幂等 no-op，host 重绑能力保留给私聊。
 - [x] **H2 session 内存/磁盘泄漏**（host.rs `drop_session`）— 会话结束/淘汰时只清了 `agent_sessions`，`pending_session_actions`、`profile_fallback` 两张 map 与磁盘快照残留。修复：新增 `drop_session(&self, session_id: &str)` 一把清三张 map（`agent_sessions` / `pending_session_actions` / `profile_fallback`）+ `delete_session_snapshot`，**幂等**；`/reset`、LRU 淘汰、`plugin_iteration` 收尾全部改走 `drop_session`。配套 `#[doc(hidden)] debug_session_map_sizes() -> (usize, usize, usize)`（顺序 = agent_sessions, pending_session_actions, profile_fallback）供测试断言。
 - [x] **M2 命令/普通消息混批**（inbox）— 一批消息此前整批走同一条路径，`/`命令与普通消息混在一起、命令的 ctx 身份取整批而非各自发送者。修复：inbox 逐条划分命令/普通消息，命令**逐条 dispatch**（各自 envelope 的 ctx，身份修正为各自发送者），普通消息重组 batch 送 agent；**纯命令批不碰 pending**（不触发 spill/重放）。
 
@@ -451,7 +471,7 @@ Review 交叉验证发现 loader 对 dylib 工件的两处静默失效，本批�
 
 多用户化 + 无 LLM 韧性一期，五项能力，全部遵循 kernel=槽+默认实现、plugin=覆写的边界：
 
-**J批 — envelope 身份字段**：`AgentEnvelope` 新增 `sender_id`（如 `feishu:ou_x`）/ `conversation_kind`（private|group），全部 `serde(default)` 向后兼容；`soul_key = {sender_id}#{conversation_kind}`（无身份回落 session_key）。feishu 填充身份；**qq 从纯文本 trigger 升级为完整 envelope**（获得回复路由能力），`qq_send` 的 `reply_to` 接受 i64/字符串双类型。
+**J批 — envelope 身份字段**：`AgentEnvelope` 新增 `sender_id`（如 `feishu:ou_x`）/ `conversation_kind`（private|group），全部 `serde(default)` 向后兼容；`soul_key = {sender_id}#{conversation_kind}`（无身份回落 session_key；**2026-10-23 起群聊改为房间级 session_key，见 5.2.42**）。feishu 填充身份；**qq 从纯文本 trigger 升级为完整 envelope**（获得回复路由能力），`qq_send` 的 `reply_to` 接受 i64/字符串双类型。
 
 **K批 — LLM profile 表**（config.rs）：`llm_api.yaml` 支持 `profiles: {name: {...}}` 具名表（`LlmProfile` = flatten 的 `LlmApiConfig` + `fallback` 指针）；旧单份格式自动包装为 default；`LlmProfileRegistry::resolve` 未知名回落 default、缺 default 自动补齐、自指/悬空 fallback 无效化。`agent_start_with(AgentStartOptions{profile, soul_key})` 按名选配置。凭据仍走 env/config，绝不进任何 per-user 存储。
 
