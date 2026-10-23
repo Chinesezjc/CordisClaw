@@ -60,12 +60,30 @@ pub fn linux_dylib_artifacts_available() -> bool {
 /// `cargo test` (workspace) / CI build it before tests run.
 #[allow(dead_code)]
 pub fn cli_binary() -> PathBuf {
+    let name = format!("cordis-runtime{}", std::env::consts::EXE_SUFFIX);
+    let mut candidates: Vec<PathBuf> = Vec::new();
     let mut path = std::env::current_exe().expect("integration test binary path");
     path.pop(); // <target>/<profile>/deps
     path.pop(); // <target>/<profile>
-    let binary = path.join(format!("cordis-runtime{}", std::env::consts::EXE_SUFFIX));
-    assert!(binary.exists(), "build the workspace first: `cargo build`");
-    binary
+    candidates.push(path.join(&name));
+    // `cargo llvm-cov` builds into `<repo>/target/llvm-cov-target`, while the CLI
+    // the tests spawn is the *plain* build (`cargo build`) at `<repo>/target/<profile>`.
+    // CI builds it before coverage (`cargo run -p cordis-cli -- prepare-artifacts`).
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    for profile in ["debug", "release"] {
+        candidates.push(repo.join("target").join(profile).join(&name));
+        candidates.push(
+            repo.join("target/llvm-cov-target")
+                .join(profile)
+                .join(&name),
+        );
+    }
+    for candidate in &candidates {
+        if candidate.exists() {
+            return candidate.clone();
+        }
+    }
+    panic!("build the workspace first: `cargo build` (looked for {candidates:?})");
 }
 
 #[allow(dead_code)]
