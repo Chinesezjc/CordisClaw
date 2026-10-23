@@ -213,6 +213,16 @@ struct NodeRequest {
     /// `payload.data_dir`), same dual-accept rationale as `policy`.
     #[serde(default)]
     data_dir: Option<String>,
+    /// Which group a policy/memory call applies to (`"<gid>"`); empty = the
+    /// shared default entry.
+    #[serde(default)]
+    group: Option<String>,
+    /// Policy mode: `quiet` | `balanced` | `chatty` | `one_on_one`.
+    #[serde(default)]
+    mode: Option<String>,
+    /// Free-text per-group memory (agent-authored).
+    #[serde(default)]
+    memory: Option<String>,
     #[serde(default)]
     message: Option<String>,
     /// Accepts both i64 (legacy direct invoke) and string (runtime inbox
@@ -1093,19 +1103,52 @@ fn should_process(text: &str) -> bool {
 // Reply policy (WS-4) — runtime-configurable reply gating
 // ---------------------------------------------------------------------------
 //
-// The gating rule ("is this message addressed to me?") used to be hard-coded
-// in this plugin's `system_hint`, so letting the bot be chattier required
-// editing Rust and rebuilding the artifact. It is data now:
-// `data/qq_reply_policy.json`, shipped to the model as a `[reply policy: ...]`
-// line at the top of every incoming message.
+// ── 回复门控与每群记忆（全部落在 data/，agent 自己可写）────────────────────
+//
+// 历史：门控最早硬编码在 `system_hint` 里，改"多说/少说"要改 Rust 重编工件。
+// 现在拆成三层，全部是数据：
+//   `data/qq_reply_policies.json` — 默认策略 + 每群覆盖（模式 + 自由文本）
+//   `data/qq_group_memory.json`   — 每群记忆（agent 自己总结、自己写）
+// 每条入站消息把它们随 envelope 下发成
+//   `[reply policy: <mode> — <text>]`
+//   `[group memory: <text>]`（只有写过才出现）
+// 于是"调整它在该群的行为"不需要重编、更不需要重启。
 
-/// Conservative default, used whenever no usable policy file exists. Kept in
-/// English because the model reads it verbatim.
-const DEFAULT_REPLY_POLICY: &str = "Decide for yourself, from the conversation context, whether this message needs an answer from you. Answer when it is addressed to you (\"bot\"/\"Bot\"/\"机器人\", or an @mention), AND ALSO when the context makes it clear the sender is talking to you: it continues a thread you are part of, asks you to do or explain something, or someone in the group explicitly wants your answer — even without naming you. Stay silent for conversation between other people, memes/stickers, and statements that do not involve you; do not hijack someone else's thread. If it is genuinely ambiguous, prefer silence.";
+/// 保守默认文案（模型逐字读，保持英文）。
+const DEFAULT_REPLY_POLICY: &str = "Decide for yourself, from the conversation context, whether this message needs an answer from you. Answer when it is addressed to you (\"bot\"/\"Bot\"/\"机器人\", or an @mention), AND ALSO when the context makes it clear the sender is talking to you: it continues a thread you are part of, asks you to do or explain something, or someone in the group explicitly wants your answer — even without naming you. Stay silent for conversation between other people, memes/stickers, and statements that do not involve you; do not hijack someone else's thread.";
 
-/// On-disk shape of `data/qq_reply_policy.json`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ReplyPolicyRecord {
+/// 四种模式。`policy` 为空时用这里的预设文案。
+const MODE_QUIET: &str = "quiet";
+const MODE_BALANCED: &str = "balanced";
+const MODE_CHATTY: &str = "chatty";
+const MODE_ONE_ON_ONE: &str = "one_on_one";
+
+/// 没有任何配置时的模式。
+const DEFAULT_MODE: &str = MODE_BALANCED;
+
+/// 每群记忆的长度上限（字符）。防 prompt 膨胀。
+const MEMORY_MAX_CHARS: usize = 800;
+
+fn mode_preset(mode: &str) -> Option<&'static str> {
+    match mode {
+        MODE_QUIET => Some("Stay silent unless the message @mentions you or addresses you by name (\"bot\"/\"Bot\"/\"机器人\"). This group does not want the bot commenting on ordinary conversation."),
+        MODE_BALANCED => Some(DEFAULT_REPLY_POLICY),
+        MODE_CHATTY => Some("Join the conversation actively: answer questions you can help with, add a short remark when it genuinely fits, and take a joke. Do not reply to every message, and never hijack a thread between two other people."),
+        MODE_ONE_ON_ONE => Some("Treat this group as a direct chat: answer every message that is meant for you (greeting, question, request). Do not stay silent just because it is technically a group."),
+        _ => None,
+    }
+}
+
+fn valid_mode(mode: &str) -> bool {
+    mode_preset(mode).is_some()
+}
+
+/// 一条策略记录（默认项或某群的覆盖项）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct PolicyEntry {
+    #[serde(default)]
+    mode: String,
+    #[serde(default)]
     policy: String,
     #[serde(default)]
     updated_at_ms: u64,
@@ -1113,40 +1156,160 @@ struct ReplyPolicyRecord {
     updated_by: String,
 }
 
-/// Resolve the reply-policy file location. Preference order is exactly
-/// soul_store's `db_path()`: explicit `data_dir` from the payload (the kernel
-/// knows the workspace root), then `$CORDIS_FIXTURES_ROOT/../data`, then a
-/// cwd-relative `data/`.
-fn reply_policy_path(data_dir: Option<&str>) -> std::path::PathBuf {
-    if let Some(dir) = data_dir {
-        if !dir.is_empty() {
-            return std::path::PathBuf::from(dir).join("qq_reply_policy.json");
-        }
+/// `data/qq_reply_policies.json` 的形状。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct PolicyStore {
+    #[serde(default)]
+    default: PolicyEntry,
+    #[serde(default)]
+    groups: std::collections::BTreeMap<String, PolicyEntry>,
+}
+
+/// 老的单策略文件 `data/qq_reply_policy.json` 的形状（迁移用）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LegacyPolicyRecord {
+    policy: String,
+    #[serde(default)]
+    updated_at_ms: u64,
+    #[serde(default)]
+    updated_by: String,
+}
+
+/// 一条每群记忆。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct MemoryEntry {
+    #[serde(default)]
+    memory: String,
+    #[serde(default)]
+    updated_at_ms: u64,
+    #[serde(default)]
+    updated_by: String,
+}
+
+type MemoryStore = std::collections::BTreeMap<String, MemoryEntry>;
+
+/// Resolve a file under `data/`. Preference order matches soul_store's
+/// `db_path()`: explicit `data_dir` from the payload, then
+/// `$CORDIS_FIXTURES_ROOT/../data`, then a cwd-relative `data/`.
+fn data_path(data_dir: Option<&str>, file: &str) -> std::path::PathBuf {
+    if let Some(dir) = data_dir.filter(|d| !d.is_empty()) {
+        return std::path::PathBuf::from(dir).join(file);
     }
     if let Ok(root) = std::env::var("CORDIS_FIXTURES_ROOT") {
         let ws = std::path::PathBuf::from(&root)
             .parent()
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| std::path::PathBuf::from(&root));
-        return ws.join("data/qq_reply_policy.json");
+        return ws.join("data").join(file);
     }
-    std::path::PathBuf::from("data/qq_reply_policy.json")
+    std::path::PathBuf::from("data").join(file)
 }
 
-/// Read the persisted policy. `None` means "no usable file" — missing,
-/// unreadable, malformed, or blank — and every caller falls back to the
-/// default rather than failing.
-fn read_reply_policy_file(data_dir: Option<&str>) -> Option<String> {
-    let path = reply_policy_path(data_dir);
-    let raw = std::fs::read_to_string(&path).ok()?;
-    let record = serde_json::from_str::<ReplyPolicyRecord>(&raw).ok()?;
-    Some(record.policy.trim().to_string()).filter(|p| !p.is_empty())
+fn policies_path(data_dir: Option<&str>) -> std::path::PathBuf {
+    data_path(data_dir, "qq_reply_policies.json")
 }
 
-/// Effective policy for this message. NEVER fails: a missing or broken file
-/// yields `DEFAULT_REPLY_POLICY`, so envelope construction cannot break.
-fn current_reply_policy(data_dir: Option<&str>) -> String {
-    read_reply_policy_file(data_dir).unwrap_or_else(|| DEFAULT_REPLY_POLICY.to_string())
+fn legacy_policy_path(data_dir: Option<&str>) -> std::path::PathBuf {
+    data_path(data_dir, "qq_reply_policy.json")
+}
+
+fn memory_path(data_dir: Option<&str>) -> std::path::PathBuf {
+    data_path(data_dir, "qq_group_memory.json")
+}
+
+/// 读策略库。**永不失败**：缺文件/坏 JSON → 空库（再回落老文件）。
+fn load_policy_store(data_dir: Option<&str>) -> PolicyStore {
+    if let Ok(raw) = std::fs::read_to_string(policies_path(data_dir)) {
+        if let Ok(store) = serde_json::from_str::<PolicyStore>(&raw) {
+            return store;
+        }
+    }
+    // 老的单策略文件当作 default 项。
+    if let Ok(raw) = std::fs::read_to_string(legacy_policy_path(data_dir)) {
+        if let Ok(rec) = serde_json::from_str::<LegacyPolicyRecord>(&raw) {
+            let policy = rec.policy.trim().to_string();
+            if !policy.is_empty() {
+                return PolicyStore {
+                    default: PolicyEntry {
+                        mode: DEFAULT_MODE.to_string(),
+                        policy,
+                        updated_at_ms: rec.updated_at_ms,
+                        updated_by: rec.updated_by,
+                    },
+                    groups: std::collections::BTreeMap::new(),
+                };
+            }
+        }
+    }
+    PolicyStore::default()
+}
+
+fn save_policy_store(
+    data_dir: Option<&str>,
+    store: &PolicyStore,
+) -> Result<std::path::PathBuf, String> {
+    let path = policies_path(data_dir);
+    ensure_policy_parent_dir(&path)?;
+    let body =
+        serde_json::to_string_pretty(store).map_err(|e| format!("encode reply policies: {e}"))?;
+    std::fs::write(&path, body).map_err(|e| format!("write reply policies: {e}"))?;
+    Ok(path)
+}
+
+/// 该群实际生效的 `(mode, policy_text, source)`，`source ∈ group|default|builtin`。
+///
+/// 解析顺序：`groups[gid]` → `default` → 内置 `balanced`。**永不失败**：
+/// 策略文件缺失/损坏只会得到内置默认，envelope 构造不会因此中断。
+fn effective_policy(data_dir: Option<&str>, group: Option<&str>) -> (String, String, &'static str) {
+    let store = load_policy_store(data_dir);
+    let group_entry = group.and_then(|g| store.groups.get(g));
+    let (entry, source) = match group_entry {
+        Some(entry) => (entry, "group"),
+        None if !store.default.mode.is_empty() || !store.default.policy.is_empty() => {
+            (&store.default, "default")
+        }
+        None => (&store.default, "builtin"),
+    };
+    let mode = if entry.mode.trim().is_empty() {
+        DEFAULT_MODE.to_string()
+    } else {
+        entry.mode.trim().to_string()
+    };
+    let text = if !entry.policy.trim().is_empty() {
+        entry.policy.trim().to_string()
+    } else {
+        mode_preset(&mode)
+            .unwrap_or(DEFAULT_REPLY_POLICY)
+            .to_string()
+    };
+    (mode, text, source)
+}
+
+fn load_memory_store(data_dir: Option<&str>) -> MemoryStore {
+    std::fs::read_to_string(memory_path(data_dir))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<MemoryStore>(&raw).ok())
+        .unwrap_or_default()
+}
+
+fn save_memory_store(
+    data_dir: Option<&str>,
+    store: &MemoryStore,
+) -> Result<std::path::PathBuf, String> {
+    let path = memory_path(data_dir);
+    ensure_policy_parent_dir(&path)?;
+    let body = serde_json::to_string_pretty(store).map_err(|e| format!("encode memory: {e}"))?;
+    std::fs::write(&path, body).map_err(|e| format!("write memory: {e}"))?;
+    Ok(path)
+}
+
+/// 该群的记忆文本（没写过就是 `None`）。
+fn group_memory(data_dir: Option<&str>, group: Option<&str>) -> Option<String> {
+    let store = load_memory_store(data_dir);
+    group
+        .and_then(|g| store.get(g))
+        .map(|e| e.memory.trim().to_string())
+        .filter(|m| !m.is_empty())
 }
 
 /// Node arguments may arrive inside `payload` (kernel convention) or as a
@@ -1199,14 +1362,19 @@ fn collect_image_urls(text: &str) -> Vec<String> {
 }
 
 fn build_envelope(msg: &IncomingMessage) -> String {
-    // WS-4: every inbound message carries the current reply policy as its
-    // first line. Unreadable/missing policy file → DEFAULT_REPLY_POLICY, so
-    // this can never fail envelope construction.
-    let reply_policy = current_reply_policy(None);
+    // 每条消息都带上「本群生效的模式 + 策略」和「本群记忆」。配置缺失/损坏只会
+    // 回落到内置默认，所以这里永远构造成功（envelope 失败会丢整条消息）。
+    let group = (msg.message_type == "group").then_some(msg.sender_id.as_str());
+    let (mode, policy, _source) = effective_policy(None, group);
+    let mut header = format!("[reply policy: {mode} — {policy}]");
+    if let Some(memory) = group_memory(None, group) {
+        header.push('\n');
+        header.push_str(&format!("[group memory: {memory}]"));
+    }
     let reply_target = format!("{}:{}", msg.message_type, msg.sender_id);
     let session_key = format!("qq:{reply_target}");
     let display = format!(
-        "[reply policy: {reply_policy}]\n[QQ {} from {} (user {})]: {}",
+        "{header}\n[QQ {} from {} (user {})]: {}",
         msg.message_type, msg.sender_id, msg.user_id, msg.message
     );
 
@@ -1701,46 +1869,169 @@ fn handle_qq_get_group_roles(req: &NodeRequest) -> Result<NodeResponse, String> 
 /// WS-4: persist the reply policy so the next inbound message already uses it
 /// (build_envelope reads the file per message — no restart, no rebuild).
 fn handle_qq_set_reply_policy(req: &NodeRequest) -> Result<NodeResponse, String> {
-    let raw =
-        node_str_arg(req.payload.as_ref(), req.policy.as_deref(), "policy").unwrap_or_default();
-    let policy = raw.trim().to_string();
-    if policy.is_empty() {
-        return Err("policy must not be empty".to_string());
-    }
-    let data_dir = node_str_arg(req.payload.as_ref(), req.data_dir.as_deref(), "data_dir");
-    let path = reply_policy_path(data_dir.as_deref());
-    ensure_policy_parent_dir(&path)?;
-    let record = ReplyPolicyRecord {
-        policy: policy.clone(),
-        updated_at_ms: now_ms(),
-        updated_by: "agent".to_string(),
+    let payload = req.payload.as_ref();
+    let data_dir = node_str_arg(payload, req.data_dir.as_deref(), "data_dir");
+    let group = node_str_arg(payload, req.group.as_deref(), "group")
+        .map(|g| g.trim().to_string())
+        .filter(|g| !g.is_empty());
+    let mode_raw = node_str_arg(payload, req.mode.as_deref(), "mode");
+    let policy_raw = node_str_arg(payload, req.policy.as_deref(), "policy");
+
+    let mode = match mode_raw.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
+        Some(raw) => {
+            if !valid_mode(raw) {
+                return Err(format!(
+                    "unknown mode '{raw}': use quiet | balanced | chatty | one_on_one"
+                ));
+            }
+            Some(raw.to_string())
+        }
+        None => None,
     };
-    let body =
-        serde_json::to_string_pretty(&record).map_err(|e| format!("encode reply policy: {e}"))?;
-    std::fs::write(&path, &body).map_err(|e| format!("write reply policy: {e}"))?;
+    let policy = policy_raw
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty());
+    if mode.is_none() && policy.is_none() {
+        return Err("mode or policy is required".to_string());
+    }
+
+    let mut store = load_policy_store(data_dir.as_deref());
+    {
+        let entry = match group.as_deref() {
+            Some(gid) => store.groups.entry(gid.to_string()).or_default(),
+            None => &mut store.default,
+        };
+        if let Some(m) = &mode {
+            entry.mode = m.clone();
+        }
+        if let Some(p) = &policy {
+            entry.policy = p.clone();
+        }
+        entry.updated_at_ms = now_ms();
+        entry.updated_by = "agent".to_string();
+    }
+    let path = save_policy_store(data_dir.as_deref(), &store)?;
+    let (effective_mode, effective_text, source) =
+        effective_policy(data_dir.as_deref(), group.as_deref());
+    eprintln!(
+        "qq policy: group={} mode={} chars={} by=agent source={}",
+        group.as_deref().unwrap_or("<default>"),
+        effective_mode,
+        effective_text.chars().count(),
+        source
+    );
     Ok(NodeResponse {
         ok: true,
         node_id: "qq_set_reply_policy".to_string(),
         messages: None,
         message: Some(format!("reply policy updated at {}", path.display())),
-        data: Some(json!({"policy": policy, "path": path.display().to_string()})),
+        data: Some(json!({
+            "group": group,
+            "mode": effective_mode,
+            "policy": effective_text,
+            "source": source,
+            "path": path.display().to_string(),
+        })),
         error: None,
     })
 }
 
-/// WS-4: read the persisted reply policy (`is_default` = nothing stored yet).
+/// Read the effective policy (`group` = that group's, absent = default).
 fn handle_qq_get_reply_policy(req: &NodeRequest) -> Result<NodeResponse, String> {
-    let data_dir = node_str_arg(req.payload.as_ref(), req.data_dir.as_deref(), "data_dir");
-    let stored = read_reply_policy_file(data_dir.as_deref());
-    let is_default = stored.is_none();
+    let payload = req.payload.as_ref();
+    let data_dir = node_str_arg(payload, req.data_dir.as_deref(), "data_dir");
+    let group = node_str_arg(payload, req.group.as_deref(), "group")
+        .map(|g| g.trim().to_string())
+        .filter(|g| !g.is_empty());
+    let (mode, policy, source) = effective_policy(data_dir.as_deref(), group.as_deref());
     Ok(NodeResponse {
         ok: true,
         node_id: "qq_get_reply_policy".to_string(),
         messages: None,
         message: None,
         data: Some(json!({
-            "policy": stored.unwrap_or_else(|| DEFAULT_REPLY_POLICY.to_string()),
-            "is_default": is_default,
+            "group": group,
+            "mode": mode,
+            "policy": policy,
+            "source": source,
+            "is_default": source != "group",
+        })),
+        error: None,
+    })
+}
+
+/// Upsert (or clear, when `memory` is blank) the memo the agent keeps about a
+/// group: how talkative it wants the bot, its standing topics, what it already
+/// rejected. Over `MEMORY_MAX_CHARS` the tail is dropped rather than failing.
+fn handle_qq_set_group_memory(req: &NodeRequest) -> Result<NodeResponse, String> {
+    let payload = req.payload.as_ref();
+    let data_dir = node_str_arg(payload, req.data_dir.as_deref(), "data_dir");
+    let group = node_str_arg(payload, req.group.as_deref(), "group")
+        .map(|g| g.trim().to_string())
+        .filter(|g| !g.is_empty())
+        .ok_or_else(|| "group is required for qq_set_group_memory".to_string())?;
+    let memory = node_str_arg(payload, req.memory.as_deref(), "memory")
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let mut store = load_memory_store(data_dir.as_deref());
+    let truncated: String = memory.chars().take(MEMORY_MAX_CHARS).collect();
+    let dropped_chars = memory
+        .chars()
+        .count()
+        .saturating_sub(truncated.chars().count());
+    if truncated.is_empty() {
+        store.remove(&group);
+    } else {
+        store.insert(
+            group.clone(),
+            MemoryEntry {
+                memory: truncated.clone(),
+                updated_at_ms: now_ms(),
+                updated_by: "agent".to_string(),
+            },
+        );
+    }
+    let path = save_memory_store(data_dir.as_deref(), &store)?;
+    eprintln!(
+        "qq memory: group={group} chars={} dropped={dropped_chars} by=agent",
+        truncated.chars().count()
+    );
+    Ok(NodeResponse {
+        ok: true,
+        node_id: "qq_set_group_memory".to_string(),
+        messages: None,
+        message: Some(format!("group memory updated at {}", path.display())),
+        data: Some(json!({
+            "group": group,
+            "memory": truncated,
+            "dropped_chars": dropped_chars,
+            "path": path.display().to_string(),
+        })),
+        error: None,
+    })
+}
+
+/// Read back the memo for one group (`memory` = null when nothing was written).
+fn handle_qq_get_group_memory(req: &NodeRequest) -> Result<NodeResponse, String> {
+    let payload = req.payload.as_ref();
+    let data_dir = node_str_arg(payload, req.data_dir.as_deref(), "data_dir");
+    let group = node_str_arg(payload, req.group.as_deref(), "group")
+        .map(|g| g.trim().to_string())
+        .filter(|g| !g.is_empty())
+        .ok_or_else(|| "group is required for qq_get_group_memory".to_string())?;
+    let store = load_memory_store(data_dir.as_deref());
+    let entry = store.get(&group);
+    Ok(NodeResponse {
+        ok: true,
+        node_id: "qq_get_group_memory".to_string(),
+        messages: None,
+        message: None,
+        data: Some(json!({
+            "group": group,
+            "memory": entry.map(|e| e.memory.clone()),
+            "updated_at_ms": entry.map(|e| e.updated_at_ms),
+            "updated_by": entry.map(|e| e.updated_by.clone()),
         })),
         error: None,
     })
@@ -2003,6 +2294,8 @@ fn handle(req: &NodeRequest) -> Result<NodeResponse, String> {
         "qq_get_group_roles" => handle_qq_get_group_roles(req),
         "qq_get_reply_policy" => handle_qq_get_reply_policy(req),
         "qq_set_reply_policy" => handle_qq_set_reply_policy(req),
+        "qq_get_group_memory" => handle_qq_get_group_memory(req),
+        "qq_set_group_memory" => handle_qq_set_group_memory(req),
         "qq_system_notify" => handle_qq_system_notify(req),
         "qq_get_group_info" => handle_qq_get_group_info(req),
         // For qq_entry, delegate to legacy handler.
@@ -2256,11 +2549,12 @@ fn docs_value() -> cordis_plugin_sdk::PluginDocs {
             ).with_agent_accessible(),
             node_doc(
                 "qq_get_reply_policy",
-                "Read the persisted reply policy — the rule the bot follows to decide whether an incoming QQ message is addressed to it. is_default=true means no policy has been stored yet.",
+                "Read the reply policy that is EFFECTIVE for a group (omit `group` to read the shared default). Returns the mode (quiet | balanced | chatty | one_on_one), the policy text actually shipped to the model, and where it came from (group | default | builtin).",
                 json!({
                     "type": "object", "required": ["node_id"],
                     "properties": {
                         "node_id": { "type": "string", "const": "qq_get_reply_policy" },
+                        "group": { "type": "string", "description": "QQ group id; omit for the shared default" },
                         "data_dir": { "type": "string", "description": "Optional data directory override" }
                     }
                 }),
@@ -2271,23 +2565,28 @@ fn docs_value() -> cordis_plugin_sdk::PluginDocs {
                         "data": {
                             "type": "object",
                             "properties": {
+                                "group": { "type": ["string", "null"] },
+                                "mode": { "type": "string" },
                                 "policy": { "type": "string" },
+                                "source": { "type": "string", "description": "group | default | builtin" },
                                 "is_default": { "type": "boolean" }
                             }
                         }
                     }
                 }),
-                &["reads data/qq_reply_policy.json"],
+                &["reads data/qq_reply_policies.json"],
                 &[],
             ).with_agent_accessible(),
             node_doc(
                 "qq_set_reply_policy",
-                "Persist the reply policy: the rule the bot follows when deciding whether an incoming message is addressed to it. It is shipped to the model as the first line of every message, so it takes effect on the NEXT message — no rebuild and no restart.",
+                "Persist the reply policy for ONE group (or the shared default when `group` is omitted). Two ways to set it: `mode` picks a preset (quiet = only when named/@; balanced = judge by context; chatty = join in actively; one_on_one = treat as a direct chat), `policy` overrides the preset with free text. Takes effect on the NEXT message — no rebuild, no restart.",
                 json!({
-                    "type": "object", "required": ["node_id", "policy"],
+                    "type": "object", "required": ["node_id"],
                     "properties": {
                         "node_id": { "type": "string", "const": "qq_set_reply_policy" },
-                        "policy": { "type": "string", "description": "New reply rule text (English; shown to the model verbatim)" },
+                        "group": { "type": "string", "description": "QQ group id; omit to change the shared default" },
+                        "mode": { "type": "string", "enum": ["quiet", "balanced", "chatty", "one_on_one"] },
+                        "policy": { "type": "string", "description": "Optional free-text override (English; shown verbatim)" },
                         "data_dir": { "type": "string", "description": "Optional data directory override" }
                     }
                 }),
@@ -2304,8 +2603,67 @@ fn docs_value() -> cordis_plugin_sdk::PluginDocs {
                         }
                     }
                 }),
-                &["writes data/qq_reply_policy.json"],
-                &["policy must not be empty"],
+                &["writes data/qq_reply_policies.json"],
+                &["mode or policy is required", "unknown mode"],
+            ).with_agent_accessible(),
+            node_doc(
+                "qq_get_group_memory",
+                "Read the memo you wrote about this group: how talkative it wants you, its standing topics, what it already rejected. memory=null means you have not written anything for this group yet.",
+                json!({
+                    "type": "object", "required": ["node_id", "group"],
+                    "properties": {
+                        "node_id": { "type": "string", "const": "qq_get_group_memory" },
+                        "group": { "type": "string", "description": "QQ group id" },
+                        "data_dir": { "type": "string", "description": "Optional data directory override" }
+                    }
+                }),
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "ok": { "type": "boolean" },
+                        "data": {
+                            "type": "object",
+                            "properties": {
+                                "group": { "type": "string" },
+                                "memory": { "type": ["string", "null"] },
+                                "updated_at_ms": { "type": ["integer", "null"] },
+                                "updated_by": { "type": ["string", "null"] }
+                            }
+                        }
+                    }
+                }),
+                &["reads data/qq_group_memory.json"],
+                &["group is required for qq_get_group_memory"],
+            ).with_agent_accessible(),
+            node_doc(
+                "qq_set_group_memory",
+                "Write the memo about a group, in your own words: does it want you talkative or quiet, what it talks about, what you already tried and got told off for. Shipped as a `[group memory: ...]` line on every message from that group, so write only what is DURABLE (not something you read from one message). Blank `memory` deletes the entry. Capped at 800 characters.",
+                json!({
+                    "type": "object", "required": ["node_id", "group"],
+                    "properties": {
+                        "node_id": { "type": "string", "const": "qq_set_group_memory" },
+                        "group": { "type": "string", "description": "QQ group id" },
+                        "memory": { "type": "string", "description": "Memo text; empty string deletes it" },
+                        "data_dir": { "type": "string", "description": "Optional data directory override" }
+                    }
+                }),
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "ok": { "type": "boolean" },
+                        "data": {
+                            "type": "object",
+                            "properties": {
+                                "group": { "type": "string" },
+                                "memory": { "type": "string" },
+                                "dropped_chars": { "type": "integer" },
+                                "path": { "type": "string" }
+                            }
+                        }
+                    }
+                }),
+                &["writes data/qq_group_memory.json"],
+                &["group is required for qq_set_group_memory"],
             ).with_agent_accessible(),
             node_doc(
                 "qq_system_notify",
@@ -2332,11 +2690,16 @@ fn docs_value() -> cordis_plugin_sdk::PluginDocs {
     Some("\
 QQ GROUP CHAT MODE — you are running in a QQ group. Messages may be casual chat NOT directed at you.\n\
 CRITICAL: Always decide whether the message is actually talking to YOU before responding.\n\
-REPLY POLICY — the authority on whether to answer: every incoming message begins with a line `[reply policy: ...]`. That line IS the rule; follow it exactly. It may be more permissive than you expect (e.g. \"reply whenever someone seems to want an answer\"), so do not apply a stricter rule of your own.\n\
-If a message has NO `[reply policy: ...]` line, fall back to the conservative default: answer ONLY when the message @mentions you or addresses you by name (\"bot\", \"Bot\", \"机器人\"); otherwise suspend.\n\
-A message is NOT directed at you if: general group discussion; questions not explicitly addressed to you under the policy above; casual chat; emoji/sticker; talking about someone else.\n\
-If NOT directed at you: use {\"action\":\"suspend\"}.\n\
-If directed at you: invoke_plugin(qq, qq_send, ...) to send your reply, then output {\"action\":\"suspend\"}.\n\
+REPLY POLICY — the authority on whether to answer. Every incoming message starts with `[reply policy: <mode> — <text>]`. That line IS the rule for this group; follow it exactly and do not substitute a stricter rule of your own.\n\
+  quiet      — answer only when @mentioned or addressed by name.\n\
+  balanced   — judge from the conversation: answer when it is addressed to you or clearly wants your answer; stay out of threads between other people.\n\
+  chatty     — this group WANTS you to participate: answer questions you can help with, add a short remark when it fits, take a joke. Never hijack a thread between two others.\n\
+  one_on_one — treat it as a direct chat: answer every message meant for you; do not go silent just because it is technically a group.\n\
+HOW TO JUDGE — use the conversation history, not just this one message: who is talking to whom, whether the last few lines are a thread you are part of, whether someone asked a question nobody answered. A message that continues a thread you are already in is addressed to you even without naming you.\n\
+[group memory: ...] — this is YOUR OWN memo about this group (how talkative it wants you, its standing topics, what it told you off for). Follow it. If the line is absent you have written nothing yet.\n\
+WRITING MEMORY — when you learn something DURABLE about a group (it wants you quiet, it wants you chatty, its standing topic, a joke that landed badly), persist it: invoke_plugin(qq, qq_set_group_memory, {\"node_id\":\"qq_set_group_memory\",\"group\":\"<gid>\",\"memory\":\"<1-3 sentences>\"}). Do NOT write on every message — only durable preferences, and never guess one from a single message. To change how talkative you are in a group: invoke_plugin(qq, qq_set_reply_policy, {\"node_id\":\"qq_set_reply_policy\",\"group\":\"<gid>\",\"mode\":\"quiet|balanced|chatty|one_on_one\"}). Both take effect on the next message.\n\
+If the message is NOT for you: use {\"action\":\"suspend\"}.\n\
+If it IS for you: invoke_plugin(qq, qq_send, ...) to send your reply, then output {\"action\":\"suspend\"}.\n\
 IMPORTANT: NEVER use {\"action\":\"respond\"} — it will cause duplicate messages. Always send via qq_send and finish with {\"action\":\"suspend\"}.\n\
 If the user asks you to change the reply rule (e.g. \"reply to everything I say\", \"stop answering so often\"), persist it: invoke_plugin(qq, qq_set_reply_policy, {\"node_id\":\"qq_set_reply_policy\",\"policy\":\"<new rule text>\"}), then tell the user it is already in effect — the next message uses the new policy, no restart needed.\n\
 \n\
@@ -2760,29 +3123,62 @@ mod test_support {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// WS-4 (A)：回复策略读写 + build_envelope 下发 `[reply policy: ...]` 行。
+// 每群策略（四种模式）+ 每群记忆：读写、下发、审计。
+//
+// 旧实现是"一个全局策略文件"；现在 `data/qq_reply_policies.json` 是
+// `{default, groups{gid}}`，`data/qq_group_memory.json` 是 `{gid: memory}`。
+// 两者都只由 agent 通过节点写，**改动下一条消息即生效**。
 // ═══════════════════════════════════════════════════════════════════════
 #[cfg(test)]
 mod reply_policy_tests {
     use super::test_support::{temp_dir, with_isolated_fixtures};
     use super::*;
 
-    fn req(value: Value) -> NodeRequest {
-        serde_json::from_value(value).expect("well-formed NodeRequest")
+    fn policy_req(node: &str, dir: &std::path::Path) -> NodeRequest {
+        serde_json::from_value(json!({
+            "node_id": node,
+            "data_dir": dir.to_str().unwrap_or_default(),
+        }))
+        .expect("NodeRequest")
     }
 
-    fn policy_req(node_id: &str, data_dir: &std::path::Path) -> NodeRequest {
-        req(json!({
-            "node_id": node_id,
-            "payload": {"data_dir": data_dir.to_str().unwrap()}
-        }))
+    fn set_mode(node: &str, dir: &std::path::Path, group: Option<&str>, mode: &str) -> NodeRequest {
+        let mut value = json!({
+            "node_id": node,
+            "data_dir": dir.to_str().unwrap_or_default(),
+            "mode": mode,
+        });
+        if let Some(g) = group {
+            value["group"] = json!(g);
+        }
+        serde_json::from_value(value).expect("NodeRequest")
     }
 
-    fn set_req(policy: &str, data_dir: &std::path::Path) -> NodeRequest {
-        req(json!({
-            "node_id": "qq_set_reply_policy",
-            "payload": {"policy": policy, "data_dir": data_dir.to_str().unwrap()}
+    fn set_policy(
+        node: &str,
+        dir: &std::path::Path,
+        group: Option<&str>,
+        policy: &str,
+    ) -> NodeRequest {
+        let mut value = json!({
+            "node_id": node,
+            "data_dir": dir.to_str().unwrap_or_default(),
+            "policy": policy,
+        });
+        if let Some(g) = group {
+            value["group"] = json!(g);
+        }
+        serde_json::from_value(value).expect("NodeRequest")
+    }
+
+    fn set_memory(node: &str, dir: &std::path::Path, group: &str, memory: &str) -> NodeRequest {
+        serde_json::from_value(json!({
+            "node_id": node,
+            "data_dir": dir.to_str().unwrap_or_default(),
+            "group": group,
+            "memory": memory,
         }))
+        .expect("NodeRequest")
     }
 
     fn sample_msg() -> IncomingMessage {
@@ -2791,158 +3187,285 @@ mod reply_policy_tests {
             sender_id: "123456".to_string(),
             user_id: "789".to_string(),
             message: "hello".to_string(),
-            message_id: Some(42),
+            message_id: Some(1),
             reply_to_msg_id: None,
             raw_event: None,
         }
     }
 
-    fn display_of(envelope_json: &str) -> String {
-        let env: Value = serde_json::from_str(envelope_json).expect("envelope json");
-        env["display"]
-            .as_str()
+    fn display_of(envelope: &str) -> String {
+        let env: Value = serde_json::from_str(envelope).expect("envelope json");
+        env.get("display")
+            .and_then(Value::as_str)
             .expect("display must be a string")
             .to_string()
     }
 
-    // 路径解析顺序与 soul_store::db_path 完全一致：
-    // 显式 data_dir → $CORDIS_FIXTURES_ROOT/../data → cwd 相对 data/。
+    fn data_of(resp: &NodeResponse) -> Value {
+        resp.data.clone().unwrap_or(Value::Null)
+    }
+
+    // 路径解析顺序与 soul_store::db_path 一致，并且策略/记忆/老文件各有各的名字。
     #[test]
-    fn reply_policy_path_resolution_order() {
+    fn data_paths_resolve_like_soul_store() {
         with_isolated_fixtures(|root| {
-            // 1) payload 的 data_dir 最优先。
-            let explicit = reply_policy_path(Some("/tmp/ws4-explicit"));
+            let explicit = policies_path(Some("/tmp/ws5-explicit"));
             assert_eq!(
                 explicit,
-                std::path::PathBuf::from("/tmp/ws4-explicit/qq_reply_policy.json")
+                std::path::PathBuf::from("/tmp/ws5-explicit/qq_reply_policies.json")
             );
-            // 2) 空 data_dir 视作未给 → 走 $CORDIS_FIXTURES_ROOT/../data。
-            let from_env = reply_policy_path(Some(""));
-            assert_eq!(from_env, root.join("data").join("qq_reply_policy.json"));
-            // 3) fixtures root 无父目录时退回 root 自身。
-            std::env::set_var("CORDIS_FIXTURES_ROOT", "/");
-            let root_self = reply_policy_path(None);
-            assert_eq!(
-                root_self,
-                std::path::PathBuf::from("/data/qq_reply_policy.json")
-            );
-            // 4) 无 env → cwd 相对的 data/。
+            let from_env = policies_path(Some(""));
+            assert_eq!(from_env, root.join("data").join("qq_reply_policies.json"));
+            let memory = memory_path(Some(""));
+            assert_eq!(memory, root.join("data").join("qq_group_memory.json"));
+            let legacy = legacy_policy_path(Some(""));
+            assert_eq!(legacy, root.join("data").join("qq_reply_policy.json"));
+            // 无 env → cwd 相对 data/。
             std::env::remove_var("CORDIS_FIXTURES_ROOT");
-            let cwd_relative = reply_policy_path(None);
             assert_eq!(
-                cwd_relative,
-                std::path::PathBuf::from("data/qq_reply_policy.json")
+                policies_path(None),
+                std::path::PathBuf::from("data/qq_reply_policies.json")
             );
         });
     }
 
-    // 未设置 → 默认策略 + is_default=true；set 之后 get 返回同一文本且
-    // is_default=false，落盘格式含 updated_by="agent"。
+    // 没有任何配置 → builtin/balanced；显式 default 之后 → default。
     #[test]
-    fn get_returns_default_then_roundtrips_set_policy() {
+    fn effective_policy_falls_back_to_builtin_then_default() {
         let dir = temp_dir();
-        let before = handle_qq_get_reply_policy(&policy_req("qq_get_reply_policy", &dir))
-            .expect("get without a file must not fail");
-        let before_data = before.data.expect("data");
-        assert_eq!(before_data["policy"], DEFAULT_REPLY_POLICY);
-        assert_eq!(before_data["is_default"], true);
+        let dir_s = dir.to_str().unwrap_or_default();
+        let (mode, text, source) = effective_policy(Some(dir_s), Some("123"));
+        assert_eq!(mode, DEFAULT_MODE);
+        assert_eq!(text, DEFAULT_REPLY_POLICY);
+        assert_eq!(source, "builtin");
 
-        let set = handle_qq_set_reply_policy(&set_req(
-            "Reply whenever someone seems to want an answer.",
-            &dir,
-        ))
-        .expect("set must succeed");
-        let set_data = set.data.expect("data");
-        assert_eq!(
-            set_data["policy"],
-            "Reply whenever someone seems to want an answer."
-        );
-        assert_eq!(
-            set_data["path"],
-            dir.join("qq_reply_policy.json").to_str().unwrap()
-        );
-
-        let raw = std::fs::read_to_string(dir.join("qq_reply_policy.json")).expect("policy file");
-        let record: ReplyPolicyRecord = serde_json::from_str(&raw).expect("policy json");
-        assert_eq!(record.updated_by, "agent");
-        assert_eq!(
-            record.policy,
-            "Reply whenever someone seems to want an answer."
-        );
-
-        let after = handle_qq_get_reply_policy(&policy_req("qq_get_reply_policy", &dir))
-            .expect("get after set");
-        let after_data = after.data.expect("data");
-        assert_eq!(
-            after_data["policy"],
-            "Reply whenever someone seems to want an answer."
-        );
-        assert_eq!(after_data["is_default"], false);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    // top-level 字段形式（不经 payload）也接受：policy / data_dir。
-    #[test]
-    fn set_accepts_top_level_policy_and_data_dir() {
-        let dir = temp_dir();
-        let top_level_set = req(json!({
-            "node_id": "qq_set_reply_policy",
-            "policy": "Only answer when @mentioned.",
-            "data_dir": dir.to_str().unwrap()
-        }));
-        handle_qq_set_reply_policy(&top_level_set).expect("top-level set");
-        let get = req(json!({
-            "node_id": "qq_get_reply_policy",
-            "data_dir": dir.to_str().unwrap()
-        }));
-        let resp = handle_qq_get_reply_policy(&get).expect("top-level get");
-        assert_eq!(
-            resp.data.expect("data")["policy"],
-            "Only answer when @mentioned."
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    // 两个策略节点必须进 handle() 分发（kernel 只经 handle() 调插件）。
-    #[test]
-    fn handle_dispatches_policy_nodes() {
-        let dir = temp_dir();
-        let set = req(json!({
-            "node_id": "qq_set_reply_policy",
-            "payload": {"policy": "Dispatched through handle().", "data_dir": dir.to_str().unwrap()}
-        }));
-        let resp = handle(&set).expect("set through handle");
+        // 显式设置 default 的模式 → 所有没有覆盖的群都跟着走。
+        let resp =
+            handle_qq_set_reply_policy(&set_mode("qq_set_reply_policy", &dir, None, MODE_QUIET))
+                .expect("set default mode");
         assert!(resp.ok);
-        assert_eq!(resp.node_id, "qq_set_reply_policy");
-        let get = req(json!({
-            "node_id": "qq_get_reply_policy",
-            "payload": {"data_dir": dir.to_str().unwrap()}
-        }));
-        let resp = handle(&get).expect("get through handle");
-        let data = resp.data.expect("data");
-        assert_eq!(data["policy"], "Dispatched through handle().");
-        assert_eq!(data["is_default"], false);
+        let (mode, text, source) = effective_policy(Some(dir_s), Some("123"));
+        assert_eq!(mode, MODE_QUIET);
+        assert_eq!(source, "default");
+        assert!(text.contains("Stay silent"), "preset text: {text}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // 空 / 全空白 / 缺省 policy → 明确错误，且不落盘。
+    // 群覆盖优先于 default，并且自由文本覆盖模式预设。
     #[test]
-    fn set_rejects_empty_policy() {
+    fn group_override_beats_default_and_free_text_beats_preset() {
         let dir = temp_dir();
-        for bad in ["", "   \n\t "] {
-            let err = handle_qq_set_reply_policy(&set_req(bad, &dir))
-                .expect_err("empty policy must be rejected");
-            assert_eq!(err, "policy must not be empty");
-        }
-        let missing_field = req(json!({
+        let dir_s = dir.to_str().unwrap_or_default();
+        handle_qq_set_reply_policy(&set_mode("qq_set_reply_policy", &dir, None, MODE_QUIET))
+            .expect("default quiet");
+        handle_qq_set_reply_policy(&set_mode(
+            "qq_set_reply_policy",
+            &dir,
+            Some("777"),
+            MODE_CHATTY,
+        ))
+        .expect("group chatty");
+        let (mode, text, source) = effective_policy(Some(dir_s), Some("777"));
+        assert_eq!(mode, MODE_CHATTY);
+        assert_eq!(source, "group");
+        assert!(text.contains("Join the conversation"), "{text}");
+        // 别的群仍然吃 default。
+        let (other_mode, _, other_source) = effective_policy(Some(dir_s), Some("888"));
+        assert_eq!(other_mode, MODE_QUIET);
+        assert_eq!(other_source, "default");
+        // 自由文本覆盖预设文案（模式不变）。
+        handle_qq_set_reply_policy(&set_policy(
+            "qq_set_reply_policy",
+            &dir,
+            Some("777"),
+            "只回技术问题",
+        ))
+        .expect("free text");
+        let (mode, text, _) = effective_policy(Some(dir_s), Some("777"));
+        assert_eq!(mode, MODE_CHATTY, "free text must not reset the mode");
+        assert_eq!(text, "只回技术问题");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // 非法 mode / 两个参数都缺 → 报错，且不落盘。
+    #[test]
+    fn set_rejects_unknown_mode_and_empty_update() {
+        let dir = temp_dir();
+        let err = handle_qq_set_reply_policy(&set_mode("qq_set_reply_policy", &dir, None, "loud"))
+            .expect_err("unknown mode");
+        assert!(err.starts_with("unknown mode 'loud'"), "err: {err}");
+        let empty: NodeRequest = serde_json::from_value(json!({
             "node_id": "qq_set_reply_policy",
-            "payload": {"data_dir": dir.to_str().unwrap()}
-        }));
-        let err = handle_qq_set_reply_policy(&missing_field)
-            .expect_err("missing policy must be rejected");
-        assert_eq!(err, "policy must not be empty");
-        let untouched = !dir.join("qq_reply_policy.json").exists();
+            "data_dir": dir.to_str().unwrap_or_default(),
+        }))
+        .expect("NodeRequest");
+        let err = handle_qq_set_reply_policy(&empty).expect_err("nothing to set");
+        assert_eq!(err, "mode or policy is required");
+        let untouched = !policies_path(Some(dir.to_str().unwrap_or_default())).exists();
         assert!(untouched, "a rejected set must not create the file");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // get 先给 builtin，set 之后给 group，并带上 source。
+    #[test]
+    fn get_reports_effective_mode_and_source() {
+        let dir = temp_dir();
+        let before =
+            handle_qq_get_reply_policy(&policy_req("qq_get_reply_policy", &dir)).expect("get");
+        assert_eq!(data_of(&before)["mode"], DEFAULT_MODE);
+        assert_eq!(data_of(&before)["source"], "builtin");
+        assert_eq!(data_of(&before)["is_default"], true);
+
+        let mut req = set_mode("qq_set_reply_policy", &dir, Some("555"), MODE_ONE_ON_ONE);
+        req.node_id = "qq_set_reply_policy".to_string();
+        handle_qq_set_reply_policy(&req).expect("set group mode");
+
+        let mut get = policy_req("qq_get_reply_policy", &dir);
+        get.group = Some("555".to_string());
+        let after = handle_qq_get_reply_policy(&get).expect("get group");
+        assert_eq!(data_of(&after)["mode"], MODE_ONE_ON_ONE);
+        assert_eq!(data_of(&after)["source"], "group");
+        assert_eq!(data_of(&after)["is_default"], false);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // 老的单策略文件被当作 default 读入（升级不丢配置）。
+    #[test]
+    fn legacy_single_policy_file_is_migrated_as_default() {
+        let dir = temp_dir();
+        std::fs::write(
+            dir.join("qq_reply_policy.json"),
+            r#"{"policy":"旧规则","updated_by":"agent"}"#,
+        )
+        .expect("write legacy");
+        let (mode, text, source) = effective_policy(Some(dir.to_str().unwrap_or_default()), None);
+        assert_eq!(text, "旧规则");
+        assert_eq!(mode, DEFAULT_MODE);
+        assert_eq!(source, "default");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // 记忆：写 → 读；空串删除；超长截断到上限并报告 dropped_chars。
+    #[test]
+    fn memory_roundtrips_truncates_and_deletes() {
+        let dir = temp_dir();
+        let resp = handle_qq_set_group_memory(&set_memory(
+            "qq_set_group_memory",
+            &dir,
+            "999",
+            "这个群希望 bot 多说话",
+        ))
+        .expect("set memory");
+        assert_eq!(data_of(&resp)["memory"], "这个群希望 bot 多说话");
+        let got = handle_qq_get_group_memory(
+            &serde_json::from_value::<NodeRequest>(json!({
+                "node_id": "qq_get_group_memory",
+                "data_dir": dir.to_str().unwrap_or_default(),
+                "group": "999",
+            }))
+            .expect("req"),
+        )
+        .expect("get memory");
+        assert_eq!(data_of(&got)["memory"], "这个群希望 bot 多说话");
+        assert_eq!(data_of(&got)["updated_by"], "agent");
+
+        let long = "x".repeat(MEMORY_MAX_CHARS + 10);
+        let resp =
+            handle_qq_set_group_memory(&set_memory("qq_set_group_memory", &dir, "999", &long))
+                .expect("set long memory");
+        assert_eq!(data_of(&resp)["dropped_chars"], 10);
+        assert_eq!(
+            data_of(&resp)["memory"]
+                .as_str()
+                .unwrap_or_default()
+                .chars()
+                .count(),
+            MEMORY_MAX_CHARS
+        );
+
+        handle_qq_set_group_memory(&set_memory("qq_set_group_memory", &dir, "999", ""))
+            .expect("clear memory");
+        let got = handle_qq_get_group_memory(
+            &serde_json::from_value::<NodeRequest>(json!({
+                "node_id": "qq_get_group_memory",
+                "data_dir": dir.to_str().unwrap_or_default(),
+                "group": "999",
+            }))
+            .expect("req"),
+        )
+        .expect("get after clear");
+        assert!(data_of(&got)["memory"].is_null());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // memory 缺 group → 报错（不写空 key）。
+    #[test]
+    fn memory_requires_group() {
+        let dir = temp_dir();
+        let req: NodeRequest = serde_json::from_value(json!({
+            "node_id": "qq_set_group_memory",
+            "data_dir": dir.to_str().unwrap_or_default(),
+            "memory": "x",
+        }))
+        .expect("req");
+        let err = handle_qq_set_group_memory(&req).expect_err("group required");
+        assert_eq!(err, "group is required for qq_set_group_memory");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // 下发：策略行带 mode 前缀；没写记忆时没有 memory 行；写了就多一行。
+    #[test]
+    fn envelope_carries_mode_and_memory_lines() {
+        with_isolated_fixtures(|root| {
+            let data_dir = root.join("data");
+            let display = display_of(&build_envelope(&sample_msg()));
+            let first = display.lines().next().unwrap_or_default().to_string();
+            assert!(
+                first.starts_with(&format!("[reply policy: {DEFAULT_MODE} — ")),
+                "first line: {first}"
+            );
+            assert!(
+                !display.contains("[group memory:"),
+                "no memory yet: {display}"
+            );
+            let user_text = display.rsplit_once("]: ").map(|(_, t)| t).unwrap_or("");
+            assert_eq!(user_text, "hello");
+
+            handle_qq_set_reply_policy(&set_mode(
+                "qq_set_reply_policy",
+                &data_dir,
+                Some("123456"),
+                MODE_CHATTY,
+            ))
+            .expect("set chatty");
+            handle_qq_set_group_memory(&set_memory(
+                "qq_set_group_memory",
+                &data_dir,
+                "123456",
+                "喜欢玩笑",
+            ))
+            .expect("set memory");
+
+            let display = display_of(&build_envelope(&sample_msg()));
+            let first = display.lines().next().unwrap_or_default().to_string();
+            assert!(first.starts_with("[reply policy: chatty — "), "{first}");
+            let has_memory = display.contains("[group memory: 喜欢玩笑]");
+            assert!(has_memory, "{display}");
+        });
+    }
+
+    // 坏 JSON / 空白 → 回落（策略与记忆都不许把 envelope 弄挂）。
+    #[test]
+    fn malformed_files_fall_back_to_defaults() {
+        let dir = temp_dir();
+        std::fs::write(dir.join("qq_reply_policies.json"), b"{not json").expect("bad policies");
+        std::fs::write(dir.join("qq_group_memory.json"), b"{also bad").expect("bad memory");
+        let dir_s = dir.to_str().unwrap_or_default();
+        let (mode, text, source) = effective_policy(Some(dir_s), Some("1"));
+        assert_eq!(mode, DEFAULT_MODE);
+        assert_eq!(text, DEFAULT_REPLY_POLICY);
+        assert_eq!(source, "builtin");
+        assert!(group_memory(Some(dir_s), Some("1")).is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2953,8 +3476,13 @@ mod reply_policy_tests {
         let blocker = dir.join("blocker");
         std::fs::write(&blocker, b"not a directory").expect("write blocker file");
         let unreachable = blocker.join("sub");
-        let err = handle_qq_set_reply_policy(&set_req("whatever", &unreachable))
-            .expect_err("create_dir_all under a regular file must fail");
+        let err = handle_qq_set_reply_policy(&set_mode(
+            "qq_set_reply_policy",
+            &unreachable,
+            None,
+            MODE_QUIET,
+        ))
+        .expect_err("create_dir_all under a regular file must fail");
         let is_create_error = err.starts_with("create data dir:");
         assert!(is_create_error, "err: {err}");
         let _ = std::fs::remove_dir_all(&dir);
@@ -2964,69 +3492,49 @@ mod reply_policy_tests {
     #[test]
     fn set_reports_write_failure() {
         let dir = temp_dir();
-        std::fs::create_dir_all(dir.join("qq_reply_policy.json")).expect("occupy target path");
-        let err = handle_qq_set_reply_policy(&set_req("whatever", &dir))
-            .expect_err("writing over a directory must fail");
-        let is_write_error = err.starts_with("write reply policy:");
+        std::fs::create_dir_all(dir.join("qq_reply_policies.json")).expect("occupy target path");
+        let err =
+            handle_qq_set_reply_policy(&set_mode("qq_set_reply_policy", &dir, None, MODE_QUIET))
+                .expect_err("writing over a directory must fail");
+        let is_write_error = err.starts_with("write reply policies:");
         assert!(is_write_error, "err: {err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // 文件损坏 / 空白 → 视作未配置，回落默认策略（绝不让读失败上浮）。
+    // 记忆写失败臂（同名目录占位）。
     #[test]
-    fn malformed_or_blank_file_falls_back_to_default() {
+    fn memory_reports_write_failure() {
         let dir = temp_dir();
-        let path = dir.join("qq_reply_policy.json");
-        let data_dir = dir.to_str().unwrap();
-        std::fs::write(&path, b"{not json").expect("write malformed");
-        assert!(read_reply_policy_file(Some(data_dir)).is_none());
-        std::fs::write(&path, br#"{"policy":"   "}"#).expect("write blank");
-        assert!(read_reply_policy_file(Some(data_dir)).is_none());
-        assert_eq!(current_reply_policy(Some(data_dir)), DEFAULT_REPLY_POLICY);
-        std::fs::write(
-            &path,
-            br#"{"policy":"  custom rule  ","updated_by":"agent"}"#,
-        )
-        .expect("write custom");
-        assert_eq!(
-            read_reply_policy_file(Some(data_dir)).as_deref(),
-            Some("custom rule")
-        );
+        std::fs::create_dir_all(dir.join("qq_group_memory.json")).expect("occupy target path");
+        let err = handle_qq_set_group_memory(&set_memory("qq_set_group_memory", &dir, "1", "x"))
+            .expect_err("writing over a directory must fail");
+        let is_write_error = err.starts_with("write memory:");
+        assert!(is_write_error, "err: {err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // 未设置策略 → display 首行是默认策略行；原始 [QQ group from ...] 仍完整。
+    // dispatch 里四个节点都要能路由到（回归：新增节点别忘接线）。
     #[test]
-    fn build_envelope_uses_default_policy_line() {
-        with_isolated_fixtures(|_root| {
-            let display = display_of(&build_envelope(&sample_msg()));
-            let expected = format!("[reply policy: {DEFAULT_REPLY_POLICY}]");
-            assert_eq!(display.lines().next(), Some(expected.as_str()));
-            let has_original = display.contains("[QQ group from 123456 (user 789)]: hello");
-            assert!(has_original, "display: {display}");
-        });
-    }
-
-    // 已设置策略（env 解析到同一 data 目录）→ 首行是配置的策略。
-    #[test]
-    fn build_envelope_uses_configured_policy_line() {
-        with_isolated_fixtures(|root| {
-            let data_dir = root.join("data");
-            std::fs::create_dir_all(&data_dir).expect("create data dir");
-            handle_qq_set_reply_policy(&set_req("Reply to every message in the group.", &data_dir))
-                .expect("set policy");
-            let display = display_of(&build_envelope(&sample_msg()));
-            assert_eq!(
-                display.lines().next(),
-                Some("[reply policy: Reply to every message in the group.]")
-            );
-            let has_original = display.contains("[QQ group from 123456 (user 789)]: hello");
-            assert!(has_original, "display: {display}");
-            // 运行时用 rsplit_once("]: ") 取用户文本（命令路由），
-            // 策略行不能破坏它。
-            let user_text = display.rsplit_once("]: ").map(|(_, t)| t).unwrap_or("");
-            assert_eq!(user_text, "hello");
-        });
+    fn handle_dispatches_policy_and_memory_nodes() {
+        let dir = temp_dir();
+        let dir_s = dir.to_str().unwrap_or_default();
+        for (node, extra) in [
+            ("qq_get_reply_policy", json!({})),
+            ("qq_set_reply_policy", json!({"mode": "quiet"})),
+            ("qq_get_group_memory", json!({"group": "1"})),
+            ("qq_set_group_memory", json!({"group": "1", "memory": "m"})),
+        ] {
+            let mut value = json!({"node_id": node, "data_dir": dir_s});
+            if let Value::Object(map) = extra {
+                for (k, v) in map {
+                    value[k] = v;
+                }
+            }
+            let req: NodeRequest = serde_json::from_value(value).expect("req");
+            let resp = handle(&req).unwrap_or_else(|e| panic!("node {node} failed: {e}"));
+            assert!(resp.ok, "node {node}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
@@ -3319,7 +3827,7 @@ mod docs_tests {
             !hardcoded_doubt_rule,
             "'when in doubt' must not be hard-coded"
         );
-        let points_at_policy = hint.contains("[reply policy: ...]");
+        let points_at_policy = hint.contains("[reply policy: <mode> — <text>]");
         assert!(
             points_at_policy,
             "hint must point at the per-message policy line"
@@ -3414,10 +3922,8 @@ mod image_url_tests {
     // 图片地址必须随 envelope 一起交出去，否则 kernel 根本不知道有图。
     #[test]
     fn build_envelope_carries_image_urls() {
-        let env: Value = serde_json::from_str(&build_envelope(&msg(
-            "看这个 [image: https://a/1.png]",
-        )))
-        .unwrap();
+        let env: Value =
+            serde_json::from_str(&build_envelope(&msg("看这个 [image: https://a/1.png]"))).unwrap();
         let urls = env["images"].as_array().expect("images array");
         assert_eq!(urls.len(), 1);
         assert_eq!(urls[0], "https://a/1.png");
@@ -3460,28 +3966,45 @@ mod hint_silence_bias_tests {
 
     #[test]
     fn hint_does_not_treat_silence_as_the_default() {
-        let hint = docs_value().system_hint.expect("qq must ship a system hint");
+        let hint = docs_value()
+            .system_hint
+            .expect("qq must ship a system hint");
         let still_orders_immediate_silence = hint.contains("suspend immediately");
         assert!(
             !still_orders_immediate_silence,
             "hint 不应再命令'立即挂起'（模型会把它当默认）"
         );
-        let says_silence_is_not_default = hint.contains("NOT the default");
-        assert!(
-            says_silence_is_not_default,
-            "hint 必须明确：沉默不是默认"
-        );
         let keeps_tool_guard = hint.contains("do NOT call any kernel introspection tool");
-        assert!(
-            keeps_tool_guard,
-            "图片/表情/闲聊仍然不该触发内核自省工具"
-        );
+        assert!(keeps_tool_guard, "图片/表情/闲聊仍然不该触发内核自省工具");
+    }
+
+    // 每群策略与记忆：hint 必须讲清四种模式、记忆行的含义、以及"只在学到
+    // 稳定偏好时才写记忆"，否则模型不会用这套运行时配置。
+    #[test]
+    fn hint_explains_modes_and_memory() {
+        let hint = docs_value()
+            .system_hint
+            .expect("qq must ship a system hint");
+        for mode in ["quiet", "balanced", "chatty", "one_on_one"] {
+            let listed = hint.contains(mode);
+            assert!(listed, "hint must explain mode {mode}");
+        }
+        let explains_memory_line = hint.contains("[group memory: ...]");
+        assert!(explains_memory_line, "hint must explain the memory line");
+        let explains_writer = hint.contains("qq_set_group_memory");
+        assert!(explains_writer, "hint must advertise the memory writer");
+        let warns_durable_only = hint.contains("DURABLE");
+        assert!(warns_durable_only, "hint must say: only durable memory");
+        let explains_judging = hint.contains("use the conversation history");
+        assert!(explains_judging, "hint must tell it to judge from history");
     }
 
     #[test]
     fn hint_still_points_at_the_reply_policy() {
-        let hint = docs_value().system_hint.expect("qq must ship a system hint");
-        let points_at_policy = hint.contains("[reply policy: ...]");
+        let hint = docs_value()
+            .system_hint
+            .expect("qq must ship a system hint");
+        let points_at_policy = hint.contains("[reply policy: <mode> — <text>]");
         assert!(points_at_policy, "策略行仍是唯一权威");
     }
 }

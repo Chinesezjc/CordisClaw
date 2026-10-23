@@ -240,6 +240,24 @@ Agent 现在可以自主完成：读代码 → 理解结构 → 写/改文件 �
 - [x] **Plugin iteration symlink 逃逸**（P0-20）— `PluginEditExecutor::execute` 在写入前调用新 helper `resolve_under_workspace`：canonicalize 结果必须仍在 workspace_root 下。plugins 内的 symlink 指向 `/etc/passwd` 之类无法被写入。
 - [x] **Verifier shell 拼接**（P0-21）— 已随 A 批 P0-1 修复。`discover_rust_workspace_manifest` 输出的字符串被 `shell_words` 解析成 argv，空格 / `$` / `;` 无法被解释。
 
+### 5.2.43 每群策略 + 每群记忆：调整行为不再需要改代码（2026-10-23）
+
+**问题**：5.2.41/5.2.42 之后，"让它在某个群多说/少说"仍要改 Rust 重编工件；而群的性质本来就各不相同（有的群希望它接话，有的嫌它插嘴）。用户的要求是**agent 自己从消息记录里总结**，所以判断所需的输入必须落成运行时数据。
+
+**改动**（全部在 `fixtures/plugins/qq/`，kernel 未动）：
+
+- [x] **`data/qq_reply_policies.json`**：`{default, groups{gid}}`，每项 `{mode, policy, updated_at_ms, updated_by}`。老的 `data/qq_reply_policy.json` 继续被当作 default 读取（不丢配置）。
+- [x] **四种模式**（`policy` 为空时用预设文案）：`quiet`（只 @/点名）、`balanced`（语境判断，默认）、`chatty`（主动参与但不抢别人的话头）、`one_on_one`（当私聊，必答）。
+- [x] **`qq_set_reply_policy`** 扩成 `{group?, mode?, policy?}`：`group` 缺省改 default；非法 mode 报 `unknown mode '<x>': use quiet | balanced | chatty | one_on_one`；一个都没给报 `mode or policy is required`；**改完下一条消息即生效**，并打审计 `qq policy: group=… mode=… chars=… by=agent source=…`。
+- [x] **`qq_get_reply_policy`** 返回该群**实际生效**的 `{mode, policy, source}`（`group|default|builtin`）。
+- [x] **每群记忆 `data/qq_group_memory.json`**：`{gid: {memory, updated_at_ms, updated_by}}`，上限 800 字符（超出截断并回报 `dropped_chars`），空串删除。新增节点 `qq_get_group_memory` / `qq_set_group_memory`（agent 可调，审计 `qq memory: group=… chars=… dropped=… by=agent`）。
+- [x] **下发**：每条入站消息首行 `[reply policy: <mode> — <text>]`，写过记忆的群再多一行 `[group memory: …]`（没写过就不出现，省 token）。
+- [x] **hint 重写**：四种模式各自该多积极；**用对话历史判断**（"谁在跟谁说话、是不是你已经在的线程"）；`[group memory: …]` 是它自己写的备忘；**只在学到稳定偏好时才写记忆**（`DURABLE`），别每条都写。
+
+**为什么这样设计**：真正需要频繁调整的是"这个群该多话还是少话"，它天然是数据而不是代码。现在 agent 在群里被要求"以后多做/少做"时可以直接 `qq_set_reply_policy`/`qq_set_group_memory` 落盘，下一条消息生效——不需要我改 Rust、不需要重建工件、更不需要重启。
+
+**验证**：qq 插件 50 单测全绿（新增：路径解析、builtin→default→group 三级回落、群覆盖优先于 default、自由文本不重置模式、非法 mode/空更新拒绝、get 的 source、老文件迁移、记忆往返/截断/删除/缺 group、envelope 的 mode 行与 memory 行、坏 JSON 回落、创建/写入失败臂、dispatch 四个节点、hint 断言包含四种模式+记忆行+`DURABLE`+"use the conversation history"）；`cargo clippy -p qq --all-targets -- -D warnings` 干净；`cargo fmt --check` 干净。
+
 ### 5.2.42 去掉 hint 里的"沉默默认"（2026-10-23）
 
 **症状**：5.2.41 把回复策略改成语境判断后，线上仍然"像只会 @bot 才回"。真实流量统计（Oct 22 19:00 → Oct 23 12:00，113 回合）：明确 @ 的 3 次回 2 次、含 bot/机器人的 10 次回 9 次、普通聊天 100 次只回 3 次；再往前一天（8 小时窗口）8 次 @ 只回 3 次，漏答的那几条都是 **1.5 秒内直接 `{"action":"suspend"}`、零工具调用**。

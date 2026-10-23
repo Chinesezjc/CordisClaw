@@ -111,6 +111,19 @@ effect on the next message — no rebuild, no restart. An empty policy is reject
 - 表情、贴纸、单字回复
 - 不涉及机器人的陈述
 
+## 每群策略 + 每群记忆
+
+两件事都落在 `data/`，由 agent 自己写，**下一条消息即生效**（不改 Rust、不重建、不重启）：
+
+| 文件 | 内容 |
+|---|---|
+| `data/qq_reply_policies.json` | `{default, groups{gid}}`，每项 `{mode, policy, …}`；老的 `qq_reply_policy.json` 仍当 default 读 |
+| `data/qq_group_memory.json` | `{gid: {memory, …}}`，每群备忘 ≤ 800 字符 |
+
+四种 mode：`quiet`（只 @/点名）· `balanced`（语境判断，默认）· `chatty`（主动参与，不抢别人的话头）· `one_on_one`（当私聊，必答）。节点：`qq_set_reply_policy {group?, mode?, policy?}` / `qq_get_reply_policy {group?}`（返回实际生效的 `source`）/ `qq_get_group_memory` / `qq_set_group_memory`。
+
+每条消息首行 `[reply policy: <mode> — <text>]`，写过记忆的群再加 `[group memory: …]`。
+
 ## 沉默不是默认
 
 门控的唯一权威是每条消息首行的 `[reply policy: …]`。hint 里显式写明：图片、表情、
