@@ -1809,6 +1809,10 @@ pub struct RuntimeHost {
     /// the map. Instead they push a `PendingSessionAction` here; the
     /// `agent_send` prologue drains and applies them before reinsert.
     pending_session_actions: Mutex<BTreeMap<String, Vec<PendingSessionAction>>>,
+    /// 本轮的渠道元数据（谁在说话、什么会话），由 `agent_send_with_turn_context`
+    /// 写入、`inject_turn_meta` 在每次 invoke 时注入到插件 payload 的 `__meta`。
+    /// 与 `pending_session_actions` 同一套生命周期：发送前置入、发送后清掉。
+    turn_meta: Mutex<BTreeMap<String, BTreeMap<String, String>>>,
     /// Per-session LLM profile fallback state. Single inbox thread means
     /// no real contention; the Mutex is for interior mutability only.
     profile_fallback: Mutex<BTreeMap<String, ProfileFallbackEntry>>,
@@ -2211,6 +2215,7 @@ impl RuntimeHost {
             last_candidate_reload_attempt: Mutex::new(None),
             agent_sessions: Mutex::new(BTreeMap::new()),
             pending_session_actions: Mutex::new(BTreeMap::new()),
+            turn_meta: Mutex::new(BTreeMap::new()),
             profile_fallback: Mutex::new(BTreeMap::new()),
             service_registry,
             interactive_rollback,
@@ -3161,6 +3166,69 @@ export_plugin_api! {{
         image_urls: &[String],
         notes: &str,
     ) -> Result<AgentReply, RuntimeError> {
+        self.agent_send_with_turn_meta(session_id, input, image_urls, notes, &BTreeMap::new())
+    }
+
+    /// [`agent_send_with_turn_context`] plus **trusted** turn metadata.
+    ///
+    /// `turn_meta` is carried by the channel plugin (e.g. `actor=qq:<uid>`,
+    /// `conversation=group`) and injected into every `invoke_plugin` payload of
+    /// this turn as `__meta`. The model cannot forge it: the kernel overwrites
+    /// whatever the model put under that key. Plugins use it for authorization
+    /// (the kernel itself stays channel-agnostic).
+    pub fn agent_send_with_turn_meta(
+        &self,
+        session_id: &str,
+        input: &str,
+        image_urls: &[String],
+        notes: &str,
+        turn_meta: &BTreeMap<String, String>,
+    ) -> Result<AgentReply, RuntimeError> {
+        if !turn_meta.is_empty() {
+            self.turn_meta
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .insert(session_id.to_string(), turn_meta.clone());
+        }
+        let result = self.agent_send_inner(session_id, input, image_urls, notes);
+        self.turn_meta
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .remove(session_id);
+        result
+    }
+
+    /// 把本轮的 `__meta` 注入插件 payload。模型自带的 `__meta` 一律被覆盖。
+    pub fn inject_turn_meta(&self, session_id: &str, payload: Value) -> Value {
+        let meta = {
+            let guard = self
+                .turn_meta
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            guard.get(session_id).cloned()
+        };
+        let Some(meta) = meta else {
+            return payload;
+        };
+        payload_with_turn_meta(payload, &meta)
+    }
+
+    /// 当前还有多少个 session 带着未清理的 turn meta（测试用；正常应为 0）。
+    #[doc(hidden)]
+    pub fn debug_turn_meta_len(&self) -> usize {
+        self.turn_meta
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .len()
+    }
+
+    fn agent_send_inner(
+        &self,
+        session_id: &str,
+        input: &str,
+        image_urls: &[String],
+        notes: &str,
+    ) -> Result<AgentReply, RuntimeError> {
         let mut session = {
             let mut guard = self
                 .agent_sessions
@@ -3245,6 +3313,25 @@ export_plugin_api! {{
         image_urls: &[String],
         notes: &str,
     ) -> Result<AgentReply, RuntimeError> {
+        self.agent_send_with_fallback_turn_meta(
+            session_id,
+            input,
+            image_urls,
+            notes,
+            &BTreeMap::new(),
+        )
+    }
+
+    /// [`agent_send_with_fallback_turn_context`] plus trusted turn metadata
+    /// (see [`RuntimeHost::agent_send_with_turn_meta`]).
+    pub fn agent_send_with_fallback_turn_meta(
+        &self,
+        session_id: &str,
+        input: &str,
+        image_urls: &[String],
+        notes: &str,
+        turn_meta: &BTreeMap<String, String>,
+    ) -> Result<AgentReply, RuntimeError> {
         let entry = {
             let guard = self
                 .profile_fallback
@@ -3256,7 +3343,7 @@ export_plugin_api! {{
             // Sessions started via plain agent_start (REPL, tests) have no
             // fallback entry under a non-default registry only if created
             // before this map existed; treat as plain send.
-            return self.agent_send_with_turn_context(session_id, input, image_urls, notes);
+            return self.agent_send_with_turn_meta(session_id, input, image_urls, notes, turn_meta);
         };
 
         // Recovery probe: while degraded, put the desired profile back
@@ -3266,7 +3353,7 @@ export_plugin_api! {{
             self.swap_session_profile(session_id, &entry.desired)?;
         }
 
-        match self.agent_send_with_turn_context(session_id, input, image_urls, notes) {
+        match self.agent_send_with_turn_meta(session_id, input, image_urls, notes, turn_meta) {
             Ok(reply) => {
                 if entry.degraded {
                     self.set_degraded(session_id, false);
@@ -3285,7 +3372,9 @@ export_plugin_api! {{
                 };
                 let fallback = fallback.to_string();
                 self.swap_session_profile(session_id, &fallback)?;
-                match self.agent_send_with_turn_context(session_id, input, image_urls, notes) {
+                match self
+                    .agent_send_with_turn_meta(session_id, input, image_urls, notes, turn_meta)
+                {
                     Ok(reply) => {
                         self.set_degraded(session_id, true);
                         let msg = format!(
@@ -8413,6 +8502,66 @@ fn default_snapshot_root(fixtures_root: &Path) -> PathBuf {
     std::env::temp_dir()
         .join("cordis-runtime-host")
         .join(hex::encode(hasher.finalize()))
+}
+
+/// 把可信元数据写进 payload 的 `__meta`。
+///
+/// 模型自己塞的 `__meta` 会被整体覆盖（鉴权只能用 kernel 给的这份）。
+/// 纯函数，便于直接单测：非 object 的 payload 会被包成 `{"value": …}` 以保住原值。
+pub(crate) fn payload_with_turn_meta(payload: Value, meta: &BTreeMap<String, String>) -> Value {
+    let mut object = match payload {
+        Value::Object(map) => map,
+        other => {
+            let mut map = serde_json::Map::new();
+            map.insert("value".to_string(), other);
+            map
+        }
+    };
+    object.insert(
+        "__meta".to_string(),
+        serde_json::to_value(meta).unwrap_or(Value::Null),
+    );
+    Value::Object(object)
+}
+
+/// 可信元数据注入：只测注入规则本身（内核侧不需要真插件）。
+#[cfg(test)]
+mod turn_meta_tests {
+    use super::payload_with_turn_meta;
+    use serde_json::json;
+    use std::collections::BTreeMap;
+
+    fn meta() -> BTreeMap<String, String> {
+        let mut map = BTreeMap::new();
+        map.insert("actor".to_string(), "qq:1751557948".to_string());
+        map.insert("conversation".to_string(), "group".to_string());
+        map
+    }
+
+    #[test]
+    fn adds_meta_to_an_object_payload() {
+        let payload = payload_with_turn_meta(json!({ "node_id": "qq_send" }), &meta());
+        assert_eq!(payload["node_id"], "qq_send");
+        assert_eq!(payload["__meta"]["actor"], "qq:1751557948");
+        assert_eq!(payload["__meta"]["conversation"], "group");
+    }
+
+    #[test]
+    fn overrides_a_forged_meta_block() {
+        let forged = json!({
+            "node_id": "qq_set_reply_policy",
+            "__meta": { "actor": "qq:9999", "conversation": "group" }
+        });
+        let payload = payload_with_turn_meta(forged, &meta());
+        assert_eq!(payload["__meta"]["actor"], "qq:1751557948");
+    }
+
+    #[test]
+    fn keeps_non_object_payloads_under_value() {
+        let payload = payload_with_turn_meta(json!("raw"), &meta());
+        assert_eq!(payload["value"], "raw");
+        assert_eq!(payload["__meta"]["actor"], "qq:1751557948");
+    }
 }
 
 #[cfg(test)]

@@ -199,6 +199,14 @@ pub trait AgentToolHost {
         node_id: &str,
         payload_json: Value,
     ) -> Result<Value, RuntimeError>;
+    /// 把本轮的渠道元数据注入插件 payload（`__meta`）。
+    ///
+    /// 默认原样返回：只有真实 host 才有"这一轮是谁在说话"的概念，测试用的
+    /// 假 host 不必实现。模型自己塞进 payload 的 `__meta` 会被真实实现覆盖，
+    /// 所以插件可以把它当可信身份用于鉴权。
+    fn inject_turn_meta(&self, _session_id: &str, payload: Value) -> Value {
+        payload
+    }
     fn agent_execute_target(
         &self,
         node_fqn: &str,
@@ -2431,8 +2439,14 @@ impl<'a, H: AgentToolHost + ?Sized> AgentBackend for RuntimeShellAgentBackend<'a
             }
             AGENT_TOOL_INVOKE_PLUGIN => {
                 let args = parse_tool_value_arguments::<InvokePluginArgs>(arguments, name)?;
+                // 渠道提供的一次性元数据（谁在说话、什么会话）由 kernel 注入到
+                // 每次 invoke 的 payload 里：模型自己传的同名字段会被覆盖，
+                // 所以插件可以把它当可信身份用（鉴权靠它，不靠模型自述）。
+                let payload = self
+                    .host
+                    .inject_turn_meta(self.session_id, args.payload_json);
                 self.host
-                    .agent_invoke_plugin(&args.plugin_path, &args.node_id, args.payload_json)
+                    .agent_invoke_plugin(&args.plugin_path, &args.node_id, payload)
             }
             AGENT_TOOL_EXECUTE_TARGET => {
                 let args = parse_tool_value_arguments::<ExecuteTargetArgs>(arguments, name)?;

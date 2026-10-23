@@ -240,6 +240,28 @@ Agent 现在可以自主完成：读代码 → 理解结构 → 写/改文件 �
 - [x] **Plugin iteration symlink 逃逸**（P0-20）— `PluginEditExecutor::execute` 在写入前调用新 helper `resolve_under_workspace`：canonicalize 结果必须仍在 workspace_root 下。plugins 内的 symlink 指向 `/etc/passwd` 之类无法被写入。
 - [x] **Verifier shell 拼接**（P0-21）— 已随 A 批 P0-1 修复。`discover_rust_workspace_manifest` 输出的字符串被 `shell_words` 解析成 argv，空格 / `$` / `;` 无法被解释。
 
+### 5.2.47 策略/记忆写权限：kernel 只转交身份，规则在插件（2026-10-23）
+
+**问题**：`qq_set_reply_policy` / `qq_set_group_memory` 只收到模型传的 `{group, mode}`——插件不知道是谁在要求，等于群里任何人说一句就能让 bot 改自己群的行为（还改得动别的群）。
+
+**位置划分**（用户拍板"规则不该在 kernel"）：
+- **谁能改** → qq 插件（kernel 不认识"群主/管理员"）；
+- **"这一轮是谁在说话"这个事实** → kernel（只有它有 envelope 的 `sender_id`），并且**模型伪造不了**。
+
+**改动**：
+- [x] kernel 新增**通用的一次性元数据通道**（不含任何 QQ 知识）：`agent_send_with_turn_meta(..., &BTreeMap<String,String>)` 把渠道元数据挂在 session 上，`inject_turn_meta` 在每次 `invoke_plugin` 时把它写进 `payload["__meta"]`，**覆盖**模型自己塞的同名字段；发送结束（含失败）清空。`AgentToolHost::inject_turn_meta` 给了 no-op 默认实现，测试假 host 不受影响。
+- [x] inbox 填入 `actor`（`qq:<uid>`）/ `conversation` / `target`（`group:<gid>`）。
+- [x] qq 插件判权 `authorize_policy_write`：
+  - 没有 `__meta`（CLI/运维直接 invoke）→ 视为操作员，放行，审计 `by=operator-cli`；
+  - 改某个群 → 必须是该群 **owner/admin**（`get_group_member_list` + 10 分钟角色缓存），或 `data/qq_operators.json` 白名单；
+  - 改**全局 default** → 只认白名单（文件缺失=空名单=谁都不许）；
+  - 只能改「这条消息来自的那个群」（`__meta.target` vs 参数 `group`），拦住"诱导它改别的群"；
+  - 角色查不到（bot 无权限/接口失败）→ **拒绝**（fail closed）；
+  - 审计行带 actor：`qq policy: … by=<actor> …` / `qq memory: … by=<actor>`。
+- [x] 白名单 `data/qq_operators.json` 已按当前群主 QQ 号播种（`1751557948`）。
+
+**验证**：kernel lib **993** + bin 35 全绿（新增 `turn_meta_tests` 三例：对象注入、**覆盖伪造的 `__meta`**、非对象 payload 包进 `value`）；qq 插件 **59** 单测（新增 7 例：CLI 放行、owner/admin 放行、普通群员拒绝且不落盘、未知角色 fail closed、跨群改写被拒、全局 default 需白名单、记忆写同样受控）；`clippy -D warnings` 与 `fmt --check` 干净。
+
 ### 5.2.46 把 node 文档真正喂进 prompt（工具文档此前没进上下文，2026-10-23）
 
 **诊断**（用户提出，查证属实）：`docs.nodes[].summary / input_schema / output_schema` 早在工件里，但 kernel 拼插件目录时**只列 node id**：

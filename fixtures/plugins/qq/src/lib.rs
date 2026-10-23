@@ -1872,6 +1872,162 @@ fn handle_qq_get_group_roles(req: &NodeRequest) -> Result<NodeResponse, String> 
 
 /// WS-4: persist the reply policy so the next inbound message already uses it
 /// (build_envelope reads the file per message — no restart, no rebuild).
+// ── 判权：谁能改这个群的策略 / 记忆 ─────────────────────────────────────
+//
+// 规则在插件里（kernel 不认识"群主/管理员"）；"谁在要求"由 kernel 转交：
+// 每轮 `invoke_plugin` 的 payload 会带一个**模型无法伪造**的 `__meta`
+// （`actor` = `qq:<uid>`，`target` = `group:<gid>`，kernel 覆盖同名键）。
+//
+//   - 没有 `__meta`（CLI / 运维直接 invoke）→ 视为操作员，放行并审计；
+//   - 有 `__meta`：改某个群 → 必须是该群 owner/admin，或 `data/qq_operators.json`
+//     里的运营白名单；改全局 default → 只认运营白名单；
+//   - 角色查不到（bot 无权限 / 接口失败）→ **拒绝**（fail closed）。
+
+/// 角色缓存 TTL：同一群 10 分钟内只查一次成员列表。
+const ROLE_CACHE_TTL: Duration = Duration::from_secs(600);
+
+static ROLE_CACHE: Mutex<Vec<(String, std::collections::HashMap<String, String>, std::time::Instant)>> =
+    Mutex::new(Vec::new());
+
+/// kernel 注入的可信元数据里的发送者（去掉 `qq:` 前缀）。
+fn meta_actor(req: &NodeRequest) -> Option<String> {
+    req.payload
+        .as_ref()?
+        .get("__meta")?
+        .get("actor")?
+        .as_str()
+        .map(|a| a.trim().trim_start_matches("qq:").to_string())
+        .filter(|a| !a.is_empty())
+}
+
+/// kernel 注入的 `__meta.target` → `group:<id>` 里的 id。
+fn meta_group_id(req: &NodeRequest) -> Option<String> {
+    let target = req
+        .payload
+        .as_ref()?
+        .get("__meta")?
+        .get("target")?
+        .as_str()?
+        .trim()
+        .to_string();
+    target.strip_prefix("group:").map(|s| s.to_string())
+}
+
+/// 运营白名单 `data/qq_operators.json`（`{"operators":["<uid>", …]}`）。
+fn operator_allowlist(data_dir: Option<&str>) -> Vec<String> {
+    let path = data_path(data_dir, "qq_operators.json");
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&raw) else {
+        return Vec::new();
+    };
+    value
+        .get("operators")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(Value::as_str)
+                .map(|s| s.trim().trim_start_matches("qq:").to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// 该群成员角色（`owner` / `admin` / `member`），10 分钟缓存。
+///
+/// `None` = 查不到（没有 OneBot URL、接口报错、成员列表里没这个人）。
+fn cached_group_role(gid: &str, uid: &str, payload: Option<&Value>) -> Option<String> {
+    {
+        let cache = ROLE_CACHE.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some((_, roles, fetched_at)) = cache.iter().find(|(g, _, _)| g == gid) {
+            if fetched_at.elapsed() < ROLE_CACHE_TTL {
+                return roles.get(uid).cloned();
+            }
+        }
+    }
+    let base_url = payload
+        .and_then(|p| p.get("onebot_url"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| STATE.lock().ok().and_then(|s| s.onebot_url.clone()))
+        .or_else(|| {
+            load_runtime_config().and_then(|c| c.get("onebot_url")?.as_str().map(|s| s.to_string()))
+        })?;
+    let token = payload
+        .and_then(|p| p.get("access_token"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| STATE.lock().ok().and_then(|s| s.access_token.clone()))
+        .or_else(|| {
+            load_runtime_config()
+                .and_then(|c| c.get("access_token")?.as_str().map(|s| s.to_string()))
+        });
+    let Ok(group_id) = gid.parse::<i64>() else {
+        return None;
+    };
+    let members = onebot_call(
+        &base_url,
+        "get_group_member_list",
+        &json!({ "group_id": group_id }),
+        token.as_deref(),
+    )
+    .ok()?;
+    let mut roles = std::collections::HashMap::new();
+    if let Some(arr) = members.get("data").and_then(Value::as_array) {
+        for member in arr {
+            let uid = member.get("user_id").and_then(|v| v.as_i64());
+            let role = member.get("role").and_then(Value::as_str);
+            if let (Some(uid), Some(role)) = (uid, role) {
+                roles.insert(uid.to_string(), role.to_string());
+            }
+        }
+    }
+    let found = roles.get(uid).cloned();
+    let mut cache = ROLE_CACHE.lock().unwrap_or_else(|p| p.into_inner());
+    cache.retain(|(g, _, _)| g != gid);
+    cache.push((gid.to_string(), roles, std::time::Instant::now()));
+    found
+}
+
+/// 判权入口。`Ok(actor_tag)` 里的 tag 只用于审计行。
+///
+/// `group = None` 表示改的是全局默认策略。
+fn authorize_policy_write(
+    req: &NodeRequest,
+    data_dir: Option<&str>,
+    group: Option<&str>,
+    what: &str,
+) -> Result<String, String> {
+    let Some(actor) = meta_actor(req) else {
+        // 没有 __meta：CLI/运维直接 invoke，视为操作员。
+        return Ok("operator-cli".to_string());
+    };
+    // 只能改「这条消息来自的那个群」：模型被诱导去改别的群时必须拦住。
+    if let (Some(group), Some(from_group)) = (group, meta_group_id(req)) {
+        if group != from_group {
+            return Err(format!(
+                "you can only change the {what} of the group this message came from"
+            ));
+        }
+    }
+    let allowlisted = operator_allowlist(data_dir).iter().any(|op| op == &actor);
+    if allowlisted {
+        return Ok(format!("operator:{actor}"));
+    }
+    let Some(group) = group else {
+        return Err(format!(
+            "only a configured operator can change the global {what} (add your QQ id to data/qq_operators.json)"
+        ));
+    };
+    match cached_group_role(group, &actor, req.payload.as_ref()).as_deref() {
+        Some("owner") | Some("admin") => Ok(format!("{actor}")),
+        _ => Err(format!(
+            "only the group owner or an admin can change this group's {what}"
+        )),
+    }
+}
+
 fn handle_qq_set_reply_policy(req: &NodeRequest) -> Result<NodeResponse, String> {
     let payload = req.payload.as_ref();
     let data_dir = node_str_arg(payload, req.data_dir.as_deref(), "data_dir");
@@ -1898,6 +2054,7 @@ fn handle_qq_set_reply_policy(req: &NodeRequest) -> Result<NodeResponse, String>
     if mode.is_none() && policy.is_none() {
         return Err("mode or policy is required".to_string());
     }
+    let actor = authorize_policy_write(req, data_dir.as_deref(), group.as_deref(), "reply policy")?;
 
     let mut store = load_policy_store(data_dir.as_deref());
     {
@@ -1918,10 +2075,11 @@ fn handle_qq_set_reply_policy(req: &NodeRequest) -> Result<NodeResponse, String>
     let (effective_mode, effective_text, source) =
         effective_policy(data_dir.as_deref(), group.as_deref());
     eprintln!(
-        "qq policy: group={} mode={} chars={} by=agent source={}",
+        "qq policy: group={} mode={} chars={} by={} source={}",
         group.as_deref().unwrap_or("<default>"),
         effective_mode,
         effective_text.chars().count(),
+        actor,
         source
     );
     Ok(NodeResponse {
@@ -1978,6 +2136,7 @@ fn handle_qq_set_group_memory(req: &NodeRequest) -> Result<NodeResponse, String>
         .unwrap_or_default()
         .trim()
         .to_string();
+    let actor = authorize_policy_write(req, data_dir.as_deref(), Some(group.as_str()), "memory")?;
     let mut store = load_memory_store(data_dir.as_deref());
     let truncated: String = memory.chars().take(MEMORY_MAX_CHARS).collect();
     let dropped_chars = memory
@@ -1998,7 +2157,7 @@ fn handle_qq_set_group_memory(req: &NodeRequest) -> Result<NodeResponse, String>
     }
     let path = save_memory_store(data_dir.as_deref(), &store)?;
     eprintln!(
-        "qq memory: group={group} chars={} dropped={dropped_chars} by=agent",
+        "qq memory: group={group} chars={} dropped={dropped_chars} by={actor}",
         truncated.chars().count()
     );
     Ok(NodeResponse {
@@ -4069,5 +4228,175 @@ mod hint_silence_bias_tests {
             .expect("qq must ship a system hint");
         let points_at_policy = hint.contains("[reply policy: <mode> — <text>]");
         assert!(points_at_policy, "策略行仍是唯一权威");
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// 判权：谁能改本群策略 / 记忆。
+//
+// 规则在插件（kernel 不认识群主/管理员）；"谁在要求"由 kernel 通过
+// payload.__meta 转交（模型伪造不了）。角色从 get_group_member_list 取，
+// 10 分钟缓存；查不到就拒绝（fail closed）。
+// ═══════════════════════════════════════════════════════════════════════
+#[cfg(test)]
+mod auth_tests {
+    use super::test_support::temp_dir;
+    use super::*;
+
+    /// 起一个最小 OneBot HTTP stub，只回 get_group_member_list。
+    fn member_stub(roles: &'static [(&'static str, &'static str)]) -> String {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub");
+        let addr = listener.local_addr().expect("addr");
+        std::thread::spawn(move || {
+            for _ in 0..4 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut buf = [0u8; 2048];
+                let _ = stream.read(&mut buf);
+                let members: Vec<Value> = roles
+                    .iter()
+                    .map(|(uid, role)| json!({ "user_id": uid.parse::<i64>().unwrap_or(0), "role": role }))
+                    .collect();
+                let body = json!({ "status": "ok", "retcode": 0, "data": members }).to_string();
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(header.as_bytes());
+                let _ = stream.write_all(body.as_bytes());
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    fn req_with_meta(node: &str, dir: &std::path::Path, group: &str, actor: &str, url: &str) -> NodeRequest {
+        serde_json::from_value(json!({
+            "node_id": node,
+            "data_dir": dir.to_str().unwrap_or_default(),
+            "group": group,
+            "mode": "chatty",
+            "payload": {
+                "onebot_url": url,
+                "__meta": { "actor": format!("qq:{actor}"), "target": format!("group:{group}") }
+            }
+        }))
+        .expect("NodeRequest")
+    }
+
+    // 没有 __meta（CLI / 运维直接 invoke）→ 视为操作员，放行。
+    #[test]
+    fn cli_invoke_without_meta_is_allowed() {
+        let dir = temp_dir();
+        let req: NodeRequest = serde_json::from_value(json!({
+            "node_id": "qq_set_reply_policy",
+            "data_dir": dir.to_str().unwrap_or_default(),
+            "group": "800001",
+            "mode": "quiet",
+        }))
+        .expect("req");
+        let resp = handle_qq_set_reply_policy(&req).expect("operator path must work");
+        assert!(resp.ok);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // 群主 / 管理员可以改本群策略。
+    #[test]
+    fn owner_and_admin_can_change_their_group() {
+        let dir = temp_dir();
+        let url = member_stub(&[("1001", "owner"), ("2002", "admin"), ("3003", "member")]);
+        for (actor, group) in [("1001", "800002"), ("2002", "800003")] {
+            let req = req_with_meta("qq_set_reply_policy", &dir, group, actor, &url);
+            let resp = handle_qq_set_reply_policy(&req).unwrap_or_else(|e| panic!("{actor}: {e}"));
+            assert!(resp.ok, "{actor}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // 普通群员不能改，且错误文本要说清原因。
+    #[test]
+    fn plain_member_is_rejected() {
+        let dir = temp_dir();
+        let url = member_stub(&[("1001", "owner"), ("3003", "member")]);
+        let req = req_with_meta("qq_set_reply_policy", &dir, "800004", "3003", &url);
+        let err = handle_qq_set_reply_policy(&req).expect_err("member must be rejected");
+        assert_eq!(
+            err,
+            "only the group owner or an admin can change this group's reply policy"
+        );
+        // 被拒时不许落盘。
+        let touched = policies_path(Some(dir.to_str().unwrap_or_default())).exists();
+        assert!(!touched, "a rejected write must not create the file");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // 角色查不到（接口失败 / 群里没这个人）→ 拒绝（fail closed）。
+    #[test]
+    fn unknown_role_is_denied() {
+        let dir = temp_dir();
+        let url = member_stub(&[("1001", "owner")]);
+        let req = req_with_meta("qq_set_reply_policy", &dir, "800005", "9999", &url);
+        let err = handle_qq_set_reply_policy(&req).expect_err("unknown actor must be denied");
+        let mentions_permission = err.contains("owner or an admin");
+        assert!(mentions_permission, "err: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // 不能改「别的群」的策略（模型被诱导时拦住）。
+    #[test]
+    fn cannot_touch_a_group_other_than_the_originating_one() {
+        let dir = temp_dir();
+        let url = member_stub(&[("1001", "owner")]);
+        let mut req = req_with_meta("qq_set_reply_policy", &dir, "800006", "1001", &url);
+        // 消息来自 800006，但要求改 800007。
+        req.payload.as_mut().and_then(|p| p.get_mut("__meta")).and_then(|m| m.as_object_mut())
+            .map(|m| m.insert("target".to_string(), json!("group:800007")));
+        let err = handle_qq_set_reply_policy(&req).expect_err("cross-group write must be denied");
+        let explains = err.contains("only change the reply policy of the group this message came from");
+        assert!(explains, "err: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // 全局 default 只认运营白名单；白名单为空时连群主也不行。
+    #[test]
+    fn global_default_requires_the_operator_allowlist() {
+        let dir = temp_dir();
+        let url = member_stub(&[("1001", "owner")]);
+        let req: NodeRequest = serde_json::from_value(json!({
+            "node_id": "qq_set_reply_policy",
+            "data_dir": dir.to_str().unwrap_or_default(),
+            "mode": "quiet",
+            "payload": { "onebot_url": url, "__meta": { "actor": "qq:1001" } }
+        }))
+        .expect("req");
+        let err = handle_qq_set_reply_policy(&req).expect_err("global change must need allowlist");
+        let mentions_operators = err.contains("qq_operators.json");
+        assert!(mentions_operators, "err: {err}");
+
+        // 把 1001 加进白名单后放行。
+        std::fs::write(
+            dir.join("qq_operators.json"),
+            r#"{"operators":["1001"]}"#,
+        )
+        .expect("write allowlist");
+        let resp = handle_qq_set_reply_policy(&req).expect("allowlisted operator may change it");
+        assert!(resp.ok);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // 记忆的写路径同样受判权保护（普通群员不行）。
+    #[test]
+    fn memory_writes_are_gated_too() {
+        let dir = temp_dir();
+        let url = member_stub(&[("1001", "owner"), ("3003", "member")]);
+        let mut req = req_with_meta("qq_set_group_memory", &dir, "800008", "3003", &url);
+        req.memory = Some("x".to_string());
+        let err = handle_qq_set_group_memory(&req).expect_err("member must be rejected");
+        let mentions_permission = err.contains("owner or an admin");
+        assert!(mentions_permission, "err: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

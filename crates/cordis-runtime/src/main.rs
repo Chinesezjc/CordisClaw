@@ -1073,11 +1073,18 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                         .collect();
                     // 一次性上下文只取最后一条（策略/记忆是按群的，整批一致）。
                     let batch_notes = normals.last().map(|e| e.notes.clone()).unwrap_or_default();
-                    match host.agent_send_with_fallback_turn_context(
+                    // 可信身份：kernel 把它注入每次 invoke 的 payload.__meta，
+                    // 插件据此判权；模型自己传的同名字段会被 kernel 覆盖。
+                    let mut turn_meta = std::collections::BTreeMap::new();
+                    turn_meta.insert("actor".to_string(), route.sender_id.clone());
+                    turn_meta.insert("conversation".to_string(), route.conversation_kind.clone());
+                    turn_meta.insert("target".to_string(), route.reply_target.clone());
+                    match host.agent_send_with_fallback_turn_meta(
                         sid,
                         &agent_input,
                         &batch_images,
                         &batch_notes,
+                        &turn_meta,
                     ) {
                         Ok(reply) => {
                             pending::clear(&data_dir, session_key);

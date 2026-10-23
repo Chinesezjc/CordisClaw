@@ -111,6 +111,12 @@ effect on the next message — no rebuild, no restart. An empty policy is reject
 - 表情、贴纸、单字回复
 - 不涉及机器人的陈述
 
+## 谁能改策略 / 记忆
+
+改某个群的策略或记忆，要求发起人是**该群的群主或管理员**（角色取自 `get_group_member_list`，10 分钟缓存）；改全局默认策略只认 `data/qq_operators.json` 白名单。角色查不到（bot 没权限、接口失败）一律拒绝。
+
+"谁在要求"不是模型自己说的：kernel 会把本轮的 `actor` 注入每次 `invoke_plugin` 的 `payload.__meta`（模型传入的同名字段会被覆盖），插件据此判权。CLI / 运维直接 invoke 没有 `__meta`，视为操作员并记审计。
+
 ## 每群策略 + 每群记忆
 
 两件事都落在 `data/`，由 agent 自己写，**下一条消息即生效**（不改 Rust、不重建、不重启）：
