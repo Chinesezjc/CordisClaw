@@ -3571,6 +3571,39 @@ export_plugin_api! {{
         Ok(())
     }
 
+    /// P4: rebind the caller's role flags. Group room persona edits are
+    /// gated on `is_admin`; private chats ignore both flags. Refreshed per
+    /// batch by the inbox, so the flags always describe whoever's tools are
+    /// about to run. Returns `AgentSessionNotFound` if the session is gone.
+    pub fn refresh_session_caller(
+        &self,
+        session_id: &str,
+        is_group: bool,
+        is_admin: bool,
+    ) -> Result<(), RuntimeError> {
+        let mut guard = self
+            .agent_sessions
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let not_found = || RuntimeError::AgentSessionNotFound {
+            session_id: session_id.to_string(),
+        };
+        let managed = guard.get_mut(session_id).ok_or_else(not_found)?;
+        managed.session.set_caller_policy(is_group, is_admin);
+        Ok(())
+    }
+
+    /// Read side of `refresh_session_caller`: `None` when the session is
+    /// gone (the caller has no role facts to act on).
+    pub(crate) fn session_caller_policy(&self, session_id: &str) -> Option<(bool, bool)> {
+        let guard = self
+            .agent_sessions
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let managed = guard.get(session_id)?;
+        Some(managed.session.caller_policy())
+    }
+
     fn set_degraded(&self, session_id: &str, degraded: bool) {
         let mut guard = self
             .profile_fallback
@@ -9936,6 +9969,55 @@ mod tests {
             .refresh_session_soul("no-such-session", "user:42")
             .expect_err("unknown session should error");
         assert!(matches!(err, RuntimeError::AgentSessionNotFound { .. }));
+    }
+
+    // P4: 未知 sid 不能写 caller 角色位。
+    #[test]
+    #[serial]
+    fn refresh_session_caller_unknown_sid_errors() {
+        use crate::agent::AgentToolHost;
+
+        let host = shared_host();
+        let err = host
+            .refresh_session_caller("no-such-session", true, true)
+            .expect_err("unknown session should error");
+        assert!(matches!(err, RuntimeError::AgentSessionNotFound { .. }));
+        // 读侧同样无事实可报：None 表示"宿主判断不了"，门控不生效。
+        assert_eq!(host.agent_session_caller("no-such-session"), None);
+    }
+
+    // P4: 已知 sid 写入后能原样读回；默认是"非群聊、非管理员"。
+    #[test]
+    #[serial]
+    fn refresh_session_caller_roundtrips_policy() {
+        use crate::agent::{AgentToolHost, SessionCaller};
+
+        let host = shared_host();
+        let handle = host
+            .agent_start_with(AgentSessionKind::RuntimeShell, AgentStartOptions::default())
+            .expect("agent should start");
+        let session_id = handle.session_id;
+        // 新会话未绑定时既不是群聊也不是管理员（安全默认）。
+        assert_eq!(
+            host.agent_session_caller(&session_id),
+            Some(SessionCaller {
+                is_group: false,
+                is_admin: false,
+            })
+        );
+        host.refresh_session_caller(&session_id, true, true)
+            .expect("known session should accept the policy");
+        assert_eq!(
+            host.agent_session_caller(&session_id),
+            Some(SessionCaller {
+                is_group: true,
+                is_admin: true,
+            })
+        );
+        // 会话自己也能读回同一组旗标。
+        let guard = host.agent_sessions_mut();
+        let managed = guard.get(&session_id).expect("session should exist");
+        assert_eq!(managed.session.caller_policy(), (true, true));
     }
 
     // Build a one-node `RuntimeSnapshot` whose single plugin is registered as
