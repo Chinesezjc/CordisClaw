@@ -9,3 +9,5 @@ fixtures/tmp/
 fixtures/.artifacts-build.lock
 data/
 *.profraw
+fixtures/plugins/**/Cargo.lock
+!fixtures/plugins/Cargo.lock

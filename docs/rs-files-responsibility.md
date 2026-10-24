@@ -84,6 +84,7 @@
 |---|---|---|
 | `crates/cordis-runtime/src/soul.rs` | per-用户人格（soul）存储槽：`Soul` 数据模型（persona + LLM profile 引用）、`SoulProvider` trait、kernel 内建 `FileSoulProvider`（`data/souls/*.json`，0600）。插件同时声明 `soul_get`+`soul_set` 节点即覆写（host 侧 `PluginSoulProvider`） | `SoulProvider::get/set`、`FileSoulProvider::new`、`sanitize_soul_key` |
 | `crates/cordis-runtime/src/command_router.rs` | bypass-LLM 指令路由：`/` 前缀消息不经 LLM 直接执行，经 envelope 回复通路返回；内建 /status /help /reset /soul，插件经 `command_name`+`command_entry` 节点注册；LLM 全挂时的管理面 | `dispatch`、`CommandContext`、`CommandOutcome` |
+| `crates/cordis-runtime/src/guard.rs` | 确定性聊天护栏（无 LLM、无语义猜测）：高精度危机短语 → 固定求助话术；群聊同发言人连续轮次预算（`DEFAULT_TURN_CAP`）→ 一次固定提示后静默。inbox 在调用模型前应用 | `crisis_reply`、`ReplyBudget::begin_turn/record_turn`、`TurnVerdict` |
 
 ## 7. Service 层 (`crates/cordis-runtime/src/service`)
 

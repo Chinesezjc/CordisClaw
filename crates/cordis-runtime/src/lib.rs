@@ -4,6 +4,7 @@ pub mod config;
 pub mod context;
 pub mod core;
 pub mod execution;
+pub mod guard;
 pub mod host;
 pub mod kernel;
 mod llm_sink;

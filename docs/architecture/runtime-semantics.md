@@ -193,8 +193,9 @@ inbox 一次可取到一批消息（同一渠道多条堆积）。批处理不�
 - **命令 vs 普通消息逐条切分**：批内每条按正文是否 `/` 前缀分类。命令**逐条 dispatch**，各自用**自己 envelope 的 ctx**（身份 = 各自发送者，不是整批统一身份）；普通消息重组成一个 batch 送 agent。命令先于普通消息处理。
 - **`/reset` 的同批语义**：`/reset` 走 `drop_session`（清 `agent_sessions` / `pending_session_actions` / `profile_fallback` 三张 map + 删磁盘快照，幂等）。同一批里 `/reset` 之后到来的普通消息进入**新 session**。
 - **人格作用域：私聊按人、群聊按房间**（5.2.42 修正）：`AgentEnvelope::soul_key()` 私聊返回 `{sender_id}#private`，群聊返回**房间** `session_key`——一个群只有一个人格，不随发言人切换。inbox 每批 send 前的 `refresh_session_soul` 在群聊里因此退化为**幂等 no-op**（host 能力保留，私聊仍可显式重绑）。**profile（LLM 端点）仍保持 session 起点**，换 profile 需 `/reset` 起新会话。
-- **群聊里的 `set_soul` / `/soul`**：作用域是**本群房间**，任何成员改人格 = 改全群看到的角色（当前无管理员校验，见 5.2.42 待办）。私聊仍是"只改自己的"。
-- **说话人标识**（5.2.42）：qq 的 envelope `display` 形如 `[QQ group from <gid> (user <uid>, name "<display>")]: <text>`，名字在入口清洗（控制字符/引号/括号过滤 + 24 字符截断），防昵称注入与伪造 envelope 标记。
+- **群聊里的 `set_soul` / `/soul`**：作用域是**本群房间**，但改动由 owner/admin 门控（5.2.43）：qq 的 `sender_role` 进 envelope，host 每批 `refresh_session_caller` 写 session 的 `caller_policy`，`set_soul` 工具在"群聊 + 非管理员"时直接拒绝。feishu 事件不带群角色 → 其群聊人格编辑按安全默认被拒。私聊仍是"只改自己的"。
+- **说话人标识**（5.2.42/5.2.43）：qq / feishu 的 envelope `display` 形如 `[QQ group from <gid> (user <uid>, name "<display>")]: <text>`（媒体消息另带 `msg=`），名字在入口清洗（控制字符/引号/括号过滤 + 24 字符截断），防昵称注入与伪造 envelope 标记。feishu 名字来自成员接口（30min TTL 缓存，失败静默回退无名字格式）。
+- **确定性护栏**（5.2.43，`guard.rs`）：inbox 在调用模型前先过两条无 LLM 检查——高精度危机短语 → 固定求助话术（短路，不受轮次预算影响）；群聊同一发言人连续轮次上限 4，第 5 轮固定提示、第 6 轮起静默，换人即重置。语义级越界识别明确不做。
 - **纯命令批不碰 pending**：整批都是命令时不触发 pending spill / 重放（命令本就不经 LLM，无"打穿"可言）。
 - **批次边界标记**（5.2.36）：普通消息 batch 送 agent 时，正文用渠道中立标记 `CURRENT_INCOMING_BATCH_START` / `CURRENT_INCOMING_BATCH_END` 包裹，并附"只把当前批次当请求，不针对则 suspend"指令，防止 agent 把历史消息误当当前请求。包裹只发生在 `agent_send` 发送点；spill / pending 落盘的是原始未包裹文本。
 - **agent 回复只取首个 JSON 值**（5.2.36）：agent 输出经 `serde_json::Deserializer` 只消费首个 JSON 值（suspend / respond），容忍尾随杂质，agent 在 JSON 后追加的解释文本不再导致解析失败。

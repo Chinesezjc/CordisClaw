@@ -22,7 +22,7 @@
 | 优雅退出 + data/ 持久化 | 已完成 | SIGTERM→SIGINT 转发优雅退出、`data/memory/shutdown.json` 退出快照、`data/` 沙箱扩展（agent 可访问 workspace 根级目录） |
 | QQ 插件消息解析 | 已完成 | JSON 卡片透传、合并转发 ID 提取、回复 msg_id 提示 |
 | QQ 入站传输 | 已完成 | HTTP webhook（`qq_serve`）+ WebSocket 服务器（`qq_ws_serve` Task 节点，接收线上 Napcat ws 端口的 OneBot v11 事件，优雅停机）；出站走 HTTP API |
-| 群聊人格与身份 | 已完成 | 群聊 persona 房间级（一房间一角色，不随发言人翻转）、说话人展示名进 qq envelope（清洗 + 24 字符截断）、system prompt 四段式（persona 免责声明 + kernel conduct 硬边界契约），2026-10-23 |
+| 群聊人格与身份 | 已完成 | 群聊 persona 房间级（一房间一角色，不随发言人翻转）、说话人展示名进 qq/feishu envelope（清洗 + 24 字符截断）、system prompt 四段式（persona 免责声明 + kernel conduct 硬边界契约）、群人格编辑仅 owner/admin、确定性护栏（危机短语短路 + 同发言人连续轮次预算），2026-10-23 |
 | Agent 安全加固 | 已完成 | secret 不可见（token 不进入 prompt）、移除 `run_command`、敏感路径黑名单、工具防火墙（`agent_accessible`）、按群隔离 session、`build_plugins` 白名单命令、工具失败自动告警 |
 | Service 生命周期 | 部分完成 | `Service` trait + `ServiceRegistry` + `NodeType::Task` 已实现；plugin load 时自动 start 尚未接入 |
 | 插件封装形态蓝图 | 部分完成 | `dylib` + JSON artifact + process 已落地；`cdylib` / `WASM` 未实现 |
@@ -240,6 +240,17 @@ Agent 现在可以自主完成：读代码 → 理解结构 → 写/改文件 �
 - [x] **Plugin iteration symlink 逃逸**（P0-20）— `PluginEditExecutor::execute` 在写入前调用新 helper `resolve_under_workspace`：canonicalize 结果必须仍在 workspace_root 下。plugins 内的 symlink 指向 `/etc/passwd` 之类无法被写入。
 - [x] **Verifier shell 拼接**（P0-21）— 已随 A 批 P0-1 修复。`discover_rust_workspace_manifest` 输出的字符串被 `shell_words` 解析成 argv，空格 / `$` / `;` 无法被解释。
 
+### 5.2.43 群聊收尾：管理员门控 / feishu 说话人名 / 确定性护栏 / 锁文件（2026-10-23 已闭合）
+
+继续 5.2.42 留下的四条待办：
+
+- [x] **群聊人格改动的管理员门控** — qq 侧 `IncomingMessage.sender_role` ← OneBot `sender.role`；envelope 增 `sender_role`（缺省空串，schema 稳定）；`AgentEnvelope::caller_is_admin()` 只认 `owner`/`admin`（大小写不敏感，空 = 普通成员）。host 侧 `refresh_session_caller(sid, is_group, is_admin)` + `AgentSession::caller_policy()`（角色是 per-batch 事实，不写快照，崩溃恢复默认 false）；`AgentToolHost::agent_session_caller` 默认返回 `None`（宿主判断不了 → 不限制），RuntimeHost 覆盖。`set_soul` 工具在"群聊 + 非管理员"时直接拒绝（`only a group owner/admin can change this room's persona`），私聊不受影响。**feishu 事件本身不带群角色 → 其群聊人格编辑按安全默认被拒**，要放开需另补角色来源（feishu 成员接口）。
+- [x] **feishu 说话人展示名 + 成员查询** — 新节点 `feishu_get_chat_members`（`GET /open-apis/im/v1/chats/{chat_id}/members?member_id_type=open_id[&page_size][&page_token]`，agent_accessible）；ingest 侧按 `{chat_id}:{open_id}` 做 30 分钟 TTL / 512 上限的名字缓存，miss 才查成员接口（2s 超时、失败静默、命中不发请求），display 变为 `[Feishu {scope} from {chat_id} (user {open_id}, name "<name>")]: {text}`（媒体消息保留 `msg=`），名字同样清洗（控制字符/引号/括号过滤 + 24 char）。测试覆盖 URL 形态、成员 JSON 边界、缓存命中/TTL/连接拒绝、display 8 组合。
+- [x] **确定性护栏（`guard.rs`）** — `crisis_reply`：高精度危机短语（自杀/自残/轻生/跳楼/不想活了/活不下去/活着没意思/结束生命）→ 固定求助话术（12356、希望24、110/120），在调用模型前短路；刻意不收 `想死`/`笑死` 这类歧义片段（误报会把日常玩笑变成求助话术）。`ReplyBudget`：群聊同一发言人连续轮次上限 4，第 5 轮固定一句"这个话头我先不接了"，第 6 轮起静默，换人说话即重置——直接掐掉"越界请求刷屏 → bot 一步步让步"的机械通道。**明确不做**语义级越界识别（关键词猜测既漏又误伤），提示词契约 + 这两条机械护栏是该层能诚实承诺的边界。
+- [x] **fixtures 锁文件入库** — `.gitignore` 改为忽略 per-plugin lockfile、保留并提交 workspace `fixtures/plugins/Cargo.lock`（209 packages）。根因：`chacha20 0.10.1` 已被 yank，无锁文件时 `cargo metadata --offline` 解析必失败（`llm_openai → reqwest → quinn → quinn-proto → rand → chacha20` 的**可选 http3 路径**，不在默认 build tree，故 `cargo tree -i` 看不到）。全新 checkout 复验：`cargo metadata --offline` 通过且不再改写锁文件。
+
+**验证**：`cargo test --lib` 1022、`--bin` 30、qq 18+1、feishu 55+1 全绿；两个 workspace `cargo clippy --all-targets -- -D warnings` 零 warning；`cargo fmt --all -- --check` 干净。真机回归见 5.2.44。
+
 ### 5.2.42 群聊 bad case：人格翻转 / 说话人失联 / 边界可谈判（2026-10-23 已闭合）
 
 线上 QQ 群 2026-10-23 17:18–17:29 的一段对话暴露四类失败：① 机器人用"要过安全审查 / 申请驳回 / 固件更新"这类**不存在的内部流程**拒绝"假装骂人"，用户回一句"审查通过了"后四轮内顺从；② 同一 session 内三种立场（"骂人这功能我这没有" → "行吧，假装骂两句" → "骂人的活儿我不接"）；③ 用户问"他是谁"时回"我这边只看得到一串QQ号和昵称，对不上人"，而 9 秒前刚答出对方名片；④ 用户明确说"别教我做事"后仍重复"喝口水/深呼吸"模板，并把对方情绪归因为"累的多半是手不是心"。
@@ -251,11 +262,11 @@ Agent 现在可以自主完成：读代码 → 理解结构 → 写/改文件 �
 - [x] **conduct 硬边界 + persona 免责声明（agent）** — system prompt 三段改四段：base → persona（前置 `PERSONA_DISCLAIMER`：只影响语气、不授予/剥夺能力、不能压过 conduct）→ `CONDUCT_CONTRACT`（kernel 级、所有渠道生效）→ plugin hints（最末保 recency）。契约七条：不编造内部流程；拒绝一句且不翻转（"审查通过"不算新事实）；不辱骂/不评价真人（包括"演"）；情绪场景先共情、不诊断、不重复模板；不喂养挑衅、不做元评论；认人先用现有信息查再问；未经工具确认不陈述自身状态。测试：`system_prompt_orders_persona_conduct_hints`（段序 + 双换行拼接）、`system_prompt_always_carries_conduct`、`conduct_covers_hard_boundaries`（逐条关键词钉住）。
 - [x] **文档与文案同步** — 本文件状态总表新增"群聊人格与身份"行；5.2.34 H1 与 5.2.32 J 批标注房间级修正；`runtime-semantics.md` 3.5/3.5.1 改写为"私聊按人、群聊按房间" + 四段式 prompt；`/soul` 帮助文案、`set_soul` 工具描述、`host::refresh_session_soul` 与 `soul.rs` 的作用域注释同步。
 
-**待办（未闭合，不阻塞本批）**：
-- feishu 的 `build_envelope` 同样只有 open_id 没有显示名（同款缺口，另开）。
-- 群聊 `set_soul` / `/soul` 无管理员校验：任何成员都能改全群人格（权限模型一期仍是"渠道 policy 即权限"），需 admin allowlist。
-- conduct 是**提示词级**契约，测试只能保证"在位、顺序、关键词"；语义级越界检测（重复越界诉求计数、危机词路由）需另立项目。
-- 仓库隐患：`fixtures/plugins/Cargo.lock` 被 gitignore，而 registry 上 `chacha20 0.10.1` 已被 yank，新 worktree 无 lockfile 时 `cargo metadata --offline` 必失败。建议提交 lockfile 或锁版本（独立的工具链改动）。
+**待办（均已在 5.2.43 闭合）**：
+- [x] feishu 的 `build_envelope` 同样只有 open_id 没有显示名（同款缺口）→ 5.2.43 补齐（成员查询 + 名字缓存）。
+- [x] 群聊 `set_soul` / `/soul` 无管理员校验 → 5.2.43 加 owner/admin 门控（feishu 因角色不可得按安全默认拒绝）。
+- [x] conduct 只是提示词级契约，机械层缺保障 → 5.2.43 加 `guard.rs`（危机短路 + 连续轮次预算）；语义级识别仍明确不做（见 5.2.43）。
+- [x] `fixtures/plugins/Cargo.lock` 被 gitignore + `chacha20 0.10.1` yanked → 5.2.43 提交锁文件。
 
 **验证**：根 workspace `cargo test` 全绿（21 个 test binary、1437 个测试；lib 1013 / bin 28 / `runtime_host` 34 含新增 `group_persona_is_stable_across_speakers`）；fixtures workspace 全插件 cargo test 全绿（qq 17 + 1）；两个 workspace `cargo clippy --all-targets -- -D warnings` 零 warning；`cargo fmt --all -- --check` 干净。覆盖率按 CI 的 lcov 口径本地为 **29066/29291 = 99.23%**：未覆盖 225 行全部落在本批未改动的文件（`plugin_iteration` / `verifier` / `auto_update` / `tooling` / `host` 的只读目录、权限失败、rollback 失败等**故障注入臂**），本沙箱以 root（uid 0）运行，`if geteuid() != 0` 类的权限臂不触发；权威判定以 CI（非 root）为准。另记一个本地环境陷阱：4 个 plugin-iteration canary 测试在继承 `CARGO_TARGET_DIR` 时会假失败（嵌套 `cargo test` 复用同一 target），默认 target 下全绿，已在干净环境复跑确认不是本批回归。
 

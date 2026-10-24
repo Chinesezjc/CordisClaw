@@ -599,6 +599,9 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         let health_host = std::sync::Arc::clone(&host);
         let park_host = std::sync::Arc::clone(&host);
         let mut sessions: BTreeMap<String, String> = BTreeMap::new();
+        // P5: per-room consecutive-turn budget (only group chats use it).
+        let mut reply_budgets: BTreeMap<String, cordis_runtime::guard::ReplyBudget> =
+            BTreeMap::new();
         std::thread::spawn(move || {
             loop {
                 let mut msgs: Vec<String> = Vec::new();
@@ -715,6 +718,44 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                         normals.len(),
                         combined
                     );
+                    // P5: deterministic guards, applied before any LLM work.
+                    // A crisis phrase always gets the fixed helpline reply —
+                    // it must not be skipped by an exhausted turn budget.
+                    if let Some(reply) = cordis_runtime::guard::crisis_reply(&combined) {
+                        eprintln!("inbox: [{session_key}] crisis phrase → fixed reply");
+                        send_via(&route, reply);
+                        continue;
+                    }
+                    if route.conversation_kind == "group" {
+                        let budget =
+                            reply_budgets.entry(session_key.clone()).or_insert_with(|| {
+                                cordis_runtime::guard::ReplyBudget::new(
+                                    cordis_runtime::guard::DEFAULT_TURN_CAP,
+                                )
+                            });
+                        match budget.begin_turn(&route.sender_id) {
+                            // Counted as a turn whether the agent answers or
+                            // suspends: the budget limits attention, not just
+                            // outbound messages.
+                            cordis_runtime::guard::TurnVerdict::Allow => budget.record_turn(),
+                            cordis_runtime::guard::TurnVerdict::Warn => {
+                                eprintln!(
+                                    "inbox: [{session_key}] turn budget exhausted for {} → fixed warning",
+                                    route.sender_id
+                                );
+                                send_via(&route, cordis_runtime::guard::BUDGET_WARNING);
+                                budget.record_turn();
+                                continue;
+                            }
+                            cordis_runtime::guard::TurnVerdict::Drop => {
+                                eprintln!(
+                                    "inbox: [{session_key}] turn budget exhausted for {} → drop",
+                                    route.sender_id
+                                );
+                                continue;
+                            }
+                        }
+                    }
                     // P1-53: don't drain rx.try_recv() here — messages on the
                     // channel are from ALL sessions; the outer loop shards
                     // them correctly next iteration.
