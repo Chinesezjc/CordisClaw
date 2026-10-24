@@ -152,7 +152,7 @@ const DEFAULT_PORT: u16 = 8100;
 // A queued inbound message
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct IncomingMessage {
     /// "group" | "p2p"
     chat_type: String,
@@ -160,6 +160,11 @@ struct IncomingMessage {
     chat_id: String,
     /// Sender open_id (ou_...).
     open_id: String,
+    /// Sanitized speaker display name, resolved best-effort from the chat
+    /// member list (Feishu message events carry no sender nickname). None
+    /// keeps the name-less display form.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sender_name: Option<String>,
     /// Extracted plain text.
     text: String,
     /// message_id (om_...) for dedup + quote-reply.
@@ -632,10 +637,17 @@ fn parse_message_event(v: &Value, bot_open_id: Option<&str>) -> Option<IncomingM
         text
     };
 
+    // Feishu message events carry only the sender's open_id, never a display
+    // name; resolve it best-effort from the chat member list so the envelope
+    // can show a human name. Any failure (no credentials, missing permission,
+    // network) degrades to None and never affects delivery.
+    let sender_name = resolve_sender_name(&chat_id, &open_id);
+
     Some(IncomingMessage {
         chat_type,
         chat_id,
         open_id,
+        sender_name,
         text: cleaned,
         message_id,
         root_id,
@@ -730,10 +742,12 @@ fn parse_card_action(v: &Value) -> Option<IncomingMessage> {
         .or_else(|| v.get("open_id").and_then(|o| o.as_str()))
         .unwrap_or("")
         .to_string();
+    let sender_name = resolve_sender_name(&chat_id, &open_id);
     Some(IncomingMessage {
         chat_type: "group".to_string(),
         chat_id,
         open_id,
+        sender_name,
         text,
         message_id: format!(
             "cardaction:{}",
@@ -990,24 +1004,30 @@ fn feishu_download_resource(
     Ok(bytes)
 }
 
-/// GET a Feishu API endpoint with Bearer auth, parse JSON, require code==0,
-/// return the `data` object (or Null when absent).
-fn feishu_get_json(api_base: &str, token: &str, path: &str) -> Result<Value, String> {
-    let url = format!("{api_base}{path}");
-    let resp = ureq::get(&url)
+/// GET an absolute Feishu API URL with Bearer auth, parse JSON and require
+/// code==0. Returns the whole response body (callers pick `data`).
+fn feishu_get_url(url: &str, token: &str) -> Result<Value, String> {
+    let resp = ureq::get(url)
         .set("Authorization", &format!("Bearer {token}"))
         .call()
-        .map_err(|e| format!("feishu GET {path} failed: {e}"))?;
+        .map_err(|e| format!("feishu GET {url} failed: {e}"))?;
     let parsed: Value = resp
         .into_json()
-        .map_err(|e| format!("feishu GET {path} parse: {e}"))?;
+        .map_err(|e| format!("feishu GET {url} parse: {e}"))?;
     let code = parsed.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
     if code != 0 {
         return Err(format!(
-            "feishu GET {path} error code={code}: {}",
+            "feishu GET {url} error code={code}: {}",
             parsed.get("msg").and_then(|m| m.as_str()).unwrap_or("")
         ));
     }
+    Ok(parsed)
+}
+
+/// GET a Feishu API endpoint with Bearer auth, parse JSON, require code==0,
+/// return the `data` object (or Null when absent).
+fn feishu_get_json(api_base: &str, token: &str, path: &str) -> Result<Value, String> {
+    let parsed = feishu_get_url(&format!("{api_base}{path}"), token)?;
     Ok(parsed.get("data").cloned().unwrap_or(Value::Null))
 }
 
@@ -1052,6 +1072,219 @@ fn feishu_list_chats_api(
         format!("/open-apis/im/v1/chats?{query}")
     };
     feishu_get_json(api_base, token, &path)
+}
+
+/// Build the chat-members URL. Query order is fixed (`member_id_type` always
+/// present, then `page_size`, then `page_token`) and absent pagination params
+/// are omitted, so the same inputs always produce the same URL.
+fn chat_members_url(
+    api_base: &str,
+    chat_id: &str,
+    page_size: Option<i64>,
+    page_token: Option<&str>,
+) -> String {
+    let mut url =
+        format!("{api_base}/open-apis/im/v1/chats/{chat_id}/members?member_id_type=open_id");
+    if let Some(size) = page_size {
+        url.push_str(&format!("&page_size={size}"));
+    }
+    if let Some(token) = page_token {
+        url.push_str("&page_token=");
+        url.push_str(&encode_query_value(token));
+    }
+    url
+}
+
+/// Percent-encode a query-string value, keeping only RFC 3986 unreserved
+/// characters. Feishu page tokens are opaque and may contain `+`, `/` or `=`,
+/// which would otherwise change meaning inside a query string.
+fn encode_query_value(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for byte in raw.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(byte as char);
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
+/// GET a chat's members (im/v1/chats/{chat_id}/members) and return the raw
+/// `data` object — `items` plus pagination — like feishu_get_chat_info.
+fn feishu_get_members_api(
+    api_base: &str,
+    token: &str,
+    chat_id: &str,
+    page_size: Option<i64>,
+    page_token: Option<&str>,
+) -> Result<Value, String> {
+    let url = chat_members_url(api_base, chat_id, page_size, page_token);
+    let parsed = feishu_get_url(&url, token)?;
+    Ok(parsed.get("data").cloned().unwrap_or(Value::Null))
+}
+
+// ---------------------------------------------------------------------------
+// Best-effort speaker names (TTL-cached)
+// ---------------------------------------------------------------------------
+
+/// How long a resolved speaker name stays fresh. Display names change rarely,
+/// and the cache keeps ingest from hammering the members endpoint.
+const MEMBER_NAME_TTL: Duration = Duration::from_secs(30 * 60);
+/// Upper bound on cached names (clear-all on overflow — simplest policy).
+const MEMBER_NAME_CACHE_CAP: usize = 512;
+/// The ingest-time members lookup must never stall message processing.
+const MEMBER_NAME_HTTP_TIMEOUT: Duration = Duration::from_secs(2);
+/// Page size for the ingest-time lookup (Feishu's maximum).
+const MEMBER_LOOKUP_PAGE_SIZE: i64 = 100;
+
+type MemberNameCache = Mutex<HashMap<String, (String, Instant)>>;
+
+/// Best-effort (chat_id, open_id) → display name cache.
+static MEMBER_NAME_CACHE: LazyLock<MemberNameCache> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Inputs of one member-name lookup (bundled to keep helpers readable).
+struct MemberLookup<'a> {
+    api_base: &'a str,
+    token: &'a str,
+    chat_id: &'a str,
+    open_id: &'a str,
+}
+
+/// Sanitize a user-controlled display name before it enters model-visible
+/// text. Control characters and `[`, `]`, `"`, `` ` ``, `'` become spaces (so
+/// a nickname cannot forge envelope markup or escape a quoted field),
+/// whitespace runs collapse, the result is truncated to 24 *chars* (not bytes
+/// — CJK names must not be split mid-codepoint), and a blank result degrades
+/// to `None` (callers then emit the name-less form).
+fn sanitize_display_name(raw: &str) -> Option<String> {
+    let cleaned: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_control() || matches!(c, '[' | ']' | '"' | '`' | '\'') {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect();
+    let collapsed = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+    let truncated: String = collapsed.chars().take(24).collect();
+    let trimmed = truncated.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// Find `open_id`'s sanitized `name` in a members-list `data` object.
+fn member_name_from_data(data: &Value, open_id: &str) -> Option<String> {
+    let items = data.get("items")?.as_array()?;
+    let item = items
+        .iter()
+        .find(|item| item.get("member_id").and_then(|m| m.as_str()) == Some(open_id))?;
+    sanitize_display_name(item.get("name").and_then(|n| n.as_str())?)
+}
+
+/// One members-endpoint lookup for a display name. Failures of any kind
+/// (network, timeout, non-zero code, missing permission) are swallowed: the
+/// caller falls back to the name-less display and delivery is unaffected.
+/// Only the first (maximal) page is consulted — best-effort, bounded work;
+/// `feishu_get_chat_members` remains the way to page through everyone.
+fn fetch_member_name_with(
+    api_base: &str,
+    token: &str,
+    chat_id: &str,
+    open_id: &str,
+) -> Option<String> {
+    let url = chat_members_url(api_base, chat_id, Some(MEMBER_LOOKUP_PAGE_SIZE), None);
+    let resp = ureq::get(&url)
+        .set("Authorization", &format!("Bearer {token}"))
+        .timeout(MEMBER_NAME_HTTP_TIMEOUT)
+        .call()
+        .ok()?;
+    let body: Value = resp.into_json().ok()?;
+    let code = body.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
+    if code != 0 {
+        return None;
+    }
+    member_name_from_data(body.get("data")?, open_id)
+}
+
+fn member_cache_key(chat_id: &str, open_id: &str) -> String {
+    format!("{chat_id}:{open_id}")
+}
+
+/// Cache lookup: a name is fresh while `now - stored < ttl`.
+fn cache_lookup(cache: &MemberNameCache, key: &str, now: Instant, ttl: Duration) -> Option<String> {
+    let guard = cache.lock().unwrap_or_else(|p| p.into_inner());
+    guard
+        .get(key)
+        .filter(|(_, stored)| now.saturating_duration_since(*stored) < ttl)
+        .map(|(name, _)| name.clone())
+}
+
+/// Store a resolved name, keeping the cache bounded. At capacity the whole
+/// cache is cleared and rebuilt (cheap, predictable, no eviction bookkeeping).
+fn cache_store(cache: &MemberNameCache, key: String, name: &str, now: Instant) {
+    let mut guard = cache.lock().unwrap_or_else(|p| p.into_inner());
+    if guard.len() >= MEMBER_NAME_CACHE_CAP && !guard.contains_key(&key) {
+        guard.clear();
+    }
+    guard.insert(key, (name.to_string(), now));
+}
+
+/// Resolve a speaker name through the TTL cache, hitting the members endpoint
+/// only on a miss. `now`/`ttl` are injected so expiry is testable without
+/// sleeping.
+fn member_name_cached_with(
+    cache: &MemberNameCache,
+    now: Instant,
+    ttl: Duration,
+    lookup: &MemberLookup<'_>,
+) -> Option<String> {
+    let key = member_cache_key(lookup.chat_id, lookup.open_id);
+    if let Some(name) = cache_lookup(cache, &key, now, ttl) {
+        return Some(name);
+    }
+    let name = fetch_member_name_with(
+        lookup.api_base,
+        lookup.token,
+        lookup.chat_id,
+        lookup.open_id,
+    )?;
+    cache_store(cache, key, &name, now);
+    Some(name)
+}
+
+/// Ingest-time speaker-name resolution. A warm cache entry is served without
+/// touching credentials at all; a miss falls back to the members endpoint.
+/// Without credentials this returns None without touching the network; every
+/// failure path is silent by design (a per-message log would flood a busy
+/// group).
+fn resolve_sender_name(chat_id: &str, open_id: &str) -> Option<String> {
+    if chat_id.is_empty() || open_id.is_empty() {
+        return None;
+    }
+    let key = member_cache_key(chat_id, open_id);
+    if let Some(name) = cache_lookup(&MEMBER_NAME_CACHE, &key, Instant::now(), MEMBER_NAME_TTL) {
+        return Some(name);
+    }
+    let token = resolve_token(None).ok()?;
+    let base = api_base();
+    member_name_cached_with(
+        &MEMBER_NAME_CACHE,
+        Instant::now(),
+        MEMBER_NAME_TTL,
+        &MemberLookup {
+            api_base: &base,
+            token: &token,
+            chat_id,
+            open_id,
+        },
+    )
 }
 
 /// Build a multipart/form-data body for the image upload endpoint: an
@@ -1368,6 +1601,25 @@ fn handle_feishu_get_chat_info(req: &NodeRequest) -> Result<NodeResponse, String
     Ok(NodeResponse {
         ok: true,
         node_id: "feishu_get_chat_info".to_string(),
+        message: None,
+        data: Some(data),
+        error: None,
+    })
+}
+
+fn handle_feishu_get_chat_members(req: &NodeRequest) -> Result<NodeResponse, String> {
+    let payload = req.payload.as_ref().ok_or("payload is required")?;
+    let chat_id = payload
+        .get("chat_id")
+        .and_then(|v| v.as_str())
+        .ok_or("chat_id is required")?;
+    let page_size = payload.get("page_size").and_then(|v| v.as_i64());
+    let page_token = payload.get("page_token").and_then(|v| v.as_str());
+    let token = resolve_token(req.payload.as_ref())?;
+    let data = feishu_get_members_api(&api_base(), &token, chat_id, page_size, page_token)?;
+    Ok(NodeResponse {
+        ok: true,
+        node_id: "feishu_get_chat_members".to_string(),
         message: None,
         data: Some(data),
         error: None,
@@ -1837,18 +2089,24 @@ fn build_envelope(msg: &IncomingMessage) -> String {
     } else {
         "group"
     };
+    // Display names are resolved best-effort at ingest; when present they
+    // ride inside the identity parenthesis, before any msg= suffix.
+    let identity = match msg.sender_name.as_deref() {
+        Some(name) => format!("{}, name \"{}\"", msg.open_id, name),
+        None => msg.open_id.clone(),
+    };
     // Media messages carry a msg=<message_id> in the display prefix so the
     // agent can pass it to feishu_fetch_resource alongside the file_key from
     // the placeholder. Synthetic card-action ids are not real messages.
     let display = if msg.has_media && !msg.message_id.starts_with("cardaction:") {
         format!(
             "[Feishu {} from {} (user {}) msg={}]: {}",
-            scope, msg.chat_id, msg.open_id, msg.message_id, msg.text
+            scope, msg.chat_id, identity, msg.message_id, msg.text
         )
     } else {
         format!(
             "[Feishu {} from {} (user {})]: {}",
-            scope, msg.chat_id, msg.open_id, msg.text
+            scope, msg.chat_id, identity, msg.text
         )
     };
     let mut env = json!({
@@ -1885,6 +2143,7 @@ fn handle(req: &NodeRequest) -> Result<NodeResponse, String> {
         "feishu_send_image" => handle_feishu_send_image(req),
         "feishu_get_message" => handle_feishu_get_message(req),
         "feishu_get_chat_info" => handle_feishu_get_chat_info(req),
+        "feishu_get_chat_members" => handle_feishu_get_chat_members(req),
         "feishu_list_chats" => handle_feishu_list_chats(req),
         other => Err(format!("unknown node_id: {other}")),
     }
@@ -1972,6 +2231,14 @@ fn docs_value() -> cordis_plugin_sdk::PluginDocs {
                 &["auth failure","resource not found"],
             ).with_agent_accessible(),
             node_doc(
+                "feishu_get_chat_members",
+                "List the members of a Feishu chat/group (im/v1/chats/{chat_id}/members with member_id_type=open_id). Optional page_size (1-100) and page_token for pagination; returns the raw data object — items[] carry member_id (an open_id) and name, so this maps the open_id in an inbound display prefix to a person. Requires a chat-member read permission on the app (e.g. im:chat.members:read).",
+                json!({"type":"object","required":["node_id","payload"],"properties":{"node_id":{"const":"feishu_get_chat_members"},"payload":{"type":"object","required":["chat_id"],"properties":{"chat_id":{"type":"string"},"page_size":{"type":"integer"},"page_token":{"type":"string"}}}}}),
+                json!({"type":"object","properties":{"ok":{"type":"boolean"},"data":{"type":"object","properties":{"items":{"type":"array","items":{"type":"object","properties":{"member_id":{"type":"string"},"name":{"type":"string"}},"additionalProperties":true}},"page_token":{"type":"string"},"has_more":{"type":"boolean"}}}}}),
+                &["network:feishu-api"],
+                &["auth failure","resource not found","missing permission (im:chat.members:read)"],
+            ).with_agent_accessible(),
+            node_doc(
                 "feishu_list_chats",
                 "List chats the bot belongs to (im/v1/chats). Optional page_size and page_token for pagination.",
                 json!({"type":"object","required":["node_id"],"properties":{"node_id":{"const":"feishu_list_chats"},"payload":{"type":"object","properties":{"page_size":{"type":"integer"},"page_token":{"type":"string"}}}}}),
@@ -1981,7 +2248,8 @@ fn docs_value() -> cordis_plugin_sdk::PluginDocs {
             ).with_agent_accessible(),
         ],
         Some(
-            "You are chatting in Feishu (Lark). Each incoming message is prefixed with its source, e.g. \"[Feishu group from <chat_id> (user <open_id>)]: <text>\".\n\
+            "You are chatting in Feishu (Lark). Each incoming message is prefixed with its source, e.g. \"[Feishu group from <chat_id> (user <open_id>)]: <text>\"; when the speaker's display name could be resolved the identity reads (user <open_id>, name \"<name>\").\n\
+If an open_id has no name and you need to know who it is, call invoke_plugin(feishu, feishu_get_chat_members, {\"node_id\":\"feishu_get_chat_members\",\"payload\":{\"chat_id\":\"<chat_id>\"}}) to list group members with their names.\n\
 Your FINAL output each turn MUST be exactly one JSON object:\n\
   {\"action\":\"respond\",\"message\":\"<reply text>\"}  — to reply to the chat, OR\n\
   {\"action\":\"suspend\"}  — when no reply is warranted.\n\
@@ -2119,6 +2387,7 @@ mod tests {
             chat_type: "group".to_string(),
             chat_id: "oc_5".to_string(),
             open_id: "ou_u".to_string(),
+            sender_name: None,
             text: "hello".to_string(),
             message_id: "om_5".to_string(),
             root_id: None,
@@ -2188,6 +2457,7 @@ mod tests {
             chat_type: chat_type.to_string(),
             chat_id: chat_id.to_string(),
             open_id: open_id.to_string(),
+            sender_name: None,
             text: "hi".to_string(),
             message_id: "om_t".to_string(),
             root_id: None,
@@ -2425,6 +2695,7 @@ mod tests {
             chat_type: "p2p".into(),
             chat_id: "oc".into(),
             open_id: "ou".into(),
+            sender_name: None,
             text,
             message_id: "om_x".into(),
             root_id: None,
@@ -2516,6 +2787,7 @@ mod tests {
             chat_type: "group".into(),
             chat_id: "oc_m".into(),
             open_id: "ou_m".into(),
+            sender_name: None,
             text: "[image file_key=k]".into(),
             message_id: "om_media".into(),
             root_id: None,
@@ -2533,6 +2805,7 @@ mod tests {
             chat_type: "group".into(),
             chat_id: "oc_t".into(),
             open_id: "ou_t".into(),
+            sender_name: None,
             text: "hello".into(),
             message_id: "om_t2".into(),
             root_id: None,
@@ -2591,5 +2864,520 @@ mod tests {
         // The raw bytes are embedded verbatim.
         let needle = b"\r\n\r\n\x89PNGdata\r\n";
         assert!(body.windows(needle.len()).any(|w| w == needle));
+    }
+
+    // ---- feishu_get_chat_members: URL construction ----------------------
+
+    #[test]
+    fn chat_members_url_is_stable_and_ordered() {
+        let base = "https://open.feishu.cn";
+        assert_eq!(
+            chat_members_url(base, "oc_1", None, None),
+            "https://open.feishu.cn/open-apis/im/v1/chats/oc_1/members?member_id_type=open_id"
+        );
+        assert_eq!(
+            chat_members_url(base, "oc_1", Some(20), None),
+            "https://open.feishu.cn/open-apis/im/v1/chats/oc_1/members\
+             ?member_id_type=open_id&page_size=20"
+        );
+        assert_eq!(
+            chat_members_url(base, "oc_1", None, Some("tok2")),
+            "https://open.feishu.cn/open-apis/im/v1/chats/oc_1/members\
+             ?member_id_type=open_id&page_token=tok2"
+        );
+        assert_eq!(
+            chat_members_url(base, "oc_1", Some(50), Some("tok2")),
+            "https://open.feishu.cn/open-apis/im/v1/chats/oc_1/members\
+             ?member_id_type=open_id&page_size=50&page_token=tok2"
+        );
+        // Opaque page tokens are percent-encoded so reserved characters do
+        // not change the meaning of the query.
+        assert_eq!(
+            chat_members_url(base, "oc_1", None, Some("a+b/c=")),
+            "https://open.feishu.cn/open-apis/im/v1/chats/oc_1/members\
+             ?member_id_type=open_id&page_token=a%2Bb%2Fc%3D"
+        );
+    }
+
+    // ---- Member-list JSON → display name --------------------------------
+
+    #[test]
+    fn chat_members_node_is_registered_and_agent_accessible() {
+        let docs = docs_value();
+        let doc = docs
+            .nodes
+            .iter()
+            .find(|node| node.id == "feishu_get_chat_members")
+            .expect("feishu_get_chat_members must be documented");
+        assert!(
+            doc.agent_accessible,
+            "members node must be agent-accessible"
+        );
+        assert_eq!(
+            doc.input_schema["properties"]["node_id"]["const"],
+            "feishu_get_chat_members"
+        );
+        assert!(doc.input_schema["required"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("payload")));
+        assert!(doc.output_schema["properties"]["data"].is_object());
+        // Dispatch reaches the handler: a missing payload is the first error.
+        let req: NodeRequest =
+            serde_json::from_str(r#"{"node_id":"feishu_get_chat_members"}"#).unwrap();
+        assert_eq!(handle(&req).unwrap_err(), "payload is required");
+    }
+
+    #[test]
+    fn sender_name_is_optional_in_serde() {
+        let im: IncomingMessage = serde_json::from_value(json!({
+            "chat_type": "group",
+            "chat_id": "oc_serde",
+            "open_id": "ou_serde",
+            "text": "hi",
+            "message_id": "om_serde",
+            "root_id": null,
+            "mentioned": false,
+            "message_type": "text",
+            "has_media": false
+        }))
+        .expect("sender_name is optional");
+        assert_eq!(im.sender_name, None);
+        // None is skipped on the wire rather than serialized as null.
+        assert!(serde_json::to_value(&im)
+            .unwrap()
+            .get("sender_name")
+            .is_none());
+        let named = IncomingMessage {
+            sender_name: Some("小明".to_string()),
+            ..im
+        };
+        assert_eq!(serde_json::to_value(&named).unwrap()["sender_name"], "小明");
+    }
+
+    #[test]
+    fn member_name_from_data_maps_member_id_to_name() {
+        let data = json!({
+            "items": [
+                {"member_id": "ou_alice", "name": "Alice"},
+                {"member_id": "ou_bob", "name": "  Bob [x]\n "}
+            ]
+        });
+        assert_eq!(
+            member_name_from_data(&data, "ou_alice").as_deref(),
+            Some("Alice")
+        );
+        // Names are sanitized on the way out of the member list too.
+        assert_eq!(
+            member_name_from_data(&data, "ou_bob").as_deref(),
+            Some("Bob x")
+        );
+        // Unknown open_id.
+        assert_eq!(member_name_from_data(&data, "ou_absent"), None);
+        // items missing or not an array.
+        assert_eq!(
+            member_name_from_data(&json!({"has_more": false}), "ou_alice"),
+            None
+        );
+        assert_eq!(
+            member_name_from_data(&json!({"items": "nope"}), "ou_alice"),
+            None
+        );
+        // A matching item without a name.
+        assert_eq!(
+            member_name_from_data(&json!({"items": [{"member_id": "ou_alice"}]}), "ou_alice"),
+            None
+        );
+        // A blank name degrades to None.
+        assert_eq!(
+            member_name_from_data(
+                &json!({"items": [{"member_id": "ou_alice", "name": "   "}]}),
+                "ou_alice"
+            ),
+            None
+        );
+    }
+
+    // Minimal scripted HTTP server for the members endpoint: every accepted
+    // connection gets the same JSON body and is counted. The listener is
+    // non-blocking so Drop can stop it deterministically.
+    struct MockMembers {
+        base: String,
+        hits: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        request_line: std::sync::Arc<Mutex<String>>,
+        stop: std::sync::Arc<AtomicBool>,
+        handle: Option<thread::JoinHandle<()>>,
+    }
+
+    impl MockMembers {
+        fn start(body: &'static str) -> Self {
+            use std::io::{BufRead, BufReader, Write};
+            use std::net::TcpListener;
+            use std::sync::atomic::AtomicUsize;
+            use std::sync::Arc;
+
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock members server");
+            listener
+                .set_nonblocking(true)
+                .expect("mock members listener nonblocking");
+            let base = format!(
+                "http://{}",
+                listener.local_addr().expect("mock members addr")
+            );
+            let hits = Arc::new(AtomicUsize::new(0));
+            let request_line = Arc::new(Mutex::new(String::new()));
+            let stop = Arc::new(AtomicBool::new(false));
+            let hits_thread = Arc::clone(&hits);
+            let line_thread = Arc::clone(&request_line);
+            let stop_thread = Arc::clone(&stop);
+            let handle = thread::spawn(move || {
+                while !stop_thread.load(Ordering::SeqCst) {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            hits_thread.fetch_add(1, Ordering::SeqCst);
+                            let mut reader =
+                                BufReader::new(stream.try_clone().expect("clone mock stream"));
+                            let mut first = String::new();
+                            if reader.read_line(&mut first).unwrap_or(0) > 0 {
+                                *line_thread.lock().unwrap_or_else(|p| p.into_inner()) =
+                                    first.trim_end().to_string();
+                            }
+                            // Drain the remaining request headers before replying.
+                            loop {
+                                let mut header = String::new();
+                                match reader.read_line(&mut header) {
+                                    Ok(0) | Err(_) => break,
+                                    Ok(_) if header.trim().is_empty() => break,
+                                    Ok(_) => {}
+                                }
+                            }
+                            let response = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                body.len()
+                            );
+                            let _ = stream.write_all(response.as_bytes());
+                            let _ = stream.flush();
+                        }
+                        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(2));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+            MockMembers {
+                base,
+                hits,
+                request_line,
+                stop,
+                handle: Some(handle),
+            }
+        }
+
+        fn hits(&self) -> usize {
+            self.hits.load(Ordering::SeqCst)
+        }
+
+        fn request_line(&self) -> String {
+            self.request_line
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone()
+        }
+    }
+
+    impl Drop for MockMembers {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+
+    const MEMBERS_BODY: &str = r#"{"code":0,"msg":"ok","data":{"items":[
+        {"member_id":"ou_alice","name":"Alice"},
+        {"member_id":"ou_bob","name":"Bob"}
+    ],"page_token":"","has_more":false}}"#;
+
+    fn lookup<'a>(base: &'a str, chat_id: &'a str, open_id: &'a str) -> MemberLookup<'a> {
+        MemberLookup {
+            api_base: base,
+            token: "tok",
+            chat_id,
+            open_id,
+        }
+    }
+
+    #[test]
+    fn members_api_returns_raw_data_and_hits_members_path() {
+        let server = MockMembers::start(MEMBERS_BODY);
+        let data = feishu_get_members_api(&server.base, "tok", "oc_api", Some(50), None)
+            .expect("members api succeeds");
+        assert_eq!(data["items"][0]["name"], "Alice");
+        assert_eq!(data["has_more"].as_bool(), Some(false));
+        let request = server.request_line();
+        assert!(
+            request.contains(
+                "/open-apis/im/v1/chats/oc_api/members\
+                 ?member_id_type=open_id&page_size=50"
+            ),
+            "unexpected request line: {request}"
+        );
+    }
+
+    #[test]
+    fn member_name_cache_hit_skips_second_request() {
+        let server = MockMembers::start(MEMBERS_BODY);
+        let cache: MemberNameCache = Mutex::new(HashMap::new());
+        let now = Instant::now();
+        let lookup = lookup(&server.base, "oc_hit", "ou_alice");
+
+        assert_eq!(
+            member_name_cached_with(&cache, now, MEMBER_NAME_TTL, &lookup).as_deref(),
+            Some("Alice")
+        );
+        assert_eq!(
+            member_name_cached_with(
+                &cache,
+                now + Duration::from_secs(1),
+                MEMBER_NAME_TTL,
+                &lookup
+            )
+            .as_deref(),
+            Some("Alice")
+        );
+        assert_eq!(server.hits(), 1, "a cache hit must not re-request members");
+        // The ingest lookup asks for one maximal page of members.
+        assert!(server
+            .request_line()
+            .contains("members?member_id_type=open_id&page_size=100"));
+    }
+
+    #[test]
+    fn member_name_cache_expires_and_refetches() {
+        let server = MockMembers::start(MEMBERS_BODY);
+        let cache: MemberNameCache = Mutex::new(HashMap::new());
+        let now = Instant::now();
+        let lookup = lookup(&server.base, "oc_ttl", "ou_alice");
+
+        assert_eq!(
+            member_name_cached_with(&cache, now, MEMBER_NAME_TTL, &lookup).as_deref(),
+            Some("Alice")
+        );
+        // At exactly the TTL the entry is stale and must be refetched.
+        assert_eq!(
+            member_name_cached_with(&cache, now + MEMBER_NAME_TTL, MEMBER_NAME_TTL, &lookup)
+                .as_deref(),
+            Some("Alice")
+        );
+        assert_eq!(server.hits(), 2, "an expired entry must be refetched");
+    }
+
+    #[test]
+    fn member_lookup_network_failure_is_none_and_does_not_panic() {
+        // Reserve a port, then drop the listener so the connection is refused.
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("reserve a port");
+        let addr = listener.local_addr().expect("reserved addr");
+        drop(listener);
+        let base = format!("http://{addr}");
+        let cache: MemberNameCache = Mutex::new(HashMap::new());
+
+        assert_eq!(
+            member_name_cached_with(
+                &cache,
+                Instant::now(),
+                MEMBER_NAME_TTL,
+                &lookup(&base, "oc_dead", "ou_dead")
+            ),
+            None
+        );
+        assert!(cache.lock().unwrap_or_else(|p| p.into_inner()).is_empty());
+        // Without ids there is nothing to look up (and no credentials are read).
+        assert_eq!(resolve_sender_name("", "ou_x"), None);
+        assert_eq!(resolve_sender_name("oc_x", ""), None);
+    }
+
+    #[test]
+    fn resolve_sender_name_serves_warm_cache_without_credentials() {
+        // No credentials are configured in tests; a warm cache entry must be
+        // returned anyway (the token path is never reached).
+        let key = member_cache_key("oc_warm", "ou_warm");
+        cache_store(&MEMBER_NAME_CACHE, key.clone(), "Warm", Instant::now());
+        assert_eq!(
+            resolve_sender_name("oc_warm", "ou_warm").as_deref(),
+            Some("Warm")
+        );
+        MEMBER_NAME_CACHE
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&key);
+    }
+
+    #[test]
+    fn member_name_cache_is_bounded() {
+        let cache: MemberNameCache = Mutex::new(HashMap::new());
+        let now = Instant::now();
+        for i in 0..MEMBER_NAME_CACHE_CAP {
+            cache_store(&cache, format!("k{i}"), "name", now);
+        }
+        assert_eq!(
+            cache.lock().unwrap_or_else(|p| p.into_inner()).len(),
+            MEMBER_NAME_CACHE_CAP
+        );
+        // Overwriting an existing key at capacity must not purge the cache.
+        cache_store(&cache, "k0".to_string(), "renamed", now);
+        assert_eq!(
+            cache.lock().unwrap_or_else(|p| p.into_inner()).len(),
+            MEMBER_NAME_CACHE_CAP
+        );
+        assert_eq!(
+            cache_lookup(&cache, "k0", now, MEMBER_NAME_TTL).as_deref(),
+            Some("renamed")
+        );
+        // A brand-new key at capacity clears the cache (simple bounded policy).
+        cache_store(&cache, "overflow".to_string(), "name", now);
+        assert_eq!(
+            cache.lock().unwrap_or_else(|p| p.into_inner()).len(),
+            1,
+            "overflow should reset the cache"
+        );
+        assert_eq!(cache_lookup(&cache, "k0", now, MEMBER_NAME_TTL), None);
+    }
+
+    // ---- Display-name sanitizing ---------------------------------------
+
+    // 清洗：控制字符与 [ ] " ` ' 变空格，空白折叠，截断到 24 字符。
+    #[test]
+    fn sanitize_display_name_strips_control_and_wrapping() {
+        assert_eq!(
+            sanitize_display_name("  小\n明\t[name]\""),
+            Some("小 明 name".to_string())
+        );
+        assert_eq!(
+            sanitize_display_name("'`\"]["),
+            None,
+            "全是过滤字符应清洗为空"
+        );
+    }
+
+    #[test]
+    fn sanitize_display_name_rejects_blank() {
+        assert_eq!(sanitize_display_name(""), None);
+        assert_eq!(sanitize_display_name("   "), None);
+        assert_eq!(sanitize_display_name("\n\t"), None);
+        assert_eq!(sanitize_display_name("[ ] \" ` '"), None);
+    }
+
+    // 按字符（非字节）截断到 24 个 char，CJK 不被拆坏。
+    #[test]
+    fn sanitize_display_name_truncates_to_24_chars() {
+        let input = format!("{}{}", "一".repeat(15), "a".repeat(16));
+        assert_eq!(input.chars().count(), 31);
+        let out = sanitize_display_name(&input).unwrap();
+        assert_eq!(out.chars().count(), 24);
+        assert_eq!(out, format!("{}{}", "一".repeat(15), "a".repeat(9)));
+    }
+
+    // ---- Envelope display matrix: private/group × text/media × name -----
+
+    fn display_msg(chat_type: &str, has_media: bool, sender_name: Option<&str>) -> IncomingMessage {
+        IncomingMessage {
+            chat_type: chat_type.to_string(),
+            chat_id: "oc_1".to_string(),
+            open_id: "ou_u".to_string(),
+            sender_name: sender_name.map(|n| n.to_string()),
+            text: if has_media {
+                "[image file_key=k]".to_string()
+            } else {
+                "hi".to_string()
+            },
+            message_id: "om_1".to_string(),
+            root_id: None,
+            mentioned: true,
+            message_type: if has_media { "image" } else { "text" }.to_string(),
+            has_media,
+        }
+    }
+
+    #[test]
+    fn envelope_display_covers_all_scope_media_name_combinations() {
+        let cases = [
+            (
+                "p2p",
+                false,
+                None,
+                "[Feishu private from oc_1 (user ou_u)]: hi",
+            ),
+            (
+                "p2p",
+                true,
+                None,
+                "[Feishu private from oc_1 (user ou_u) msg=om_1]: [image file_key=k]",
+            ),
+            (
+                "group",
+                false,
+                None,
+                "[Feishu group from oc_1 (user ou_u)]: hi",
+            ),
+            (
+                "group",
+                true,
+                None,
+                "[Feishu group from oc_1 (user ou_u) msg=om_1]: [image file_key=k]",
+            ),
+            (
+                "p2p",
+                false,
+                Some("小明"),
+                "[Feishu private from oc_1 (user ou_u, name \"小明\")]: hi",
+            ),
+            (
+                "p2p",
+                true,
+                Some("小明"),
+                "[Feishu private from oc_1 (user ou_u, name \"小明\") msg=om_1]: [image file_key=k]",
+            ),
+            (
+                "group",
+                false,
+                Some("小明"),
+                "[Feishu group from oc_1 (user ou_u, name \"小明\")]: hi",
+            ),
+            (
+                "group",
+                true,
+                Some("小明"),
+                "[Feishu group from oc_1 (user ou_u, name \"小明\") msg=om_1]: [image file_key=k]",
+            ),
+        ];
+        for (chat_type, has_media, sender_name, expected) in cases {
+            let im = display_msg(chat_type, has_media, sender_name);
+            let env: Value = serde_json::from_str(&build_envelope(&im)).unwrap();
+            assert_eq!(
+                env["display"].as_str().unwrap(),
+                expected,
+                "{chat_type} media={has_media} name={sender_name:?}"
+            );
+        }
+    }
+
+    // A resolved name must not disturb the routing/identity fields.
+    #[test]
+    fn named_envelope_keeps_routing_fields_unchanged() {
+        let im = display_msg("group", false, Some("小明"));
+        let env: Value = serde_json::from_str(&build_envelope(&im)).unwrap();
+        assert_eq!(env["source_plugin"], "feishu");
+        assert_eq!(env["reply_node"], "feishu_send");
+        assert_eq!(env["session_key"], "feishu:chat:oc_1");
+        assert_eq!(env["reply_target"], "chat:oc_1");
+        assert_eq!(env["sender_id"], "feishu:ou_u");
+        assert_eq!(env["conversation_kind"], "group");
+        assert_eq!(env["reply_to"], "om_1");
+        // sender_name itself is display-only; it never leaks into the envelope.
+        assert!(env.get("sender_name").is_none());
     }
 }
