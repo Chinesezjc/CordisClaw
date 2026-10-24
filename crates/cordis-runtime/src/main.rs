@@ -64,6 +64,11 @@ struct AgentEnvelope {
     /// Conversation dimension: "private" | "group". Empty = unknown.
     #[serde(default)]
     conversation_kind: String,
+    /// Group role reported by the channel: "owner" | "admin" | "member".
+    /// Empty = the channel cannot report it (feishu), which the gate reads
+    /// as a plain member (safe default).
+    #[serde(default)]
+    sender_role: String,
 }
 
 impl AgentEnvelope {
@@ -82,12 +87,22 @@ impl AgentEnvelope {
                 reply_to: None,
                 sender_id: String::new(),
                 conversation_kind: String::new(),
+                sender_role: String::new(),
             },
         }
     }
 
     fn can_reply(&self) -> bool {
         !self.source_plugin.is_empty() && !self.reply_node.is_empty()
+    }
+
+    /// Only a group owner/admin may change a room persona; an empty role
+    /// (channel cannot report it) counts as a plain member.
+    fn caller_is_admin(&self) -> bool {
+        matches!(
+            self.sender_role.to_ascii_lowercase().as_str(),
+            "owner" | "admin"
+        )
     }
 
     /// Soul scope key. Private chats are per-user: `{sender_id}#private`.
@@ -738,6 +753,11 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     // also covers the just-created session. Errors ignored
                     // (a missing session surfaces on agent_send instead).
                     let _ = host.refresh_session_soul(sid, &route.soul_key());
+                    // P4: bind the caller's role flags so the agent's
+                    // `set_soul` tool can refuse room persona edits from
+                    // plain members. Private chats ignore both flags.
+                    let is_group = route.conversation_kind == "group";
+                    let _ = host.refresh_session_caller(sid, is_group, route.caller_is_admin());
                     // Process agent output: parse JSON, dispatch action, send
                     // the reply back to the ORIGINATING plugin (route). Returns
                     // Some(feedback) if the agent needs to retry.
@@ -2555,6 +2575,46 @@ mod batch_tests {
             envelope("feishu:ou_xyz").soul_key(),
             "feishu:ou_xyz#private"
         );
+    }
+
+    // Build a group envelope with an optional channel-reported sender_role.
+    fn with_sender_role(sender_role: Option<&str>) -> AgentEnvelope {
+        let mut payload = serde_json::json!({
+            "session_key": "qq:group:777",
+            "display": "hi",
+            "sender_id": "qq:42",
+            "conversation_kind": "group",
+        });
+        if let Some(role) = sender_role {
+            payload["sender_role"] = serde_json::json!(role);
+        }
+        AgentEnvelope::parse(&payload.to_string())
+    }
+
+    // P4: 缺字段 = 渠道报不出角色 = 空串 = 普通成员（安全默认）。
+    #[test]
+    fn envelope_sender_role_defaults_to_empty() {
+        let env = with_sender_role(None);
+        assert_eq!(env.sender_role, "");
+        assert!(!env.caller_is_admin());
+        // 非 JSON 的 legacy 纯文本同样没有角色。
+        let legacy = AgentEnvelope::parse("plain text trigger");
+        assert_eq!(legacy.sender_role, "");
+        assert!(!legacy.caller_is_admin());
+    }
+
+    // P4: 只有 owner/admin 算管理员，且大小写不敏感。
+    #[test]
+    fn envelope_caller_is_admin_reads_channel_role() {
+        assert_eq!(with_sender_role(Some("admin")).sender_role, "admin");
+        assert!(with_sender_role(Some("admin")).caller_is_admin());
+        assert!(with_sender_role(Some("owner")).caller_is_admin());
+        assert!(
+            with_sender_role(Some("Owner")).caller_is_admin(),
+            "大小写不敏感"
+        );
+        assert!(!with_sender_role(Some("member")).caller_is_admin());
+        assert!(!with_sender_role(Some("")).caller_is_admin());
     }
 }
 

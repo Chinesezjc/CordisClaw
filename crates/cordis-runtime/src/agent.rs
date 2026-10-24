@@ -180,6 +180,16 @@ const AGENT_TOOL_CREATE_PLUGIN: &str = "create_plugin";
 const AGENT_TOOL_SET_SOUL: &str = "set_soul";
 const LLM_DEBUG_ENV: &str = "CORDIS_LLM_DEBUG";
 
+/// P4: caller role facts the host tracks for one agent session. `is_group`
+/// says the conversation is a room (not a 1:1 chat); `is_admin` says the
+/// speaker is that room's owner/admin. Both default to `false`, i.e. a
+/// group speaker with no reported role is treated as a plain member.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionCaller {
+    pub is_group: bool,
+    pub is_admin: bool,
+}
+
 pub trait AgentToolHost {
     fn agent_runtime_status(&self) -> Result<Value, RuntimeError>;
     fn agent_list_plugins(&self) -> Result<Value, RuntimeError>;
@@ -242,6 +252,11 @@ pub trait AgentToolHost {
     /// O批: persona overlay text for the given soul scope, if any.
     /// Default None keeps non-runtime hosts (tests) working unchanged.
     fn agent_soul_overlay(&self, _soul_key: &str) -> Option<String> {
+        None
+    }
+    /// P4: caller role flags for `session_id`, when the host tracks them.
+    /// `None` = host cannot tell (no restriction applied).
+    fn agent_session_caller(&self, _session_id: &str) -> Option<SessionCaller> {
         None
     }
     /// O批: update the soul for a scope key. The KEY IS NOT LLM-SUPPLIED —
@@ -994,6 +1009,15 @@ impl AgentToolHost for RuntimeHost {
         }
     }
 
+    /// P4: expose the session's caller-role flags so the `set_soul` gate can
+    /// tell a room admin from a plain member. An unknown session reads as
+    /// `None` (no restriction) — the impersonation risk lives in the live
+    /// chat session, and `agent_set_soul` still enforces identity.
+    fn agent_session_caller(&self, session_id: &str) -> Option<SessionCaller> {
+        let (is_group, is_admin) = self.session_caller_policy(session_id)?;
+        Some(SessionCaller { is_group, is_admin })
+    }
+
     fn agent_set_soul(
         &self,
         soul_key: &str,
@@ -1165,6 +1189,11 @@ pub struct AgentSession {
     /// O批: soul scope key ({sender_id}#{conversation_kind}) this session
     /// serves. Empty = no per-user soul (REPL, legacy callers).
     soul_key: String,
+    /// P4: this session serves a group room (as opposed to a 1:1 chat).
+    is_group: bool,
+    /// P4: the current speaker is that room's owner/admin. Meaningless for
+    /// private chats, which never gate persona edits on it.
+    caller_is_admin: bool,
 }
 
 /// Serializable snapshot of an AgentSession for crash recovery.
@@ -1214,7 +1243,21 @@ impl AgentSession {
             reasoning_only_strikes: 0,
             unknown_tool_strikes: 0,
             soul_key: String::new(),
+            is_group: false,
+            caller_is_admin: false,
         })
+    }
+
+    /// P4: bind the caller's role flags. The inbox refreshes these per batch
+    /// (whoever speaks last is the one whose tools run), so a room persona
+    /// edit is refused for plain members. Private chats ignore both flags.
+    pub fn set_caller_policy(&mut self, is_group: bool, is_admin: bool) {
+        self.is_group = is_group;
+        self.caller_is_admin = is_admin;
+    }
+
+    pub fn caller_policy(&self) -> (bool, bool) {
+        (self.is_group, self.caller_is_admin)
     }
 
     /// O批: bind this session to a soul scope key. Set once at
@@ -2007,6 +2050,11 @@ impl AgentSession {
             reasoning_only_strikes: snapshot.reasoning_only_strikes,
             unknown_tool_strikes: snapshot.unknown_tool_strikes,
             soul_key: snapshot.soul_key,
+            // P4: caller flags are per-batch facts, not session state — a
+            // recovered session starts unpinned and is rebound by the next
+            // inbox batch before any tool can run.
+            is_group: false,
+            caller_is_admin: false,
         })
     }
 }
@@ -2501,6 +2549,17 @@ impl<'a, H: AgentToolHost + ?Sized> AgentBackend for RuntimeShellAgentBackend<'a
             }
             AGENT_TOOL_SET_SOUL => {
                 let args = parse_tool_value_arguments::<SetSoulArgs>(arguments, name)?;
+                // P4: a room persona is shared by everyone in the room, so
+                // only the room's owner/admin may rewrite it. Private chats
+                // stay self-service (the scope is already one person).
+                if let Some(caller) = self.host.agent_session_caller(self.session_id) {
+                    if caller.is_group && !caller.is_admin {
+                        return Err(RuntimeError::InvalidArgument {
+                            message: "only a group owner/admin can change this room's persona"
+                                .to_string(),
+                        });
+                    }
+                }
                 self.host.agent_set_soul(
                     &self.soul_key,
                     args.persona.as_deref(),
@@ -2727,7 +2786,7 @@ fn shell_agent_tools() -> Vec<AgentToolSpec> {
         },
         AgentToolSpec {
             name: AGENT_TOOL_SET_SOUL,
-            description: "Update the persona (soul) and/or LLM profile for the CURRENT conversation scope. Private chats are per-user; group chats are per-room, so in a group this changes the persona every member sees. Use when the user asks to change your personality, tone, role, or which model profile serves them. persona: full replacement persona text (omit to keep). profile: named LLM profile like \"default\" or \"fast\" (omit to keep; empty string clears back to default). A new persona applies from the next turn; a new profile only applies to sessions started after /reset. You can never edit another scope's soul — the scope is bound to this session.",
+            description: "Update the persona (soul) and/or LLM profile for the CURRENT conversation scope. Private chats are per-user; group chats are per-room, so in a group this changes the persona every member sees — in a group only the room owner/admin may change it, plain members are refused. Use when the user asks to change your personality, tone, role, or which model profile serves them. persona: full replacement persona text (omit to keep). profile: named LLM profile like \"default\" or \"fast\" (omit to keep; empty string clears back to default). A new persona applies from the next turn; a new profile only applies to sessions started after /reset. You can never edit another scope's soul — the scope is bound to this session.",
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -3066,12 +3125,15 @@ mod tests {
     struct FakeHost {
         persona: Option<String>,
         hints: Vec<String>,
+        /// P4: role flags for the gated `set_soul` tool; None = untracked.
+        caller: Option<SessionCaller>,
     }
 
     /// Reference host for backends that never consult soul/hints.
     static EMPTY_FAKE_HOST: FakeHost = FakeHost {
         persona: None,
         hints: Vec::new(),
+        caller: None,
     };
 
     impl AgentToolHost for FakeHost {
@@ -3247,6 +3309,19 @@ mod tests {
         fn agent_soul_overlay(&self, _soul_key: &str) -> Option<String> {
             self.persona.clone()
         }
+
+        fn agent_session_caller(&self, _session_id: &str) -> Option<SessionCaller> {
+            self.caller
+        }
+
+        fn agent_set_soul(
+            &self,
+            _soul_key: &str,
+            _persona: Option<&str>,
+            _profile: Option<&str>,
+        ) -> Result<Value, RuntimeError> {
+            Ok(json!({ "ok": true }))
+        }
     }
 
     /// 拼装顺序契约：base → persona（先免责声明再正文）→ conduct → hints。
@@ -3256,6 +3331,7 @@ mod tests {
         let host = FakeHost {
             persona: Some("毒舌运维".to_string()),
             hints: vec!["HINT-MARK".to_string()],
+            caller: None,
         };
         let backend = RuntimeShellAgentBackend {
             host: &host,
@@ -3330,6 +3406,66 @@ mod tests {
                 "missing conduct boundary: {needle}"
             );
         }
+    }
+
+    /// P4 `set_soul` 门控的共用调用面：一个带 soul scope 的 runtime shell
+    /// backend，直接分发 `set_soul` 工具（不经过 LLM）。
+    fn call_set_soul(host: &FakeHost) -> Result<Value, RuntimeError> {
+        let mut backend = RuntimeShellAgentBackend {
+            host,
+            session_id: "soul-gate",
+            soul_key: "qq:group:777".to_string(),
+        };
+        backend.execute_tool(AGENT_TOOL_SET_SOUL, json!({ "persona": "新人格" }))
+    }
+
+    fn caller(is_group: bool, is_admin: bool) -> Option<SessionCaller> {
+        Some(SessionCaller { is_group, is_admin })
+    }
+
+    /// 群聊人格是房间级共享资源：普通成员改它就是改所有人的 bot 人格。
+    #[test]
+    fn set_soul_rejects_group_non_admin() {
+        let host = FakeHost {
+            caller: caller(true, false),
+            ..Default::default()
+        };
+        let err = call_set_soul(&host).expect_err("plain member must be refused");
+        let message = err.to_string();
+        assert!(
+            message.contains("owner/admin"),
+            "unexpected error text: {message}"
+        );
+    }
+
+    /// 群主 / 管理员可以改本群人格。
+    #[test]
+    fn set_soul_allows_group_admin() {
+        let host = FakeHost {
+            caller: caller(true, true),
+            ..Default::default()
+        };
+        let out = call_set_soul(&host).expect("room admin may set the persona");
+        assert_eq!(out, json!({ "ok": true }));
+    }
+
+    /// 私聊仍是自助的：不是管理员也照改自己的（自己的 scope 就是自己）。
+    #[test]
+    fn set_soul_allows_private_member() {
+        let host = FakeHost {
+            caller: caller(false, false),
+            ..Default::default()
+        };
+        let out = call_set_soul(&host).expect("private chat is self-service");
+        assert_eq!(out, json!({ "ok": true }));
+    }
+
+    /// 宿主不跟踪调用者角色（`None`）时不加限制——门控只对能判断的宿主动手。
+    #[test]
+    fn set_soul_without_caller_facts_is_ungated() {
+        let host = FakeHost::default();
+        let out = call_set_soul(&host).expect("untracked caller is not gated");
+        assert_eq!(out, json!({ "ok": true }));
     }
 
     #[test]

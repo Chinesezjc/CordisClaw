@@ -120,6 +120,10 @@ struct IncomingMessage {
     /// fallback. Sanitized before it can reach model-visible text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     sender_name: Option<String>,
+    /// OneBot group role (owner/admin/member). Only group admins may change
+    /// the room persona; `None` = the event carried no role.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sender_role: Option<String>,
     /// Raw OneBot event for debugging
     #[serde(skip_serializing_if = "Option::is_none")]
     raw_event: Option<Value>,
@@ -859,6 +863,10 @@ fn handle_onebot_event(event: &OneBotEvent) {
         .and_then(|s| s.card.as_deref().or(s.nickname.as_deref()))
         .and_then(sanitize_display_name);
 
+    // 群角色（owner/admin/member）原样透传给 runtime；runtime 只据此判断
+    // 调用者能否改群人格，qq 自己不消费它。
+    let sender_role = event.sender.as_ref().and_then(|s| s.role.clone());
+
     let msg = IncomingMessage {
         message_type: msg_type,
         sender_id,
@@ -867,6 +875,7 @@ fn handle_onebot_event(event: &OneBotEvent) {
         message_id,
         reply_to_msg_id,
         sender_name,
+        sender_role,
         raw_event: Some(serde_json::to_value(event).unwrap_or_default()),
     };
 
@@ -1150,6 +1159,8 @@ fn build_envelope(msg: &IncomingMessage) -> String {
         "reply_target": reply_target,
         "sender_id": format!("qq:{}", msg.user_id),
         "conversation_kind": msg.message_type,
+        // 缺省空串：渠道报不出群角色时 runtime 按普通成员处理（安全默认）。
+        "sender_role": msg.sender_role.clone().unwrap_or_default(),
     });
     if let Some(mid) = msg.message_id {
         env["reply_to"] = json!(mid.to_string());
@@ -2105,6 +2116,20 @@ mod chain_tests {
         serde_json::from_value(v).unwrap()
     }
 
+    /// 群事件 + OneBot sender（含 role）：角色要能穿过 ingest 进队列。
+    fn group_event_with_role(mid: i64, gid: i64, text: &str, role: &str) -> OneBotEvent {
+        let v = json!({
+            "post_type": "message",
+            "message_type": "group",
+            "message": [{"type": "text", "data": {"text": text}}],
+            "message_id": mid,
+            "user_id": 111,
+            "group_id": gid,
+            "sender": {"nickname": "小明", "role": role}
+        });
+        serde_json::from_value(v).unwrap()
+    }
+
     fn queue_len() -> usize {
         MESSAGE_QUEUE.lock().unwrap().len()
     }
@@ -2122,6 +2147,23 @@ mod chain_tests {
         // ── 段2 去重：相同 message_id 再来一次被丢弃 ──────────────
         handle_onebot_event(&group_event(2001, 222, "hello world"));
         assert_eq!(queue_len(), 1, "重复 message_id 不应二次入队");
+        // 段1b：sender.role 必须原样入队（P4 群人格门控的数据来源）。
+        handle_onebot_event(&group_event_with_role(3000, 222, "role msg", "admin"));
+        {
+            let queue = MESSAGE_QUEUE.lock().unwrap();
+            let last = queue.back().expect("role message should be queued");
+            assert_eq!(last.sender_role.as_deref(), Some("admin"));
+        }
+        // 无 sender 的事件（心跳式/精简事件）角色为 None，不是空串。
+        assert_eq!(
+            MESSAGE_QUEUE
+                .lock()
+                .unwrap()
+                .front()
+                .expect("first message should still be queued")
+                .sender_role,
+            None
+        );
         MESSAGE_QUEUE.lock().unwrap().clear();
 
         // ── 段3 灰度白名单：设置 allow_groups 后只放行白名单群 ─────
@@ -2230,6 +2272,7 @@ mod chain_tests {
             message_id: Some(42),
             reply_to_msg_id: None,
             sender_name: None,
+            sender_role: None,
             raw_event: None,
         };
         let env: Value = serde_json::from_str(&build_envelope(&msg)).unwrap();
@@ -2239,6 +2282,7 @@ mod chain_tests {
         assert_eq!(env["reply_target"], "group:123456");
         assert_eq!(env["sender_id"], "qq:789");
         assert_eq!(env["conversation_kind"], "group");
+        assert_eq!(env["sender_role"], "");
         assert_eq!(env["reply_to"], "42");
         // 无名字时 display 保持旧格式，不出现 name 字段片段。
         assert_eq!(
@@ -2262,6 +2306,7 @@ mod chain_tests {
             message_id: Some(42),
             reply_to_msg_id: Some(7),
             sender_name: Some("小明".to_string()),
+            sender_role: None,
             raw_event: None,
         };
         let env: Value = serde_json::from_str(&build_envelope(&msg)).unwrap();
@@ -2281,6 +2326,36 @@ mod chain_tests {
         assert_eq!(env["sender_id"], "qq:789");
         assert_eq!(env["conversation_kind"], "group");
         assert_eq!(env["reply_to"], "42");
+    }
+
+    // 群角色透传：OneBot 的 sender.role=admin → envelope 的 sender_role。
+    // runtime 用它把"改群人格"限制在群主/管理员，路由字段一个都不能变。
+    #[test]
+    fn build_envelope_carries_sender_role() {
+        let msg = IncomingMessage {
+            message_type: "group".to_string(),
+            sender_id: "123456".to_string(),
+            user_id: "789".to_string(),
+            message: "hello".to_string(),
+            message_id: Some(42),
+            reply_to_msg_id: None,
+            sender_name: None,
+            sender_role: Some("admin".to_string()),
+            raw_event: None,
+        };
+        let env: Value = serde_json::from_str(&build_envelope(&msg)).unwrap();
+        assert_eq!(env["sender_role"], "admin");
+        assert_eq!(env["source_plugin"], "qq");
+        assert_eq!(env["reply_node"], "qq_send");
+        assert_eq!(env["session_key"], "qq:group:123456");
+        assert_eq!(env["reply_target"], "group:123456");
+        assert_eq!(env["sender_id"], "qq:789");
+        assert_eq!(env["conversation_kind"], "group");
+        assert_eq!(env["reply_to"], "42");
+        assert_eq!(
+            env["display"],
+            "[QQ group from 123456 (user 789)]: hello".to_string()
+        );
     }
 
     // 清洗：控制字符与 [ ] " ` ' 变空格，空白折叠，截断到 24 字符。
