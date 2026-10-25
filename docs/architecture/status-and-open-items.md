@@ -240,6 +240,30 @@ Agent 现在可以自主完成：读代码 → 理解结构 → 写/改文件 �
 - [x] **Plugin iteration symlink 逃逸**（P0-20）— `PluginEditExecutor::execute` 在写入前调用新 helper `resolve_under_workspace`：canonicalize 结果必须仍在 workspace_root 下。plugins 内的 symlink 指向 `/etc/passwd` 之类无法被写入。
 - [x] **Verifier shell 拼接**（P0-21）— 已随 A 批 P0-1 修复。`discover_rust_workspace_manifest` 输出的字符串被 `shell_words` 解析成 argv，空格 / `$` / `;` 无法被解释。
 
+### 5.2.45 上下文丢失：机器人看不到自己说过的话（2026-10-23 已闭合）
+
+10-23 深夜与 10-25 的两段线上对话暴露新失败：机器人先给出 `mpft = 冒泡防踢`（正确），两分钟后又说"中文互联网上没有公认的含义"，**无痕反转**，并且把别人的梗接成自己的段子（`我插嘴容易显呆`）。
+
+**根因（代码级）**：成功轮只调 `remember_exchange(user_input, final_content)`（agent.rs）；而消息渠道的可见回复走 `qq_send` / `feishu_send` 工具调用，最终输出恒为 `{"action":"suspend"}`（实测 `content_chars=20`）。工具调用/结果只在"轮次溢出"的补救路径落历史，**成功路径直接丢弃**——于是下一轮请求里 assistant 只剩裸 action JSON。模型从来没看到过自己说过的话，"冒泡防踢"（模型知识）与"没有公认含义"（检索结果）在它看来都是第一次回答。这同时解释了它为什么像"每轮重新认识你"。
+
+**修复**：
+- [x] **对外回复进历史** — `AgentSession::replace_last_action_with_reply` + `RuntimeHost::agent_record_outbound_reply`；inbox 从 `reply.tool_events` 的 `invoke_plugin(payload_json.message)`（兼容 legacy `respond.message`）抽取本轮实际发出的文本，替换掉裸 action JSON。只替换、不追加（重试再记一次返回 false，不产生重复条目）。测试：`replace_last_action_with_reply_*`（裸 action 替换 / 普通回复不动 / 空历史）、host 集成 `agent_record_outbound_reply_rewrites_action_placeholder`、inbox 抽取 `outbound_replies_reads_tool_events_and_respond_action`。
+- [x] **一致性 / 检索语义 / 不插话（契约 ⑧⑨⑩）** — ⑧与已说过的话和工具结果保持一致，冲突必须明说改了什么；⑨搜不到 ≠ 不存在，未真正运行检索不得声称"我查了"，检索结果只是证据之一（要结合频道语境）；⑩未点名不插话、不替群里解释梗/缩写。关键词测试已钉住。
+- [x] **检索端点可配置** — web 插件的搜索端点原为硬编码（`https://api.deepseek.com/anthropic/messages`），读到 `base_url` 却丢弃。现在优先级 `CORDIS_WEB_SEARCH_URL` > `config/llm_api.yaml` 的 `web_search_url:` > 默认；`docs/human/overview.md` 改写为真实行为（原 Brave/Bing 描述已过时）。测试：`resolve_search_url` 优先级、`config_search_url` 解析。
+
+**真机验证（4 轮，真实 DeepSeek + mock OneBot）**：
+
+| 轮 | 期望 | 机器人实际回复（节选） |
+|---|---|---|
+| `bot 解释一下啥是mpft` | 不确定就说明 | 列出 4 种英文含义（NHS / 傅里叶变换 / z-OS / 可靠性工程）并反问语境 |
+| `bot 你搜一下确认，到底是不是冒泡防踢` | 与上轮冲突必须明说 | "查了，基本能对上：MPFT = 冒泡防踢……**另外纠正一下我上一条**：上次列的 NHS 信托、极坐标傅里叶变换……在这个语境里答案是冒泡防踢" |
+| `bot 你刚才说 mpft 是什么来着？` | 复述自己前两轮回答 | 准确复述"我第一条说法……第二条按你说的语境改口了……所以现在要的答案就一句：冒泡防踢" |
+| 未点名的闲聊（另一人） | 保持沉默 | 无回复 |
+
+检索本身已单独探针验证：同一 API key 打 `/anthropic/messages` + `web_search` 返回 200；`MPFT` 的英文检索结果只有 NHS 信托、遥感论文、缩略语词典—**"搜不到中文梗"是常态**，这正是规则 ⑨ 存在的原因。
+
+**验证**：`cargo test --lib` 1024、`--bin` 31、`host_llm_coverage` 7、web 2+1 全绿；两个 workspace `clippy -D warnings` 零 warning；`fmt` 干净。
+
 ### 5.2.44 真机回归：10-23 事故剧本重放（2026-10-23）
 
 用真实 DeepSeek（`config/llm_api.yaml` 的 default profile，temperature 0.2）+ 真实 runtime（`serve --runtime-only`）+ mock OneBot sink 重放事故剧本。为避免打扰本机 8099/5700 上的生产实例，临时把 `startup_invoke.json` 改到 8199/5800（已还原），data/config 全在临时 worktree 内。14 条消息覆盖：越界请求阶梯、安慰与"别教我做事"、连续发言人、身份/指代、危机短语。

@@ -3571,6 +3571,27 @@ export_plugin_api! {{
         Ok(())
     }
 
+    /// P6: persist the text the channel actually sent for `session_id`.
+    /// Messaging replies travel through a tool call, so the stored assistant
+    /// entry is only the bare action JSON; the inbox calls this to replace it
+    /// with the visible reply. Returns `Ok(false)` when there was nothing to
+    /// replace, `AgentSessionNotFound` when the session is gone.
+    pub fn agent_record_outbound_reply(
+        &self,
+        session_id: &str,
+        reply: &str,
+    ) -> Result<bool, RuntimeError> {
+        let mut guard = self
+            .agent_sessions
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let not_found = || RuntimeError::AgentSessionNotFound {
+            session_id: session_id.to_string(),
+        };
+        let managed = guard.get_mut(session_id).ok_or_else(not_found)?;
+        Ok(managed.session.replace_last_action_with_reply(reply))
+    }
+
     /// P4: rebind the caller's role flags. Group room persona edits are
     /// gated on `is_admin`; private chats ignore both flags. Refreshed per
     /// batch by the inbox, so the flags always describe whoever's tools are

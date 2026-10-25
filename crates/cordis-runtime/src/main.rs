@@ -1,4 +1,4 @@
-use cordis_runtime::agent::ShellAgentReply;
+use cordis_runtime::agent::{AgentToolEvent, ShellAgentReply};
 use cordis_runtime::context::ContextRegistry;
 use cordis_runtime::host::{
     AgentSessionKind, KernelApplyRequest, KernelPluginIterationResult, RuntimeHost,
@@ -213,6 +213,43 @@ fn extract_user_text(display: &str) -> &str {
         .map(|(_, t)| t)
         .unwrap_or(display)
         .trim()
+}
+
+/// P6: collect the text the channel actually sent during this agent turn.
+///
+/// Messaging replies leave the process through a tool call
+/// (`invoke_plugin(qq, qq_send, {message})` / `feishu_send`), or through the
+/// legacy `{"action":"respond","message":...}` output; both carry the visible
+/// text. The inbox records it into history so the next turn can see what the
+/// bot told the room (otherwise the stored assistant entry is only the bare
+/// action JSON and the bot contradicts itself).
+fn outbound_replies(reply_content: &str, tool_events: &[AgentToolEvent]) -> Vec<String> {
+    let mut replies = Vec::new();
+    for event in tool_events {
+        if event.name != "invoke_plugin" {
+            continue;
+        }
+        let message = event
+            .arguments
+            .pointer("/payload_json/message")
+            .and_then(Value::as_str)
+            .or_else(|| event.arguments.get("message").and_then(Value::as_str));
+        if let Some(message) = message.filter(|m| !m.trim().is_empty()) {
+            replies.push(message.to_string());
+        }
+    }
+    if let Ok(command) = parse_first_json(reply_content.trim()) {
+        if command.get("action").and_then(Value::as_str) == Some("respond") {
+            if let Some(message) = command
+                .get("message")
+                .and_then(Value::as_str)
+                .filter(|m| !m.trim().is_empty())
+            {
+                replies.push(message.to_string());
+            }
+        }
+    }
+    replies
 }
 
 /// A batch envelope classified by whether its user text is a `/command`.
@@ -928,6 +965,17 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                             if let Some(fb) = feedback {
                                 if let Ok(reply2) = host.agent_send_with_fallback(sid, &fb) {
                                     process(reply2.content.trim().to_string(), "retry");
+                                }
+                            }
+                            // P6: history only has the bare action JSON; put
+                            // the text the channel actually sent in its place
+                            // so the next turn knows what the bot said.
+                            let sent = outbound_replies(reply.content.trim(), &reply.tool_events);
+                            if !sent.is_empty() {
+                                if let Err(e) =
+                                    host.agent_record_outbound_reply(sid, &sent.join("\n"))
+                                {
+                                    eprintln!("inbox: record outbound reply failed: {e}");
                                 }
                             }
                         }
@@ -2463,7 +2511,9 @@ mod pending_tests {
 
 #[cfg(test)]
 mod batch_tests {
-    use super::{extract_user_text, partition_batch, AgentEnvelope, BatchItem};
+    use super::{extract_user_text, outbound_replies, partition_batch, AgentEnvelope, BatchItem};
+    use cordis_runtime::agent::AgentToolEvent;
+    use serde_json::{json, Value};
 
     // Build an envelope with a given display + sender via the JSON parser
     // (no public struct literal outside the module).
@@ -2541,6 +2591,44 @@ mod batch_tests {
         // No "]: " marker → whole string, trimmed.
         assert_eq!(extract_user_text("  plain text  "), "plain text");
         assert_eq!(extract_user_text("/help"), "/help");
+    }
+
+    // P6: the inbox must recover the visible reply from the tool call (or the
+    // legacy respond action) so history records what the channel actually sent.
+    #[test]
+    fn outbound_replies_reads_tool_events_and_respond_action() {
+        let event = |name: &str, arguments: Value| AgentToolEvent {
+            name: name.to_string(),
+            arguments,
+            ok: true,
+            output: None,
+            error: None,
+        };
+        let qq_send = event(
+            "invoke_plugin",
+            json!({
+                "plugin_path": "qq",
+                "node_id": "qq_send",
+                "payload_json": {"node_id": "qq_send", "target": "group:1", "message": "你好"}
+            }),
+        );
+        assert_eq!(
+            outbound_replies("{\"action\":\"suspend\"}", &[qq_send]),
+            vec!["你好".to_string()]
+        );
+        // Flat `message` argument (other channel wrappers).
+        let flat = event("invoke_plugin", json!({"message": "平铺"}));
+        assert_eq!(outbound_replies("", &[flat]), vec!["平铺".to_string()]);
+        // Non-messaging tool events are ignored.
+        let other = event("read_file", json!({"message": "不是回复"}));
+        assert!(outbound_replies("{\"action\":\"suspend\"}", &[other]).is_empty());
+        // Legacy respond action carries the text in the JSON.
+        assert_eq!(
+            outbound_replies("{\"action\":\"respond\",\"message\":\"回复\"}", &[]),
+            vec!["回复".to_string()]
+        );
+        // Empty message is not recorded.
+        assert!(outbound_replies("{\"action\":\"respond\",\"message\":\"  \"}", &[]).is_empty());
     }
 
     // 混合批过滤 Normal 后 last 的 sender 是最后一条普通消息的发送者；

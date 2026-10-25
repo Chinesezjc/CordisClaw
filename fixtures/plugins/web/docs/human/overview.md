@@ -5,29 +5,35 @@ Provides web access capabilities for the CordisClaw agent.
 ## Nodes
 
 ### `web_search`
-Search the web using Brave Search API or Bing API.
-Auto-selects backend based on which API key is available:
+Runs a web search through a DeepSeek **Anthropic-compatible** endpoint
+(`/anthropic/messages`) using the server-side `web_search` tool.
 
-1. If `BRAVE_API_KEY` is set → uses **Brave Search** (free tier: 2,000 queries/month)
-2. Else if `BING_API_KEY` is set → uses **Bing Search API v7**
-3. If neither is set → returns an error
+- Endpoint resolution: `CORDIS_WEB_SEARCH_URL` env → `web_search_url:` in
+  `config/llm_api.yaml` → `https://api.deepseek.com/anthropic/messages`.
+- Credentials: the `api_key` in `config/llm_api.yaml` (same key as chat).
+- Returns a numbered list of results (title + URL) plus the model summary, so
+  the agent can verify a specific page with `web_fetch`.
+- A failure (missing key, HTTP error, timeout) is returned as an error string —
+  callers must treat it as "search failed", not as "nothing exists".
 
-Returns title, URL, and snippet for each result. Max 20 results per query.
+The endpoint is intentionally separate from the chat `base_url`: providers
+often expose the Anthropic-compatible surface under a different path than the
+OpenAI-compatible one used for chat.
 
 ### `web_fetch`
 Fetch a web page and return its plain-text content with HTML tags stripped.
 Limited to 8000 characters. http/https only; localhost and private IPs are blocked.
 
-## Environment Variables
+## Configuration
 
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `BRAVE_API_KEY` | No* | Brave Search API key (sign up at https://api.search.brave.com) |
-| `BING_API_KEY` | No* | Bing Search API v7 key (Azure subscription required) |
-
-\* At least one of `BRAVE_API_KEY` or `BING_API_KEY` must be set for `web_search` to work.
+| Key | Where | Description |
+|-----|-------|-------------|
+| `api_key` | `config/llm_api.yaml` | Required for `web_search` (shared with chat) |
+| `model` | `config/llm_api.yaml` | Model passed to the search endpoint |
+| `web_search_url` | `config/llm_api.yaml` | Optional endpoint override |
+| `CORDIS_WEB_SEARCH_URL` | environment | Endpoint override, wins over config |
 
 ## Security
 - Only http/https protocols allowed
 - Localhost, loopback (127.0.0.1, ::1), and private network addresses (10.x, 172.16.x, 192.168.x) are blocked
-- Request timeout: 15 seconds
+- Request timeout: 60 seconds

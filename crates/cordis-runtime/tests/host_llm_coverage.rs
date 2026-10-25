@@ -373,6 +373,46 @@ fn agent_send_returns_assistant_reply_and_auto_saves() {
     );
 }
 
+// P6: the inbox records what the channel actually sent, replacing the bare
+// `{"action":"suspend"}` history entry so the next turn can see it.
+#[test]
+#[serial]
+fn agent_record_outbound_reply_rewrites_action_placeholder() {
+    let temp = setup_empty_fixture();
+    let fixtures = fixtures_dir(&temp);
+
+    let (url, requests_rx, handle) = spawn_chunked_mock_llm_server_sequence(vec![assistant_reply(
+        "rec_1",
+        "{\"action\":\"suspend\"}",
+    )]);
+    write_single_profile_config(&fixtures, &url);
+
+    let host = RuntimeHost::boot(&fixtures).expect("host should boot");
+    let sid = host
+        .agent_start(AgentSessionKind::RuntimeShell)
+        .expect("agent start")
+        .session_id;
+    host.agent_send(&sid, "hi").expect("send should succeed");
+    let _ = requests_rx.recv().expect("captured requests");
+    handle.join().expect("join mock server");
+
+    assert!(
+        host.agent_record_outbound_reply(&sid, "实际回复")
+            .expect("record should succeed"),
+        "action placeholder must be replaced"
+    );
+    assert!(
+        !host
+            .agent_record_outbound_reply(&sid, "实际回复")
+            .expect("second record should succeed"),
+        "a real reply has nothing to replace"
+    );
+    let err = host
+        .agent_record_outbound_reply("no-such-session", "x")
+        .expect_err("unknown session must error");
+    assert!(matches!(err, RuntimeError::AgentSessionNotFound { .. }));
+}
+
 // ── agent_send: session-not-found ────────────────────────────────────────
 #[test]
 #[serial]

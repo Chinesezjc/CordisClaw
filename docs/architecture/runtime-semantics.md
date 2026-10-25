@@ -195,6 +195,7 @@ inbox 一次可取到一批消息（同一渠道多条堆积）。批处理不�
 - **人格作用域：私聊按人、群聊按房间**（5.2.42 修正）：`AgentEnvelope::soul_key()` 私聊返回 `{sender_id}#private`，群聊返回**房间** `session_key`——一个群只有一个人格，不随发言人切换。inbox 每批 send 前的 `refresh_session_soul` 在群聊里因此退化为**幂等 no-op**（host 能力保留，私聊仍可显式重绑）。**profile（LLM 端点）仍保持 session 起点**，换 profile 需 `/reset` 起新会话。
 - **群聊里的 `set_soul` / `/soul`**：作用域是**本群房间**，但改动由 owner/admin 门控（5.2.43）：qq 的 `sender_role` 进 envelope，host 每批 `refresh_session_caller` 写 session 的 `caller_policy`，`set_soul` 工具在"群聊 + 非管理员"时直接拒绝。feishu 事件不带群角色 → 其群聊人格编辑按安全默认被拒。私聊仍是"只改自己的"。
 - **说话人标识**（5.2.42/5.2.43）：qq / feishu 的 envelope `display` 形如 `[QQ group from <gid> (user <uid>, name "<display>")]: <text>`（媒体消息另带 `msg=`），名字在入口清洗（控制字符/引号/括号过滤 + 24 字符截断），防昵称注入与伪造 envelope 标记。feishu 名字来自成员接口（30min TTL 缓存，失败静默回退无名字格式）。
+- **对外回复进历史**（5.2.45）：消息渠道的可见回复经 `qq_send` / `feishu_send` 工具发出，最终输出只是 `{"action":"suspend"}`；inbox 在 `agent_send` 返回后把本轮实际发出的文本回填进 assistant 历史（替换裸 action JSON），所以下一轮请求能看到"自己说过什么"。缺失这条时模型会把每轮都当成第一次回答——线上表现为同一问题前后不一致。
 - **确定性护栏**（5.2.43，`guard.rs`）：inbox 在调用模型前先过两条无 LLM 检查——高精度危机短语 → 固定求助话术（短路，不受轮次预算影响）；群聊同一发言人连续轮次上限 4，第 5 轮固定提示、第 6 轮起静默，换人即重置。语义级越界识别明确不做。
 - **纯命令批不碰 pending**：整批都是命令时不触发 pending spill / 重放（命令本就不经 LLM，无"打穿"可言）。
 - **批次边界标记**（5.2.36）：普通消息 batch 送 agent 时，正文用渠道中立标记 `CURRENT_INCOMING_BATCH_START` / `CURRENT_INCOMING_BATCH_END` 包裹，并附"只把当前批次当请求，不针对则 suspend"指令，防止 agent 把历史消息误当当前请求。包裹只发生在 `agent_send` 发送点；spill / pending 落盘的是原始未包裹文本。

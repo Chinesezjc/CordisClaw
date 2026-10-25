@@ -1969,6 +1969,42 @@ impl AgentSession {
         (before_len, self.history.len())
     }
 
+    /// P6: messaging channels send their visible reply through a tool call
+    /// (`qq_send` / `feishu_send`), so the entry written by
+    /// [`Self::remember_exchange`] is only the bare action JSON
+    /// (`{"action":"suspend"}`). Without this replace step the model never sees
+    /// what it actually told the room and contradicts itself on the next turn.
+    ///
+    /// Idempotent: a retried send just overwrites the same placeholder again.
+    /// Returns `true` when the placeholder was replaced; `false` when the last
+    /// assistant entry is already a real reply (nothing to do).
+    pub fn replace_last_action_with_reply(&mut self, reply: &str) -> bool {
+        let Some(Value::Object(obj)) = self.history.last_mut() else {
+            return false;
+        };
+        if obj.get("role").and_then(Value::as_str) != Some("assistant") {
+            return false;
+        }
+        let Some(content) = obj.get("content").and_then(Value::as_str) else {
+            return false;
+        };
+        let action_placeholder = serde_json::from_str::<Value>(content)
+            .ok()
+            .and_then(|v| v.get("action").map(|_| ()))
+            .is_some();
+        if !action_placeholder {
+            return false;
+        }
+        let old = estimate_tokens(content);
+        obj.insert("content".to_string(), Value::String(reply.to_string()));
+        let new = estimate_tokens(reply);
+        self.estimated_tokens = self
+            .estimated_tokens
+            .saturating_sub(old)
+            .saturating_add(new);
+        true
+    }
+
     fn remember_exchange(
         &mut self,
         user_input: &str,
@@ -2833,6 +2869,17 @@ refusal, answer with the same one line or not at all; no meta-commentary about b
 prefix, recent messages, group-member lookups — before saying you cannot tell. Ask only \
 after a lookup fails.
 7. Never state your own runtime state, capabilities, or history unless a tool confirmed it.
+8. Stay consistent with what you already told this conversation and with what a \
+tool already returned. Never silently overwrite it: if new evidence contradicts an \
+earlier answer, say plainly which answer changed and why (earlier I said X, the \
+search shows Y, so the answer is Y).
+9. A failed or empty search is not evidence that something does not exist. Say you \
+could not find it instead of asserting there is no such meaning. Never claim you \
+searched, checked or looked something up unless a search tool actually ran and \
+returned in this conversation; weigh results against what you already know and \
+against the community this conversation belongs to.
+10. Do not join conversations that are not addressed to you, and do not explain \
+memes, acronyms or in-jokes for a group unless someone asks you directly.
 ";
 
 fn shell_agent_system_prompt() -> String {
@@ -3406,6 +3453,10 @@ mod tests {
             "provocation",
             "lookup",
             "tool confirmed",
+            "silently",
+            "could not find",
+            "actually ran",
+            "addressed to you",
         ] {
             assert!(
                 CONDUCT_CONTRACT.contains(needle),
@@ -3508,6 +3559,53 @@ mod tests {
         session.reset();
         assert_eq!(session.status().completed_turns, 0);
         assert_eq!(session.status().stored_messages, 0);
+    }
+
+    fn session_for_reply_tests() -> AgentSession {
+        AgentSession::new(
+            LlmApiConfig {
+                base_url: "http://127.0.0.1:12345/v1".to_string(),
+                api_key: Some("test-key".to_string()),
+                model: "deepseek-reasoner".to_string(),
+                ..LlmApiConfig::default()
+            },
+            "reply-history-test",
+        )
+        .expect("build session")
+    }
+
+    /// P6: the channel-visible reply must replace the bare action placeholder,
+    /// otherwise the model cannot see what it said last turn.
+    #[test]
+    fn replace_last_action_with_reply_rewrites_placeholder() {
+        let mut session = session_for_reply_tests();
+        session.remember_exchange("u", "{\"action\":\"suspend\"}", None);
+        assert!(session.replace_last_action_with_reply("mpft 是冒泡防踢"));
+        assert_eq!(
+            session.history.last().and_then(|m| m["content"].as_str()),
+            Some("mpft 是冒泡防踢")
+        );
+        // A second record call finds the real reply already in place and does
+        // not duplicate the entry (the inbox ignores the false).
+        assert!(!session.replace_last_action_with_reply("mpft 是冒泡防踢"));
+        assert_eq!(session.history.len(), 2, "no extra history entry");
+    }
+
+    /// A direct answer (no messaging tool call) is already the visible reply —
+    /// never overwrite it, and an empty history has nothing to replace.
+    #[test]
+    fn replace_last_action_with_reply_leaves_real_answers_alone() {
+        let mut session = session_for_reply_tests();
+        assert!(
+            !session.replace_last_action_with_reply("x"),
+            "empty history"
+        );
+        session.remember_exchange("u", "直接回答", None);
+        assert!(!session.replace_last_action_with_reply("x"));
+        assert_eq!(
+            session.history.last().and_then(|m| m["content"].as_str()),
+            Some("直接回答")
+        );
     }
 
     struct TerminalTestBackend {
