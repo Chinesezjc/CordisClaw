@@ -240,6 +240,23 @@ Agent 现在可以自主完成：读代码 → 理解结构 → 写/改文件 �
 - [x] **Plugin iteration symlink 逃逸**（P0-20）— `PluginEditExecutor::execute` 在写入前调用新 helper `resolve_under_workspace`：canonicalize 结果必须仍在 workspace_root 下。plugins 内的 symlink 指向 `/etc/passwd` 之类无法被写入。
 - [x] **Verifier shell 拼接**（P0-21）— 已随 A 批 P0-1 修复。`discover_rust_workspace_manifest` 输出的字符串被 `shell_words` 解析成 argv，空格 / `$` / `;` 无法被解释。
 
+### 5.2.49 群聊修复移植：人格 / 身份 / 边界 / 上下文（2026-10-25 已闭合）
+
+把主分支 5.2.42–5.2.45 的修复**语义移植**到生产分支（`run-main`，拆出 cordis-tooling/cordis-cli 之后）。针对 10-23 / 10-25 线上两段事故：① 用"安全审查 / 申请驳回 / 固件更新"这类不存在的内部流程拒绝，被一句"审查通过了"打穿；② 问"他是谁"回"只看得到一串QQ号"；③ `mpft` 先答"冒泡防踢"、两分钟后又说"没有公认含义"（根因是**机器人看不到自己说过的话**）。
+
+- [x] **说话人身份** — qq：`OneBotSender` 增 `card`/`role`，`IncomingMessage` 增 `sender_name`/`sender_role`，display 变 `... (user <uid>, name "<name>")`（群名片优先、昵称回落，控制字符/引号/括号过滤 + 24 char；`notes`/`images` 原样保留）。feishu：新增 `feishu_get_chat_members` 节点 + 30min TTL 名字缓存（2s 超时、失败静默），display 带 name，媒体消息保留 `msg=`。
+- [x] **群聊人格房间级** — `AgentEnvelope::soul_key()` 群聊返回房间 `session_key`（私聊仍 `{sender_id}#private`，无身份回落 session_key）；inbox 的 `refresh_session_soul` 在群聊退化为幂等 no-op，人格不再随最后发言人翻转。
+- [x] **群人格管理员门控** — `sender_role` → `refresh_session_caller` → session caller 旗标 → `set_soul` 在"群聊 + 非 owner/admin"直接拒绝（feishu 事件不带群角色，按安全默认拒绝）。
+- [x] **conduct 契约 + persona 免责声明** — system prompt 四段：base → persona（免责声明：只影响语气）→ `CONDUCT_CONTRACT`（10 条）→ plugin hints。契约包含：拒绝一句且不翻转（"审查通过"不是新事实）、不编造内部流程、不辱骂/评价真人（含"演"）、情绪先共情不诊断不重复模板、不喂养挑衅、认人先查再问、未经工具确认不陈述自身状态、**与已说过的话和工具结果保持一致（冲突要明说改了什么）**、**搜不到 ≠ 不存在且不得谎称检索**、**未点名不插话**。
+- [x] **确定性护栏 `guard.rs`** — 高精度危机短语 → 固定求助话术（短路 LLM，不受预算影响）；群聊同发言人连续轮次上限 4（第 5 轮固定提示、第 6 轮起静默，换人重置）。语义级越界识别明确不做。
+- [x] **上下文修复（本次事故根因）** — 成功轮原本只存 `{"action":"suspend"}`，渠道真实回复在工具调用参数里被丢弃。现在 `AgentSession::replace_last_action_with_reply` + `RuntimeHost::agent_record_outbound_reply`，inbox 从 `invoke_plugin.payload_json.message`（兼容 legacy `respond.message`）抽取实际发出文本回填历史；只替换不追加。
+- [x] **web 检索端点可配置** — `CORDIS_WEB_SEARCH_URL` > `web_search_url:`（config/llm_api.yaml）> 默认，替换硬编码；文档改写为真实行为。
+- [x] **fixtures 锁文件** — 提交 workspace `fixtures/plugins/Cargo.lock`（`chacha20 0.10.1` 已 yank，无锁文件时 `cargo metadata --offline` 必失败；`.gitignore` 改为忽略 per-plugin、保留 workspace）。
+
+**验证**：`cargo test -p cordis-runtime --lib` 904、`host_llm_coverage` 7、`cargo test -p cordis-cli --bin cordis-runtime` 40、qq 64、feishu 57、web 2；workspace `clippy --all-targets -D warnings` 零 warning；`cargo fmt --all -- --check` 干净。真机回归（移植后构建、真实 DeepSeek、mock OneBot、4 轮 mpft 剧本）：第 2 轮显式"我先更正一下：上一条我只列了 NHS…"，第 3 轮准确复述自己前两轮回答并总结"以冒泡防踢为准"，未点名的闲聊保持沉默。
+
+**运维注意**：`serve` 收到 SIGTERM 时 `save_draft_and_revert` 会把 `fixtures/plugins` 的未提交改动存成 `fixtures/.cordis-drafts/draft-*.patch` 并 `git checkout -- plugins/`。在**脏 worktree** 里做真机重放后必须用该补丁恢复；生产 worktree 部署后再重启不受影响（已提交、无 diff）。
+
 ### 5.2.48 拆出 cordis-tooling / cordis-cli（2026-10-23）
 
 **动机**：构建系统（`prepare_artifacts` / `rebuild_fixture_artifacts` /

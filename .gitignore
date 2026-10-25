@@ -3,7 +3,12 @@ registered-*.html
 config/
 fixtures/artifacts/
 fixtures/tmp/
+# Per-plugin lockfiles are ignored (each plugin can build standalone), but the
+# fixtures *workspace* lock must be tracked: it is what makes
+# `cargo metadata --offline` and plugin builds reproducible from a clean
+# checkout. The negation has to come after the pattern it re-includes.
 fixtures/plugins/**/Cargo.lock
+!fixtures/plugins/Cargo.lock
 .codex
 .claude/
 .cordis-drafts/

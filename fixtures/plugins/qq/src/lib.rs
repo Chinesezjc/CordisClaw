@@ -116,6 +116,15 @@ struct IncomingMessage {
     /// Quoted message_id if this message is a reply to another message
     #[serde(skip_serializing_if = "Option::is_none")]
     reply_to_msg_id: Option<i64>,
+    /// Sanitized display name for the speaker: group card first, nickname as
+    /// fallback. Sanitized before it can reach model-visible text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sender_name: Option<String>,
+    /// OneBot group role (owner/admin/member). Carried through for the runtime,
+    /// which gates group-persona changes on it; qq itself does not consume it.
+    /// `None` = the event carried no role.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sender_role: Option<String>,
     /// Raw OneBot event for debugging
     #[serde(skip_serializing_if = "Option::is_none")]
     raw_event: Option<Value>,
@@ -147,6 +156,12 @@ struct OneBotEvent {
 struct OneBotSender {
     #[serde(default)]
     nickname: Option<String>,
+    /// Group card (群名片) — preferred display name in group chats.
+    #[serde(default)]
+    card: Option<String>,
+    /// Group role (owner/admin/member) — carried through, not consumed here.
+    #[serde(default)]
+    role: Option<String>,
     #[serde(default)]
     user_id: Option<Value>,
 }
@@ -861,6 +876,17 @@ fn handle_onebot_event(event: &OneBotEvent) {
         _ => None,
     });
 
+    // 群名片优先、昵称回落；清洗后再进模型可见文本（昵称是用户可控输入）。
+    let sender_name = event
+        .sender
+        .as_ref()
+        .and_then(|s| s.card.as_deref().or(s.nickname.as_deref()))
+        .and_then(sanitize_display_name);
+
+    // 群角色（owner/admin/member）原样透传给 runtime；runtime 只据此判断
+    // 调用者能否改群人格，qq 自己不消费它。
+    let sender_role = event.sender.as_ref().and_then(|s| s.role.clone());
+
     let msg = IncomingMessage {
         message_type: msg_type,
         sender_id,
@@ -868,6 +894,8 @@ fn handle_onebot_event(event: &OneBotEvent) {
         message: message_text,
         message_id,
         reply_to_msg_id,
+        sender_name,
+        sender_role,
         raw_event: Some(serde_json::to_value(event).unwrap_or_default()),
     };
 
@@ -1337,9 +1365,6 @@ fn ensure_policy_parent_dir(path: &std::path::Path) -> Result<(), String> {
     std::fs::create_dir_all(parent).map_err(|e| format!("create data dir: {e}"))
 }
 
-/// Build the runtime routing envelope (mirrors feishu's build_envelope).
-/// sender_id is "group:<gid>" or "private:<uid>"; the actual person is
-/// user_id, so identity is "qq:<user_id>".
 /// 从渲染后的正文里按顺序收集 `[image: <url>]` 里的 URL。
 ///
 /// 只认 `[image: `（不是 `[image file: `）——后者是没有 URL 的占位符，
@@ -1361,6 +1386,37 @@ fn collect_image_urls(text: &str) -> Vec<String> {
     urls
 }
 
+/// Sanitize a user-controlled display name before it enters model-visible text.
+///
+/// Control characters and the quoting/bracketing set `[`, `]`, `"`, `` ` ``,
+/// `'` become spaces (so a nickname cannot forge envelope markup or escape a
+/// quoted field), runs of whitespace collapse, the result is truncated to 24
+/// *chars* (not bytes — CJK names must not be split mid-codepoint), and a blank
+/// result degrades to `None` (caller then emits the name-less form).
+fn sanitize_display_name(raw: &str) -> Option<String> {
+    let cleaned: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_control() || matches!(c, '[' | ']' | '"' | '`' | '\'') {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect();
+    let collapsed = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+    let truncated: String = collapsed.chars().take(24).collect();
+    let trimmed = truncated.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// Build the runtime routing envelope (mirrors feishu's build_envelope).
+/// sender_id is "group:<gid>" or "private:<uid>"; the actual person is
+/// user_id, so identity is "qq:<user_id>".
 fn build_envelope(msg: &IncomingMessage) -> String {
     // 每条消息都带上「本群生效的模式 + 策略」和「本群记忆」。配置缺失/损坏只会
     // 回落到内置默认，所以这里永远构造成功（envelope 失败会丢整条消息）。
@@ -1375,10 +1431,19 @@ fn build_envelope(msg: &IncomingMessage) -> String {
     }
     let reply_target = format!("{}:{}", msg.message_type, msg.sender_id);
     let session_key = format!("qq:{reply_target}");
-    let display = format!(
-        "[QQ {} from {} (user {})]: {}",
-        msg.message_type, msg.sender_id, msg.user_id, msg.message
-    );
+    // 有展示名就带上（群名片/昵称，已清洗）；没有则保持旧格式。名字插在
+    // `(user <uid>` 之后、`)` 之前，所以 runtime 按 "(user " 切分还原 gid 的
+    // 逻辑不受影响，且清洗已把 `]` 去掉，`]: ` 不可能出现在名字里。
+    let display = match msg.sender_name.as_deref() {
+        Some(name) => format!(
+            "[QQ {} from {} (user {}, name \"{}\")]: {}",
+            msg.message_type, msg.sender_id, msg.user_id, name, msg.message
+        ),
+        None => format!(
+            "[QQ {} from {} (user {})]: {}",
+            msg.message_type, msg.sender_id, msg.user_id, msg.message
+        ),
+    };
 
     let mut env = json!({
         "source_plugin": "qq",
@@ -1388,6 +1453,8 @@ fn build_envelope(msg: &IncomingMessage) -> String {
         "reply_target": reply_target,
         "sender_id": format!("qq:{}", msg.user_id),
         "conversation_kind": msg.message_type,
+        // 缺省空串：渠道报不出群角色时 runtime 按普通成员处理（安全默认）。
+        "sender_role": msg.sender_role.clone().unwrap_or_default(),
         // 图片地址交给 kernel 处理（下载 + 内联），插件不碰多模态 wire format。
         "images": collect_image_urls(&msg.message),
         // 一次性上下文：策略行 + 记忆行，只进本次请求。
@@ -1870,8 +1937,6 @@ fn handle_qq_get_group_roles(req: &NodeRequest) -> Result<NodeResponse, String> 
     })
 }
 
-/// WS-4: persist the reply policy so the next inbound message already uses it
-/// (build_envelope reads the file per message — no restart, no rebuild).
 // ── 判权：谁能改这个群的策略 / 记忆 ─────────────────────────────────────
 //
 // 规则在插件里（kernel 不认识"群主/管理员"）；"谁在要求"由 kernel 转交：
@@ -1883,11 +1948,17 @@ fn handle_qq_get_group_roles(req: &NodeRequest) -> Result<NodeResponse, String> 
 //     里的运营白名单；改全局 default → 只认运营白名单；
 //   - 角色查不到（bot 无权限 / 接口失败）→ **拒绝**（fail closed）。
 
+/// 角色缓存条目：(群号, uid → role 映射, 抓取时刻)。
+type RoleCacheEntries = Vec<(
+    String,
+    std::collections::HashMap<String, String>,
+    std::time::Instant,
+)>;
+
 /// 角色缓存 TTL：同一群 10 分钟内只查一次成员列表。
 const ROLE_CACHE_TTL: Duration = Duration::from_secs(600);
 
-static ROLE_CACHE: Mutex<Vec<(String, std::collections::HashMap<String, String>, std::time::Instant)>> =
-    Mutex::new(Vec::new());
+static ROLE_CACHE: Mutex<RoleCacheEntries> = Mutex::new(Vec::new());
 
 /// kernel 注入的可信元数据里的发送者（去掉 `qq:` 前缀）。
 fn meta_actor(req: &NodeRequest) -> Option<String> {
@@ -2021,13 +2092,15 @@ fn authorize_policy_write(
         ));
     };
     match cached_group_role(group, &actor, req.payload.as_ref()).as_deref() {
-        Some("owner") | Some("admin") => Ok(format!("{actor}")),
+        Some("owner") | Some("admin") => Ok(actor.to_string()),
         _ => Err(format!(
             "only the group owner or an admin can change this group's {what}"
         )),
     }
 }
 
+/// WS-4: persist the reply policy so the next inbound message already uses it
+/// (build_envelope reads the file per message — no restart, no rebuild).
 fn handle_qq_set_reply_policy(req: &NodeRequest) -> Result<NodeResponse, String> {
     let payload = req.payload.as_ref();
     let data_dir = node_str_arg(payload, req.data_dir.as_deref(), "data_dir");
@@ -3015,6 +3088,39 @@ mod chain_tests {
         serde_json::from_value(v).unwrap()
     }
 
+    /// 群事件 + OneBot sender：展示名（card/nickname）与群角色都要穿过 ingest
+    /// 进队列。`card` / `nickname` 传 `None` 时该键从 JSON 里省略，用于验证
+    /// 回落顺序。
+    fn group_event_with_sender(
+        mid: i64,
+        gid: i64,
+        text: &str,
+        nickname: Option<&str>,
+        card: Option<&str>,
+        role: Option<&str>,
+    ) -> OneBotEvent {
+        let mut sender = serde_json::Map::new();
+        if let Some(nickname) = nickname {
+            sender.insert("nickname".to_string(), json!(nickname));
+        }
+        if let Some(card) = card {
+            sender.insert("card".to_string(), json!(card));
+        }
+        if let Some(role) = role {
+            sender.insert("role".to_string(), json!(role));
+        }
+        let v = json!({
+            "post_type": "message",
+            "message_type": "group",
+            "message": [{"type": "text", "data": {"text": text}}],
+            "message_id": mid,
+            "user_id": 111,
+            "group_id": gid,
+            "sender": Value::Object(sender),
+        });
+        serde_json::from_value(v).unwrap()
+    }
+
     fn queue_len() -> usize {
         MESSAGE_QUEUE.lock().unwrap().len()
     }
@@ -3032,6 +3138,45 @@ mod chain_tests {
         // ── 段2 去重：相同 message_id 再来一次被丢弃 ──────────────
         handle_onebot_event(&group_event(2001, 222, "hello world"));
         assert_eq!(queue_len(), 1, "重复 message_id 不应二次入队");
+
+        // ── 段2b sender.role / 群名片必须原样入队（展示名与群人格门控的数据源）──
+        handle_onebot_event(&group_event_with_sender(
+            3000,
+            222,
+            "role msg",
+            Some("小明"),
+            Some("小明的名片"),
+            Some("admin"),
+        ));
+        {
+            let queue = MESSAGE_QUEUE.lock().unwrap();
+            let last = queue.back().expect("sender message should be queued");
+            assert_eq!(last.sender_role.as_deref(), Some("admin"));
+            assert_eq!(
+                last.sender_name.as_deref(),
+                Some("小明的名片"),
+                "群名片优先于昵称"
+            );
+            // 无 sender 的事件（精简事件）名字与角色都是 None，不是空串。
+            let first = queue.front().expect("first message should still be queued");
+            assert_eq!(first.sender_role, None);
+            assert_eq!(first.sender_name, None);
+        }
+        // 段2c：没有群名片时回落到昵称；昵称里的引号/方括号按清洗规则变空格。
+        handle_onebot_event(&group_event_with_sender(
+            3001,
+            222,
+            "nick msg",
+            Some("\"小\n明\""),
+            None,
+            None,
+        ));
+        {
+            let queue = MESSAGE_QUEUE.lock().unwrap();
+            let last = queue.back().expect("nickname message should be queued");
+            assert_eq!(last.sender_name.as_deref(), Some("小 明"));
+            assert_eq!(last.sender_role, None);
+        }
         MESSAGE_QUEUE.lock().unwrap().clear();
 
         // ── 段3 灰度白名单：设置 allow_groups 后只放行白名单群 ─────
@@ -3139,6 +3284,8 @@ mod chain_tests {
             message: "hello".to_string(),
             message_id: Some(42),
             reply_to_msg_id: None,
+            sender_name: None,
+            sender_role: None,
             raw_event: None,
         };
         let env: Value = serde_json::from_str(&build_envelope(&msg)).unwrap();
@@ -3148,7 +3295,118 @@ mod chain_tests {
         assert_eq!(env["reply_target"], "group:123456");
         assert_eq!(env["sender_id"], "qq:789");
         assert_eq!(env["conversation_kind"], "group");
+        assert_eq!(env["sender_role"], "");
         assert_eq!(env["reply_to"], "42");
+        // 无名字时 display 保持旧格式，不出现 name 字段片段。
+        assert_eq!(
+            env["display"],
+            "[QQ group from 123456 (user 789)]: hello".to_string()
+        );
+        assert!(
+            !env["display"].as_str().unwrap().contains("name \""),
+            "无 sender_name 时 display 不应含 name 片段"
+        );
+    }
+
+    // 有 sender_name 时 display 带上发言人展示名，其余路由字段不变。
+    #[test]
+    fn build_envelope_carries_speaker_name() {
+        let msg = IncomingMessage {
+            message_type: "group".to_string(),
+            sender_id: "123456".to_string(),
+            user_id: "789".to_string(),
+            message: "hello".to_string(),
+            message_id: Some(42),
+            reply_to_msg_id: Some(7),
+            sender_name: Some("小明".to_string()),
+            sender_role: None,
+            raw_event: None,
+        };
+        let env: Value = serde_json::from_str(&build_envelope(&msg)).unwrap();
+        let display = env["display"].as_str().unwrap();
+        assert!(
+            display.contains("(user 789, name \"小明\")"),
+            "display 应精确包含发言人片段，实际: {display}"
+        );
+        assert_eq!(
+            display,
+            "[QQ group from 123456 (user 789, name \"小明\")]: hello"
+        );
+        assert_eq!(env["source_plugin"], "qq");
+        assert_eq!(env["reply_node"], "qq_send");
+        assert_eq!(env["session_key"], "qq:group:123456");
+        assert_eq!(env["reply_target"], "group:123456");
+        assert_eq!(env["sender_id"], "qq:789");
+        assert_eq!(env["conversation_kind"], "group");
+        assert_eq!(env["reply_to"], "42");
+        // minori 的 notes/images 字段在有名字时也必须原样保留。
+        assert!(env["notes"].as_str().unwrap().contains("[reply policy: "));
+        assert!(env["images"].as_array().is_some());
+    }
+
+    // 群角色透传：OneBot 的 sender.role=admin → envelope 的 sender_role。
+    // runtime 用它把"改群人格"限制在群主/管理员，路由字段一个都不能变。
+    #[test]
+    fn build_envelope_carries_sender_role() {
+        let msg = IncomingMessage {
+            message_type: "group".to_string(),
+            sender_id: "123456".to_string(),
+            user_id: "789".to_string(),
+            message: "hello".to_string(),
+            message_id: Some(42),
+            reply_to_msg_id: None,
+            sender_name: None,
+            sender_role: Some("admin".to_string()),
+            raw_event: None,
+        };
+        let env: Value = serde_json::from_str(&build_envelope(&msg)).unwrap();
+        assert_eq!(env["sender_role"], "admin");
+        assert_eq!(env["source_plugin"], "qq");
+        assert_eq!(env["reply_node"], "qq_send");
+        assert_eq!(env["session_key"], "qq:group:123456");
+        assert_eq!(env["reply_target"], "group:123456");
+        assert_eq!(env["sender_id"], "qq:789");
+        assert_eq!(env["conversation_kind"], "group");
+        assert_eq!(env["reply_to"], "42");
+        assert_eq!(
+            env["display"],
+            "[QQ group from 123456 (user 789)]: hello".to_string()
+        );
+    }
+
+    // 清洗：控制字符与 [ ] " ` ' 变空格，空白折叠，截断到 24 字符。
+    // 输入 "  小\n明\t[name]\"" → 替换后 "  小 明  name  " →
+    // 折叠为 "小 明 name"（9 字符，未超 24），结果为 Some("小 明 name")。
+    #[test]
+    fn sanitize_display_name_strips_control_and_wrapping() {
+        assert_eq!(
+            sanitize_display_name("  小\n明\t[name]\""),
+            Some("小 明 name".to_string())
+        );
+        assert_eq!(
+            sanitize_display_name("'`\"]["),
+            None,
+            "全是过滤字符应清洗为空"
+        );
+    }
+
+    // 空白 / 全过滤字符的输入降级为 None。
+    #[test]
+    fn sanitize_display_name_rejects_blank() {
+        assert_eq!(sanitize_display_name(""), None);
+        assert_eq!(sanitize_display_name("   "), None);
+        assert_eq!(sanitize_display_name("\n\t"), None);
+        assert_eq!(sanitize_display_name("[ ] \" ` '"), None);
+    }
+
+    // 按字符（非字节）截断到 24 个 char，CJK 不被拆坏。
+    #[test]
+    fn sanitize_display_name_truncates_to_24_chars() {
+        let input = format!("{}{}", "一".repeat(15), "a".repeat(16));
+        assert_eq!(input.chars().count(), 31);
+        let out = sanitize_display_name(&input).unwrap();
+        assert_eq!(out.chars().count(), 24);
+        assert_eq!(out, format!("{}{}", "一".repeat(15), "a".repeat(9)));
     }
 
     // reply_to 双类型解析：i64（legacy）与字符串（inbox 路由）都接受。
@@ -3369,6 +3627,8 @@ mod reply_policy_tests {
             message: "hello".to_string(),
             message_id: Some(1),
             reply_to_msg_id: None,
+            sender_name: None,
+            sender_role: None,
             raw_event: None,
         }
     }
@@ -4099,6 +4359,8 @@ mod image_url_tests {
             message: text.to_string(),
             message_id: Some(1),
             reply_to_msg_id: None,
+            sender_name: None,
+            sender_role: None,
             raw_event: None,
         }
     }
@@ -4273,7 +4535,13 @@ mod auth_tests {
         format!("http://{addr}")
     }
 
-    fn req_with_meta(node: &str, dir: &std::path::Path, group: &str, actor: &str, url: &str) -> NodeRequest {
+    fn req_with_meta(
+        node: &str,
+        dir: &std::path::Path,
+        group: &str,
+        actor: &str,
+        url: &str,
+    ) -> NodeRequest {
         serde_json::from_value(json!({
             "node_id": node,
             "data_dir": dir.to_str().unwrap_or_default(),
@@ -4352,10 +4620,14 @@ mod auth_tests {
         let url = member_stub(&[("1001", "owner")]);
         let mut req = req_with_meta("qq_set_reply_policy", &dir, "800006", "1001", &url);
         // 消息来自 800006，但要求改 800007。
-        req.payload.as_mut().and_then(|p| p.get_mut("__meta")).and_then(|m| m.as_object_mut())
+        req.payload
+            .as_mut()
+            .and_then(|p| p.get_mut("__meta"))
+            .and_then(|m| m.as_object_mut())
             .map(|m| m.insert("target".to_string(), json!("group:800007")));
         let err = handle_qq_set_reply_policy(&req).expect_err("cross-group write must be denied");
-        let explains = err.contains("only change the reply policy of the group this message came from");
+        let explains =
+            err.contains("only change the reply policy of the group this message came from");
         assert!(explains, "err: {err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -4377,11 +4649,8 @@ mod auth_tests {
         assert!(mentions_operators, "err: {err}");
 
         // 把 1001 加进白名单后放行。
-        std::fs::write(
-            dir.join("qq_operators.json"),
-            r#"{"operators":["1001"]}"#,
-        )
-        .expect("write allowlist");
+        std::fs::write(dir.join("qq_operators.json"), r#"{"operators":["1001"]}"#)
+            .expect("write allowlist");
         let resp = handle_qq_set_reply_policy(&req).expect("allowlisted operator may change it");
         assert!(resp.ok);
         let _ = std::fs::remove_dir_all(&dir);

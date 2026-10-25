@@ -1,4 +1,4 @@
-use cordis_runtime::agent::ShellAgentReply;
+use cordis_runtime::agent::{AgentToolEvent, ShellAgentReply};
 use cordis_runtime::context::ContextRegistry;
 use cordis_runtime::host::{
     AgentSessionKind, KernelApplyRequest, KernelPluginIterationResult, RuntimeHost,
@@ -65,6 +65,10 @@ struct AgentEnvelope {
     /// Conversation dimension: "private" | "group". Empty = unknown.
     #[serde(default)]
     conversation_kind: String,
+    /// P4: sender's role in a group room ("owner" | "admin" | "member").
+    /// Empty = the channel cannot report it (treated as a plain member).
+    #[serde(default)]
+    sender_role: String,
     /// 本批消息里带的图片地址（渠道中立）。kernel 自己下载并内联成
     /// `image_url` content part（见 `cordis_runtime::image_input`），所以插件只需
     /// 把图片 URL 原样交出来，不必理解多模态 wire format。
@@ -93,6 +97,7 @@ impl AgentEnvelope {
                 reply_to: None,
                 sender_id: String::new(),
                 conversation_kind: String::new(),
+                sender_role: String::new(),
                 images: Vec::new(),
                 notes: String::new(),
             },
@@ -103,15 +108,30 @@ impl AgentEnvelope {
         !self.source_plugin.is_empty() && !self.reply_node.is_empty()
     }
 
-    /// Soul scope key: `{sender_id}#{conversation_kind}` so the same user
-    /// can carry different personas in private vs group chats. Envelopes
-    /// without identity (legacy callers) scope by session_key instead.
+    /// Soul scope key. Private chats are per-user (`{sender_id}#private`);
+    /// group chats are per-room (the whole `session_key`), so every speaker
+    /// in one room meets the same persona. Envelopes without identity
+    /// (legacy callers) fall back to `session_key`.
+    ///
+    /// A group room has one bot character, not one per member: keying by
+    /// `{sender_id}#group` made the persona flip with whoever spoke last.
     fn soul_key(&self) -> String {
         if self.sender_id.is_empty() {
-            self.session_key.clone()
-        } else {
-            format!("{}#{}", self.sender_id, self.conversation_kind)
+            return self.session_key.clone();
         }
+        if self.conversation_kind == "group" && !self.session_key.is_empty() {
+            return self.session_key.clone();
+        }
+        format!("{}#{}", self.sender_id, self.conversation_kind)
+    }
+
+    /// Only a group owner/admin may change a room persona; an empty role
+    /// (channel cannot report it) counts as a plain member.
+    fn caller_is_admin(&self) -> bool {
+        matches!(
+            self.sender_role.to_ascii_lowercase().as_str(),
+            "owner" | "admin"
+        )
     }
 }
 
@@ -355,6 +375,43 @@ fn extract_user_text(display: &str) -> &str {
         .map(|(_, t)| t)
         .unwrap_or(display)
         .trim()
+}
+
+/// P6: collect the text the channel actually sent during this agent turn.
+///
+/// Messaging replies leave the process through a tool call
+/// (`invoke_plugin(qq, qq_send, {message})` / `feishu_send`), or through the
+/// legacy `{"action":"respond","message":...}` output; both carry the visible
+/// text. The inbox records it into history so the next turn can see what the
+/// bot told the room (otherwise the stored assistant entry is only the bare
+/// action JSON and the bot contradicts itself).
+fn outbound_replies(reply_content: &str, tool_events: &[AgentToolEvent]) -> Vec<String> {
+    let mut replies = Vec::new();
+    for event in tool_events {
+        if event.name != "invoke_plugin" {
+            continue;
+        }
+        let message = event
+            .arguments
+            .pointer("/payload_json/message")
+            .and_then(Value::as_str)
+            .or_else(|| event.arguments.get("message").and_then(Value::as_str));
+        if let Some(message) = message.filter(|m| !m.trim().is_empty()) {
+            replies.push(message.to_string());
+        }
+    }
+    if let Ok(command) = parse_first_json(reply_content.trim()) {
+        if command.get("action").and_then(Value::as_str) == Some("respond") {
+            if let Some(message) = command
+                .get("message")
+                .and_then(Value::as_str)
+                .filter(|m| !m.trim().is_empty())
+            {
+                replies.push(message.to_string());
+            }
+        }
+    }
+    replies
 }
 
 /// A batch envelope classified by whether its user text is a `/command`.
@@ -767,6 +824,9 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         let health_host = std::sync::Arc::clone(&host);
         let park_host = std::sync::Arc::clone(&host);
         let mut sessions: BTreeMap<String, String> = BTreeMap::new();
+        // P5: per-room consecutive-turn budget (group chats only).
+        let mut reply_budgets: BTreeMap<String, cordis_runtime::guard::ReplyBudget> =
+            BTreeMap::new();
         std::thread::spawn(move || {
             // WS-3: per-session outage-notice throttle. The inbox loop is
             // single-threaded, so a plain HashMap needs no lock.
@@ -886,6 +946,44 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                         normals.len(),
                         combined
                     );
+                    // P5: deterministic guards, applied before any LLM work.
+                    // A crisis phrase always gets the fixed helpline reply —
+                    // an exhausted turn budget must not silence it.
+                    if let Some(reply) = cordis_runtime::guard::crisis_reply(&combined) {
+                        eprintln!("inbox: [{session_key}] crisis phrase → fixed reply");
+                        send_via(&route, reply);
+                        continue;
+                    }
+                    if route.conversation_kind == "group" {
+                        let budget =
+                            reply_budgets.entry(session_key.clone()).or_insert_with(|| {
+                                cordis_runtime::guard::ReplyBudget::new(
+                                    cordis_runtime::guard::DEFAULT_TURN_CAP,
+                                )
+                            });
+                        match budget.begin_turn(&route.sender_id) {
+                            // Counted whether the agent answers or suspends:
+                            // the budget limits attention, not just outbound
+                            // messages.
+                            cordis_runtime::guard::TurnVerdict::Allow => budget.record_turn(),
+                            cordis_runtime::guard::TurnVerdict::Warn => {
+                                eprintln!(
+                                    "inbox: [{session_key}] turn budget exhausted for {} → fixed warning",
+                                    route.sender_id
+                                );
+                                send_via(&route, cordis_runtime::guard::BUDGET_WARNING);
+                                budget.record_turn();
+                                continue;
+                            }
+                            cordis_runtime::guard::TurnVerdict::Drop => {
+                                eprintln!(
+                                    "inbox: [{session_key}] turn budget exhausted for {} → drop",
+                                    route.sender_id
+                                );
+                                continue;
+                            }
+                        }
+                    }
                     // P1-53: don't drain rx.try_recv() here — messages on the
                     // channel are from ALL sessions; the outer loop shards
                     // them correctly next iteration.
@@ -924,6 +1022,8 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     // also covers the just-created session. Errors ignored
                     // (a missing session surfaces on agent_send instead).
                     let _ = host.refresh_session_soul(sid, &route.soul_key());
+                    let is_group = route.conversation_kind == "group";
+                    let _ = host.refresh_session_caller(sid, is_group, route.caller_is_admin());
                     // Process agent output: parse JSON, dispatch action, send
                     // the reply back to the ORIGINATING plugin (route). Returns
                     // Some(feedback) if the agent needs to retry.
@@ -1113,6 +1213,17 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                                         eprintln!("inbox: retry send failed: {e}");
                                         spill_and_notify(&mut outage_notified);
                                     }
+                                }
+                            }
+                            // P6: history only has the bare action JSON; put
+                            // the text the channel actually sent in its place
+                            // so the next turn knows what the bot said.
+                            let sent = outbound_replies(reply.content.trim(), &reply.tool_events);
+                            if !sent.is_empty() {
+                                if let Err(e) =
+                                    host.agent_record_outbound_reply(sid, &sent.join("\n"))
+                                {
+                                    eprintln!("inbox: record outbound reply failed: {e}");
                                 }
                             }
                         }
@@ -2849,7 +2960,9 @@ mod notify_tests {
 
 #[cfg(test)]
 mod batch_tests {
-    use super::{extract_user_text, partition_batch, AgentEnvelope, BatchItem};
+    use super::{extract_user_text, outbound_replies, partition_batch, AgentEnvelope, BatchItem};
+    use cordis_runtime::agent::AgentToolEvent;
+    use serde_json::{json, Value};
 
     // Build an envelope with a given display + sender via the JSON parser
     // (no public struct literal outside the module).
@@ -2948,7 +3061,109 @@ mod batch_tests {
         let route = normals.last().expect("at least one normal");
         // Last normal is C (the command B trails but is filtered out).
         assert_eq!(route.sender_id, "C");
-        assert_eq!(route.soul_key(), "C#group");
+        // Group persona is room-scoped: the key is the session, not the sender.
+        assert_eq!(route.soul_key(), "feishu:chat:oc_x");
+    }
+
+    /// 同一房间的不同发言人共用一个 soul（房间级人格）。
+    #[test]
+    fn group_soul_key_is_shared_by_speakers() {
+        let a = env("[feishu (user A)]: 你好", "A");
+        let b = env("[feishu (user B)]: 在吗", "B");
+        assert_eq!(a.soul_key(), "feishu:chat:oc_x");
+        assert_eq!(b.soul_key(), "feishu:chat:oc_x");
+        assert_eq!(a.soul_key(), b.soul_key());
+    }
+
+    /// 群聊但缺 session_key 时回落成 per-speaker key，不能塌成空串。
+    #[test]
+    fn group_soul_key_falls_back_without_session_key() {
+        let raw = serde_json::json!({
+            "session_key": "",
+            "display": "hi",
+            "sender_id": "A",
+            "conversation_kind": "group",
+        })
+        .to_string();
+        let env = AgentEnvelope::parse(&raw);
+        assert_eq!(env.session_key, "");
+        assert_eq!(env.soul_key(), "A#group");
+    }
+
+    /// 私聊仍按人作用域。
+    #[test]
+    fn private_soul_key_stays_per_user() {
+        let envelope = |sender: &str| {
+            let raw = serde_json::json!({
+                "session_key": "feishu:ou_abc",
+                "display": "hi",
+                "sender_id": sender,
+                "conversation_kind": "private",
+            })
+            .to_string();
+            AgentEnvelope::parse(&raw)
+        };
+        assert_eq!(
+            envelope("feishu:ou_abc").soul_key(),
+            "feishu:ou_abc#private"
+        );
+        assert_eq!(
+            envelope("feishu:ou_xyz").soul_key(),
+            "feishu:ou_xyz#private"
+        );
+    }
+
+    /// P4: role 解析——owner/admin 才可改群人格，缺省视为普通成员。
+    #[test]
+    fn sender_role_marks_admins() {
+        let with_role = |role: &str| {
+            let raw = serde_json::json!({
+                "session_key": "feishu:chat:oc_x",
+                "display": "hi",
+                "sender_id": "A",
+                "conversation_kind": "group",
+                "sender_role": role,
+            })
+            .to_string();
+            AgentEnvelope::parse(&raw)
+        };
+        assert!(with_role("admin").caller_is_admin());
+        assert!(with_role("Owner").caller_is_admin());
+        assert!(!with_role("member").caller_is_admin());
+        assert!(!with_role("").caller_is_admin());
+    }
+
+    /// P6: 从工具调用（或 legacy respond）里取出真正发给渠道的文本。
+    #[test]
+    fn outbound_replies_reads_tool_events_and_respond_action() {
+        let event = |name: &str, arguments: Value| AgentToolEvent {
+            name: name.to_string(),
+            arguments,
+            ok: true,
+            output: None,
+            error: None,
+        };
+        let qq_send = event(
+            "invoke_plugin",
+            json!({
+                "plugin_path": "qq",
+                "node_id": "qq_send",
+                "payload_json": {"node_id": "qq_send", "target": "group:1", "message": "你好"}
+            }),
+        );
+        assert_eq!(
+            outbound_replies("{\"action\":\"suspend\"}", &[qq_send]),
+            vec!["你好".to_string()]
+        );
+        let flat = event("invoke_plugin", json!({"message": "平铺"}));
+        assert_eq!(outbound_replies("", &[flat]), vec!["平铺".to_string()]);
+        let other = event("read_file", json!({"message": "不是回复"}));
+        assert!(outbound_replies("{\"action\":\"suspend\"}", &[other]).is_empty());
+        assert_eq!(
+            outbound_replies("{\"action\":\"respond\",\"message\":\"回复\"}", &[]),
+            vec!["回复".to_string()]
+        );
+        assert!(outbound_replies("{\"action\":\"respond\",\"message\":\"  \"}", &[]).is_empty());
     }
 }
 

@@ -22,6 +22,37 @@ use serde_json::{json, Value};
 use std::time::Duration;
 
 const TIMEOUT_SECS: u64 = 60;
+
+/// Default Anthropic-compatible endpoint used for web search.
+const DEFAULT_SEARCH_URL: &str = "https://api.deepseek.com/anthropic/messages";
+/// Environment override (highest priority).
+const SEARCH_URL_ENV: &str = "CORDIS_WEB_SEARCH_URL";
+
+/// Read `web_search_url:` from the same flat config file the rest of the
+/// plugin parses (kept dependency-free on purpose).
+fn config_search_url(text: &str) -> Option<String> {
+    text.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix("web_search_url:")
+            .map(|value| value.trim().trim_matches('"'))
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+    })
+}
+
+/// Resolve the search endpoint: env override > config override > default.
+/// The endpoint is deliberately separate from `base_url`: providers often
+/// expose the Anthropic-compatible surface under a different path than the
+/// OpenAI-compatible one used for chat.
+fn resolve_search_url(env_url: Option<&str>, config_text: Option<&str>) -> String {
+    env_url
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .or_else(|| config_text.and_then(config_search_url))
+        .unwrap_or_else(|| DEFAULT_SEARCH_URL.to_string())
+}
+
 const MAX_FETCH_CHARS: usize = 8000;
 
 // ---------------------------------------------------------------------------
@@ -113,9 +144,13 @@ fn web_search_anthropic(query: &str) -> Result<String, String> {
         "tools": [{"type": "web_search_20250305", "name": "web_search"}]
     });
 
-    let url = "https://api.deepseek.com/anthropic/messages";
+    let config_text = std::fs::read_to_string("config/llm_api.yaml").ok();
+    let search_url = resolve_search_url(
+        std::env::var(SEARCH_URL_ENV).ok().as_deref(),
+        config_text.as_deref(),
+    );
     let resp = client
-        .post(url)
+        .post(&search_url)
         .header("x-api-key", &api_key)
         .header("anthropic-version", "2023-06-01")
         .header("Content-Type", "application/json")
@@ -407,3 +442,38 @@ export_plugin_api! {
 
 // P2-2: SSRF tests live in `cordis-net` (see fixtures/plugins/_net/src/lib.rs)
 // now that the guard implementation is shared.
+
+#[cfg(test)]
+mod tests {
+    use super::{config_search_url, resolve_search_url, DEFAULT_SEARCH_URL};
+
+    // 端点解析优先级：env > config `web_search_url:` > 默认。
+    #[test]
+    fn search_url_prefers_env_then_config_then_default() {
+        let cfg = "api_key: sk-x\nweb_search_url: https://cfg.example/anthropic/messages\n";
+        assert_eq!(
+            resolve_search_url(Some("https://env.example/v1"), Some(cfg)),
+            "https://env.example/v1"
+        );
+        assert_eq!(
+            resolve_search_url(Some("   "), Some(cfg)),
+            "https://cfg.example/anthropic/messages"
+        );
+        assert_eq!(
+            resolve_search_url(None, Some("api_key: sk-x\n")),
+            DEFAULT_SEARCH_URL
+        );
+        assert_eq!(resolve_search_url(None, None), DEFAULT_SEARCH_URL);
+    }
+
+    // config 里的空值 / 缺键不覆盖默认，引号会被剥掉。
+    #[test]
+    fn config_search_url_ignores_blank_and_missing() {
+        assert!(config_search_url("api_key: sk-x\n").is_none());
+        assert!(config_search_url("web_search_url:   \n").is_none());
+        assert_eq!(
+            config_search_url("web_search_url: \"https://x/y\"  \n").as_deref(),
+            Some("https://x/y")
+        );
+    }
+}

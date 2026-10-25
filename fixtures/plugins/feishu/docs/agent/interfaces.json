@@ -469,6 +469,83 @@
       "agent_accessible": true
     },
     {
+      "id": "feishu_get_chat_members",
+      "summary": "List the members of a Feishu chat/group (im/v1/chats/{chat_id}/members with member_id_type=open_id). Optional page_size (1-100) and page_token for pagination; returns the raw data object — items[] carry member_id (an open_id) and name, so this maps the open_id in an inbound display prefix to a person. Requires a chat-member read permission on the app (e.g. im:chat.members:read).",
+      "input_schema": {
+        "type": "object",
+        "required": [
+          "node_id",
+          "payload"
+        ],
+        "properties": {
+          "node_id": {
+            "const": "feishu_get_chat_members"
+          },
+          "payload": {
+            "type": "object",
+            "required": [
+              "chat_id"
+            ],
+            "properties": {
+              "chat_id": {
+                "type": "string"
+              },
+              "page_size": {
+                "type": "integer"
+              },
+              "page_token": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "ok": {
+            "type": "boolean"
+          },
+          "data": {
+            "type": "object",
+            "properties": {
+              "items": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "member_id": {
+                      "type": "string"
+                    },
+                    "name": {
+                      "type": "string"
+                    }
+                  },
+                  "additionalProperties": true
+                }
+              },
+              "page_token": {
+                "type": "string"
+              },
+              "has_more": {
+                "type": "boolean"
+              }
+            }
+          }
+        }
+      },
+      "side_effects": [
+        "network:feishu-api"
+      ],
+      "failure_modes": [
+        "auth failure",
+        "resource not found",
+        "missing permission (im:chat.members:read)"
+      ],
+      "node_type": "router",
+      "agent_accessible": true
+    },
+    {
       "id": "feishu_list_chats",
       "summary": "List chats the bot belongs to (im/v1/chats). Optional page_size and page_token for pagination.",
       "input_schema": {
@@ -514,5 +591,5 @@
       "agent_accessible": true
     }
   ],
-  "system_hint": "You are chatting in Feishu (Lark). Each incoming message is prefixed with its source, e.g. \"[Feishu group from <chat_id> (user <open_id>)]: <text>\".\nYour FINAL output each turn MUST be exactly one JSON object:\n{\"action\":\"respond\",\"message\":\"<reply text>\"}  — to reply to the chat, OR\n{\"action\":\"suspend\"}  — when no reply is warranted.\nThe runtime routes your \"respond\" back to the originating Feishu chat automatically; do NOT call feishu_send yourself for the direct reply.\nTo proactively send an extra message (e.g. a progress update) to a chat: invoke_plugin(feishu, feishu_send, {\"node_id\":\"feishu_send\",\"target\":\"chat:<chat_id>\",\"message\":\"<text>\"}).\nWhen you receive a media placeholder like \"[image file_key=...]\", \"[file file_key=... name=...]\", \"[audio ...]\", \"[video ...]\" or \"[sticker ...]\", the resource is not inlined: read the message_id from the display prefix's msg=<message_id>, then call invoke_plugin(feishu, feishu_fetch_resource, {\"node_id\":\"feishu_fetch_resource\",\"payload\":{\"message_id\":\"<id>\",\"file_key\":\"<key>\",\"type\":\"image|file\"}}) to get a local {path}. Use type=image for image placeholders (image messages and post img runs) and type=file for file/audio/video/sticker. Then pass that path to vision_ocr / vision_describe for images.\nKeep replies concise and helpful; a short honest \"not sure\" beats a long wrong answer."
+  "system_hint": "You are chatting in Feishu (Lark). Each incoming message is prefixed with its source, e.g. \"[Feishu group from <chat_id> (user <open_id>)]: <text>\"; when the speaker's display name could be resolved the identity reads (user <open_id>, name \"<name>\").\nIf an open_id has no name and you need to know who it is, call invoke_plugin(feishu, feishu_get_chat_members, {\"node_id\":\"feishu_get_chat_members\",\"payload\":{\"chat_id\":\"<chat_id>\"}}) to list group members with their names.\nYour FINAL output each turn MUST be exactly one JSON object:\n{\"action\":\"respond\",\"message\":\"<reply text>\"}  — to reply to the chat, OR\n{\"action\":\"suspend\"}  — when no reply is warranted.\nThe runtime routes your \"respond\" back to the originating Feishu chat automatically; do NOT call feishu_send yourself for the direct reply.\nTo proactively send an extra message (e.g. a progress update) to a chat: invoke_plugin(feishu, feishu_send, {\"node_id\":\"feishu_send\",\"target\":\"chat:<chat_id>\",\"message\":\"<text>\"}).\nWhen you receive a media placeholder like \"[image file_key=...]\", \"[file file_key=... name=...]\", \"[audio ...]\", \"[video ...]\" or \"[sticker ...]\", the resource is not inlined: read the message_id from the display prefix's msg=<message_id>, then call invoke_plugin(feishu, feishu_fetch_resource, {\"node_id\":\"feishu_fetch_resource\",\"payload\":{\"message_id\":\"<id>\",\"file_key\":\"<key>\",\"type\":\"image|file\"}}) to get a local {path}. Use type=image for image placeholders (image messages and post img runs) and type=file for file/audio/video/sticker. Then pass that path to vision_ocr / vision_describe for images.\nKeep replies concise and helpful; a short honest \"not sure\" beats a long wrong answer."
 }

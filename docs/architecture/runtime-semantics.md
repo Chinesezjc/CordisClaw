@@ -174,7 +174,7 @@ Local(当前插件 -> 祖先插件中被 grants 明确允许的服务)
 
 serve 启动段会执行 `fixtures/startup_invoke.json` 里的全部调用（拉起 qq HTTP、feishu WSS 等外部协议服务）。`--no-startup-invoke` flag 或 `CORDIS_NO_STARTUP_INVOKE` 环境变量（非空）跳过这一段：插件照常加载、invoke/execute/REPL 全部可用，只是不连外部协议——本地落地测试必须带该开关，否则测试实例会与线上实例共用渠道凭证抢走真实用户消息（并在退出时丢弃 feishu 两段式回复的 pending 卡片，用户侧永远停在"思考中"）。
 
-`--runtime-only` 模式下，渠道插件（feishu/qq）经 `agent_trigger` FFI 投递 JSON envelope，单 inbox 线程串行消费。envelope 携带回复路由（source_plugin/reply_node/reply_target）与**身份**（`sender_id`、`conversation_kind`）；soul 作用域键 = `{sender_id}#{conversation_kind}`（无身份的 legacy 调用回落 session_key）。
+`--runtime-only` 模式下，渠道插件（feishu/qq）经 `agent_trigger` FFI 投递 JSON envelope，单 inbox 线程串行消费。envelope 携带回复路由（source_plugin/reply_node/reply_target）与**身份**（`sender_id`、`conversation_kind`、`sender_role`）；soul 作用域键私聊为 `{sender_id}#private`，群聊为**房间级** `session_key`（一房间一角色；无身份的 legacy 调用回落 session_key）。display 还携带说话人展示名（qq 群名片优先/昵称回落，feishu 走成员接口缓存；均清洗 + 24 char）。
 
 一条消息的处理顺序：
 
@@ -192,7 +192,10 @@ inbox 一次可取到一批消息（同一渠道多条堆积）。批处理不�
 
 - **命令 vs 普通消息逐条切分**：批内每条按正文是否 `/` 前缀分类。命令**逐条 dispatch**，各自用**自己 envelope 的 ctx**（身份 = 各自发送者，不是整批统一身份）；普通消息重组成一个 batch 送 agent。命令先于普通消息处理。
 - **`/reset` 的同批语义**：`/reset` 走 `drop_session`（清 `agent_sessions` / `pending_session_actions` / `profile_fallback` 三张 map + 删磁盘快照，幂等）。同一批里 `/reset` 之后到来的普通消息进入**新 session**。
-- **soul 随最近发言者刷新**：群聊里一条 session 服务多个发言者。每批 send 前，inbox 把 session 的 `soul_key` 刷成**最近发言者**的（`refresh_session_soul`），persona overlay 每轮从 `session.soul_key` 重建，因此发言者切换后 system prompt 立即换成对应的人格。**profile（LLM 端点）保持 session 起点不随刷新变**——换 profile 需 `/reset` 起新会话。
+- **人格作用域：私聊按人、群聊按房间**（5.2.49 移植）：`AgentEnvelope::soul_key()` 私聊返回 `{sender_id}#private`，群聊返回**房间** `session_key`——一个群一个人格，不随发言人切换；`refresh_session_soul` 在群聊退化为幂等 no-op。**profile（LLM 端点）保持 session 起点**，换 profile 需 `/reset`。
+- **群人格编辑门控**（5.2.49）：`sender_role` 进 envelope，inbox 每批 `refresh_session_caller` 写 session 的 caller 旗标，`set_soul` 在"群聊 + 非 owner/admin"直接拒绝；feishu 角色不可得按安全默认拒绝。
+- **确定性护栏**（5.2.49，`guard.rs`）：inbox 调模型前先过两条无 LLM 检查——高精度危机短语 → 固定求助话术（短路，不受轮次预算影响）；群聊同发言人连续轮次上限 4，第 5 轮固定提示、第 6 轮起静默，换人即重置。
+- **对外回复进历史**（5.2.49）：消息渠道的可见回复经 `qq_send` / `feishu_send` 工具发出，最终输出只是 `{"action":"suspend"}`；inbox 在发送成功后把实际文本回填进 assistant 历史（替换裸 action JSON），因此下一轮能看到"自己说过什么"。缺失时模型每轮都像第一次回答，表现为同一问题前后不一致。
 - **多 sender 批的妥协**：一批里若有多个发言者，persona 取**最后一个发言者**（last）的；该批内非 last 成员的 `set_soul` 意图也会落到 last 的 soul。这是"一 session 多用户"下的已知取舍，phase 2 若需按发言者分裂 session 再议。
 - **纯命令批不碰 pending**：整批都是命令时不触发 pending spill / 重放（命令本就不经 LLM，无"打穿"可言）。
 - **批次边界标记**（5.2.36）：普通消息 batch 送 agent 时，正文用渠道中立标记 `CURRENT_INCOMING_BATCH_START` / `CURRENT_INCOMING_BATCH_END` 包裹，并附"只把当前批次当请求，不针对则 suspend"指令，防止 agent 把历史消息误当当前请求。包裹只发生在 `agent_send` 发送点；spill / pending 落盘的是原始未包裹文本。
