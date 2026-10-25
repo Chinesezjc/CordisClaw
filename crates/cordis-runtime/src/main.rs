@@ -636,9 +636,8 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         let health_host = std::sync::Arc::clone(&host);
         let park_host = std::sync::Arc::clone(&host);
         let mut sessions: BTreeMap<String, String> = BTreeMap::new();
-        // P5: per-room consecutive-turn budget (only group chats use it).
-        let mut reply_budgets: BTreeMap<String, cordis_runtime::guard::ReplyBudget> =
-            BTreeMap::new();
+        // P5: repeated-identical-message brake (never a turn cap).
+        let mut flood_guard = cordis_runtime::guard::FloodGuard::default();
         std::thread::spawn(move || {
             loop {
                 let mut msgs: Vec<String> = Vec::new();
@@ -756,41 +755,41 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                         combined
                     );
                     // P5: deterministic guards, applied before any LLM work.
-                    // A crisis phrase always gets the fixed helpline reply —
-                    // it must not be skipped by an exhausted turn budget.
+                    // A crisis phrase always gets the fixed helpline reply.
                     if let Some(reply) = cordis_runtime::guard::crisis_reply(&combined) {
                         eprintln!("inbox: [{session_key}] crisis phrase → fixed reply");
                         send_via(&route, reply);
                         continue;
                     }
-                    if route.conversation_kind == "group" {
-                        let budget =
-                            reply_budgets.entry(session_key.clone()).or_insert_with(|| {
-                                cordis_runtime::guard::ReplyBudget::new(
-                                    cordis_runtime::guard::DEFAULT_TURN_CAP,
-                                )
-                            });
-                        match budget.begin_turn(&route.sender_id) {
-                            // Counted as a turn whether the agent answers or
-                            // suspends: the budget limits attention, not just
-                            // outbound messages.
-                            cordis_runtime::guard::TurnVerdict::Allow => budget.record_turn(),
-                            cordis_runtime::guard::TurnVerdict::Warn => {
-                                eprintln!(
-                                    "inbox: [{session_key}] turn budget exhausted for {} → fixed warning",
-                                    route.sender_id
-                                );
-                                send_via(&route, cordis_runtime::guard::BUDGET_WARNING);
-                                budget.record_turn();
-                                continue;
-                            }
-                            cordis_runtime::guard::TurnVerdict::Drop => {
-                                eprintln!(
-                                    "inbox: [{session_key}] turn budget exhausted for {} → drop",
-                                    route.sender_id
-                                );
-                                continue;
-                            }
+                    // P5: brake repeated identical messages, never ordinary
+                    // multi-turn conversation (a turn cap refused a normal
+                    // "Hangzhou / Beijing / Wuhan" sequence in production).
+                    let flood_key = format!("{session_key}|{}", route.sender_id);
+                    let flood_text = normals
+                        .iter()
+                        .map(|e| extract_user_text(&e.display))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    match flood_guard.begin(&flood_key, &flood_text, now_ms) {
+                        cordis_runtime::guard::FloodVerdict::Allow => {}
+                        cordis_runtime::guard::FloodVerdict::Warn => {
+                            eprintln!(
+                                "inbox: [{session_key}] repeated message from {} → fixed warning",
+                                route.sender_id
+                            );
+                            send_via(&route, cordis_runtime::guard::FLOOD_WARNING);
+                            continue;
+                        }
+                        cordis_runtime::guard::FloodVerdict::Drop => {
+                            eprintln!(
+                                "inbox: [{session_key}] repeated message from {} → drop",
+                                route.sender_id
+                            );
+                            continue;
                         }
                     }
                     // P1-53: don't drain rx.try_recv() here — messages on the

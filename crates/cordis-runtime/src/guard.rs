@@ -1,28 +1,32 @@
 //! P5: deterministic chat guards (no semantics, no LLM).
 //!
-//! The 2026-10-23 group incident had a mechanical half that prompt wording
-//! cannot enforce: one member kept re-asking the same out-of-bounds thing and
-//! the bot kept answering, which is exactly the reward loop a troll wants.
-//! Two guards close that mechanical half:
+//! Two guards cover the mechanical half of chat incidents without pretending to
+//! understand intent:
 //!
 //! - [`crisis_reply`] short-circuits the LLM for a small set of high-precision
 //!   crisis phrases and answers with real helpline information;
-//! - [`ReplyBudget`] caps consecutive turns addressed to the same speaker in a
-//!   room, so a single member cannot farm an escalation ladder out of the bot.
+//! - [`FloodGuard`] brakes repeated identical messages from one speaker
+//!   (flood/spam), *not* ordinary multi-turn conversation.
+//!
+//! An earlier consecutive-turn budget ("one speaker may use at most N turns")
+//! was removed after it refused a normal "Hangzhou / Beijing / Wuhan weather"
+//! sequence in production: a turn cap cannot tell a curious user from a troll,
+//! and the conduct contract already covers refusal stability and provocation.
+//! Only exact repeats inside a short window trip this guard.
 //!
 //! Anything that needs to *understand* intent (repeated out-of-bounds asks,
 //! sarcasm, grooming) is deliberately out of scope: a keyword guess for that is
 //! worse than no guard, because it both misses the real case and misfires on
-//! ordinary chat. The prompt-level contract plus these two deterministic guards
-//! are what this layer can honestly promise.
+//! ordinary chat.
 
 /// Fixed, non-LLM reply for a crisis phrase. Short, non-diagnostic, and with
 /// real mainland-China helplines (12356 psychological-aid line plus emergency
 /// numbers).
 pub const CRISIS_REPLY: &str = "先停一下：如果你现在有伤害自己的念头，请立刻联系身边可信任的人，或拨打心理援助热线 12356、希望 24 热线 400-161-9995；有即时危险请拨 110/120。你不需要一个人扛。";
 
-/// One-line reply when a speaker has used up their turn budget.
-pub const BUDGET_WARNING: &str = "这个话头我先不接了，换个话题吧。";
+/// One-line reply when the same message has been repeated too often.
+pub const FLOOD_WARNING: &str =
+    "同样的话你连着发了好几遍，我先不重复回了。换个说法，或者等会儿再说。";
 
 /// High-precision crisis phrases. Ambiguous fragments (`想死` matches
 /// `想死你了`, `笑死`) are deliberately absent — a false positive here would
@@ -46,68 +50,74 @@ pub fn crisis_reply(text: &str) -> Option<&'static str> {
         .then_some(CRISIS_REPLY)
 }
 
-/// Default consecutive-turn cap per (room, speaker). Four normal turns leaves
-/// room for a real back-and-forth; the fifth gets the fixed warning and the
-/// sixth+ are dropped until someone else speaks.
-pub const DEFAULT_TURN_CAP: u32 = 4;
+/// Collapse a user message to its letters/digits so trivial variations
+/// ("杭州天气！" / "杭州 天气" / "HANGZHOU") count as the same request.
+pub fn normalize_request(text: &str) -> String {
+    text.chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+/// How long a repeat stays counted.
+pub const FLOOD_WINDOW_MS: u64 = 300_000;
+
+/// Same normalized message seen this many times inside the window trips it.
+pub const FLOOD_REPEAT_THRESHOLD: u32 = 3;
+
+/// Messages shorter than this (after normalization) are never treated as
+/// repeats: "北京呢" / "?" carry too little signal and must stay answerable.
+pub const FLOOD_MIN_LEN: usize = 4;
 
 /// What the inbox should do with the current turn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TurnVerdict {
+pub enum FloodVerdict {
     /// Forward to the agent as usual.
     Allow,
-    /// Do not call the LLM; send [`BUDGET_WARNING`] once instead.
+    /// Do not call the LLM; send [`FLOOD_WARNING`] once instead.
     Warn,
     /// Stay silent for this turn.
     Drop,
 }
 
-/// Per-room consecutive-turn budget for one speaker at a time.
-///
-/// The budget resets as soon as a different speaker addresses the bot, so a
-/// normal group conversation never notices it; only one member monopolising the
-/// bot hits it.
-#[derive(Debug)]
-pub struct ReplyBudget {
-    cap: u32,
-    last_sender: Option<String>,
-    turns: u32,
-    warned: bool,
+/// Per-(room, speaker) tracker for repeated identical messages.
+#[derive(Debug, Default)]
+pub struct FloodGuard {
+    recent: std::collections::HashMap<String, std::collections::VecDeque<(String, u64)>>,
+    warned: std::collections::HashSet<String>,
 }
 
-impl ReplyBudget {
-    pub fn new(cap: u32) -> Self {
-        Self {
-            cap,
-            last_sender: None,
-            turns: 0,
-            warned: false,
+impl FloodGuard {
+    /// Classify the incoming turn. `key` is the channel identity of the
+    /// conversation + speaker; `now_ms` is a wall-clock timestamp so the window
+    /// stays testable.
+    pub fn begin(&mut self, key: &str, text: &str, now_ms: u64) -> FloodVerdict {
+        let normalized = normalize_request(text);
+        if normalized.chars().count() < FLOOD_MIN_LEN {
+            return FloodVerdict::Allow;
         }
-    }
-
-    /// Classify the incoming turn. `sender` is the stable per-channel identity
-    /// (e.g. `qq:123456`), not the display name.
-    pub fn begin_turn(&mut self, sender: &str) -> TurnVerdict {
-        if self.last_sender.as_deref() != Some(sender) {
-            self.last_sender = Some(sender.to_string());
-            self.turns = 0;
-            self.warned = false;
-            return TurnVerdict::Allow;
+        let queue = self.recent.entry(key.to_string()).or_default();
+        while let Some((_, at)) = queue.front() {
+            if now_ms.saturating_sub(*at) > FLOOD_WINDOW_MS {
+                queue.pop_front();
+            } else {
+                break;
+            }
         }
-        if self.turns < self.cap {
-            return TurnVerdict::Allow;
+        let repeats = queue.iter().filter(|(seen, _)| *seen == normalized).count();
+        queue.push_back((normalized.clone(), now_ms));
+        while queue.len() > 32 {
+            queue.pop_front();
         }
-        if self.warned {
-            TurnVerdict::Drop
+        if (repeats as u32) + 1 < FLOOD_REPEAT_THRESHOLD {
+            return FloodVerdict::Allow;
+        }
+        let tag = format!("{key}|{normalized}");
+        if self.warned.insert(tag) {
+            FloodVerdict::Warn
         } else {
-            self.warned = true;
-            TurnVerdict::Warn
+            FloodVerdict::Drop
         }
-    }
-
-    /// Count a turn that actually reached the agent (or sent the warning).
-    pub fn record_turn(&mut self) {
-        self.turns += 1;
     }
 }
 
@@ -135,31 +145,59 @@ mod tests {
     }
 
     #[test]
-    fn budget_allows_cap_turns_then_warns_then_drops() {
-        let mut budget = ReplyBudget::new(3);
-        for turn in 1..=3 {
-            assert_eq!(budget.begin_turn("qq:1"), TurnVerdict::Allow, "turn {turn}");
-            budget.record_turn();
-        }
-        // Fourth turn: over the cap, warning sent once and counted.
-        assert_eq!(budget.begin_turn("qq:1"), TurnVerdict::Warn);
-        budget.record_turn();
-        // Fifth+ turns to the same speaker are dropped.
-        assert_eq!(budget.begin_turn("qq:1"), TurnVerdict::Drop);
-        assert_eq!(budget.begin_turn("qq:1"), TurnVerdict::Drop);
+    fn normalize_collapses_punctuation_and_case() {
+        assert_eq!(normalize_request("杭州 天气！"), "杭州天气");
+        assert_eq!(normalize_request("MPFT??"), "mpft");
+        assert_eq!(normalize_request("？?"), "");
     }
 
     #[test]
-    fn budget_resets_when_someone_else_speaks() {
-        let mut budget = ReplyBudget::new(1);
-        assert_eq!(budget.begin_turn("qq:1"), TurnVerdict::Allow);
-        budget.record_turn();
-        assert_eq!(budget.begin_turn("qq:1"), TurnVerdict::Warn);
-        budget.record_turn();
-        assert_eq!(budget.begin_turn("qq:1"), TurnVerdict::Drop);
-        // A different speaker resets the ladder, and the old speaker starts
-        // fresh the next time they speak.
-        assert_eq!(budget.begin_turn("qq:2"), TurnVerdict::Allow);
-        assert_eq!(budget.begin_turn("qq:1"), TurnVerdict::Allow);
+    fn flood_trips_on_third_identical_message() {
+        let mut guard = FloodGuard::default();
+        assert_eq!(guard.begin("g|u", "杭州天气", 1_000), FloodVerdict::Allow);
+        assert_eq!(
+            guard.begin("g|u", "杭州 天气！", 2_000),
+            FloodVerdict::Allow
+        );
+        assert_eq!(guard.begin("g|u", "杭州天气", 3_000), FloodVerdict::Warn);
+        // Further identical sends stay silent until the message changes.
+        assert_eq!(guard.begin("g|u", "杭州天气", 4_000), FloodVerdict::Drop);
+        assert_eq!(guard.begin("g|u", "北京天气", 5_000), FloodVerdict::Allow);
+    }
+
+    #[test]
+    fn flood_ignores_short_and_distinct_messages() {
+        let mut guard = FloodGuard::default();
+        // A normal three-question sequence must all be allowed.
+        for (i, text) in ["杭州的", "北京呢", "武汉呢"].iter().enumerate() {
+            assert_eq!(
+                guard.begin("g|u", text, 1_000 + i as u64 * 1_000),
+                FloodVerdict::Allow
+            );
+        }
+        // Short messages never trip the guard no matter how often they repeat.
+        for i in 0..5 {
+            assert_eq!(guard.begin("g|u", "？", 10_000 + i), FloodVerdict::Allow);
+        }
+    }
+
+    #[test]
+    fn flood_window_expires_and_keys_are_isolated() {
+        let mut guard = FloodGuard::default();
+        assert_eq!(guard.begin("g|u", "在吗在吗", 0), FloodVerdict::Allow);
+        assert_eq!(guard.begin("g|u", "在吗在吗", 1_000), FloodVerdict::Allow);
+        // Outside the window the old repeats no longer count.
+        let later = 1_000 + FLOOD_WINDOW_MS + 1;
+        assert_eq!(guard.begin("g|u", "在吗在吗", later), FloodVerdict::Allow);
+        // Another speaker in the same room is unaffected.
+        assert_eq!(guard.begin("g|v", "在吗在吗", later), FloodVerdict::Allow);
+        assert_eq!(
+            guard.begin("g|v", "在吗在吗", later + 1),
+            FloodVerdict::Allow
+        );
+        assert_eq!(
+            guard.begin("g|v", "在吗在吗", later + 2),
+            FloodVerdict::Warn
+        );
     }
 }
