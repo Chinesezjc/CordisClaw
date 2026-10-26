@@ -240,6 +240,21 @@ Agent 现在可以自主完成：读代码 → 理解结构 → 写/改文件 �
 - [x] **Plugin iteration symlink 逃逸**（P0-20）— `PluginEditExecutor::execute` 在写入前调用新 helper `resolve_under_workspace`：canonicalize 结果必须仍在 workspace_root 下。plugins 内的 symlink 指向 `/etc/passwd` 之类无法被写入。
 - [x] **Verifier shell 拼接**（P0-21）— 已随 A 批 P0-1 修复。`discover_rust_workspace_manifest` 输出的字符串被 `shell_words` 解析成 argv，空格 / `$` / `;` 无法被解释。
 
+### 5.2.52 图片追问：链接会过期，缓存 + 追问指引（2026-10-26 已闭合）
+
+**现象**：同一张表情包，第一次问"写了什么"时机器人准确读出文字并描述画面；紧接着问"这是谁"，它回"又试了一次看图，这次图片链接直接 400 取不到，所以没法核实"——它刚刚才看过这张图。
+
+**根因**：QQ/腾讯的图片链接是签名 URL，有效期只有几分钟（部分链接近似一次性）。`vision_describe` 每次调用都重新下载 URL；第一次成功、第二次已过期 → HTTP 400。而模型没有"用自己上一条描述回答"的指引，于是把过期失败当成"没法核实"。
+
+**修复**：
+- [x] **视觉插件缓存下载字节** — `vision` 增加 10 分钟 / 8 条的进程内 URL→bytes 缓存（最旧优先淘汰），重复 describe/OCR 同一链接不再重新下载；单测覆盖 TTL 命中/过期删除/容量上限与淘汰顺序。
+- [x] **qq hint 增加追问指引** — 对已经描述过的图片（"这张呢"/"这是谁"）先用自己之前的描述回答；只有没看过才重新取图；若链接过期返回 400，明确说"链接过期了，请重发图片"，**不得**说"我看不到图片"。
+- [x] **工件与文档同步** — qq / vision 的 `.so` 重建，`docs/agent/interfaces.json` 按新 docs 重新生成。
+
+**验证**：`cargo test -p vision` 8 个测试全绿（含 2 个缓存单测）；`prepare-artifacts` 重建 qq/vision 成功；artifact docs 中 `IMAGE FOLLOW-UPS` 与 `agent_accessible=true` 均在位。
+
+**残余**：缓存只在进程内，重启即失效；同一图片跨重启后的追问仍可能遇到过期链接（届时按新指引请用户重发）。
+
 ### 5.2.51 图片理解：历史图片可查、视觉工具对 agent 开放（2026-10-26 已闭合）
 
 **现象**：群友发了一张图，随后另一人 `@bot 你看得到这张图片吗`，机器人回"能看到图片的下载链接，但拿到的是原始文件字节，我这边没有识图能力"。实际上它既没有拿到字节，也不是没有识图能力。
