@@ -240,6 +240,29 @@ Agent 现在可以自主完成：读代码 → 理解结构 → 写/改文件 �
 - [x] **Plugin iteration symlink 逃逸**（P0-20）— `PluginEditExecutor::execute` 在写入前调用新 helper `resolve_under_workspace`：canonicalize 结果必须仍在 workspace_root 下。plugins 内的 symlink 指向 `/etc/passwd` 之类无法被写入。
 - [x] **Verifier shell 拼接**（P0-21）— 已随 A 批 P0-1 修复。`discover_rust_workspace_manifest` 输出的字符串被 `shell_words` 解析成 argv，空格 / `$` / `;` 无法被解释。
 
+### 5.2.51 图片理解：历史图片可查、视觉工具对 agent 开放（2026-10-26 已闭合）
+
+**现象**：群友发了一张图，随后另一人 `@bot 你看得到这张图片吗`，机器人回"能看到图片的下载链接，但拿到的是原始文件字节，我这边没有识图能力"。实际上它既没有拿到字节，也不是没有识图能力。
+
+**根因（四条叠加）**：
+1. kernel 只把**当前批次**的图片内联成 `image_url` part（`image_input`），历史消息里只剩 `[image: <url>]` 文本占位符——图是上一条消息发的，问话是另一批，模型自然看不到画面。
+2. `vision_ocr` / `vision_describe` 两个节点**没有 `agent_accessible`**，模型调不到，只能干说"没有识图能力"。
+3. 生产环境只有 `DEEPSEEK_API_KEY`：`vision_describe` 需要 `OPENAI_API_KEY`/`VISION_API_KEY`；tesseract 未安装，OCR 也不可用。
+4. qq 的 system_hint 没有任何"图片占位符可以用视觉工具查"的指引。
+
+**修复**：
+- [x] **视觉节点对 agent 开放** — `vision_ocr` / `vision_describe` 加 `with_agent_accessible()`，模型可通过 `invoke_plugin(vision, vision_describe, {url})` 查任意历史图片。
+- [x] **qq hint 增补 IMAGES 段** — 遇到 `[image: <url>]`（本批或历史）被问画面内容时，调用 `vision_describe`（文本截图用 `vision_ocr`），**不得**未尝试就声称无法识图；工具报错就如实转述错误，不要猜内容。
+- [x] **视觉后端接到 DeepSeek** — 生产 env 增加 `VISION_API_KEY` / `VISION_BASE_URL=https://api.deepseek.com/beta` / `VISION_MODEL=deepseek-flash`；实测该端点接受 `image_url` 输入（HTTP 200），当前批次图片仍由 kernel 直接内联。
+- [x] **OCR 可用** — 安装 `tesseract-ocr` + `tesseract-ocr-chi-sim`（chi_sim+eng）。
+
+**验证**：
+- 直接 `invoke vision vision_describe`（httpbin 图片）返回 `ok=true`，说明下载 + DeepSeek 视觉调用链路通。
+- 隔离环境真机重放：梨生单独发图（该批没有任何 @）→ 另一人下一批 `bot 你看得到刚才那张图吗？描述一下画面内容` → 机器人调用视觉工具，准确描述"黑背胡狼、马鞍状黑灰斑纹、干旱沙石地面、右上方强光、左下方投影"等细节（原图正是 jackal 照片），**历史图片路径打通**。
+- 同批图片仍由 kernel 内联给模型，无需工具。
+
+**运维注意**：重启（SIGTERM）时 `save_draft_and_revert` 会把未提交的 `fixtures/plugins` 改动保存到 `.cordis-drafts/draft-*-signal.patch` 并 `git checkout -- plugins/`。本次操作期间 gacha 的未提交改动（P3-45 per-user state）就是这样被保存到 `draft-1793029118-signal.patch` 的；需要恢复时 `cd fixtures && git apply .cordis-drafts/draft-1793029118-signal.patch`。
+
 ### 5.2.50 合并 origin/main：消除 4 个月双线偏移（2026-10-26 已闭合）
 
 生产线 `run-main` 与主仓 `origin/main` 的共同祖先停在 2026-06-05（`022f890`）：main 有 212 个提交不在生产线上（安全硬化、R1–R9 并发/锁序、argv 化命令执行、覆盖率波次、敏感路径组件匹配、候选身份校验、退役快照驱逐），生产线有 218 个不在 main 上（`cordis-cli`/`cordis-tooling` 拆分、每群策略+记忆、notes、图片多模态、群角色/`__meta`、房间级人格、说话人名、conduct、危机短路、出站回复入历史）。本次一次性合并，冲突 55 个文件 / 272 处。
