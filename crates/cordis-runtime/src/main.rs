@@ -636,8 +636,6 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         let health_host = std::sync::Arc::clone(&host);
         let park_host = std::sync::Arc::clone(&host);
         let mut sessions: BTreeMap<String, String> = BTreeMap::new();
-        // P5: repeated-identical-message brake (never a turn cap).
-        let mut flood_guard = cordis_runtime::guard::FloodGuard::default();
         std::thread::spawn(move || {
             loop {
                 let mut msgs: Vec<String> = Vec::new();
@@ -760,37 +758,6 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                         eprintln!("inbox: [{session_key}] crisis phrase → fixed reply");
                         send_via(&route, reply);
                         continue;
-                    }
-                    // P5: brake repeated identical messages, never ordinary
-                    // multi-turn conversation (a turn cap refused a normal
-                    // "Hangzhou / Beijing / Wuhan" sequence in production).
-                    let flood_key = format!("{session_key}|{}", route.sender_id);
-                    let flood_text = normals
-                        .iter()
-                        .map(|e| extract_user_text(&e.display))
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    let now_ms = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_millis() as u64)
-                        .unwrap_or(0);
-                    match flood_guard.begin(&flood_key, &flood_text, now_ms) {
-                        cordis_runtime::guard::FloodVerdict::Allow => {}
-                        cordis_runtime::guard::FloodVerdict::Warn => {
-                            eprintln!(
-                                "inbox: [{session_key}] repeated message from {} → fixed warning",
-                                route.sender_id
-                            );
-                            send_via(&route, cordis_runtime::guard::FLOOD_WARNING);
-                            continue;
-                        }
-                        cordis_runtime::guard::FloodVerdict::Drop => {
-                            eprintln!(
-                                "inbox: [{session_key}] repeated message from {} → drop",
-                                route.sender_id
-                            );
-                            continue;
-                        }
                     }
                     // P1-53: don't drain rx.try_recv() here — messages on the
                     // channel are from ALL sessions; the outer loop shards

@@ -2880,6 +2880,10 @@ returned in this conversation; weigh results against what you already know and \
 against the community this conversation belongs to.
 10. Do not join conversations that are not addressed to you, and do not explain \
 memes, acronyms or in-jokes for a group unless someone asks you directly.
+11. If someone repeats the same request (identical wording, or only punctuation \
+changed), do not keep re-answering it: answer once, then refer back to that \
+answer in one short line and ask what should change. If it keeps repeating, \
+staying silent is a valid reply — never send the same wording twice in a row.
 ";
 
 fn shell_agent_system_prompt() -> String {
@@ -3457,6 +3461,8 @@ mod tests {
             "could not find",
             "actually ran",
             "addressed to you",
+            "repeats the same request",
+            "silent is a valid reply",
         ] {
             assert!(
                 CONDUCT_CONTRACT.contains(needle),
