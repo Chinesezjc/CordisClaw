@@ -194,7 +194,7 @@ inbox 一次可取到一批消息（同一渠道多条堆积）。批处理不�
 - **`/reset` 的同批语义**：`/reset` 走 `drop_session`（清 `agent_sessions` / `pending_session_actions` / `profile_fallback` 三张 map + 删磁盘快照，幂等）。同一批里 `/reset` 之后到来的普通消息进入**新 session**。
 - **人格作用域：私聊按人、群聊按房间**（5.2.49 移植）：`AgentEnvelope::soul_key()` 私聊返回 `{sender_id}#private`，群聊返回**房间** `session_key`——一个群一个人格，不随发言人切换；`refresh_session_soul` 在群聊退化为幂等 no-op。**profile（LLM 端点）保持 session 起点**，换 profile 需 `/reset`。
 - **群人格编辑门控**（5.2.49）：`sender_role` 进 envelope，inbox 每批 `refresh_session_caller` 写 session 的 caller 旗标，`set_soul` 在"群聊 + 非 owner/admin"直接拒绝；feishu 角色不可得按安全默认拒绝。
-- **确定性护栏**（5.2.49，`guard.rs`）：inbox 调模型前先过两条无 LLM 检查——高精度危机短语 → 固定求助话术（短路）；同一发言人在 5 分钟窗口内重复同一归一化文本（去标点/空白/大小写）第 3 次 → 一句固定提示、再重复则静默；短消息（<4 字符）不触发。连续轮次预算已移除（真机上误伤"杭州/北京/武汉"的正常多轮问答）。
+- **确定性护栏**（5.2.49，`guard.rs`）：只剩"高精度危机短语 → 固定求助话术"这一条无 LLM 短路。重复消息/刷屏**不由代码拦**，改由 conduct 规则 11 处理（答一次 → 指回上次答案 → 继续重复则沉默），因为两版代码护栏（连续轮次、重复文本计数）都误伤过正常多轮问答，而重复判断需要上下文理解。
 - **对外回复进历史**（5.2.49）：消息渠道的可见回复经 `qq_send` / `feishu_send` 工具发出，最终输出只是 `{"action":"suspend"}`；inbox 在发送成功后把实际文本回填进 assistant 历史（替换裸 action JSON），因此下一轮能看到"自己说过什么"。缺失时模型每轮都像第一次回答，表现为同一问题前后不一致。
 - **多 sender 批的妥协**：一批里若有多个发言者，persona 取**最后一个发言者**（last）的；该批内非 last 成员的 `set_soul` 意图也会落到 last 的 soul。这是"一 session 多用户"下的已知取舍，phase 2 若需按发言者分裂 session 再议。
 - **纯命令批不碰 pending**：整批都是命令时不触发 pending spill / 重放（命令本就不经 LLM，无"打穿"可言）。
