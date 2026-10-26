@@ -240,6 +240,17 @@ Agent 现在可以自主完成：读代码 → 理解结构 → 写/改文件 �
 - [x] **Plugin iteration symlink 逃逸**（P0-20）— `PluginEditExecutor::execute` 在写入前调用新 helper `resolve_under_workspace`：canonicalize 结果必须仍在 workspace_root 下。plugins 内的 symlink 指向 `/etc/passwd` 之类无法被写入。
 - [x] **Verifier shell 拼接**（P0-21）— 已随 A 批 P0-1 修复。`discover_rust_workspace_manifest` 输出的字符串被 `shell_words` 解析成 argv，空格 / `$` / `;` 无法被解释。
 
+### 5.2.50 合并 origin/main：消除 4 个月双线偏移（2026-10-26 已闭合）
+
+生产线 `run-main` 与主仓 `origin/main` 的共同祖先停在 2026-06-05（`022f890`）：main 有 212 个提交不在生产线上（安全硬化、R1–R9 并发/锁序、argv 化命令执行、覆盖率波次、敏感路径组件匹配、候选身份校验、退役快照驱逐），生产线有 218 个不在 main 上（`cordis-cli`/`cordis-tooling` 拆分、每群策略+记忆、notes、图片多模态、群角色/`__meta`、房间级人格、说话人名、conduct、危机短路、出站回复入历史）。本次一次性合并，冲突 55 个文件 / 272 处。
+
+- **方向**：`origin/main` 合进 `run-main`（生产吸收仓库修复），合并后 `origin/main` 成为 `run-main` 的祖先，主仓可用一次快进对齐。
+- **结构**：旧 `crates/cordis-runtime/src/main.rs` → `crates/cordis-cli/src/main.rs`（main 的改动核对后已在新位置全覆盖，旧文件删除）；旧 `plugin/tooling.rs` 与其测试 → `cordis-tooling`（并补上 main 的 R6/R7：JSON 锁按 pid 归属、命名重建全程持锁）；`plugin/artifact.rs` 保留 `read_plugin_docs`/`parse_dylib_payload`/`lock_pid_is_live` 供 loader 与 tooling 共享。
+- **取舍**：同一逻辑两边都改时 main 的修复优先；run 侧的新形态优先（四段 prompt、`sanitize_tool_chains`、`tool_failure_prompts`、多模态 `agent_send` 链、`turn_meta`、caller 策略、`plugin_builder` 接缝）。生成物（`Cargo.lock`、`docs/agent/interfaces.json`、`fixtures/artifacts`）全部重新生成，不手工合并。
+- **验证**：`cargo check --workspace` 与 fixtures workspace 通过；`cargo test --workspace --no-fail-fast` 除 4 个"继承 CARGO_TARGET_DIR 才失败"的 plugin-iteration canary 测试（直接重跑通过，与合并前同一环境陷阱）外全绿；fixtures workspace 35 个测试目标全绿；两个 workspace `clippy -D warnings` 零 warning、`fmt --check` 干净；真机重放（mpft 四问 + 杭州/北京/武汉三连问 + 未点名消息）：答案前后一致、搜不到时明确更正、三连问全部正常回答、未点名保持沉默。
+- **部署**：生产 `run-main` → 合并提交，二进制重建、`systemctl restart cordisclaw` 完成（564 会话恢复、NapCat 已重连）；`origin/run-main` 已推送。
+- **待办**：主仓 `main` 快进到 `run-main`（或经 PR）后 CI 覆盖率门槛需复验——合并树含生产线新增文件，100% 行覆盖是否满足要跑 CI 才知道；本机无法给出该结论。
+
 ### 5.2.49 群聊修复移植：人格 / 身份 / 边界 / 上下文（2026-10-25 已闭合）
 
 把主分支 5.2.42–5.2.45 的修复**语义移植**到生产分支（`run-main`，拆出 cordis-tooling/cordis-cli 之后）。针对 10-23 / 10-25 线上两段事故：① 用"安全审查 / 申请驳回 / 固件更新"这类不存在的内部流程拒绝，被一句"审查通过了"打穿；② 问"他是谁"回"只看得到一串QQ号"；③ `mpft` 先答"冒泡防踢"、两分钟后又说"没有公认含义"（根因是**机器人看不到自己说过的话**）。
