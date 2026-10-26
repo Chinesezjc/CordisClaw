@@ -13,12 +13,64 @@ use cordis_plugin_sdk::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::io::Read;
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
 const TIMEOUT_SECS: u64 = 10;
 const MAX_IMAGE_BYTES: usize = 20 * 1024 * 1024; // 20 MB
+
+// ---------------------------------------------------------------------------
+// Short-lived download cache
+// ---------------------------------------------------------------------------
+//
+// QQ/Tencent image links are signed and expire within minutes (and a given
+// link may be effectively one-shot). A follow-up question about the same
+// picture ("这张呢" / "这是谁") would otherwise re-download the same URL,
+// fail with HTTP 400, and lose the image the bot already saw. Cache the bytes
+// for a few minutes so replies stay consistent within one conversation.
+const URL_CACHE_TTL: Duration = Duration::from_secs(600);
+const URL_CACHE_CAPACITY: usize = 8;
+
+static URL_CACHE: LazyLock<Mutex<HashMap<String, (Vec<u8>, Instant)>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn cache_lookup(
+    cache: &mut HashMap<String, (Vec<u8>, Instant)>,
+    url: &str,
+    now: Instant,
+) -> Option<Vec<u8>> {
+    match cache.get(url) {
+        Some((bytes, at)) if now.saturating_duration_since(*at) <= URL_CACHE_TTL => {
+            Some(bytes.clone())
+        }
+        Some(_) => {
+            cache.remove(url);
+            None
+        }
+        None => None,
+    }
+}
+
+fn cache_store(
+    cache: &mut HashMap<String, (Vec<u8>, Instant)>,
+    url: &str,
+    bytes: &[u8],
+    now: Instant,
+) {
+    if cache.len() >= URL_CACHE_CAPACITY && !cache.contains_key(url) {
+        if let Some(oldest) = cache
+            .iter()
+            .min_by_key(|(_, (_, at))| *at)
+            .map(|(key, _)| key.clone())
+        {
+            cache.remove(&oldest);
+        }
+    }
+    cache.insert(url.to_string(), (bytes.to_vec(), now));
+}
 
 // ---------------------------------------------------------------------------
 // SSRF guard (P0-22)
@@ -79,6 +131,14 @@ struct VisionResponse {
 // ---------------------------------------------------------------------------
 
 fn download_image(url_str: &str) -> Result<Vec<u8>, String> {
+    // A repeat call for the same (expiring) link must reuse the bytes the bot
+    // already saw instead of a second download that may 400.
+    {
+        let mut cache = URL_CACHE.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(bytes) = cache_lookup(&mut cache, url_str, Instant::now()) {
+            return Ok(bytes);
+        }
+    }
     // P0-22: full SSRF check (see the module-level guard for coverage).
     // Note: `ureq::AgentBuilder` here does not follow redirects by default
     // for `.call()`, so a single check on `url_str` covers the wire path.
@@ -116,6 +176,10 @@ fn download_image(url_str: &str) -> Result<Vec<u8>, String> {
         ));
     }
 
+    {
+        let mut cache = URL_CACHE.lock().unwrap_or_else(|p| p.into_inner());
+        cache_store(&mut cache, url_str, &bytes, Instant::now());
+    }
     Ok(bytes)
 }
 
@@ -560,5 +624,41 @@ mod tests {
         let _ = std::fs::remove_file(&path);
 
         assert_eq!(result.expect("load_source path branch"), payload);
+    }
+
+    #[test]
+    fn url_cache_hits_within_ttl_and_expires_after() {
+        let mut cache: HashMap<String, (Vec<u8>, Instant)> = HashMap::new();
+        let t0 = Instant::now();
+        cache_store(&mut cache, "https://example.com/a.jpg", b"img", t0);
+        assert_eq!(
+            cache_lookup(&mut cache, "https://example.com/a.jpg", t0 + Duration::from_secs(5)),
+            Some(b"img".to_vec())
+        );
+        // Expired entries are dropped and must not be served.
+        assert_eq!(
+            cache_lookup(
+                &mut cache,
+                "https://example.com/a.jpg",
+                t0 + URL_CACHE_TTL + Duration::from_secs(1)
+            ),
+            None
+        );
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn url_cache_is_bounded_and_keeps_newest() {
+        let mut cache: HashMap<String, (Vec<u8>, Instant)> = HashMap::new();
+        let t0 = Instant::now();
+        for i in 0..(URL_CACHE_CAPACITY + 2) {
+            let url = format!("https://example.com/{i}.jpg");
+            cache_store(&mut cache, &url, b"x", t0 + Duration::from_secs(i as u64));
+        }
+        assert_eq!(cache.len(), URL_CACHE_CAPACITY);
+        // The two oldest entries were evicted.
+        assert!(!cache.contains_key("https://example.com/0.jpg"));
+        assert!(!cache.contains_key("https://example.com/1.jpg"));
+        assert!(cache.contains_key("https://example.com/9.jpg"));
     }
 }
