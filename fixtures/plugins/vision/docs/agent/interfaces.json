@@ -64,7 +64,7 @@
         "path outside temp dir"
       ],
       "node_type": "task",
-      "agent_accessible": false
+      "agent_accessible": true
     },
     {
       "id": "vision_describe",
@@ -132,7 +132,7 @@
         "path outside temp dir"
       ],
       "node_type": "task",
-      "agent_accessible": false
+      "agent_accessible": true
     }
   ],
   "system_hint": null

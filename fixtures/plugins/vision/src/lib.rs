@@ -421,7 +421,8 @@ fn docs_value() -> cordis_plugin_sdk::PluginDocs {
                 }),
                 &["reads image from url or local temp path", "runs tesseract OCR"],
                 &["tesseract not installed", "network error", "language pack missing", "no text in image", "path outside temp dir"],
-            ),
+            )
+            .with_agent_accessible(),
             task_node_doc(
                 "vision_describe",
                 "Send an image to an OpenAI-compatible vision API (default: gpt-4o-mini) for AI-powered description. Supply the image with either `url` (downloaded over HTTP) or `path` (a local file under the system temp directory); provide exactly one of them. Requires OPENAI_API_KEY (or VISION_API_KEY) env var. Supports OPENAI_BASE_URL for custom endpoints.",
@@ -446,7 +447,8 @@ fn docs_value() -> cordis_plugin_sdk::PluginDocs {
                 }),
                 &["reads image from url or local temp path", "sends to OpenAI-compatible vision API"],
                 &["API key not set", "network error", "rate limited", "API quota exceeded", "image too large", "path outside temp dir"],
-            ),
+            )
+            .with_agent_accessible(),
         ],
     None
     )
