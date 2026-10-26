@@ -114,6 +114,7 @@
 | `crates/cordis-runtime/src/testutil.rs` | `#[cfg(test)]` 单测公共工具：全 crate 唯一的 euid 特权探测点，root 下声明式跳过文件权限故障注入测试 | `skip_if_root()` |
 | `crates/cordis-runtime/src/llm_sink.rs` | token 流式旁路的 host 侧：TCP 回环监听、行分隔 JSON 帧解析、握手校验。帧判定与超时判定抽成纯函数以便全覆盖 | `SinkListener::bind()`、`classify_frame()`、`TokenSink` |
 | `crates/cordis-runtime/src/host.rs` | 常驻宿主：持有当前快照、执行原子 `reload`、保留 kernel 状态并清理 retired snapshots；snapshot 目录 GC（跨 hash 目录孤儿回收 + 退出时回收 live staged root） | `RuntimeHost::boot()`、`RuntimeHost::reload()`、`cleanup_orphaned_snapshot_roots()`、`RuntimeHost::cleanup_live_snapshot()` |
+| `crates/cordis-runtime/src/guard.rs` | 确定性危机护栏（Kernel 机制；纯函数、无 I/O、无 LLM）：高精度危机短语命中即返回固定求助回复（含真实热线），`FLOOD_WARNING` 供 prompt 层复用；模糊片段（`想死你了`/`笑死`）刻意不收，避免误报把日常玩笑当求助。重复/刷屏判定已交给 prompt 层 conduct 规则，本模块不再有代码级 repeat brake | `crisis_reply()`、`CRISIS_REPLY`、`FLOOD_WARNING` |
 | `crates/cordis-cli/src/main.rs` | 进程入口（原 `crates/cordis-runtime/src/main.rs`）：加载 fixtures、`serve`、通用 invoke、导出图 HTML、运行 auto-update、`gc` 回收 snapshot 目录、prepare/sync/refresh 构建命令；`main()` 一开始把 `cordis_tooling::CargoBuilder` 注入 runtime 的 `PluginBuilder` 接缝 | `main()` |
 
 ## 8b. CLI crate (`crates/cordis-cli`)

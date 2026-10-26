@@ -2620,3 +2620,186 @@ fn command_router_dispatch_table() {
         "/soul without soul_key must not leak another scope's persona"
     );
 }
+
+// ---------------------------------------------------------------------------
+// R1: agent_send 摘除-重插窗口（并发时序测试）
+// ---------------------------------------------------------------------------
+
+/// R1: 一个接受连接后先发 `started` 信号、再等 `release` 信号才回 SSE
+/// 补全的 mock server。让测试能精确控制 `agent_send` 的 respond 处于
+/// in-flight 的时长（期间会话在 map 外、inflight 标记在集合里），从而
+/// 可靠地插入 drop_session / 并发第二个 agent_send。
+///
+/// 返回 (base_url, started_rx, release_tx, join_handle)：测试等 started_rx
+/// 收到信号即可认为 respond 已进入 in-flight，随后做并发操作，最后发
+/// release_tx 放行补全。
+fn spawn_blocking_mock_llm_server(
+    chunks: Vec<(u64, String)>,
+) -> (
+    String,
+    std::sync::mpsc::Receiver<()>,
+    std::sync::mpsc::Sender<()>,
+    std::thread::JoinHandle<()>,
+) {
+    use std::io::{BufRead, BufReader, Read as _, Write as _};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind blocking server");
+    let addr = listener.local_addr().expect("addr");
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept");
+        let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+        let mut line = String::new();
+        reader.read_line(&mut line).expect("request line");
+        let mut content_length = 0usize;
+        loop {
+            let mut header = String::new();
+            reader.read_line(&mut header).expect("header line");
+            if header == "\r\n" {
+                break;
+            }
+            if let Some(v) = header.to_ascii_lowercase().strip_prefix("content-length:") {
+                content_length = v.trim().parse().expect("content length");
+            }
+        }
+        let mut body = vec![0u8; content_length];
+        reader.read_exact(&mut body).expect("request body");
+        // respond 已真正进入 in-flight：会话已从 map 摘除、inflight 已标记。
+        started_tx.send(()).expect("signal started");
+        // 等测试释放（期间测试可以 drop_session / 并发 agent_send）。
+        release_rx.recv().expect("release signal");
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+        )
+        .expect("headers");
+        for (delay_ms, chunk) in &chunks {
+            std::thread::sleep(std::time::Duration::from_millis(*delay_ms));
+            write!(stream, "{:X}\r\n{}\r\n", chunk.len(), chunk).expect("chunk");
+        }
+        write!(stream, "0\r\n\r\n").expect("chunked end");
+        stream.flush().expect("flush");
+    });
+    (format!("http://{addr}/v1"), started_rx, release_tx, handle)
+}
+
+/// R1(b): respond 期间 drop_session —— 会话在 map 里已不存在（被摘除），
+/// 旧的 drop 只删快照；turn 结束后不得被插回复活、不得 auto_save 重写
+/// 快照。
+#[test]
+#[serial]
+fn agent_send_drop_during_turn_does_not_resurrect_session_or_snapshot() {
+    if !support::linux_dylib_artifacts_available() {
+        eprintln!("[skip] fixture dylibs are x86_64-linux only; skipping on this host");
+        return;
+    }
+    use cordis_runtime::host::{AgentSessionKind, AgentStartOptions};
+
+    let temp = setup_fixture_workspace_copy();
+    let fixtures = temp.path().join("fixtures");
+    let (url, started_rx, release_tx, handle) =
+        spawn_blocking_mock_llm_server(assistant_response("blocked_1", "ok"));
+    write_llm_profiles_config(temp.path(), &url, &url);
+
+    let host = std::sync::Arc::new(RuntimeHost::boot(&fixtures).expect("host should boot"));
+    let sid = host
+        .agent_start_with(AgentSessionKind::RuntimeShell, AgentStartOptions::default())
+        .expect("start session")
+        .session_id;
+
+    // 线程 1：agent_send，respond 阻塞在 mock server 上。
+    let sender = std::sync::Arc::clone(&host);
+    let send_sid = sid.clone();
+    let send_thread = std::thread::spawn(move || sender.agent_send(&send_sid, "hello"));
+
+    // 等请求到达 → respond 进入 in-flight（会话不在 map）。
+    started_rx.recv().expect("request arrived");
+
+    // 期间调用 drop_session：会话本尊不在 map，必须标记 dropped_during_turn
+    // 而不是只删掉快照了事。
+    host.drop_session(&sid);
+
+    // 放行 server → respond 完成 → 收尾消费标记：不插回、不 auto_save。
+    release_tx.send(()).expect("release server");
+    let reply = send_thread
+        .join()
+        .expect("join send thread")
+        .expect("the in-flight send itself succeeds");
+    assert!(reply.content.contains("ok"), "content: {}", reply.content);
+
+    // 会话没有被复活。
+    assert!(
+        matches!(
+            host.agent_status(&sid),
+            Err(cordis_runtime::core::error::RuntimeError::AgentSessionNotFound { .. })
+        ),
+        "session must not be resurrected after drop-during-turn"
+    );
+    // 快照没有被 auto_save 重写（turn 是成功的——若复活逻辑漏了就会重写）。
+    let snapshot = temp
+        .path()
+        .join("data/sessions")
+        .join(format!("{sid}.json"));
+    assert!(
+        !snapshot.exists(),
+        "snapshot must not be rewritten after drop"
+    );
+    // drop_session 的既有语义：三张 per-session map 全清。
+    assert_eq!(host.debug_session_map_sizes(), (0, 0, 0));
+    handle.join().expect("join mock server");
+}
+
+/// R1(c): 并发第二个 agent_send 得到 `AgentSessionBusy`，而不是误报
+/// `AgentSessionNotFound`（旧实现摘除后消息静默丢失）。
+#[test]
+#[serial]
+fn agent_send_concurrent_second_send_returns_busy_not_not_found() {
+    if !support::linux_dylib_artifacts_available() {
+        eprintln!("[skip] fixture dylibs are x86_64-linux only; skipping on this host");
+        return;
+    }
+    use cordis_runtime::host::{AgentSessionKind, AgentStartOptions};
+
+    let temp = setup_fixture_workspace_copy();
+    let fixtures = temp.path().join("fixtures");
+    let (url, started_rx, release_tx, handle) =
+        spawn_blocking_mock_llm_server(assistant_response("blocked_2", "ok"));
+    write_llm_profiles_config(temp.path(), &url, &url);
+
+    let host = std::sync::Arc::new(RuntimeHost::boot(&fixtures).expect("host should boot"));
+    let sid = host
+        .agent_start_with(AgentSessionKind::RuntimeShell, AgentStartOptions::default())
+        .expect("start session")
+        .session_id;
+
+    let sender = std::sync::Arc::clone(&host);
+    let send_sid = sid.clone();
+    let send_thread = std::thread::spawn(move || sender.agent_send(&send_sid, "hello"));
+    started_rx.recv().expect("request arrived");
+
+    // 会话在 map 外（inflight）：第二个 send 必须报 Busy 而不是 NotFound。
+    let err = host
+        .agent_send(&sid, "second")
+        .expect_err("concurrent second send must be rejected");
+    assert!(
+        matches!(
+            err,
+            cordis_runtime::core::error::RuntimeError::AgentSessionBusy { ref session_id }
+                if session_id == &sid
+        ),
+        "expected AgentSessionBusy, got {err:?}"
+    );
+
+    // 放行后第一个 turn 正常完成，会话仍在、可继续对话。
+    release_tx.send(()).expect("release server");
+    let reply = send_thread
+        .join()
+        .expect("join send thread")
+        .expect("first send succeeds");
+    assert!(reply.content.contains("ok"), "content: {}", reply.content);
+    assert!(
+        host.agent_status(&sid).is_ok(),
+        "session must still be live"
+    );
+    handle.join().expect("join mock server");
+}

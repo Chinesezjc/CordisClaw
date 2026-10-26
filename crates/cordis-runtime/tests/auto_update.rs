@@ -173,3 +173,51 @@ fn auto_update_supports_structured_toml_patch() {
     let content = fs::read_to_string(&file).expect("read toml");
     assert!(content.contains("max_retries = 3"), "content: {content}");
 }
+
+/// P0-20 parity at the public-API level: a symlink inside the workspace
+/// pointing outside must reject the patch with `AutoUpdateInvalidPath` and
+/// leave the outside target untouched, mirroring the `PluginEditExecutor`
+/// guard.
+#[cfg(unix)]
+#[test]
+fn auto_update_rejects_symlink_escape_out_of_workspace() {
+    use std::os::unix::fs::symlink;
+    let temp = TempDir::new().expect("tempdir");
+    let outside = temp.path().join("outside.txt");
+    fs::write(&outside, "target-bytes").expect("write outside target");
+
+    let workspace = TempDir::new().expect("tempdir");
+    let link = workspace.path().join("conf.toml");
+    symlink(&outside, &link).expect("symlink");
+
+    let updater = AutoUpdater::new(workspace.path());
+    let err = updater
+        .execute(
+            AutoUpdatePlan {
+                issue_id: "issue-esc".to_string(),
+                patch_id: "patch-esc".to_string(),
+                manual_approved: false,
+                diff_lines: 1,
+                patches: vec![FilePatch::text("conf.toml", "target-bytes", "pwned")],
+            },
+            |_| {
+                Ok(VerificationInput {
+                    tests_passed: true,
+                    safety_checks_passed: true,
+                    quality_score: 95,
+                }
+                .into())
+            },
+        )
+        .expect_err("symlink escape must be rejected");
+
+    assert!(
+        matches!(err, RuntimeError::AutoUpdateInvalidPath { .. }),
+        "unexpected: {err:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(&outside).expect("read outside"),
+        "target-bytes",
+        "outside target must remain untouched"
+    );
+}

