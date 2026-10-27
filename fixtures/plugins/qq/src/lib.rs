@@ -96,6 +96,17 @@ static MESSAGE_QUEUE_DROPPED: AtomicU64 = AtomicU64::new(0);
 /// duplicate pollers all draining the same MESSAGE_QUEUE.
 static POLLER_STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Signalled by `stop_agent_poller`; the poller wakes from its (sliced) sleep
+/// and exits. Without this the thread outlives its dylib: a `reload /qq`
+/// unloads qq.so and the poller's next wake-up executes unmapped code
+/// (SIGSEGV, observed 2026-10-27).
+static POLLER_SHUTDOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Handle of the running poller thread, so `stop` can join it instead of
+/// leaving it to race with the reload that is unloading this dylib.
+static POLLER_HANDLE: std::sync::OnceLock<Mutex<Option<std::thread::JoinHandle<()>>>> =
+    std::sync::OnceLock::new();
+
 // ---------------------------------------------------------------------------
 // Data types
 // ---------------------------------------------------------------------------
@@ -134,6 +145,12 @@ struct IncomingMessage {
 struct OneBotEvent {
     #[serde(default)]
     post_type: String,
+
+    /// The bot's own QQ number. OneBot v11 puts it on every event and NapCat
+    /// fills it from its own login info (`self_id: parseInt(selfInfo.uin)`).
+    /// Kept as `Value` because implementations send a number or a string.
+    #[serde(default)]
+    self_id: Option<Value>,
 
     // message events
     #[serde(default)]
@@ -822,9 +839,9 @@ fn handle_onebot_event(event: &OneBotEvent) {
         return;
     }
 
-    // Extract message text and reply context.
-    let (message_text, reply_to_msg_id) =
-        extract_message_info(&event.message, event.raw_message.as_deref());
+    // Extract message text (self-mentions marked from the event's `self_id`)
+    // and reply context.
+    let (message_text, reply_to_msg_id) = event_text_and_reply(event);
 
     // Extract user_id.
     let user_id = match &event.user_id {
@@ -1106,6 +1123,43 @@ fn extract_message_info(message: &Value, raw_message: Option<&str>) -> (String, 
     (parts.join(""), reply_to)
 }
 
+/// The bot's own QQ number as sent by the adapter (number or string form).
+fn self_id_of(event: &OneBotEvent) -> Option<String> {
+    event.self_id.as_ref().and_then(|v| match v {
+        Value::Number(n) => Some(n.to_string()),
+        Value::String(s) => Some(s.clone()),
+        _ => None,
+    })
+}
+
+/// Message text as the model sees it, with self-mentions marked, plus the
+/// quoted message id when the event is a reply.
+fn event_text_and_reply(event: &OneBotEvent) -> (String, Option<i64>) {
+    let (text, reply_to) = extract_message_info(&event.message, event.raw_message.as_deref());
+    (
+        mark_self_mentions(&text, self_id_of(event).as_deref()),
+        reply_to,
+    )
+}
+
+/// Mark @-mentions of the bot itself, so the model can tell "me" from "someone
+/// else" without being told its numeric id on every turn.
+///
+/// The marker is only added where an @ already exists (`@[id=X,name=N]` →
+/// `@[id=X,self,name=N]`), so messages that mention nobody stay byte-identical:
+/// no per-message prompt growth and no cache churn. The rule for reading the
+/// marker lives in the (static, cacheable) system hint.
+fn mark_self_mentions(message: &str, self_id: Option<&str>) -> String {
+    let Some(self_id) = self_id else {
+        return message.to_string();
+    };
+    let named = format!("@[id={self_id},");
+    let bare = format!("@[id={self_id}]");
+    message
+        .replace(&named, &format!("@[id={self_id},self,"))
+        .replace(&bare, &format!("@[id={self_id},self]"))
+}
+
 fn extract_i64(val: &Value) -> Option<i64> {
     match val {
         Value::Number(n) => n.as_i64(),
@@ -1143,7 +1197,7 @@ fn should_process(text: &str) -> bool {
 // 于是"调整它在该群的行为"不需要重编、更不需要重启。
 
 /// 保守默认文案（模型逐字读，保持英文）。
-const DEFAULT_REPLY_POLICY: &str = "Decide for yourself, from the conversation context, whether this message needs an answer from you. Answer when it is addressed to you (\"bot\"/\"Bot\"/\"机器人\", or an @mention), AND ALSO when the context makes it clear the sender is talking to you: it continues a thread you are part of, asks you to do or explain something, or someone in the group explicitly wants your answer — even without naming you. Stay silent for conversation between other people, memes/stickers, and statements that do not involve you; do not hijack someone else's thread.";
+const DEFAULT_REPLY_POLICY: &str = "Decide for yourself, from the conversation context, whether this message needs an answer from you. Answer when it is addressed to you (\"bot\"/\"Bot\"/\"机器人\", or an @mention carrying the `self` marker — that marker means the mention is you), AND ALSO when the context makes it clear the sender is talking to you: it continues a thread you are part of, asks you to do or explain something, or someone in the group explicitly wants your answer — even without naming you. Stay silent for conversation between other people, memes/stickers, and statements that do not involve you; do not hijack someone else's thread.";
 
 /// 四种模式。`policy` 为空时用这里的预设文案。
 const MODE_QUIET: &str = "quiet";
@@ -1159,7 +1213,7 @@ const MEMORY_MAX_CHARS: usize = 800;
 
 fn mode_preset(mode: &str) -> Option<&'static str> {
     match mode {
-        MODE_QUIET => Some("Stay silent unless the message @mentions you or addresses you by name (\"bot\"/\"Bot\"/\"机器人\"). This group does not want the bot commenting on ordinary conversation."),
+        MODE_QUIET => Some("Stay silent unless the message @mentions you (an @mention carrying the `self` marker) or addresses you by name (\"bot\"/\"Bot\"/\"机器人\"). This group does not want the bot commenting on ordinary conversation."),
         MODE_BALANCED => Some(DEFAULT_REPLY_POLICY),
         MODE_CHATTY => Some("Join the conversation actively: answer questions you can help with, add a short remark when it genuinely fits, and take a joke. Do not reply to every message, and never hijack a thread between two other people."),
         MODE_ONE_ON_ONE => Some("Treat this group as a direct chat: answer every message that is meant for you (greeting, question, request). Do not stay silent just because it is technically a group."),
@@ -1482,8 +1536,13 @@ fn start_agent_poller() {
     if POLLER_STARTED.swap(true, Ordering::SeqCst) {
         return;
     }
-    thread::spawn(move || {
-        thread::sleep(std::time::Duration::from_secs(2));
+    POLLER_SHUTDOWN.store(false, Ordering::SeqCst);
+    let handle = thread::spawn(move || {
+        // Sliced sleeps so `stop_agent_poller` joins promptly instead of
+        // waiting out a full interval.
+        if !poller_sleep(Duration::from_secs(2)) {
+            return;
+        }
         loop {
             let msgs: Vec<IncomingMessage> = {
                 let mut queue = MESSAGE_QUEUE.lock().unwrap_or_else(|p| p.into_inner());
@@ -1495,14 +1554,53 @@ fn start_agent_poller() {
                 }
                 cordis_plugin_sdk::agent_trigger(&build_envelope(&msg));
             }
-            thread::sleep(std::time::Duration::from_secs(5));
+            if !poller_sleep(Duration::from_secs(5)) {
+                return;
+            }
         }
     });
+    if let Ok(mut guard) = POLLER_HANDLE.get_or_init(|| Mutex::new(None)).lock() {
+        *guard = Some(handle);
+    }
+}
+
+/// Sleep `total` in 100 ms slices. Returns `false` when a shutdown was
+/// requested, so the caller can exit before touching any more plugin code.
+fn poller_sleep(total: Duration) -> bool {
+    let mut remaining = total;
+    loop {
+        if POLLER_SHUTDOWN.load(Ordering::SeqCst) {
+            return false;
+        }
+        if remaining.is_zero() {
+            return true;
+        }
+        let slice = remaining.min(Duration::from_millis(100));
+        thread::sleep(slice);
+        remaining = remaining.saturating_sub(slice);
+    }
+}
+
+/// Stop the poller and join it. Called from the `stop` branch of `qq_serve`
+/// and `qq_ws_serve` so a reload never leaves a thread running inside a dylib
+/// the runtime is about to unload.
+fn stop_agent_poller() {
+    POLLER_SHUTDOWN.store(true, Ordering::SeqCst);
+    if let Some(cell) = POLLER_HANDLE.get() {
+        if let Ok(mut guard) = cell.lock() {
+            if let Some(handle) = guard.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+    POLLER_SHUTDOWN.store(false, Ordering::SeqCst);
+    POLLER_STARTED.store(false, Ordering::SeqCst);
 }
 
 fn handle_qq_serve(req: &NodeRequest) -> Result<NodeResponse, String> {
     if req.action.as_deref() == Some("stop") {
         stop_qq_serve();
+        stop_agent_poller();
         *SERVER_RUNNING.lock().map_err(|e| format!("lock: {e}"))? = false;
         return Ok(NodeResponse {
             ok: true,
@@ -2459,6 +2557,7 @@ fn handle_qq_send(req: &NodeRequest) -> Result<NodeResponse, String> {
 fn handle_qq_ws_serve(req: &NodeRequest) -> Result<NodeResponse, String> {
     if req.action.as_deref() == Some("stop") {
         stop_qq_ws_serve();
+        stop_agent_poller();
         return Ok(NodeResponse {
             ok: true,
             node_id: "qq_ws_serve".to_string(),
@@ -2942,6 +3041,7 @@ fn docs_value() -> cordis_plugin_sdk::PluginDocs {
     Some("\
 QQ GROUP CHAT MODE — you are running in a QQ group. Messages may be casual chat NOT directed at you.\n\
 CRITICAL: Always decide whether the message is actually talking to YOU before responding.\n\
+MENTION MARKER — an @mention rendered as `@[id=<qq>,self,name=<n>]` (or `@[id=<qq>,self]`) is YOU, the bot. An `@[id=...,name=...]` WITHOUT the `self` marker is somebody else. Judge \"is this for me\" from that marker, never from the numeric id.\n\
 REPLY POLICY — the authority on whether to answer. Every incoming message starts with `[reply policy: <mode> — <text>]`. That line IS the rule for this group; follow it exactly and do not substitute a stricter rule of your own.\n\
   quiet      — answer only when @mentioned or addressed by name.\n\
   balanced   — judge from the conversation: answer when it is addressed to you or clearly wants your answer; stay out of threads between other people.\n\
@@ -3056,6 +3156,64 @@ mod signature_tests {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
+// Poller 生命周期：reload 卸载 dylib 前必须把这条线程 join 掉。
+// 2026-10-27 线上 `reload /qq` SIGSEGV 就是因为它一直在跑。
+// ═══════════════════════════════════════════════════════════════════════
+#[cfg(test)]
+mod poller_tests {
+    use super::*;
+
+    #[test]
+    fn agent_poller_stops_joins_and_restarts() {
+        start_agent_poller();
+        assert!(
+            POLLER_STARTED.load(Ordering::SeqCst),
+            "poller must be marked running"
+        );
+        // A second start is a no-op (both servers call it).
+        start_agent_poller();
+        assert!(POLLER_STARTED.load(Ordering::SeqCst));
+
+        stop_agent_poller();
+        assert!(
+            !POLLER_STARTED.load(Ordering::SeqCst),
+            "stop must clear the running flag so a reloaded plugin can start again"
+        );
+        assert!(
+            POLLER_HANDLE
+                .get()
+                .and_then(|cell| cell.lock().ok().map(|guard| guard.is_none()))
+                .unwrap_or(true),
+            "stop must join and drop the handle"
+        );
+
+        // Idempotent: the second stop (other Task node's stop) is harmless.
+        stop_agent_poller();
+
+        // A restart after stop works — the reloaded plugin polls again.
+        start_agent_poller();
+        assert!(POLLER_STARTED.load(Ordering::SeqCst));
+        stop_agent_poller();
+    }
+
+    #[test]
+    fn poller_sleep_returns_early_on_shutdown() {
+        POLLER_SHUTDOWN.store(true, Ordering::SeqCst);
+        let started = std::time::Instant::now();
+        assert!(
+            !poller_sleep(Duration::from_secs(5)),
+            "shutdown must interrupt the sleep"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "an interrupted sleep must not wait out the full interval"
+        );
+        POLLER_SHUTDOWN.store(false, Ordering::SeqCst);
+        assert!(poller_sleep(Duration::ZERO));
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
 // Task D (E 批): 端到端链路分段验证 — 不消耗 token 的各段。
 // 覆盖：webhook 事件解析 → 去重 → 灰度白名单/黑名单 → 队列入列，
 // 以及 poller 产出的 agent 触发 prompt 是否能被 runtime 侧 session
@@ -3126,11 +3284,111 @@ mod chain_tests {
         MESSAGE_QUEUE.lock().unwrap().len()
     }
 
+    // ── self-mention marker ────────────────────────────────────────────────
+    //
+    // The model has to tell "this @ is me" from "this @ is someone else".
+    // OneBot puts the bot's own qq in `self_id` on every event; the marker is
+    // the only thing that connects the two, and it must not touch messages
+    // that mention nobody (that would grow every prompt for no reason).
+
+    #[test]
+    fn mark_self_mentions_marks_only_the_bot() {
+        let text = "@[id=3832224285,name=3832224285] hi @[id=406351312,name=406351312]";
+        assert_eq!(
+            mark_self_mentions(text, Some("3832224285")),
+            "@[id=3832224285,self,name=3832224285] hi @[id=406351312,name=406351312]"
+        );
+        // Bare form (no `name=`) is marked too.
+        assert_eq!(
+            mark_self_mentions("@[id=42] yo", Some("42")),
+            "@[id=42,self] yo"
+        );
+        // Nothing to mark → byte-identical.
+        assert_eq!(mark_self_mentions("plain text", Some("42")), "plain text");
+        // No self id in the event (an adapter that omits it) → untouched.
+        assert_eq!(
+            mark_self_mentions("@[id=42,name=42] hi", None),
+            "@[id=42,name=42] hi"
+        );
+    }
+
+    // End to end through the event layer (no globals involved): a group event
+    // whose `at` segment targets the bot renders with the `self` marker, and a
+    // mention of somebody else stays unmarked.
+    #[test]
+    fn self_mention_marker_comes_from_event_self_id() {
+        let event_with = |self_id: Value, at: &str| {
+            let v = json!({
+                "post_type": "message",
+                "message_type": "group",
+                "self_id": self_id,
+                "message": [
+                    {"type": "at", "data": {"qq": at}},
+                    {"type": "text", "data": {"text": " hello"}}
+                ],
+                "message_id": 9001,
+                "user_id": 111,
+                "group_id": 975594881
+            });
+            serde_json::from_value::<OneBotEvent>(v).expect("event json")
+        };
+
+        // Numeric self_id (NapCat sends `parseInt(...)`).
+        let (text, reply) = event_text_and_reply(&event_with(json!(3832224285i64), "3832224285"));
+        assert_eq!(text, "@[id=3832224285,self,name=3832224285] hello");
+        assert_eq!(reply, None);
+
+        // String self_id parses the same way.
+        assert_eq!(
+            self_id_of(&event_with(json!("3832224285"), "3832224285")),
+            Some("3832224285".to_string())
+        );
+
+        // Mentioning somebody else leaves the text unmarked.
+        let (text, _) = event_text_and_reply(&event_with(json!(3832224285i64), "406351312"));
+        assert_eq!(text, "@[id=406351312,name=406351312] hello");
+
+        // No self_id in the event → no marker, text unchanged (an adapter that
+        // omits the field must not change what the model sees).
+        let mut event = event_with(Value::Null, "3832224285");
+        event.self_id = None;
+        assert_eq!(self_id_of(&event), None);
+        let (text, _) = event_text_and_reply(&event);
+        assert_eq!(text, "@[id=3832224285,name=3832224285] hello");
+    }
+
     // 单测串行化：所有触碰全局静态（MESSAGE_QUEUE / STATE / RECENT_MESSAGE_IDS）
     // 的断言集中在这一个 test 内，避免 cargo 并行跑 test 时的全局态污染。
     #[test]
     fn webhook_ingest_dedup_whitelist_blocklist_chain() {
         clear_globals();
+
+        // ── 段0 自 @ 标记：事件自带 self_id 时，@ 到 bot 的那条带 `self` ──
+        {
+            let v = json!({
+                "post_type": "message",
+                "message_type": "group",
+                "self_id": 3832224285i64,
+                "message": [
+                    {"type": "at", "data": {"qq": "3832224285"}},
+                    {"type": "text", "data": {"text": " 你好"}}
+                ],
+                "message_id": 1999,
+                "user_id": 111,
+                "group_id": 975594881
+            });
+            let event: OneBotEvent = serde_json::from_value(v).unwrap();
+            handle_onebot_event(&event);
+            let queued = MESSAGE_QUEUE
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .pop_front()
+                .expect("self-mention event must be queued");
+            assert_eq!(
+                queued.message, "@[id=3832224285,self,name=3832224285] 你好",
+                "被 @ 到 bot 自己时必须带 self 标记，模型才知道那是它"
+            );
+        }
 
         // ── 段1 webhook 收到 → 入队 ──────────────────────────────
         handle_onebot_event(&group_event(2001, 222, "hello world"));

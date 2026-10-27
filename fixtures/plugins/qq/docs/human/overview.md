@@ -19,6 +19,16 @@ Configure your OneBot client (e.g. Napcat) to connect as a WebSocket client to `
 Inbound WS event frames go through the same dedup / grayscale whitelist / envelope path as `qq_serve`.
 Send `{"node_id":"qq_ws_serve","action":"stop"}` to stop the server and release the port; repeated start is idempotent.
 
+### 消息泵线程（poller）
+
+`qq_serve` / `qq_ws_serve` 启动时会拉起一条 poller 线程（`start_agent_poller`）：每 5 秒 drain 一次
+`MESSAGE_QUEUE`，把消息包成 envelope 后 `agent_trigger` 给 kernel。它只起一条（`POLLER_STARTED`）。
+
+**stop 必须把它 join 掉**：两个 Task 节点的 `stop` 分支都会调 `stop_agent_poller()`（置
+`POLLER_SHUTDOWN` → join → 复位 `POLLER_STARTED`）。2026-10-27 之前这条线程没有退出路径，
+`reload /qq` 会 `dlclose` 掉它正在执行的 `qq.so`，导致 SIGSEGV；顺便也会让新旧两个 poller
+同时 drain。睡眠是 100ms 分片，所以 stop 最多等一个分片就返回。
+
 ### `qq_fetch_messages`
 Fetch queued incoming messages. The agent polls this node to check for new messages.
 Returns all queued messages and drains the queue.
@@ -92,14 +102,30 @@ effect on the next message — no rebuild, no restart. An empty policy is reject
 ## Agent 意图判断规则
 
 门控规则的**唯一权威**是每条入站消息首行的 `[reply policy: …]`（5.2.40 之前是
-插件 `system_hint` 里硬编码的 `IS directed at you ONLY if …`）。没有该行时退回
+插件 `system_hint` 里硬编码的 `IS directed at it ONLY if …`）。没有该行时退回
 保守默认：显式 @ / 点名 "bot"、"Bot"、"机器人" 才响应；其余一律 suspend。
+
+### 自 @ 标记（2026-10-27）
+
+模型不能凭 QQ 号判断「这条 @ 的是不是我」——以前 prompt 里根本没有 bot 自己的号，
+于是它会把 `@[id=3832224285,name=3832224285]` 当成别人，答「@ 的不是我」。
+
+现在 `OneBotEvent.self_id`（OneBot v11 每个事件都带，NapCat 用
+`selfInfo.uin` 填）进到 ingest，@ 到 bot 自己的那条渲染成
+`@[id=<qq>,self,name=<n>]`（裸形式 `@[id=<qq>]` → `@[id=<qq>,self]`）。
+`system_hint` 里有一条静态规则说明 `self` 标记 = 你。
+
+代价：**没有 @ 的消息逐字节不变**，只有 @ 到 bot 的消息在每个 `@[id=…` 上多
+5 个字符；`self_id` 常驻事件、不需要配置，所以每轮 prompt 没有新增行，
+prefix cache 行为不变。事件里缺 `self_id`（非标准 adapter）时不加标记，
+退化成改之前的行为。
 
 默认策略（可在群里让 bot 用 `qq_set_reply_policy` 改）：
 
 > Decide for yourself, from the conversation context, whether this message needs an
 > answer from you. Answer when it is addressed to you ("bot"/"Bot"/"机器人", or an
-> @mention), AND ALSO when the context makes it clear the sender is talking to you:
+> @mention carrying the `self` marker — that marker means the mention is you),
+> AND ALSO when the context makes it clear the sender is talking to you:
 > it continues a thread you are part of, asks you to do or explain something, or
 > someone in the group explicitly wants your answer — even without naming you. Stay
 > silent for conversation between other people, memes/stickers, and statements that

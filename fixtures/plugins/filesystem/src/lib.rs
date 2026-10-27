@@ -17,6 +17,13 @@ use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
 // ── Whitelist ──────────────────────────────────────────────────────────
+//
+// Extra read roots are **not** in the source: they come from this plugin's
+// `settings.read_roots` in `config/plugins/filesystem.yaml`, which the kernel
+// merges into the invocation payload (see `invoke_registered_plugin_with_settings`).
+// Hard-coding machine-specific directories here used to mean any new project
+// needed a recompile, and a stale entry (a path that no longer exists) stayed
+// invisible: the `canonicalize()` check just skipped it forever.
 
 fn base_dir() -> PathBuf {
     // Use CORDIS_FIXTURES_ROOT if set, otherwise default to the process cwd.
@@ -32,15 +39,21 @@ fn base_dir() -> PathBuf {
         .unwrap_or_else(|_| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
 }
 
-/// Allowed roots for reading.
-fn read_roots() -> Vec<PathBuf> {
-    let base = base_dir();
-    vec![
-        base.clone(),
-        PathBuf::from("/root/Cstar"),
-        PathBuf::from("/root/PJSKBot"),
-        PathBuf::from("/root/HCIProj"),
-    ]
+/// Configured extra read roots, from `settings.read_roots`.
+///
+/// Relative entries are dropped rather than resolved against the process cwd:
+/// a config typo must not silently grant access to whatever directory the
+/// runtime happens to be started from.
+fn extra_read_roots(settings: Option<&FsSettings>) -> Vec<PathBuf> {
+    let Some(settings) = settings else {
+        return Vec::new();
+    };
+    settings
+        .read_roots
+        .iter()
+        .filter(|root| root.is_absolute())
+        .cloned()
+        .collect()
 }
 
 /// Allowed roots for writing (only plugins subtree of the fixtures root).
@@ -80,11 +93,11 @@ fn canonicalise_for_whitelist(path: &Path) -> Option<PathBuf> {
     Some(resolved)
 }
 
-fn is_allowed_read(path: &Path) -> bool {
+fn is_allowed_read(path: &Path, settings: Option<&FsSettings>) -> bool {
     let Some(canonical) = canonicalise_for_whitelist(path) else {
         return false;
     };
-    for root in &read_roots() {
+    for root in extra_read_roots(settings) {
         let Ok(canon_root) = root.canonicalize() else {
             continue;
         };
@@ -92,7 +105,8 @@ fn is_allowed_read(path: &Path) -> bool {
             return true;
         }
     }
-    // Also allow paths relative to the fixtures root.
+    // The fixtures root (repo root: `$CORDIS_FIXTURES_ROOT`, else the process
+    // cwd) is always readable — it holds the plugin sources the agent edits.
     let Ok(base) = base_dir().canonicalize() else {
         return false;
     };
@@ -133,6 +147,20 @@ struct FsRequest {
     offset: Option<usize>,
     #[serde(default)]
     limit: Option<usize>,
+    /// The plugin's `settings` block from `config/plugins/filesystem.yaml`,
+    /// merged into the payload by the kernel before dispatch.
+    #[serde(default)]
+    settings: Option<FsSettings>,
+}
+
+/// This plugin's configurable settings. Unknown keys are ignored so the
+/// settings block can grow without breaking older plugin builds.
+#[derive(Debug, Default, Deserialize)]
+struct FsSettings {
+    /// Extra directories `fs_read` / `fs_list` / `fs_search` may touch, on top
+    /// of the fixtures root. Must be absolute; relative entries are ignored.
+    #[serde(default)]
+    read_roots: Vec<PathBuf>,
 }
 
 #[derive(Debug, Serialize)]
@@ -173,7 +201,7 @@ fn handle_fs_read(req: &FsRequest) -> Result<FsResponse, String> {
         return Err("path is required for fs_read".into());
     }
     let path = resolve(path_str)?;
-    if !is_allowed_read(&path) {
+    if !is_allowed_read(&path, req.settings.as_ref()) {
         return Err("access denied: path is outside allowed read directories".into());
     }
     let content = std::fs::read_to_string(&path).map_err(|e| format!("read {path_str}: {e}"))?;
@@ -231,7 +259,7 @@ fn handle_fs_write(req: &FsRequest) -> Result<FsResponse, String> {
 fn handle_fs_list(req: &FsRequest) -> Result<FsResponse, String> {
     let path_str = req.path.as_deref().unwrap_or(".");
     let path = resolve(path_str)?;
-    if !is_allowed_read(&path) {
+    if !is_allowed_read(&path, req.settings.as_ref()) {
         return Err("access denied: path is outside allowed read directories".into());
     }
     let mut entries: Vec<Value> = Vec::new();
@@ -274,7 +302,7 @@ fn handle_fs_search(req: &FsRequest) -> Result<FsResponse, String> {
     }
     let path_str = req.path.as_deref().unwrap_or(".");
     let path = resolve(path_str)?;
-    if !is_allowed_read(&path) {
+    if !is_allowed_read(&path, req.settings.as_ref()) {
         return Err("access denied: path is outside allowed read directories".into());
     }
     let mut matches: Vec<Value> = Vec::new();
@@ -385,8 +413,31 @@ export_plugin_api! {
 
 #[cfg(test)]
 mod tests {
-    use super::canonicalise_for_whitelist;
-    use std::path::PathBuf;
+    use super::*;
+
+    /// Build a request from a JSON literal, the same shape the kernel pipes
+    /// into `api_handle` — including the host-merged `settings` block.
+    fn request(value: Value) -> FsRequest {
+        serde_json::from_value(value).expect("request json")
+    }
+
+    fn settings_for(root: &Path) -> Option<FsSettings> {
+        Some(FsSettings {
+            read_roots: vec![root.to_path_buf()],
+        })
+    }
+
+    /// A temp dir with `allowed/a.txt` (content `needle`) and a sibling
+    /// `secret.txt` one level above the allowed root.
+    fn temp_layout() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        let allowed = temp.path().join("allowed");
+        std::fs::create_dir_all(&allowed).unwrap();
+        std::fs::write(allowed.join("a.txt"), b"needle\n").unwrap();
+        std::fs::write(temp.path().join("secret.txt"), b"secret\n").unwrap();
+        let parent = temp.path().to_path_buf();
+        (temp, allowed, parent)
+    }
 
     /// P0-19: canonicalisation must succeed both for existing files
     /// AND for not-yet-created paths (walk up to the deepest existing
@@ -432,5 +483,143 @@ mod tests {
             // syntactically absolute — no risk of ambient-cwd surprise.
             assert!(p.is_absolute());
         }
+    }
+
+    // ── settings-driven read roots ──────────────────────────────────────
+
+    #[test]
+    fn extra_read_roots_empty_without_settings() {
+        assert!(extra_read_roots(None).is_empty());
+        assert!(extra_read_roots(Some(&FsSettings::default())).is_empty());
+    }
+
+    /// A relative root is dropped, not resolved against the cwd: a config typo
+    /// must never grant access to whatever directory the runtime started in.
+    #[test]
+    fn extra_read_roots_drops_relative_entries() {
+        let settings = FsSettings {
+            read_roots: vec![PathBuf::from("relative/dir")],
+        };
+        assert!(extra_read_roots(Some(&settings)).is_empty());
+    }
+
+    #[test]
+    fn configured_root_is_readable() {
+        let (_temp, allowed, _parent) = temp_layout();
+        let settings = settings_for(&allowed);
+        assert!(is_allowed_read(&allowed.join("a.txt"), settings.as_ref()));
+    }
+
+    /// No settings → a temp dir outside the fixtures root is denied. This is
+    /// the "no built-in fallback list" contract: nothing is granted implicitly.
+    #[test]
+    fn unconfigured_root_is_denied() {
+        let (_temp, allowed, _parent) = temp_layout();
+        assert!(!is_allowed_read(&allowed.join("a.txt"), None));
+        let err = handle(&request(json!({
+            "node_id": "fs_read",
+            "path": allowed.join("a.txt").to_string_lossy(),
+        })))
+        .expect_err("access denied");
+        assert!(err.contains("access denied"), "unexpected: {err}");
+    }
+
+    /// `../` out of a configured root is denied after canonicalisation.
+    #[test]
+    fn escape_via_parent_component_is_denied() {
+        let (_temp, allowed, parent) = temp_layout();
+        let settings = settings_for(&allowed);
+        let escape = allowed.join("..").join("secret.txt");
+        assert!(escape.starts_with(&allowed));
+        assert!(!is_allowed_read(&escape, settings.as_ref()));
+        assert!(parent.join("secret.txt").exists());
+    }
+
+    /// A root that no longer exists is skipped without granting anything —
+    /// the failure mode a hard-coded and later-deleted directory had.
+    #[test]
+    fn vanished_root_grants_nothing() {
+        let settings = FsSettings {
+            read_roots: vec![PathBuf::from("/does-not-exist-cordis-test-xyz")],
+        };
+        assert!(!is_allowed_read(
+            &PathBuf::from("/does-not-exist-cordis-test-xyz/foo"),
+            Some(&settings)
+        ));
+    }
+
+    /// The fixtures root stays readable without any config — it holds the
+    /// plugin sources the agent edits.
+    #[test]
+    fn fixtures_root_is_readable_without_settings() {
+        assert!(is_allowed_read(&base_dir(), None));
+    }
+
+    /// A path with no existing ancestor at all fails closed rather than
+    /// falling back to a raw prefix comparison.
+    #[test]
+    fn unresolvable_path_is_denied() {
+        assert!(!is_allowed_read(Path::new(""), None));
+    }
+
+    // ── handlers honour the configured roots end to end ─────────────────
+
+    #[test]
+    fn fs_read_reads_configured_root() {
+        let (_temp, allowed, _parent) = temp_layout();
+        let response = handle(&request(json!({
+            "node_id": "fs_read",
+            "path": allowed.join("a.txt").to_string_lossy(),
+            "settings": { "read_roots": [allowed.to_string_lossy()] },
+        })))
+        .expect("read allowed file");
+        assert!(response.ok);
+        assert_eq!(response.total_lines, Some(1));
+        let first = response.lines.as_ref().unwrap()[0].clone();
+        assert_eq!(first["text"], "needle");
+    }
+
+    #[test]
+    fn fs_list_lists_configured_root() {
+        let (_temp, allowed, _parent) = temp_layout();
+        let response = handle(&request(json!({
+            "node_id": "fs_list",
+            "path": allowed.to_string_lossy(),
+            "settings": { "read_roots": [allowed.to_string_lossy()] },
+        })))
+        .expect("list allowed dir");
+        let entries = response.entries.as_ref().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["name"], "a.txt");
+        assert_eq!(entries[0]["kind"], "file");
+    }
+
+    #[test]
+    fn fs_search_searches_configured_root() {
+        let (_temp, allowed, _parent) = temp_layout();
+        let response = handle(&request(json!({
+            "node_id": "fs_search",
+            "pattern": "needle",
+            "path": allowed.to_string_lossy(),
+            "settings": { "read_roots": [allowed.to_string_lossy()] },
+        })))
+        .expect("search allowed dir");
+        let matches = response.matches.as_ref().unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0]["text"], "needle");
+    }
+
+    /// Settings without `read_roots` must not widen the whitelist.
+    #[test]
+    fn settings_without_read_roots_widens_nothing() {
+        let (_temp, allowed, _parent) = temp_layout();
+        let request = request(json!({
+            "node_id": "fs_read",
+            "path": allowed.join("a.txt").to_string_lossy(),
+            "settings": { "some_other_setting": true },
+        }));
+        assert!(request.settings.is_some(), "settings block still parses");
+        let err = handle(&request).expect_err("no read_roots configured");
+        assert!(err.contains("access denied"), "unexpected: {err}");
     }
 }
