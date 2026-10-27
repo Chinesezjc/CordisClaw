@@ -2,7 +2,7 @@
 
 ## 1. 判定口径
 
-- 本文基于当前仓库现状整理，最近更新：2026-10-25。
+- 本文基于当前仓库现状整理，最近更新：2026-10-27。
 - 历史规划蓝图已经吸收进 [design-blueprint.md](./design-blueprint.md)，因此本文结论来自三类证据的交叉比对：
   - 设计蓝图：[design-blueprint.md](./design-blueprint.md)
   - 架构文档：[system-overview.md](./system-overview.md)、[contracts-and-loading.md](./contracts-and-loading.md)、[runtime-semantics.md](./runtime-semantics.md)、[maintenance-guide.md](./maintenance-guide.md)
@@ -28,7 +28,7 @@
 | 插件封装形态蓝图 | 部分完成 | `dylib` + JSON artifact + process 已落地；`cdylib` / `WASM` 未实现 |
 | 更真实的运行入口与服务化边界 | 部分完成 | `RuntimeHost`、`serve` REPL、agent chat、shell console 可用；尚未稳定化为外部服务边界 |
 | YAML 配置入口 | 已完成 | runtime / kernel / llm_api / plugins 配置模型完整 |
-| CI | 已完成 | GitHub Actions（`.github/workflows/ci.yml`）：push main + PR 触发，ubuntu-latest 上执行 fmt / clippy `-D warnings` / prepare-artifacts / build / test（并行）；x86_64-linux 门控恒真，dylib 集成测试全量执行，fixture 插件经 `prepare-artifacts` 预构建并由 rust-cache 缓存。并行安全：snapshot 目录名带创建者 pid，boot 的 stale 清理只删已死进程的残留（`cleanup_stale_snapshot_dirs`）；mock LLM server accept 超时 CI 下 900s / 本地 30s（`mock_llm_accept_timeout`，冷缓存 runner 上迭代测试中途 cargo build 远超 30s） |
+| CI | 已完成 | GitHub Actions（`.github/workflows/ci.yml`）：push main + PR 触发，ubuntu-latest 上执行 fmt / clippy `-D warnings` / prepare-artifacts / build / test（并行）；x86_64-linux 门控恒真，dylib 集成测试全量执行，fixture 插件经 `prepare-artifacts` 预构建并由 rust-cache 缓存。并行安全：snapshot 目录名带创建者 pid，boot 的 stale 清理只删已死进程的残留（`cleanup_stale_snapshot_dirs`）；mock LLM server accept 超时 CI 下 900s / 本地 30s（`mock_llm_accept_timeout`，冷缓存 runner 上迭代测试中途 cargo build 远超 30s）。工具链由 `rust-toolchain.toml` 钉在 1.97.1，CI 同步 `toolchain: 1.97.1`（见 5.2.53）；fixtures 测试（12 个 member + 10 个 excluded expr 子 crate + root 占位）由 `scripts/test-fixtures.sh` 跑进同一 job（见 5.2.54） |
 
 ## 3. 已完成
 
@@ -121,6 +121,41 @@ Agent 现在可以自主完成：读代码 → 理解结构 → 写/改文件 �
 - `qq` — OneBot v11 QQ 适配器（configure/send/status/call/JSON卡片透传/转发/回复）
 - `gacha` — 原神抽卡模拟器（角色/武器池、软硬保底、50/50、data/ 持久化）
 - `root` / `root/child` — scaffold 占位
+
+### 3.8 `config/plugins/*.yaml` 的 `enabled` + `settings` 已接线，reload 会重读配置（2026-10-27）
+
+之前只有"解析 + 数个数"：`PluginConfigFile.settings` 进 `RuntimeKernel.plugin_configs` 后只贡献
+`plugin_config_count`，`enabled` 没有任何代码读，`invoke` 只往 payload 注入 `node_id`；`reload`
+也不会重读 `config/`（`RuntimeConfig::load` 全仓只有 `boot` 一处调用）。现在：
+
+- **`settings` 下发**：快照携带 `plugin 名 → settings`，`RuntimeSnapshot::invoke` 调
+  `invoke_registered_plugin_with_settings` 合并进 payload 的 `settings` 键（调用方同名键优先，
+  空 `{}`/`null` 不注入，仅 dylib 插件生效——JSON/process 工件的 stdin 保持原样字节）。
+- **`enabled: false` 在 load 阶段过滤**：`Loader::with_disabled` 不 stage、不 dlopen、不注册，
+  Task 服务自然不启动；reload 丢掉某插件时其服务在换快照前 stop。`KernelStatus.plugin_disabled_count`
+  与 `LoaderMetrics.disabled_plugins_skipped` 可观测。
+- **配置热重载**：`reload_internal` / `reload_candidate` 先 `RuntimeConfig::load`，再用新配置
+  建快照；`promote_candidate` 安装候选快照携带的配置。坏配置 → `ReloadAttemptReport.failed`
+  （`failure_summary` 带文件与原因），旧快照继续服务。不热生效项：`runtime.snapshot_root`
+  （进程内 staging 根已定，保留 boot 值并打日志）、`kernel.change_history_limit`（构造时生效）。
+- **首个使用者**：`filesystem` 插件的读取白名单改由 `settings.read_roots` 下发，源码里的
+  `/root/Cstar`、`/root/PJSKBot`、`/root/HCIProj` 硬编码整段删除（其中 `/root/Cstar` 早已不存在，
+  每次 canonicalize 失败后被静默跳过）。缺省不回落任何内置目录；相对路径条目被丢弃；不存在的
+  条目跳过。模板见 `config.example/plugins/filesystem.yaml`。
+
+### 3.9 reload 不再卸载 Task 插件的 dylib（2026-10-27，修 SIGSEGV）
+
+线上 `reload /qq` 成功后 1 秒进程 SIGSEGV。链路：`reload_subtree` 停完服务（WS/HTTP 线程都 join 了）
+→ `unregister_task_library("qq")` → `dlclose` 旧 `qq.so`；而 qq 还有一条**永不停止**的 detached
+线程（`start_agent_poller`，没有 shutdown flag、没有 join），它下一次醒来执行的就是已 unmap 的代码。
+
+- kernel：`TASK_LIBRARIES` 里被替换/摘除的句柄现在移入 `RETAINED_TASK_LIBRARIES`，**永不 drop**
+  （`unregister_task_library` 语义改为"退役"）。`retained_task_library_count()` 供测试断言。
+  代价：每次 reload 一个 Task 插件泄漏一份映射（qq.so ~18MB），进程退出才回收。理由：插件的
+  `stop` 契约不要求 join 所有线程，无法安全判定何时可以 `dlclose`。
+- qq：poller 加 `POLLER_SHUTDOWN` + 句柄 join（`stop_agent_poller`，在 `qq_serve` / `qq_ws_serve`
+  的 stop 分支调用并复位 `POLLER_STARTED`），sleep 拆 100ms 分片以便快速退出；否则 reload 后
+  旧 poller 与新 poller 会双 drain / 双 `agent_trigger`。
 
 ## 4. 部分完成
 
@@ -239,6 +274,70 @@ Agent 现在可以自主完成：读代码 → 理解结构 → 写/改文件 �
 - [x] **Filesystem / Git 白名单不再静默降级**（P0-19）— `canonicalize` 失败时不再退回未规范化路径。新增 `canonicalise_for_whitelist` / `validate_path_in_root` 的深度 ancestor 解析：路径不存在时 canonicalize 最深的存在祖先再拼 tail；两侧都失败则 fail-closed。`../../etc/shadow` 之类的构造再无绕过。
 - [x] **Plugin iteration symlink 逃逸**（P0-20）— `PluginEditExecutor::execute` 在写入前调用新 helper `resolve_under_workspace`：canonicalize 结果必须仍在 workspace_root 下。plugins 内的 symlink 指向 `/etc/passwd` 之类无法被写入。
 - [x] **Verifier shell 拼接**（P0-21）— 已随 A 批 P0-1 修复。`discover_rust_workspace_manifest` 输出的字符串被 `shell_words` 解析成 argv，空格 / `$` / `;` 无法被解释。
+
+### 5.2.54 fixtures 测试接入 CI 门禁（2026-10-27）
+
+**背景**：CI 只跑主 workspace 的 `cargo test --locked`，fixtures 的测试一个都不在门禁里：
+12 个 workspace member、10 个 expr 子 crate（在 fixtures workspace 的 `exclude` 里，各自
+独立 manifest）、以及 root 占位 crate。后果是 `expr/lexer/tests/lexer.rs` 里一条从 HEAD
+起就红着的断言（拿 `1 + a` 当词法错误，但 `a` 是合法标识符）一直活到 5.2.53 才被发现。
+
+**改动**：
+
+- [x] **`scripts/test-fixtures.sh`** — 唯一入口（CI 与本地共用）：member 走
+  `cargo test --locked --manifest-path fixtures/plugins/Cargo.toml`；10 个 expr 子 crate +
+  root 逐个 manifest 跑，统一 `CARGO_TARGET_DIR=fixtures/plugins/target` 只编一次
+  cordis-plugin-sdk（实测 154s → 22s）。这些独立 manifest **不能**加 `--locked`：它们的
+  lock 被 `.gitignore` 的 `fixtures/plugins/**/Cargo.lock` 忽略，干净 checkout 上锁文件
+  根本不存在，加了必失败。
+- [x] **CI** — `ci.yml` 在 `test` 之后加一步 `fixtures tests`，失败时按现有风格打
+  `::error::` 注解。放在 `prepare-artifacts` 之后：插件已构建，实测热身 **7s**（从零冷跑
+  64s，含 12 个插件的构建）。`rust-cache` 的 `workspaces` 无需改动（共享的
+  `fixtures/plugins` 已在列表里）。
+- [x] **`root` 占位 crate 归档** — 它此前既不是 member 也不在 `exclude`，cargo 直接报
+  "current package believes it's in a workspace when it's not"，连自己的测试都跑不起来；
+  而 `Cargo.toml` 里又声明了 `abi_kind = "rust"` / `declared_nodes = ["root_entry"]`，
+  看着像真插件（`src/lib.rs` 里其实只有一个 marker 函数，没有 `export_plugin_api!`）。
+  现在：列进 `exclude` + 加空 `[workspace]` 表让它能独立构建、在 Cargo.toml 顶部注明
+  "无 ABI 导出、不是可加载插件"；原先的空断言测试 `fn root_scaffold_marker() {}` 换成
+  `assert_eq!(root::root_plugin_marker(), "root")`，至少保证它还能被独立编译。
+
+**验证**：`bash scripts/test-fixtures.sh` 冷 64s / 热 7s 全绿（member 194 项 + 11 个独立
+manifest）；`ci.yml` 通过 YAML 解析且 steps 顺序正确；本批不碰 `crates/`，主 workspace 的
+`cargo test --locked` 不受影响。
+
+**不在本批**：fixtures 覆盖率统计（fixtures 是样例插件，不进 100% 行覆盖门槛；要统计需
+另设计 lcov 合并）、fixtures 的 `clippy` / `fmt` 门禁（`fixtures/plugins/vision/src/lib.rs`
+在 HEAD 上就有一处 fmt 漂移，接门禁前必须先修）、把 10 个 expr 子 crate 并进 fixtures
+workspace（`prepare-artifacts` 会开始把它们当插件扫描，需先验证 tooling 的行为）。
+
+### 5.2.53 工具链 pin 与词法层非有限数守卫（2026-10-27）
+
+两个互不相干的硬化，都不动运行时语义：
+
+- [x] **工具链 pin（构建期预防）**：新增 `rust-toolchain.toml`（`channel = "1.97.1"`，
+  含 `clippy`/`rustfmt`）。插件 ABI 是 Rust ABI（`fn` 指针 + 按值 `String`），宿主与
+  dylib 必须由同一个 rustc 编译；`AbiFingerprint` 只在加载期兜底，缺实例时表现为
+  加载期 undefined symbol。CI 六个 `dtolnay/rust-toolchain` 步骤同步从 `@stable` 改为
+  `@master` + `toolchain: 1.97.1`，避免"pin 了文件、CI 却装另一个 stable"的错配。
+  升级方式：改 `channel` → 同步改 5 个 workflow → `prepare-artifacts --full` 重建
+  成品（工件的 rustc 指纹随之变化）。
+- [x] **词法层拦非有限字面量**：`f64::from_str` 对超大数字**不报错**而是返回 `inf`，
+  而 `inf`/`NaN` 会被 `serde_json` 序列化成 `null`——`/expr` 于是把"无限大"当成一个
+  正常的 `null` 回给调用方，排查时看不到任何线索。现在 `lexer/src/core.rs` 在 parse
+  成功后校验 `is_finite()`，非有限即 `LexError::InvalidNumber`（与 `.` 这类本就非法的
+  字面量走同一条错误路径）；边界内的大数（如 10^308）仍照常通过。
+
+**顺带修掉一个一直红着的测试**：`expr/lexer/tests/lexer.rs::rejects_unexpected_character`
+原来拿 `1 + a` 断言词法错误，但 `a` 是合法标识符（`pi`/`e` 在 parser 里才解析成常量）。
+`expr/lexer` 在 `fixtures/plugins` workspace 的 `exclude` 名单里，而 CI 只跑主 workspace
+的 `cargo test --locked`，所以这条早已失败的断言从没被门禁发现。现在改成 `1 + @`，并补
+`lexes_unknown_identifier_as_token` 把"词法层接受标识符、语法层才拒绝"这条边界固定下来。
+
+**验证**：`expr` 集成测试 22 项、`expr/lexer` 6 项全过；两 crate 的
+`cargo clippy --all-targets -- -D warnings` 与 `rustfmt --check` 干净；
+`rustup show active-toolchain` 在仓库内解析为
+`1.97.1-x86_64-unknown-linux-gnu (overridden by 'rust-toolchain.toml')`。
 
 ### 5.2.52 图片追问：链接会过期，缓存 + 追问指引（2026-10-26 已闭合）
 
@@ -1374,3 +1473,17 @@ cd fixtures/plugins/expr/lexer && cargo test --lib  # excluded, external tests o
 - **工作流 SDK 已就绪，运行时适配层缺失** — `WorkflowRuntime` trait 与 6 种原语在 SDK 中有定义和测试，但运行时桥接层尚未实现。
 - **金丝雀发布只有单次回放，无流量分层和自动晋升。**
 - 未完成的主要是：执行语义闭合、产品化、服务化、更多插件形态和金丝雀闭环。
+
+### 4.6 一次性 `invoke` CLI 不注入 `settings`
+
+`settings` 的注入点在 `RuntimeSnapshot::invoke`（`RuntimeHost` 路径：agent 工具、console/REPL、
+`execute_target`）。调试用的 `cordis-runtime invoke <plugin> <node>` 走 `PluginInvoker`，它只加载
+插件、不读 `config/plugins/`，所以同一个 `filesystem` 插件在调试 CLI 里只认 fixtures 根，对配置
+出来的目录会报 `access denied`。补齐方式是让 `PluginInvoker::load` 也加载 `RuntimeConfig` 并同样
+注入，属独立小批。
+
+### 4.7 `runtime.snapshot_root` / `kernel.change_history_limit` 不支持热重载
+
+前者决定 staging 根，进程内已固定；后者在 `RuntimeKernel::new` 时写进 `ChangeMemory`。两者在
+reload 时保留 boot 值（`snapshot_root` 会打日志说明），要改只能重启。若要支持，需要定义
+"换 staging 根时旧快照与 retired 目录怎么回收"的语义。

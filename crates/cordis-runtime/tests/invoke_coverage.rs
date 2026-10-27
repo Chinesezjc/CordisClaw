@@ -29,7 +29,7 @@ use cordis_runtime::core::models::{
 };
 use cordis_runtime::plugin::dynamic::LoadedDylibApi;
 use cordis_runtime::plugin::invoke::{
-    invoke_registered_plugin, unregister_task_library, PluginInvoker,
+    invoke_registered_plugin, retained_task_library_count, unregister_task_library, PluginInvoker,
 };
 use cordis_runtime::plugin::registry::PluginRegistry;
 use std::collections::BTreeSet;
@@ -1059,6 +1059,43 @@ fn task_service_vtable_start_is_invoked() {
     std::env::remove_var("COV_SVC_OUT");
     // Release the keep-alive dylib handle registered by the Task invoke.
     unregister_task_library("svcmini");
+}
+
+// A reload replaces a Task-node plugin's keep-alive handle. The old dylib must
+// be *retained*, not dlclosed: a plugin's stop handler is not required to join
+// its threads, and unmapping a dylib that a live thread still executes is
+// exactly how `reload /qq` used to SIGSEGV (its message poller never stopped).
+#[test]
+#[serial_test::serial]
+fn task_library_handles_are_retained_instead_of_unloaded() {
+    let Some((temp, dylib)) = build_svcmini_dylib() else {
+        return; // skip: toolchain unavailable
+    };
+    let registry = PluginRegistry::default();
+    register_loaded_dylib(&registry, "svcmini", &dylib);
+    std::env::set_var("COV_SVC_OUT", temp.path().join("retain.marker"));
+
+    let before = retained_task_library_count();
+    // Two Task invokes: the second replaces the keep-alive handle.
+    invoke_registered_plugin(&registry, "svcmini", "svc_task", "{}".to_string())
+        .expect("first task invoke");
+    invoke_registered_plugin(&registry, "svcmini", "svc_task", "{}".to_string())
+        .expect("second task invoke");
+    assert!(
+        retained_task_library_count() > before,
+        "the replaced handle must be retained, not dropped"
+    );
+
+    // The reload path calls this; it must retire the handle instead of freeing it.
+    let before_unregister = retained_task_library_count();
+    unregister_task_library("svcmini");
+    assert_eq!(
+        retained_task_library_count(),
+        before_unregister + 1,
+        "unregister_task_library must retain the mapping"
+    );
+
+    std::env::remove_var("COV_SVC_OUT");
 }
 
 // The null-vtable sub-branch: a Task node whose `_cordis_create_service`

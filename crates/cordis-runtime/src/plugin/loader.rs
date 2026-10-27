@@ -19,7 +19,7 @@ use crate::plugin::artifact::{
 use crate::plugin::registry::{NodeRegistry, PluginRegistry};
 use crate::service::doc_registry::DocRegistry;
 use crate::service::graph_registry::GraphRegistry;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -41,6 +41,9 @@ pub struct LoaderMetrics {
     pub dylib_no_fallback_total: u64,
     /// Count of plugins marked unavailable.
     pub plugin_unavailable_total: u64,
+    /// Count of plugins skipped because `config/plugins/<name>.yaml` set
+    /// `enabled: false`. They are never staged, loaded or registered.
+    pub disabled_plugins_skipped: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -57,11 +60,29 @@ pub struct LoadOutput {
 #[derive(Debug)]
 pub struct Loader {
     config: LoaderConfig,
+    /// Plugin paths disabled by `config/plugins/<name>.yaml` (`enabled: false`).
+    /// Filtered out of the load entirely: no staging, no dylib open, no node
+    /// registration — so a disabled plugin's Task services never start, and a
+    /// reload that drops it also stops the services it had.
+    disabled: BTreeSet<String>,
 }
 
 impl Loader {
     pub fn new(config: LoaderConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            disabled: BTreeSet::new(),
+        }
+    }
+
+    /// Same loader configuration, but skipping `disabled` plugin paths.
+    pub fn with_disabled(mut self, disabled: BTreeSet<String>) -> Self {
+        self.disabled = disabled;
+        self
+    }
+
+    pub fn disabled(&self) -> &BTreeSet<String> {
+        &self.disabled
     }
 
     pub fn load(&self) -> Result<LoadOutput, RuntimeError> {
@@ -77,10 +98,16 @@ impl Loader {
         let mut index = load_artifact_index(&self.config.artifact_index_path)?;
         self.ensure_not_timed_out(started_at)?;
 
-        let plugin_count = index.entries.len();
+        let enabled_count = index
+            .entries
+            .iter()
+            .filter(|entry| !self.disabled.contains(&entry.plugin_path))
+            .count();
+        let plugin_count = enabled_count;
         let declared_nodes = index
             .entries
             .iter()
+            .filter(|entry| !self.disabled.contains(&entry.plugin_path))
             .map(|entry| entry.docs.nodes.len())
             .sum::<usize>();
         if plugin_count > self.config.budget.max_total_plugins
@@ -124,6 +151,11 @@ impl Loader {
 
         for plugin_path in &index.topo_order {
             self.ensure_not_timed_out(started_at)?;
+            if self.disabled.contains(plugin_path) {
+                metrics.disabled_plugins_skipped += 1;
+                eprintln!("[loader] plugin `{plugin_path}` disabled by config; skipping");
+                continue;
+            }
             let entry =
                 index_map
                     .get(plugin_path)
@@ -1255,6 +1287,54 @@ mod loader_flow_tests {
     }
 
     // --- budget --------------------------------------------------------------
+
+    // `enabled: false` filters the plugin out before staging: nothing is
+    // registered, the skip is counted, and the plugin no longer consumes the
+    // plugin budget (so a disabled plugin can't push a load over the limit).
+    #[test]
+    fn load_with_disabled_skips_plugin_and_frees_budget() {
+        let tmp = TempDir::new().unwrap();
+        let artifacts_dir = tmp.path().join("artifacts");
+        fs::create_dir_all(&artifacts_dir).unwrap();
+        let mut entries = Vec::new();
+        for plugin_path in ["alpha", "beta"] {
+            let abi = abi_host("crate_v1", "api_v2");
+            let d = docs(plugin_path);
+            let artifact = PluginArtifact {
+                plugin_path: plugin_path.to_string(),
+                abi_fingerprint: abi.clone(),
+                docs: d.clone(),
+                exports: Vec::new(),
+                execution: None,
+            };
+            let rel = format!("{plugin_path}.json");
+            let (rel, sha) = write_json_artifact(&artifacts_dir, &rel, &artifact);
+            entries.push(json_entry(plugin_path, &rel, &sha, abi, d));
+        }
+        let mut config = write_index(
+            tmp.path(),
+            &ArtifactIndex {
+                schema_version: ARTIFACT_INDEX_SCHEMA_VERSION,
+                generated_at: "now".to_string(),
+                topo_order: vec!["alpha".to_string(), "beta".to_string()],
+                entries,
+            },
+        );
+        // Budget of one plugin would reject the unfiltered tree of two.
+        config.budget.max_total_plugins = 1;
+
+        let loader = Loader::new(config).with_disabled(["alpha".to_string()].into_iter().collect());
+        assert!(loader.disabled().contains("alpha"));
+        let out = loader
+            .load()
+            .expect("disabled plugin must not trip the budget");
+        assert!(out.plugin_registry.get("alpha").is_none());
+        assert!(matches!(
+            out.plugin_registry.get("beta").unwrap().load_result,
+            PluginLoadResult::Loaded
+        ));
+        assert_eq!(out.metrics.disabled_plugins_skipped, 1);
+    }
 
     #[test]
     fn load_budget_exceeded_plugins() {

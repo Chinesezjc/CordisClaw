@@ -521,3 +521,284 @@ fn setup_artifacts_only_copy() -> TempDir {
     }
     temp
 }
+
+// ---------------------------------------------------------------------------
+// Config hot-reload: `settings` / `enabled` / LLM profiles come from `config/`,
+// so a reload has to re-read it. A broken config must fail the reload and leave
+// the previous snapshot serving.
+// ---------------------------------------------------------------------------
+
+/// A JSON-artifact fixture tree whose sibling `config/` directory is where
+/// `discover_config_dir` will look (the dir is literally named `fixtures`).
+/// `snapshot_root` is pinned inside the same `TempDir` so staging bytes die
+/// with the test.
+fn configurable_fixture(plugin_paths: &[&str]) -> (TempDir, PathBuf, PathBuf) {
+    let (temp, fixtures) = json_fixture(plugin_paths);
+    let config_dir = temp.path().join("config");
+    fs::create_dir_all(config_dir.join("plugins")).expect("create config dir");
+    fs::write(
+        config_dir.join("runtime.yaml"),
+        format!(
+            "runtime:\n  snapshot_root: {}\n",
+            temp.path().join(".snapshots").display()
+        ),
+    )
+    .expect("write runtime.yaml");
+    (temp, fixtures, config_dir)
+}
+
+fn write_plugin_config(config_dir: &Path, plugin: &str, body: &str) {
+    fs::write(
+        config_dir.join("plugins").join(format!("{plugin}.yaml")),
+        body,
+    )
+    .expect("write plugin config");
+}
+
+fn write_llm_config(config_dir: &Path, model: &str) {
+    fs::write(
+        config_dir.join("llm_api.yaml"),
+        format!(
+            "provider: deepseek\nbase_url: http://127.0.0.1:9/v1\napi_key: test-key\nmodel: {model}\ntemperature: 0.0\nmax_tokens: 16\ntimeout_ms: 1000\nstream_timeout_secs: 1\n"
+        ),
+    )
+    .expect("write llm_api.yaml");
+}
+
+// `enabled: false` keeps the plugin out of the snapshot entirely, and a reload
+// after flipping the flag brings it back (or drops it again).
+#[test]
+#[serial]
+fn reload_honours_plugin_enabled_flag_both_ways() {
+    let (temp, fixtures, config_dir) = configurable_fixture(&["alpha", "beta"]);
+    let _guard = ConfigDirGuard::unset();
+    write_plugin_config(
+        &config_dir,
+        "alpha",
+        "plugin: alpha\nenabled: false\nsettings:\n  read_roots: [/tmp/alpha]\n",
+    );
+
+    let host = RuntimeHost::boot(&fixtures).expect("boot with alpha disabled");
+    assert!(
+        host.current_snapshot()
+            .plugin_registry()
+            .get("alpha")
+            .is_none(),
+        "a disabled plugin must not be loaded at all"
+    );
+    assert!(host
+        .current_snapshot()
+        .plugin_registry()
+        .get("beta")
+        .is_some());
+    // Only `alpha` has a config file; `plugin_config_count` counts configured
+    // plugins, not loaded ones.
+    assert_eq!(host.kernel().status().plugin_disabled_count, 1);
+    assert_eq!(host.kernel().status().plugin_config_count, 1);
+
+    // Disabled means "not registered", so an invoke is a clean not-registered
+    // error rather than a call into a plugin the operator switched off.
+    let err = host
+        .invoke("alpha", "alpha_entry", "{}".to_string())
+        .expect_err("disabled plugin must not be invokable");
+    assert!(
+        matches!(&err, RuntimeError::PluginNotRegistered { plugin_path } if plugin_path == "alpha"),
+        "unexpected: {err:?}"
+    );
+
+    write_plugin_config(
+        &config_dir,
+        "alpha",
+        "plugin: alpha\nenabled: true\nsettings:\n  read_roots: [/tmp/alpha]\n",
+    );
+    let report = host.reload_with_diagnostics("/");
+    assert_eq!(
+        report.status,
+        ReloadAttemptStatus::Reloaded,
+        "reload after enabling alpha: {report:?}"
+    );
+    assert!(host
+        .current_snapshot()
+        .plugin_registry()
+        .get("alpha")
+        .is_some());
+    assert_eq!(host.kernel().status().plugin_disabled_count, 0);
+
+    write_plugin_config(&config_dir, "alpha", "plugin: alpha\nenabled: false\n");
+    let report = host.reload_with_diagnostics("/");
+    assert_eq!(report.status, ReloadAttemptStatus::Reloaded);
+    assert!(
+        host.current_snapshot()
+            .plugin_registry()
+            .get("alpha")
+            .is_none(),
+        "re-disabling alpha must drop it from the new snapshot"
+    );
+    assert_eq!(host.kernel().status().plugin_disabled_count, 1);
+    drop(temp);
+}
+
+// The LLM profile is part of the config, so a reload must surface the new
+// provider/model in `kernel status` — otherwise "restart to change the model"
+// would still be true after claiming hot reload.
+#[test]
+#[serial]
+fn reload_rereads_llm_model() {
+    let (temp, fixtures, config_dir) = configurable_fixture(&["alpha"]);
+    let _guard = ConfigDirGuard::unset();
+    write_llm_config(&config_dir, "model-one");
+
+    let host = RuntimeHost::boot(&fixtures).expect("boot with model-one");
+    assert_eq!(host.kernel().status().llm_model, "model-one");
+    assert_eq!(host.config().llm_api.model, "model-one");
+
+    write_llm_config(&config_dir, "model-two");
+    let report = host.reload_with_diagnostics("/");
+    assert_eq!(report.status, ReloadAttemptStatus::Reloaded);
+    assert_eq!(
+        host.kernel().status().llm_model,
+        "model-two",
+        "reload must install the new LLM config"
+    );
+    assert_eq!(host.config().llm_api.model, "model-two");
+    drop(temp);
+}
+
+// A broken config fails the reload and leaves the previous snapshot serving.
+#[test]
+#[serial]
+fn reload_with_broken_config_fails_and_keeps_snapshot() {
+    let (temp, fixtures, config_dir) = configurable_fixture(&["alpha"]);
+    let _guard = ConfigDirGuard::unset();
+    write_llm_config(&config_dir, "model-one");
+
+    let host = RuntimeHost::boot(&fixtures).expect("boot");
+    let before = host.current_snapshot().snapshot_id().to_string();
+
+    fs::write(config_dir.join("llm_api.yaml"), "provider: [unclosed\n").expect("break yaml");
+    let report = host.reload_with_diagnostics("/");
+    assert_eq!(report.status, ReloadAttemptStatus::Failed);
+    let summary = report.failure_summary.clone().unwrap_or_default();
+    assert!(
+        summary.contains("llm_api.yaml") || summary.contains("config"),
+        "failure must point at the config file: {summary}"
+    );
+    assert_eq!(
+        host.current_snapshot().snapshot_id(),
+        before,
+        "a failed reload must not swap in a new snapshot"
+    );
+    assert_eq!(host.kernel().status().llm_model, "model-one");
+
+    // Fixing the config makes the next reload succeed again.
+    write_llm_config(&config_dir, "model-three");
+    let report = host.reload_with_diagnostics("/");
+    assert_eq!(report.status, ReloadAttemptStatus::Reloaded);
+    assert_eq!(host.kernel().status().llm_model, "model-three");
+    drop(temp);
+}
+
+// `runtime.snapshot_root` decides where snapshots are staged; the process pins
+// it at boot, so a reload keeps the boot value instead of silently staging
+// somewhere else.
+#[test]
+#[serial]
+fn reload_keeps_boot_snapshot_root() {
+    let (temp, fixtures, config_dir) = configurable_fixture(&["alpha"]);
+    let _guard = ConfigDirGuard::unset();
+    let host = RuntimeHost::boot(&fixtures).expect("boot");
+    let boot_root = host.config().runtime.snapshot_root.clone();
+
+    fs::write(
+        config_dir.join("runtime.yaml"),
+        format!(
+            "runtime:\n  snapshot_root: {}\n",
+            temp.path().join(".other-snapshots").display()
+        ),
+    )
+    .expect("rewrite runtime.yaml");
+    let report = host.reload_with_diagnostics("/");
+    assert_eq!(report.status, ReloadAttemptStatus::Reloaded);
+    assert_eq!(
+        host.config().runtime.snapshot_root,
+        boot_root,
+        "snapshot_root must not change under a running host"
+    );
+    drop(temp);
+}
+
+/// Keep `CORDIS_CONFIG_DIR` unset across a test (other serial tests set it),
+/// restoring whatever value was there on drop.
+struct ConfigDirGuard {
+    previous: Option<std::ffi::OsString>,
+}
+
+impl ConfigDirGuard {
+    fn unset() -> Self {
+        let previous = std::env::var_os("CORDIS_CONFIG_DIR");
+        std::env::remove_var("CORDIS_CONFIG_DIR");
+        Self { previous }
+    }
+}
+
+impl Drop for ConfigDirGuard {
+    fn drop(&mut self) {
+        match self.previous.take() {
+            Some(value) => std::env::set_var("CORDIS_CONFIG_DIR", value),
+            None => std::env::remove_var("CORDIS_CONFIG_DIR"),
+        }
+    }
+}
+
+// `reload_candidate` builds its snapshot from the freshly loaded config, but a
+// candidate must not change live behaviour until it is promoted.
+#[test]
+#[serial]
+fn candidate_reload_defers_config_until_promote() {
+    let (temp, fixtures, config_dir) = configurable_fixture(&["alpha"]);
+    let _guard = ConfigDirGuard::unset();
+    write_llm_config(&config_dir, "model-one");
+
+    let host = RuntimeHost::boot(&fixtures).expect("boot with model-one");
+    assert_eq!(host.kernel().status().llm_model, "model-one");
+
+    write_llm_config(&config_dir, "model-two");
+    let report = host.reload_candidate_with_diagnostics();
+    assert_eq!(
+        report.status,
+        ReloadAttemptStatus::Staged,
+        "candidate reload stages a snapshot: {report:?}"
+    );
+    assert_eq!(
+        host.kernel().status().llm_model,
+        "model-one",
+        "a staged candidate must not install its config before promotion"
+    );
+
+    host.promote_candidate()
+        .expect("promote the staged candidate");
+    assert_eq!(host.kernel().status().llm_model, "model-two");
+    assert_eq!(host.config().llm_api.model, "model-two");
+    drop(temp);
+}
+
+// A broken config also fails the *candidate* reload: nothing is staged, so a
+// later promote cannot install a config that never parsed.
+#[test]
+#[serial]
+fn candidate_reload_with_broken_config_reports_failed() {
+    let (temp, fixtures, config_dir) = configurable_fixture(&["alpha"]);
+    let _guard = ConfigDirGuard::unset();
+    let host = RuntimeHost::boot(&fixtures).expect("boot");
+    let before = host.current_snapshot().snapshot_id().to_string();
+
+    fs::write(config_dir.join("llm_api.yaml"), "provider: [unclosed\n").expect("break yaml");
+    let report = host.reload_candidate_with_diagnostics();
+    assert_eq!(report.status, ReloadAttemptStatus::Failed);
+    assert!(
+        host.candidate_status().is_none(),
+        "a candidate reload with a broken config must not stage anything"
+    );
+    assert_eq!(host.current_snapshot().snapshot_id(), before);
+    drop(temp);
+}

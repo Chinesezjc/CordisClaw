@@ -32,7 +32,7 @@ use crate::kernel::verifier::{
 };
 use crate::plugin::abi::PluginResponse;
 use crate::plugin::builder::{missing_builder_error, plugin_builder};
-use crate::plugin::invoke::invoke_registered_plugin;
+use crate::plugin::invoke::invoke_registered_plugin_with_settings;
 use crate::plugin::loader::{default_loader_config, LoadOutput, Loader};
 use crate::plugin::registry::{NodeRegistry, PluginRegistry, RegisteredPlugin};
 use crate::service::doc_registry::DocRegistry;
@@ -62,6 +62,10 @@ pub struct RuntimeSnapshot {
     graph_registry: GraphRegistry,
     context_baseline: RuntimeContext,
     staged_artifact_root: PathBuf,
+    /// Per-plugin `settings` from `config/plugins/<name>.yaml`, carried by the
+    /// snapshot so every invocation path (agent tool call, `execute_target`,
+    /// reload) sees the same configuration without re-reading the config dir.
+    plugin_settings: BTreeMap<String, PluginConfigFile>,
 }
 
 impl RuntimeSnapshot {
@@ -99,7 +103,17 @@ impl RuntimeSnapshot {
         node_id: &str,
         payload: String,
     ) -> Result<PluginResponse, RuntimeError> {
-        invoke_registered_plugin(&self.plugin_registry, plugin_path, node_id, payload)
+        let settings = self
+            .plugin_settings
+            .get(plugin_path)
+            .map(|config| &config.settings);
+        invoke_registered_plugin_with_settings(
+            &self.plugin_registry,
+            plugin_path,
+            node_id,
+            payload,
+            settings,
+        )
     }
 
     pub fn execute_registered_target(
@@ -688,7 +702,7 @@ mod cov_fa_host_1_3500_tests {
     };
     use cordis_plugin_sdk::{node_doc, plugin_docs, AbiFingerprint, NodeDoc};
     use serde_json::json;
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::fs;
     use std::path::PathBuf;
     use tempfile::TempDir;
@@ -780,7 +794,97 @@ mod cov_fa_host_1_3500_tests {
                 metrics: crate::plugin::loader::LoaderMetrics::default(),
             },
             PathBuf::from("/tmp/cordis-ghost-upstream-staged"),
+            BTreeMap::new(),
         )
+    }
+
+    // The snapshot carries each plugin's `settings` and hands them to the
+    // invoker. A JSON-artifact plugin (`cat`) proves what the plugin receives:
+    // a configured dylib plugin would get `settings` merged into its payload,
+    // while a process plugin still sees its stdin verbatim.
+    #[test]
+    fn snapshot_invoke_passes_configured_plugin_settings() {
+        let plugin_path = "json/echo".to_string();
+        let node_id = "echo_node".to_string();
+        let docs = plugin_docs(
+            plugin_path.clone(),
+            plugin_path.clone(),
+            "0.1.0",
+            None,
+            vec![node_doc(
+                &node_id,
+                "echoes the payload",
+                json!({ "type": "object" }),
+                json!({ "type": "object" }),
+                &[],
+                &[],
+            )],
+            None,
+        );
+        let dir = TempDir::new().expect("tempdir");
+        let artifact = dir.path().join("plugin.json");
+        fs::write(&artifact, "{}").expect("write artifact stub");
+
+        let plugin_registry = crate::plugin::registry::PluginRegistry::default();
+        plugin_registry.insert_loaded(
+            plugin_path.clone(),
+            None,
+            true,
+            BTreeSet::new(),
+            docs,
+            artifact,
+            ArtifactKind::Json,
+            AbiFingerprint::current_build("crate_echo_v1", "api_v2"),
+            Some(crate::core::models::PluginExecution::Process {
+                command: "/bin/cat".to_string(),
+                args: vec![],
+            }),
+        );
+        let node_registry = crate::plugin::registry::NodeRegistry::default();
+        let doc_registry =
+            crate::service::doc_registry::DocRegistry::from_plugin_registry(&plugin_registry);
+        let graph_registry = crate::service::graph_registry::GraphRegistry::from_registries(
+            &plugin_registry,
+            &node_registry,
+        );
+
+        let with_settings = |settings: BTreeMap<String, crate::config::PluginConfigFile>| {
+            runtime_snapshot_from_output(
+                crate::plugin::loader::LoadOutput {
+                    execution_id: "snap-settings".to_string(),
+                    plugin_registry: plugin_registry.clone(),
+                    node_registry: node_registry.clone(),
+                    doc_registry: doc_registry.clone(),
+                    graph_registry: graph_registry.clone(),
+                    context: crate::context::RuntimeContext::default(),
+                    metrics: crate::plugin::loader::LoaderMetrics::default(),
+                },
+                PathBuf::from("/tmp/cordis-settings-staged"),
+                settings,
+            )
+        };
+
+        // Configured plugin: the invoker is handed its settings block, and the
+        // process plugin still receives exactly the caller's stdin.
+        let mut configured = BTreeMap::new();
+        configured.insert(
+            plugin_path.clone(),
+            crate::config::PluginConfigFile {
+                plugin: plugin_path.clone(),
+                enabled: true,
+                settings: json!({ "read_roots": ["/tmp/configured-root"] }),
+            },
+        );
+        let echoed = with_settings(configured)
+            .invoke(&plugin_path, &node_id, r#"{"hello":"world"}"#.to_string())
+            .expect("cat echoes the payload");
+        assert_eq!(echoed.payload, r#"{"hello":"world"}"#);
+
+        // Unconfigured plugin: no settings lookup hit, payload unchanged.
+        let plain = with_settings(BTreeMap::new())
+            .invoke(&plugin_path, &node_id, r#"{"hello":"world"}"#.to_string())
+            .expect("cat echoes the payload");
+        assert_eq!(plain.payload, r#"{"hello":"world"}"#);
     }
 
     #[test]
@@ -1143,6 +1247,10 @@ pub struct KernelStatus {
     pub llm_provider: String,
     pub llm_model: String,
     pub plugin_config_count: usize,
+    /// Plugins switched off by `config/plugins/<name>.yaml` (`enabled: false`).
+    /// They are filtered out at load time, so they never appear in the registry.
+    #[serde(default)]
+    pub plugin_disabled_count: usize,
     pub iteration_total: u64,
     pub iteration_promote_total: u64,
     pub iteration_rollback_total: u64,
@@ -1227,8 +1335,11 @@ struct KernelIterationMetrics {
 pub struct RuntimeKernel {
     workspace_root: PathBuf,
     config_dir: PathBuf,
-    llm_api: LlmApiConfig,
-    plugin_configs: BTreeMap<String, PluginConfigFile>,
+    /// LLM API of the "default" profile. `RwLock` so a reload that re-reads
+    /// `config/llm_api.yaml` can swap it without rebuilding the kernel; the
+    /// many read sites clone it out under the lock.
+    llm_api: RwLock<LlmApiConfig>,
+    plugin_configs: RwLock<BTreeMap<String, PluginConfigFile>>,
     plugin_iteration_policy: PluginIterationPolicy,
     plugin_issues: Mutex<BTreeMap<String, KernelPluginIssue>>,
     plugin_history: Mutex<VecDeque<PluginIterationHistoryEntry>>,
@@ -1245,8 +1356,8 @@ impl RuntimeKernel {
         let workspace_root = workspace_root.into();
         Self {
             config_dir: config.config_dir.clone(),
-            llm_api: config.llm_api.clone(),
-            plugin_configs: config.plugin_configs.clone(),
+            llm_api: RwLock::new(config.llm_api.clone()),
+            plugin_configs: RwLock::new(config.plugin_configs.clone()),
             plugin_iteration_policy: PluginIterationPolicy::default(),
             plugin_issues: Mutex::new(BTreeMap::new()),
             plugin_history: Mutex::new(VecDeque::new()),
@@ -1260,6 +1371,20 @@ impl RuntimeKernel {
         }
     }
 
+    /// Install a reloaded config: the LLM API and the per-plugin config block
+    /// both feed `status()` and the plugin-iteration gate, so they have to move
+    /// together with the host's copy.
+    pub fn apply_config(&self, config: &RuntimeConfig) {
+        *self
+            .llm_api
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner()) = config.llm_api.clone();
+        *self
+            .plugin_configs
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner()) = config.plugin_configs.clone();
+    }
+
     pub fn workspace_root(&self) -> &Path {
         &self.workspace_root
     }
@@ -1268,6 +1393,17 @@ impl RuntimeKernel {
         // Lock each field individually and drop the guard immediately
         // to prevent deadlocks with concurrent PluginIteration operations
         // that may also need these locks.
+        let llm_api = self
+            .llm_api
+            .read()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone();
+        let plugin_configs = self
+            .plugin_configs
+            .read()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let plugin_config_count = plugin_configs.len();
+        let plugin_disabled_count = plugin_configs.values().filter(|c| !c.enabled).count();
         let plugin_issue_count = self
             .plugin_issues
             .lock()
@@ -1317,9 +1453,10 @@ impl RuntimeKernel {
         KernelStatus {
             workspace_root: self.workspace_root.display().to_string(),
             config_dir: self.config_dir.display().to_string(),
-            llm_provider: self.llm_api.provider.clone(),
-            llm_model: self.llm_api.model.clone(),
-            plugin_config_count: self.plugin_configs.len(),
+            llm_provider: llm_api.provider.clone(),
+            llm_model: llm_api.model.clone(),
+            plugin_config_count,
+            plugin_disabled_count,
             iteration_total,
             iteration_promote_total,
             iteration_rollback_total,
@@ -1435,12 +1572,17 @@ impl RuntimeKernel {
     }
 
     pub fn can_auto_iterate_plugins(&self) -> bool {
-        self.llm_api
+        let llm_api = self
+            .llm_api
+            .read()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone();
+        llm_api
             .api_key
             .as_ref()
             .map(|key| !key.trim().is_empty())
             .unwrap_or(false)
-            || std::env::var(&self.llm_api.api_key_env)
+            || std::env::var(&llm_api.api_key_env)
                 .map(|value| !value.trim().is_empty())
                 .unwrap_or(false)
     }
@@ -1802,8 +1944,10 @@ impl RuntimeKernel {
 #[derive(Debug)]
 pub struct RuntimeHost {
     fixtures_root: PathBuf,
-    config: RuntimeConfig,
-    loader: Loader,
+    /// Boot-time configuration, replaced by a `reload` that re-reads
+    /// `config/` (see `reload_internal`). `RwLock` because reload installs the
+    /// new value while agent turns / status readers keep borrowing the old one.
+    config: RwLock<RuntimeConfig>,
     snapshot_root: PathBuf,
     current_snapshot: RwLock<Arc<RuntimeSnapshot>>,
     candidate_snapshot: Mutex<Option<StagedCandidateSnapshot>>,
@@ -1852,6 +1996,9 @@ struct RetiredSnapshot {
 struct StagedCandidateSnapshot {
     snapshot: Arc<RuntimeSnapshot>,
     status: CandidateSnapshotStatus,
+    /// Config the candidate snapshot was built with. `reload_candidate` reads
+    /// `config/` to build it, but the values only go live on `promote`.
+    config: RuntimeConfig,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -2303,7 +2450,8 @@ impl RuntimeHost {
     pub fn boot(fixtures_root: impl AsRef<Path>) -> Result<Self, RuntimeError> {
         let fixtures_root = fixtures_root.as_ref().to_path_buf();
         let config = RuntimeConfig::load(&fixtures_root)?;
-        let loader = Loader::new(default_loader_config(&fixtures_root));
+        let loader = Loader::new(default_loader_config(&fixtures_root))
+            .with_disabled(disabled_plugins(&config));
         let snapshot_root = config
             .resolve_snapshot_root(&fixtures_root)
             .unwrap_or_else(|| default_snapshot_root(&fixtures_root));
@@ -2332,14 +2480,17 @@ impl RuntimeHost {
         // staging 期间持锁：并发 boot 的 GC 试锁失败 → 跳过本目录，不会删掉
         // 我们刚 mkdir、还没 stage 完的 staging 目录。
         let _staging_guard = snapshot_staging_lock::hold(&snapshot_root);
-        let initial_snapshot = Arc::new(build_snapshot(&loader, &snapshot_root)?);
+        let initial_snapshot = Arc::new(build_snapshot(
+            &loader,
+            &snapshot_root,
+            &config.plugin_configs,
+        )?);
         let interactive_rollback = Mutex::new(PluginEditRollback::empty(&fixtures_root));
         let service_registry = Arc::new(crate::context::ServiceRegistry::new());
         let host = Self {
             kernel: RuntimeKernel::new(&fixtures_root, &config),
-            config,
+            config: RwLock::new(config),
             fixtures_root,
-            loader,
             snapshot_root,
             current_snapshot: RwLock::new(initial_snapshot),
             candidate_snapshot: Mutex::new(None),
@@ -3089,8 +3240,49 @@ impl RuntimeHost {
         Ok(count)
     }
 
-    pub fn config(&self) -> &RuntimeConfig {
-        &self.config
+    /// Snapshot of the current configuration. A clone rather than a reference
+    /// because `reload` can replace it under our feet; callers that need one
+    /// consistent read take it once.
+    pub fn config(&self) -> RuntimeConfig {
+        self.config_value()
+    }
+
+    /// Read the current config under the lock and clone it out.
+    fn config_value(&self) -> RuntimeConfig {
+        self.config
+            .read()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone()
+    }
+
+    /// Reconcile a freshly loaded config with values that cannot change while
+    /// the process runs.
+    ///
+    /// `runtime.snapshot_root` decides where snapshots are staged; the staging
+    /// root is fixed for the process lifetime, so a reload keeps the boot value
+    /// and says so instead of quietly writing snapshots somewhere else. Every
+    /// other field (`llm_api` / `llm_profiles` / `plugin_configs` / image policy)
+    /// is hot-swappable.
+    fn adopt_reloaded_config(&self, mut config: RuntimeConfig) -> RuntimeConfig {
+        let boot_snapshot_root = self.config_value().runtime.snapshot_root;
+        if config.runtime.snapshot_root != boot_snapshot_root {
+            eprintln!(
+                "[reload] runtime.snapshot_root changes require a restart; keeping the boot value"
+            );
+            config.runtime.snapshot_root = boot_snapshot_root;
+        }
+        config
+    }
+
+    /// Make a reloaded config live: host-side readers and the kernel's status
+    /// both have to see it, otherwise `kernel status` would keep reporting the
+    /// boot-time provider/model.
+    fn install_config(&self, config: RuntimeConfig) {
+        *self
+            .config
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner()) = config.clone();
+        self.kernel.apply_config(&config);
     }
 
     pub fn current_snapshot(&self) -> Arc<RuntimeSnapshot> {
@@ -3318,7 +3510,12 @@ export_plugin_api! {{
             }
         };
         let profile_name = options.profile.as_deref().unwrap_or("default");
-        let api = self.config.llm_profiles.resolve(profile_name).api.clone();
+        let api = self
+            .config_value()
+            .llm_profiles
+            .resolve(profile_name)
+            .api
+            .clone();
         let mut session = AgentSession::new(api, session_kind_label)?;
         session.set_soul_key(options.soul_key.clone());
         self.profile_fallback
@@ -3363,7 +3560,7 @@ export_plugin_api! {{
     /// 纯文本照常发。绝不让一张图毁掉整轮。
     pub fn image_parts_for_batch(&self, image_urls: &[String]) -> Vec<serde_json::Value> {
         let (parts, skips) = crate::image_input::plan_for_settings(
-            &self.config.runtime.images,
+            &self.config_value().runtime.images,
             image_urls,
             &crate::image_input::fetch_http,
         );
@@ -3648,7 +3845,8 @@ export_plugin_api! {{
                 Ok(reply)
             }
             Err(primary_err) => {
-                let Some(fallback) = self.config.llm_profiles.fallback_of(&entry.desired) else {
+                let config = self.config_value();
+                let Some(fallback) = config.llm_profiles.fallback_of(&entry.desired) else {
                     return Err(primary_err);
                 };
                 let fallback = fallback.to_string();
@@ -3694,7 +3892,12 @@ export_plugin_api! {{
         session_id: &str,
         profile_name: &str,
     ) -> Result<(), RuntimeError> {
-        let api = self.config.llm_profiles.resolve(profile_name).api.clone();
+        let api = self
+            .config_value()
+            .llm_profiles
+            .resolve(profile_name)
+            .api
+            .clone();
         let mut guard = self
             .agent_sessions
             .lock()
@@ -3873,7 +4076,7 @@ export_plugin_api! {{
         context_paths: PluginIterationContextPaths,
     ) -> Result<String, RuntimeError> {
         let session_id = normalize_request_id(None, "plugin-agent-session");
-        let mut llm_config = self.config.llm_api.clone();
+        let mut llm_config = self.config_value().llm_api.clone();
         llm_config.timeout_ms = llm_config
             .timeout_ms
             .min(PLUGIN_ITERATION_AGENT_TIMEOUT_CAP_MS);
@@ -4221,9 +4424,14 @@ export_plugin_api! {{
                     eprintln!("[reload] stop handler for {plugin_id}::{node_id} panicked: {msg}");
                 }
             }
-            // P0-16: drop the keep-alive dylib handle for this plugin path
-            // so the OS can unmap the old .so once the new one is loaded.
-            // Without this, every reload leaks a mapping.
+            // Retire the keep-alive dylib handle for this plugin path. The
+            // handle is moved to a retained list, NOT dropped: unloading a
+            // Task-node dylib unmaps code that the plugin's own detached
+            // threads may still be executing (observed as SIGSEGV right after
+            // a `reload /qq`, whose message poller never stops). A `stop`
+            // handler is not required to join every thread, so the mapping
+            // stays until process exit; the cost is one mapping per reload of
+            // a Task-node plugin.
             crate::plugin::invoke::unregister_task_library(plugin_path);
         }
 
@@ -4515,7 +4723,12 @@ export_plugin_api! {{
             }
             guard.take().ok_or(RuntimeError::CandidateSnapshotMissing)?
         };
-        let next_snapshot = candidate.snapshot;
+        let StagedCandidateSnapshot {
+            snapshot: next_snapshot,
+            config,
+            ..
+        } = candidate;
+        self.install_config(config);
         {
             let mut guard = self
                 .current_snapshot
@@ -5467,29 +5680,46 @@ export_plugin_api! {{
         let previous_snapshot = self.current_snapshot();
         let staged_artifact_root = next_staged_artifact_root(&self.snapshot_root);
         let started_at = Instant::now();
+        // Config is part of a reload: `settings`, `enabled` and the LLM profiles
+        // all come from `config/`, so a reload that only rebuilt dylibs would
+        // keep running on stale config. A broken config fails the reload and
+        // leaves the previous snapshot serving.
+        let config = match RuntimeConfig::load(&self.fixtures_root) {
+            Ok(config) => self.adopt_reloaded_config(config),
+            Err(err) => {
+                let attempt = failed_reload_attempt(
+                    previous_snapshot.as_ref(),
+                    &self.snapshot_root,
+                    &staged_artifact_root,
+                    started_at.elapsed().as_millis(),
+                    &err,
+                );
+                return Err((err, Box::new(attempt)));
+            }
+        };
+        let loader = Loader::new(default_loader_config(&self.fixtures_root))
+            .with_disabled(disabled_plugins(&config));
 
-        let next_snapshot =
-            match build_snapshot_with_staged_root(&self.loader, staged_artifact_root.clone()) {
-                Ok(snapshot) => Arc::new(snapshot),
-                Err(err) => {
-                    let attempt = ReloadAttemptReport {
-                        status: ReloadAttemptStatus::Failed,
-                        from_snapshot_id: previous_snapshot.snapshot_id().to_string(),
-                        to_snapshot_id: None,
-                        snapshot_root: self.snapshot_root.display().to_string(),
-                        staged_artifact_root: staged_artifact_root.display().to_string(),
-                        elapsed_ms: started_at.elapsed().as_millis(),
-                        plugin_count: None,
-                        node_count: None,
-                        added_plugins: Vec::new(),
-                        removed_plugins: Vec::new(),
-                        changed_plugins: Vec::new(),
-                        changed_plugin_reasons: BTreeMap::new(),
-                        failure_summary: Some(err.to_string()),
-                    };
-                    return Err((err, Box::new(attempt)));
-                }
-            };
+        let next_snapshot = match build_snapshot_with_staged_root(
+            &loader,
+            staged_artifact_root.clone(),
+            &config.plugin_configs,
+        ) {
+            Ok(snapshot) => Arc::new(snapshot),
+            Err(err) => {
+                let attempt = failed_reload_attempt(
+                    previous_snapshot.as_ref(),
+                    &self.snapshot_root,
+                    &staged_artifact_root,
+                    started_at.elapsed().as_millis(),
+                    &err,
+                );
+                return Err((err, Box::new(attempt)));
+            }
+        };
+        // Snapshot built → the reload is going to succeed, so the new config
+        // goes live together with it (settings, `enabled`, LLM profiles).
+        self.install_config(config);
 
         // Stop services for plugins that are being removed or changed in the
         // new snapshot before swapping it in.
@@ -5613,29 +5843,43 @@ export_plugin_api! {{
         let previous_snapshot = self.current_snapshot();
         let staged_artifact_root = next_staged_artifact_root(&self.snapshot_root);
         let started_at = Instant::now();
+        // Config is part of a reload: `settings`, `enabled` and the LLM profiles
+        // all come from `config/`, so a reload that only rebuilt dylibs would
+        // keep running on stale config. A broken config fails the reload and
+        // leaves the previous snapshot serving.
+        let config = match RuntimeConfig::load(&self.fixtures_root) {
+            Ok(config) => self.adopt_reloaded_config(config),
+            Err(err) => {
+                let attempt = failed_reload_attempt(
+                    previous_snapshot.as_ref(),
+                    &self.snapshot_root,
+                    &staged_artifact_root,
+                    started_at.elapsed().as_millis(),
+                    &err,
+                );
+                return Err((err, Box::new(attempt)));
+            }
+        };
+        let loader = Loader::new(default_loader_config(&self.fixtures_root))
+            .with_disabled(disabled_plugins(&config));
 
-        let next_snapshot =
-            match build_snapshot_with_staged_root(&self.loader, staged_artifact_root.clone()) {
-                Ok(snapshot) => Arc::new(snapshot),
-                Err(err) => {
-                    let attempt = ReloadAttemptReport {
-                        status: ReloadAttemptStatus::Failed,
-                        from_snapshot_id: previous_snapshot.snapshot_id().to_string(),
-                        to_snapshot_id: None,
-                        snapshot_root: self.snapshot_root.display().to_string(),
-                        staged_artifact_root: staged_artifact_root.display().to_string(),
-                        elapsed_ms: started_at.elapsed().as_millis(),
-                        plugin_count: None,
-                        node_count: None,
-                        added_plugins: Vec::new(),
-                        removed_plugins: Vec::new(),
-                        changed_plugins: Vec::new(),
-                        changed_plugin_reasons: BTreeMap::new(),
-                        failure_summary: Some(err.to_string()),
-                    };
-                    return Err((err, Box::new(attempt)));
-                }
-            };
+        let next_snapshot = match build_snapshot_with_staged_root(
+            &loader,
+            staged_artifact_root.clone(),
+            &config.plugin_configs,
+        ) {
+            Ok(snapshot) => Arc::new(snapshot),
+            Err(err) => {
+                let attempt = failed_reload_attempt(
+                    previous_snapshot.as_ref(),
+                    &self.snapshot_root,
+                    &staged_artifact_root,
+                    started_at.elapsed().as_millis(),
+                    &err,
+                );
+                return Err((err, Box::new(attempt)));
+            }
+        };
 
         let report = ReloadReport::from_snapshots(
             previous_snapshot.as_ref(),
@@ -5653,6 +5897,7 @@ export_plugin_api! {{
         let candidate_entry = StagedCandidateSnapshot {
             snapshot: next_snapshot,
             status: status.clone(),
+            config,
         };
 
         let mut guard = self
@@ -7708,14 +7953,59 @@ fn fill_missing_execution_traces(
     }
 }
 
-fn build_snapshot(loader: &Loader, snapshot_root: &Path) -> Result<RuntimeSnapshot, RuntimeError> {
+/// Plugin paths switched off by `config/plugins/<name>.yaml` (`enabled: false`).
+///
+/// A disabled plugin is filtered out at load time: it is never staged, never
+/// dlopened and never registered, so its Task services cannot start and
+/// `invoke_plugin` reports it as not registered.
+fn disabled_plugins(config: &RuntimeConfig) -> BTreeSet<String> {
+    config
+        .plugin_configs
+        .iter()
+        .filter(|(_, plugin_config)| !plugin_config.enabled)
+        .map(|(plugin_path, _)| plugin_path.clone())
+        .collect()
+}
+
+/// A failed `ReloadAttemptReport` (status `failed`), shared by the config-load
+/// failure and the snapshot-build failure paths so both report the same shape.
+fn failed_reload_attempt(
+    previous_snapshot: &RuntimeSnapshot,
+    snapshot_root: &Path,
+    staged_artifact_root: &Path,
+    elapsed_ms: u128,
+    err: &RuntimeError,
+) -> ReloadAttemptReport {
+    ReloadAttemptReport {
+        status: ReloadAttemptStatus::Failed,
+        from_snapshot_id: previous_snapshot.snapshot_id().to_string(),
+        to_snapshot_id: None,
+        snapshot_root: snapshot_root.display().to_string(),
+        staged_artifact_root: staged_artifact_root.display().to_string(),
+        elapsed_ms,
+        plugin_count: None,
+        node_count: None,
+        added_plugins: Vec::new(),
+        removed_plugins: Vec::new(),
+        changed_plugins: Vec::new(),
+        changed_plugin_reasons: BTreeMap::new(),
+        failure_summary: Some(err.to_string()),
+    }
+}
+
+fn build_snapshot(
+    loader: &Loader,
+    snapshot_root: &Path,
+    plugin_settings: &BTreeMap<String, PluginConfigFile>,
+) -> Result<RuntimeSnapshot, RuntimeError> {
     let staged_artifact_root = next_staged_artifact_root(snapshot_root);
-    build_snapshot_with_staged_root(loader, staged_artifact_root)
+    build_snapshot_with_staged_root(loader, staged_artifact_root, plugin_settings)
 }
 
 fn build_snapshot_with_staged_root(
     loader: &Loader,
     staged_artifact_root: PathBuf,
+    plugin_settings: &BTreeMap<String, PluginConfigFile>,
 ) -> Result<RuntimeSnapshot, RuntimeError> {
     fs::create_dir_all(&staged_artifact_root)
         .map_err(|e| region_io_error(&staged_artifact_root, &e))?;
@@ -7756,7 +8046,11 @@ fn build_snapshot_with_staged_root(
         );
     }
 
-    Ok(runtime_snapshot_from_output(output, staged_artifact_root))
+    Ok(runtime_snapshot_from_output(
+        output,
+        staged_artifact_root,
+        plugin_settings.clone(),
+    ))
 }
 
 fn register_builtin_agent_node(plugin_registry: &PluginRegistry, node_registry: &mut NodeRegistry) {
@@ -7828,6 +8122,7 @@ fn register_builtin_agent_node(plugin_registry: &PluginRegistry, node_registry: 
 fn runtime_snapshot_from_output(
     output: LoadOutput,
     staged_artifact_root: PathBuf,
+    plugin_settings: BTreeMap<String, PluginConfigFile>,
 ) -> RuntimeSnapshot {
     RuntimeSnapshot {
         snapshot_id: output.execution_id,
@@ -7837,6 +8132,7 @@ fn runtime_snapshot_from_output(
         graph_registry: output.graph_registry,
         context_baseline: output.context,
         staged_artifact_root,
+        plugin_settings,
     }
 }
 
@@ -9168,6 +9464,7 @@ mod tests {
         KernelPluginIterationRequest, PluginEditOpKind, PluginEditOperation,
     };
     use serial_test::serial;
+    use std::collections::BTreeMap;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::OnceLock;
@@ -10350,6 +10647,7 @@ mod tests {
                 metrics: crate::plugin::loader::LoaderMetrics::default(),
             },
             PathBuf::from("/tmp/cordis-broken-artifact-staged"),
+            BTreeMap::new(),
         )
     }
 
@@ -12599,6 +12897,7 @@ warning: unused import
                 metrics: crate::plugin::loader::LoaderMetrics::default(),
             },
             std::path::PathBuf::from("/tmp/cordis-empty-staged"),
+            BTreeMap::new(),
         )
     }
 
@@ -12904,7 +13203,7 @@ warning: unused import
             },
         });
         let staged = root.join("staged");
-        let err = build_snapshot_with_staged_root(&loader, staged.clone())
+        let err = build_snapshot_with_staged_root(&loader, staged.clone(), &BTreeMap::new())
             .expect_err("unavailable plugin must surface PluginUnavailable");
         assert!(
             matches!(&err, RuntimeError::PluginUnavailable { plugin_path, required, .. }
@@ -13454,6 +13753,7 @@ mod region_3500_5500_seam_tests {
                 metrics: crate::plugin::loader::LoaderMetrics::default(),
             },
             PathBuf::from("/tmp/cordis-seam-unavail-staged"),
+            BTreeMap::new(),
         )
     }
 
@@ -14937,7 +15237,7 @@ mod region_3500_5500_seam_tests {
         host.swap_session_profile(&sid, "no-such-profile")
             .expect("swap to the fallback-resolved default profile");
         let expected = host
-            .config
+            .config()
             .llm_profiles
             .resolve("default")
             .api

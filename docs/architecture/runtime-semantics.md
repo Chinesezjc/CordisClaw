@@ -166,7 +166,27 @@ Local(当前插件 -> 祖先插件中被 grants 明确允许的服务)
   - **具名 profile 表（推荐）**：顶层 `profiles: {name: {...}}`，每个 profile 是完整的 API 配置（provider/base_url/api_key_env/api_key/model/temperature/max_tokens/timeout_ms）外加可选 `fallback: <另一 profile 名>`（请求打穿后机械切换目标，L批）。`default` 必在（缺失自动补齐）；未知名引用回落 default。
   - **旧单份格式（兼容）**：整份文件是一个 API 配置，加载时自动包装为 `default` profile。
 - `config/plugins/*.yaml`
-  - 为各插件预留 `enabled + settings` 配置位
+  - `plugin` / `enabled` / `settings`，两项都已接通：
+  - `enabled: false` 在 **load 阶段**过滤：不 stage 工件、不 dlopen、不注册节点，
+    因此该插件的 Task 服务不会启动；reload 时被它移除的插件，其服务在换快照前
+    stop（与原有"docs 变更即重启服务"同一条路径）。`kernel status` 多一个
+    `plugin_disabled_count`，load 指标多一个 `disabled_plugins_skipped`。
+  - `settings` 由快照携带（`<plugin 名> → settings`），`RuntimeSnapshot::invoke`
+    调 `invoke_registered_plugin_with_settings` 合并进 payload 的 `settings` 键：
+    调用方自带同名键优先；空 `{}`/`null` 不注入；仅 dylib 插件生效（JSON/process
+    插件的 stdin 保持调用方原样字节）。首个使用者是 `filesystem` 的
+    `settings.read_roots`（读取白名单不再硬编码在源码里）。
+
+**配置热重载**（2026-10-27）：`reload`（`reload_internal` / `reload_candidate`）会先重读
+`config/`，再建快照；成功后新配置随快照一起生效，`promote_candidate` 安装候选快照携带
+的那一份配置。语义边界：
+
+- 热生效：`llm_api` / `llm_profiles`、`plugin_configs`（`enabled` + `settings`）、
+  `runtime.images` 等运行期读取的字段。
+- 不热生效：`runtime.snapshot_root`（进程内 staging 根已定，reload 保留 boot 值并打日志）、
+  `kernel.change_history_limit`（kernel 构造时生效）。
+- 配置解析失败 → reload 返回 `failed` 的 `ReloadAttemptReport`（`failure_summary` 带
+  文件与解析原因），旧快照继续服务，进程不受影响。
 
 仓库把模板放在 `config.example/`，本地运行时目录仍是 `config/`。
 
