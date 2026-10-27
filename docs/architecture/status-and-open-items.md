@@ -157,6 +157,18 @@ Agent 现在可以自主完成：读代码 → 理解结构 → 写/改文件 �
   的 stop 分支调用并复位 `POLLER_STARTED`），sleep 拆 100ms 分片以便快速退出；否则 reload 后
   旧 poller 与新 poller 会双 drain / 双 `agent_trigger`。
 
+### 3.10 关停不再回滚 `fixtures/plugins/`（2026-10-27）
+
+`cordis-runtime serve` 的 SIGTERM/SIGINT 处理器原本调 `save_draft_and_revert(.., "signal")`，
+它把未提交的 `plugins/` diff 存成 `fixtures/.cordis-drafts/draft-*.patch` 之后**再执行
+`git checkout -- plugins/`**。后果：任何人 `systemctl restart` 一次，工作区里所有未提交的插件改动
+（不只是 agent 自己改的）都会被还原——2026-10-27 两次重启就把刚落的 qq / filesystem 改动冲掉，
+只能从 draft 里 `git apply` 回来。
+
+现在信号路径只调 `save_draft`：写草稿、**不碰工作树**（`draft_tests::save_draft_leaves_working_tree_untouched`
+锁住这个行为）。`save_draft_and_revert` 保留给 agent 出错路径——那里丢弃 agent 自己写了一半的改动
+才是目的。
+
 ## 4. 部分完成
 
 ### 4.1 Execution engine 有正式入口，数据面验证不足

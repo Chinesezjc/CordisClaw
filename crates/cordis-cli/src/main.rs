@@ -733,7 +733,12 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             }
             eprint!("\n⏸ interrupted, saving...");
             let _ = std::io::stderr().flush();
-            save_draft_and_revert(&fixtures_root, "signal");
+            // Save only, never revert: a restart must not destroy uncommitted
+            // `plugins/` work (that used to wipe every pending edit whenever
+            // systemd stopped the service).
+            if let Some(path) = save_draft(&fixtures_root, "signal") {
+                eprintln!("draft saved: {path} (working tree left untouched)");
+            }
             shutdown_host.write_shutdown_memory();
             // `exit` 绕过所有 Drop，`RuntimeHost::drop` 的 staged root 回收
             // 不会触发，故信号路径必须显式清一次（该方法幂等）。
@@ -1718,6 +1723,34 @@ fn emit_invoke_response(payload: &str) -> Result<(), Box<dyn std::error::Error>>
 /// lost that work on the first error the agent produced. The new flow
 /// preserves untracked files under `.cordis-drafts/` and never runs
 /// `git clean` outright.
+/// Snapshot the tracked `plugins/` diff into `.cordis-drafts/` **without
+/// touching the working tree**.
+///
+/// Used on SIGTERM/SIGINT: the operator's uncommitted plugin edits have to
+/// survive a restart. The destructive variant below (`save_draft_and_revert`)
+/// stays for the agent-error path, where discarding the agent's own half-done
+/// edits is the point.
+fn save_draft(fixtures_root: &Path, reason: &str) -> Option<String> {
+    let diff = std::process::Command::new("git")
+        .args(["diff", "--", "plugins/"])
+        .current_dir(fixtures_root)
+        .output()
+        .ok()?;
+    let patch = String::from_utf8_lossy(&diff.stdout).into_owned();
+    if patch.trim().is_empty() {
+        return None;
+    }
+    let draft_dir = fixtures_root.join(".cordis-drafts");
+    std::fs::create_dir_all(&draft_dir).ok()?;
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let name = format!("draft-{ts}-{reason}.patch");
+    std::fs::write(draft_dir.join(&name), patch.as_bytes()).ok()?;
+    Some(format!(".cordis-drafts/{name}"))
+}
+
 fn save_draft_and_revert(fixtures_root: &Path, reason: &str) -> Option<String> {
     let draft_dir = fixtures_root.join(".cordis-drafts");
     let _ = std::fs::create_dir_all(&draft_dir);
@@ -3225,5 +3258,89 @@ mod inbox_framing_tests {
     #[test]
     fn parse_first_json_leading_garbage_fails() {
         assert!(parse_first_json(r#"garbage {"action":"suspend"}"#).is_err());
+    }
+}
+
+#[cfg(test)]
+mod draft_tests {
+    use super::*;
+
+    /// Minimal temp dir (the CLI crate has no `tempfile` dev-dependency).
+    struct TempDir {
+        path: PathBuf,
+    }
+
+    impl TempDir {
+        fn new() -> Self {
+            static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let path = std::env::temp_dir()
+                .join(format!("cordis-cli-draft-test-{}-{n}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).expect("create temp dir");
+            Self { path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn git(dir: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .status()
+            .expect("git must be installed for this test");
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    /// A shutdown must never discard uncommitted plugin edits: `save_draft`
+    /// only writes the patch, it must leave the working tree as it was.
+    #[test]
+    fn save_draft_leaves_working_tree_untouched() {
+        let temp = TempDir::new();
+        let root = temp.path();
+        git(root, &["init", "-q"]);
+        std::fs::create_dir_all(root.join("plugins/demo/src")).expect("mkdir");
+        std::fs::write(root.join("plugins/demo/src/a.rs"), "ORIGINAL\n").expect("write");
+        git(root, &["add", "."]);
+        git(
+            root,
+            &[
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-q",
+                "-m",
+                "init",
+            ],
+        );
+
+        std::fs::write(root.join("plugins/demo/src/a.rs"), "EDITED\n").expect("edit");
+        let draft = save_draft(root, "signal").expect("a tracked diff must produce a draft");
+        assert!(
+            root.join(&draft).exists(),
+            "draft patch must be written next to the fixtures root"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("plugins/demo/src/a.rs")).expect("read"),
+            "EDITED\n",
+            "save_draft must not revert the working tree"
+        );
+        let patch = std::fs::read_to_string(root.join(&draft)).expect("read patch");
+        assert!(patch.contains("EDITED"), "draft must carry the change");
+
+        // No diff → no draft, and nothing is written.
+        git(root, &["checkout", "--", "plugins/"]);
+        assert!(save_draft(root, "signal").is_none());
     }
 }
