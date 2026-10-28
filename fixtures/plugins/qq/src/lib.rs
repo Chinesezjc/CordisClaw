@@ -349,67 +349,17 @@ fn onebot_send_group_msg(
     onebot_call(base_url, "send_group_msg", &params, token)
 }
 
-/// Prepend a OneBot reply segment when reply_to is Some, and turn the
-/// model-facing `@[id=<qq>]` / `@[id=<qq>,name=<n>]` markers into real
-/// OneBot `at` segments.
+/// Prepend a OneBot reply segment when reply_to is Some.
 ///
-/// The marker syntax is the same one the plugin renders for *incoming*
-/// mentions, so the model can copy an id out of the message header
-/// (`(user <uid>)`) and actually mention that person. Before this, `qq_send`
-/// only ever sent plain text and the bot had to tell people "you need to
-/// mention me by id" instead of mentioning them.
+/// Everything else passes through verbatim: `qq_send` accepts OneBot CQ codes
+/// (`[CQ:at,qq=…]`, `[CQ:image,file=…]`) directly, so the plugin needs no
+/// second marker syntax to translate. Verified live on 2026-10-28: a raw
+/// `[CQ:image,file=…]` rendered as a picture in the QQ client.
 fn build_reply_message(message: &str, reply_to: Option<i64>) -> String {
-    let with_mentions = rewrite_mentions_for_onebot(message);
     match reply_to {
-        Some(mid) => format!("[CQ:reply,id={}]{}", mid, with_mentions),
-        None => with_mentions,
+        Some(mid) => format!("[CQ:reply,id={}]{}", mid, message),
+        None => message.to_string(),
     }
-}
-
-/// Replace `@[id=<digits>]` / `@[id=<digits>,name=...]` with `[CQ:at,qq=<digits>]`.
-///
-/// Anything that is not a well-formed id marker (`@[id=abc]`, a bare `@nick`,
-/// `@[name=x]`) is left untouched, so ordinary text keeps working exactly as
-/// before.
-fn rewrite_mentions_for_onebot(message: &str) -> String {
-    let mut out = String::with_capacity(message.len());
-    let mut rest = message;
-    while let Some(start) = rest.find("@[id=") {
-        out.push_str(&rest[..start]);
-        let after = &rest[start + "@[id=".len()..];
-        // The id runs up to `,` (name=...) or `]`.
-        let (id, tail) = match after.find([',', ']']) {
-            Some(end) => (&after[..end], &after[end..]),
-            None => {
-                // Unterminated marker: keep the text verbatim.
-                out.push_str(&rest[start..]);
-                return out;
-            }
-        };
-        let digits_only = !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit());
-        if !digits_only {
-            // Not one of our markers — keep it literal and continue scanning.
-            out.push_str("@[id=");
-            rest = after;
-            continue;
-        }
-        // Skip the whole marker: `]` or `,name=<anything>]`.
-        let consumed = if tail.starts_with(']') {
-            1
-        } else {
-            match tail.find(']') {
-                Some(end) => end + 1,
-                None => {
-                    out.push_str(&rest[start..]);
-                    return out;
-                }
-            }
-        };
-        out.push_str(&format!("[CQ:at,qq={id}]"));
-        rest = &tail[consumed..];
-    }
-    out.push_str(rest);
-    out
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3103,7 +3053,8 @@ fn docs_value() -> cordis_plugin_sdk::PluginDocs {
 QQ GROUP CHAT MODE — you are running in a QQ group. Messages may be casual chat NOT directed at you.\n\
 CRITICAL: Always decide whether the message is actually talking to YOU before responding.\n\
 MENTION MARKER — an @mention rendered as `@[id=<qq>,self,name=<n>]` (or `@[id=<qq>,self]`) is YOU, the bot. An `@[id=...,name=...]` WITHOUT the `self` marker is somebody else. Judge \"is this for me\" from that marker, never from the numeric id. Plain text that merely starts with `@` (e.g. `@我试试`) is NOT a mention — never claim you were mentioned unless a `@[id=...]` token is present.\n\
-TO @ SOMEONE — put `@[id=<qq>]` in the `qq_send` message and the plugin sends a real mention: e.g. `@[id=1751557948] 收到`. The sender's qq number is in the message header as `(user <uid>)`; use it to mention the person you are replying to. A bare `@nickname` is sent as literal text.\n\
+TO @ SOMEONE — `qq_send` passes OneBot CQ codes through verbatim, so write `[CQ:at,qq=<uid>]` in the message (e.g. `[CQ:at,qq=1751557948] 收到`). The sender's qq number is in the message header as `(user <uid>)`. A bare `@nickname` is literal text, not a mention.\n\
+TO SEND AN IMAGE — same channel: `[CQ:image,file=<https url>]` (or `[CQ:image,file=base64://<data>]`). Prefer a URL the QQ client can fetch; inline base64 makes the message large.\n\
 REPLY POLICY — the authority on whether to answer. Every incoming message starts with `[reply policy: <mode> — <text>]`. That line IS the rule for this group; follow it exactly and do not substitute a stricter rule of your own.\n\
   quiet      — answer only when @mentioned or addressed by name.\n\
   balanced   — judge from the conversation: answer when it is addressed to you or clearly wants your answer; stay out of threads between other people.\n\
@@ -3116,7 +3067,7 @@ WRITING MEMORY — when you learn something DURABLE about a group (it wants you 
 If the message is NOT for you: use {\"action\":\"suspend\"}.\n\
 If it IS for you: invoke_plugin(qq, qq_send, ...) to send your reply, then output {\"action\":\"suspend\"}.\n\
 IMPORTANT: NEVER use {\"action\":\"respond\"} — it will cause duplicate messages. Always send via qq_send and finish with {\"action\":\"suspend\"}.\n\
-OUTPUT FORMAT — your ENTIRE final output must be one JSON object (`{\"action\":\"suspend\"}` after a successful qq_send). Never emit chat text as your final output, and never write an `@[id=...]` marker outside the `message` field of a `qq_send` call: the runtime cannot send plain text, it can only parse JSON. A message whose text is `[id=...] 你好` is not JSON and will be dropped and retried.\n\
+OUTPUT FORMAT — your ENTIRE final output must be one JSON object (`{\"action\":\"suspend\"}` after a successful qq_send). Never emit chat text as your final output, and keep chat text (including CQ codes) only inside the `message` field of a `qq_send` call: the runtime can only parse JSON. A message whose text is `[id=...] 你好` is not JSON and will be dropped and retried.\n\
 If the user asks you to change the reply rule (e.g. \"reply to everything I say\", \"stop answering so often\"), persist it: invoke_plugin(qq, qq_set_reply_policy, {\"node_id\":\"qq_set_reply_policy\",\"policy\":\"<new rule text>\"}), then tell the user it is already in effect — the next message uses the new policy, no restart needed.\n\
 \n\
 ANTI-HALLUCINATION rules:\n\
@@ -3219,45 +3170,28 @@ mod signature_tests {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// 出站 @：把模型写的 `@[id=<qq>]` 转成 OneBot 的 at 段。
-// 之前只能发纯文本，bot 想圈人只能回一句"你得圈 <id>"。
+// 出站消息：CQ 码原样透传（模型已经会写），插件不做第二套标记转换。
 // ═══════════════════════════════════════════════════════════════════════
 #[cfg(test)]
-mod outbound_mention_tests {
+mod outbound_message_tests {
     use super::*;
 
     #[test]
-    fn rewrites_id_markers_to_at_segments() {
+    fn cq_codes_pass_through_untouched() {
+        let message = "图：[CQ:image,file=https://e.com/a.png] 和 [CQ:at,qq=1751557948]";
+        assert_eq!(build_reply_message(message, None), message);
         assert_eq!(
-            rewrite_mentions_for_onebot("@[id=1751557948] 你好"),
-            "[CQ:at,qq=1751557948] 你好"
+            build_reply_message("[CQ:image,file=base64://QUJD]", None),
+            "[CQ:image,file=base64://QUJD]"
         );
-        assert_eq!(
-            rewrite_mentions_for_onebot("@[id=1751557948,name=Chinese_zjc_] 你好"),
-            "[CQ:at,qq=1751557948] 你好"
-        );
-        // Several markers in one message (name= is dropped, at segment kept).
-        assert_eq!(
-            rewrite_mentions_for_onebot("@[id=1,name=a] @[id=2] hi"),
-            "[CQ:at,qq=1] [CQ:at,qq=2] hi"
-        );
-        // Text without markers is byte-identical (no prompt/format drift).
-        assert_eq!(rewrite_mentions_for_onebot("你好呀"), "你好呀");
-        assert_eq!(rewrite_mentions_for_onebot("@我试试"), "@我试试");
-        // Malformed markers stay literal instead of being dropped.
-        assert_eq!(rewrite_mentions_for_onebot("@[id=abc]"), "@[id=abc]");
-        assert_eq!(rewrite_mentions_for_onebot("@[id=]"), "@[id=]");
-        assert_eq!(rewrite_mentions_for_onebot("@[id=12"), "@[id=12");
-        assert_eq!(
-            rewrite_mentions_for_onebot("@[id=12,name=x"),
-            "@[id=12,name=x"
-        );
+        // Plain text (including a bare @) is untouched.
+        assert_eq!(build_reply_message("@我试试", None), "@我试试");
     }
 
     #[test]
-    fn reply_segment_stays_in_front_of_the_mention() {
+    fn reply_segment_stays_in_front_of_the_body() {
         assert_eq!(
-            build_reply_message("@[id=42] 收到", Some(9)),
+            build_reply_message("[CQ:at,qq=42] 收到", Some(9)),
             "[CQ:reply,id=9][CQ:at,qq=42] 收到"
         );
         assert_eq!(build_reply_message("收到", None), "收到");
@@ -4633,9 +4567,9 @@ mod docs_tests {
     }
 
     // The bot kept answering with plain chat text (once even starting with a
-    // bare `[id=...]` mention marker), which the runtime cannot parse. The
-    // hint must state that the final output is JSON-only and that the mention
-    // marker belongs inside a qq_send message.
+    // plain text starting with a `[id=...]` fragment), which the runtime cannot
+    // parse. The hint must state that the final output is JSON-only and that
+    // chat text (including CQ codes) belongs inside a qq_send message.
     #[test]
     fn system_hint_requires_json_final_output() {
         let hint = docs_value()
@@ -4646,8 +4580,8 @@ mod docs_tests {
             "hint must call out the output format"
         );
         assert!(
-            hint.contains("never write an `@[id=...]` marker outside the `message` field"),
-            "hint must keep mention markers inside qq_send: {hint}"
+            hint.contains("keep chat text (including CQ codes) only inside the `message` field"),
+            "hint must keep chat text/CQ codes inside qq_send: {hint}"
         );
     }
 
