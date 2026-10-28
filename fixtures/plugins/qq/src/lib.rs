@@ -146,12 +146,6 @@ struct OneBotEvent {
     #[serde(default)]
     post_type: String,
 
-    /// The bot's own QQ number. OneBot v11 puts it on every event and NapCat
-    /// fills it from its own login info (`self_id: parseInt(selfInfo.uin)`).
-    /// Kept as `Value` because implementations send a number or a string.
-    #[serde(default)]
-    self_id: Option<Value>,
-
     // message events
     #[serde(default)]
     message_type: String,
@@ -844,9 +838,11 @@ fn handle_onebot_event(event: &OneBotEvent) {
         return;
     }
 
-    // Extract message text (self-mentions marked from the event's `self_id`)
-    // and reply context.
-    let (message_text, reply_to_msg_id) = event_text_and_reply(event);
+    // Extract message text and reply context. Mentions pass through as
+    // `@[id=<qq>,name=<n>]`; the model compares that id with its own (given in
+    // the system hint) instead of the plugin tagging "self" on the message.
+    let (message_text, reply_to_msg_id) =
+        extract_message_info(&event.message, event.raw_message.as_deref());
 
     // Extract user_id.
     let user_id = match &event.user_id {
@@ -1128,43 +1124,6 @@ fn extract_message_info(message: &Value, raw_message: Option<&str>) -> (String, 
     (parts.join(""), reply_to)
 }
 
-/// The bot's own QQ number as sent by the adapter (number or string form).
-fn self_id_of(event: &OneBotEvent) -> Option<String> {
-    event.self_id.as_ref().and_then(|v| match v {
-        Value::Number(n) => Some(n.to_string()),
-        Value::String(s) => Some(s.clone()),
-        _ => None,
-    })
-}
-
-/// Message text as the model sees it, with self-mentions marked, plus the
-/// quoted message id when the event is a reply.
-fn event_text_and_reply(event: &OneBotEvent) -> (String, Option<i64>) {
-    let (text, reply_to) = extract_message_info(&event.message, event.raw_message.as_deref());
-    (
-        mark_self_mentions(&text, self_id_of(event).as_deref()),
-        reply_to,
-    )
-}
-
-/// Mark @-mentions of the bot itself, so the model can tell "me" from "someone
-/// else" without being told its numeric id on every turn.
-///
-/// The marker is only added where an @ already exists (`@[id=X,name=N]` →
-/// `@[id=X,self,name=N]`), so messages that mention nobody stay byte-identical:
-/// no per-message prompt growth and no cache churn. The rule for reading the
-/// marker lives in the (static, cacheable) system hint.
-fn mark_self_mentions(message: &str, self_id: Option<&str>) -> String {
-    let Some(self_id) = self_id else {
-        return message.to_string();
-    };
-    let named = format!("@[id={self_id},");
-    let bare = format!("@[id={self_id}]");
-    message
-        .replace(&named, &format!("@[id={self_id},self,"))
-        .replace(&bare, &format!("@[id={self_id},self]"))
-}
-
 fn extract_i64(val: &Value) -> Option<i64> {
     match val {
         Value::Number(n) => n.as_i64(),
@@ -1202,7 +1161,7 @@ fn should_process(text: &str) -> bool {
 // 于是"调整它在该群的行为"不需要重编、更不需要重启。
 
 /// 保守默认文案（模型逐字读，保持英文）。
-const DEFAULT_REPLY_POLICY: &str = "Decide for yourself, from the conversation context, whether this message needs an answer from you. Answer when it is addressed to you (\"bot\"/\"Bot\"/\"机器人\", or an @mention carrying the `self` marker — that marker means the mention is you), AND ALSO when the context makes it clear the sender is talking to you: it continues a thread you are part of, asks you to do or explain something, or someone in the group explicitly wants your answer — even without naming you. Stay silent for conversation between other people, memes/stickers, and statements that do not involve you; do not hijack someone else's thread.";
+const DEFAULT_REPLY_POLICY: &str = "Decide for yourself, from the conversation context, whether this message needs an answer from you. Answer when it is addressed to you (\"bot\"/\"Bot\"/\"机器人\", or an @mention whose id is your own QQ number — see YOUR QQ NUMBER), AND ALSO when the context makes it clear the sender is talking to you: it continues a thread you are part of, asks you to do or explain something, or someone in the group explicitly wants your answer — even without naming you. Stay silent for conversation between other people, memes/stickers, and statements that do not involve you; do not hijack someone else's thread.";
 
 /// 四种模式。`policy` 为空时用这里的预设文案。
 const MODE_QUIET: &str = "quiet";
@@ -1218,7 +1177,7 @@ const MEMORY_MAX_CHARS: usize = 800;
 
 fn mode_preset(mode: &str) -> Option<&'static str> {
     match mode {
-        MODE_QUIET => Some("Stay silent unless the message @mentions you (an @mention carrying the `self` marker) or addresses you by name (\"bot\"/\"Bot\"/\"机器人\"). This group does not want the bot commenting on ordinary conversation."),
+        MODE_QUIET => Some("Stay silent unless the message @mentions you (an @mention whose id is your own QQ number) or addresses you by name (\"bot\"/\"Bot\"/\"机器人\"). This group does not want the bot commenting on ordinary conversation."),
         MODE_BALANCED => Some(DEFAULT_REPLY_POLICY),
         MODE_CHATTY => Some("Join the conversation actively: answer questions you can help with, add a short remark when it genuinely fits, and take a joke. Do not reply to every message, and never hijack a thread between two other people."),
         MODE_ONE_ON_ONE => Some("Treat this group as a direct chat: answer every message that is meant for you (greeting, question, request). Do not stay silent just because it is technically a group."),
@@ -3052,7 +3011,7 @@ fn docs_value() -> cordis_plugin_sdk::PluginDocs {
     Some("\
 QQ GROUP CHAT MODE — you are running in a QQ group. Messages may be casual chat NOT directed at you.\n\
 CRITICAL: Always decide whether the message is actually talking to YOU before responding.\n\
-MENTION MARKER — an @mention rendered as `@[id=<qq>,self,name=<n>]` (or `@[id=<qq>,self]`) is YOU, the bot. An `@[id=...,name=...]` WITHOUT the `self` marker is somebody else. Judge \"is this for me\" from that marker, never from the numeric id. Plain text that merely starts with `@` (e.g. `@我试试`) is NOT a mention — never claim you were mentioned unless a `@[id=...]` token is present.\n\
+YOUR QQ NUMBER — you are qq user {setting:bot_uin}. An @mention is you exactly when its id equals that number; `@[id=<other>,name=...]` is somebody else. Plain text that merely starts with `@` (e.g. `@我试试`) is NOT a mention — never claim you were mentioned unless an `@[id=...]` token is present.\n\
 TO @ SOMEONE — `qq_send` passes OneBot CQ codes through verbatim, so write `[CQ:at,qq=<uid>]` in the message (e.g. `[CQ:at,qq=1751557948] 收到`). The sender's qq number is in the message header as `(user <uid>)`. A bare `@nickname` is literal text, not a mention.\n\
 TO SEND AN IMAGE — same channel: `[CQ:image,file=<https url>]` (or `[CQ:image,file=base64://<data>]`). Prefer a URL the QQ client can fetch; inline base64 makes the message large.\n\
 REPLY POLICY — the authority on whether to answer. Every incoming message starts with `[reply policy: <mode> — <text>]`. That line IS the rule for this group; follow it exactly and do not substitute a stricter rule of your own.\n\
@@ -3319,111 +3278,11 @@ mod chain_tests {
         MESSAGE_QUEUE.lock().unwrap().len()
     }
 
-    // ── self-mention marker ────────────────────────────────────────────────
-    //
-    // The model has to tell "this @ is me" from "this @ is someone else".
-    // OneBot puts the bot's own qq in `self_id` on every event; the marker is
-    // the only thing that connects the two, and it must not touch messages
-    // that mention nobody (that would grow every prompt for no reason).
-
-    #[test]
-    fn mark_self_mentions_marks_only_the_bot() {
-        let text = "@[id=3832224285,name=3832224285] hi @[id=406351312,name=406351312]";
-        assert_eq!(
-            mark_self_mentions(text, Some("3832224285")),
-            "@[id=3832224285,self,name=3832224285] hi @[id=406351312,name=406351312]"
-        );
-        // Bare form (no `name=`) is marked too.
-        assert_eq!(
-            mark_self_mentions("@[id=42] yo", Some("42")),
-            "@[id=42,self] yo"
-        );
-        // Nothing to mark → byte-identical.
-        assert_eq!(mark_self_mentions("plain text", Some("42")), "plain text");
-        // No self id in the event (an adapter that omits it) → untouched.
-        assert_eq!(
-            mark_self_mentions("@[id=42,name=42] hi", None),
-            "@[id=42,name=42] hi"
-        );
-    }
-
-    // End to end through the event layer (no globals involved): a group event
-    // whose `at` segment targets the bot renders with the `self` marker, and a
-    // mention of somebody else stays unmarked.
-    #[test]
-    fn self_mention_marker_comes_from_event_self_id() {
-        let event_with = |self_id: Value, at: &str| {
-            let v = json!({
-                "post_type": "message",
-                "message_type": "group",
-                "self_id": self_id,
-                "message": [
-                    {"type": "at", "data": {"qq": at}},
-                    {"type": "text", "data": {"text": " hello"}}
-                ],
-                "message_id": 9001,
-                "user_id": 111,
-                "group_id": 975594881
-            });
-            serde_json::from_value::<OneBotEvent>(v).expect("event json")
-        };
-
-        // Numeric self_id (NapCat sends `parseInt(...)`).
-        let (text, reply) = event_text_and_reply(&event_with(json!(3832224285i64), "3832224285"));
-        assert_eq!(text, "@[id=3832224285,self,name=3832224285] hello");
-        assert_eq!(reply, None);
-
-        // String self_id parses the same way.
-        assert_eq!(
-            self_id_of(&event_with(json!("3832224285"), "3832224285")),
-            Some("3832224285".to_string())
-        );
-
-        // Mentioning somebody else leaves the text unmarked.
-        let (text, _) = event_text_and_reply(&event_with(json!(3832224285i64), "406351312"));
-        assert_eq!(text, "@[id=406351312,name=406351312] hello");
-
-        // No self_id in the event → no marker, text unchanged (an adapter that
-        // omits the field must not change what the model sees).
-        let mut event = event_with(Value::Null, "3832224285");
-        event.self_id = None;
-        assert_eq!(self_id_of(&event), None);
-        let (text, _) = event_text_and_reply(&event);
-        assert_eq!(text, "@[id=3832224285,name=3832224285] hello");
-    }
-
     // 单测串行化：所有触碰全局静态（MESSAGE_QUEUE / STATE / RECENT_MESSAGE_IDS）
     // 的断言集中在这一个 test 内，避免 cargo 并行跑 test 时的全局态污染。
     #[test]
     fn webhook_ingest_dedup_whitelist_blocklist_chain() {
         clear_globals();
-
-        // ── 段0 自 @ 标记：事件自带 self_id 时，@ 到 bot 的那条带 `self` ──
-        {
-            let v = json!({
-                "post_type": "message",
-                "message_type": "group",
-                "self_id": 3832224285i64,
-                "message": [
-                    {"type": "at", "data": {"qq": "3832224285"}},
-                    {"type": "text", "data": {"text": " 你好"}}
-                ],
-                "message_id": 1999,
-                "user_id": 111,
-                "group_id": 975594881
-            });
-            let event: OneBotEvent = serde_json::from_value(v).unwrap();
-            handle_onebot_event(&event);
-            let queued = MESSAGE_QUEUE
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .pop_front()
-                .expect("self-mention event must be queued");
-            assert_eq!(
-                queued.message, "@[id=3832224285,self,name=3832224285] 你好",
-                "被 @ 到 bot 自己时必须带 self 标记，模型才知道那是它"
-            );
-        }
 
         // ── 段1 webhook 收到 → 入队 ──────────────────────────────
         handle_onebot_event(&group_event(2001, 222, "hello world"));
@@ -4582,6 +4441,13 @@ mod docs_tests {
         assert!(
             hint.contains("keep chat text (including CQ codes) only inside the `message` field"),
             "hint must keep chat text/CQ codes inside qq_send: {hint}"
+        );
+
+        // The bot's own qq number comes from config/plugins/qq.yaml, rendered
+        // into the system prompt via `{setting:bot_uin}` — no hard-coded id.
+        assert!(
+            hint.contains("YOUR QQ NUMBER — you are qq user {setting:bot_uin}"),
+            "hint must carry the bot_uin placeholder: {hint}"
         );
     }
 
