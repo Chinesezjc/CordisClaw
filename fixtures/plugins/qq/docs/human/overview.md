@@ -36,6 +36,11 @@ Returns all queued messages and drains the queue.
 ### `qq_send`
 Send a message to a QQ group or private chat.
 
+**出站 @（2026-10-27）**：`message` 里写 `@[id=<qq>]`（或 `@[id=<qq>,name=…]`）会被转成 OneBot 的
+`[CQ:at,qq=<qq>]` at 段，也就是真正圈人。发送者的 QQ 号就在消息头 `(user <uid>)` 里，所以
+「圈一下刚才说话的人」= ``@[id=<uid>] 收到``。没有 id 的裸 `@昵称` 原样当文字发出；`@[id=abc]`
+这类畸形标记同样原样保留，不会吞字。`reply_to` 仍然排在 at 段之前（`[CQ:reply,…][CQ:at,…]`）。
+
 ## LunaBot 消息中转
 
 LunaBot 作为 OneBot 消息的主处理器，CordisClaw 作为 fallback：
