@@ -981,9 +981,33 @@ impl AgentToolHost for RuntimeHost {
         plugin_path: &str,
         instruction: &str,
     ) -> Result<Value, RuntimeError> {
-        let pp = plugin_path.trim_start_matches('/');
+        let pp = plugin_path
+            .trim()
+            .trim_start_matches('/')
+            .trim_end_matches('/');
+        let pp = pp.strip_prefix("plugins/").unwrap_or(pp);
         // Empty plugin_path (from "/") means root workspace mode — the agent
         // can create/edit files anywhere under plugins/, not just one subtree.
+        if !pp.is_empty() {
+            let loaded: Vec<String> = self
+                .current_snapshot()
+                .plugin_registry()
+                .iter()
+                .map(|(path, _)| path)
+                .collect();
+            let known = loaded
+                .iter()
+                .any(|known| known == pp || known.starts_with(&format!("{pp}/")));
+            if !known {
+                return Ok(serde_json::json!({
+                    "ok": false,
+                    "error": format!(
+                        "unknown plugin path \"{plugin_path}\". Use \"/<plugin>\" for one plugin (e.g. \"/qq\") or \"/\" for the whole workspace. Loaded plugins: {}",
+                        loaded.join(", ")
+                    ),
+                }));
+            }
+        }
         let target_plugin_paths: Vec<String> = if pp.is_empty() {
             vec![]
         } else {

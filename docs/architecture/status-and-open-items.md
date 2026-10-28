@@ -266,6 +266,31 @@ system prompt 里"你的 QQ 号"比对，插件不再逐条消息打标记。
 好处：id 只在 system prompt 里出现一次（天然被缓存），每条消息零额外 token；换号 = 改
 `config/plugins/qq.yaml` + `/reload /qq`（重读 config），不用重编插件。
 
+### 3.15 新插件迭代的三处卡点（2026-10-28）
+
+线上让 agent 自己写插件时，8 次 iteration 全部回滚，最后它得出"我没有写插件的通道"的错误结论。
+日志显示真正的卡点是三处，全部已修：
+
+1. **新插件在构建前校验上是死锁的**：`create_plugin` 只生成 `Cargo.toml` + `src/lib.rs`，而
+   `validate_scaffold` 要求 `tests/`、`docs/human/overview.md`，默认还要求
+   `docs/agent/interfaces.json`（构建产物、策略又禁止手写）→ 想构建缺文件、想补文件被拒。
+   现在模板自带 `tests/<name>.rs`、`docs/human/overview.md`，并在
+   `[package.metadata.cordis]` 里写 `allow_generated_docs = true`（配合模板已有的
+   `crate-type = ["rlib","dylib"]`）。
+2. **迭代读不到 `plugins/Cargo.toml`**：新插件要进 workspace members，策略允许带 `expected_sha256`
+   改它，但可读集合不含这个文件 → 算不出 sha，edit 被 `stale edit precondition` 拒。
+   现在 `collect_plugin_context_paths` 把它放进 `all_paths`。
+3. **`request_iteration` 的坏路径没有可操作信息**：`plugin_path` 空/未知时只报
+   `plugin subtree not found for `。现在空根给出"传 "/<plugin>" 或 "/" 加可用插件列表"的提示，
+   `agent_request_iteration` 也会容忍 `plugins/<name>` 写法并列出已加载插件。
+
+测试：`create_plugin_scaffolds_what_the_build_requires`、`iteration_context_includes_the_workspace_manifest`、
+`begin_plugin_iteration_explains_a_missing_issue_root`。
+
+另外清掉了失败迭代留下的空壳：`fixtures/plugins/qqbot`（有 src 无 docs/tests，移到
+`/root/cordis-wip/`，未删源码）、`fixtures/plugins/imggen`（只剩一个生成的 interfaces.json）、
+`fixtures/plugins/tmp`（迭代测试产出的 PNG）。
+
 ## 4. 部分完成
 
 ### 4.1 Execution engine 有正式入口，数据面验证不足
