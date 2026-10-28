@@ -319,6 +319,24 @@ system prompt 里"你的 QQ 号"比对，插件不再逐条消息打标记。
 `prepare-artifacts` → `sync-plugin-docs` → `reload`；代码层面还应收敛成
 "reload 失败也要把已停的服务拉回来"。
 
+### 3.17 群记忆改为拉取式（2026-10-28）
+
+`[group memory: …]` 之前随每条消息注入 `notes`。它是有用的，但绝大多数消息用不上，等于每条
+prompt 都替模型付一遍 token；上限 800 字符也只是在压这个成本。
+
+现在改为**拉取**：
+
+- `build_envelope` 只注入 `[reply policy: mode — text]`，不再注入记忆；
+- 提示词明确说"记忆不会被注入，需要时用 `qq_get_group_memory` 读"，并给了读的时机
+  （话题延续之前的讨论、写之前先读避免覆盖）；
+- 写入规则不变：自己主动写、覆盖式、无长度上限。
+
+顺带修了 reload 的 docs 判等：`reload_subtree` Phase 1 之前把 dylib 的 docs 和索引条目逐字段比，
+重建后只要改过 summary/schema 文案就报
+`ABI mismatch … diff=["docs mismatch: expected 13 nodes, got 13"]`（17:12 掉线就是这个）。
+现在只把**节点集合**（id + node_type）变化当契约变更，文案漂移直接采纳（工件是它自己 docs 的来源）。
+测试：`only_a_changed_node_set_is_a_contract_change`。
+
 ## 4. 部分完成
 
 ### 4.1 Execution engine 有正式入口，数据面验证不足
