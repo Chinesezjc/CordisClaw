@@ -447,8 +447,14 @@ impl AgentToolHost for RuntimeHost {
             snapshot
                 .plugin_registry()
                 .iter()
-                .filter_map(|(_, plugin)| plugin.docs)
-                .filter_map(|docs| docs.system_hint),
+                .filter_map(|(path, plugin)| {
+                    let hint = plugin.docs.as_ref()?.system_hint.as_ref()?;
+                    // Hints may carry `{setting:<key>}` placeholders that resolve
+                    // against that plugin's `config/plugins/<name>.yaml` settings
+                    // (e.g. qq's own uin), so a deployment value never has to be
+                    // hard-coded in the plugin or resent every turn.
+                    Some(snapshot.render_system_hint(&path, hint))
+                }),
         );
         hints
     }

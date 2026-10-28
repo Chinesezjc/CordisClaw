@@ -231,8 +231,8 @@ agent 的 `reload_runtime` 与控制通道两条路径行为一致，不会再�
 透传；hint 改成教模型写 CQ 码（`[CQ:at,qq=<uid>]`、`[CQ:image,file=<https url>]`），并明确
 最终输出必须是 JSON、聊天文本只能出现在 `qq_send` 的 `message` 里。
 
-**注意**：入站的 `@[id=<qq>,self,…]` 标记仍然保留——那是给模型**读**的（判断"这条 @ 是不是我"），
-与出站无关。
+**注意**：入站的 `@[id=<qq>,self,…]` 标记也已移除（见 3.14）——模型改成拿 @ 的 id 与
+system prompt 里"你的 QQ 号"比对，插件不再逐条消息打标记。
 
 ### 3.13 reload 现在会把插件重指向新工件（2026-10-28，修 QQ 掉线）
 
@@ -246,6 +246,25 @@ agent 的 `reload_runtime` 与控制通道两条路径行为一致，不会再�
 现在 `Prepared` 带上本次校验过的 `resolved` 路径，`PluginRegistry::reload_plugin_entry_with_artifact`
 把它写回条目（`reload_plugin_entry` 保留，委托为"只刷 docs"）。测试：
 `reload_plugin_entry_with_artifact_repoints_the_path`。
+
+### 3.14 模型自己的 QQ 号来自 config + system prompt 插值（2026-10-28）
+
+之前为了让模型知道"这条 @ 的是不是我"，入站消息里的 @ 会被改写成
+`@[id=<qq>,self,name=…]`（每条被 @ 的消息多 5 个字符）。这仍然是"插件替模型判"，
+而且标记只在该条消息里出现。
+
+现在改成"模型自己判"：
+
+- `config/plugins/qq.yaml` 的 `settings.bot_uin` 写机器人自己的号；
+- system hint 里写成 `you are qq user {setting:bot_uin}`；
+- `RuntimeHost` 组装 agent system prompt 时，用**该插件自己的 settings** 把
+  `{setting:<key>}` 插值（`RuntimeSnapshot::render_system_hint` +
+  `interpolate_hint_settings`）。未配置/非标量/畸形占位符原样保留，不会静默吞掉整句；
+- 入站 @ 恢复成原始渲染 `@[id=<qq>,name=…]`，不再打 `self` 标记（`OneBotEvent.self_id`
+  的解析与 `mark_self_mentions` 一并删除）。
+
+好处：id 只在 system prompt 里出现一次（天然被缓存），每条消息零额外 token；换号 = 改
+`config/plugins/qq.yaml` + `/reload /qq`（重读 config），不用重编插件。
 
 ## 4. 部分完成
 

@@ -93,6 +93,19 @@ impl RuntimeSnapshot {
         &self.context_baseline
     }
 
+    /// Render one plugin's `system_hint` with its configured `settings`
+    /// interpolated (`{setting:<key>}`), so a hint can carry a
+    /// deployment-specific value — e.g. the bot's own QQ number — without
+    /// hard-coding it in the plugin source and without re-sending it on every
+    /// message.
+    pub fn render_system_hint(&self, plugin_path: &str, hint: &str) -> String {
+        let settings = self
+            .plugin_settings
+            .get(plugin_path)
+            .map(|config| &config.settings);
+        interpolate_hint_settings(hint, settings)
+    }
+
     pub fn staged_artifact_root(&self) -> &Path {
         &self.staged_artifact_root
     }
@@ -796,6 +809,44 @@ mod cov_fa_host_1_3500_tests {
             PathBuf::from("/tmp/cordis-ghost-upstream-staged"),
             BTreeMap::new(),
         )
+    }
+
+    // A plugin's system hint is rendered with its configured settings, so
+    // deployment-specific values (qq's own uin) live in config/plugins/*.yaml
+    // instead of the plugin source or a per-message line.
+    #[test]
+    fn snapshot_renders_system_hint_with_plugin_settings() {
+        let mut plugin_settings = BTreeMap::new();
+        plugin_settings.insert(
+            "qq".to_string(),
+            crate::config::PluginConfigFile {
+                plugin: "qq".to_string(),
+                enabled: true,
+                settings: json!({ "bot_uin": "3832224285" }),
+            },
+        );
+        let snapshot = runtime_snapshot_from_output(
+            crate::plugin::loader::LoadOutput {
+                execution_id: "snap-hint".to_string(),
+                plugin_registry: crate::plugin::registry::PluginRegistry::default(),
+                node_registry: crate::plugin::registry::NodeRegistry::default(),
+                doc_registry: crate::service::doc_registry::DocRegistry::default(),
+                graph_registry: crate::service::graph_registry::GraphRegistry::default(),
+                context: crate::context::RuntimeContext::default(),
+                metrics: crate::plugin::loader::LoaderMetrics::default(),
+            },
+            PathBuf::from("/tmp/cordis-hint-staged"),
+            plugin_settings,
+        );
+        assert_eq!(
+            snapshot.render_system_hint("qq", "you are qq user {setting:bot_uin}"),
+            "you are qq user 3832224285"
+        );
+        // Unconfigured plugin: the placeholder stays visible.
+        assert_eq!(
+            snapshot.render_system_hint("feishu", "id={setting:bot_uin}"),
+            "id={setting:bot_uin}"
+        );
     }
 
     // The snapshot carries each plugin's `settings` and hands them to the
@@ -8034,11 +8085,100 @@ fn fill_missing_execution_traces(
     }
 }
 
+/// Replace `{setting:<key>}` placeholders with values from a plugin's
+/// `settings` block.
+///
+/// Scalars are rendered as text; a missing key, a non-scalar value or a
+/// malformed placeholder is left verbatim (a visible marker beats silently
+/// dropping the sentence the hint was built around).
+fn interpolate_hint_settings(hint: &str, settings: Option<&serde_json::Value>) -> String {
+    let Some(settings) = settings else {
+        return hint.to_string();
+    };
+    let mut out = String::with_capacity(hint.len());
+    let mut rest = hint;
+    while let Some(start) = rest.find("{setting:") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + "{setting:".len()..];
+        let Some(end) = after.find('}') else {
+            out.push_str(&rest[start..]);
+            return out;
+        };
+        let key = after[..end].trim();
+        let value = settings.get(key).and_then(|value| match value {
+            serde_json::Value::String(text) => Some(text.clone()),
+            serde_json::Value::Number(number) => Some(number.to_string()),
+            serde_json::Value::Bool(flag) => Some(flag.to_string()),
+            _ => None,
+        });
+        match value {
+            Some(value) => out.push_str(&value),
+            None => {
+                out.push_str("{setting:");
+                out.push_str(&after[..end]);
+                out.push('}');
+            }
+        }
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Plugin paths switched off by `config/plugins/<name>.yaml` (`enabled: false`).
 ///
 /// A disabled plugin is filtered out at load time: it is never staged, never
 /// dlopened and never registered, so its Task services cannot start and
 /// `invoke_plugin` reports it as not registered.
+#[cfg(test)]
+mod hint_interpolation_tests {
+    use super::interpolate_hint_settings;
+    use serde_json::json;
+
+    #[test]
+    fn interpolates_scalar_settings() {
+        let settings = json!({ "bot_uin": "3832224285", "count": 3, "flag": true });
+        assert_eq!(
+            interpolate_hint_settings(
+                "you are qq user {setting:bot_uin} (#{setting:count})",
+                Some(&settings)
+            ),
+            "you are qq user 3832224285 (#3)"
+        );
+        assert_eq!(
+            interpolate_hint_settings("{setting:flag}", Some(&settings)),
+            "true"
+        );
+    }
+
+    #[test]
+    fn leaves_unresolvable_placeholders_verbatim() {
+        // Missing key, non-scalar value, no settings block, malformed marker.
+        assert_eq!(
+            interpolate_hint_settings("id={setting:bot_uin}", Some(&json!({}))),
+            "id={setting:bot_uin}"
+        );
+        assert_eq!(
+            interpolate_hint_settings("x={setting:obj}", Some(&json!({ "obj": {"a": 1} }))),
+            "x={setting:obj}"
+        );
+        assert_eq!(
+            interpolate_hint_settings("id={setting:bot_uin}", None),
+            "id={setting:bot_uin}"
+        );
+        assert_eq!(
+            interpolate_hint_settings("id={setting:bot_uin", Some(&json!({ "bot_uin": "1" }))),
+            "id={setting:bot_uin"
+        );
+    }
+
+    #[test]
+    fn text_without_placeholders_is_unchanged() {
+        let hint = "plain hint with braces {not-a-setting} and {}";
+        assert_eq!(interpolate_hint_settings(hint, Some(&json!({}))), hint);
+    }
+}
+
 fn disabled_plugins(config: &RuntimeConfig) -> BTreeSet<String> {
     config
         .plugin_configs
