@@ -11957,57 +11957,56 @@ mod ffi_panic_seam_tests {
     #[test]
     #[serial]
     fn stop_handler_panic_is_caught_and_reload_path_survives() {
-        let (_temp, fixtures) = setup_task_plugin_fixture();
-        let host = RuntimeHost::boot(&fixtures).expect("host should boot on task fixture");
-
-        // The Task node must be registered so the stop-handler loop has a
-        // target to iterate over.
-        let snapshot = host.current_snapshot();
-        let task_fqns = snapshot.node_registry().task_node_fqns();
+        // A panic inside a plugin's stop handler runs in that plugin's dylib,
+        // so it is caught at the FFI seam and the reload keeps going instead of
+        // unwinding the process. Use a real dylib plugin so Phase 1 validates
+        // and Phase 2 actually runs the stop handler.
+        let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures")
+            .canonicalize()
+            .expect("fixtures root");
+        let host = RuntimeHost::boot(&fixtures).expect("host should boot on the repo fixtures");
+        let task_fqns = host.current_snapshot().node_registry().task_node_fqns();
         assert!(
-            task_fqns.iter().any(|fqn| fqn == "svc::svc_serve"),
-            "svc::svc_serve Task node must be registered, got: {task_fqns:?}"
+            task_fqns.iter().any(|fqn| fqn == "qq::qq_serve"),
+            "qq::qq_serve Task node must be registered, got: {task_fqns:?}"
         );
-        drop(snapshot);
 
-        // Arm the stop-handler injection and reload the svc subtree. The panic
-        // fires inside the per-node stop `catch_unwind`; the guard must catch
-        // it and let the reload continue. (Phase 1 then dlopens the JSON
-        // artifact and fails — an expected, caught Err — proving the reload
-        // path kept running past the panic instead of unwinding the thread.)
         TEST_STOP_HANDLER_PANIC_INJECTION.store(true, SeqCst);
-        let reload_result = host.reload("svc");
+        let reload_result = host.reload("qq");
         assert!(
             !TEST_STOP_HANDLER_PANIC_INJECTION.load(SeqCst),
             "stop-handler injection flag must be reset after firing"
         );
-        // The reload_subtree Phase-1 dlopen of a JSON artifact fails, but the
-        // stop-handler panic was already caught by then — the process did not
-        // abort, which is the property under test.
         assert!(
-            reload_result.is_err(),
-            "reloading a JSON artifact via reload_subtree fails at Phase 1 dlopen"
+            reload_result.is_ok(),
+            "a panic in a stop handler must not abort the reload: {reload_result:?}"
         );
+    }
 
-        // The host is still usable after the caught panic: a fresh snapshot
-        // read and a second reload attempt both succeed at the API level
-        // (i.e. no poisoned lock / aborted thread).
-        let after = host.current_snapshot();
+    // A reload rejected during validation must leave the running plugins
+    // untouched: stop handlers run in Phase 2, after Phase 1 accepts the new
+    // artifact. (Before that reorder, a rejected reload had already killed
+    // e.g. qq's 8099/8002 listeners — the 2026-10-28 outage.)
+    #[test]
+    #[serial]
+    fn failed_reload_does_not_stop_services() {
+        let (_temp, fixtures) = setup_task_plugin_fixture();
+        let host = RuntimeHost::boot(&fixtures).expect("host should boot on task fixture");
+        TEST_STOP_HANDLER_PANIC_INJECTION.store(true, SeqCst);
+
+        // The fixture's artifact is JSON, so Phase 1's dlopen fails.
+        let err = host
+            .reload("svc")
+            .expect_err("JSON artifact cannot be dlopened");
+        let message = err.to_string();
+        assert!(!message.is_empty(), "the failure must be reported: {err:?}");
+
         assert!(
-            after
-                .node_registry()
-                .task_node_fqns()
-                .iter()
-                .any(|fqn| fqn == "svc::svc_serve"),
-            "Task node registry must survive the caught panic"
+            TEST_STOP_HANDLER_PANIC_INJECTION.load(SeqCst),
+            "a rejected reload must not run stop handlers"
         );
-        // Second reload without the flag set: still reaches Phase 1 and errs
-        // on the same JSON dlopen, but does not panic — confirms repeatability.
-        let second = host.reload("svc");
-        assert!(
-            second.is_err(),
-            "second reload also fails cleanly at Phase 1 (no panic)"
-        );
+        TEST_STOP_HANDLER_PANIC_INJECTION.store(false, SeqCst);
     }
 
     // ── C-seam #2b: reload stop-loop tolerates a failing stop invoke ──────
