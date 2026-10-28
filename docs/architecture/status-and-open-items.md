@@ -128,9 +128,18 @@ Agent 现在可以自主完成：读代码 → 理解结构 → 写/改文件 �
   按钮 markdown + 点击回执（`PUT /interactions/{id}`）、富媒体按 URL 收发、附件下载落盘。
 - 节点：`qqbot_configure` / `qqbot_status` / `qqbot_serve`（Task，`payload.stop` 停机）/
   `qqbot_send` / `qqbot_ask` / `qqbot_send_media` / `qqbot_download_media` / `qqbot_set_policy` / `qqbot_ack`。
+- 测试与覆盖率：116 个单测 + 2 个集成测试（`tests/scaffold.rs`、`tests/docs.rs`）；
+  `cargo llvm-cov -p qqbot --lib --lcov` 报 **3395/3395 行、0 未覆盖（100%）**，
+  `clippy --all-targets -D warnings` 与 `fmt --check` 均干净。节点成功路径靠 **线程局部 transport 注入缝**
+  （`api::tests_support`）驱动，`qqbot_serve` 的线程体被抽成具名 `gateway_loop` 直接单测，
+  `WsSocket` 用本地 tungstenite stub + 手写帧覆盖非文本/断开帧臂。
+- 脚手架：新插件必须带 `tests/`、`docs/human/overview.md`、`docs/agent/interfaces.json`，
+  否则 `prepare-artifacts` / `sync-plugin-docs` 与 `cordis-runtime --test architecture` 都会
+  报 `missing plugin scaffold`；`interfaces.json` 由 `tests/docs.rs` 与 `docs_value()` 对拍，
+  改了节点文档必须重跑 `cargo run -p cordis-cli -- prepare-artifacts fixtures`。
 - 未完成：**分片上传**（`upload_prepare` / `upload_part_finish` 链路，当前只走协议允许的
   `url` 直传）、扫码绑定（官方协议无此流程，凭据走 `qqbot_configure` 或 `QQBOT_APPID`/`QQBOT_SECRET`）、
-  真机联调（需要 appId/secret）、覆盖率门槛补齐。
+  真机联调（需要 appId/secret）。
 
 ## 3.7 插件样例已扩展
 
@@ -210,6 +219,33 @@ CLI：`cordis-runtime reload [plugin_path] [--fixtures-root=<dir>]`。返回 JSO
 （按插件 reload，agent 工具与控制通道都走它）在停完目标服务后、`reload_internal`（`/` 全量）
 在停完"被删除/文档变更"的插件后，各自调用 `restart_services_for` 重放对应条目。因此
 agent 的 `reload_runtime` 与控制通道两条路径行为一致，不会再出现"reload 完 qq/feishu 不再监听"。
+
+### 3.12 出站消息只透传 CQ 码，不再做标记转换（2026-10-28）
+
+一开始给 `qq_send` 加了两套"糖"：`@[id=<qq>]` → `[CQ:at,qq=…]`、`[image: <url>]` →
+`[CQ:image,file=…]`。线上日志证明这是多此一举：模型本来就会直接写 `[CQ:image,file=…]`，
+客户端也照常渲染成图（2026-10-28 15:36，retcode 0，看图成功）。而且第二套语法还带来了自己的
+解析器、它自己的拒绝规则（禁 `file://`）和与原生语义不一致的风险。
+
+现在 `build_reply_message` 只做一件事：有 `reply_to` 时在前面加 `[CQ:reply,id=…]`，其余字节原样
+透传；hint 改成教模型写 CQ 码（`[CQ:at,qq=<uid>]`、`[CQ:image,file=<https url>]`），并明确
+最终输出必须是 JSON、聊天文本只能出现在 `qq_send` 的 `message` 里。
+
+**注意**：入站的 `@[id=<qq>,self,…]` 标记仍然保留——那是给模型**读**的（判断"这条 @ 是不是我"），
+与出站无关。
+
+### 3.13 reload 现在会把插件重指向新工件（2026-10-28，修 QQ 掉线）
+
+`reload_subtree` 之前只更新 registry 里的 docs / fingerprint，**不更新 `artifact_path`**，而 invoke
+打开的是 `plugin.artifact_path`——也就是 boot 时 staged 的那份旧 `.so`。后果：
+
+- rebuild 之后 reload，插件表面"重载"了，实际仍在跑旧代码；
+- 一旦新 docs 与旧 dylib 不一致，invoke 直接 `ContractViolation`（2026-10-28 15:43 就是这样：
+  reload 停掉了 qq 的 8099/8002，重放启动项时撞 ContractViolation，QQ 掉线约 1 分钟，直到手动重启）。
+
+现在 `Prepared` 带上本次校验过的 `resolved` 路径，`PluginRegistry::reload_plugin_entry_with_artifact`
+把它写回条目（`reload_plugin_entry` 保留，委托为"只刷 docs"）。测试：
+`reload_plugin_entry_with_artifact_repoints_the_path`。
 
 ## 4. 部分完成
 

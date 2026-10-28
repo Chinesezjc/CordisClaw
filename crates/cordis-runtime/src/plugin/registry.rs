@@ -197,6 +197,24 @@ impl PluginRegistry {
         docs: PluginDocs,
         abi_fingerprint: AbiFingerprint,
     ) -> bool {
+        self.reload_plugin_entry_with_artifact(plugin_path, docs, abi_fingerprint, None)
+    }
+
+    /// [`Self::reload_plugin_entry`] that also repoints the entry at the
+    /// artifact the reload just validated.
+    ///
+    /// A reload re-resolves `artifacts/<plugin>` from the index, but the
+    /// registry entry keeps the artifact path the *boot* snapshot staged. The
+    /// invoke path opens `plugin.artifact_path`, so without this the reloaded
+    /// plugin silently kept running the old dylib — and once the docs differ
+    /// from it, every invoke failed with `ContractViolation`.
+    pub fn reload_plugin_entry_with_artifact(
+        &self,
+        plugin_path: &str,
+        docs: PluginDocs,
+        abi_fingerprint: AbiFingerprint,
+        artifact_path: Option<PathBuf>,
+    ) -> bool {
         let normalized = normalize_plugin_path(plugin_path);
         let mut guard = self
             .plugins
@@ -207,6 +225,9 @@ impl PluginRegistry {
             plugin.docs = Some(docs);
             plugin.abi_fingerprint = Some(abi_fingerprint);
             plugin.fingerprint_diff = Vec::new();
+            if artifact_path.is_some() {
+                plugin.artifact_path = artifact_path;
+            }
             true
         } else {
             false
@@ -1006,5 +1027,86 @@ mod mutator_normalization_tests {
             .get("qq")
             .expect("canonical lookup after insert_raw");
         assert_eq!(entry.plugin_path, "qq");
+    }
+}
+
+#[cfg(test)]
+mod reload_artifact_tests {
+    use super::*;
+    use std::collections::BTreeSet;
+    use std::path::Path;
+
+    fn docs(plugin_path: &str, summary: &str) -> PluginDocs {
+        PluginDocs {
+            plugin_id: plugin_path.to_string(),
+            plugin_path: plugin_path.to_string(),
+            plugin_version: "0.1.0".to_string(),
+            abi_version: 2,
+            command_name: None,
+            nodes: vec![cordis_plugin_sdk::NodeDoc {
+                id: format!("{plugin_path}_entry"),
+                summary: summary.to_string(),
+                input_schema: serde_json::json!({}),
+                output_schema: serde_json::json!({}),
+                side_effects: Vec::new(),
+                failure_modes: Vec::new(),
+                node_type: cordis_plugin_sdk::NodeType::Router,
+                agent_accessible: true,
+            }],
+            system_hint: None,
+        }
+    }
+
+    // A reload must repoint the entry at the artifact it just validated —
+    // otherwise invoke keeps opening the boot-staged dylib (old code, and later
+    // a ContractViolation once docs differ).
+    #[test]
+    fn reload_plugin_entry_with_artifact_repoints_the_path() {
+        let registry = PluginRegistry::default();
+        registry.insert_loaded(
+            "qq".to_string(),
+            None,
+            true,
+            BTreeSet::new(),
+            docs("qq", "old"),
+            PathBuf::from("/staged/boot/qq.so"),
+            crate::core::models::ArtifactKind::Dylib,
+            AbiFingerprint::current_build("crate_qq_v1", "api_v2"),
+            None,
+        );
+        assert!(registry.reload_plugin_entry_with_artifact(
+            "qq",
+            docs("qq", "new"),
+            AbiFingerprint::current_build("crate_qq_v1", "api_v2"),
+            Some(PathBuf::from("/artifacts/qq.so")),
+        ));
+        let entry = registry.get("qq").expect("entry");
+        assert_eq!(
+            entry.artifact_path.as_deref(),
+            Some(Path::new("/artifacts/qq.so"))
+        );
+        assert_eq!(
+            entry.docs.as_ref().map(|d| d.nodes[0].summary.as_str()),
+            Some("new")
+        );
+
+        // The plain variant keeps the existing path (docs-only refresh).
+        assert!(registry.reload_plugin_entry(
+            "qq",
+            docs("qq", "newer"),
+            AbiFingerprint::current_build("crate_qq_v1", "api_v2"),
+        ));
+        let entry = registry.get("qq").expect("entry");
+        assert_eq!(
+            entry.artifact_path.as_deref(),
+            Some(Path::new("/artifacts/qq.so"))
+        );
+        // Unknown plugin: report failure instead of creating an entry.
+        assert!(!registry.reload_plugin_entry_with_artifact(
+            "missing",
+            docs("missing", "x"),
+            AbiFingerprint::current_build("crate_x_v1", "api_v2"),
+            None,
+        ));
     }
 }

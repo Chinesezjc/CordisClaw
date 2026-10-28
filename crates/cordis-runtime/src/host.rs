@@ -4512,6 +4512,9 @@ export_plugin_api! {{
             plugin_path: String,
             docs: PluginDocs,
             abi_fingerprint: AbiFingerprint,
+            /// Artifact the reload just validated; repointed in the registry so
+            /// the next invoke runs THIS build instead of the boot-staged one.
+            artifact_path: PathBuf,
             _dylib: crate::plugin::dynamic::LoadedDylibApi,
         }
         let mut prepared: Vec<Prepared> = Vec::new();
@@ -4566,6 +4569,7 @@ export_plugin_api! {{
                 plugin_path: plugin_path.clone(),
                 docs: new_docs,
                 abi_fingerprint: actual_fingerprint,
+                artifact_path: resolved.clone(),
                 _dylib: dylib,
             });
         }
@@ -4581,7 +4585,12 @@ export_plugin_api! {{
                 .stop_plugin_services_timed(&p.plugin_path);
         }
         for p in &prepared {
-            registry.reload_plugin_entry(&p.plugin_path, p.docs.clone(), p.abi_fingerprint.clone());
+            registry.reload_plugin_entry_with_artifact(
+                &p.plugin_path,
+                p.docs.clone(),
+                p.abi_fingerprint.clone(),
+                Some(p.artifact_path.clone()),
+            );
             changed_plugins.push(p.plugin_path.clone());
             changed_reasons.insert(p.plugin_path.clone(), vec!["subtree reload".to_string()]);
             eprintln!("reload_subtree: reloaded {}", p.plugin_path);
