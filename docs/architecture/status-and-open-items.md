@@ -291,6 +291,34 @@ system prompt 里"你的 QQ 号"比对，插件不再逐条消息打标记。
 `/root/cordis-wip/`，未删源码）、`fixtures/plugins/imggen`（只剩一个生成的 interfaces.json）、
 `fixtures/plugins/tmp`（迭代测试产出的 PNG）。
 
+### 3.16 群记忆由 agent 自己写、且不设长度上限（2026-10-28）
+
+之前每群记忆（`data/qq_group_memory.json`）和回复策略共用同一道判权：
+`authorize_policy_write` 要求写的人必须是群主/管理员/操作员。于是普通成员说话时，agent 就算
+看出"这个群喜欢玩笑"也写不进去——它只能等被明确要求、而对方恰好有权限。
+
+现在拆成两条规则：
+
+- **记忆**（`qq_set_group_memory`）：agent 自己的备忘，只要目标群 == 这条消息来源群就允许
+  （跨群仍拒，CLI 运维无 `__meta` 视为操作员）。不再要求群主/管理员。
+- **策略**（`qq_set_reply_policy`）：保持 owner/admin/operator 判定——它改变的是群里所有人
+  看到的行为。
+
+同时去掉 800 字符上限：整条记忆原样保存，`dropped_chars` 字段一并删除。提示词改成"这份备忘
+由你自己维护"：被纠正、明确偏好、固定话题、踩过的坑都该写，不用征求同意也不用问"要不要记"；
+同时提醒它"这段会随每条消息下发，所以写短一点"（建议，不是硬限制）。
+
+测试：`memory_roundtrips_without_a_length_cap`（5 万字符原样保存）、
+`agent_may_write_memory_for_the_originating_group_only`（同群允许、跨群拒绝）、
+`memory_is_self_written_but_policy_stays_gated`（普通成员可写记忆、仍不能改策略）。
+
+**踩到的坑（未修，记在这里）**：重建工件后如果先跑 `sync-plugin-docs` 再跑
+`prepare-artifacts`，索引里的 docs 会来自旧 `.so`，`reload` 会以
+`ABI mismatch … diff=["docs mismatch: expected 13 nodes, got 13"]` 失败；而且 reload 在失败前
+已经停掉了目标插件的服务，于是 QQ 监听直接没了（17:12 就发生过，靠重启恢复）。正确顺序是
+`prepare-artifacts` → `sync-plugin-docs` → `reload`；代码层面还应收敛成
+"reload 失败也要把已停的服务拉回来"。
+
 ## 4. 部分完成
 
 ### 4.1 Execution engine 有正式入口，数据面验证不足

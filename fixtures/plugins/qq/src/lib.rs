@@ -1172,9 +1172,6 @@ const MODE_ONE_ON_ONE: &str = "one_on_one";
 /// 没有任何配置时的模式。
 const DEFAULT_MODE: &str = MODE_BALANCED;
 
-/// 每群记忆的长度上限（字符）。防 prompt 膨胀。
-const MEMORY_MAX_CHARS: usize = 800;
-
 fn mode_preset(mode: &str) -> Option<&'static str> {
     match mode {
         MODE_QUIET => Some("Stay silent unless the message @mentions you (an @mention whose id is your own QQ number) or addresses you by name (\"bot\"/\"Bot\"/\"机器人\"). This group does not want the bot commenting on ordinary conversation."),
@@ -2132,6 +2129,25 @@ fn cached_group_role(gid: &str, uid: &str, payload: Option<&Value>) -> Option<St
 /// 判权入口。`Ok(actor_tag)` 里的 tag 只用于审计行。
 ///
 /// `group = None` 表示改的是全局默认策略。
+/// Group memory is the agent's own memo: any sender may trigger a write for
+/// the group the message came from (cross-group is still refused), no
+/// owner/admin gate. Reply policy keeps that gate — it changes what everyone
+/// in the group experiences.
+fn authorize_memory_write(req: &NodeRequest, group: &str) -> Result<String, String> {
+    let Some(actor) = meta_actor(req) else {
+        // CLI/ops invoke: treated as the operator.
+        return Ok("operator-cli".to_string());
+    };
+    if let Some(from_group) = meta_group_id(req) {
+        if group != from_group {
+            return Err(
+                "you can only change the memory of the group this message came from".to_string(),
+            );
+        }
+    }
+    Ok(format!("agent:{actor}"))
+}
+
 fn authorize_policy_write(
     req: &NodeRequest,
     data_dir: Option<&str>,
@@ -2277,20 +2293,17 @@ fn handle_qq_set_group_memory(req: &NodeRequest) -> Result<NodeResponse, String>
         .unwrap_or_default()
         .trim()
         .to_string();
-    let actor = authorize_policy_write(req, data_dir.as_deref(), Some(group.as_str()), "memory")?;
+    let actor = authorize_memory_write(req, &group)?;
     let mut store = load_memory_store(data_dir.as_deref());
-    let truncated: String = memory.chars().take(MEMORY_MAX_CHARS).collect();
-    let dropped_chars = memory
-        .chars()
-        .count()
-        .saturating_sub(truncated.chars().count());
-    if truncated.is_empty() {
+    // No length cap: the memo is the agent's own to maintain. It ships with
+    // every message, so keeping it short is advice, not a hard limit.
+    if memory.is_empty() {
         store.remove(&group);
     } else {
         store.insert(
             group.clone(),
             MemoryEntry {
-                memory: truncated.clone(),
+                memory: memory.clone(),
                 updated_at_ms: now_ms(),
                 updated_by: "agent".to_string(),
             },
@@ -2298,8 +2311,8 @@ fn handle_qq_set_group_memory(req: &NodeRequest) -> Result<NodeResponse, String>
     }
     let path = save_memory_store(data_dir.as_deref(), &store)?;
     eprintln!(
-        "qq memory: group={group} chars={} dropped={dropped_chars} by={actor}",
-        truncated.chars().count()
+        "qq memory: group={group} chars={} by={actor}",
+        memory.chars().count()
     );
     Ok(NodeResponse {
         ok: true,
@@ -2308,8 +2321,7 @@ fn handle_qq_set_group_memory(req: &NodeRequest) -> Result<NodeResponse, String>
         message: Some(format!("group memory updated at {}", path.display())),
         data: Some(json!({
             "group": group,
-            "memory": truncated,
-            "dropped_chars": dropped_chars,
+            "memory": memory,
             "path": path.display().to_string(),
         })),
         error: None,
@@ -2958,7 +2970,7 @@ fn docs_value() -> cordis_plugin_sdk::PluginDocs {
             ).with_agent_accessible(),
             node_doc(
                 "qq_set_group_memory",
-                "Write the memo about a group, in your own words: does it want you talkative or quiet, what it talks about, what you already tried and got told off for. Shipped as a `[group memory: ...]` line on every message from that group, so write only what is DURABLE (not something you read from one message). Blank `memory` deletes the entry. Capped at 800 characters.",
+                "Write the memo about a group, in your own words: does it want you talkative or quiet, what it talks about, what you already tried and got told off for. Shipped as a `[group memory: ...]` line on every message from that group, so write only what is DURABLE (not something you read from one message). Blank `memory` deletes the entry. There is no length cap; keep it short anyway because it is injected into every message from that group.",
                 json!({
                     "type": "object", "required": ["node_id", "group"],
                     "properties": {
@@ -2977,7 +2989,6 @@ fn docs_value() -> cordis_plugin_sdk::PluginDocs {
                             "properties": {
                                 "group": { "type": "string" },
                                 "memory": { "type": "string" },
-                                "dropped_chars": { "type": "integer" },
                                 "path": { "type": "string" }
                             }
                         }
@@ -3022,7 +3033,7 @@ REPLY POLICY — the authority on whether to answer. Every incoming message star
 SMALL GROUPS — a group that is effectively private (you and one or two people) should behave like a direct chat. If you are not sure how big a group is, look it up once with `qq_get_group_info` (its docs are in the plugin catalog below) and, when member_count <= 2, set this group's mode to one_on_one with `qq_set_reply_policy` and remember it. Decide once per group — never probe on every message.\n\
 HOW TO JUDGE — use the conversation history, not just this one message: who is talking to whom, whether the last few lines are a thread you are part of, whether someone asked a question nobody answered. A message that continues a thread you are already in is addressed to you even without naming you.\n\
 [group memory: ...] — this is YOUR OWN memo about this group (how talkative it wants you, its standing topics, what it told you off for). Follow it. If the line is absent you have written nothing yet.\n\
-WRITING MEMORY — when you learn something DURABLE about a group (it wants you quiet, it wants you chatty, its standing topic, a joke that landed badly), persist it with `qq_set_group_memory` (see the catalog for its arguments). Do NOT write on every message — only durable preferences, and never guess one from a single message. To change how talkative you are, use `qq_set_reply_policy` with one of the four modes. Both take effect on the next message.\n\
+WRITING MEMORY — the memo is YOURS: maintain it on your own initiative, without waiting to be asked and without asking permission. Write when you learn something DURABLE: an explicit preference (wants you quiet/chatty), a correction (\"don't do that again\"), the group's standing topic or in-jokes, or a mistake you already paid for. Do not write about one-off facts or guesses from a single message; overwrite the entry (it replaces, not appends) and keep it compact — it ships with EVERY message from that group, so it costs tokens each time even though there is no length cap. Use `qq_set_group_memory` (see the catalog). Changing how talkative you are is separate: `qq_set_reply_policy` with one of the four modes, and that one needs the group owner/admin or a configured operator. Both take effect on the next message.\n\
 If the message is NOT for you: use {\"action\":\"suspend\"}.\n\
 If it IS for you: invoke_plugin(qq, qq_send, ...) to send your reply, then output {\"action\":\"suspend\"}.\n\
 IMPORTANT: NEVER use {\"action\":\"respond\"} — it will cause duplicate messages. Always send via qq_send and finish with {\"action\":\"suspend\"}.\n\
@@ -3938,9 +3949,9 @@ mod reply_policy_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // 记忆：写 → 读；空串删除；超长截断到上限并报告 dropped_chars。
+    // 记忆：写 → 读；空串删除；无长度上限（写入即全文保存）。
     #[test]
-    fn memory_roundtrips_truncates_and_deletes() {
+    fn memory_roundtrips_without_a_length_cap() {
         let dir = temp_dir();
         let resp = handle_qq_set_group_memory(&set_memory(
             "qq_set_group_memory",
@@ -3962,18 +3973,15 @@ mod reply_policy_tests {
         assert_eq!(data_of(&got)["memory"], "这个群希望 bot 多说话");
         assert_eq!(data_of(&got)["updated_by"], "agent");
 
-        let long = "x".repeat(MEMORY_MAX_CHARS + 10);
+        // No length cap: the whole memo is stored verbatim (it is the agent's
+        // own to maintain; keeping it short is advice, not a limit).
+        let long = "x".repeat(50_000);
         let resp =
             handle_qq_set_group_memory(&set_memory("qq_set_group_memory", &dir, "999", &long))
                 .expect("set long memory");
-        assert_eq!(data_of(&resp)["dropped_chars"], 10);
         assert_eq!(
-            data_of(&resp)["memory"]
-                .as_str()
-                .unwrap_or_default()
-                .chars()
-                .count(),
-            MEMORY_MAX_CHARS
+            data_of(&resp)["memory"].as_str().unwrap_or_default().len(),
+            50_000
         );
 
         handle_qq_set_group_memory(&set_memory("qq_set_group_memory", &dir, "999", ""))
@@ -4763,6 +4771,47 @@ mod auth_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // Memory is the agent's own memo: a plain member's message in the same
+    // group may trigger a write (no owner/admin gate), cross-group may not.
+    #[test]
+    fn agent_may_write_memory_for_the_originating_group_only() {
+        let dir = temp_dir();
+        let req: NodeRequest = serde_json::from_value(json!({
+            "node_id": "qq_set_group_memory",
+            "data_dir": dir.to_str().unwrap_or_default(),
+            "group": "800004",
+            "memory": "这个群喜欢玩笑，别太正式",
+            "payload": {
+                "__meta": { "actor": "qq:3003", "target": "group:800004" }
+            }
+        }))
+        .expect("req");
+        let resp = handle_qq_set_group_memory(&req).expect("memory write must be allowed");
+        assert!(resp.ok);
+        assert_eq!(
+            resp.data.as_ref().expect("data")["memory"],
+            "这个群喜欢玩笑，别太正式"
+        );
+
+        // A memory write aimed at another group is refused.
+        let cross: NodeRequest = serde_json::from_value(json!({
+            "node_id": "qq_set_group_memory",
+            "data_dir": dir.to_str().unwrap_or_default(),
+            "group": "800005",
+            "memory": "别的群",
+            "payload": {
+                "__meta": { "actor": "qq:3003", "target": "group:800004" }
+            }
+        }))
+        .expect("req");
+        let err = handle_qq_set_group_memory(&cross).expect_err("cross-group must be refused");
+        assert_eq!(
+            err,
+            "you can only change the memory of the group this message came from"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // 普通群员不能改，且错误文本要说清原因。
     #[test]
     fn plain_member_is_rejected() {
@@ -4835,16 +4884,21 @@ mod auth_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // 记忆的写路径同样受判权保护（普通群员不行）。
+    // 记忆是 agent 自己的备忘：普通群员的消息也能触发写入（同群），
+    // 但策略写入仍然要 owner/admin —— 它改变的是群里所有人看到的行为。
     #[test]
-    fn memory_writes_are_gated_too() {
+    fn memory_is_self_written_but_policy_stays_gated() {
         let dir = temp_dir();
         let url = member_stub(&[("1001", "owner"), ("3003", "member")]);
         let mut req = req_with_meta("qq_set_group_memory", &dir, "800008", "3003", &url);
         req.memory = Some("x".to_string());
-        let err = handle_qq_set_group_memory(&req).expect_err("member must be rejected");
-        let mentions_permission = err.contains("owner or an admin");
-        assert!(mentions_permission, "err: {err}");
+        let resp = handle_qq_set_group_memory(&req).expect("the agent may keep its own memo");
+        assert!(resp.ok);
+
+        // 同一个普通群员改策略 → 仍被拒。
+        let policy = req_with_meta("qq_set_reply_policy", &dir, "800008", "3003", &url);
+        let err = handle_qq_set_reply_policy(&policy).expect_err("policy stays gated");
+        assert!(err.contains("owner or an admin"), "err: {err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
