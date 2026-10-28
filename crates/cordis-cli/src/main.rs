@@ -596,6 +596,13 @@ fn main() {
         }
         return;
     }
+    if args.first().map(|x| x.as_str()) == Some("reload") {
+        if let Err(err) = run_reload_command(&args[1..]) {
+            eprintln!("reload failed: {err}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if args.first().map(|x| x.as_str()) == Some("gc") {
         if let Err(err) = run_gc(&args[1..]) {
             eprintln!("gc failed: {err}");
@@ -754,43 +761,24 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     // Read startup_invoke.json from fixtures root and execute each
     // invocation before entering the REPL.  This is used to start
     // background services (e.g. qq_serve HTTP server).
-    let startup_file = root.join("startup_invoke.json");
-    if no_startup_invoke {
+    let startup_invocations = if no_startup_invoke {
         eprintln!("[startup] startup_invoke.json skipped (--no-startup-invoke)");
-    } else if startup_file.exists() {
-        match fs::read_to_string(&startup_file) {
-            Ok(text) => match serde_json::from_str::<Value>(&text) {
-                Ok(Value::Array(items)) => {
-                    for item in &items {
-                        let plugin_path = item["plugin_path"].as_str().unwrap_or("");
-                        let node_id = item["node_id"].as_str().unwrap_or("");
-                        let payload = item["payload"]
-                            .as_object()
-                            .map(|o| serde_json::to_string(o).unwrap_or_default())
-                            .unwrap_or_else(|| "{}".to_string());
-                        if !plugin_path.is_empty() && !node_id.is_empty() {
-                            match host.invoke(plugin_path, node_id, payload) {
-                                Ok(response) => {
-                                    eprintln!(
-                                        "[startup] invoke {plugin_path}::{node_id} ok={}",
-                                        response.payload
-                                    );
-                                }
-                                Err(err) => {
-                                    eprintln!(
-                                        "[startup] invoke {plugin_path}::{node_id} failed: {err}"
-                                    );
-                                }
-                            }
-                        }
-                    }
+        Vec::new()
+    } else {
+        let invocations = load_startup_invocations(&root);
+        for invocation in &invocations {
+            eprintln!(
+                "[startup] invoke {}::{} {}",
+                invocation.plugin_path,
+                invocation.node_id,
+                match run_startup_invocation(&host, invocation) {
+                    Ok(payload) => format!("ok={payload}"),
+                    Err(err) => format!("failed: {err}"),
                 }
-                Ok(_) => eprintln!("[startup] startup_invoke.json must be an array"),
-                Err(e) => eprintln!("[startup] startup_invoke.json parse error: {e}"),
-            },
-            Err(e) => eprintln!("[startup] cannot read startup_invoke.json: {e}"),
+            );
         }
-    }
+        invocations
+    };
 
     // Use rustyline for readline-like editing: history, cursor movement, etc.
     let mut rl = rustyline::DefaultEditor::new()?;
@@ -819,6 +807,16 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("pending: archived {archived} stale spill(s)");
         }
         let (tx, rx) = std::sync::mpsc::sync_channel::<String>(AGENT_TRIGGER_CAPACITY);
+        // Ops channel: `cordis-runtime reload` talks to this process instead of
+        // restarting it (a restart drops every channel connection and reloads
+        // every plugin).
+        let (control_tx, control_rx) = std::sync::mpsc::channel::<ControlJob>();
+        let startup_for_control = std::sync::Arc::new(startup_invocations);
+        let control_socket = control_socket_path(host.fixtures_root());
+        match start_control_socket(&control_socket, control_tx) {
+            Ok(()) => eprintln!("control: listening on {}", control_socket.display()),
+            Err(e) => eprintln!("control: disabled ({}): {e}", control_socket.display()),
+        }
         let inject_queue = std::sync::Arc::new(std::sync::Mutex::new(
             std::collections::VecDeque::<String>::new(),
         ));
@@ -834,10 +832,16 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             // single-threaded, so a plain HashMap needs no lock.
             let mut outage_notified: HashMap<String, Instant> = HashMap::new();
             loop {
+                // Ops requests run on THIS thread: it is the one that runs
+                // agent turns, so a reload cannot race one.
+                while let Ok(job) = control_rx.try_recv() {
+                    run_control_job(&host, job, &startup_for_control);
+                }
                 let mut msgs: Vec<String> = Vec::new();
-                match rx.recv() {
+                match rx.recv_timeout(Duration::from_millis(200)) {
                     Ok(m) => msgs.push(m),
-                    Err(_) => break,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                 }
                 while let Ok(m) = rx.try_recv() {
                     msgs.push(m);
@@ -2486,6 +2490,7 @@ fn usage() -> String {
     "Usage:
   cargo run -p cordis-runtime -- <fixtures_root>
   cargo run -p cordis-runtime -- serve [fixtures_root] [--runtime-only] [--no-startup-invoke]
+  cargo run -p cordis-runtime -- reload [plugin_path] [--fixtures-root=<dir>]   (reload in the RUNNING host)
   cargo run -p cordis-runtime -- invoke <plugin_path> <node_id> --payload-json=<json> [--fixtures-root=fixtures] [--runtime-only]
   cargo run -p cordis-runtime -- execute <node_fqn> --payload-json=<json> [--fixtures-root=fixtures] [--runtime-only]
   cargo run -p cordis-runtime -- llm-auto-update <workspace_root> --instruction=<text> --path=<relative_path> [--path=<relative_path> ...] [--issue-id=<id>] [--patch-id=<id>] [--manual-approved] [--tests-command=<shell>] [--safety-command=<shell>] [--verify-profile=<default|rust-workspace>] [--quality-score=<u32>] [--dry-run]
@@ -3342,5 +3347,536 @@ mod draft_tests {
         // No diff → no draft, and nothing is written.
         git(root, &["checkout", "--", "plugins/"]);
         assert!(save_draft(root, "signal").is_none());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Control channel (unix socket) — lets an operator trigger a plugin reload in
+// the *running* host without restarting it.
+//
+// `systemctl restart` drops every connection (QQ/Feishu) and reloads every
+// plugin; a plugin-only change only needs `reload /<plugin>`. The socket is
+// private to the invoking user (dir 0700, socket 0600, peer uid checked) and
+// accepts exactly two actions: `reload` and `status`.
+// ---------------------------------------------------------------------------
+
+/// Cap on a single request line: this is a control channel, not a data pipe.
+const CONTROL_MAX_LINE: usize = 64 * 1024;
+
+/// Per-user directory for the control sockets.
+fn control_socket_path(fixtures_root: &Path) -> PathBuf {
+    let root = fixtures_root
+        .canonicalize()
+        .unwrap_or_else(|_| fixtures_root.to_path_buf());
+    // FNV-1a over the canonical root: stable across processes (no RandomState)
+    // and distinct per checkout, so two runtimes on one box never share a
+    // socket.
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in root.to_string_lossy().as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100_0000_01b3);
+    }
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let uid = unsafe { libc::geteuid() };
+    control_socket_dir(uid).join(format!("{hash:016x}.sock"))
+}
+
+/// Where the control sockets live: `/run` when it is writable (shared with the
+/// service's mount namespace), else the temp dir (tests, non-root CI).
+fn control_socket_dir(uid: libc::uid_t) -> PathBuf {
+    let run = PathBuf::from(format!("/run/cordis-runtime-{uid}"));
+    if fs::create_dir_all(&run).is_ok() {
+        return run;
+    }
+    std::env::temp_dir().join(format!("cordis-runtime-ctl-{uid}"))
+}
+
+/// One control request, with the channel used to hand the response back.
+struct ControlJob {
+    action: ControlAction,
+    reply: std::sync::mpsc::SyncSender<String>,
+}
+
+enum ControlAction {
+    Reload { plugin_path: String },
+    Status,
+}
+
+fn parse_control_request(line: &str) -> Result<ControlAction, String> {
+    let value: Value = serde_json::from_str(line).map_err(|e| format!("invalid json: {e}"))?;
+    let action = value
+        .get("action")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "missing \"action\"".to_string())?;
+    match action {
+        "reload" => Ok(ControlAction::Reload {
+            plugin_path: value
+                .get("plugin_path")
+                .and_then(Value::as_str)
+                .unwrap_or("/")
+                .to_string(),
+        }),
+        "status" => Ok(ControlAction::Status),
+        other => Err(format!("unknown action: {other}")),
+    }
+}
+
+fn control_error(message: &str) -> String {
+    json!({ "ok": false, "error": message }).to_string()
+}
+
+/// Bind the control socket and serve it from a detached thread.
+///
+/// Bound synchronously so the caller knows the socket is ready before the
+/// Serve loop starts accepting jobs.
+fn start_control_socket(
+    path: &Path,
+    tx: std::sync::mpsc::Sender<ControlJob>,
+) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = path.parent().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "socket has no dir")
+    })?;
+    fs::create_dir_all(dir)?;
+    // Only this user may enter the directory or talk to the socket.
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+    // A stale socket from a crashed run would make bind() fail; remove it.
+    let _ = fs::remove_file(path);
+    let listener = std::os::unix::net::UnixListener::bind(path)?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let tx = tx.clone();
+            std::thread::spawn(move || serve_control_connection(stream, &tx));
+        }
+    });
+    Ok(())
+}
+
+/// Reflect the request line back to the client after the inbox thread answers,
+/// or immediately for malformed input.
+fn serve_control_connection(
+    stream: std::os::unix::net::UnixStream,
+    tx: &std::sync::mpsc::Sender<ControlJob>,
+) {
+    use std::io::{BufRead, BufReader, Read as _};
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+    if !control_peer_is_us(&stream) {
+        let _ = write_control_response(&stream, &control_error("peer uid mismatch"));
+        return;
+    }
+    let mut reader = BufReader::new(&stream).take((CONTROL_MAX_LINE + 1) as u64);
+    let mut line = String::new();
+    if let Err(e) = reader.read_line(&mut line) {
+        let _ = write_control_response(&stream, &control_error(&format!("read failed: {e}")));
+        return;
+    }
+    if line.len() > CONTROL_MAX_LINE {
+        let _ = write_control_response(&stream, &control_error("request line too long"));
+        return;
+    }
+    let response = match parse_control_request(line.trim()) {
+        Ok(action) => {
+            let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel::<String>(1);
+            if tx
+                .send(ControlJob {
+                    action,
+                    reply: reply_tx,
+                })
+                .is_err()
+            {
+                control_error("inbox is not running (control channel unavailable)")
+            } else {
+                // A reload rebuilds a snapshot: give it room, but never hang
+                // the client forever.
+                reply_rx
+                    .recv_timeout(Duration::from_secs(120))
+                    .unwrap_or_else(|_| control_error("timed out waiting for the host"))
+            }
+        }
+        Err(e) => control_error(&e),
+    };
+    let _ = write_control_response(&stream, &response);
+}
+
+fn write_control_response(
+    stream: &std::os::unix::net::UnixStream,
+    response: &str,
+) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut stream = stream;
+    stream.write_all(response.as_bytes())?;
+    stream.write_all(b"\n")?;
+    stream.flush()
+}
+
+/// Only the owning user may drive the control channel (defence in depth on top
+/// of the 0700/0600 permissions).
+fn control_peer_is_us(stream: &std::os::unix::net::UnixStream) -> bool {
+    use std::os::unix::io::AsRawFd;
+    let mut cred: libc::ucred = libc::ucred {
+        pid: 0,
+        uid: 0,
+        gid: 0,
+    };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: `cred`/`len` are valid for the syscall's documented sizes and the
+    // fd comes from a live UnixStream.
+    let rc = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&mut cred as *mut libc::ucred).cast(),
+            &mut len,
+        )
+    };
+    rc == 0 && cred.uid == unsafe { libc::geteuid() }
+}
+
+/// Handle one control job on the inbox thread, so a reload never races an
+/// in-flight agent turn.
+fn run_control_job(host: &RuntimeHost, job: ControlJob, startup: &[StartupInvocation]) {
+    let response = match job.action {
+        ControlAction::Reload { plugin_path } => {
+            let report = host.reload_with_diagnostics(&plugin_path);
+            let ok = report.status != cordis_runtime::host::ReloadAttemptStatus::Failed;
+            // A reload stops the target plugin's Task services (so the old
+            // dylib can be replaced) but nothing restarts them: re-run the
+            // startup invocations that brought them up. Without this a
+            // `reload /qq` leaves the bot with no QQ listener at all.
+            let services: Vec<Value> = if ok {
+                startup_invocations_for(startup, &plugin_path)
+                    .into_iter()
+                    .map(|invocation| {
+                        let outcome = run_startup_invocation(host, invocation);
+                        json!({
+                            "plugin_path": invocation.plugin_path,
+                            "node_id": invocation.node_id,
+                            "ok": outcome.is_ok(),
+                            "message": outcome.err().unwrap_or_default(),
+                        })
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            json!({ "ok": ok, "action": "reload", "report": report, "services": services })
+                .to_string()
+        }
+        ControlAction::Status => {
+            json!({ "ok": true, "action": "status", "status": host.status() }).to_string()
+        }
+    };
+    let _ = job.reply.send(response);
+}
+
+/// One entry from `fixtures/startup_invoke.json`: how to start a Task service.
+#[derive(Debug, Clone)]
+struct StartupInvocation {
+    plugin_path: String,
+    node_id: String,
+    payload: String,
+}
+
+/// Parse `fixtures/startup_invoke.json`. A missing/broken file yields an empty
+/// list (the service simply starts nothing), matching the boot behaviour.
+fn load_startup_invocations(root: &Path) -> Vec<StartupInvocation> {
+    let path = root.join("startup_invoke.json");
+    let Ok(text) = fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let Ok(Value::Array(items)) = serde_json::from_str::<Value>(&text) else {
+        eprintln!("[startup] startup_invoke.json must be an array");
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|item| {
+            let plugin_path = item["plugin_path"].as_str().unwrap_or("");
+            let node_id = item["node_id"].as_str().unwrap_or("");
+            if plugin_path.is_empty() || node_id.is_empty() {
+                return None;
+            }
+            let payload = item["payload"]
+                .as_object()
+                .map(|o| serde_json::to_string(o).unwrap_or_default())
+                .unwrap_or_else(|| "{}".to_string());
+            Some(StartupInvocation {
+                plugin_path: plugin_path.to_string(),
+                node_id: node_id.to_string(),
+                payload,
+            })
+        })
+        .collect()
+}
+
+fn run_startup_invocation(
+    host: &RuntimeHost,
+    invocation: &StartupInvocation,
+) -> Result<String, String> {
+    host.invoke(
+        &invocation.plugin_path,
+        &invocation.node_id,
+        invocation.payload.clone(),
+    )
+    .map(|response| response.payload)
+    .map_err(|e| e.to_string())
+}
+
+/// Startup invocations belonging to a reload target: `/` or `` means all,
+/// `/qq`/`qq` matches `qq` and its children.
+fn startup_invocations_for<'a>(
+    invocations: &'a [StartupInvocation],
+    target: &str,
+) -> Vec<&'a StartupInvocation> {
+    let normalized = target.trim().trim_start_matches('/');
+    invocations
+        .iter()
+        .filter(|invocation| {
+            normalized.is_empty()
+                || invocation.plugin_path == normalized
+                || invocation
+                    .plugin_path
+                    .starts_with(&format!("{normalized}/"))
+        })
+        .collect()
+}
+
+/// `cordis-runtime reload [plugin_path] [--fixtures-root=<dir>]`
+fn run_reload_command(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut plugin_path = "/".to_string();
+    let mut fixtures_root = PluginInvoker::default_fixtures_root();
+    let mut have_plugin = false;
+    for token in args {
+        if let Some(value) = token.strip_prefix("--fixtures-root=") {
+            fixtures_root = PathBuf::from(value);
+            continue;
+        }
+        if token.starts_with("--") {
+            return Err(format!("unknown flag: {token}").into());
+        }
+        if have_plugin {
+            return Err(format!("unexpected extra arg: {token}").into());
+        }
+        plugin_path = token.clone();
+        have_plugin = true;
+    }
+    let socket = control_socket_path(&fixtures_root);
+    let request = json!({ "action": "reload", "plugin_path": plugin_path }).to_string();
+    let response = request_control(&socket, &request)?;
+    println!("{response}");
+    let parsed: Value = serde_json::from_str(&response)?;
+    if parsed.get("ok").and_then(Value::as_bool) == Some(false) {
+        return Err("reload failed (see the response above)".into());
+    }
+    Ok(())
+}
+
+/// One request/response round trip with the running host.
+fn request_control(socket: &Path, request: &str) -> Result<String, String> {
+    use std::io::{BufRead, BufReader, Write as _};
+    let mut stream = std::os::unix::net::UnixStream::connect(socket)
+        .map_err(|e| format!("cannot reach the running host at {}: {e}", socket.display()))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(130)))
+        .map_err(|e| format!("socket timeout: {e}"))?;
+    stream
+        .write_all(request.as_bytes())
+        .and_then(|_| stream.write_all(b"\n"))
+        .map_err(|e| format!("write failed: {e}"))?;
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    reader
+        .read_line(&mut line)
+        .map_err(|e| format!("read failed: {e}"))?;
+    if line.trim().is_empty() {
+        return Err("host closed the control socket without a response".into());
+    }
+    Ok(line.trim().to_string())
+}
+
+#[cfg(test)]
+mod control_tests {
+    use super::*;
+
+    struct TempDir {
+        path: PathBuf,
+    }
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let path =
+                std::env::temp_dir().join(format!("cordis-ctl-{tag}-{}-{n}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).expect("create temp dir");
+            Self { path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    /// Bind a socket under the temp dir and answer every job with `reply`.
+    fn serve_with(tag: &str, reply: &'static str) -> (TempDir, PathBuf) {
+        let temp = TempDir::new(tag);
+        let socket = temp.path().join("control.sock");
+        let (tx, rx) = std::sync::mpsc::channel::<ControlJob>();
+        start_control_socket(&socket, tx).expect("bind control socket");
+        std::thread::spawn(move || {
+            while let Ok(job) = rx.recv() {
+                // Exercise the real job shape without a host.
+                let _ = match job.action {
+                    ControlAction::Reload { plugin_path } => plugin_path,
+                    ControlAction::Status => "status".to_string(),
+                };
+                let _ = job.reply.send(reply.to_string());
+            }
+        });
+        (temp, socket)
+    }
+
+    #[test]
+    fn socket_path_is_stable_and_per_checkout() {
+        let a = control_socket_path(Path::new("/tmp/checkout-a/fixtures"));
+        let b = control_socket_path(Path::new("/tmp/checkout-a/fixtures"));
+        let c = control_socket_path(Path::new("/tmp/checkout-b/fixtures"));
+        assert_eq!(a, b, "same root must map to the same socket");
+        assert_ne!(a, c, "different checkouts must not share a socket");
+        assert_eq!(
+            a.extension().and_then(|e| e.to_str()),
+            Some("sock"),
+            "socket path: {}",
+            a.display()
+        );
+        // Per-user directory: another user must not be able to reach it.
+        let uid = unsafe { libc::geteuid() };
+        assert!(
+            a.parent()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+                .is_some_and(|name| name.ends_with(&uid.to_string())),
+            "socket dir must be per-uid: {}",
+            a.display()
+        );
+    }
+
+    #[test]
+    fn control_request_round_trips() {
+        let (_temp, socket) = serve_with("roundtrip", r#"{"ok":true,"action":"status"}"#);
+        let response = request_control(&socket, r#"{"action":"status"}"#).expect("round trip");
+        assert_eq!(response, r#"{"ok":true,"action":"status"}"#);
+    }
+
+    #[test]
+    fn control_rejects_unknown_action_bad_json_and_long_lines() {
+        let (_temp, socket) = serve_with("reject", r#"{"ok":true}"#);
+        // Unknown action is rejected before it ever reaches the inbox thread.
+        let response = request_control(&socket, r#"{"action":"shutdown"}"#).expect("response");
+        assert!(
+            response.contains("unknown action: shutdown"),
+            "response: {response}"
+        );
+        // Malformed JSON likewise.
+        let response = request_control(&socket, "{not json").expect("response");
+        assert!(response.contains("invalid json"), "response: {response}");
+        // Missing action.
+        let response = request_control(&socket, r#"{"plugin_path":"/qq"}"#).expect("response");
+        assert!(response.contains("missing"), "response: {response}");
+        // Oversized line is refused instead of buffering without bound.
+        let big = format!(
+            r#"{{"action":"status","pad":"{}"}}"#,
+            "x".repeat(CONTROL_MAX_LINE)
+        );
+        let response = request_control(&socket, &big).expect("response");
+        assert!(response.contains("too long"), "response: {response}");
+    }
+
+    #[test]
+    fn control_reports_missing_host() {
+        let temp = TempDir::new("missing");
+        let socket = temp.path().join("nothing.sock");
+        let err = request_control(&socket, r#"{"action":"status"}"#).expect_err("no host");
+        assert!(err.contains("cannot reach the running host"), "{err}");
+    }
+
+    #[test]
+    fn parse_control_request_defaults_plugin_path_to_root() {
+        match parse_control_request(r#"{"action":"reload"}"#).expect("parse") {
+            ControlAction::Reload { plugin_path } => assert_eq!(plugin_path, "/"),
+            ControlAction::Status => panic!("expected reload"),
+        }
+        match parse_control_request(r#"{"action":"reload","plugin_path":"/qq"}"#).expect("parse") {
+            ControlAction::Reload { plugin_path } => assert_eq!(plugin_path, "/qq"),
+            ControlAction::Status => panic!("expected reload"),
+        }
+        assert!(matches!(
+            parse_control_request(r#"{"action":"status"}"#).expect("parse"),
+            ControlAction::Status
+        ));
+    }
+
+    #[test]
+    fn control_peer_is_us_accepts_own_connection() {
+        let temp = TempDir::new("peer");
+        let socket = temp.path().join("peer.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind");
+        let client = std::os::unix::net::UnixStream::connect(&socket).expect("connect");
+        let (server, _) = listener.accept().expect("accept");
+        assert!(control_peer_is_us(&server));
+        drop(client);
+    }
+}
+
+#[cfg(test)]
+mod startup_invocation_tests {
+    use super::*;
+
+    fn write_startup(root: &Path, body: &str) {
+        std::fs::write(root.join("startup_invoke.json"), body).expect("write startup file");
+    }
+
+    #[test]
+    fn startup_invocations_parse_and_filter() {
+        let temp = std::env::temp_dir().join(format!("cordis-startup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).expect("mkdir");
+        write_startup(
+            &temp,
+            r#"[{"plugin_path":"qq","node_id":"qq_serve","payload":{"port":8099}},
+                {"plugin_path":"feishu","node_id":"feishu_serve","payload":{"mode":"ws"}},
+                {"plugin_path":"","node_id":"ignored"},
+                {"plugin_path":"nocontent"}]"#,
+        );
+        let invocations = load_startup_invocations(&temp);
+        assert_eq!(invocations.len(), 2, "malformed entries are dropped");
+        assert_eq!(invocations[0].plugin_path, "qq");
+        assert_eq!(invocations[0].payload, r#"{"port":8099}"#);
+
+        // "/" and "" mean every invocation; a plugin path matches itself and
+        // its children.
+        assert_eq!(startup_invocations_for(&invocations, "/").len(), 2);
+        assert_eq!(startup_invocations_for(&invocations, "qq").len(), 1);
+        assert_eq!(startup_invocations_for(&invocations, "/feishu").len(), 1);
+        assert!(startup_invocations_for(&invocations, "/expr").is_empty());
+
+        // Broken / non-array files start nothing instead of panicking.
+        write_startup(&temp, "not json");
+        assert!(load_startup_invocations(&temp).is_empty());
+        write_startup(&temp, r#"{"plugin_path":"qq"}"#);
+        assert!(load_startup_invocations(&temp).is_empty());
+        std::fs::remove_file(temp.join("startup_invoke.json")).expect("rm");
+        assert!(load_startup_invocations(&temp).is_empty());
+        let _ = std::fs::remove_dir_all(&temp);
     }
 }

@@ -2,7 +2,7 @@
 
 ## 1. 判定口径
 
-- 本文基于当前仓库现状整理，最近更新：2026-10-27。
+- 本文基于当前仓库现状整理，最近更新：2026-10-28。
 - 历史规划蓝图已经吸收进 [design-blueprint.md](./design-blueprint.md)，因此本文结论来自三类证据的交叉比对：
   - 设计蓝图：[design-blueprint.md](./design-blueprint.md)
   - 架构文档：[system-overview.md](./system-overview.md)、[contracts-and-loading.md](./contracts-and-loading.md)、[runtime-semantics.md](./runtime-semantics.md)、[maintenance-guide.md](./maintenance-guide.md)
@@ -114,11 +114,30 @@ Agent 现在可以自主完成：读代码 → 理解结构 → 写/改文件 �
 - `RuntimeHost::start_service()` 公开 API
 - TODO: 插件加载时自动遍历 Task 节点并 start
 
-### 3.7 插件样例已扩展
+#### 3.6.x QQ 官方协议插件 `qqbot`（新增，2026-10-28）
+
+与 `qq`（OneBot v11 / Napcat）**并存**的第二条 QQ 渠道：直接对接官方开放平台 API v2，
+没有 OneBot 中转，也没有任何闭源 SDK 依赖（对比 `@tencent-connect/dsh-qqbot` 的
+`qqbot-connector` 是 UNLICENSED）。
+
+- 已完成：access token 缓存与提前刷新（`protocol/token.rs` + `api.rs` 的 401 重试一次）、
+  gateway 握手/心跳/续连（`gateway.rs`、`serve.rs` 的 `pump`）、`C2C_MESSAGE_CREATE` /
+  `GROUP_AT_MESSAGE_CREATE` / `INTERACTION_CREATE` 解析、群白黑名单与 @ 门控、事件 id 去重、
+  envelope 构造（`session_key = qqbot:group:<gid>` / `qqbot:c2c:<openid>`、`reply_to = 事件 id`）、
+  文本分片、私聊流式（`/v2/users/{openid}/stream_messages`，群聊协议无此端点故退化分片）、
+  按钮 markdown + 点击回执（`PUT /interactions/{id}`）、富媒体按 URL 收发、附件下载落盘。
+- 节点：`qqbot_configure` / `qqbot_status` / `qqbot_serve`（Task，`payload.stop` 停机）/
+  `qqbot_send` / `qqbot_ask` / `qqbot_send_media` / `qqbot_download_media` / `qqbot_set_policy` / `qqbot_ack`。
+- 未完成：**分片上传**（`upload_prepare` / `upload_part_finish` 链路，当前只走协议允许的
+  `url` 直传）、扫码绑定（官方协议无此流程，凭据走 `qqbot_configure` 或 `QQBOT_APPID`/`QQBOT_SECRET`）、
+  真机联调（需要 appId/secret）、覆盖率门槛补齐。
+
+## 3.7 插件样例已扩展
 
 - `expr` — 递归下降四则运算 + 取模 (`%`) + 幂 (`^`)，6 个运算符子插件
 - `shell` — 命令 catalog 分发（Nonebot console 模式）
 - `qq` — OneBot v11 QQ 适配器（configure/send/status/call/JSON卡片透传/转发/回复）
+- `qqbot` — QQ 官方开放平台（API v2）适配器，与 `qq` 并存：token/gateway/消息/富媒体/按钮全部按官方线协议自实现，不依赖任何腾讯 SDK
 - `gacha` — 原神抽卡模拟器（角色/武器池、软硬保底、50/50、data/ 持久化）
 - `root` / `root/child` — scaffold 占位
 
@@ -168,6 +187,26 @@ Agent 现在可以自主完成：读代码 → 理解结构 → 写/改文件 �
 现在信号路径只调 `save_draft`：写草稿、**不碰工作树**（`draft_tests::save_draft_leaves_working_tree_untouched`
 锁住这个行为）。`save_draft_and_revert` 保留给 agent 出错路径——那里丢弃 agent 自己写了一半的改动
 才是目的。
+
+### 3.11 运维通道：`reload` 不再需要重启进程（2026-10-28）
+
+`systemctl restart` 会断掉 QQ/飞书连接、重载全部插件、从磁盘恢复会话；只改了一个插件（尤其只是
+`qq.so`）时这是过重的操作。现在运行中的 host 会在
+`/run/cordis-runtime-<uid>/<hash>.sock`（目录 0700、socket 0600、`SO_PEERCRED` 校验同 uid）
+监听一个控制通道，只接受两种请求：
+
+- `{"action":"reload","plugin_path":"/qq"}` → 在 **inbox 线程**上执行 `reload_with_diagnostics`
+  （与 agent 回合同一线程，不会并发），然后**重放 `fixtures/startup_invoke.json` 里属于该插件的
+  startup invocation**——reload 会停掉插件的 Task 服务，不重放的话 `reload /qq` 会让 bot 变成
+  聋子（8099/8002 不再监听）。
+- `{"action":"status"}` → `host.status()`。
+
+CLI：`cordis-runtime reload [plugin_path] [--fixtures-root=<dir>]`。返回 JSON 里带
+`report` 与 `services`（每个 startup invocation 的 ok/message）。socket 默认放 `/run`（service 的
+`/tmp` 是私有命名空间，放在 `/tmp` 里外部进程看不见），不可写时回落到 `temp_dir`。
+
+**注意**：agent 通过 `reload_runtime` 工具触发的 reload 走的是 host 内部路径，**不会**重放
+startup invocation，因此对 Task 插件（qq/feishu）仍会留下"服务已停、不再启动"的空档——见 4.8。
 
 ## 4. 部分完成
 
@@ -1499,3 +1538,12 @@ cd fixtures/plugins/expr/lexer && cargo test --lib  # excluded, external tests o
 前者决定 staging 根，进程内已固定；后者在 `RuntimeKernel::new` 时写进 `ChangeMemory`。两者在
 reload 时保留 boot 值（`snapshot_root` 会打日志说明），要改只能重启。若要支持，需要定义
 "换 staging 根时旧快照与 retired 目录怎么回收"的语义。
+
+### 4.8 agent 触发的 reload 不会重启 Task 服务
+
+`reload_runtime`（agent 工具）在 host 内直接调 `reload_internal`，它会停掉目标插件的 Task 服务
+（qq 的 8099/8002、feishu 的 ws），但没有人重放 `startup_invoke.json`，于是插件被 reload 后
+服务不再监听。控制通道（3.11）在 CLI 侧重放了 startup invoke，**agent 路径还没修**。
+
+修法：把 startup invocation 列表注册进 `RuntimeHost`，在 `reload_internal` / `promote_candidate`
+换完快照后由 host 自己重放（一次实现，两条路径都覆盖），并删掉 CLI 侧那份重放逻辑。
