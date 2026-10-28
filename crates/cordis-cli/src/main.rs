@@ -761,11 +761,22 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     // Read startup_invoke.json from fixtures root and execute each
     // invocation before entering the REPL.  This is used to start
     // background services (e.g. qq_serve HTTP server).
-    let startup_invocations = if no_startup_invoke {
+    if no_startup_invoke {
         eprintln!("[startup] startup_invoke.json skipped (--no-startup-invoke)");
-        Vec::new()
     } else {
         let invocations = load_startup_invocations(&root);
+        // Hand the list to the host so a reload can restart the services it
+        // had to stop (agent-triggered and control-channel reloads alike).
+        host.set_startup_invocations(
+            invocations
+                .iter()
+                .map(|invocation| cordis_runtime::host::StartupInvocation {
+                    plugin_path: invocation.plugin_path.clone(),
+                    node_id: invocation.node_id.clone(),
+                    payload: invocation.payload.clone(),
+                })
+                .collect(),
+        );
         for invocation in &invocations {
             eprintln!(
                 "[startup] invoke {}::{} {}",
@@ -777,8 +788,7 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 }
             );
         }
-        invocations
-    };
+    }
 
     // Use rustyline for readline-like editing: history, cursor movement, etc.
     let mut rl = rustyline::DefaultEditor::new()?;
@@ -811,7 +821,6 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         // restarting it (a restart drops every channel connection and reloads
         // every plugin).
         let (control_tx, control_rx) = std::sync::mpsc::channel::<ControlJob>();
-        let startup_for_control = std::sync::Arc::new(startup_invocations);
         let control_socket = control_socket_path(host.fixtures_root());
         match start_control_socket(&control_socket, control_tx) {
             Ok(()) => eprintln!("control: listening on {}", control_socket.display()),
@@ -835,7 +844,7 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 // Ops requests run on THIS thread: it is the one that runs
                 // agent turns, so a reload cannot race one.
                 while let Ok(job) = control_rx.try_recv() {
-                    run_control_job(&host, job, &startup_for_control);
+                    run_control_job(&host, job);
                 }
                 let mut msgs: Vec<String> = Vec::new();
                 match rx.recv_timeout(Duration::from_millis(200)) {
@@ -3537,33 +3546,15 @@ fn control_peer_is_us(stream: &std::os::unix::net::UnixStream) -> bool {
 
 /// Handle one control job on the inbox thread, so a reload never races an
 /// in-flight agent turn.
-fn run_control_job(host: &RuntimeHost, job: ControlJob, startup: &[StartupInvocation]) {
+fn run_control_job(host: &RuntimeHost, job: ControlJob) {
     let response = match job.action {
         ControlAction::Reload { plugin_path } => {
             let report = host.reload_with_diagnostics(&plugin_path);
             let ok = report.status != cordis_runtime::host::ReloadAttemptStatus::Failed;
-            // A reload stops the target plugin's Task services (so the old
-            // dylib can be replaced) but nothing restarts them: re-run the
-            // startup invocations that brought them up. Without this a
-            // `reload /qq` leaves the bot with no QQ listener at all.
-            let services: Vec<Value> = if ok {
-                startup_invocations_for(startup, &plugin_path)
-                    .into_iter()
-                    .map(|invocation| {
-                        let outcome = run_startup_invocation(host, invocation);
-                        json!({
-                            "plugin_path": invocation.plugin_path,
-                            "node_id": invocation.node_id,
-                            "ok": outcome.is_ok(),
-                            "message": outcome.err().unwrap_or_default(),
-                        })
-                    })
-                    .collect()
-            } else {
-                Vec::new()
-            };
-            json!({ "ok": ok, "action": "reload", "report": report, "services": services })
-                .to_string()
+            // The host restarts the Task services this reload stopped (it owns
+            // the startup-invocation list), so the response only carries the
+            // report.
+            json!({ "ok": ok, "action": "reload", "report": report }).to_string()
         }
         ControlAction::Status => {
             json!({ "ok": true, "action": "status", "status": host.status() }).to_string()
@@ -3623,25 +3614,6 @@ fn run_startup_invocation(
     )
     .map(|response| response.payload)
     .map_err(|e| e.to_string())
-}
-
-/// Startup invocations belonging to a reload target: `/` or `` means all,
-/// `/qq`/`qq` matches `qq` and its children.
-fn startup_invocations_for<'a>(
-    invocations: &'a [StartupInvocation],
-    target: &str,
-) -> Vec<&'a StartupInvocation> {
-    let normalized = target.trim().trim_start_matches('/');
-    invocations
-        .iter()
-        .filter(|invocation| {
-            normalized.is_empty()
-                || invocation.plugin_path == normalized
-                || invocation
-                    .plugin_path
-                    .starts_with(&format!("{normalized}/"))
-        })
-        .collect()
 }
 
 /// `cordis-runtime reload [plugin_path] [--fixtures-root=<dir>]`
@@ -3862,13 +3834,6 @@ mod startup_invocation_tests {
         assert_eq!(invocations.len(), 2, "malformed entries are dropped");
         assert_eq!(invocations[0].plugin_path, "qq");
         assert_eq!(invocations[0].payload, r#"{"port":8099}"#);
-
-        // "/" and "" mean every invocation; a plugin path matches itself and
-        // its children.
-        assert_eq!(startup_invocations_for(&invocations, "/").len(), 2);
-        assert_eq!(startup_invocations_for(&invocations, "qq").len(), 1);
-        assert_eq!(startup_invocations_for(&invocations, "/feishu").len(), 1);
-        assert!(startup_invocations_for(&invocations, "/expr").is_empty());
 
         // Broken / non-array files start nothing instead of panicking.
         write_startup(&temp, "not json");

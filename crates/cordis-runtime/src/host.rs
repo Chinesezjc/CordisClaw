@@ -1175,6 +1175,18 @@ pub enum ReloadAttemptStatus {
     Failed,
 }
 
+/// One `fixtures/startup_invoke.json` entry: how to bring a plugin's Task
+/// service up. The host replays the matching entries after a reload that
+/// stopped the plugin's services (a reload stops them so the old dylib can be
+/// replaced; nothing else would start them again, which left the bot with no
+/// QQ/Feishu listener).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartupInvocation {
+    pub plugin_path: String,
+    pub node_id: String,
+    pub payload: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ReloadReport {
     pub from_snapshot_id: String,
@@ -1981,6 +1993,9 @@ pub struct RuntimeHost {
     profile_fallback: Mutex<BTreeMap<String, ProfileFallbackEntry>>,
     /// Registry of background services (Task nodes).
     pub service_registry: Arc<crate::context::ServiceRegistry>,
+    /// How to start each plugin's Task services, installed by the CLI from
+    /// `fixtures/startup_invoke.json`. Replayed after a reload stopped them.
+    startup_invocations: Mutex<Vec<StartupInvocation>>,
     /// Accumulated rollback for interactive agent file edits.
     interactive_rollback: Mutex<PluginEditRollback>,
     kernel: RuntimeKernel,
@@ -2505,6 +2520,7 @@ impl RuntimeHost {
             turn_meta: Mutex::new(BTreeMap::new()),
             profile_fallback: Mutex::new(BTreeMap::new()),
             service_registry,
+            startup_invocations: Mutex::new(Vec::new()),
             interactive_rollback,
         };
         host.detect_crash_and_recover();
@@ -3253,6 +3269,52 @@ impl RuntimeHost {
             .read()
             .unwrap_or_else(|poison| poison.into_inner())
             .clone()
+    }
+
+    /// Install the startup invocations the CLI read from
+    /// `fixtures/startup_invoke.json`. Called once at boot, before any reload
+    /// can happen.
+    pub fn set_startup_invocations(&self, invocations: Vec<StartupInvocation>) {
+        *self
+            .startup_invocations
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = invocations;
+    }
+
+    /// Re-run the startup invocations belonging to `plugin_paths` (a plugin
+    /// path also covers its children). Used after a reload stopped services.
+    fn restart_services_for(&self, plugin_paths: &[String]) {
+        let invocations = self
+            .startup_invocations
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone();
+        let wanted: Vec<&StartupInvocation> = invocations
+            .iter()
+            .filter(|invocation| {
+                plugin_paths.iter().any(|target| {
+                    invocation.plugin_path == *target
+                        || invocation.plugin_path.starts_with(&format!("{target}/"))
+                })
+            })
+            .collect();
+        for invocation in wanted {
+            let outcome = self.invoke(
+                &invocation.plugin_path,
+                &invocation.node_id,
+                invocation.payload.clone(),
+            );
+            match outcome {
+                Ok(response) => eprintln!(
+                    "[reload] restarted {}::{} ok={}",
+                    invocation.plugin_path, invocation.node_id, response.payload
+                ),
+                Err(err) => eprintln!(
+                    "[reload] restart {}::{} failed: {err}",
+                    invocation.plugin_path, invocation.node_id
+                ),
+            }
+        }
     }
 
     /// Reconcile a freshly loaded config with values that cannot change while
@@ -4525,6 +4587,10 @@ export_plugin_api! {{
             eprintln!("reload_subtree: reloaded {}", p.plugin_path);
         }
 
+        // A subtree reload stops every target's services; bring them back up
+        // with the freshly loaded dylibs.
+        self.restart_services_for(&changed_plugins);
+
         let zombie_count = self.service_registry.zombie_count();
         if zombie_count > 0 {
             eprintln!(
@@ -5735,9 +5801,11 @@ export_plugin_api! {{
             .collect();
         // Plugins the new snapshot dropped — stop their services.
         // 用 `_timed` 变体：stop 卡住时有上限，不会把 reload 拖死。
+        let mut stopped_services: Vec<String> = Vec::new();
         for plugin_path in previous_plugins.difference(&next_plugins) {
             self.service_registry
                 .stop_plugin_services_timed(plugin_path);
+            stopped_services.push(plugin_path.clone());
         }
         // Also stop services for plugins whose docs changed (the new snapshot
         // may have different Task nodes).
@@ -5751,6 +5819,7 @@ export_plugin_api! {{
             if prev_docs != next_docs {
                 self.service_registry
                     .stop_plugin_services_timed(plugin_path);
+                stopped_services.push(plugin_path.clone());
             }
         }
 
@@ -5766,6 +5835,9 @@ export_plugin_api! {{
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
             .take();
+        // Restart the Task services this reload stopped, against the new
+        // snapshot (otherwise a reloaded qq/feishu stops listening for good).
+        self.restart_services_for(&stopped_services);
 
         let report = ReloadReport::from_snapshots(
             previous_snapshot.as_ref(),

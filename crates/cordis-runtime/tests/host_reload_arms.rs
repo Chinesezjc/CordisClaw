@@ -22,7 +22,9 @@ use cordis_plugin_sdk::{AbiFingerprint, NodeDoc, NodeType, PluginDocs};
 use cordis_runtime::agent::AgentTranscriptEntry;
 use cordis_runtime::context::Service;
 use cordis_runtime::core::error::RuntimeError;
-use cordis_runtime::host::{AgentSessionKind, AgentStartOptions, ReloadAttemptStatus, RuntimeHost};
+use cordis_runtime::host::{
+    AgentSessionKind, AgentStartOptions, ReloadAttemptStatus, RuntimeHost, StartupInvocation,
+};
 use serde_json::json;
 use serial_test::serial;
 use std::fs;
@@ -801,4 +803,118 @@ fn candidate_reload_with_broken_config_reports_failed() {
     );
     assert_eq!(host.current_snapshot().snapshot_id(), before);
     drop(temp);
+}
+
+// ---------------------------------------------------------------------------
+// Startup invocation replay: a reload stops the target's Task services, so the
+// host must re-run the startup invocations that brought them up — otherwise a
+// reloaded qq/feishu stops listening for good.
+// ---------------------------------------------------------------------------
+
+/// JSON-artifact plugin whose invocation appends the payload to `log`, so a
+/// test can observe that a startup invocation was replayed.
+fn write_json_plugin_with_hook(
+    artifacts: &Path,
+    plugin_path: &str,
+    docs: &PluginDocs,
+    log: &Path,
+) -> serde_json::Value {
+    let abi = AbiFingerprint::current_build(format!("crate_{plugin_path}_v1"), "api_v2");
+    let execution = json!({
+        "kind": "process",
+        "command": "/bin/sh",
+        "args": ["-c", format!("cat >> {}", log.display())]
+    });
+    let artifact_value = json!({
+        "plugin_path": plugin_path,
+        "abi_fingerprint": abi,
+        "docs": docs,
+        "exports": [],
+        "execution": execution,
+    });
+    let file_name = format!("{}.json", plugin_path.replace('/', "_"));
+    let artifact_file = artifacts.join(&file_name);
+    fs::write(
+        &artifact_file,
+        serde_json::to_vec_pretty(&artifact_value).expect("serialize artifact"),
+    )
+    .expect("write artifact");
+    let sha256 = cordis_runtime::plugin::artifact::sha256_file(&artifact_file).expect("hash");
+
+    json!({
+        "plugin_path": plugin_path,
+        "version": "0.1.0",
+        "abi_fingerprint": abi,
+        "artifact_path": file_name,
+        "sha256": sha256,
+        "built_at": "0",
+        "parent": null,
+        "required": true,
+        "grants_from_parent": [],
+        "docs": docs,
+        "exports": [],
+        "execution": execution,
+        "artifact_kind": "json",
+        "build_fingerprint": format!("fp_{plugin_path}"),
+    })
+}
+
+fn plugin_invocation(plugin_path: &str, payload: &str) -> StartupInvocation {
+    StartupInvocation {
+        plugin_path: plugin_path.to_string(),
+        node_id: format!("{}_entry", plugin_path),
+        payload: payload.to_string(),
+    }
+}
+
+/// A docs change makes `reload("/")` stop that plugin's services; the host must
+/// then replay exactly that plugin's startup invocation (not unrelated ones).
+#[test]
+fn reload_restarts_startup_services_of_the_changed_plugin() {
+    let temp = TempDir::new().expect("tempdir");
+    let fixtures = temp.path().join("fixtures");
+    let artifacts = fixtures.join("artifacts");
+    fs::create_dir_all(&artifacts).expect("artifacts dir");
+
+    let alpha_log = temp.path().join("alpha.log");
+    let beta_log = temp.path().join("beta.log");
+    let alpha_docs = plugin_docs("alpha", cordis_plugin_sdk::NodeType::Task, "revision one");
+    let beta_docs = plugin_docs("beta", cordis_plugin_sdk::NodeType::Task, "revision one");
+    let alpha_entry = write_json_plugin_with_hook(&artifacts, "alpha", &alpha_docs, &alpha_log);
+    let beta_entry = write_json_plugin_with_hook(&artifacts, "beta", &beta_docs, &beta_log);
+    write_index(
+        &artifacts,
+        &["alpha", "beta"],
+        vec![alpha_entry, beta_entry],
+    );
+
+    let host = RuntimeHost::boot(&fixtures).expect("boot");
+    host.set_startup_invocations(vec![
+        plugin_invocation("alpha", r#"{"action":"start"}"#),
+        plugin_invocation("beta", r#"{"action":"start"}"#),
+    ]);
+
+    // Publish a new docs revision for alpha only.
+    let revised = plugin_docs("alpha", cordis_plugin_sdk::NodeType::Task, "revision two");
+    let revised_entry = write_json_plugin_with_hook(&artifacts, "alpha", &revised, &alpha_log);
+    let mut index = read_index(&fixtures);
+    index["entries"][0] = revised_entry;
+    write_index_value(&fixtures, &index);
+
+    let report = host.reload_with_diagnostics("/");
+    assert_eq!(
+        report.status,
+        ReloadAttemptStatus::Reloaded,
+        "reload: {report:?}"
+    );
+
+    let alpha_calls = fs::read_to_string(&alpha_log).expect("alpha startup must be replayed");
+    assert!(
+        alpha_calls.contains(r#"{"action":"start"}"#),
+        "alpha startup payload: {alpha_calls}"
+    );
+    assert!(
+        !beta_log.exists(),
+        "an unchanged plugin's startup invocation must not be replayed"
+    );
 }

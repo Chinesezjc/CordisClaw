@@ -205,8 +205,11 @@ CLI：`cordis-runtime reload [plugin_path] [--fixtures-root=<dir>]`。返回 JSO
 `report` 与 `services`（每个 startup invocation 的 ok/message）。socket 默认放 `/run`（service 的
 `/tmp` 是私有命名空间，放在 `/tmp` 里外部进程看不见），不可写时回落到 `temp_dir`。
 
-**注意**：agent 通过 `reload_runtime` 工具触发的 reload 走的是 host 内部路径，**不会**重放
-startup invocation，因此对 Task 插件（qq/feishu）仍会留下"服务已停、不再启动"的空档——见 4.8。
+**startup invocation 由 host 重放**（2026-10-28 补齐）：CLI 启动时把
+`fixtures/startup_invoke.json` 交给 `RuntimeHost::set_startup_invocations`；`reload_subtree`
+（按插件 reload，agent 工具与控制通道都走它）在停完目标服务后、`reload_internal`（`/` 全量）
+在停完"被删除/文档变更"的插件后，各自调用 `restart_services_for` 重放对应条目。因此
+agent 的 `reload_runtime` 与控制通道两条路径行为一致，不会再出现"reload 完 qq/feishu 不再监听"。
 
 ## 4. 部分完成
 
@@ -1539,11 +1542,3 @@ cd fixtures/plugins/expr/lexer && cargo test --lib  # excluded, external tests o
 reload 时保留 boot 值（`snapshot_root` 会打日志说明），要改只能重启。若要支持，需要定义
 "换 staging 根时旧快照与 retired 目录怎么回收"的语义。
 
-### 4.8 agent 触发的 reload 不会重启 Task 服务
-
-`reload_runtime`（agent 工具）在 host 内直接调 `reload_internal`，它会停掉目标插件的 Task 服务
-（qq 的 8099/8002、feishu 的 ws），但没有人重放 `startup_invoke.json`，于是插件被 reload 后
-服务不再监听。控制通道（3.11）在 CLI 侧重放了 startup invoke，**agent 路径还没修**。
-
-修法：把 startup invocation 列表注册进 `RuntimeHost`，在 `reload_internal` / `promote_candidate`
-换完快照后由 host 自己重放（一次实现，两条路径都覆盖），并删掉 CLI 侧那份重放逻辑。
