@@ -3116,6 +3116,7 @@ WRITING MEMORY — when you learn something DURABLE about a group (it wants you 
 If the message is NOT for you: use {\"action\":\"suspend\"}.\n\
 If it IS for you: invoke_plugin(qq, qq_send, ...) to send your reply, then output {\"action\":\"suspend\"}.\n\
 IMPORTANT: NEVER use {\"action\":\"respond\"} — it will cause duplicate messages. Always send via qq_send and finish with {\"action\":\"suspend\"}.\n\
+OUTPUT FORMAT — your ENTIRE final output must be one JSON object (`{\"action\":\"suspend\"}` after a successful qq_send). Never emit chat text as your final output, and never write an `@[id=...]` marker outside the `message` field of a `qq_send` call: the runtime cannot send plain text, it can only parse JSON. A message whose text is `[id=...] 你好` is not JSON and will be dropped and retried.\n\
 If the user asks you to change the reply rule (e.g. \"reply to everything I say\", \"stop answering so often\"), persist it: invoke_plugin(qq, qq_set_reply_policy, {\"node_id\":\"qq_set_reply_policy\",\"policy\":\"<new rule text>\"}), then tell the user it is already in effect — the next message uses the new policy, no restart needed.\n\
 \n\
 ANTI-HALLUCINATION rules:\n\
@@ -4629,6 +4630,25 @@ mod docs_tests {
             let declared = inner.get(field).is_some();
             assert!(declared, "data.data.{field} must be declared: {inner}");
         }
+    }
+
+    // The bot kept answering with plain chat text (once even starting with a
+    // bare `[id=...]` mention marker), which the runtime cannot parse. The
+    // hint must state that the final output is JSON-only and that the mention
+    // marker belongs inside a qq_send message.
+    #[test]
+    fn system_hint_requires_json_final_output() {
+        let hint = docs_value()
+            .system_hint
+            .expect("qq must ship a system hint");
+        assert!(
+            hint.contains("OUTPUT FORMAT"),
+            "hint must call out the output format"
+        );
+        assert!(
+            hint.contains("never write an `@[id=...]` marker outside the `message` field"),
+            "hint must keep mention markers inside qq_send: {hint}"
+        );
     }
 
     // 门控语义的回归保护：hint 不再硬编码 ONLY-if / When-in-doubt，
