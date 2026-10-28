@@ -1347,7 +1347,11 @@ fn save_memory_store(
 }
 
 /// 该群的记忆文本（没写过就是 `None`）。
-fn group_memory(data_dir: Option<&str>, group: Option<&str>) -> Option<String> {
+/// Read the memo for `group` (`None` when nothing was written).
+///
+/// Public so tests and tooling can read it without going through the node;
+/// the agent reads it through `qq_get_group_memory`.
+pub fn group_memory(data_dir: Option<&str>, group: Option<&str>) -> Option<String> {
     let store = load_memory_store(data_dir);
     group
         .and_then(|g| store.get(g))
@@ -1433,17 +1437,14 @@ fn sanitize_display_name(raw: &str) -> Option<String> {
 /// sender_id is "group:<gid>" or "private:<uid>"; the actual person is
 /// user_id, so identity is "qq:<user_id>".
 fn build_envelope(msg: &IncomingMessage) -> String {
-    // 每条消息都带上「本群生效的模式 + 策略」和「本群记忆」。配置缺失/损坏只会
-    // 回落到内置默认，所以这里永远构造成功（envelope 失败会丢整条消息）。
+    // 每条消息都带上「本群生效的模式 + 策略」。配置缺失/损坏只会回落到内置默认，
+    // 所以这里永远构造成功（envelope 失败会丢整条消息）。
     let group = (msg.message_type == "group").then_some(msg.sender_id.as_str());
     let (mode, policy, _source) = effective_policy(None, group);
-    // 策略/记忆放进 `notes`：kernel 只把它们随**本次**请求发给模型，
-    // 不写进 history（否则每条历史都带着这份噪声，几十万字节白烧）。
-    let mut notes = format!("[reply policy: {mode} — {policy}]");
-    if let Some(memory) = group_memory(None, group) {
-        notes.push('\n');
-        notes.push_str(&format!("[group memory: {memory}]"));
-    }
+    // 策略放进 `notes`：kernel 只把它随**本次**请求发给模型，不写进 history。
+    // 群记忆**不注入**——那是 agent 自己的备忘，需要时用 `qq_get_group_memory` 去读，
+    // 每条消息都塞进来只会让绝大多数请求白付 token。
+    let notes = format!("[reply policy: {mode} — {policy}]");
     let reply_target = format!("{}:{}", msg.message_type, msg.sender_id);
     let session_key = format!("qq:{reply_target}");
     // 有展示名就带上（群名片/昵称，已清洗）；没有则保持旧格式。名字插在
@@ -2970,7 +2971,7 @@ fn docs_value() -> cordis_plugin_sdk::PluginDocs {
             ).with_agent_accessible(),
             node_doc(
                 "qq_set_group_memory",
-                "Write the memo about a group, in your own words: does it want you talkative or quiet, what it talks about, what you already tried and got told off for. Shipped as a `[group memory: ...]` line on every message from that group, so write only what is DURABLE (not something you read from one message). Blank `memory` deletes the entry. There is no length cap; keep it short anyway because it is injected into every message from that group.",
+                "Write the memo about a group, in your own words: does it want you talkative or quiet, what it talks about, what you already tried and got told off for. The memo is not injected into your context — read it with `qq_get_group_memory` when you need it. Write only what is DURABLE (not something you read from one message). Blank `memory` deletes the entry. There is no length cap.",
                 json!({
                     "type": "object", "required": ["node_id", "group"],
                     "properties": {
@@ -3032,8 +3033,8 @@ REPLY POLICY — the authority on whether to answer. Every incoming message star
   one_on_one — treat it as a direct chat: answer every message meant for you; do not go silent just because it is technically a group.\n\
 SMALL GROUPS — a group that is effectively private (you and one or two people) should behave like a direct chat. If you are not sure how big a group is, look it up once with `qq_get_group_info` (its docs are in the plugin catalog below) and, when member_count <= 2, set this group's mode to one_on_one with `qq_set_reply_policy` and remember it. Decide once per group — never probe on every message.\n\
 HOW TO JUDGE — use the conversation history, not just this one message: who is talking to whom, whether the last few lines are a thread you are part of, whether someone asked a question nobody answered. A message that continues a thread you are already in is addressed to you even without naming you.\n\
-[group memory: ...] — this is YOUR OWN memo about this group (how talkative it wants you, its standing topics, what it told you off for). Follow it. If the line is absent you have written nothing yet.\n\
-WRITING MEMORY — the memo is YOURS: maintain it on your own initiative, without waiting to be asked and without asking permission. Write when you learn something DURABLE: an explicit preference (wants you quiet/chatty), a correction (\"don't do that again\"), the group's standing topic or in-jokes, or a mistake you already paid for. Do not write about one-off facts or guesses from a single message; overwrite the entry (it replaces, not appends) and keep it compact — it ships with EVERY message from that group, so it costs tokens each time even though there is no length cap. Use `qq_set_group_memory` (see the catalog). Changing how talkative you are is separate: `qq_set_reply_policy` with one of the four modes, and that one needs the group owner/admin or a configured operator. Both take effect on the next message.\n\
+GROUP MEMORY — you keep your own memo per group (how talkative it wants you, its standing topics, what it told you off for). It is NOT injected into your context: read it with `qq_get_group_memory` when a message refers to something you may have written down earlier, when a conversation seems to continue a thread you had, or before you write to it — otherwise you do not need the round trip.\n\
+WRITING MEMORY — the memo is YOURS: maintain it on your own initiative, without waiting to be asked and without asking permission. Write when you learn something DURABLE: an explicit preference (wants you quiet/chatty), a correction, the group's standing topic or in-jokes, or a mistake you already paid for. Do not write about one-off facts or guesses from a single message; overwrite the entry (it replaces, not appends). Read the current memo first (`qq_get_group_memory`) so you do not clobber it, then use `qq_set_group_memory`. Changing how talkative you are is separate: `qq_set_reply_policy` with one of the four modes, and that one needs the group owner/admin or a configured operator. Both take effect on the next message.\n\
 If the message is NOT for you: use {\"action\":\"suspend\"}.\n\
 If it IS for you: invoke_plugin(qq, qq_send, ...) to send your reply, then output {\"action\":\"suspend\"}.\n\
 IMPORTANT: NEVER use {\"action\":\"respond\"} — it will cause duplicate messages. Always send via qq_send and finish with {\"action\":\"suspend\"}.\n\
@@ -4052,8 +4053,14 @@ mod reply_policy_tests {
             let env: Value = serde_json::from_str(&build_envelope(&sample_msg())).expect("env");
             let notes = env["notes"].as_str().unwrap_or_default().to_string();
             assert!(notes.starts_with("[reply policy: chatty — "), "{notes}");
-            let has_memory = notes.contains("[group memory: 喜欢玩笑]");
-            assert!(has_memory, "{notes}");
+            // Group memory is pull-based: even once written it is NOT injected
+            // into the message envelope — the agent reads it with
+            // qq_get_group_memory when it needs it.
+            let leaks_memory = notes.contains("[group memory");
+            assert!(!leaks_memory, "memory must stay out of notes: {notes}");
+            let read_back =
+                group_memory(Some(data_dir.to_str().unwrap_or_default()), Some("123456"));
+            assert_eq!(read_back.as_deref(), Some("喜欢玩笑"));
         });
     }
 
@@ -4660,8 +4667,12 @@ mod hint_silence_bias_tests {
             let listed = hint.contains(mode);
             assert!(listed, "hint must explain mode {mode}");
         }
-        let explains_memory_line = hint.contains("[group memory: ...]");
-        assert!(explains_memory_line, "hint must explain the memory line");
+        let explains_pull =
+            hint.contains("NOT injected into your context") && hint.contains("qq_get_group_memory");
+        assert!(
+            explains_pull,
+            "hint must say memory is not injected and how to read it"
+        );
         let explains_writer = hint.contains("qq_set_group_memory");
         assert!(explains_writer, "hint must advertise the memory writer");
         let warns_durable_only = hint.contains("DURABLE");
