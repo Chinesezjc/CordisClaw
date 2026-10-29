@@ -487,6 +487,25 @@ API/CLI。所以"会改变行为"的修改只能由操作员在宿主侧批准�
 `approve_iteration_tool_is_advertised_and_dispatched`（工具在列表里、分发到 host）、
 qq 侧 `approve_iteration_capability_follows_operator_list_and_room_role`。
 
+### 3.25 迭代闸门改成"测试说了算"（2026-10-29）
+
+canary 回放是不靠谱的代理（随机、副作用、录制时机都能左右它）。现在闸门就三条：
+
+1. **代码改动必须带测试**：`record_iteration_summary` 会检查本次迭代的编辑里是否包含
+   `plugins/<p>/tests/**`（或 `*_test.rs`/`tests.rs`）的新增/修改；没有就直接拒绝摘要并给出
+   "先补测试、跑 run_plugin_test 再记录"的可操作提示。**纯文档改动豁免**（只动 `docs/**` 或 `*.md`）。
+2. **测试不过不能落地**：最终判定只看 verifier（它跑 `cargo test`）是否 Pass；Fail 就
+   `RolledBack` 并恢复工作区。
+3. **改既有测试要审批**：如果改动里包含对**已存在**测试文件的修改/删除（`CreateFile` 之外的
+   kind），迭代会在测试通过后停在 `Blocked`（候选保留、工作区保留），必须由
+   `approve_iteration`（3.24，渠道侧判权）批准才 promote。
+   canary 仍会记录，但只作诊断，不再参与判定。
+
+测试：`test_change_policy_tests`（测试路径识别、新增/修改分类、docs-only 豁免）、
+`finalize_blocks_a_change_that_edits_an_existing_test`、
+`finalize_manual_approval_promotes_a_test_editing_change`、
+`finalize_partial_canary_does_not_block_a_tested_change`。
+
 ## 4. 部分完成
 
 ### 4.1 Execution engine 有正式入口，数据面验证不足
