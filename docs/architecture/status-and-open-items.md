@@ -337,6 +337,30 @@ prompt 都替模型付一遍 token；上限 800 字符也只是在压这个成�
 现在只把**节点集合**（id + node_type）变化当契约变更，文案漂移直接采纳（工件是它自己 docs 的来源）。
 测试：`only_a_changed_node_set_is_a_contract_change`。
 
+### 3.18 新插件"写不进第一行代码"的两个真卡点（2026-10-29）
+
+bot 报告说 `request_iteration` 返回 `verdict=Pass` 却一个字节都没落地、并据此得出"我没有写文件的
+动作、只能拿 `fs_write` 绕过"。日志反驳了这个结论：同一轮迭代里 `replace_file_exact` /
+`create_file` 对 `plugins/bili_watch/...` 全部返回 `ok` 且 `changed_paths` 有内容，bili_watch 的
+代码确实落地了。真正的卡点是另外两个：
+
+1. **未加载的插件不能被迭代**。`begin_plugin_iteration` 只用 plugin registry 解析 root，
+   `determine_root_plugin_path` 对不在 registry 里的路径直接报
+   `target plugin paths do not share a loaded subtree root: lpl`。而新建插件在第一次构建成功前必然
+   不在 registry 里——于是"写第一行代码"这一步永远被拒（21:24、21:26 两次
+   `plugin subtree not found for lpl` 就是这个）。现在：目标在 `plugins/<name>` 存在但未加载时，
+   直接把它当自己的 root 迭代（`allowed_plugin_roots` = `plugins/<name>`，上下文照常收集）。
+2. **新插件 reload 是静默 no-op**。`reload /lpl` 在 snapshot 里找不到目标时直接返回
+   `status=reloaded, changed_plugins=[]`，看起来成功、其实什么都没加载，于是 `list_plugins`
+   永远缺 lpl、内核问题里挂着 `load_failure HashMismatch`。现在：目标在 artifact index 里、
+   但不在当前 snapshot 时，回落到整快照 reload（`reload_internal`），新插件因此能被加载。
+
+测试：`iteration_accepts_a_plugin_that_exists_only_on_disk`、
+`reload_of_a_brand_new_plugin_falls_back_to_a_full_reload`。
+
+**给 bot 的建议路径**（不要再走 `fs_write`）：`request_iteration({"plugin_path":"/lpl", …})` →
+`run_plugin_check` / `run_plugin_test` → `record_iteration_summary` → `reload /lpl`。
+
 ## 4. 部分完成
 
 ### 4.1 Execution engine 有正式入口，数据面验证不足
