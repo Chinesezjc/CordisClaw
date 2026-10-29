@@ -63,9 +63,6 @@ pub struct RuntimeSnapshot {
     graph_registry: GraphRegistry,
     context_baseline: RuntimeContext,
     staged_artifact_root: PathBuf,
-    /// Per-plugin `settings` from `config/plugins/<name>.yaml`, carried by the
-    /// snapshot so every invocation path (agent tool call, `execute_target`,
-    /// reload) sees the same configuration without re-reading the config dir.
     plugin_settings: BTreeMap<String, PluginConfigFile>,
 }
 
@@ -611,9 +608,6 @@ struct KernelIterationMetrics {
 pub struct RuntimeKernel {
     workspace_root: PathBuf,
     config_dir: PathBuf,
-    /// LLM API of the "default" profile. `RwLock` so a reload that re-reads
-    /// `config/llm_api.yaml` can swap it without rebuilding the kernel; the
-    /// many read sites clone it out under the lock.
     llm_api: RwLock<LlmApiConfig>,
     plugin_configs: RwLock<BTreeMap<String, PluginConfigFile>>,
     plugin_iteration_policy: PluginIterationPolicy,
@@ -630,9 +624,6 @@ pub struct RuntimeKernel {
 #[derive(Debug)]
 pub struct RuntimeHost {
     fixtures_root: PathBuf,
-    /// Boot-time configuration, replaced by a `reload` that re-reads
-    /// `config/` (see `reload_internal`). `RwLock` because reload installs the
-    /// new value while agent turns / status readers keep borrowing the old one.
     config: RwLock<RuntimeConfig>,
     snapshot_root: PathBuf,
     current_snapshot: RwLock<Arc<RuntimeSnapshot>>,
@@ -642,35 +633,13 @@ pub struct RuntimeHost {
     last_reload_attempt: Mutex<Option<ReloadAttemptReport>>,
     last_candidate_reload_attempt: Mutex<Option<ReloadAttemptReport>>,
     agent_sessions: Mutex<BTreeMap<String, ManagedAgentSession>>,
-    /// R1: 正被 `agent_send` 处理（已从 `agent_sessions` 摘除、`respond`
-    /// 进行中）的会话 id。id 在摘除时刻插入、turn 收尾时刻摘除；并发
-    /// 第二个 `agent_send` 据此判 `AgentSessionBusy` 而不是误报
-    /// `AgentSessionNotFound`。
     inflight_sessions: Mutex<BTreeSet<String>>,
-    /// R1: turn 进行期间被 `drop_session` 标记为"丢弃"的会话 id。turn 收尾
-    /// 消费该标记：标记过的 id 不再插回 map、不再 auto_save（会话随局部
-    /// 变量销毁），防止 drop 之后被复活并重写快照。
     dropped_during_turn: Mutex<BTreeSet<String>>,
-    /// P1-25: side-channel for tool calls that need to mutate their own
-    /// active `AgentSession`. During `agent_send` the session is removed
-    /// from `agent_sessions` for the duration of `respond`; tools like
-    /// `compact_context` can't `get_mut` the session because it's not in
-    /// the map. Instead they push a `PendingSessionAction` here; the
-    /// `agent_send` prologue drains and applies them before reinsert.
     pending_session_actions: Mutex<BTreeMap<String, Vec<PendingSessionAction>>>,
-    /// 本轮的渠道元数据（谁在说话、什么会话），由 `agent_send_with_turn_context`
-    /// 写入、`inject_turn_meta` 在每次 invoke 时注入到插件 payload 的 `__meta`。
-    /// 与 `pending_session_actions` 同一套生命周期：发送前置入、发送后清掉。
     turn_meta: Mutex<BTreeMap<String, BTreeMap<String, String>>>,
-    /// Per-session LLM profile fallback state. Single inbox thread means
-    /// no real contention; the Mutex is for interior mutability only.
     profile_fallback: Mutex<BTreeMap<String, ProfileFallbackEntry>>,
-    /// Registry of background services (Task nodes).
     pub service_registry: Arc<crate::context::ServiceRegistry>,
-    /// How to start each plugin's Task services, installed by the CLI from
-    /// `fixtures/startup_invoke.json`. Replayed after a reload stopped them.
     startup_invocations: Mutex<Vec<StartupInvocation>>,
-    /// Accumulated rollback for interactive agent file edits.
     interactive_rollback: Mutex<PluginEditRollback>,
     kernel: RuntimeKernel,
 }
@@ -685,8 +654,6 @@ struct RetiredSnapshot {
 struct StagedCandidateSnapshot {
     snapshot: Arc<RuntimeSnapshot>,
     status: CandidateSnapshotStatus,
-    /// Config the candidate snapshot was built with. `reload_candidate` reads
-    /// `config/` to build it, but the values only go live on `promote`.
     config: RuntimeConfig,
 }
 
@@ -704,7 +671,6 @@ pub enum AgentSessionKind {
 /// reinserting.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PendingSessionAction {
-    /// Run `session.compact_history()` after the current turn.
     CompactHistory,
 }
 
@@ -720,7 +686,6 @@ pub struct AgentSessionHandle {
 #[derive(Debug, Clone, Default)]
 pub struct AgentStartOptions {
     pub profile: Option<String>,
-    /// Soul scope key for the persona overlay; "" = no per-user soul.
     pub soul_key: String,
 }
 
@@ -779,11 +744,6 @@ impl crate::soul::SoulProvider for PluginSoulProvider<'_> {
     }
 }
 
-/// 经插件执行补全的 [`LlmProvider`](crate::agent::LlmProvider) 实现。
-///
-/// 形状照 `PluginSoulProvider`：构造 payload → `host.invoke` → 解析回复。
-/// 差别在于多一条 token 旁路——存在 sink 时先绑一个回环监听器，把地址与握手
-/// key 一并放进 payload，插件边读上游边把增量写回来。
 pub(crate) struct PluginLlmProvider<'a> {
     pub(crate) host: &'a RuntimeHost,
     pub(crate) plugin_path: String,
@@ -931,7 +891,6 @@ struct PluginIterationAgentRun {
     tool_summary: Option<AgentToolExecutionSummary>,
     transcript_excerpt: Vec<AgentTranscriptEntry>,
     recorded_summary: Option<String>,
-    /// The change edits an existing test; finalize stages it for approval.
     requires_approval: bool,
     changed_paths: Vec<String>,
     rollback: PluginEditRollback,
@@ -952,8 +911,6 @@ struct PluginIterationAgentState {
     rollback: PluginEditRollback,
     operations: Vec<PluginEditOperation>,
     scaffolded_children: Vec<ScaffoldedChildRegistration>,
-    /// Set by `record_iteration_summary` when the iteration edits an existing
-    /// test: tests are the contract, so that change waits for approval.
     requires_approval: bool,
 }
 
@@ -2807,70 +2764,6 @@ node here (`docs/agent/interfaces.json` is generated by the build).
         Ok(session.session.transcript().to_vec())
     }
 
-    fn start_plugin_iteration_agent_session(
-        &self,
-        prepared: PreparedPluginIteration,
-        context_paths: PluginIterationContextPaths,
-    ) -> Result<String, RuntimeError> {
-        let session_id = normalize_request_id(None, "plugin-agent-session");
-        let mut llm_config = self.config_value().llm_api.clone();
-        llm_config.timeout_ms = llm_config
-            .timeout_ms
-            .min(PLUGIN_ITERATION_AGENT_TIMEOUT_CAP_MS);
-        let session = AgentSession::new(llm_config, "plugin_iteration")?;
-        self.agent_sessions
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .insert(
-                session_id.clone(),
-                ManagedAgentSession {
-                    handle: AgentSessionHandle {
-                        session_id: session_id.clone(),
-                        kind: AgentSessionKind::PluginIteration,
-                    },
-                    session,
-                    state: ManagedAgentState::PluginIteration(Box::new(
-                        PluginIterationAgentState::new(
-                            prepared,
-                            context_paths,
-                            &self.fixtures_root,
-                        ),
-                    )),
-                },
-            );
-        Ok(session_id)
-    }
-
-    fn plugin_iteration_agent_snapshot(
-        &self,
-        session_id: &str,
-    ) -> Result<PluginIterationAgentRun, RuntimeError> {
-        let guard = self
-            .agent_sessions
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        let managed = guard
-            .get(session_id)
-            .ok_or_else(|| RuntimeError::AgentSessionNotFound {
-                session_id: session_id.to_string(),
-            })?;
-        let ManagedAgentState::PluginIteration(state) = &managed.state else {
-            return Err(RuntimeError::InvalidArgument {
-                message: format!("agent session {session_id} is not a plugin iteration session"),
-            });
-        };
-        Ok(PluginIterationAgentRun {
-            session_id: Some(session_id.to_string()),
-            tool_summary: None,
-            transcript_excerpt: Vec::new(),
-            recorded_summary: state.recorded_summary.clone(),
-            requires_approval: state.requires_approval,
-            changed_paths: state.derived_edit_plan().changed_paths(),
-            rollback: state.rollback.clone(),
-            derived_edit_plan: state.derived_edit_plan(),
-        })
-    }
-
     pub fn status(&self) -> RuntimeHostStatus {
         let snapshot = self.current_snapshot();
         RuntimeHostStatus {
@@ -3050,765 +2943,6 @@ node here (`docs/agent/interfaces.json` is generated by the build).
 
     pub fn kernel(&self) -> &RuntimeKernel {
         &self.kernel
-    }
-
-    pub fn iterate_plugins(
-        &self,
-        request: KernelPluginIterationRequest,
-    ) -> Result<KernelPluginIterationResult, RuntimeError> {
-        let snapshot = self.current_snapshot();
-        let prepared = self
-            .kernel
-            .begin_plugin_iteration(snapshot.as_ref(), &request)?;
-        let iteration_id = prepared.iteration_id.clone();
-
-        // Wrap the entire iteration body in a panic guard: if any step panics
-        // (e.g. inside the agent loop, rebuild, or verification), we catch it
-        // and perform emergency rollback instead of crashing the server.
-        let result: std::thread::Result<Result<KernelPluginIterationResult, RuntimeError>> =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                // `assert!(!injected, msg)` panics with exactly `msg` (a `&str`
-                // payload), same as the previous `if injected { panic!(msg) }`,
-                // but without a not-taken block whose closing brace llvm-cov
-                // can never reach.
-                #[cfg(test)]
-                let injected =
-                    TEST_ITERATION_PANIC_INJECTION.swap(false, std::sync::atomic::Ordering::SeqCst);
-                #[cfg(test)]
-                assert!(!injected, "test panic injection: plugin iteration");
-                let mut state = PluginIterationRunState::new(prepared.clone());
-
-                // Step 1: Run the agent loop — the agent freely decides what to do.
-                match self.run_plugin_iteration_agent(&state.prepared) {
-                    Ok(agent) => {
-                        state.changed_paths = agent.changed_paths.clone();
-                        state.rollback = Some(agent.rollback.clone());
-                        if agent.recorded_summary.is_none() {
-                            let sid = agent.session_id.as_deref().unwrap_or("unknown-session");
-                            let err = missing_summary_error(sid);
-                            self.fail_stage(&mut state, "agent", &err);
-                        }
-                        state.agent = Some(agent);
-                    }
-                    Err(err) => {
-                        self.fail_stage(&mut state, "agent", &err);
-                    }
-                }
-
-                // Step 2: Persist the rollback journal.
-                if state.stage_error.is_none() {
-                    // Both outcomes funnel into one `fail_stage` call site.
-                    // `state.rollback` is `Some` on every path Step 1 can take
-                    // (the edit-plan branch starts from
-                    // `PluginEditRollback::empty(..)` and the agent branch reads
-                    // one out of the session snapshot), so the fallback is
-                    // purely defensive — kept as a named, unit-tested
-                    // constructor on the same line as the covered
-                    // `unwrap_or_else` call rather than as its own arm.
-                    let journal_error = state
-                        .rollback
-                        .as_ref()
-                        .map(|rollback| {
-                            // 注入的 ENOSPC 与真实 persist 走同一条表达式：
-                            // `Option::map_or_else` 没有"未走到的臂"，而
-                            // `if { return .. }` 的收尾在 if 不成立时不执行，
-                            // 会在 100% 行覆盖门槛下留一行永久缺口。
-                            injected_journal_enospc(&plugin_iteration_journal_path(
-                                &self.snapshot_root,
-                            ))
-                            .map_or_else(
-                                || {
-                                    rollback.persist_journal(
-                                        &plugin_iteration_journal_path(&self.snapshot_root),
-                                        &state.prepared.iteration_id,
-                                    )
-                                },
-                                Err,
-                            )
-                        })
-                        .unwrap_or_else(|| Err(plugin_iteration_missing_rollback_error()))
-                        .err();
-                    for err in journal_error.iter() {
-                        self.fail_stage(&mut state, "edit", err);
-                    }
-                }
-
-                // Step 3: Rebuild the target plugin only — UNLESS the iteration
-                // touched any Cargo.toml. A manifest change is structural: a
-                // scaffolded child plugin (new crate + parent children entry)
-                // exists neither in the cargo build graph of `-p <target>` nor
-                // in artifacts/index.json, so a target-only rebuild would
-                // silently drop it and the subsequent candidate load could
-                // never register it (the `45febba` regression). Manifest-touching
-                // iterations take the full `rebuild_fixture_artifacts` path,
-                // which re-resolves the plugin graph and regenerates the index.
-                if state.stage_error.is_none() {
-                    let manifest_changed = state
-                        .changed_paths
-                        .iter()
-                        .any(|path| path.ends_with("Cargo.toml"));
-                    let plugin_path = if manifest_changed {
-                        "/".to_string()
-                    } else {
-                        format!("/{}", state.prepared.root_plugin_path)
-                    };
-                    // P0-8: capture the current `.so` before rebuild so rollback
-                    // reverts BOTH source and compiled artifact. Otherwise
-                    // source-code rollback runs but the new `.so` stays on disk,
-                    // producing silent behaviour drift on the next run.
-                    //
-                    // Backup → journal re-persist → rebuild is one `and_then`
-                    // chain, so all three fallible steps share a single
-                    // `fail_stage("rebuild", ..)` call site and each step still
-                    // short-circuits the ones after it exactly as the previous
-                    // `if state.stage_error.is_none()` gates did.
-                    let journal = plugin_iteration_journal_path(&self.snapshot_root);
-                    let iteration_id = state.prepared.iteration_id.clone();
-                    let root_plugin_path = state.prepared.root_plugin_path.clone();
-                    let rebuilt = state
-                        .rollback
-                        .as_mut()
-                        .map(|rollback| {
-                            backup_artifacts_into_rollback(
-                                &self.fixtures_root,
-                                &root_plugin_path,
-                                rollback,
-                            )
-                            // Re-persist the journal now that artifact backups
-                            // landed in the rollback; otherwise a crash after
-                            // rebuild would leave the artifact rollback-able
-                            // only in memory.
-                            .and_then(|()| rollback.persist_journal(&journal, &iteration_id))
-                        })
-                        .unwrap_or_else(|| Err(plugin_iteration_missing_rollback_error()))
-                        .and_then(|()| {
-                            let builder = plugin_builder().ok_or_else(missing_builder_error)?;
-                            builder.rebuild_plugin(&self.fixtures_root, &plugin_path)
-                        });
-                    match rebuilt {
-                        Ok(artifacts) => {
-                            state.rebuilt_artifacts = artifacts;
-                        }
-                        Err(err) => {
-                            self.fail_stage(&mut state, "rebuild", &err);
-                        }
-                    }
-                }
-
-                // Step 4: Stage candidate snapshot.
-                if state.stage_error.is_none() {
-                    match self.reload_candidate() {
-                        Ok(candidate) => {
-                            state.candidate = Some(candidate);
-                        }
-                        Err(err) => {
-                            self.fail_stage(&mut state, "stage_candidate", &err);
-                        }
-                    }
-                }
-
-                // Step 5: Verify.
-                if state.stage_error.is_none() {
-                    match self.verify_plugin_iteration(&state) {
-                        Ok(report) => {
-                            let verdict =
-                                if report.input.tests_passed && report.input.safety_checks_passed {
-                                    VerifierVerdict::Pass
-                                } else {
-                                    VerifierVerdict::Fail
-                                };
-                            if verdict == VerifierVerdict::Fail {
-                                self.kernel.observe_plugin_issue(
-                                KernelPluginIssueSource::VerifierFailure,
-                                state.prepared.root_plugin_path.clone(),
-                                format!(
-                                    "plugin verifier failed for {}: tests_passed={}, safety_checks_passed={}",
-                                    state.prepared.root_plugin_path,
-                                    report.input.tests_passed,
-                                    report.input.safety_checks_passed,
-                                ),
-                            );
-                            }
-                            state.verification = Some(report);
-                            state.verifier_verdict = Some(verdict);
-                        }
-                        Err(err) => {
-                            self.fail_stage(&mut state, "verify", &err);
-                        }
-                    }
-                }
-
-                // Step 6: Canary replay.
-                if state.stage_error.is_none() {
-                    match self.run_plugin_canary(&state) {
-                        Ok(report) => {
-                            if report.verdict == CanaryVerdict::Fail {
-                                self.kernel.observe_plugin_issue(
-                                    KernelPluginIssueSource::CanaryFailure,
-                                    state.prepared.root_plugin_path.clone(),
-                                    format!(
-                                        "plugin canary failed for {}: {}",
-                                        state.prepared.root_plugin_path, report.message
-                                    ),
-                                );
-                            }
-                            state.canary = Some(report);
-                        }
-                        Err(err) => {
-                            self.fail_stage(&mut state, "canary", &err);
-                        }
-                    }
-                }
-
-                // Step 7: Promote or rollback (always runs, even after stage errors).
-                let _final_verdict = self.finalize_plugin_iteration(&mut state)?;
-
-                let net_output = ExecutionOutput {
-                    execution_id: format!("plugin-iteration-{iteration_id}"),
-                    order: vec![
-                        "plugin_iteration::agent".to_string(),
-                        "plugin_iteration::edit".to_string(),
-                        "plugin_iteration::rebuild".to_string(),
-                        "plugin_iteration::stage_candidate".to_string(),
-                        "plugin_iteration::verify".to_string(),
-                        "plugin_iteration::canary".to_string(),
-                        "plugin_iteration::promote_or_rollback".to_string(),
-                    ],
-                    outcomes: std::collections::BTreeMap::new(),
-                    keyed_outcomes: std::collections::BTreeMap::new(),
-                    metrics: crate::execution::engine::ExecutionMetrics::default(),
-                };
-                state.into_result(net_output)
-            }));
-
-        self.kernel.finish_plugin_iteration(&iteration_id);
-
-        match result {
-            // No panic: record the outcome iff the body produced one, then
-            // clean up and hand the body's own `Result` back unchanged. Written
-            // as one arm over `Result::iter()` rather than separate `Ok(Ok)` /
-            // `Ok(Err)` arms because the cleanup and the return value are
-            // identical in both — only the `record_plugin_iteration_outcome`
-            // call is conditional, and it is conditional on exactly the same
-            // `Ok`-ness the iterator encodes.
-            Ok(outcome) => {
-                for result in outcome.iter() {
-                    self.kernel.record_plugin_iteration_outcome(result);
-                }
-                self.cleanup_retired_snapshots();
-                outcome
-            }
-            Err(panic_payload) => {
-                // Emergency cleanup: restore workspace files, rollback candidate,
-                // and clear journal so the system stays in a consistent state.
-                let _ = restore_plugin_iteration_workspace(
-                    &self.fixtures_root,
-                    &self.snapshot_root,
-                    None,
-                );
-                if self.candidate_snapshot().is_some() {
-                    let _ = self.rollback_candidate();
-                }
-                self.cleanup_retired_snapshots();
-                Err(plugin_iteration_panic_error(&panic_payload))
-            }
-        }
-    }
-
-    fn run_plugin_iteration_agent(
-        &self,
-        prepared: &PreparedPluginIteration,
-    ) -> Result<PluginIterationAgentRun, RuntimeError> {
-        if let Some(plan) = &prepared.edit_plan {
-            self.kernel
-                .plugin_iteration_policy
-                .validate_plan(&prepared.allowed_plugin_roots, plan)?;
-            let mut rollback = PluginEditRollback::empty(&self.fixtures_root);
-            let executor = PluginEditExecutor::new(&self.fixtures_root);
-            for (idx, operation) in plan.operations.iter().enumerate() {
-                let single = PluginEditPlan {
-                    issue_id: plan.issue_id.clone(),
-                    patch_id: format!("{}-manual-{idx}", prepared.iteration_id),
-                    summary: plan.summary.clone(),
-                    operations: vec![operation.clone()],
-                };
-                // Bound out of the `?` so each fallible call is a single line:
-                // a `?` spanning several lines leaves llvm-cov a zero-hit
-                // region on the continuation line no test can reach.
-                let policy = &self.kernel.plugin_iteration_policy;
-                let roots = &prepared.allowed_plugin_roots;
-                let executed = executor.execute(policy, roots, &single);
-                let (_, op_rollback) = executed?;
-                rollback.absorb(op_rollback)?;
-            }
-            return Ok(PluginIterationAgentRun {
-                session_id: None,
-                tool_summary: None,
-                transcript_excerpt: Vec::new(),
-                recorded_summary: Some(plan.summary.clone()),
-                // An edit-plan iteration goes through the same test policy as
-                // an agent one; it does not get a silent bypass.
-                requires_approval: !test_changes(&plan.operations).modified.is_empty(),
-                changed_paths: plan.changed_paths(),
-                rollback,
-                derived_edit_plan: plan.clone(),
-            });
-        }
-        let collected = collect_plugin_context_paths(
-            &self.fixtures_root,
-            &prepared.root_plugin_path,
-            &prepared.target_plugin_paths,
-        );
-        let context_paths = collected?;
-        let session_id =
-            self.start_plugin_iteration_agent_session(prepared.clone(), context_paths)?;
-        let input = prepared
-            .instruction
-            .clone()
-            .unwrap_or_else(|| prepared.summary.clone());
-        if let Err(err) = self.agent_send(&session_id, &input) {
-            let transcript_excerpt = self
-                .agent_transcript(&session_id)
-                .map(|transcript| transcript_excerpt(&transcript, 12))
-                .unwrap_or_default();
-            let tool_summary = self.agent_status(&session_id).ok().and_then(|_| {
-                self.agent_sessions
-                    .lock()
-                    .unwrap_or_else(|poison| poison.into_inner())
-                    .get(&session_id)
-                    .map(|managed| managed.session.tool_execution_summary())
-            });
-            // H2: excerpt/tool_summary captured above; terminate the failed
-            // session and reclaim its map entries before returning the error.
-            self.drop_session(&session_id);
-            return Err(enrich_plugin_iteration_agent_error(
-                err,
-                &session_id,
-                tool_summary.as_ref(),
-                &transcript_excerpt,
-            ));
-        }
-        let run = self.plugin_iteration_agent_snapshot(&session_id)?;
-        let transcript = self.agent_transcript(&session_id)?;
-        let transcript_excerpt = transcript_excerpt(&transcript, 12);
-        let tool_summary = self.agent_status(&session_id).ok().and_then(|_| {
-            self.agent_sessions
-                .lock()
-                .unwrap_or_else(|poison| poison.into_inner())
-                .get(&session_id)
-                .map(|managed| managed.session.tool_execution_summary())
-        });
-        // H2: transcript/snapshot are fully read above; terminate the session
-        // and reclaim its map entries before returning success.
-        self.drop_session(&session_id);
-        Ok(PluginIterationAgentRun {
-            session_id: Some(session_id),
-            tool_summary,
-            transcript_excerpt,
-            ..run
-        })
-    }
-
-    fn verify_plugin_iteration(
-        &self,
-        state: &PluginIterationRunState,
-    ) -> Result<VerificationReport, RuntimeError> {
-        let tests_command = state
-            .tests_command
-            .clone()
-            .or_else(|| state.prepared.tests_command.clone())
-            .or_else(|| Some("cargo test --quiet --manifest-path plugins/Cargo.toml".to_string()));
-        let safety_command = state
-            .safety_command
-            .clone()
-            .or_else(|| state.prepared.safety_command.clone());
-        // P0-4: `plugin:` commands must exercise the staged candidate. Wire an
-        // invoker closure that dispatches into the candidate snapshot rather
-        // than loading a fresh live invoker inside the verifier.
-        let candidate_invoker = |plugin_path: &str,
-                                 node_id: &str,
-                                 payload: String|
-         -> Result<PluginResponse, RuntimeError> {
-            self.invoke_candidate(plugin_path, node_id, payload)
-        };
-        let options = VerifyOptions {
-            candidate_invoker: Some(&candidate_invoker),
-            command_timeout: None,
-        };
-        // Bound out of the `?` (single-line fallible expression) so the error
-        // edge shares a line with the call it guards.
-        let verified = CommandVerifier::verify_with_options(
-            &self.fixtures_root,
-            state.prepared.verify_profile,
-            tests_command.as_deref(),
-            safety_command.as_deref(),
-            state.prepared.quality_score,
-            &options,
-        );
-        verified
-    }
-
-    fn run_plugin_canary(
-        &self,
-        state: &PluginIterationRunState,
-    ) -> Result<CanaryReport, RuntimeError> {
-        let target_plugins = state
-            .prepared
-            .target_plugin_paths
-            .iter()
-            .cloned()
-            .collect::<BTreeSet<_>>();
-        let samples = self
-            .invocation_samples
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .iter()
-            .cloned()
-            .collect::<Vec<_>>();
-        let current_snapshot = self.current_snapshot();
-        for sample in samples {
-            if !target_plugins.contains(&sample.plugin_path) {
-                continue;
-            }
-            // Skip invocations that mutate state (replaying a pull would
-            // consume pity twice) and probe the rest for determinism: a node
-            // whose response changes between two runs of the *same* build
-            // cannot serve as evidence, and failing canary on it would revert
-            // every iteration that touches a random plugin.
-            let mutating =
-                node_declares_side_effects(&current_snapshot, &sample.plugin_path, &sample.node_id);
-            if mutating {
-                continue;
-            }
-            // Both fallible steps are bound out of their `?` onto a single line
-            // each: a `?` whose call spans several lines leaves llvm-cov a
-            // zero-hit region on the continuation lines.
-            let encoded = serde_json::to_string(&sample.payload)
-                .map_err(|err| canary_payload_serialize_error(&err));
-            let payload = encoded?;
-            let first = self
-                .invoke_candidate(&sample.plugin_path, &sample.node_id, payload.clone())
-                .map(|response| parse_response_payload(&response.payload))?;
-            let second = self
-                .invoke_candidate(&sample.plugin_path, &sample.node_id, payload.clone())
-                .map(|response| parse_response_payload(&response.payload))?;
-            let Some(verdict) =
-                crate::iteration::policy::canary_probe_verdict(&first, &second, &sample.response)
-            else {
-                // Nondeterministic (random / clock dependent): no evidence.
-                continue;
-            };
-            let actual = first;
-            return Ok(CanaryReport {
-                verdict,
-                mode: "recent_successful_invocation_replay".to_string(),
-                plugin_path: Some(sample.plugin_path),
-                node_id: Some(sample.node_id),
-                payload: Some(sample.payload),
-                expected_response: Some(sample.response),
-                actual_response: Some(actual.clone()),
-                message: if verdict == CanaryVerdict::Pass {
-                    "candidate replay matched current response".to_string()
-                } else {
-                    "candidate replay response diverged from current response".to_string()
-                },
-            });
-        }
-
-        for candidate in self.candidate_snapshot().into_iter() {
-            for plugin_path in &state.prepared.target_plugin_paths {
-                // Registry miss and a plugin without docs are both "no
-                // evidence here, try the next target". Chained through
-                // `and_then` so the two skips share one `for`-over-`Option`
-                // gate instead of two `let ... else { continue }` guards whose
-                // not-taken edges sit on their own lines.
-                let declared = candidate
-                    .plugin_registry()
-                    .get(plugin_path)
-                    .and_then(|plugin| plugin.docs)
-                    .and_then(|docs| {
-                        docs.nodes
-                            .into_iter()
-                            .find(|node| node.id.contains("canary") || node.id.contains("verify"))
-                    });
-                if let Some(node) = declared {
-                    let invoked = self.invoke_candidate(plugin_path, &node.id, "{}".to_string());
-                    let response = invoked?;
-                    let actual = parse_response_payload(&response.payload);
-                    return Ok(CanaryReport {
-                        verdict: CanaryVerdict::Pass,
-                        mode: "declared_plugin_verifier_node".to_string(),
-                        plugin_path: Some(plugin_path.clone()),
-                        node_id: Some(node.id.clone()),
-                        payload: Some(Value::Object(Map::new())),
-                        expected_response: None,
-                        actual_response: Some(actual),
-                        message: "plugin-declared canary/verifier node completed successfully"
-                            .to_string(),
-                    });
-                }
-            }
-        }
-
-        Ok(CanaryReport {
-            verdict: CanaryVerdict::Partial,
-            mode: "no_canary_evidence".to_string(),
-            plugin_path: None,
-            node_id: None,
-            payload: None,
-            expected_response: None,
-            actual_response: None,
-            message: "no recent successful invocation or declared canary/verifier node found"
-                .to_string(),
-        })
-    }
-
-    fn finalize_plugin_iteration(
-        &self,
-        state: &mut PluginIterationRunState,
-    ) -> Result<PluginIterationFinalVerdict, RuntimeError> {
-        // R3: 本迭代 Step 4 暂存候选时记录的身份。promote / rollback 用它
-        // 校验 staged 候选没被并发 `reload_candidate` 替换；候选从未暂存
-        // （stage 失败）时为 None → 不校验（回滚路径仍清理任何残留候选）。
-        let staged_candidate_id = state
-            .candidate
-            .as_ref()
-            .map(|candidate| candidate.candidate_snapshot_id.as_str());
-        if let Some(stage_error) = state.stage_error.clone() {
-            let candidate_rollback = self.rollback_candidate_if_staged(staged_candidate_id);
-            let workspace_restore = restore_plugin_iteration_workspace(
-                &self.fixtures_root,
-                &self.snapshot_root,
-                state.rollback.as_ref(),
-            )
-            .map(|_| ());
-            state.blocked_reason = Some(aggregate_rollback_failure(
-                stage_error,
-                candidate_rollback,
-                workspace_restore,
-            ));
-            // 基础设施故障（磁盘满等）与"验证失败"分开定级。回滚照常先跑
-            // （上面已执行），回滚自身失败也不改变这个判定——错误文本已由
-            // `aggregate_rollback_failure` 拼进 blocked_reason，journal 留在盘上
-            // 供人工恢复。
-            let verdict = if state.stage_error_is_infrastructure {
-                PluginIterationFinalVerdict::InfrastructureFailure
-            } else {
-                PluginIterationFinalVerdict::RolledBack
-            };
-            state.final_verdict = Some(verdict);
-            return Ok(verdict);
-        }
-        let verifier_verdict = state.verifier_verdict.unwrap_or(VerifierVerdict::Partial);
-
-        // P0-3: guard against concurrent source-tree mutation between verify
-        // and promote. The verifier hashes the tree; here we rehash and
-        // compare. Any drift → downgrade the verdict to a rollback so we
-        // don't promote code we never verified.
-        let mut effective_verifier = verifier_verdict;
-        let source_drift_reason = detect_plugin_source_drift(
-            verifier_verdict,
-            state
-                .verification
-                .as_ref()
-                .and_then(|r| r.source_tree_hash.as_deref()),
-            state
-                .verification
-                .as_ref()
-                .and_then(|r| r.hash_error.as_deref()),
-            || hash_source_tree(&self.fixtures_root),
-        );
-        if source_drift_reason.is_some() {
-            effective_verifier = VerifierVerdict::Fail;
-        }
-        if let Some(reason) = source_drift_reason.as_deref() {
-            self.kernel.observe_plugin_issue(
-                KernelPluginIssueSource::VerifierFailure,
-                state.prepared.root_plugin_path.clone(),
-                format!(
-                    "plugin verifier TOCTOU guard tripped for {}: {}",
-                    state.prepared.root_plugin_path, reason
-                ),
-            );
-        }
-
-        // Tests are the contract: the decision lives in `iteration::policy`.
-        // This function only carries out the side effects of that decision.
-        let decision = promotion_verdict(
-            effective_verifier,
-            state
-                .agent
-                .as_ref()
-                .is_some_and(|agent| agent.requires_approval),
-            state.prepared.manual_approved,
-        );
-        let final_verdict = match decision {
-            PluginIterationFinalVerdict::Promoted => {
-                // P2-25: promote failure used to `?` propagate straight out,
-                // leaving the workspace modified with journal on disk but no
-                // rollback trigger. On failure, roll back + restore explicitly.
-                match self.promote_candidate_matching(staged_candidate_id) {
-                    Ok(_) => PluginIterationFinalVerdict::Promoted,
-                    Err(err) => {
-                        let candidate_rollback =
-                            self.rollback_candidate_if_staged(staged_candidate_id);
-                        let workspace_restore = restore_plugin_iteration_workspace(
-                            &self.fixtures_root,
-                            &self.snapshot_root,
-                            state.rollback.as_ref(),
-                        )
-                        .map(|_| ());
-                        state.blocked_reason = Some(aggregate_rollback_failure(
-                            format!("promote failed: {err}"),
-                            candidate_rollback,
-                            workspace_restore,
-                        ));
-                        return Err(err);
-                    }
-                }
-            }
-            PluginIterationFinalVerdict::Blocked => {
-                // Keep the candidate alive: `approve_iteration` promotes it.
-                state.blocked_reason =
-                    Some(crate::iteration::policy::BLOCKED_EDITS_EXISTING_TEST.to_string());
-                PluginIterationFinalVerdict::Blocked
-            }
-            _ => {
-                if let Some(reason) = source_drift_reason.as_ref() {
-                    state.blocked_reason = Some(reason.clone());
-                }
-                let candidate_error = self
-                    .rollback_candidate_if_staged(staged_candidate_id)
-                    .and_then(|outcome| outcome.err())
-                    .map(|err| verdict_rollback_partial_cleanup_reason(&err));
-                let restored = restore_plugin_iteration_workspace(
-                    &self.fixtures_root,
-                    &self.snapshot_root,
-                    state.rollback.as_ref(),
-                );
-                restored?;
-                state.blocked_reason = candidate_error.or(state.blocked_reason.take());
-                PluginIterationFinalVerdict::RolledBack
-            }
-        };
-        state.final_verdict = Some(final_verdict);
-        Ok(final_verdict)
-    }
-
-    fn record_invocation_sample(
-        &self,
-        plugin_path: &str,
-        node_id: &str,
-        payload: &str,
-        response_payload: &str,
-    ) {
-        let payload =
-            serde_json::from_str(payload).unwrap_or_else(|_| Value::String(payload.to_string()));
-        let response = parse_response_payload(response_payload);
-        let mut samples = self
-            .invocation_samples
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        samples.push_front(InvocationSample {
-            plugin_path: plugin_path.to_string(),
-            node_id: node_id.to_string(),
-            payload,
-            response,
-            observed_at_ms: now_ms(),
-        });
-        while samples.len() > 64 {
-            samples.pop_back();
-        }
-    }
-
-    /// Record a stage failure on the iteration state: file a kernel issue via
-    /// `observe_plugin_iteration_failure` and stamp `stage_error` so the run
-    /// short-circuits to rollback. One call site per pipeline stage.
-    fn fail_stage(&self, state: &mut PluginIterationRunState, stage: &str, err: &RuntimeError) {
-        self.observe_plugin_iteration_failure(&state.prepared, stage, err);
-        state.stage_error = Some(err.to_string());
-        // 同时记下这次失败是否为基础设施故障（磁盘满 / 配额耗尽）。所有 stage
-        // 的失败都经本函数，故此处是唯一需要标记的地方；收尾时据此给
-        // `InfrastructureFailure` 而不是把 ENOSPC 误报成"验证失败"。
-        state.stage_error_is_infrastructure = err.is_infrastructure_failure();
-    }
-
-    fn observe_plugin_iteration_failure(
-        &self,
-        prepared: &PreparedPluginIteration,
-        stage: &str,
-        err: &RuntimeError,
-    ) {
-        // 基础设施故障（磁盘满等）不是插件的问题：此前 rebuild /
-        // stage_candidate 阶段的任何错误都被记成 LoadFailure 归咎于插件，
-        // 于 ENOSPC 时会凭空产生一条"插件加载失败"的 kernel issue。
-        if err.is_infrastructure_failure() {
-            return;
-        }
-        let source = match err {
-            RuntimeError::PluginIterationPolicyBlocked { .. } => {
-                Some(KernelPluginIssueSource::PolicyBlocked)
-            }
-            _ if matches!(stage, "rebuild" | "stage_candidate") => {
-                Some(KernelPluginIssueSource::LoadFailure)
-            }
-            _ => None,
-        };
-        let Some(source) = source else {
-            return;
-        };
-        self.kernel.observe_plugin_issue(
-            source,
-            prepared.root_plugin_path.clone(),
-            format!(
-                "plugin iteration {stage} failed for {}: {err}",
-                prepared.root_plugin_path
-            ),
-        );
-    }
-
-    fn observe_snapshot_plugin_issues(
-        &self,
-        snapshot: &RuntimeSnapshot,
-        report: &ReloadReport,
-        stage: &str,
-    ) {
-        for (plugin_path, plugin) in snapshot.plugin_registry().iter() {
-            let changed_reasons = report
-                .changed_plugin_reasons
-                .get(&plugin_path)
-                .cloned()
-                .unwrap_or_default();
-            match plugin.load_result {
-                PluginLoadResult::Unavailable(reason) => {
-                    let source = match reason {
-                        PluginUnavailableReason::ContractViolation => {
-                            KernelPluginIssueSource::DocsDrift
-                        }
-                        _ => KernelPluginIssueSource::LoadFailure,
-                    };
-                    self.kernel.observe_plugin_issue(
-                        source,
-                        plugin_path.clone(),
-                        format!("{stage} observed plugin {plugin_path} unavailable: {reason:?}"),
-                    );
-                }
-                PluginLoadResult::Loaded => {
-                    if changed_reasons.iter().any(|reason| {
-                        matches!(reason.as_str(), "docs_changed" | "fingerprint_diff_changed")
-                    }) {
-                        self.kernel.observe_plugin_issue(
-                            KernelPluginIssueSource::DocsDrift,
-                            plugin_path.clone(),
-                            format!(
-                                "{stage} detected docs/contract drift for {plugin_path}: {}",
-                                changed_reasons.join(", ")
-                            ),
-                        );
-                    }
-                }
-            }
-        }
     }
 
     fn observe_reload_error(&self, stage: &str, err: &RuntimeError) {
@@ -5450,9 +4584,6 @@ fn runtime_snapshot_from_output(
 #[derive(Debug, Clone)]
 struct PluginIterationRunState {
     prepared: PreparedPluginIteration,
-    /// Everything the agent phase produced, in one place. The pipeline used to
-    /// copy each of these fields out of the run, so a new fact had to be added
-    /// in three structs (and was forgotten twice).
     agent: Option<PluginIterationAgentRun>,
     rollback: Option<PluginEditRollback>,
     changed_paths: Vec<String>,
@@ -5463,8 +4594,6 @@ struct PluginIterationRunState {
     canary: Option<CanaryReport>,
     blocked_reason: Option<String>,
     stage_error: Option<String>,
-    /// `stage_error` 是否源自基础设施故障（磁盘满 / 配额耗尽），而非插件缺陷。
-    /// 决定收尾时给 `InfrastructureFailure` 还是 `RolledBack`。
     stage_error_is_infrastructure: bool,
 
     final_verdict: Option<PluginIterationFinalVerdict>,
@@ -5909,17 +5038,11 @@ fn snapshot_dir_owner_is_alive(name: &str) -> bool {
 /// 跨 hash 目录 GC 的统计结果。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SnapshotGcReport {
-    /// 扫描到的 hash 目录总数。
     pub scanned: usize,
-    /// 已删除（或 dry-run 下判定可删）的 hash 目录数。
     pub removed: usize,
-    /// 回收的字节数。
     pub bytes_reclaimed: u64,
-    /// 因含未重放的 rollback journal 而跳过的目录数。
     pub skipped_journal: usize,
-    /// 因仍有活进程持有 in-flight staging 而跳过的目录数。
     pub skipped_live: usize,
-    /// 因未到保留期而跳过的目录数。
     pub skipped_recent: usize,
 }
 
@@ -6168,7 +5291,6 @@ mod snapshot_staging_lock {
     use std::path::{Path, PathBuf};
 
     pub struct Guard {
-        /// 持有 fd 即持有 flock； 里读它来解锁。
         file: Option<File>,
     }
 
@@ -6721,6 +5843,7 @@ pub(crate) fn payload_with_turn_meta(payload: Value, meta: &BTreeMap<String, Str
     Value::Object(object)
 }
 
+mod iteration;
 /// 可信元数据注入：只测注入规则本身（内核侧不需要真插件）。
 mod iteration_agent;
 mod kernel;
