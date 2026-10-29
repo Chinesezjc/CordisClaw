@@ -176,6 +176,7 @@ const AGENT_TOOL_COPY_FILE: &str = "copy_file";
 const AGENT_TOOL_COMPACT_CONTEXT: &str = "compact_context";
 const AGENT_TOOL_RUN_PLUGIN_TEST: &str = "run_plugin_test";
 const AGENT_TOOL_REQUEST_ITERATION: &str = "request_iteration";
+const AGENT_TOOL_APPROVE_ITERATION: &str = "approve_iteration";
 const AGENT_TOOL_CREATE_PLUGIN: &str = "create_plugin";
 const AGENT_TOOL_SET_SOUL: &str = "set_soul";
 const LLM_DEBUG_ENV: &str = "CORDIS_LLM_DEBUG";
@@ -188,6 +189,11 @@ const LLM_DEBUG_ENV: &str = "CORDIS_LLM_DEBUG";
 pub struct SessionCaller {
     pub is_group: bool,
     pub is_admin: bool,
+    /// Whether this speaker may approve a staged plugin iteration. The kernel
+    /// treats it purely as a channel-provided fact: the plugin that produced
+    /// the envelope decides (operator allowlist, room owner/admin, …), so the
+    /// approval policy stays in the plugin layer.
+    pub can_approve_iteration: bool,
 }
 
 pub trait AgentToolHost {
@@ -251,6 +257,14 @@ pub trait AgentToolHost {
         plugin_path: &str,
         instruction: &str,
     ) -> Result<Value, RuntimeError>;
+    /// Promote a staged (blocked) iteration. The approval *policy* is the
+    /// channel plugin's: it reports the capability per session, the kernel only
+    /// enforces it.
+    fn agent_approve_iteration(
+        &self,
+        session_id: &str,
+        iteration_id: &str,
+    ) -> Result<Value, RuntimeError>;
     fn agent_create_plugin(
         &self,
         name: &str,
@@ -279,6 +293,27 @@ pub trait AgentToolHost {
         Err(RuntimeError::InvalidArgument {
             message: "soul storage is not available on this host".to_string(),
         })
+    }
+}
+
+/// Approval gate for `agent_approve_iteration`.
+///
+/// The decision is deliberately not made here: `can_approve_iteration` is
+/// produced by the channel plugin (operator allowlist / room owner / admin).
+/// The kernel only enforces what it was told.
+fn approve_iteration_permission(
+    caller: Option<SessionCaller>,
+) -> Result<(), crate::core::error::RuntimeError> {
+    use crate::core::error::RuntimeError;
+    match caller {
+        None => Err(RuntimeError::InvalidArgument {
+            message: "approve_iteration: unknown agent session (no caller identity)".to_string(),
+        }),
+        Some(caller) if !caller.can_approve_iteration => Err(RuntimeError::InvalidArgument {
+            message: "approve_iteration: this speaker may not approve iterations. The                       channel must report the capability (operator allowlist or the room's                       owner/admin); ask an operator to approve it instead."
+                .to_string(),
+        }),
+        Some(_) => Ok(()),
     }
 }
 
@@ -346,7 +381,11 @@ impl AgentToolHost for RuntimeHost {
     /// trait 默认的 `None`（= 判断不了就不限制），普通成员就能改本群人格。
     fn agent_session_caller(&self, session_id: &str) -> Option<SessionCaller> {
         let (is_group, is_admin) = self.session_caller_policy(session_id)?;
-        Some(SessionCaller { is_group, is_admin })
+        Some(SessionCaller {
+            is_group,
+            is_admin,
+            can_approve_iteration: self.session_approval_capability(session_id)?,
+        })
     }
 
     fn agent_runtime_status(&self) -> Result<Value, RuntimeError> {
@@ -1090,6 +1129,26 @@ impl AgentToolHost for RuntimeHost {
         }
     }
 
+    /// Approve a blocked iteration. The permission is a channel-provided fact
+    /// (`SessionCaller::can_approve_iteration`): the kernel never decides who
+    /// counts as an operator, it only refuses when the channel did not grant it.
+    fn agent_approve_iteration(
+        &self,
+        session_id: &str,
+        iteration_id: &str,
+    ) -> Result<Value, RuntimeError> {
+        let caller = self.agent_session_caller(session_id);
+        approve_iteration_permission(caller)?;
+        let result = self.approve_blocked_iteration(iteration_id)?;
+        Ok(serde_json::json!({
+            "ok": true,
+            "iteration_id": result.iteration_id,
+            "verdict": format!("{:?}", result.final_verdict),
+            "changed_paths": result.changed_paths,
+            "summary": result.summary,
+        }))
+    }
+
     fn agent_create_plugin(
         &self,
         name: &str,
@@ -1289,6 +1348,8 @@ pub struct AgentSession {
     /// P4: the current speaker is that room's owner/admin. Meaningless for
     /// private chats, which never gate persona edits on it.
     caller_is_admin: bool,
+    /// Channel-provided: this speaker may approve a staged iteration.
+    can_approve_iteration: bool,
 }
 
 /// Serializable snapshot of an AgentSession for crash recovery.
@@ -1340,6 +1401,7 @@ impl AgentSession {
             soul_key: String::new(),
             is_group: false,
             caller_is_admin: false,
+            can_approve_iteration: false,
         })
     }
 
@@ -1349,6 +1411,14 @@ impl AgentSession {
     pub fn set_caller_policy(&mut self, is_group: bool, is_admin: bool) {
         self.is_group = is_group;
         self.caller_is_admin = is_admin;
+    }
+
+    pub fn set_approval_capability(&mut self, can_approve: bool) {
+        self.can_approve_iteration = can_approve;
+    }
+
+    pub fn can_approve_iteration(&self) -> bool {
+        self.can_approve_iteration
     }
 
     pub fn caller_policy(&self) -> (bool, bool) {
@@ -2196,6 +2266,7 @@ impl AgentSession {
             // inbox batch before any tool can run.
             is_group: false,
             caller_is_admin: false,
+            can_approve_iteration: false,
         })
     }
 }
@@ -2402,6 +2473,12 @@ struct RunPluginTestArgs {
 struct RequestIterationArgs {
     plugin_path: String,
     instruction: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ApproveIterationArgs {
+    iteration_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2707,6 +2784,11 @@ impl<'a, H: AgentToolHost + ?Sized> AgentBackend for RuntimeShellAgentBackend<'a
                 self.host
                     .agent_request_iteration(&args.plugin_path, &args.instruction)
             }
+            AGENT_TOOL_APPROVE_ITERATION => {
+                let args = parse_tool_value_arguments::<ApproveIterationArgs>(arguments, name)?;
+                self.host
+                    .agent_approve_iteration(self.session_id, &args.iteration_id)
+            }
             AGENT_TOOL_CREATE_PLUGIN => {
                 let args = parse_tool_value_arguments::<CreatePluginArgs>(arguments, name)?;
                 self.host
@@ -2933,6 +3015,18 @@ fn shell_agent_tools() -> Vec<AgentToolSpec> {
                     "instruction": { "type": "string", "description": "What change to make in this iteration." },
                 },
                 "required": ["plugin_path", "instruction"],
+                "additionalProperties": false,
+            }),
+        },
+        AgentToolSpec {
+            name: AGENT_TOOL_APPROVE_ITERATION,
+            description: "Promote a staged plugin iteration (one that is `Blocked` because the canary could not verify it). Use ONLY when the human on the other side explicitly approved that change; the runtime refuses unless the channel reports that this speaker may approve iterations (e.g. the operator allowlist or the room owner/admin). iteration_id: the id returned by request_iteration.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "iteration_id": { "type": "string", "description": "Iteration id to promote." },
+                },
+                "required": ["iteration_id"],
                 "additionalProperties": false,
             }),
         },
@@ -3480,6 +3574,16 @@ mod tests {
             Ok(json!({ "ok": true, "plugin_path": format!("/{name}") }))
         }
 
+        fn agent_approve_iteration(
+            &self,
+            _session_id: &str,
+            iteration_id: &str,
+        ) -> Result<Value, RuntimeError> {
+            Err(RuntimeError::InvalidArgument {
+                message: format!("fake host cannot approve {iteration_id}"),
+            })
+        }
+
         fn agent_send_warning_to_test_groups(&self, _message: &str) {}
 
         fn agent_build_plugins(&self, _plugin_name: &str) -> Result<Value, RuntimeError> {
@@ -3600,6 +3704,35 @@ mod tests {
         }
     }
 
+    // `approve_iteration` is advertised and dispatched through the host; the
+    // permission decision itself lives in the caller fact (see the gate tests).
+    #[test]
+    fn approve_iteration_tool_is_advertised_and_dispatched() {
+        let tools = shell_agent_tools();
+        let spec = tools
+            .iter()
+            .find(|tool| tool.name == AGENT_TOOL_APPROVE_ITERATION)
+            .expect("approve_iteration must be advertised");
+        assert_eq!(spec.parameters["required"], json!(["iteration_id"]));
+
+        let host = FakeHost {
+            caller: None,
+            ..FakeHost::default()
+        };
+        let mut backend = RuntimeShellAgentBackend {
+            host: &host,
+            session_id: "approve-dispatch",
+            soul_key: String::new(),
+        };
+        let err = backend
+            .execute_tool(
+                AGENT_TOOL_APPROVE_ITERATION,
+                json!({ "iteration_id": "it-1" }),
+            )
+            .expect_err("the fake host must refuse");
+        assert!(err.to_string().contains("cannot approve"), "err: {err}");
+    }
+
     /// P4 `set_soul` 门控的共用调用面：一个带 soul scope 的 runtime shell
     /// backend，直接分发 `set_soul` 工具（不经过 LLM）。
     fn call_set_soul(host: &FakeHost) -> Result<Value, RuntimeError> {
@@ -3612,7 +3745,11 @@ mod tests {
     }
 
     fn caller(is_group: bool, is_admin: bool) -> Option<SessionCaller> {
-        Some(SessionCaller { is_group, is_admin })
+        Some(SessionCaller {
+            is_group,
+            is_admin,
+            can_approve_iteration: false,
+        })
     }
 
     /// 群聊人格是房间级共享资源：普通成员改它就是改所有人的 bot 人格。
@@ -4073,6 +4210,38 @@ mod tests {
         ];
         let filtered = filter_kernel_introspection_messages(&turn);
         assert_eq!(filtered, turn, "ordinary turn must be unchanged");
+    }
+}
+
+#[cfg(test)]
+mod approve_iteration_gate_tests {
+    use super::{approve_iteration_permission, SessionCaller};
+
+    fn caller(can_approve_iteration: bool) -> SessionCaller {
+        SessionCaller {
+            is_group: true,
+            is_admin: false,
+            can_approve_iteration,
+        }
+    }
+
+    // The kernel only enforces the channel's fact; it does not invent policy.
+    #[test]
+    fn approval_requires_the_channel_to_grant_the_capability() {
+        let err = approve_iteration_permission(Some(caller(false))).expect_err("refused");
+        let message = err.to_string();
+        assert!(message.contains("may not approve"), "message: {message}");
+        assert!(message.contains("operator"), "message: {message}");
+        assert!(approve_iteration_permission(Some(caller(true))).is_ok());
+    }
+
+    #[test]
+    fn unknown_session_is_refused() {
+        let err = approve_iteration_permission(None).expect_err("refused");
+        assert!(
+            err.to_string().contains("unknown agent session"),
+            "err: {err}"
+        );
     }
 }
 

@@ -1433,6 +1433,25 @@ fn sanitize_display_name(raw: &str) -> Option<String> {
     }
 }
 
+/// Channel-side approval policy: who may promote a staged iteration.
+///
+/// The runtime does not decide this — it just enforces what the channel
+/// reports. Here the rule is: a configured operator (`data/qq_operators.json`),
+/// or the room's owner/admin.
+fn caller_can_approve_iteration(msg: &IncomingMessage) -> bool {
+    approve_iteration_decision(
+        msg.sender_role.as_deref(),
+        &msg.user_id,
+        &operator_allowlist(None),
+    )
+}
+
+fn approve_iteration_decision(role: Option<&str>, user_id: &str, operators: &[String]) -> bool {
+    let role = role.unwrap_or_default().to_ascii_lowercase();
+    matches!(role.as_str(), "owner" | "admin")
+        || operators.iter().any(|operator| operator == user_id)
+}
+
 /// Build the runtime routing envelope (mirrors feishu's build_envelope).
 /// sender_id is "group:<gid>" or "private:<uid>"; the actual person is
 /// user_id, so identity is "qq:<user_id>".
@@ -1471,6 +1490,8 @@ fn build_envelope(msg: &IncomingMessage) -> String {
         "conversation_kind": msg.message_type,
         // 缺省空串：渠道报不出群角色时 runtime 按普通成员处理（安全默认）。
         "sender_role": msg.sender_role.clone().unwrap_or_default(),
+        // 批准迭代是渠道侧策略（操作员名单 / 群主管理员），runtime 只执行这个事实。
+        "caller_can_approve": caller_can_approve_iteration(msg),
         // 图片地址交给 kernel 处理（下载 + 内联），插件不碰多模态 wire format。
         "images": collect_image_urls(&msg.message),
         // 一次性上下文：策略行 + 记忆行，只进本次请求。
@@ -4751,6 +4772,31 @@ mod auth_tests {
             }
         }))
         .expect("NodeRequest")
+    }
+
+    // 批准迭代的渠道策略：操作员名单、或群主/管理员；普通成员不授予。
+    #[test]
+    fn approve_iteration_capability_follows_operator_list_and_room_role() {
+        let operators = vec!["1751557948".to_string()];
+        assert!(approve_iteration_decision(None, "1751557948", &operators));
+        assert!(approve_iteration_decision(
+            Some("owner"),
+            "1001",
+            &operators
+        ));
+        assert!(approve_iteration_decision(
+            Some("Admin"),
+            "1002",
+            &operators
+        ));
+        assert!(!approve_iteration_decision(
+            Some("member"),
+            "1003",
+            &operators
+        ));
+        assert!(!approve_iteration_decision(None, "1003", &operators));
+        // 空名单 + 报不出角色 → 不授予（安全默认）。
+        assert!(!approve_iteration_decision(None, "1003", &[]));
     }
 
     // 没有 __meta（CLI / 运维直接 invoke）→ 视为操作员，放行。

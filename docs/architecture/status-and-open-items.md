@@ -451,6 +451,42 @@ invocation 回放了新构建，响应变了（这正是"改行为"），于是 
 API/CLI。所以"会改变行为"的修改只能由操作员在宿主侧批准；bot 现在至少会如实报"需要批准"，
 而不是谎称已改或反复重试。
 
+### 3.23 canary 不再拿随机节点当证据（2026-10-29）
+
+上一版 canary 会把**最近一次成功调用**（请求+响应）录制下来，重建后回放比对。问题：
+
+- `gacha_entry{pull}` 这类节点**带随机性**：同一 payload 两次结果不同 → 回放必然不匹配 →
+  canary=Fail → 任何动到该插件的迭代都被回滚（"改行为"永远落不了地）；
+- 回放还有副作用：为比对而再抽一次卡，会真的消耗保底（bot 报过"保底从 24 变 34"）。
+
+现在：
+
+1. **声明了 side_effects 的节点不参与回放**（`node_declares_side_effects`，读节点 docs）；
+2. 其余样本先做**确定性探测**：同一 payload 连跑两次，两次不一致 → 判为非确定性，跳过该样本
+   （`canary_probe_verdict` 返回 `None`）；
+3. 只有确定性样本才与录制基线比对 → Pass/Fail。
+
+效果：随机/副作用节点不再把迭代拖进回滚，确定性节点的行为变化仍会被拦。
+测试：`canary_probe_tests`（非确定性→无证据、确定性一致→Pass、确定性但变了→Fail、声明副作用被跳过）。
+
+### 3.24 迭代批准通道（策略在插件，机制在 kernel）（2026-10-29）
+
+`Blocked` 的迭代原来没有任何 agent 侧入口能批准（`approve_blocked_iteration` 只存在于 host API）。
+现在加了 `approve_iteration` 工具，但**判权不写在 runtime 里**：
+
+- **策略在插件**：qq 插件在 envelope 里给出 `caller_can_approve` ——
+  操作员名单（`data/qq_operators.json`）**或**该群 owner/admin 时为 true（
+  `approve_iteration_decision`，有单测）；别的渠道插件可以按自己的规则给值；
+- **机制在 kernel**：CLI 把该字段存进会话（`refresh_session_caller(..., can_approve)`），
+  `SessionCaller::can_approve_iteration` 暴露给工具层；`agent_approve_iteration` 只做
+  "渠道给了这个能力吗"的判定（`approve_iteration_permission`），通过才调
+  `approve_blocked_iteration`。
+
+工具描述明确要求"仅当对方明确批准这次改动时使用"，模型自批无意义（它拿不到别人会话的能力位）。
+测试：`approve_iteration_gate_tests`（未知会话拒绝、无能力拒绝、有能力放行）、
+`approve_iteration_tool_is_advertised_and_dispatched`（工具在列表里、分发到 host）、
+qq 侧 `approve_iteration_capability_follows_operator_list_and_room_role`。
+
 ## 4. 部分完成
 
 ### 4.1 Execution engine 有正式入口，数据面验证不足
@@ -1783,11 +1819,5 @@ reload 时保留 boot 值（`snapshot_root` 会打日志说明），要改只能
 "换 staging 根时旧快照与 retired 目录怎么回收"的语义。
 
 
-### 4.9 agent 没有迭代批准通道
+### 4.9 ~~agent 没有迭代批准通道~~（2026-10-29 已闭合，见 3.24）
 
-行为变更（canary 回放响应变化）会让 `finalize_plugin_iteration` 回滚，这是设计："没有验证过的
-行为变化不落地"。但批准入口 `approve_blocked_iteration` 只暴露在 host API/CLI，agent 侧没有任何
-工具能触发它，于是"让 bot 改行为"这条链在 canary 有样本之后是死的（2026-10-29 撤销映射就撞在这）。
-
-修法（待做）：给 agent 加 `approve_iteration` 工具，但**必须绑定调用者身份**——复用
-`agent_session_caller`（群主/管理员）或 `data/qq_operators.json`，禁止模型自批。

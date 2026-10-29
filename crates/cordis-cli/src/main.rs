@@ -69,6 +69,11 @@ struct AgentEnvelope {
     /// Empty = the channel cannot report it (treated as a plain member).
     #[serde(default)]
     sender_role: String,
+    /// Channel-provided fact: may this speaker approve a staged iteration?
+    /// The plugin decides (operator allowlist / room owner / admin); the kernel
+    /// only enforces it, so approval policy stays in the plugin layer.
+    #[serde(default)]
+    caller_can_approve: bool,
     /// 本批消息里带的图片地址（渠道中立）。kernel 自己下载并内联成
     /// `image_url` content part（见 `cordis_runtime::image_input`），所以插件只需
     /// 把图片 URL 原样交出来，不必理解多模态 wire format。
@@ -98,6 +103,7 @@ impl AgentEnvelope {
                 sender_id: String::new(),
                 conversation_kind: String::new(),
                 sender_role: String::new(),
+                caller_can_approve: false,
                 images: Vec::new(),
                 notes: String::new(),
             },
@@ -127,6 +133,10 @@ impl AgentEnvelope {
 
     /// Only a group owner/admin may change a room persona; an empty role
     /// (channel cannot report it) counts as a plain member.
+    fn caller_can_approve_iteration(&self) -> bool {
+        self.caller_can_approve
+    }
+
     fn caller_is_admin(&self) -> bool {
         matches!(
             self.sender_role.to_ascii_lowercase().as_str(),
@@ -1007,7 +1017,12 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     // (a missing session surfaces on agent_send instead).
                     let _ = host.refresh_session_soul(sid, &route.soul_key());
                     let is_group = route.conversation_kind == "group";
-                    let _ = host.refresh_session_caller(sid, is_group, route.caller_is_admin());
+                    let _ = host.refresh_session_caller(
+                        sid,
+                        is_group,
+                        route.caller_is_admin(),
+                        route.caller_can_approve_iteration(),
+                    );
                     // Process agent output: parse JSON, dispatch action, send
                     // the reply back to the ORIGINATING plugin (route). Returns
                     // Some(feedback) if the agent needs to retry.
