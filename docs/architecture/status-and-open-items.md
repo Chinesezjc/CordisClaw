@@ -423,6 +423,34 @@ raw 可达，所以用了这份镜像数据集。）
 已知近似：镜像数据是"每个相位一份四星三件套"，同期两池共用同一组四星；真实游戏里 5.x 之后两池
 四星常常不同。要精确到池，用操作员身份 `history_add` 覆盖对应 id（`same id` 会替换）。
 
+### 3.22 迭代"成功"的假象：真正的判定没回给 agent（2026-10-29）
+
+bot 两次"撤销映射"都报了成功（`record_iteration_summary` 通过、`changed_paths` 有值、测试通过），
+但文件还是老样子。查日志后确认：那两次迭代的**最终判定是 `RolledBack`**——canary 用录制的
+invocation 回放了新构建，响应变了（这正是"改行为"），于是 `finalize_plugin_iteration` 走了
+"验证失败 → `restore_plugin_iteration_workspace`"，把文件还原了；而 `request_iteration` 只把
+**verifier_verdict（Pass）** 回给 agent，所以它以为成功、去读文件发现没变，只能说"空判定/没工具"。
+
+现在 `request_iteration` 的返回是真实的最终状态：
+
+```json
+{"ok": false, "verdict": "RolledBack", "final_verdict": "RolledBack",
+ "verifier_verdict": "Pass", "canary_verdict": "Fail",
+ "changed_paths": [...], "summary": "...",
+ "rolled_back": true,
+ "error": "iteration did not promote (RolledBack): <原因>. the canary replayed recorded
+           invocations ... so the workspace was restored. Changing behavior intentionally
+           needs operator approval ... Do NOT report the change as done."}
+```
+
+- `ok` 只在 **Promoted** 时为 true；
+- Blocked（候选已暂存、`working tree` 里有改动但没生效）也会说明"等操作员批准"，不会说成成功；
+- 代码：`iteration_result_json`（纯函数，3 个单测覆盖 Promoted / RolledBack+canary Fail / Blocked）。
+
+**仍未闭合**（见 4.9）：agent 目前**没有**批准通道——`approve_blocked_iteration` 只存在于 host
+API/CLI。所以"会改变行为"的修改只能由操作员在宿主侧批准；bot 现在至少会如实报"需要批准"，
+而不是谎称已改或反复重试。
+
 ## 4. 部分完成
 
 ### 4.1 Execution engine 有正式入口，数据面验证不足
@@ -1754,3 +1782,12 @@ cd fixtures/plugins/expr/lexer && cargo test --lib  # excluded, external tests o
 reload 时保留 boot 值（`snapshot_root` 会打日志说明），要改只能重启。若要支持，需要定义
 "换 staging 根时旧快照与 retired 目录怎么回收"的语义。
 
+
+### 4.9 agent 没有迭代批准通道
+
+行为变更（canary 回放响应变化）会让 `finalize_plugin_iteration` 回滚，这是设计："没有验证过的
+行为变化不落地"。但批准入口 `approve_blocked_iteration` 只暴露在 host API/CLI，agent 侧没有任何
+工具能触发它，于是"让 bot 改行为"这条链在 canary 有样本之后是死的（2026-10-29 撤销映射就撞在这）。
+
+修法（待做）：给 agent 加 `approve_iteration` 工具，但**必须绑定调用者身份**——复用
+`agent_session_caller`（群主/管理员）或 `data/qq_operators.json`，禁止模型自批。

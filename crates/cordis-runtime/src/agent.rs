@@ -282,6 +282,59 @@ pub trait AgentToolHost {
     }
 }
 
+/// Shape the iteration result for the agent.
+///
+/// `ok` is only true when the change was actually **promoted**: a rolled-back
+/// iteration restored the workspace, so reporting success would leave the agent
+/// describing files it never changed.
+fn iteration_result_json(result: &crate::host::KernelPluginIterationResult) -> serde_json::Value {
+    use crate::kernel::plugin_iteration::{CanaryVerdict, PluginIterationFinalVerdict};
+    let final_verdict = result.final_verdict;
+    let promoted = final_verdict == PluginIterationFinalVerdict::Promoted;
+    let canary_verdict = result.canary.as_ref().map(|report| report.verdict);
+    let mut value = serde_json::json!({
+        "ok": promoted,
+        "iteration_id": result.iteration_id,
+        "verdict": format!("{final_verdict:?}"),
+        "final_verdict": format!("{final_verdict:?}"),
+        "verifier_verdict": result.verifier_verdict.map(|verdict| format!("{verdict:?}")),
+        "canary_verdict": canary_verdict.map(|verdict| format!("{verdict:?}")),
+        "changed_paths": result.changed_paths,
+        "summary": result.summary,
+    });
+    if !promoted {
+        let reason = result
+            .blocked_reason
+            .clone()
+            .unwrap_or_else(|| "no reason recorded".to_string());
+        let hint = match (final_verdict, canary_verdict) {
+            (PluginIterationFinalVerdict::RolledBack, Some(CanaryVerdict::Fail)) => {
+                "the canary replayed recorded invocations against the new build and their \
+                 responses changed, so the workspace was restored. Changing behavior \
+                 intentionally needs operator approval; ask them to approve this iteration."
+            }
+            (PluginIterationFinalVerdict::RolledBack, _) => {
+                "verification failed, so the workspace was restored (your edits are gone)."
+            }
+            (PluginIterationFinalVerdict::Blocked, _) => {
+                "the iteration is staged as a candidate and is waiting for operator approval; \
+                 the working tree still holds your edits, but they are NOT live."
+            }
+            (PluginIterationFinalVerdict::InfrastructureFailure, _) => {
+                "an infrastructure failure (disk, IO) aborted the iteration."
+            }
+            (PluginIterationFinalVerdict::Promoted, _) => "",
+        };
+        value["error"] = serde_json::json!(format!(
+            "iteration did not promote ({final_verdict:?}): {reason}. {hint} \
+             Do NOT report the change as done."
+        ));
+        value["rolled_back"] =
+            serde_json::json!(final_verdict == PluginIterationFinalVerdict::RolledBack);
+    }
+    value
+}
+
 impl AgentToolHost for RuntimeHost {
     /// 转发到 host 的真实实现。**少了这个转发，trait 的默认 no-op 会被调用**
     /// ——插件就再也收不到 `__meta`，鉴权会静默退化成"当作 CLI 操作员放行"。
@@ -1025,11 +1078,11 @@ impl AgentToolHost for RuntimeHost {
             quality_score: None,
         };
         match self.iterate_plugins(request) {
-            Ok(result) => Ok(serde_json::json!({
-                "ok": true,
-                "summary": result.summary,
-                "verdict": format!("{:?}", result.verifier_verdict),
-            })),
+            // Report the FINAL verdict, not just the verifier's. A rollout that
+            // the canary rolled back (or that is blocked awaiting approval)
+            // used to be reported as `verdict: Pass`, so the agent believed it
+            // had changed files that were in fact restored.
+            Ok(result) => Ok(iteration_result_json(&result)),
             Err(e) => Ok(serde_json::json!({
                 "ok": false,
                 "error": e.to_string(),
@@ -4020,5 +4073,99 @@ mod tests {
         ];
         let filtered = filter_kernel_introspection_messages(&turn);
         assert_eq!(filtered, turn, "ordinary turn must be unchanged");
+    }
+}
+
+#[cfg(test)]
+mod iteration_result_json_tests {
+    use super::iteration_result_json;
+    use crate::host::KernelPluginIterationResult;
+    use crate::kernel::plugin_iteration::{
+        CanaryReport, CanaryVerdict, PluginEditPlan, PluginIterationFinalVerdict, VerifierVerdict,
+    };
+
+    fn result(final_verdict: PluginIterationFinalVerdict) -> KernelPluginIterationResult {
+        KernelPluginIterationResult {
+            iteration_id: "it-1".to_string(),
+            issue_id: "issue-1".to_string(),
+            root_plugin_path: "gacha".to_string(),
+            target_plugin_paths: vec!["gacha".to_string()],
+            source: None,
+            summary: "remove the mapping".to_string(),
+            agent_session_id: None,
+            tool_execution_summary: None,
+            derived_edit_plan: PluginEditPlan {
+                issue_id: "issue-1".to_string(),
+                patch_id: "patch-1".to_string(),
+                summary: "remove the mapping".to_string(),
+                operations: Vec::new(),
+            },
+            transcript_excerpt: Vec::new(),
+            changed_paths: vec!["plugins/gacha/src/lib.rs".to_string()],
+            rebuilt_artifacts: Vec::new(),
+            candidate: None,
+            verification: None,
+            verifier_verdict: Some(VerifierVerdict::Pass),
+            canary: Some(CanaryReport {
+                verdict: CanaryVerdict::Fail,
+                mode: "replay".to_string(),
+                plugin_path: Some("gacha".to_string()),
+                node_id: Some("gacha_entry".to_string()),
+                payload: None,
+                expected_response: None,
+                actual_response: None,
+                message: "replay mismatch".to_string(),
+            }),
+            final_verdict,
+            blocked_reason: Some("canary replay mismatch".to_string()),
+            net_output: crate::execution::engine::ExecutionOutput {
+                execution_id: "it-1".to_string(),
+                order: Vec::new(),
+                outcomes: std::collections::BTreeMap::new(),
+                keyed_outcomes: std::collections::BTreeMap::new(),
+                metrics: crate::execution::engine::ExecutionMetrics::default(),
+            },
+        }
+    }
+
+    // A rolled-back iteration must NOT be reported as a success: the workspace
+    // was restored, so "ok: true" made the agent describe files it never wrote.
+    #[test]
+    fn rolled_back_iteration_is_reported_as_failure_with_the_reason() {
+        let value = iteration_result_json(&result(PluginIterationFinalVerdict::RolledBack));
+        assert_eq!(value["ok"], false);
+        assert_eq!(value["verdict"], "RolledBack");
+        assert_eq!(value["verifier_verdict"], "Pass");
+        assert_eq!(value["canary_verdict"], "Fail");
+        assert_eq!(value["rolled_back"], true);
+        let error = value["error"].as_str().expect("error");
+        assert!(error.contains("canary"), "error: {error}");
+        assert!(error.contains("restored"), "error: {error}");
+        assert!(error.contains("operator approval"), "error: {error}");
+    }
+
+    #[test]
+    fn promoted_iteration_reports_success_and_no_error() {
+        let value = iteration_result_json(&result(PluginIterationFinalVerdict::Promoted));
+        assert_eq!(value["ok"], true);
+        assert_eq!(value["verdict"], "Promoted");
+        assert!(value.get("error").is_none());
+        assert!(value.get("rolled_back").is_none());
+        assert_eq!(
+            value["changed_paths"],
+            serde_json::json!(["plugins/gacha/src/lib.rs"])
+        );
+    }
+
+    // Blocked means "edits are in the tree but not live" — say that, don't
+    // pretend it failed and don't pretend it is done.
+    #[test]
+    fn blocked_iteration_explains_it_awaits_approval() {
+        let value = iteration_result_json(&result(PluginIterationFinalVerdict::Blocked));
+        assert_eq!(value["ok"], false);
+        let error = value["error"].as_str().expect("error");
+        assert!(error.contains("approval"), "error: {error}");
+        assert!(!error.contains("restored"), "error: {error}");
+        assert_eq!(value["rolled_back"], false);
     }
 }
