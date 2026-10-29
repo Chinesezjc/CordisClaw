@@ -8,6 +8,7 @@ pub mod execution;
 pub mod guard;
 pub mod host;
 pub mod image_input;
+pub mod iteration;
 pub mod kernel;
 mod llm_sink;
 pub mod plugin;

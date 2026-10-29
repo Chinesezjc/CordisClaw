@@ -506,6 +506,31 @@ canary 回放是不靠谱的代理（随机、副作用、录制时机都能左�
 `finalize_manual_approval_promotes_a_test_editing_change`、
 `finalize_partial_canary_does_not_block_a_tested_change`。
 
+### 3.26 重构第一步：迭代策略独立成模块（2026-10-29）
+
+原来"这次改动能落地吗"的判断散在三处（summary 工具里查测试、finalize 里读 `requires_approval`、
+agent 工具层做批准门控），加一条规则要改 6 个地方。现在收进 `crates/cordis-runtime/src/iteration/`：
+
+- `policy.rs` —— 纯函数，不碰文件系统/时钟/host：
+  `test_changes` / `is_test_path` / `iteration_changes_docs_only` / `summary_rejection` /
+  `canary_probe_verdict` / `node_declares_side_effects_in` / `promotion_verdict` /
+  `BLOCKED_EDITS_EXISTING_TEST`。判据表就是一个 `match`，组合全覆盖；
+- `report.rs` —— 结果措辞与批准门控：`iteration_result_json`（Promoted/Blocked/RolledBack 的
+  真实回报）与 `approve_iteration_permission`（渠道给的能力位）。
+
+`host.rs` 的 summary 与 finalize 现在只做副作用（落盘、恢复、promote），判定全部委托给
+`iteration::policy`；`agent.rs` 只剩工具分发。测试随之搬家（policy 7 条、report 4 条）。
+
+行数变化：`agent.rs` 4340 → ~3550，`host.rs` 17106 → 16900 左右，新增 `iteration/` 约 400 行。
+
+**后续（未做）**：
+
+1. 把 6 个迭代状态结构（Prepared/AgentState/AgentSnapshot/AgentRun/RunState/KernelResult）合成
+   一个 `IterationRecord`；
+2. 拆 `host.rs`（loader / snapshot / reload / iteration / tools / observability）；
+3. 插件 ABI 引入 `&mut PluginInstance`（store/clock/logger 注入），去掉进程级 static；
+4. 工件内容寻址 + 单一派生索引，`interfaces.json` 只作投影缓存。
+
 ## 4. 部分完成
 
 ### 4.1 Execution engine 有正式入口，数据面验证不足
