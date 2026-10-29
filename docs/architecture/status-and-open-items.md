@@ -361,6 +361,31 @@ bot 报告说 `request_iteration` 返回 `verdict=Pass` 却一个字节都没落
 **给 bot 的建议路径**（不要再走 `fs_write`）：`request_iteration({"plugin_path":"/lpl", …})` →
 `run_plugin_check` / `run_plugin_test` → `record_iteration_summary` → `reload /lpl`。
 
+### 3.19 抽卡：每人一个池子，默认池跟真实卡池（2026-10-29）
+
+之前 `data/gacha/state.json` 是**全局单份**：谁抽都写同一个保底，`setbanner` 也没有任何权限
+判断（只有一把防并发写的 `STATE_LOCK`）。于是"池子被谁改了""谁都能改"都是真的。
+
+现在：
+
+- **按人分池**：`data/gacha/users/<uid>.json` 存 `{state, banner}`，`uid` 来自内核注入的
+  `__meta.actor`（`qq:1751557948` → `1751557948`），CLI/运维用 `default`。老的
+  `state.json` 作为 `default` 的兼容读入口，首次写入后迁移到 `users/default.json`。
+- **默认池 = 真实卡池**：内置 `real_banner()`（当前写的是 玛薇卡 + 班尼特/迪奥娜/卡齐娜），
+  `data/gacha/banner.json` 可覆盖，无需重编。
+- **权限**：操作员（`data/qq_operators.json`，或无 `__meta` 的 CLI）的 `setbanner` 改**默认池**；
+  其他人只能改**自己那份**，`user` 参数只对操作员生效——普通玩家没法改别人的池。
+- **UP/歪计数**：`GachaState` 新增 `char_5_featured_count` / `char_4_featured_count` /
+  `char_4_off_banner_count`，`pull`/`status` 返回 `stats`，报告必须用这三项。按名字统计是错的
+  （常驻四星池里就有 UP 的名字），4★ 的 UP 期望也是 **75%**（50% + 歪一次保底），不是 50/50。
+
+测试（`cargo test -p gacha`，8 个）：`per_player_pools_are_independent_and_banner_comes_from_the_real_default`
+（两人保底互不影响、默认池继承、玩家改自己、玩家劫持 `user` 无害、玩家改不动 `banner.json`）、
+`featured_counters_match_the_four_star_total`、`legacy_state_file_seeds_the_default_player`。
+
+部署：`prepare-artifacts` + `sync-plugin-docs` + `reload /gacha`（10:54，**不需要重启**——
+正是 3.17 里那个 docs 漂移修复让 reload 能过）。
+
 ## 4. 部分完成
 
 ### 4.1 Execution engine 有正式入口，数据面验证不足

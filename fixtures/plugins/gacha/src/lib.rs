@@ -14,7 +14,7 @@ use std::path::PathBuf;
 
 // ── gacha state ────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct GachaState {
     char_pity_5: u32,
     char_pity_4: u32,
@@ -31,6 +31,15 @@ struct GachaState {
     /// The correct denominator is the count of 5★ events, tracked here.
     #[serde(default)]
     char_5_star_count: u64,
+    /// P3: featured/off-banner accounting, so a report can never be built by
+    /// matching names again (the standard 4★ pool contains the featured
+    /// names, so name matching conflates the two).
+    #[serde(default)]
+    char_5_featured_count: u64,
+    #[serde(default)]
+    char_4_featured_count: u64,
+    #[serde(default)]
+    char_4_off_banner_count: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -45,110 +54,228 @@ struct Store {
     banner: BannerConfig,
 }
 
-fn store_path() -> PathBuf {
-    // P2-38: was a relative `data/gacha/state.json`, which resolved
-    // against whatever the process cwd happened to be — two launches
-    // from different directories saw different state files. Prefer
-    // `$CORDIS_FIXTURES_ROOT/../data/gacha/state.json` (relative to the
-    // workspace root above `fixtures/`); fall back to the historical
-    // relative path only when the env is unset.
+/// Where the runtime keeps gacha data (`data/gacha`), resolved like before:
+/// `$CORDIS_FIXTURES_ROOT/../data/gacha`, else the historical relative path.
+fn resolve_data_dir() -> PathBuf {
     if let Ok(root) = std::env::var("CORDIS_FIXTURES_ROOT") {
         let ws = PathBuf::from(&root)
             .parent()
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| PathBuf::from(&root));
-        return ws.join("data/gacha/state.json");
+        return ws.join("data/gacha");
     }
-    PathBuf::from("data/gacha/state.json")
+    PathBuf::from("data/gacha")
 }
 
-fn load_store() -> Store {
-    let path = store_path();
-    if path.exists() {
-        // P1-44: `.ok()` used to silently swallow deserialize failures
-        // and reset state to default (nuking user progress). Log the
-        // parse error to stderr and preserve default only when the file
-        // is genuinely absent.
-        match std::fs::read_to_string(&path) {
-            Ok(text) => match serde_json::from_str::<Store>(&text) {
-                Ok(store) => store,
-                Err(err) => {
-                    eprintln!(
-                        "[gacha] state file at {} failed to parse ({err}); \
-                         refusing to overwrite — please repair or delete it",
-                        path.display()
-                    );
-                    // Return a poison sentinel: an in-memory default so
-                    // reads don't crash, but any subsequent save is
-                    // blocked below by SAVE_BLOCKED.
-                    SAVE_BLOCKED.store(true, std::sync::atomic::Ordering::SeqCst);
-                    Store::default()
-                }
-            },
-            Err(err) => {
-                eprintln!("[gacha] state file read failed: {err}");
-                Store::default()
-            }
-        }
+/// A player id safe to use as a file name.
+fn sanitize_uid(raw: &str) -> String {
+    let cleaned: String = raw
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+        .take(64)
+        .collect();
+    if cleaned.is_empty() {
+        "default".to_string()
     } else {
-        Store::default()
+        cleaned
+    }
+}
+
+/// The banner every player gets unless they set their own: the real Genshin
+/// rate-up this plugin was last updated for. `data/gacha/banner.json`
+/// overrides it (what an operator's `setbanner` writes), so rotation does not
+/// need a rebuild.
+fn real_banner() -> BannerConfig {
+    BannerConfig {
+        featured_5: "玛薇卡".to_string(),
+        featured_4: [
+            "班尼特".to_string(),
+            "迪奥娜".to_string(),
+            "卡齐娜".to_string(),
+        ],
+    }
+}
+
+fn banner_path(dir: &std::path::Path) -> PathBuf {
+    dir.join("banner.json")
+}
+
+/// The default banner: `banner.json` when present, else the built-in one.
+fn default_banner(dir: &std::path::Path) -> BannerConfig {
+    std::fs::read_to_string(banner_path(dir))
+        .ok()
+        .and_then(|text| serde_json::from_str::<BannerConfig>(&text).ok())
+        .filter(|banner| !banner.featured_5.trim().is_empty())
+        .unwrap_or_else(real_banner)
+}
+
+fn user_store_path(dir: &std::path::Path, uid: &str) -> PathBuf {
+    dir.join("users")
+        .join(format!("{}.json", sanitize_uid(uid)))
+}
+
+/// Legacy single-player file; used as the `default` player's store until it is
+/// written once (then the per-user file takes over).
+fn legacy_store_path(dir: &std::path::Path) -> PathBuf {
+    dir.join("state.json")
+}
+
+impl Store {
+    fn with_banner(banner: BannerConfig) -> Self {
+        Store {
+            state: GachaState::default(),
+            banner,
+        }
     }
 }
 
 /// P1-44: sticky flag set when a load failure would otherwise be masked;
-/// prevents save_store from clobbering the on-disk file until an operator
+/// prevents saves from clobbering the on-disk file until an operator
 /// intervenes.
 static SAVE_BLOCKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// P1-44: process-wide lock around read-modify-write of the gacha state.
 /// Concurrent pull invocations used to interleave `load → mutate → save`,
 /// losing pity increments. This is a coarse mutex (whole state), which is
-/// fine because gacha is one small file.
+/// fine because gacha is a handful of small files.
 static STATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-fn save_store(store: &Store) {
-    if SAVE_BLOCKED.load(std::sync::atomic::Ordering::SeqCst) {
-        eprintln!("[gacha] save blocked because prior load failed to parse");
-        return;
+fn load_store_at(path: &std::path::Path, fallback_banner: BannerConfig) -> Store {
+    if !path.exists() {
+        return Store::with_banner(fallback_banner);
     }
-    let path = store_path();
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    if let Ok(json) = serde_json::to_string(store) {
-        // P1-44: atomic tmp + rename so a crash mid-write doesn't leave
-        // a truncated state file (which would then trip the load-poison
-        // path on next boot).
-        let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
-        if let Err(err) = std::fs::write(&tmp, &json) {
-            eprintln!("[gacha] save tmp write failed: {err}");
-            return;
-        }
-        if let Err(err) = std::fs::rename(&tmp, &path) {
-            eprintln!("[gacha] save rename failed: {err}");
-            let _ = std::fs::remove_file(&tmp);
+    // P1-44: `.ok()` used to silently swallow deserialize failures and reset
+    // state to default (nuking user progress). Log the parse error and block
+    // further saves instead.
+    match std::fs::read_to_string(path) {
+        Ok(text) => match serde_json::from_str::<Store>(&text) {
+            Ok(store) => store,
+            Err(err) => {
+                eprintln!(
+                    "[gacha] state file at {} failed to parse ({err}); \
+                     refusing to overwrite — please repair or delete it",
+                    path.display()
+                );
+                SAVE_BLOCKED.store(true, std::sync::atomic::Ordering::SeqCst);
+                Store::with_banner(fallback_banner)
+            }
+        },
+        Err(err) => {
+            eprintln!("[gacha] state file read failed: {err}");
+            Store::with_banner(fallback_banner)
         }
     }
 }
 
-impl Default for Store {
-    fn default() -> Self {
-        Store {
-            state: GachaState {
-                char_pity_5: 0,
-                char_pity_4: 0,
-                char_guaranteed: false,
-                char_4_guaranteed: false,
-                char_pity_5_total: 0,
-                char_total_pulls: 0,
-                char_5_star_count: 0,
-            },
-            banner: BannerConfig {
-                featured_5: String::new(),
-                featured_4: [String::new(), String::new(), String::new()],
-            },
+/// One player's store: their own file, else the legacy file (only for the
+/// `default` player), else a fresh store on the default banner.
+fn load_user_store(dir: &std::path::Path, uid: &str) -> Store {
+    let path = user_store_path(dir, uid);
+    let fallback = default_banner(dir);
+    if path.exists() {
+        return load_store_at(&path, fallback);
+    }
+    let legacy = legacy_store_path(dir);
+    if sanitize_uid(uid) == "default" && legacy.exists() {
+        return load_store_at(&legacy, fallback);
+    }
+    Store::with_banner(fallback)
+}
+
+fn write_json_atomic(path: &std::path::Path, value: &impl Serialize) {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let Ok(json) = serde_json::to_string(value) else {
+        return;
+    };
+    // P1-44: atomic tmp + rename so a crash mid-write doesn't leave a
+    // truncated file (which would then trip the load-poison path on boot).
+    let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
+    if let Err(err) = std::fs::write(&tmp, &json) {
+        eprintln!("[gacha] save tmp write failed: {err}");
+        return;
+    }
+    if let Err(err) = std::fs::rename(&tmp, path) {
+        eprintln!("[gacha] save rename failed: {err}");
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+fn save_user_store(dir: &std::path::Path, uid: &str, store: &Store) {
+    if SAVE_BLOCKED.load(std::sync::atomic::Ordering::SeqCst) {
+        eprintln!("[gacha] save blocked because prior load failed to parse");
+        return;
+    }
+    write_json_atomic(&user_store_path(dir, uid), store);
+}
+
+fn save_default_banner(dir: &std::path::Path, banner: &BannerConfig) {
+    write_json_atomic(&banner_path(dir), banner);
+}
+
+// ── caller identity / permission ────────────────────────────────────────
+
+/// Administrators allowed to change the DEFAULT banner. Reuses the QQ
+/// operator list (`data/qq_operators.json`) so there is one place to manage
+/// who may do this.
+fn operator_allowlist(dir: &std::path::Path) -> Vec<String> {
+    let path = dir
+        .parent()
+        .map(|p| p.join("qq_operators.json"))
+        .unwrap_or_else(|| dir.join("qq_operators.json"));
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return Vec::new();
+    };
+    value
+        .get("operators")
+        .and_then(|ops| ops.as_array())
+        .map(|ops| {
+            ops.iter()
+                .filter_map(|op| op.as_str())
+                .map(sanitize_uid)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The invoking human, from the kernel-injected `__meta` (never from the model).
+fn meta_actor_id(req: &GachaRequest) -> Option<String> {
+    let actor = req
+        .meta
+        .as_ref()?
+        .get("actor")?
+        .as_str()?
+        .rsplit(':')
+        .next()
+        .unwrap_or_default();
+    let id = sanitize_uid(actor.trim());
+    (id != "default").then_some(id)
+}
+
+/// No `__meta` (CLI / ops invoke) counts as an operator; otherwise the actor
+/// must be on the operator list.
+fn caller_is_operator(req: &GachaRequest, dir: &std::path::Path) -> bool {
+    match req.meta {
+        None => true,
+        Some(_) => meta_actor_id(req)
+            .map(|actor| operator_allowlist(dir).iter().any(|op| op == &actor))
+            .unwrap_or(false),
+    }
+}
+
+/// A player may only touch their own pool: an explicit `user` is honoured for
+/// operators only, everyone else is pinned to their `__meta` identity.
+fn caller_uid(req: &GachaRequest, dir: &std::path::Path) -> String {
+    if caller_is_operator(req, dir) {
+        if let Some(user) = req.user.as_deref().map(str::trim).filter(|u| !u.is_empty()) {
+            return sanitize_uid(user);
         }
     }
+    meta_actor_id(req).unwrap_or_else(|| "default".to_string())
 }
 
 // ── gacha constants ────────────────────────────────────────────────────
@@ -311,6 +438,15 @@ struct GachaRequest {
     count: Option<u32>,
     #[serde(default)]
     args: Option<Vec<String>>,
+    /// Optional target player. Honoured for operators only — everyone else is
+    /// pinned to their `__meta` identity, so nobody can edit another player's
+    /// pool.
+    #[serde(default)]
+    user: Option<String>,
+    /// Kernel-injected identity for agent invocations (`{actor, target}`).
+    /// The model cannot forge it, so it is the authorization source.
+    #[serde(default, rename = "__meta")]
+    meta: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -327,6 +463,16 @@ struct GachaResponse {
     pity_4: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     guaranteed: Option<bool>,
+    /// Which player's pool this response is about.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    uid: Option<String>,
+    /// Featured / off-banner counters, so a report cannot be built by matching
+    /// character names (the standard 4★ pool contains the featured names).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stats: Option<serde_json::Value>,
+    /// The pool this player pulls on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    banner: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -360,6 +506,9 @@ fn pull_char_banner(state: &mut GachaState, banner: &BannerConfig) -> GachaResul
             state.char_guaranteed = true;
             (pick(STANDARD_5).to_string(), false)
         };
+        if is_feat {
+            state.char_5_featured_count += 1;
+        }
         state.char_pity_5 = 0;
         state.char_pity_4 = 0; // 5★ pull also resets 4★ pity
         return GachaResult {
@@ -388,6 +537,11 @@ fn pull_char_banner(state: &mut GachaState, banner: &BannerConfig) -> GachaResul
         } else {
             (pick(ALL_4).to_string(), false)
         };
+        if is_feat {
+            state.char_4_featured_count += 1;
+        } else {
+            state.char_4_off_banner_count += 1;
+        }
         state.char_pity_4 = 0;
         return GachaResult {
             name,
@@ -405,7 +559,23 @@ fn pull_char_banner(state: &mut GachaState, banner: &BannerConfig) -> GachaResul
 
 // ── handlers ───────────────────────────────────────────────────────────
 
-fn handle_pull(count: u32) -> Result<GachaResponse, String> {
+fn banner_line(banner: &BannerConfig) -> String {
+    format!(
+        "UP5★: {} | UP4★: {} / {} / {}",
+        banner.featured_5, banner.featured_4[0], banner.featured_4[1], banner.featured_4[2]
+    )
+}
+
+fn stats_value(store: &Store) -> serde_json::Value {
+    json!({
+        "uid": serde_json::Value::Null,
+        "featured_5_count": store.state.char_5_featured_count,
+        "featured_4_count": store.state.char_4_featured_count,
+        "off_banner_4_count": store.state.char_4_off_banner_count,
+    })
+}
+
+fn handle_pull(dir: &std::path::Path, uid: &str, count: u32) -> Result<GachaResponse, String> {
     if count == 0 || count > 100 {
         return Err("count must be 1-100".into());
     }
@@ -413,12 +583,12 @@ fn handle_pull(count: u32) -> Result<GachaResponse, String> {
     // P1-44: hold STATE_LOCK across the whole read-modify-write so
     // concurrent pulls don't lose pity or duplicate results.
     let _guard = STATE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-    let mut store = load_store();
+    let mut store = load_user_store(dir, uid);
     let mut results = Vec::new();
     for _ in 0..count {
         results.push(pull_char_banner(&mut store.state, &store.banner));
     }
-    save_store(&store);
+    save_user_store(dir, uid, &store);
 
     Ok(GachaResponse {
         ok: true,
@@ -428,28 +598,19 @@ fn handle_pull(count: u32) -> Result<GachaResponse, String> {
         pity_5: Some(store.state.char_pity_5),
         pity_4: Some(store.state.char_pity_4),
         guaranteed: Some(store.state.char_guaranteed),
+        uid: Some(uid.to_string()),
+        stats: Some(stats_value(&store)),
+        banner: None,
     })
 }
 
-fn handle_status() -> Result<GachaResponse, String> {
-    let store = load_store();
-    let has_banner = !store.banner.featured_5.is_empty();
-    let banner_info = if has_banner {
-        format!(
-            " | UP5★: {} | UP4★: {} / {} / {}",
-            store.banner.featured_5,
-            store.banner.featured_4[0],
-            store.banner.featured_4[1],
-            store.banner.featured_4[2]
-        )
-    } else {
-        " | 未设置UP池 (用 setbanner 设置)".to_string()
-    };
+fn handle_status(dir: &std::path::Path, uid: &str) -> Result<GachaResponse, String> {
+    let store = load_user_store(dir, uid);
     Ok(GachaResponse {
         ok: true,
         action: "status".into(),
         message: Some(format!(
-            "5★ pity: {}, 4★ pity: {}, 5★保底: {}, 4★保底: {}, total pulls: {}, avg 5★: {:.1}{}",
+            "[{uid}] 5★ pity: {}, 4★ pity: {}, 5★保底: {}, 4★保底: {}, total pulls: {}, avg 5★: {:.1} | {} | UP 5★: {} / 4★: {}",
             store.state.char_pity_5,
             store.state.char_pity_4,
             store.state.char_guaranteed,
@@ -461,46 +622,40 @@ fn handle_status() -> Result<GachaResponse, String> {
             } else {
                 0.0
             },
-            banner_info,
+            banner_line(&store.banner),
+            store.state.char_5_featured_count,
+            store.state.char_4_featured_count,
         )),
         results: None,
         pity_5: Some(store.state.char_pity_5),
         pity_4: Some(store.state.char_pity_4),
         guaranteed: Some(store.state.char_guaranteed),
+        uid: Some(uid.to_string()),
+        stats: Some(stats_value(&store)),
+        banner: Some(json!({
+            "featured_5": store.banner.featured_5,
+            "featured_4": store.banner.featured_4,
+        })),
     })
 }
 
-fn handle_banner() -> Result<GachaResponse, String> {
-    let store = load_store();
-    if store.banner.featured_5.is_empty() {
-        Ok(GachaResponse {
-            ok: true,
-            action: "banner".into(),
-            message: Some(
-                "当前未设置UP池。使用 setbanner <5星> <4星1> <4星2> <4星3> 来设置".into(),
-            ),
-            results: None,
-            pity_5: None,
-            pity_4: None,
-            guaranteed: None,
-        })
-    } else {
-        Ok(GachaResponse {
-            ok: true,
-            action: "banner".into(),
-            message: Some(format!(
-                "UP5★: {} | UP4★: {} / {} / {}",
-                store.banner.featured_5,
-                store.banner.featured_4[0],
-                store.banner.featured_4[1],
-                store.banner.featured_4[2]
-            )),
-            results: None,
-            pity_5: None,
-            pity_4: None,
-            guaranteed: None,
-        })
-    }
+fn handle_banner(dir: &std::path::Path, uid: &str) -> Result<GachaResponse, String> {
+    let store = load_user_store(dir, uid);
+    Ok(GachaResponse {
+        ok: true,
+        action: "banner".into(),
+        message: Some(banner_line(&store.banner)),
+        results: None,
+        pity_5: None,
+        pity_4: None,
+        guaranteed: None,
+        uid: Some(uid.to_string()),
+        stats: None,
+        banner: Some(json!({
+            "featured_5": store.banner.featured_5,
+            "featured_4": store.banner.featured_4,
+        })),
+    })
 }
 
 fn resolve_5star(name: &str) -> Option<&'static str> {
@@ -542,45 +697,73 @@ fn resolve_4star(name: &str) -> Option<&'static str> {
     None
 }
 
-fn handle_setbanner(args: &[String]) -> Result<GachaResponse, String> {
+/// `setbanner` changes the DEFAULT pool for operators (so it follows the real
+/// game banner) and the caller's OWN pool for everyone else. A player can
+/// never touch another player's pool: their identity comes from `__meta`, and
+/// an explicit `user` argument is honoured for operators only.
+fn handle_setbanner(
+    dir: &std::path::Path,
+    uid: &str,
+    operator: bool,
+    args: &[String],
+) -> Result<GachaResponse, String> {
     if args.len() < 4 {
         return Err("用法: setbanner <5星角色> <4星1> <4星2> <4星3>".into());
     }
-    let f5_raw = &args[0];
-    let f4_0_raw = &args[1];
-    let f4_1_raw = &args[2];
-    let f4_2_raw = &args[3];
-
-    let f5 = resolve_5star(f5_raw)
-        .ok_or_else(|| format!("未知5星角色: {f5_raw}。用 list 查看可用角色"))?
+    let f5 = resolve_5star(&args[0])
+        .ok_or_else(|| format!("未知5星角色: {}。用 list 查看可用角色", args[0]))?
         .to_string();
-    let f4_0 = resolve_4star(f4_0_raw)
-        .ok_or_else(|| format!("未知4星角色: {f4_0_raw}。用 list 查看可用角色"))?
-        .to_string();
-    let f4_1 = resolve_4star(f4_1_raw)
-        .ok_or_else(|| format!("未知4星角色: {f4_1_raw}。用 list 查看可用角色"))?
-        .to_string();
-    let f4_2 = resolve_4star(f4_2_raw)
-        .ok_or_else(|| format!("未知4星角色: {f4_2_raw}。用 list 查看可用角色"))?
-        .to_string();
+    let f4 = [
+        resolve_4star(&args[1])
+            .ok_or_else(|| format!("未知4星角色: {}。用 list 查看可用角色", args[1]))?
+            .to_string(),
+        resolve_4star(&args[2])
+            .ok_or_else(|| format!("未知4星角色: {}。用 list 查看可用角色", args[2]))?
+            .to_string(),
+        resolve_4star(&args[3])
+            .ok_or_else(|| format!("未知4星角色: {}。用 list 查看可用角色", args[3]))?
+            .to_string(),
+    ];
+    let banner = BannerConfig {
+        featured_5: f5.clone(),
+        featured_4: f4.clone(),
+    };
 
     let _guard = STATE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-    let mut store = load_store();
-    store.banner.featured_5 = f5.clone();
-    store.banner.featured_4 = [f4_0.clone(), f4_1.clone(), f4_2.clone()];
-    save_store(&store);
-
+    let message = if operator {
+        // The default pool, shared by players who never set their own.
+        save_default_banner(dir, &banner);
+        // Keep the operator's own pool in sync so their next pull uses it.
+        let mut store = load_user_store(dir, uid);
+        store.banner = banner.clone();
+        save_user_store(dir, uid, &store);
+        format!(
+            "默认UP池已设置（操作员）: {f5} | 4★ {} / {} / {}",
+            f4[0], f4[1], f4[2]
+        )
+    } else {
+        let mut store = load_user_store(dir, uid);
+        store.banner = banner.clone();
+        save_user_store(dir, uid, &store);
+        format!(
+            "你的UP池已设置: {f5} | 4★ {} / {} / {}",
+            f4[0], f4[1], f4[2]
+        )
+    };
     Ok(GachaResponse {
         ok: true,
         action: "setbanner".into(),
-        message: Some(format!(
-            "UP池已设置: 5★ {} | 4★ {} / {} / {}",
-            f5, f4_0, f4_1, f4_2
-        )),
+        message: Some(message),
         results: None,
         pity_5: None,
         pity_4: None,
         guaranteed: None,
+        uid: Some(uid.to_string()),
+        stats: None,
+        banner: Some(json!({
+            "featured_5": banner.featured_5,
+            "featured_4": banner.featured_4,
+        })),
     })
 }
 
@@ -608,34 +791,32 @@ fn handle_list() -> Result<GachaResponse, String> {
         pity_5: None,
         pity_4: None,
         guaranteed: None,
+        uid: None,
+        stats: None,
+        banner: None,
     })
 }
 
-fn handle_reset() -> Result<GachaResponse, String> {
+fn handle_reset(dir: &std::path::Path, uid: &str) -> Result<GachaResponse, String> {
     let _guard = STATE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-    let mut store = load_store();
-    store.state = GachaState {
-        char_pity_5: 0,
-        char_pity_4: 0,
-        char_guaranteed: false,
-        char_4_guaranteed: false,
-        char_pity_5_total: 0,
-        char_total_pulls: 0,
-        char_5_star_count: 0,
-    };
-    save_store(&store);
+    let mut store = load_user_store(dir, uid);
+    store.state = GachaState::default();
+    save_user_store(dir, uid, &store);
     Ok(GachaResponse {
         ok: true,
         action: "reset".into(),
-        message: Some("保底数据已重置".into()),
+        message: Some(format!("[{uid}] 保底数据已重置")),
         results: None,
         pity_5: Some(0),
         pity_4: Some(0),
         guaranteed: Some(false),
+        uid: Some(uid.to_string()),
+        stats: None,
+        banner: None,
     })
 }
 
-fn handle(req: GachaRequest) -> Result<GachaResponse, String> {
+fn handle_in(dir: &std::path::Path, req: GachaRequest) -> Result<GachaResponse, String> {
     // P1-43: enforce per-node command whitelist. gacha_status must only
     // ever return status; gacha_entry accepts the full command set.
     if let Some(node) = req.node_id.as_deref() {
@@ -654,20 +835,24 @@ fn handle(req: GachaRequest) -> Result<GachaResponse, String> {
             }
         }
     }
+    let uid = caller_uid(&req, dir);
+    let operator = caller_is_operator(&req, dir);
     match req.cmd.as_str() {
-        "pull" => handle_pull(req.count.unwrap_or(1)),
-        "status" => handle_status(),
-        "banner" => handle_banner(),
-        "setbanner" => {
-            let args: Vec<String> = req.args.unwrap_or_default();
-            handle_setbanner(&args)
-        }
+        "pull" => handle_pull(dir, &uid, req.count.unwrap_or(1)),
+        "status" => handle_status(dir, &uid),
+        "banner" => handle_banner(dir, &uid),
+        "setbanner" => handle_setbanner(dir, &uid, operator, &req.args.unwrap_or_default()),
         "list" => handle_list(),
-        "reset" => handle_reset(),
+        "reset" => handle_reset(dir, &uid),
         other => Err(format!(
             "未知命令: {other}。可用: pull, status, banner, setbanner, list, reset"
         )),
     }
+}
+
+fn handle(req: GachaRequest) -> Result<GachaResponse, String> {
+    let dir = resolve_data_dir();
+    handle_in(&dir, req)
 }
 
 // ── plugin api ─────────────────────────────────────────────────────────
@@ -678,11 +863,12 @@ fn docs_value() -> cordis_plugin_sdk::PluginDocs {
         Some("Gacha"),
         vec![
             node_doc("gacha_entry",
-                "原神抽卡模拟器。支持自定义UP池，完整角色库，精准保底与50/50机制。\n命令: pull [N] | status | banner | setbanner <5星> <4星> <4星> <4星> | list | reset",
+                "原神抽卡模拟器。每个玩家有自己的池子和保底（按 QQ 号区分）：默认池是当前真实卡池，玩家可以用 setbanner 换自己的 UP；操作员改的是默认池。\n命令: pull [N] | status | banner | setbanner <5星> <4星> <4星> <4星> | list | reset\n返回里的 stats.featured_4_count / off_banner_4_count 是权威的四星 UP/歪 计数——不要用角色名字去数（常驻四星池包含 UP 名字，按名字统计会重复计入）。",
                 json!({ "type":"object","required":["cmd"],"properties":{
                     "cmd":{"type":"string","description":"pull | status | banner | setbanner | list | reset"},
                     "count":{"type":"integer","description":"抽数 1-100, 默认1"},
-                    "args":{"type":"array","items":{"type":"string"},"description":"setbanner参数: [5星, 4星1, 4星2, 4星3]"}
+                    "args":{"type":"array","items":{"type":"string"},"description":"setbanner参数: [5星, 4星1, 4星2, 4星3]；普通玩家只改自己的池，操作员（data/qq_operators.json）改默认池"},
+                    "user":{"type":"string","description":"仅操作员可用：指定要改的用户池；普通玩家的身份由内核注入，不能指定别人"}
                 }}),
                 json!({ "type":"object","properties":{
                     "ok":{"type":"boolean"},"action":{"type":"string"},
@@ -691,7 +877,7 @@ fn docs_value() -> cordis_plugin_sdk::PluginDocs {
                     "pity_5":{"type":"integer"},"pity_4":{"type":"integer"},
                     "guaranteed":{"type":"boolean"}
                 }}),
-                &["accurate Genshin pity model","soft pity starts at 73","50/50 system","custom banner support","complete character roster"],
+                &["per-player pools and pity, keyed by QQ id","default banner follows the real rate-up (setbanner by an operator)","accurate Genshin pity model","soft pity starts at 73","50/50 system with 4-star guarantee (75% featured overall)","complete character roster"],
                 &["invalid count","unknown character name"],
             ).with_agent_accessible(),
             node_doc("gacha_status",
@@ -729,6 +915,9 @@ fn api_handle(req: PluginRequest) -> PluginResponse {
             pity_5: None,
             pity_4: None,
             guaranteed: None,
+            uid: None,
+            stats: None,
+            banner: None,
         }),
     }
 }
@@ -749,7 +938,164 @@ mod tests {
             cmd: cmd.to_string(),
             count: None,
             args: None,
+            user: None,
+            meta: None,
         }
+    }
+
+    /// A request from a specific QQ user (kernel-injected `__meta`).
+    fn user_req(uid: &str, cmd: &str) -> GachaRequest {
+        GachaRequest {
+            meta: Some(serde_json::json!({ "actor": format!("qq:{uid}") })),
+            ..req(Some("gacha_entry"), cmd)
+        }
+    }
+
+    fn setbanner_req(meta: Option<&str>, names: [&str; 4]) -> GachaRequest {
+        GachaRequest {
+            args: Some(names.iter().map(|n| n.to_string()).collect()),
+            meta: meta.map(|uid| serde_json::json!({ "actor": format!("qq:{uid}") })),
+            ..req(Some("gacha_entry"), "setbanner")
+        }
+    }
+
+    fn temp_gacha_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "gacha-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("temp gacha dir");
+        dir
+    }
+
+    // Per-player pools: two players keep independent pity/banner, the default
+    // banner comes from the built-in real-banner constant, and only operators
+    // change the default (players may change their own).
+    #[test]
+    fn per_player_pools_are_independent_and_banner_comes_from_the_real_default() {
+        let dir = temp_gacha_dir("pools");
+        // Operator (no __meta) sets the default pool.
+        let r = super::handle_in(
+            &dir,
+            setbanner_req(None, ["玛薇卡", "班尼特", "迪奥娜", "卡齐娜"]),
+        )
+        .expect("operator setbanner");
+        assert!(r.ok);
+        let msg = r.message.unwrap_or_default();
+        assert!(msg.contains("默认UP池已设置"), "message: {msg}");
+
+        // A fresh player inherits that default.
+        let status = super::handle_in(&dir, user_req("111", "status")).expect("status");
+        let banner = status.banner.expect("banner");
+        assert_eq!(banner["featured_5"], "玛薇卡");
+        assert_eq!(banner["featured_4"][2], "卡齐娜");
+
+        // Player 111 pulls; player 222's pity must stay untouched.
+        super::handle_in(
+            &dir,
+            GachaRequest {
+                count: Some(10),
+                ..user_req("111", "pull")
+            },
+        )
+        .expect("pull");
+        let other = super::handle_in(&dir, user_req("222", "status")).expect("status");
+        assert_eq!(other.pity_5, Some(0));
+        assert_eq!(other.pity_4, Some(0));
+
+        // Player 222 sets their own pool: default stays, their own changes.
+        let own = super::handle_in(
+            &dir,
+            setbanner_req(Some("222"), ["那维莱特", "行秋", "香菱", "班尼特"]),
+        )
+        .expect("player setbanner");
+        let own_msg = own.message.unwrap_or_default();
+        assert!(own_msg.contains("你的UP池已设置"), "message: {own_msg}");
+        let p222 = super::handle_in(&dir, user_req("222", "status")).expect("status");
+        assert_eq!(
+            p222.banner.as_ref().expect("banner")["featured_5"],
+            "那维莱特"
+        );
+        let p111 = super::handle_in(&dir, user_req("111", "status")).expect("status");
+        assert_eq!(
+            p111.banner.as_ref().expect("banner")["featured_5"],
+            "玛薇卡"
+        );
+
+        // A plain player cannot target someone else via `user`.
+        let hijack = GachaRequest {
+            user: Some("111".to_string()),
+            ..setbanner_req(Some("333"), ["丝柯克", "坎蒂丝", "米卡", "香菱"])
+        };
+        super::handle_in(&dir, hijack).expect("player setbanner");
+        let p111 = super::handle_in(&dir, user_req("111", "status")).expect("status");
+        assert_eq!(
+            p111.banner.as_ref().expect("banner")["featured_5"],
+            "玛薇卡",
+            "a player must not be able to edit another player's pool"
+        );
+
+        // The operator list gates default changes: a player's setbanner must
+        // not touch banner.json.
+        let banner_file = dir.join("banner.json");
+        let before = std::fs::read_to_string(&banner_file).expect("default banner file");
+        let player = setbanner_req(Some("333"), ["丝柯克", "坎蒂丝", "米卡", "香菱"]);
+        super::handle_in(&dir, player).expect("player setbanner");
+        let after = std::fs::read_to_string(&banner_file).expect("default banner file");
+        assert_eq!(before, after, "a player must not change the default pool");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // The featured/off-banner counters must add up to the 4★ total, so nobody
+    // can produce an off-rate report by matching names again.
+    #[test]
+    fn featured_counters_match_the_four_star_total() {
+        let dir = temp_gacha_dir("counters");
+        let r = super::handle_in(
+            &dir,
+            GachaRequest {
+                count: Some(100),
+                ..req(Some("gacha_entry"), "pull")
+            },
+        )
+        .expect("pull");
+        let stats = r.stats.expect("stats");
+        let four_star = r
+            .results
+            .as_ref()
+            .expect("results")
+            .iter()
+            .filter(|item| item.stars == 4)
+            .count() as u64;
+        assert_eq!(
+            stats["featured_4_count"].as_u64().unwrap_or(0)
+                + stats["off_banner_4_count"].as_u64().unwrap_or(0),
+            four_star,
+            "stats: {stats}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // A legacy single-player state file still seeds the `default` player.
+    #[test]
+    fn legacy_state_file_seeds_the_default_player() {
+        let dir = temp_gacha_dir("legacy");
+        std::fs::write(
+            dir.join("state.json"),
+            r#"{"state":{"char_pity_5":42,"char_pity_4":3,"char_guaranteed":true,"char_4_guaranteed":false,"char_pity_5_total":7,"char_total_pulls":99,"char_5_star_count":2},"banner":{"featured_5":"丝柯克","featured_4":["坎蒂丝","米卡","香菱"]}}"#,
+        )
+        .expect("legacy state");
+        let status = super::handle_in(&dir, req(None, "status")).expect("status");
+        assert_eq!(status.pity_5, Some(42));
+        assert_eq!(
+            status.banner.as_ref().expect("banner")["featured_5"],
+            "丝柯克"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// P1-43: `gacha_status` node must reject any command other than
