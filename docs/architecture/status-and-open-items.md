@@ -406,6 +406,23 @@ bot 报告说 `request_iteration` 返回 `verdict=Pass` 却一个字节都没落
 
 部署：`prepare-artifacts` + `sync-plugin-docs` + `reload /gacha`（10:59，无重启）。
 
+### 3.21 往期卡池库已灌入真实数据（2026-10-29）
+
+`data/gacha/banners.json` 现在有 **184 条**记录（1.0 上 ~ 7.0 下，覆盖 105 个版本相位；同期双池拆成
+`<版本>-<相位>a/b`，例如 `5.3-1a` / `5.3-1b`）。每条带 `source`：
+
+`https://github.com/SleepCloudMX/genshin-wish-almanac/blob/main/data/UP.json`
+
+（fandom 的 `Wish/List` 从这台机器连不上——`curl` 直连超时，`web_fetch` 也 `fetch failed`；GitHub
+raw 可达，所以用了这份镜像数据集。）
+
+同时把角色库补全：新增 15 个五星（伊涅芙/兹白/哥伦比娅/奈芙尔/奥黛塔/尼可/杜林/枫原万叶/桑多涅/
+法尔伽/洛恩/瓦雷莎/莉奈娅/菈乌玛/菲林斯）和 7 个四星（叶洛亚/塔利雅/布伦妮/爱诺/赛索斯/阿罗夏/
+雅珂达），使 105 个相位全部能解析、能套用（插件只接受角色库里的真名）。
+
+已知近似：镜像数据是"每个相位一份四星三件套"，同期两池共用同一组四星；真实游戏里 5.x 之后两池
+四星常常不同。要精确到池，用操作员身份 `history_add` 覆盖对应 id（`same id` 会替换）。
+
 ## 4. 部分完成
 
 ### 4.1 Execution engine 有正式入口，数据面验证不足
