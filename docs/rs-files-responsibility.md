@@ -200,6 +200,16 @@
 | `fixtures/plugins/qq/src/lib.rs` | QQ 适配器 dylib：OneBot v11 协议。入站事件接收走 HTTP webhook（`qq_serve`）+ WebSocket 服务器（`qq_ws_serve` Task 节点，tungstenite 接收线上 Napcat ws 端口事件，bind 竞态修复 + stop 关 listener/join 线程优雅停机）；出站走 HTTP API，支持 configure/send/status/call | `onebot_call()`、`parse_target()`、`handle_qq_ws_serve()`、`start_ws_server()` |
 | `fixtures/plugins/qq/tests/test_parse.rs` | QQ 适配器测试：target 字符串解析 | `test_parse_target` |
 
+## 13.0 QQ 官方协议插件 (`fixtures/plugins/qqbot`)
+
+| 文件 | 职责 | 关键项 |
+| --- | --- | --- |
+| `fixtures/plugins/qqbot/src/lib.rs` | 节点分发与 ABI 出口：configure/status/serve/send/ask/send_media/download_media/set_policy/ack | `api_handle()`、`handle_serve()`、`handle_send()` |
+| `fixtures/plugins/qqbot/src/api.rs` | token 缓存 + 401 重试一次 + 业务 API 调用 | `Api::access_token()`、`Api::call()` |
+| `fixtures/plugins/qqbot/src/gateway.rs` / `serve.rs` | 官方 Gateway 线协议与帧循环（Identify/Resume/Heartbeat → 门控 → `agent_trigger`） | `decode_frame()`、`pump()`、`AgentSink` |
+| `fixtures/plugins/qqbot/src/inbound.rs` / `envelope.rs` | 事件解析、白黑名单与 @ 门控、去重、kernel envelope | `parse_message_event()`、`build_envelope()`、`Dedup` |
+| `fixtures/plugins/qqbot/src/outbound.rs` / `interaction.rs` / `media.rs` | 分片/流式/按钮消息，交互回执，富媒体收发与下载 | `send_text()`、`send_stream_c2c()`、`send_media()` |
+
 ## 13.1 Feishu Adapter 插件 (`fixtures/plugins/feishu`)
 
 | 文件 | 职责定位 | 关键入口 |
@@ -231,3 +241,11 @@
 10. `tests/*.rs`（对照验收场景）。
 
 ## 16. 覆盖声明
+
+## `crates/cordis-runtime/src/host/`
+
+`host/mod.rs` holds the runtime host (loader wiring, snapshots, reload,
+plugin-iteration pipeline, agent tools). Its test modules live in sibling
+files (`*_tests.rs`, `tests.rs`) so the production file stays navigable;
+`crates/cordis-runtime/src/iteration/` holds the iteration policy and result
+reporting as pure functions.
