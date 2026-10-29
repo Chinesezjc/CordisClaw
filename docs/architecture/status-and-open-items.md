@@ -521,7 +521,10 @@ agent 工具层做批准门控），加一条规则要改 6 个地方。现在�
 `host.rs` 的 summary 与 finalize 现在只做副作用（落盘、恢复、promote），判定全部委托给
 `iteration::policy`；`agent.rs` 只剩工具分发。测试随之搬家（policy 7 条、report 4 条）。
 
-行数变化：`agent.rs` 4340 → ~3550，`host.rs` 17106 → 16900 左右，新增 `iteration/` 约 400 行。
+行数变化：`agent.rs` 4340 → 4144，`host.rs` 17106 → 16893，新增 `iteration/` 490 行。
+
+**提交后继续做的**：去掉 `PluginIterationAgentSnapshot` 中间层（agent 阶段的结果现在直接是
+`PluginIterationAgentRun`，字段不再抄两份）——迭代状态结构从 6 个降到 5 个。
 
 **后续（未做）**：
 
