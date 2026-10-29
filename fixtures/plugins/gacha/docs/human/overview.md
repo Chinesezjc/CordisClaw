@@ -36,3 +36,22 @@ after a non-featured 4★), not 50/50.
 - **gacha_entry** — Pull wishes (`pull`), inspect or set the pool (`banner`,
   `setbanner`), compare with the roster (`list`), reset pity (`reset`).
 - **gacha_status** — Check current pity counters and guarantee state.
+
+## Historical banners
+
+`data/gacha/banners.json` records past rate-ups:
+
+```json
+[{ "id": "5.3-1", "version": "5.3", "phase": 1, "from": "2025-01-01", "to": "2025-01-21",
+   "featured_5": ["玛薇卡", "茜特菈莉"], "featured_4": ["班尼特", "迪奥娜", "菲米尼"],
+   "source": "https://…" }]
+```
+
+- `search <关键词>` matches id, version, dates and character names.
+- `setbanner <id>` applies a recorded banner to your own pool (an operator applies
+  it to the default pool).
+- `history_add` writes an entry and is **operator-only**: a player must not be
+  able to seed fake history that everyone then searches. Characters are validated
+  against the roster, so a recorded banner is always pullable.
+- The file starts empty. Populate it with `history_add` (keep the `source` URL);
+  an agent can fill it from its own web search when an operator asks.

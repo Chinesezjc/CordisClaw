@@ -386,6 +386,26 @@ bot 报告说 `request_iteration` 返回 `verdict=Pass` 却一个字节都没落
 部署：`prepare-artifacts` + `sync-plugin-docs` + `reload /gacha`（10:54，**不需要重启**——
 正是 3.17 里那个 docs 漂移修复让 reload 能过）。
 
+### 3.20 往期卡池：本地库 + 搜索 + 套用（2026-10-29）
+
+"搜往期池子"做成确定性查询，不做现场网页解析：
+
+- `data/gacha/banners.json`：`[{id, version, phase?, from, to, featured_5[], featured_4[],
+  source?}]`；`search <关键词>` 按 id/版本/日期/角色名匹配，返回命中的卡池；
+- `setbanner <id>` 把某期记录套到**自己的池**（操作员套到默认池），之后正常抽；
+- `history_add` 写库，**只允许操作员**（`data/qq_operators.json` 或 CLI）——否则普通玩家能让
+  bot 灌假历史，其他人再搜到假池子；录入时角色必须是 `list` 里的真名，保证套用后能抽；
+- 库里没收录时，`search` 明确回"没有收录 + 用 history_add 录入"，不会瞎猜。
+
+库初始为空：`history_add` 由操作员录入（保留 `source` URL），也可以让 agent 用它自己的
+`web_search` 查完后写入——那一步走的是它的搜索通道，不依赖本机的 web 搜索配置。
+
+测试（`cargo test -p gacha`，9 个）：`historical_banners_are_operator_recorded_searchable_and_applicable`
+（玩家录入被拒、按版本/角色/日期命中、未命中、套用到自己的池、默认池不被玩家改动、未知 id 报错、
+未知角色被拒、缺 banner 对象被拒）。
+
+部署：`prepare-artifacts` + `sync-plugin-docs` + `reload /gacha`（10:59，无重启）。
+
 ## 4. 部分完成
 
 ### 4.1 Execution engine 有正式入口，数据面验证不足

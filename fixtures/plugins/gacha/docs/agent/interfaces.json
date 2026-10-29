@@ -7,7 +7,7 @@
   "nodes": [
     {
       "id": "gacha_entry",
-      "summary": "原神抽卡模拟器。每个玩家有自己的池子和保底（按 QQ 号区分）：默认池是当前真实卡池，玩家可以用 setbanner 换自己的 UP；操作员改的是默认池。\n命令: pull [N] | status | banner | setbanner <5星> <4星> <4星> <4星> | list | reset\n返回里的 stats.featured_4_count / off_banner_4_count 是权威的四星 UP/歪 计数——不要用角色名字去数（常驻四星池包含 UP 名字，按名字统计会重复计入）。",
+      "summary": "原神抽卡模拟器。每个玩家有自己的池子和保底（按 QQ 号区分）：默认池是当前真实卡池，玩家可以用 setbanner 换自己的 UP；操作员改的是默认池。\n命令: pull [N] | status | banner | setbanner <5星> <4星> <4星> <4星> | setbanner <往期卡池id> | search <关键词> | history_add | list | reset\n往期卡池存在 data/gacha/banners.json：search 按版本/角色/日期/id 查，setbanner <id> 套用到自己的池。history_add 只允许操作员录入（banner 对象里带 source URL 便于核对）——玩家不能给历史池子灌假数据。\n返回里的 stats.featured_4_count / off_banner_4_count 是权威的四星 UP/歪 计数——不要用角色名字去数（常驻四星池包含 UP 名字，按名字统计会重复计入）。",
       "input_schema": {
         "type": "object",
         "required": [
@@ -27,11 +27,15 @@
             "items": {
               "type": "string"
             },
-            "description": "setbanner参数: [5星, 4星1, 4星2, 4星3]；普通玩家只改自己的池，操作员（data/qq_operators.json）改默认池"
+            "description": "setbanner: [5星, 4星1, 4星2, 4星3] 或 [往期卡池id]；search: [关键词]；普通玩家只改自己的池，操作员（data/qq_operators.json）改默认池"
           },
           "user": {
             "type": "string",
             "description": "仅操作员可用：指定要改的用户池；普通玩家的身份由内核注入，不能指定别人"
+          },
+          "banner": {
+            "type": "object",
+            "description": "history_add 用：{id, version, phase?, from, to, featured_5:[...], featured_4:[...], source?}；角色必须是 list 里的真名"
           }
         }
       },
@@ -70,6 +74,7 @@
       "side_effects": [
         "per-player pools and pity, keyed by QQ id",
         "default banner follows the real rate-up (setbanner by an operator)",
+        "search recorded historical banners and pull on one (setbanner <id>)",
         "accurate Genshin pity model",
         "soft pity starts at 73",
         "50/50 system with 4-star guarantee (75% featured overall)",

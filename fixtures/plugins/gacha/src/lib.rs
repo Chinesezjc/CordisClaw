@@ -96,6 +96,77 @@ fn real_banner() -> BannerConfig {
     }
 }
 
+/// One historical rate-up recorded by an operator (or the agent after a web
+/// search, keeping the source URL for auditing). `id` is what
+/// `setbanner <id>` accepts.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct HistoricalBanner {
+    id: String,
+    version: String,
+    #[serde(default)]
+    phase: Option<u32>,
+    #[serde(default)]
+    from: String,
+    #[serde(default)]
+    to: String,
+    featured_5: Vec<String>,
+    featured_4: Vec<String>,
+    #[serde(default)]
+    source: Option<String>,
+}
+
+fn history_path(dir: &std::path::Path) -> PathBuf {
+    dir.join("banners.json")
+}
+
+fn load_history(dir: &std::path::Path) -> Vec<HistoricalBanner> {
+    std::fs::read_to_string(history_path(dir))
+        .ok()
+        .and_then(|text| serde_json::from_str::<Vec<HistoricalBanner>>(&text).ok())
+        .unwrap_or_default()
+}
+
+fn save_history(dir: &std::path::Path, history: &[HistoricalBanner]) {
+    write_json_atomic(&history_path(dir), &history.to_vec());
+}
+
+fn banner_matches(entry: &HistoricalBanner, query: &str) -> bool {
+    let q = query.trim().to_lowercase();
+    if q.is_empty() {
+        return false;
+    }
+    let haystack = format!(
+        "{} {} {} {} {} {} {}",
+        entry.id,
+        entry.version,
+        entry.phase.map(|p| p.to_string()).unwrap_or_default(),
+        entry.from,
+        entry.to,
+        entry.featured_5.join(" "),
+        entry.featured_4.join(" ")
+    )
+    .to_lowercase();
+    haystack.contains(&q)
+}
+
+fn history_summary(entry: &HistoricalBanner) -> String {
+    let phase = entry.phase.map(|p| format!(" 第{p}期")).unwrap_or_default();
+    let source = entry
+        .source
+        .as_deref()
+        .map(|url| format!(" | {url}"))
+        .unwrap_or_default();
+    format!(
+        "{} ({}{}) 5★ {} | 4★ {}{}",
+        entry.id,
+        entry.version,
+        phase,
+        entry.featured_5.join("/"),
+        entry.featured_4.join("/"),
+        source
+    )
+}
+
 fn banner_path(dir: &std::path::Path) -> PathBuf {
     dir.join("banner.json")
 }
@@ -447,6 +518,10 @@ struct GachaRequest {
     /// The model cannot forge it, so it is the authorization source.
     #[serde(default, rename = "__meta")]
     meta: Option<serde_json::Value>,
+    /// `history_add` payload: one recorded banner (structured, so dates and the
+    /// source URL are not optional accidents).
+    #[serde(default)]
+    banner: Option<HistoricalBanner>,
 }
 
 #[derive(Debug, Serialize)]
@@ -473,6 +548,9 @@ struct GachaResponse {
     /// The pool this player pulls on.
     #[serde(skip_serializing_if = "Option::is_none")]
     banner: Option<serde_json::Value>,
+    /// `search` / `history_add` hits: recorded historical banners.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    banners: Option<Vec<HistoricalBanner>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -601,6 +679,7 @@ fn handle_pull(dir: &std::path::Path, uid: &str, count: u32) -> Result<GachaResp
         uid: Some(uid.to_string()),
         stats: Some(stats_value(&store)),
         banner: None,
+        banners: None,
     })
 }
 
@@ -636,6 +715,7 @@ fn handle_status(dir: &std::path::Path, uid: &str) -> Result<GachaResponse, Stri
             "featured_5": store.banner.featured_5,
             "featured_4": store.banner.featured_4,
         })),
+        banners: None,
     })
 }
 
@@ -655,6 +735,7 @@ fn handle_banner(dir: &std::path::Path, uid: &str) -> Result<GachaResponse, Stri
             "featured_5": store.banner.featured_5,
             "featured_4": store.banner.featured_4,
         })),
+        banners: None,
     })
 }
 
@@ -707,8 +788,15 @@ fn handle_setbanner(
     operator: bool,
     args: &[String],
 ) -> Result<GachaResponse, String> {
+    // `setbanner <id>` applies a recorded historical banner; the four-name
+    // form sets an ad-hoc pool.
+    if args.len() == 1 {
+        return handle_setbanner_by_id(dir, uid, operator, &args[0]);
+    }
     if args.len() < 4 {
-        return Err("用法: setbanner <5星角色> <4星1> <4星2> <4星3>".into());
+        return Err(
+            "用法: setbanner <5星角色> <4星1> <4星2> <4星3>，或 setbanner <往期卡池id>".into(),
+        );
     }
     let f5 = resolve_5star(&args[0])
         .ok_or_else(|| format!("未知5星角色: {}。用 list 查看可用角色", args[0]))?
@@ -764,6 +852,151 @@ fn handle_setbanner(
             "featured_5": banner.featured_5,
             "featured_4": banner.featured_4,
         })),
+        banners: None,
+    })
+}
+
+/// Look up recorded historical rate-ups by id, version, date or character
+/// name. Read-only, available to everyone.
+fn handle_search(dir: &std::path::Path, query: &str) -> Result<GachaResponse, String> {
+    let hits: Vec<HistoricalBanner> = load_history(dir)
+        .into_iter()
+        .filter(|entry| banner_matches(entry, query))
+        .collect();
+    let message = if hits.is_empty() {
+        format!("没有收录匹配「{query}」的往期卡池；操作员可用 history_add 录入（带 source URL）")
+    } else {
+        hits.iter()
+            .map(history_summary)
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    Ok(GachaResponse {
+        ok: true,
+        action: "search".into(),
+        message: Some(message),
+        results: None,
+        pity_5: None,
+        pity_4: None,
+        guaranteed: None,
+        uid: None,
+        stats: None,
+        banner: None,
+        banners: Some(hits),
+    })
+}
+
+/// Record one historical banner. Operator-only: a player asking the bot to add
+/// a pool must not be able to seed fake history that everyone then searches.
+fn handle_history_add(
+    dir: &std::path::Path,
+    operator: bool,
+    entry: Option<HistoricalBanner>,
+) -> Result<GachaResponse, String> {
+    if !operator {
+        return Err("只有操作员（data/qq_operators.json）或 CLI 可以录入往期卡池".to_string());
+    }
+    let Some(mut entry) = entry else {
+        return Err("history_add 需要 banner 对象".to_string());
+    };
+    entry.id = entry.id.trim().to_string();
+    entry.version = entry.version.trim().to_string();
+    if entry.id.is_empty() || entry.version.is_empty() {
+        return Err("history_add 需要 banner.id 和 banner.version".to_string());
+    }
+    if entry.featured_5.is_empty() || entry.featured_4.is_empty() {
+        return Err("history_add 需要 featured_5 与 featured_4".to_string());
+    }
+    entry.featured_5 = entry
+        .featured_5
+        .iter()
+        .map(|name| {
+            resolve_5star(name)
+                .map(str::to_string)
+                .ok_or_else(|| format!("未知5星角色: {name}。用 list 查看可用角色"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    entry.featured_4 = entry
+        .featured_4
+        .iter()
+        .map(|name| {
+            resolve_4star(name)
+                .map(str::to_string)
+                .ok_or_else(|| format!("未知4星角色: {name}。用 list 查看可用角色"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let _guard = STATE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let mut history = load_history(dir);
+    history.retain(|existing| existing.id != entry.id);
+    history.push(entry.clone());
+    history.sort_by(|a, b| a.version.cmp(&b.version).then_with(|| a.id.cmp(&b.id)));
+    save_history(dir, &history);
+    Ok(GachaResponse {
+        ok: true,
+        action: "history_add".into(),
+        message: Some(format!("已录入往期卡池 {}", history_summary(&entry))),
+        results: None,
+        pity_5: None,
+        pity_4: None,
+        guaranteed: None,
+        uid: None,
+        stats: None,
+        banner: None,
+        banners: Some(vec![entry]),
+    })
+}
+
+/// Apply a recorded historical banner to the caller's pool (`setbanner <id>`).
+fn handle_setbanner_by_id(
+    dir: &std::path::Path,
+    uid: &str,
+    operator: bool,
+    id: &str,
+) -> Result<GachaResponse, String> {
+    let entry = load_history(dir)
+        .into_iter()
+        .find(|entry| entry.id == id.trim())
+        .ok_or_else(|| format!("没收录往期卡池 id={id}；先用 search <关键词> 查"))?;
+    if entry.featured_5.is_empty() || entry.featured_4.len() != 3 {
+        return Err(format!("往期卡池 {id} 数据不完整，不能套用"));
+    }
+    let banner = BannerConfig {
+        featured_5: entry.featured_5[0].clone(),
+        featured_4: [
+            entry.featured_4[0].clone(),
+            entry.featured_4[1].clone(),
+            entry.featured_4[2].clone(),
+        ],
+    };
+    let _guard = STATE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let message = if operator {
+        save_default_banner(dir, &banner);
+        let mut store = load_user_store(dir, uid);
+        store.banner = banner.clone();
+        save_user_store(dir, uid, &store);
+        format!("默认UP池已设为往期 {}: {}", entry.id, banner_line(&banner))
+    } else {
+        let mut store = load_user_store(dir, uid);
+        store.banner = banner.clone();
+        save_user_store(dir, uid, &store);
+        format!("你的UP池已设为往期 {}: {}", entry.id, banner_line(&banner))
+    };
+    Ok(GachaResponse {
+        ok: true,
+        action: "setbanner".into(),
+        message: Some(message),
+        results: None,
+        pity_5: None,
+        pity_4: None,
+        guaranteed: None,
+        uid: Some(uid.to_string()),
+        stats: None,
+        banner: Some(json!({
+            "featured_5": banner.featured_5,
+            "featured_4": banner.featured_4,
+        })),
+        banners: Some(vec![entry]),
     })
 }
 
@@ -794,6 +1027,7 @@ fn handle_list() -> Result<GachaResponse, String> {
         uid: None,
         stats: None,
         banner: None,
+        banners: None,
     })
 }
 
@@ -813,6 +1047,7 @@ fn handle_reset(dir: &std::path::Path, uid: &str) -> Result<GachaResponse, Strin
         uid: Some(uid.to_string()),
         stats: None,
         banner: None,
+        banners: None,
     })
 }
 
@@ -842,10 +1077,18 @@ fn handle_in(dir: &std::path::Path, req: GachaRequest) -> Result<GachaResponse, 
         "status" => handle_status(dir, &uid),
         "banner" => handle_banner(dir, &uid),
         "setbanner" => handle_setbanner(dir, &uid, operator, &req.args.unwrap_or_default()),
+        "search" => handle_search(
+            dir,
+            &req.args
+                .as_ref()
+                .and_then(|args| args.first().cloned())
+                .unwrap_or_default(),
+        ),
+        "history_add" => handle_history_add(dir, operator, req.banner.clone()),
         "list" => handle_list(),
         "reset" => handle_reset(dir, &uid),
         other => Err(format!(
-            "未知命令: {other}。可用: pull, status, banner, setbanner, list, reset"
+            "未知命令: {other}。可用: pull, status, banner, setbanner, search, history_add, list, reset"
         )),
     }
 }
@@ -863,12 +1106,13 @@ fn docs_value() -> cordis_plugin_sdk::PluginDocs {
         Some("Gacha"),
         vec![
             node_doc("gacha_entry",
-                "原神抽卡模拟器。每个玩家有自己的池子和保底（按 QQ 号区分）：默认池是当前真实卡池，玩家可以用 setbanner 换自己的 UP；操作员改的是默认池。\n命令: pull [N] | status | banner | setbanner <5星> <4星> <4星> <4星> | list | reset\n返回里的 stats.featured_4_count / off_banner_4_count 是权威的四星 UP/歪 计数——不要用角色名字去数（常驻四星池包含 UP 名字，按名字统计会重复计入）。",
+                "原神抽卡模拟器。每个玩家有自己的池子和保底（按 QQ 号区分）：默认池是当前真实卡池，玩家可以用 setbanner 换自己的 UP；操作员改的是默认池。\n命令: pull [N] | status | banner | setbanner <5星> <4星> <4星> <4星> | setbanner <往期卡池id> | search <关键词> | history_add | list | reset\n往期卡池存在 data/gacha/banners.json：search 按版本/角色/日期/id 查，setbanner <id> 套用到自己的池。history_add 只允许操作员录入（banner 对象里带 source URL 便于核对）——玩家不能给历史池子灌假数据。\n返回里的 stats.featured_4_count / off_banner_4_count 是权威的四星 UP/歪 计数——不要用角色名字去数（常驻四星池包含 UP 名字，按名字统计会重复计入）。",
                 json!({ "type":"object","required":["cmd"],"properties":{
                     "cmd":{"type":"string","description":"pull | status | banner | setbanner | list | reset"},
                     "count":{"type":"integer","description":"抽数 1-100, 默认1"},
-                    "args":{"type":"array","items":{"type":"string"},"description":"setbanner参数: [5星, 4星1, 4星2, 4星3]；普通玩家只改自己的池，操作员（data/qq_operators.json）改默认池"},
-                    "user":{"type":"string","description":"仅操作员可用：指定要改的用户池；普通玩家的身份由内核注入，不能指定别人"}
+                    "args":{"type":"array","items":{"type":"string"},"description":"setbanner: [5星, 4星1, 4星2, 4星3] 或 [往期卡池id]；search: [关键词]；普通玩家只改自己的池，操作员（data/qq_operators.json）改默认池"},
+                    "user":{"type":"string","description":"仅操作员可用：指定要改的用户池；普通玩家的身份由内核注入，不能指定别人"},
+                    "banner":{"type":"object","description":"history_add 用：{id, version, phase?, from, to, featured_5:[...], featured_4:[...], source?}；角色必须是 list 里的真名"}
                 }}),
                 json!({ "type":"object","properties":{
                     "ok":{"type":"boolean"},"action":{"type":"string"},
@@ -877,7 +1121,7 @@ fn docs_value() -> cordis_plugin_sdk::PluginDocs {
                     "pity_5":{"type":"integer"},"pity_4":{"type":"integer"},
                     "guaranteed":{"type":"boolean"}
                 }}),
-                &["per-player pools and pity, keyed by QQ id","default banner follows the real rate-up (setbanner by an operator)","accurate Genshin pity model","soft pity starts at 73","50/50 system with 4-star guarantee (75% featured overall)","complete character roster"],
+                &["per-player pools and pity, keyed by QQ id","default banner follows the real rate-up (setbanner by an operator)","search recorded historical banners and pull on one (setbanner <id>)","accurate Genshin pity model","soft pity starts at 73","50/50 system with 4-star guarantee (75% featured overall)","complete character roster"],
                 &["invalid count","unknown character name"],
             ).with_agent_accessible(),
             node_doc("gacha_status",
@@ -918,6 +1162,7 @@ fn api_handle(req: PluginRequest) -> PluginResponse {
             uid: None,
             stats: None,
             banner: None,
+            banners: None,
         }),
     }
 }
@@ -940,6 +1185,7 @@ mod tests {
             args: None,
             user: None,
             meta: None,
+            banner: None,
         }
     }
 
@@ -1077,6 +1323,101 @@ mod tests {
             four_star,
             "stats: {stats}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Recorded historical banners: operators add them, everybody searches them,
+    // and `setbanner <id>` applies one to your own pool.
+    #[test]
+    fn historical_banners_are_operator_recorded_searchable_and_applicable() {
+        let dir = temp_gacha_dir("history");
+        let entry = serde_json::json!({
+            "id": "5.3-1",
+            "version": "5.3",
+            "phase": 1,
+            "from": "2025-01-01",
+            "to": "2025-01-21",
+            "featured_5": ["玛薇卡", "茜特菈莉"],
+            "featured_4": ["班尼特", "迪奥娜", "菲米尼"],
+            "source": "https://example.invalid/banner/5.3-1",
+        });
+        // A plain player may not seed history.
+        let player_add = GachaRequest {
+            banner: serde_json::from_value(entry.clone()).ok(),
+            ..user_req("333", "history_add")
+        };
+        let err = super::handle_in(&dir, player_add).expect_err("player must not add history");
+        assert!(err.contains("只有操作员"), "err: {err}");
+
+        // Operator (CLI-style: no __meta) records it.
+        let operator_add = GachaRequest {
+            banner: serde_json::from_value(entry).ok(),
+            ..req(Some("gacha_entry"), "history_add")
+        };
+        let added = super::handle_in(&dir, operator_add).expect("operator history_add");
+        assert!(added.ok);
+
+        // Search by version, by character, by date, and a miss.
+        for query in ["5.3", "玛薇卡", "茜特菈莉", "2025-01-01"] {
+            let hit = GachaRequest {
+                args: Some(vec![query.to_string()]),
+                ..req(Some("gacha_entry"), "search")
+            };
+            let r = super::handle_in(&dir, hit).expect("search");
+            let banners = r.banners.expect("banners");
+            assert_eq!(banners.len(), 1, "query {query}");
+            assert_eq!(banners[0].id, "5.3-1");
+        }
+        let missing = GachaRequest {
+            args: Some(vec!["9.9".to_string()]),
+            ..req(Some("gacha_entry"), "search")
+        };
+        let r = super::handle_in(&dir, missing).expect("search");
+        assert!(r.banners.expect("banners").is_empty());
+
+        // Applying the recorded banner changes only this player's pool.
+        let apply = GachaRequest {
+            args: Some(vec!["5.3-1".to_string()]),
+            ..user_req("444", "setbanner")
+        };
+        super::handle_in(&dir, apply).expect("apply recorded banner");
+        let p444 = super::handle_in(&dir, user_req("444", "status")).expect("status");
+        assert_eq!(
+            p444.banner.as_ref().expect("banner")["featured_5"],
+            "玛薇卡"
+        );
+        // The default banner was not touched by a player's apply.
+        let default_status = super::handle_in(&dir, user_req("555", "status")).expect("status");
+        assert_eq!(
+            default_status.banner.as_ref().expect("banner")["featured_5"],
+            "玛薇卡",
+            "fresh players keep the built-in default"
+        );
+        // Unknown id → actionable error.
+        let bogus = GachaRequest {
+            args: Some(vec!["9.9-1".to_string()]),
+            ..user_req("444", "setbanner")
+        };
+        let err = super::handle_in(&dir, bogus).expect_err("unknown id");
+        assert!(err.contains("没收录"), "err: {err}");
+
+        // Validation: unknown character / missing fields are rejected.
+        let bad = serde_json::json!({
+            "id": "x-1", "version": "x", "featured_5": ["不存在的角色"],
+            "featured_4": ["班尼特", "迪奥娜", "卡齐娜"]
+        });
+        let bad_req = GachaRequest {
+            banner: serde_json::from_value(bad).ok(),
+            ..req(Some("gacha_entry"), "history_add")
+        };
+        let err = super::handle_in(&dir, bad_req).expect_err("unknown character");
+        assert!(err.contains("未知5星角色"), "err: {err}");
+        let no_fields = GachaRequest {
+            banner: None,
+            ..req(Some("gacha_entry"), "history_add")
+        };
+        let err = super::handle_in(&dir, no_fields).expect_err("missing banner");
+        assert!(err.contains("banner 对象"), "err: {err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
