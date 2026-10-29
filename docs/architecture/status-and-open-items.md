@@ -534,6 +534,25 @@ agent 工具层做批准门控），加一条规则要改 6 个地方。现在�
 3. 插件 ABI 引入 `&mut PluginInstance`（store/clock/logger 注入），去掉进程级 static；
 4. 工件内容寻址 + 单一派生索引，`interfaces.json` 只作投影缓存。
 
+### 3.27 host.rs 拆分（2026-10-29）
+
+`crates/cordis-runtime/src/host.rs` **16,897 行** → `host/mod.rs` **6,861 行** + 子模块：
+
+| 文件 | 行数 | 内容 |
+|---|---|---|
+| `host/mod.rs` | 6,861 | RuntimeHost 主体（boot/invoke/agent/tools） |
+| `host/reload.rs` | 823 | reload / candidate / promote / rollback / approve / startup 重放 |
+| `host/iteration_agent.rs` | 729 | 插件迭代 agent 的工具面（PluginIterationAgentBackend + AgentBackend） |
+| `host/kernel.rs` | 632 | `impl RuntimeKernel` |
+| `host/*_tests.rs`（19 个） | ~6,000 | 原先内联在 host.rs 里的测试 |
+
+做法：`host.rs` → `host/mod.rs`；测试模块改 `#[cfg(test)] mod X;` 指向 `host/X.rs`；impl 块整块搬到子模块并把方法改成 `pub(crate)`/`pub(super)`（集成测试用到的保留 `pub`）。
+
+工具经验：按大括号计数找模块末尾会被字符串里的 `{}` 带偏（第一版截断了 3 个文件）；稳妥做法是"下一个列 0 的顶层项之前、最后一个 `}` 行"。
+
+验证：`cargo test -p cordis-runtime --lib` 986、`--test host_reload_arms` 14、
+`-p cordis-cli` 48；fmt/clippy 干净。
+
 ## 4. 部分完成
 
 ### 4.1 Execution engine 有正式入口，数据面验证不足
