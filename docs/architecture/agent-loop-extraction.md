@@ -424,6 +424,27 @@ n=4 requests, tool summary total_calls=7（仍无 record_iteration_summary）
 打印 `tool_events` 里每一条的 name/ok/error 即可分辨。**不要再凭猜改循环**——这轮
 已经因为"停在执行前"回滚过两次。
 
+## 第 23 轮：summary 在 specs 里，却仍未被调用
+
+核对结果：`PLUGIN_AGENT_TOOL_RECORD_ITERATION_SUMMARY` **在**
+`PluginIterationAgentBackend::tool_specs()` 里（iteration_agent.rs:533），执行分支也有
+（:683），终止钩子也有（:722）。所以不是"未知工具"。
+
+但实测仍只有 7 个工具：
+
+```
+requests=4, tool summary total_calls=7
+tool_names=[replace_file_exact, run_plugin_test, scaffold_child_plugin]
+第 5 次请求连不上（脚本只有 4 条）
+```
+
+4 条脚本按序是：scaffold / 5×replace / run_tests / record_summary。第 4 条被消耗了，
+却没有产出 summary 调用——说明**它被当成对某条 nudge 的回复**（`run_plugin_test` 的
+warning 触发重试），而重试回合里的工具调用没有执行（或解析为空）。
+
+下一轮先加一条诊断日志：每回合打印解析出的 call 名字列表与是否进入执行分支。
+这是唯一能分辨"解析为空"还是"执行被跳过"的观测点。
+
 ## 未决问题（2026-10-31，下一轮先查）
 
 `cargo test -p cordis-runtime --test runtime_host` 有 5 个 `iterate_plugins` 相关用例失败，
