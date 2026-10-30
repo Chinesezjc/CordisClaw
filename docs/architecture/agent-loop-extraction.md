@@ -104,6 +104,10 @@ kernel 不能在正常依赖里出现 `cordis-agent`，否则回到循环依赖�
   "选哪个 provider"（profile 回退、能力节点查找都在 host），循环只接收
   `&dyn LlmProvider`。理由：provider 的**选取**依赖插件注册表，那是 kernel 的机制；
   循环只需要一个补全接口。
+- 下一步的两个具体前置（已确认）：`PluginIterationAgentState` 目前是私有 `struct`，
+  trait 要给它一个入口就必须先 `pub`（或把 iteration 状态随循环一起搬走，即第 4 步
+  提前）；`ManagedAgentSession` 的 `#[derive(Debug)]` 也要改成手写 impl，因为
+  `Box<dyn AgentSessionApi>` 不是 `Debug`。
 - 下一步：把 `ManagedAgentSession.session` 换成 `Box<dyn AgentSessionApi>`，构造点
   （`agent_start_with`、`detect_crash_and_recover`、`host/iteration.rs`）全部改走
   `agent_loop()`，然后建 `crates/cordis-agent` 搬运循环本体。
