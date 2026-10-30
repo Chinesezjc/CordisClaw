@@ -386,6 +386,25 @@ DSML 下要靠一条纯文本回合或 `record_iteration_summary` 的终止语�
 
 本轮把测试文件恢复原状（避免半截改动），已把结论写在这里。
 
+## 第 22 轮：结束判定放错了位置（重要）
+
+把 mock 迁到 DSML 并补上**包装感知**的检测后，请求数从 5 降到 4、会话提前结束，
+但 transcript 里 `record_iteration_summary` 从未执行：
+
+```
+summary: total_calls=7 ... tool_names=[replace_file_exact, run_plugin_test, scaffold_child_plugin]
+blocked: "exited without calling record_iteration_summary"
+```
+
+原因：`ends_after_tools` 的 `return` 落在工具执行**之前**的分支上，于是"看到 summary
+就直接收尾"，summary 本身没执行。这不是小事——它会让真实迭代同样丢掉 summary。
+
+正确的落点：在**执行完**那一批工具之后、`continue` 之前判断并返回。因为 DSML 会把
+未知节点包成 `invoke_plugin`，检测要同时看 `function.name` 与
+`arguments.contains("record_iteration_summary")`。
+
+本轮已回滚这次改动（不留错误的提前返回）。下一轮把判定移到执行之后，再迁移 mock。
+
 ## 未决问题（2026-10-31，下一轮先查）
 
 `cargo test -p cordis-runtime --test runtime_host` 有 5 个 `iterate_plugins` 相关用例失败，
