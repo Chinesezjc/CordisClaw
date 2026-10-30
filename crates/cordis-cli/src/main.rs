@@ -477,6 +477,22 @@ fn wrap_inbox_batch(combined: &str) -> String {
 /// (e.g. DSML XML or stray prose the model appended after its JSON verdict).
 /// `serde_json::from_str` rejects trailing bytes, so a `Deserializer` that
 /// consumes a single value is used instead.
+/// Reply text carried by a final-output object, tolerating the shapes a model
+/// actually emits: `{"message": ...}`, `{"action":"respond","message": ...}`, or
+/// a nested `payload.message` (an echoed tool result).
+fn reply_text_of(cmd: &serde_json::Value) -> Option<String> {
+    let direct = cmd.get("message").and_then(|v| v.as_str());
+    let nested = cmd
+        .get("payload")
+        .and_then(|p| p.get("message"))
+        .and_then(|v| v.as_str());
+    direct
+        .or(nested)
+        .map(str::trim)
+        .filter(|msg| !msg.is_empty())
+        .map(str::to_string)
+}
+
 fn parse_first_json(s: &str) -> serde_json::Result<Value> {
     let mut de = serde_json::Deserializer::from_str(s);
     Value::deserialize(&mut de)
@@ -850,6 +866,9 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             // WS-3: per-session outage-notice throttle. The inbox loop is
             // single-threaded, so a plain HashMap needs no lock.
             let mut outage_notified: HashMap<String, Instant> = HashMap::new();
+            // Format-error notices ("⚠️ 回复格式异常") are internal retry detail:
+            // one per session per window, not one per attempt.
+            let mut format_notified: HashMap<String, Instant> = HashMap::new();
             loop {
                 // Ops requests run on THIS thread: it is the one that runs
                 // agent turns, so a reload cannot race one.
@@ -1026,7 +1045,7 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     // Process agent output: parse JSON, dispatch action, send
                     // the reply back to the ORIGINATING plugin (route). Returns
                     // Some(feedback) if the agent needs to retry.
-                    let process = |raw: String, label: &str| -> Option<String> {
+                    let mut process = |raw: String, label: &str| -> Option<String> {
                         if raw.is_empty() {
                             return None;
                         }
@@ -1117,13 +1136,27 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                                 None
                             }
                             Ok(ref cmd) => {
-                                let action =
-                                    cmd.get("action").and_then(|v| v.as_str()).unwrap_or("?");
+                                // A JSON object with a message but no `action`
+                                // is a reply the model forgot to label; sending
+                                // it beats a retry loop that spams the group.
+                                let action = cmd.get("action").and_then(|v| v.as_str());
+                                if action.is_none() {
+                                    if let Some(msg) = reply_text_of(cmd) {
+                                        eprintln!(
+                                            "inbox: reply without action from {label}; sending it"
+                                        );
+                                        send_via(&route, &msg);
+                                        return None;
+                                    }
+                                }
+                                let action = action.unwrap_or("(missing)");
                                 eprintln!(
                                     "inbox: unknown JSON action={action}, dropping raw={}...",
                                     raw.chars().take(200).collect::<String>().replace('\n', " ")
                                 );
-                                cordis_runtime::kernel::notify::send(&host, &format!("[{session_key}] ⚠️ 回复异常（未知动作: {action}），正在重试..."));
+                                // Internal retry detail: log it, do not post to
+                                // the group (the old notice fired on every
+                                // attempt, which is the spam users saw).
                                 Some(format!("SYSTEM: Your last output was valid JSON but had unknown action \"{action}\". Allowed actions: \"suspend\" or \"respond\". Please retry.\n\nYour raw output was:\n{raw}"))
                             }
                             Err(e) => {
@@ -1132,10 +1165,17 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                                     raw.chars().take(200).collect::<String>().replace('\n', " "),
                                     out.chars().take(200).collect::<String>().replace('\n', " ")
                                 );
-                                cordis_runtime::kernel::notify::send(
-                                    &host,
-                                    &format!("[{session_key}] ⚠️ 回复格式异常，正在重试...（{e}）"),
-                                );
+                                if should_notify(
+                                    &mut format_notified,
+                                    session_key,
+                                    Instant::now(),
+                                    OUTAGE_NOTIFY_WINDOW,
+                                ) {
+                                    send_via(
+                                        &route,
+                                        &format!("⚠️ 回复格式异常，正在重试...（{e}）"),
+                                    );
+                                }
                                 Some(format!("SYSTEM: Your last output was not valid JSON and was dropped. Parse error: {e}\n\nPlease fix the JSON formatting and retry. Final output must be exactly {{\"action\":\"suspend\"}} or {{\"action\":\"respond\",\"message\":\"...\"}}.\n\nYour raw output was:\n{raw}"))
                             }
                         }
@@ -3858,5 +3898,46 @@ mod startup_invocation_tests {
         std::fs::remove_file(temp.join("startup_invoke.json")).expect("rm");
         assert!(load_startup_invocations(&temp).is_empty());
         let _ = std::fs::remove_dir_all(&temp);
+    }
+}
+
+#[cfg(test)]
+mod reply_text_tests {
+    use super::reply_text_of;
+
+    // The model sometimes leaks a tool call as text: the first JSON object is
+    // the tool arguments (`{"node_id":"qq_send","message":...}`) with no
+    // `action`. Sending that message recovers the reply instead of retrying.
+    #[test]
+    fn recovers_a_leaked_tool_call() {
+        let value = serde_json::json!({
+            "node_id": "qq_send",
+            "target": "group:975594881",
+            "message": "13×7=91，100−91=9，找 9 块"
+        });
+        assert_eq!(
+            reply_text_of(&value).as_deref(),
+            Some("13×7=91，100−91=9，找 9 块")
+        );
+    }
+
+    #[test]
+    fn reads_nested_payload_message_and_trims() {
+        let value = serde_json::json!({ "payload": { "message": "  收到  " } });
+        assert_eq!(reply_text_of(&value).as_deref(), Some("收到"));
+    }
+
+    #[test]
+    fn ignores_empty_or_missing_messages() {
+        assert_eq!(reply_text_of(&serde_json::json!({})), None);
+        assert_eq!(
+            reply_text_of(&serde_json::json!({ "message": "   " })),
+            None
+        );
+        assert_eq!(
+            reply_text_of(&serde_json::json!({ "action": "suspend" })),
+            None
+        );
+        assert_eq!(reply_text_of(&serde_json::json!({ "message": 42 })), None);
     }
 }
