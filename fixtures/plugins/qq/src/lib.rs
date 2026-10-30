@@ -8,6 +8,11 @@
 //! - `qq_serve`         — Task node: starts HTTP server to receive OneBot events
 //! - `qq_fetch_messages` — return queued incoming messages (agent polls this)
 //! - `qq_send`          — send a message to a group or private chat
+//!
+//! 存图：群消息里的图片除了交给 kernel 内联，还会同步落盘到
+//! `data/media/<群号>/`（`spawn_media_archive`）。不想要就写
+//! `data/qq_media_archive.json`：`{"enabled": false}`，只想存部分群就写
+//! `{"groups": ["<群号>"]}`。
 
 use cordis_plugin_sdk::{
     export_plugin_api, json_response, node_doc, plugin_docs, task_node_doc, AbiFingerprint,
@@ -1040,6 +1045,17 @@ fn handle_onebot_event(event: &OneBotEvent) {
         }
     }
 
+    // 存图：群消息里的图片同步落盘（配置见 `data/qq_media_archive.json`）。
+    // 放在去重之后，重复事件不会重复下载；失败只打日志，不影响收消息。
+    let image_urls = collect_image_urls(&msg.message);
+    let _ = spawn_media_archive(
+        &msg.message_type,
+        &msg.sender_id,
+        &msg.user_id,
+        msg.message_id,
+        &image_urls,
+    );
+
     if let Ok(mut queue) = MESSAGE_QUEUE.lock() {
         if queue.len() < 128 {
             queue.push_back(msg);
@@ -1489,6 +1505,240 @@ fn now_ms() -> u64 {
 fn ensure_policy_parent_dir(path: &std::path::Path) -> Result<(), String> {
     let parent = path.parent().unwrap_or(path);
     std::fs::create_dir_all(parent).map_err(|e| format!("create data dir: {e}"))
+}
+
+// ── 群消息图片落盘（存图）──────────────────────────────────────────────
+//
+// kernel 会按 envelope 的 `images` 下载并内联成多模态 content part，但那
+// 只服务"这一次请求"：消息过去，图也就没了。存图把群消息里的图片同步写到
+// `data/media/<群号>/`，与内联互不影响。
+//
+// 配置 `data/qq_media_archive.json`：
+//   {"enabled": true, "groups": ["*"], "dir": ""}
+//   enabled 缺省 true；groups 缺省 ["*"]（`*` = 全部群，否则精确匹配群号）；
+//   dir 缺省为空 → `data/media`（解析方式跟 data_path 一致）。
+//
+// 全程同步：插件 unload 后不能留下还在跑的线程，所以这里不 spawn。
+
+/// `data/qq_media_archive.json` 的形状。所有字段都有默认值。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MediaArchiveConfig {
+    #[serde(default = "media_archive_enabled_default")]
+    enabled: bool,
+    #[serde(default = "media_archive_groups_default")]
+    groups: Vec<String>,
+    /// 落盘根目录；空串 = `data/media`。
+    #[serde(default)]
+    dir: String,
+}
+
+fn media_archive_enabled_default() -> bool {
+    true
+}
+
+fn media_archive_groups_default() -> Vec<String> {
+    vec!["*".to_string()]
+}
+
+impl Default for MediaArchiveConfig {
+    fn default() -> Self {
+        Self {
+            enabled: media_archive_enabled_default(),
+            groups: media_archive_groups_default(),
+            dir: String::new(),
+        }
+    }
+}
+
+/// 读存图配置。**永不失败**：缺文件 / 坏 JSON → 默认（开启、全部群）。
+fn media_archive_config(data_dir: Option<&str>) -> MediaArchiveConfig {
+    std::fs::read_to_string(data_path(data_dir, "qq_media_archive.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<MediaArchiveConfig>(&raw).ok())
+        .unwrap_or_default()
+}
+
+/// 该群要不要存图：`*` 或精确匹配群号。
+fn media_archive_group_allowed(groups: &[String], group_id: &str) -> bool {
+    groups
+        .iter()
+        .map(|group| group.trim())
+        .any(|group| group == "*" || group == group_id)
+}
+
+/// 存图根目录：显式 `dir` 优先，否则跟 data_path 一样落 `data/media`。
+fn media_archive_root(data_dir: Option<&str>, config: &MediaArchiveConfig) -> std::path::PathBuf {
+    let dir = config.dir.trim();
+    if dir.is_empty() {
+        data_path(data_dir, "media")
+    } else {
+        std::path::PathBuf::from(dir)
+    }
+}
+
+/// 该群的落盘子目录 `<root>/<group_id>`（只拼路径，不创建）。
+fn media_archive_group_dir(
+    data_dir: Option<&str>,
+    config: &MediaArchiveConfig,
+    group_id: &str,
+) -> std::path::PathBuf {
+    media_archive_root(data_dir, config).join(sanitize_path_component(group_id))
+}
+
+/// 该群现在会不会存图；会的话返回落盘目录（只拼路径，不创建、不下载）。
+///
+/// 公开入口给集成测试 / 运维排查用：不需要起服务器，也不会发网络请求。
+pub fn media_archive_dir(
+    data_dir: Option<&str>,
+    msg_type: &str,
+    group_id: &str,
+) -> Option<std::path::PathBuf> {
+    let config = media_archive_config(data_dir);
+    media_archive_plan(data_dir, &config, msg_type, group_id)
+}
+
+/// 决定这次要不要存、存到哪个目录；跳过时返回 `None`。
+fn media_archive_plan(
+    data_dir: Option<&str>,
+    config: &MediaArchiveConfig,
+    msg_type: &str,
+    group_id: &str,
+) -> Option<std::path::PathBuf> {
+    if msg_type != "group"
+        || !config.enabled
+        || !media_archive_group_allowed(&config.groups, group_id)
+    {
+        return None;
+    }
+    Some(media_archive_group_dir(data_dir, config, group_id))
+}
+
+/// [`media_archive_plan`] + `create_dir_all`；返回真正可写的目录。
+fn media_archive_prepare_dir(
+    data_dir: Option<&str>,
+    config: &MediaArchiveConfig,
+    msg_type: &str,
+    group_id: &str,
+) -> Option<std::path::PathBuf> {
+    let dir = media_archive_plan(data_dir, config, msg_type, group_id)?;
+    match std::fs::create_dir_all(&dir) {
+        Ok(()) => Some(dir),
+        Err(e) => {
+            eprintln!("[qq] media archive: create {}: {e}", dir.display());
+            None
+        }
+    }
+}
+
+/// 把可能来自事件的字符串收成安全的单层文件名 / 目录名片段（挡掉 `../`）。
+fn sanitize_path_component(raw: &str) -> String {
+    let cleaned: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if cleaned.is_empty() {
+        "0".to_string()
+    } else {
+        cleaned
+    }
+}
+
+/// 从 URL 路径后缀猜扩展名；认不出就是 `bin`（URL 可能带查询串或没有后缀）。
+fn media_archive_ext(url: &str) -> &'static str {
+    let path = url.split(['?', '#']).next().unwrap_or("");
+    let name = path.rsplit('/').next().unwrap_or("");
+    let ext = name
+        .rsplit_once('.')
+        .map(|(_, ext)| ext.to_ascii_lowercase())
+        .unwrap_or_default();
+    match ext.as_str() {
+        "jpg" => "jpg",
+        "jpeg" => "jpeg",
+        "png" => "png",
+        "gif" => "gif",
+        "webp" => "webp",
+        "bmp" => "bmp",
+        _ => "bin",
+    }
+}
+
+/// 文件名 `{now_ms}_{user_id}_{message_id_or_0}_{index}.{ext}`。
+fn media_archive_file_name(
+    now_ms: u64,
+    user_id: &str,
+    message_id: Option<i64>,
+    index: usize,
+    url: &str,
+) -> String {
+    format!(
+        "{now_ms}_{}_{}_{index}.{}",
+        sanitize_path_component(user_id),
+        message_id.unwrap_or(0),
+        media_archive_ext(url)
+    )
+}
+
+/// 群消息里的图片落盘。**同步执行**（unload 不能留悬空线程），失败只打日志。
+///
+/// 返回落盘目录；跳过（非群消息 / 没有图 / 已关闭 / 该群不在 groups）时 `None`。
+fn spawn_media_archive(
+    msg_type: &str,
+    group_id: &str,
+    user_id: &str,
+    message_id: Option<i64>,
+    urls: &[String],
+) -> Option<std::path::PathBuf> {
+    if msg_type != "group" || urls.is_empty() {
+        return None;
+    }
+    let config = media_archive_config(None);
+    let dir = media_archive_prepare_dir(None, &config, msg_type, group_id)?;
+    let now = now_ms();
+    let targets: Vec<(String, std::path::PathBuf)> = urls
+        .iter()
+        .enumerate()
+        .map(|(index, url)| {
+            (
+                url.clone(),
+                dir.join(media_archive_file_name(now, user_id, message_id, index, url)),
+            )
+        })
+        .collect();
+    // 名字是 spawn 就得真的 spawn：下载在 OneBot 事件线程上做，一张 20MB 图
+    // （或一个 10s 超时）会把收消息整个堵住。
+    std::thread::spawn(move || media_archive_fetch_all(&targets));
+    Some(dir)
+}
+
+/// 逐张下载到 `targets` 里的路径。单张失败只记一行，继续下一张——存图是旁路，
+/// 永远不能影响收消息或让整批图片丢失。
+fn media_archive_fetch_all(targets: &[(String, std::path::PathBuf)]) {
+    for (url, path) in targets {
+        if let Err(e) = media_archive_download(url, path) {
+            eprintln!("[qq] media archive: {url}: {e}");
+        }
+    }
+}
+
+/// 下载单张图片写到 `path`：10s 超时 + 20MB 上限（别让一条消息把磁盘写满）。
+fn media_archive_download(url: &str, path: &std::path::Path) -> Result<(), String> {
+    use std::io::Read;
+    let response = ureq::get(url)
+        .timeout(Duration::from_secs(10))
+        .call()
+        .map_err(|e| format!("download: {e}"))?;
+    let mut reader = response.into_reader().take(20 * 1024 * 1024);
+    let mut body = Vec::new();
+    reader
+        .read_to_end(&mut body)
+        .map_err(|e| format!("read body: {e}"))?;
+    std::fs::write(path, &body).map_err(|e| format!("write {}: {e}", path.display()))
 }
 
 /// 从渲染后的正文里按顺序收集 `[image: <url>]` 里的 URL。
@@ -5019,5 +5269,193 @@ mod auth_tests {
         let err = handle_qq_set_reply_policy(&policy).expect_err("policy stays gated");
         assert!(err.contains("owner or an admin"), "err: {err}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// 存图：群消息图片落盘（`data/media/<群号>/`，配置 data/qq_media_archive.json）。
+// 这里只测纯函数 + 目录拼装，不发任何网络请求（下载分支靠 eprintln 降级）。
+// ═══════════════════════════════════════════════════════════════════════
+#[cfg(test)]
+mod media_archive_tests {
+    use super::test_support::temp_dir;
+    use super::*;
+
+    fn write_config(dir: &std::path::Path, body: &str) {
+        std::fs::write(dir.join("qq_media_archive.json"), body).expect("write media archive config");
+    }
+
+    // 缺文件 / 空对象 / 只给一部分字段 → 其余字段都是缺省值。
+    #[test]
+    fn config_defaults_to_enabled_and_all_groups() {
+        let dir = temp_dir();
+        let dir_s = dir.to_str().unwrap_or_default();
+        let config = media_archive_config(Some(dir_s));
+        assert!(config.enabled, "缺配置时默认开启");
+        assert_eq!(config.groups, vec!["*".to_string()]);
+        assert!(config.dir.is_empty(), "dir 缺省为空 → data/media");
+
+        write_config(&dir, "{}");
+        let config = media_archive_config(Some(dir_s));
+        assert!(config.enabled);
+        assert_eq!(config.groups, vec!["*".to_string()]);
+
+        // 只写 groups：enabled 仍然是缺省的 true；只写 enabled：groups 仍是 ["*"]。
+        write_config(&dir, r#"{"groups":["12345"]}"#);
+        let config = media_archive_config(Some(dir_s));
+        assert!(config.enabled);
+        assert_eq!(config.groups, vec!["12345".to_string()]);
+        assert!(config.dir.is_empty());
+        write_config(&dir, r#"{"enabled":false}"#);
+        let config = media_archive_config(Some(dir_s));
+        assert!(!config.enabled);
+        assert_eq!(config.groups, vec!["*".to_string()]);
+
+        // 坏 JSON → 默认（配置坏了也不能把收消息拖下水）。
+        write_config(&dir, "{not json");
+        let config = media_archive_config(Some(dir_s));
+        assert!(config.enabled);
+        assert_eq!(config.groups, vec!["*".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // groups 判定：`*` = 全部群；否则按群号精确匹配（条目两侧空白忽略）。
+    #[test]
+    fn group_filter_accepts_star_or_exact_id() {
+        let all = vec!["*".to_string()];
+        assert!(media_archive_group_allowed(&all, "123456"));
+        let only = vec!["123456".to_string(), " 999 ".to_string()];
+        assert!(media_archive_group_allowed(&only, "123456"));
+        assert!(media_archive_group_allowed(&only, "999"), "条目两侧空白要忽略");
+        assert!(!media_archive_group_allowed(&only, "123457"));
+        assert!(!media_archive_group_allowed(&[], "123456"), "空列表 = 一个群都不存");
+    }
+
+    // 扩展名只看 URL 路径（查询串 / 锚点不参与），认不出就 bin。
+    #[test]
+    fn ext_comes_from_url_path() {
+        assert_eq!(media_archive_ext("https://a/b/c.PNG"), "png");
+        assert_eq!(media_archive_ext("https://a/b/c.jpg?x=1.png"), "jpg");
+        assert_eq!(media_archive_ext("https://a/b/c.jpeg#frag"), "jpeg");
+        assert_eq!(media_archive_ext("https://a/c.gif"), "gif");
+        assert_eq!(media_archive_ext("https://a/c.webp"), "webp");
+        assert_eq!(media_archive_ext("https://a/c.bmp"), "bmp");
+        assert_eq!(media_archive_ext("https://a/c.avif"), "bin");
+        assert_eq!(media_archive_ext("https://a/c"), "bin");
+        assert_eq!(media_archive_ext(""), "bin");
+    }
+
+    // 文件名形状：{now_ms}_{user_id}_{message_id_or_0}_{index}.{ext}
+    #[test]
+    fn file_name_follows_the_documented_shape() {
+        let name =
+            media_archive_file_name(1_700_000_000_000, "789", Some(42), 0, "https://a/1.png");
+        assert_eq!(name, "1700000000000_789_42_0.png");
+        // 没有 message_id 用 0；user_id 里的分隔符收成下划线（挡路径穿越）。
+        let name = media_archive_file_name(1, "78/9", None, 2, "https://a/x");
+        assert_eq!(name, "1_78_9_0_2.bin");
+    }
+
+    // 关闭 / 群不在名单 / 私聊 → None，且一个目录都不建。
+    #[test]
+    fn disabled_or_unlisted_group_returns_none() {
+        let dir = temp_dir();
+        let dir_s = dir.to_str().unwrap_or_default();
+        let disabled = MediaArchiveConfig {
+            enabled: false,
+            ..MediaArchiveConfig::default()
+        };
+        assert!(media_archive_plan(Some(dir_s), &disabled, "group", "1").is_none());
+        assert!(media_archive_prepare_dir(Some(dir_s), &disabled, "group", "1").is_none());
+
+        let listed = MediaArchiveConfig {
+            groups: vec!["2".to_string()],
+            ..MediaArchiveConfig::default()
+        };
+        assert!(media_archive_prepare_dir(Some(dir_s), &listed, "group", "1").is_none());
+        assert!(media_archive_prepare_dir(Some(dir_s), &listed, "private", "2").is_none());
+        assert!(!dir.join("media").exists(), "跳过时不应创建目录");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // 目录拼装：缺省 dir → <data_dir>/media/<群号>，显式 dir → <dir>/<群号>，
+    // 并且 create_dir_all 真的把目录建出来。
+    #[test]
+    fn group_dir_is_created_under_the_data_dir() {
+        let dir = temp_dir();
+        let dir_s = dir.to_str().unwrap_or_default();
+        let config = MediaArchiveConfig::default();
+        let group_dir = media_archive_prepare_dir(Some(dir_s), &config, "group", "123456")
+            .expect("enabled archive should prepare a dir");
+        assert_eq!(group_dir, dir.join("media").join("123456"));
+        assert!(group_dir.is_dir(), "目录必须真的被创建");
+
+        let explicit = dir.join("pics");
+        let config = MediaArchiveConfig {
+            dir: explicit.to_str().unwrap_or_default().to_string(),
+            ..MediaArchiveConfig::default()
+        };
+        let group_dir = media_archive_prepare_dir(Some(dir_s), &config, "group", "42")
+            .expect("explicit dir should win");
+        assert_eq!(group_dir, explicit.join("42"));
+        assert!(group_dir.is_dir());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 一个只发一次固定字节的极简 HTTP stub，用来覆盖下载线程本体。
+    fn serve_once(body: &'static [u8]) -> String {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub");
+        let addr = listener.local_addr().expect("addr");
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                        body.len()
+                    )
+                    .as_bytes(),
+                );
+                let _ = stream.write_all(body);
+            }
+        });
+        format!("http://{addr}/a.png")
+    }
+
+    // 下载线程本体：写到给定路径，内容原样落盘。
+    #[test]
+    fn fetch_all_writes_the_downloaded_bytes() {
+        let dir = std::env::temp_dir().join(format!("qq-media-fetch-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let target = dir.join("one.png");
+        media_archive_fetch_all(&[(serve_once(b"PNGDATA"), target.clone())]);
+        assert_eq!(std::fs::read(&target).expect("read"), b"PNGDATA");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // 一张失败不能拖垮其余：后面的图仍然落盘。
+    #[test]
+    fn fetch_all_keeps_going_after_a_failure() {
+        let dir = std::env::temp_dir().join(format!("qq-media-fail-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let good = dir.join("good.png");
+        media_archive_fetch_all(&[
+            ("http://127.0.0.1:1/none.png".to_string(), dir.join("bad.png")),
+            (serve_once(b"OK"), good.clone()),
+        ]);
+        assert_eq!(std::fs::read(&good).expect("good read"), b"OK");
+        assert!(!dir.join("bad.png").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // 非群消息 / 没有图：直接跳过，不读配置、更不发网络请求。
+    #[test]
+    fn spawn_skips_non_group_and_empty_urls() {
+        let urls = vec!["https://example.invalid/a.png".to_string()];
+        assert!(spawn_media_archive("private", "1", "2", Some(3), &urls).is_none());
+        assert!(spawn_media_archive("group", "1", "2", Some(3), &[]).is_none());
     }
 }
