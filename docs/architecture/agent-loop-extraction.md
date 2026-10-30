@@ -132,6 +132,26 @@ kernel。所以接缝必须同时抽象"谁提供补全"：要么把 `LlmProvide
 
 结论：第二步开始前先定这一点，否则 trait 签名会返工。
 
+## 搬 crate 前必须公开的项（已核对，2026-10-31）
+
+循环现在用到的 kernel 内部件，全部要从 `pub(crate)` 提升：
+
+| 项 | 位置 | 现状 |
+|---|---|---|
+| `llm_sink`（`TokenSink`） | `lib.rs:15` | `mod` → 需 `pub mod` |
+| `agent_toolchain`（`sanitize_tool_chains`） | `lib.rs:4` | `pub(crate) mod` → `pub mod` |
+| `iteration::policy::*`（`test_changes` / `promotion_verdict` / …） | `iteration/policy.rs` | `pub(crate) fn` |
+| `iteration::report::*`（`iteration_result_json` / `approve_iteration_permission`） | `iteration/report.rs` | `pub(crate) fn` |
+| `host::PluginIterationAgentState` | `host/mod.rs` | 已 `pub`（本轮改） |
+| `host::PluginIterationAgentBackend` | `host/mod.rs` | 已 `pub(crate)`（本轮改） |
+
+`guard` / `image_input` / `soul` / `kernel::notify` / `plugin::node_catalog` 已经是 `pub mod`，
+不需要动。
+
+公开这些之后，`crates/cordis-agent` 的 `lib.rs` 就是：
+`pub struct CargoAgentLoop;` 实现 `AgentLoop`（create/restore → `AgentSession`），
+`pub fn install()` 调 `install_agent_loop`，cli 里在 `RuntimeHost::boot` 之前调用即可。
+
 ## 已知硬点
 
 - **崩溃恢复**：`host/mod.rs::detect_crash_and_recover` 现在直接
