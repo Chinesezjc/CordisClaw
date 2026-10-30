@@ -219,6 +219,23 @@ agent_loop.rs            AgentSession（KernelAgentLoop + impl）→ 随循环�
 `UNKNOWN_TOOL_STRIKE_LIMIT` 已移到 `agent_tools`（`4e9aad1` 之后），所以循环搬走后
 kernel 不再需要 `agent.rs`。
 
+## 第 10 轮结论：搬循环与搬 iteration 必须同时进行
+
+把 `agent.rs` 复制进 crate 后，编译**能过**，但 `clippy -D warnings` 立刻报 kernel 里
+的迭代后端成了死代码：
+
+```
+PluginIterationAgentState 多个字段从未被读取
+ContextFilesScope 从未使用
+PLUGIN_AGENT_TOOL_LIST_CONTEXT_FILES / READ_CONTEXT_FILES 从未使用
+```
+
+原因：`PluginIterationAgentBackend` 的 `tool_specs`/`execute_tool` 只被**循环**调用；
+循环一走，kernel 里就没有调用者，于是整条迭代装配在 kernel 侧失去引用。也就是说
+"循环搬走"和"`host/iteration*.rs` + `iteration/` 搬走"是**同一次改动**，不能分两轮。
+
+已完整回滚到 `bbcfa3a`（绿色），把这条结论落盘。下一轮按"循环 + 迭代一起搬"执行。
+
 ## 未决问题（2026-10-31，下一轮先查）
 
 `cargo test -p cordis-runtime --test runtime_host` 有 5 个 `iterate_plugins` 相关用例失败，
