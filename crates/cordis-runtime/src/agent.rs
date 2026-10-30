@@ -44,6 +44,10 @@ fn drain_inject_queue() -> Vec<String> {
     }
 }
 
+/// How many times one turn re-issues a request the provider answered with
+/// nothing (no content, no tool calls) before reporting a failure.
+const EMPTY_RESPONSE_RETRIES: usize = 2;
+
 const AGENT_HISTORY_MESSAGE_LIMIT: usize = 8192;
 const AGENT_MAX_TOOL_TURNS: usize = 96;
 const UNKNOWN_TOOL_STRIKE_LIMIT: usize = 1;
@@ -1277,6 +1281,10 @@ pub struct AgentSession {
     estimated_tokens: usize,
     /// Consecutive reasoning-only responses (no content, no tool_calls).
     reasoning_only_strikes: usize,
+    /// Consecutive degenerate completions (no content, no tool calls) for this
+    /// turn. The provider occasionally finishes with nothing; that is a glitch
+    /// to retry, not a contract violation that kills the turn.
+    empty_response_strikes: usize,
     /// Consecutive calls to tools that don't exist in this session (LLM hallucination guard).
     unknown_tool_strikes: usize,
     /// O批: soul scope key ({sender_id}#{conversation_kind}) this session
@@ -1303,6 +1311,7 @@ pub struct AgentSessionSnapshot {
     pub completed_turns: usize,
     pub estimated_tokens: usize,
     pub reasoning_only_strikes: usize,
+    pub empty_response_strikes: usize,
     pub unknown_tool_strikes: usize,
     /// `#[serde(default)]` keeps pre-O批 snapshots deserializable.
     #[serde(default)]
@@ -1336,6 +1345,7 @@ impl AgentSession {
             completed_turns: 0,
             estimated_tokens: 0,
             reasoning_only_strikes: 0,
+            empty_response_strikes: 0,
             unknown_tool_strikes: 0,
             soul_key: String::new(),
             is_group: false,
@@ -1525,7 +1535,14 @@ impl AgentSession {
             "role": "system",
             "content": backend.system_prompt(),
         }));
-        messages.extend(self.history.clone());
+        // A client-injected failure notice is not conversation: once it sits in
+        // history the model echoes it back verbatim.
+        messages.extend(
+            self.history
+                .iter()
+                .filter(|message| !is_client_notice_text(message))
+                .cloned(),
+        );
         // 一次性上下文（策略/记忆行）与图片都只随这一条新消息进请求；
         // history 里只留纯文本，否则每一轮都会重发同一份噪声。
         let request_text = if notes.trim().is_empty() {
@@ -1888,6 +1905,7 @@ impl AgentSession {
                         "⚠ Agent produced 3 consecutive reasoning-only responses — may be stuck.",
                     );
                     self.reasoning_only_strikes = 0;
+                    self.empty_response_strikes = 0;
                 }
                 messages.push(json!({
                     "role": "user",
@@ -1897,8 +1915,26 @@ impl AgentSession {
             }
             self.reasoning_only_strikes = 0;
 
+            // A completion with no content and no tool calls is a provider
+            // glitch (the adapter on the other side of this seam may also emit
+            // one). Retry the identical request a couple of times before
+            // giving up: failing here spills the user's message and shows a
+            // failure notice for something a second attempt usually fixes.
+            self.empty_response_strikes += 1;
+            if self.empty_response_strikes <= EMPTY_RESPONSE_RETRIES {
+                emit_agent_diagnostic(format!(
+                    "agent_empty_response_retry kind={} attempt={}",
+                    self.kind, self.empty_response_strikes
+                ));
+                continue;
+            }
+            self.empty_response_strikes = 0;
             return Err(RuntimeError::LlmResponseInvalid {
-                message: "agent response had neither tool_calls nor final content".to_string(),
+                message: format!(
+                    "agent response had neither tool_calls nor final content \
+                     (after {} retries)",
+                    EMPTY_RESPONSE_RETRIES
+                ),
             });
         }
 
@@ -2196,6 +2232,7 @@ impl AgentSession {
             completed_turns: self.completed_turns,
             estimated_tokens: self.estimated_tokens,
             reasoning_only_strikes: self.reasoning_only_strikes,
+            empty_response_strikes: 0,
             unknown_tool_strikes: self.unknown_tool_strikes,
             soul_key: self.soul_key.clone(),
         }
@@ -2219,6 +2256,7 @@ impl AgentSession {
             completed_turns: snapshot.completed_turns,
             estimated_tokens: snapshot.estimated_tokens,
             reasoning_only_strikes: snapshot.reasoning_only_strikes,
+            empty_response_strikes: 0,
             unknown_tool_strikes: snapshot.unknown_tool_strikes,
             soul_key: snapshot.soul_key,
             // P4: caller flags are per-batch facts, not session state — a
@@ -2311,6 +2349,22 @@ fn flush_tool_failure_prompts(messages: &mut Vec<Value>, prompts: &mut Vec<Strin
 ///
 /// 由 `ChatMessage::to_request_message` 原样迁来——它只做 JSON 拼装、不含
 /// wire 解析，因此随契约类型留在 kernel（构造请求体是 kernel 的职责）。
+/// A client-injected notice rather than something a person said.
+///
+/// The web/desktop client posts 「我这边刚才调用模型失败了，你的消息我记下了，稍后会自动重试。」
+/// as a user message when its own model call fails. It carries no conversation,
+/// and once it is in history the model echoes it back verbatim — the assistant
+/// has literally answered a room with that sentence. Short matches only, so a
+/// person quoting the notice at length is still delivered.
+fn is_client_notice_text(message: &Value) -> bool {
+    let content = message
+        .get("content")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim();
+    content.starts_with("我这边刚才调用模型失败") && content.chars().count() <= 120
+}
+
 fn llm_message_to_request(message: &cordis_plugin_sdk::llm::LlmMessage) -> Value {
     let mut out = Map::new();
     out.insert("role".to_string(), Value::String("assistant".to_string()));
@@ -3345,6 +3399,33 @@ fn to_json_value<T: Serialize>(label: &str, value: T) -> Result<Value, RuntimeEr
 mod tests {
     use super::*;
 
+    // The client's failure notice must never reach the model: it carries no
+    // conversation, and the assistant echoed it verbatim into a group chat.
+    #[test]
+    fn client_failure_notices_are_dropped_from_requests() {
+        let notice = json!({
+            "role": "user",
+            "content": "我这边刚才调用模型失败了，你的消息我记下了，稍后会自动重试。"
+        });
+        assert!(is_client_notice_text(&notice));
+        let echoed = json!({
+            "role": "assistant",
+            "content": "我这边刚才调用模型失败了，你的消息我记下了，稍后会自动重试。"
+        });
+        assert!(is_client_notice_text(&echoed));
+        // Real speech is untouched, including a long quotation of the notice.
+        assert!(!is_client_notice_text(
+            &json!({"role": "user", "content": "你好"})
+        ));
+        assert!(!is_client_notice_text(&json!({
+            "role": "user",
+            "content": format!("我这边刚才调用模型失败了{}", "，".repeat(200))
+        })));
+        assert!(!is_client_notice_text(
+            &json!({"role": "user", "content": 42})
+        ));
+    }
+
     const TEST_TOOL_RECORD: &str = "record_summary";
     const TEST_TOOL_READ: &str = "read_context";
 
@@ -4070,6 +4151,57 @@ mod tests {
         assert!(
             bodies[1].to_string().contains("snapshot-demo"),
             "second turn must carry the tool result back"
+        );
+    }
+
+    // A provider that finishes with neither content nor tool calls used to kill
+    // the whole turn (the inbox then spilled the message and posted a failure
+    // notice). It is a glitch: re-issue the same request first.
+    #[test]
+    fn empty_completions_are_retried_inside_the_turn() {
+        let provider = FakeLlmProvider::new(vec![
+            cordis_plugin_sdk::llm::LlmMessage::default(),
+            assistant_reply("second attempt works"),
+        ]);
+        let mut session = ShellAgentSession::new(LlmApiConfig::default()).expect("build session");
+        let reply = session
+            .respond_via(
+                &EMPTY_FAKE_HOST,
+                "test-session-empty-retry",
+                "hi",
+                &provider,
+            )
+            .expect("the retry must succeed");
+        assert_eq!(reply.content, "second attempt works");
+        assert_eq!(
+            provider.seen_bodies.lock().expect("bodies").len(),
+            2,
+            "the same request must be re-issued once"
+        );
+    }
+
+    // Retries are bounded: a provider that keeps returning nothing fails the
+    // turn instead of looping forever.
+    #[test]
+    fn persistent_empty_completions_fail_after_the_retries() {
+        let provider = FakeLlmProvider::new(vec![
+            cordis_plugin_sdk::llm::LlmMessage::default(),
+            cordis_plugin_sdk::llm::LlmMessage::default(),
+            cordis_plugin_sdk::llm::LlmMessage::default(),
+            cordis_plugin_sdk::llm::LlmMessage::default(),
+        ]);
+        let mut session = ShellAgentSession::new(LlmApiConfig::default()).expect("build session");
+        let err = session
+            .respond_via(&EMPTY_FAKE_HOST, "test-session-empty-fail", "hi", &provider)
+            .expect_err("must give up");
+        assert!(
+            matches!(err, RuntimeError::LlmResponseInvalid { .. }),
+            "{err:?}"
+        );
+        assert_eq!(
+            provider.seen_bodies.lock().expect("bodies").len(),
+            EMPTY_RESPONSE_RETRIES + 1,
+            "initial attempt plus the bounded retries"
         );
     }
 
