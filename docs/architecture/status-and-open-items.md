@@ -654,6 +654,36 @@ agent response had neither tool_calls nor final content」。一轮对话因为�
 验证：runtime 993（空→真两次请求成功、持续空 2+1 次后失败、告示识别）、cli 52（重试成功/首次即成
 功不等待/耗尽返回最后错误），clippy 干净；18:3x 重启，8099/8002 正常。
 
+### 3.33 群图归档：入站图片落盘（2026-10-31）
+
+**背景**：QQ 图片此前只有一个去处——`image_input` 下载字节、base64 内联进请求，看完即弃；
+`[image: <url>]` 里的 QQ 链接还带时效，等于群里的图从来留不下来。
+
+**实现**（`fixtures/plugins/qq`）：收到群消息时把图存到 `data/media/<群号>/`，文件名
+`<时间戳>-<user>-<msg_id>-<序号>.<ext>`；配置 `data/qq_media_archive.json`
+（默认启用、`groups: ["*"]`、`dir` 可改），私聊不存。
+
+三条边界：
+
+1. **旁路**：下载在独立线程（`spawn_media_archive` 真的 spawn），单张失败只记
+   `[qq] media archive: …`，消息照常入队；单张 10s 超时 + 20MB 上限。
+2. **去重前提**：放在事件去重之后，重复投递不会重复下载。
+3. **可测**：`media_archive_dir` 公开给集成测试；下载线程本体 `media_archive_fetch_all`
+   用本地 stub 服务直接单测（成功落盘 / 一张失败仍继续）。
+
+### 3.34 房间 ↔ session 绑定持久化（2026-10-31）
+
+**问题**：会话对象与快照本来就有（`data/sessions/*.json`，启动时 crash recovery 会读回），
+但 cli 里 `session_key → session_id` 的映射是**纯内存**的，每次重启都为房间新建 session：
+上下文断掉，磁盘快照变孤儿（实测积累了 675 个）。
+
+**实现**：`data/sessions/index.json` 持久化绑定，tmp+rename 原子写；启动时读回并用
+`agent_status` 探测，宿主没恢复的条目直接丢弃（同时重写索引）；新建会话时写入，
+LRU 淘汰时同步删除。
+
+**验证**：重启后同一房间仍是 `agent-session-1793381492493-1`，快照数不变（677），
+重启后 16 条消息继续走同一个会话。
+
 ## 4. 部分完成
 
 ### 4.1 Execution engine 有正式入口，数据面验证不足

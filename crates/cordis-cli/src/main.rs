@@ -473,6 +473,66 @@ fn wrap_inbox_batch(combined: &str) -> String {
 /// consumes a single value is used instead.
 /// Did this turn already deliver a message through `reply_node`? Used to keep
 /// `{"action":"respond"}` and `qq_send` from double-sending the same text.
+/// Persistent `session_key -> session_id` binding.
+///
+/// Without it every restart created a fresh session per room: the group lost
+/// its history, and the snapshots under `data/sessions/` became orphans that
+/// crash recovery loaded and nothing ever addressed again.
+mod session_index {
+    use std::collections::BTreeMap;
+    use std::path::{Path, PathBuf};
+
+    const RELATIVE: &str = "sessions/index.json";
+
+    fn path(data_dir: &Path) -> PathBuf {
+        data_dir.join(RELATIVE)
+    }
+
+    /// Read the binding. A missing or unreadable file is an empty map, never a
+    /// startup failure — losing the binding is recoverable, refusing to boot is
+    /// not.
+    pub fn load(data_dir: &Path) -> BTreeMap<String, String> {
+        let Ok(raw) = std::fs::read_to_string(path(data_dir)) else {
+            return BTreeMap::new();
+        };
+        match serde_json::from_str(&raw) {
+            Ok(index) => index,
+            Err(error) => {
+                eprintln!("inbox: session index unreadable ({error}); starting empty");
+                BTreeMap::new()
+            }
+        }
+    }
+
+    /// Write the binding atomically: a crash mid-write must leave the previous
+    /// index intact, not a truncated one.
+    pub fn save(data_dir: &Path, index: &BTreeMap<String, String>) {
+        let target = path(data_dir);
+        if let Some(parent) = target.parent() {
+            if let Err(error) = std::fs::create_dir_all(parent) {
+                eprintln!("inbox: cannot create {}: {error}", parent.display());
+                return;
+            }
+        }
+        let json = match serde_json::to_vec_pretty(index) {
+            Ok(json) => json,
+            Err(error) => {
+                eprintln!("inbox: cannot serialize session index: {error}");
+                return;
+            }
+        };
+        let tmp = target.with_extension("json.tmp");
+        if let Err(error) = std::fs::write(&tmp, &json) {
+            eprintln!("inbox: cannot write {}: {error}", tmp.display());
+            return;
+        }
+        if let Err(error) = std::fs::rename(&tmp, &target) {
+            eprintln!("inbox: cannot replace {}: {error}", target.display());
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
+}
+
 /// Delays between immediate send retries for one batch.
 ///
 /// A failed turn used to be spilled to `pending` and replayed only when the
@@ -901,7 +961,22 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         cordis_runtime::agent::set_agent_inject_queue(inject_queue.clone());
         let health_host = std::sync::Arc::clone(&host);
         let park_host = std::sync::Arc::clone(&host);
-        let mut sessions: BTreeMap<String, String> = BTreeMap::new();
+        let data_dir = host.data_dir();
+        // Resume the room -> session binding from the previous run, dropping
+        // any entry whose session the host did not recover (deleted snapshot,
+        // evicted session). Without this every restart started a new session
+        // per room and orphaned the snapshots on disk.
+        let mut sessions: BTreeMap<String, String> = session_index::load(&data_dir);
+        let bound = sessions.len();
+        sessions.retain(|_key, sid| host.agent_status(sid).is_ok());
+        if sessions.len() != bound {
+            eprintln!(
+                "inbox: dropped {} stale session binding(s) ({} kept)",
+                bound - sessions.len(),
+                sessions.len()
+            );
+            session_index::save(&data_dir, &sessions);
+        }
         std::thread::spawn(move || {
             // The format-error banner is throttled per session per window so a
             // model stuck emitting bad JSON cannot flood the room; the parse
@@ -1054,6 +1129,7 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                                     evict_key, evicted_sid
                                 );
                                 host.drop_session(&evicted_sid);
+                                session_index::save(&data_dir, &sessions);
                             }
                         }
                     }
@@ -1062,16 +1138,27 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     // persona overlays the system prompt. Unknown profile
                     // names fall back to default inside resolve().
                     let soul_key = route.soul_key();
-                    let sid = sessions.entry(session_key.clone()).or_insert_with(|| {
-                        let soul = host.get_soul(&soul_key).ok().flatten();
-                        let options = cordis_runtime::host::AgentStartOptions {
-                            profile: soul.as_ref().and_then(|s| s.profile.clone()),
-                            soul_key: soul_key.clone(),
-                        };
-                        host.agent_start_with(AgentSessionKind::RuntimeShell, options)
-                            .map(|s| s.session_id)
-                            .unwrap_or_default()
-                    });
+                    let sid = match sessions.get(session_key).cloned() {
+                        Some(sid) => sid,
+                        None => {
+                            let soul = host.get_soul(&soul_key).ok().flatten();
+                            let options = cordis_runtime::host::AgentStartOptions {
+                                profile: soul.as_ref().and_then(|s| s.profile.clone()),
+                                soul_key: soul_key.clone(),
+                            };
+                            let sid = host
+                                .agent_start_with(AgentSessionKind::RuntimeShell, options)
+                                .map(|s| s.session_id)
+                                .unwrap_or_default();
+                            if !sid.is_empty() {
+                                sessions.insert(session_key.clone(), sid.clone());
+                                session_index::save(&data_dir, &sessions);
+                            }
+                            sid
+                        }
+                    };
+                    // Call sites take `&str`; shadow the owned id.
+                    let sid = sid.as_str();
                     // H1: re-scope the soul to THIS batch's speaker before
                     // sending. Idempotent — a cheap no-op when unchanged, and
                     // also covers the just-created session. Errors ignored
@@ -3395,6 +3482,87 @@ mod send_retry_tests {
         );
         assert_eq!(result, Err("still down"));
         assert_eq!(slept.get(), SEND_RETRY_DELAYS.len());
+    }
+}
+
+#[cfg(test)]
+mod session_index_tests {
+    use super::session_index;
+    use std::collections::BTreeMap;
+    use std::path::{Path, PathBuf};
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!("cordis-session-index-{tag}-{nanos}"));
+            std::fs::create_dir_all(&path).expect("temp dir");
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn sample() -> BTreeMap<String, String> {
+        let mut index = BTreeMap::new();
+        index.insert("qq:group:1".to_string(), "agent-session-a".to_string());
+        index.insert("qq:group:2".to_string(), "agent-session-b".to_string());
+        index
+    }
+
+    // The binding has to survive a restart: that is the whole point.
+    #[test]
+    fn save_then_load_round_trips() {
+        let dir = TempDir::new("roundtrip");
+        session_index::save(dir.path(), &sample());
+        assert_eq!(session_index::load(dir.path()), sample());
+    }
+
+    // No file yet is a normal first boot, not an error.
+    #[test]
+    fn a_missing_index_is_empty() {
+        let dir = TempDir::new("missing");
+        assert!(session_index::load(dir.path()).is_empty());
+    }
+
+    // A corrupt index must not stop the bot from booting.
+    #[test]
+    fn a_corrupt_index_is_ignored() {
+        let dir = TempDir::new("corrupt");
+        let path = dir.path().join("sessions/index.json");
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+        std::fs::write(&path, b"{not json").expect("write");
+        assert!(session_index::load(dir.path()).is_empty());
+    }
+
+    // A second save replaces the first instead of corrupting it, and leaves no
+    // temp file behind.
+    #[test]
+    fn saving_again_replaces_atomically() {
+        let dir = TempDir::new("replace");
+        session_index::save(dir.path(), &sample());
+        let mut smaller = BTreeMap::new();
+        smaller.insert("qq:group:1".to_string(), "agent-session-c".to_string());
+        session_index::save(dir.path(), &smaller);
+        assert_eq!(session_index::load(dir.path()), smaller);
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path().join("sessions"))
+            .expect("dir")
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(leftovers, vec!["index.json".to_string()], "{leftovers:?}");
     }
 }
 
