@@ -132,6 +132,28 @@ kernel。所以接缝必须同时抽象"谁提供补全"：要么把 `LlmProvide
 
 结论：第二步开始前先定这一点，否则 trait 签名会返工。
 
+## `agent.rs` 切分图（2026-10-31 实测行号）
+
+| 行段 | 内容 | 归属 |
+|---|---|---|
+| 31–207 | inject queue、`AGENT_TOOL_*` 常量、`SessionCaller` | **kernel**（工具 ABI） |
+| 208–1078 | `impl AgentToolHost for RuntimeHost` | **kernel**（宿主实现） |
+| 1079–1176 | `LlmProvider`、`LlmCompletionParts`、`AgentSession`、快照、`AGENT_TOOL_END_TURN`、`ShellAgentSession`、`estimate_tokens` | **cordis-agent** |
+| 1177–2267 | `impl AgentSession`、`impl ShellAgentSession` | **cordis-agent** |
+| 2268–2331 | `flush_tool_failure_prompts`、`is_outage_notice_text`、`llm_message_to_request` | **cordis-agent** |
+| 2332–2452 | 工具参数结构体（`ReadFileArgs` 等） | **kernel**（ABI） |
+| 2453–2583 | `execute_agent_tool_call` | **kernel**（分派） |
+| 2584–2778 | `RuntimeShellAgentBackend` | **cordis-agent**（后端） |
+| 2779–3042 | DSML 解析 + `dsml_protocol_prompt` | **cordis-agent** |
+| 3043–3262 | `shell_agent_tools` | **cordis-agent** |
+| 3263–3415 | `PERSONA_DISCLAIMER`、`CONDUCT_CONTRACT`、`shell_agent_system_prompt` | **cordis-agent** |
+| 3410–3429 | `emit_agent_diagnostic`、`parse_json_or_string`、`parse_tool_value_arguments`、`to_json_value` | 两边都要（公开） |
+
+搬完后的依赖形态：`cordis-agent` → `cordis-runtime`（用 `agent_api`、`agent_loop` 的 trait、
+`llm_sink::TokenSink`、`config`、`iteration::report`、`kernel::plugin_iteration` 的数据类型）；
+kernel 里不再出现 `AgentSession`，只有 `Box<dyn AgentSessionApi>` 与 `KernelAgentLoop`
+（`KernelAgentLoop` 也要搬去 crate，kernel 的 `boot` 改为“没装就报错”，cli 负责注入）。
+
 ## 搬 crate 前必须公开的项（已核对，2026-10-31）
 
 循环现在用到的 kernel 内部件，全部要从 `pub(crate)` 提升：
