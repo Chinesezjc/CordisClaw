@@ -1585,14 +1585,21 @@ fn build_envelope(msg: &IncomingMessage) -> String {
     // 有展示名就带上（群名片/昵称，已清洗）；没有则保持旧格式。名字插在
     // `(user <uid>` 之后、`)` 之前，所以 runtime 按 "(user " 切分还原 gid 的
     // 逻辑不受影响，且清洗已把 `]` 去掉，`]: ` 不可能出现在名字里。
+    // `msg=<id>` rides in the header so the model can name the message it is
+    // answering: `qq_send` takes an optional `reply_to` — quoting is the bot's
+    // choice, never the runtime guessing "the last one".
+    let msg_id = msg
+        .message_id
+        .map(|id| format!(" msg={id}"))
+        .unwrap_or_default();
     let display = match msg.sender_name.as_deref() {
         Some(name) => format!(
-            "[QQ {} from {} (user {}, name \"{}\")]: {}",
-            msg.message_type, msg.sender_id, msg.user_id, name, msg.message
+            "[QQ {} from {} (user {}{}, name \"{}\")]: {}",
+            msg.message_type, msg.sender_id, msg.user_id, msg_id, name, msg.message
         ),
         None => format!(
-            "[QQ {} from {} (user {})]: {}",
-            msg.message_type, msg.sender_id, msg.user_id, msg.message
+            "[QQ {} from {} (user {}{})]: {}",
+            msg.message_type, msg.sender_id, msg.user_id, msg_id, msg.message
         ),
     };
 
@@ -3173,10 +3180,10 @@ HOW TO JUDGE — use the conversation history, not just this one message: who is
 GROUP MEMORY — you keep your own memo per group (how talkative it wants you, its standing topics, what it told you off for). It is NOT injected into your context: read it with `qq_get_group_memory` when a message refers to something you may have written down earlier, when a conversation seems to continue a thread you had, or before you write to it — otherwise you do not need the round trip.\n\
 WRITING MEMORY — the memo is YOURS: maintain it on your own initiative, without waiting to be asked and without asking permission. Write when you learn something DURABLE: an explicit preference (wants you quiet/chatty), a correction, the group's standing topic or in-jokes, or a mistake you already paid for. Do not write about one-off facts or guesses from a single message; overwrite the entry (it replaces, not appends). Read the current memo first (`qq_get_group_memory`) so you do not clobber it, then use `qq_set_group_memory`. Changing how talkative you are is separate: `qq_set_reply_policy` with one of the four modes, and that one needs the group owner/admin or a configured operator. Both take effect on the next message.\n\
 If the message is NOT for you: use {\"action\":\"suspend\"}.\n\
-If it IS for you: invoke_plugin(qq, qq_send, ...) to send your reply, then output {\"action\":\"suspend\"}.\n\
-TO REPLY WITH PLAIN TEXT — output {\"action\":\"respond\",\"message\":\"<your reply>\"} as your final output (the runtime delivers it through qq_send for you). Use the qq_send tool ONLY when the message needs CQ codes (a mention or an image); then finish with {\"action\":\"suspend\"}. Never do both in one turn: if you already called qq_send, end with suspend.\n\
+If it IS for you: invoke_plugin(qq, qq_send, {\"node_id\":\"qq_send\",\"target\":\"<reply_target>\",\"message\":\"<your reply>\"}) to send the message, then end the turn with {\"action\":\"suspend\"}.\n\
 MUTED — if the context line contains `[muted: ...]`, or a send fails with 禁言, you are banned in that group. Do not keep calling qq_send and do not retry: say nothing and wait. The ban lifts on its own and the note disappears; retrying only produces more failures.\n\
-OUTPUT FORMAT — your ENTIRE final output must be one JSON object (`{\"action\":\"suspend\"}` after a successful qq_send). Never emit chat text as your final output, and keep chat text (including CQ codes) only inside the `message` field of a `qq_send` call: the runtime can only parse JSON. A message whose text is `[id=...] 你好` is not JSON and will be dropped and retried.\n\
+TO QUOTE A MESSAGE — every incoming header carries its id as `msg=<id>`; add \"reply_to\": \"<id>\" to the same qq_send call to quote the message you are actually answering (the one that asked you, not merely the newest line). Omit it when you reply to the room rather than to one message.\n\
+OUTPUT FORMAT — your ENTIRE final output must be one JSON object and nothing else: {\"action\":\"suspend\"} once the message was sent through the tool. Chat text (including CQ codes) lives only in the tool call; a bare sentence or an `[id=...]` prefix as your final output is not JSON and will be dropped and retried.\n\
 If the user asks you to change the reply rule (e.g. \"reply to everything I say\", \"stop answering so often\"), persist it: invoke_plugin(qq, qq_set_reply_policy, {\"node_id\":\"qq_set_reply_policy\",\"policy\":\"<new rule text>\"}), then tell the user it is already in effect — the next message uses the new policy, no restart needed.\n\
 \n\
 ANTI-HALLUCINATION rules:\n\
@@ -3603,7 +3610,7 @@ mod chain_tests {
         // 无名字时 display 保持旧格式，不出现 name 字段片段。
         assert_eq!(
             env["display"],
-            "[QQ group from 123456 (user 789)]: hello".to_string()
+            "[QQ group from 123456 (user 789 msg=42)]: hello".to_string()
         );
         assert!(
             !env["display"].as_str().unwrap().contains("name \""),
@@ -3628,12 +3635,12 @@ mod chain_tests {
         let env: Value = serde_json::from_str(&build_envelope(&msg)).unwrap();
         let display = env["display"].as_str().unwrap();
         assert!(
-            display.contains("(user 789, name \"小明\")"),
+            display.contains("(user 789 msg=42, name \"小明\")"),
             "display 应精确包含发言人片段，实际: {display}"
         );
         assert_eq!(
             display,
-            "[QQ group from 123456 (user 789, name \"小明\")]: hello"
+            "[QQ group from 123456 (user 789 msg=42, name \"小明\")]: hello"
         );
         assert_eq!(env["source_plugin"], "qq");
         assert_eq!(env["reply_node"], "qq_send");
@@ -3673,7 +3680,7 @@ mod chain_tests {
         assert_eq!(env["reply_to"], "42");
         assert_eq!(
             env["display"],
-            "[QQ group from 123456 (user 789)]: hello".to_string()
+            "[QQ group from 123456 (user 789 msg=42)]: hello".to_string()
         );
     }
 
@@ -4647,7 +4654,7 @@ mod docs_tests {
             "hint must call out the output format"
         );
         assert!(
-            hint.contains("keep chat text (including CQ codes) only inside the `message` field"),
+            hint.contains("Chat text (including CQ codes) lives only in the tool call"),
             "hint must keep chat text/CQ codes inside qq_send: {hint}"
         );
 
@@ -4689,8 +4696,11 @@ mod docs_tests {
         );
         let advertises_roles = hint.contains("qq_get_group_roles");
         assert!(advertises_roles, "hint must advertise the roles node");
-        let explains_respond = hint.contains("\"action\":\"respond\"");
-        assert!(explains_respond, "hint must explain how to reply with text");
+        let replies_through_the_tool = hint.contains("invoke_plugin(qq, qq_send")
+            && hint.contains("TO QUOTE A MESSAGE");
+        assert!(replies_through_the_tool, "hint must reply through the tool: {hint}");
+        let dropped_plain_text_reply = !hint.contains("TO REPLY WITH PLAIN TEXT");
+        assert!(dropped_plain_text_reply, "the plain-text reply path must be gone");
         let keeps_suspend = hint.contains("{\"action\":\"suspend\"}");
         assert!(keeps_suspend, "the suspend requirement must stay");
         let explains_mute = hint.contains("MUTED — if the context line contains");
