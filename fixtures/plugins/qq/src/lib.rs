@@ -3175,7 +3175,8 @@ REPLY POLICY — the authority on whether to answer. Every incoming message star
   balanced   — judge from the conversation: answer when it is addressed to you or clearly wants your answer; stay out of threads between other people.\n\
   chatty     — this group WANTS you to participate: answer questions you can help with, add a short remark when it fits, take a joke. Never hijack a thread between two others.\n\
   one_on_one — treat it as a direct chat: answer every message meant for you; do not go silent just because it is technically a group.\n\
-SMALL GROUPS — a group that is effectively private (you and one or two people) should behave like a direct chat. If you are not sure how big a group is, look it up once with `qq_get_group_info` (its docs are in the plugin catalog below) and, when member_count <= 2, set this group's mode to one_on_one with `qq_set_reply_policy` and remember it. Decide once per group — never probe on every message.\n\
+SMALL GROUPS — a group that is effectively private (you and one other person) should behave like a direct chat. Before switching a group to one_on_one, look it up once with `qq_get_group_info` (docs in the plugin catalog below) and require BOTH: member_count <= 2 AND every speaker you have seen in that group is the same single user. `member_count` from OneBot is not reliable (a busy group once reported 2), so a second distinct speaker such as `(user 123 ...)` outweighs the count — if you see two people talking, it is a group: stay on a group mode (balanced) and never set one_on_one there. Decide once per group — never probe on every message.\n\
+SPEAKING BUDGET — in a fast back-and-forth, do not answer every line. If your own message is already the newest one and nobody has addressed you since, stay out; if two people are trading jokes, you may take one turn and then let them talk. One message per turn, never two in a row to the same person.\n\
 HOW TO JUDGE — use the conversation history, not just this one message: who is talking to whom, whether the last few lines are a thread you are part of, whether someone asked a question nobody answered. A message that continues a thread you are already in is addressed to you even without naming you.\n\
 GROUP MEMORY — you keep your own memo per group (how talkative it wants you, its standing topics, what it told you off for). It is NOT injected into your context: read it with `qq_get_group_memory` when a message refers to something you may have written down earlier, when a conversation seems to continue a thread you had, or before you write to it — otherwise you do not need the round trip.\n\
 WRITING MEMORY — the memo is YOURS: maintain it on your own initiative, without waiting to be asked and without asking permission. Write when you learn something DURABLE: an explicit preference (wants you quiet/chatty), a correction, the group's standing topic or in-jokes, or a mistake you already paid for. Do not write about one-off facts or guesses from a single message; overwrite the entry (it replaces, not appends). Read the current memo first (`qq_get_group_memory`) so you do not clobber it, then use `qq_set_group_memory`. Changing how talkative you are is separate: `qq_set_reply_policy` with one of the four modes, and that one needs the group owner/admin or a configured operator. Both take effect on the next message.\n\
@@ -4859,6 +4860,11 @@ mod hint_silence_bias_tests {
         assert!(persists_decision, "hint must name the one_on_one mode");
         let points_at_catalog = hint.contains("plugin catalog");
         assert!(points_at_catalog, "hint must defer to the catalog for docs");
+        // The count alone is not enough: OneBot once reported 2 for a busy group.
+        let distrusts_the_count = hint.contains("not reliable");
+        assert!(distrusts_the_count, "hint must not trust member_count alone");
+        let requires_one_speaker = hint.contains("every speaker you have seen");
+        assert!(requires_one_speaker, "hint must require a single speaker");
     }
 
     // 每群策略与记忆：hint 必须讲清四种模式、记忆行的含义、以及"只在学到
