@@ -24,6 +24,13 @@
 //! out to `cargo build`. Boot is then a pure file read on any host target and
 //! the whole file runs in well under a second.
 
+// 需要真实循环的用例住在 crate 侧（runtime 的测试拿不到 loop）。
+
+#[ctor::ctor]
+fn _install_loop() {
+    let _ = cordis_agent::install();
+}
+
 use std::fs;
 use std::path::{Path, PathBuf};
 
