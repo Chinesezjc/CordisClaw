@@ -588,7 +588,25 @@ DSML 泄漏是 provider 侧的低频行为（本地连打 8 次探针都是正�
 验证：`cargo test -p cordis-runtime --lib` 990（新增 4 条 DSML 用例：还原、纯文本不误伤、
 多对象保序、嵌套/转义提取），cli 49、qq 71、feishu 57，clippy 干净。
 
-## 4. 部分完成
+### 3.30 被禁言时 bot 自己知道（2026-10-30）
+
+**症状**：bot 在群里被禁言后照旧"回复"，OneBot 每次返回失败，模型只知道"发送失败"，于是继续
+尝试——它不知道自己被禁言了。
+
+**做法**（qq 插件，全在渠道侧，kernel 不动）：
+
+- `onebot_send_group_msg` 失败时向 OneBot 求证：`get_login_info` 拿自己的 uin →
+  `get_group_member_info` 读 `shut_up_timestamp`（秒，0 表示未禁言），得到权威解禁时间；
+- 求证不到但错误文案含 禁言 / mute / shut up 时，按 10 分钟兜底记录（至少让行为正确）；
+- 记录进 `MUTE_UNTIL`（group → 解禁毫秒）：禁言期内 `qq_send` **直接拒绝**并返回
+  `你在本群被禁言，消息未发送（…）。[muted: 约 N 分钟后解禁]`，不再打 API；
+- 下一条入站消息的 `notes` 追加同一句 `[muted: ...]`——模型在**决定要不要说之前**就知道，
+  而不是说完才看到失败；
+- 发送成功即清除记录；提示词新增 MUTED 规则（不要重试、保持安静、解禁后自动恢复）。
+
+验证：qq 75 单测（新增 4 条：文案识别、`shut_up_timestamp` 换算、分钟数四舍五入、表的记录/过期/清除），
+kernel 990、cli 49、clippy 干净；16:28 重启，8099/8002 正常。
+
 ## 4. 部分完成
 
 ### 4.1 Execution engine 有正式入口，数据面验证不足
