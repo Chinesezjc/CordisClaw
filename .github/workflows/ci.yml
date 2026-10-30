@@ -21,8 +21,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: 1.97.1
           components: clippy, rustfmt
 
       # fixtures/plugins 是独立 workspace：集成测试首次运行时会在
@@ -74,5 +75,19 @@ jobs:
           cargo test --locked 2>&1 | tee /tmp/test.log || {
             echo "::error::failed tests: $(grep -E '^test .* FAILED' /tmp/test.log | head -c 600 | tr '\n' ' ')"
             echo "::error::first panic: $(grep -m1 -A2 'panicked at' /tmp/test.log | tr '\n' ' ' | head -c 900)"
+            exit 1
+          }
+
+      # fixtures 的测试此前完全不在门禁里：12 个 workspace member、10 个 expr
+      # 子 crate（在 fixtures workspace 的 `exclude` 里、各自独立 manifest）、
+      # 以及 root 占位 crate。`expr/lexer` 里一条从 HEAD 起就红的断言因此一直
+      # 活到 5.2.53（那里把合法标识符 `1 + a` 当成词法错误）。
+      # 放在 prepare-artifacts 之后：插件已构建，跑测试基本只是热身（实测 ~2s）。
+      - name: fixtures tests
+        run: |
+          set -o pipefail
+          bash scripts/test-fixtures.sh 2>&1 | tee /tmp/fixtures-test.log || {
+            echo "::error::failed fixtures tests: $(grep -E '^test .* FAILED' /tmp/fixtures-test.log | head -c 600 | tr '\n' ' ')"
+            echo "::error::first panic: $(grep -m1 -A2 'panicked at' /tmp/fixtures-test.log | tr '\n' ' ' | head -c 900)"
             exit 1
           }

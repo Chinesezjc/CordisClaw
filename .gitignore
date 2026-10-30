@@ -15,3 +15,6 @@ fixtures/plugins/**/Cargo.lock
 fixtures/.artifacts-build.lock
 data/
 *.profraw
+
+# Scratch space at the repo root (tarballs, jars); never part of the repo.
+/tmp/
