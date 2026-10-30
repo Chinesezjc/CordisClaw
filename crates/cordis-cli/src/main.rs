@@ -478,6 +478,18 @@ fn wrap_inbox_batch(combined: &str) -> String {
 /// consumes a single value is used instead.
 /// Did this turn already deliver a message through `reply_node`? Used to keep
 /// `{"action":"respond"}` and `qq_send` from double-sending the same text.
+/// The message an answer may safely quote, if any.
+///
+/// A batch from several senders has no single message the answer is "to";
+/// quoting the last one misattributes it. Only a one-message batch is
+/// unambiguous.
+fn quote_target(envs: &[AgentEnvelope]) -> Option<String> {
+    match envs {
+        [only] => only.reply_to.clone(),
+        _ => None,
+    }
+}
+
 fn reply_was_sent(events: &[cordis_runtime::agent::AgentToolEvent], reply_node: &str) -> bool {
     events.iter().any(|event| {
         event.ok
@@ -968,7 +980,12 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     }
                     // Reply routing / soul come from the LAST NORMAL envelope
                     // (all share session_key, so same source/target).
-                    let route = normals.last().cloned().unwrap();
+                    let mut route = normals.last().cloned().unwrap();
+                    // Quote only when the batch names exactly one message. The
+                    // last envelope's id used to be attached unconditionally, so
+                    // a reply to one person in a multi-sender batch appeared as a
+                    // quote of somebody else ("why are you replying to me").
+                    route.reply_to = quote_target(&normals);
                     eprintln!(
                         "inbox: [{session_key}] (soul {}) batch {} msgs: {}",
                         route.soul_key(),
@@ -3214,6 +3231,47 @@ mod batch_tests {
             vec!["回复".to_string()]
         );
         assert!(outbound_replies("{\"action\":\"respond\",\"message\":\"  \"}", &[]).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod quote_target_tests {
+    use super::{quote_target, AgentEnvelope};
+
+    fn envelope(id: &str, reply_to: Option<&str>) -> AgentEnvelope {
+        let raw = serde_json::json!({
+            "session_key": "qq:group:1",
+            "display": "hi",
+            "sender_id": "qq:1",
+            "conversation_kind": "group",
+            "reply_node": "qq_send",
+            "reply_target": "group:1",
+            "reply_to": reply_to,
+        })
+        .to_string();
+        let _ = id;
+        AgentEnvelope::parse(&raw)
+    }
+
+    // Quoting the last message of a multi-sender batch attributes the answer to
+    // the wrong person ("why are you replying to me").
+    #[test]
+    fn only_a_single_message_batch_is_quoted() {
+        assert_eq!(
+            quote_target(&[envelope("m1", Some("m1"))]).as_deref(),
+            Some("m1")
+        );
+        assert_eq!(
+            quote_target(&[envelope("m1", Some("m1")), envelope("m2", Some("m2")),]),
+            None
+        );
+        assert_eq!(quote_target(&[]), None);
+    }
+
+    // A batch whose single message carries no id quotes nothing.
+    #[test]
+    fn a_message_without_an_id_is_not_quoted() {
+        assert_eq!(quote_target(&[envelope("m1", None)]), None);
     }
 }
 
