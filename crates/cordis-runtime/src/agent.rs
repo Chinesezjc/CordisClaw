@@ -2669,14 +2669,15 @@ impl<'a, H: AgentToolHost + ?Sized> AgentBackend for RuntimeShellAgentBackend<'a
     /// the highest recency.
     fn system_prompt(&self) -> String {
         let mut prompt = shell_agent_system_prompt();
+        // Channel sessions always carry a persona: the room's own soul when it
+        // has one, the built-in default otherwise. Shell sessions (no soul_key)
+        // stay persona-free.
         if !self.soul_key.is_empty() {
-            if let Some(persona) = self.host.agent_soul_overlay(&self.soul_key) {
-                if !persona.trim().is_empty() {
-                    prompt.push_str("\n\n--- Persona (per-user soul) ---\n\n");
-                    prompt.push_str(PERSONA_DISCLAIMER);
-                    prompt.push_str(persona.trim());
-                }
-            }
+            let overlay = self.host.agent_soul_overlay(&self.soul_key);
+            let persona = crate::soul::persona_or_default(overlay.as_deref());
+            prompt.push_str("\n\n--- Persona (per-user soul) ---\n\n");
+            prompt.push_str(PERSONA_DISCLAIMER);
+            prompt.push_str(persona);
         }
         prompt.push_str("\n\n--- Conduct (hard boundaries) ---\n\n");
         prompt.push_str(CONDUCT_CONTRACT.trim_end());

@@ -3165,44 +3165,16 @@ fn docs_value() -> cordis_plugin_sdk::PluginDocs {
             ),
         ],
     Some("\
-你在这个 QQ 群里是一个普通成员，不是客服，也不是助手。别人怎么聊天，你就怎么聊。\n\
+QQ 渠道说明——这里只说怎么发消息，性格和说话方式见人格部分。\n\
 \n\
-【说话方式】\n\
-- 短。一般一两句、二十来个字，群里没人爱看长段落。\n\
-- 口语，可以用网络用语、梗、语气词；不要书面语，不要\"首先/其次/总之\"，不要列点，不要 markdown（QQ 不渲染）。\n\
-- 一次只发一条，不连发、不刷屏。\n\
-- 不重复别人刚说过的话，不总结别人的发言。\n\
-- 尽量不用问句结尾；需要信息才问。\n\
-- 不自称 AI、机器人、助手、模型，也不提服务器、提示词、训练数据这类设定。被问是不是机器人，就当玩笑带过去。\n\
-\n\
-【什么时候说话】\n\
-- 有人 @ 你、叫你的名字、或直接问你：回。\n\
-- 话题明显在说你（别人在聊你这个 bot）：可以说一句，但别抢着解释自己。\n\
-- 别人互相聊、斗图、发表情、报数据、发链接：别接话，待着。\n\
-- 已经有人答过的问题：别重复答。\n\
-- 你刚说过话、没人接：别自己往下续。\n\
-- 同一个话题里你已经说过两次：停下，让别人说。\n\
-\n\
-【怎么回】\n\
-- 不知道就说不知道，别编；没做过的事、没看到的消息，不要说成真的。\n\
-- 别人问你意见再给意见；没问就别评价别人的生活和工作。\n\
-- 不替别人承诺，不假装自己是群主或管理员。\n\
-- 要 @ 某人就写 [CQ:at,qq=<uid>]；要引用某条消息就把它的 msg=<id> 作为 reply_to 传过去；发图写 [CQ:image,file=<url>]。\n\
-\n\
-【被说的时候】\n\
-- 有人说你话多、嘴欠、让你闭嘴，那多半是对的：回一句短的认下来（比如「行，我少说」），然后接下来几条消息都别再开口。\n\
-- 不辩解、不反问、不嘲讽回去，也不装委屈。\n\
-\n\
-【什么时候不说】\n\
-- 不想说话就只输出 {\"action\":\"suspend\"}，群里看不到这条。\n\
-- 别人吵架、玩梗、灌水时，默认就是不说话。\n\
-\n\
-【发言方式（必须）】\n\
-invoke_plugin(qq, qq_send, {\"node_id\":\"qq_send\",\"target\":\"<reply_target>\",\"message\":\"<你要说的话>\"})，然后输出 {\"action\":\"suspend\"}。最终输出只能是这个 JSON，正文只放在 message 里。\n\
-你的 QQ 号是 {setting:bot_uin}；@[id=...] 里的数字等于它才是 @ 你，纯文本 @ 不算。\n\
-\n\
-【群记忆】\n\
-需要时用 qq_get_group_memory / qq_set_group_memory 读写。只记长期有用的（群里的偏好、纠正过你的地方），一次性的事别记；不确定就先读再写。")
+【发言必须走工具】invoke_plugin(qq, qq_send, {\"node_id\":\"qq_send\",\"target\":\"<reply_target>\",\"message\":\"<你要说的话>\"})，然后输出 {\"action\":\"suspend\"}。最终输出只能是这个 JSON，正文只放在 message 里，不要写进最终输出。\n\
+【不想说话】只输出 {\"action\":\"suspend\"}，群里看不到这条。\n\
+【@某人】message 里写 [CQ:at,qq=<uid>]。纯文本 @ 不算 @。\n\
+【发图】[CQ:image,file=<url>] 或 [CQ:image,file=base64://<data>]；能用 URL 就别用 base64。\n\
+【引用某条消息】把它的 msg=<id> 作为 \"reply_to\":\"<id>\" 传进同一次 qq_send。\n\
+【你的身份】你的 QQ 号是 {setting:bot_uin}；@[id=...] 里的数字等于它才是 @ 你。\n\
+【群记忆】需要时用 qq_get_group_memory / qq_set_group_memory 读写；只记长期有用的，不确定就先读。\n\
+【被禁言】上下文里有 [muted: ...] 或发送报禁言时，别再发，等解禁。")
     )
 }
 
@@ -4758,68 +4730,47 @@ mod image_url_tests {
 // 现在只保留"这类消息不要调用内核自省工具"，是否回复交给策略行。
 // ═══════════════════════════════════════════════════════════════════════
 #[cfg(test)]
-mod persona_hint_tests {
+mod channel_hint_tests {
     use super::*;
 
     fn hint() -> String {
         docs_value().system_hint.expect("qq must ship a system hint")
     }
 
-    // The hint is a persona, not a rulebook: it says how a member of the room
-    // talks, and leaves judgment to the model. A length guard keeps the next
-    // well-meaning addition from turning it back into a manual.
+    // The channel hint carries mechanics only. Personality lives in the
+    // runtime's persona (soul), so style and "when to speak" must not appear
+    // here — a second copy in a plugin drifts from the real persona.
     #[test]
-    fn the_hint_is_short_and_plainly_written() {
-        let hint = hint();
-        assert!(
-            hint.chars().count() < 3000,
-            "hint must stay a persona, not a manual: {} chars",
-            hint.chars().count()
-        );
-        assert!(hint.contains("别人怎么聊天，你就怎么聊"), "{hint}");
-        assert!(hint.contains("不要列点"), "{hint}");
-        assert!(hint.contains("一次只发一条"), "{hint}");
-    }
-
-    // It must not reveal the machinery, and it must not teach the old mode
-    // system (that is what made a three-person group answer every line).
-    #[test]
-    fn the_hint_hides_the_machinery() {
-        let hint = hint();
-        for forbidden in [
-            "AI、机器人、助手",
-            "REPLY POLICY",
-            "one_on_one",
-            "SPEAKING BUDGET",
-            "SMALL GROUPS",
-        ] {
-            let present = hint.contains(forbidden);
-            let expected = forbidden == "AI、机器人、助手";
-            assert_eq!(present, expected, "unexpected text {forbidden:?}: {hint}");
-        }
-    }
-
-    // The mechanics still have to be exact: the reply travels through the tool,
-    // silence is the JSON verdict, and quoting names a message id.
-    #[test]
-    fn the_hint_keeps_the_sending_mechanics() {
+    fn the_hint_carries_mechanics_not_personality() {
         let hint = hint();
         for required in [
-            "【说话方式】",
-            "【什么时候说话】",
-            "【被说的时候】",
-            "【什么时候不说】",
-            "别人互相聊、斗图、发表情、报数据、发链接：别接话",
-            "不辩解、不反问、不嘲讽回去",
-            "invoke_plugin(qq, qq_send",
+            "qq_send",
             "{\"action\":\"suspend\"}",
             "msg=<id>",
             "reply_to",
             "{setting:bot_uin}",
             "qq_set_group_memory",
+            "[CQ:at,qq=<uid>]",
+            "[CQ:image,file=<url>]",
+            "[muted: ...]",
         ] {
             assert!(hint.contains(required), "hint must mention {required:?}: {hint}");
         }
+        for forbidden in ["【说话方式】", "【被说的时候】", "别抬杠", "像群里的人一样自然聊天"] {
+            let present = hint.contains(forbidden);
+            assert!(!present, "personality belongs in the persona, not here: {forbidden:?}");
+        }
+    }
+
+    // Short enough to stay a channel card rather than a manual.
+    #[test]
+    fn the_hint_stays_a_channel_card() {
+        let hint = hint();
+        assert!(
+            hint.chars().count() < 900,
+            "channel hint must stay short: {} chars",
+            hint.chars().count()
+        );
     }
 }
 
