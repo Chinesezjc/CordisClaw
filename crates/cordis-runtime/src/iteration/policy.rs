@@ -13,18 +13,18 @@ use crate::kernel::plugin_iteration::{
 /// must ship with one, and editing an *existing* test needs human approval
 /// (otherwise a model could "fix" the failing test instead of the code).
 #[derive(Debug, Default, PartialEq, Eq)]
-pub(crate) struct TestChanges {
+pub struct TestChanges {
     pub(crate) added: Vec<String>,
     pub(crate) modified: Vec<String>,
 }
 
-pub(crate) fn is_test_path(path: &str) -> bool {
+pub fn is_test_path(path: &str) -> bool {
     path.split('/').any(|segment| segment == "tests")
         || path.ends_with("_test.rs")
         || path.ends_with("tests.rs")
 }
 
-pub(crate) fn test_changes(operations: &[PluginEditOperation]) -> TestChanges {
+pub fn test_changes(operations: &[PluginEditOperation]) -> TestChanges {
     let mut changes = TestChanges::default();
     for operation in operations {
         if !is_test_path(&operation.path) {
@@ -43,7 +43,7 @@ pub(crate) fn test_changes(operations: &[PluginEditOperation]) -> TestChanges {
 }
 
 /// A docs-only iteration does not need a test: nothing executable changed.
-pub(crate) fn iteration_changes_docs_only(operations: &[PluginEditOperation]) -> bool {
+pub fn iteration_changes_docs_only(operations: &[PluginEditOperation]) -> bool {
     !operations.is_empty()
         && operations
             .iter()
@@ -51,7 +51,7 @@ pub(crate) fn iteration_changes_docs_only(operations: &[PluginEditOperation]) ->
 }
 
 /// Why an iteration cannot record its summary yet (`None` = fine to record).
-pub(crate) fn summary_rejection(operations: &[PluginEditOperation]) -> Option<&'static str> {
+pub fn summary_rejection(operations: &[PluginEditOperation]) -> Option<&'static str> {
     let changes = test_changes(operations);
     if iteration_changes_docs_only(operations)
         || !changes.added.is_empty()
@@ -70,7 +70,7 @@ pub(crate) fn summary_rejection(operations: &[PluginEditOperation]) -> Option<&'
 /// that draws randomness (a gacha pull) or reads the clock cannot be compared
 /// with a recorded response. Probe the candidate twice and skip the sample when
 /// the two runs disagree.
-pub(crate) fn canary_probe_verdict(
+pub fn canary_probe_verdict(
     first: &serde_json::Value,
     second: &serde_json::Value,
     recorded: &serde_json::Value,
@@ -87,7 +87,7 @@ pub(crate) fn canary_probe_verdict(
 /// Side effects a node declares in its docs. A node that declares any is not
 /// replayed as canary evidence: replaying it mutates state (a pull consumes
 /// pity) and its response is usually the very thing the edit changes.
-pub(crate) fn node_declares_side_effects_in(
+pub fn node_declares_side_effects_in(
     nodes: &[cordis_plugin_sdk::NodeDoc],
     node_id: &str,
 ) -> bool {
@@ -104,7 +104,7 @@ pub(crate) fn node_declares_side_effects_in(
 /// passes. An iteration that edits an existing test is staged for approval
 /// instead — tests are the contract, so changing them needs a human. The canary
 /// is diagnostics only: random/side-effecting nodes made it a coin flip.
-pub(crate) fn promotion_verdict(
+pub fn promotion_verdict(
     verifier: VerifierVerdict,
     requires_approval: bool,
     manual_approved: bool,

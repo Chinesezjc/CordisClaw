@@ -1,7 +1,7 @@
 pub mod agent;
 pub mod agent_api;
 pub mod agent_loop;
-pub(crate) mod agent_toolchain;
+pub mod agent_toolchain;
 pub mod command_router;
 pub mod config;
 pub mod context;
@@ -12,7 +12,7 @@ pub mod host;
 pub mod image_input;
 pub mod iteration;
 pub mod kernel;
-mod llm_sink;
+pub mod llm_sink;
 pub mod plugin;
 pub mod service;
 pub mod soul;

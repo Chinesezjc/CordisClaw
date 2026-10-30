@@ -12,7 +12,7 @@ use serde_json::Value;
 /// `ok` is only true when the change was actually **promoted**: a rolled-back
 /// iteration restored the workspace, so reporting success would leave the agent
 /// describing files it never changed.
-pub(crate) fn iteration_result_json(result: &crate::host::KernelPluginIterationResult) -> Value {
+pub fn iteration_result_json(result: &crate::host::KernelPluginIterationResult) -> Value {
     let final_verdict = result.final_verdict;
     let promoted = final_verdict == PluginIterationFinalVerdict::Promoted;
     let canary_verdict = result.canary.as_ref().map(|report| report.verdict);
@@ -64,7 +64,7 @@ pub(crate) fn iteration_result_json(result: &crate::host::KernelPluginIterationR
 /// The decision is deliberately not made here: `can_approve_iteration` is
 /// produced by the channel plugin (operator allowlist / room owner / admin).
 /// The kernel only enforces what it was told.
-pub(crate) fn approve_iteration_permission(
+pub fn approve_iteration_permission(
     caller: Option<crate::agent::SessionCaller>,
 ) -> Result<(), &'static str> {
     match caller {
