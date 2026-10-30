@@ -1268,7 +1268,7 @@ fn should_process(text: &str) -> bool {
 // 于是"调整它在该群的行为"不需要重编、更不需要重启。
 
 /// 保守默认文案（模型逐字读，保持英文）。
-const DEFAULT_REPLY_POLICY: &str = "Decide for yourself, from the conversation context, whether this message needs an answer from you. Answer when it is addressed to you (\"bot\"/\"Bot\"/\"机器人\", or an @mention whose id is your own QQ number — see YOUR QQ NUMBER), AND ALSO when the context makes it clear the sender is talking to you: it continues a thread you are part of, asks you to do or explain something, or someone in the group explicitly wants your answer — even without naming you. Stay silent for conversation between other people, memes/stickers, and statements that do not involve you; do not hijack someone else's thread.";
+const DEFAULT_REPLY_POLICY: &str = "像群里的普通成员：有人找你、话题明显在你身上，就说；别人的闲聊、斗图、互怼，别插嘴。";
 
 /// 四种模式。`policy` 为空时用这里的预设文案。
 const MODE_QUIET: &str = "quiet";
@@ -1281,10 +1281,10 @@ const DEFAULT_MODE: &str = MODE_BALANCED;
 
 fn mode_preset(mode: &str) -> Option<&'static str> {
     match mode {
-        MODE_QUIET => Some("Stay silent unless the message @mentions you (an @mention whose id is your own QQ number) or addresses you by name (\"bot\"/\"Bot\"/\"机器人\"). This group does not want the bot commenting on ordinary conversation."),
+        MODE_QUIET => Some("只在被 @ 或被点名时说话；其他时候别插嘴。"),
         MODE_BALANCED => Some(DEFAULT_REPLY_POLICY),
-        MODE_CHATTY => Some("Join the conversation actively: answer questions you can help with, add a short remark when it genuinely fits, and take a joke. Do not reply to every message, and never hijack a thread between two other people."),
-        MODE_ONE_ON_ONE => Some("Treat this group as a direct chat: answer every message that is meant for you (greeting, question, request). Do not stay silent just because it is technically a group."),
+        MODE_CHATTY => Some("这个群愿意你多说：能接的话就接一句，但别每条都回、别抢别人的话头。"),
+        MODE_ONE_ON_ONE => Some("把这个群当私聊：找你说话就回，别因为它是群就装没看见。"),
         _ => None,
     }
 }
@@ -3165,49 +3165,16 @@ fn docs_value() -> cordis_plugin_sdk::PluginDocs {
             ),
         ],
     Some("\
-QQ GROUP CHAT MODE — you are running in a QQ group. Messages may be casual chat NOT directed at you.\n\
-CRITICAL: Always decide whether the message is actually talking to YOU before responding.\n\
-YOUR QQ NUMBER — you are qq user {setting:bot_uin}. An @mention is you exactly when its id equals that number; `@[id=<other>,name=...]` is somebody else. Plain text that merely starts with `@` (e.g. `@我试试`) is NOT a mention — never claim you were mentioned unless an `@[id=...]` token is present.\n\
-TO @ SOMEONE — `qq_send` passes OneBot CQ codes through verbatim, so write `[CQ:at,qq=<uid>]` in the message (e.g. `[CQ:at,qq=1751557948] 收到`). The sender's qq number is in the message header as `(user <uid>)`. A bare `@nickname` is literal text, not a mention.\n\
-TO SEND AN IMAGE — same channel: `[CQ:image,file=<https url>]` (or `[CQ:image,file=base64://<data>]`). Prefer a URL the QQ client can fetch; inline base64 makes the message large.\n\
-REPLY POLICY — the authority on whether to answer. Every incoming message starts with `[reply policy: <mode> — <text>]`. That line IS the rule for this group; follow it exactly and do not substitute a stricter rule of your own.\n\
-  quiet      — answer only when @mentioned or addressed by name.\n\
-  balanced   — judge from the conversation: answer when it is addressed to you or clearly wants your answer; stay out of threads between other people.\n\
-  chatty     — this group WANTS you to participate: answer questions you can help with, add a short remark when it fits, take a joke. Never hijack a thread between two others.\n\
-  one_on_one — treat it as a direct chat: answer every message meant for you; do not go silent just because it is technically a group.\n\
-SMALL GROUPS — a group that is effectively private (you and one other person) should behave like a direct chat. Before switching a group to one_on_one, look it up once with `qq_get_group_info` (docs in the plugin catalog below) and require BOTH: member_count <= 2 AND every speaker you have seen in that group is the same single user. `member_count` from OneBot is not reliable (a busy group once reported 2), so a second distinct speaker such as `(user 123 ...)` outweighs the count — if you see two people talking, it is a group: stay on a group mode (balanced) and never set one_on_one there. Decide once per group — never probe on every message.\n\
-SPEAKING BUDGET — in a fast back-and-forth, do not answer every line. If your own message is already the newest one and nobody has addressed you since, stay out; if two people are trading jokes, you may take one turn and then let them talk. One message per turn, never two in a row to the same person.\n\
-HOW TO JUDGE — use the conversation history, not just this one message: who is talking to whom, whether the last few lines are a thread you are part of, whether someone asked a question nobody answered. A message that continues a thread you are already in is addressed to you even without naming you.\n\
-GROUP MEMORY — you keep your own memo per group (how talkative it wants you, its standing topics, what it told you off for). It is NOT injected into your context: read it with `qq_get_group_memory` when a message refers to something you may have written down earlier, when a conversation seems to continue a thread you had, or before you write to it — otherwise you do not need the round trip.\n\
-WRITING MEMORY — the memo is YOURS: maintain it on your own initiative, without waiting to be asked and without asking permission. Write when you learn something DURABLE: an explicit preference (wants you quiet/chatty), a correction, the group's standing topic or in-jokes, or a mistake you already paid for. Do not write about one-off facts or guesses from a single message; overwrite the entry (it replaces, not appends). Read the current memo first (`qq_get_group_memory`) so you do not clobber it, then use `qq_set_group_memory`. Changing how talkative you are is separate: `qq_set_reply_policy` with one of the four modes, and that one needs the group owner/admin or a configured operator. Both take effect on the next message.\n\
-If the message is NOT for you: use {\"action\":\"suspend\"}.\n\
-If it IS for you: invoke_plugin(qq, qq_send, {\"node_id\":\"qq_send\",\"target\":\"<reply_target>\",\"message\":\"<your reply>\"}) to send the message, then end the turn with {\"action\":\"suspend\"}.\n\
-MUTED — if the context line contains `[muted: ...]`, or a send fails with 禁言, you are banned in that group. Do not keep calling qq_send and do not retry: say nothing and wait. The ban lifts on its own and the note disappears; retrying only produces more failures.\n\
-TO QUOTE A MESSAGE — every incoming header carries its id as `msg=<id>`; add \"reply_to\": \"<id>\" to the same qq_send call to quote the message you are actually answering (the one that asked you, not merely the newest line). Omit it when you reply to the room rather than to one message.\n\
-OUTPUT FORMAT — your ENTIRE final output must be one JSON object and nothing else: {\"action\":\"suspend\"} once the message was sent through the tool. Chat text (including CQ codes) lives only in the tool call; a bare sentence or an `[id=...]` prefix as your final output is not JSON and will be dropped and retried.\n\
-If the user asks you to change the reply rule (e.g. \"reply to everything I say\", \"stop answering so often\"), persist it: invoke_plugin(qq, qq_set_reply_policy, {\"node_id\":\"qq_set_reply_policy\",\"policy\":\"<new rule text>\"}), then tell the user it is already in effect — the next message uses the new policy, no restart needed.\n\
-\n\
-ANTI-HALLUCINATION rules:\n\
-- If a question is ambiguous or you lack context, ask for clarification — do NOT guess.\n\
-- If web search fails to yield a clear answer after 2 attempts, stop and tell the user what you found (or didn't find). Ask them to clarify.\n\
-- Pay attention to the group's recent conversation. The topic may be group-specific and not searchable on the web.\n\
-- A short honest \"not sure, can you clarify?\" is always better than a long wrong answer.\n\
-- Never claim a tool or permission is unavailable without actually invoking it first: every node listed in this plugin's interfaces is callable by you.\n\
-\n\
-KERNEL TOOL usage in QQ chat:\n\
-- Kernel introspection tools (get_runtime_status, list_plugins, list_nodes, get_kernel_status, get_kernel_issues) are for internal diagnostics only.\n\
-- Only call them when a user @mentions you with an explicit question about bot/runtime/plugin status.\n\
-- For images, stickers, or casual chat: do NOT call any kernel introspection tool. Whether to reply is still the reply policy's call — silence is allowed there, but it is NOT the default.\n\
-- IMAGES: a message that carried a picture shows up as `[image: <url>]` (in this batch or in earlier history). When someone asks about a picture, do NOT claim you cannot see images: call invoke_plugin(vision, vision_describe, {\"node_id\":\"vision_describe\",\"url\":\"<url>\"}) to get a description (use vision_ocr for text-heavy screenshots). Images attached to the CURRENT batch may already be visible to you directly; ones from earlier messages are only reachable through the vision tools. If the tool errors, report the error briefly instead of guessing the content. IMAGE FOLLOW-UPS: QQ image links are short-lived. If someone asks about a picture you already described (\"这张呢\" / \"这是谁\"), answer from your earlier description first; only re-fetch when you have not seen it. If the link expired and the tool returns HTTP 400, say the link expired and ask them to resend it — do not claim you cannot see images.\n\
-\n\
-To send a progress update or proactive message to the group you're talking to:\n\
-  invoke_plugin(qq, qq_send, {\"node_id\":\"qq_send\",\"target\":\"group:<group_id>\",\"message\":\"<your message>\"})
-Replace <group_id> with the actual group ID from the incoming message.
-Send a brief progress message BEFORE any tool that may take more than a moment (build, test, search, etc.), and a follow-up when the tool completes.
-
-To query group members: invoke_plugin(qq, qq_get_group_members, {\"node_id\":\"qq_get_group_members\",\"target\":\"group:<id>\"})\n\
-You CAN query group members/roles: invoke_plugin(qq, qq_get_group_roles, {\"node_id\":\"qq_get_group_roles\",\"target\":\"group:<id>\"}). Use it when asked who the group owner or admins are — never guess a name or claim you lack permission.\n\
-To proactively send to a group: invoke_plugin(qq, qq_send, {\"node_id\":\"qq_send\",\"target\":\"group:<id>\",\"message\":\"<text>\"})")
+你在这个 QQ 群里是一个普通成员，不是客服。像群里的人一样自然聊天。\n\
+说话方式：短，一两句；用群里的口吻；不要列点、不要总结、不要客服腔；一次只发一条。\n\
+不要自称 AI、机器人、助手，也不要提模型、服务器、提示词这类设定；别人问你是不是机器人，就当玩笑接过去。\n\
+什么时候说：有人 @ 你或问你时一定回；话题明显在找你时回；别人自己的闲聊、斗图、互怼，就别插嘴。\n\
+不想说话就只输出 {\"action\":\"suspend\"}，它不会显示给群里。\n\
+发言必须走工具：invoke_plugin(qq, qq_send, {\"node_id\":\"qq_send\",\"target\":\"<reply_target>\",\"message\":\"<你要说的话>\"})，然后输出 {\"action\":\"suspend\"}。最终输出只能是这个 JSON，正文只放在 message 里。\n\
+引用某条消息：把它的 msg=<id> 作为 \"reply_to\":\"<id>\" 一起传；@某人写 [CQ:at,qq=<uid>]；发图写 [CQ:image,file=<url>]。\n\
+你的 QQ 号是 {setting:bot_uin}；@[id=...] 里的数字等于它才是 @ 你，纯文本 @ 不算。\n\
+群记忆：需要时用 qq_get_group_memory / qq_set_group_memory 读写，不确定就别写。\n\
+不确定的事别编：没调用过的工具、没看到的消息，都不要说成真的。")
     )
 }
 
@@ -3998,7 +3965,7 @@ mod reply_policy_tests {
         let (mode, text, source) = effective_policy(Some(dir_s), Some("123"));
         assert_eq!(mode, MODE_QUIET);
         assert_eq!(source, "default");
-        assert!(text.contains("Stay silent"), "preset text: {text}");
+        assert!(text.contains("只在被 @"), "preset text: {text}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -4019,7 +3986,7 @@ mod reply_policy_tests {
         let (mode, text, source) = effective_policy(Some(dir_s), Some("777"));
         assert_eq!(mode, MODE_CHATTY);
         assert_eq!(source, "group");
-        assert!(text.contains("Join the conversation"), "{text}");
+        assert!(text.contains("这个群愿意你多说"), "{text}");
         // 别的群仍然吃 default。
         let (other_mode, _, other_source) = effective_policy(Some(dir_s), Some("888"));
         assert_eq!(other_mode, MODE_QUIET);
@@ -4645,70 +4612,6 @@ mod docs_tests {
     // plain text starting with a `[id=...]` fragment), which the runtime cannot
     // parse. The hint must state that the final output is JSON-only and that
     // chat text (including CQ codes) belongs inside a qq_send message.
-    #[test]
-    fn system_hint_requires_json_final_output() {
-        let hint = docs_value()
-            .system_hint
-            .expect("qq must ship a system hint");
-        assert!(
-            hint.contains("OUTPUT FORMAT"),
-            "hint must call out the output format"
-        );
-        assert!(
-            hint.contains("Chat text (including CQ codes) lives only in the tool call"),
-            "hint must keep chat text/CQ codes inside qq_send: {hint}"
-        );
-
-        // The bot's own qq number comes from config/plugins/qq.yaml, rendered
-        // into the system prompt via `{setting:bot_uin}` — no hard-coded id.
-        assert!(
-            hint.contains("YOUR QQ NUMBER — you are qq user {setting:bot_uin}"),
-            "hint must carry the bot_uin placeholder: {hint}"
-        );
-    }
-
-    // 门控语义的回归保护：hint 不再硬编码 ONLY-if / When-in-doubt，
-    // 而是让模型按每条消息首行的 `[reply policy: ...]` 判断；同时保留
-    // 「必须用 qq_send、绝不用 respond、最后 suspend」的既有约束。
-    #[test]
-    fn system_hint_defers_to_reply_policy_line() {
-        let hint = docs_value()
-            .system_hint
-            .expect("qq must ship a system hint");
-        let hardcoded_mention_gate = hint.contains("ONLY if: contains @[id=3832224285]");
-        assert!(
-            !hardcoded_mention_gate,
-            "mention gate must not be hard-coded"
-        );
-        let hardcoded_doubt_rule = hint.contains("When in doubt, suspend");
-        assert!(
-            !hardcoded_doubt_rule,
-            "'when in doubt' must not be hard-coded"
-        );
-        let points_at_policy = hint.contains("[reply policy: <mode> — <text>]");
-        assert!(
-            points_at_policy,
-            "hint must point at the per-message policy line"
-        );
-        let advertises_setter = hint.contains("qq_set_reply_policy");
-        assert!(
-            advertises_setter,
-            "hint must tell the model how to persist a new rule"
-        );
-        let advertises_roles = hint.contains("qq_get_group_roles");
-        assert!(advertises_roles, "hint must advertise the roles node");
-        let replies_through_the_tool = hint.contains("invoke_plugin(qq, qq_send")
-            && hint.contains("TO QUOTE A MESSAGE");
-        assert!(replies_through_the_tool, "hint must reply through the tool: {hint}");
-        let dropped_plain_text_reply = !hint.contains("TO REPLY WITH PLAIN TEXT");
-        assert!(dropped_plain_text_reply, "the plain-text reply path must be gone");
-        let keeps_suspend = hint.contains("{\"action\":\"suspend\"}");
-        assert!(keeps_suspend, "the suspend requirement must stay");
-        let explains_mute = hint.contains("MUTED — if the context line contains");
-        assert!(explains_mute, "hint must explain a group ban: {hint}");
-        let keeps_send = hint.contains("qq_send");
-        assert!(keeps_send, "hint must still document qq_send");
-    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -4807,8 +4710,9 @@ mod image_url_tests {
     #[test]
     fn default_policy_is_context_based() {
         let policy = DEFAULT_REPLY_POLICY;
-        assert!(policy.contains("conversation context"), "{policy}");
-        assert!(policy.contains("even without naming you"), "{policy}");
+        // One line, in the room's voice: the mode no longer ships a manual.
+        assert!(policy.contains("像群里的普通成员"), "{policy}");
+        assert!(policy.chars().count() < 80, "policy must stay short: {policy}");
         assert!(
             !policy.contains("Otherwise stay silent."),
             "旧清单式收尾不应再出现: {policy}"
@@ -4826,79 +4730,62 @@ mod image_url_tests {
 // 现在只保留"这类消息不要调用内核自省工具"，是否回复交给策略行。
 // ═══════════════════════════════════════════════════════════════════════
 #[cfg(test)]
-mod hint_silence_bias_tests {
+mod persona_hint_tests {
     use super::*;
 
+    fn hint() -> String {
+        docs_value().system_hint.expect("qq must ship a system hint")
+    }
+
+    // The hint is a persona, not a rulebook: it says how a member of the room
+    // talks, and leaves judgment to the model. A length guard keeps the next
+    // well-meaning addition from turning it back into a manual.
     #[test]
-    fn hint_does_not_treat_silence_as_the_default() {
-        let hint = docs_value()
-            .system_hint
-            .expect("qq must ship a system hint");
-        let still_orders_immediate_silence = hint.contains("suspend immediately");
+    fn the_hint_is_short_and_plainly_written() {
+        let hint = hint();
         assert!(
-            !still_orders_immediate_silence,
-            "hint 不应再命令'立即挂起'（模型会把它当默认）"
+            hint.chars().count() < 1200,
+            "hint must stay a persona, not a manual: {} chars",
+            hint.chars().count()
         );
-        let keeps_tool_guard = hint.contains("do NOT call any kernel introspection tool");
-        assert!(keeps_tool_guard, "图片/表情/闲聊仍然不该触发内核自省工具");
+        assert!(hint.contains("像群里的人一样自然聊天"), "{hint}");
+        assert!(hint.contains("不要列点、不要总结、不要客服腔"), "{hint}");
+        assert!(hint.contains("一次只发一条"), "{hint}");
     }
 
-    // 小群：hint 必须告诉它"去查 member_count、<=2 就设 one_on_one、只查一次"，
-    // 否则它没有任何理由主动去查群规模（B 方案：自动化靠提示词引导，不加硬规则）。
+    // It must not reveal the machinery, and it must not teach the old mode
+    // system (that is what made a three-person group answer every line).
     #[test]
-    fn hint_says_how_to_detect_a_small_group() {
-        let hint = docs_value()
-            .system_hint
-            .expect("qq must ship a system hint");
-        let mentions_size_probe = hint.contains("member_count");
-        assert!(mentions_size_probe, "hint must point at data.member_count");
-        let names_the_probe_node = hint.contains("qq_get_group_info");
-        assert!(names_the_probe_node, "hint must name the probe node");
-        let says_once_per_group = hint.contains("Decide once per group");
-        assert!(says_once_per_group, "hint must say: decide once per group");
-        let persists_decision = hint.contains("one_on_one");
-        assert!(persists_decision, "hint must name the one_on_one mode");
-        let points_at_catalog = hint.contains("plugin catalog");
-        assert!(points_at_catalog, "hint must defer to the catalog for docs");
-        // The count alone is not enough: OneBot once reported 2 for a busy group.
-        let distrusts_the_count = hint.contains("not reliable");
-        assert!(distrusts_the_count, "hint must not trust member_count alone");
-        let requires_one_speaker = hint.contains("every speaker you have seen");
-        assert!(requires_one_speaker, "hint must require a single speaker");
-    }
-
-    // 每群策略与记忆：hint 必须讲清四种模式、记忆行的含义、以及"只在学到
-    // 稳定偏好时才写记忆"，否则模型不会用这套运行时配置。
-    #[test]
-    fn hint_explains_modes_and_memory() {
-        let hint = docs_value()
-            .system_hint
-            .expect("qq must ship a system hint");
-        for mode in ["quiet", "balanced", "chatty", "one_on_one"] {
-            let listed = hint.contains(mode);
-            assert!(listed, "hint must explain mode {mode}");
+    fn the_hint_hides_the_machinery() {
+        let hint = hint();
+        for forbidden in [
+            "AI、机器人、助手",
+            "REPLY POLICY",
+            "one_on_one",
+            "SPEAKING BUDGET",
+            "SMALL GROUPS",
+        ] {
+            let present = hint.contains(forbidden);
+            let expected = forbidden == "AI、机器人、助手";
+            assert_eq!(present, expected, "unexpected text {forbidden:?}: {hint}");
         }
-        let explains_pull =
-            hint.contains("NOT injected into your context") && hint.contains("qq_get_group_memory");
-        assert!(
-            explains_pull,
-            "hint must say memory is not injected and how to read it"
-        );
-        let explains_writer = hint.contains("qq_set_group_memory");
-        assert!(explains_writer, "hint must advertise the memory writer");
-        let warns_durable_only = hint.contains("DURABLE");
-        assert!(warns_durable_only, "hint must say: only durable memory");
-        let explains_judging = hint.contains("use the conversation history");
-        assert!(explains_judging, "hint must tell it to judge from history");
     }
 
+    // The mechanics still have to be exact: the reply travels through the tool,
+    // silence is the JSON verdict, and quoting names a message id.
     #[test]
-    fn hint_still_points_at_the_reply_policy() {
-        let hint = docs_value()
-            .system_hint
-            .expect("qq must ship a system hint");
-        let points_at_policy = hint.contains("[reply policy: <mode> — <text>]");
-        assert!(points_at_policy, "策略行仍是唯一权威");
+    fn the_hint_keeps_the_sending_mechanics() {
+        let hint = hint();
+        for required in [
+            "invoke_plugin(qq, qq_send",
+            "{\"action\":\"suspend\"}",
+            "msg=<id>",
+            "reply_to",
+            "{setting:bot_uin}",
+            "qq_set_group_memory",
+        ] {
+            assert!(hint.contains(required), "hint must mention {required:?}: {hint}");
+        }
     }
 }
 
