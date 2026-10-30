@@ -364,6 +364,28 @@ recorder 内容——留给下一轮。
 现状：kernel 965 通过；`runtime_host` 31/33，剩 2 个 agent 驱动的用例
 （`agent_adds_dist_child`、`agent_retries_on_warning`）因 verifier 回滚失败。
 
+## 第 20 轮：agent 迭代用例的 mock 必须迁到 DSML（进行中）
+
+打印失败原因后确认：两个 agent 驱动的用例仍在用**原生 `tool_calls`** 的 mock SSE 脚本，
+而循环已改成 DSML 文本协议，于是工具一个都没执行、verifier 拿不到编辑、回滚。
+
+把 `tool_call_response()` 改成发 DSML 文本后，agent 真的跑起来了：
+
+```
+tool summary: total_calls=7 successful_calls=7 failed_calls=0
+  tool_names=replace_file_exact, run_plugin_test, scaffold_child_plugin
+```
+
+但回合计数变了：脚本按"一个 response 一批调用"写，而 DSML 下同一批调用在一个
+文本块里、循环的结束条件也不同（原生协议靠 `finish_reason: tool_calls` 收尾，
+DSML 下要靠一条纯文本回合或 `record_iteration_summary` 的终止语义）。追加一条
+收尾回合会让 `requests.len()` 从 4 变成 5，而移除它又会在
+"exited without calling record_iteration_summary" 上失败——说明**终止语义在迁移
+时丢了**：prompt 里写着"record_iteration_summary 立即结束会话"，循环却没有据此
+停止。这才是要修的代码，不是改断言。
+
+本轮把测试文件恢复原状（避免半截改动），已把结论写在这里。
+
 ## 未决问题（2026-10-31，下一轮先查）
 
 `cargo test -p cordis-runtime --test runtime_host` 有 5 个 `iterate_plugins` 相关用例失败，
