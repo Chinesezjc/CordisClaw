@@ -33,3 +33,29 @@ impl AgentLoop for CargoAgentLoop {
         cordis_runtime::agent_loop::KernelAgentLoop.restore(snapshot)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{install, CargoAgentLoop};
+    use cordis_runtime::agent_loop::{agent_loop, AgentLoop};
+    use cordis_runtime::config::LlmApiConfig;
+
+    // The crate's whole contract: installing it makes the process use this
+    // loop, and that loop can build a session.
+    #[test]
+    fn installing_makes_the_process_use_this_loop() {
+        assert!(install());
+        assert!(agent_loop().is_some());
+        let session = CargoAgentLoop
+            .create(LlmApiConfig::default(), "runtime_shell")
+            .expect("create a session");
+        assert_eq!(session.kind(), "runtime_shell");
+    }
+
+    // A second install is a no-op, matching `install_plugin_builder`.
+    #[test]
+    fn a_second_install_is_ignored() {
+        let _ = install();
+        assert!(!install());
+    }
+}
