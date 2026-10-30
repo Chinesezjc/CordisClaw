@@ -553,47 +553,42 @@ agent 工具层做批准门控），加一条规则要改 6 个地方。现在�
 验证：`cargo test -p cordis-runtime --lib` 986、`--test host_reload_arms` 14、
 `-p cordis-cli` 48；fmt/clippy 干净。
 
-### 3.28 B1：回复即正文，删掉 JSON envelope（2026-10-30）
+### 3.28 B1 试过了，已回滚：工具调用回到回复通道（2026-10-30）
 
-**症状**：模型经常把 `invoke_plugin(qq, qq_send, {...})` **当文本吐出来**（DeepSeek 的 DSML 模板
-序列化），provider 没把它解析成 `tool_calls`，于是整段落进 `content`。inbox 解析首段 JSON，发现
-没有 `action`，判为 `未知动作: ?` → 丢弃重试，并且每次尝试都往群里发一条横幅。10:21–12:54 之间
-十几条回复就是这样丢的（每条横幅背后都是一条被丢弃的正确回复）。
+**试过的方案**：把"回复"从工具调用改成"助手正文即消息"，删掉 `{"action":...}` envelope 与整个
+JSON 解析/重试回路。动机是 DSML 泄漏——模型把 `invoke_plugin(qq, qq_send, …)` 序列化成文本，
+provider 没解析成 `tool_calls`，inbox 看到没有 `action` 的 JSON 就丢弃重试并刷屏。
 
-**根因不在解析，在契约**：我们既要求"必须用 `qq_send` 工具发回复"，又禁用
-`{"action":"respond"}`（早年为了防重复），模型于是**每句话都得凑一个工具调用**；凑不出来就写成
-文本。两套协议（provider 的 tool_calls + 自造的 final-output envelope）叠在一起，缝上不断长出新
-bug：未知动作、DSML 泄漏、重试刷屏、重复消息、审批能力穿四层。
+**为什么回滚**：换掉回复通道后，"不说话"失去结构性表达。先是用 `[silence]` 标记，模型把它翻译成
+`[寂静]`/`[沉默]`；改成 `[SILENCE]` + 识别本地化方括号后，仍然要在一个可翻译的自然语言通道里
+编码一个符号。随后试的"回复闸门"（独立一次 YES/NO 调用）也不被接受：多一次模型调用，而且把
+判断从主模型挪走了。
 
-**改法**（B1，对齐 DSH 的"正文即回答"）：
+**现在的契约**（回到 dd56e41 的状态）：回复走工具调用 `invoke_plugin(qq, qq_send, …)`，
+`{"action":"suspend"}` 表示本轮结束/不说话，`{"action":"respond","message":…}` 仍可用；
+inbox 解析首个 JSON 值，未知 action 只写日志（不再往群里发横幅），格式异常横幅按会话节流。
 
-- inbox 不再解析 agent 文本：正文非空就是回复，空正文就是沉默；删掉 `parse_first_json`、
-  action 分支、重试反馈回路、格式异常横幅；
-- 同一轮里工具已发出**完全相同**的文本才跳过（`already_sent`），所以"图片 + 配文"仍然两样都发；
-- qq / feishu / kernel-shell 三处提示词统一改写：**最终文本就是消息**，工具只做动作；
-- `send_via` 恢复引用回复（`reply_to` → CQ reply），这是原先只在 respond 分支里做的。
+**教训**：把"回复"从工具调用里拿出来，等于把"不说话"变成一种需要在正文里编码的符号；只要它是
+符号，模型就会翻译它。结构化的东西（工具调用）才扛得住多语言与改写。
 
-**验证**：`cargo test -p cordis-runtime --lib` 986、`-p cordis-cli` 45、`-p qq` 71、`-p feishu` 57；
-clippy 干净。新增 `already_sent` 的"仅相同文本才抑制"用例、`outbound_replies` 的正文收录用例、
-qq hint 的"禁止 JSON envelope"断言。
+### 3.29 DSML：把被序列化的工具调用捞回来（2026-10-30）
 
-### 3.29 B1 的收尾：JSON mode 与静默标记（2026-10-30）
+DSML 泄漏是 provider 侧的低频行为（本地连打 8 次探针都是正常结构化 `tool_calls`，线上却偶发）。
+既然格式无法先验确定，就在**协议层**做结构化恢复，而不是在 CLI 猜意图：
 
-B1 上线后线上出现两种"协议残渣"，都是旧契约的尾巴：
+- `looks_like_serialized_call`：只有正文里出现 DSML 标记（`dsml` / `｜｜` / `<invoke` / `<tool_call`）
+  才考虑，普通回复里出现 JSON 一律不动；
+- `extract_json_objects`：按括号配对 + 字符串/转义感知，抽出正文里所有顶层 JSON 对象；
+- `serialized_call_to_tool_call`：每个对象带 `node_id` 就还原成一次 `invoke_plugin` 调用
+  （`payload_json` 就是该对象）；缺少 `plugin_path` 时由 `RuntimeHost::plugin_for_node` 在已加载
+  快照里按节点唯一解析，找不到/有歧义就报明确错误；
+- 命中时把 `content` 清空（那本来是序列化的调用，不是要发出去的话），并打
+  `agent_dsml_salvage` 诊断（含完整原文），下一次真实泄漏就能留下确切样本。
 
-1. **`{"type":"json_object"}` 被当消息发出去**：kernel 每个请求都带
-   `response_format: {"type":"json_object"}`（旧 envelope 时代强制 JSON 输出）。B1 之后它逼模型
-   吐 JSON，而 inbox 现在把正文原样发送。已删除该字段（`chat_request_body` 提取成具名函数 +
-   回归测试断言请求体里没有 `response_format`）。
-2. **模型把"沉默"写成 `(empty)`**：对 chat-completions 模型来说"输出空"不可表达，于是它发明占位符。
-   现在只认一个标记 `[silence]`（qq / feishu / 批次包裹三处提示词都写明），inbox 仅在该字面量
-   完全相等时不发送；其余一律当消息。这不是解析兜底，是一条单一、可断言的契约。
+验证：`cargo test -p cordis-runtime --lib` 990（新增 4 条 DSML 用例：还原、纯文本不误伤、
+多对象保序、嵌套/转义提取），cli 49、qq 71、feishu 57，clippy 干净。
 
-同时清掉历史污染：`is_protocol_only_assistant` 在构造请求时跳过"整条内容只有一个协议对象"的
-assistant 历史（旧的 `{"action":...}` 与 JSON-mode 回显），否则模型会照着历史继续输出 JSON。
-
-验证：runtime 988、cli 47、qq 71、feishu 57；clippy 干净；15:24 重启，8099/8002 正常。
-
+## 4. 部分完成
 ## 4. 部分完成
 
 ### 4.1 Execution engine 有正式入口，数据面验证不足

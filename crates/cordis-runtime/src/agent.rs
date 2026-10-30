@@ -483,6 +483,15 @@ impl AgentToolHost for RuntimeHost {
         node_id: &str,
         payload_json: Value,
     ) -> Result<Value, RuntimeError> {
+        // A call recovered from serialised provider text names only the node
+        // (the model never wrote a plugin path), so resolve it when exactly one
+        // loaded plugin declares that node.
+        let resolved = if plugin_path.is_empty() {
+            RuntimeHost::plugin_for_node(self, node_id)?
+        } else {
+            plugin_path.to_string()
+        };
+        let plugin_path = resolved.as_str();
         self.check_agent_accessible(plugin_path, node_id)?;
         let payload_text =
             serde_json::to_string(&payload_json).map_err(|err| RuntimeError::Invariant {
@@ -1516,16 +1525,7 @@ impl AgentSession {
             "role": "system",
             "content": backend.system_prompt(),
         }));
-        // Legacy turns ended with a protocol verdict (`{"action":"suspend"}`)
-        // or a JSON-mode echo (`{"type":"json_object"}`). Under the
-        // text-is-the-reply contract those teach the model to answer with
-        // JSON, and they carry no information, so they never go back out.
-        messages.extend(
-            self.history
-                .iter()
-                .filter(|message| !is_protocol_only_assistant(message))
-                .cloned(),
-        );
+        messages.extend(self.history.clone());
         // 一次性上下文（策略/记忆行）与图片都只随这一条新消息进请求；
         // history 里只留纯文本，否则每一轮都会重发同一份噪声。
         let request_text = if notes.trim().is_empty() {
@@ -1613,14 +1613,15 @@ impl AgentSession {
                 );
             }
 
-            // No `response_format: json_object`: the reply is plain text now.
-            // JSON mode forced the model to answer with a JSON object, which
-            // the inbox then delivered verbatim ({"type":"json_object"}).
-            let request_body = chat_request_body(
-                &self.config,
-                &messages,
-                tool_specs_to_request_payload(&tool_specs),
-            );
+            let request_body = json!({
+                "model": self.config.model,
+                "messages": messages,
+                "temperature": self.config.temperature,
+                "max_tokens": self.config.max_tokens,
+                "tools": tool_specs_to_request_payload(&tool_specs),
+                "tool_choice": "auto",
+                "response_format": {"type": "json_object"},
+            });
             let parts =
                 provider.complete(request_body, sink.clone(), self.config.to_transport())?;
             let (message, response_id, finish_reason) =
@@ -1636,6 +1637,27 @@ impl AgentSession {
                 message.reasoning_content.as_deref().map(str::len).unwrap_or(0),
                 finish_reason.as_deref().unwrap_or("-"),
             ));
+
+            // DSML salvage: the provider occasionally serialises a tool call
+            // into the content stream instead of returning `tool_calls`. The
+            // JSON objects in that text ARE the call, so recover them rather
+            // than dropping the turn (a lost reply) or posting the markup
+            // (garbage in the room).
+            let mut message = message;
+            if message.tool_calls.is_empty() {
+                let raw = message.content.clone().unwrap_or_default();
+                let salvaged = salvage_serialized_tool_calls(&raw);
+                if !salvaged.is_empty() {
+                    emit_agent_diagnostic(format!(
+                        "agent_dsml_salvage calls={} chars={} raw={:?}",
+                        salvaged.len(),
+                        raw.chars().count(),
+                        raw
+                    ));
+                    message.tool_calls = salvaged;
+                    message.content = None;
+                }
+            }
 
             if !message.tool_calls.is_empty() {
                 let available_tools = tool_specs
@@ -2762,62 +2784,153 @@ impl<'a, H: AgentToolHost + ?Sized> AgentBackend for RuntimeShellAgentBackend<'a
     }
 }
 
-/// An assistant history entry whose whole content is a protocol verdict.
+/// A serialised tool call the provider wrote into the content stream.
 ///
-/// Matches the deleted `{"action":"respond"|"suspend"}` envelope and the
-/// `{"type":"json_object"}` echo the old JSON mode produced. Such an entry
-/// carries no conversation, only a stub for the model to imitate.
-fn is_protocol_only_assistant(message: &Value) -> bool {
-    if message.get("role").and_then(Value::as_str) != Some("assistant") {
-        return false;
+/// DeepSeek sometimes emits its internal DSML markup instead of structured
+/// `tool_calls`; the payload is still the tool's JSON arguments, so the call is
+/// recoverable. Only text that actually carries that markup is considered —
+/// an ordinary reply that happens to contain JSON must never execute.
+fn salvage_serialized_tool_calls(content: &str) -> Vec<cordis_plugin_sdk::llm::LlmToolCall> {
+    let trimmed = content.trim();
+    if trimmed.is_empty() || !looks_like_serialized_call(trimmed) {
+        return Vec::new();
     }
-    let has_calls = message
-        .get("tool_calls")
-        .and_then(Value::as_array)
-        .is_some_and(|calls| !calls.is_empty());
-    if has_calls {
-        return false;
-    }
-    let content = message
-        .get("content")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .trim();
-    let Ok(value) = serde_json::from_str::<Value>(content) else {
-        return false;
-    };
-    let Some(object) = value.as_object() else {
-        return false;
-    };
-    if object.len() != 1 {
-        return false;
-    }
-    matches!(
-        object.get("type").and_then(Value::as_str),
-        Some("json_object")
-    ) || matches!(
-        object.get("action").and_then(Value::as_str),
-        Some("suspend" | "respond")
-    )
+    extract_json_objects(trimmed)
+        .into_iter()
+        .filter_map(|value| serialized_call_to_tool_call(&value))
+        .collect()
 }
 
-/// One `/chat/completions` body for an agent step.
+/// Does this text carry the provider's serialised-call markup?
+fn looks_like_serialized_call(content: &str) -> bool {
+    let lowered = content.to_ascii_lowercase();
+    lowered.contains("dsml")
+        || content.contains("｜｜")
+        || lowered.contains("<invoke")
+        || lowered.contains("<tool_call")
+}
+
+/// Every top-level JSON object embedded in `text`, in order.
+fn extract_json_objects(text: &str) -> Vec<Value> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut values = Vec::new();
+    let mut index = 0;
+    while index < chars.len() {
+        if chars[index] != '{' {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        let mut depth = 0usize;
+        let mut in_string = false;
+        let mut escaped = false;
+        while index < chars.len() {
+            let ch = chars[index];
+            if in_string {
+                if escaped {
+                    escaped = false;
+                } else if ch == '\\' {
+                    escaped = true;
+                } else if ch == '"' {
+                    in_string = false;
+                }
+            } else if ch == '"' {
+                in_string = true;
+            } else if ch == '{' {
+                depth += 1;
+            } else if ch == '}' {
+                depth -= 1;
+                if depth == 0 {
+                    let candidate: String = chars[start..=index].iter().collect();
+                    if let Ok(value) = serde_json::from_str::<Value>(&candidate) {
+                        values.push(value);
+                    }
+                    break;
+                }
+            }
+            index += 1;
+        }
+        index += 1;
+    }
+    values
+}
+
+/// Turn one recovered JSON object into an `invoke_plugin` call.
 ///
-/// Deliberately has no `response_format`: forcing `json_object` makes the model
-/// answer with a JSON blob, and the inbox delivers assistant text verbatim.
-fn chat_request_body(
-    config: &crate::config::LlmApiConfig,
-    messages: &[Value],
-    tools: Vec<Value>,
-) -> Value {
-    json!({
-        "model": config.model,
-        "messages": messages,
-        "temperature": config.temperature,
-        "max_tokens": config.max_tokens,
-        "tools": tools,
-        "tool_choice": "auto",
+/// A serialised payload is a plugin node request (`node_id` plus that node's
+/// fields). `plugin_path` may be absent — the host resolves it from the loaded
+/// snapshot when exactly one plugin declares the node.
+fn serialized_call_to_tool_call(value: &Value) -> Option<cordis_plugin_sdk::llm::LlmToolCall> {
+    let object = value.as_object()?;
+    let node_id = object.get("node_id").and_then(Value::as_str)?;
+    let plugin_path = object
+        .get("plugin_path")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let arguments = json!({
+        "plugin_path": plugin_path,
+        "node_id": node_id,
+        "payload_json": value,
+    });
+    Some(cordis_plugin_sdk::llm::LlmToolCall {
+        id: format!("dsml-{node_id}"),
+        call_type: "function".to_string(),
+        function: cordis_plugin_sdk::llm::LlmToolFunction {
+            name: AGENT_TOOL_INVOKE_PLUGIN.to_string(),
+            arguments: arguments.to_string(),
+        },
     })
+}
+
+#[cfg(test)]
+mod dsml_salvage_tests {
+    use super::{extract_json_objects, looks_like_serialized_call, salvage_serialized_tool_calls};
+
+    // The provider serialises the call into the content stream; the JSON is the
+    // payload, the DSML markup is decoration. This is the shape seen in the
+    // logs (truncated at 200 chars there, reconstructed here).
+    const LEAK: &str = r#"<｜｜DSML｜｜invoke name="invoke_plugin">
+{"node_id": "qq_send", "target": "group:975594881", "message": "13×7=91，找 9 块喵"}
+</｜｜DSML｜｜ parameter name="plugin_path" string="true">qq</｜｜DSML｜｜>"#;
+
+    #[test]
+    fn recovers_the_call_from_markup() {
+        let calls = salvage_serialized_tool_calls(LEAK);
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert_eq!(calls[0].function.name, "invoke_plugin");
+        let args: serde_json::Value =
+            serde_json::from_str(&calls[0].function.arguments).expect("args json");
+        assert_eq!(args["node_id"], "qq_send");
+        // plugin_path is absent in the serialised payload; the host resolves it.
+        assert_eq!(args["plugin_path"], "");
+        assert_eq!(args["payload_json"]["message"], "13×7=91，找 9 块喵");
+    }
+
+    // A normal reply that merely mentions JSON must never become a tool call.
+    #[test]
+    fn plain_text_with_json_is_not_a_call() {
+        assert!(salvage_serialized_tool_calls(r#"{"node_id":"qq_send"}"#).is_empty());
+        assert!(salvage_serialized_tool_calls(r#"答案是 9 块 {"a":1}"#).is_empty());
+        assert!(salvage_serialized_tool_calls("").is_empty());
+        assert!(!looks_like_serialized_call("13×7=91"));
+        assert!(looks_like_serialized_call(LEAK));
+    }
+
+    #[test]
+    fn multiple_objects_are_recovered_in_order() {
+        let text = r#"<｜｜DSML｜｜invoke>{"node_id":"qq_send","message":"一"}<｜｜DSML｜｜>{"node_id":"qq_send","message":"二"}"#.to_string();
+        let calls = salvage_serialized_tool_calls(&text);
+        assert_eq!(calls.len(), 2, "{calls:?}");
+        assert!(calls[0].function.arguments.contains("一"));
+        assert!(calls[1].function.arguments.contains("二"));
+    }
+
+    #[test]
+    fn extractor_handles_nested_braces_and_strings() {
+        let values = extract_json_objects(r#"noise {"a":{"b":[{"c":"]}"}]}} tail"#);
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0]["a"]["b"][0]["c"], "]}");
+    }
 }
 
 fn tool_specs_to_request_payload(specs: &[AgentToolSpec]) -> Vec<Value> {
@@ -3187,8 +3300,9 @@ You cannot edit plugin code directly — always use request_iteration.\n\
 Prefer concise, operator-friendly replies. Mention important tool outcomes plainly.\n\
 Do not invent runtime state or claim a command succeeded unless a tool confirmed it.\n\
 \n\
-Your reply is plain text: it streams straight to the operator. Write what you want them to read — no JSON envelope, no protocol object.\n\
-Use tools for actions (running commands, reading files, invoking plugins), not for talking. If you have nothing to add, answer with an empty response.\n\
+CRITICAL: Your final output must be {\"action\":\"suspend\"} (JSON, nothing else).\n\
+To send a reply, use the invoke_plugin tool to call qq_send instead of outputting text.\n\
+Never output plain text — it will be dropped. All communication goes through tools.\n\
 \n\
 CRITICAL — YOUR TOOLS (only these exist; all others will fail immediately):\n\
   get_runtime_status, list_plugins, list_nodes, get_kernel_status, get_kernel_issues,\n\
@@ -3230,65 +3344,6 @@ fn to_json_value<T: Serialize>(label: &str, value: T) -> Result<Value, RuntimeEr
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn protocol_only_history_entries_are_dropped() {
-        let verdict = json!({"role": "assistant", "content": "{\"action\":\"suspend\"}"});
-        assert!(is_protocol_only_assistant(&verdict));
-        let echo = json!({"role": "assistant", "content": "{\"type\":\"json_object\"}"});
-        assert!(is_protocol_only_assistant(&echo));
-        // Real talk and tool-call turns are kept.
-        assert!(!is_protocol_only_assistant(
-            &json!({"role": "assistant", "content": "13×7=91，找 9 块"})
-        ));
-        assert!(!is_protocol_only_assistant(&json!({
-            "role": "assistant",
-            "content": "{\"action\":\"suspend\"}",
-            "tool_calls": [{"id": "1", "function": {"name": "t"}}],
-        })));
-        // A JSON object with extra keys is content, not a stub.
-        assert!(!is_protocol_only_assistant(
-            &json!({"role": "assistant", "content": "{\"action\":\"suspend\",\"why\":\"x\"}"})
-        ));
-        assert!(!is_protocol_only_assistant(
-            &json!({"role": "user", "content": "{}"})
-        ));
-        assert!(!is_protocol_only_assistant(
-            &json!({"role": "assistant", "content": "[1,2,3]"})
-        ));
-    }
-
-    // The reply is plain text now, so the request must NOT force JSON mode:
-    // `response_format: json_object` made the model answer with a JSON blob
-    // (`{"type":"json_object"}`) that the inbox then delivered verbatim.
-    #[test]
-    fn chat_request_body_never_forces_json_mode() {
-        let config = crate::config::LlmApiConfig {
-            provider: "deepseek".to_string(),
-            base_url: "https://api.deepseek.com/beta".to_string(),
-            api_key_env: "DEEPSEEK_API_KEY".to_string(),
-            api_key: None,
-            model: "deepseek-flash".to_string(),
-            organization: None,
-            project: None,
-            temperature: 0.2,
-            max_tokens: 1024,
-            timeout_ms: 1000,
-            stream_timeout_secs: 60,
-        };
-        let body = chat_request_body(
-            &config,
-            &[json!({"role": "user", "content": "hi"})],
-            vec![json!({"type": "function", "function": {"name": "t"}})],
-        );
-        assert!(
-            body.get("response_format").is_none(),
-            "no JSON mode: {body}"
-        );
-        assert_eq!(body["tool_choice"], "auto");
-        assert_eq!(body["tools"].as_array().map(Vec::len), Some(1));
-        assert_eq!(body["model"], "deepseek-flash");
-    }
 
     const TEST_TOOL_RECORD: &str = "record_summary";
     const TEST_TOOL_READ: &str = "read_context";

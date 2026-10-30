@@ -1546,6 +1546,38 @@ impl RuntimeHost {
 
     /// Resolve a relative path within the fixtures root, rejecting traversal
     /// attempts (absolute paths, `..` components) and symlink escapes.
+    /// The plugin path declaring `node_id`, when exactly one loaded plugin does.
+    ///
+    /// Used for a tool call recovered from serialised provider text: those name
+    /// only the node, never the plugin.
+    pub(crate) fn plugin_for_node(&self, node_id: &str) -> Result<String, RuntimeError> {
+        let snapshot = self.current_snapshot();
+        let mut matches: Vec<String> = snapshot
+            .plugin_registry()
+            .iter()
+            .filter(|(_, plugin)| {
+                plugin
+                    .docs
+                    .as_ref()
+                    .is_some_and(|docs| docs.nodes.iter().any(|node| node.id == node_id))
+            })
+            .map(|(path, _)| path)
+            .collect();
+        match matches.len() {
+            1 => Ok(matches.remove(0)),
+            0 => Err(RuntimeError::InvalidArgument {
+                message: format!(
+                    "invoke_plugin needs a plugin_path: no loaded plugin declares node {node_id}"
+                ),
+            }),
+            _ => Err(RuntimeError::InvalidArgument {
+                message: format!(
+                    "invoke_plugin needs a plugin_path: node {node_id} is declared by several plugins"
+                ),
+            }),
+        }
+    }
+
     pub fn check_agent_accessible(
         &self,
         plugin_path: &str,

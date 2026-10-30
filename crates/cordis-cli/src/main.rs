@@ -17,6 +17,7 @@ use cordis_tooling::{
     prepare_artifacts, rebuild_fixture_artifacts, refresh_artifact_index, sync_plugin_docs,
     PrepareMode,
 };
+use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
@@ -386,87 +387,41 @@ fn extract_user_text(display: &str) -> &str {
         .trim()
 }
 
-/// The canonical in-band way to say "do not post anything".
-///
-/// "Answer with nothing" is not expressible through a chat-completions
-/// provider: asked for silence, a model emits a placeholder — and, given a
-/// lowercase English word, it translates it (`[寂静]`, `[沉默]`), which is how
-/// a "silent" turn ends up posting two different tokens to the room.
-///
-/// So: an ASCII, copy-exact token, and a lone short bracketed token in *any*
-/// script also counts as silence. A bracketed token followed by real text is
-/// still a message.
-const SILENCE_TOKEN: &str = "[SILENCE]";
-
-/// Does this assistant text mean "stay quiet"?
-fn is_silence_text(text: &str) -> bool {
-    let trimmed = text.trim();
-    if trimmed.is_empty() || trimmed == SILENCE_TOKEN {
-        return true;
-    }
-    // Tolerate a quoted or code-fenced copy of the token.
-    let unquoted = trimmed
-        .trim_matches(|c| c == '"' || c == '\'' || c == '`')
-        .trim();
-    if unquoted == SILENCE_TOKEN {
-        return true;
-    }
-    // A lone bracketed token: [沉默] / [寂静] / [no reply] / 【跳过】.
-    let inner = unquoted
-        .strip_prefix('[')
-        .and_then(|rest| rest.strip_suffix(']'))
-        .or_else(|| {
-            unquoted
-                .strip_prefix('【')
-                .and_then(|rest| rest.strip_suffix('】'))
-        });
-    inner.is_some_and(|inner| !inner.is_empty() && inner.chars().count() <= 12)
-}
-
-/// Text one tool-call event actually delivered (the `message` it sent).
-fn event_message(event: &AgentToolEvent) -> Option<&str> {
-    if event.name != "invoke_plugin" {
-        return None;
-    }
-    event
-        .arguments
-        .pointer("/payload_json/message")
-        .and_then(Value::as_str)
-        .or_else(|| event.arguments.get("message").and_then(Value::as_str))
-        .map(str::trim)
-        .filter(|message| !message.is_empty())
-}
-
 /// P6: collect the text the channel actually sent during this agent turn.
 ///
-/// A reply leaves the process through a tool call
-/// (`invoke_plugin(qq, qq_send, {message})`) or through the assistant's final
+/// Messaging replies leave the process through a tool call
+/// (`invoke_plugin(qq, qq_send, {message})` / `feishu_send`), or through the
+/// legacy `{"action":"respond","message":...}` output; both carry the visible
 /// text. The inbox records it into history so the next turn can see what the
-/// bot told the room.
-fn outbound_replies(content: &str, tool_events: &[AgentToolEvent]) -> Vec<String> {
-    let mut replies: Vec<String> = tool_events
-        .iter()
-        .filter_map(event_message)
-        .map(str::to_string)
-        .collect();
-    let text = content.trim();
-    if !text.is_empty() && !replies.iter().any(|sent| sent == text) {
-        replies.push(text.to_string());
+/// bot told the room (otherwise the stored assistant entry is only the bare
+/// action JSON and the bot contradicts itself).
+fn outbound_replies(reply_content: &str, tool_events: &[AgentToolEvent]) -> Vec<String> {
+    let mut replies = Vec::new();
+    for event in tool_events {
+        if event.name != "invoke_plugin" {
+            continue;
+        }
+        let message = event
+            .arguments
+            .pointer("/payload_json/message")
+            .and_then(Value::as_str)
+            .or_else(|| event.arguments.get("message").and_then(Value::as_str));
+        if let Some(message) = message.filter(|m| !m.trim().is_empty()) {
+            replies.push(message.to_string());
+        }
+    }
+    if let Ok(command) = parse_first_json(reply_content.trim()) {
+        if command.get("action").and_then(Value::as_str) == Some("respond") {
+            if let Some(message) = command
+                .get("message")
+                .and_then(Value::as_str)
+                .filter(|m| !m.trim().is_empty())
+            {
+                replies.push(message.to_string());
+            }
+        }
     }
     replies
-}
-
-/// Was this exact text already delivered through `reply_node` in this turn?
-///
-/// The model can send an image (or an @ message) with a tool call and then
-/// answer in text; only a byte-identical repeat is suppressed, so a caption is
-/// still delivered.
-fn already_sent(text: &str, events: &[AgentToolEvent], reply_node: &str) -> bool {
-    events.iter().any(|event| {
-        event.ok
-            && event.arguments.get("node_id").and_then(Value::as_str) == Some(reply_node)
-            && event_message(event) == Some(text)
-    })
 }
 
 /// A batch envelope classified by whether its user text is a `/command`.
@@ -514,7 +469,7 @@ fn wrap_inbox_batch(combined: &str) -> String {
          Do not re-answer an older message as if it were a new request, \
          and do not claim someone is asking you a question unless the question is in this batch or in the thread it continues. \
          Whether to answer is decided by the `[reply policy: ...]` line (see the plugin instructions) plus that context — \
-         if the message is clearly between other people, answer with exactly `[SILENCE]` and nothing else."
+         if the message is clearly between other people, output exactly {{\"action\":\"suspend\"}}."
     )
 }
 
@@ -522,6 +477,21 @@ fn wrap_inbox_batch(combined: &str) -> String {
 /// (e.g. DSML XML or stray prose the model appended after its JSON verdict).
 /// `serde_json::from_str` rejects trailing bytes, so a `Deserializer` that
 /// consumes a single value is used instead.
+/// Did this turn already deliver a message through `reply_node`? Used to keep
+/// `{"action":"respond"}` and `qq_send` from double-sending the same text.
+fn reply_was_sent(events: &[cordis_runtime::agent::AgentToolEvent], reply_node: &str) -> bool {
+    events.iter().any(|event| {
+        event.ok
+            && !reply_node.is_empty()
+            && event.arguments.get("node_id").and_then(|v| v.as_str()) == Some(reply_node)
+    })
+}
+
+fn parse_first_json(s: &str) -> serde_json::Result<Value> {
+    let mut de = serde_json::Deserializer::from_str(s);
+    Value::deserialize(&mut de)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ServeMode {
     Command,
@@ -890,6 +860,9 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             // WS-3: per-session outage-notice throttle. The inbox loop is
             // single-threaded, so a plain HashMap needs no lock.
             let mut outage_notified: HashMap<String, Instant> = HashMap::new();
+            // Retry detail ("⚠️ 回复格式异常") is for the log, not the group: one
+            // notice per session per window instead of one per attempt.
+            let mut format_notified: HashMap<String, Instant> = HashMap::new();
             loop {
                 // Ops requests run on THIS thread: it is the one that runs
                 // agent turns, so a reload cannot race one.
@@ -936,16 +909,11 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                             );
                             return;
                         }
-                        let mut payload = serde_json::json!({
+                        let payload = serde_json::json!({
                             "node_id": env.reply_node,
                             "target": env.reply_target,
                             "message": message,
                         });
-                        // Quote the message being answered when the channel
-                        // gave us one (the plugin renders it as a CQ reply).
-                        if let Some(reply_to) = env.reply_to.as_ref() {
-                            payload["reply_to"] = serde_json::json!(reply_to);
-                        }
                         if let Err(e) =
                             host.invoke(&env.source_plugin, &env.reply_node, payload.to_string())
                         {
@@ -1071,27 +1039,150 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     // Process agent output: parse JSON, dispatch action, send
                     // the reply back to the ORIGINATING plugin (route). Returns
                     // Some(feedback) if the agent needs to retry.
-                    // B1: the assistant's final text IS the reply. There is no
-                    // `{"action":...}` envelope any more — an empty answer means
-                    // silence, and a tool call is an action (image/@/admin),
-                    // never the reply channel. This deletes the whole class of
-                    // "valid JSON, unknown action" failures.
-                    let process = |content: &str, label: &str, tool_events: &[AgentToolEvent]| {
-                        let text = content.trim();
-                        if is_silence_text(text) {
-                            eprintln!("inbox: no reply text ({label}); staying silent");
-                            return;
+                    let mut process = |raw: String,
+                                       label: &str,
+                                       tool_events: &[cordis_runtime::agent::AgentToolEvent]|
+                     -> Option<String> {
+                        if raw.is_empty() {
+                            return None;
                         }
-                        if already_sent(text, tool_events, &route.reply_node) {
-                            eprintln!(
-                                "inbox: text already delivered via {} this turn ({label}); not repeating",
-                                route.reply_node
-                            );
-                            return;
+                        // Preprocess: escape newlines and embedded quotes inside JSON strings.
+                        let chars: Vec<char> = raw.chars().collect();
+                        let mut out = String::with_capacity(raw.len() + 64);
+                        let mut in_string = false;
+                        let mut i = 0;
+                        while i < chars.len() {
+                            let ch = chars[i];
+                            if ch == '"' {
+                                if in_string {
+                                    let already_escaped = i > 0 && chars[i - 1] == '\\';
+                                    if already_escaped {
+                                        out.push('"');
+                                    } else {
+                                        let mut j = i + 1;
+                                        while j < chars.len() && chars[j] == ' ' {
+                                            j += 1;
+                                        }
+                                        let next = chars.get(j).copied();
+                                        if matches!(
+                                            next,
+                                            Some(':') | Some(',') | Some('}') | Some(']') | None
+                                        ) {
+                                            in_string = false;
+                                            out.push('"');
+                                        } else {
+                                            out.push_str("\\\"");
+                                        }
+                                    }
+                                } else {
+                                    in_string = true;
+                                    out.push('"');
+                                }
+                            } else if ch == '\n' && in_string {
+                                out.push_str("\\n");
+                            } else {
+                                out.push(ch);
+                            }
+                            i += 1;
                         }
-                        send_via(&route, text);
+                        match parse_first_json(&out) {
+                            Ok(ref cmd)
+                                if cmd.get("action").and_then(|v| v.as_str())
+                                    == Some("suspend") =>
+                            {
+                                eprintln!("inbox: session suspended ({label})");
+                                None
+                            }
+                            Ok(ref cmd)
+                                if cmd.get("action").and_then(|v| v.as_str())
+                                    == Some("respond") =>
+                            {
+                                let msg = cmd.get("message").and_then(|v| v.as_str()).unwrap_or("");
+                                // The model may use the sanctioned `respond`
+                                // action AND call the reply node in the same
+                                // turn; that would deliver the text twice, which
+                                // is why `respond` used to be banned. Dedupe by
+                                // looking at what this turn actually sent.
+                                if reply_was_sent(tool_events, route.reply_node.as_str()) {
+                                    eprintln!(
+                                        "inbox: dropping duplicate respond ({label}); {} already sent this turn",
+                                        route.reply_node
+                                    );
+                                    return None;
+                                }
+                                if !msg.is_empty() {
+                                    eprintln!(
+                                        "inbox: agent reply ({label}): {}...",
+                                        msg.chars().take(100).collect::<String>()
+                                    );
+                                    if route.can_reply() {
+                                        let mut payload = serde_json::json!({
+                                            "node_id": route.reply_node,
+                                            "target": route.reply_target,
+                                            "message": msg,
+                                        });
+                                        if let Some(rt) = &route.reply_to {
+                                            payload["reply_to"] = serde_json::json!(rt);
+                                        }
+                                        match host.invoke(
+                                            &route.source_plugin,
+                                            &route.reply_node,
+                                            payload.to_string(),
+                                        ) {
+                                            Ok(_) => eprintln!(
+                                                "inbox: {}::{} OK ({label})",
+                                                route.source_plugin, route.reply_node
+                                            ),
+                                            Err(e) => eprintln!(
+                                                "inbox: {}::{} failed ({label}): {e}",
+                                                route.source_plugin, route.reply_node
+                                            ),
+                                        }
+                                    } else {
+                                        eprintln!("inbox: no reply route for session {session_key}, dropping reply ({label})");
+                                    }
+                                }
+                                None
+                            }
+                            Ok(ref cmd) => {
+                                let action =
+                                    cmd.get("action").and_then(|v| v.as_str()).unwrap_or("?");
+                                eprintln!(
+                                    "inbox: unknown JSON action={action}, dropping raw={}...",
+                                    raw.chars().take(200).collect::<String>().replace('\n', " ")
+                                );
+
+                                Some(format!("SYSTEM: Your last output was valid JSON but had unknown action \"{action}\". Allowed actions: \"suspend\" or \"respond\". Please retry.\n\nYour raw output was:\n{raw}"))
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "inbox: JSON parse failed: {e} — raw={}... preprocessed={}...",
+                                    raw.chars().take(200).collect::<String>().replace('\n', " "),
+                                    out.chars().take(200).collect::<String>().replace('\n', " ")
+                                );
+                                if should_notify(
+                                    &mut format_notified,
+                                    session_key,
+                                    Instant::now(),
+                                    OUTAGE_NOTIFY_WINDOW,
+                                ) {
+                                    send_via(
+                                        &route,
+                                        &format!("⚠️ 回复格式异常，正在重试...（{e}）"),
+                                    );
+                                }
+                                Some(format!("SYSTEM: Your last output was not valid JSON and was dropped. Parse error: {e}\n\nPlease fix the JSON formatting and retry. Final output must be exactly {{\"action\":\"suspend\"}} or {{\"action\":\"respond\",\"message\":\"...\"}}.\n\nYour raw output was:\n{raw}"))
+                            }
+                        }
                     };
-                    // Commands were already handled above the LLM call.
+                    // WS-3: single sink for EVERY LLM failure exit of this
+                    // batch. Spill the user's text first (it must survive the
+                    // outage), then tell the batch's origin through the same
+                    // no-LLM fixed-template path as command replies — throttled
+                    // to one notice per session per OUTAGE_NOTIFY_WINDOW. A
+                    // failed notice only logs inside send_via and never changes
+                    // the outcome. Only the NORMAL messages are spilled:
+                    // commands were already handled above the LLM call.
                     let spill_and_notify = |notified: &mut HashMap<String, Instant>| {
                         pending::save(
                             &data_dir,
@@ -1142,10 +1233,33 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     ) {
                         Ok(reply) => {
                             pending::clear(&data_dir, session_key);
-                            process(reply.content.trim(), "inbox", &reply.tool_events);
-                            // P6: history must hold what the room actually saw
-                            // (tool-sent text and/or the answer text), not the
-                            // raw model output.
+                            let feedback = process(
+                                reply.content.trim().to_string(),
+                                "inbox",
+                                &reply.tool_events,
+                            );
+                            if let Some(fb) = feedback {
+                                // WS-3: failure exit #2 — the retry after a
+                                // format/unknown-action feedback failed. Same
+                                // sink, so this turn cannot vanish silently.
+                                match host.agent_send_with_fallback_turn_context(sid, &fb, &[], "")
+                                {
+                                    Ok(reply2) => {
+                                        process(
+                                            reply2.content.trim().to_string(),
+                                            "retry",
+                                            &reply2.tool_events,
+                                        );
+                                    }
+                                    Err(e) => {
+                                        eprintln!("inbox: retry send failed: {e}");
+                                        spill_and_notify(&mut outage_notified);
+                                    }
+                                }
+                            }
+                            // P6: history only has the bare action JSON; put
+                            // the text the channel actually sent in its place
+                            // so the next turn knows what the bot said.
                             let sent = outbound_replies(reply.content.trim(), &reply.tool_events);
                             if !sent.is_empty() {
                                 if let Err(e) =
@@ -3090,9 +3204,9 @@ mod batch_tests {
         assert!(!with_role("").caller_is_admin());
     }
 
-    /// P6: 从工具调用和助手正文里取出真正发给渠道的文本。
+    /// P6: 从工具调用（或 legacy respond）里取出真正发给渠道的文本。
     #[test]
-    fn outbound_replies_reads_tool_events_and_answer_text() {
+    fn outbound_replies_reads_tool_events_and_respond_action() {
         let event = |name: &str, arguments: Value| AgentToolEvent {
             name: name.to_string(),
             arguments,
@@ -3108,38 +3222,35 @@ mod batch_tests {
                 "payload_json": {"node_id": "qq_send", "target": "group:1", "message": "你好"}
             }),
         );
-        // A tool-sent message and a spoken answer both belong in history.
         assert_eq!(
-            outbound_replies("回答", std::slice::from_ref(&qq_send)),
-            vec!["你好".to_string(), "回答".to_string()]
+            outbound_replies("{\"action\":\"suspend\"}", &[qq_send]),
+            vec!["你好".to_string()]
         );
         let flat = event("invoke_plugin", json!({"message": "平铺"}));
         assert_eq!(outbound_replies("", &[flat]), vec!["平铺".to_string()]);
         let other = event("read_file", json!({"message": "不是回复"}));
-        assert!(outbound_replies("", &[other]).is_empty());
-        // An answer identical to what a tool already sent is recorded once.
+        assert!(outbound_replies("{\"action\":\"suspend\"}", &[other]).is_empty());
         assert_eq!(
-            outbound_replies("你好", &[qq_send]),
-            vec!["你好".to_string()]
+            outbound_replies("{\"action\":\"respond\",\"message\":\"回复\"}", &[]),
+            vec!["回复".to_string()]
         );
-        // Whitespace-only text is silence, not a reply.
-        assert!(outbound_replies("   \n", &[]).is_empty());
+        assert!(outbound_replies("{\"action\":\"respond\",\"message\":\"  \"}", &[]).is_empty());
     }
 }
 
 #[cfg(test)]
 mod inbox_framing_tests {
-    use super::wrap_inbox_batch;
+    use super::{parse_first_json, wrap_inbox_batch};
 
     // Channel-neutral markers frame a plain single-line batch, with the
-    // scope instruction and the silence-in-plain-words rule present.
+    // scope instruction and the exact suspend token present.
     #[test]
     fn wrap_plain_batch() {
         let wrapped = wrap_inbox_batch("[user A]: 你好");
         assert!(wrapped.starts_with("CURRENT_INCOMING_BATCH_START\n"));
         assert!(wrapped.contains("\n[user A]: 你好\n"));
         assert!(wrapped.contains("CURRENT_INCOMING_BATCH_END\n"));
-        assert!(wrapped.contains("answer with exactly `[SILENCE]`"));
+        assert!(wrapped.contains(r#"{"action":"suspend"}"#));
         // Channel-neutral: no protocol name leaks into runtime framing.
         assert!(!wrapped.contains("QQ"));
         assert!(!wrapped.contains("Feishu"));
@@ -3190,6 +3301,35 @@ mod inbox_framing_tests {
         let once = wrap_inbox_batch("hi");
         let twice = wrap_inbox_batch(&once);
         assert_eq!(twice.matches("CURRENT_INCOMING_BATCH_START").count(), 2);
+    }
+
+    // Pure JSON parses to the suspend verdict.
+    #[test]
+    fn parse_first_json_pure() {
+        let v = parse_first_json(r#"{"action":"suspend"}"#).expect("pure JSON parses");
+        assert_eq!(v.get("action").and_then(|a| a.as_str()), Some("suspend"));
+    }
+
+    // Trailing DSML XML after the JSON is ignored; only the first value is read.
+    #[test]
+    fn parse_first_json_trailing_xml() {
+        let v = parse_first_json(r#"{"action":"suspend"}<dsml>noise</dsml>"#)
+            .expect("first JSON value parses despite trailing XML");
+        assert_eq!(v.get("action").and_then(|a| a.as_str()), Some("suspend"));
+    }
+
+    // Trailing whitespace after the JSON is tolerated.
+    #[test]
+    fn parse_first_json_trailing_whitespace() {
+        let v = parse_first_json("{\"action\":\"respond\",\"message\":\"hi\"}   \n\t")
+            .expect("trailing whitespace tolerated");
+        assert_eq!(v.get("action").and_then(|a| a.as_str()), Some("respond"));
+    }
+
+    // Leading non-JSON content fails (the first token is not a JSON value).
+    #[test]
+    fn parse_first_json_leading_garbage_fails() {
+        assert!(parse_first_json(r#"garbage {"action":"suspend"}"#).is_err());
     }
 }
 
@@ -3765,102 +3905,32 @@ mod startup_invocation_tests {
 }
 
 #[cfg(test)]
-#[cfg(test)]
-mod silence_token_tests {
-    use super::{is_silence_text, SILENCE_TOKEN};
-
-    // The model translates a lowercase English token (`[silence]` -> `[寂静]`),
-    // which is how a silent turn posted both `[寂静]` and `[沉默]`. The
-    // canonical token is ASCII and copy-exact; a lone short bracketed token in
-    // any script is also silence.
-    #[test]
-    fn canonical_and_localized_tokens_are_silence() {
-        for text in [
-            "[SILENCE]",
-            "  [SILENCE]\n",
-            "\"[SILENCE]\"",
-            "`[SILENCE]`",
-            "[silence]",
-            "[寂静]",
-            "[沉默]",
-            "【跳过】",
-            "[no reply]",
-            "[skip]",
-            "",
-            "   ",
-        ] {
-            assert!(is_silence_text(text), "should be silence: {text:?}");
-        }
-    }
-
-    #[test]
-    fn real_text_is_never_silence() {
-        for text in [
-            "(empty)",
-            "[图片] 看这个",
-            "[沉默] 但我想说一句",
-            "13×7=91",
-            "[SILENCE] 补充一句",
-            "[这是一个很长的方括号内容超过了十二个字]",
-        ] {
-            assert!(!is_silence_text(text), "should be a message: {text:?}");
-        }
-    }
-
-    #[test]
-    fn the_token_is_documented_for_the_model() {
-        let hint = include_str!("../../../fixtures/plugins/qq/src/lib.rs");
-        assert!(hint.contains("exactly `[SILENCE]`"), "qq hint must name it");
-        assert!(
-            hint.contains("do not translate it"),
-            "qq hint must forbid translating the token"
-        );
-        assert_eq!(SILENCE_TOKEN, "[SILENCE]");
-    }
-}
-
-#[cfg(test)]
 mod reply_dedupe_tests {
-    use super::already_sent;
+    use super::reply_was_sent;
     use cordis_runtime::agent::AgentToolEvent;
     use serde_json::json;
 
-    fn event(node_id: &str, message: &str, ok: bool) -> AgentToolEvent {
+    fn event(node_id: &str, ok: bool) -> AgentToolEvent {
         AgentToolEvent {
             name: "invoke_plugin".to_string(),
-            arguments: json!({
-                "node_id": node_id,
-                "plugin_path": "qq",
-                "payload_json": { "node_id": node_id, "message": message },
-            }),
+            arguments: json!({ "node_id": node_id, "plugin_path": "qq" }),
             ok,
             output: None,
             error: None,
         }
     }
 
-    // The answer text is the reply; a byte-identical repeat of what a tool
-    // already sent this turn is suppressed, while a caption still goes out.
+    // `respond` is allowed again; the CLI drops it when the turn already sent
+    // through the reply node, which is what the old hard ban was guarding.
     #[test]
-    fn only_an_identical_repeat_is_suppressed() {
-        let sent = event("qq_send", "你好", true);
-        assert!(already_sent("你好", std::slice::from_ref(&sent), "qq_send"));
-        assert!(!already_sent(
-            "你好，图在这",
-            std::slice::from_ref(&sent),
+    fn a_successful_send_this_turn_suppresses_the_respond_action() {
+        assert!(reply_was_sent(&[event("qq_send", true)], "qq_send"));
+        assert!(!reply_was_sent(&[event("qq_send", false)], "qq_send"));
+        assert!(!reply_was_sent(
+            &[event("qq_get_group_info", true)],
             "qq_send"
         ));
-        assert!(!already_sent(
-            "你好",
-            &[event("qq_send", "你好", false)],
-            "qq_send"
-        ));
-        assert!(!already_sent(
-            "你好",
-            &[event("qq_get_group_info", "你好", true)],
-            "qq_send"
-        ));
-        assert!(!already_sent("你好", &[], "qq_send"));
-        assert!(!already_sent("你好", &[sent], ""));
+        assert!(!reply_was_sent(&[], "qq_send"));
+        assert!(!reply_was_sent(&[event("qq_send", true)], ""));
     }
 }
