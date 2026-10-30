@@ -106,6 +106,12 @@ pub type ShellAgentReply = AgentReply;
 /// this name appears among the calls, so text-only output keeps the turn alive.
 pub const AGENT_TOOL_END_TURN: &str = "suspend";
 
+/// Plugin-iteration sessions end when the agent records its summary: the
+/// prompt promises "it ends the session immediately", and the promotion
+/// pipeline reads that summary. Without this the loop kept asking for another
+/// turn and the run died on "exited without calling record_iteration_summary".
+pub const AGENT_TOOL_RECORD_ITERATION_SUMMARY: &str = "record_iteration_summary";
+
 #[derive(Debug, Clone)]
 pub struct ShellAgentSession {
     inner: AgentSession,
@@ -497,6 +503,15 @@ impl AgentSession {
                 }
             }
 
+            // A recorded summary closes an iteration turn.
+            // Only iteration backends expose this tool, so no kind gate is
+            // needed — and a kind gate would miss the exact session kind the
+            // host uses for the iteration agent.
+            let ends_after_tools = message
+                .tool_calls
+                .iter()
+                .any(|call| call.function.name == AGENT_TOOL_RECORD_ITERATION_SUMMARY);
+
             if !message.tool_calls.is_empty() {
                 let available_tools = tool_specs
                     .iter()
@@ -679,6 +694,15 @@ impl AgentSession {
                 // this point would sit between two tool results of the same
                 // assistant and break the chain).
                 flush_tool_failure_prompts(&mut messages, &mut tool_failure_prompts);
+                if ends_after_tools {
+                    self.no_end_strikes = 0;
+                    self.completed_turns += 1;
+                    return Ok(AgentReply {
+                        response_id,
+                        content: message.content.unwrap_or_default(),
+                        tool_events,
+                    });
+                }
                 continue;
             }
 
@@ -2952,6 +2976,34 @@ mod tests {
     // A channel turn is not over when the model stops calling tools: it needs
     // an explicit `suspend`. A text-only step is nudged and the turn continues.
     #[test]
+    // The iteration prompt promises the summary "ends the session
+    // immediately"; without this the loop asked for another turn and the run
+    // failed on "exited without calling record_iteration_summary".
+    #[test]
+    fn recording_the_iteration_summary_ends_the_turn() {
+        let provider = FakeLlmProvider::new(vec![
+            cordis_plugin_sdk::llm::LlmMessage {
+                tool_calls: vec![cordis_plugin_sdk::llm::LlmToolCall {
+                    id: "summary".to_string(),
+                    call_type: "function".to_string(),
+                    function: cordis_plugin_sdk::llm::LlmToolFunction {
+                        name: AGENT_TOOL_RECORD_ITERATION_SUMMARY.to_string(),
+                        arguments: "{}".to_string(),
+                    },
+                }],
+                ..Default::default()
+            },
+            assistant_reply("should never be requested"),
+        ]);
+        let mut session = ShellAgentSession::new(LlmApiConfig::default()).expect("build session");
+        let reply = session
+            .respond_via(&EMPTY_FAKE_HOST, "test-session-summary", "iterate", &provider)
+            .expect("turn");
+        assert_eq!(session.status().completed_turns, 1);
+        assert_eq!(provider.seen_bodies.lock().expect("bodies").len(), 1);
+        assert!(reply.tool_events.is_empty());
+    }
+
     fn a_channel_turn_ends_only_on_the_suspend_call() {
         let provider = FakeLlmProvider::new(vec![
             assistant_reply("我先说一句"),
