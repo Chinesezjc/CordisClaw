@@ -236,6 +236,28 @@ PLUGIN_AGENT_TOOL_LIST_CONTEXT_FILES / READ_CONTEXT_FILES 从未使用
 
 已完整回滚到 `bbcfa3a`（绿色），把这条结论落盘。下一轮按"循环 + 迭代一起搬"执行。
 
+## 第 11 轮设计决定：状态归会话，宿主只提供事实
+
+要让循环和迭代装配一起搬走，必须先解决一个结构问题：`ManagedAgentSession` 现在
+同时持有 `Box<dyn AgentSessionApi>` 和 `ManagedAgentState`（里面是
+`PluginIterationAgentState`）。状态留在宿主，迭代后端就永远搬不走。
+
+决定：**状态属于会话，不属于宿主**。
+
+```
+ManagedAgentSession { handle, session: Box<dyn AgentSessionApi> }   ← 只剩这两个
+```
+
+- 迭代会话在 crate 里是 `IterationSession { inner: AgentSession, state: PluginIterationAgentState }`，
+  自己实现 `AgentSessionApi`；宿主只调 `respond`，不再区分种类；
+- 因此 trait 上的 `respond_with_iteration` 消失，只剩 `respond`；
+- 迭代后端要读的两样东西（`fixtures_root`、`plugin_iteration_policy`）改由
+  `AgentToolHost` 提供（宿主本来就该提供事实，不该由循环反查具体类型）；
+- `AgentLoop::create` 需要接受可选的迭代上下文（`prepared` + `context_paths`），
+  即 `create(config, kind, Option<IterationSeed>)`。
+
+这样 `iteration/`、`host/iteration*.rs`、`agent.rs` 三者可以一起搬，宿主侧不留残余。
+
 ## 未决问题（2026-10-31，下一轮先查）
 
 `cargo test -p cordis-runtime --test runtime_host` 有 5 个 `iterate_plugins` 相关用例失败，
