@@ -19,7 +19,11 @@ use std::process::{Command, Stdio};
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
-const TIMEOUT_SECS: u64 = 10;
+/// Downloading a QQ CDN image is fast; the vision model is not: a
+/// reasoning-capable model needs ~10-15s for one image, so a 10s API timeout
+/// made `vision_describe` fail (or, worse, appear to succeed with no answer).
+const DOWNLOAD_TIMEOUT_SECS: u64 = 10;
+const API_TIMEOUT_SECS: u64 = 60;
 const MAX_IMAGE_BYTES: usize = 20 * 1024 * 1024; // 20 MB
 
 // ---------------------------------------------------------------------------
@@ -34,8 +38,9 @@ const MAX_IMAGE_BYTES: usize = 20 * 1024 * 1024; // 20 MB
 const URL_CACHE_TTL: Duration = Duration::from_secs(600);
 const URL_CACHE_CAPACITY: usize = 8;
 
-static URL_CACHE: LazyLock<Mutex<HashMap<String, (Vec<u8>, Instant)>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+type UrlCache = Mutex<HashMap<String, (Vec<u8>, Instant)>>;
+
+static URL_CACHE: LazyLock<UrlCache> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
 fn cache_lookup(
     cache: &mut HashMap<String, (Vec<u8>, Instant)>,
@@ -145,7 +150,7 @@ fn download_image(url_str: &str) -> Result<Vec<u8>, String> {
     check_url_safety(url_str)?;
 
     let resp = ureq::AgentBuilder::new()
-        .timeout(Duration::from_secs(TIMEOUT_SECS))
+        .timeout(Duration::from_secs(DOWNLOAD_TIMEOUT_SECS))
         .redirects(0) // block redirects; caller must re-issue if needed
         .build()
         .get(url_str)
@@ -318,6 +323,45 @@ fn vision_ocr(url: Option<&str>, path: Option<&str>, lang: &str) -> Result<Strin
 // vision_describe — OpenAI-compatible vision API
 // ---------------------------------------------------------------------------
 
+/// How many tokens the vision model may spend. A reasoning-capable model
+/// spends part of this on `reasoning_content` before writing `content`; with
+/// the old 1024 budget a detailed image exhausted it and the reply came back
+/// with an empty `content` (finish_reason=length), which looked like "the
+/// model saw nothing".
+fn vision_max_tokens() -> u32 {
+    std::env::var("VISION_MAX_TOKENS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(4096)
+}
+
+/// Pull the answer out of a vision API response, or explain why there is none.
+fn describe_text_from_response(body: &str) -> Result<String, String> {
+    let json: Value =
+        serde_json::from_str(body).map_err(|e| format!("parse response JSON: {e}"))?;
+    let choice = &json["choices"][0];
+    let text = choice["message"]["content"]
+        .as_str()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if !text.is_empty() {
+        return Ok(text);
+    }
+    let finish = choice["finish_reason"].as_str().unwrap_or("unknown");
+    let reasoning_chars = choice["message"]["reasoning_content"]
+        .as_str()
+        .map(str::chars)
+        .map(Iterator::count)
+        .unwrap_or(0);
+    Err(format!(
+        "vision model returned an empty answer (finish_reason={finish}, \
+         reasoning_chars={reasoning_chars}, max_tokens={}); raise VISION_MAX_TOKENS or retry",
+        vision_max_tokens()
+    ))
+}
+
 fn vision_describe(
     url: Option<&str>,
     path: Option<&str>,
@@ -361,13 +405,13 @@ fn vision_describe(
                 ]
             }
         ],
-        "max_tokens": 1024
+        "max_tokens": vision_max_tokens()
     });
 
     let body_str = serde_json::to_string(&body).map_err(|e| format!("serialize request: {e}"))?;
 
     let resp = ureq::AgentBuilder::new()
-        .timeout(Duration::from_secs(TIMEOUT_SECS))
+        .timeout(Duration::from_secs(API_TIMEOUT_SECS))
         .build()
         .post(&format!("{base_url}/chat/completions"))
         .set("Authorization", &format!("Bearer {api_key}"))
@@ -385,15 +429,48 @@ fn vision_describe(
         return Err(format!("API error ({status}): {resp_body}"));
     }
 
-    let json: Value =
-        serde_json::from_str(&resp_body).map_err(|e| format!("parse response JSON: {e}"))?;
-
-    let text = json["choices"][0]["message"]["content"]
-        .as_str()
-        .ok_or_else(|| "unexpected API response format".to_string())?
-        .to_string();
+    let text = describe_text_from_response(&resp_body)?;
 
     Ok((text, model))
+}
+
+#[cfg(test)]
+mod describe_response_tests {
+    use super::{describe_text_from_response, vision_max_tokens};
+
+    // A reasoning model can exhaust the token budget before writing `content`.
+    // That must be an error, not a successful empty description — an empty
+    // "ok" made the assistant believe it had no visual information at all.
+    #[test]
+    fn empty_content_is_an_error_that_explains_why() {
+        let body = r#"{"choices":[{"finish_reason":"length","message":{"role":"assistant","content":"","reasoning_content":"thinking..."}}]}"#;
+        let err = describe_text_from_response(body).expect_err("empty content must fail");
+        assert!(err.contains("finish_reason=length"), "err: {err}");
+        assert!(err.contains("VISION_MAX_TOKENS"), "err: {err}");
+        assert!(
+            err.contains(&format!("max_tokens={}", vision_max_tokens())),
+            "err: {err}"
+        );
+    }
+
+    #[test]
+    fn non_empty_content_is_returned_trimmed() {
+        let body =
+            r#"{"choices":[{"finish_reason":"stop","message":{"content":"  一只猫在键盘上  "}}]}"#;
+        assert_eq!(
+            describe_text_from_response(body).expect("content"),
+            "一只猫在键盘上"
+        );
+    }
+
+    #[test]
+    fn malformed_response_is_reported() {
+        let err = describe_text_from_response("not json").expect_err("must fail");
+        assert!(err.contains("parse response JSON"), "err: {err}");
+        // A response with no `choices` at all is an empty answer, not a panic.
+        let err = describe_text_from_response("{}").expect_err("must fail");
+        assert!(err.contains("empty answer"), "err: {err}");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -632,7 +709,11 @@ mod tests {
         let t0 = Instant::now();
         cache_store(&mut cache, "https://example.com/a.jpg", b"img", t0);
         assert_eq!(
-            cache_lookup(&mut cache, "https://example.com/a.jpg", t0 + Duration::from_secs(5)),
+            cache_lookup(
+                &mut cache,
+                "https://example.com/a.jpg",
+                t0 + Duration::from_secs(5)
+            ),
             Some(b"img".to_vec())
         );
         // Expired entries are dropped and must not be served.
