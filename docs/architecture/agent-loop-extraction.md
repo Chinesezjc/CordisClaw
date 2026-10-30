@@ -95,6 +95,26 @@ kernel 不能在正常依赖里出现 `cordis-agent`，否则回到循环依赖�
 5. 文档与 `docs/rs-files-responsibility.md` 同步；coverage 正则去掉 `agent.rs` 排除
    （循环此时在可测 crate 里）。
 
+## 第二步踩到的硬点（2026-10-31，待继续）
+
+`AgentSessionApi::respond` 不能只收 `&dyn AgentToolHost`：真正的一轮入口是
+
+```rust
+pub(crate) fn respond_with_runtime_host_via_images<H: AgentToolHost + ?Sized>(
+    &mut self, host: &H, session_id: &str, input: &str, images: &[Value], notes: &str,
+    provider: &dyn LlmProvider,                 // ← pub(crate)
+    sink: Option<Arc<dyn crate::llm_sink::TokenSink>>,
+) -> Result<AgentReply, RuntimeError>
+```
+
+`LlmProvider` 是 `pub(crate)`，而 provider 的**选取**（配置解析、profile 回退）也在
+kernel。所以接缝必须同时抽象"谁提供补全"：要么把 `LlmProvider` 提升成 `pub` 并
+随 trait 一起暴露，要么让循环自己拿 provider 名 + 配置去查 `llm_complete` 能力节点。
+后者更符合"传输已移出 kernel"，代价是循环要知道能力节点约定（可接受，它本来就是
+协议的一部分）。
+
+结论：第二步开始前先定这一点，否则 trait 签名会返工。
+
 ## 已知硬点
 
 - **崩溃恢复**：`host/mod.rs::detect_crash_and_recover` 现在直接
