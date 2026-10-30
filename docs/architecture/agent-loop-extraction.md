@@ -283,6 +283,17 @@ error: the trait bound `AgentSession: AgentSessionApi` is not satisfied
 
 已完整回滚到 `04678de`（绿色）。
 
+## 第 15 轮：循环相关集成测试批量迁移完成
+
+9 个 `tests/*.rs`（`runtime_host`、`host_coverage`、`host_llm_coverage`、
+`host_coverage_rest`、`host_reload_arms`、`agent_toolchain_400`、`host_ops_arms`、
+`host_iterate_stages`、`host_build_coverage`）已移到 `crates/cordis-agent/tests/`，
+每个文件顶部用 `#[ctor]` 装 loop。
+
+结果：`host_boot_session_arms` 25/25、`agent_toolchain_400` 6/6、`boot_with_loop` 1/1
+等绝大多数通过；`runtime_host` 里 **5 个迭代用例仍失败**，与第 3 轮在 `98ebff2`
+上复现的是同一批（canary 判定 `Partial`），属既有问题，不是迁移引入。
+
 ## 未决问题（2026-10-31，下一轮先查）
 
 `cargo test -p cordis-runtime --test runtime_host` 有 5 个 `iterate_plugins` 相关用例失败，

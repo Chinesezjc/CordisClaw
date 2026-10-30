@@ -13,6 +13,11 @@
 //! `linux_dylib_artifacts_available()`; `ensure_fixture_artifacts` rebuilds
 //! the fixture dylibs for the current host so a real boot succeeds on macOS.
 
+#[ctor::ctor]
+fn _install_agent_loop() {
+    let _ = cordis_agent::install();
+}
+
 use cordis_runtime::core::error::RuntimeError;
 use cordis_runtime::core::models::NodeOutcome;
 use cordis_runtime::execution::engine::{ExecutionMetrics, ExecutionOutput};

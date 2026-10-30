@@ -13,6 +13,11 @@
 //! 脚本按 payload 里的 `transport.base_url` 打本地 mock SSE）。因此本文件不依赖
 //! fixture dylib，boot 也快。
 
+#[ctor::ctor]
+fn _install_agent_loop() {
+    let _ = cordis_agent::install();
+}
+
 use cordis_runtime::host::{AgentSessionKind, RuntimeHost};
 use serde_json::{json, Value};
 use std::fs;

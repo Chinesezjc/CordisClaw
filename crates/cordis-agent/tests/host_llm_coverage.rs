@@ -13,6 +13,11 @@
 //! Boot on an empty index is near-instant, so these tests avoid the ~120s
 //! `ensure_fixture_artifacts` dylib rebuild that the full-fixture tests pay.
 
+#[ctor::ctor]
+fn _install_agent_loop() {
+    let _ = cordis_agent::install();
+}
+
 use cordis_runtime::core::error::RuntimeError;
 use cordis_runtime::host::{AgentSessionKind, AgentStartOptions, RuntimeHost};
 use cordis_runtime::kernel::plugin_iteration::KernelPluginIssueSource;

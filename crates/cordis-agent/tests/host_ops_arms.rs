@@ -14,6 +14,11 @@
 //! Nothing here disables coverage instrumentation; every arm is reached by
 //! driving the public API.
 
+#[ctor::ctor]
+fn _install_agent_loop() {
+    let _ = cordis_agent::install();
+}
+
 use cordis_runtime::core::error::RuntimeError;
 use cordis_runtime::host::{apply_plugin_iteration_journal, RuntimeHost};
 use cordis_runtime::kernel::plugin_iteration::PluginEditRollback;

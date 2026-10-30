@@ -9,6 +9,11 @@
 //! reads `artifacts/`; the snapshot root lives in the OS temp dir), while any
 //! path that mutates the fixtures tree runs against a throwaway copy.
 
+#[ctor::ctor]
+fn _install_agent_loop() {
+    let _ = cordis_agent::install();
+}
+
 use cordis_runtime::agent::{AgentSession, AgentToolHost};
 use cordis_runtime::config::RuntimeConfig;
 use cordis_runtime::core::error::RuntimeError;

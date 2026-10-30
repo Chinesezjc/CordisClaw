@@ -17,6 +17,11 @@
 //! runs on any platform. Only `mini` is ever compiled, so the build cost is a
 //! single small crate rather than the entire fixtures graph.
 
+#[ctor::ctor]
+fn _install_agent_loop() {
+    let _ = cordis_agent::install();
+}
+
 use cordis_runtime::host::RuntimeHost;
 use cordis_runtime::kernel::plugin_iteration::{
     CanaryVerdict, KernelPluginIssueSource, KernelPluginIterationRequest, PluginEditOpKind,

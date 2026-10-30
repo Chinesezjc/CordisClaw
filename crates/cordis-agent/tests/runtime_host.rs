@@ -1,3 +1,9 @@
+
+#[ctor::ctor]
+fn _install_agent_loop() {
+    let _ = cordis_agent::install();
+}
+
 use cordis_runtime::host::{ReloadAttemptStatus, RuntimeHost, RuntimeSnapshot};
 use cordis_runtime::kernel::auto_update::{AutoUpdatePlan, FilePatch};
 use cordis_runtime::kernel::evaluator::VerificationInput;
