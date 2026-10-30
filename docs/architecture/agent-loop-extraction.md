@@ -138,7 +138,28 @@ kernel。所以接缝必须同时抽象"谁提供补全"：要么把 `LlmProvide
 
 结论：第二步开始前先定这一点，否则 trait 签名会返工。
 
-## `agent.rs` 切分图（2026-10-31 实测行号）
+## `agent.rs` 切分图（2026-10-31 实测行号，第二轮校正）
+
+上一版行号是旧修订的，照抄会切错（第一次尝试在 2093 行断在函数中间）。以下由
+花括号匹配算出，可直接用：
+
+**移入 `cordis-agent`（循环本体）**
+`591–1079`（`SessionCaller` 之后到 `impl AgentSession` 之前：`LlmProvider`、
+`LlmCompletionParts`、`AgentSession`、快照、`AGENT_TOOL_END_TURN`、`ShellAgentSession`、
+`estimate_tokens`）、`1080–2331`（两个 impl + 失败提示/镜像/消息转换）、
+`2583–3415`（`RuntimeShellAgentBackend`、DSML、`dsml_protocol_prompt`、`shell_agent_tools`、
+人格/conduct/system prompt）、`3434` 之后（测试）。
+
+**留在 kernel（工具 ABI + 宿主实现）**
+常量行 `59–64`、`72`、`172–191`；`81–83`、`104–171`（内省工具过滤）；
+`198–207`（`SessionCaller`）；`208–1072`（`impl AgentToolHost`）；
+`2332–2451`（全部参数结构体）；`2453–2582`（`execute_agent_tool_call`）；
+`3416–3433`（`parse_json_or_string`、`parse_tool_value_arguments`、`to_json_value`）。
+
+第一次尝试失败的原因记录下来：用旧行号切，`agent.rs` 在中途被切断，编译报
+`unexpected closing delimiter`；已回滚，仓库保持绿色。
+
+## `agent.rs` 切分图（旧版，行号已失效，仅留内容归属）
 
 | 行段 | 内容 | 归属 |
 |---|---|---|
