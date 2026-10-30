@@ -87,14 +87,29 @@ pub fn canary_probe_verdict(
 /// Side effects a node declares in its docs. A node that declares any is not
 /// replayed as canary evidence: replaying it mutates state (a pull consumes
 /// pity) and its response is usually the very thing the edit changes.
+/// Does this node's declared effect *mutate* something a replay would repeat?
+///
+/// Declaring any side effect used to be enough to skip canary replay, which
+/// also skipped plain terminal I/O (`reads stdin`, `writes stdout`) — exactly
+/// the nodes worth replaying. Only effects that touch persistent state, files
+/// or consumables disqualify a sample.
 pub fn node_declares_side_effects_in(
     nodes: &[cordis_plugin_sdk::NodeDoc],
     node_id: &str,
 ) -> bool {
+    const MUTATING: [&str; 15] = [
+        "consum", "mutat", "persist", "delete", "remove", "increment", "decrement", "save",
+        "update", "create", "spend", "charge", "grant", "file", "disk",
+    ];
     nodes
         .iter()
         .find(|node| node.id == node_id)
-        .map(|node| !node.side_effects.is_empty())
+        .map(|node| {
+            node.side_effects.iter().any(|effect| {
+                let effect = effect.to_ascii_lowercase();
+                MUTATING.iter().any(|marker| effect.contains(marker))
+            })
+        })
         .unwrap_or(false)
 }
 
@@ -255,6 +270,14 @@ mod canary_probe_tests {
             node("gacha_entry", vec!["consumes pity".to_string()]),
             node("gacha_status", Vec::new()),
         ];
+        // Terminal I/O is not mutation: replaying `echo` twice is harmless,
+        // and skipping it left the canary with no evidence at all.
+        let io_nodes = vec![
+            node("shell_entry", vec!["reads stdin".to_string(), "writes stdout".to_string()]),
+            node("writes_files", vec!["writes files".to_string()]),
+        ];
+        assert!(!node_declares_side_effects_in(&io_nodes, "shell_entry"));
+        assert!(node_declares_side_effects_in(&io_nodes, "writes_files"));
         assert!(node_declares_side_effects_in(&nodes, "gacha_entry"));
         assert!(!node_declares_side_effects_in(&nodes, "gacha_status"));
         assert!(!node_declares_side_effects_in(&nodes, "nope"));

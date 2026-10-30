@@ -34,7 +34,7 @@ fn _install_loop() {
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use cordis_runtime::agent::AgentSession;
+use cordis_agent::AgentSession;
 use cordis_runtime::config::RuntimeConfig;
 use cordis_runtime::core::error::RuntimeError;
 use cordis_runtime::host::{AgentSessionKind, AgentStartOptions, RuntimeHost, WalkControl};

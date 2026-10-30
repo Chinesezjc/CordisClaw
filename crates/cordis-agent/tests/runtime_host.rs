@@ -2280,7 +2280,7 @@ fn soul_roundtrip_profile_reference_and_scope_guard() {
         eprintln!("[skip] fixture dylibs are x86_64-linux only; skipping on this host");
         return;
     }
-    use cordis_runtime::agent::AgentToolHost;
+    use cordis_runtime::agent_api::AgentToolHost;
     use cordis_runtime::soul::Soul;
 
     let temp = setup_fixture_workspace_copy();
@@ -2329,7 +2329,7 @@ fn soul_store_plugin_overrides_file_provider() {
         eprintln!("[skip] fixture dylibs are x86_64-linux only; skipping on this host");
         return;
     }
-    use cordis_runtime::agent::AgentToolHost;
+    use cordis_runtime::agent_api::AgentToolHost;
 
     let temp = setup_fixture_workspace_copy();
     let fixtures = temp.path().join("fixtures");
@@ -2373,7 +2373,7 @@ fn refresh_session_soul_switches_persona_scope() {
         eprintln!("[skip] fixture dylibs are x86_64-linux only; skipping on this host");
         return;
     }
-    use cordis_runtime::agent::AgentToolHost;
+    use cordis_runtime::agent_api::AgentToolHost;
     use cordis_runtime::host::{AgentSessionKind, AgentStartOptions};
 
     let temp = setup_fixture_workspace_copy();
@@ -2551,7 +2551,7 @@ fn command_router_dispatch_table() {
         eprintln!("[skip] fixture dylibs are x86_64-linux only; skipping on this host");
         return;
     }
-    use cordis_runtime::agent::AgentToolHost;
+    use cordis_runtime::agent_api::AgentToolHost;
     use cordis_runtime::command_router::{dispatch, CommandContext, CommandOutcome};
     use CommandOutcome::Reply;
 

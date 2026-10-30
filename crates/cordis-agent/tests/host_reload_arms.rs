@@ -24,7 +24,7 @@ fn _install_agent_loop() {
 }
 
 use cordis_plugin_sdk::{AbiFingerprint, NodeDoc, NodeType, PluginDocs};
-use cordis_runtime::agent::AgentTranscriptEntry;
+use cordis_runtime::agent_api::AgentTranscriptEntry;
 use cordis_runtime::context::Service;
 use cordis_runtime::core::error::RuntimeError;
 use cordis_runtime::host::{

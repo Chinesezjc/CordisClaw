@@ -14,7 +14,7 @@ fn _install_agent_loop() {
     let _ = cordis_agent::install();
 }
 
-use cordis_runtime::agent::{AgentSession, AgentToolHost};
+use cordis_agent::{AgentSession, AgentToolHost};
 use cordis_runtime::config::RuntimeConfig;
 use cordis_runtime::core::error::RuntimeError;
 use cordis_runtime::core::models::NodeOutcome;
