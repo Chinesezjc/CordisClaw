@@ -386,13 +386,42 @@ fn extract_user_text(display: &str) -> &str {
         .trim()
 }
 
-/// The one in-band way to say "do not post anything".
+/// The canonical in-band way to say "do not post anything".
 ///
 /// "Answer with nothing" is not expressible through a chat-completions
-/// provider: asked for silence, a model emits a placeholder like `(empty)`.
-/// One literal token beats an envelope — the inbox recognises only this exact
-/// string, and everything else is the message.
-const SILENCE_TOKEN: &str = "[silence]";
+/// provider: asked for silence, a model emits a placeholder — and, given a
+/// lowercase English word, it translates it (`[寂静]`, `[沉默]`), which is how
+/// a "silent" turn ends up posting two different tokens to the room.
+///
+/// So: an ASCII, copy-exact token, and a lone short bracketed token in *any*
+/// script also counts as silence. A bracketed token followed by real text is
+/// still a message.
+const SILENCE_TOKEN: &str = "[SILENCE]";
+
+/// Does this assistant text mean "stay quiet"?
+fn is_silence_text(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || trimmed == SILENCE_TOKEN {
+        return true;
+    }
+    // Tolerate a quoted or code-fenced copy of the token.
+    let unquoted = trimmed
+        .trim_matches(|c| c == '"' || c == '\'' || c == '`')
+        .trim();
+    if unquoted == SILENCE_TOKEN {
+        return true;
+    }
+    // A lone bracketed token: [沉默] / [寂静] / [no reply] / 【跳过】.
+    let inner = unquoted
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .or_else(|| {
+            unquoted
+                .strip_prefix('【')
+                .and_then(|rest| rest.strip_suffix('】'))
+        });
+    inner.is_some_and(|inner| !inner.is_empty() && inner.chars().count() <= 12)
+}
 
 /// Text one tool-call event actually delivered (the `message` it sent).
 fn event_message(event: &AgentToolEvent) -> Option<&str> {
@@ -485,7 +514,7 @@ fn wrap_inbox_batch(combined: &str) -> String {
          Do not re-answer an older message as if it were a new request, \
          and do not claim someone is asking you a question unless the question is in this batch or in the thread it continues. \
          Whether to answer is decided by the `[reply policy: ...]` line (see the plugin instructions) plus that context — \
-         if the message is clearly between other people, answer with exactly `[silence]` and nothing else."
+         if the message is clearly between other people, answer with exactly `[SILENCE]` and nothing else."
     )
 }
 
@@ -1049,7 +1078,7 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     // "valid JSON, unknown action" failures.
                     let process = |content: &str, label: &str, tool_events: &[AgentToolEvent]| {
                         let text = content.trim();
-                        if text.is_empty() || text == SILENCE_TOKEN {
+                        if is_silence_text(text) {
                             eprintln!("inbox: no reply text ({label}); staying silent");
                             return;
                         }
@@ -3110,7 +3139,7 @@ mod inbox_framing_tests {
         assert!(wrapped.starts_with("CURRENT_INCOMING_BATCH_START\n"));
         assert!(wrapped.contains("\n[user A]: 你好\n"));
         assert!(wrapped.contains("CURRENT_INCOMING_BATCH_END\n"));
-        assert!(wrapped.contains("answer with exactly `[silence]`"));
+        assert!(wrapped.contains("answer with exactly `[SILENCE]`"));
         // Channel-neutral: no protocol name leaks into runtime framing.
         assert!(!wrapped.contains("QQ"));
         assert!(!wrapped.contains("Feishu"));
@@ -3738,24 +3767,55 @@ mod startup_invocation_tests {
 #[cfg(test)]
 #[cfg(test)]
 mod silence_token_tests {
-    use super::SILENCE_TOKEN;
+    use super::{is_silence_text, SILENCE_TOKEN};
 
-    // Silence has exactly one spelling. A placeholder the model invents
-    // (`(empty)`) is just text and must still be distinguishable, so the
-    // inbox only suppresses the literal token.
+    // The model translates a lowercase English token (`[silence]` -> `[寂静]`),
+    // which is how a silent turn posted both `[寂静]` and `[沉默]`. The
+    // canonical token is ASCII and copy-exact; a lone short bracketed token in
+    // any script is also silence.
     #[test]
-    fn only_the_exact_token_is_silence() {
-        let is_silence = |content: &str| content.trim() == SILENCE_TOKEN;
-        assert!(is_silence("  [silence]\n"));
-        assert!(!is_silence("(empty)"));
-        assert!(!is_silence("[silence] 好"));
-        assert!(!is_silence(""));
+    fn canonical_and_localized_tokens_are_silence() {
+        for text in [
+            "[SILENCE]",
+            "  [SILENCE]\n",
+            "\"[SILENCE]\"",
+            "`[SILENCE]`",
+            "[silence]",
+            "[寂静]",
+            "[沉默]",
+            "【跳过】",
+            "[no reply]",
+            "[skip]",
+            "",
+            "   ",
+        ] {
+            assert!(is_silence_text(text), "should be silence: {text:?}");
+        }
+    }
+
+    #[test]
+    fn real_text_is_never_silence() {
+        for text in [
+            "(empty)",
+            "[图片] 看这个",
+            "[沉默] 但我想说一句",
+            "13×7=91",
+            "[SILENCE] 补充一句",
+            "[这是一个很长的方括号内容超过了十二个字]",
+        ] {
+            assert!(!is_silence_text(text), "should be a message: {text:?}");
+        }
     }
 
     #[test]
     fn the_token_is_documented_for_the_model() {
         let hint = include_str!("../../../fixtures/plugins/qq/src/lib.rs");
-        assert!(hint.contains("exactly `[silence]`"), "qq hint must name it");
+        assert!(hint.contains("exactly `[SILENCE]`"), "qq hint must name it");
+        assert!(
+            hint.contains("do not translate it"),
+            "qq hint must forbid translating the token"
+        );
+        assert_eq!(SILENCE_TOKEN, "[SILENCE]");
     }
 }
 

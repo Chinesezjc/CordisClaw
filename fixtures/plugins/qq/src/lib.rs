@@ -3057,7 +3057,7 @@ HOW TO JUDGE — use the conversation history, not just this one message: who is
 GROUP MEMORY — you keep your own memo per group (how talkative it wants you, its standing topics, what it told you off for). It is NOT injected into your context: read it with `qq_get_group_memory` when a message refers to something you may have written down earlier, when a conversation seems to continue a thread you had, or before you write to it — otherwise you do not need the round trip.\n\
 WRITING MEMORY — the memo is YOURS: maintain it on your own initiative, without waiting to be asked and without asking permission. Write when you learn something DURABLE: an explicit preference (wants you quiet/chatty), a correction, the group's standing topic or in-jokes, or a mistake you already paid for. Do not write about one-off facts or guesses from a single message; overwrite the entry (it replaces, not appends). Read the current memo first (`qq_get_group_memory`) so you do not clobber it, then use `qq_set_group_memory`. Changing how talkative you are is separate: `qq_set_reply_policy` with one of the four modes, and that one needs the group owner/admin or a configured operator. Both take effect on the next message.\n\
 HOW TO REPLY — your final assistant text IS the message sent to this chat. Write exactly what you want the room to see, in plain chat text (CQ codes included when you use them). Never wrap it in JSON, never emit a protocol object: whatever you say as your final text is what the group reads.\n\
-SILENCE — if the message is not for you, or you have nothing worth adding, your entire output must be exactly `[silence]` and nothing else. That token is the only way to stay quiet; never write a placeholder like \"(empty)\", \"(no reply)\" or a bare 「…」 — those are sent to the room as text.\n\
+SILENCE — if the message is not for you, or you have nothing worth adding, your entire output must be exactly `[SILENCE]` and nothing else. Copy it verbatim: do not translate it, do not add punctuation or quotes, do not wrap it in a sentence. That token is the only way to stay quiet; never write a placeholder like \"(empty)\", \"(no reply)\" or a bare 「…」 — those are sent to the room as text.\n\
 TOOLS ARE FOR ACTIONS, NOT FOR TALKING — use a tool only when the message needs something text cannot express: `qq_send` with CQ codes for an image or an @mention, `qq_get_group_info` to size a group, `qq_set_reply_policy` / `qq_get_group_roles` for administration. Do not send a plain reply through `qq_send` and then repeat it in your text; if you already sent the message with a tool, your text should add nothing (or be empty).\n\
 If the user asks you to change the reply rule (e.g. \"reply to everything I say\", \"stop answering so often\"), persist it: invoke_plugin(qq, qq_set_reply_policy, {\"node_id\":\"qq_set_reply_policy\",\"policy\":\"<new rule text>\"}), then tell the user it is already in effect — the next message uses the new policy, no restart needed.\n\
 \n\
@@ -4474,7 +4474,7 @@ mod docs_tests {
         let no_envelope_left = !hint.contains("\"action\":\"respond\"")
             && !hint.contains("\"action\":\"suspend\"");
         assert!(no_envelope_left, "no action envelope may remain: {hint}");
-        let explains_silence = hint.contains("exactly `[silence]`");
+        let explains_silence = hint.contains("exactly `[SILENCE]`");
         assert!(explains_silence, "hint must define silence: {hint}");
 
         // The bot's own qq number comes from config/plugins/qq.yaml, rendered
