@@ -14,8 +14,7 @@ use cordis_runtime::kernel::verifier::VerificationProfile;
 use cordis_runtime::plugin::invoke::PluginInvoker;
 use cordis_runtime::plugin::loader::{default_loader_config, Loader};
 use cordis_tooling::{
-    prepare_artifacts, rebuild_fixture_artifacts, refresh_artifact_index, sync_plugin_docs,
-    PrepareMode,
+    prepare_artifacts, rebuild_fixture_artifacts, refresh_artifact_index, PrepareMode,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -650,14 +649,6 @@ fn main() {
     if args.first().map(|x| x.as_str()) == Some("net-html") {
         if let Err(err) = run_net_html(&args[1..]) {
             eprintln!("net-html failed: {err}");
-            eprintln!("{}", usage());
-            std::process::exit(1);
-        }
-        return;
-    }
-    if args.first().map(|x| x.as_str()) == Some("sync-plugin-docs") {
-        if let Err(err) = run_sync_plugin_docs(&args[1..]) {
-            eprintln!("sync-plugin-docs failed: {err}");
             eprintln!("{}", usage());
             std::process::exit(1);
         }
@@ -2399,17 +2390,6 @@ fn run_net_html(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn run_sync_plugin_docs(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    let root = parse_optional_root_arg(args, "fixtures")?;
-    prepare_fixtures_root(&root, false)?;
-    let written = sync_plugin_docs(&root)?;
-    println!("synced_plugin_docs={}", written.len());
-    for path in written {
-        println!("{}", path.display());
-    }
-    Ok(())
-}
-
 fn run_refresh_artifact_index(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let root = parse_optional_root_arg(args, "fixtures")?;
     prepare_fixtures_root(&root, false)?;
@@ -2566,7 +2546,6 @@ fn usage() -> String {
   cargo run -p cordis-runtime -- graph-html [fixtures_root] [--output=registered-nodes.html]
   cargo run -p cordis-runtime -- net-html [fixtures_root] [--output=registered-net.html]
   cargo run -p cordis-runtime -- prepare-artifacts [fixtures_root] [--full]
-  cargo run -p cordis-runtime -- sync-plugin-docs [fixtures_root]
   cargo run -p cordis-runtime -- refresh-artifact-index [fixtures_root]
   cargo run -p cordis-runtime -- rebuild-fixture-artifacts [fixtures_root]
   cargo run -p cordis-runtime -- gc [--dry-run] [--max-age-hours=<u64>]

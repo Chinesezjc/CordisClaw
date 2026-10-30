@@ -16,8 +16,8 @@
 
 | 文件 | 职责定位 | 关键入口 |
 |---|---|---|
-| `crates/cordis-tooling/src/lib.rs` | 构建系统全部实现（原 `cordis-runtime/src/plugin/tooling.rs`）：manifest/metadata 解析、dirty 指纹与 input probe、构建锁、`cargo` 子进程（超时/offline/proxy 清理）、`artifacts/index.json` 生成、`interfaces.json` 回写、dylib 工件构建；并通过 `CargoBuilder` 实现 runtime 的 `PluginBuilder` 接缝 | `prepare_artifacts()`、`rebuild_fixture_artifacts()`、`rebuild_plugin_workspace()`、`sync_plugin_docs()`、`refresh_artifact_index()`、`CargoBuilder` |
-| `crates/cordis-tooling/tests/tooling.rs` | 构建系统验收（原 `crates/cordis-runtime/tests/tooling.rs`）：docs 回写、artifact index 刷新、dirty/增量/全量重建、构建锁、cargo 失败臂 | `sync_plugin_docs_*`、`refresh_artifact_index_*`、`prepare_artifacts_*` |
+| `crates/cordis-tooling/src/lib.rs` | 构建系统全部实现（原 `cordis-runtime/src/plugin/tooling.rs`）：manifest/metadata 解析、dirty 指纹与 input probe、构建锁、`cargo` 子进程（超时/offline/proxy 清理）、`artifacts/index.json` 生成、`interfaces.json` 回写、dylib 工件构建；并通过 `CargoBuilder` 实现 runtime 的 `PluginBuilder` 接缝 | `prepare_artifacts()`、`rebuild_fixture_artifacts()`、`rebuild_plugin_workspace()`、`refresh_artifact_index()`、`CargoBuilder` |
+| `crates/cordis-tooling/tests/tooling.rs` | 构建系统验收（原 `crates/cordis-runtime/tests/tooling.rs`）：docs 回写、artifact index 刷新、dirty/增量/全量重建、构建锁、cargo 失败臂 | `refresh_artifact_index_*`、`prepare_artifacts_*` |
 | `crates/cordis-tooling/tests/support/mod.rs` | 本 crate 集成测试的 fixtures 根与宿主原生 dylib 探针 | `fixtures_root()`、`linux_dylib_artifacts_available()` |
 
 ## 2. Core 层 (`crates/cordis-runtime/src/core`)
@@ -132,7 +132,7 @@
 | `crates/cordis-runtime/tests/actor_executor.rs` | Actor 执行批次和并发上限行为 | `actor_executor_respects_parallel_limit_and_order` |
 | `crates/cordis-runtime/tests/auto_update.rs` | 自动更新行为验收：应用成功保留、验证失败回滚、路径越界拒绝 | `auto_update_*` |
 | `crates/cordis-runtime/tests/shell_plugin.rs` | 外部 shell 插件验收：loader 注册、generic invoke、交互 REPL、Expr 分发 | `shell_plugin_*` |
-| `crates/cordis-tooling/tests/tooling.rs` | 工具链验收（5.2.48 起随构建系统搬到 `cordis-tooling`）：自动回写 `interfaces.json` 与自动刷新 artifact index 哈希 | `sync_plugin_docs_*`、`refresh_artifact_index_*` |
+| `crates/cordis-tooling/tests/tooling.rs` | 工具链验收（5.2.48 起随构建系统搬到 `cordis-tooling`）：构建时自动回写 `interfaces.json` 与自动刷新 artifact index 哈希 | `refresh_artifact_index_*`、`prepare_artifacts_*` |
 | `crates/cordis-runtime/tests/runtime_host.rs` | RuntimeHost 验收：boot/invoke、reload、旧快照隔离、agent 迭代、rollback、canary、serve CLI、YAML config | `runtime_host_*`、`serve_mode_*` |
 
 > **已删除**: `tests/kernel.rs`（测试已删除的 SelfIterationKernel）、`tests/llm_auto_update.rs`（测试已删除的 LlmPatchPlanner）

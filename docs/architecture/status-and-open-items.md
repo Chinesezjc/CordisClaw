@@ -607,6 +607,29 @@ DSML 泄漏是 provider 侧的低频行为（本地连打 8 次探针都是正�
 验证：qq 75 单测（新增 4 条：文案识别、`shut_up_timestamp` 换算、分钟数四舍五入、表的记录/过期/清除），
 kernel 990、cli 49、clippy 干净；16:28 重启，8099/8002 正常。
 
+### 3.31 移除 `sync-plugin-docs`（2026-10-30）
+
+**它做什么**：读 `artifacts/index.json`，把每个插件的 `docs` 再写成
+`fixtures/plugins/<名>/docs/agent/interfaces.json`。
+
+**为什么删**：
+
+- `prepare_artifacts` 在构建 dylib 插件时**已经**写同一个文件
+  （`cordis-tooling/src/lib.rs`：`write_pretty_json(&docs_path, &docs)`），所以它是同一个文件的
+  第二个写入者，且唯一能做的事是"不重建、只刷新镜像"——恰好是镜像最容易与源码脱节的时刻；
+- 运行时**不读**这份镜像：docs 的真相在 `artifacts/index.json`（loader 从那里取），镜像的唯一
+  消费者是 tooling 的 `collect_files(include_docs)`，把它当迭代上下文文件塞进去，且缺失也容忍；
+- 它带维护税：文档里被写成固定流程、每次要跑一次、忘了就陈旧，还制造了
+  "每次重写都吃掉文件末尾换行"的 git 噪音。
+
+**顺带修掉的换行根因**：`cordis_plugin_sdk::pretty_json` 直接返回
+`to_string_pretty`，不带结尾换行，于是每次写盘都把文件的换行吃掉。现在它补一个 `\n`
+（有单测断言"以且仅以一个换行结尾"），所有由它写出的文件（docs 镜像、artifact index）
+从此不再产生 `\ No newline at end of file` 噪音。
+
+**历史记录说明**：本文档早前章节（3.x）里的 `prepare-artifacts → sync-plugin-docs → reload`
+流程描述保留原样，作为当时的部署记录；**现在请只跑 `prepare-artifacts`**。
+
 ## 4. 部分完成
 
 ### 4.1 Execution engine 有正式入口，数据面验证不足

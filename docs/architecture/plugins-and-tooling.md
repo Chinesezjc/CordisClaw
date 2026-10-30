@@ -110,8 +110,6 @@ expr
   - 导出已注册节点图 HTML
 - `cargo run -p cordis-runtime -- net-html fixtures --output=...`
   - 导出已注册 net HTML
-- `cargo run -p cordis-runtime -- sync-plugin-docs fixtures`
-  - 从 dylib `docs()` 回写 `interfaces.json`
 - `cargo run -p cordis-runtime -- refresh-artifact-index fixtures`
   - 刷新工件索引中的 `sha256`
 - `cargo run -p cordis-runtime -- rebuild-fixture-artifacts [fixtures_root]`

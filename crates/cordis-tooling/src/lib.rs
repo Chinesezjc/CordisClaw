@@ -591,48 +591,6 @@ fn stage_then_rename_file_with_fs(
     Ok(())
 }
 
-pub fn sync_plugin_docs(fixtures_root: &Path) -> Result<Vec<PathBuf>, RuntimeError> {
-    let fixtures_root = absolute_path(fixtures_root)?;
-    let plugins_root = fixtures_root.join("plugins");
-    // Defence: fixtures_root must contain a `plugins/` directory with a
-    // Cargo workspace manifest.  If `fixtures_root` is already pointing
-    // inside `plugins/`, reject it so we don't create nested paths like
-    // `fixtures/plugins/plugins/qq/docs/`.
-    if !plugins_root.join("Cargo.toml").exists() {
-        return Err(invariant(format!(
-            "plugins workspace not found at {}; \
-             fixtures_root must be the project fixtures/ directory, \
-             not the plugins/ subdirectory",
-            plugins_root.display()
-        )));
-    }
-    let artifact_index_path = fixtures_root.join("artifacts/index.json");
-    let index = load_artifact_index(&artifact_index_path)?;
-
-    let mut written = Vec::new();
-    for entry in index.entries {
-        // Build the directory first and join the file name onto it, rather than
-        // building the file path and recovering the directory with `.parent()`:
-        // the resulting paths are identical, and the `None` arm of that lookup
-        // was structurally unreachable (a path ending in a file name always has
-        // a parent).
-        let docs_dir = plugins_root
-            .join(
-                entry
-                    .plugin_path
-                    .replace('/', std::path::MAIN_SEPARATOR_STR),
-            )
-            .join("docs/agent");
-        let docs_path = docs_dir.join("interfaces.json");
-        fs::create_dir_all(&docs_dir).map_err(|e| io_error(&docs_dir, e))?;
-        // P1-17: durable atomic write for interfaces.json.
-        write_pretty_json(&docs_path, &entry.docs)?;
-        written.push(docs_path);
-    }
-
-    Ok(written)
-}
-
 pub fn refresh_artifact_index(fixtures_root: &Path) -> Result<Vec<(String, String)>, RuntimeError> {
     let fixtures_root = absolute_path(fixtures_root)?;
     let artifact_index_path = fixtures_root.join("artifacts/index.json");

@@ -8,7 +8,7 @@ use cordis_runtime::plugin::artifact::read_plugin_docs;
 use cordis_runtime::plugin::package::PackageResolver;
 use cordis_tooling::{
     ensure_fixture_artifacts, prepare_artifacts, rebuild_fixture_artifacts,
-    rebuild_plugin_workspace, refresh_artifact_index, sync_plugin_docs, PrepareMode,
+    rebuild_plugin_workspace, refresh_artifact_index, PrepareMode,
 };
 use serde_json::Value;
 use std::fs;
@@ -21,8 +21,8 @@ use support::fixtures_root;
 
 // ---------------------------------------------------------------------------
 // Synthetic JSON-only workspace helpers. These exercise the public
-// tooling surface (sync_plugin_docs / refresh_artifact_index /
-// read_plugin_docs) without any dylib or `cargo` build, so they run on
+// tooling surface (refresh_artifact_index / read_plugin_docs) without any
+// dylib or `cargo` build, so they run on
 // every host regardless of the fixture artifacts' target triple.
 // ---------------------------------------------------------------------------
 
@@ -63,9 +63,8 @@ fn json_entry(plugin_path: &str, artifact_rel: &str, sha: &str) -> ArtifactIndex
     }
 }
 
-/// Build a minimal fixtures root: `plugins/Cargo.toml` (workspace marker
-/// so sync_plugin_docs accepts it) + `artifacts/index.json` referencing
-/// JSON artifacts written under `artifacts/`.
+/// Build a minimal fixtures root: a `plugins/Cargo.toml` workspace marker and
+/// an `artifacts/index.json` referencing JSON artifacts under `artifacts/`.
 fn synthetic_fixtures(entries: Vec<ArtifactIndexEntry>) -> TempDir {
     let temp = TempDir::new().expect("tempdir");
     let root = temp.path();
@@ -294,31 +293,6 @@ fn modulo_returns_remainder() {
 }
 
 #[test]
-fn sync_plugin_docs_rewrites_dylib_interfaces_json() {
-    if !support::linux_dylib_artifacts_available() {
-        eprintln!("[skip] fixture dylibs are x86_64-linux only; skipping on this host");
-        return;
-    }
-    let temp = setup_fixture_copy();
-    let expr_docs = temp.path().join("plugins/expr/docs/agent/interfaces.json");
-    fs::write(&expr_docs, "{}\n").expect("write broken docs");
-
-    let written = sync_plugin_docs(temp.path()).expect("sync docs should succeed");
-    assert!(written.iter().any(|path| path == &expr_docs));
-
-    let content = fs::read_to_string(&expr_docs).expect("read synced docs");
-    let value: Value = serde_json::from_str(&content).expect("valid synced json");
-    assert_eq!(
-        value.get("plugin_path").and_then(|v| v.as_str()),
-        Some("expr")
-    );
-    assert_eq!(
-        value.get("command_name").and_then(|v| v.as_str()),
-        Some("Expr")
-    );
-}
-
-#[test]
 fn refresh_artifact_index_recomputes_hashes() {
     if !support::linux_dylib_artifacts_available() {
         eprintln!("[skip] fixture dylibs are x86_64-linux only; skipping on this host");
@@ -391,100 +365,6 @@ fn package_resolver_allows_new_dylib_child_without_generated_agent_docs() {
     assert!(
         plugin.docs.nodes.is_empty(),
         "missing generated docs should synthesize a placeholder until rebuild writes real docs"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// sync_plugin_docs — JSON-only, cross-platform.
-// ---------------------------------------------------------------------------
-
-#[test]
-fn sync_plugin_docs_writes_interfaces_for_json_entries() {
-    let temp = synthetic_fixtures(vec![
-        json_entry("alpha", "alpha.json", "aa"),
-        json_entry("beta/child", "beta_child.json", "bb"),
-    ]);
-    let written = sync_plugin_docs(temp.path()).expect("sync docs ok");
-    assert_eq!(written.len(), 2);
-
-    // Nested plugin path resolves under plugins/<segments>/docs/agent/.
-    let alpha_docs = temp.path().join("plugins/alpha/docs/agent/interfaces.json");
-    let beta_docs = temp
-        .path()
-        .join("plugins/beta/child/docs/agent/interfaces.json");
-    assert!(alpha_docs.exists());
-    assert!(beta_docs.exists());
-    assert!(written.contains(&alpha_docs));
-    assert!(written.contains(&beta_docs));
-
-    let value: Value = serde_json::from_str(&fs::read_to_string(&alpha_docs).unwrap()).unwrap();
-    assert_eq!(
-        value.get("plugin_path").and_then(|v| v.as_str()),
-        Some("alpha")
-    );
-    assert_eq!(
-        value.get("command_name").and_then(|v| v.as_str()),
-        Some("Cmd")
-    );
-}
-
-#[test]
-fn sync_plugin_docs_overwrites_drifted_interfaces_json() {
-    let temp = synthetic_fixtures(vec![json_entry("alpha", "alpha.json", "aa")]);
-    let docs_path = temp.path().join("plugins/alpha/docs/agent/interfaces.json");
-    fs::create_dir_all(docs_path.parent().unwrap()).unwrap();
-    fs::write(&docs_path, "{\"plugin_path\":\"WRONG\"}\n").unwrap();
-
-    sync_plugin_docs(temp.path()).expect("sync docs ok");
-    let value: Value = serde_json::from_str(&fs::read_to_string(&docs_path).unwrap()).unwrap();
-    assert_eq!(
-        value.get("plugin_path").and_then(|v| v.as_str()),
-        Some("alpha"),
-        "drifted docs should be rewritten from the index entry"
-    );
-}
-
-#[test]
-fn sync_plugin_docs_rejects_missing_plugins_workspace() {
-    let temp = TempDir::new().unwrap();
-    // No plugins/Cargo.toml -> Invariant error.
-    let err = sync_plugin_docs(temp.path());
-    assert!(matches!(err, Err(RuntimeError::Invariant { .. })));
-}
-
-#[test]
-fn sync_plugin_docs_errors_when_index_missing() {
-    let temp = TempDir::new().unwrap();
-    fs::create_dir_all(temp.path().join("plugins")).unwrap();
-    fs::write(temp.path().join("plugins/Cargo.toml"), "[workspace]\n").unwrap();
-    // plugins workspace exists but artifacts/index.json does not.
-    let err = sync_plugin_docs(temp.path());
-    assert!(matches!(err, Err(RuntimeError::Io { .. })));
-}
-
-/// `sync_plugin_docs` maps a failed `create_dir_all(docs_dir)` to Io: a
-/// read-only `plugins/` directory blocks creating the per-plugin
-/// `docs/agent/` path. Covers the create-docs-dir map_err arm.
-#[cfg(unix)]
-#[test]
-fn sync_plugin_docs_errors_when_docs_dir_cannot_be_created() {
-    use std::os::unix::fs::PermissionsExt;
-    let temp = synthetic_fixtures(vec![json_entry("alpha", "alpha.json", "aa")]);
-    let plugins = temp.path().join("plugins");
-    // Deny writes under plugins/ so create_dir_all(plugins/alpha/docs/agent) fails.
-    fs::set_permissions(&plugins, fs::Permissions::from_mode(0o555)).unwrap();
-    let err = sync_plugin_docs(temp.path());
-    fs::set_permissions(&plugins, fs::Permissions::from_mode(0o755)).unwrap();
-    // Root ignores the read-only mode bits, so the sync succeeds there. Compare
-    // a computed expectation instead of branching: a per-euid `if/else` would
-    // leave whichever arm this host does not take permanently uncovered.
-    // SAFETY: `geteuid` is always safe to call and cannot fail.
-    let enforced = (unsafe { libc::geteuid() }) != 0;
-    let denied = matches!(err, Err(RuntimeError::Io { .. }));
-    assert_eq!(
-        denied, enforced,
-        "a read-only plugins/ must deny the sync only when mode bits bind \
-         (euid_enforced={enforced}): {err:?}"
     );
 }
 
