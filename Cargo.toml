@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/cordis-agent",
   "crates/cordis-cli",
   "crates/cordis-plugin-host",
   "crates/cordis-plugin-sdk",

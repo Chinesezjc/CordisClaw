@@ -96,6 +96,12 @@ kernel 不能在正常依赖里出现 `cordis-agent`，否则回到循环依赖�
    （循环此时在可测 crate 里）。
 
 ## 进展
+- 注入路径已打通（`242298a` 之后）：`crates/cordis-agent` 存在，`cordis_agent::install()`
+  在 cli 的 `main` 里最先调用（和 `install_plugin_builder` 并列）；`CargoAgentLoop`
+  目前把 create/restore 委托给 kernel 的 `KernelAgentLoop`——这是过渡形态，下一步把
+  实现搬过来、kernel 删掉 `KernelAgentLoop`。
+- 线上验证：05:18 注入事件 → `qq_send` → `sent 1 message(s) through tools`。
+
 
 - 第二步的接缝已落地：`agent_loop.rs` 提供 `AgentSessionApi` / `AgentLoop` /
   `install_agent_loop`，`KernelAgentLoop` 是默认实现（包住现有 `AgentSession`），

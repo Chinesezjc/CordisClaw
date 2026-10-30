@@ -632,6 +632,9 @@ fn main() {
     let _ = cordis_runtime::plugin::builder::install_plugin_builder(Box::new(
         cordis_tooling::CargoBuilder,
     ));
+    // Same for the agent loop: the kernel holds the seam, this binary decides
+    // which loop runs. Installed before any host boots.
+    let _ = cordis_agent::install();
 
     if args.first().map(|x| x.as_str()) == Some("auto-update") {
         if let Err(err) = run_auto_update(&args[1..]) {
