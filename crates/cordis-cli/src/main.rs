@@ -511,6 +511,28 @@ where
     }
 }
 
+/// Does this reply promise work the turn never started?
+///
+/// Deliberately narrow — first-person future markers that only read as a
+/// commitment to act ("我这就去", "我去写", "弄好了喊你"). It is used to grant one
+/// nudge turn, never to rewrite what was said: the failure this catches is the
+/// one where the bot answers "行，我去写个插件" and calls no tool at all, so the
+/// room waits for something that will never arrive.
+fn promises_future_action(text: &str) -> bool {
+    const MARKERS: [&str; 9] = [
+        "我这就去",
+        "我这就做",
+        "我去写",
+        "我去做",
+        "我去弄",
+        "我马上做",
+        "我马上去",
+        "弄好了喊你",
+        "做好告诉你",
+    ];
+    MARKERS.iter().any(|marker| text.contains(marker))
+}
+
 fn reply_was_sent(events: &[cordis_runtime::agent::AgentToolEvent], reply_node: &str) -> bool {
     events.iter().any(|event| {
         event.ok
@@ -1279,6 +1301,32 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     match sent {
                         Ok(reply) => {
                             pending::clear(&data_dir, session_key);
+                            // A promise the turn never acted on: the room reads
+                            // "行，我去写个插件" and nothing ever happens. Give the
+                            // model exactly one chance to act or retract.
+                            let reply = if reply.tool_events.is_empty()
+                                && promises_future_action(&reply.content)
+                            {
+                                eprintln!(
+                                    "inbox: [{session_key}] promise without a tool call; \
+                                     asking once more"
+                                );
+                                match host.agent_send_with_fallback_turn_context(
+                                    sid,
+                                    "SYSTEM: 你上一条答应了要去做一件事，但这一轮没有调用任何工具。\
+                                     要么现在调用工具动手，要么直接说做不了/不做。",
+                                    &[],
+                                    "",
+                                ) {
+                                    Ok(second) => second,
+                                    Err(e) => {
+                                        eprintln!("inbox: promise follow-up failed: {e}");
+                                        reply
+                                    }
+                                }
+                            } else {
+                                reply
+                            };
                             let feedback = process(
                                 reply.content.trim().to_string(),
                                 "inbox",
@@ -3347,6 +3395,40 @@ mod send_retry_tests {
         );
         assert_eq!(result, Err("still down"));
         assert_eq!(slept.get(), SEND_RETRY_DELAYS.len());
+    }
+}
+
+#[cfg(test)]
+mod promise_tests {
+    use super::promises_future_action;
+
+    // The pattern that left the room waiting: a commitment to act with no tool
+    // call behind it.
+    #[test]
+    fn commitments_to_act_are_recognised() {
+        for text in [
+            "行，我这就去写",
+            "我去写个插件，弄好了喊你",
+            "能，我去做",
+            "我马上去弄",
+            "做好告诉你",
+        ] {
+            assert!(promises_future_action(text), "must match: {text}");
+        }
+    }
+
+    // Ordinary chat must not trigger a second turn.
+    #[test]
+    fn ordinary_replies_do_not_match() {
+        for text in [
+            "行，我闭嘴",
+            "我去吃饭了",
+            "这个我做不了",
+            "哈哈，上班快乐",
+            "写完这段话我就走",
+        ] {
+            assert!(!promises_future_action(text), "must not match: {text}");
+        }
     }
 }
 
