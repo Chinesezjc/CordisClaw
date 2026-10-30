@@ -17,15 +17,14 @@ use cordis_runtime::plugin::loader::{default_loader_config, Loader};
 use cordis_tooling::{
     prepare_artifacts, rebuild_fixture_artifacts, refresh_artifact_index, PrepareMode,
 };
-use serde::Deserialize;
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// Structured message envelope carried over `agent_trigger`.
 ///
@@ -348,28 +347,6 @@ mod pending {
 }
 
 /// WS-3: at most one outage notice per session per window — a flapping
-/// provider must not turn a burst of user messages into a burst of replies.
-const OUTAGE_NOTIFY_WINDOW: Duration = Duration::from_secs(10 * 60);
-
-/// WS-3: rate-limit gate for [`OUTAGE_NOTICE`]. Returns `true` when `key`
-/// has not been notified inside `window` before `now`, recording `now` so
-/// later calls inside the window are throttled. Pure apart from the map, so
-/// the throttle policy is unit-testable without an inbox.
-fn should_notify(
-    last_notified: &mut HashMap<String, Instant>,
-    key: &str,
-    now: Instant,
-    window: Duration,
-) -> bool {
-    match last_notified.get(key) {
-        Some(prev) if now.duration_since(*prev) < window => false,
-        _ => {
-            last_notified.insert(key.to_string(), now);
-            true
-        }
-    }
-}
-
 /// Strip a channel-plugin source tag (e.g. `[feishu (user 张三)]: `) from a
 /// display line, returning the trimmed user text. Falls back to the trimmed
 /// original when no `]: ` marker is present (raw / legacy callers).
@@ -389,33 +366,24 @@ fn extract_user_text(display: &str) -> &str {
 /// text. The inbox records it into history so the next turn can see what the
 /// bot told the room (otherwise the stored assistant entry is only the bare
 /// action JSON and the bot contradicts itself).
-fn outbound_replies(reply_content: &str, tool_events: &[AgentToolEvent]) -> Vec<String> {
-    let mut replies = Vec::new();
-    for event in tool_events {
-        if event.name != "invoke_plugin" {
-            continue;
-        }
-        let message = event
-            .arguments
-            .pointer("/payload_json/message")
-            .and_then(Value::as_str)
-            .or_else(|| event.arguments.get("message").and_then(Value::as_str));
-        if let Some(message) = message.filter(|m| !m.trim().is_empty()) {
-            replies.push(message.to_string());
-        }
-    }
-    if let Ok(command) = parse_first_json(reply_content.trim()) {
-        if command.get("action").and_then(Value::as_str) == Some("respond") {
-            if let Some(message) = command
-                .get("message")
+/// Messages the turn actually delivered, read off its tool calls.
+///
+/// This is the only reply channel: text the model writes is not sent, so a turn
+/// that calls no tool says nothing at all.
+fn outbound_replies(tool_events: &[AgentToolEvent]) -> Vec<String> {
+    tool_events
+        .iter()
+        .filter(|event| event.name == "invoke_plugin")
+        .filter_map(|event| {
+            event
+                .arguments
+                .pointer("/payload_json/message")
                 .and_then(Value::as_str)
-                .filter(|m| !m.trim().is_empty())
-            {
-                replies.push(message.to_string());
-            }
-        }
-    }
-    replies
+                .or_else(|| event.arguments.get("message").and_then(Value::as_str))
+                .filter(|message| !message.trim().is_empty())
+                .map(str::to_string)
+        })
+        .collect()
 }
 
 /// A batch envelope classified by whether its user text is a `/command`.
@@ -571,40 +539,7 @@ where
     }
 }
 
-/// Does this reply promise work the turn never started?
-///
-/// Deliberately narrow — first-person future markers that only read as a
-/// commitment to act ("我这就去", "我去写", "弄好了喊你"). It is used to grant one
-/// nudge turn, never to rewrite what was said: the failure this catches is the
-/// one where the bot answers "行，我去写个插件" and calls no tool at all, so the
-/// room waits for something that will never arrive.
-fn promises_future_action(text: &str) -> bool {
-    const MARKERS: [&str; 9] = [
-        "我这就去",
-        "我这就做",
-        "我去写",
-        "我去做",
-        "我去弄",
-        "我马上做",
-        "我马上去",
-        "弄好了喊你",
-        "做好告诉你",
-    ];
-    MARKERS.iter().any(|marker| text.contains(marker))
-}
 
-fn reply_was_sent(events: &[cordis_runtime::agent::AgentToolEvent], reply_node: &str) -> bool {
-    events.iter().any(|event| {
-        event.ok
-            && !reply_node.is_empty()
-            && event.arguments.get("node_id").and_then(|v| v.as_str()) == Some(reply_node)
-    })
-}
-
-fn parse_first_json(s: &str) -> serde_json::Result<Value> {
-    let mut de = serde_json::Deserializer::from_str(s);
-    Value::deserialize(&mut de)
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ServeMode {
@@ -978,10 +913,6 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             session_index::save(&data_dir, &sessions);
         }
         std::thread::spawn(move || {
-            // The format-error banner is throttled per session per window so a
-            // model stuck emitting bad JSON cannot flood the room; the parse
-            // error itself stays in the log.
-            let mut format_notified: HashMap<String, Instant> = HashMap::new();
             loop {
                 // Ops requests run on THIS thread: it is the one that runs
                 // agent turns, so a reload cannot race one.
@@ -1145,6 +1076,10 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                             let options = cordis_runtime::host::AgentStartOptions {
                                 profile: soul.as_ref().and_then(|s| s.profile.clone()),
                                 soul_key: soul_key.clone(),
+                                // A channel turn ends when the bot says so,
+                                // by calling `suspend` — not when it stops
+                                // producing tool calls.
+                                require_end_tool: true,
                             };
                             let sid = host
                                 .agent_start_with(AgentSessionKind::RuntimeShell, options)
@@ -1174,139 +1109,6 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     // Process agent output: parse JSON, dispatch action, send
                     // the reply back to the ORIGINATING plugin (route). Returns
                     // Some(feedback) if the agent needs to retry.
-                    let mut process = |raw: String,
-                                       label: &str,
-                                       tool_events: &[cordis_runtime::agent::AgentToolEvent]|
-                     -> Option<String> {
-                        if raw.is_empty() {
-                            return None;
-                        }
-                        // Preprocess: escape newlines and embedded quotes inside JSON strings.
-                        let chars: Vec<char> = raw.chars().collect();
-                        let mut out = String::with_capacity(raw.len() + 64);
-                        let mut in_string = false;
-                        let mut i = 0;
-                        while i < chars.len() {
-                            let ch = chars[i];
-                            if ch == '"' {
-                                if in_string {
-                                    let already_escaped = i > 0 && chars[i - 1] == '\\';
-                                    if already_escaped {
-                                        out.push('"');
-                                    } else {
-                                        let mut j = i + 1;
-                                        while j < chars.len() && chars[j] == ' ' {
-                                            j += 1;
-                                        }
-                                        let next = chars.get(j).copied();
-                                        if matches!(
-                                            next,
-                                            Some(':') | Some(',') | Some('}') | Some(']') | None
-                                        ) {
-                                            in_string = false;
-                                            out.push('"');
-                                        } else {
-                                            out.push_str("\\\"");
-                                        }
-                                    }
-                                } else {
-                                    in_string = true;
-                                    out.push('"');
-                                }
-                            } else if ch == '\n' && in_string {
-                                out.push_str("\\n");
-                            } else {
-                                out.push(ch);
-                            }
-                            i += 1;
-                        }
-                        match parse_first_json(&out) {
-                            Ok(ref cmd)
-                                if cmd.get("action").and_then(|v| v.as_str())
-                                    == Some("suspend") =>
-                            {
-                                eprintln!("inbox: session suspended ({label})");
-                                None
-                            }
-                            Ok(ref cmd)
-                                if cmd.get("action").and_then(|v| v.as_str())
-                                    == Some("respond") =>
-                            {
-                                let msg = cmd.get("message").and_then(|v| v.as_str()).unwrap_or("");
-                                // The model may use the sanctioned `respond`
-                                // action AND call the reply node in the same
-                                // turn; that would deliver the text twice, which
-                                // is why `respond` used to be banned. Dedupe by
-                                // looking at what this turn actually sent.
-                                if reply_was_sent(tool_events, route.reply_node.as_str()) {
-                                    eprintln!(
-                                        "inbox: dropping duplicate respond ({label}); {} already sent this turn",
-                                        route.reply_node
-                                    );
-                                    return None;
-                                }
-                                if !msg.is_empty() {
-                                    eprintln!(
-                                        "inbox: agent reply ({label}): {}...",
-                                        msg.chars().take(100).collect::<String>()
-                                    );
-                                    if route.can_reply() {
-                                        let payload = serde_json::json!({
-                                            "node_id": route.reply_node,
-                                            "target": route.reply_target,
-                                            "message": msg,
-                                        });
-                                        match host.invoke(
-                                            &route.source_plugin,
-                                            &route.reply_node,
-                                            payload.to_string(),
-                                        ) {
-                                            Ok(_) => eprintln!(
-                                                "inbox: {}::{} OK ({label})",
-                                                route.source_plugin, route.reply_node
-                                            ),
-                                            Err(e) => eprintln!(
-                                                "inbox: {}::{} failed ({label}): {e}",
-                                                route.source_plugin, route.reply_node
-                                            ),
-                                        }
-                                    } else {
-                                        eprintln!("inbox: no reply route for session {session_key}, dropping reply ({label})");
-                                    }
-                                }
-                                None
-                            }
-                            Ok(ref cmd) => {
-                                let action =
-                                    cmd.get("action").and_then(|v| v.as_str()).unwrap_or("?");
-                                eprintln!(
-                                    "inbox: unknown JSON action={action}, dropping raw={}...",
-                                    raw.chars().take(200).collect::<String>().replace('\n', " ")
-                                );
-
-                                Some(format!("SYSTEM: Your last output was valid JSON but had unknown action \"{action}\". Allowed actions: \"suspend\" or \"respond\". Please retry.\n\nYour raw output was:\n{raw}"))
-                            }
-                            Err(e) => {
-                                eprintln!(
-                                    "inbox: JSON parse failed: {e} — raw={}... preprocessed={}...",
-                                    raw.chars().take(200).collect::<String>().replace('\n', " "),
-                                    out.chars().take(200).collect::<String>().replace('\n', " ")
-                                );
-                                if should_notify(
-                                    &mut format_notified,
-                                    session_key,
-                                    Instant::now(),
-                                    OUTAGE_NOTIFY_WINDOW,
-                                ) {
-                                    // The raw parse error is for the log; the
-                                    // room only needs to know it is retrying.
-                                    eprintln!("inbox: invalid model output ({e})");
-                                    send_via(&route, "⚠️ 回复格式异常，正在重试…");
-                                }
-                                Some(format!("SYSTEM: Your last output was not valid JSON and was dropped. Parse error: {e}\n\nPlease fix the JSON formatting and retry. Final output must be exactly {{\"action\":\"suspend\"}} or {{\"action\":\"respond\",\"message\":\"...\"}}.\n\nYour raw output was:\n{raw}"))
-                            }
-                        }
-                    };
                     // WS-3: single sink for EVERY LLM failure exit of this
                     // batch. Spill the user's text first (it must survive the
                     // outage), then tell the batch's origin through the same
@@ -1388,60 +1190,23 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     match sent {
                         Ok(reply) => {
                             pending::clear(&data_dir, session_key);
-                            // A promise the turn never acted on: the room reads
-                            // "行，我去写个插件" and nothing ever happens. Give the
-                            // model exactly one chance to act or retract.
-                            let reply = if reply.tool_events.is_empty()
-                                && promises_future_action(&reply.content)
-                            {
-                                eprintln!(
-                                    "inbox: [{session_key}] promise without a tool call; \
-                                     asking once more"
-                                );
-                                match host.agent_send_with_fallback_turn_context(
-                                    sid,
-                                    "SYSTEM: 你上一条答应了要去做一件事，但这一轮没有调用任何工具。\
-                                     要么现在调用工具动手，要么直接说做不了/不做。",
-                                    &[],
-                                    "",
-                                ) {
-                                    Ok(second) => second,
-                                    Err(e) => {
-                                        eprintln!("inbox: promise follow-up failed: {e}");
-                                        reply
-                                    }
-                                }
+                            // The bot speaks only through tool calls. Whatever
+                            // text the model produced is not a reply channel,
+                            // so there is no envelope to parse, nothing to
+                            // post, and no format-retry to run: a turn that
+                            // calls no tool simply says nothing.
+                            let sent = outbound_replies(&reply.tool_events);
+                            if sent.is_empty() {
+                                eprintln!("inbox: [{session_key}] turn produced no tool call → silent");
                             } else {
-                                reply
-                            };
-                            let feedback = process(
-                                reply.content.trim().to_string(),
-                                "inbox",
-                                &reply.tool_events,
-                            );
-                            if let Some(fb) = feedback {
-                                // WS-3: failure exit #2 — the retry after a
-                                // format/unknown-action feedback failed. Same
-                                // sink, so this turn cannot vanish silently.
-                                match host.agent_send_with_fallback_turn_context(sid, &fb, &[], "")
-                                {
-                                    Ok(reply2) => {
-                                        process(
-                                            reply2.content.trim().to_string(),
-                                            "retry",
-                                            &reply2.tool_events,
-                                        );
-                                    }
-                                    Err(e) => {
-                                        eprintln!("inbox: retry send failed: {e}");
-                                        spill_and_log();
-                                    }
-                                }
+                                eprintln!(
+                                    "inbox: [{session_key}] sent {} message(s) through tools",
+                                    sent.len()
+                                );
                             }
-                            // P6: history only has the bare action JSON; put
-                            // the text the channel actually sent in its place
-                            // so the next turn knows what the bot said.
-                            let sent = outbound_replies(reply.content.trim(), &reply.tool_events);
+                            // P6: history only has the bare tool calls; put the
+                            // text the channel actually sent in its place so the
+                            // next turn knows what the bot said.
                             if !sent.is_empty() {
                                 if let Err(e) =
                                     host.agent_record_outbound_reply(sid, &sent.join("\n"))
@@ -3146,63 +2911,8 @@ mod pending_tests {
 }
 
 #[cfg(test)]
-mod notify_tests {
-    use super::should_notify;
-    use std::collections::HashMap;
-    use std::time::{Duration, Instant};
-
-    const WINDOW: Duration = Duration::from_secs(10 * 60);
-
-    // 窗口内第二次被限流，窗口边界（满 10 分钟）重新放行。
-    #[test]
-    fn should_notify_throttles_within_window() {
-        let mut last = HashMap::new();
-        let t0 = Instant::now();
-        assert!(should_notify(&mut last, "k", t0, WINDOW));
-        assert!(!should_notify(
-            &mut last,
-            "k",
-            t0 + Duration::from_secs(1),
-            WINDOW
-        ));
-        assert!(!should_notify(
-            &mut last,
-            "k",
-            t0 + WINDOW - Duration::from_secs(1),
-            WINDOW
-        ));
-        assert!(should_notify(&mut last, "k", t0 + WINDOW, WINDOW));
-    }
-
-    // 不同 session_key 各计各的，互不影响。
-    #[test]
-    fn should_notify_is_per_key() {
-        let mut last = HashMap::new();
-        let t0 = Instant::now();
-        assert!(should_notify(&mut last, "a", t0, WINDOW));
-        assert!(should_notify(&mut last, "b", t0, WINDOW));
-        assert!(!should_notify(
-            &mut last,
-            "a",
-            t0 + Duration::from_secs(60),
-            WINDOW
-        ));
-        assert!(!should_notify(
-            &mut last,
-            "b",
-            t0 + Duration::from_secs(60),
-            WINDOW
-        ));
-        // A brand-new session is never throttled by other sessions' notices.
-        assert!(should_notify(&mut last, "c", t0, WINDOW));
-    }
-}
-
-#[cfg(test)]
 mod batch_tests {
-    use super::{extract_user_text, outbound_replies, partition_batch, AgentEnvelope, BatchItem};
-    use cordis_runtime::agent::AgentToolEvent;
-    use serde_json::{json, Value};
+    use super::{extract_user_text, partition_batch, AgentEnvelope, BatchItem};
 
     // Build an envelope with a given display + sender via the JSON parser
     // (no public struct literal outside the module).
@@ -3373,38 +3083,6 @@ mod batch_tests {
         assert!(!with_role("").caller_is_admin());
     }
 
-    /// P6: 从工具调用（或 legacy respond）里取出真正发给渠道的文本。
-    #[test]
-    fn outbound_replies_reads_tool_events_and_respond_action() {
-        let event = |name: &str, arguments: Value| AgentToolEvent {
-            name: name.to_string(),
-            arguments,
-            ok: true,
-            output: None,
-            error: None,
-        };
-        let qq_send = event(
-            "invoke_plugin",
-            json!({
-                "plugin_path": "qq",
-                "node_id": "qq_send",
-                "payload_json": {"node_id": "qq_send", "target": "group:1", "message": "你好"}
-            }),
-        );
-        assert_eq!(
-            outbound_replies("{\"action\":\"suspend\"}", &[qq_send]),
-            vec!["你好".to_string()]
-        );
-        let flat = event("invoke_plugin", json!({"message": "平铺"}));
-        assert_eq!(outbound_replies("", &[flat]), vec!["平铺".to_string()]);
-        let other = event("read_file", json!({"message": "不是回复"}));
-        assert!(outbound_replies("{\"action\":\"suspend\"}", &[other]).is_empty());
-        assert_eq!(
-            outbound_replies("{\"action\":\"respond\",\"message\":\"回复\"}", &[]),
-            vec!["回复".to_string()]
-        );
-        assert!(outbound_replies("{\"action\":\"respond\",\"message\":\"  \"}", &[]).is_empty());
-    }
 }
 
 #[cfg(test)]
@@ -3567,42 +3245,8 @@ mod session_index_tests {
 }
 
 #[cfg(test)]
-mod promise_tests {
-    use super::promises_future_action;
-
-    // The pattern that left the room waiting: a commitment to act with no tool
-    // call behind it.
-    #[test]
-    fn commitments_to_act_are_recognised() {
-        for text in [
-            "行，我这就去写",
-            "我去写个插件，弄好了喊你",
-            "能，我去做",
-            "我马上去弄",
-            "做好告诉你",
-        ] {
-            assert!(promises_future_action(text), "must match: {text}");
-        }
-    }
-
-    // Ordinary chat must not trigger a second turn.
-    #[test]
-    fn ordinary_replies_do_not_match() {
-        for text in [
-            "行，我闭嘴",
-            "我去吃饭了",
-            "这个我做不了",
-            "哈哈，上班快乐",
-            "写完这段话我就走",
-        ] {
-            assert!(!promises_future_action(text), "must not match: {text}");
-        }
-    }
-}
-
-#[cfg(test)]
 mod inbox_framing_tests {
-    use super::{parse_first_json, wrap_inbox_batch};
+    use super::wrap_inbox_batch;
 
     // Channel-neutral markers frame a plain single-line batch, with the
     // scope instruction and the exact suspend token present.
@@ -3665,34 +3309,6 @@ mod inbox_framing_tests {
         assert_eq!(twice.matches("CURRENT_INCOMING_BATCH_START").count(), 2);
     }
 
-    // Pure JSON parses to the suspend verdict.
-    #[test]
-    fn parse_first_json_pure() {
-        let v = parse_first_json(r#"{"action":"suspend"}"#).expect("pure JSON parses");
-        assert_eq!(v.get("action").and_then(|a| a.as_str()), Some("suspend"));
-    }
-
-    // Trailing DSML XML after the JSON is ignored; only the first value is read.
-    #[test]
-    fn parse_first_json_trailing_xml() {
-        let v = parse_first_json(r#"{"action":"suspend"}<dsml>noise</dsml>"#)
-            .expect("first JSON value parses despite trailing XML");
-        assert_eq!(v.get("action").and_then(|a| a.as_str()), Some("suspend"));
-    }
-
-    // Trailing whitespace after the JSON is tolerated.
-    #[test]
-    fn parse_first_json_trailing_whitespace() {
-        let v = parse_first_json("{\"action\":\"respond\",\"message\":\"hi\"}   \n\t")
-            .expect("trailing whitespace tolerated");
-        assert_eq!(v.get("action").and_then(|a| a.as_str()), Some("respond"));
-    }
-
-    // Leading non-JSON content fails (the first token is not a JSON value).
-    #[test]
-    fn parse_first_json_leading_garbage_fails() {
-        assert!(parse_first_json(r#"garbage {"action":"suspend"}"#).is_err());
-    }
 }
 
 #[cfg(test)]
@@ -4266,33 +3882,3 @@ mod startup_invocation_tests {
     }
 }
 
-#[cfg(test)]
-mod reply_dedupe_tests {
-    use super::reply_was_sent;
-    use cordis_runtime::agent::AgentToolEvent;
-    use serde_json::json;
-
-    fn event(node_id: &str, ok: bool) -> AgentToolEvent {
-        AgentToolEvent {
-            name: "invoke_plugin".to_string(),
-            arguments: json!({ "node_id": node_id, "plugin_path": "qq" }),
-            ok,
-            output: None,
-            error: None,
-        }
-    }
-
-    // `respond` is allowed again; the CLI drops it when the turn already sent
-    // through the reply node, which is what the old hard ban was guarding.
-    #[test]
-    fn a_successful_send_this_turn_suppresses_the_respond_action() {
-        assert!(reply_was_sent(&[event("qq_send", true)], "qq_send"));
-        assert!(!reply_was_sent(&[event("qq_send", false)], "qq_send"));
-        assert!(!reply_was_sent(
-            &[event("qq_get_group_info", true)],
-            "qq_send"
-        ));
-        assert!(!reply_was_sent(&[], "qq_send"));
-        assert!(!reply_was_sent(&[event("qq_send", true)], ""));
-    }
-}

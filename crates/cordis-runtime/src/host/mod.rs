@@ -687,7 +687,11 @@ pub struct AgentSessionHandle {
 pub struct AgentStartOptions {
     pub profile: Option<String>,
     pub soul_key: String,
+    /// Channels set this: the turn ends only when the model calls `suspend`.
+    /// Shell sessions leave it false so a text answer still finishes a turn.
+    pub require_end_tool: bool,
 }
+
 
 /// Per-session profile fallback state. `desired` is the profile the
 /// session was started with; `degraded` is true while requests are being

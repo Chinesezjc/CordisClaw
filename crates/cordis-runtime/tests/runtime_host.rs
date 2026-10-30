@@ -2397,6 +2397,7 @@ fn refresh_session_soul_switches_persona_scope() {
             AgentStartOptions {
                 profile: None,
                 soul_key: "userA#group".to_string(),
+                ..Default::default()
             },
         )
         .expect("agent start");

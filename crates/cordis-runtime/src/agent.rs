@@ -1285,6 +1285,10 @@ pub struct AgentSession {
     /// turn. The provider occasionally finishes with nothing; that is a glitch
     /// to retry, not a contract violation that kills the turn.
     empty_response_strikes: usize,
+    /// When set, the turn only ends on an explicit `suspend` call.
+    require_end_tool: bool,
+    /// Consecutive turns that produced no tool call and no end marker.
+    no_end_strikes: usize,
     /// Consecutive calls to tools that don't exist in this session (LLM hallucination guard).
     unknown_tool_strikes: usize,
     /// O批: soul scope key ({sender_id}#{conversation_kind}) this session
@@ -1314,6 +1318,10 @@ pub struct AgentSessionSnapshot {
     /// Missing from snapshots written before the retry existed.
     #[serde(default)]
     pub empty_response_strikes: usize,
+    #[serde(default)]
+    pub require_end_tool: bool,
+    #[serde(default)]
+    pub no_end_strikes: usize,
     pub unknown_tool_strikes: usize,
     /// `#[serde(default)]` keeps pre-O批 snapshots deserializable.
     #[serde(default)]
@@ -1322,6 +1330,12 @@ pub struct AgentSessionSnapshot {
 
 pub type ShellAgentStatus = AgentSessionStatus;
 pub type ShellAgentReply = AgentReply;
+
+/// The tool a channel session calls to close its turn.
+///
+/// The runtime does not infer "done" from the model stopping: a turn ends when
+/// this name appears among the calls, so text-only output keeps the turn alive.
+pub const AGENT_TOOL_END_TURN: &str = "suspend";
 
 #[derive(Debug, Clone)]
 pub struct ShellAgentSession {
@@ -1348,6 +1362,8 @@ impl AgentSession {
             estimated_tokens: 0,
             reasoning_only_strikes: 0,
             empty_response_strikes: 0,
+            require_end_tool: false,
+            no_end_strikes: 0,
             unknown_tool_strikes: 0,
             soul_key: String::new(),
             is_group: false,
@@ -1545,7 +1561,7 @@ impl AgentSession {
         // already serialises calls on its own.
         messages.push(json!({
             "role": "system",
-            "content": dsml_protocol_prompt(&tool_specs),
+            "content": dsml_protocol_prompt(&tool_specs, self.require_end_tool),
         }));
         // A client-injected failure notice is not conversation: once it sits in
         // history the model echoes it back verbatim.
@@ -1687,6 +1703,28 @@ impl AgentSession {
                     ));
                     message.tool_calls = salvaged;
                     message.content = None;
+                }
+            }
+
+            // Channel sessions end on an explicit marker, not on silence.
+            let mut end_requested = false;
+            if self.require_end_tool {
+                if let Some(position) = message
+                    .tool_calls
+                    .iter()
+                    .position(|call| call.function.name == AGENT_TOOL_END_TURN)
+                {
+                    message.tool_calls.remove(position);
+                    end_requested = true;
+                }
+                if end_requested && message.tool_calls.is_empty() {
+                    self.no_end_strikes = 0;
+                    self.completed_turns += 1;
+                    return Ok(AgentReply {
+                        response_id,
+                        content: message.content.unwrap_or_default(),
+                        tool_events,
+                    });
                 }
             }
 
@@ -1873,6 +1911,37 @@ impl AgentSession {
                 // assistant and break the chain).
                 flush_tool_failure_prompts(&mut messages, &mut tool_failure_prompts);
                 continue;
+            }
+
+            if end_requested {
+                self.no_end_strikes = 0;
+                self.completed_turns += 1;
+                return Ok(AgentReply {
+                    response_id,
+                    content: message.content.unwrap_or_default(),
+                    tool_events,
+                });
+            }
+
+            // Text without a tool call does not end a channel turn: nudge the
+            // model to keep working or to close the turn explicitly.
+            if self.require_end_tool {
+                self.no_end_strikes += 1;
+                if self.no_end_strikes <= 3 {
+                    emit_agent_diagnostic(format!(
+                        "agent_missing_end_tool kind={} attempt={}",
+                        self.kind, self.no_end_strikes
+                    ));
+                    messages.push(json!({
+                        "role": "user",
+                        "content": "[system] 这一轮还没结束。继续调用工具；要结束就调用 suspend。正文不会发给任何人。",
+                    }));
+                    continue;
+                }
+                self.no_end_strikes = 0;
+                return Err(RuntimeError::LlmResponseInvalid {
+                    message: "agent turn never called the end tool (suspend)".to_string(),
+                });
             }
 
             if let Some(content) = message
@@ -2244,6 +2313,11 @@ impl AgentSession {
         });
     }
 
+    /// Channels end a turn explicitly, on a `suspend` call.
+    pub fn set_require_end_tool(&mut self, require: bool) {
+        self.require_end_tool = require;
+    }
+
     /// Create a serializable snapshot of the current session state.
     pub fn to_snapshot(&self) -> AgentSessionSnapshot {
         AgentSessionSnapshot {
@@ -2255,6 +2329,8 @@ impl AgentSession {
             estimated_tokens: self.estimated_tokens,
             reasoning_only_strikes: self.reasoning_only_strikes,
             empty_response_strikes: 0,
+            require_end_tool: self.require_end_tool,
+            no_end_strikes: 0,
             unknown_tool_strikes: self.unknown_tool_strikes,
             soul_key: self.soul_key.clone(),
         }
@@ -2279,6 +2355,8 @@ impl AgentSession {
             estimated_tokens: snapshot.estimated_tokens,
             reasoning_only_strikes: snapshot.reasoning_only_strikes,
             empty_response_strikes: 0,
+            require_end_tool: snapshot.require_end_tool,
+            no_end_strikes: snapshot.no_end_strikes,
             unknown_tool_strikes: snapshot.unknown_tool_strikes,
             soul_key: snapshot.soul_key,
             // P4: caller flags are per-batch facts, not session state — a
@@ -2300,6 +2378,11 @@ impl ShellAgentSession {
 
     pub fn reset(&mut self) {
         self.inner.reset();
+    }
+
+    /// Channel sessions end explicitly, on a `suspend` call.
+    pub fn set_require_end_tool(&mut self, require: bool) {
+        self.inner.set_require_end_tool(require);
     }
 
     pub fn status(&self) -> ShellAgentStatus {
@@ -3080,7 +3163,7 @@ mod dsml_salvage_tests {
 /// deliberately compact (name + one line, plus the parameter names) so the
 /// request stays smaller than the JSON-schema `tools` array it replaces;
 /// argument validation belongs to the node, not to a provider-side schema.
-fn dsml_protocol_prompt(specs: &[AgentToolSpec]) -> String {
+fn dsml_protocol_prompt(specs: &[AgentToolSpec], require_end_tool: bool) -> String {
     let mut text = String::from(
         "TOOL PROTOCOL — there is no native function calling here. To call a tool, \
          write exactly this block in your message and nothing else in it:\n\
@@ -3095,6 +3178,13 @@ fn dsml_protocol_prompt(specs: &[AgentToolSpec]) -> String {
          and never print it as text when you are not calling a tool.\n\n\
          AVAILABLE TOOLS — `tool` (parameters):\n",
     );
+    if require_end_tool {
+        text.push_str(
+            "\nEND OF TURN — this turn never ends by itself. When you are done, call \
+             {\"node_id\": \"suspend\"} (with no payload). Text you write is not sent \
+             anywhere, so a turn that only writes text is wasted.\n",
+        );
+    }
     for spec in specs {
         let parameters = spec
             .parameters
@@ -3668,7 +3758,7 @@ mod tests {
                 parameters: json!({"type":"object","properties":{}}),
             },
         ];
-        let prompt = dsml_protocol_prompt(&specs);
+        let prompt = dsml_protocol_prompt(&specs, false);
         assert!(prompt.contains("<|DSML|tool_calls>"), "{prompt}");
         assert!(prompt.contains("</|DSML|tool_calls>"), "{prompt}");
         assert!(prompt.contains("AVAILABLE TOOLS"), "{prompt}");
@@ -4313,6 +4403,51 @@ mod tests {
             bodies[1].to_string().contains("snapshot-demo"),
             "second turn must carry the tool result back"
         );
+    }
+
+    // A channel turn is not over when the model stops calling tools: it needs
+    // an explicit `suspend`. A text-only step is nudged and the turn continues.
+    #[test]
+    fn a_channel_turn_ends_only_on_the_suspend_call() {
+        let provider = FakeLlmProvider::new(vec![
+            assistant_reply("我先说一句"),
+            cordis_plugin_sdk::llm::LlmMessage {
+                tool_calls: vec![cordis_plugin_sdk::llm::LlmToolCall {
+                    id: "end".to_string(),
+                    call_type: "function".to_string(),
+                    function: cordis_plugin_sdk::llm::LlmToolFunction {
+                        name: AGENT_TOOL_END_TURN.to_string(),
+                        arguments: "{}".to_string(),
+                    },
+                }],
+                ..Default::default()
+            },
+        ]);
+        let mut session = ShellAgentSession::new(LlmApiConfig::default()).expect("build session");
+        session.set_require_end_tool(true);
+        let reply = session
+            .respond_via(&EMPTY_FAKE_HOST, "test-session-end-tool", "hi", &provider)
+            .expect("turn");
+        assert_eq!(session.status().completed_turns, 1);
+        assert!(reply.tool_events.is_empty(), "the marker is not executed");
+        let bodies = provider.seen_bodies.lock().expect("bodies");
+        assert_eq!(bodies.len(), 2, "text alone must not end the turn");
+        assert!(
+            bodies[1].to_string().contains("这一轮还没结束"),
+            "the model must be told to close the turn"
+        );
+    }
+
+    // Without the flag (shell sessions) a text answer still finishes a turn.
+    #[test]
+    fn a_shell_turn_still_ends_on_text() {
+        let provider = FakeLlmProvider::new(vec![assistant_reply("done")]);
+        let mut session = ShellAgentSession::new(LlmApiConfig::default()).expect("build session");
+        let reply = session
+            .respond_via(&EMPTY_FAKE_HOST, "test-session-text-end", "hi", &provider)
+            .expect("turn");
+        assert_eq!(reply.content, "done");
+        assert_eq!(provider.seen_bodies.lock().expect("bodies").len(), 1);
     }
 
     // A provider that finishes with neither content nor tool calls used to kill

@@ -1084,7 +1084,8 @@ fn host_agent_start_with_profile_and_soul_option() {
             AgentStartOptions {
                 profile: Some("definitely-not-a-real-profile".to_string()),
                 soul_key: "host-coverage:profile-opt#private".to_string(),
-            },
+            ..Default::default()
+        },
         )
         .expect("agent should start with unknown profile via default fallback");
     let sid = handle.session_id.clone();

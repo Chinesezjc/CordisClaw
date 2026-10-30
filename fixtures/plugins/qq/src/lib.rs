@@ -3417,8 +3417,8 @@ fn docs_value() -> cordis_plugin_sdk::PluginDocs {
     Some("\
 QQ 渠道说明——这里只说怎么发消息，性格和说话方式见人格部分。\n\
 \n\
-【发言必须走工具】invoke_plugin(qq, qq_send, {\"node_id\":\"qq_send\",\"target\":\"<reply_target>\",\"message\":\"<你要说的话>\"})，然后输出 {\"action\":\"suspend\"}。最终输出只能是这个 JSON，正文只放在 message 里，不要写进最终输出。\n\
-【不想说话】只输出 {\"action\":\"suspend\"}，群里看不到这条。\n\
+【发言必须走工具】调用 qq_send：{\"node_id\":\"qq_send\",\"target\":\"<reply_target>\",\"message\":\"<你要说的话>\"}。你自己写的正文不会发出去，只有工具调用里的 message 会。\n\
+【结束这一轮】调用 {\"node_id\":\"suspend\"}。这一轮会一直继续，直到你调它；不想说话就直接调 suspend，群里看不到。\n\
 【@某人】message 里写 [CQ:at,qq=<uid>]。纯文本 @ 不算 @。\n\
 【发图】[CQ:image,file=<url>] 或 [CQ:image,file=base64://<data>]；能用 URL 就别用 base64。\n\
 【引用某条消息】把它的 msg=<id> 作为 \"reply_to\":\"<id>\" 传进同一次 qq_send。\n\
@@ -4995,7 +4995,7 @@ mod channel_hint_tests {
         let hint = hint();
         for required in [
             "qq_send",
-            "{\"action\":\"suspend\"}",
+            "{\"node_id\":\"suspend\"}",
             "msg=<id>",
             "reply_to",
             "{setting:bot_uin}",

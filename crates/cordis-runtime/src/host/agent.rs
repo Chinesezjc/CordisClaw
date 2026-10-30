@@ -96,6 +96,7 @@ impl RuntimeHost {
             .clone();
         let mut session = AgentSession::new(api, session_kind_label)?;
         session.set_soul_key(options.soul_key.clone());
+        session.set_require_end_tool(options.require_end_tool);
         self.profile_fallback
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())

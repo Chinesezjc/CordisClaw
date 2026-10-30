@@ -715,6 +715,26 @@ LRU 淘汰时同步删除。
 **副作用**：`session` 快照新增 `empty_response_strikes` 字段漏了 `#[serde(default)]`，
 导致启动时 653 个旧快照解析失败被跳过；已补默认值，恢复 `recovered 677, skipped 1`。
 
+### 3.36 回合结束改由 `suspend` 工具决定（2026-10-31）
+
+**语义**：渠道会话的回合**不会因为模型停下来而结束**。模型只能通过工具说话（`qq_send`），
+自己写的正文不发送；只有调用 `suspend` 才结束这一轮。这样"沉默"和"没写完"不再混淆。
+
+**实现**：
+
+- `AgentStartOptions.require_end_tool`（渠道 = true，shell = false），随会话快照持久化；
+- 循环里把 `suspend` 从待执行调用里摘掉：它是标记，不是工具；
+- 没有调用且没有标记 → 推一条 `[system] 这一轮还没结束…`，最多 3 次，仍不结束才报
+  `agent turn never called the end tool (suspend)`；
+- 协议提示里同步写明：正文不会发给任何人，结束时调用 `{"node_id":"suspend"}`。
+
+**同时删掉的东西**：cli 侧的 JSON 信封（`parse_first_json` / `respond` / `suspend` 动作 /
+格式错误重试 / `⚠️ 回复格式异常` 横幅 / `OUTAGE_NOTFY_WINDOW` 节流表）。正文即丢弃，
+`outbound_replies` 只从工具调用里取真正发出的文本。
+
+**验证**：注入签名事件后日志为 `⚙ invoke_plugin … qq_send → ok sent`，随后
+`sent 1 message(s) through tools`，全程没有正文被发到群里。
+
 ## 4. 部分完成
 
 ### 4.1 Execution engine 有正式入口，数据面验证不足
