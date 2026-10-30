@@ -477,20 +477,14 @@ fn wrap_inbox_batch(combined: &str) -> String {
 /// (e.g. DSML XML or stray prose the model appended after its JSON verdict).
 /// `serde_json::from_str` rejects trailing bytes, so a `Deserializer` that
 /// consumes a single value is used instead.
-/// Reply text carried by a final-output object, tolerating the shapes a model
-/// actually emits: `{"message": ...}`, `{"action":"respond","message": ...}`, or
-/// a nested `payload.message` (an echoed tool result).
-fn reply_text_of(cmd: &serde_json::Value) -> Option<String> {
-    let direct = cmd.get("message").and_then(|v| v.as_str());
-    let nested = cmd
-        .get("payload")
-        .and_then(|p| p.get("message"))
-        .and_then(|v| v.as_str());
-    direct
-        .or(nested)
-        .map(str::trim)
-        .filter(|msg| !msg.is_empty())
-        .map(str::to_string)
+/// Did this turn already deliver a message through `reply_node`? Used to keep
+/// `{"action":"respond"}` and `qq_send` from double-sending the same text.
+fn reply_was_sent(events: &[cordis_runtime::agent::AgentToolEvent], reply_node: &str) -> bool {
+    events.iter().any(|event| {
+        event.ok
+            && !reply_node.is_empty()
+            && event.arguments.get("node_id").and_then(|v| v.as_str()) == Some(reply_node)
+    })
 }
 
 fn parse_first_json(s: &str) -> serde_json::Result<Value> {
@@ -866,8 +860,8 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             // WS-3: per-session outage-notice throttle. The inbox loop is
             // single-threaded, so a plain HashMap needs no lock.
             let mut outage_notified: HashMap<String, Instant> = HashMap::new();
-            // Format-error notices ("⚠️ 回复格式异常") are internal retry detail:
-            // one per session per window, not one per attempt.
+            // Retry detail ("⚠️ 回复格式异常") is for the log, not the group: one
+            // notice per session per window instead of one per attempt.
             let mut format_notified: HashMap<String, Instant> = HashMap::new();
             loop {
                 // Ops requests run on THIS thread: it is the one that runs
@@ -1045,7 +1039,10 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     // Process agent output: parse JSON, dispatch action, send
                     // the reply back to the ORIGINATING plugin (route). Returns
                     // Some(feedback) if the agent needs to retry.
-                    let mut process = |raw: String, label: &str| -> Option<String> {
+                    let mut process = |raw: String,
+                                       label: &str,
+                                       tool_events: &[cordis_runtime::agent::AgentToolEvent]|
+                     -> Option<String> {
                         if raw.is_empty() {
                             return None;
                         }
@@ -1101,6 +1098,18 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                                     == Some("respond") =>
                             {
                                 let msg = cmd.get("message").and_then(|v| v.as_str()).unwrap_or("");
+                                // The model may use the sanctioned `respond`
+                                // action AND call the reply node in the same
+                                // turn; that would deliver the text twice, which
+                                // is why `respond` used to be banned. Dedupe by
+                                // looking at what this turn actually sent.
+                                if reply_was_sent(tool_events, route.reply_node.as_str()) {
+                                    eprintln!(
+                                        "inbox: dropping duplicate respond ({label}); {} already sent this turn",
+                                        route.reply_node
+                                    );
+                                    return None;
+                                }
                                 if !msg.is_empty() {
                                     eprintln!(
                                         "inbox: agent reply ({label}): {}...",
@@ -1136,27 +1145,13 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                                 None
                             }
                             Ok(ref cmd) => {
-                                // A JSON object with a message but no `action`
-                                // is a reply the model forgot to label; sending
-                                // it beats a retry loop that spams the group.
-                                let action = cmd.get("action").and_then(|v| v.as_str());
-                                if action.is_none() {
-                                    if let Some(msg) = reply_text_of(cmd) {
-                                        eprintln!(
-                                            "inbox: reply without action from {label}; sending it"
-                                        );
-                                        send_via(&route, &msg);
-                                        return None;
-                                    }
-                                }
-                                let action = action.unwrap_or("(missing)");
+                                let action =
+                                    cmd.get("action").and_then(|v| v.as_str()).unwrap_or("?");
                                 eprintln!(
                                     "inbox: unknown JSON action={action}, dropping raw={}...",
                                     raw.chars().take(200).collect::<String>().replace('\n', " ")
                                 );
-                                // Internal retry detail: log it, do not post to
-                                // the group (the old notice fired on every
-                                // attempt, which is the spam users saw).
+
                                 Some(format!("SYSTEM: Your last output was valid JSON but had unknown action \"{action}\". Allowed actions: \"suspend\" or \"respond\". Please retry.\n\nYour raw output was:\n{raw}"))
                             }
                             Err(e) => {
@@ -1238,7 +1233,11 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     ) {
                         Ok(reply) => {
                             pending::clear(&data_dir, session_key);
-                            let feedback = process(reply.content.trim().to_string(), "inbox");
+                            let feedback = process(
+                                reply.content.trim().to_string(),
+                                "inbox",
+                                &reply.tool_events,
+                            );
                             if let Some(fb) = feedback {
                                 // WS-3: failure exit #2 — the retry after a
                                 // format/unknown-action feedback failed. Same
@@ -1246,7 +1245,11 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                                 match host.agent_send_with_fallback_turn_context(sid, &fb, &[], "")
                                 {
                                     Ok(reply2) => {
-                                        process(reply2.content.trim().to_string(), "retry");
+                                        process(
+                                            reply2.content.trim().to_string(),
+                                            "retry",
+                                            &reply2.tool_events,
+                                        );
                                     }
                                     Err(e) => {
                                         eprintln!("inbox: retry send failed: {e}");
@@ -3902,42 +3905,32 @@ mod startup_invocation_tests {
 }
 
 #[cfg(test)]
-mod reply_text_tests {
-    use super::reply_text_of;
+mod reply_dedupe_tests {
+    use super::reply_was_sent;
+    use cordis_runtime::agent::AgentToolEvent;
+    use serde_json::json;
 
-    // The model sometimes leaks a tool call as text: the first JSON object is
-    // the tool arguments (`{"node_id":"qq_send","message":...}`) with no
-    // `action`. Sending that message recovers the reply instead of retrying.
-    #[test]
-    fn recovers_a_leaked_tool_call() {
-        let value = serde_json::json!({
-            "node_id": "qq_send",
-            "target": "group:975594881",
-            "message": "13×7=91，100−91=9，找 9 块"
-        });
-        assert_eq!(
-            reply_text_of(&value).as_deref(),
-            Some("13×7=91，100−91=9，找 9 块")
-        );
+    fn event(node_id: &str, ok: bool) -> AgentToolEvent {
+        AgentToolEvent {
+            name: "invoke_plugin".to_string(),
+            arguments: json!({ "node_id": node_id, "plugin_path": "qq" }),
+            ok,
+            output: None,
+            error: None,
+        }
     }
 
+    // `respond` is allowed again; the CLI drops it when the turn already sent
+    // through the reply node, which is what the old hard ban was guarding.
     #[test]
-    fn reads_nested_payload_message_and_trims() {
-        let value = serde_json::json!({ "payload": { "message": "  收到  " } });
-        assert_eq!(reply_text_of(&value).as_deref(), Some("收到"));
-    }
-
-    #[test]
-    fn ignores_empty_or_missing_messages() {
-        assert_eq!(reply_text_of(&serde_json::json!({})), None);
-        assert_eq!(
-            reply_text_of(&serde_json::json!({ "message": "   " })),
-            None
-        );
-        assert_eq!(
-            reply_text_of(&serde_json::json!({ "action": "suspend" })),
-            None
-        );
-        assert_eq!(reply_text_of(&serde_json::json!({ "message": 42 })), None);
+    fn a_successful_send_this_turn_suppresses_the_respond_action() {
+        assert!(reply_was_sent(&[event("qq_send", true)], "qq_send"));
+        assert!(!reply_was_sent(&[event("qq_send", false)], "qq_send"));
+        assert!(!reply_was_sent(
+            &[event("qq_get_group_info", true)],
+            "qq_send"
+        ));
+        assert!(!reply_was_sent(&[], "qq_send"));
+        assert!(!reply_was_sent(&[event("qq_send", true)], ""));
     }
 }

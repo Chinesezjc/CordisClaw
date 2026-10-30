@@ -3058,7 +3058,7 @@ GROUP MEMORY — you keep your own memo per group (how talkative it wants you, i
 WRITING MEMORY — the memo is YOURS: maintain it on your own initiative, without waiting to be asked and without asking permission. Write when you learn something DURABLE: an explicit preference (wants you quiet/chatty), a correction, the group's standing topic or in-jokes, or a mistake you already paid for. Do not write about one-off facts or guesses from a single message; overwrite the entry (it replaces, not appends). Read the current memo first (`qq_get_group_memory`) so you do not clobber it, then use `qq_set_group_memory`. Changing how talkative you are is separate: `qq_set_reply_policy` with one of the four modes, and that one needs the group owner/admin or a configured operator. Both take effect on the next message.\n\
 If the message is NOT for you: use {\"action\":\"suspend\"}.\n\
 If it IS for you: invoke_plugin(qq, qq_send, ...) to send your reply, then output {\"action\":\"suspend\"}.\n\
-IMPORTANT: NEVER use {\"action\":\"respond\"} — it will cause duplicate messages. Always send via qq_send and finish with {\"action\":\"suspend\"}.\n\
+TO REPLY WITH PLAIN TEXT — output {\"action\":\"respond\",\"message\":\"<your reply>\"} as your final output (the runtime delivers it through qq_send for you). Use the qq_send tool ONLY when the message needs CQ codes (a mention or an image); then finish with {\"action\":\"suspend\"}. Never do both in one turn: if you already called qq_send, end with suspend.\n\
 OUTPUT FORMAT — your ENTIRE final output must be one JSON object (`{\"action\":\"suspend\"}` after a successful qq_send). Never emit chat text as your final output, and keep chat text (including CQ codes) only inside the `message` field of a `qq_send` call: the runtime can only parse JSON. A message whose text is `[id=...] 你好` is not JSON and will be dropped and retried.\n\
 If the user asks you to change the reply rule (e.g. \"reply to everything I say\", \"stop answering so often\"), persist it: invoke_plugin(qq, qq_set_reply_policy, {\"node_id\":\"qq_set_reply_policy\",\"policy\":\"<new rule text>\"}), then tell the user it is already in effect — the next message uses the new policy, no restart needed.\n\
 \n\
@@ -4517,12 +4517,12 @@ mod docs_tests {
         );
         let advertises_roles = hint.contains("qq_get_group_roles");
         assert!(advertises_roles, "hint must advertise the roles node");
-        let keeps_respond_ban = hint.contains("NEVER use {\"action\":\"respond\"}");
-        assert!(keeps_respond_ban, "the respond ban must stay verbatim");
-        let keeps_suspend = hint.contains("then output {\"action\":\"suspend\"}");
-        assert!(keeps_suspend, "the suspend requirement must stay verbatim");
-        let keeps_send = hint.contains("invoke_plugin(qq, qq_send, ...) to send your reply");
-        assert!(keeps_send, "the qq_send requirement must stay verbatim");
+        let explains_respond = hint.contains("\"action\":\"respond\"");
+        assert!(explains_respond, "hint must explain how to reply with text");
+        let keeps_suspend = hint.contains("{\"action\":\"suspend\"}");
+        assert!(keeps_suspend, "the suspend requirement must stay");
+        let keeps_send = hint.contains("qq_send");
+        assert!(keeps_send, "hint must still document qq_send");
     }
 }
 
