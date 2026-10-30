@@ -258,6 +258,31 @@ ManagedAgentSession { handle, session: Box<dyn AgentSessionApi> }   ← 只剩�
 
 这样 `iteration/`、`host/iteration*.rs`、`agent.rs` 三者可以一起搬，宿主侧不留残余。
 
+## 第 12 轮结论：dev-dependency 环会造出两份 runtime，测试方案必须重做
+
+循环搬进 crate 后，库能编，但 `cordis-runtime` 的测试撞墙：
+
+```
+error: multiple different versions of crate `cordis_runtime` in the dependency graph
+error: the trait bound `AgentSession: AgentSessionApi` is not satisfied
+```
+
+原因：`cordis-runtime` 为了在测试里拿到 loop，dev-depend 了 `cordis-agent`，而
+`cordis-agent` 正常依赖 `cordis-runtime`。cargo 于是编两份 runtime（一份带 `cfg(test)`、
+一份不带），`AgentSession` 与 `AgentSessionApi` 来自不同副本，类型不统一。**这条环
+不能用来给测试提供 loop。**
+
+两点结论，下一轮必须先解决其一：
+
+1. **测试跟着代码走**：`cordis-agent` 自带针对循环的测试（`imp.rs` 里已经带了 1000+
+   行测试，它们是随文件一起搬过去的）；runtime 侧只保留"接缝"测试，用 trait 的
+   **测试替身**（`#[cfg(test)] struct FakeSession`）覆盖 `auto_save_session` 这类宿主逻辑；
+2. **集成测试换装配**：`tests/*.rs` 里 15 个 `RuntimeHost::boot` 的用例同样拿不到
+   loop；它们应改为安装一个 runtime 内部的测试替身，或者整体搬到 `cordis-agent`
+   的集成测试里去跑。
+
+已完整回滚到 `04678de`（绿色）。
+
 ## 未决问题（2026-10-31，下一轮先查）
 
 `cargo test -p cordis-runtime --test runtime_host` 有 5 个 `iterate_plugins` 相关用例失败，
