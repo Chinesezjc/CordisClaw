@@ -206,6 +206,8 @@ struct ChatStreamReadResult {
     event_count: usize,
     saw_done: bool,
     finish_reason: Option<String>,
+    /// First bytes of the raw stream, for diagnosing an empty completion.
+    raw_preview: String,
 }
 
 #[derive(Debug)]
@@ -476,14 +478,26 @@ fn send_chat_request(
         {
             eprintln!(
                 "[llm_openai] empty completion attempt={attempt} status={} finish_reason={} \
-                 response_bytes={} stream_events={} stream_done={} tool_calls={} {}",
+                 response_bytes={} stream_events={} stream_done={} tool_calls={} \
+                 reasoning_chars={} {}",
                 status.as_u16(),
                 streamed.finish_reason.as_deref().unwrap_or("-"),
                 streamed.raw_bytes,
                 streamed.event_count,
                 streamed.saw_done,
                 streamed.message.tool_calls.len(),
+                streamed
+                    .message
+                    .reasoning_content
+                    .as_deref()
+                    .map(|r| r.chars().count())
+                    .unwrap_or(0),
                 request_summary,
+            );
+            eprintln!(
+                "[llm_openai] empty completion raw preview ({} bytes): {:?}",
+                streamed.raw_preview.len(),
+                streamed.raw_preview
             );
         }
 
@@ -550,6 +564,11 @@ fn read_chat_stream(
     });
 
     let mut raw_bytes = 0usize;
+    // Bounded capture of the raw stream: when a completion comes back empty,
+    // the first bytes decide whether the provider sent empty deltas or runaway
+    // whitespace. Never unbounded — a healthy response is hundreds of KB.
+    let mut raw_preview = String::new();
+    const RAW_PREVIEW_LIMIT: usize = 1200;
     let mut event_count = 0usize;
     let mut saw_done = false;
     let mut finish_reason = None;
@@ -615,6 +634,9 @@ fn read_chat_stream(
                     let leftover = std::mem::take(&mut line_buf);
                     let line = String::from_utf8_lossy(&leftover).to_string();
                     raw_bytes += line.len();
+                    if raw_preview.len() < RAW_PREVIEW_LIMIT {
+                        raw_preview.push_str(&line);
+                    }
                     if !pending_data_lines.is_empty() {
                         saw_done = process_stream_event(
                             &pending_data_lines.join("\n"),
@@ -737,6 +759,7 @@ fn read_chat_stream(
         event_count,
         saw_done,
         finish_reason,
+        raw_preview,
     })
 }
 

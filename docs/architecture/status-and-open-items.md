@@ -684,6 +684,37 @@ LRU 淘汰时同步删除。
 **验证**：重启后同一房间仍是 `agent-session-1793381492493-1`，快照数不变（677），
 重启后 16 条消息继续走同一个会话。
 
+### 3.35 工具调用改走 DSML 文本协议（2026-10-31）
+
+**动机**：`response_format: json_object` 与工具调用互斥——模型一想调工具就退化成
+"只有空白 delta、`finish_reason=stop`、0 正文 0 调用"，一轮里重试 12 次全是同一请求。
+同时 DeepSeek 本来就会把调用序列化成 DSML 文本（早期就靠 `salvage_serialized_tool_calls` 打捞）。
+
+**改法**：请求里**不再发** `tools` / `tool_choice` / `response_format`；改为第二条 system
+消息描述协议，并附一份紧凑工具目录（`node_id` + 一句话 + 参数名）：
+
+```
+<|DSML|tool_calls>
+{"node_id": "read_file", "payload_json": {"path": "..."}}
+</|DSML|tool_calls>
+```
+
+插件节点统一走 `invoke_plugin`（`payload_json` 内带 `plugin_path`/`node_id`/`payload_json`）。
+
+**解析**：`salvage_serialized_tool_calls(content, tools)` 把块里的每个 JSON 对象变成
+`LlmToolCall`：
+
+- `plugin_path` 为空且 `node_id` 命中内核工具 → **直接调用**该工具（参数取 `payload_json`）；
+- 否则包成 `invoke_plugin`（`plugin_path` 可为空，由 host 按节点反查插件）；
+- id 为 `dsml-<序号>-<node>`，同一轮重复调同一节点不会撞 id。
+
+**验证**：向 qq 插件 HTTP 端口注入一条签名事件（群 867130587），日志出现
+`⚙ invoke_plugin {"plugin_path":"","node_id":"qq_send",…} -> ok sent`，且模型先调
+`get_runtime_status` 拿到了真实状态——内核工具与插件节点两条路都通。
+
+**副作用**：`session` 快照新增 `empty_response_strikes` 字段漏了 `#[serde(default)]`，
+导致启动时 653 个旧快照解析失败被跳过；已补默认值，恢复 `recovered 677, skipped 1`。
+
 ## 4. 部分完成
 
 ### 4.1 Execution engine 有正式入口，数据面验证不足

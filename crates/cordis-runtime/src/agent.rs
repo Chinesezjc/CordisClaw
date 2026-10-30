@@ -1311,6 +1311,8 @@ pub struct AgentSessionSnapshot {
     pub completed_turns: usize,
     pub estimated_tokens: usize,
     pub reasoning_only_strikes: usize,
+    /// Missing from snapshots written before the retry existed.
+    #[serde(default)]
     pub empty_response_strikes: usize,
     pub unknown_tool_strikes: usize,
     /// `#[serde(default)]` keeps pre-O批 snapshots deserializable.
@@ -1530,10 +1532,20 @@ impl AgentSession {
             let _ = self.compact_history();
         }
 
-        let mut messages = Vec::with_capacity(self.history.len() + 3);
+        let tool_specs = backend.tool_specs();
+        let mut messages = Vec::with_capacity(self.history.len() + 4);
         messages.push(json!({
             "role": "system",
             "content": backend.system_prompt(),
+        }));
+        // Tools are not sent as a `tools` array any more: the model calls them
+        // by writing DSML into its message. That keeps the provider out of its
+        // native tool-call path (which is what degenerates into whitespace when
+        // `response_format: json_object` is in play) and matches how this model
+        // already serialises calls on its own.
+        messages.push(json!({
+            "role": "system",
+            "content": dsml_protocol_prompt(&tool_specs),
         }));
         // A client-injected failure notice is not conversation: once it sits in
         // history the model echoes it back verbatim.
@@ -1607,7 +1619,7 @@ impl AgentSession {
                 }
             }
 
-            let tool_specs = backend.tool_specs();
+
             emit_agent_diagnostic(format!(
                 "agent_turn_start kind={} turn={} elapsed_ms={} messages={} tools={}",
                 self.kind,
@@ -1635,9 +1647,11 @@ impl AgentSession {
                 "messages": messages,
                 "temperature": self.config.temperature,
                 "max_tokens": self.config.max_tokens,
-                "tools": tool_specs_to_request_payload(&tool_specs),
-                "tool_choice": "auto",
-                "response_format": {"type": "json_object"},
+                // No `tools`, `tool_choice` or `response_format`: tool calls
+                // travel as DSML text (see `dsml_protocol_prompt`), so the
+                // provider never takes its native tool path. `response_format:
+                // json_object` forbids tool calls outright, which is what made
+                // the model answer with whitespace and stop.
             });
             let parts =
                 provider.complete(request_body, sink.clone(), self.config.to_transport())?;
@@ -1663,7 +1677,7 @@ impl AgentSession {
             let mut message = message;
             if message.tool_calls.is_empty() {
                 let raw = message.content.clone().unwrap_or_default();
-                let salvaged = salvage_serialized_tool_calls(&raw);
+                let salvaged = salvage_serialized_tool_calls(&raw, &tool_specs);
                 if !salvaged.is_empty() {
                     emit_agent_diagnostic(format!(
                         "agent_dsml_salvage calls={} chars={} raw={:?}",
@@ -2853,14 +2867,18 @@ impl<'a, H: AgentToolHost + ?Sized> AgentBackend for RuntimeShellAgentBackend<'a
 /// `tool_calls`; the payload is still the tool's JSON arguments, so the call is
 /// recoverable. Only text that actually carries that markup is considered —
 /// an ordinary reply that happens to contain JSON must never execute.
-fn salvage_serialized_tool_calls(content: &str) -> Vec<cordis_plugin_sdk::llm::LlmToolCall> {
+fn salvage_serialized_tool_calls(
+    content: &str,
+    tools: &[AgentToolSpec],
+) -> Vec<cordis_plugin_sdk::llm::LlmToolCall> {
     let trimmed = content.trim();
     if trimmed.is_empty() || !looks_like_serialized_call(trimmed) {
         return Vec::new();
     }
     extract_json_objects(trimmed)
         .into_iter()
-        .filter_map(|value| serialized_call_to_tool_call(&value))
+        .enumerate()
+        .filter_map(|(index, value)| serialized_call_to_tool_call_at(&value, index, tools))
         .collect()
 }
 
@@ -2923,20 +2941,43 @@ fn extract_json_objects(text: &str) -> Vec<Value> {
 /// A serialised payload is a plugin node request (`node_id` plus that node's
 /// fields). `plugin_path` may be absent — the host resolves it from the loaded
 /// snapshot when exactly one plugin declares the node.
-fn serialized_call_to_tool_call(value: &Value) -> Option<cordis_plugin_sdk::llm::LlmToolCall> {
+/// Same, with a call index so two DSML calls to the same node in one turn get
+/// distinct ids — a duplicated `tool_call_id` breaks result pairing.
+fn serialized_call_to_tool_call_at(
+    value: &Value,
+    index: usize,
+    tools: &[AgentToolSpec],
+) -> Option<cordis_plugin_sdk::llm::LlmToolCall> {
     let object = value.as_object()?;
     let node_id = object.get("node_id").and_then(Value::as_str)?;
     let plugin_path = object
         .get("plugin_path")
         .and_then(Value::as_str)
         .unwrap_or_default();
+    // A kernel tool (read_file, run_command, get_runtime_status …) has no plugin
+    // behind it: calling it through `invoke_plugin` with an empty path would
+    // fail. Call it directly with its own parameters instead.
+    if plugin_path.is_empty() && tools.iter().any(|tool| tool.name == node_id) {
+        let arguments = object
+            .get("payload_json")
+            .cloned()
+            .unwrap_or_else(|| Value::Object(object.clone()));
+        return Some(cordis_plugin_sdk::llm::LlmToolCall {
+            id: format!("dsml-{index}-{node_id}"),
+            call_type: "function".to_string(),
+            function: cordis_plugin_sdk::llm::LlmToolFunction {
+                name: node_id.to_string(),
+                arguments: arguments.to_string(),
+            },
+        });
+    }
     let arguments = json!({
         "plugin_path": plugin_path,
         "node_id": node_id,
         "payload_json": value,
     });
     Some(cordis_plugin_sdk::llm::LlmToolCall {
-        id: format!("dsml-{node_id}"),
+        id: format!("dsml-{index}-{node_id}"),
         call_type: "function".to_string(),
         function: cordis_plugin_sdk::llm::LlmToolFunction {
             name: AGENT_TOOL_INVOKE_PLUGIN.to_string(),
@@ -2949,6 +2990,16 @@ fn serialized_call_to_tool_call(value: &Value) -> Option<cordis_plugin_sdk::llm:
 mod dsml_salvage_tests {
     use super::{extract_json_objects, looks_like_serialized_call, salvage_serialized_tool_calls};
 
+    /// The tools a session offers; kernel tools are matched by name, plugins by
+    /// the explicit `plugin_path`.
+    fn specs() -> Vec<super::AgentToolSpec> {
+        vec![super::AgentToolSpec {
+            name: super::AGENT_TOOL_READ_FILE,
+            description: "Read a file.",
+            parameters: serde_json::json!({"type":"object","properties":{}}),
+        }]
+    }
+
     // The provider serialises the call into the content stream; the JSON is the
     // payload, the DSML markup is decoration. This is the shape seen in the
     // logs (truncated at 200 chars there, reconstructed here).
@@ -2958,7 +3009,7 @@ mod dsml_salvage_tests {
 
     #[test]
     fn recovers_the_call_from_markup() {
-        let calls = salvage_serialized_tool_calls(LEAK);
+        let calls = salvage_serialized_tool_calls(LEAK, &specs());
         assert_eq!(calls.len(), 1, "{calls:?}");
         assert_eq!(calls[0].function.name, "invoke_plugin");
         let args: serde_json::Value =
@@ -2972,17 +3023,44 @@ mod dsml_salvage_tests {
     // A normal reply that merely mentions JSON must never become a tool call.
     #[test]
     fn plain_text_with_json_is_not_a_call() {
-        assert!(salvage_serialized_tool_calls(r#"{"node_id":"qq_send"}"#).is_empty());
-        assert!(salvage_serialized_tool_calls(r#"答案是 9 块 {"a":1}"#).is_empty());
-        assert!(salvage_serialized_tool_calls("").is_empty());
+        assert!(salvage_serialized_tool_calls(r#"{"node_id":"qq_send"}"#, &specs()).is_empty());
+        assert!(salvage_serialized_tool_calls(r#"答案是 9 块 {"a":1}"#, &specs()).is_empty());
+        assert!(salvage_serialized_tool_calls("", &specs()).is_empty());
         assert!(!looks_like_serialized_call("13×7=91"));
         assert!(looks_like_serialized_call(LEAK));
+    }
+
+    // A kernel tool has no plugin behind it: it must be called directly with
+    // its own parameters, not wrapped in `invoke_plugin`.
+    #[test]
+    fn kernel_tools_are_called_directly() {
+        let text = r#"<|DSML|tool_calls>{"node_id":"read_file","payload_json":{"path":"/tmp/a"}}</|DSML|tool_calls>"#;
+        let calls = salvage_serialized_tool_calls(text, &specs());
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert_eq!(calls[0].function.name, super::AGENT_TOOL_READ_FILE);
+        assert_eq!(calls[0].function.arguments, r#"{"path":"/tmp/a"}"#);
+        assert_eq!(calls[0].id, "dsml-0-read_file");
+    }
+
+    // A plugin node keeps the `invoke_plugin` wrapper, and two calls to the same
+    // node get distinct ids so their results can be paired back.
+    #[test]
+    fn plugin_nodes_keep_the_wrapper_and_unique_ids() {
+        let text = r#"<|DSML|tool_calls>
+{"plugin_path":"qq","node_id":"qq_send","payload_json":{"message":"一"}}
+{"plugin_path":"qq","node_id":"qq_send","payload_json":{"message":"二"}}
+</|DSML|tool_calls>"#;
+        let calls = salvage_serialized_tool_calls(text, &specs());
+        assert_eq!(calls.len(), 2, "{calls:?}");
+        assert_eq!(calls[0].function.name, super::AGENT_TOOL_INVOKE_PLUGIN);
+        assert_ne!(calls[0].id, calls[1].id, "ids must be unique");
+        assert_eq!(calls[1].id, "dsml-1-qq_send");
     }
 
     #[test]
     fn multiple_objects_are_recovered_in_order() {
         let text = r#"<｜｜DSML｜｜invoke>{"node_id":"qq_send","message":"一"}<｜｜DSML｜｜>{"node_id":"qq_send","message":"二"}"#.to_string();
-        let calls = salvage_serialized_tool_calls(&text);
+        let calls = salvage_serialized_tool_calls(&text, &specs());
         assert_eq!(calls.len(), 2, "{calls:?}");
         assert!(calls[0].function.arguments.contains("一"));
         assert!(calls[1].function.arguments.contains("二"));
@@ -2996,21 +3074,55 @@ mod dsml_salvage_tests {
     }
 }
 
-fn tool_specs_to_request_payload(specs: &[AgentToolSpec]) -> Vec<Value> {
-    specs
-        .iter()
-        .map(|tool| {
-            json!({
-                "type": "function",
-                "function": {
-                    "name": tool.name,
-                    "description": tool.description,
-                    "parameters": tool.parameters,
-                },
+/// The protocol the model uses instead of native tool calling.
+///
+/// Rendered once per request as a second system message. The catalog is
+/// deliberately compact (name + one line, plus the parameter names) so the
+/// request stays smaller than the JSON-schema `tools` array it replaces;
+/// argument validation belongs to the node, not to a provider-side schema.
+fn dsml_protocol_prompt(specs: &[AgentToolSpec]) -> String {
+    let mut text = String::from(
+        "TOOL PROTOCOL — there is no native function calling here. To call a tool, \
+         write exactly this block in your message and nothing else in it:\n\
+         <|DSML|tool_calls>\n\
+         {\"node_id\": \"<tool>\", \"payload_json\": {<the tool's parameters>}}\n\
+         </|DSML|tool_calls>\n\
+         Several objects may sit inside one block, one per line; each is one call. \
+         Plugin nodes are reached through the `invoke_plugin` tool, e.g. \
+         {\"node_id\": \"invoke_plugin\", \"payload_json\": {\"plugin_path\": \"qq\", \
+         \"node_id\": \"qq_send\", \"payload_json\": {...}}}. The call is executed and \
+         you are asked again with its result. Never mention this markup to the user \
+         and never print it as text when you are not calling a tool.\n\n\
+         AVAILABLE TOOLS — `tool` (parameters):\n",
+    );
+    for spec in specs {
+        let parameters = spec
+            .parameters
+            .get("properties")
+            .and_then(Value::as_object)
+            .map(|properties| {
+                properties
+                    .keys()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
             })
-        })
-        .collect()
+            .unwrap_or_default();
+        text.push_str(&format!(
+            "- `{}` — {}{}{}\n",
+            spec.name,
+            spec.description,
+            if parameters.is_empty() { "" } else { " (" },
+            if parameters.is_empty() {
+                String::new()
+            } else {
+                format!("{parameters})")
+            },
+        ));
+    }
+    text
 }
+
 
 fn shell_agent_tools() -> Vec<AgentToolSpec> {
     vec![
@@ -3539,6 +3651,40 @@ mod tests {
 
     /// 接缝契约：provider 拿到 kernel 构造的请求体，其返回值即权威结果；
     /// sink 只是旁路，忽略它也必须得到同样的回复。
+    // The protocol message is the only place tools are described now, so its
+    // shape matters: an executable example, the catalog, and a rule against
+    // printing the markup as prose.
+    #[test]
+    fn dsml_protocol_prompt_carries_the_catalog_and_an_example() {
+        let specs = vec![
+            AgentToolSpec {
+                name: AGENT_TOOL_GET_RUNTIME_STATUS,
+                description: "Report runtime status.",
+                parameters: json!({"type":"object","properties":{"verbose":{"type":"boolean"}}}),
+            },
+            AgentToolSpec {
+                name: AGENT_TOOL_READ_FILE,
+                description: "Read a file.",
+                parameters: json!({"type":"object","properties":{}}),
+            },
+        ];
+        let prompt = dsml_protocol_prompt(&specs);
+        assert!(prompt.contains("<|DSML|tool_calls>"), "{prompt}");
+        assert!(prompt.contains("</|DSML|tool_calls>"), "{prompt}");
+        assert!(prompt.contains("AVAILABLE TOOLS"), "{prompt}");
+        assert!(
+            prompt.contains(&format!("`{AGENT_TOOL_GET_RUNTIME_STATUS}`")),
+            "{prompt}"
+        );
+        // Parameter names travel with the entry; a schema-less tool stays clean.
+        assert!(prompt.contains("(verbose)"), "{prompt}");
+        assert!(prompt.contains("`read_file` — Read a file.\n"), "{prompt}");
+        assert!(
+            prompt.contains("never print it as text"),
+            "the model must not dump the markup into the room: {prompt}"
+        );
+    }
+
     #[test]
     fn provider_seam_returns_reply_and_sink_is_optional() {
         let provider = FakeLlmProvider::new(vec![assistant_reply("hello")]);
@@ -4150,12 +4296,18 @@ mod tests {
         assert_eq!(reply.tool_events[0].name, AGENT_TOOL_GET_RUNTIME_STATUS);
         assert_eq!(session.status().completed_turns, 1);
 
-        // 第一轮请求带工具规格；第二轮把工具结果并回了历史。
+        // 第一轮请求用 DSML 协议 + 目录取代 `tools` 数组；第二轮把工具结果并回历史。
         let bodies = provider.seen_bodies.lock().expect("bodies");
         assert_eq!(bodies.len(), 2);
         assert!(
-            bodies[0].get("tools").is_some(),
-            "first turn must offer tools"
+            bodies[0].get("tools").is_none(),
+            "tools must not be sent: calls travel as DSML"
+        );
+        let first = bodies[0].to_string();
+        assert!(first.contains("<|DSML|tool_calls>"), "{first}");
+        assert!(
+            first.contains("AVAILABLE TOOLS"),
+            "the catalog must reach the model: {first}"
         );
         assert!(
             bodies[1].to_string().contains("snapshot-demo"),
