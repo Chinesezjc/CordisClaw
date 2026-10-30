@@ -1,5 +1,6 @@
 use cordis_runtime::agent::{AgentToolEvent, ShellAgentReply};
 use cordis_runtime::context::ContextRegistry;
+use cordis_runtime::core::error::RuntimeError;
 use cordis_runtime::host::{
     AgentSessionKind, KernelApplyRequest, KernelPluginIterationResult, RuntimeHost,
 };
@@ -486,16 +487,22 @@ const SEND_RETRY_DELAYS: [Duration; 3] = [
 /// Run `op`, retrying with `delays` between attempts, and return the last error.
 ///
 /// `sleep` is injected so the policy is testable without real waiting.
-fn with_retries<T, E, F, S>(delays: &[Duration], mut op: F, mut sleep: S) -> Result<T, E>
+fn with_retries<T, E, F, S, R>(
+    delays: &[Duration],
+    mut op: F,
+    mut sleep: S,
+    retryable: R,
+) -> Result<T, E>
 where
     F: FnMut() -> Result<T, E>,
     S: FnMut(Duration),
+    R: Fn(&E) -> bool,
 {
     let mut attempt = 0usize;
     loop {
         match op() {
             Ok(value) => return Ok(value),
-            Err(error) if attempt >= delays.len() => return Err(error),
+            Err(error) if attempt >= delays.len() || !retryable(&error) => return Err(error),
             Err(_) => {
                 sleep(delays[attempt]);
                 attempt += 1;
@@ -1261,6 +1268,12 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                                 delay.as_secs()
                             );
                             std::thread::sleep(delay);
+                        },
+                        // The kernel has already retried a degenerate completion
+                        // with a changed request; re-sending the same batch would
+                        // repeat the identical body and multiply the cost.
+                        |error: &RuntimeError| {
+                            !matches!(error, RuntimeError::LlmResponseInvalid { .. })
                         },
                     );
                     match sent {
@@ -3283,6 +3296,7 @@ mod send_retry_tests {
                 }
             },
             |delay| slept.borrow_mut().push(delay),
+            |_: &&str| true,
         );
         assert_eq!(result, Ok(3));
         assert_eq!(
@@ -3298,9 +3312,26 @@ mod send_retry_tests {
             &SEND_RETRY_DELAYS,
             || Ok(1),
             |delay| slept.borrow_mut().push(delay),
+            |_: &&str| true,
         );
         assert_eq!(result, Ok(1));
         assert!(slept.borrow().is_empty());
+    }
+
+    // A deterministic failure must not be re-sent: the kernel already retried
+    // it with a changed request, and repeating the same batch only multiplies
+    // the provider calls.
+    #[test]
+    fn a_non_retryable_error_returns_without_waiting() {
+        let slept = Cell::new(0usize);
+        let result: Result<u32, &str> = with_retries(
+            &SEND_RETRY_DELAYS,
+            || Err("deterministic"),
+            |_delay: Duration| slept.set(slept.get() + 1),
+            |_: &&str| false,
+        );
+        assert_eq!(result, Err("deterministic"));
+        assert_eq!(slept.get(), 0, "no retry, no wait");
     }
 
     // Exhausted retries surface the last error after exactly `delays.len()`
@@ -3312,6 +3343,7 @@ mod send_retry_tests {
             &SEND_RETRY_DELAYS,
             || Err("still down"),
             |_delay: Duration| slept.set(slept.get() + 1),
+            |_: &&str| true,
         );
         assert_eq!(result, Err("still down"));
         assert_eq!(slept.get(), SEND_RETRY_DELAYS.len());

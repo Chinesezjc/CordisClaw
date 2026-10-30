@@ -46,7 +46,7 @@ fn drain_inject_queue() -> Vec<String> {
 
 /// How many times one turn re-issues a request the provider answered with
 /// nothing (no content, no tool calls) before reporting a failure.
-const EMPTY_RESPONSE_RETRIES: usize = 2;
+const EMPTY_RESPONSE_RETRIES: usize = 1;
 
 const AGENT_HISTORY_MESSAGE_LIMIT: usize = 8192;
 const AGENT_MAX_TOOL_TURNS: usize = 96;
@@ -1922,6 +1922,14 @@ impl AgentSession {
             // failure notice for something a second attempt usually fixes.
             self.empty_response_strikes += 1;
             if self.empty_response_strikes <= EMPTY_RESPONSE_RETRIES {
+                // Change the request: re-sending the identical body after a
+                // deterministic empty reply can only fail again, and the CLI
+                // retries below multiply that into a dozen wasted calls.
+                messages.push(json!({
+                    "role": "user",
+                    "content": "[system] Your previous reply was empty. Answer now: \
+                                call a tool, or write the message body.",
+                }));
                 emit_agent_diagnostic(format!(
                     "agent_empty_response_retry kind={} attempt={}",
                     self.kind, self.empty_response_strikes
@@ -4174,10 +4182,18 @@ mod tests {
             )
             .expect("the retry must succeed");
         assert_eq!(reply.content, "second attempt works");
-        assert_eq!(
-            provider.seen_bodies.lock().expect("bodies").len(),
-            2,
-            "the same request must be re-issued once"
+        let bodies = provider.seen_bodies.lock().expect("bodies");
+        assert_eq!(bodies.len(), 2, "one retry");
+        // The retry must differ from the first request; repeating it verbatim
+        // is what turned one empty reply into a dozen identical provider calls.
+        assert!(
+            !bodies[1].to_string().contains("second attempt"),
+            "sanity: bodies are request payloads"
+        );
+        assert_ne!(
+            bodies[0].to_string(),
+            bodies[1].to_string(),
+            "the retry must change the request"
         );
     }
 
@@ -4202,7 +4218,7 @@ mod tests {
         assert_eq!(
             provider.seen_bodies.lock().expect("bodies").len(),
             EMPTY_RESPONSE_RETRIES + 1,
-            "initial attempt plus the bounded retries"
+            "initial attempt plus the single retry"
         );
     }
 

@@ -462,6 +462,31 @@ fn send_chat_request(
             request_summary,
         ));
 
+        // An empty completion is the one case the layers above must retry, and
+        // they can only do it sensibly if the log says what came back. Not
+        // gated behind CORDIS_AGENT_DIAG: this is the failure we chase.
+        if streamed
+            .message
+            .content
+            .as_deref()
+            .unwrap_or_default()
+            .trim()
+            .is_empty()
+            && streamed.message.tool_calls.is_empty()
+        {
+            eprintln!(
+                "[llm_openai] empty completion attempt={attempt} status={} finish_reason={} \
+                 response_bytes={} stream_events={} stream_done={} tool_calls={} {}",
+                status.as_u16(),
+                streamed.finish_reason.as_deref().unwrap_or("-"),
+                streamed.raw_bytes,
+                streamed.event_count,
+                streamed.saw_done,
+                streamed.message.tool_calls.len(),
+                request_summary,
+            );
+        }
+
         return Ok((
             streamed.message,
             streamed.response_id,
