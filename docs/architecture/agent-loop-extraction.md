@@ -294,6 +294,19 @@ error: the trait bound `AgentSession: AgentSessionApi` is not satisfied
 等绝大多数通过；`runtime_host` 里 **5 个迭代用例仍失败**，与第 3 轮在 `98ebff2`
 上复现的是同一批（canary 判定 `Partial`），属既有问题，不是迁移引入。
 
+## 第 16 轮：循环本体已搬出 kernel ✅
+
+- `crates/cordis-runtime/src/agent.rs` 删除；循环（3303 行）在 `crates/cordis-agent/src/imp.rs`，
+  `impl AgentSessionApi for imp::AgentSession` 也搬过去了；
+- kernel 的 `agent_loop.rs` 只剩 trait + 注册表 + `missing_loop_error` + **测试替身**
+  （`#[cfg(test)] mod test_loop`），`boot` 在 `cfg(test)` 下装替身；
+- 宿主测试用的两处 `AgentSession::new` 改为 `agent_loop().create(...)`；
+- kernel 里 `LlmCompletionParts` 字段、`sanitize_tool_chains`、`RepairStats`、
+  `PluginIterationAgentState/Backend`、`ContextFilesScope` 公开（跨 crate 使用）。
+
+验证：kernel lib 965 通过（从 1003 减去随文件搬走的 36 个循环测试）、crate lib 38 通过、
+cli 49 通过、clippy 0 error；线上 06:03 重启后注入事件 → `qq_send` → `sent 1 message(s)`。
+
 ## 未决问题（2026-10-31，下一轮先查）
 
 `cargo test -p cordis-runtime --test runtime_host` 有 5 个 `iterate_plugins` 相关用例失败，

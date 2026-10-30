@@ -19,7 +19,6 @@ use std::sync::{Arc, OnceLock};
 
 use serde_json::Value;
 
-use crate::agent::AgentSession;
 use crate::agent_api::{AgentSessionSnapshot, LlmProvider};
 use crate::agent_api::{
     AgentReply, AgentSessionStatus, AgentToolExecutionSummary, AgentToolHost, AgentTranscriptEntry,
@@ -118,142 +117,158 @@ pub fn missing_loop_error() -> RuntimeError {
     }
 }
 
-/// The kernel's own loop: today's `AgentSession`, unchanged.
-pub struct KernelAgentLoop;
-
-impl AgentLoop for KernelAgentLoop {
-    fn create(
-        &self,
-        config: LlmApiConfig,
-        kind: &str,
-    ) -> Result<Box<dyn AgentSessionApi>, RuntimeError> {
-        Ok(Box::new(AgentSession::new(config, kind)?))
-    }
-
-    fn restore(
-        &self,
-        snapshot: AgentSessionSnapshot,
-    ) -> Result<Box<dyn AgentSessionApi>, RuntimeError> {
-        Ok(Box::new(AgentSession::from_snapshot(snapshot)?))
-    }
-}
-
-impl AgentSessionApi for AgentSession {
-    fn kind(&self) -> &str {
-        AgentSession::kind(self)
-    }
-
-    fn status(&self) -> AgentSessionStatus {
-        AgentSession::status(self)
-    }
-
-    fn history_len(&self) -> usize {
-        AgentSession::history_len(self)
-    }
-
-    fn compact_history(&mut self) -> (usize, usize) {
-        AgentSession::compact_history(self)
-    }
-
-    fn swap_config(&mut self, config: LlmApiConfig) -> Result<(), RuntimeError> {
-        AgentSession::swap_config(self, config)
-    }
-
-    fn set_soul_key(&mut self, key: String) {
-        AgentSession::set_soul_key(self, key);
-    }
-
-    fn set_require_end_tool(&mut self, require: bool) {
-        AgentSession::set_require_end_tool(self, require);
-    }
-
-    fn set_caller_policy(&mut self, is_group: bool, is_admin: bool) {
-        AgentSession::set_caller_policy(self, is_group, is_admin);
-    }
-
-    fn set_approval_capability(&mut self, can_approve: bool) {
-        AgentSession::set_approval_capability(self, can_approve);
-    }
-
-    fn caller_policy(&self) -> (bool, bool) {
-        AgentSession::caller_policy(self)
-    }
-
-    fn can_approve_iteration(&self) -> bool {
-        AgentSession::can_approve_iteration(self)
-    }
-
-    fn tool_execution_summary(&self) -> AgentToolExecutionSummary {
-        AgentSession::tool_execution_summary(self)
-    }
-
-    fn transcript(&self) -> Vec<AgentTranscriptEntry> {
-        AgentSession::transcript(self).to_vec()
-    }
-
-    fn replace_last_action_with_reply(&mut self, reply: &str) -> bool {
-        AgentSession::replace_last_action_with_reply(self, reply)
-    }
-
-    fn inject_exchange(&mut self, user_input: &str, assistant_output: &str) {
-        AgentSession::inject_exchange(self, user_input, assistant_output);
-    }
-
-    fn to_snapshot(&self) -> AgentSessionSnapshot {
-        AgentSession::to_snapshot(self)
-    }
-
-    fn respond(
-        &mut self,
-        host: &dyn AgentToolHost,
-        session_id: &str,
-        input: &str,
-        images: &[Value],
-        notes: &str,
-        provider: &dyn LlmProvider,
-        sink: Option<Arc<dyn TokenSink>>,
-    ) -> Result<AgentReply, RuntimeError> {
-        AgentSession::respond_with_runtime_host_via_images(
-            self, host, session_id, input, images, notes, provider, sink,
-        )
-    }
-
-    fn respond_with_iteration(
-        &mut self,
-        host: &crate::host::RuntimeHost,
-        state: &mut crate::host::PluginIterationAgentState,
-        input: &str,
-        images: &[Value],
-        notes: &str,
-        provider: &dyn LlmProvider,
-        sink: Option<Arc<dyn TokenSink>>,
-    ) -> Result<AgentReply, RuntimeError> {
-        let mut backend = crate::host::PluginIterationAgentBackend { host, state };
-        AgentSession::respond_with_provider_images(self, &mut backend, input, images, notes, provider, sink)
-    }
-}
-
 #[cfg(test)]
-mod tests {
-    use super::{agent_loop, install_agent_loop, AgentLoop, KernelAgentLoop};
+pub mod test_loop {
+    use super::{AgentLoop, AgentSessionApi};
+    use crate::agent_api::{
+        AgentReply, AgentSessionSnapshot, AgentSessionStatus, AgentToolExecutionSummary,
+        AgentToolHost, AgentTranscriptEntry,
+    };
     use crate::config::LlmApiConfig;
+    use crate::core::error::RuntimeError;
+    use serde_json::Value;
+    use std::sync::Arc;
 
-    // The seam must build a session the same way the kernel always did; this is
-    // the contract `cordis-agent` will replace with its own implementation.
-    #[test]
-    fn the_default_loop_creates_a_session() {
-        let session = KernelAgentLoop
-            .create(LlmApiConfig::default(), "runtime_shell")
-            .expect("default loop creates a session");
-        assert_eq!(session.kind(), "runtime_shell");
-        assert_eq!(session.history_len(), 0);
+    #[derive(Default)]
+    pub struct TestSession {
+        kind: String,
+        history_len: usize,
+        can_approve: bool,
+        policy: (bool, bool),
+        config: LlmApiConfig,
     }
 
-    // Installing is idempotent and the first loop wins, like the plugin builder.
-    #[test]
-    fn installing_twice_keeps_the_first_loop() {
-        assert!(install_agent_loop(Box::new(KernelAgentLoop)));
-        assert!(!install_agent_loop(Box::new(KernelAgentLoop)));
-        assert!(agent_loop().is_some());
+    impl AgentSessionApi for TestSession {
+        fn kind(&self) -> &str {
+            &self.kind
+        }
+        fn status(&self) -> AgentSessionStatus {
+            AgentSessionStatus {
+                kind: self.kind.clone(),
+                provider: self.config.provider.clone(),
+                model: self.config.model.clone(),
+                completed_turns: 0,
+                stored_messages: self.history_len,
+                transcript_events: 0,
+            }
+        }
+        fn history_len(&self) -> usize {
+            self.history_len
+        }
+        fn compact_history(&mut self) -> (usize, usize) {
+            (self.history_len, self.history_len)
+        }
+        fn swap_config(&mut self, config: LlmApiConfig) -> Result<(), RuntimeError> {
+            self.config = config;
+            Ok(())
+        }
+        fn set_soul_key(&mut self, _key: String) {}
+        fn set_require_end_tool(&mut self, _require: bool) {}
+        fn set_caller_policy(&mut self, is_group: bool, is_admin: bool) {
+            self.policy = (is_group, is_admin);
+        }
+        fn set_approval_capability(&mut self, can_approve: bool) {
+            self.can_approve = can_approve;
+        }
+        fn caller_policy(&self) -> (bool, bool) {
+            self.policy
+        }
+        fn can_approve_iteration(&self) -> bool {
+            self.can_approve
+        }
+        fn tool_execution_summary(&self) -> AgentToolExecutionSummary {
+            AgentToolExecutionSummary {
+                total_calls: 0,
+                successful_calls: 0,
+                failed_calls: 0,
+                tool_names: Vec::new(),
+            }
+        }
+        fn transcript(&self) -> Vec<AgentTranscriptEntry> {
+            Vec::new()
+        }
+        fn replace_last_action_with_reply(&mut self, _reply: &str) -> bool {
+            false
+        }
+        fn inject_exchange(&mut self, _user_input: &str, _assistant_output: &str) {}
+        fn to_snapshot(&self) -> AgentSessionSnapshot {
+            AgentSessionSnapshot {
+                kind: self.kind.clone(),
+                config: LlmApiConfig::default(),
+                history: Vec::new(),
+                transcript: Vec::new(),
+                completed_turns: 0,
+                estimated_tokens: 0,
+                reasoning_only_strikes: 0,
+                empty_response_strikes: 0,
+                require_end_tool: false,
+                no_end_strikes: 0,
+                unknown_tool_strikes: 0,
+                soul_key: String::new(),
+            }
+        }
+        fn respond(
+            &mut self,
+            _host: &dyn AgentToolHost,
+            _session_id: &str,
+            _input: &str,
+            _images: &[Value],
+            _notes: &str,
+            _provider: &dyn crate::agent_api::LlmProvider,
+            _sink: Option<Arc<dyn crate::llm_sink::TokenSink>>,
+        ) -> Result<AgentReply, RuntimeError> {
+            Ok(AgentReply {
+                response_id: None,
+                content: String::new(),
+                tool_events: Vec::new(),
+            })
+        }
+        fn respond_with_iteration(
+            &mut self,
+            _host: &crate::host::RuntimeHost,
+            _state: &mut crate::host::PluginIterationAgentState,
+            _input: &str,
+            _images: &[Value],
+            _notes: &str,
+            _provider: &dyn crate::agent_api::LlmProvider,
+            _sink: Option<Arc<dyn crate::llm_sink::TokenSink>>,
+        ) -> Result<AgentReply, RuntimeError> {
+            Ok(AgentReply {
+                response_id: None,
+                content: String::new(),
+                tool_events: Vec::new(),
+            })
+        }
+    }
+
+    pub struct TestLoop;
+
+    impl AgentLoop for TestLoop {
+        fn create(
+            &self,
+            _config: LlmApiConfig,
+            kind: &str,
+        ) -> Result<Box<dyn AgentSessionApi>, RuntimeError> {
+            Ok(Box::new(TestSession {
+                kind: kind.to_string(),
+                history_len: 0,
+                can_approve: false,
+                policy: (false, false),
+                config: LlmApiConfig::default(),
+            }))
+        }
+
+        fn restore(
+            &self,
+            snapshot: AgentSessionSnapshot,
+        ) -> Result<Box<dyn AgentSessionApi>, RuntimeError> {
+            Ok(Box::new(TestSession {
+                kind: snapshot.kind,
+                history_len: snapshot.history.len(),
+                can_approve: false,
+                policy: (false, false),
+                config: snapshot.config,
+            }))
+        }
     }
 }

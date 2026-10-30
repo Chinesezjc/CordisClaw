@@ -1,7 +1,7 @@
-use crate::config::LlmApiConfig;
-use crate::agent_api::{AgentSessionSnapshot, LlmProvider};
-use crate::agent_tools::*;
-use crate::core::error::RuntimeError;
+use cordis_runtime::config::LlmApiConfig;
+use cordis_runtime::agent_api::{AgentSessionSnapshot, LlmProvider};
+use cordis_runtime::agent_tools::*;
+use cordis_runtime::core::error::RuntimeError;
 use chrono::Local;
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeSet, VecDeque};
@@ -10,7 +10,7 @@ use std::io::Write;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-pub use crate::agent_api::{
+pub use cordis_runtime::agent_api::{
     AgentBackend, AgentReply, AgentSessionStatus, AgentToolEvent, AgentToolExecutionSummary,
     AgentToolHost, AgentToolSpec, AgentTranscriptEntry,
 };
@@ -294,7 +294,7 @@ impl AgentSession {
         // 绝不写进 history —— 每轮重发同一份会白烧几十万字节上下文。
         notes: &str,
         provider: &dyn LlmProvider,
-        sink: Option<std::sync::Arc<dyn crate::llm_sink::TokenSink>>,
+        sink: Option<std::sync::Arc<dyn cordis_runtime::llm_sink::TokenSink>>,
     ) -> Result<AgentReply, RuntimeError> {
         let trimmed = user_input.trim();
         if trimmed.is_empty() {
@@ -349,7 +349,7 @@ impl AgentSession {
         };
         messages.push(json!({
             "role": "user",
-            "content": crate::image_input::user_content_with_images(&request_text, images),
+            "content": cordis_runtime::image_input::user_content_with_images(&request_text, images),
         }));
         self.transcript.push(AgentTranscriptEntry::User {
             content: trimmed.to_string(),
@@ -417,7 +417,7 @@ impl AgentSession {
             // Repair broken tool_calls chains before the request goes out.
             // 链破形有两种方向（assistant 的 call 没应答 / tool 消息成孤儿），
             // 两者都会让 DeepSeek 整轮 400，见 `agent_toolchain` 模块文档。
-            let repair = crate::agent_toolchain::sanitize_tool_chains(&mut messages);
+            let repair = cordis_runtime::agent_toolchain::sanitize_tool_chains(&mut messages);
             if repair.changed() {
                 eprintln!(
                     "[tool_calls repair] dropped_calls={} dropped_tool_messages={} dropped_assistant_messages={}",
@@ -843,13 +843,13 @@ impl AgentSession {
         backend: &mut B,
         user_input: &str,
         provider: &dyn LlmProvider,
-        sink: Option<std::sync::Arc<dyn crate::llm_sink::TokenSink>>,
+        sink: Option<std::sync::Arc<dyn cordis_runtime::llm_sink::TokenSink>>,
     ) -> Result<AgentReply, RuntimeError> {
         self.respond_with_provider_images(backend, user_input, &[], "", provider, sink)
     }
 
     /// [`respond_with_provider`] 的多模态入口：`images` 是已经拼好的
-    /// `image_url` content part（见 `crate::image_input`）。空切片等价于纯文本。
+    /// `image_url` content part（见 `cordis_runtime::image_input`）。空切片等价于纯文本。
     pub(crate) fn respond_with_provider_images<B: AgentBackend + ?Sized>(
         &mut self,
         backend: &mut B,
@@ -857,7 +857,7 @@ impl AgentSession {
         images: &[Value],
         notes: &str,
         provider: &dyn LlmProvider,
-        sink: Option<std::sync::Arc<dyn crate::llm_sink::TokenSink>>,
+        sink: Option<std::sync::Arc<dyn cordis_runtime::llm_sink::TokenSink>>,
     ) -> Result<AgentReply, RuntimeError> {
         let transcript_len_before = self.transcript.len();
         let result = self.respond_inner(backend, user_input, images, notes, provider, sink);
@@ -891,7 +891,7 @@ impl AgentSession {
         session_id: &str,
         user_input: &str,
         provider: &dyn LlmProvider,
-        sink: Option<std::sync::Arc<dyn crate::llm_sink::TokenSink>>,
+        sink: Option<std::sync::Arc<dyn cordis_runtime::llm_sink::TokenSink>>,
     ) -> Result<AgentReply, RuntimeError> {
         let soul_key = self.soul_key.clone();
         let mut backend = RuntimeShellAgentBackend {
@@ -915,7 +915,7 @@ impl AgentSession {
         images: &[Value],
         notes: &str,
         provider: &dyn LlmProvider,
-        sink: Option<std::sync::Arc<dyn crate::llm_sink::TokenSink>>,
+        sink: Option<std::sync::Arc<dyn cordis_runtime::llm_sink::TokenSink>>,
     ) -> Result<AgentReply, RuntimeError> {
         let soul_key = self.soul_key.clone();
         let mut backend = RuntimeShellAgentBackend {
@@ -1335,7 +1335,7 @@ impl<'a, H: AgentToolHost + ?Sized> AgentBackend for RuntimeShellAgentBackend<'a
         // stay persona-free.
         if !self.soul_key.is_empty() {
             let overlay = self.host.agent_soul_overlay(&self.soul_key);
-            let persona = crate::soul::persona_or_default(overlay.as_deref());
+            let persona = cordis_runtime::soul::persona_or_default(overlay.as_deref());
             prompt.push_str("\n\n--- Persona (per-user soul) ---\n\n");
             prompt.push_str(PERSONA_DISCLAIMER);
             prompt.push_str(persona);
@@ -2152,7 +2152,7 @@ fn emit_agent_diagnostic(message: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent_api::LlmCompletionParts;
+    use cordis_runtime::agent_api::LlmCompletionParts;
 
     // The client's failure notice must never reach the model: it carries no
     // conversation, and the assistant echoed it verbatim into a group chat.
@@ -2221,7 +2221,7 @@ mod tests {
         fn complete(
             &self,
             body: Value,
-            sink: Option<std::sync::Arc<dyn crate::llm_sink::TokenSink>>,
+            sink: Option<std::sync::Arc<dyn cordis_runtime::llm_sink::TokenSink>>,
             _transport: cordis_plugin_sdk::llm::LlmTransportConfig,
         ) -> Result<LlmCompletionParts, RuntimeError> {
             self.seen_bodies.lock().expect("seen_bodies").push(body);
@@ -2261,7 +2261,7 @@ mod tests {
         events: std::sync::Mutex<Vec<String>>,
     }
 
-    impl crate::llm_sink::TokenSink for RecordingTokenSink {
+    impl cordis_runtime::llm_sink::TokenSink for RecordingTokenSink {
         fn on_reasoning(&self, delta: &str) {
             self.events
                 .lock()
@@ -2352,7 +2352,7 @@ mod tests {
         let parts = provider
             .complete(
                 json!({}),
-                Some(sink.clone() as std::sync::Arc<dyn crate::llm_sink::TokenSink>),
+                Some(sink.clone() as std::sync::Arc<dyn cordis_runtime::llm_sink::TokenSink>),
                 Default::default(),
             )
             .expect("complete");

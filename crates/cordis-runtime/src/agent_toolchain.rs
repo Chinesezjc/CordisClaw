@@ -20,7 +20,7 @@ use std::collections::BTreeSet;
 
 /// 一次整形丢掉了什么。
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct RepairStats {
+pub struct RepairStats {
     /// 从 assistant 的 `tool_calls` 数组里删掉的 call 数。
     pub dropped_calls: usize,
     /// 删掉的孤儿 `role=="tool"` 消息数。
@@ -39,7 +39,7 @@ impl RepairStats {
 /// 就地整形 `messages`，返回丢掉了什么。
 ///
 /// 幂等：对返回 `changed() == false` 的数组再跑一次仍返回全 0。
-pub(crate) fn sanitize_tool_chains(messages: &mut Vec<Value>) -> RepairStats {
+pub fn sanitize_tool_chains(messages: &mut Vec<Value>) -> RepairStats {
     let mut stats = RepairStats::default();
 
     // 第一遍：assistant 的 tool_calls 只保留「紧随其后连续 tool 消息」里出现过

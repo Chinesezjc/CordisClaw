@@ -204,9 +204,9 @@ pub trait LlmProvider {
 
 #[derive(Debug)]
 pub struct LlmCompletionParts {
-    pub(crate) message: cordis_plugin_sdk::llm::LlmMessage,
-    pub(crate) response_id: Option<String>,
-    pub(crate) finish_reason: Option<String>,
+    pub message: cordis_plugin_sdk::llm::LlmMessage,
+    pub response_id: Option<String>,
+    pub finish_reason: Option<String>,
 }
 
 /// Serializable snapshot of a session, for crash recovery.

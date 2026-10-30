@@ -1,7 +1,7 @@
 use crate::agent_api::AgentSessionSnapshot;
-use crate::agent::{
-    AgentBackend, AgentReply, AgentSessionStatus,
-    AgentToolExecutionSummary, AgentToolSpec, AgentTranscriptEntry,
+use crate::agent_api::{
+    AgentBackend, AgentReply, AgentSessionStatus, AgentToolExecutionSummary, AgentToolSpec,
+    AgentTranscriptEntry,
 };
 use crate::config::{LlmApiConfig, PluginConfigFile, RuntimeConfig};
 use crate::context::RuntimeContext;
@@ -977,7 +977,7 @@ struct ScaffoldedChildRegistration {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ContextFilesScope {
+pub enum ContextFilesScope {
     Focus,
     All,
 }
@@ -1107,8 +1107,9 @@ impl RuntimeHost {
         // The kernel's own loop is installed here so a bare `boot` (tests,
         // embedding) is usable; an embedding crate may replace it before this
         // runs, and `install_agent_loop` keeps the first one.
+        #[cfg(test)]
         let _ = crate::agent_loop::install_agent_loop(Box::new(
-            crate::agent_loop::KernelAgentLoop,
+            crate::agent_loop::test_loop::TestLoop,
         ));
         let fixtures_root = fixtures_root.as_ref().to_path_buf();
         let config = RuntimeConfig::load(&fixtures_root)?;
@@ -2850,9 +2851,9 @@ impl ManagedAgentSession {
     }
 }
 
-pub(crate) struct PluginIterationAgentBackend<'a> {
-    pub(crate) host: &'a RuntimeHost,
-    pub(crate) state: &'a mut PluginIterationAgentState,
+pub struct PluginIterationAgentBackend<'a> {
+    pub host: &'a RuntimeHost,
+    pub state: &'a mut PluginIterationAgentState,
 }
 
 fn parse_agent_args<T>(arguments: Value, tool_name: &str) -> Result<T, RuntimeError>

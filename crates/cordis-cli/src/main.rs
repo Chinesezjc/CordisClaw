@@ -1,4 +1,5 @@
-use cordis_runtime::agent::{AgentToolEvent, ShellAgentReply};
+use cordis_runtime::agent_api::AgentToolEvent;
+use cordis_agent::ShellAgentReply;
 use cordis_runtime::context::ContextRegistry;
 use cordis_runtime::core::error::RuntimeError;
 use cordis_runtime::host::{
@@ -896,7 +897,7 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         // OnceLock::set returns Err if already set; runtime-only branch is
         // entered at most once so the first-set path always wins.
         let _ = AGENT_TRIGGER_TX.set(tx);
-        cordis_runtime::agent::set_agent_inject_queue(inject_queue.clone());
+        cordis_agent::set_agent_inject_queue(inject_queue.clone());
         let health_host = std::sync::Arc::clone(&host);
         let park_host = std::sync::Arc::clone(&host);
         let data_dir = host.data_dir();

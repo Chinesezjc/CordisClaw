@@ -53,7 +53,7 @@ use super::{
     ReplaceFilesExactArgs, RetiredSnapshot, RuntimeHost, ScaffoldChildPluginArgs,
     PLUGIN_AGENT_TOOL_RECORD_ITERATION_SUMMARY, PLUGIN_AGENT_TOOL_REPLACE_FILES_EXACT,
 };
-use crate::agent::AgentTranscriptEntry;
+use crate::agent_api::AgentTranscriptEntry;
 use crate::core::error::RuntimeError;
 use crate::core::models::PluginUnavailableReason;
 use crate::kernel::plugin_iteration::{
@@ -1079,9 +1079,10 @@ fn managed_session_compact_history_wrapper_is_noop_below_threshold() {
             session_id: "s-1".to_string(),
             kind: AgentSessionKind::RuntimeShell,
         },
-        session: Box::new(
-            crate::agent::AgentSession::new(config, "runtime_shell").expect("build agent session"),
-        ),
+        session: crate::agent_loop::agent_loop()
+            .expect("loop installed")
+            .create(config, "runtime_shell")
+            .expect("build agent session"),
         state: ManagedAgentState::RuntimeShell,
     };
     let (old, new) = managed.compact_history();

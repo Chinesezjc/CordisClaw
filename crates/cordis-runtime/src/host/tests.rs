@@ -1071,7 +1071,7 @@ fn refresh_session_soul_unknown_sid_errors() {
 #[test]
 #[serial]
 fn refresh_session_caller_unknown_sid_errors() {
-    use crate::agent::AgentToolHost;
+    use crate::agent_api::AgentToolHost;
 
     let host = shared_host();
     let err = host

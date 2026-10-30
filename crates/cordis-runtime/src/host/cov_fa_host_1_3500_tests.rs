@@ -463,13 +463,16 @@ fn auto_save_and_delete_session_arms_survive_fs_faults() {
         model: "m".to_string(),
         ..crate::config::LlmApiConfig::default()
     };
-    let session = crate::agent::AgentSession::new(config, "runtime_shell").expect("build session");
+    let session = crate::agent_loop::agent_loop()
+        .expect("loop installed")
+        .create(config, "runtime_shell")
+        .expect("build session");
 
     // Arm 1: create_dir_all failure — put a FILE where data/sessions goes.
     let data_dir = host.data_dir();
     fs::create_dir_all(&data_dir).unwrap();
     fs::write(data_dir.join("sessions"), b"squatter").unwrap();
-    host.auto_save_session("s1", &session); // must log-and-return, not panic
+    host.auto_save_session("s1", session.as_ref()); // must log-and-return, not panic
     fs::remove_file(data_dir.join("sessions")).unwrap();
 
     // Arm 2: tmp write failure — sessions dir exists but is read-only.
@@ -478,13 +481,13 @@ fn auto_save_and_delete_session_arms_survive_fs_faults() {
     let ro = fs::Permissions::from_mode(0o555);
     fs::set_permissions(&sessions_dir, ro).unwrap();
     if unsafe { libc::geteuid() } != 0 {
-        host.auto_save_session("s2", &session);
+        host.auto_save_session("s2", session.as_ref());
     }
     fs::set_permissions(&sessions_dir, fs::Permissions::from_mode(0o700)).unwrap();
 
     // Arm 3: rename failure — a DIRECTORY squats on the target filename.
     fs::create_dir_all(sessions_dir.join("s3.json")).unwrap();
-    host.auto_save_session("s3", &session);
+    host.auto_save_session("s3", session.as_ref());
     fs::remove_dir(sessions_dir.join("s3.json")).unwrap();
 
     // Arm 4: delete failure — target exists but parent becomes read-only.

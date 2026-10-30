@@ -1,4 +1,3 @@
-pub mod agent;
 pub mod agent_api;
 pub mod agent_tools;
 pub mod agent_loop;
