@@ -3056,10 +3056,9 @@ SMALL GROUPS — a group that is effectively private (you and one or two people)
 HOW TO JUDGE — use the conversation history, not just this one message: who is talking to whom, whether the last few lines are a thread you are part of, whether someone asked a question nobody answered. A message that continues a thread you are already in is addressed to you even without naming you.\n\
 GROUP MEMORY — you keep your own memo per group (how talkative it wants you, its standing topics, what it told you off for). It is NOT injected into your context: read it with `qq_get_group_memory` when a message refers to something you may have written down earlier, when a conversation seems to continue a thread you had, or before you write to it — otherwise you do not need the round trip.\n\
 WRITING MEMORY — the memo is YOURS: maintain it on your own initiative, without waiting to be asked and without asking permission. Write when you learn something DURABLE: an explicit preference (wants you quiet/chatty), a correction, the group's standing topic or in-jokes, or a mistake you already paid for. Do not write about one-off facts or guesses from a single message; overwrite the entry (it replaces, not appends). Read the current memo first (`qq_get_group_memory`) so you do not clobber it, then use `qq_set_group_memory`. Changing how talkative you are is separate: `qq_set_reply_policy` with one of the four modes, and that one needs the group owner/admin or a configured operator. Both take effect on the next message.\n\
-If the message is NOT for you: use {\"action\":\"suspend\"}.\n\
-If it IS for you: invoke_plugin(qq, qq_send, ...) to send your reply, then output {\"action\":\"suspend\"}.\n\
-TO REPLY WITH PLAIN TEXT — output {\"action\":\"respond\",\"message\":\"<your reply>\"} as your final output (the runtime delivers it through qq_send for you). Use the qq_send tool ONLY when the message needs CQ codes (a mention or an image); then finish with {\"action\":\"suspend\"}. Never do both in one turn: if you already called qq_send, end with suspend.\n\
-OUTPUT FORMAT — your ENTIRE final output must be one JSON object (`{\"action\":\"suspend\"}` after a successful qq_send). Never emit chat text as your final output, and keep chat text (including CQ codes) only inside the `message` field of a `qq_send` call: the runtime can only parse JSON. A message whose text is `[id=...] 你好` is not JSON and will be dropped and retried.\n\
+HOW TO REPLY — your final assistant text IS the message sent to this chat. Write exactly what you want the room to see, in plain chat text (CQ codes included when you use them). Never wrap it in JSON, never emit a protocol object: whatever you say as your final text is what the group reads.\n\
+SILENCE — if the message is not for you, or you have nothing worth adding, answer with nothing at all: an empty response is silence and is the correct choice for a thread between other people. Do not send a placeholder like 「(no reply)」.\n\
+TOOLS ARE FOR ACTIONS, NOT FOR TALKING — use a tool only when the message needs something text cannot express: `qq_send` with CQ codes for an image or an @mention, `qq_get_group_info` to size a group, `qq_set_reply_policy` / `qq_get_group_roles` for administration. Do not send a plain reply through `qq_send` and then repeat it in your text; if you already sent the message with a tool, your text should add nothing (or be empty).\n\
 If the user asks you to change the reply rule (e.g. \"reply to everything I say\", \"stop answering so often\"), persist it: invoke_plugin(qq, qq_set_reply_policy, {\"node_id\":\"qq_set_reply_policy\",\"policy\":\"<new rule text>\"}), then tell the user it is already in effect — the next message uses the new policy, no restart needed.\n\
 \n\
 ANTI-HALLUCINATION rules:\n\
@@ -4461,23 +4460,22 @@ mod docs_tests {
         }
     }
 
-    // The bot kept answering with plain chat text (once even starting with a
-    // plain text starting with a `[id=...]` fragment), which the runtime cannot
-    // parse. The hint must state that the final output is JSON-only and that
-    // chat text (including CQ codes) belongs inside a qq_send message.
+    // The reply contract is the assistant's own text: no JSON envelope, no
+    // protocol object. Silence is an empty answer.
     #[test]
-    fn system_hint_requires_json_final_output() {
+    fn system_hint_makes_the_final_text_the_reply() {
         let hint = docs_value()
             .system_hint
             .expect("qq must ship a system hint");
-        assert!(
-            hint.contains("OUTPUT FORMAT"),
-            "hint must call out the output format"
-        );
-        assert!(
-            hint.contains("keep chat text (including CQ codes) only inside the `message` field"),
-            "hint must keep chat text/CQ codes inside qq_send: {hint}"
-        );
+        let says_text_is_the_reply = hint.contains("your final assistant text IS the message");
+        assert!(says_text_is_the_reply, "hint must say the text is the reply");
+        let forbids_json = hint.contains("Never wrap it in JSON");
+        assert!(forbids_json, "hint must forbid a JSON envelope");
+        let no_envelope_left = !hint.contains("\"action\":\"respond\"")
+            && !hint.contains("\"action\":\"suspend\"");
+        assert!(no_envelope_left, "no action envelope may remain: {hint}");
+        let explains_silence = hint.contains("an empty response is silence");
+        assert!(explains_silence, "hint must define silence: {hint}");
 
         // The bot's own qq number comes from config/plugins/qq.yaml, rendered
         // into the system prompt via `{setting:bot_uin}` — no hard-coded id.
@@ -4488,8 +4486,8 @@ mod docs_tests {
     }
 
     // 门控语义的回归保护：hint 不再硬编码 ONLY-if / When-in-doubt，
-    // 而是让模型按每条消息首行的 `[reply policy: ...]` 判断；同时保留
-    // 「必须用 qq_send、绝不用 respond、最后 suspend」的既有约束。
+    // 而是让模型按每条消息首行的 `[reply policy: ...]` 判断；回复是正文，
+    // 工具只用于动作（图片/@/管理）。
     #[test]
     fn system_hint_defers_to_reply_policy_line() {
         let hint = docs_value()
@@ -4517,10 +4515,8 @@ mod docs_tests {
         );
         let advertises_roles = hint.contains("qq_get_group_roles");
         assert!(advertises_roles, "hint must advertise the roles node");
-        let explains_respond = hint.contains("\"action\":\"respond\"");
-        assert!(explains_respond, "hint must explain how to reply with text");
-        let keeps_suspend = hint.contains("{\"action\":\"suspend\"}");
-        assert!(keeps_suspend, "the suspend requirement must stay");
+        let tools_are_actions = hint.contains("TOOLS ARE FOR ACTIONS, NOT FOR TALKING");
+        assert!(tools_are_actions, "hint must scope tools to actions");
         let keeps_send = hint.contains("qq_send");
         assert!(keeps_send, "hint must still document qq_send");
     }

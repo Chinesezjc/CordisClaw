@@ -553,6 +553,30 @@ agent 工具层做批准门控），加一条规则要改 6 个地方。现在�
 验证：`cargo test -p cordis-runtime --lib` 986、`--test host_reload_arms` 14、
 `-p cordis-cli` 48；fmt/clippy 干净。
 
+### 3.28 B1：回复即正文，删掉 JSON envelope（2026-10-30）
+
+**症状**：模型经常把 `invoke_plugin(qq, qq_send, {...})` **当文本吐出来**（DeepSeek 的 DSML 模板
+序列化），provider 没把它解析成 `tool_calls`，于是整段落进 `content`。inbox 解析首段 JSON，发现
+没有 `action`，判为 `未知动作: ?` → 丢弃重试，并且每次尝试都往群里发一条横幅。10:21–12:54 之间
+十几条回复就是这样丢的（每条横幅背后都是一条被丢弃的正确回复）。
+
+**根因不在解析，在契约**：我们既要求"必须用 `qq_send` 工具发回复"，又禁用
+`{"action":"respond"}`（早年为了防重复），模型于是**每句话都得凑一个工具调用**；凑不出来就写成
+文本。两套协议（provider 的 tool_calls + 自造的 final-output envelope）叠在一起，缝上不断长出新
+bug：未知动作、DSML 泄漏、重试刷屏、重复消息、审批能力穿四层。
+
+**改法**（B1，对齐 DSH 的"正文即回答"）：
+
+- inbox 不再解析 agent 文本：正文非空就是回复，空正文就是沉默；删掉 `parse_first_json`、
+  action 分支、重试反馈回路、格式异常横幅；
+- 同一轮里工具已发出**完全相同**的文本才跳过（`already_sent`），所以"图片 + 配文"仍然两样都发；
+- qq / feishu / kernel-shell 三处提示词统一改写：**最终文本就是消息**，工具只做动作；
+- `send_via` 恢复引用回复（`reply_to` → CQ reply），这是原先只在 respond 分支里做的。
+
+**验证**：`cargo test -p cordis-runtime --lib` 986、`-p cordis-cli` 45、`-p qq` 71、`-p feishu` 57；
+clippy 干净。新增 `already_sent` 的"仅相同文本才抑制"用例、`outbound_replies` 的正文收录用例、
+qq hint 的"禁止 JSON envelope"断言。
+
 ## 4. 部分完成
 
 ### 4.1 Execution engine 有正式入口，数据面验证不足

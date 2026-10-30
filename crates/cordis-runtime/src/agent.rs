@@ -3121,9 +3121,8 @@ You cannot edit plugin code directly — always use request_iteration.\n\
 Prefer concise, operator-friendly replies. Mention important tool outcomes plainly.\n\
 Do not invent runtime state or claim a command succeeded unless a tool confirmed it.\n\
 \n\
-CRITICAL: Your final output must be {\"action\":\"suspend\"} (JSON, nothing else).\n\
-To send a reply, use the invoke_plugin tool to call qq_send instead of outputting text.\n\
-Never output plain text — it will be dropped. All communication goes through tools.\n\
+Your reply is plain text: it streams straight to the operator. Write what you want them to read — no JSON envelope, no protocol object.\n\
+Use tools for actions (running commands, reading files, invoking plugins), not for talking. If you have nothing to add, answer with an empty response.\n\
 \n\
 CRITICAL — YOUR TOOLS (only these exist; all others will fail immediately):\n\
   get_runtime_status, list_plugins, list_nodes, get_kernel_status, get_kernel_issues,\n\

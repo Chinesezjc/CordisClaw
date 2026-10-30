@@ -215,11 +215,11 @@ inbox 一次可取到一批消息（同一渠道多条堆积）。批处理不�
 - **人格作用域：私聊按人、群聊按房间**（5.2.49 移植）：`AgentEnvelope::soul_key()` 私聊返回 `{sender_id}#private`，群聊返回**房间** `session_key`——一个群一个人格，不随发言人切换；`refresh_session_soul` 在群聊退化为幂等 no-op。**profile（LLM 端点）保持 session 起点**，换 profile 需 `/reset`。
 - **群人格编辑门控**（5.2.49）：`sender_role` 进 envelope，inbox 每批 `refresh_session_caller` 写 session 的 caller 旗标，`set_soul` 在"群聊 + 非 owner/admin"直接拒绝；feishu 角色不可得按安全默认拒绝。
 - **确定性护栏**（5.2.49，`guard.rs`）：只剩"高精度危机短语 → 固定求助话术"这一条无 LLM 短路。重复消息/刷屏**不由代码拦**，改由 conduct 规则 11 处理（答一次 → 指回上次答案 → 继续重复则沉默），因为两版代码护栏（连续轮次、重复文本计数）都误伤过正常多轮问答，而重复判断需要上下文理解。
-- **对外回复进历史**（5.2.49）：消息渠道的可见回复经 `qq_send` / `feishu_send` 工具发出，最终输出只是 `{"action":"suspend"}`；inbox 在发送成功后把实际文本回填进 assistant 历史（替换裸 action JSON），因此下一轮能看到"自己说过什么"。缺失时模型每轮都像第一次回答，表现为同一问题前后不一致。
+- **回复即正文**（B1）：agent 的**最终文本就是发给渠道的消息**，不再有 `{"action":...}` envelope。空正文 = 沉默（这是"不接话"的唯一表达）；工具只用于动作（图片/@ CQ 码/管理节点），不用于说普通的话。inbox 把正文与工具实际发出的文本一起回填进 assistant 历史，因此下一轮能看到"自己说过什么"。
 - **多 sender 批的妥协**：一批里若有多个发言者，persona 取**最后一个发言者**（last）的；该批内非 last 成员的 `set_soul` 意图也会落到 last 的 soul。这是"一 session 多用户"下的已知取舍，phase 2 若需按发言者分裂 session 再议。
 - **纯命令批不碰 pending**：整批都是命令时不触发 pending spill / 重放（命令本就不经 LLM，无"打穿"可言）。
-- **批次边界标记**（5.2.36）：普通消息 batch 送 agent 时，正文用渠道中立标记 `CURRENT_INCOMING_BATCH_START` / `CURRENT_INCOMING_BATCH_END` 包裹，并附"只把当前批次当请求，不针对则 suspend"指令，防止 agent 把历史消息误当当前请求。包裹只发生在 `agent_send` 发送点；spill / pending 落盘的是原始未包裹文本。
-- **agent 回复只取首个 JSON 值**（5.2.36）：agent 输出经 `serde_json::Deserializer` 只消费首个 JSON 值（suspend / respond），容忍尾随杂质，agent 在 JSON 后追加的解释文本不再导致解析失败。
+- **批次边界标记**（5.2.36）：普通消息 batch 送 agent 时，正文用渠道中立标记 `CURRENT_INCOMING_BATCH_START` / `CURRENT_INCOMING_BATCH_END` 包裹，并附"只把当前批次当请求，不针对则回答空"指令，防止 agent 把历史消息误当当前请求。包裹只发生在 `agent_send` 发送点；spill / pending 落盘的是原始未包裹文本。
+- **不再解析 JSON 输出**（B1）：inbox 不解析 agent 文本，也就没有 parse-fail / unknown-action 的重试回路。同一轮里若工具已发出**完全相同**的文本则跳过（图片仍可配文字），其余一律按正文发送。
 
 soul_key 越权防护：H2 的 `drop_session` 幂等，重复 drop 不 panic；`command_router` 的 `/soul` 在 `ctx.soul_key` 为空（无身份会话）时回"无身份"提示而非泄漏任何其他作用域的 persona。
 
