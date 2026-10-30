@@ -152,6 +152,24 @@ kernel。所以接缝必须同时抽象"谁提供补全"：要么把 `LlmProvide
 `pub struct CargoAgentLoop;` 实现 `AgentLoop`（create/restore → `AgentSession`），
 `pub fn install()` 调 `install_agent_loop`，cli 里在 `RuntimeHost::boot` 之前调用即可。
 
+## 未决问题（2026-10-31，下一轮先查）
+
+`cargo test -p cordis-runtime --test runtime_host` 有 5 个 `iterate_plugins` 相关用例失败，
+断言点是 canary 判定 `Partial` 而不是 `Pass`：
+
+```
+runtime_host_boot_recovers_plugin_iteration_journal
+runtime_host_iterate_plugins_blocks_without_canary_evidence_and_approve_promotes
+runtime_host_iterate_plugins_agent_adds_dist_child_plugin_and_promotes
+runtime_host_iterate_plugins_promotes_after_canary_replay
+runtime_host_iterate_plugins_agent_retries_on_warning_and_promotes
+```
+
+两条线索：(a) 复现稳定，不是 flaky；(b) 该用例传了 `edit_plan`，理论上**不经过 agent
+回合**，所以与"会话换成 trait object"大概率无关，可能是环境性的（canary 会 replay
+录制调用，并 shell 出 `cargo test --manifest-path plugins/shell/Cargo.toml`）。
+下一轮第一件事：在 `git worktree` 里检出 `98ebff2` 跑同一个用例，确认是回归还是既有失败。
+
 ## 已知硬点
 
 - **崩溃恢复**：`host/mod.rs::detect_crash_and_recover` 现在直接
