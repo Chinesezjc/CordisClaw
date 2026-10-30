@@ -7,7 +7,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::agent::SessionCaller;
+use crate::agent_tools::SessionCaller;
+use crate::config::LlmApiConfig;
 use crate::core::error::RuntimeError;
 
 pub trait AgentToolHost {
@@ -188,4 +189,45 @@ pub trait AgentBackend {
     fn tool_scope_label(&self) -> String {
         "agent".to_string()
     }
+}
+
+pub trait LlmProvider {
+    /// `sink` 为 `Some` 时 provider **可以**逐段推送增量；忽略它也必须正确工作，
+    /// 权威结果始终是本函数的返回值。
+    fn complete(
+        &self,
+        body: Value,
+        sink: Option<std::sync::Arc<dyn crate::llm_sink::TokenSink>>,
+        transport: cordis_plugin_sdk::llm::LlmTransportConfig,
+    ) -> Result<LlmCompletionParts, RuntimeError>;
+}
+
+#[derive(Debug)]
+pub struct LlmCompletionParts {
+    pub(crate) message: cordis_plugin_sdk::llm::LlmMessage,
+    pub(crate) response_id: Option<String>,
+    pub(crate) finish_reason: Option<String>,
+}
+
+/// Serializable snapshot of a session, for crash recovery.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentSessionSnapshot {
+    pub kind: String,
+    pub config: LlmApiConfig,
+    pub history: Vec<Value>,
+    pub transcript: Vec<AgentTranscriptEntry>,
+    pub completed_turns: usize,
+    pub estimated_tokens: usize,
+    pub reasoning_only_strikes: usize,
+    /// Missing from snapshots written before the retry existed.
+    #[serde(default)]
+    pub empty_response_strikes: usize,
+    #[serde(default)]
+    pub require_end_tool: bool,
+    #[serde(default)]
+    pub no_end_strikes: usize,
+    pub unknown_tool_strikes: usize,
+    /// `#[serde(default)]` keeps pre-O批 snapshots deserializable.
+    #[serde(default)]
+    pub soul_key: String,
 }

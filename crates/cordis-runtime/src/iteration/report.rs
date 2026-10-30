@@ -65,7 +65,7 @@ pub fn iteration_result_json(result: &crate::host::KernelPluginIterationResult) 
 /// produced by the channel plugin (operator allowlist / room owner / admin).
 /// The kernel only enforces what it was told.
 pub fn approve_iteration_permission(
-    caller: Option<crate::agent::SessionCaller>,
+    caller: Option<crate::agent_tools::SessionCaller>,
 ) -> Result<(), &'static str> {
     match caller {
         None => Err("approve_iteration: unknown agent session (no caller identity)"),
@@ -81,7 +81,7 @@ pub fn approve_iteration_permission(
 #[cfg(test)]
 mod tests {
     use super::{approve_iteration_permission, iteration_result_json};
-    use crate::agent::SessionCaller;
+    use crate::agent_tools::SessionCaller;
     use crate::host::KernelPluginIterationResult;
     use crate::kernel::plugin_iteration::{
         CanaryReport, CanaryVerdict, PluginEditPlan, PluginIterationFinalVerdict, VerifierVerdict,

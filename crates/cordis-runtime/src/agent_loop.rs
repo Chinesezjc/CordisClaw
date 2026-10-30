@@ -19,7 +19,8 @@ use std::sync::{Arc, OnceLock};
 
 use serde_json::Value;
 
-use crate::agent::{AgentSession, AgentSessionSnapshot, LlmProvider};
+use crate::agent::AgentSession;
+use crate::agent_api::{AgentSessionSnapshot, LlmProvider};
 use crate::agent_api::{
     AgentReply, AgentSessionStatus, AgentToolExecutionSummary, AgentToolHost, AgentTranscriptEntry,
 };

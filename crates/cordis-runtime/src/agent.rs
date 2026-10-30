@@ -1,8 +1,8 @@
 use crate::config::LlmApiConfig;
+use crate::agent_api::{AgentSessionSnapshot, LlmProvider};
 use crate::agent_tools::*;
 use crate::core::error::RuntimeError;
 use chrono::Local;
-use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeSet, VecDeque};
 use std::env;
@@ -59,20 +59,6 @@ pub(crate) const UNKNOWN_TOOL_STRIKE_LIMIT: usize = 1;
 
 
 
-/// P4: caller role facts the host tracks for one agent session. `is_group`
-/// says the conversation is a room (not a 1:1 chat); `is_admin` says the
-/// speaker is that room's owner/admin. Both default to `false`, i.e. a
-/// group speaker with no reported role is treated as a plain member.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SessionCaller {
-    pub is_group: bool,
-    pub is_admin: bool,
-    /// Whether this speaker may approve a staged plugin iteration. The kernel
-    /// treats it purely as a channel-provided fact: the plugin that produced
-    /// the envelope decides (operator allowlist, room owner/admin, …), so the
-    /// approval policy stays in the plugin layer.
-    pub can_approve_iteration: bool,
-}
 
 
 
@@ -81,25 +67,7 @@ pub struct SessionCaller {
 /// 这是 agent 循环（机制）与供应商传输（可覆写）之间的接缝。循环只要求拿回
 /// **结构化的** `tool_calls`——它在本轮中途就要据此分派工具，因此只回文本的
 /// provider 无法驱动工具调用。
-pub trait LlmProvider {
-    /// `sink` 为 `Some` 时 provider **可以**逐段推送增量；忽略它也必须正确工作，
-    /// 权威结果始终是本函数的返回值。
-    fn complete(
-        &self,
-        body: Value,
-        sink: Option<std::sync::Arc<dyn crate::llm_sink::TokenSink>>,
-        transport: cordis_plugin_sdk::llm::LlmTransportConfig,
-    ) -> Result<LlmCompletionParts, RuntimeError>;
-}
 
-/// 一次补全的返回三件套。具名结构体而非裸元组：它要跨 `agent`/`host` 两个模块
-/// 使用，字段名比位置更经得起演进。
-#[derive(Debug)]
-pub struct LlmCompletionParts {
-    pub(crate) message: cordis_plugin_sdk::llm::LlmMessage,
-    pub(crate) response_id: Option<String>,
-    pub(crate) finish_reason: Option<String>,
-}
 
 #[derive(Debug, Clone)]
 pub struct AgentSession {
@@ -132,31 +100,6 @@ pub struct AgentSession {
     caller_is_admin: bool,
     /// Channel-provided: this speaker may approve a staged iteration.
     can_approve_iteration: bool,
-}
-
-/// Serializable snapshot of an AgentSession for crash recovery.
-/// Captures everything needed to reconstruct the session except the
-/// LLM 传输（已移出 kernel，见 fixtures/plugins/llm_openai）。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AgentSessionSnapshot {
-    pub kind: String,
-    pub config: LlmApiConfig,
-    pub history: Vec<Value>,
-    pub transcript: Vec<AgentTranscriptEntry>,
-    pub completed_turns: usize,
-    pub estimated_tokens: usize,
-    pub reasoning_only_strikes: usize,
-    /// Missing from snapshots written before the retry existed.
-    #[serde(default)]
-    pub empty_response_strikes: usize,
-    #[serde(default)]
-    pub require_end_tool: bool,
-    #[serde(default)]
-    pub no_end_strikes: usize,
-    pub unknown_tool_strikes: usize,
-    /// `#[serde(default)]` keeps pre-O批 snapshots deserializable.
-    #[serde(default)]
-    pub soul_key: String,
 }
 
 pub type ShellAgentStatus = AgentSessionStatus;
@@ -2214,6 +2157,7 @@ fn emit_agent_diagnostic(message: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent_api::LlmCompletionParts;
 
     // The client's failure notice must never reach the model: it carries no
     // conversation, and the assistant echoed it verbatim into a group chat.

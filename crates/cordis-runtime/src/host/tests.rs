@@ -1086,7 +1086,8 @@ fn refresh_session_caller_unknown_sid_errors() {
 #[test]
 #[serial]
 fn refresh_session_caller_roundtrips_policy() {
-    use crate::agent::{AgentToolHost, SessionCaller};
+    use crate::agent_api::AgentToolHost;
+    use crate::agent_tools::SessionCaller;
 
     let host = shared_host();
     let handle = host

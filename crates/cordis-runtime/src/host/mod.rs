@@ -1,5 +1,6 @@
+use crate::agent_api::AgentSessionSnapshot;
 use crate::agent::{
-    AgentBackend, AgentReply, AgentSessionSnapshot, AgentSessionStatus,
+    AgentBackend, AgentReply, AgentSessionStatus,
     AgentToolExecutionSummary, AgentToolSpec, AgentTranscriptEntry,
 };
 use crate::config::{LlmApiConfig, PluginConfigFile, RuntimeConfig};
@@ -753,13 +754,13 @@ pub(crate) struct PluginLlmProvider<'a> {
     pub(crate) plugin_path: String,
 }
 
-impl crate::agent::LlmProvider for PluginLlmProvider<'_> {
+impl crate::agent_api::LlmProvider for PluginLlmProvider<'_> {
     fn complete(
         &self,
         body: serde_json::Value,
         sink: Option<std::sync::Arc<dyn crate::llm_sink::TokenSink>>,
         transport: cordis_plugin_sdk::llm::LlmTransportConfig,
-    ) -> Result<crate::agent::LlmCompletionParts, RuntimeError> {
+    ) -> Result<crate::agent_api::LlmCompletionParts, RuntimeError> {
         // 流式预算沿用配置里的每块超时，与拆分前的语义一致。
         let budget = std::time::Duration::from_secs(transport.stream_timeout_secs.max(1));
         let listener =
@@ -802,7 +803,7 @@ pub(crate) fn attach_sink_fields(payload: &mut serde_json::Value, sink: Option<(
 pub(crate) fn parse_llm_reply(
     plugin_path: &str,
     raw: &str,
-) -> Result<crate::agent::LlmCompletionParts, RuntimeError> {
+) -> Result<crate::agent_api::LlmCompletionParts, RuntimeError> {
     let value: serde_json::Value =
         serde_json::from_str(raw).map_err(|e| RuntimeError::InvalidArgument {
             message: format!("llm_complete reply from {plugin_path} is not JSON: {e}"),
@@ -825,7 +826,7 @@ pub(crate) fn parse_llm_reply(
     let message = serde_json::from_value(message).map_err(|e| RuntimeError::InvalidArgument {
         message: format!("llm_complete reply from {plugin_path} has a malformed message: {e}"),
     })?;
-    Ok(crate::agent::LlmCompletionParts {
+    Ok(crate::agent_api::LlmCompletionParts {
         message,
         response_id: value
             .get("response_id")

@@ -10,7 +10,7 @@ use serde_json::{json, Value};
 
 use std::collections::BTreeSet;
 
-use crate::agent::{SessionCaller, UNKNOWN_TOOL_STRIKE_LIMIT};
+use crate::agent::UNKNOWN_TOOL_STRIKE_LIMIT;
 use crate::agent_api::{AgentBackend, AgentToolEvent, AgentToolHost};
 use crate::core::error::RuntimeError;
 use crate::host::RuntimeHost;
@@ -1259,3 +1259,19 @@ pub(crate) fn to_json_value<T: Serialize>(label: &str, value: T) -> Result<Value
         message: format!("failed to serialize {label}: {err}"),
     })
 }
+
+/// P4: caller role facts the host tracks for one agent session. `is_group`
+/// says the conversation is a room (not a 1:1 chat); `is_admin` says the
+/// speaker is that room's owner/admin. Both default to `false`, i.e. a
+/// group speaker with no reported role is treated as a plain member.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionCaller {
+    pub is_group: bool,
+    pub is_admin: bool,
+    /// Whether this speaker may approve a staged plugin iteration. The kernel
+    /// treats it purely as a channel-provided fact: the plugin that produced
+    /// the envelope decides (operator allowlist, room owner/admin, …), so the
+    /// approval policy stays in the plugin layer.
+    pub can_approve_iteration: bool,
+}
+

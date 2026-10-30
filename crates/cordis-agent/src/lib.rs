@@ -27,7 +27,7 @@ impl AgentLoop for CargoAgentLoop {
 
     fn restore(
         &self,
-        snapshot: cordis_runtime::agent::AgentSessionSnapshot,
+        snapshot: cordis_runtime::agent_api::AgentSessionSnapshot,
     ) -> Result<Box<dyn cordis_runtime::agent_loop::AgentSessionApi>, cordis_runtime::core::error::RuntimeError>
     {
         cordis_runtime::agent_loop::KernelAgentLoop.restore(snapshot)
