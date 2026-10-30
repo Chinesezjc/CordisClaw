@@ -405,6 +405,25 @@ blocked: "exited without calling record_iteration_summary"
 
 本轮已回滚这次改动（不留错误的提前返回）。下一轮把判定移到执行之后，再迁移 mock。
 
+## 第 22 轮补充：即使 summary 是直接调用，也停在它之前
+
+去掉 mock 里的 `plugin_path`（让 summary 成为直接调用、不再被包成 `invoke_plugin`）后：
+
+```
+n=4 requests, tool summary total_calls=7（仍无 record_iteration_summary）
+第 5 次请求把 mock 脚本耗尽 → error sending request
+```
+
+两种可能，下一轮先分辨：
+
+1. DSML 解析把 `record_iteration_summary` 当成**未知工具**丢掉（strike → 重试提示 →
+   多一轮请求）；
+2. `execute_tool` 因"requires at least one edit and one successful verification step"
+   拒绝了它（需要打印该工具事件的 ok/err）。
+
+打印 `tool_events` 里每一条的 name/ok/error 即可分辨。**不要再凭猜改循环**——这轮
+已经因为"停在执行前"回滚过两次。
+
 ## 未决问题（2026-10-31，下一轮先查）
 
 `cargo test -p cordis-runtime --test runtime_host` 有 5 个 `iterate_plugins` 相关用例失败，
