@@ -341,6 +341,29 @@ cli 49 通过、clippy 0 error；线上 06:03 重启后注入事件 → `qq_send
 探测过 `shell_entry`"决定了这些 Blocked 用例的输入。要彻底说清，需要打印迭代时的
 recorder 内容——留给下一轮。
 
+## 第 19 轮：canary 门控是错的，已回退；真正要改的是两条过期断言
+
+实验过程与结论：
+
+1. 打印 `rollback_candidate` 的迭代结果 → `canary=Partial(no_canary_evidence)`、
+   `verifier=Pass`、`changed=["plugins/shell/src/lib.rs"]`、`blocked_reason=None` → Promoted。
+2. 因此"`Partial` 的 canary 应该挡住晋升"看起来是缺失的门控，于是加进
+   `finalize_plugin_iteration`：`canary_unproven || agent.requires_approval`。
+   结果：3 个 edit-plan 用例通过，但 **kernel 自己的单元契约测试失败**：
+   `finalize_partial_canary_does_not_block_a_tested_change` 明确断言
+   "verifier 通过 + canary Partial → 不阻塞"。
+3. 改成只对"盲改"（无 agent 的 edit plan）生效后，`agent_*` 用例仍因 verifier
+   `RolledBack` 失败（与门控无关）。
+
+结论：**当前 kernel 的契约就是"Partial 不阻塞"**，而三个集成用例期望 Blocked——
+它们编码的是旧策略。要不要改这三条断言（`rollback_candidate`、
+`blocks_without_canary_evidence_and_approve_promotes`、`boot_recovers_journal`）
+是产品决定：要么承认"仅测试通过即可晋升"，三条改成 Promoted/RolledBack；要么
+把门控加回去并同时改掉那条单元契约测试。**已回退门控，等拍板。**
+
+现状：kernel 965 通过；`runtime_host` 31/33，剩 2 个 agent 驱动的用例
+（`agent_adds_dist_child`、`agent_retries_on_warning`）因 verifier 回滚失败。
+
 ## 未决问题（2026-10-31，下一轮先查）
 
 `cargo test -p cordis-runtime --test runtime_host` 有 5 个 `iterate_plugins` 相关用例失败，

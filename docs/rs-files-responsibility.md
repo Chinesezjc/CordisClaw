@@ -78,7 +78,14 @@
 
 > **已删除**: `kernel/loop.rs`（9 阶段 Petri Net 替换为 agent loop）、`kernel/planner.rs`（独立 LLM 路径合并到 AgentSession）
 
-## 6b. Agent 层 (`crates/cordis-runtime/src/agent.rs`、`agent_toolchain.rs`)
+## 6b. Agent 层 (`crates/cordis-agent/src/`、`crates/cordis-runtime/src/agent_tools.rs`、`agent_toolchain.rs`)
+
+> **2026-10-31 已移出 kernel**：循环本体（`AgentSession`、`ShellAgentSession`、
+> DSML 解析、prompt 组装、工具分派）住在 `crates/cordis-agent/src/imp.rs`；
+> 接缝留在 `crates/cordis-runtime/src/agent_api.rs`（traits + DTOs）与
+> `agent_loop.rs`（`AgentLoop` + 注册表 + 测试替身）。kernel 不再默认安装任何
+> loop——由 `cordis-cli` 调 `cordis_agent::install()` 注入，与
+> `install_plugin_builder` 同一形状。
 
 > **不含 LLM 传输**：与供应商对话的 HTTP/SSE、鉴权、重试、wire format 已整体
 > 移出到 `fixtures/plugins/llm_openai`（2026-08-05）。本层只构造请求体、经
@@ -233,7 +240,8 @@
 2. `core/models.rs` + `core/error.rs`（runtime 专属契约与错误语义）。
 3. `plugin/package.rs` + `plugin/loader.rs`（发现/解析/实例化主流程）。
 4. `context/mod.rs`（注入链、overlay、CAS、Service 生命周期）。
-5. `agent.rs`（agent 会话、工具执行、轮次编排；传输已移出至 provider 插件）。
+5. `crates/cordis-agent/src/imp.rs`（agent 会话、工具执行、轮次编排）+
+   `crates/cordis-runtime/src/agent_api.rs`（接缝：trait 与 DTO）。
 6. `host.rs`（常驻宿主、iterate_plugins、自迭代 agent loop、回退安全网）。
 7. `execution/net.rs` + `execution/gate.rs` + `execution/actor.rs`（执行语义骨架）。
 8. `execution/engine.rs` + `execution/router.rs`（CPN 运行时集成与子图边界）。
