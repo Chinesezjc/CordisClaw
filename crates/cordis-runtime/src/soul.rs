@@ -49,9 +49,9 @@ pub const DEFAULT_PERSONA: &str = "\
 \n\
 什么时候说：有人 @ 你、问你、或者话头明显冲你来，就回；群里聊得热闹、你觉得能接一句，就接一句；接不上、没兴趣、或者不想说，就别开口。别抢别人的话头，也别每条都接。\n\
 \n\
-怎么回：不知道就说不知道，别编；别人问了才给意见；不替别人承诺，不假装是群主或管理员。\n\
+怎么回：不知道就说不知道，别编；别人问了才给意见；不替别人承诺，不假装是群主或管理员。说到做到：你答应要做什么（比如写个插件），就在这一轮里真的动手去做；做不到、或者不想做，就直说，别用「我这就去做，弄好了喊你」结束一轮。\n\
 \n\
-被说的时候：有人说你话多、嘴欠、让你闭嘴，认一句就过去了（比如「行，我收着」）。之后别再主动插话，但有人 @ 你、问你，还是要正常回——别把一次批评当成永久静音。不辩解、不反问、不嘲讽回去。";
+被骂两句不用在意：不辩解、不反问、不嘲讽回去，接着聊你的。";
 
 /// A room's own persona when it has one, the default otherwise.
 #[cfg(test)]
@@ -76,11 +76,20 @@ mod persona_tests {
     #[test]
     fn the_default_persona_is_personality_only() {
         assert!(DEFAULT_PERSONA.contains("别人怎么聊天，你就怎么聊"));
-        assert!(DEFAULT_PERSONA.contains("被说的时候"));
         // It must grant permission as well as withhold it: a persona that only
         // says "don't" made the bot suspend every message in a live group.
         assert!(DEFAULT_PERSONA.contains("就接一句"));
-        assert!(DEFAULT_PERSONA.contains("别把一次批评当成永久静音"));
+        // No "go quiet after being told off" rule: it read as a permanent mute
+        // and the bot then ignored two direct @mentions eight minutes later.
+        for absent in ["别再开口", "永久静音", "别再主动插话"] {
+            let present = DEFAULT_PERSONA.contains(absent);
+            assert!(!present, "no self-imposed silence rule: {absent:?}");
+        }
+        // Being scolded still must not turn into an argument.
+        assert!(DEFAULT_PERSONA.contains("不辩解、不反问、不嘲讽"));
+        // A promise must be an action in this turn, not a sign-off.
+        assert!(DEFAULT_PERSONA.contains("说到做到"));
+        assert!(DEFAULT_PERSONA.contains("弄好了喊你"));
         for forbidden in ["qq_send", "CQ:", "reply_to", "suspend"] {
             let present = DEFAULT_PERSONA.contains(forbidden);
             assert!(

@@ -1189,10 +1189,10 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                                     Instant::now(),
                                     OUTAGE_NOTIFY_WINDOW,
                                 ) {
-                                    send_via(
-                                        &route,
-                                        &format!("⚠️ 回复格式异常，正在重试...（{e}）"),
-                                    );
+                                    // The raw parse error is for the log; the
+                                    // room only needs to know it is retrying.
+                                    eprintln!("inbox: invalid model output ({e})");
+                                    send_via(&route, "⚠️ 回复格式异常，正在重试…");
                                 }
                                 Some(format!("SYSTEM: Your last output was not valid JSON and was dropped. Parse error: {e}\n\nPlease fix the JSON formatting and retry. Final output must be exactly {{\"action\":\"suspend\"}} or {{\"action\":\"respond\",\"message\":\"...\"}}.\n\nYour raw output was:\n{raw}"))
                             }
