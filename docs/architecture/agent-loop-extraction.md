@@ -307,6 +307,31 @@ error: the trait bound `AgentSession: AgentSessionApi` is not satisfied
 验证：kernel lib 965 通过（从 1003 减去随文件搬走的 36 个循环测试）、crate lib 38 通过、
 cli 49 通过、clippy 0 error；线上 06:03 重启后注入事件 → `qq_send` → `sent 1 message(s)`。
 
+## 迭代测试的剩余 5 个失败：已定位到两条互相矛盾的期望（2026-10-31）
+
+逐个隔离跑过的结果：
+
+| 用例 | 期望 | 实测 | 原因 |
+|---|---|---|---|
+| `boot_recovers_plugin_iteration_journal` | Blocked | Promoted | 与下面两条同源 |
+| `blocks_without_canary_evidence_and_approve_promotes` | Blocked | Promoted | 同上 |
+| `rollback_candidate_restores_...` | Blocked | Promoted | 同上 |
+| `agent_adds_dist_child_plugin_and_promotes` | — | 未单独验证 | 待查 |
+| `agent_retries_on_warning_and_promotes` | — | 未单独验证 | 待查 |
+
+关键发现：`shell_entry` 在宿主启动/自检时就被调用过，因此它**总是在 recorder 里**。
+
+- 旧规则（任何副作用都跳过）→ 它被跳过 → canary 无证据 → `Partial` → 三个用例的
+  `Blocked` 成立，但 `promotes_after_canary_replay` 永远失败（它明确期望 replay 生效）；
+- 新规则（只有会改变状态的副作用才跳过）→ `shell_entry` 可 replay → 该用例通过，
+  但另外三个"期望无证据"的用例变成 Promoted。
+
+也就是说这 5 个用例里，**至少有一组期望必须改**：要么承认"启动期对终端节点的调用"
+算 canary 证据（改三个 Blocked 用例），要么明确把启动期探测排除在 recorder 之外
+（改 replay 用例）。这是产品判断，不是我能单方面定的——**需要你拍板**。
+
+当前保留新规则（语义上更正确：重放 `echo` 两次无害），因此 4 个失败待处理。
+
 ## 未决问题（2026-10-31，下一轮先查）
 
 `cargo test -p cordis-runtime --test runtime_host` 有 5 个 `iterate_plugins` 相关用例失败，
