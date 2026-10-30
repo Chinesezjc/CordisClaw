@@ -1073,18 +1073,14 @@ fn managed_session_compact_history_wrapper_is_noop_below_threshold() {
         model: "m".to_string(),
         ..crate::config::LlmApiConfig::default()
     };
-    let mut session =
-        crate::agent::AgentSession::new(config, "runtime_shell").expect("build agent session");
     // Below the compaction threshold: wrapper returns (old, old) unchanged.
     let mut managed = ManagedAgentSession {
         handle: AgentSessionHandle {
             session_id: "s-1".to_string(),
             kind: AgentSessionKind::RuntimeShell,
         },
-        session: std::mem::replace(
-            &mut session,
-            crate::agent::AgentSession::new(crate::config::LlmApiConfig::default(), "throwaway")
-                .expect("throwaway session"),
+        session: Box::new(
+            crate::agent::AgentSession::new(config, "runtime_shell").expect("build agent session"),
         ),
         state: ManagedAgentState::RuntimeShell,
     };

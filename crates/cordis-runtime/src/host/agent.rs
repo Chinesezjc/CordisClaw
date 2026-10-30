@@ -94,7 +94,9 @@ impl RuntimeHost {
             .resolve(profile_name)
             .api
             .clone();
-        let mut session = AgentSession::new(api, session_kind_label)?;
+        let mut session = crate::agent_loop::agent_loop()
+            .ok_or_else(crate::agent_loop::missing_loop_error)?
+            .create(api, session_kind_label)?;
         session.set_soul_key(options.soul_key.clone());
         session.set_require_end_tool(options.require_end_tool);
         self.profile_fallback
@@ -245,7 +247,7 @@ impl RuntimeHost {
             // Auto-save on success for RuntimeShell sessions so that
             // session context survives crashes and restarts.
             if result.is_ok() && matches!(session.state, ManagedAgentState::RuntimeShell) {
-                self.auto_save_session(session_id, &session.session);
+                self.auto_save_session(session_id, session.session.as_ref());
             }
             self.agent_sessions
                 .lock()

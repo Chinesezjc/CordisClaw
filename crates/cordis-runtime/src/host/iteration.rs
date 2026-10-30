@@ -11,7 +11,9 @@ impl RuntimeHost {
         llm_config.timeout_ms = llm_config
             .timeout_ms
             .min(PLUGIN_ITERATION_AGENT_TIMEOUT_CAP_MS);
-        let session = AgentSession::new(llm_config, "plugin_iteration")?;
+        let session = crate::agent_loop::agent_loop()
+            .ok_or_else(crate::agent_loop::missing_loop_error)?
+            .create(llm_config, "plugin_iteration")?;
         self.agent_sessions
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())

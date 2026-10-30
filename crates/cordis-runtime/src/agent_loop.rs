@@ -47,6 +47,7 @@ pub trait AgentSessionApi: Send {
     fn tool_execution_summary(&self) -> AgentToolExecutionSummary;
     fn transcript(&self) -> Vec<AgentTranscriptEntry>;
     fn replace_last_action_with_reply(&mut self, reply: &str) -> bool;
+    fn inject_exchange(&mut self, user_input: &str, assistant_output: &str);
     fn to_snapshot(&self) -> AgentSessionSnapshot;
     /// Run one turn against `host`, using `provider` for completions.
     // Eight parameters is the honest shape of a turn: host, identity, input,
@@ -59,6 +60,22 @@ pub trait AgentSessionApi: Send {
         &mut self,
         host: &dyn AgentToolHost,
         session_id: &str,
+        input: &str,
+        images: &[Value],
+        notes: &str,
+        provider: &dyn LlmProvider,
+        sink: Option<Arc<dyn TokenSink>>,
+    ) -> Result<AgentReply, RuntimeError>;
+    /// Run one turn for a plugin-iteration conversation, whose backend carries
+    /// state the host owns.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "same shape as `respond`, plus the iteration state"
+    )]
+    fn respond_with_iteration(
+        &mut self,
+        host: &crate::host::RuntimeHost,
+        state: &mut crate::host::PluginIterationAgentState,
         input: &str,
         images: &[Value],
         notes: &str,
@@ -177,6 +194,10 @@ impl AgentSessionApi for AgentSession {
         AgentSession::replace_last_action_with_reply(self, reply)
     }
 
+    fn inject_exchange(&mut self, user_input: &str, assistant_output: &str) {
+        AgentSession::inject_exchange(self, user_input, assistant_output);
+    }
+
     fn to_snapshot(&self) -> AgentSessionSnapshot {
         AgentSession::to_snapshot(self)
     }
@@ -194,6 +215,20 @@ impl AgentSessionApi for AgentSession {
         AgentSession::respond_with_runtime_host_via_images(
             self, host, session_id, input, images, notes, provider, sink,
         )
+    }
+
+    fn respond_with_iteration(
+        &mut self,
+        host: &crate::host::RuntimeHost,
+        state: &mut crate::host::PluginIterationAgentState,
+        input: &str,
+        images: &[Value],
+        notes: &str,
+        provider: &dyn LlmProvider,
+        sink: Option<Arc<dyn TokenSink>>,
+    ) -> Result<AgentReply, RuntimeError> {
+        let mut backend = crate::host::PluginIterationAgentBackend { host, state };
+        AgentSession::respond_with_provider_images(self, &mut backend, input, images, notes, provider, sink)
     }
 }
 

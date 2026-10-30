@@ -1,5 +1,5 @@
 use crate::agent::{
-    AgentBackend, AgentReply, AgentSession, AgentSessionSnapshot, AgentSessionStatus,
+    AgentBackend, AgentReply, AgentSessionSnapshot, AgentSessionStatus,
     AgentToolExecutionSummary, AgentToolSpec, AgentTranscriptEntry,
 };
 use crate::config::{LlmApiConfig, PluginConfigFile, RuntimeConfig};
@@ -870,12 +870,21 @@ fn mark_dropped_if_inflight(
     }
 }
 
-#[derive(Debug)]
 pub(crate) struct ManagedAgentSession {
     #[allow(dead_code)]
     handle: AgentSessionHandle,
-    session: AgentSession,
+    session: Box<dyn crate::agent_loop::AgentSessionApi>,
     state: ManagedAgentState,
+}
+
+impl std::fmt::Debug for ManagedAgentSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ManagedAgentSession")
+            .field("handle", &self.handle)
+            .field("kind", &self.session.kind())
+            .field("state", &self.state)
+            .finish()
+    }
 }
 
 #[derive(Debug)]
@@ -902,7 +911,7 @@ struct PluginIterationAgentRun {
 }
 
 #[derive(Debug, Clone)]
-struct PluginIterationAgentState {
+pub struct PluginIterationAgentState {
     prepared: PreparedPluginIteration,
     focus_context_paths: Vec<String>,
     all_context_paths: Vec<String>,
@@ -967,7 +976,7 @@ struct ScaffoldedChildRegistration {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ContextFilesScope {
+pub(crate) enum ContextFilesScope {
     Focus,
     All,
 }
@@ -1094,6 +1103,12 @@ fn sensitive_path_keyword(path: &str) -> Option<&'static str> {
 
 impl RuntimeHost {
     pub fn boot(fixtures_root: impl AsRef<Path>) -> Result<Self, RuntimeError> {
+        // The kernel's own loop is installed here so a bare `boot` (tests,
+        // embedding) is usable; an embedding crate may replace it before this
+        // runs, and `install_agent_loop` keeps the first one.
+        let _ = crate::agent_loop::install_agent_loop(Box::new(
+            crate::agent_loop::KernelAgentLoop,
+        ));
         let fixtures_root = fixtures_root.as_ref().to_path_buf();
         let config = RuntimeConfig::load(&fixtures_root)?;
         let loader = Loader::new(default_loader_config(&fixtures_root))
@@ -1342,7 +1357,7 @@ impl RuntimeHost {
     /// Best-effort save of a session snapshot to `data/sessions/<id>.json`.
     /// Uses atomic temp-file-then-rename.  Errors are logged but never
     /// propagated — an auto-save failure must not break the agent response.
-    fn auto_save_session(&self, session_id: &str, session: &AgentSession) {
+    fn auto_save_session(&self, session_id: &str, session: &dyn crate::agent_loop::AgentSessionApi) {
         let sessions_dir = self.data_dir().join("sessions");
         if let Err(e) = std::fs::create_dir_all(&sessions_dir) {
             let subject = format!("failed to create sessions dir {}", sessions_dir.display());
@@ -1473,7 +1488,9 @@ impl RuntimeHost {
                     })
                 })
                 .and_then(|snapshot| {
-                    AgentSession::from_snapshot(snapshot)
+                    crate::agent_loop::agent_loop()
+                        .ok_or_else(crate::agent_loop::missing_loop_error)
+                        .and_then(|installed| installed.restore(snapshot))
                         .map_err(|e| crash_recovery_reconstruct_log_line(&path, &e))
                 });
             let session = match hydrated {
@@ -2710,7 +2727,7 @@ struct ReadContextFilesArgs {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct ScaffoldChildPluginArgs {
+pub(crate) struct ScaffoldChildPluginArgs {
     parent_plugin_path: String,
     child_name: String,
     #[serde(default)]
@@ -2722,7 +2739,7 @@ struct ScaffoldChildPluginArgs {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct ReplaceFileExactArgs {
+pub(crate) struct ReplaceFileExactArgs {
     path: String,
     expected_old_string: String,
     new_content: String,
@@ -2810,7 +2827,7 @@ impl ManagedAgentSession {
         };
         let provider = PluginLlmProvider { host, plugin_path };
         match &mut self.state {
-            ManagedAgentState::RuntimeShell => self.session.respond_with_runtime_host_via_images(
+            ManagedAgentState::RuntimeShell => self.session.respond(
                 host,
                 &self.handle.session_id,
                 input,
@@ -2819,27 +2836,22 @@ impl ManagedAgentSession {
                 &provider,
                 None,
             ),
-            ManagedAgentState::PluginIteration(state) => {
-                let mut backend = PluginIterationAgentBackend {
-                    host,
-                    state: state.as_mut(),
-                };
-                self.session.respond_with_provider_images(
-                    &mut backend,
-                    input,
-                    images,
-                    notes,
-                    &provider,
-                    None,
-                )
-            }
+            ManagedAgentState::PluginIteration(state) => self.session.respond_with_iteration(
+                host,
+                state.as_mut(),
+                input,
+                images,
+                notes,
+                &provider,
+                None,
+            ),
         }
     }
 }
 
-struct PluginIterationAgentBackend<'a> {
-    host: &'a RuntimeHost,
-    state: &'a mut PluginIterationAgentState,
+pub(crate) struct PluginIterationAgentBackend<'a> {
+    pub(crate) host: &'a RuntimeHost,
+    pub(crate) state: &'a mut PluginIterationAgentState,
 }
 
 fn parse_agent_args<T>(arguments: Value, tool_name: &str) -> Result<T, RuntimeError>
