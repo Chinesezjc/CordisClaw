@@ -735,6 +735,15 @@ LRU 淘汰时同步删除。
 **验证**：注入签名事件后日志为 `⚙ invoke_plugin … qq_send → ok sent`，随后
 `sent 1 message(s) through tools`，全程没有正文被发到群里。
 
+### 3.37 agent loop 移出 kernel（进行中，2026-10-31）
+
+目标与分阶段计划见 [agent-loop-extraction.md](agent-loop-extraction.md)。第一步（抽
+`agent_api` 接缝类型）已完成并提交（`ac4d055`）；后续步骤是 `AgentLoop` 注入点、
+`crates/cordis-agent` 建 crate 搬运循环、以及 `iteration/` 随之迁出。
+
+动机：`agent.rs` 4585 行、是仓库唯一被 coverage 排除的面，而这一晚所有的行为改动
+（B1 回滚、DSML 协议、end-tool 语义）都必须改 kernel + 全量重建 + 重启。
+
 ## 4. 部分完成
 
 ### 4.1 Execution engine 有正式入口，数据面验证不足

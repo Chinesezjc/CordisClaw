@@ -1,0 +1,107 @@
+# 把 agent loop 移出 kernel
+
+目标：kernel 只保留**机制**（CPN 引擎、插件加载、context、插件调用、会话注册），
+对话循环（请求组装、工具分派、历史/压缩、DSML 协议、回合结束语义）移进独立 crate
+`cordis-agent`，由 `cordis-cli` 注入。之后才能谈"多 session / session 间通信 /
+session 网络"——循环变成一个可替换组件，才可能同一进程里跑多种循环。
+
+## 为什么
+
+- `agent.rs` 现在 4585 行，是仓库唯一被 coverage 排除的地方：**最大的未测试面**。
+  它是策略（prompt 取什么、什么时候结束、失败怎么重试），不是机制。
+- 本仓一晚改的三件事（B1 回滚、DSML 协议、end-tool）全部只能改 kernel、全量重建、
+  重启服务；如果循环是独立 crate，这些改动可以独立版本化、独立测试。
+- 与已有的 `PluginBuilder` 完全同构：kernel 定义 trait，独立 crate 实现，cli 注入。
+
+## 现状（第一步已完成）
+
+`crates/cordis-runtime/src/agent_api.rs` 已抽出接缝类型：`AgentToolHost`、
+`AgentBackend`、`AgentReply`、`AgentToolEvent`、`AgentToolSpec`、`AgentSessionStatus`、
+`AgentSessionSnapshot`、`AgentTranscriptEntry`。`agent` 模块 re-export，调用点不变。
+
+## 目标结构
+
+```
+crates/cordis-runtime/src/
+  agent_api.rs        接口：trait + DTO（已有）
+  agent_loop.rs       新增：AgentLoop 工厂 trait + AgentSessionApi + 注入点
+  agent.rs            过渡期保留：默认实现（DefaultAgentLoop）包住现有 AgentSession
+crates/cordis-agent/  新 crate：循环、DSML、prompt、history、iteration/*
+crates/cordis-cli/    调用 install_agent_loop(cordis_agent::factory())
+```
+
+```rust
+// agent_api.rs（kernel 定义，插件/独立 crate 实现）
+pub trait AgentSessionApi: Send {
+    fn kind(&self) -> &str;
+    fn respond_with_runtime_host_via_images(
+        &mut self, host: &dyn AgentToolHost, session_id: &str,
+        input: &str, images: &[Value], notes: &str,
+    ) -> Result<AgentReply, RuntimeError>;
+    fn status(&self) -> AgentSessionStatus;
+    fn to_snapshot(&self) -> AgentSessionSnapshot;
+    fn history_len(&self) -> usize;
+    fn compact_history(&mut self) -> Result<(), RuntimeError>;
+    fn swap_config(&mut self, api: LlmApiConfig);
+    fn set_soul_key(&mut self, key: String);
+    fn set_require_end_tool(&mut self, require: bool);
+    fn set_caller_policy(&mut self, is_group: bool, is_admin: bool);
+    fn set_approval_capability(&mut self, can_approve: bool);
+    fn caller_policy(&self) -> (bool, bool);
+    fn can_approve_iteration(&self) -> bool;
+    fn tool_execution_summary(&self) -> AgentToolExecutionSummary;
+    fn transcript(&self) -> Vec<AgentTranscriptEntry>;
+    fn replace_last_action_with_reply(&mut self, reply: &str) -> bool;
+}
+
+pub trait AgentLoop: Send + Sync {
+    fn create(&self, api: LlmApiConfig, kind: &str) -> Result<Box<dyn AgentSessionApi>, RuntimeError>;
+    fn restore(&self, snapshot: AgentSessionSnapshot) -> Result<Box<dyn AgentSessionApi>, RuntimeError>;
+}
+
+static LOOP: OnceLock<Box<dyn AgentLoop>> = OnceLock::new();
+pub fn install_agent_loop(loop_: Box<dyn AgentLoop>) -> bool;   // 同 install_plugin_builder
+pub fn agent_loop() -> Option<&'static dyn AgentLoop>;
+pub fn missing_loop_error() -> RuntimeError;
+```
+
+`RuntimeHost` 的 `agent_sessions` 由 `BTreeMap<String, ManagedAgentSession>` 变成
+持有 `Box<dyn AgentSessionApi>`；`ManagedAgentState::PluginIteration(Box<...>)` 里的
+`PluginIterationAgentState` 一并移入 `cordis-agent`。
+
+## 依赖方向
+
+```
+cordis-cli → { cordis-runtime, cordis-agent, cordis-tooling }
+cordis-agent → cordis-runtime          （用 agent_api + config + error）
+cordis-runtime ↛ cordis-agent          （只认 trait，不认实现）
+```
+
+kernel 不能在正常依赖里出现 `cordis-agent`，否则回到循环依赖。默认实现
+（`DefaultAgentLoop`，包住现有 `AgentSession`）保留在 kernel 的 `agent.rs` 里，
+由 kernel 自己在 `RuntimeHost::boot` 里注册；`cordis-agent` 装上时覆盖它
+（`install_agent_loop` 后装者生效，或首次安装生效——与 builder 一致：幂等、先到先得）。
+
+## 分阶段（每阶段可独立编译、测试、提交）
+
+1. ✅ 抽 `agent_api`（已完成，`ac4d055`）。
+2. `agent_loop.rs`：`AgentSessionApi` + `AgentLoop` + 注入点；`AgentSession` 实现
+   `AgentSessionApi`；`host` 改持 trait object；默认工厂注册在 `boot`。
+   **行为不变**，全部测试必须过。
+3. 建 `crates/cordis-agent`，把循环（`AgentSession` 本体、DSML、prompt、history、
+   压缩、快照）搬过去；kernel 只留 `default_agent_loop` 的薄壳与 `SessionCaller`。
+4. 把 `iteration/` 与 `host/iteration.rs` 搬进 `cordis-agent`（它们只用到循环 + 工具执行
+   + 构建器）。
+5. 文档与 `docs/rs-files-responsibility.md` 同步；coverage 正则去掉 `agent.rs` 排除
+   （循环此时在可测 crate 里）。
+
+## 已知硬点
+
+- **崩溃恢复**：`host/mod.rs::detect_crash_and_recover` 现在直接
+  `AgentSession::from_snapshot`，必须改成 `agent_loop().restore(...)`。
+- **迭代流水线**：`host/iteration.rs` 直接 `AgentSession::new(_, "plugin_iteration")`，
+  同样走工厂；`ManagedAgentState::PluginIteration` 的状态类型要跟着移。
+- **测试**：`host/*_tests.rs` 里多处直接造 `AgentSession`，要么走工厂，要么留
+  `#[cfg(test)]` 的构造便捷函数。
+- **单例**：注入点是 `OnceLock`，测试并行跑时只有一个实现——默认实现必须在
+  `boot` 之前注册，否则测试顺序会影响结果（builder 已有同样的约束）。
