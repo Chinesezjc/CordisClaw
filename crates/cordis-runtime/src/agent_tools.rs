@@ -10,10 +10,12 @@ use serde_json::{json, Value};
 
 use std::collections::BTreeSet;
 
-use crate::agent::UNKNOWN_TOOL_STRIKE_LIMIT;
 use crate::agent_api::{AgentBackend, AgentToolEvent, AgentToolHost};
 use crate::core::error::RuntimeError;
 use crate::host::RuntimeHost;
+
+/// How many unknown-tool calls a turn tolerates before it stops retrying.
+pub const UNKNOWN_TOOL_STRIKE_LIMIT: usize = 1;
 
 pub const AGENT_TOOL_GET_RUNTIME_STATUS: &str = "get_runtime_status";
 pub const AGENT_TOOL_LIST_PLUGINS: &str = "list_plugins";

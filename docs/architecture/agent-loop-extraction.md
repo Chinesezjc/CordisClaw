@@ -201,6 +201,24 @@ kernel 里不再出现 `AgentSession`，只有 `Box<dyn AgentSessionApi>` 与 `K
 `pub struct CargoAgentLoop;` 实现 `AgentLoop`（create/restore → `AgentSession`），
 `pub fn install()` 调 `install_agent_loop`，cli 里在 `RuntimeHost::boot` 之前调用即可。
 
+## 搬本体前的最后一份引用清单（2026-10-31 核对，已最小化）
+
+kernel 里指向 `crate::agent::` 的地方只剩 6 处，全部是类型或测试构造：
+
+```
+host/mod.rs:1-5          AgentBackend/AgentReply/AgentSessionStatus/
+                         AgentToolExecutionSummary/AgentToolSpec/AgentTranscriptEntry
+                         → 全部改从 agent_api
+host/tests.rs            AgentToolHost → agent_api
+host/region_3500_5500_seam_tests.rs   AgentTranscriptEntry → agent_api；
+                         AgentSession::new ×1 → agent_loop().create(...)
+host/cov_fa_host_1_3500_tests.rs      AgentSession::new ×1 → 同上
+agent_loop.rs            AgentSession（KernelAgentLoop + impl）→ 随循环搬走
+```
+
+`UNKNOWN_TOOL_STRIKE_LIMIT` 已移到 `agent_tools`（`4e9aad1` 之后），所以循环搬走后
+kernel 不再需要 `agent.rs`。
+
 ## 未决问题（2026-10-31，下一轮先查）
 
 `cargo test -p cordis-runtime --test runtime_host` 有 5 个 `iterate_plugins` 相关用例失败，

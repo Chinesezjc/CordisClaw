@@ -54,11 +54,6 @@ const EMPTY_RESPONSE_RETRIES: usize = 1;
 
 const AGENT_HISTORY_MESSAGE_LIMIT: usize = 8192;
 const AGENT_MAX_TOOL_TURNS: usize = 96;
-pub(crate) const UNKNOWN_TOOL_STRIKE_LIMIT: usize = 1;
-
-
-
-
 
 
 
