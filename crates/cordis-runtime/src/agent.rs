@@ -1076,7 +1076,7 @@ impl AgentToolHost for RuntimeHost {
 /// 这是 agent 循环（机制）与供应商传输（可覆写）之间的接缝。循环只要求拿回
 /// **结构化的** `tool_calls`——它在本轮中途就要据此分派工具，因此只回文本的
 /// provider 无法驱动工具调用。
-pub(crate) trait LlmProvider {
+pub trait LlmProvider {
     /// `sink` 为 `Some` 时 provider **可以**逐段推送增量；忽略它也必须正确工作，
     /// 权威结果始终是本函数的返回值。
     fn complete(
@@ -1090,7 +1090,7 @@ pub(crate) trait LlmProvider {
 /// 一次补全的返回三件套。具名结构体而非裸元组：它要跨 `agent`/`host` 两个模块
 /// 使用，字段名比位置更经得起演进。
 #[derive(Debug)]
-pub(crate) struct LlmCompletionParts {
+pub struct LlmCompletionParts {
     pub(crate) message: cordis_plugin_sdk::llm::LlmMessage,
     pub(crate) response_id: Option<String>,
     pub(crate) finish_reason: Option<String>,

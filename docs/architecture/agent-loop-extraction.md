@@ -95,7 +95,20 @@ kernel 不能在正常依赖里出现 `cordis-agent`，否则回到循环依赖�
 5. 文档与 `docs/rs-files-responsibility.md` 同步；coverage 正则去掉 `agent.rs` 排除
    （循环此时在可测 crate 里）。
 
-## 第二步踩到的硬点（2026-10-31，待继续）
+## 进展
+
+- 第二步的接缝已落地：`agent_loop.rs` 提供 `AgentSessionApi` / `AgentLoop` /
+  `install_agent_loop`，`KernelAgentLoop` 是默认实现（包住现有 `AgentSession`），
+  行为不变，runtime 1003 / cli 49 通过。
+- provider 问题按**方案 1** 解决：`LlmProvider` 提升为 `pub`，由 host 继续负责
+  "选哪个 provider"（profile 回退、能力节点查找都在 host），循环只接收
+  `&dyn LlmProvider`。理由：provider 的**选取**依赖插件注册表，那是 kernel 的机制；
+  循环只需要一个补全接口。
+- 下一步：把 `ManagedAgentSession.session` 换成 `Box<dyn AgentSessionApi>`，构造点
+  （`agent_start_with`、`detect_crash_and_recover`、`host/iteration.rs`）全部改走
+  `agent_loop()`，然后建 `crates/cordis-agent` 搬运循环本体。
+
+## 第二步踩到的硬点（2026-10-31，已按方案 1 解决）
 
 `AgentSessionApi::respond` 不能只收 `&dyn AgentToolHost`：真正的一轮入口是
 
