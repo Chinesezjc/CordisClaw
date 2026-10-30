@@ -53,6 +53,60 @@ static STATE: Mutex<QqState> = Mutex::new(QqState {
     llm_model: None,
 });
 
+/// Per-group "the bot may not speak until" table (group_id → unix ms).
+///
+/// A group ban does not stop the agent from *trying*: OneBot answers the send
+/// with a failure and the model never learns why. Recording the ban lets the
+/// next turn tell the model it is muted, and lets `qq_send` refuse early
+/// instead of hammering the API.
+static MUTE_UNTIL: Mutex<Vec<(i64, i64)>> = Mutex::new(Vec::new());
+
+/// Does OneBot's failure wording describe a group ban?
+fn looks_like_mute_error(wording: &str) -> bool {
+    let lowered = wording.to_lowercase();
+    lowered.contains("禁言") || lowered.contains("mute") || lowered.contains("shut up")
+}
+
+/// Mute deadline in ms from OneBot's `shut_up_timestamp` (seconds, 0 = not muted).
+fn mute_deadline_ms(now_ms: u64, shut_up_seconds: i64) -> Option<i64> {
+    let until = shut_up_seconds.checked_mul(1000)?;
+    (until > now_ms as i64).then_some(until)
+}
+
+/// Human note for the model: how long it cannot speak here.
+fn mute_note(until_ms: i64, now_ms: u64) -> String {
+    let minutes = ((until_ms - now_ms as i64).max(0) + 59_999) / 60_000;
+    format!("[muted: 你在本群被禁言，约 {minutes} 分钟后解禁；在解禁前不要发言]")
+}
+
+/// Recorded deadline for `group`, ignoring expired entries.
+fn mute_until_for(group_id: i64) -> Option<i64> {
+    let now = now_ms() as i64;
+    MUTE_UNTIL
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .iter()
+        .find(|(group, until)| *group == group_id && *until > now)
+        .map(|(_, until)| *until)
+}
+
+fn record_mute(group_id: i64, until_ms: i64) {
+    let mut table = MUTE_UNTIL
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    match table.iter_mut().find(|(group, _)| *group == group_id) {
+        Some(entry) => entry.1 = until_ms,
+        None => table.push((group_id, until_ms)),
+    }
+}
+
+fn clear_mute(group_id: i64) {
+    MUTE_UNTIL
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .retain(|(group, _)| *group != group_id);
+}
+
 /// ⚠ CRITICAL — incoming message queue. Populated by handle_onebot_event,
 /// drained by start_agent_poller → agent_trigger → inbox loop.
 static MESSAGE_QUEUE: Mutex<VecDeque<IncomingMessage>> = Mutex::new(VecDeque::new());
@@ -338,9 +392,62 @@ fn onebot_send_group_msg(
     reply_to: Option<i64>,
     token: Option<&str>,
 ) -> Result<Value, String> {
+    // Refuse early while a recorded ban is still in force: hammering the API
+    // produces the same failure and gives the model nothing to act on.
+    if let Some(until) = mute_until_for(group_id) {
+        return Err(format!(
+            "你在本群被禁言，消息未发送。{}",
+            mute_note(until, now_ms())
+        ));
+    }
     let full_message = build_reply_message(message, reply_to);
     let params = json!({ "group_id": group_id, "message": full_message });
-    onebot_call(base_url, "send_group_msg", &params, token)
+    match onebot_call(base_url, "send_group_msg", &params, token) {
+        Ok(value) => {
+            clear_mute(group_id);
+            Ok(value)
+        }
+        Err(err) => {
+            // OneBot does not name the reason, so ask the authoritative source:
+            // the bot's own member record carries `shut_up_timestamp`.
+            match probe_group_mute(base_url, group_id, token) {
+                Some(until) => {
+                    record_mute(group_id, until);
+                    Err(format!(
+                        "你在本群被禁言，消息未发送（OneBot: {err}）。{}",
+                        mute_note(until, now_ms())
+                    ))
+                }
+                None if looks_like_mute_error(&err) => {
+                    // The wording says ban but the member record was unreadable:
+                    // assume a short ban so the bot at least behaves.
+                    let until = now_ms() as i64 + 10 * 60 * 1000;
+                    record_mute(group_id, until);
+                    Err(format!(
+                        "你在本群被禁言，消息未发送（OneBot: {err}）。{}",
+                        mute_note(until, now_ms())
+                    ))
+                }
+                None => Err(err),
+            }
+        }
+    }
+}
+
+/// The bot's own ban deadline in `group_id`, read from OneBot.
+fn probe_group_mute(base_url: &str, group_id: i64, token: Option<&str>) -> Option<i64> {
+    let login = onebot_call(base_url, "get_login_info", &json!({}), token).ok()?;
+    let bot_uin = login
+        .get("data")
+        .and_then(|data| data.get("user_id"))
+        .and_then(Value::as_i64)?;
+    let params = json!({ "group_id": group_id, "user_id": bot_uin });
+    let member = onebot_call(base_url, "get_group_member_info", &params, token).ok()?;
+    let shut_up = member
+        .get("data")
+        .and_then(|data| data.get("shut_up_timestamp"))
+        .and_then(Value::as_i64)?;
+    mute_deadline_ms(now_ms(), shut_up)
 }
 
 /// Prepend a OneBot reply segment when reply_to is Some.
@@ -1463,7 +1570,16 @@ fn build_envelope(msg: &IncomingMessage) -> String {
     // 策略放进 `notes`：kernel 只把它随**本次**请求发给模型，不写进 history。
     // 群记忆**不注入**——那是 agent 自己的备忘，需要时用 `qq_get_group_memory` 去读，
     // 每条消息都塞进来只会让绝大多数请求白付 token。
-    let notes = format!("[reply policy: {mode} — {policy}]");
+    let mut notes = format!("[reply policy: {mode} — {policy}]");
+    // A group ban is folded into the per-message context: the model must know
+    // it cannot speak before it decides to, not after a failed send.
+    if let Some(until) = group
+        .and_then(|group| group.parse::<i64>().ok())
+        .and_then(mute_until_for)
+    {
+        notes.push(' ');
+        notes.push_str(&mute_note(until, now_ms()));
+    }
     let reply_target = format!("{}:{}", msg.message_type, msg.sender_id);
     let session_key = format!("qq:{reply_target}");
     // 有展示名就带上（群名片/昵称，已清洗）；没有则保持旧格式。名字插在
@@ -3059,6 +3175,7 @@ WRITING MEMORY — the memo is YOURS: maintain it on your own initiative, withou
 If the message is NOT for you: use {\"action\":\"suspend\"}.\n\
 If it IS for you: invoke_plugin(qq, qq_send, ...) to send your reply, then output {\"action\":\"suspend\"}.\n\
 TO REPLY WITH PLAIN TEXT — output {\"action\":\"respond\",\"message\":\"<your reply>\"} as your final output (the runtime delivers it through qq_send for you). Use the qq_send tool ONLY when the message needs CQ codes (a mention or an image); then finish with {\"action\":\"suspend\"}. Never do both in one turn: if you already called qq_send, end with suspend.\n\
+MUTED — if the context line contains `[muted: ...]`, or a send fails with 禁言, you are banned in that group. Do not keep calling qq_send and do not retry: say nothing and wait. The ban lifts on its own and the note disappears; retrying only produces more failures.\n\
 OUTPUT FORMAT — your ENTIRE final output must be one JSON object (`{\"action\":\"suspend\"}` after a successful qq_send). Never emit chat text as your final output, and keep chat text (including CQ codes) only inside the `message` field of a `qq_send` call: the runtime can only parse JSON. A message whose text is `[id=...] 你好` is not JSON and will be dropped and retried.\n\
 If the user asks you to change the reply rule (e.g. \"reply to everything I say\", \"stop answering so often\"), persist it: invoke_plugin(qq, qq_set_reply_policy, {\"node_id\":\"qq_set_reply_policy\",\"policy\":\"<new rule text>\"}), then tell the user it is already in effect — the next message uses the new policy, no restart needed.\n\
 \n\
@@ -4411,6 +4528,61 @@ mod role_tests {
 // 出现在 docs 且带标志，否则 agent 又被拒成 "not allowed to call ..."。
 // ═══════════════════════════════════════════════════════════════════════
 #[cfg(test)]
+mod mute_tests {
+    use super::{
+        clear_mute, looks_like_mute_error, mute_deadline_ms, mute_note, mute_until_for, record_mute,
+    };
+
+    #[test]
+    fn wording_recognises_a_group_ban() {
+        for wording in [
+            "你已被禁言",
+            "该群全员禁言中",
+            "bot is muted",
+            "shut up",
+        ] {
+            assert!(looks_like_mute_error(wording), "{wording}");
+        }
+        for wording in ["bad request", "retcode=100", "invalid token"] {
+            assert!(!looks_like_mute_error(wording), "{wording}");
+        }
+    }
+
+    // `shut_up_timestamp` is in seconds; 0 means "not muted".
+    #[test]
+    fn deadline_comes_from_the_member_record() {
+        let now = 1_700_000_000_000u64;
+        assert_eq!(mute_deadline_ms(now, 1_700_000_600), Some(1_700_000_600_000));
+        assert_eq!(mute_deadline_ms(now, 0), None);
+        assert_eq!(mute_deadline_ms(now, 1_699_999_000), None);
+    }
+
+    #[test]
+    fn note_reports_minutes_left() {
+        let now = 1_000_000u64;
+        assert!(mute_note(now as i64 + 90_000, now).contains("约 2 分钟后解禁"));
+        assert!(mute_note(now as i64 + 1, now).contains("约 1 分钟后解禁"));
+        // Already expired: never report a negative wait.
+        assert!(mute_note(now as i64 - 5_000, now).contains("约 0 分钟后解禁"));
+    }
+
+    #[test]
+    fn table_remembers_expires_and_clears() {
+        let group = 987_654_321;
+        clear_mute(group);
+        assert_eq!(mute_until_for(group), None);
+        record_mute(group, 4_000_000_000_000);
+        assert_eq!(mute_until_for(group), Some(4_000_000_000_000));
+        record_mute(group, 4_000_000_000_001);
+        assert_eq!(mute_until_for(group), Some(4_000_000_000_001));
+        record_mute(group, 1);
+        assert_eq!(mute_until_for(group), None, "expired entries are ignored");
+        clear_mute(group);
+        assert_eq!(mute_until_for(group), None);
+    }
+}
+
+#[cfg(test)]
 mod docs_tests {
     use super::*;
 
@@ -4521,6 +4693,8 @@ mod docs_tests {
         assert!(explains_respond, "hint must explain how to reply with text");
         let keeps_suspend = hint.contains("{\"action\":\"suspend\"}");
         assert!(keeps_suspend, "the suspend requirement must stay");
+        let explains_mute = hint.contains("MUTED — if the context line contains");
+        assert!(explains_mute, "hint must explain a group ban: {hint}");
         let keeps_send = hint.contains("qq_send");
         assert!(keeps_send, "hint must still document qq_send");
     }
