@@ -15,19 +15,19 @@ use crate::agent_api::{AgentBackend, AgentToolEvent, AgentToolHost};
 use crate::core::error::RuntimeError;
 use crate::host::RuntimeHost;
 
-pub(crate) const AGENT_TOOL_GET_RUNTIME_STATUS: &str = "get_runtime_status";
-pub(crate) const AGENT_TOOL_LIST_PLUGINS: &str = "list_plugins";
-pub(crate) const AGENT_TOOL_LIST_NODES: &str = "list_nodes";
-pub(crate) const AGENT_TOOL_GET_KERNEL_STATUS: &str = "get_kernel_status";
-pub(crate) const AGENT_TOOL_GET_KERNEL_ISSUES: &str = "get_kernel_issues";
-pub(crate) const AGENT_TOOL_RELOAD_RUNTIME: &str = "reload_runtime";
+pub const AGENT_TOOL_GET_RUNTIME_STATUS: &str = "get_runtime_status";
+pub const AGENT_TOOL_LIST_PLUGINS: &str = "list_plugins";
+pub const AGENT_TOOL_LIST_NODES: &str = "list_nodes";
+pub const AGENT_TOOL_GET_KERNEL_STATUS: &str = "get_kernel_status";
+pub const AGENT_TOOL_GET_KERNEL_ISSUES: &str = "get_kernel_issues";
+pub const AGENT_TOOL_RELOAD_RUNTIME: &str = "reload_runtime";
 /// Kernel introspection tools — their output describes the agent's own
 /// internal state (plugin counts, snapshot ids, kernel counters), not
 /// conversational content. Their tool call/result pairs are stripped by
 /// [`filter_kernel_introspection_messages`] before persisting to cross-turn
 /// history so they don't teach the LLM to imitate diagnostic call patterns on
 /// later turns.
-pub(crate) const KERNEL_INTROSPECTION_TOOLS: &[&str] = &[
+pub const KERNEL_INTROSPECTION_TOOLS: &[&str] = &[
     AGENT_TOOL_GET_RUNTIME_STATUS,
     AGENT_TOOL_LIST_PLUGINS,
     AGENT_TOOL_LIST_NODES,
@@ -35,7 +35,7 @@ pub(crate) const KERNEL_INTROSPECTION_TOOLS: &[&str] = &[
     AGENT_TOOL_GET_KERNEL_ISSUES,
 ];
 /// Returns true if `name` is one of the kernel introspection tools.
-pub(crate) fn is_kernel_introspection(name: &str) -> bool {
+pub fn is_kernel_introspection(name: &str) -> bool {
     KERNEL_INTROSPECTION_TOOLS.contains(&name)
 }
 /// Strip kernel-introspection tool call/result pairs from a slice of chat
@@ -57,7 +57,7 @@ pub(crate) fn is_kernel_introspection(name: &str) -> bool {
 /// - Any `tool` result message whose `tool_call_id` matches a dropped
 ///   introspection call is removed.
 /// - All other messages pass through unchanged.
-pub(crate) fn filter_kernel_introspection_messages(messages: &[Value]) -> Vec<Value> {
+pub fn filter_kernel_introspection_messages(messages: &[Value]) -> Vec<Value> {
     let mut skip_tool_ids: Vec<String> = Vec::new();
     let mut out: Vec<Value> = Vec::with_capacity(messages.len());
     for msg in messages {
@@ -125,26 +125,26 @@ pub(crate) fn filter_kernel_introspection_messages(messages: &[Value]) -> Vec<Va
     }
     out
 }
-pub(crate) const AGENT_TOOL_BUILD_PLUGINS: &str = "build_plugins";
-pub(crate) const AGENT_TOOL_INVOKE_PLUGIN: &str = "invoke_plugin";
-pub(crate) const AGENT_TOOL_EXECUTE_TARGET: &str = "execute_target";
-pub(crate) const AGENT_TOOL_READ_FILE: &str = "read_file";
-pub(crate) const AGENT_TOOL_LIST_DIRECTORY: &str = "list_directory";
-pub(crate) const AGENT_TOOL_SEARCH_CODE: &str = "search_code";
-pub(crate) const AGENT_TOOL_WRITE_FILE: &str = "write_file";
-pub(crate) const AGENT_TOOL_REPLACE_IN_FILE: &str = "replace_in_file";
-pub(crate) const AGENT_TOOL_REVERT_CHANGES: &str = "revert_changes";
-pub(crate) const AGENT_TOOL_DELETE_FILE: &str = "delete_file";
-pub(crate) const AGENT_TOOL_RENAME_FILE: &str = "rename_file";
-pub(crate) const AGENT_TOOL_MOVE_FILE: &str = "move_file";
-pub(crate) const AGENT_TOOL_COPY_FILE: &str = "copy_file";
-pub(crate) const AGENT_TOOL_COMPACT_CONTEXT: &str = "compact_context";
-pub(crate) const AGENT_TOOL_RUN_PLUGIN_TEST: &str = "run_plugin_test";
-pub(crate) const AGENT_TOOL_REQUEST_ITERATION: &str = "request_iteration";
-pub(crate) const AGENT_TOOL_APPROVE_ITERATION: &str = "approve_iteration";
-pub(crate) const AGENT_TOOL_CREATE_PLUGIN: &str = "create_plugin";
-pub(crate) const AGENT_TOOL_SET_SOUL: &str = "set_soul";
-pub(crate) const LLM_DEBUG_ENV: &str = "CORDIS_LLM_DEBUG";
+pub const AGENT_TOOL_BUILD_PLUGINS: &str = "build_plugins";
+pub const AGENT_TOOL_INVOKE_PLUGIN: &str = "invoke_plugin";
+pub const AGENT_TOOL_EXECUTE_TARGET: &str = "execute_target";
+pub const AGENT_TOOL_READ_FILE: &str = "read_file";
+pub const AGENT_TOOL_LIST_DIRECTORY: &str = "list_directory";
+pub const AGENT_TOOL_SEARCH_CODE: &str = "search_code";
+pub const AGENT_TOOL_WRITE_FILE: &str = "write_file";
+pub const AGENT_TOOL_REPLACE_IN_FILE: &str = "replace_in_file";
+pub const AGENT_TOOL_REVERT_CHANGES: &str = "revert_changes";
+pub const AGENT_TOOL_DELETE_FILE: &str = "delete_file";
+pub const AGENT_TOOL_RENAME_FILE: &str = "rename_file";
+pub const AGENT_TOOL_MOVE_FILE: &str = "move_file";
+pub const AGENT_TOOL_COPY_FILE: &str = "copy_file";
+pub const AGENT_TOOL_COMPACT_CONTEXT: &str = "compact_context";
+pub const AGENT_TOOL_RUN_PLUGIN_TEST: &str = "run_plugin_test";
+pub const AGENT_TOOL_REQUEST_ITERATION: &str = "request_iteration";
+pub const AGENT_TOOL_APPROVE_ITERATION: &str = "approve_iteration";
+pub const AGENT_TOOL_CREATE_PLUGIN: &str = "create_plugin";
+pub const AGENT_TOOL_SET_SOUL: &str = "set_soul";
+pub const LLM_DEBUG_ENV: &str = "CORDIS_LLM_DEBUG";
 impl AgentToolHost for RuntimeHost {
     /// 转发到 host 的真实实现。**少了这个转发，trait 的默认 no-op 会被调用**
     /// ——插件就再也收不到 `__meta`，鉴权会静默退化成"当作 CLI 操作员放行"。
@@ -1011,109 +1011,109 @@ impl AgentToolHost for RuntimeHost {
     }
 }
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
-pub(crate) struct EmptyArgs {}
+pub struct EmptyArgs {}
 #[derive(Debug, Clone, Deserialize, PartialEq)]
-pub(crate) struct InvokePluginArgs {
-    pub(crate) plugin_path: String,
-    pub(crate) node_id: String,
-    pub(crate) payload_json: Value,
+pub struct InvokePluginArgs {
+    pub plugin_path: String,
+    pub node_id: String,
+    pub payload_json: Value,
 }
 #[derive(Debug, Clone, Deserialize, PartialEq)]
-pub(crate) struct ExecuteTargetArgs {
-    pub(crate) node_fqn: String,
-    pub(crate) payload_json: Value,
+pub struct ExecuteTargetArgs {
+    pub node_fqn: String,
+    pub payload_json: Value,
 }
 #[derive(Debug, Clone, Deserialize, PartialEq)]
-pub(crate) struct ReadFileArgs {
-    pub(crate) path: String,
+pub struct ReadFileArgs {
+    pub path: String,
     #[serde(default)]
-    pub(crate) offset: Option<usize>,
+    pub offset: Option<usize>,
     #[serde(default)]
-    pub(crate) limit: Option<usize>,
+    pub limit: Option<usize>,
 }
 #[derive(Debug, Clone, Deserialize, PartialEq)]
-pub(crate) struct ListDirectoryArgs {
+pub struct ListDirectoryArgs {
     #[serde(default)]
-    pub(crate) path: Option<String>,
+    pub path: Option<String>,
 }
 #[derive(Debug, Clone, Deserialize, PartialEq)]
-pub(crate) struct SearchCodeArgs {
-    pub(crate) pattern: String,
+pub struct SearchCodeArgs {
+    pub pattern: String,
     #[serde(default)]
-    pub(crate) path: Option<String>,
+    pub path: Option<String>,
 }
 #[derive(Debug, Clone, Deserialize, PartialEq)]
-pub(crate) struct WriteFileArgs {
-    pub(crate) path: String,
-    pub(crate) content: String,
+pub struct WriteFileArgs {
+    pub path: String,
+    pub content: String,
 }
 #[derive(Debug, Clone, Deserialize, PartialEq)]
-pub(crate) struct ReplaceInFileArgs {
-    pub(crate) path: String,
-    pub(crate) find: String,
-    pub(crate) replace: String,
+pub struct ReplaceInFileArgs {
+    pub path: String,
+    pub find: String,
+    pub replace: String,
 }
 #[derive(Debug, Clone, Deserialize, PartialEq)]
-pub(crate) struct DeleteFileArgs {
-    pub(crate) path: String,
+pub struct DeleteFileArgs {
+    pub path: String,
 }
 #[derive(Debug, Clone, Deserialize, PartialEq)]
-pub(crate) struct RenameFileArgs {
-    pub(crate) path: String,
-    pub(crate) new_path: String,
+pub struct RenameFileArgs {
+    pub path: String,
+    pub new_path: String,
 }
 #[derive(Debug, Clone, Deserialize, PartialEq)]
-pub(crate) struct MoveFileArgs {
-    pub(crate) path: String,
-    pub(crate) new_path: String,
+pub struct MoveFileArgs {
+    pub path: String,
+    pub new_path: String,
 }
 #[derive(Debug, Clone, Deserialize, PartialEq)]
-pub(crate) struct CopyFileArgs {
-    pub(crate) path: String,
-    pub(crate) new_path: String,
+pub struct CopyFileArgs {
+    pub path: String,
+    pub new_path: String,
 }
 #[derive(Debug, Clone, Deserialize, PartialEq)]
-pub(crate) struct BuildPluginsArgs {
-    pub(crate) plugin_name: String,
+pub struct BuildPluginsArgs {
+    pub plugin_name: String,
 }
 #[derive(Debug, Clone, Deserialize)]
-pub(crate) struct RunPluginTestArgs {
+pub struct RunPluginTestArgs {
     #[serde(default)]
-    pub(crate) command: Option<String>,
+    pub command: Option<String>,
 }
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct RequestIterationArgs {
-    pub(crate) plugin_path: String,
-    pub(crate) instruction: String,
+pub struct RequestIterationArgs {
+    pub plugin_path: String,
+    pub instruction: String,
 }
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct ApproveIterationArgs {
-    pub(crate) iteration_id: String,
+pub struct ApproveIterationArgs {
+    pub iteration_id: String,
 }
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct CreatePluginArgs {
-    pub(crate) name: String,
+pub struct CreatePluginArgs {
+    pub name: String,
     #[serde(default)]
-    pub(crate) description: Option<String>,
+    pub description: Option<String>,
 }
 /// O批: set_soul deliberately has NO soul_key parameter — the scope is
 /// injected from the session, so the LLM can't target another user.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct SetSoulArgs {
+pub struct SetSoulArgs {
     #[serde(default)]
-    pub(crate) persona: Option<String>,
+    pub persona: Option<String>,
     #[serde(default)]
-    pub(crate) profile: Option<String>,
+    pub profile: Option<String>,
 }
 #[derive(Debug, Clone, Deserialize, PartialEq)]
-pub(crate) struct ReloadRuntimeArgs {
-    pub(crate) plugin_path: String,
+pub struct ReloadRuntimeArgs {
+    pub plugin_path: String,
 }
-pub(crate) fn execute_agent_tool_call<B: AgentBackend + ?Sized>(
+pub fn execute_agent_tool_call<B: AgentBackend + ?Sized>(
     backend: &mut B,
     available_tools: &BTreeSet<String>,
     session_kind: &str,
@@ -1243,10 +1243,10 @@ pub(crate) fn execute_agent_tool_call<B: AgentBackend + ?Sized>(
         }
     }
 }
-pub(crate) fn parse_json_or_string(text: &str) -> Value {
+pub fn parse_json_or_string(text: &str) -> Value {
     serde_json::from_str(text).unwrap_or_else(|_| Value::String(text.to_string()))
 }
-pub(crate) fn parse_tool_value_arguments<T>(args: Value, tool_name: &str) -> Result<T, RuntimeError>
+pub fn parse_tool_value_arguments<T>(args: Value, tool_name: &str) -> Result<T, RuntimeError>
 where
     T: DeserializeOwned,
 {
@@ -1254,7 +1254,7 @@ where
         message: format!("shell agent tool {tool_name} had invalid arguments: {err}"),
     })
 }
-pub(crate) fn to_json_value<T: Serialize>(label: &str, value: T) -> Result<Value, RuntimeError> {
+pub fn to_json_value<T: Serialize>(label: &str, value: T) -> Result<Value, RuntimeError> {
     serde_json::to_value(value).map_err(|err| RuntimeError::Invariant {
         message: format!("failed to serialize {label}: {err}"),
     })

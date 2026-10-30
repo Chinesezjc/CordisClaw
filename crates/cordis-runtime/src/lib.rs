@@ -1,6 +1,6 @@
 pub mod agent;
 pub mod agent_api;
-pub(crate) mod agent_tools;
+pub mod agent_tools;
 pub mod agent_loop;
 pub mod agent_toolchain;
 pub mod command_router;
