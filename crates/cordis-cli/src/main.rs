@@ -346,11 +346,6 @@ mod pending {
     }
 }
 
-/// WS-3: fixed-template notice sent to the batch's origin after an LLM
-/// failure has spilled the message. Deliberately LLM-free — this is the one
-/// path that must still work when the model does not.
-const OUTAGE_NOTICE: &str = "我这边刚才调用模型失败了，你的消息我记下了，稍后会自动重试。";
-
 /// WS-3: at most one outage notice per session per window — a flapping
 /// provider must not turn a burst of user messages into a burst of replies.
 const OUTAGE_NOTIFY_WINDOW: Duration = Duration::from_secs(10 * 60);
@@ -879,11 +874,9 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         let park_host = std::sync::Arc::clone(&host);
         let mut sessions: BTreeMap<String, String> = BTreeMap::new();
         std::thread::spawn(move || {
-            // WS-3: per-session outage-notice throttle. The inbox loop is
-            // single-threaded, so a plain HashMap needs no lock.
-            let mut outage_notified: HashMap<String, Instant> = HashMap::new();
-            // Retry detail ("⚠️ 回复格式异常") is for the log, not the group: one
-            // notice per session per window instead of one per attempt.
+            // The format-error banner is throttled per session per window so a
+            // model stuck emitting bad JSON cannot flood the room; the parse
+            // error itself stays in the log.
             let mut format_notified: HashMap<String, Instant> = HashMap::new();
             loop {
                 // Ops requests run on THIS thread: it is the one that runs
@@ -1206,7 +1199,7 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     // failed notice only logs inside send_via and never changes
                     // the outcome. Only the NORMAL messages are spilled:
                     // commands were already handled above the LLM call.
-                    let spill_and_notify = |notified: &mut HashMap<String, Instant>| {
+                    let spill_and_log = || {
                         pending::save(
                             &data_dir,
                             &pending::PendingMessage {
@@ -1219,14 +1212,14 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                                 enqueued_at_ms: pending::now_ms(),
                             },
                         );
-                        if should_notify(
-                            notified,
-                            session_key,
-                            Instant::now(),
-                            OUTAGE_NOTIFY_WINDOW,
-                        ) {
-                            send_via(&route, OUTAGE_NOTICE);
-                        }
+                        // The room is not told: the message is spilled and
+                        // replayed as soon as the next turn succeeds, and a
+                        // "模型失败, 稍后重试" line reads as the bot talking
+                        // about itself. Operators get it here instead.
+                        eprintln!(
+                            "inbox: [{session_key}] LLM outage — message spilled to pending \
+                             (no notice posted)"
+                        );
                     };
                     // Wrap the FINAL combined batch (spill already prepended)
                     // in START/END markers at the send site only. The raw
@@ -1293,7 +1286,7 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                                     }
                                     Err(e) => {
                                         eprintln!("inbox: retry send failed: {e}");
-                                        spill_and_notify(&mut outage_notified);
+                                        spill_and_log();
                                     }
                                 }
                             }
@@ -1313,7 +1306,7 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                             eprintln!("inbox: {e}");
                             // WS-3: failure exit #1 — the first send failed
                             // (provider exhausted retries + profile fallback).
-                            spill_and_notify(&mut outage_notified);
+                            spill_and_log();
                             cordis_runtime::kernel::notify::send(
                                 &host,
                                 &format!(

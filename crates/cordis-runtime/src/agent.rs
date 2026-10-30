@@ -1540,7 +1540,7 @@ impl AgentSession {
         messages.extend(
             self.history
                 .iter()
-                .filter(|message| !is_client_notice_text(message))
+                .filter(|message| !is_outage_notice_text(message))
                 .cloned(),
         );
         // 一次性上下文（策略/记忆行）与图片都只随这一条新消息进请求；
@@ -2349,14 +2349,14 @@ fn flush_tool_failure_prompts(messages: &mut Vec<Value>, prompts: &mut Vec<Strin
 ///
 /// 由 `ChatMessage::to_request_message` 原样迁来——它只做 JSON 拼装、不含
 /// wire 解析，因此随契约类型留在 kernel（构造请求体是 kernel 的职责）。
-/// A client-injected notice rather than something a person said.
+/// Our own outage notice, not something a person said.
 ///
-/// The web/desktop client posts 「我这边刚才调用模型失败了，你的消息我记下了，稍后会自动重试。」
-/// as a user message when its own model call fails. It carries no conversation,
-/// and once it is in history the model echoes it back verbatim — the assistant
-/// has literally answered a room with that sentence. Short matches only, so a
-/// person quoting the notice at length is still delivered.
-fn is_client_notice_text(message: &Value) -> bool {
+/// When a turn fails and the message is spilled to `pending`, older builds
+/// posted 「我这边刚才调用模型失败了，你的消息我记下了，稍后会自动重试。」 into the
+/// room. It is machine text, and once it sat in history the model echoed it
+/// back verbatim in unrelated turns — so it never enters a request. Short
+/// matches only, so a person quoting the notice at length is still delivered.
+fn is_outage_notice_text(message: &Value) -> bool {
     let content = message
         .get("content")
         .and_then(Value::as_str)
@@ -3403,26 +3403,26 @@ mod tests {
     // The client's failure notice must never reach the model: it carries no
     // conversation, and the assistant echoed it verbatim into a group chat.
     #[test]
-    fn client_failure_notices_are_dropped_from_requests() {
+    fn outage_notices_are_dropped_from_requests() {
         let notice = json!({
             "role": "user",
             "content": "我这边刚才调用模型失败了，你的消息我记下了，稍后会自动重试。"
         });
-        assert!(is_client_notice_text(&notice));
+        assert!(is_outage_notice_text(&notice));
         let echoed = json!({
             "role": "assistant",
             "content": "我这边刚才调用模型失败了，你的消息我记下了，稍后会自动重试。"
         });
-        assert!(is_client_notice_text(&echoed));
+        assert!(is_outage_notice_text(&echoed));
         // Real speech is untouched, including a long quotation of the notice.
-        assert!(!is_client_notice_text(
+        assert!(!is_outage_notice_text(
             &json!({"role": "user", "content": "你好"})
         ));
-        assert!(!is_client_notice_text(&json!({
+        assert!(!is_outage_notice_text(&json!({
             "role": "user",
             "content": format!("我这边刚才调用模型失败了{}", "，".repeat(200))
         })));
-        assert!(!is_client_notice_text(
+        assert!(!is_outage_notice_text(
             &json!({"role": "user", "content": 42})
         ));
     }
