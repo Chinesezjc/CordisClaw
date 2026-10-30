@@ -577,6 +577,23 @@ bug：未知动作、DSML 泄漏、重试刷屏、重复消息、审批能力穿
 clippy 干净。新增 `already_sent` 的"仅相同文本才抑制"用例、`outbound_replies` 的正文收录用例、
 qq hint 的"禁止 JSON envelope"断言。
 
+### 3.29 B1 的收尾：JSON mode 与静默标记（2026-10-30）
+
+B1 上线后线上出现两种"协议残渣"，都是旧契约的尾巴：
+
+1. **`{"type":"json_object"}` 被当消息发出去**：kernel 每个请求都带
+   `response_format: {"type":"json_object"}`（旧 envelope 时代强制 JSON 输出）。B1 之后它逼模型
+   吐 JSON，而 inbox 现在把正文原样发送。已删除该字段（`chat_request_body` 提取成具名函数 +
+   回归测试断言请求体里没有 `response_format`）。
+2. **模型把"沉默"写成 `(empty)`**：对 chat-completions 模型来说"输出空"不可表达，于是它发明占位符。
+   现在只认一个标记 `[silence]`（qq / feishu / 批次包裹三处提示词都写明），inbox 仅在该字面量
+   完全相等时不发送；其余一律当消息。这不是解析兜底，是一条单一、可断言的契约。
+
+同时清掉历史污染：`is_protocol_only_assistant` 在构造请求时跳过"整条内容只有一个协议对象"的
+assistant 历史（旧的 `{"action":...}` 与 JSON-mode 回显），否则模型会照着历史继续输出 JSON。
+
+验证：runtime 988、cli 47、qq 71、feishu 57；clippy 干净；15:24 重启，8099/8002 正常。
+
 ## 4. 部分完成
 
 ### 4.1 Execution engine 有正式入口，数据面验证不足

@@ -386,6 +386,14 @@ fn extract_user_text(display: &str) -> &str {
         .trim()
 }
 
+/// The one in-band way to say "do not post anything".
+///
+/// "Answer with nothing" is not expressible through a chat-completions
+/// provider: asked for silence, a model emits a placeholder like `(empty)`.
+/// One literal token beats an envelope — the inbox recognises only this exact
+/// string, and everything else is the message.
+const SILENCE_TOKEN: &str = "[silence]";
+
 /// Text one tool-call event actually delivered (the `message` it sent).
 fn event_message(event: &AgentToolEvent) -> Option<&str> {
     if event.name != "invoke_plugin" {
@@ -477,7 +485,7 @@ fn wrap_inbox_batch(combined: &str) -> String {
          Do not re-answer an older message as if it were a new request, \
          and do not claim someone is asking you a question unless the question is in this batch or in the thread it continues. \
          Whether to answer is decided by the `[reply policy: ...]` line (see the plugin instructions) plus that context — \
-         if the message is clearly between other people, answer with nothing at all (an empty response is silence)."
+         if the message is clearly between other people, answer with exactly `[silence]` and nothing else."
     )
 }
 
@@ -1041,7 +1049,7 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     // "valid JSON, unknown action" failures.
                     let process = |content: &str, label: &str, tool_events: &[AgentToolEvent]| {
                         let text = content.trim();
-                        if text.is_empty() {
+                        if text.is_empty() || text == SILENCE_TOKEN {
                             eprintln!("inbox: no reply text ({label}); staying silent");
                             return;
                         }
@@ -3102,7 +3110,7 @@ mod inbox_framing_tests {
         assert!(wrapped.starts_with("CURRENT_INCOMING_BATCH_START\n"));
         assert!(wrapped.contains("\n[user A]: 你好\n"));
         assert!(wrapped.contains("CURRENT_INCOMING_BATCH_END\n"));
-        assert!(wrapped.contains("answer with nothing at all"));
+        assert!(wrapped.contains("answer with exactly `[silence]`"));
         // Channel-neutral: no protocol name leaks into runtime framing.
         assert!(!wrapped.contains("QQ"));
         assert!(!wrapped.contains("Feishu"));
@@ -3724,6 +3732,30 @@ mod startup_invocation_tests {
         std::fs::remove_file(temp.join("startup_invoke.json")).expect("rm");
         assert!(load_startup_invocations(&temp).is_empty());
         let _ = std::fs::remove_dir_all(&temp);
+    }
+}
+
+#[cfg(test)]
+#[cfg(test)]
+mod silence_token_tests {
+    use super::SILENCE_TOKEN;
+
+    // Silence has exactly one spelling. A placeholder the model invents
+    // (`(empty)`) is just text and must still be distinguishable, so the
+    // inbox only suppresses the literal token.
+    #[test]
+    fn only_the_exact_token_is_silence() {
+        let is_silence = |content: &str| content.trim() == SILENCE_TOKEN;
+        assert!(is_silence("  [silence]\n"));
+        assert!(!is_silence("(empty)"));
+        assert!(!is_silence("[silence] 好"));
+        assert!(!is_silence(""));
+    }
+
+    #[test]
+    fn the_token_is_documented_for_the_model() {
+        let hint = include_str!("../../../fixtures/plugins/qq/src/lib.rs");
+        assert!(hint.contains("exactly `[silence]`"), "qq hint must name it");
     }
 }
 
