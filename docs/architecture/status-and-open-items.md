@@ -630,6 +630,28 @@ kernel 990、cli 49、clippy 干净；16:28 重启，8099/8002 正常。
 **历史记录说明**：本文档早前章节（3.x）里的 `prepare-artifacts → sync-plugin-docs → reload`
 流程描述保留原样，作为当时的部署记录；**现在请只跑 `prepare-artifacts`**。
 
+### 3.32 失败不再靠"等下一条消息"：空补全与就地重试（2026-10-30）
+
+**症状**：群里 bot 发「⚠️ LLM 请求失败（消息已暂存待重放）: LLM response invalid:
+agent response had neither tool_calls nor final content」。一轮对话因为一次**空补全**
+被整体丢弃，消息进 `pending`，而 `pending` 只在下一条消息到来时才重放——于是没人再说话，
+它就永远不回了。另外群里出现过「我这边刚才调用模型失败了，你的消息我记下了，稍后会自动重试。」：
+那是**客户端**在它自己的模型调用失败时注入的用户消息，进了历史后被模型原样复读。
+
+**两处改动**：
+
+1. kernel（`agent.rs`）：空补全（既无正文也无 tool_calls）**不是**契约违规，是 provider 抖动。
+   同一请求最多重发 `EMPTY_RESPONSE_RETRIES = 2` 次；拿到真回复即清零，只有连续失败才报错
+   （错误文本带 after N retries）。
+2. cli（`main.rs`）：`agent_send` 失败后**就地重试**（2s / 5s / 15s，共 3 次），而不是立刻写
+   `pending` 等别人开口；三次都失败才 spill + 告示。`with_retries` 的 sleep 是注入的，策略可单测。
+
+顺带：`is_client_notice_text` 把那条客户端告示（以及模型对它的复读）从请求历史里滤掉——它不含
+对话内容，只提供模仿样本；只匹配 ≤120 字的短文本，真人长篇引用不受影响。
+
+验证：runtime 993（空→真两次请求成功、持续空 2+1 次后失败、告示识别）、cli 52（重试成功/首次即成
+功不等待/耗尽返回最后错误），clippy 干净；18:3x 重启，8099/8002 正常。
+
 ## 4. 部分完成
 
 ### 4.1 Execution engine 有正式入口，数据面验证不足

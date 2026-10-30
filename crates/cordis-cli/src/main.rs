@@ -477,6 +477,38 @@ fn wrap_inbox_batch(combined: &str) -> String {
 /// consumes a single value is used instead.
 /// Did this turn already deliver a message through `reply_node`? Used to keep
 /// `{"action":"respond"}` and `qq_send` from double-sending the same text.
+/// Delays between immediate send retries for one batch.
+///
+/// A failed turn used to be spilled to `pending` and replayed only when the
+/// next message arrived, so a transient provider outage silenced the bot until
+/// somebody else spoke. These delays keep that turn alive instead.
+const SEND_RETRY_DELAYS: [Duration; 3] = [
+    Duration::from_secs(2),
+    Duration::from_secs(5),
+    Duration::from_secs(15),
+];
+
+/// Run `op`, retrying with `delays` between attempts, and return the last error.
+///
+/// `sleep` is injected so the policy is testable without real waiting.
+fn with_retries<T, E, F, S>(delays: &[Duration], mut op: F, mut sleep: S) -> Result<T, E>
+where
+    F: FnMut() -> Result<T, E>,
+    S: FnMut(Duration),
+{
+    let mut attempt = 0usize;
+    loop {
+        match op() {
+            Ok(value) => return Ok(value),
+            Err(error) if attempt >= delays.len() => return Err(error),
+            Err(_) => {
+                sleep(delays[attempt]);
+                attempt += 1;
+            }
+        }
+    }
+}
+
 fn reply_was_sent(events: &[cordis_runtime::agent::AgentToolEvent], reply_node: &str) -> bool {
     events.iter().any(|event| {
         event.ok
@@ -1215,13 +1247,30 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     turn_meta.insert("actor".to_string(), route.sender_id.clone());
                     turn_meta.insert("conversation".to_string(), route.conversation_kind.clone());
                     turn_meta.insert("target".to_string(), route.reply_target.clone());
-                    match host.agent_send_with_fallback_turn_meta(
-                        sid,
-                        &agent_input,
-                        &batch_images,
-                        &batch_notes,
-                        &turn_meta,
-                    ) {
+                    // Retry the same turn in place before giving up on it:
+                    // the kernel already repeats empty completions twice, and
+                    // this covers the slower provider outages that used to
+                    // leave the message collecting dust in `pending`.
+                    let sent = with_retries(
+                        &SEND_RETRY_DELAYS,
+                        || {
+                            host.agent_send_with_fallback_turn_meta(
+                                sid,
+                                &agent_input,
+                                &batch_images,
+                                &batch_notes,
+                                &turn_meta,
+                            )
+                        },
+                        |delay| {
+                            eprintln!(
+                                "inbox: [{session_key}] send failed, retrying in {}s",
+                                delay.as_secs()
+                            );
+                            std::thread::sleep(delay);
+                        },
+                    );
+                    match sent {
                         Ok(reply) => {
                             pending::clear(&data_dir, session_key);
                             let feedback = process(
@@ -3214,6 +3263,65 @@ mod batch_tests {
             vec!["回复".to_string()]
         );
         assert!(outbound_replies("{\"action\":\"respond\",\"message\":\"  \"}", &[]).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod send_retry_tests {
+    use super::{with_retries, SEND_RETRY_DELAYS};
+    use std::cell::{Cell, RefCell};
+    use std::time::Duration;
+
+    // A success waits exactly once per failed attempt, with the configured
+    // delays in order.
+    #[test]
+    fn retries_until_the_operation_succeeds() {
+        let slept: RefCell<Vec<Duration>> = RefCell::new(Vec::new());
+        let attempts = Cell::new(0u32);
+        let result: Result<u32, &str> = with_retries(
+            &SEND_RETRY_DELAYS,
+            || {
+                let n = attempts.get() + 1;
+                attempts.set(n);
+                if n < 3 {
+                    Err("transient")
+                } else {
+                    Ok(n)
+                }
+            },
+            |delay| slept.borrow_mut().push(delay),
+        );
+        assert_eq!(result, Ok(3));
+        assert_eq!(
+            *slept.borrow(),
+            vec![SEND_RETRY_DELAYS[0], SEND_RETRY_DELAYS[1]]
+        );
+    }
+
+    #[test]
+    fn a_first_attempt_success_never_waits() {
+        let slept: RefCell<Vec<Duration>> = RefCell::new(Vec::new());
+        let result: Result<u32, &str> = with_retries(
+            &SEND_RETRY_DELAYS,
+            || Ok(1),
+            |delay| slept.borrow_mut().push(delay),
+        );
+        assert_eq!(result, Ok(1));
+        assert!(slept.borrow().is_empty());
+    }
+
+    // Exhausted retries surface the last error after exactly `delays.len()`
+    // waits, so a dead provider cannot loop forever.
+    #[test]
+    fn exhausted_retries_return_the_last_error() {
+        let slept = Cell::new(0usize);
+        let result: Result<u32, &str> = with_retries(
+            &SEND_RETRY_DELAYS,
+            || Err("still down"),
+            |_delay: Duration| slept.set(slept.get() + 1),
+        );
+        assert_eq!(result, Err("still down"));
+        assert_eq!(slept.get(), SEND_RETRY_DELAYS.len());
     }
 }
 
