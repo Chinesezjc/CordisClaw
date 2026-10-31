@@ -589,6 +589,38 @@ after:  left: Blocked
 
 本轮已把尝试回滚，kernel 965 全绿。
 
+## 第 31 轮：iteration 的归属已经查清，先铺好共享面
+
+`iteration/` 不能被单独搬走，因为它的消费者在 kernel 两侧：
+
+```
+agent_tools.rs:910  crate::iteration::report::iteration_result_json    ← 工具 ABI
+agent_tools.rs:927  crate::iteration::report::approve_iteration_permission
+host/mod.rs:19      crate::iteration::policy::{promotion_verdict, summary_rejection, test_changes}
+host/mod.rs:2922    crate::iteration::policy::node_declares_side_effects_in
+host/iteration.rs   canary_probe_verdict / BLOCKED_EDITS_EXISTING_TEST
+```
+
+也就是说 `iteration/` 同时属于「工具分派」和「宿主编排」。要搬它，必须把**两边**都搬到
+`cordis-agent`，kernel 只留接缝：
+
+```
+cordis-agent::iteration::run(host, request)          ← 管线
+cordis-agent::iteration::tool_entry(host, name, args) ← 工具分支
+```
+
+而 kernel 不能反向依赖 crate（环），所以顺序必须是：先把宿主能力开放出来（本轮做了），
+再让管线以 `&RuntimeHost` 参数的形式住在 crate 里，最后 kernel 的 `iterate_plugins` 与
+`execute_agent_tool_call` 改成一行委托。
+
+本轮已开放（零行为变化）：
+
+- `RuntimeHost::snapshot_root()`、`RuntimeHost::kernel_state()`
+- `RuntimeHost::cleanup_retired_snapshots()`、`RuntimeHost::rollback_candidate_if_staged()`
+- `fixtures_root()` 本来就有
+
+kernel 966 全绿、clippy 0 error。
+
 ## 未决问题（2026-10-31，下一轮先查）
 
 `cargo test -p cordis-runtime --test runtime_host` 有 5 个 `iterate_plugins` 相关用例失败，

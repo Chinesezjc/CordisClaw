@@ -605,7 +605,7 @@ impl RuntimeHost {
         Ok(result)
     }
 
-    pub(crate) fn rollback_candidate_if_staged(
+    pub fn rollback_candidate_if_staged(
         &self,
         expected_candidate_snapshot_id: Option<&str>,
     ) -> Option<Result<(), RuntimeError>> {
