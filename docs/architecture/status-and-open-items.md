@@ -2,7 +2,7 @@
 
 ## 1. 判定口径
 
-- 本文基于当前仓库现状整理，最近更新：2026-10-28。
+- 本文基于当前仓库现状整理，最近更新：2026-10-31。
 - 历史规划蓝图已经吸收进 [design-blueprint.md](./design-blueprint.md)，因此本文结论来自三类证据的交叉比对：
   - 设计蓝图：[design-blueprint.md](./design-blueprint.md)
   - 架构文档：[system-overview.md](./system-overview.md)、[contracts-and-loading.md](./contracts-and-loading.md)、[runtime-semantics.md](./runtime-semantics.md)、[maintenance-guide.md](./maintenance-guide.md)
@@ -31,6 +31,27 @@
 | CI | 已完成 | GitHub Actions（`.github/workflows/ci.yml`）：push main + PR 触发，ubuntu-latest 上执行 fmt / clippy `-D warnings` / prepare-artifacts / build / test（并行）；x86_64-linux 门控恒真，dylib 集成测试全量执行，fixture 插件经 `prepare-artifacts` 预构建并由 rust-cache 缓存。并行安全：snapshot 目录名带创建者 pid，boot 的 stale 清理只删已死进程的残留（`cleanup_stale_snapshot_dirs`）；mock LLM server accept 超时 CI 下 900s / 本地 30s（`mock_llm_accept_timeout`，冷缓存 runner 上迭代测试中途 cargo build 远超 30s）。工具链由 `rust-toolchain.toml` 钉在 1.97.1，CI 同步 `toolchain: 1.97.1`（见 5.2.53）；fixtures 测试（12 个 member + 10 个 excluded expr 子 crate + root 占位）由 `scripts/test-fixtures.sh` 跑进同一 job（见 5.2.54） |
 
 ## 3. 已完成
+
+### 3.0a Agent loop 已移出 kernel（2026-10-31）
+
+循环不再是 kernel 的一部分：
+
+- 新增 `crates/cordis-agent`：`imp.rs`（原 `agent.rs` 的 3303 行循环本体 + 其 36 个
+  单测）、`lib.rs`（`CargoAgentLoop` + `install()` + `impl AgentSessionApi`）；
+- kernel 只保留接缝：`agent_api`（trait + DTO）、`agent_loop`（`AgentLoop` /
+  `AgentSessionApi` / 注册表 / 测试替身）、`agent_tools`（工具 ABI）；
+- `cordis-cli` 在 `main()` 里 `install_agent_loop`，与 `install_plugin_builder` 同形；
+  `boot` 不再默认安装，仅在 `cfg(test)` 装测试替身；
+- 需要真实回合的集成测试随代码迁入 `crates/cordis-agent/tests/`（10 个文件）。
+
+同一批还修了四个真 bug：工具目录只算一次（迭代 summary 永远不可调用）、
+`vision` 测试假设工作区不在 `/tmp`、`Partial` canary 与盲改的门控、
+以及 **canary Fail 会晋升**（回放已证明改坏仍然 promote）。
+
+插件迭代管线同样接了缝：`iteration_api::IterationRunner`（kernel 默认实现）+ 
+`IterationHost`（16 个能力），管线已泛型化为 `fn f<H: IterationHost>(host: &H, …)`，
+不再访问任何宿主私有字段。**文件搬家尚未完成**：kernel 单元测试依赖私有测试脚手架
+（`empty_host` / `prepared_for`），管线的最终迁入需要先给这些测试设计替身。
 
 ### 3.0 覆盖率治理战役（2026-07-23 ~ 07-27，已收官）
 
