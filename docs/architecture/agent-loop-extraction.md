@@ -477,6 +477,28 @@ blocked_reason=None
 verifier=Fail   ← 只剩这一处
 ```
 
+## 第 25 轮：verifier 失败来自 fixture 里的 vision 测试，与迭代无关
+
+把 `verification` 打进断言消息后读到完整报告：
+
+```
+StaticCheck: Passed  (cargo check --manifest-path plugins/Cargo.toml)
+Tests:       Failed  (cargo test   --manifest-path plugins/Cargo.toml)
+  → -p vision --lib: 10 passed; 1 failed
+  → stderr: "error: test failed, to rerun pass `-p vision --lib`"
+canary = Pass, blocked_reason = None
+```
+
+关键：**同一个命令在仓库里单独跑是 11/11 全过**（`cargo test --quiet --manifest-path
+fixtures/plugins/Cargo.toml -p vision --lib`）。差异只在于迭代是在**临时工作区副本**里
+跑的。所以这是 fixture 测试对运行环境敏感（临时目录/并行），不是 dist 子插件改动引起，
+也不是循环搬家的回归。
+
+下一轮两条路，先试第一条：
+
+1. 在临时副本里复现那条 vision 失败并修 fixture 测试（让它不依赖固定 temp 路径）；
+2. 或让 `verify_profile` 只跑受影响的包——但这会放松验证，需谨慎。
+
 ## 未决问题（2026-10-31，下一轮先查）
 
 `cargo test -p cordis-runtime --test runtime_host` 有 5 个 `iterate_plugins` 相关用例失败，

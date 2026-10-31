@@ -1328,7 +1328,8 @@ fn runtime_host_iterate_plugins_agent_adds_dist_child_plugin_and_promotes() {
     assert_eq!(
         result.final_verdict,
         PluginIterationFinalVerdict::Promoted,
-        "blocked_reason={:?} verifier={:?} canary={:?}",
+        "blocked_reason={:?} verifier={:?} canary={:?} verification={:?}",
+        result.verification,
         result.blocked_reason,
         result.verifier_verdict,
         result.canary.as_ref().map(|r| (&r.verdict, &r.message)),
