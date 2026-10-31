@@ -756,39 +756,23 @@ impl AgentSession {
                 });
             }
 
-            // Once the turn has actually done something (a message went out),
-            // a plain text reply closes it. Demanding the `suspend` ceremony
-            // after the model already spoke turned successful turns into
-            // "LLM outage" spills.
-            if self.require_end_tool && !tool_events.is_empty() {
-                self.no_end_strikes = 0;
-                self.completed_turns += 1;
-                return Ok(AgentReply {
-                    response_id,
-                    content: message.content.unwrap_or_default(),
-                    tool_events,
-                });
-            }
-
             // Text without a tool call does not end a channel turn: nudge the
             // model to keep working or to close the turn explicitly.
             if self.require_end_tool {
+                // A channel turn ends on `suspend` and nothing else. Asking a
+                // bounded number of times turned a model that forgot the marker
+                // into "LLM outage" spills, so keep asking — `AGENT_MAX_TOOL_TURNS`
+                // remains the only bound.
                 self.no_end_strikes += 1;
-                if self.no_end_strikes <= 3 {
-                    emit_agent_diagnostic(format!(
-                        "agent_missing_end_tool kind={} attempt={}",
-                        self.kind, self.no_end_strikes
-                    ));
-                    messages.push(json!({
-                        "role": "user",
-                        "content": "[system] 这一轮还没结束。继续调用工具；要结束就调用 suspend。正文不会发给任何人。",
-                    }));
-                    continue;
-                }
-                self.no_end_strikes = 0;
-                return Err(RuntimeError::LlmResponseInvalid {
-                    message: "agent turn never called the end tool (suspend)".to_string(),
-                });
+                emit_agent_diagnostic(format!(
+                    "agent_missing_end_tool kind={} attempt={}",
+                    self.kind, self.no_end_strikes
+                ));
+                messages.push(json!({
+                    "role": "user",
+                    "content": "[system] 这一轮还没结束。继续调用工具；要结束就调用 suspend。正文不会发给任何人。",
+                }));
+                continue;
             }
 
             if let Some(content) = message
