@@ -499,6 +499,25 @@ fixtures/plugins/Cargo.toml -p vision --lib`）。差异只在于迭代是在**�
 1. 在临时副本里复现那条 vision 失败并修 fixture 测试（让它不依赖固定 temp 路径）；
 2. 或让 `verify_profile` 只跑受影响的包——但这会放松验证，需谨慎。
 
+## 第 26/27 轮：两个独立的谜团，分开处理
+
+### A. vision 测试对"工作区落在 /tmp"敏感（已复现，已修，暂未提交）
+
+`read_local_image_rejects_path_outside_temp_dir` 用
+`concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml")` 当"temp 之外的路径"。迭代测试把
+整个工作区复制到 `/tmp` 下跑，于是 crate 目录本身就在 temp 内，`unwrap_err()` 拿到
+`Ok` 就 panic。修复：manifest 落在 temp 内时，在 temp 根的父目录种一个文件当外部路径，
+用完删除。仓库内与镜像工作区都验证 11/11。
+
+### B. 迭代用例的失败集合会随负载漂移
+
+同一份代码：31/33（两次）→ 改 fixture 后 28/33（5 个失败）。可疑点不是 fixture 本身，
+而是这 33 个用例在单个测试二进制里并行跑，每个都 boot 宿主、跑 cargo、连 mock SSE；
+mock 服务器的请求等待上限是 30s，重负载下会误判。这解释了失败集合的漂移。
+
+正在跑的判据：`--test-threads=1` 串行跑同一文件。若串行全绿，则并行度就是根因，
+修法是让这组用例串行（或把 mock 的等待上限提高），而不是去改断言。
+
 ## 未决问题（2026-10-31，下一轮先查）
 
 `cargo test -p cordis-runtime --test runtime_host` 有 5 个 `iterate_plugins` 相关用例失败，
