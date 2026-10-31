@@ -659,6 +659,32 @@ cordis-runtime lib 966 / cli 49 / sdk 33 / tooling 47 …
 clippy --all-targets 0 error
 ```
 
+## 第 34 轮：迭代接缝就位
+
+和第 33 轮的 loop 接缝同形：
+
+```rust
+pub trait IterationRunner: Send + Sync {
+    fn iterate(&self, host: &RuntimeHost, request: KernelPluginIterationRequest)
+        -> Result<KernelPluginIterationResult, RuntimeError>;
+    fn approve(&self, host: &RuntimeHost, iteration_id: &str)
+        -> Result<KernelPluginIterationResult, RuntimeError>;
+}
+install_iteration_runner / iteration_runner / missing_runner_error
+```
+
+- `KernelIterationRunner` 是 kernel 的默认实现（转调 `iterate_plugins` / `approve_blocked_iteration`）；
+- `agent_tools` 的两个迭代工具分支改走 `iteration_runner()`，不再是 `self.iterate_plugins(...)`；
+- `boot` 只在 `cfg(test)` 下装默认实现；`cordis-cli` 与 `cordis_agent::install()` 并排安装。
+
+**最后一步的形状已经确定**：把 `host/iteration.rs` + `host/iteration_agent.rs` +
+`iteration/policy.rs` 搬进 `cordis-agent/src/iteration/`，crate 实现 `IterationRunner`，
+cli 换成 `install_iteration_runner(Box::new(cordis_agent::iteration::CargoIterationRunner))`，
+kernel 删除这三个文件、保留 `iteration/report.rs`（工具 ABI 需要它，反向依赖不允许）。
+
+kernel 测试里直接调管线的只有 `ffi_panic_seam_tests.rs`（4 处）以及
+`region_3500_5500_seam_tests.rs` 里调 `finalize_plugin_iteration` 的几条——它们要跟着搬。
+
 ## 未决问题（2026-10-31，下一轮先查）
 
 `cargo test -p cordis-runtime --test runtime_host` 有 5 个 `iterate_plugins` 相关用例失败，
