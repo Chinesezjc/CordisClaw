@@ -515,8 +515,24 @@ fixtures/plugins/Cargo.toml -p vision --lib`）。差异只在于迭代是在**�
 而是这 33 个用例在单个测试二进制里并行跑，每个都 boot 宿主、跑 cargo、连 mock SSE；
 mock 服务器的请求等待上限是 30s，重负载下会误判。这解释了失败集合的漂移。
 
-正在跑的判据：`--test-threads=1` 串行跑同一文件。若串行全绿，则并行度就是根因，
-修法是让这组用例串行（或把 mock 的等待上限提高），而不是去改断言。
+串行判据已跑完：**28/33，5 个失败——与并行完全一样**。所以并行负载不是根因，
+排除。
+
+串行结果里 `agent_adds_dist_child` 的失败报告给出了确定答案：
+
+```
+Stages: StaticCheck Passed, Tests Failed
+  → -p vision --lib: tests::read_local_image_rejects_path_outside_temp_dir FAILED
+  → 该测试用 CARGO_MANIFEST_DIR 当"temp 之外"，而迭代在 /tmp 下的工作区副本里跑
+```
+
+所以 vision 这条修复**必须落盘**，它是 dist_child 用例的直接原因。另外 4 个
+（journal / blocks_without_canary / rollback / retries_on_warning）需要各自打印
+`verification` 与 `canary` 才能定性；同一用例两次跑出现 `canary=Pass` 与 `canary=Fail`
+两种结果，说明它们还受"录制样本"的状态影响（每个 host 自己的 recorder，重放到别的
+插件节点时会因工件重建而分歧）。
+
+优先级：先落 vision 修复 → 重跑，看 5 个降到几个。
 
 ## 未决问题（2026-10-31，下一轮先查）
 
