@@ -902,7 +902,13 @@ impl AgentToolHost for RuntimeHost {
             verify_profile: None,
             quality_score: None,
         };
-        match self.iterate_plugins(request) {
+        let Some(runner) = crate::iteration_api::iteration_runner() else {
+            return Ok(serde_json::json!({
+                "ok": false,
+                "error": crate::iteration_api::missing_runner_error().to_string(),
+            }));
+        };
+        match runner.iterate(self, request) {
             // Report the FINAL verdict, not just the verifier's. A rollout that
             // the canary rolled back (or that is blocked awaiting approval)
             // used to be reported as `verdict: Pass`, so the agent believed it
@@ -929,7 +935,10 @@ impl AgentToolHost for RuntimeHost {
                 message: message.to_string(),
             }
         })?;
-        let result = self.approve_blocked_iteration(iteration_id)?;
+        let Some(runner) = crate::iteration_api::iteration_runner() else {
+            return Err(crate::iteration_api::missing_runner_error());
+        };
+        let result = runner.approve(self, iteration_id)?;
         Ok(serde_json::json!({
             "ok": true,
             "iteration_id": result.iteration_id,

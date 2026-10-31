@@ -1124,6 +1124,12 @@ impl RuntimeHost {
         let _ = crate::agent_loop::install_agent_loop(Box::new(
             crate::agent_loop::test_loop::TestLoop,
         ));
+        // The runner is injected by the embedding binary. Tests install the
+        // kernel's own runner so a bare `boot` stays usable.
+        #[cfg(test)]
+        let _ = crate::iteration_api::install_iteration_runner(Box::new(
+            crate::iteration_api::KernelIterationRunner,
+        ));
         let fixtures_root = fixtures_root.as_ref().to_path_buf();
         let config = RuntimeConfig::load(&fixtures_root)?;
         let loader = Loader::new(default_loader_config(&fixtures_root))

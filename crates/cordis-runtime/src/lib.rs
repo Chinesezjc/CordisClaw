@@ -1,6 +1,7 @@
 pub mod agent_api;
 pub mod agent_tools;
 pub mod agent_loop;
+pub mod iteration_api;
 pub mod agent_toolchain;
 pub mod command_router;
 pub mod config;

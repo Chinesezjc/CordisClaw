@@ -636,6 +636,11 @@ fn main() {
     // Same for the agent loop: the kernel holds the seam, this binary decides
     // which loop runs. Installed before any host boots.
     let _ = cordis_agent::install();
+    // The iteration runner is a seam too: today the kernel's own pipeline
+    // backs it, and moving that pipeline into the crate swaps this line.
+    let _ = cordis_runtime::iteration_api::install_iteration_runner(Box::new(
+        cordis_runtime::iteration_api::KernelIterationRunner,
+    ));
 
     if args.first().map(|x| x.as_str()) == Some("auto-update") {
         if let Err(err) = run_auto_update(&args[1..]) {
