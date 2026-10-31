@@ -518,6 +518,21 @@ impl AgentSession {
                     end_requested = true;
                 }
                 if end_requested && message.tool_calls.is_empty() {
+                    // Ending a channel turn without having done anything is the
+                    // silent-bot failure: the model calls the end marker and
+                    // nothing was ever sent. Ask once, concretely.
+                    if tool_events.is_empty() && self.no_end_strikes < 3 {
+                        self.no_end_strikes += 1;
+                        emit_agent_diagnostic(format!(
+                            "agent_ended_without_action kind={} attempt={}",
+                            self.kind, self.no_end_strikes
+                        ));
+                        messages.push(json!({
+                            "role": "user",
+                            "content": "[system] 你还没有把任何内容发出去。先用工具完成动作（例如调用 qq_send 把要说的话发出去），再调用 suspend 结束这一轮。",
+                        }));
+                        continue;
+                    }
                     self.no_end_strikes = 0;
                     self.completed_turns += 1;
                     return Ok(AgentReply {
