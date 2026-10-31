@@ -584,13 +584,15 @@ fn finalize_verifier_fail_rolls_back_without_candidate() {
     assert_eq!(verdict, PluginIterationFinalVerdict::RolledBack);
 }
 
-// The canary is diagnostics now: tests decide. A Partial canary must not
-// block a change whose tests pass (random plugins made it a coin flip).
+// An agent-driven change carries its own evidence (a transcript and a tool
+// summary), so a Partial canary must not block it — random plugins made the
+// replay a coin flip.
 #[test]
 #[serial]
-fn finalize_partial_canary_does_not_block_a_tested_change() {
+fn finalize_partial_canary_does_not_block_an_agent_change() {
     let (_temp, host) = empty_host();
     let mut state = PluginIterationRunState::new(prepared_for("mini", &["mini"]));
+    state.agent = Some(TestAgentRun::with_requires_approval(false));
     state.verifier_verdict = Some(VerifierVerdict::Pass);
     state.canary = Some(crate::kernel::plugin_iteration::CanaryReport {
         verdict: CanaryVerdict::Partial,
@@ -614,11 +616,40 @@ fn finalize_partial_canary_does_not_block_a_tested_change() {
     );
 }
 
+// A blind edit has no transcript to vouch for it, so unproven behaviour waits
+// for an operator instead of riding on the tests alone.
+#[test]
+#[serial]
+fn finalize_partial_canary_blocks_a_blind_change() {
+    let (_temp, host) = empty_host();
+    let mut state = PluginIterationRunState::new(prepared_for("mini", &["mini"]));
+    state.verifier_verdict = Some(VerifierVerdict::Pass);
+    state.canary = Some(crate::kernel::plugin_iteration::CanaryReport {
+        verdict: CanaryVerdict::Partial,
+        mode: "no_canary_evidence".to_string(),
+        plugin_path: None,
+        node_id: None,
+        payload: None,
+        expected_response: None,
+        actual_response: None,
+        message: "no evidence".to_string(),
+    });
+    let verdict = host
+        .finalize_plugin_iteration(&mut state)
+        .expect("blocked is not an error");
+    assert_eq!(verdict, PluginIterationFinalVerdict::Blocked);
+    assert!(state
+        .blocked_reason
+        .as_deref()
+        .is_some_and(|reason| reason.contains("no canary evidence")));
+}
+
 /// Minimal agent-phase result for tests that only care about one flag.
 struct TestAgentRun;
 impl TestAgentRun {
     fn with_requires_approval(flag: bool) -> super::PluginIterationAgentRun {
         super::PluginIterationAgentRun {
+            llm_driven: true,
             session_id: None,
             tool_summary: None,
             transcript_excerpt: Vec::new(),

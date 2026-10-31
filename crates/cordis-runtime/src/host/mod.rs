@@ -901,6 +901,9 @@ enum ManagedAgentState {
 /// there is nothing else to unwrap.
 #[derive(Debug, Clone)]
 struct PluginIterationAgentRun {
+    /// True when an LLM drove the change (a session with a transcript); false
+    /// for an edit plan applied blind. Only the former carries its own evidence.
+    llm_driven: bool,
     session_id: Option<String>,
     tool_summary: Option<AgentToolExecutionSummary>,
     transcript_excerpt: Vec<AgentTranscriptEntry>,

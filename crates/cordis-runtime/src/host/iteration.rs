@@ -1,5 +1,10 @@
 use super::*;
 
+/// Why a tested change still waits: nothing replayed.
+const BLOCKED_NO_CANARY_EVIDENCE: &str = "this change has no canary evidence: no \
+recent invocation replayed cleanly and no verifier node is declared, so the \
+behaviour is unproven. Ask an operator to approve this iteration (approve_iteration).";
+
 impl RuntimeHost {
     pub(super) fn start_plugin_iteration_agent_session(
         &self,
@@ -56,6 +61,7 @@ impl RuntimeHost {
             });
         };
         Ok(PluginIterationAgentRun {
+            llm_driven: true,
             session_id: Some(session_id.to_string()),
             tool_summary: None,
             transcript_excerpt: Vec::new(),
@@ -357,6 +363,7 @@ impl RuntimeHost {
                 rollback.absorb(op_rollback)?;
             }
             return Ok(PluginIterationAgentRun {
+                llm_driven: false,
                 session_id: None,
                 tool_summary: None,
                 transcript_excerpt: Vec::new(),
@@ -417,6 +424,7 @@ impl RuntimeHost {
         // and reclaim its map entries before returning success.
         self.drop_session(&session_id);
         Ok(PluginIterationAgentRun {
+            llm_driven: true,
             session_id: Some(session_id),
             tool_summary,
             transcript_excerpt,
@@ -649,12 +657,22 @@ impl RuntimeHost {
 
         // Tests are the contract: the decision lives in `iteration::policy`.
         // This function only carries out the side effects of that decision.
+        // A blind edit (no agent behind it) needs replayable evidence: the
+        // canary proves the change still behaves. An agent-driven change
+        // carries a transcript instead, and a brand new plugin has nothing to
+        // replay at all.
+        let canary_unproven = state.agent.as_ref().is_none_or(|run| !run.llm_driven)
+            && state
+                .canary
+                .as_ref()
+                .is_some_and(|report| report.verdict == CanaryVerdict::Partial);
         let decision = promotion_verdict(
             effective_verifier,
-            state
-                .agent
-                .as_ref()
-                .is_some_and(|agent| agent.requires_approval),
+            canary_unproven
+                || state
+                    .agent
+                    .as_ref()
+                    .is_some_and(|agent| agent.requires_approval),
             state.prepared.manual_approved,
         );
         let final_verdict = match decision {
@@ -684,8 +702,11 @@ impl RuntimeHost {
             }
             PluginIterationFinalVerdict::Blocked => {
                 // Keep the candidate alive: `approve_iteration` promotes it.
-                state.blocked_reason =
-                    Some(crate::iteration::policy::BLOCKED_EDITS_EXISTING_TEST.to_string());
+                state.blocked_reason = Some(if canary_unproven {
+                    BLOCKED_NO_CANARY_EVIDENCE.to_string()
+                } else {
+                    crate::iteration::policy::BLOCKED_EDITS_EXISTING_TEST.to_string()
+                });
                 PluginIterationFinalVerdict::Blocked
             }
             _ => {
