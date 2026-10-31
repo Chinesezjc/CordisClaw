@@ -790,3 +790,51 @@ runtime_host_iterate_plugins_agent_retries_on_warning_and_promotes
   `#[cfg(test)]` 的构造便捷函数。
 - **单例**：注入点是 `OnceLock`，测试并行跑时只有一个实现——默认实现必须在
   `boot` 之前注册，否则测试顺序会影响结果（builder 已有同样的约束）。
+
+---
+
+## 交接：目标剩余的最后一件事
+
+### 已完成（可交付）
+
+| 项 | 状态 |
+|---|---|
+| 循环移出 kernel | ✅ `crates/cordis-agent/src/imp.rs`（3303 行 + 36 单测） |
+| kernel 只剩接缝 | ✅ `agent_api`（trait+DTO）、`agent_loop`（`AgentLoop`/`AgentSessionApi`/注册表/测试替身）、`agent_tools`（工具 ABI） |
+| cli 注入 | ✅ `cordis_agent::install()` + `install_iteration_runner(KernelIterationRunner)` |
+| 测试跟着代码走 | ✅ 10 个集成测试文件迁入 `crates/cordis-agent/tests/` |
+| 零 warning / 全绿 | ✅ `clippy --all-targets -D warnings`、`cargo test --workspace` |
+| 文档 | ✅ 本文件、`rs-files-responsibility.md`、`status-and-open-items.md` |
+
+### 未完成（唯一一项）
+
+`iteration/` 与 `host/iteration.rs` 的文件搬家。**前置全部就绪**：
+
+- `IterationRunner` 接缝（kernel 默认实现 + cli 安装）；
+- `IterationHost` 边界（16 个能力）；
+- 管线已泛型化为 `fn f<H: IterationHost>(host: &H, …)`，不访问任何私有字段。
+
+**卡点**：kernel 自己的管线单元测试（`region_3500_5500_seam_tests.rs` 5 条）直接调
+`host.run_plugin_canary` / `finalize_plugin_iteration` / `verify_plugin_iteration` /
+`run_plugin_iteration_agent` / `start_plugin_iteration_agent_session`，这些是
+`#[cfg(test)]` 委托。文件搬走后委托无处可去，而 kernel 测试装不了 crate 的 runner
+（dev-dependency 环会编两份 runtime）。
+
+### 推荐执行顺序（下一轮预算）
+
+1. 把上述 5 条用例连同脚手架（`empty_host` / `prepared_for` / `TestAgentRun`）复制到
+   `crates/cordis-agent/tests/iteration_pipeline.rs`，用 crate 的 `CargoIterationRunner`
+   驱动；
+2. 删除 kernel 里对应的 5 条与 5 个 `#[cfg(test)]` 委托；
+3. 复制 `iteration/policy.rs`、`host/iteration.rs`、`host/iteration_agent.rs` 到
+   `cordis-agent/src/iteration/`（`crate::` → `cordis_runtime::`，`super::*` → 显式导入）；
+4. crate 实现 `IterationRunner`，cli 改安装它；
+5. kernel 删除三个文件，`agent_tools` 保持走 `iteration_runner()` 不变；
+6. `cargo test --workspace` + 线上注入验证。
+
+### 如果选择不做
+
+那么当前接缝（`IterationRunner` + `IterationHost`）就是最终边界：管线留在 kernel，
+理由成立——它是宿主状态机（暂存候选、验证、回放、晋升/回滚、写 journal），不是纯策略。
+此时建议把 `status-and-open-items.md` 的 3.0a 一节从"文件搬家尚未完成"改成
+"以接缝为最终边界"。
