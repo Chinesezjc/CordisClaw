@@ -657,6 +657,16 @@ impl RuntimeHost {
 
         // Tests are the contract: the decision lives in `iteration::policy`.
         // This function only carries out the side effects of that decision.
+        // A canary *failure* is positive evidence of breakage: the replay
+        // diverged, so the change cannot land no matter what the tests say.
+        let canary_failed = state
+            .canary
+            .as_ref()
+            .is_some_and(|report| report.verdict == CanaryVerdict::Fail);
+        if canary_failed {
+            effective_verifier = VerifierVerdict::Fail;
+        }
+
         // A blind edit (no agent behind it) needs replayable evidence: the
         // canary proves the change still behaves. An agent-driven change
         // carries a transcript instead, and a brand new plugin has nothing to
