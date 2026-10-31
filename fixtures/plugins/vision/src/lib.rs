@@ -643,9 +643,25 @@ mod tests {
 
     #[test]
     fn read_local_image_rejects_path_outside_temp_dir() {
-        // Cargo.toml lives in the crate directory, not the temp dir.
-        let outside = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml");
-        let err = read_local_image(outside).unwrap_err();
+        // The guard resolves symlinks before comparing, so the path has to
+        // exist *and* sit outside the temp dir. Fixture tests also run inside a
+        // temporary workspace copy, which makes the crate dir itself a temp
+        // path — hence the fallback that plants a file next to the temp root.
+        let temp_root = std::fs::canonicalize(std::env::temp_dir()).expect("resolve temp dir");
+        let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let planted = manifest.starts_with(&temp_root).then(|| {
+            let outside = temp_root
+                .parent()
+                .expect("temp dir has a parent")
+                .join(format!("cordis-vision-outside-{}.png", std::process::id()));
+            std::fs::write(&outside, b"x").expect("plant outside file");
+            outside
+        });
+        let outside = planted.clone().unwrap_or_else(|| manifest.join("Cargo.toml"));
+        let err = read_local_image(outside.to_str().expect("utf-8 path")).unwrap_err();
+        if let Some(path) = planted {
+            let _ = std::fs::remove_file(path);
+        }
         assert!(
             err.contains("path outside temp dir"),
             "expected temp-dir rejection, got: {err}"
