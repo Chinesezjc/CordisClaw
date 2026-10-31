@@ -758,6 +758,19 @@ impl AgentSession {
 
             // Text without a tool call does not end a channel turn: nudge the
             // model to keep working or to close the turn explicitly.
+            // Once something actually went out, a text reply closes the turn.
+            // Pushing for the marker at that point made the model repeat the
+            // same message, which the room saw as duplicate replies.
+            if !tool_events.is_empty() {
+                self.no_end_strikes = 0;
+                self.completed_turns += 1;
+                return Ok(AgentReply {
+                    response_id,
+                    content: message.content.unwrap_or_default(),
+                    tool_events,
+                });
+            }
+
             if self.require_end_tool {
                 // A channel turn ends on `suspend` and nothing else. Asking a
                 // bounded number of times turned a model that forgot the marker
@@ -765,13 +778,20 @@ impl AgentSession {
                 // remains the only bound.
                 self.no_end_strikes += 1;
                 emit_agent_diagnostic(format!(
-                    "agent_missing_end_tool kind={} attempt={}",
-                    self.kind, self.no_end_strikes
+                    "agent_missing_end_tool kind={} attempt={} acted={}",
+                    self.kind,
+                    self.no_end_strikes,
+                    !tool_events.is_empty()
                 ));
-                messages.push(json!({
-                    "role": "user",
-                    "content": "[system] 这一轮还没结束。继续调用工具；要结束就调用 suspend。正文不会发给任何人。",
-                }));
+                // Two different asks: before anything is sent, push it to act;
+                // after it acted, stop it from sending the same thing again —
+                // "keep working" made the model repeat its message.
+                let nudge = if tool_events.is_empty() {
+                    "[system] 这一轮还没结束：你还没有发出任何消息。先调用 qq_send 把要说的话发出去，再调用 suspend。正文不会发给任何人。"
+                } else {
+                    "[system] 消息已经发出去了。不要再发第二条；直接调用 suspend 结束这一轮。"
+                };
+                messages.push(json!({ "role": "user", "content": nudge }));
                 continue;
             }
 
@@ -1672,6 +1692,32 @@ fn serialized_call_to_tool_call_at(
     // A kernel tool (read_file, run_command, get_runtime_status …) has no plugin
     // behind it: calling it through `invoke_plugin` with an empty path would
     // fail. Call it directly with its own parameters instead.
+    // The model sometimes wraps a kernel tool in `invoke_plugin` anyway:
+    // `{"node_id":"invoke_plugin","payload_json":{"node_id":"suspend"}}`. Unwrap
+    // it, otherwise the turn can never end (and every retry looks like work).
+    if node_id == AGENT_TOOL_INVOKE_PLUGIN {
+        let inner = object
+            .get("payload_json")
+            .and_then(|value| value.get("node_id"))
+            .and_then(Value::as_str);
+        if let Some(inner) = inner {
+            if tools.iter().any(|tool| tool.name == inner) {
+                let arguments = object
+                    .get("payload_json")
+                    .and_then(|value| value.get("payload_json"))
+                    .cloned()
+                    .unwrap_or_else(|| json!({}));
+                return Some(cordis_plugin_sdk::llm::LlmToolCall {
+                    id: format!("dsml-{index}-{inner}"),
+                    call_type: "function".to_string(),
+                    function: cordis_plugin_sdk::llm::LlmToolFunction {
+                        name: inner.to_string(),
+                        arguments: arguments.to_string(),
+                    },
+                });
+            }
+        }
+    }
     if plugin_path.is_empty() && tools.iter().any(|tool| tool.name == node_id) {
         let arguments = object
             .get("payload_json")
