@@ -323,7 +323,10 @@ impl AgentSession {
             let _ = self.compact_history();
         }
 
-        let tool_specs = backend.tool_specs();
+        let mut tool_specs = backend.tool_specs();
+        if self.require_end_tool {
+            tool_specs.push(end_turn_tool_spec());
+        }
         let mut messages = Vec::with_capacity(self.history.len() + 4);
         messages.push(json!({
             "role": "system",
@@ -370,7 +373,10 @@ impl AgentSession {
             // that happens *inside* this loop. Re-read it every turn and keep
             // the DSML catalogue in sync, otherwise the model's summary call
             // gets wrapped as `invoke_plugin` and rejected as unknown.
-            let tool_specs = backend.tool_specs();
+            let mut tool_specs = backend.tool_specs();
+            if self.require_end_tool {
+                tool_specs.push(end_turn_tool_spec());
+            }
             if let Some(catalog) = messages.iter_mut().find(|message| {
                 message["role"] == "system"
                     && message["content"]
@@ -1549,6 +1555,20 @@ impl<'a, H: AgentToolHost + ?Sized> AgentBackend for RuntimeShellAgentBackend<'a
 /// `tool_calls`; the payload is still the tool's JSON arguments, so the call is
 /// recoverable. Only text that actually carries that markup is considered —
 /// an ordinary reply that happens to contain JSON must never execute.
+/// The end-of-turn marker, as a tool the DSML parser can resolve.
+///
+/// Without it a `<|DSML|tool_calls>{"node_id":"suspend"}</|DSML|tool_calls>`
+/// block was parsed as `invoke_plugin` with an empty path (the parser only maps
+/// a name to a direct call when the name is in the tool list), so every channel
+/// turn retried until it gave up — the bot went silent.
+fn end_turn_tool_spec() -> AgentToolSpec {
+    AgentToolSpec {
+        name: AGENT_TOOL_END_TURN,
+        description: "End this turn. Call it after your last message; text alone never ends a turn.",
+        parameters: json!({"type": "object", "properties": {}, "additionalProperties": false}),
+    }
+}
+
 fn salvage_serialized_tool_calls(
     content: &str,
     tools: &[AgentToolSpec],
