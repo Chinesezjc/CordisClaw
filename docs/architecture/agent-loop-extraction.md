@@ -445,6 +445,38 @@ warning 触发重试），而重试回合里的工具调用没有执行（或解
 下一轮先加一条诊断日志：每回合打印解析出的 call 名字列表与是否进入执行分支。
 这是唯一能分辨"解析为空"还是"执行被跳过"的观测点。
 
+## 第 24 轮：找到真凶——工具目录只算了一次，且算在回合循环之外
+
+`respond_inner` 在进入回合循环**之前**取了一次 `let tool_specs = backend.tool_specs();`。
+可迭代后端的工具列表是**按阶段变化**的：
+
+```rust
+// iteration_agent.rs:531
+if self.state.verification_successes > 0 && self.state.recorded_summary.is_none() {
+    tools.push(record_iteration_summary);
+}
+```
+
+而 `verification_successes` 恰恰是在**循环内部**跑完 `run_plugin_test` 才 +1 的。于是：
+
+- 第 4 回合模型写 `record_iteration_summary`；
+- 解析时用的仍是回合开始前的旧目录 → 该名字不在其中 →
+  `serialized_call_to_tool_call_at` 回退成 `invoke_plugin` → 被判未知工具 → 重试 → 脚本耗尽。
+
+修复：每个回合开头重新取 `backend.tool_specs()`，并同步刷新那条 DSML 目录 system 消息。
+
+修复后的观测（同一用例）：
+
+```
+turn 1 calls=[scaffold_child_plugin]
+turn 2 calls=[replace_file_exact ×5]
+turn 3 calls=[run_plugin_test]
+turn 4 calls=[record_iteration_summary]     ← 不再被包成 invoke_plugin
+canary=Pass "candidate replay matched current response"
+blocked_reason=None
+verifier=Fail   ← 只剩这一处
+```
+
 ## 未决问题（2026-10-31，下一轮先查）
 
 `cargo test -p cordis-runtime --test runtime_host` 有 5 个 `iterate_plugins` 相关用例失败，

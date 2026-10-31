@@ -365,6 +365,25 @@ impl AgentSession {
         let mut tool_events = Vec::new();
 
         for turn in 0..AGENT_MAX_TOOL_TURNS {
+            // The backend's tool list is phase dependent: the iteration
+            // summary only becomes callable once a verification succeeded, and
+            // that happens *inside* this loop. Re-read it every turn and keep
+            // the DSML catalogue in sync, otherwise the model's summary call
+            // gets wrapped as `invoke_plugin` and rejected as unknown.
+            let tool_specs = backend.tool_specs();
+            if let Some(catalog) = messages.iter_mut().find(|message| {
+                message["role"] == "system"
+                    && message["content"]
+                        .as_str()
+                        .is_some_and(|content| content.starts_with("TOOL PROTOCOL"))
+            }) {
+                *catalog = json!({
+                    "role": "system",
+                    "content": dsml_protocol_prompt(&tool_specs, self.require_end_tool),
+                });
+            }
+
+
             // P1-37: unify the two timeout budgets. `timeout_ms` (per
             // HTTP request) and `stream_timeout_secs * 5` (per-stream
             // overall) were checked independently — a session where

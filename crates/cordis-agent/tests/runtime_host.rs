@@ -112,34 +112,23 @@ fn tool_call_response(
     response_id: &str,
     tool_calls: Vec<(&str, &str, Value)>,
 ) -> Vec<(u64, String)> {
+    let body = tool_calls
+        .into_iter()
+        .map(|(_call_id, name, arguments)| {
+            serde_json::to_string(&json!({ "node_id": name, "payload_json": arguments }))
+                .expect("serialize tool call")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let content = format!("<|DSML|tool_calls>\n{body}\n</|DSML|tool_calls>");
     sse_response(vec![
         json!({
             "id": response_id,
-            "choices": [{
-                "delta": {
-                    "tool_calls": tool_calls
-                        .into_iter()
-                        .enumerate()
-                        .map(|(index, (call_id, name, arguments))| json!({
-                            "index": index,
-                            "id": call_id,
-                            "type": "function",
-                            "function": {
-                                "name": name,
-                                "arguments": serde_json::to_string(&arguments)
-                                    .expect("serialize tool arguments"),
-                            }
-                        }))
-                        .collect::<Vec<_>>()
-                }
-            }]
+            "choices": [{ "delta": { "content": content } }]
         }),
         json!({
             "id": response_id,
-            "choices": [{
-                "delta": {},
-                "finish_reason": "tool_calls"
-            }]
+            "choices": [{ "delta": {}, "finish_reason": "stop" }]
         }),
     ])
 }
