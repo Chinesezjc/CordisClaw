@@ -712,6 +712,23 @@ invoke_candidate / verify / journal …），管线作为泛型代码住进 crat
 已完整回滚到 `f4b80f9`（接缝 + 全绿）。第 34 轮建立的 `IterationRunner` 接缝仍然有效，
 它是未来那次设计的落点。
 
+## 第 36 轮：把边界命名出来
+
+`IterationHost` 落地（`iteration_api.rs`），十个能力、由 `RuntimeHost` 委托实现：
+
+```
+fixtures_root / snapshot_root / kernel / current_snapshot / candidate_snapshot /
+invoke_candidate / cleanup_retired_snapshots / rollback_candidate_if_staged /
+drop_session / agent_status
+```
+
+下一步的顺序（每步都保持全绿）：
+
+1. 把 `start_plugin_iteration_agent_session`、以及"读会话 tool summary"这两处
+   `self.agent_sessions` 直接访问也变成 `IterationHost` 的方法（各一个，不暴露 map）；
+2. 把 `impl RuntimeHost` 里的管线函数改成 `fn f<H: IterationHost>(host: &H, …)`；
+3. 此时再"文件搬家"就是纯移动——没有私有细节要公开。
+
 ## 未决问题（2026-10-31，下一轮先查）
 
 `cargo test -p cordis-runtime --test runtime_host` 有 5 个 `iterate_plugins` 相关用例失败，
