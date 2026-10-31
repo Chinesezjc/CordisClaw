@@ -71,6 +71,25 @@ pub trait IterationHost: Send + Sync {
         &self,
         session_id: &str,
     ) -> Option<crate::agent_api::AgentToolExecutionSummary>;
+    fn agent_send(
+        &self,
+        session_id: &str,
+        input: &str,
+    ) -> Result<crate::agent_api::AgentReply, RuntimeError>;
+    fn agent_transcript(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<crate::agent_api::AgentTranscriptEntry>, RuntimeError>;
+    fn reload_candidate(
+        &self,
+    ) -> Result<crate::host::CandidateSnapshotStatus, RuntimeError>;
+    fn promote_candidate_matching(
+        &self,
+        expected_candidate_snapshot_id: Option<&str>,
+    ) -> Result<crate::host::ReloadReport, RuntimeError>;
+    fn rollback_candidate(
+        &self,
+    ) -> Result<crate::host::CandidateSnapshotStatus, RuntimeError>;
 }
 
 impl IterationHost for RuntimeHost {
@@ -127,6 +146,31 @@ impl IterationHost for RuntimeHost {
         session_id: &str,
     ) -> Option<crate::agent_api::AgentToolExecutionSummary> {
         RuntimeHost::iteration_session_tool_summary(self, session_id)
+    }
+    fn agent_send(
+        &self,
+        session_id: &str,
+        input: &str,
+    ) -> Result<crate::agent_api::AgentReply, RuntimeError> {
+        RuntimeHost::agent_send(self, session_id, input)
+    }
+    fn agent_transcript(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<crate::agent_api::AgentTranscriptEntry>, RuntimeError> {
+        RuntimeHost::agent_transcript(self, session_id)
+    }
+    fn reload_candidate(&self) -> Result<crate::host::CandidateSnapshotStatus, RuntimeError> {
+        RuntimeHost::reload_candidate(self)
+    }
+    fn promote_candidate_matching(
+        &self,
+        expected_candidate_snapshot_id: Option<&str>,
+    ) -> Result<crate::host::ReloadReport, RuntimeError> {
+        RuntimeHost::promote_candidate_matching(self, expected_candidate_snapshot_id)
+    }
+    fn rollback_candidate(&self) -> Result<crate::host::CandidateSnapshotStatus, RuntimeError> {
+        RuntimeHost::rollback_candidate(self)
     }
 }
 
