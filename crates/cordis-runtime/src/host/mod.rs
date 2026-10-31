@@ -570,7 +570,7 @@ pub struct KernelPluginIterationResult {
 }
 
 #[derive(Debug, Clone)]
-struct PreparedPluginIteration {
+pub struct PreparedPluginIteration {
     iteration_id: String,
     issue_id: String,
     root_plugin_path: String,
@@ -968,7 +968,7 @@ impl PluginIterationAgentState {
 }
 
 #[derive(Debug, Clone)]
-struct PluginIterationContextPaths {
+pub struct PluginIterationContextPaths {
     focus_paths: Vec<String>,
     all_paths: Vec<String>,
 }
@@ -1106,6 +1106,54 @@ fn sensitive_path_keyword(path: &str) -> Option<&'static str> {
 }
 
 impl RuntimeHost {
+    /// Start a plugin-iteration agent session and register it in the map.
+    ///
+    /// Kept on the host (not in the pipeline) so the pipeline only needs a
+    /// named capability instead of reaching into `agent_sessions`.
+    pub fn start_iteration_session(
+        &self,
+        prepared: PreparedPluginIteration,
+        context_paths: PluginIterationContextPaths,
+    ) -> Result<String, RuntimeError> {
+        let session_id = normalize_request_id(None, "plugin-agent-session");
+        let mut llm_config = self.config_value().llm_api.clone();
+        llm_config.timeout_ms = llm_config
+            .timeout_ms
+            .min(PLUGIN_ITERATION_AGENT_TIMEOUT_CAP_MS);
+        let session = crate::agent_loop::agent_loop()
+            .ok_or_else(crate::agent_loop::missing_loop_error)?
+            .create(llm_config, "plugin_iteration")?;
+        self.agent_sessions
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .insert(
+                session_id.clone(),
+                ManagedAgentSession {
+                    handle: AgentSessionHandle {
+                        session_id: session_id.clone(),
+                        kind: AgentSessionKind::PluginIteration,
+                    },
+                    session,
+                    state: ManagedAgentState::PluginIteration(Box::new(
+                        PluginIterationAgentState::new(prepared, context_paths, &self.fixtures_root),
+                    )),
+                },
+            );
+        Ok(session_id)
+    }
+
+    /// Tool-execution summary of a live session, if it is still around.
+    pub fn iteration_session_tool_summary(
+        &self,
+        session_id: &str,
+    ) -> Option<AgentToolExecutionSummary> {
+        self.agent_sessions
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .get(session_id)
+            .map(|managed| managed.session.tool_execution_summary())
+    }
+
     /// Where staged snapshots are written.
     pub fn snapshot_root(&self) -> &std::path::Path {
         &self.snapshot_root
@@ -2734,7 +2782,7 @@ const PLUGIN_AGENT_TOOL_RUN_PLUGIN_CHECK: &str = "run_plugin_check";
 const PLUGIN_AGENT_TOOL_RUN_PLUGIN_TEST: &str = "run_plugin_test";
 const PLUGIN_AGENT_TOOL_REBUILD_PLUGIN_WORKSPACE: &str = "rebuild_plugin_workspace";
 const PLUGIN_AGENT_TOOL_RECORD_ITERATION_SUMMARY: &str = "record_iteration_summary";
-const PLUGIN_ITERATION_AGENT_TIMEOUT_CAP_MS: u64 = 1_200_000;
+pub(crate) const PLUGIN_ITERATION_AGENT_TIMEOUT_CAP_MS: u64 = 1_200_000;
 
 #[derive(Debug, Clone, Deserialize)]
 struct ListContextFilesArgs {

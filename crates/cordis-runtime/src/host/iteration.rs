@@ -11,35 +11,7 @@ impl RuntimeHost {
         prepared: PreparedPluginIteration,
         context_paths: PluginIterationContextPaths,
     ) -> Result<String, RuntimeError> {
-        let session_id = normalize_request_id(None, "plugin-agent-session");
-        let mut llm_config = self.config_value().llm_api.clone();
-        llm_config.timeout_ms = llm_config
-            .timeout_ms
-            .min(PLUGIN_ITERATION_AGENT_TIMEOUT_CAP_MS);
-        let session = crate::agent_loop::agent_loop()
-            .ok_or_else(crate::agent_loop::missing_loop_error)?
-            .create(llm_config, "plugin_iteration")?;
-        self.agent_sessions
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .insert(
-                session_id.clone(),
-                ManagedAgentSession {
-                    handle: AgentSessionHandle {
-                        session_id: session_id.clone(),
-                        kind: AgentSessionKind::PluginIteration,
-                    },
-                    session,
-                    state: ManagedAgentState::PluginIteration(Box::new(
-                        PluginIterationAgentState::new(
-                            prepared,
-                            context_paths,
-                            &self.fixtures_root,
-                        ),
-                    )),
-                },
-            );
-        Ok(session_id)
+        self.start_iteration_session(prepared, context_paths)
     }
 
     pub(super) fn plugin_iteration_agent_snapshot(
@@ -393,13 +365,10 @@ impl RuntimeHost {
                 .agent_transcript(&session_id)
                 .map(|transcript| transcript_excerpt(&transcript, 12))
                 .unwrap_or_default();
-            let tool_summary = self.agent_status(&session_id).ok().and_then(|_| {
-                self.agent_sessions
-                    .lock()
-                    .unwrap_or_else(|poison| poison.into_inner())
-                    .get(&session_id)
-                    .map(|managed| managed.session.tool_execution_summary())
-            });
+            let tool_summary = self
+                .agent_status(&session_id)
+                .ok()
+                .and_then(|_| self.iteration_session_tool_summary(&session_id));
             // H2: excerpt/tool_summary captured above; terminate the failed
             // session and reclaim its map entries before returning the error.
             self.drop_session(&session_id);
@@ -413,13 +382,10 @@ impl RuntimeHost {
         let run = self.plugin_iteration_agent_snapshot(&session_id)?;
         let transcript = self.agent_transcript(&session_id)?;
         let transcript_excerpt = transcript_excerpt(&transcript, 12);
-        let tool_summary = self.agent_status(&session_id).ok().and_then(|_| {
-            self.agent_sessions
-                .lock()
-                .unwrap_or_else(|poison| poison.into_inner())
-                .get(&session_id)
-                .map(|managed| managed.session.tool_execution_summary())
-        });
+        let tool_summary = self
+            .agent_status(&session_id)
+            .ok()
+            .and_then(|_| self.iteration_session_tool_summary(&session_id));
         // H2: transcript/snapshot are fully read above; terminate the session
         // and reclaim its map entries before returning success.
         self.drop_session(&session_id);

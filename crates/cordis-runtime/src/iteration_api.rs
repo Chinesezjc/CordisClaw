@@ -60,6 +60,17 @@ pub trait IterationHost: Send + Sync {
         &self,
         session_id: &str,
     ) -> Result<crate::agent_api::AgentSessionStatus, RuntimeError>;
+    /// Register a plugin-iteration agent session and return its id.
+    fn start_iteration_session(
+        &self,
+        prepared: crate::host::PreparedPluginIteration,
+        context_paths: crate::host::PluginIterationContextPaths,
+    ) -> Result<String, RuntimeError>;
+    /// Tool-execution summary of a live iteration session.
+    fn iteration_session_tool_summary(
+        &self,
+        session_id: &str,
+    ) -> Option<crate::agent_api::AgentToolExecutionSummary>;
 }
 
 impl IterationHost for RuntimeHost {
@@ -103,6 +114,19 @@ impl IterationHost for RuntimeHost {
         session_id: &str,
     ) -> Result<crate::agent_api::AgentSessionStatus, RuntimeError> {
         RuntimeHost::agent_status(self, session_id)
+    }
+    fn start_iteration_session(
+        &self,
+        prepared: crate::host::PreparedPluginIteration,
+        context_paths: crate::host::PluginIterationContextPaths,
+    ) -> Result<String, RuntimeError> {
+        RuntimeHost::start_iteration_session(self, prepared, context_paths)
+    }
+    fn iteration_session_tool_summary(
+        &self,
+        session_id: &str,
+    ) -> Option<crate::agent_api::AgentToolExecutionSummary> {
+        RuntimeHost::iteration_session_tool_summary(self, session_id)
     }
 }
 
