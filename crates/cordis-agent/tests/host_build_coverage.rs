@@ -1118,7 +1118,19 @@ fn iterate_plugins_agent_walks_execute_tool_surface_and_promotes() {
                 "command": "cargo test --quiet --manifest-path plugins/mini/Cargo.toml"
             }),
         ),
-        // 17) record_iteration_summary ends the session.
+        // 17) a code change must come with a test, so add one before asking
+        // for the summary — the summary tool rejects the whole iteration
+        // otherwise.
+        one_tool_turn(
+            "iter_17a",
+            "c_add_test",
+            "create_file",
+            json!({
+                "path": "plugins/mini/tests/agent_walk.rs",
+                "new_content": "#[test]\nfn agent_walk_smoke() {}\n"
+            }),
+        ),
+        // 18) record_iteration_summary ends the session.
         one_tool_turn(
             "iter_17",
             "c_record",
@@ -1147,8 +1159,8 @@ fn iterate_plugins_agent_walks_execute_tool_surface_and_promotes() {
     handle.join().expect("join mock server");
     assert_eq!(
         requests.len(),
-        17,
-        "record_iteration_summary must end the session on the 17th turn"
+        18,
+        "record_iteration_summary must end the session on the last turn"
     );
 
     assert_eq!(
@@ -1192,7 +1204,9 @@ fn iterate_plugins_agent_walks_execute_tool_surface_and_promotes() {
         summary.failed_calls >= 4,
         "the four deliberately-failing calls should be recorded: {summary:?}"
     );
-    assert_eq!(summary.total_calls, 17);
+    // One more than the tool-surface turns: the script also creates the test
+    // file the change needs.
+    assert_eq!(summary.total_calls, 18);
 
     // The manifest version bump and lib.rs edit both landed in changed_paths.
     assert!(result
