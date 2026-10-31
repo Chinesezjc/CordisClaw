@@ -756,6 +756,20 @@ impl AgentSession {
                 });
             }
 
+            // Once the turn has actually done something (a message went out),
+            // a plain text reply closes it. Demanding the `suspend` ceremony
+            // after the model already spoke turned successful turns into
+            // "LLM outage" spills.
+            if self.require_end_tool && !tool_events.is_empty() {
+                self.no_end_strikes = 0;
+                self.completed_turns += 1;
+                return Ok(AgentReply {
+                    response_id,
+                    content: message.content.unwrap_or_default(),
+                    tool_events,
+                });
+            }
+
             // Text without a tool call does not end a channel turn: nudge the
             // model to keep working or to close the turn explicitly.
             if self.require_end_tool {

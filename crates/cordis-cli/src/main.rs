@@ -1171,6 +1171,10 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     // the kernel already repeats empty completions twice, and
                     // this covers the slower provider outages that used to
                     // leave the message collecting dust in `pending`.
+                    // Re-assert the channel contract every turn: a session
+                    // restored from a snapshot keeps whatever flag it was saved
+                    // with, and plain text is never sent to a room.
+                    host.agent_set_require_end_tool(sid, true);
                     let sent = with_retries(
                         &SEND_RETRY_DELAYS,
                         || {

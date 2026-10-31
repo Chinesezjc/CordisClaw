@@ -131,6 +131,21 @@ impl RuntimeHost {
         Ok(handle)
     }
 
+    /// Force the end-of-turn contract on a live session.
+    ///
+    /// Sessions restored from a snapshot keep whatever flag they were saved
+    /// with, so a channel must re-assert it before every send; otherwise a
+    /// recovered session answers in plain text and the room never hears it.
+    pub fn agent_set_require_end_tool(&self, session_id: &str, require: bool) {
+        let mut guard = self
+            .agent_sessions
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if let Some(managed) = guard.get_mut(session_id) {
+            managed.session.set_require_end_tool(require);
+        }
+    }
+
     pub fn agent_send(&self, session_id: &str, input: &str) -> Result<AgentReply, RuntimeError> {
         self.agent_send_with_images(session_id, input, &[])
     }
