@@ -556,6 +556,39 @@ after:  left: Blocked
 
 本轮到此为止，不擅自改断言。
 
+## 第 29 轮：五条失败分成互斥的两组，无法同时满足
+
+逐条隔离跑完，结论是**两条策略互相排斥**，而测试分别钉住了两边：
+
+| 用例 | 期望 | 实测 | 现行策略下的原因 |
+|---|---|---|---|
+| `boot_recovers_plugin_iteration_journal` | Blocked | Promoted | edit-plan 盲改，canary Partial 但不阻塞 |
+| `blocks_without_canary_evidence_and_approve_promotes` | Blocked | Promoted | 同上 |
+| `rollback_candidate_restores_...` | Blocked | Promoted | 同上 |
+| `agent_adds_dist_child_plugin_and_promotes` | Promoted | Blocked | 改了测试文件 → 需批准 |
+| `agent_retries_on_warning_and_promotes` | Promoted | Blocked | 同上 |
+
+- 现行策略（单位测试钉死）：`finalize_partial_canary_does_not_block_a_tested_change`
+  → **canary 无证据不阻塞**；**改测试要批准**。
+- 三条集成用例编码的是旧策略：**canary 无证据要阻塞**、改测试不需要批准。
+
+我尝试加回"盲改必须有 canary 证据"的门控（只对无 agent 的 edit-plan 生效），三条立即
+通过；但上面那条单元测试随即失败，因为它正是"Partial 不阻塞"的契约。**两边不能同时绿。**
+
+可选方案（需要拍板）：
+
+1. **以单元契约为准**：改三条集成用例的期望（Blocked → Promoted/授受批准流程），
+   并给两条 agent 用例补 `manual_approved: true`；
+2. **以集成用例为准**：恢复 canary 门控，改写那条单元测试为
+   `finalize_partial_canary_blocks_a_blind_change`（明确 agent 例外）；
+3. **两者都要**：门控只对"无 agent 且未手动批准"的盲改生效，同时把单元测试改成
+   带 agent 的场景，验证"agent 例外"。
+
+我倾向 3（语义最完整：盲改需证据、agent 携带 transcript、改测试需批准），但它要动
+一条既有单元契约测试，属于产品决定，**没有你确认我不改**。
+
+本轮已把尝试回滚，kernel 965 全绿。
+
 ## 未决问题（2026-10-31，下一轮先查）
 
 `cargo test -p cordis-runtime --test runtime_host` 有 5 个 `iterate_plugins` 相关用例失败，
