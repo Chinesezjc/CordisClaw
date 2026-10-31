@@ -621,6 +621,25 @@ cordis-agent::iteration::tool_entry(host, name, args) ← 工具分支
 
 kernel 966 全绿、clippy 0 error。
 
+## 第 32 轮：整仓测试只剩 1 个失败，且原因明确
+
+`cargo test --workspace` 的结果里只剩 `host_build_coverage` 的
+`iterate_plugins_agent_walks_execute_tool_surface_and_promotes` 挂在
+`record_iteration_summary` 被拒：
+
+```
+⚙ record_iteration_summary {"summary":"Walked the plugin-iteration agent tool surface on mini.", …}
+  -> FAIL {"error":"invalid argument: every code change must come with a test: add or
+            update a file under plugins/mini/tests"}
+```
+
+原因：脚本改了 `mini/src/lib.rs` 却没往 `tests/` 加文件，命中"改代码必须配测试"的
+规则。**修法是在 summary 之前补一轮 `create_file` 到 `mini/tests/`**，而不是放松规则。
+
+本轮同时把该文件的 mock 从原生 `tool_calls` 迁到 DSML——迁移前 agent 一个工具都跑不
+起来（文本回合直接结束会话），迁移后整条工具面（list/read/create/replace/delete/
+check/rebuild/test）都真实执行了，只剩最后那一步脚本缺口。
+
 ## 未决问题（2026-10-31，下一轮先查）
 
 `cargo test -p cordis-runtime --test runtime_host` 有 5 个 `iterate_plugins` 相关用例失败，
