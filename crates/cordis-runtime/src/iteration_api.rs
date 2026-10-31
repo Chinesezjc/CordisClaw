@@ -12,7 +12,7 @@
 use std::sync::OnceLock;
 
 use crate::core::error::RuntimeError;
-use crate::host::{KernelPluginIterationResult, RuntimeHost};
+use crate::host::{KernelPluginIterationResult, RuntimeHost, RuntimeKernel};
 use crate::kernel::plugin_iteration::KernelPluginIterationRequest;
 
 /// One iteration runner, as the kernel sees it.
@@ -30,6 +30,80 @@ pub trait IterationRunner: Send + Sync {
         host: &RuntimeHost,
         iteration_id: &str,
     ) -> Result<KernelPluginIterationResult, RuntimeError>;
+}
+
+/// What the pipeline needs from a host.
+///
+/// The pipeline is a state machine over host state — it stages candidates,
+/// verifies them, replays a canary, then promotes or rolls back — so it cannot
+/// move as a file: it needs a named boundary. This trait is that boundary, and
+/// a host implements it by exposing capabilities (not its internals).
+pub trait IterationHost: Send + Sync {
+    fn fixtures_root(&self) -> &std::path::Path;
+    fn snapshot_root(&self) -> &std::path::Path;
+    fn kernel(&self) -> &RuntimeKernel;
+    fn current_snapshot(&self) -> std::sync::Arc<crate::host::RuntimeSnapshot>;
+    fn candidate_snapshot(&self) -> Option<std::sync::Arc<crate::host::RuntimeSnapshot>>;
+    fn invoke_candidate(
+        &self,
+        plugin_path: &str,
+        node_id: &str,
+        payload: String,
+    ) -> Result<crate::plugin::abi::PluginResponse, RuntimeError>;
+    fn cleanup_retired_snapshots(&self);
+    fn rollback_candidate_if_staged(
+        &self,
+        expected_candidate_snapshot_id: Option<&str>,
+    ) -> Option<Result<(), RuntimeError>>;
+    fn drop_session(&self, session_id: &str);
+    fn agent_status(
+        &self,
+        session_id: &str,
+    ) -> Result<crate::agent_api::AgentSessionStatus, RuntimeError>;
+}
+
+impl IterationHost for RuntimeHost {
+    fn fixtures_root(&self) -> &std::path::Path {
+        RuntimeHost::fixtures_root(self)
+    }
+    fn snapshot_root(&self) -> &std::path::Path {
+        RuntimeHost::snapshot_root(self)
+    }
+    fn kernel(&self) -> &RuntimeKernel {
+        self.kernel_state()
+    }
+    fn current_snapshot(&self) -> std::sync::Arc<crate::host::RuntimeSnapshot> {
+        RuntimeHost::current_snapshot(self)
+    }
+    fn candidate_snapshot(&self) -> Option<std::sync::Arc<crate::host::RuntimeSnapshot>> {
+        RuntimeHost::candidate_snapshot(self)
+    }
+    fn invoke_candidate(
+        &self,
+        plugin_path: &str,
+        node_id: &str,
+        payload: String,
+    ) -> Result<crate::plugin::abi::PluginResponse, RuntimeError> {
+        RuntimeHost::invoke_candidate(self, plugin_path, node_id, payload)
+    }
+    fn cleanup_retired_snapshots(&self) {
+        RuntimeHost::cleanup_retired_snapshots(self)
+    }
+    fn rollback_candidate_if_staged(
+        &self,
+        expected_candidate_snapshot_id: Option<&str>,
+    ) -> Option<Result<(), RuntimeError>> {
+        RuntimeHost::rollback_candidate_if_staged(self, expected_candidate_snapshot_id)
+    }
+    fn drop_session(&self, session_id: &str) {
+        RuntimeHost::drop_session(self, session_id)
+    }
+    fn agent_status(
+        &self,
+        session_id: &str,
+    ) -> Result<crate::agent_api::AgentSessionStatus, RuntimeError> {
+        RuntimeHost::agent_status(self, session_id)
+    }
 }
 
 static RUNNER: OnceLock<Box<dyn IterationRunner>> = OnceLock::new();
