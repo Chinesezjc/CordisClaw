@@ -729,6 +729,39 @@ drop_session / agent_status
 2. 把 `impl RuntimeHost` 里的管线函数改成 `fn f<H: IterationHost>(host: &H, …)`；
 3. 此时再"文件搬家"就是纯移动——没有私有细节要公开。
 
+## 第 39 轮：泛型化后的验证，以及最后一块的真正阻碍
+
+重跑两个最重的套件（泛型化会动到它们经过的每一条路径）：
+
+```
+runtime_host        33 passed  (1061s)
+host_build_coverage  8 passed  (126s)
+kernel lib         966 passed
+clippy --all-targets 0 error
+```
+
+### 最后一块为什么仍然停在这里
+
+管线已经可以纯文件移动，但 **kernel 自己的单元测试会随之失效**：
+
+`region_3500_5500_seam_tests.rs` 直接调用
+`host.run_plugin_canary` / `finalize_plugin_iteration` / `verify_plugin_iteration` /
+`run_plugin_iteration_agent` / `start_plugin_iteration_agent_session`，而这些现在只是
+`#[cfg(test)]` 的委托。文件一搬走，委托无处可去（kernel 不能依赖 crate），
+测试就得改用 **公开 API + 已安装的 runner**——而 kernel 测试装不了 crate 的 runner
+（dev-dependency 环会编出两份 runtime，这个坑第 12 轮踩过）。
+
+三条出路，都需要一次明确决定：
+
+1. 把这些用例搬到 `cordis-agent/tests/`，用 crate 自己的 runner 驱动（测试脚手架
+   `empty_host` / `prepared_for` 要跟着搬）；
+2. 给 kernel 留一个 `#[cfg(test)]` 的 runner 替身，只覆盖这些用例断言的行为；
+3. 接受管线留在 kernel（它确实是宿主状态机），把 `IterationRunner` + `IterationHost`
+   作为最终边界。
+
+我倾向 1（测试跟着代码走，与循环那次一致），但它是一次独立的测试迁移，不该塞进
+本目标的最后一轮草率完成。
+
 ## 未决问题（2026-10-31，下一轮先查）
 
 `cargo test -p cordis-runtime --test runtime_host` 有 5 个 `iterate_plugins` 相关用例失败，
