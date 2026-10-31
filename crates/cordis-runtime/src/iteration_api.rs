@@ -90,6 +90,11 @@ pub trait IterationHost: Send + Sync {
     fn rollback_candidate(
         &self,
     ) -> Result<crate::host::CandidateSnapshotStatus, RuntimeError>;
+    fn recent_invocation_samples(&self) -> Vec<crate::host::InvocationSample>;
+    fn iteration_agent_snapshot(
+        &self,
+        session_id: &str,
+    ) -> Result<crate::host::PluginIterationAgentRun, RuntimeError>;
 }
 
 impl IterationHost for RuntimeHost {
@@ -171,6 +176,15 @@ impl IterationHost for RuntimeHost {
     }
     fn rollback_candidate(&self) -> Result<crate::host::CandidateSnapshotStatus, RuntimeError> {
         RuntimeHost::rollback_candidate(self)
+    }
+    fn recent_invocation_samples(&self) -> Vec<crate::host::InvocationSample> {
+        RuntimeHost::recent_invocation_samples(self)
+    }
+    fn iteration_agent_snapshot(
+        &self,
+        session_id: &str,
+    ) -> Result<crate::host::PluginIterationAgentRun, RuntimeError> {
+        RuntimeHost::iteration_agent_snapshot(self, session_id)
     }
 }
 

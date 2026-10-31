@@ -589,7 +589,7 @@ pub struct PreparedPluginIteration {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-struct InvocationSample {
+pub struct InvocationSample {
     plugin_path: String,
     node_id: String,
     payload: Value,
@@ -900,7 +900,7 @@ enum ManagedAgentState {
 /// field the pipeline needed was copied twice. The run is the phase's result;
 /// there is nothing else to unwrap.
 #[derive(Debug, Clone)]
-struct PluginIterationAgentRun {
+pub struct PluginIterationAgentRun {
     /// True when an LLM drove the change (a session with a transcript); false
     /// for an edit plan applied blind. Only the former carries its own evidence.
     llm_driven: bool,
@@ -1140,6 +1140,24 @@ impl RuntimeHost {
                 },
             );
         Ok(session_id)
+    }
+
+    /// The recorded invocations the canary replays, newest first.
+    pub fn recent_invocation_samples(&self) -> Vec<InvocationSample> {
+        self.invocation_samples
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    /// Snapshot of a live plugin-iteration session's run state.
+    pub fn iteration_agent_snapshot(
+        &self,
+        session_id: &str,
+    ) -> Result<PluginIterationAgentRun, RuntimeError> {
+        self.plugin_iteration_agent_snapshot(session_id)
     }
 
     /// Tool-execution summary of a live session, if it is still around.
@@ -4164,7 +4182,7 @@ fn runtime_snapshot_from_output(
 }
 
 #[derive(Debug, Clone)]
-struct PluginIterationRunState {
+pub struct PluginIterationRunState {
     prepared: PreparedPluginIteration,
     agent: Option<PluginIterationAgentRun>,
     rollback: Option<PluginEditRollback>,
