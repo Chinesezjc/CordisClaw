@@ -640,6 +640,25 @@ kernel 966 全绿、clippy 0 error。
 起来（文本回合直接结束会话），迁移后整条工具面（list/read/create/replace/delete/
 check/rebuild/test）都真实执行了，只剩最后那一步脚本缺口。
 
+## 第 33 轮：整仓测试全绿
+
+三件事收口：
+
+1. `host_build_coverage` 的脚本补了一轮 `create_file`（`plugins/mini/tests/agent_walk.rs`），
+   summary 不再被"改代码必须配测试"拒绝；请求数 17→18、工具数 17→18 随之更新。
+2. 顺带发现 `iterate_plugins_canary_fail_verdict_observes_a_canary_failure_issue`
+   一直在失败（之前的 `tail` 把它截掉了）：`promotion_verdict` 根本不看 canary，
+   所以 canary **Fail** 也会晋升。修复：canary Fail 视为 verifier Fail → 回滚。
+3. `cargo test --workspace` 全绿：
+
+```
+cordis-agent lib 39 / boot_with_loop 1 / agent_toolchain_400 6 / host_boot_session_arms 25
+host_build_coverage 8 / host_coverage 42 / host_reload_arms 34 / host_iterate_stages 10
+runtime_host 33 / host_llm_coverage 14 / host_ops_arms 12 / host_coverage_rest 27
+cordis-runtime lib 966 / cli 49 / sdk 33 / tooling 47 …
+clippy --all-targets 0 error
+```
+
 ## 未决问题（2026-10-31，下一轮先查）
 
 `cargo test -p cordis-runtime --test runtime_host` 有 5 个 `iterate_plugins` 相关用例失败，
