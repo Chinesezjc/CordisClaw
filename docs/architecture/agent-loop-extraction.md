@@ -534,6 +534,28 @@ Stages: StaticCheck Passed, Tests Failed
 
 优先级：先落 vision 修复 → 重跑，看 5 个降到几个。
 
+## 第 28 轮：vision 修复生效，失败性质从 RolledBack 变成 Blocked
+
+落盘 `f63ae0e` 后重跑：整体仍是 28/33，但 `agent_adds_dist_child` 的**失败性质变了**：
+
+```
+before: left: RolledBack   (verifier Tests Failed → vision 测试挂)
+after:  left: Blocked
+        verifier = Pass
+        (StaticCheck Passed, Tests Passed)
+```
+
+也就是说 verifier 现在全过，卡在晋升判定上：这条用例的编辑计划**改动了测试文件**
+（`plugins/expr/tests/eval.rs`），于是 `test_changes().modified` 非空 →
+`requires_approval = true` → `Blocked`。
+
+而用例期望 `Promoted`。这跟第 19 轮那三条"期望 Blocked 却 Promoted"是同一族问题
+的镜像：**"改测试要不要人工批准"这条策略在集成用例与实现之间没有对齐**。要么用例
+补 `manual_approved: true`（表示操作者已批准），要么策略承认"只新增测试、不改断言"
+可以自动晋升。
+
+本轮到此为止，不擅自改断言。
+
 ## 未决问题（2026-10-31，下一轮先查）
 
 `cargo test -p cordis-runtime --test runtime_host` 有 5 个 `iterate_plugins` 相关用例失败，
