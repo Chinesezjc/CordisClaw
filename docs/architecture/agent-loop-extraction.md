@@ -685,6 +685,33 @@ kernel 删除这三个文件、保留 `iteration/report.rs`（工具 ABI 需要�
 kernel 测试里直接调管线的只有 `ffi_panic_seam_tests.rs`（4 处）以及
 `region_3500_5500_seam_tests.rs` 里调 `finalize_plugin_iteration` 的几条——它们要跟着搬。
 
+## 第 35 轮：管线搬不动的原因不是"文件大"，而是它碰的是宿主实现
+
+尝试把 `iteration/policy.rs` + `host/iteration_agent.rs` 复制进 crate 并编译，长尾暴露出来：
+
+```
+第一轮错误：PluginEditOperation / PluginEditPlan / ReplaceFileExactArgs /
+           ContextFilesScope / ScaffoldChildPluginArgs / TomlValue / fs / Command
+第二轮错误：ScaffoldedChildRegistration / scaffolded_child_order /
+           ListContextFilesArgs / toml 依赖
+第三轮错误：ReadContextFilesArgs / ReplaceFilesExactArgs / CreateFileArgs /
+           TomlSetArgs / JsonSetArgs / RunCommandArgs / RunPluginCommandArgs /
+           parse_agent_args / DeleteFileArgs …
+```
+
+这些不是"顺手公开一下"就能解决的：`scaffolded_child_order`、`ScaffoldedChildRegistration`、
+`TomlValue` 别名、`parse_agent_args` 都是宿主的**内部实现细节**。把它们全部公开，等于
+把 kernel 的私有用具箱摊开给外部，只为让一段代码"搬出去"——架构上比现在更差。
+
+结论：`host/iteration.rs` 是**宿主状态机**（暂存候选、验证、回放、晋升/回滚、写 journal），
+不是纯策略。正确做法不是"文件搬家"，而是设计一个 `IterationHost` 边界（约 15 个能力：
+fixtures_root / snapshot_root / kernel_state / current_snapshot / candidate_snapshot /
+invoke_candidate / verify / journal …），管线作为泛型代码住进 crate。这需要单独一轮设计，
+本轮不做半截改动。
+
+已完整回滚到 `f4b80f9`（接缝 + 全绿）。第 34 轮建立的 `IterationRunner` 接缝仍然有效，
+它是未来那次设计的落点。
+
 ## 未决问题（2026-10-31，下一轮先查）
 
 `cargo test -p cordis-runtime --test runtime_host` 有 5 个 `iterate_plugins` 相关用例失败，
