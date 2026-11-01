@@ -493,6 +493,20 @@ impl AgentSession {
                     self.empty_response_strikes = 0;
                     continue;
                 }
+                // A provider failure after the message went out is not a
+                // reason to replay the whole turn: the room already heard it.
+                Err(err) if !tool_events.is_empty() => {
+                    emit_agent_diagnostic(format!(
+                        "agent_provider_failed_after_delivery kind={} turn={} err={:?}",
+                        self.kind, turn, err.to_string()
+                    ));
+                    self.completed_turns += 1;
+                    return Ok(AgentReply {
+                        response_id: None,
+                        content: String::new(),
+                        tool_events,
+                    });
+                }
                 Err(err) => return Err(err),
             };
             let (message, response_id, finish_reason) =
@@ -910,6 +924,18 @@ impl AgentSession {
                 continue;
             }
             self.empty_response_strikes = 0;
+            // If a message already went out this turn, the turn succeeded even
+            // though the closing reply was empty. Returning an error here made
+            // the channel spill the message to `pending` and replay it later —
+            // the same sentence arriving twice, sometimes a day apart.
+            if !tool_events.is_empty() {
+                self.completed_turns += 1;
+                return Ok(AgentReply {
+                    response_id,
+                    content: String::new(),
+                    tool_events,
+                });
+            }
             return Err(RuntimeError::LlmResponseInvalid {
                 message: format!(
                     "agent response had neither tool_calls nor final content \
@@ -3256,6 +3282,26 @@ mod tests {
         assert_eq!(*provider.calls.lock().expect("calls"), 2, "one retry");
         let history = serde_json::to_string(&session.history).expect("history json");
         assert!(!history.contains("broken.png"), "the image is gone: {history}");
+    }
+
+    /// A turn that delivered a message must not come back as an error: the
+    /// channel spills errored turns to `pending` and replays them, which is how
+    /// the same sentence arrived again a day later.
+    #[test]
+    fn a_delivered_turn_survives_an_empty_closing_reply() {
+        let provider = FakeLlmProvider::new(vec![
+            assistant_reply(
+                "<|DSML|tool_calls>\n{\"node_id\": \"invoke_plugin\", \"payload_json\":                  {\"plugin_path\": \"qq\", \"node_id\": \"qq_send\", \"payload_json\":                  {\"message\": \"手脚宝宝是啥\"}}}\n</|DSML|tool_calls>",
+            ),
+            // then the provider runs dry: the turn must still be a success
+        ]);
+        let mut session = ShellAgentSession::new(LlmApiConfig::default()).expect("build session");
+        session.set_require_end_tool(true);
+        let reply = session
+            .respond_via(&EMPTY_FAKE_HOST, "test-session-delivered", "hi", &provider)
+            .expect("a delivered turn is a success");
+        assert_eq!(reply.tool_events.len(), 1);
+        assert_eq!(session.status().completed_turns, 1);
     }
 
     /// A text-only reply is nudged without a retry cap — the old three-strike
