@@ -838,7 +838,22 @@ impl AgentSession {
                     }
                     continue; // re-enter loop with new messages
                 }
-                self.remember_exchange(trimmed, content, message.reasoning_content.as_deref());
+                // Keep the fact that pictures came with this message: history
+                // used to store the text alone, so the next turn saw "no image"
+                // and answered as if nothing had been sent.
+                let remembered = if images.is_empty() {
+                    trimmed.to_string()
+                } else {
+                    format!(
+                        "{trimmed}\n[附图 {} 张，我在这一轮已经看过它们的内容]",
+                        images.len()
+                    )
+                };
+                self.remember_exchange(
+                    &remembered,
+                    content,
+                    message.reasoning_content.as_deref(),
+                );
                 self.completed_turns += 1;
                 self.transcript.push(AgentTranscriptEntry::Assistant {
                     content: content.to_string(),
@@ -3156,6 +3171,91 @@ mod tests {
         );
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].function.name, AGENT_TOOL_END_TURN);
+    }
+
+    /// History keeps a note that pictures came with the message. Without it the
+    /// next turn sees only text and answers "no image, I can't guess" — the
+    /// reported badcase.
+    #[test]
+    fn a_picture_leaves_a_note_in_history() {
+        let provider = FakeLlmProvider::new(vec![assistant_reply("看起来是个抽卡游戏")]);
+        let mut session = AgentSession::new(LlmApiConfig::default(), "runtime_shell")
+            .expect("build session");
+        session
+            .respond_with_runtime_host_via_images(
+                &EMPTY_FAKE_HOST,
+                "test-session-image-note",
+                "你觉得这个游戏怎么样",
+                &[json!({"url": "https://example.com/a.png"})],
+                "",
+                &provider,
+                None,
+            )
+            .expect("turn");
+        let history = serde_json::to_string(&session.history).expect("history json");
+        assert!(
+            history.contains("附图 1 张"),
+            "history must record the picture: {history}"
+        );
+    }
+
+    /// A provider that fails once with an unsupported-image error, then answers.
+    struct FailOnceImageProvider {
+        inner: FakeLlmProvider,
+        calls: std::sync::Mutex<usize>,
+    }
+
+    impl FailOnceImageProvider {
+        fn new(replies: Vec<cordis_plugin_sdk::llm::LlmMessage>) -> Self {
+            Self {
+                inner: FakeLlmProvider::new(replies),
+                calls: std::sync::Mutex::new(0),
+            }
+        }
+    }
+
+    impl LlmProvider for FailOnceImageProvider {
+        fn complete(
+            &self,
+            body: Value,
+            sink: Option<std::sync::Arc<dyn cordis_runtime::llm_sink::TokenSink>>,
+            transport: cordis_plugin_sdk::llm::LlmTransportConfig,
+        ) -> Result<LlmCompletionParts, RuntimeError> {
+            let mut calls = self.calls.lock().expect("calls");
+            *calls += 1;
+            if *calls == 1 {
+                return Err(RuntimeError::LlmRequestFailed {
+                    message: "messages[1].image[0]: You have uploaded an unsupported image"
+                        .to_string(),
+                });
+            }
+            self.inner.complete(body, sink, transport)
+        }
+    }
+
+    /// One unsupported image used to poison the whole session: every later
+    /// request replayed it and got the same 400. The loop drops the image parts
+    /// and retries once.
+    #[test]
+    fn an_unsupported_image_is_dropped_and_the_turn_retried() {
+        let provider = FailOnceImageProvider::new(vec![assistant_reply("我能看到图片了")]);
+        let mut session = AgentSession::new(LlmApiConfig::default(), "runtime_shell")
+            .expect("build session");
+        let reply = session
+            .respond_with_runtime_host_via_images(
+                &EMPTY_FAKE_HOST,
+                "test-session-image-drop",
+                "这张图里是什么",
+                &[json!({"url": "https://example.com/broken.png"})],
+                "",
+                &provider,
+                None,
+            )
+            .expect("turn recovers after dropping the image");
+        assert_eq!(reply.content, "我能看到图片了");
+        assert_eq!(*provider.calls.lock().expect("calls"), 2, "one retry");
+        let history = serde_json::to_string(&session.history).expect("history json");
+        assert!(!history.contains("broken.png"), "the image is gone: {history}");
     }
 
     /// A text-only reply is nudged without a retry cap — the old three-strike
