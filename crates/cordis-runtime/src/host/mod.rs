@@ -571,21 +571,21 @@ pub struct KernelPluginIterationResult {
 
 #[derive(Debug, Clone)]
 pub struct PreparedPluginIteration {
-    iteration_id: String,
-    issue_id: String,
-    root_plugin_path: String,
-    target_plugin_paths: Vec<String>,
-    source: Option<KernelPluginIssueSource>,
-    summary: String,
+    pub iteration_id: String,
+    pub issue_id: String,
+    pub root_plugin_path: String,
+    pub target_plugin_paths: Vec<String>,
+    pub source: Option<KernelPluginIssueSource>,
+    pub summary: String,
     #[allow(dead_code)]
-    manual_approved: bool,
-    tests_command: Option<String>,
-    safety_command: Option<String>,
-    verify_profile: VerificationProfile,
-    quality_score: Option<u32>,
-    edit_plan: Option<PluginEditPlan>,
-    instruction: Option<String>,
-    allowed_plugin_roots: BTreeMap<String, String>,
+    pub manual_approved: bool,
+    pub tests_command: Option<String>,
+    pub safety_command: Option<String>,
+    pub verify_profile: VerificationProfile,
+    pub quality_score: Option<u32>,
+    pub edit_plan: Option<PluginEditPlan>,
+    pub instruction: Option<String>,
+    pub allowed_plugin_roots: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -916,19 +916,19 @@ pub struct PluginIterationAgentRun {
 
 #[derive(Debug, Clone)]
 pub struct PluginIterationAgentState {
-    prepared: PreparedPluginIteration,
-    focus_context_paths: Vec<String>,
-    all_context_paths: Vec<String>,
-    context_scope_expanded: bool,
-    recorded_summary: Option<String>,
-    tests_command: Option<String>,
-    safety_command: Option<String>,
-    verification_attempts: usize,
-    verification_successes: usize,
-    rollback: PluginEditRollback,
-    operations: Vec<PluginEditOperation>,
-    scaffolded_children: Vec<ScaffoldedChildRegistration>,
-    requires_approval: bool,
+    pub prepared: PreparedPluginIteration,
+    pub focus_context_paths: Vec<String>,
+    pub all_context_paths: Vec<String>,
+    pub context_scope_expanded: bool,
+    pub recorded_summary: Option<String>,
+    pub tests_command: Option<String>,
+    pub safety_command: Option<String>,
+    pub verification_attempts: usize,
+    pub verification_successes: usize,
+    pub rollback: PluginEditRollback,
+    pub operations: Vec<PluginEditOperation>,
+    pub scaffolded_children: Vec<ScaffoldedChildRegistration>,
+    pub requires_approval: bool,
 }
 
 impl PluginIterationAgentState {
@@ -969,12 +969,12 @@ impl PluginIterationAgentState {
 
 #[derive(Debug, Clone)]
 pub struct PluginIterationContextPaths {
-    focus_paths: Vec<String>,
-    all_paths: Vec<String>,
+    pub focus_paths: Vec<String>,
+    pub all_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ScaffoldedChildRegistration {
+pub struct ScaffoldedChildRegistration {
     parent_manifest_path: String,
     child_root_path: String,
 }
@@ -2826,7 +2826,7 @@ pub(crate) struct ScaffoldChildPluginArgs {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub(crate) struct ReplaceFileExactArgs {
+pub struct ReplaceFileExactArgs {
     path: String,
     expected_old_string: String,
     new_content: String,
@@ -2941,7 +2941,7 @@ pub struct PluginIterationAgentBackend<'a> {
     pub state: &'a mut PluginIterationAgentState,
 }
 
-fn parse_agent_args<T>(arguments: Value, tool_name: &str) -> Result<T, RuntimeError>
+pub fn parse_agent_args<T>(arguments: Value, tool_name: &str) -> Result<T, RuntimeError>
 where
     T: DeserializeOwned,
 {
@@ -4183,22 +4183,22 @@ fn runtime_snapshot_from_output(
 
 #[derive(Debug, Clone)]
 pub struct PluginIterationRunState {
-    prepared: PreparedPluginIteration,
-    agent: Option<PluginIterationAgentRun>,
-    rollback: Option<PluginEditRollback>,
-    changed_paths: Vec<String>,
-    rebuilt_artifacts: Vec<(String, String)>,
-    candidate: Option<CandidateSnapshotStatus>,
-    verification: Option<VerificationReport>,
-    verifier_verdict: Option<VerifierVerdict>,
-    canary: Option<CanaryReport>,
-    blocked_reason: Option<String>,
-    stage_error: Option<String>,
-    stage_error_is_infrastructure: bool,
+    pub prepared: PreparedPluginIteration,
+    pub agent: Option<PluginIterationAgentRun>,
+    pub rollback: Option<PluginEditRollback>,
+    pub changed_paths: Vec<String>,
+    pub rebuilt_artifacts: Vec<(String, String)>,
+    pub candidate: Option<CandidateSnapshotStatus>,
+    pub verification: Option<VerificationReport>,
+    pub verifier_verdict: Option<VerifierVerdict>,
+    pub canary: Option<CanaryReport>,
+    pub blocked_reason: Option<String>,
+    pub stage_error: Option<String>,
+    pub stage_error_is_infrastructure: bool,
 
-    final_verdict: Option<PluginIterationFinalVerdict>,
-    tests_command: Option<String>,
-    safety_command: Option<String>,
+    pub final_verdict: Option<PluginIterationFinalVerdict>,
+    pub tests_command: Option<String>,
+    pub safety_command: Option<String>,
 }
 
 impl PluginIterationRunState {
