@@ -889,7 +889,7 @@ impl std::fmt::Debug for ManagedAgentSession {
 }
 
 #[derive(Debug)]
-enum ManagedAgentState {
+pub enum ManagedAgentState {
     RuntimeShell,
     PluginIteration(Box<PluginIterationAgentState>),
 }
@@ -2777,16 +2777,16 @@ impl CandidateSnapshotStatus {
     }
 }
 
-const PLUGIN_AGENT_TOOL_LIST_CONTEXT_FILES: &str = "list_context_files";
-const PLUGIN_AGENT_TOOL_READ_CONTEXT_FILES: &str = "read_context_files";
-const PLUGIN_AGENT_TOOL_INSPECT_PLUGIN_CATALOG: &str = "inspect_plugin_catalog";
-const PLUGIN_AGENT_TOOL_SCAFFOLD_CHILD_PLUGIN: &str = "scaffold_child_plugin";
-const PLUGIN_AGENT_TOOL_REPLACE_FILE_EXACT: &str = "replace_file_exact";
-const PLUGIN_AGENT_TOOL_REPLACE_FILES_EXACT: &str = "replace_files_exact";
-const PLUGIN_AGENT_TOOL_CREATE_FILE: &str = "create_file";
-const PLUGIN_AGENT_TOOL_DELETE_FILE: &str = "delete_file";
-const PLUGIN_AGENT_TOOL_TOML_SET: &str = "toml_set";
-const PLUGIN_AGENT_TOOL_JSON_SET: &str = "json_set";
+pub const PLUGIN_AGENT_TOOL_LIST_CONTEXT_FILES: &str = "list_context_files";
+pub const PLUGIN_AGENT_TOOL_READ_CONTEXT_FILES: &str = "read_context_files";
+pub const PLUGIN_AGENT_TOOL_INSPECT_PLUGIN_CATALOG: &str = "inspect_plugin_catalog";
+pub const PLUGIN_AGENT_TOOL_SCAFFOLD_CHILD_PLUGIN: &str = "scaffold_child_plugin";
+pub const PLUGIN_AGENT_TOOL_REPLACE_FILE_EXACT: &str = "replace_file_exact";
+pub const PLUGIN_AGENT_TOOL_REPLACE_FILES_EXACT: &str = "replace_files_exact";
+pub const PLUGIN_AGENT_TOOL_CREATE_FILE: &str = "create_file";
+pub const PLUGIN_AGENT_TOOL_DELETE_FILE: &str = "delete_file";
+pub const PLUGIN_AGENT_TOOL_TOML_SET: &str = "toml_set";
+pub const PLUGIN_AGENT_TOOL_JSON_SET: &str = "json_set";
 // P2-3: `run_plugin_check` / `run_plugin_test` / `rebuild_plugin_workspace`
 // share names with tools of the same name in `agent.rs`
 // (`AGENT_TOOL_RUN_PLUGIN_TEST`, etc). The two backends never share a
@@ -2796,25 +2796,25 @@ const PLUGIN_AGENT_TOOL_JSON_SET: &str = "json_set";
 // `plugin_iteration.run_plugin_test` etc, or fold the two schemas into
 // one and accept the wider superset. Keeping the names identical for
 // now avoids gratuitous churn in agent prompts.
-const PLUGIN_AGENT_TOOL_RUN_PLUGIN_CHECK: &str = "run_plugin_check";
-const PLUGIN_AGENT_TOOL_RUN_PLUGIN_TEST: &str = "run_plugin_test";
-const PLUGIN_AGENT_TOOL_REBUILD_PLUGIN_WORKSPACE: &str = "rebuild_plugin_workspace";
-const PLUGIN_AGENT_TOOL_RECORD_ITERATION_SUMMARY: &str = "record_iteration_summary";
+pub const PLUGIN_AGENT_TOOL_RUN_PLUGIN_CHECK: &str = "run_plugin_check";
+pub const PLUGIN_AGENT_TOOL_RUN_PLUGIN_TEST: &str = "run_plugin_test";
+pub const PLUGIN_AGENT_TOOL_REBUILD_PLUGIN_WORKSPACE: &str = "rebuild_plugin_workspace";
+pub const PLUGIN_AGENT_TOOL_RECORD_ITERATION_SUMMARY: &str = "record_iteration_summary";
 pub(crate) const PLUGIN_ITERATION_AGENT_TIMEOUT_CAP_MS: u64 = 1_200_000;
 
 #[derive(Debug, Clone, Deserialize)]
-struct ListContextFilesArgs {
+pub struct ListContextFilesArgs {
     #[serde(default)]
     scope: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct ReadContextFilesArgs {
+pub struct ReadContextFilesArgs {
     paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub(crate) struct ScaffoldChildPluginArgs {
+pub struct ScaffoldChildPluginArgs {
     parent_plugin_path: String,
     child_name: String,
     #[serde(default)]
@@ -2833,24 +2833,24 @@ pub struct ReplaceFileExactArgs {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct ReplaceFilesExactArgs {
+pub struct ReplaceFilesExactArgs {
     edits: Vec<ReplaceFileExactArgs>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct CreateFileArgs {
+pub struct CreateFileArgs {
     path: String,
     new_content: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct DeleteFileArgs {
+pub struct DeleteFileArgs {
     path: String,
     expected_sha256: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct TomlSetArgs {
+pub struct TomlSetArgs {
     path: String,
     expected_sha256: String,
     dotted_key: String,
@@ -2858,7 +2858,7 @@ struct TomlSetArgs {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct JsonSetArgs {
+pub struct JsonSetArgs {
     path: String,
     expected_sha256: String,
     pointer: String,
@@ -2866,7 +2866,7 @@ struct JsonSetArgs {
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
-struct RunPluginCommandArgs {
+pub struct RunPluginCommandArgs {
     #[serde(default)]
     command: Option<String>,
     #[serde(default)]
@@ -2874,7 +2874,7 @@ struct RunPluginCommandArgs {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct RecordIterationSummaryArgs {
+pub struct RecordIterationSummaryArgs {
     summary: String,
     #[serde(default)]
     tests_command: Option<String>,
@@ -2950,7 +2950,7 @@ where
     })
 }
 
-fn parse_context_files_scope(raw: Option<&str>) -> Result<ContextFilesScope, RuntimeError> {
+pub fn parse_context_files_scope(raw: Option<&str>) -> Result<ContextFilesScope, RuntimeError> {
     match raw.unwrap_or("focus").trim() {
         "" | "focus" => Ok(ContextFilesScope::Focus),
         "all" => Ok(ContextFilesScope::All),
@@ -2962,7 +2962,7 @@ fn parse_context_files_scope(raw: Option<&str>) -> Result<ContextFilesScope, Run
     }
 }
 
-fn transcript_excerpt(
+pub fn transcript_excerpt(
     transcript: &[AgentTranscriptEntry],
     limit: usize,
 ) -> Vec<AgentTranscriptEntry> {
@@ -2979,7 +2979,7 @@ fn transcript_excerpt(
 /// A/D seam: serialize failure of a canary replay payload. The invocation
 /// samples are already valid JSON `Value`s, so this only trips on pathological
 /// serializer states; kept as a named mapper for uniform error text.
-fn canary_payload_serialize_error(err: &serde_json::Error) -> RuntimeError {
+pub fn canary_payload_serialize_error(err: &serde_json::Error) -> RuntimeError {
     RuntimeError::Invariant {
         message: format!("canary payload serialize failed: {err}"),
     }
@@ -2992,7 +2992,7 @@ fn canary_payload_serialize_error(err: &serde_json::Error) -> RuntimeError {
 /// Side effects a node declares in its docs. A node that declares any is not
 /// replayed as canary evidence: replaying it mutates state (a pull consumes
 /// pity) and its response is usually the very thing the edit changes.
-fn node_declares_side_effects(
+pub fn node_declares_side_effects(
     snapshot: &RuntimeSnapshot,
     plugin_path: &str,
     node_id: &str,
@@ -3006,7 +3006,7 @@ fn node_declares_side_effects(
 }
 
 /// A/D seam: failure to spawn the `cargo <op> …` verification subprocess.
-fn checked_command_spawn_error(
+pub fn checked_command_spawn_error(
     program: &str,
     args: &[String],
     err: &std::io::Error,
@@ -3020,7 +3020,7 @@ fn checked_command_spawn_error(
 
 /// A/D seam: failure to parse the parent plugin's `Cargo.toml` when scaffolding
 /// a child plugin. Preserves the toml error text verbatim.
-fn parent_manifest_parse_error(path: &Path, err: &toml::de::Error) -> RuntimeError {
+pub fn parent_manifest_parse_error(path: &Path, err: &toml::de::Error) -> RuntimeError {
     RuntimeError::CargoParse {
         path: path.to_path_buf(),
         message: err.to_string(),
@@ -3038,7 +3038,7 @@ fn parent_manifest_parse_error(path: &Path, err: &toml::de::Error) -> RuntimeErr
 /// hash there is no way to prove the tree did not change — same policy as a
 /// re-hash failure). Returns `None` when there is no drift to act on (verdict
 /// was not `Pass`, no baseline hash was recorded, or the hashes matched).
-pub(crate) fn detect_plugin_source_drift(
+pub fn detect_plugin_source_drift(
     verifier_verdict: VerifierVerdict,
     expected_source_tree_hash: Option<&str>,
     baseline_hash_error: Option<&str>,
@@ -3066,7 +3066,7 @@ pub(crate) fn detect_plugin_source_drift(
     }
 }
 
-fn enrich_plugin_iteration_agent_error(
+pub fn enrich_plugin_iteration_agent_error(
     err: RuntimeError,
     session_id: &str,
     tool_summary: Option<&AgentToolExecutionSummary>,
@@ -3138,7 +3138,7 @@ fn truncate_agent_excerpt_text(text: &str, max_chars: usize) -> String {
     truncated
 }
 
-fn enrich_plugin_iteration_edit_error(
+pub fn enrich_plugin_iteration_edit_error(
     operation: &PluginEditOperation,
     workspace_root: &Path,
     err: RuntimeError,
@@ -3170,7 +3170,7 @@ fn enrich_plugin_iteration_edit_error(
 /// happened while unwinding it. Extracted from `apply_operations`' double-fault
 /// arm so the (hard to reach in situ) wrapping is directly unit-testable; the
 /// emitted message is byte-for-byte what the inline `format!` produced.
-fn with_partial_batch_rollback_failure(
+pub fn with_partial_batch_rollback_failure(
     enriched: RuntimeError,
     rollback_err: Option<RuntimeError>,
 ) -> RuntimeError {
@@ -3185,7 +3185,7 @@ fn with_partial_batch_rollback_failure(
     }
 }
 
-fn normalize_optional_command(command: Option<String>) -> Option<String> {
+pub fn normalize_optional_command(command: Option<String>) -> Option<String> {
     command.and_then(|value| {
         let trimmed = value.trim();
         if trimmed.is_empty() {
@@ -3196,7 +3196,7 @@ fn normalize_optional_command(command: Option<String>) -> Option<String> {
     })
 }
 
-fn validated_verification_command(
+pub fn validated_verification_command(
     explicit: Option<String>,
     fallback: Option<String>,
     required_prefix: &str,
@@ -3237,7 +3237,7 @@ fn validated_verification_command(
 /// no shell expansion) to a plain `cargo <op> …` argv with no shell
 /// metacharacter in any element, so no `;` / `&&` / `|` / backtick / `$()`
 /// tail can ever reach a shell.
-fn validate_verification_argv(
+pub fn validate_verification_argv(
     command: &str,
     required_op: &str,
 ) -> Result<Vec<String>, RuntimeError> {
@@ -3268,7 +3268,7 @@ fn validate_verification_argv(
 /// spaces for the display string; every element is validated to be free of
 /// whitespace and shell metacharacters, so the join round-trips through
 /// `shell_words::split` exactly).
-fn verification_default_command(op: &str, package_segment: &str) -> String {
+pub fn verification_default_command(op: &str, package_segment: &str) -> String {
     let mut argv = vec![
         "cargo".to_string(),
         op.to_string(),
@@ -3289,7 +3289,7 @@ fn verification_default_command(op: &str, package_segment: &str) -> String {
 /// remaining character outside a conservative alphanumeric / `-_./` set — or
 /// a `..` segment — is rejected up front, so the value can never smuggle
 /// shell syntax through the old `format!`-interpolated default command.
-fn verification_package_segment(plugin_path: &str) -> Result<String, RuntimeError> {
+pub fn verification_package_segment(plugin_path: &str) -> Result<String, RuntimeError> {
     let segment = plugin_path.trim_start_matches('/').trim();
     if segment.is_empty() {
         return Ok(String::new());
@@ -3311,7 +3311,7 @@ fn verification_package_segment(plugin_path: &str) -> Result<String, RuntimeErro
 /// `scaffold_child_plugin` — the closure body only runs when an iteration
 /// scaffolds two or more children, which no in-process test reaches, so the
 /// ordering is asserted directly against this function instead.
-fn scaffolded_child_order(
+pub fn scaffolded_child_order(
     left: &ScaffoldedChildRegistration,
     right: &ScaffoldedChildRegistration,
 ) -> std::cmp::Ordering {
@@ -3320,7 +3320,7 @@ fn scaffolded_child_order(
         .then_with(|| left.parent_manifest_path.cmp(&right.parent_manifest_path))
 }
 
-fn ensure_scaffold_integration_edits(
+pub fn ensure_scaffold_integration_edits(
     scaffolded_children: &[ScaffoldedChildRegistration],
     operations: &[PluginEditOperation],
 ) -> Result<(), RuntimeError> {
@@ -3349,7 +3349,7 @@ fn ensure_scaffold_integration_edits(
     }
 }
 
-fn should_track_context_file(path: &str) -> bool {
+pub fn should_track_context_file(path: &str) -> bool {
     matches!(
         Path::new(path)
             .extension()
@@ -3358,11 +3358,11 @@ fn should_track_context_file(path: &str) -> bool {
     )
 }
 
-fn sort_plugin_context_paths(paths: &mut [String]) {
+pub fn sort_plugin_context_paths(paths: &mut [String]) {
     paths.sort_by_key(|path| plugin_context_priority(path));
 }
 
-fn sort_and_dedup_context_paths(paths: &mut Vec<String>) {
+pub fn sort_and_dedup_context_paths(paths: &mut Vec<String>) {
     sort_plugin_context_paths(paths);
     paths.dedup();
 }
@@ -3387,7 +3387,7 @@ fn plugin_context_priority(path: &str) -> (u8, String) {
     }
 }
 
-fn sanitize_child_plugin_segment(raw: &str) -> String {
+pub fn sanitize_child_plugin_segment(raw: &str) -> String {
     let trimmed = raw.trim().trim_matches('/');
     let normalized = trimmed
         .chars()
@@ -3409,13 +3409,13 @@ fn sanitize_child_plugin_segment(raw: &str) -> String {
     }
 }
 
-fn sha256_text(content: &str) -> String {
+pub fn sha256_text(content: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(content.as_bytes());
     format!("{:x}", hasher.finalize())
 }
 
-fn render_child_plugin_manifest(crate_name: &str, plugin_path: &str, node_id: &str) -> String {
+pub fn render_child_plugin_manifest(crate_name: &str, plugin_path: &str, node_id: &str) -> String {
     format!(
         "[package]\nname = \"{crate_name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\ncrate-type = [\"rlib\", \"dylib\"]\n\n[package.metadata.cordis]\nplugin_path = \"{plugin_path}\"\nabi_kind = \"rust\"\ndeclared_nodes = [\"{node_id}\"]\nchildren = []\n# The scaffold ships no docs/agent/interfaces.json — docs are read from\n# the built dylib. P1-48 made this bypass an explicit opt-in.\nallow_generated_docs = true\n\n[package.metadata.cordis.abi_fingerprint]\ncrate_hash = \"crate_{crate_name}_v1\"\napi_hash = \"api_v2\"\n\n[dependencies]\ncordis-plugin-sdk = {{ path = \"../../../../../crates/cordis-plugin-sdk\" }}\nserde = {{ version = \"1\", features = [\"derive\"] }}\nserde_json = \"1\"\nthiserror = \"2\"\n\n[workspace]\n",
         crate_name = crate_name.replace('-', "_"),
@@ -3424,7 +3424,7 @@ fn render_child_plugin_manifest(crate_name: &str, plugin_path: &str, node_id: &s
     )
 }
 
-fn render_child_plugin_lib(
+pub fn render_child_plugin_lib(
     crate_name: &str,
     plugin_path: &str,
     node_id: &str,
@@ -3439,7 +3439,7 @@ fn render_child_plugin_lib(
     )
 }
 
-fn render_child_plugin_core(child_segment: &str) -> String {
+pub fn render_child_plugin_core(child_segment: &str) -> String {
     let type_name = child_segment
         .split('-')
         .map(|part| {
@@ -3455,20 +3455,20 @@ fn render_child_plugin_core(child_segment: &str) -> String {
     )
 }
 
-fn render_child_plugin_test(crate_name: &str) -> String {
+pub fn render_child_plugin_test(crate_name: &str) -> String {
     format!(
         "use {crate_name}::apply;\n\n#[test]\nfn scaffold_exports_apply() {{\n    let _ = apply(5.0, 2.0);\n}}\n"
     )
 }
 
-fn render_child_plugin_overview(plugin_path: &str) -> String {
+pub fn render_child_plugin_overview(plugin_path: &str) -> String {
     format!(
         "# {}\n\nThis child plugin scaffold was created by the Cordis plugin-iteration agent. Replace the placeholder implementation in `src/core.rs`, keep the child layout aligned with sibling plugins in this subtree, then update the placeholder smoke test and docs once the behavior is real.\n",
         plugin_path
     )
 }
 
-fn warning_diagnostics_for_changed_paths(
+pub fn warning_diagnostics_for_changed_paths(
     stdout: &str,
     stderr: &str,
     operations: &[PluginEditOperation],
@@ -3647,7 +3647,7 @@ fn is_warning_block_boundary(line: &str) -> bool {
         || line.starts_with("Doc-tests ")
 }
 
-fn warning_cleanup_error_message(command: &str, warnings: &[String]) -> String {
+pub fn warning_cleanup_error_message(command: &str, warnings: &[String]) -> String {
     let excerpt = warnings
         .iter()
         .take(2)
@@ -3879,7 +3879,7 @@ fn extract_response_field(response_payload: &Value, field: &str) -> Option<Value
         .cloned()
 }
 
-fn parse_response_payload(raw_payload: &str) -> Value {
+pub fn parse_response_payload(raw_payload: &str) -> Value {
     serde_json::from_str(raw_payload).unwrap_or_else(|_| Value::String(raw_payload.to_string()))
 }
 
@@ -4365,7 +4365,7 @@ fn determine_root_plugin_path(
     })
 }
 
-fn collect_plugin_context_paths(
+pub fn collect_plugin_context_paths(
     workspace_root: &Path,
     root_plugin_path: &str,
     target_plugin_paths: &[String],
@@ -4507,7 +4507,7 @@ fn insert_context_file_if_exists(
 /// A/D seam: wrap a raw `std::io::Error` into `RuntimeError::Io` for a path,
 /// with the error text preserved verbatim (no context prefix). Shared by the
 /// >3500 region's filesystem seams (context reads, manifest reads, scan walk).
-fn region_io_error(path: &Path, err: &std::io::Error) -> RuntimeError {
+pub fn region_io_error(path: &Path, err: &std::io::Error) -> RuntimeError {
     RuntimeError::Io {
         path: path.to_path_buf(),
         message: err.to_string(),
@@ -4842,7 +4842,7 @@ fn next_staged_artifact_root(snapshot_root: &Path) -> PathBuf {
 ///
 /// 做成返回 `Option` 的函数而不是 `if cfg!(test) { .. }` 内联块：后者在
 /// 注入未触发时会留下不执行的收尾行，破坏 100% 行覆盖门槛。
-fn injected_journal_enospc(journal_path: &Path) -> Option<RuntimeError> {
+pub fn injected_journal_enospc(journal_path: &Path) -> Option<RuntimeError> {
     #[cfg(test)]
     {
         TEST_ITERATION_ENOSPC_INJECTION
@@ -4859,7 +4859,7 @@ fn injected_journal_enospc(journal_path: &Path) -> Option<RuntimeError> {
     }
 }
 
-fn plugin_iteration_journal_path(snapshot_root: &Path) -> PathBuf {
+pub fn plugin_iteration_journal_path(snapshot_root: &Path) -> PathBuf {
     snapshot_root.join("plugin-iteration-edit-journal.json")
 }
 
@@ -5095,7 +5095,7 @@ fn flock_failure_line(path: &Path) -> String {
 
 /// Error for an agent session that ran to completion without ever calling
 /// `record_iteration_summary` — the iteration cannot be finalized without it.
-fn missing_summary_error(session_id: &str) -> RuntimeError {
+pub fn missing_summary_error(session_id: &str) -> RuntimeError {
     RuntimeError::LlmResponseInvalid {
         message: format!(
             "plugin iteration agent session {session_id} exited without calling record_iteration_summary"
@@ -5177,7 +5177,7 @@ fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 /// Fold the current on-disk artifacts for `root_plugin_path` into `rollback`
 /// as single-file backups, so a post-rebuild rollback restores the exact
 /// pre-rebuild artifact bytes. Stops at the first absorb failure.
-fn backup_artifacts_into_rollback(
+pub fn backup_artifacts_into_rollback(
     fixtures_root: &Path,
     root_plugin_path: &str,
     rollback: &mut crate::kernel::plugin_iteration::PluginEditRollback,
@@ -5200,7 +5200,7 @@ fn backup_artifacts_into_rollback(
 /// wording — the inner `"candidate rollback: "` prefix came from the vector the
 /// old code pushed into. Extracted so both halves of the message are testable
 /// without having to stage a candidate whose rollback fails.
-fn verdict_rollback_partial_cleanup_reason(err: &RuntimeError) -> String {
+pub fn verdict_rollback_partial_cleanup_reason(err: &RuntimeError) -> String {
     format!("verdict rollback with partial candidate cleanup error: candidate rollback: {err}")
 }
 
@@ -5211,7 +5211,7 @@ fn verdict_rollback_partial_cleanup_reason(err: &RuntimeError) -> String {
 /// never calls) falls back to a fixed label. Extracted so all three arms are
 /// unit-testable from synthetic payloads without having to make the pipeline
 /// panic three different ways.
-fn plugin_iteration_panic_error(payload: &Box<dyn std::any::Any + Send>) -> RuntimeError {
+pub fn plugin_iteration_panic_error(payload: &Box<dyn std::any::Any + Send>) -> RuntimeError {
     let msg = payload
         .downcast_ref::<&str>()
         .map(|s| (*s).to_string())
@@ -5256,7 +5256,7 @@ fn candidate_replaced_error(expected: &str, actual: &str) -> RuntimeError {
 /// through the public entry point. Extracted so the exact wording stays stable
 /// and is directly unit-testable instead of living inline in a branch nothing
 /// can drive.
-fn plugin_iteration_missing_rollback_error() -> RuntimeError {
+pub fn plugin_iteration_missing_rollback_error() -> RuntimeError {
     RuntimeError::Invariant {
         message: "plugin iteration rollback journal missing after agent execution".to_string(),
     }
@@ -5293,7 +5293,7 @@ fn clear_plugin_iteration_journal(snapshot_root: &Path) -> Result<(), RuntimeErr
 /// `Some(Err(_))` when it failed. Byte-for-byte preserves the historical
 /// `"{base}; rollback errors: [candidate rollback: ..., workspace restore: ...]"`
 /// wording so error text stays stable across the extraction.
-fn aggregate_rollback_failure(
+pub fn aggregate_rollback_failure(
     base_message: String,
     candidate_rollback: Option<Result<(), RuntimeError>>,
     workspace_restore: Result<(), RuntimeError>,
@@ -5320,7 +5320,7 @@ fn plugin_iteration_applied_marker_path(snapshot_root: &Path) -> PathBuf {
     snapshot_root.join("plugin-iteration-edit-journal.applied")
 }
 
-fn restore_plugin_iteration_workspace(
+pub fn restore_plugin_iteration_workspace(
     fixtures_root: &Path,
     snapshot_root: &Path,
     in_memory_rollback: Option<&crate::kernel::plugin_iteration::PluginEditRollback>,
