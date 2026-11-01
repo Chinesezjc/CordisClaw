@@ -3143,6 +3143,71 @@ mod tests {
         assert!(reply.tool_events.is_empty());
     }
 
+    /// DSML `{"node_id":"suspend"}` must parse as a direct call: the parser
+    /// only resolves names that are in the tool list, and a missing entry is
+    /// what kept every channel turn retrying until it gave up.
+    #[test]
+    fn the_end_marker_parses_as_a_direct_call() {
+        let mut specs = shell_agent_tools();
+        specs.push(end_turn_tool_spec());
+        let calls = salvage_serialized_tool_calls(
+            "<|DSML|tool_calls>\n{\"node_id\": \"suspend\"}\n</|DSML|tool_calls>",
+            &specs,
+        );
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, AGENT_TOOL_END_TURN);
+    }
+
+    /// A text-only reply is nudged without a retry cap — the old three-strike
+    /// limit turned a forgetful model into an "LLM outage" spill.
+    #[test]
+    fn a_silent_model_is_asked_again_until_it_calls_the_marker() {
+        let provider = FakeLlmProvider::new(vec![
+            assistant_reply("第一句"),
+            assistant_reply("第二句"),
+            assistant_reply("第三句"),
+            assistant_reply("第四句"),
+            assistant_reply("<|DSML|tool_calls>\n{\"node_id\": \"suspend\"}\n</|DSML|tool_calls>"),
+        ]);
+        let mut session = ShellAgentSession::new(LlmApiConfig::default()).expect("build session");
+        session.set_require_end_tool(true);
+        let reply = session
+            .respond_via(&EMPTY_FAKE_HOST, "test-session-nudge", "hi", &provider)
+            .expect("turn");
+        assert_eq!(session.status().completed_turns, 1);
+        assert!(reply.tool_events.is_empty());
+        assert_eq!(
+            provider.seen_bodies.lock().expect("bodies").len(),
+            5,
+            "four nudges then the marker: no cap at three"
+        );
+    }
+
+    /// Once a message went out, the next text reply closes the turn. Pushing
+    /// for the marker there made the model send the same message twice.
+    #[test]
+    fn a_turn_that_sent_something_closes_on_text() {
+        let provider = FakeLlmProvider::new(vec![
+            assistant_reply(
+                "<|DSML|tool_calls>\n{\"node_id\": \"invoke_plugin\", \"payload_json\":                  {\"plugin_path\": \"qq\", \"node_id\": \"qq_send\", \"payload_json\":                  {\"message\": \"hi\"}}}\n</|DSML|tool_calls>",
+            ),
+            assistant_reply("说完了"),
+            assistant_reply("<|DSML|tool_calls>\n{\"node_id\": \"suspend\"}\n</|DSML|tool_calls>"),
+        ]);
+        let mut session = ShellAgentSession::new(LlmApiConfig::default()).expect("build session");
+        session.set_require_end_tool(true);
+        let reply = session
+            .respond_via(&EMPTY_FAKE_HOST, "test-session-sent", "hi", &provider)
+            .expect("turn");
+        assert_eq!(session.status().completed_turns, 1);
+        assert_eq!(reply.tool_events.len(), 1, "exactly one tool ran");
+        assert_eq!(
+            provider.seen_bodies.lock().expect("bodies").len(),
+            2,
+            "the text reply after a send ends the turn"
+        );
+    }
+
     fn a_channel_turn_ends_only_on_the_suspend_call() {
         let provider = FakeLlmProvider::new(vec![
             assistant_reply("我先说一句"),
