@@ -1210,7 +1210,6 @@ impl AgentSession {
             "role": "user",
             "content": content,
         }));
-        prune_history_images(&mut self.history, HISTORY_IMAGES_KEPT);
         self.history.push(assistant_msg);
         // Update token estimate.
         self.estimated_tokens += estimate_tokens(user_input)
@@ -1700,34 +1699,6 @@ fn history_images(images: &[Value], stripped: bool) -> &[Value] {
         &[]
     } else {
         images
-    }
-}
-
-/// How many of the newest user turns keep their picture parts.
-const HISTORY_IMAGES_KEPT: usize = 2;
-
-/// Drop picture parts from older user messages, keeping their text.
-fn prune_history_images(history: &mut [Value], keep: usize) {
-    let mut seen = 0usize;
-    for message in history.iter_mut().rev() {
-        if message["role"] != "user" || !message["content"].is_array() {
-            continue;
-        }
-        seen += 1;
-        if seen <= keep {
-            continue;
-        }
-        let text = message["content"]
-            .as_array()
-            .map(|parts| {
-                parts
-                    .iter()
-                    .filter_map(|part| part.get("text").and_then(Value::as_str))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            })
-            .unwrap_or_default();
-        message["content"] = Value::String(format!("{text}\n[附图已省略]"));
     }
 }
 
@@ -3331,27 +3302,45 @@ mod tests {
         assert!(!history.contains("broken.png"), "the image is gone: {history}");
     }
 
-    /// Pictures stay in history for the newest turns and are dropped from older
-    /// ones, so a follow-up question can still see what was sent without every
-    /// request replaying every screenshot.
+    /// Pictures stay in history: a later turn must still be able to look at
+    /// what the user sent earlier (the "没图没名" badcase). Cost is not the
+    /// constraint — one image is a few hundred tokens.
     #[test]
-    fn history_keeps_the_newest_pictures_only() {
-        let mut history: Vec<Value> = (0..4)
-            .map(|i| {
-                json!({"role": "user", "content": [
-                    {"type": "text", "text": format!("q{i}")},
-                    {"type": "image_url", "image_url": {"url": format!("https://x/{i}.png")}}
-                ]})
-            })
-            .collect();
-        prune_history_images(&mut history, 2);
-        assert!(history[0]["content"].is_string(), "oldest lost its picture");
-        assert!(history[1]["content"]
-            .as_str()
-            .expect("text")
-            .contains("附图已省略"));
-        assert!(history[2]["content"].is_array(), "newest two keep pictures");
-        assert!(history[3]["content"].is_array());
+    fn a_picture_stays_in_history_across_turns() {
+        let provider = FakeLlmProvider::new(vec![
+            assistant_reply("第一轮看过图"),
+            assistant_reply("第二轮还能看图"),
+        ]);
+        let mut session =
+            AgentSession::new(LlmApiConfig::default(), "runtime_shell").expect("build session");
+        let image = json!({"url": "https://example.com/keep.png"});
+        session
+            .respond_with_runtime_host_via_images(
+                &EMPTY_FAKE_HOST,
+                "s1",
+                "这张图是什么",
+                std::slice::from_ref(&image),
+                "",
+                &provider,
+                None,
+            )
+            .expect("first turn");
+        session
+            .respond_with_runtime_host_via_images(
+                &EMPTY_FAKE_HOST,
+                "s1",
+                "再想想",
+                &[],
+                "",
+                &provider,
+                None,
+            )
+            .expect("second turn");
+        let history = serde_json::to_string(&session.history).expect("history json");
+        assert!(
+            history.contains("keep.png"),
+            "the picture must survive into later turns: {history}"
+        );
     }
 
     /// A turn that delivered a message must not come back as an error: the
