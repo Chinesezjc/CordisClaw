@@ -81,6 +81,9 @@ pub struct AgentSession {
     empty_response_strikes: usize,
     /// When set, the turn only ends on an explicit `suspend` call.
     require_end_tool: bool,
+    /// Set once a turn dropped unsupported image parts, so a 400 that merely
+    /// mentions the word cannot loop forever.
+    image_parts_stripped: bool,
     /// Consecutive turns that produced no tool call and no end marker.
     no_end_strikes: usize,
     /// Consecutive calls to tools that don't exist in this session (LLM hallucination guard).
@@ -138,6 +141,7 @@ impl AgentSession {
             reasoning_only_strikes: 0,
             empty_response_strikes: 0,
             require_end_tool: false,
+            image_parts_stripped: false,
             no_end_strikes: 0,
             unknown_tool_strikes: 0,
             soul_key: String::new(),
@@ -469,8 +473,28 @@ impl AgentSession {
                 // json_object` forbids tool calls outright, which is what made
                 // the model answer with whitespace and stop.
             });
-            let parts =
-                provider.complete(request_body, sink.clone(), self.config.to_transport())?;
+            let parts = match provider.complete(request_body, sink.clone(), self.config.to_transport())
+            {
+                Ok(parts) => parts,
+                // A single unsupported image poisons the whole history: every
+                // later request replays it and gets the same 400. Drop the image
+                // parts and try the turn again — text survives, pictures do not.
+                Err(err)
+                    if !self.image_parts_stripped
+                        && err.to_string().contains("image") =>
+                {
+                    self.image_parts_stripped = true;
+                    emit_agent_diagnostic(format!(
+                        "agent_image_rejected kind={} turn={} err={:?}",
+                        self.kind, turn, err.to_string()
+                    ));
+                    strip_image_parts(&mut messages);
+                    strip_image_parts(&mut self.history);
+                    self.empty_response_strikes = 0;
+                    continue;
+                }
+                Err(err) => return Err(err),
+            };
             let (message, response_id, finish_reason) =
                 (parts.message, parts.response_id, parts.finish_reason);
 
@@ -1207,6 +1231,7 @@ impl AgentSession {
             reasoning_only_strikes: snapshot.reasoning_only_strikes,
             empty_response_strikes: 0,
             require_end_tool: snapshot.require_end_tool,
+            image_parts_stripped: false,
             no_end_strikes: snapshot.no_end_strikes,
             unknown_tool_strikes: snapshot.unknown_tool_strikes,
             soul_key: snapshot.soul_key,
@@ -1599,6 +1624,22 @@ fn end_turn_tool_spec() -> AgentToolSpec {
         name: AGENT_TOOL_END_TURN,
         description: "End this turn. Call it after your last message; text alone never ends a turn.",
         parameters: json!({"type": "object", "properties": {}, "additionalProperties": false}),
+    }
+}
+
+/// Remove every image content part from a message list, turning multimodal
+/// user content back into a plain string.
+fn strip_image_parts(messages: &mut [Value]) {
+    for message in messages.iter_mut() {
+        let Some(parts) = message.get_mut("content").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        let text: String = parts
+            .iter()
+            .filter_map(|part| part.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n");
+        *message.get_mut("content").expect("content") = Value::String(text);
     }
 }
 
