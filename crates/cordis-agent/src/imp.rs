@@ -368,6 +368,7 @@ impl AgentSession {
             content: trimmed.to_string(),
         });
 
+        self.image_parts_stripped = false;
         let turn_started = Instant::now();
         let mut tool_events = Vec::new();
 
@@ -754,6 +755,7 @@ impl AgentSession {
                             trimmed,
                             &reply_content,
                             message.reasoning_content.as_deref(),
+                            history_images(images, self.image_parts_stripped),
                         );
                         self.completed_turns += 1;
                         self.transcript.push(AgentTranscriptEntry::Assistant {
@@ -867,6 +869,7 @@ impl AgentSession {
                     &remembered,
                     content,
                     message.reasoning_content.as_deref(),
+                    history_images(images, self.image_parts_stripped),
                 );
                 self.completed_turns += 1;
                 self.transcript.push(AgentTranscriptEntry::Assistant {
@@ -1188,6 +1191,7 @@ impl AgentSession {
         user_input: &str,
         assistant_output: &str,
         reasoning: Option<&str>,
+        images: &[Value],
     ) {
         let mut assistant_msg = json!({
             "role": "assistant",
@@ -1198,10 +1202,15 @@ impl AgentSession {
                 assistant_msg["reasoning_content"] = Value::String(r.to_string());
             }
         }
+        // Pictures stay in the history so later turns can look at them again;
+        // only the newest few turns keep them (token cost, and one bad image
+        // poisons every request that replays it).
+        let content = cordis_runtime::image_input::user_content_with_images(user_input, images);
         self.history.push(json!({
             "role": "user",
-            "content": user_input,
+            "content": content,
         }));
+        prune_history_images(&mut self.history, HISTORY_IMAGES_KEPT);
         self.history.push(assistant_msg);
         // Update token estimate.
         self.estimated_tokens += estimate_tokens(user_input)
@@ -1219,7 +1228,7 @@ impl AgentSession {
     /// triggering an LLM call. Used by `/` shortcuts so the agent stays
     /// aware of direct invocations.
     pub fn inject_exchange(&mut self, user_input: &str, assistant_output: &str) {
-        self.remember_exchange(user_input, assistant_output, None);
+        self.remember_exchange(user_input, assistant_output, None, &[]);
         self.transcript.push(AgentTranscriptEntry::User {
             content: user_input.to_string(),
         });
@@ -1344,7 +1353,7 @@ impl ShellAgentSession {
     #[cfg(test)]
     fn remember_exchange(&mut self, user_input: &str, assistant_output: &str) {
         self.inner
-            .remember_exchange(user_input, assistant_output, None);
+            .remember_exchange(user_input, assistant_output, None, &[]);
         self.inner.completed_turns += 1;
     }
 }
@@ -1681,6 +1690,44 @@ fn strip_image_parts(messages: &mut [Value]) {
             .collect::<Vec<_>>()
             .join("\n");
         *message.get_mut("content").expect("content") = Value::String(text);
+    }
+}
+
+/// Pictures the provider rejected must not go back into history, or the next
+/// turn replays the same 400.
+fn history_images(images: &[Value], stripped: bool) -> &[Value] {
+    if stripped {
+        &[]
+    } else {
+        images
+    }
+}
+
+/// How many of the newest user turns keep their picture parts.
+const HISTORY_IMAGES_KEPT: usize = 2;
+
+/// Drop picture parts from older user messages, keeping their text.
+fn prune_history_images(history: &mut [Value], keep: usize) {
+    let mut seen = 0usize;
+    for message in history.iter_mut().rev() {
+        if message["role"] != "user" || !message["content"].is_array() {
+            continue;
+        }
+        seen += 1;
+        if seen <= keep {
+            continue;
+        }
+        let text = message["content"]
+            .as_array()
+            .map(|parts| {
+                parts
+                    .iter()
+                    .filter_map(|part| part.get("text").and_then(Value::as_str))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default();
+        message["content"] = Value::String(format!("{text}\n[附图已省略]"));
     }
 }
 
@@ -3034,7 +3081,7 @@ mod tests {
     #[test]
     fn replace_last_action_with_reply_rewrites_placeholder() {
         let mut session = session_for_reply_tests();
-        session.remember_exchange("u", "{\"action\":\"suspend\"}", None);
+        session.remember_exchange("u", "{\"action\":\"suspend\"}", None, &[]);
         assert!(session.replace_last_action_with_reply("mpft 是冒泡防踢"));
         assert_eq!(
             session.history.last().and_then(|m| m["content"].as_str()),
@@ -3055,7 +3102,7 @@ mod tests {
             !session.replace_last_action_with_reply("x"),
             "empty history"
         );
-        session.remember_exchange("u", "直接回答", None);
+        session.remember_exchange("u", "直接回答", None, &[]);
         assert!(!session.replace_last_action_with_reply("x"));
         assert_eq!(
             session.history.last().and_then(|m| m["content"].as_str()),
@@ -3282,6 +3329,29 @@ mod tests {
         assert_eq!(*provider.calls.lock().expect("calls"), 2, "one retry");
         let history = serde_json::to_string(&session.history).expect("history json");
         assert!(!history.contains("broken.png"), "the image is gone: {history}");
+    }
+
+    /// Pictures stay in history for the newest turns and are dropped from older
+    /// ones, so a follow-up question can still see what was sent without every
+    /// request replaying every screenshot.
+    #[test]
+    fn history_keeps_the_newest_pictures_only() {
+        let mut history: Vec<Value> = (0..4)
+            .map(|i| {
+                json!({"role": "user", "content": [
+                    {"type": "text", "text": format!("q{i}")},
+                    {"type": "image_url", "image_url": {"url": format!("https://x/{i}.png")}}
+                ]})
+            })
+            .collect();
+        prune_history_images(&mut history, 2);
+        assert!(history[0]["content"].is_string(), "oldest lost its picture");
+        assert!(history[1]["content"]
+            .as_str()
+            .expect("text")
+            .contains("附图已省略"));
+        assert!(history[2]["content"].is_array(), "newest two keep pictures");
+        assert!(history[3]["content"].is_array());
     }
 
     /// A turn that delivered a message must not come back as an error: the
@@ -3544,7 +3614,7 @@ mod tests {
         let mut session = AgentSession::new(test_config(), "runtime_shell").unwrap();
         // Add far fewer than COMPACT_AT_MSGS (4000).
         for i in 0..10 {
-            session.remember_exchange(&format!("u{i}"), &format!("a{i}"), None);
+            session.remember_exchange(&format!("u{i}"), &format!("a{i}"), None, &[]);
         }
         let before = session.status().stored_messages;
         let (old_len, new_len) = session.compact_history();
@@ -3562,7 +3632,7 @@ mod tests {
         // 4000+ msgs to cross COMPACT_AT_MSGS; include some Chinese
         // text so the char/byte guard (P1-33) is exercised.
         for i in 0..2200 {
-            session.remember_exchange(&format!("请求{i}"), &format!("回复{i}"), None);
+            session.remember_exchange(&format!("请求{i}"), &format!("回复{i}"), None, &[]);
         }
         let before = session.status().stored_messages;
         assert!(before > 4000, "sanity: {before} messages");
