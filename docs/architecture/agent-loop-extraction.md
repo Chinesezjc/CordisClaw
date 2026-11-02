@@ -838,3 +838,28 @@ runtime_host_iterate_plugins_agent_retries_on_warning_and_promotes
 理由成立——它是宿主状态机（暂存候选、验证、回放、晋升/回滚、写 journal），不是纯策略。
 此时建议把 `status-and-open-items.md` 的 3.0a 一节从"文件搬家尚未完成"改成
 "以接缝为最终边界"。
+
+## 第 40+ 轮：管线已在 crate 里编译通过（仅剩测试移植）
+
+一次完整的搬迁尝试（未提交，已回滚以保持绿色）得到了关键结论：
+
+- `policy.rs` + `driver.rs` + `iteration_agent.rs`(backend) 三个文件放进
+  `crates/cordis-agent/src/iteration/` 后，**crate 编译通过**；
+- `CargoIterationRunner` 实现 `IterationRunner`，cli 已能装它；
+- kernel 删掉三个文件与 `KernelIterationRunner` 后，**kernel 与 cli 也编译通过**。
+
+唯一剩下的红的是 **kernel 的单元测试**（23 个错误）：它们调用
+`start_plugin_iteration_agent_session` / `run_plugin_canary` /
+`finalize_plugin_iteration` / `verify_plugin_iteration` /
+`run_plugin_iteration_agent` / `iterate_plugins`，而这些实现已经搬走。
+
+移植方式与第 39 轮搬 17 个 backend 测试完全相同：
+
+1. 从 `region_3500_5500_seam_tests.rs`、`ffi_panic_seam_tests.rs`、
+   `host_iterate_stages` 相关文件里抽取调用这些方法的测试函数；
+2. 追加到 `crates/cordis-agent/tests/iteration_pipeline.rs`（已有 `empty_host` /
+   `prepared_for` / `with_backend` 助手）；
+3. 删除 kernel 侧副本；
+4. 重新跑 `cargo test --workspace`。
+
+预计一批即可完成。
