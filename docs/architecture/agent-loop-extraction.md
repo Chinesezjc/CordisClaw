@@ -890,3 +890,22 @@ lib 不带 `cfg(test)`，否则这些分支在新位置不可达。
 
 顺带把 mock LLM 的 accept 预算从 30s 提到 300s（首次 90s）：整仓并行跑时多个二进制
 各自 shell 出 cargo，30s 会把负载误判成"mock 从未被拨号"。
+
+
+## 下一步：多 session 与 session 间通信
+
+已落地的最小闭环：
+
+- `RuntimeHost::agent_list_sessions()` — 列出活着的会话（id/kind/计数）；
+- `AgentToolHost::agent_live_sessions()` / `agent_send_to_session()` — 接缝；
+- 两个工具 `list_sessions`、`send_to_session`（未知 id 直接拒绝，不隐式建会话）。
+
+仍需设计的三件事：
+
+1. **寻址**：现在只用 `session_id`；跨群/跨用户需要稳定地址（例如
+   `qq:group:<id>`），而 `session_id` 是进程内生成的。地址表应该由 CLI 维护并注入，
+   而不是让 agent 猜。
+2. **投递语义**：`send_to_session` 目前是同步阻塞（等对方回合结束）。会话之间可能
+   互相等待，需要超时与"正在忙"的拒绝（`inflight_sessions` 已经在 host 里）。
+3. **网络**：跨进程/跨机器需要把 `list_sessions` + `send_to_session` 变成一个
+   可序列化的帧，走 interconnect；kernel 只应该有 trait，实现由 cli 提供。
