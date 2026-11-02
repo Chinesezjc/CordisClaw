@@ -1,4 +1,23 @@
-use super::*;
+//! The backend a plugin-iteration session talks to.
+
+use crate::iteration::policy::{summary_rejection, test_changes};
+use cordis_runtime::agent_api::{AgentBackend, AgentToolSpec};
+use cordis_runtime::core::error::RuntimeError;
+use cordis_runtime::host::*;
+use cordis_runtime::kernel::plugin_iteration::*;
+use cordis_runtime::plugin::builder::plugin_builder;
+use serde_json::{json, Value};
+use std::collections::BTreeSet;
+use std::fs;
+use std::process::Command;
+
+/// The backend a plugin-iteration session talks to.
+pub struct PluginIterationAgentBackend<'a> {
+    pub host: &'a RuntimeHost,
+    pub state: &'a mut PluginIterationAgentState,
+}
+
+
 
 impl<'a> PluginIterationAgentBackend<'a> {
     pub fn phase(&self) -> &'static str {
@@ -29,10 +48,10 @@ impl<'a> PluginIterationAgentBackend<'a> {
             .values()
             .cloned()
             .collect::<BTreeSet<_>>();
-        validate_reserved_child_keyword_identifiers(&combined_operations, &writable_roots)?;
+        cordis_runtime::kernel::plugin_iteration::validate_reserved_child_keyword_identifiers(&combined_operations, &writable_roots)?;
 
-        let executor = PluginEditExecutor::new(&self.host.fixtures_root);
-        let mut local_rollback = PluginEditRollback::empty(&self.host.fixtures_root);
+        let executor = PluginEditExecutor::new(self.host.fixtures_root());
+        let mut local_rollback = PluginEditRollback::empty(self.host.fixtures_root());
         for (idx, operation) in operations.iter().enumerate() {
             let single = PluginEditPlan {
                 issue_id: self.state.prepared.issue_id.clone(),
@@ -41,7 +60,7 @@ impl<'a> PluginIterationAgentBackend<'a> {
                 operations: vec![operation.clone()],
             };
             let execute = executor.execute(
-                &self.host.kernel.plugin_iteration_policy,
+                &self.host.kernel_state().plugin_iteration_policy,
                 &self.state.prepared.allowed_plugin_roots,
                 &single,
             );
@@ -53,7 +72,7 @@ impl<'a> PluginIterationAgentBackend<'a> {
                     let rollback_err = local_rollback.rollback().err();
                     let enriched = enrich_plugin_iteration_edit_error(
                         operation,
-                        &self.host.fixtures_root,
+                        self.host.fixtures_root(),
                         err,
                     );
                     return Err(with_partial_batch_rollback_failure(enriched, rollback_err));
@@ -67,7 +86,7 @@ impl<'a> PluginIterationAgentBackend<'a> {
         // restart — no window where files are modified but no backup exists.
         // Bound out of the `?` so the fallible expression fits one line.
         let persisted = self.state.rollback.persist_journal(
-            &plugin_iteration_journal_path(&self.host.snapshot_root),
+            &plugin_iteration_journal_path(self.host.snapshot_root()),
             &self.state.prepared.iteration_id,
         );
         persisted?;
@@ -160,7 +179,7 @@ impl<'a> PluginIterationAgentBackend<'a> {
                 ),
             });
         }
-        let abs_path = self.host.fixtures_root.join(&normalized);
+        let abs_path = self.host.fixtures_root().join(&normalized);
         let content =
             fs::read_to_string(&abs_path).map_err(|err| region_io_error(&abs_path, &err))?;
         Ok(json!({
@@ -249,21 +268,21 @@ impl<'a> PluginIterationAgentBackend<'a> {
             .unwrap_or_else(|| format!("Child plugin scaffold for {child_plugin_path}"));
 
         let parent_manifest_rel = format!("plugins/{}/Cargo.toml", args.parent_plugin_path);
-        let parent_manifest_abs = self.host.fixtures_root.join(&parent_manifest_rel);
+        let parent_manifest_abs = self.host.fixtures_root().join(&parent_manifest_rel);
         let parent_manifest_text = fs::read_to_string(&parent_manifest_abs)
             .map_err(|err| region_io_error(&parent_manifest_abs, &err))?;
         let parent_manifest_sha = file_sha256(&parent_manifest_abs)?;
-        let parent_toml: TomlValue = toml::from_str(&parent_manifest_text)
+        let parent_toml: toml::Value = toml::from_str(&parent_manifest_text)
             .map_err(|err| parent_manifest_parse_error(&parent_manifest_abs, &err))?;
         let mut children = parent_toml
             .get("package")
-            .and_then(TomlValue::as_table)
+            .and_then(toml::Value::as_table)
             .and_then(|value| value.get("metadata"))
-            .and_then(TomlValue::as_table)
+            .and_then(toml::Value::as_table)
             .and_then(|value| value.get("cordis"))
-            .and_then(TomlValue::as_table)
+            .and_then(toml::Value::as_table)
             .and_then(|value| value.get("children"))
-            .and_then(TomlValue::as_array)
+            .and_then(toml::Value::as_array)
             .cloned()
             .unwrap_or_default()
             .into_iter()
@@ -401,7 +420,7 @@ impl<'a> PluginIterationAgentBackend<'a> {
         let argv = validate_verification_argv(&command, required_op)?;
         let output = Command::new(&argv[0])
             .args(&argv[1..])
-            .current_dir(&self.host.fixtures_root)
+            .current_dir(self.host.fixtures_root())
             .output()
             .map_err(|err| checked_command_spawn_error(&argv[0], &argv[1..], &err))?;
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
@@ -411,7 +430,7 @@ impl<'a> PluginIterationAgentBackend<'a> {
                 &stdout,
                 &stderr,
                 &self.state.operations,
-                &self.host.fixtures_root,
+                self.host.fixtures_root(),
             );
             if !warning_diagnostics.is_empty() {
                 return Err(RuntimeError::LlmResponseInvalid {
@@ -672,8 +691,8 @@ Do not attempt to modify runtime crates, repository root manifests, config, .git
                     .and_then(|v| v.as_str())
                     .unwrap_or("/");
                 let rebuilt = plugin_builder()
-                    .ok_or_else(missing_builder_error)?
-                    .rebuild_plugin(&self.host.fixtures_root, pp)?;
+                    .ok_or_else(cordis_runtime::plugin::builder::missing_builder_error)?
+                    .rebuild_plugin(self.host.fixtures_root(), pp)?;
                 Ok(json!({
                     "rebuilt_count": rebuilt.len(),
                     "rebuilt": rebuilt,

@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+toml = "0.8"
 cordis-runtime = { path = "../cordis-runtime" }
 cordis-plugin-sdk = { path = "../cordis-plugin-sdk" }
 serde = { version = "1", features = ["derive"] }

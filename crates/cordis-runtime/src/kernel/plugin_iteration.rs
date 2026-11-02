@@ -1310,7 +1310,7 @@ pub fn now_ms() -> u128 {
 // Reserved keyword validation (moved from kernel/planner)
 // ---------------------------------------------------------------------------
 
-pub(crate) fn validate_reserved_child_keyword_identifiers(
+pub fn validate_reserved_child_keyword_identifiers(
     operations: &[PluginEditOperation],
     writable_roots: &BTreeSet<String>,
 ) -> Result<(), RuntimeError> {

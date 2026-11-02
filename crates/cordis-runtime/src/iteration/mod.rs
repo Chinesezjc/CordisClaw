@@ -7,5 +7,4 @@
 //! a verdict, so a policy change is one edit here instead of six spread across
 //! `host.rs`.
 
-pub(crate) mod policy;
 pub(crate) mod report;

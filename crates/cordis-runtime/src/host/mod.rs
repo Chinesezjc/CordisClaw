@@ -1,6 +1,6 @@
 use crate::agent_api::AgentSessionSnapshot;
 use crate::agent_api::{
-    AgentBackend, AgentReply, AgentSessionStatus, AgentToolExecutionSummary, AgentToolSpec,
+    AgentReply, AgentSessionStatus, AgentToolExecutionSummary,
     AgentTranscriptEntry,
 };
 use crate::config::{LlmApiConfig, PluginConfigFile, RuntimeConfig};
@@ -16,21 +16,20 @@ use crate::execution::engine::{
 use crate::execution::gate::RunPolicy;
 use crate::execution::net::{ArcDirection, ArcSpec, JoinPolicy, PlaceSpec, TransitionSpec};
 use crate::execution::scheduler::SchedulerConfig;
-use crate::iteration::policy::{promotion_verdict, summary_rejection, test_changes};
 use crate::kernel::auto_update::{
     AutoUpdatePlan, AutoUpdateResult, AutoUpdater, VerificationEnvelope,
 };
 use crate::kernel::evaluator::VerificationInput;
 use crate::kernel::memory::{ChangeMemory, ChangeRecord};
 use crate::kernel::plugin_iteration::{
-    file_sha256, normalize_rel_path, now_ms, validate_reserved_child_keyword_identifiers,
-    CanaryReport, CanaryVerdict, KernelPluginIssue, KernelPluginIssueSource,
-    KernelPluginIssueStatus, KernelPluginIterationRequest, PluginEditExecutor, PluginEditOpKind,
+    normalize_rel_path, now_ms,
+    CanaryReport, KernelPluginIssue, KernelPluginIssueSource,
+    KernelPluginIssueStatus, KernelPluginIterationRequest, PluginEditOpKind,
     PluginEditOperation, PluginEditPlan, PluginEditRollback, PluginIterationFinalVerdict,
     PluginIterationHistoryEntry, PluginIterationPolicy, PluginIterationStatus, VerifierVerdict,
 };
 use crate::kernel::verifier::{
-    hash_source_tree, CommandVerifier, VerificationProfile, VerificationReport, VerifyOptions,
+    VerificationProfile, VerificationReport,
 };
 use crate::plugin::abi::PluginResponse;
 use crate::plugin::builder::{missing_builder_error, plugin_builder};
@@ -44,12 +43,11 @@ use crate::service::graph_registry::{
 use cordis_plugin_sdk::NodeType;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -590,15 +588,15 @@ pub struct PreparedPluginIteration {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct InvocationSample {
-    plugin_path: String,
-    node_id: String,
-    payload: Value,
-    response: Value,
-    observed_at_ms: u128,
+    pub plugin_path: String,
+    pub node_id: String,
+    pub payload: Value,
+    pub response: Value,
+    pub observed_at_ms: u128,
 }
 
 #[derive(Debug, Default, Clone)]
-struct KernelIterationMetrics {
+pub struct KernelIterationMetrics {
     iteration_total: u64,
     iteration_promote_total: u64,
     iteration_rollback_total: u64,
@@ -607,19 +605,19 @@ struct KernelIterationMetrics {
 
 #[derive(Debug)]
 pub struct RuntimeKernel {
-    workspace_root: PathBuf,
-    config_dir: PathBuf,
-    llm_api: RwLock<LlmApiConfig>,
-    plugin_configs: RwLock<BTreeMap<String, PluginConfigFile>>,
-    plugin_iteration_policy: PluginIterationPolicy,
-    plugin_issues: Mutex<BTreeMap<String, KernelPluginIssue>>,
-    plugin_history: Mutex<VecDeque<PluginIterationHistoryEntry>>,
-    blocked_iterations: Mutex<BTreeMap<String, KernelPluginIterationResult>>,
-    last_plugin_iteration: Mutex<Option<KernelPluginIterationResult>>,
-    active_plugin_iteration: Mutex<Option<String>>,
-    iteration_metrics: Mutex<KernelIterationMetrics>,
-    memory: Mutex<ChangeMemory>,
-    updater: AutoUpdater,
+    pub workspace_root: PathBuf,
+    pub config_dir: PathBuf,
+    pub llm_api: RwLock<LlmApiConfig>,
+    pub plugin_configs: RwLock<BTreeMap<String, PluginConfigFile>>,
+    pub plugin_iteration_policy: PluginIterationPolicy,
+    pub plugin_issues: Mutex<BTreeMap<String, KernelPluginIssue>>,
+    pub plugin_history: Mutex<VecDeque<PluginIterationHistoryEntry>>,
+    pub blocked_iterations: Mutex<BTreeMap<String, KernelPluginIterationResult>>,
+    pub last_plugin_iteration: Mutex<Option<KernelPluginIterationResult>>,
+    pub active_plugin_iteration: Mutex<Option<String>>,
+    pub iteration_metrics: Mutex<KernelIterationMetrics>,
+    pub memory: Mutex<ChangeMemory>,
+    pub updater: AutoUpdater,
 }
 
 #[derive(Debug)]
@@ -903,15 +901,15 @@ pub enum ManagedAgentState {
 pub struct PluginIterationAgentRun {
     /// True when an LLM drove the change (a session with a transcript); false
     /// for an edit plan applied blind. Only the former carries its own evidence.
-    llm_driven: bool,
-    session_id: Option<String>,
-    tool_summary: Option<AgentToolExecutionSummary>,
-    transcript_excerpt: Vec<AgentTranscriptEntry>,
-    recorded_summary: Option<String>,
-    requires_approval: bool,
-    changed_paths: Vec<String>,
-    rollback: PluginEditRollback,
-    derived_edit_plan: PluginEditPlan,
+    pub llm_driven: bool,
+    pub session_id: Option<String>,
+    pub tool_summary: Option<AgentToolExecutionSummary>,
+    pub transcript_excerpt: Vec<AgentTranscriptEntry>,
+    pub recorded_summary: Option<String>,
+    pub requires_approval: bool,
+    pub changed_paths: Vec<String>,
+    pub rollback: PluginEditRollback,
+    pub derived_edit_plan: PluginEditPlan,
 }
 
 #[derive(Debug, Clone)]
@@ -954,7 +952,7 @@ impl PluginIterationAgentState {
         }
     }
 
-    fn derived_edit_plan(&self) -> PluginEditPlan {
+    pub fn derived_edit_plan(&self) -> PluginEditPlan {
         PluginEditPlan {
             issue_id: self.prepared.issue_id.clone(),
             patch_id: format!("{}-agent", self.prepared.iteration_id),
@@ -975,8 +973,8 @@ pub struct PluginIterationContextPaths {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScaffoldedChildRegistration {
-    parent_manifest_path: String,
-    child_root_path: String,
+    pub parent_manifest_path: String,
+    pub child_root_path: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -990,8 +988,7 @@ pub enum ContextFilesScope {
 /// exercise the emergency-rollback arm without a real plugin fault. Swapped
 /// back to `false` on read so it fires exactly once. Referenced by the
 /// `#[cfg(test)]` arm inside `iterate_plugins` and by `mod tests`.
-#[cfg(test)]
-pub(crate) static TEST_ITERATION_PANIC_INJECTION: std::sync::atomic::AtomicBool =
+pub static TEST_ITERATION_PANIC_INJECTION: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 /// R1: test-only panic injection for `ManagedAgentSession::respond_with_images`.
@@ -1016,8 +1013,7 @@ pub(crate) static TEST_STOP_HANDLER_PANIC_INJECTION: std::sync::atomic::AtomicBo
 /// `InfrastructureFailure` 而非 `RolledBack`"。journal 写在 `snapshot_root` 下，
 /// 正是磁盘写满时最先失败的位置之一（真实链路 persist_journal → atomic_write
 /// → `RuntimeError::Io`）。读后置回 `false`，只触发一次。
-#[cfg(test)]
-pub(crate) static TEST_ITERATION_ENOSPC_INJECTION: std::sync::atomic::AtomicBool =
+pub static TEST_ITERATION_ENOSPC_INJECTION: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 /// Sensitive path keywords matched against individual path *components*: a
@@ -1106,6 +1102,116 @@ fn sensitive_path_keyword(path: &str) -> Option<&'static str> {
 }
 
 impl RuntimeHost {
+    pub(crate) fn plugin_iteration_agent_snapshot(
+    &self,
+    session_id: &str,
+) -> Result<PluginIterationAgentRun, RuntimeError> {
+    let guard = self
+        .agent_sessions
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let managed = guard
+        .get(session_id)
+        .ok_or_else(|| RuntimeError::AgentSessionNotFound {
+            session_id: session_id.to_string(),
+        })?;
+    let ManagedAgentState::PluginIteration(state) = &managed.state else {
+        return Err(RuntimeError::InvalidArgument {
+            message: format!("agent session {session_id} is not a plugin iteration session"),
+        });
+    };
+    Ok(PluginIterationAgentRun {
+        llm_driven: true,
+        session_id: Some(session_id.to_string()),
+        tool_summary: None,
+        transcript_excerpt: Vec::new(),
+        recorded_summary: state.recorded_summary.clone(),
+        requires_approval: state.requires_approval,
+        changed_paths: state.derived_edit_plan().changed_paths(),
+        rollback: state.rollback.clone(),
+        derived_edit_plan: state.derived_edit_plan(),
+    })
+}
+
+    pub fn record_invocation_sample(
+    &self,
+    plugin_path: &str,
+    node_id: &str,
+    payload: &str,
+    response_payload: &str,
+) {
+    let payload =
+        serde_json::from_str(payload).unwrap_or_else(|_| Value::String(payload.to_string()));
+    let response = parse_response_payload(response_payload);
+    let mut samples = self
+        .invocation_samples
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    samples.push_front(InvocationSample {
+        plugin_path: plugin_path.to_string(),
+        node_id: node_id.to_string(),
+        payload,
+        response,
+        observed_at_ms: now_ms(),
+    });
+    while samples.len() > 64 {
+        samples.pop_back();
+    }
+}
+
+    pub(crate) fn observe_snapshot_plugin_issues(
+    &self,
+    snapshot: &RuntimeSnapshot,
+    report: &ReloadReport,
+    stage: &str,
+) {
+    for (plugin_path, plugin) in snapshot.plugin_registry().iter() {
+        let changed_reasons = report
+            .changed_plugin_reasons
+            .get(&plugin_path)
+            .cloned()
+            .unwrap_or_default();
+        match plugin.load_result {
+            PluginLoadResult::Unavailable(reason) => {
+                let source = match reason {
+                    PluginUnavailableReason::ContractViolation => {
+                        KernelPluginIssueSource::DocsDrift
+                    }
+                    _ => KernelPluginIssueSource::LoadFailure,
+                };
+                self.kernel.observe_plugin_issue(
+                    source,
+                    plugin_path.clone(),
+                    format!("{stage} observed plugin {plugin_path} unavailable: {reason:?}"),
+                );
+            }
+            PluginLoadResult::Loaded => {
+                if changed_reasons.iter().any(|reason| {
+                    matches!(reason.as_str(), "docs_changed" | "fingerprint_diff_changed")
+                }) {
+                    self.kernel.observe_plugin_issue(
+                        KernelPluginIssueSource::DocsDrift,
+                        plugin_path.clone(),
+                        format!(
+                            "{stage} detected docs/contract drift for {plugin_path}: {}",
+                            changed_reasons.join(", ")
+                        ),
+                    );
+                }
+            }
+        }
+    }
+}
+
+    pub fn iterate_plugins(
+        &self,
+        request: crate::kernel::plugin_iteration::KernelPluginIterationRequest,
+    ) -> Result<KernelPluginIterationResult, crate::core::error::RuntimeError> {
+        let runner = crate::iteration_api::iteration_runner()
+            .ok_or_else(crate::iteration_api::missing_runner_error)?;
+        runner.iterate(self, request)
+    }
+
     /// Start a plugin-iteration agent session and register it in the map.
     ///
     /// Kept on the host (not in the pipeline) so the pipeline only needs a
@@ -1190,12 +1296,7 @@ impl RuntimeHost {
         let _ = crate::agent_loop::install_agent_loop(Box::new(
             crate::agent_loop::test_loop::TestLoop,
         ));
-        // The runner is injected by the embedding binary. Tests install the
-        // kernel's own runner so a bare `boot` stays usable.
-        #[cfg(test)]
-        let _ = crate::iteration_api::install_iteration_runner(Box::new(
-            crate::iteration_api::KernelIterationRunner,
-        ));
+
         let fixtures_root = fixtures_root.as_ref().to_path_buf();
         let config = RuntimeConfig::load(&fixtures_root)?;
         let loader = Loader::new(default_loader_config(&fixtures_root))
@@ -2805,12 +2906,12 @@ pub(crate) const PLUGIN_ITERATION_AGENT_TIMEOUT_CAP_MS: u64 = 1_200_000;
 #[derive(Debug, Clone, Deserialize)]
 pub struct ListContextFilesArgs {
     #[serde(default)]
-    scope: Option<String>,
+    pub scope: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ReadContextFilesArgs {
-    paths: Vec<String>,
+    pub paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2827,59 +2928,59 @@ pub struct ScaffoldChildPluginArgs {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ReplaceFileExactArgs {
-    path: String,
-    expected_old_string: String,
-    new_content: String,
+    pub path: String,
+    pub expected_old_string: String,
+    pub new_content: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ReplaceFilesExactArgs {
-    edits: Vec<ReplaceFileExactArgs>,
+    pub edits: Vec<ReplaceFileExactArgs>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct CreateFileArgs {
-    path: String,
-    new_content: String,
+    pub path: String,
+    pub new_content: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct DeleteFileArgs {
-    path: String,
-    expected_sha256: String,
+    pub path: String,
+    pub expected_sha256: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct TomlSetArgs {
-    path: String,
-    expected_sha256: String,
-    dotted_key: String,
-    value: Value,
+    pub path: String,
+    pub expected_sha256: String,
+    pub dotted_key: String,
+    pub value: Value,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct JsonSetArgs {
-    path: String,
-    expected_sha256: String,
-    pointer: String,
-    value: Value,
+    pub path: String,
+    pub expected_sha256: String,
+    pub pointer: String,
+    pub value: Value,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct RunPluginCommandArgs {
     #[serde(default)]
-    command: Option<String>,
+    pub command: Option<String>,
     #[serde(default)]
-    plugin_path: Option<String>,
+    pub plugin_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct RecordIterationSummaryArgs {
-    summary: String,
+    pub summary: String,
     #[serde(default)]
-    tests_command: Option<String>,
+    pub tests_command: Option<String>,
     #[serde(default)]
-    safety_command: Option<String>,
+    pub safety_command: Option<String>,
 }
 
 impl ManagedAgentSession {
@@ -2936,10 +3037,7 @@ impl ManagedAgentSession {
     }
 }
 
-pub struct PluginIterationAgentBackend<'a> {
-    pub host: &'a RuntimeHost,
-    pub state: &'a mut PluginIterationAgentState,
-}
+
 
 pub fn parse_agent_args<T>(arguments: Value, tool_name: &str) -> Result<T, RuntimeError>
 where
@@ -2992,6 +3090,23 @@ pub fn canary_payload_serialize_error(err: &serde_json::Error) -> RuntimeError {
 /// Side effects a node declares in its docs. A node that declares any is not
 /// replayed as canary evidence: replaying it mutates state (a pull consumes
 /// pity) and its response is usually the very thing the edit changes.
+fn node_declares_side_effects_in(nodes: &[cordis_plugin_sdk::NodeDoc], node_id: &str) -> bool {
+    const MUTATING: [&str; 15] = [
+        "consum", "mutat", "persist", "delete", "remove", "increment", "decrement", "save",
+        "update", "create", "spend", "charge", "grant", "file", "disk",
+    ];
+    nodes
+        .iter()
+        .find(|node| node.id == node_id)
+        .map(|node| {
+            node.side_effects.iter().any(|effect| {
+                let effect = effect.to_ascii_lowercase();
+                MUTATING.iter().any(|marker| effect.contains(marker))
+            })
+        })
+        .unwrap_or(false)
+}
+
 pub fn node_declares_side_effects(
     snapshot: &RuntimeSnapshot,
     plugin_path: &str,
@@ -3001,7 +3116,7 @@ pub fn node_declares_side_effects(
         .plugin_registry()
         .get(plugin_path)
         .and_then(|plugin| plugin.docs.clone());
-    docs.map(|docs| crate::iteration::policy::node_declares_side_effects_in(&docs.nodes, node_id))
+    docs.map(|docs| node_declares_side_effects_in(&docs.nodes, node_id))
         .unwrap_or(false)
 }
 
@@ -4222,7 +4337,7 @@ impl PluginIterationRunState {
         }
     }
 
-    fn into_result(
+    pub fn into_result(
         self,
         net_output: ExecutionOutput,
     ) -> Result<KernelPluginIterationResult, RuntimeError> {
@@ -4843,20 +4958,15 @@ fn next_staged_artifact_root(snapshot_root: &Path) -> PathBuf {
 /// 做成返回 `Option` 的函数而不是 `if cfg!(test) { .. }` 内联块：后者在
 /// 注入未触发时会留下不执行的收尾行，破坏 100% 行覆盖门槛。
 pub fn injected_journal_enospc(journal_path: &Path) -> Option<RuntimeError> {
-    #[cfg(test)]
-    {
-        TEST_ITERATION_ENOSPC_INJECTION
-            .swap(false, std::sync::atomic::Ordering::SeqCst)
-            .then(|| RuntimeError::Io {
-                path: journal_path.to_path_buf(),
-                message: "No space left on device (os error 28)".to_string(),
-            })
-    }
-    #[cfg(not(test))]
-    {
-        let _ = journal_path;
-        None
-    }
+    // Unconditional: an integration test links this lib without `cfg(test)`,
+    // so a gated read would be unreachable from the crate's own tests. The flag
+    // is false unless a test sets it.
+    TEST_ITERATION_ENOSPC_INJECTION
+        .swap(false, std::sync::atomic::Ordering::SeqCst)
+        .then(|| RuntimeError::Io {
+            path: journal_path.to_path_buf(),
+            message: "No space left on device (os error 28)".to_string(),
+        })
 }
 
 pub fn plugin_iteration_journal_path(snapshot_root: &Path) -> PathBuf {
@@ -5444,9 +5554,7 @@ pub(crate) fn payload_with_turn_meta(payload: Value, meta: &BTreeMap<String, Str
 }
 
 mod agent;
-mod iteration;
 /// 可信元数据注入：只测注入规则本身（内核侧不需要真插件）。
-mod iteration_agent;
 mod kernel;
 mod reload;
 

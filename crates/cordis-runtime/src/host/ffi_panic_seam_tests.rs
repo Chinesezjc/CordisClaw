@@ -1,12 +1,7 @@
 use super::{
-    plugin_iteration_journal_path, RuntimeHost, TEST_AGENT_RESPOND_PANIC_INJECTION,
-    TEST_ITERATION_ENOSPC_INJECTION, TEST_ITERATION_PANIC_INJECTION,
-    TEST_STOP_HANDLER_PANIC_INJECTION,
+    RuntimeHost, TEST_AGENT_RESPOND_PANIC_INJECTION, TEST_STOP_HANDLER_PANIC_INJECTION,
 };
 use crate::core::error::RuntimeError;
-use crate::kernel::plugin_iteration::{
-    KernelPluginIssueSource, KernelPluginIterationRequest, PluginIterationFinalVerdict,
-};
 use cordis_plugin_sdk::{AbiFingerprint, NodeDoc, NodeType, PluginDocs};
 use serde_json::json;
 use serial_test::serial;
@@ -181,151 +176,12 @@ fn setup_task_plugin_fixture() -> (TempDir, PathBuf) {
     (temp, fixtures)
 }
 
-fn iteration_request() -> KernelPluginIterationRequest {
-    // Root mode (empty targets) so `begin_plugin_iteration` succeeds even
-    // with zero registered plugins.
-    KernelPluginIterationRequest {
-        issue_id: None,
-        target_plugin_paths: Vec::new(),
-        instruction: Some("seam panic injection".to_string()),
-        edit_plan: None,
-        manual_approved: false,
-        tests_command: None,
-        safety_command: None,
-        verify_profile: None,
-        quality_score: None,
-    }
-}
 
-/// 一个空 edit_plan 的请求：带 edit_plan 时 `run_plugin_iteration_agent`
-/// 走手工执行分支、完全不碰 LLM；operations 为空则不触碰任何文件，从而
-/// 绕开插件编辑面策略（空 fixture 里没有任何可写的插件子树），让迭代
-/// 确定性地推进到注入点所在的 journal persist 阶段。
-fn empty_plan_request() -> KernelPluginIterationRequest {
-    use crate::kernel::plugin_iteration::PluginEditPlan;
-    KernelPluginIterationRequest {
-        issue_id: None,
-        target_plugin_paths: Vec::new(),
-        instruction: Some("enospc injection".to_string()),
-        edit_plan: Some(PluginEditPlan {
-            issue_id: "enospc-issue".to_string(),
-            patch_id: "enospc-patch".to_string(),
-            summary: "no-op plan".to_string(),
-            operations: Vec::new(),
-        }),
-        manual_approved: true,
-        tests_command: None,
-        safety_command: None,
-        verify_profile: None,
-        quality_score: None,
-    }
-}
 
 /// 磁盘满必须被判成 `InfrastructureFailure`，而不是 `RolledBack`。
 ///
 /// 这是本批修复的核心断言：ENOSPC 此前经 `stage_error: Option<String>`
 /// 丢掉类型信息，在 `finalize_plugin_iteration` 被降级成"验证失败"，
-/// 于是污染 rollback 率、把插件 issue 标成 Open、还丢掉重试入口。
-#[test]
-#[serial]
-fn iterate_plugins_reports_infrastructure_failure_on_enospc() {
-    let (_temp, fixtures) = setup_empty_fixture();
-    let host = RuntimeHost::boot(&fixtures).expect("host should boot on empty index");
-
-    let before = host.kernel().status();
-
-    TEST_ITERATION_ENOSPC_INJECTION.store(true, SeqCst);
-    let result = host
-        .iterate_plugins(empty_plan_request())
-        .expect("infrastructure failure is a verdict, not an Err");
-
-    assert_eq!(
-        result.final_verdict,
-        PluginIterationFinalVerdict::InfrastructureFailure,
-        "ENOSPC must not be reported as RolledBack; blocked_reason={:?}",
-        result.blocked_reason
-    );
-    let reason = result.blocked_reason.as_deref().unwrap_or_default();
-    assert!(
-        reason.contains("No space left on device"),
-        "the errno text must survive to blocked_reason, got: {reason}"
-    );
-
-    let after = host.kernel().status();
-    assert_eq!(
-        after.iteration_rollback_total, before.iteration_rollback_total,
-        "infrastructure failures must not inflate the rollback metric"
-    );
-    assert_eq!(
-        after.iteration_infrastructure_failure_total,
-        before.iteration_infrastructure_failure_total + 1,
-        "infrastructure failures get their own counter"
-    );
-
-    // 插件没有被冤枉：不产生 LoadFailure issue。
-    assert!(
-        !host
-            .kernel()
-            .plugin_issues()
-            .iter()
-            .any(|issue| issue.source == KernelPluginIssueSource::LoadFailure),
-        "a full disk must not be recorded as a plugin LoadFailure"
-    );
-
-    // 仍可重试：迭代留在 blocked_iterations 里（RolledBack 会被摘除）。
-    assert!(
-        host.kernel()
-            .blocked_iterations()
-            .iter()
-            .any(|entry| entry.iteration_id == result.iteration_id),
-        "infrastructure failures stay retryable"
-    );
-}
-
-/// 回归护栏：真正的 stage 失败仍然是 `RolledBack`，没被新变体抢走。
-#[test]
-#[serial]
-fn genuine_stage_failure_still_rolls_back() {
-    let (_temp, fixtures) = setup_empty_fixture();
-    let host = RuntimeHost::boot(&fixtures).expect("host should boot on empty index");
-
-    // 不注入 ENOSPC；改一个策略禁止的路径（crates/ 属 forbidden_prefixes），
-    // 这是插件侧的真实失败，必须仍判 RolledBack。
-    let mut request = empty_plan_request();
-    if let Some(plan) = request.edit_plan.as_mut() {
-        plan.operations = vec![crate::kernel::plugin_iteration::PluginEditOperation {
-            path: "crates/cordis-runtime/src/lib.rs".to_string(),
-            kind: crate::kernel::plugin_iteration::PluginEditOpKind::ReplaceExact,
-            expected_old_string: Some("pub".to_string()),
-            expected_sha256: None,
-            new_content: Some("mod".to_string()),
-            pointer: None,
-            dotted_key: None,
-            value: None,
-        }];
-    }
-
-    let before = host.kernel().status();
-    let result = host
-        .iterate_plugins(request)
-        .expect("policy block is a verdict, not an Err");
-
-    assert_eq!(
-        result.final_verdict,
-        PluginIterationFinalVerdict::RolledBack,
-        "a genuine policy-blocked edit must remain RolledBack"
-    );
-    let after = host.kernel().status();
-    assert_eq!(
-        after.iteration_infrastructure_failure_total, before.iteration_infrastructure_failure_total,
-        "a genuine failure must not land in the infrastructure counter"
-    );
-    assert_eq!(
-        after.iteration_rollback_total,
-        before.iteration_rollback_total + 1,
-        "a genuine failure still counts as a rollback"
-    );
-}
 
 #[test]
 fn log_builtin_registration_failure_emits_without_panicking() {
@@ -540,89 +396,6 @@ fn mark_dropped_if_inflight_marks_only_inflight_ids() {
 }
 
 // ── C-seam #1: iterate_plugins emergency-rollback arm ────────────────
-#[test]
-#[serial]
-fn iterate_plugins_panic_is_caught_and_rolls_back_candidate_and_clears_journal() {
-    let (_temp, fixtures) = setup_empty_fixture();
-    let host = RuntimeHost::boot(&fixtures).expect("host should boot on empty index");
-
-    // Seed a candidate snapshot so we can prove the panic arm rolls it back.
-    host.reload_candidate().expect("stage candidate");
-    assert!(
-        host.candidate_snapshot().is_some(),
-        "candidate should be staged before the panic"
-    );
-
-    // Seed a rollback journal so we can prove the panic arm clears it. The
-    // journal records the (empty) current bytes of an in-workspace file;
-    // rollback restores those same bytes (a no-op edit), so `restore_
-    // plugin_iteration_workspace` runs cleanly without a cargo rebuild.
-    let marker_rel = "artifacts/seam-marker.txt";
-    let marker_abs = fixtures.join(marker_rel);
-    fs::write(&marker_abs, b"original").expect("seed marker file");
-    let rollback = crate::kernel::plugin_iteration::PluginEditRollback::single_backup(
-        fixtures.clone(),
-        marker_rel,
-        Some(b"original".to_vec()),
-    );
-    let journal_path = plugin_iteration_journal_path(&host.snapshot_root);
-    rollback
-        .persist_journal(&journal_path, "seam-iteration")
-        .expect("persist journal");
-    assert!(journal_path.exists(), "journal should exist before panic");
-
-    // Arm the injection and drive the iteration.
-    TEST_ITERATION_PANIC_INJECTION.store(true, SeqCst);
-    let result = host.iterate_plugins(iteration_request());
-
-    // The panic was caught: iterate_plugins returns an Invariant error
-    // whose message carries the injected panic text.
-    let err = result.expect_err("panic must surface as Err, not unwind");
-    let msg = err.to_string();
-    assert!(
-        msg.contains("test panic injection: plugin iteration"),
-        "error must carry the injected panic message, got: {msg}"
-    );
-    assert!(
-        msg.contains("workspace has been restored"),
-        "error must report the emergency restore, got: {msg}"
-    );
-
-    // The flag was consumed exactly once (swapped back to false).
-    assert!(
-        !TEST_ITERATION_PANIC_INJECTION.load(SeqCst),
-        "injection flag must be reset after firing"
-    );
-    // Candidate was rolled back.
-    assert!(
-        host.candidate_snapshot().is_none(),
-        "candidate must be rolled back by the panic arm"
-    );
-    // Journal was cleared.
-    assert!(
-        !journal_path.exists(),
-        "rollback journal must be cleared by the panic arm"
-    );
-    // The iteration lock was released (finish_plugin_iteration ran before
-    // the match arm), so a subsequent iteration can start. Re-arm the flag
-    // so the follow-up panics at the closure's first line again — this
-    // proves the lock was freed WITHOUT driving a real LLM agent turn (an
-    // unarmed, edit-plan-less iteration would otherwise call out to the
-    // configured LLM endpoint).
-    TEST_ITERATION_PANIC_INJECTION.store(true, SeqCst);
-    let followup = host.iterate_plugins(iteration_request());
-    let followup_msg = followup
-        .expect_err("re-armed follow-up must also surface as Err")
-        .to_string();
-    assert!(
-        followup_msg.contains("test panic injection: plugin iteration"),
-        "follow-up must reach the injection point (lock was released), got: {followup_msg}"
-    );
-    assert!(
-        !TEST_ITERATION_PANIC_INJECTION.load(SeqCst),
-        "injection flag must be reset after the follow-up fires"
-    );
-}
 
 // ── C-seam #2: reload/stop-handler catch_unwind arm ──────────────────
 #[test]

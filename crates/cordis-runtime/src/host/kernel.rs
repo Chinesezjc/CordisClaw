@@ -305,7 +305,7 @@ impl RuntimeKernel {
         Ok(candidates.into_iter().next())
     }
 
-    pub(super) fn begin_plugin_iteration(
+    pub fn begin_plugin_iteration(
         &self,
         snapshot: &RuntimeSnapshot,
         request: &KernelPluginIterationRequest,

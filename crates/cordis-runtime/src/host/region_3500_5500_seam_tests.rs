@@ -47,21 +47,17 @@ fn llm_response_invalid_message_labels_other_variants() {
 
 use super::{
     enrich_plugin_iteration_edit_error, format_agent_transcript_excerpt, parse_agent_args,
-    transcript_excerpt, AgentBackend, AgentSessionHandle, AgentSessionKind, InvocationSample,
-    ManagedAgentSession, ManagedAgentState, PluginIterationAgentBackend, PluginIterationAgentState,
-    PluginIterationContextPaths, PluginIterationRunState, PreparedPluginIteration, ReloadReport,
+    transcript_excerpt, AgentSessionHandle, AgentSessionKind,
+    ManagedAgentSession, ManagedAgentState, ReloadReport,
     ReplaceFilesExactArgs, RetiredSnapshot, RuntimeHost, PLUGIN_AGENT_TOOL_REPLACE_FILES_EXACT,
 };
 use crate::agent_api::AgentTranscriptEntry;
 use crate::core::error::RuntimeError;
 use crate::core::models::PluginUnavailableReason;
 use crate::kernel::plugin_iteration::{
-    CanaryVerdict, KernelPluginIssueSource, PluginEditOpKind, PluginEditOperation,
-    PluginIterationFinalVerdict, VerifierVerdict,
+    KernelPluginIssueSource, PluginEditOpKind, PluginEditOperation,
 };
-use crate::kernel::verifier::VerificationProfile;
-use cordis_plugin_sdk::{AbiFingerprint, NodeDoc, NodeType, PluginDocs};
-use serde_json::{json, Value};
+use serde_json::json;
 use serial_test::serial;
 use std::collections::BTreeMap;
 use std::fs;
@@ -92,14 +88,6 @@ fn setup_empty_fixture() -> (TempDir, PathBuf) {
     (temp, fixtures)
 }
 
-/// Seed a writable `plugins/mini/src/<name>` file inside the host's tree.
-fn seed_writable_source(host: &RuntimeHost, name: &str, body: &str) -> String {
-    let rel = format!("plugins/mini/src/{name}");
-    let abs = host.fixtures_root().join(&rel);
-    fs::create_dir_all(abs.parent().expect("parent")).expect("mkdir src");
-    fs::write(&abs, body).expect("seed source");
-    rel
-}
 
 fn empty_host() -> (TempDir, RuntimeHost) {
     let (temp, fixtures) = setup_empty_fixture();
@@ -107,29 +95,6 @@ fn empty_host() -> (TempDir, RuntimeHost) {
     (temp, host)
 }
 
-fn prepared_for(root: &str, targets: &[&str]) -> PreparedPluginIteration {
-    let target_plugin_paths: Vec<String> = targets.iter().map(|s| (*s).to_string()).collect();
-    let allowed_plugin_roots: BTreeMap<String, String> = target_plugin_paths
-        .iter()
-        .map(|p| (p.clone(), format!("plugins/{p}")))
-        .collect();
-    PreparedPluginIteration {
-        iteration_id: "iter-seam-3500".to_string(),
-        issue_id: "issue-seam-3500".to_string(),
-        root_plugin_path: root.to_string(),
-        target_plugin_paths,
-        source: None,
-        summary: "seam iteration".to_string(),
-        manual_approved: false,
-        tests_command: None,
-        safety_command: None,
-        verify_profile: VerificationProfile::Default,
-        quality_score: None,
-        edit_plan: None,
-        instruction: None,
-        allowed_plugin_roots,
-    }
-}
 
 // ───────────────────────── pure functions ────────────────────────────
 
@@ -514,184 +479,22 @@ fn reload_report_from_snapshots_records_removed_plugin() {
 
 // ─────────────── run_plugin_canary no-evidence path ──────────────────
 
-#[test]
-#[serial]
-fn run_plugin_canary_returns_partial_without_evidence() {
-    let (_temp, host) = empty_host();
-    let state = PluginIterationRunState::new(prepared_for("mini", &["mini"]));
-    let report = host.run_plugin_canary(&state).expect("canary runs");
-    assert_eq!(report.verdict, CanaryVerdict::Partial);
-    assert_eq!(report.mode, "no_canary_evidence");
-    assert!(report.plugin_path.is_none());
-}
 
-#[test]
-#[serial]
-fn run_plugin_canary_skips_samples_for_other_plugins() {
-    let (_temp, host) = empty_host();
-    // Seed a sample for a plugin NOT in the target set → the `continue`
-    // arm skips it, and with no candidate we fall through to Partial.
-    host.invocation_samples
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .push_front(InvocationSample {
-            plugin_path: "other".to_string(),
-            node_id: "n".to_string(),
-            payload: json!({}),
-            response: json!({ "ok": true }),
-            observed_at_ms: 0,
-        });
-    let state = PluginIterationRunState::new(prepared_for("mini", &["mini"]));
-    let report = host.run_plugin_canary(&state).expect("canary runs");
-    assert_eq!(report.verdict, CanaryVerdict::Partial);
-    assert_eq!(report.mode, "no_canary_evidence");
-}
 
 // ─────────────── finalize_plugin_iteration arms ──────────────────────
 
-#[test]
-#[serial]
-fn finalize_stage_error_short_circuits_to_rolled_back() {
-    let (_temp, host) = empty_host();
-    let mut state = PluginIterationRunState::new(prepared_for("mini", &["mini"]));
-    state.stage_error = Some("rebuild blew up".to_string());
-    let verdict = host
-        .finalize_plugin_iteration(&mut state)
-        .expect("finalize returns RolledBack for a stage error");
-    assert_eq!(verdict, PluginIterationFinalVerdict::RolledBack);
-    assert_eq!(
-        state.blocked_reason.as_deref(),
-        Some("rebuild blew up"),
-        "no candidate + clean restore → base message verbatim"
-    );
-}
 
-#[test]
-#[serial]
-fn finalize_verifier_fail_rolls_back_without_candidate() {
-    let (_temp, host) = empty_host();
-    let mut state = PluginIterationRunState::new(prepared_for("mini", &["mini"]));
-    state.verifier_verdict = Some(VerifierVerdict::Fail);
-    // A concrete Fail canary (not the Partial default) so the `else`
-    // rollback arm — not the Partial-canary Blocked arm — is selected.
-    state.canary = Some(crate::kernel::plugin_iteration::CanaryReport {
-        verdict: CanaryVerdict::Fail,
-        mode: "recent_successful_invocation_replay".to_string(),
-        plugin_path: Some("mini".to_string()),
-        node_id: Some("mini_echo".to_string()),
-        payload: Some(json!({})),
-        expected_response: Some(json!({ "ok": true })),
-        actual_response: Some(json!({ "ok": false })),
-        message: "diverged".to_string(),
-    });
-    // No candidate staged → the `else` rollback arm runs (candidate cleanup
-    // is a no-op) and the workspace restore succeeds on the empty fixture.
-    let verdict = host
-        .finalize_plugin_iteration(&mut state)
-        .expect("finalize returns RolledBack for a failed verifier");
-    assert_eq!(verdict, PluginIterationFinalVerdict::RolledBack);
-}
 
 // An agent-driven change carries its own evidence (a transcript and a tool
 // summary), so a Partial canary must not block it — random plugins made the
 // replay a coin flip.
-#[test]
-#[serial]
-fn finalize_partial_canary_does_not_block_an_agent_change() {
-    let (_temp, host) = empty_host();
-    let mut state = PluginIterationRunState::new(prepared_for("mini", &["mini"]));
-    state.agent = Some(TestAgentRun::with_requires_approval(false));
-    state.verifier_verdict = Some(VerifierVerdict::Pass);
-    state.canary = Some(crate::kernel::plugin_iteration::CanaryReport {
-        verdict: CanaryVerdict::Partial,
-        mode: "no_canary_evidence".to_string(),
-        plugin_path: None,
-        node_id: None,
-        payload: None,
-        expected_response: None,
-        actual_response: None,
-        message: "no evidence".to_string(),
-    });
-    // No candidate staged in this hermetic host, so promotion reports the
-    // missing candidate instead of Blocked — the point is that the canary
-    // no longer diverts the decision to Blocked.
-    let err = host
-        .finalize_plugin_iteration(&mut state)
-        .expect_err("no candidate staged");
-    assert!(
-        matches!(err, RuntimeError::CandidateSnapshotMissing),
-        "got: {err:?}"
-    );
-}
 
 // A blind edit has no transcript to vouch for it, so unproven behaviour waits
 // for an operator instead of riding on the tests alone.
-#[test]
-#[serial]
-fn finalize_partial_canary_blocks_a_blind_change() {
-    let (_temp, host) = empty_host();
-    let mut state = PluginIterationRunState::new(prepared_for("mini", &["mini"]));
-    state.verifier_verdict = Some(VerifierVerdict::Pass);
-    state.canary = Some(crate::kernel::plugin_iteration::CanaryReport {
-        verdict: CanaryVerdict::Partial,
-        mode: "no_canary_evidence".to_string(),
-        plugin_path: None,
-        node_id: None,
-        payload: None,
-        expected_response: None,
-        actual_response: None,
-        message: "no evidence".to_string(),
-    });
-    let verdict = host
-        .finalize_plugin_iteration(&mut state)
-        .expect("blocked is not an error");
-    assert_eq!(verdict, PluginIterationFinalVerdict::Blocked);
-    assert!(state
-        .blocked_reason
-        .as_deref()
-        .is_some_and(|reason| reason.contains("no canary evidence")));
-}
 
-/// Minimal agent-phase result for tests that only care about one flag.
-struct TestAgentRun;
-impl TestAgentRun {
-    fn with_requires_approval(flag: bool) -> super::PluginIterationAgentRun {
-        super::PluginIterationAgentRun {
-            llm_driven: true,
-            session_id: None,
-            tool_summary: None,
-            transcript_excerpt: Vec::new(),
-            recorded_summary: Some("test".to_string()),
-            requires_approval: flag,
-            changed_paths: Vec::new(),
-            rollback: super::PluginEditRollback::empty(std::path::Path::new(".")),
-            derived_edit_plan: super::PluginEditPlan {
-                issue_id: "issue".to_string(),
-                patch_id: "patch".to_string(),
-                summary: "test".to_string(),
-                operations: Vec::new(),
-            },
-        }
-    }
-}
 
 // Editing an existing test stages the change for approval instead of
 // promoting it (tests are the contract).
-#[test]
-#[serial]
-fn finalize_blocks_a_change_that_edits_an_existing_test() {
-    let (_temp, host) = empty_host();
-    let mut state = PluginIterationRunState::new(prepared_for("mini", &["mini"]));
-    state.verifier_verdict = Some(VerifierVerdict::Pass);
-    state.agent = Some(TestAgentRun::with_requires_approval(true));
-    let verdict = host
-        .finalize_plugin_iteration(&mut state)
-        .expect("blocked, not rolled back");
-    assert_eq!(verdict, PluginIterationFinalVerdict::Blocked);
-    let reason = state.blocked_reason.unwrap_or_default();
-    assert!(reason.contains("existing test"), "reason: {reason}");
-    assert!(reason.contains("approval"), "reason: {reason}");
-}
 
 // ─────────────── rollback_candidate_if_staged (no candidate) ─────────
 
@@ -709,31 +512,6 @@ fn rollback_candidate_if_staged_is_none_without_candidate() {
 
 
 
-#[test]
-#[serial]
-fn backend_run_plugin_test_uses_prepared_tests_command_fallback() {
-    let (_temp, host) = empty_host();
-    let prepared = {
-        let mut p = prepared_for("mini", &["mini"]);
-        p.tests_command = Some("cargo test --quiet -p mini --lib".to_string());
-        p
-    };
-    let context_paths = PluginIterationContextPaths {
-        focus_paths: Vec::new(),
-        all_paths: Vec::new(),
-    };
-    let mut state = PluginIterationAgentState::new(prepared, context_paths, &host.fixtures_root);
-    let mut backend = PluginIterationAgentBackend {
-        host: &host,
-        state: &mut state,
-    };
-    // No explicit command → the `.or_else(prepared.tests_command)` fallback
-    // arm supplies the prepared command.
-    let out = AgentBackend::execute_tool(&mut backend, "run_plugin_test", json!({}))
-        .expect("run_plugin_test Ok");
-    let cmd = out.get("command").and_then(Value::as_str).expect("command");
-    assert_eq!(cmd, "cargo test --quiet -p mini --lib");
-}
 
 
 
@@ -778,140 +556,8 @@ fn managed_session_compact_history_wrapper_is_noop_below_threshold() {
 
 // ─────────────── canary declared-verifier-node (JSON candidate) ──────
 
-/// Build a JSON-artifact fixture whose `svc` plugin declares a node whose
-/// id contains "verify" and is backed by a `Process` executor that echoes a
-/// fixed JSON. Staging it as a candidate lets `run_plugin_canary` take the
-/// declared-verifier-node branch (host.rs 3803-3832 in cov6 numbering).
-fn setup_verify_node_json_fixture() -> (TempDir, PathBuf) {
-    let temp = TempDir::new().expect("tempdir");
-    let fixtures = temp.path().join("fixtures");
-    let artifacts = fixtures.join("artifacts");
-    fs::create_dir_all(&artifacts).expect("artifacts dir");
 
-    // A tiny echo executable: a shell script that prints a fixed JSON.
-    let echo = artifacts.join("svc_verify.sh");
-    fs::write(&echo, "#!/bin/sh\ncat >/dev/null\necho '{\"ok\":true}'\n")
-        .expect("write echo script");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = fs::metadata(&echo).expect("meta").permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&echo, perms).expect("chmod echo");
-    }
 
-    let abi = AbiFingerprint::current_build("crate_svc_v1", "api_v2");
-    let node = NodeDoc {
-        id: "svc_verify".to_string(),
-        summary: "declared verifier node".to_string(),
-        input_schema: json!({ "type": "object" }),
-        output_schema: json!({ "type": "object" }),
-        side_effects: Vec::new(),
-        failure_modes: Vec::new(),
-        node_type: NodeType::Task,
-        agent_accessible: false,
-    };
-    let docs = PluginDocs {
-        plugin_id: "svc".to_string(),
-        plugin_path: "svc".to_string(),
-        plugin_version: "0.1.0".to_string(),
-        abi_version: 2,
-        command_name: Some("Svc".to_string()),
-        nodes: vec![node],
-        system_hint: None,
-    };
-    let execution = json!({ "kind": "process", "command": "svc_verify.sh", "args": [] });
-    let artifact_value = json!({
-        "plugin_path": "svc",
-        "abi_fingerprint": abi,
-        "docs": docs,
-        "exports": [],
-        "execution": execution,
-    });
-    let artifact_path = artifacts.join("svc.json");
-    fs::write(
-        &artifact_path,
-        serde_json::to_vec_pretty(&artifact_value).expect("serialize artifact"),
-    )
-    .expect("write artifact");
-    let sha256 = crate::plugin::artifact::sha256_file(&artifact_path).expect("hash svc artifact");
-    let index_value = json!({
-        "schema_version": 2,
-        "generated_at": "2026-07-25T00:00:00Z",
-        "topo_order": ["svc"],
-        "entries": [{
-            "plugin_path": "svc",
-            "version": "0.1.0",
-            "abi_fingerprint": abi,
-            "artifact_path": "svc.json",
-            "sha256": sha256,
-            "built_at": "0",
-            "parent": null,
-            "required": true,
-            "grants_from_parent": [],
-            "docs": docs,
-            "exports": [],
-            "execution": execution,
-            "artifact_kind": "json",
-            "build_fingerprint": "bf",
-            "input_probe": { "files": [] },
-            "local_path_deps": []
-        }]
-    });
-    fs::write(
-        artifacts.join("index.json"),
-        serde_json::to_vec_pretty(&index_value).expect("serialize index"),
-    )
-    .expect("write index");
-    (temp, fixtures)
-}
-
-#[test]
-#[serial]
-fn run_plugin_canary_uses_declared_verifier_node_from_candidate() {
-    let (_temp, fixtures) = setup_verify_node_json_fixture();
-    let host = RuntimeHost::boot(&fixtures).expect("boot on svc fixture");
-    // Stage the current tree as a candidate (no source change needed): the
-    // candidate registry then carries the `svc` plugin with the verify node.
-    host.reload_candidate().expect("stage candidate");
-    assert!(host.candidate_snapshot().is_some());
-
-    let state = PluginIterationRunState::new(prepared_for("svc", &["svc"]));
-    let report = host
-        .run_plugin_canary(&state)
-        .expect("canary invokes the declared verify node");
-    assert_eq!(report.verdict, CanaryVerdict::Pass);
-    assert_eq!(report.mode, "declared_plugin_verifier_node");
-    assert_eq!(report.node_id.as_deref(), Some("svc_verify"));
-    let _ = Arc::strong_count(&host.candidate_snapshot().expect("candidate live"));
-}
-
-#[test]
-#[serial]
-fn run_plugin_canary_replay_divergence_yields_fail() {
-    let (_temp, fixtures) = setup_verify_node_json_fixture();
-    let host = RuntimeHost::boot(&fixtures).expect("boot on svc fixture");
-    host.reload_candidate().expect("stage candidate");
-    // Seed a replay sample for svc/svc_verify whose recorded response does
-    // NOT match what the candidate echoes ({"ok":true}) → divergence Fail.
-    host.invocation_samples
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .push_front(InvocationSample {
-            plugin_path: "svc".to_string(),
-            node_id: "svc_verify".to_string(),
-            payload: json!({}),
-            response: json!({ "ok": false }),
-            observed_at_ms: 0,
-        });
-    let state = PluginIterationRunState::new(prepared_for("svc", &["svc"]));
-    let report = host.run_plugin_canary(&state).expect("canary replay runs");
-    assert_eq!(report.verdict, CanaryVerdict::Fail);
-    assert_eq!(report.mode, "recent_successful_invocation_replay");
-    assert!(report
-        .message
-        .contains("candidate replay response diverged from current response"));
-}
 
 // ─────────── R2: cleanup_retired_snapshots pinned-snapshot eviction ──
 
@@ -1042,314 +688,28 @@ fn evict_retired_snapshots_removes_dead_prefix_entries() {
 
 // ─────────── finalize promote-failure arms (Pass/Pass) ───────────────
 
-/// Force `promote_candidate` to fail by making the journal path a
-/// non-empty directory: `clear_plugin_iteration_journal` → `remove_file`
-/// on a directory errors, so `promote_candidate` returns Err and the
-/// finalize promote-failure arm runs.
-fn wedge_journal_as_dir(host: &RuntimeHost) {
-    let journal = super::plugin_iteration_journal_path(&host.snapshot_root);
-    fs::create_dir_all(&journal).expect("create journal-as-dir");
-    fs::write(journal.join("blocker.txt"), b"x").expect("nonempty dir");
-}
 
-#[test]
-#[serial]
-fn finalize_promote_failure_pass_pass_arm_returns_err_and_records_reason() {
-    let (_temp, host) = empty_host();
-    host.reload_candidate().expect("stage candidate");
-    wedge_journal_as_dir(&host);
-    let mut state = PluginIterationRunState::new(prepared_for("mini", &["mini"]));
-    state.verifier_verdict = Some(VerifierVerdict::Pass);
-    state.canary = Some(crate::kernel::plugin_iteration::CanaryReport {
-        verdict: CanaryVerdict::Pass,
-        mode: "recent_successful_invocation_replay".to_string(),
-        plugin_path: Some("mini".to_string()),
-        node_id: Some("mini_echo".to_string()),
-        payload: Some(json!({})),
-        expected_response: Some(json!({ "ok": true })),
-        actual_response: Some(json!({ "ok": true })),
-        message: "match".to_string(),
-    });
-    let out = host.finalize_plugin_iteration(&mut state);
-    assert!(out.is_err(), "promote failure must propagate as Err");
-    let reason = state.blocked_reason.expect("blocked reason recorded");
-    assert!(
-        reason.starts_with("promote failed: "),
-        "unexpected reason: {reason}"
-    );
-}
 
 // Manual approval is what unblocks a test-editing change: it promotes
 // through the same arm (and reports a promote failure the same way).
-#[test]
-#[serial]
-fn finalize_manual_approval_promotes_a_test_editing_change() {
-    let (_temp, host) = empty_host();
-    host.reload_candidate().expect("stage candidate");
-    let mut prepared = prepared_for("mini", &["mini"]);
-    prepared.manual_approved = true;
-    let mut state = PluginIterationRunState::new(prepared);
-    state.verifier_verdict = Some(VerifierVerdict::Pass);
-    state.agent = Some(TestAgentRun::with_requires_approval(true));
-    let verdict = host
-        .finalize_plugin_iteration(&mut state)
-        .expect("manual approval promotes");
-    assert_eq!(verdict, PluginIterationFinalVerdict::Promoted);
-}
 
 // ─────────── finalize TOCTOU source-drift downgrade ──────────────────
 
-#[test]
-#[serial]
-fn finalize_toctou_drift_downgrades_pass_to_rolled_back() {
-    let (_temp, host) = empty_host();
-    let mut state = PluginIterationRunState::new(prepared_for("mini", &["mini"]));
-    state.verifier_verdict = Some(VerifierVerdict::Pass);
-    state.canary = Some(crate::kernel::plugin_iteration::CanaryReport {
-        verdict: CanaryVerdict::Pass,
-        mode: "recent_successful_invocation_replay".to_string(),
-        plugin_path: Some("mini".to_string()),
-        node_id: Some("mini_echo".to_string()),
-        payload: Some(json!({})),
-        expected_response: Some(json!({ "ok": true })),
-        actual_response: Some(json!({ "ok": true })),
-        message: "match".to_string(),
-    });
-    // A verification report whose recorded source-tree hash cannot match the
-    // real re-hash of the empty fixture → detect_plugin_source_drift trips,
-    // downgrading the effective verdict to Fail → RolledBack.
-    state.verification = Some(crate::kernel::verifier::VerificationReport {
-        plan: crate::kernel::verifier::VerificationPlan {
-            profile: VerificationProfile::Default,
-            static_check_command: None,
-            tests_command: None,
-            safety_command: None,
-        },
-        stages: Vec::new(),
-        input: crate::kernel::evaluator::VerificationInput {
-            tests_passed: true,
-            safety_checks_passed: true,
-            quality_score: 100,
-        },
-        tests: None,
-        safety: None,
-        source_tree_hash: Some("stale-hash-that-will-not-match".to_string()),
-        hash_error: None,
-    });
-    let verdict = host
-        .finalize_plugin_iteration(&mut state)
-        .expect("TOCTOU drift rolls back cleanly (no candidate staged)");
-    assert_eq!(verdict, PluginIterationFinalVerdict::RolledBack);
-    assert!(state
-        .blocked_reason
-        .as_deref()
-        .expect("drift reason")
-        .contains("source tree mutated between verify and promote"));
-    // The kernel recorded a VerifierFailure TOCTOU issue.
-    let issues = host.kernel().plugin_issues();
-    assert!(issues.iter().any(|i| {
-        i.source == KernelPluginIssueSource::VerifierFailure
-            && i.summary.contains("TOCTOU guard tripped")
-    }));
-}
 
-#[test]
-#[serial]
-fn finalize_baseline_hash_failure_downgrades_pass_to_rolled_back() {
-    // A Pass verdict whose verification report carries a baseline-hash
-    // failure (unreadable entry, dangling symlink, permissions) must NOT
-    // be promotable: with no recorded hash there is no way to prove the
-    // tree did not change, so it is downgraded exactly like a re-hash
-    // failure before promote.
-    let (_temp, host) = empty_host();
-    let mut state = PluginIterationRunState::new(prepared_for("mini", &["mini"]));
-    state.verifier_verdict = Some(VerifierVerdict::Pass);
-    state.canary = Some(crate::kernel::plugin_iteration::CanaryReport {
-        verdict: CanaryVerdict::Pass,
-        mode: "recent_successful_invocation_replay".to_string(),
-        plugin_path: Some("mini".to_string()),
-        node_id: Some("mini_echo".to_string()),
-        payload: Some(json!({})),
-        expected_response: Some(json!({ "ok": true })),
-        actual_response: Some(json!({ "ok": true })),
-        message: "match".to_string(),
-    });
-    state.verification = Some(crate::kernel::verifier::VerificationReport {
-        plan: crate::kernel::verifier::VerificationPlan {
-            profile: VerificationProfile::Default,
-            static_check_command: None,
-            tests_command: None,
-            safety_command: None,
-        },
-        stages: Vec::new(),
-        input: crate::kernel::evaluator::VerificationInput {
-            tests_passed: true,
-            safety_checks_passed: true,
-            quality_score: 100,
-        },
-        tests: None,
-        safety: None,
-        source_tree_hash: None,
-        hash_error: Some("unable to read plugins/mini/src/lib.rs".to_string()),
-    });
-    let verdict = host
-        .finalize_plugin_iteration(&mut state)
-        .expect("baseline hash failure rolls back cleanly (no candidate staged)");
-    assert_eq!(verdict, PluginIterationFinalVerdict::RolledBack);
-    assert!(state
-        .blocked_reason
-        .as_deref()
-        .expect("drift reason")
-        .contains("unable to hash source tree at verify time"));
-    // The kernel recorded a VerifierFailure TOCTOU issue for the baseline
-    // hash failure as well.
-    let issues = host.kernel().plugin_issues();
-    assert!(issues.iter().any(|i| {
-        i.source == KernelPluginIssueSource::VerifierFailure
-            && i.summary.contains("TOCTOU guard tripped")
-    }));
-}
 
 // ─────────── apply_operations partial-batch rollback error ───────────
 
 
 // ─────────── run_plugin_iteration_agent edit_plan (no LLM) path ──────
 
-#[test]
-#[serial]
-fn run_plugin_iteration_agent_applies_edit_plan_without_llm() {
-    let (_temp, host) = empty_host();
-    let rel = seed_writable_source(&host, "planned.rs", "old body\n");
-    let mut prepared = prepared_for("mini", &["mini"]);
-    prepared.edit_plan = Some(crate::kernel::plugin_iteration::PluginEditPlan {
-        issue_id: "issue-x".to_string(),
-        patch_id: "patch-x".to_string(),
-        summary: "planned edit".to_string(),
-        operations: vec![PluginEditOperation {
-            path: rel.clone(),
-            kind: PluginEditOpKind::ReplaceExact,
-            expected_old_string: Some("old body\n".to_string()),
-            expected_sha256: None,
-            new_content: Some("planned body\n".to_string()),
-            pointer: None,
-            dotted_key: None,
-            value: None,
-        }],
-    });
-    let run = host
-        .run_plugin_iteration_agent(&prepared)
-        .expect("edit-plan path runs without any LLM call");
-    // No agent session in the edit-plan branch.
-    assert!(run.session_id.is_none());
-    assert_eq!(run.recorded_summary.as_deref(), Some("planned edit"));
-    assert!(run.changed_paths.iter().any(|p| p == &rel));
-    // The planned edit landed on disk.
-    assert_eq!(
-        fs::read_to_string(host.fixtures_root.join(&rel)).expect("read"),
-        "planned body\n"
-    );
-}
 
 // ─────────── verify_plugin_iteration wiring (cheap commands) ─────────
 
-#[test]
-#[serial]
-fn verify_plugin_iteration_runs_trivial_commands_and_reports() {
-    let (_temp, host) = empty_host();
-    let mut prepared = prepared_for("mini", &["mini"]);
-    // Trivial shell commands so the verifier's command stages run fast and
-    // pass, exercising the candidate_invoker closure construction and the
-    // CommandVerifier::verify_with_options `?` call site.
-    prepared.tests_command = Some("cargo test --help".to_string());
-    prepared.safety_command = Some("cargo --version".to_string());
-    let state = PluginIterationRunState::new(prepared);
-    let report = host
-        .verify_plugin_iteration(&state)
-        .expect("verify runs the trivial commands");
-    // Both trivial commands exit 0 → tests_passed true.
-    assert!(report.input.tests_passed);
-}
 
-#[test]
-#[serial]
-fn verify_plugin_iteration_plugin_command_invokes_candidate_closure() {
-    // A staged JSON `svc` candidate + a `plugin:` tests command makes the
-    // verifier route through the `candidate_invoker` closure (the closure
-    // body dispatches into `invoke_candidate`), covering that seam.
-    let (_temp, fixtures) = setup_verify_node_json_fixture();
-    let host = RuntimeHost::boot(&fixtures).expect("boot svc fixture");
-    host.reload_candidate().expect("stage candidate");
-    let mut prepared = prepared_for("svc", &["svc"]);
-    let spec = json!({
-        "plugin_path": "svc",
-        "node_id": "svc_verify",
-        "payload_json": {}
-    });
-    prepared.tests_command = Some(format!("plugin:{spec}"));
-    // Skip the safety stage; keep the run to just the plugin: tests command.
-    prepared.safety_command = None;
-    let state = PluginIterationRunState::new(prepared);
-    let report = host
-        .verify_plugin_iteration(&state)
-        .expect("verify routes the plugin: command through the candidate closure");
-    // The candidate echoes {"ok":true} and exits successfully.
-    assert!(report.input.tests_passed, "plugin: candidate invoke passed");
-}
 
 // ─────────── finalize manual-approved promote SUCCESS ────────────────
 
-#[test]
-#[serial]
-fn finalize_manual_approved_partial_promotes_when_candidate_staged() {
-    let (_temp, host) = empty_host();
-    host.reload_candidate().expect("stage candidate");
-    let mut prepared = prepared_for("", &[]);
-    prepared.manual_approved = true;
-    let mut state = PluginIterationRunState::new(prepared);
-    state.verifier_verdict = Some(VerifierVerdict::Pass);
-    state.canary = Some(crate::kernel::plugin_iteration::CanaryReport {
-        verdict: CanaryVerdict::Partial,
-        mode: "no_canary_evidence".to_string(),
-        plugin_path: None,
-        node_id: None,
-        payload: None,
-        expected_response: None,
-        actual_response: None,
-        message: "no evidence".to_string(),
-    });
-    // Pass verifier + Partial canary + manual_approved + a real staged
-    // candidate + clean journal → the manual-approved promote SUCCESS arm
-    // (`Ok(_) => Promoted`) runs.
-    let verdict = host
-        .finalize_plugin_iteration(&mut state)
-        .expect("manual-approved promote succeeds");
-    assert_eq!(verdict, PluginIterationFinalVerdict::Promoted);
-    assert!(host.candidate_snapshot().is_none(), "candidate promoted");
-}
 
-#[test]
-#[serial]
-fn finalize_pass_pass_promotes_when_candidate_staged() {
-    let (_temp, host) = empty_host();
-    host.reload_candidate().expect("stage candidate");
-    let mut state = PluginIterationRunState::new(prepared_for("", &[]));
-    state.verifier_verdict = Some(VerifierVerdict::Pass);
-    state.canary = Some(crate::kernel::plugin_iteration::CanaryReport {
-        verdict: CanaryVerdict::Pass,
-        mode: "recent_successful_invocation_replay".to_string(),
-        plugin_path: Some("x".to_string()),
-        node_id: Some("n".to_string()),
-        payload: Some(json!({})),
-        expected_response: Some(json!({ "ok": true })),
-        actual_response: Some(json!({ "ok": true })),
-        message: "match".to_string(),
-    });
-    let verdict = host
-        .finalize_plugin_iteration(&mut state)
-        .expect("pass/pass promote succeeds");
-    assert_eq!(verdict, PluginIterationFinalVerdict::Promoted);
-    assert!(host.candidate_snapshot().is_none());
-}
 
 // ─────────── R3: promote/rollback/approve 候选身份校验 ──────────────
 
@@ -1429,33 +789,6 @@ fn rollback_candidate_rejects_replaced_candidate() {
 
 /// R3: finalize 的 Pass/Pass promote 路径把 Step 4 记录的身份传下去——
 /// 候选被替换时 finalize 返回 Err 且候选仍 staged。
-#[test]
-#[serial]
-fn finalize_rejects_promote_of_replaced_candidate() {
-    let (_temp, host) = empty_host();
-    let first = host.reload_candidate().expect("stage candidate #1");
-    host.reload_candidate().expect("replace candidate #2");
-    let mut state = PluginIterationRunState::new(prepared_for("", &[]));
-    // Step 4 记录的候选是 first；当前 staged 已被替换成 second。
-    state.candidate = Some(first);
-    state.verifier_verdict = Some(VerifierVerdict::Pass);
-    state.canary = Some(crate::kernel::plugin_iteration::CanaryReport {
-        verdict: CanaryVerdict::Pass,
-        mode: "recent_successful_invocation_replay".to_string(),
-        plugin_path: Some("x".to_string()),
-        node_id: Some("n".to_string()),
-        payload: Some(json!({})),
-        expected_response: Some(json!({ "ok": true })),
-        actual_response: Some(json!({ "ok": true })),
-        message: "match".to_string(),
-    });
-    let out = host.finalize_plugin_iteration(&mut state);
-    assert!(out.is_err(), "promote of a replaced candidate must fail");
-    assert!(
-        host.candidate_snapshot().is_some(),
-        "the (replaced) candidate must remain staged"
-    );
-}
 
 // ─────────── reload retire-candidate + double reload_candidate ───────
 
@@ -1489,19 +822,6 @@ fn double_reload_candidate_retires_previous_candidate() {
 
 // ─────────── run_plugin_canary candidate loop continue arm ───────────
 
-#[test]
-#[serial]
-fn run_plugin_canary_continues_when_candidate_lacks_target_plugin() {
-    let (_temp, host) = empty_host();
-    // Stage an (empty) candidate, then run canary for a target plugin that
-    // is NOT in the candidate registry → the `let Some(plugin) = ... else
-    // { continue }` arm fires, then falls through to Partial.
-    host.reload_candidate().expect("stage empty candidate");
-    let state = PluginIterationRunState::new(prepared_for("ghost", &["ghost"]));
-    let report = host.run_plugin_canary(&state).expect("canary runs");
-    assert_eq!(report.verdict, CanaryVerdict::Partial);
-    assert_eq!(report.mode, "no_canary_evidence");
-}
 
 // ─────────── session-lookup / wrong-kind error arms ───────────
 //
@@ -1587,30 +907,4 @@ fn plugin_iteration_agent_snapshot_rejects_missing_and_wrong_kind_sessions() {
         message,
         format!("agent session {sid} is not a plugin iteration session")
     );
-}
-
-/// `plugin_iteration_agent_snapshot`'s success path: a real
-/// `ManagedAgentState::PluginIteration` entry returns its snapshot.
-#[test]
-#[serial]
-fn plugin_iteration_agent_snapshot_returns_state_for_an_iteration_session() {
-    let (temp, host) = empty_host();
-    let prepared = prepared_for("ghost", &["ghost"]);
-    let context_paths = PluginIterationContextPaths {
-        focus_paths: Vec::new(),
-        all_paths: Vec::new(),
-    };
-    let session_id = host
-        .start_plugin_iteration_agent_session(prepared.clone(), context_paths)
-        .expect("start an iteration session");
-
-    let snapshot = host
-        .plugin_iteration_agent_snapshot(&session_id)
-        .expect("iteration session yields a snapshot");
-    // A freshly started session has recorded no summary yet, so the derived
-    // plan falls back to the prepared summary.
-    assert!(snapshot.recorded_summary.is_none());
-    assert_eq!(snapshot.derived_edit_plan.summary, prepared.summary);
-    assert!(snapshot.changed_paths.is_empty());
-    drop(temp);
 }

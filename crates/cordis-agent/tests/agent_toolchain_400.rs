@@ -16,6 +16,9 @@
 #[ctor::ctor]
 fn _install_agent_loop() {
     let _ = cordis_agent::install();
+    let _ = cordis_runtime::iteration_api::install_iteration_runner(Box::new(
+        cordis_agent::iteration::CargoIterationRunner,
+    ));
 }
 
 use cordis_runtime::host::{AgentSessionKind, RuntimeHost};

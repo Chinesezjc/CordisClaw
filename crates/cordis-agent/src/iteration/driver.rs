@@ -1,6 +1,19 @@
-use super::*;
+//! The plugin-iteration driver.
 
-use crate::iteration_api::IterationHost;
+use crate::iteration::policy::{promotion_verdict, test_changes};
+use cordis_runtime::core::error::RuntimeError;
+use cordis_runtime::execution::engine::ExecutionOutput;
+use cordis_runtime::host::*;
+use cordis_runtime::kernel::plugin_iteration::*;
+use cordis_runtime::kernel::verifier::{hash_source_tree, CommandVerifier, VerificationReport, VerifyOptions};
+use cordis_runtime::plugin::abi::PluginResponse;
+use cordis_runtime::plugin::builder::plugin_builder;
+use serde_json::{Map, Value};
+use std::collections::BTreeSet;
+
+
+
+use cordis_runtime::iteration_api::IterationHost;
 
 /// Why a tested change still waits: nothing replayed.
 const BLOCKED_NO_CANARY_EVIDENCE: &str = "this change has no canary evidence: no \
@@ -37,10 +50,12 @@ pub fn iterate_plugins<H: IterationHost>(
             // payload), same as the previous `if injected { panic!(msg) }`,
             // but without a not-taken block whose closing brace llvm-cov
             // can never reach.
-            #[cfg(test)]
+            // Unconditional: an integration test links the lib without
+            // `cfg(test)`, so gating this out would make the injection
+            // unreachable from the crate's own tests. The flag is false unless
+            // a test sets it.
             let injected =
-                TEST_ITERATION_PANIC_INJECTION.swap(false, std::sync::atomic::Ordering::SeqCst);
-            #[cfg(test)]
+                cordis_runtime::host::TEST_ITERATION_PANIC_INJECTION.swap(false, std::sync::atomic::Ordering::SeqCst);
             assert!(!injected, "test panic injection: plugin iteration");
             let mut state = PluginIterationRunState::new(prepared.clone());
 
@@ -148,7 +163,7 @@ pub fn iterate_plugins<H: IterationHost>(
                     })
                     .unwrap_or_else(|| Err(plugin_iteration_missing_rollback_error()))
                     .and_then(|()| {
-                        let builder = plugin_builder().ok_or_else(missing_builder_error)?;
+                        let builder = plugin_builder().ok_or_else(cordis_runtime::plugin::builder::missing_builder_error)?;
                         builder.rebuild_plugin(host.fixtures_root(), &plugin_path)
                     });
                 match rebuilt {
@@ -242,7 +257,7 @@ pub fn iterate_plugins<H: IterationHost>(
                 ],
                 outcomes: std::collections::BTreeMap::new(),
                 keyed_outcomes: std::collections::BTreeMap::new(),
-                metrics: crate::execution::engine::ExecutionMetrics::default(),
+                metrics: cordis_runtime::execution::engine::ExecutionMetrics::default(),
             };
             state.into_result(net_output)
         }));
@@ -722,158 +737,4 @@ pub fn observe_plugin_iteration_failure<H: IterationHost>(
             prepared.root_plugin_path
         ),
     );
-}
-
-
-
-/// The host-facing entry points, kept so `host.iterate_plugins(..)` still works.
-impl RuntimeHost {
-    #[cfg(test)]
-    pub(crate) fn start_plugin_iteration_agent_session(
-        &self,
-        prepared: PreparedPluginIteration,
-        context_paths: PluginIterationContextPaths,
-    ) -> Result<String, RuntimeError> {
-        start_plugin_iteration_agent_session(self, prepared, context_paths)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn run_plugin_iteration_agent(
-        &self,
-        prepared: &PreparedPluginIteration,
-    ) -> Result<PluginIterationAgentRun, RuntimeError> {
-        run_plugin_iteration_agent(self, prepared)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn verify_plugin_iteration(
-        &self,
-        state: &PluginIterationRunState,
-    ) -> Result<VerificationReport, RuntimeError> {
-        verify_plugin_iteration(self, state)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn run_plugin_canary(
-        &self,
-        state: &PluginIterationRunState,
-    ) -> Result<CanaryReport, RuntimeError> {
-        run_plugin_canary(self, state)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn finalize_plugin_iteration(
-        &self,
-        state: &mut PluginIterationRunState,
-    ) -> Result<PluginIterationFinalVerdict, RuntimeError> {
-        finalize_plugin_iteration(self, state)
-    }
-
-pub(crate) fn plugin_iteration_agent_snapshot(
-    &self,
-    session_id: &str,
-) -> Result<PluginIterationAgentRun, RuntimeError> {
-    let guard = self
-        .agent_sessions
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner());
-    let managed = guard
-        .get(session_id)
-        .ok_or_else(|| RuntimeError::AgentSessionNotFound {
-            session_id: session_id.to_string(),
-        })?;
-    let ManagedAgentState::PluginIteration(state) = &managed.state else {
-        return Err(RuntimeError::InvalidArgument {
-            message: format!("agent session {session_id} is not a plugin iteration session"),
-        });
-    };
-    Ok(PluginIterationAgentRun {
-        llm_driven: true,
-        session_id: Some(session_id.to_string()),
-        tool_summary: None,
-        transcript_excerpt: Vec::new(),
-        recorded_summary: state.recorded_summary.clone(),
-        requires_approval: state.requires_approval,
-        changed_paths: state.derived_edit_plan().changed_paths(),
-        rollback: state.rollback.clone(),
-        derived_edit_plan: state.derived_edit_plan(),
-    })
-}
-
-pub(crate) fn observe_snapshot_plugin_issues(
-    &self,
-    snapshot: &RuntimeSnapshot,
-    report: &ReloadReport,
-    stage: &str,
-) {
-    for (plugin_path, plugin) in snapshot.plugin_registry().iter() {
-        let changed_reasons = report
-            .changed_plugin_reasons
-            .get(&plugin_path)
-            .cloned()
-            .unwrap_or_default();
-        match plugin.load_result {
-            PluginLoadResult::Unavailable(reason) => {
-                let source = match reason {
-                    PluginUnavailableReason::ContractViolation => {
-                        KernelPluginIssueSource::DocsDrift
-                    }
-                    _ => KernelPluginIssueSource::LoadFailure,
-                };
-                self.kernel.observe_plugin_issue(
-                    source,
-                    plugin_path.clone(),
-                    format!("{stage} observed plugin {plugin_path} unavailable: {reason:?}"),
-                );
-            }
-            PluginLoadResult::Loaded => {
-                if changed_reasons.iter().any(|reason| {
-                    matches!(reason.as_str(), "docs_changed" | "fingerprint_diff_changed")
-                }) {
-                    self.kernel.observe_plugin_issue(
-                        KernelPluginIssueSource::DocsDrift,
-                        plugin_path.clone(),
-                        format!(
-                            "{stage} detected docs/contract drift for {plugin_path}: {}",
-                            changed_reasons.join(", ")
-                        ),
-                    );
-                }
-            }
-        }
-    }
-}
-
-pub(crate) fn record_invocation_sample(
-    &self,
-    plugin_path: &str,
-    node_id: &str,
-    payload: &str,
-    response_payload: &str,
-) {
-    let payload =
-        serde_json::from_str(payload).unwrap_or_else(|_| Value::String(payload.to_string()));
-    let response = parse_response_payload(response_payload);
-    let mut samples = self
-        .invocation_samples
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner());
-    samples.push_front(InvocationSample {
-        plugin_path: plugin_path.to_string(),
-        node_id: node_id.to_string(),
-        payload,
-        response,
-        observed_at_ms: now_ms(),
-    });
-    while samples.len() > 64 {
-        samples.pop_back();
-    }
-}
-
-    pub fn iterate_plugins(
-        &self,
-        request: KernelPluginIterationRequest,
-    ) -> Result<KernelPluginIterationResult, RuntimeError> {
-        iterate_plugins(self, request)
-    }
 }

@@ -4,7 +4,8 @@
 //! a decision over plain data, which makes the whole policy table unit-testable
 //! and keeps `host.rs` free of scattered rules.
 
-use crate::kernel::plugin_iteration::{
+
+use cordis_runtime::kernel::plugin_iteration::{
     CanaryVerdict, PluginEditOpKind, PluginEditOperation, PluginIterationFinalVerdict,
     VerifierVerdict,
 };

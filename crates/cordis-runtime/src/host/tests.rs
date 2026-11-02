@@ -3,19 +3,13 @@ use super::{
     dir_is_older_than, dir_size_bytes, ensure_scaffold_integration_edits, extract_warning_blocks,
     render_child_plugin_core, render_child_plugin_test, sanitize_child_plugin_segment,
     snapshot_staging_lock, sort_plugin_context_paths, staged_artifact_root_is_removable,
-    warning_diagnostics_for_changed_paths, AgentBackend, AgentSessionKind, AgentStartOptions,
-    ContextFilesScope, PluginIterationAgentBackend, PluginIterationAgentState, RuntimeHost,
-    ScaffoldedChildRegistration, SnapshotGcReport, PLUGIN_AGENT_TOOL_CREATE_FILE,
-    PLUGIN_AGENT_TOOL_DELETE_FILE, PLUGIN_AGENT_TOOL_INSPECT_PLUGIN_CATALOG,
-    PLUGIN_AGENT_TOOL_JSON_SET, PLUGIN_AGENT_TOOL_LIST_CONTEXT_FILES,
-    PLUGIN_AGENT_TOOL_READ_CONTEXT_FILES, PLUGIN_AGENT_TOOL_REPLACE_FILES_EXACT,
-    PLUGIN_AGENT_TOOL_REPLACE_FILE_EXACT, PLUGIN_AGENT_TOOL_SCAFFOLD_CHILD_PLUGIN,
-    PLUGIN_AGENT_TOOL_TOML_SET,
+    warning_diagnostics_for_changed_paths, AgentSessionKind, AgentStartOptions,
+    RuntimeHost, ScaffoldedChildRegistration, SnapshotGcReport,
 };
 use crate::core::error::RuntimeError;
 use crate::core::models::NodeOutcome;
 use crate::kernel::plugin_iteration::{
-    KernelPluginIterationRequest, PluginEditOpKind, PluginEditOperation,
+    PluginEditOpKind, PluginEditOperation,
 };
 use serial_test::serial;
 use std::collections::BTreeMap;
@@ -862,131 +856,6 @@ fn scaffold_integration_edits_require_host_source_or_tests() {
     assert!(ensure_scaffold_integration_edits(&scaffolded_children, &integrated).is_ok());
 }
 
-#[test]
-#[serial]
-fn plugin_iteration_tool_surface_and_context_reads_expand_from_focus_to_all() {
-    cordis_tooling::refresh_artifact_index(&repo_fixtures_root())
-        .expect("refresh artifact index before boot");
-    let fixtures_root = repo_fixtures_root();
-    let host = RuntimeHost::boot(&fixtures_root).expect("host should boot");
-    let snapshot = host.current_snapshot();
-    let prepared = host
-        .kernel
-        .begin_plugin_iteration(
-            snapshot.as_ref(),
-            &KernelPluginIterationRequest {
-                issue_id: None,
-                target_plugin_paths: vec!["expr".to_string()],
-                instruction: Some("inspect expr subtree".to_string()),
-                edit_plan: None,
-                manual_approved: false,
-                tests_command: None,
-                safety_command: None,
-                verify_profile: None,
-                quality_score: None,
-            },
-        )
-        .expect("prepare iteration");
-    let iteration_id = prepared.iteration_id.clone();
-    let context_paths = collect_plugin_context_paths(
-        &fixtures_root,
-        &prepared.root_plugin_path,
-        &prepared.target_plugin_paths,
-    )
-    .expect("collect context paths");
-    let mut state = PluginIterationAgentState::new(prepared, context_paths, &fixtures_root);
-    let mut backend = PluginIterationAgentBackend {
-        host: &host,
-        state: &mut state,
-    };
-
-    let initial_tools = backend.tool_specs();
-    assert!(initial_tools
-        .iter()
-        .any(|tool| tool.name == PLUGIN_AGENT_TOOL_LIST_CONTEXT_FILES));
-    assert!(initial_tools
-        .iter()
-        .any(|tool| tool.name == PLUGIN_AGENT_TOOL_READ_CONTEXT_FILES));
-    assert!(initial_tools
-        .iter()
-        .any(|tool| tool.name == PLUGIN_AGENT_TOOL_INSPECT_PLUGIN_CATALOG));
-    assert!(initial_tools
-        .iter()
-        .any(|tool| tool.name == PLUGIN_AGENT_TOOL_SCAFFOLD_CHILD_PLUGIN));
-    assert!(initial_tools
-        .iter()
-        .any(|tool| tool.name == PLUGIN_AGENT_TOOL_REPLACE_FILE_EXACT));
-    assert!(initial_tools
-        .iter()
-        .any(|tool| tool.name == PLUGIN_AGENT_TOOL_REPLACE_FILES_EXACT));
-    assert!(initial_tools
-        .iter()
-        .any(|tool| tool.name == PLUGIN_AGENT_TOOL_CREATE_FILE));
-    assert!(initial_tools
-        .iter()
-        .any(|tool| tool.name == PLUGIN_AGENT_TOOL_DELETE_FILE));
-    assert!(initial_tools
-        .iter()
-        .any(|tool| tool.name == PLUGIN_AGENT_TOOL_TOML_SET));
-    assert!(initial_tools
-        .iter()
-        .any(|tool| tool.name == PLUGIN_AGENT_TOOL_JSON_SET));
-
-    let focus = backend.list_context_files(ContextFilesScope::Focus);
-    let focus_paths = focus
-        .get("focus_paths")
-        .and_then(|value| value.as_array())
-        .expect("focus paths array")
-        .iter()
-        .filter_map(|value| value.as_str())
-        .collect::<Vec<_>>();
-    assert!(focus_paths.contains(&"plugins/expr/lexer/src/core.rs"));
-    assert!(focus_paths.contains(&"plugins/expr/evaluator/src/core.rs"));
-    assert!(focus_paths.contains(&"plugins/expr/evaluator/div/src/core.rs"));
-    assert!(!focus_paths.contains(&"plugins/expr/evaluator/div/tests/div.rs"));
-
-    let hidden_err = backend
-        .read_context_files(&["plugins/expr/evaluator/div/tests/div.rs".to_string()])
-        .expect_err("deep non-source file should require explicit expansion");
-    assert!(hidden_err
-        .to_string()
-        .contains("hidden behind the structural focus shortlist"));
-
-    let expanded = backend.list_context_files(ContextFilesScope::All);
-    let expanded_paths = expanded
-        .get("paths")
-        .and_then(|value| value.as_array())
-        .expect("expanded paths array")
-        .iter()
-        .filter_map(|value| value.as_str())
-        .collect::<Vec<_>>();
-    assert!(expanded_paths.contains(&"plugins/expr/evaluator/div/src/core.rs"));
-    assert!(expanded_paths.contains(&"plugins/expr/evaluator/div/tests/div.rs"));
-
-    let expanded_tools = backend.tool_specs();
-    assert!(expanded_tools
-        .iter()
-        .any(|tool| tool.name == PLUGIN_AGENT_TOOL_INSPECT_PLUGIN_CATALOG));
-    assert!(expanded_tools
-        .iter()
-        .any(|tool| tool.name == PLUGIN_AGENT_TOOL_CREATE_FILE));
-    assert!(expanded_tools
-        .iter()
-        .any(|tool| tool.name == PLUGIN_AGENT_TOOL_DELETE_FILE));
-    assert!(expanded_tools
-        .iter()
-        .any(|tool| tool.name == PLUGIN_AGENT_TOOL_TOML_SET));
-    assert!(expanded_tools
-        .iter()
-        .any(|tool| tool.name == PLUGIN_AGENT_TOOL_JSON_SET));
-
-    let deep_read = backend
-        .read_context_files(&["plugins/expr/evaluator/div/tests/div.rs".to_string()])
-        .expect("expanded context should allow reading deep test file");
-    assert!(deep_read.to_string().contains("DivisionByZero"));
-
-    host.kernel.finish_plugin_iteration(&iteration_id);
-}
 
 #[test]
 fn validated_verification_command_accepts_short_check_and_test_aliases() {

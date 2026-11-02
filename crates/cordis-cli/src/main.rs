@@ -639,7 +639,7 @@ fn main() {
     // The iteration runner is a seam too: today the kernel's own pipeline
     // backs it, and moving that pipeline into the crate swaps this line.
     let _ = cordis_runtime::iteration_api::install_iteration_runner(Box::new(
-        cordis_runtime::iteration_api::KernelIterationRunner,
+        cordis_agent::iteration::CargoIterationRunner,
     ));
 
     if args.first().map(|x| x.as_str()) == Some("auto-update") {

@@ -7,6 +7,8 @@
 
 use cordis_runtime::agent_loop::{install_agent_loop, AgentLoop};
 
+pub mod iteration;
+
 mod imp;
 pub use imp::*;
 
@@ -112,7 +114,7 @@ impl cordis_runtime::agent_loop::AgentSessionApi for imp::AgentSession {
         provider: &dyn cordis_runtime::agent_api::LlmProvider,
         sink: Option<std::sync::Arc<dyn cordis_runtime::llm_sink::TokenSink>>,
     ) -> Result<cordis_runtime::agent_api::AgentReply, cordis_runtime::core::error::RuntimeError> {
-        let mut backend = cordis_runtime::host::PluginIterationAgentBackend { host, state };
+        let mut backend = crate::iteration::backend::PluginIterationAgentBackend { host, state };
         imp::AgentSession::respond_with_provider_images(self, &mut backend, input, images, notes, provider, sink)
     }
 }

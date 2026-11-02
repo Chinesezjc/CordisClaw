@@ -208,24 +208,3 @@ pub fn missing_runner_error() -> RuntimeError {
             .to_string(),
     }
 }
-
-/// The kernel's own runner: today's `RuntimeHost::iterate_plugins`.
-pub struct KernelIterationRunner;
-
-impl IterationRunner for KernelIterationRunner {
-    fn iterate(
-        &self,
-        host: &RuntimeHost,
-        request: KernelPluginIterationRequest,
-    ) -> Result<KernelPluginIterationResult, RuntimeError> {
-        host.iterate_plugins(request)
-    }
-
-    fn approve(
-        &self,
-        host: &RuntimeHost,
-        iteration_id: &str,
-    ) -> Result<KernelPluginIterationResult, RuntimeError> {
-        host.approve_blocked_iteration(iteration_id)
-    }
-}
