@@ -1,7 +1,7 @@
 use super::*;
 
 impl<'a> PluginIterationAgentBackend<'a> {
-    pub(crate) fn phase(&self) -> &'static str {
+    pub fn phase(&self) -> &'static str {
         if self.state.recorded_summary.is_some() {
             "finalized"
         } else if self.state.operations.is_empty() {
@@ -15,7 +15,7 @@ impl<'a> PluginIterationAgentBackend<'a> {
         }
     }
 
-    pub(crate) fn apply_operations(
+    pub fn apply_operations(
         &mut self,
         summary: &str,
         operations: Vec<PluginEditOperation>,
@@ -88,7 +88,7 @@ impl<'a> PluginIterationAgentBackend<'a> {
         }))
     }
 
-    pub(crate) fn replace_file_exact_operation(args: ReplaceFileExactArgs) -> PluginEditOperation {
+    pub fn replace_file_exact_operation(args: ReplaceFileExactArgs) -> PluginEditOperation {
         PluginEditOperation {
             path: args.path,
             kind: PluginEditOpKind::ReplaceExact,
@@ -109,7 +109,7 @@ impl<'a> PluginIterationAgentBackend<'a> {
         }
     }
 
-    pub(crate) fn list_context_files(&mut self, scope: ContextFilesScope) -> Value {
+    pub fn list_context_files(&mut self, scope: ContextFilesScope) -> Value {
         if scope == ContextFilesScope::All {
             self.state.context_scope_expanded = true;
         }
@@ -170,7 +170,7 @@ impl<'a> PluginIterationAgentBackend<'a> {
         }))
     }
 
-    pub(crate) fn read_context_files(&self, paths: &[String]) -> Result<Value, RuntimeError> {
+    pub fn read_context_files(&self, paths: &[String]) -> Result<Value, RuntimeError> {
         let files = paths
             .iter()
             .map(|path| self.read_context_path(path))
@@ -178,7 +178,7 @@ impl<'a> PluginIterationAgentBackend<'a> {
         Ok(json!({ "files": files }))
     }
 
-    pub(crate) fn inspect_plugin_catalog(&self) -> Value {
+    pub fn inspect_plugin_catalog(&self) -> Value {
         let snapshot = self.host.current_snapshot();
         let plugins = snapshot
             .plugin_registry()
@@ -216,7 +216,7 @@ impl<'a> PluginIterationAgentBackend<'a> {
         })
     }
 
-    pub(crate) fn scaffold_child_plugin(
+    pub fn scaffold_child_plugin(
         &mut self,
         args: ScaffoldChildPluginArgs,
     ) -> Result<Value, RuntimeError> {
@@ -385,7 +385,7 @@ impl<'a> PluginIterationAgentBackend<'a> {
         }))
     }
 
-    pub(crate) fn run_checked_command(
+    pub fn run_checked_command(
         &mut self,
         stage: &str,
         command: String,

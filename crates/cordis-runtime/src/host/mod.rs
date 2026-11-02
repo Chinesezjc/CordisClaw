@@ -932,7 +932,7 @@ pub struct PluginIterationAgentState {
 }
 
 impl PluginIterationAgentState {
-    fn new(
+    pub fn new(
         prepared: PreparedPluginIteration,
         context_paths: PluginIterationContextPaths,
         workspace_root: &Path,
@@ -2815,14 +2815,14 @@ pub struct ReadContextFilesArgs {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ScaffoldChildPluginArgs {
-    parent_plugin_path: String,
-    child_name: String,
+    pub parent_plugin_path: String,
+    pub child_name: String,
     #[serde(default)]
-    template_plugin_path: Option<String>,
+    pub template_plugin_path: Option<String>,
     #[serde(default)]
-    node_id: Option<String>,
+    pub node_id: Option<String>,
     #[serde(default)]
-    summary: Option<String>,
+    pub summary: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -4202,7 +4202,7 @@ pub struct PluginIterationRunState {
 }
 
 impl PluginIterationRunState {
-    fn new(prepared: PreparedPluginIteration) -> Self {
+    pub fn new(prepared: PreparedPluginIteration) -> Self {
         Self {
             prepared,
             agent: None,
