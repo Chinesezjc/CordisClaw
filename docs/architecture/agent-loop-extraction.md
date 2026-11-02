@@ -863,3 +863,30 @@ runtime_host_iterate_plugins_agent_retries_on_warning_and_promotes
 4. 重新跑 `cargo test --workspace`。
 
 预计一批即可完成。
+
+## 迭代管线搬迁完成（11f6f62）
+
+```
+crates/cordis-agent/src/iteration/
+  policy.rs    纯策略：晋升判定、canary 探针、副作用规则、测试变更分类
+  driver.rs    状态机：agent → edit → rebuild → stage → verify → canary → promote/rollback
+  backend.rs   PluginIterationAgentBackend（结构体 + 两个 impl）
+  mod.rs       CargoIterationRunner（实现 kernel 的 IterationRunner）
+```
+
+kernel 侧只剩：
+
+- `iteration_api.rs` 的 trait + 注册表（`KernelIterationRunner` 已删除）；
+- `iteration/report.rs`（工具层需要的报告词汇）；
+- `RuntimeHost::iterate_plugins` 一行委托给已安装的 runner；
+- 若干 `pub` 的宿主能力（roots、候选快照、journal、验证辅助），供 crate 调用。
+
+测试跟着代码走：`crates/cordis-agent/tests/iteration_pipeline.rs` 42 个
+（17 个 backend + 25 个 pipeline）。每个 crate 测试二进制在 `#[ctor]` 里同时安装
+agent loop 与 iteration runner，因为 `host.iterate_plugins` 现在走注册表。
+
+两处测试注入改成无条件（`injected_journal_enospc`、panic 注入）：集成测试链接的
+lib 不带 `cfg(test)`，否则这些分支在新位置不可达。
+
+顺带把 mock LLM 的 accept 预算从 30s 提到 300s（首次 90s）：整仓并行跑时多个二进制
+各自 shell 出 cargo，30s 会把负载误判成"mock 从未被拨号"。
