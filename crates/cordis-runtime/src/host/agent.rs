@@ -146,6 +146,23 @@ impl RuntimeHost {
         }
     }
 
+    /// Every live session, with the facts a caller needs to address it.
+    ///
+    /// This is the first piece of session-to-session work: before one session
+    /// can talk to another it has to be able to see that the other exists.
+    pub fn agent_list_sessions(&self) -> Vec<crate::agent_api::AgentSessionStatus> {
+        let guard = self
+            .agent_sessions
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let mut listed = guard
+            .values()
+            .map(|managed| managed.session.status())
+            .collect::<Vec<_>>();
+        listed.sort_by(|a, b| a.kind.cmp(&b.kind));
+        listed
+    }
+
     pub fn agent_send(&self, session_id: &str, input: &str) -> Result<AgentReply, RuntimeError> {
         self.agent_send_with_images(session_id, input, &[])
     }

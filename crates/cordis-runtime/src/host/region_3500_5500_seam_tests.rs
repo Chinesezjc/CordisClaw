@@ -47,7 +47,7 @@ fn llm_response_invalid_message_labels_other_variants() {
 
 use super::{
     enrich_plugin_iteration_edit_error, format_agent_transcript_excerpt, parse_agent_args,
-    transcript_excerpt, AgentSessionHandle, AgentSessionKind,
+    transcript_excerpt, AgentSessionHandle, AgentSessionKind, AgentStartOptions,
     ManagedAgentSession, ManagedAgentState, ReloadReport,
     ReplaceFilesExactArgs, RetiredSnapshot, RuntimeHost, PLUGIN_AGENT_TOOL_REPLACE_FILES_EXACT,
 };
@@ -497,6 +497,20 @@ fn reload_report_from_snapshots_records_removed_plugin() {
 // promoting it (tests are the contract).
 
 // ─────────────── rollback_candidate_if_staged (no candidate) ─────────
+
+#[test]
+#[serial]
+fn agent_list_sessions_reports_every_live_session() {
+    let (_temp, host) = empty_host();
+    assert!(host.agent_list_sessions().is_empty());
+    let started = host
+        .agent_start_with(AgentSessionKind::RuntimeShell, AgentStartOptions::default())
+        .expect("start a session");
+    let listed = host.agent_list_sessions();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].kind, "runtime_shell");
+    let _ = started;
+}
 
 #[test]
 #[serial]
