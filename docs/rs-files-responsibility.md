@@ -78,6 +78,18 @@
 
 > **已删除**: `kernel/loop.rs`（9 阶段 Petri Net 替换为 agent loop）、`kernel/planner.rs`（独立 LLM 路径合并到 AgentSession）
 
+## 6a. 插件迭代管线 (`crates/cordis-agent/src/iteration/`)
+
+> 2026-11-01 从 kernel 迁入。kernel 只保留接缝（`iteration_api::IterationRunner`）
+> 与工具层需要的报告词汇（`crates/cordis-runtime/src/iteration/report.rs`）。
+
+| 文件 | 职责 | 关键入口 |
+|---|---|---|
+| `policy.rs` | 纯策略：晋升判定、canary 探针比较、副作用/测试变更分类 | `promotion_verdict()`、`canary_probe_verdict()`、`test_changes()`、`node_declares_side_effects_in()` |
+| `driver.rs` | 迭代状态机：agent → edit → rebuild → stage → verify → canary → promote/rollback；泛型于 `IterationHost` | `iterate_plugins()`、`run_plugin_canary()`、`finalize_plugin_iteration()` |
+| `backend.rs` | 迭代 agent 后端：scaffold/edit/verify 工具集与状态记录 | `PluginIterationAgentBackend`、`impl AgentBackend` |
+| `mod.rs` | 接缝实现 | `CargoIterationRunner`（cli 安装） |
+
 ## 6b. Agent 层 (`crates/cordis-agent/src/`、`crates/cordis-runtime/src/agent_tools.rs`、`agent_toolchain.rs`)
 
 > **2026-10-31 已移出 kernel**：循环本体（`AgentSession`、`ShellAgentSession`、
