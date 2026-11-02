@@ -673,6 +673,9 @@ pub trait IterationRunner: Send + Sync {
 install_iteration_runner / iteration_runner / missing_runner_error
 ```
 
+> ⚠️ 本节记录的是**中间状态**，`KernelIterationRunner` 已在 `11f6f62` 删除；
+> 现在 kernel 只留注册表，实现是 crate 的 `CargoIterationRunner`。以下内容按时间顺序保留。
+
 - `KernelIterationRunner` 是 kernel 的默认实现（转调 `iterate_plugins` / `approve_blocked_iteration`）；
 - `agent_tools` 的两个迭代工具分支改走 `iteration_runner()`，不再是 `self.iterate_plugins(...)`；
 - `boot` 只在 `cfg(test)` 下装默认实现；`cordis-cli` 与 `cordis_agent::install()` 并排安装。
