@@ -900,12 +900,17 @@ lib 不带 `cfg(test)`，否则这些分支在新位置不可达。
 - `AgentToolHost::agent_live_sessions()` / `agent_send_to_session()` — 接缝；
 - 两个工具 `list_sessions`、`send_to_session`（未知 id 直接拒绝，不隐式建会话）。
 
-仍需设计的三件事：
+已完成：
 
-1. **寻址**：现在只用 `session_id`；跨群/跨用户需要稳定地址（例如
-   `qq:group:<id>`），而 `session_id` 是进程内生成的。地址表应该由 CLI 维护并注入，
-   而不是让 agent 猜。
-2. **投递语义**：`send_to_session` 目前是同步阻塞（等对方回合结束）。会话之间可能
-   互相等待，需要超时与"正在忙"的拒绝（`inflight_sessions` 已经在 host 里）。
-3. **网络**：跨进程/跨机器需要把 `list_sessions` + `send_to_session` 变成一个
-   可序列化的帧，走 interconnect；kernel 只应该有 trait，实现由 cli 提供。
+- **寻址**（`bfd8afb`）：会话可以带一个地址，QQ 循环为每个新建/恢复的会话注册
+  `qq:group:<id>`；`send_to_session` 接受 id 或地址。**id 优先于地址**，所以注册一个
+  撞车的地址无法遮蔽活着的会话；给已死 id 注册会被拒绝。
+- **投递语义**：无需新机制——`agent_send` 对正在跑的会话直接返回
+  `AgentSessionBusy`（`runtime_host.rs` 的 R1(c) 已覆盖），所以两个会话互相发消息
+  不会死锁，而是**快速失败**并把错误交给模型。
+
+仍需设计：
+
+- **网络**：跨进程/跨机器需要把 `list_sessions` + `send_to_session` 变成可序列化的
+  帧走 interconnect；kernel 只保留 trait，实现由 cli 提供。要点是地址即路由键，
+  所以帧里只需要 `{address, message}` 与一个 `sessions` 快照，不需要传 session id。
