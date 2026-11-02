@@ -17,6 +17,22 @@ pub trait AgentToolHost {
     fn agent_list_nodes(&self) -> Result<Value, RuntimeError>;
     fn agent_kernel_status(&self) -> Result<Value, RuntimeError>;
     fn agent_kernel_issues(&self) -> Result<Value, RuntimeError>;
+    /// Sessions that are alive right now, so one session can address another.
+    ///
+    /// Default: none. A host without a session map (the loop's test doubles)
+    /// simply has nothing to list.
+    fn agent_live_sessions(&self) -> Vec<AgentSessionStatus> {
+        Vec::new()
+    }
+    /// Deliver a message into another live session's inbox.
+    ///
+    /// Default: refused. Only a real host can route between sessions; a double
+    /// says so instead of pretending.
+    fn agent_send_to_session(&self, _session_id: &str, _input: &str) -> Result<Value, RuntimeError> {
+        Err(RuntimeError::Invariant {
+            message: "this host cannot route messages between sessions".to_string(),
+        })
+    }
     fn agent_reload_runtime(&self, plugin_path: &str) -> Result<Value, RuntimeError>;
     fn agent_build_plugins(&self, plugin_name: &str) -> Result<Value, RuntimeError>;
     /// Collect system_hint strings from all loaded plugins. The Agent's

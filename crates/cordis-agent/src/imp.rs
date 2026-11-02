@@ -1515,6 +1515,15 @@ impl<'a, H: AgentToolHost + ?Sized> AgentBackend for RuntimeShellAgentBackend<'a
 
     fn execute_tool(&mut self, name: &str, arguments: Value) -> Result<Value, RuntimeError> {
         match name {
+            cordis_runtime::agent_tools::AGENT_TOOL_LIST_SESSIONS => {
+                parse_tool_value_arguments::<EmptyArgs>(arguments, name)?;
+                let sessions = self.host.agent_live_sessions();
+                Ok(json!({ "sessions": sessions }))
+            }
+            cordis_runtime::agent_tools::AGENT_TOOL_SEND_TO_SESSION => {
+                let args = parse_tool_value_arguments::<SendToSessionArgs>(arguments, name)?;
+                self.host.agent_send_to_session(&args.session_id, &args.message)
+            }
             AGENT_TOOL_GET_RUNTIME_STATUS => {
                 parse_tool_value_arguments::<EmptyArgs>(arguments, name)?;
                 self.host.agent_runtime_status()
@@ -1992,8 +2001,37 @@ fn dsml_protocol_prompt(specs: &[AgentToolSpec], require_end_tool: bool) -> Stri
 }
 
 
+/// Arguments for `send_to_session`.
+#[derive(serde::Deserialize)]
+struct SendToSessionArgs {
+    session_id: String,
+    message: String,
+}
+
 fn shell_agent_tools() -> Vec<AgentToolSpec> {
     vec![
+        AgentToolSpec {
+            name: cordis_runtime::agent_tools::AGENT_TOOL_LIST_SESSIONS,
+            description: "List the live agent sessions (id, kind, message counts). Use it before messaging another session.",
+            parameters: json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false,
+            }),
+        },
+        AgentToolSpec {
+            name: cordis_runtime::agent_tools::AGENT_TOOL_SEND_TO_SESSION,
+            description: "Deliver a message into another live session and wait for its reply.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "session_id": {"type": "string"},
+                    "message": {"type": "string"}
+                },
+                "required": ["session_id", "message"],
+                "additionalProperties": false,
+            }),
+        },
         AgentToolSpec {
             name: AGENT_TOOL_GET_RUNTIME_STATUS,
             description: "Get the current runtime host status, snapshot ids, candidate status, and recent reload reports.",
@@ -2606,6 +2644,8 @@ mod tests {
         hints: Vec<String>,
         /// P4: role flags for the gated `set_soul` tool; None = untracked.
         caller: Option<SessionCaller>,
+        /// Session-to-session deliveries, as `"<id>:<message>"`.
+        routed: std::sync::Mutex<Vec<String>>,
     }
 
     /// Reference host for backends that never consult soul/hints.
@@ -2613,9 +2653,29 @@ mod tests {
         persona: None,
         hints: Vec::new(),
         caller: None,
+        routed: std::sync::Mutex::new(Vec::new()),
     };
 
     impl AgentToolHost for FakeHost {
+        fn agent_live_sessions(&self) -> Vec<cordis_runtime::agent_api::AgentSessionStatus> {
+            vec![cordis_runtime::agent_api::AgentSessionStatus {
+                kind: "qq:group:2".to_string(),
+                provider: "p".to_string(),
+                model: "m".to_string(),
+                completed_turns: 1,
+                stored_messages: 2,
+                transcript_events: 3,
+            }]
+        }
+
+        fn agent_send_to_session(&self, session_id: &str, input: &str) -> Result<Value, RuntimeError> {
+            self.routed
+                .lock()
+                .expect("routed")
+                .push(format!("{session_id}:{input}"));
+            Ok(json!({ "ok": true, "session_id": session_id }))
+        }
+
         fn agent_runtime_status(&self) -> Result<Value, RuntimeError> {
             Ok(json!({
                 "current_snapshot_id": "snapshot-demo",
@@ -2821,6 +2881,7 @@ mod tests {
             persona: Some("毒舌运维".to_string()),
             hints: vec!["HINT-MARK".to_string()],
             caller: None,
+            routed: std::sync::Mutex::new(Vec::new()),
         };
         let backend = RuntimeShellAgentBackend {
             host: &host,
@@ -3341,6 +3402,37 @@ mod tests {
             history.contains("keep.png"),
             "the picture must survive into later turns: {history}"
         );
+    }
+
+    /// A session can see its siblings and hand a message to one of them.
+    #[test]
+    fn a_session_can_list_and_message_another_session() {
+        let host = FakeHost {
+            persona: None,
+            hints: Vec::new(),
+            caller: None,
+            routed: std::sync::Mutex::new(Vec::new()),
+        };
+        let mut backend = RuntimeShellAgentBackend {
+            host: &host,
+            session_id: "s1",
+            soul_key: String::new(),
+        };
+        let listed = AgentBackend::execute_tool(
+            &mut backend,
+            cordis_runtime::agent_tools::AGENT_TOOL_LIST_SESSIONS,
+            json!({}),
+        )
+        .expect("list");
+        assert_eq!(listed["sessions"].as_array().expect("array").len(), 1);
+        let sent = AgentBackend::execute_tool(
+            &mut backend,
+            cordis_runtime::agent_tools::AGENT_TOOL_SEND_TO_SESSION,
+            json!({"session_id": "s2", "message": "hi"}),
+        )
+        .expect("send");
+        assert_eq!(sent["session_id"], "s2");
+        assert_eq!(host.routed.lock().expect("routed").as_slice(), &["s2:hi"]);
     }
 
     /// A turn that delivered a message must not come back as an error: the

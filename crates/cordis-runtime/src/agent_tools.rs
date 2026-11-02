@@ -23,6 +23,10 @@ pub const AGENT_TOOL_LIST_NODES: &str = "list_nodes";
 pub const AGENT_TOOL_GET_KERNEL_STATUS: &str = "get_kernel_status";
 pub const AGENT_TOOL_GET_KERNEL_ISSUES: &str = "get_kernel_issues";
 pub const AGENT_TOOL_RELOAD_RUNTIME: &str = "reload_runtime";
+/// Session-to-session: list the live sessions.
+pub const AGENT_TOOL_LIST_SESSIONS: &str = "list_sessions";
+/// Session-to-session: deliver a message into another live session.
+pub const AGENT_TOOL_SEND_TO_SESSION: &str = "send_to_session";
 /// Kernel introspection tools — their output describes the agent's own
 /// internal state (plugin counts, snapshot ids, kernel counters), not
 /// conversational content. Their tool call/result pairs are stripped by
@@ -220,6 +224,23 @@ impl AgentToolHost for RuntimeHost {
 
     fn agent_kernel_issues(&self) -> Result<Value, RuntimeError> {
         to_json_value("kernel issues", self.kernel().plugin_issues())
+    }
+
+    fn agent_live_sessions(&self) -> Vec<crate::agent_api::AgentSessionStatus> {
+        crate::host::RuntimeHost::agent_list_sessions(self)
+    }
+
+    fn agent_send_to_session(&self, session_id: &str, input: &str) -> Result<Value, RuntimeError> {
+        // Refuse an unknown target explicitly: silently creating a session
+        // would let one room's agent seed conversations elsewhere.
+        self.agent_status(session_id)?;
+        let reply = self.agent_send(session_id, input)?;
+        Ok(serde_json::json!({
+            "ok": true,
+            "session_id": session_id,
+            "reply_chars": reply.content.chars().count(),
+            "tool_calls": reply.tool_events.len(),
+        }))
     }
 
     fn agent_reload_runtime(&self, plugin_path: &str) -> Result<Value, RuntimeError> {
