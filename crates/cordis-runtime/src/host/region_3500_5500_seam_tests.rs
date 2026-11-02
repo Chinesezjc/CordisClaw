@@ -514,6 +514,41 @@ fn agent_list_sessions_reports_every_live_session() {
 
 #[test]
 #[serial]
+fn agent_addresses_resolve_and_unknown_ones_are_refused() {
+    let (_temp, host) = empty_host();
+    let first = host
+        .agent_start_with(AgentSessionKind::RuntimeShell, AgentStartOptions::default())
+        .expect("first session")
+        .session_id;
+    let second = host
+        .agent_start_with(AgentSessionKind::RuntimeShell, AgentStartOptions::default())
+        .expect("second session")
+        .session_id;
+
+    // No address until one is registered.
+    assert_eq!(host.agent_session_address(&first), None);
+    host.agent_set_session_address(&first, "qq:group:1")
+        .expect("register address");
+    assert_eq!(
+        host.agent_session_address(&first).as_deref(),
+        Some("qq:group:1")
+    );
+
+    // An id resolves to itself, an address to its session.
+    assert_eq!(host.agent_resolve_session(&first).as_deref(), Some(&first[..]));
+    assert_eq!(host.agent_resolve_session("qq:group:1").as_deref(), Some(&first[..]));
+    assert_eq!(host.agent_resolve_session("qq:group:2"), None);
+
+    // Registering on a dead id is refused rather than silently ignored.
+    let err = host
+        .agent_set_session_address("nope", "qq:group:3")
+        .expect_err("unknown session");
+    assert!(err.to_string().contains("is not live"), "got {err}");
+    assert_eq!(host.agent_session_address(&second), None);
+}
+
+#[test]
+#[serial]
 fn rollback_candidate_if_staged_is_none_without_candidate() {
     let (_temp, host) = empty_host();
     assert!(host.rollback_candidate_if_staged(None).is_none());
@@ -554,6 +589,7 @@ fn managed_session_compact_history_wrapper_is_noop_below_threshold() {
     };
     // Below the compaction threshold: wrapper returns (old, old) unchanged.
     let mut managed = ManagedAgentSession {
+        address: None,
         handle: AgentSessionHandle {
             session_id: "s-1".to_string(),
             kind: AgentSessionKind::RuntimeShell,

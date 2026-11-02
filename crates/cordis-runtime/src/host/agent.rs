@@ -126,6 +126,7 @@ impl RuntimeHost {
                     handle: handle.clone(),
                     session,
                     state,
+                    address: None,
                 },
             );
         Ok(handle)
@@ -161,6 +162,55 @@ impl RuntimeHost {
             .collect::<Vec<_>>();
         listed.sort_by(|a, b| a.kind.cmp(&b.kind));
         listed
+    }
+
+    /// Give a session a stable, externally meaningful address.
+    ///
+    /// `agent_start` mints an opaque id; a channel adapter knows the room, so it
+    /// registers that here and other sessions can then reach it by address.
+    pub fn agent_set_session_address(
+        &self,
+        session_id: &str,
+        address: &str,
+    ) -> Result<(), RuntimeError> {
+        let mut guard = self
+            .agent_sessions
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let managed = guard.get_mut(session_id).ok_or_else(|| {
+            RuntimeError::InvalidArgument {
+                message: format!("agent session {session_id} is not live"),
+            }
+        })?;
+        managed.address = Some(address.to_string());
+        Ok(())
+    }
+
+    /// Resolve an id *or* an address to a live session id.
+    ///
+    /// Ids win: an address is only consulted when no live id matches, so a
+    /// session cannot shadow another by picking a colliding address.
+    pub fn agent_resolve_session(&self, id_or_address: &str) -> Option<String> {
+        let guard = self
+            .agent_sessions
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if guard.contains_key(id_or_address) {
+            return Some(id_or_address.to_string());
+        }
+        guard
+            .iter()
+            .find(|(_, managed)| managed.address.as_deref() == Some(id_or_address))
+            .map(|(id, _)| id.clone())
+    }
+
+    /// The address a session was registered under, if any.
+    pub fn agent_session_address(&self, session_id: &str) -> Option<String> {
+        self.agent_sessions
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .get(session_id)
+            .and_then(|managed| managed.address.clone())
     }
 
     pub fn agent_send(&self, session_id: &str, input: &str) -> Result<AgentReply, RuntimeError> {

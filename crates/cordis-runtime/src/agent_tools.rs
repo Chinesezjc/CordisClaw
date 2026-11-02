@@ -231,13 +231,18 @@ impl AgentToolHost for RuntimeHost {
     }
 
     fn agent_send_to_session(&self, session_id: &str, input: &str) -> Result<Value, RuntimeError> {
-        // Refuse an unknown target explicitly: silently creating a session
-        // would let one room's agent seed conversations elsewhere.
-        self.agent_status(session_id)?;
-        let reply = self.agent_send(session_id, input)?;
+        // Accept an id or a registered address. An unknown target is refused
+        // explicitly: silently creating a session would let one room's agent
+        // seed conversations elsewhere.
+        let resolved = self.agent_resolve_session(session_id).ok_or_else(|| {
+            RuntimeError::InvalidArgument {
+                message: format!("no live agent session or address {session_id}"),
+            }
+        })?;
+        let reply = self.agent_send(&resolved, input)?;
         Ok(serde_json::json!({
             "ok": true,
-            "session_id": session_id,
+            "session_id": resolved,
             "reply_chars": reply.content.chars().count(),
             "tool_calls": reply.tool_events.len(),
         }))

@@ -1101,6 +1101,11 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                             sid
                         }
                     };
+                    // The room doubles as the address: another session can
+                    // reach this one as `qq:group:<id>` without knowing the
+                    // generated session id. Idempotent, so restored sessions
+                    // get their address too.
+                    let _ = host.agent_set_session_address(&sid, session_key);
                     // Call sites take `&str`; shadow the owned id.
                     let sid = sid.as_str();
                     // H1: re-scope the soul to THIS batch's speaker before

@@ -874,6 +874,9 @@ pub(crate) struct ManagedAgentSession {
     handle: AgentSessionHandle,
     session: Box<dyn crate::agent_loop::AgentSessionApi>,
     state: ManagedAgentState,
+    /// Where this session can be reached from the outside, e.g.
+    /// `qq:group:867130587`. `None` until whoever created it says so.
+    address: Option<String>,
 }
 
 impl std::fmt::Debug for ManagedAgentSession {
@@ -1235,6 +1238,7 @@ impl RuntimeHost {
             .insert(
                 session_id.clone(),
                 ManagedAgentSession {
+                    address: None,
                     handle: AgentSessionHandle {
                         session_id: session_id.clone(),
                         kind: AgentSessionKind::PluginIteration,
@@ -1724,6 +1728,7 @@ impl RuntimeHost {
                 .insert(
                     session_id,
                     ManagedAgentSession {
+                        address: None,
                         handle,
                         session,
                         state: agent_state,
