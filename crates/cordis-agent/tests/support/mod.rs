@@ -183,7 +183,10 @@ fn mock_llm_accept_timeout() -> Duration {
     if std::env::var_os("CI").is_some() {
         Duration::from_secs(900)
     } else {
-        Duration::from_secs(30)
+        // A full `cargo test --workspace` runs several binaries that each shell
+        // out to cargo; 30s was short enough that a loaded machine looked like
+        // "the mock never got its request". Failures still surface, just later.
+        Duration::from_secs(300)
     }
 }
 
@@ -201,7 +204,7 @@ fn mock_llm_first_accept_timeout() -> Duration {
     if std::env::var_os("CI").is_some() {
         Duration::from_secs(120)
     } else {
-        Duration::from_secs(30)
+        Duration::from_secs(90)
     }
 }
 
