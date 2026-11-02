@@ -2,7 +2,7 @@
 
 ## 1. 判定口径
 
-- 本文基于当前仓库现状整理，最近更新：2026-10-31。
+- 本文基于当前仓库现状整理，最近更新：2026-11-01。
 - 历史规划蓝图已经吸收进 [design-blueprint.md](./design-blueprint.md)，因此本文结论来自三类证据的交叉比对：
   - 设计蓝图：[design-blueprint.md](./design-blueprint.md)
   - 架构文档：[system-overview.md](./system-overview.md)、[contracts-and-loading.md](./contracts-and-loading.md)、[runtime-semantics.md](./runtime-semantics.md)、[maintenance-guide.md](./maintenance-guide.md)
@@ -50,8 +50,10 @@
 
 插件迭代管线同样接了缝：`iteration_api::IterationRunner`（kernel 默认实现）+ 
 `IterationHost`（16 个能力），管线已泛型化为 `fn f<H: IterationHost>(host: &H, …)`，
-不再访问任何宿主私有字段。**文件搬家尚未完成**：kernel 单元测试依赖私有测试脚手架
-（`empty_host` / `prepared_for`），管线的最终迁入需要先给这些测试设计替身。
+不再访问任何宿主私有字段。**管线已于 2026-11-01 完成迁入**：`crates/cordis-agent/src/iteration/` 存放
+policy / driver / backend，`CargoIterationRunner` 实现 kernel 的 `IterationRunner`
+并由 CLI 安装；kernel 只保留接缝、报告词汇与一行委托。42 个管线/后端测试随代码搬入
+`crates/cordis-agent/tests/iteration_pipeline.rs`。
 
 ### 3.0 覆盖率治理战役（2026-07-23 ~ 07-27，已收官）
 
