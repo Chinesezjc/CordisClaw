@@ -3238,6 +3238,7 @@ fn format_agent_transcript_excerpt(entries: &[AgentTranscriptEntry]) -> String {
             AgentTranscriptEntry::Assistant {
                 content,
                 response_id,
+                ..
             } => {
                 let prefix = response_id
                     .as_deref()

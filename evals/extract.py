@@ -92,6 +92,7 @@ def summarise(turn):
     """The model-visible output: text it wrote and the calls it made."""
     calls = []
     text = None
+    reasoning_text = None
     for entry in turn["entries"]:
         kind = entry.get("kind")
         if kind == "tool":
@@ -104,7 +105,10 @@ def summarise(turn):
             content = entry.get("content")
             if isinstance(content, str) and content.strip() and content.strip() != '{"action":"suspend"}':
                 text = content
-    return calls, text
+            reasoning = entry.get("reasoning")
+            if isinstance(reasoning, str) and reasoning.strip():
+                reasoning_text = reasoning
+    return calls, text, reasoning_text
 
 
 def main():
@@ -139,7 +143,7 @@ def main():
                     continue
                 for flag in flags:
                     flagged[flag] = flagged.get(flag, 0) + 1
-                calls, text = summarise(turn)
+                calls, text, reasoning = summarise(turn)
                 context = context_for(history)
                 history.append((turn, text))
                 out.write(json.dumps({
@@ -149,6 +153,7 @@ def main():
                     "input": turn["input"],
                     "calls": calls,
                     "text": text,
+                    "reasoning": reasoning,
                     "flags": flags,
                     "verdict": {"label": None, "failure": None, "expected": None},
                 }, ensure_ascii=False) + "\n")

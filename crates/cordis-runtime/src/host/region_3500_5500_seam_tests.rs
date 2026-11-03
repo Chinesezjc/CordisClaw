@@ -127,10 +127,12 @@ fn format_agent_transcript_excerpt_renders_all_three_variants() {
         AgentTranscriptEntry::Assistant {
             content: "an answer".to_string(),
             response_id: Some("resp-1".to_string()),
+            reasoning: Some("why".to_string()),
         },
         AgentTranscriptEntry::Assistant {
             content: "no id answer".to_string(),
             response_id: None,
+            reasoning: None,
         },
         AgentTranscriptEntry::Tool {
             name: "create_file".to_string(),

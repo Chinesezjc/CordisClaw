@@ -283,6 +283,7 @@ impl AgentSession {
             self.transcript.push(AgentTranscriptEntry::Assistant {
                 content: format!("[error] {err}"),
                 response_id: None,
+                reasoning: None,
             });
         }
     }
@@ -570,9 +571,18 @@ impl AgentSession {
                     }
                     self.no_end_strikes = 0;
                     self.completed_turns += 1;
+                    // The transcript keeps the model's reasoning: the live
+                    // history is pruned, so without it "why did it say that"
+                    // becomes unanswerable once the turn leaves the window.
+                    let closing = message.content.unwrap_or_default();
+                    self.transcript.push(AgentTranscriptEntry::Assistant {
+                        content: closing.clone(),
+                        response_id: response_id.clone(),
+                        reasoning: message.reasoning_content.clone(),
+                    });
                     return Ok(AgentReply {
                         response_id,
-                        content: message.content.unwrap_or_default(),
+                        content: closing,
                         tool_events,
                     });
                 }
@@ -757,6 +767,7 @@ impl AgentSession {
                         self.transcript.push(AgentTranscriptEntry::Assistant {
                             content: reply_content.clone(),
                             response_id: response_id.clone(),
+                            reasoning: message.reasoning_content.clone(),
                         });
                         return Ok(AgentReply {
                             response_id,
@@ -871,6 +882,7 @@ impl AgentSession {
                 self.transcript.push(AgentTranscriptEntry::Assistant {
                     content: content.to_string(),
                     response_id: response_id.clone(),
+                    reasoning: message.reasoning_content.clone(),
                 });
                 return Ok(AgentReply {
                     response_id,
@@ -1230,6 +1242,7 @@ impl AgentSession {
         self.transcript.push(AgentTranscriptEntry::Assistant {
             content: assistant_output.to_string(),
             response_id: None,
+            reasoning: None,
         });
     }
 

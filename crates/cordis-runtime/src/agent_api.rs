@@ -169,6 +169,13 @@ pub enum AgentTranscriptEntry {
         content: String,
         #[serde(default)]
         response_id: Option<String>,
+        /// What the model reasoned before answering, when the provider sent it.
+        ///
+        /// Kept in the transcript because the live history is pruned: without
+        /// this, "why did it say that" is unanswerable the moment the turn
+        /// falls out of the window.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning: Option<String>,
     },
     Tool {
         name: String,
