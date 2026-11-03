@@ -18,3 +18,6 @@ data/
 
 # Scratch space at the repo root (tarballs, jars); never part of the repo.
 /tmp/
+
+# 真实轮次语料（含群聊内容，体积大）
+evals/*.jsonl
