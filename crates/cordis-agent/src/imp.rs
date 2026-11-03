@@ -1745,6 +1745,31 @@ fn extract_json_objects(text: &str) -> Vec<Value> {
 /// snapshot when exactly one plugin declares the node.
 /// Same, with a call index so two DSML calls to the same node in one turn get
 /// distinct ids — a duplicated `tool_call_id` breaks result pairing.
+/// Peel `payload_json` envelopes off a serialized call.
+///
+/// The model sometimes nests the wrapper it was shown instead of the node's own
+/// arguments: `{"node_id":"qq_send","payload_json":{"node_id":"qq_send",
+/// "payload_json":{"target":…}}}`, which reaches the plugin as a payload with no
+/// `target` and fails with "target is required". Only a bare envelope is peeled
+/// (keys limited to `node_id`/`payload_json`), so a plugin that genuinely takes
+/// a `payload_json` argument keeps it.
+fn peel_envelope(value: &Value) -> Value {
+    let mut current = value.clone();
+    loop {
+        let Some(object) = current.as_object() else {
+            return current;
+        };
+        let bare = object
+            .keys()
+            .all(|key| key == "node_id" || key == "payload_json");
+        let inner = object.get("payload_json").filter(|inner| inner.is_object());
+        match inner {
+            Some(inner) if bare => current = inner.clone(),
+            _ => return current,
+        }
+    }
+}
+
 fn serialized_call_to_tool_call_at(
     value: &Value,
     index: usize,
@@ -1802,7 +1827,7 @@ fn serialized_call_to_tool_call_at(
     let arguments = json!({
         "plugin_path": plugin_path,
         "node_id": node_id,
-        "payload_json": value,
+        "payload_json": peel_envelope(value),
     });
     Some(cordis_plugin_sdk::llm::LlmToolCall {
         id: format!("dsml-{index}-{node_id}"),
@@ -1868,6 +1893,33 @@ mod dsml_salvage_tests {
         assert_eq!(calls[0].function.name, super::AGENT_TOOL_READ_FILE);
         assert_eq!(calls[0].function.arguments, r#"{"path":"/tmp/a"}"#);
         assert_eq!(calls[0].id, "dsml-0-read_file");
+    }
+
+    // The model sometimes nests the envelope inside itself. The plugin must
+    // still receive the node's own arguments, or it fails with "target is
+    // required for qq_send" and the turn burns a retry.
+    #[test]
+    fn a_doubly_nested_envelope_reaches_the_plugin_flat() {
+        let text = r#"<|DSML|tool_calls>{"node_id":"qq_send","payload_json":{"node_id":"qq_send","payload_json":{"target":"group:1","message":"hi"}}}</|DSML|tool_calls>"#;
+        let calls = salvage_serialized_tool_calls(text, &specs());
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert_eq!(calls[0].function.name, "invoke_plugin");
+        let args: serde_json::Value =
+            serde_json::from_str(&calls[0].function.arguments).expect("args json");
+        assert_eq!(args["node_id"], "qq_send");
+        assert_eq!(args["payload_json"]["target"], "group:1");
+        assert_eq!(args["payload_json"]["message"], "hi");
+    }
+
+    // A plugin that genuinely takes a `payload_json` argument keeps it: only a
+    // bare `{node_id, payload_json}` envelope is peeled.
+    #[test]
+    fn a_real_payload_json_argument_survives() {
+        let text = r#"<|DSML|tool_calls>{"node_id":"qq_send","target":"group:1","payload_json":{"inner":true}}</|DSML|tool_calls>"#;
+        let calls = salvage_serialized_tool_calls(text, &specs());
+        let args: serde_json::Value =
+            serde_json::from_str(&calls[0].function.arguments).expect("args json");
+        assert_eq!(args["payload_json"]["payload_json"]["inner"], true);
     }
 
     // A plugin node keeps the `invoke_plugin` wrapper, and two calls to the same

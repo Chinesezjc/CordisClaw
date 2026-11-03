@@ -431,6 +431,8 @@ fn wrap_inbox_batch(combined: &str) -> String {
          whether this continues a thread you are part of, and whether a reply would actually help. \
          Do not re-answer an older message as if it were a new request, \
          and do not claim someone is asking you a question unless the question is in this batch or in the thread it continues. \
+         A bare follow-up (你呢 / 然后呢 / 为什么) refers to the messages immediately before it, not to a topic from earlier in the history: \
+         if those messages are between other people, it is not addressed to you. \
          Whether to answer is decided by the `[reply policy: ...]` line (see the plugin instructions) plus that context — \
          if the message is clearly between other people, output exactly {{\"action\":\"suspend\"}}."
     )
@@ -3293,6 +3295,21 @@ mod inbox_framing_tests {
         let keeps_anti_hallucination =
             wrapped.contains("do not claim someone is asking you a question");
         assert!(keeps_anti_hallucination, "{wrapped}");
+    }
+
+    // 一个光秃秃的追问只可能指它前面那几条消息：2026-11-03 群里一句"你呢"被答成
+    // "问我穿啥"，模型翻到了上百条之前的穿衣话题。规则必须点名"紧邻"而不是"历史"。
+    #[test]
+    fn wrap_pins_a_bare_follow_up_to_the_adjacent_messages() {
+        let wrapped = wrap_inbox_batch("[user A]: 你呢");
+        assert!(
+            wrapped.contains("refers to the messages immediately before it"),
+            "{wrapped}"
+        );
+        assert!(
+            wrapped.contains("not to a topic from earlier in the history"),
+            "{wrapped}"
+        );
     }
 
     // A multi-line combined batch (outage spill prepended to fresh messages)
