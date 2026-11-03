@@ -70,6 +70,13 @@ pub struct AgentSession {
     completed_turns: usize,
     /// Conservative estimate of total tokens in history (chars / 2).
     estimated_tokens: usize,
+    /// Reasoning produced by every model call of the turn in progress.
+    ///
+    /// A channel turn takes several calls (act, then close), and the reasoning
+    /// that explains the reply belongs to the call that produced it — not to the
+    /// last one, which is just "I already answered". The transcript keeps them
+    /// all, joined, because history is pruned.
+    turn_reasoning: Vec<String>,
     /// Consecutive reasoning-only responses (no content, no tool_calls).
     reasoning_only_strikes: usize,
     /// Consecutive degenerate completions (no content, no tool calls) for this
@@ -135,6 +142,7 @@ impl AgentSession {
             transcript: Vec::new(),
             completed_turns: 0,
             estimated_tokens: 0,
+            turn_reasoning: Vec::new(),
             reasoning_only_strikes: 0,
             empty_response_strikes: 0,
             require_end_tool: false,
@@ -304,6 +312,7 @@ impl AgentSession {
         provider: &dyn LlmProvider,
         sink: Option<std::sync::Arc<dyn cordis_runtime::llm_sink::TokenSink>>,
     ) -> Result<AgentReply, RuntimeError> {
+        self.turn_reasoning.clear();
         let trimmed = user_input.trim();
         if trimmed.is_empty() {
             return Err(RuntimeError::InvalidArgument {
@@ -575,10 +584,11 @@ impl AgentSession {
                     // history is pruned, so without it "why did it say that"
                     // becomes unanswerable once the turn leaves the window.
                     let closing = message.content.unwrap_or_default();
+                    let reasoning = closing_reasoning(&self.turn_reasoning);
                     self.transcript.push(AgentTranscriptEntry::Assistant {
                         content: closing.clone(),
                         response_id: response_id.clone(),
-                        reasoning: message.reasoning_content.clone(),
+                        reasoning,
                     });
                     return Ok(AgentReply {
                         response_id,
@@ -596,6 +606,14 @@ impl AgentSession {
                 .tool_calls
                 .iter()
                 .any(|call| call.function.name == AGENT_TOOL_RECORD_ITERATION_SUMMARY);
+
+            if let Some(reasoning) = message
+                .reasoning_content
+                .as_deref()
+                .filter(|reasoning| !reasoning.trim().is_empty())
+            {
+                self.turn_reasoning.push(reasoning.to_string());
+            }
 
             if !message.tool_calls.is_empty() {
                 let available_tools = tool_specs
@@ -767,7 +785,7 @@ impl AgentSession {
                         self.transcript.push(AgentTranscriptEntry::Assistant {
                             content: reply_content.clone(),
                             response_id: response_id.clone(),
-                            reasoning: message.reasoning_content.clone(),
+                            reasoning: closing_reasoning(&self.turn_reasoning),
                         });
                         return Ok(AgentReply {
                             response_id,
@@ -784,9 +802,16 @@ impl AgentSession {
                 if ends_after_tools {
                     self.no_end_strikes = 0;
                     self.completed_turns += 1;
+                    let closing = message.content.unwrap_or_default();
+                    let reasoning = closing_reasoning(&self.turn_reasoning);
+                    self.transcript.push(AgentTranscriptEntry::Assistant {
+                        content: closing.clone(),
+                        response_id: response_id.clone(),
+                        reasoning,
+                    });
                     return Ok(AgentReply {
                         response_id,
-                        content: message.content.unwrap_or_default(),
+                        content: closing,
                         tool_events,
                     });
                 }
@@ -796,9 +821,15 @@ impl AgentSession {
             if end_requested {
                 self.no_end_strikes = 0;
                 self.completed_turns += 1;
+                let closing = message.content.unwrap_or_default();
+                self.transcript.push(AgentTranscriptEntry::Assistant {
+                    content: closing.clone(),
+                    response_id: response_id.clone(),
+                    reasoning: closing_reasoning(&self.turn_reasoning),
+                });
                 return Ok(AgentReply {
                     response_id,
-                    content: message.content.unwrap_or_default(),
+                    content: closing,
                     tool_events,
                 });
             }
@@ -811,9 +842,18 @@ impl AgentSession {
             if !tool_events.is_empty() {
                 self.no_end_strikes = 0;
                 self.completed_turns += 1;
+                // This is how a channel turn normally closes: something went
+                // out, then the model stopped. The assistant entry is the only
+                // place the reasoning survives, because history is pruned.
+                let closing = message.content.unwrap_or_default();
+                self.transcript.push(AgentTranscriptEntry::Assistant {
+                    content: closing.clone(),
+                    response_id: response_id.clone(),
+                    reasoning: closing_reasoning(&self.turn_reasoning),
+                });
                 return Ok(AgentReply {
                     response_id,
-                    content: message.content.unwrap_or_default(),
+                    content: closing,
                     tool_events,
                 });
             }
@@ -882,7 +922,7 @@ impl AgentSession {
                 self.transcript.push(AgentTranscriptEntry::Assistant {
                     content: content.to_string(),
                     response_id: response_id.clone(),
-                    reasoning: message.reasoning_content.clone(),
+                    reasoning: closing_reasoning(&self.turn_reasoning),
                 });
                 return Ok(AgentReply {
                     response_id,
@@ -1020,7 +1060,38 @@ impl AgentSession {
         let transcript_len_before = self.transcript.len();
         let result = self.respond_inner(backend, user_input, images, notes, provider, sink);
         self.repair_transcript_on_error(transcript_len_before, &result);
+        self.record_turn_end(transcript_len_before, &result);
         result
+    }
+
+    /// Guarantee one assistant entry per turn.
+    ///
+    /// The loop returns from a dozen different places — a delivered message then
+    /// text, an explicit marker, an iteration summary, a provider failure — and
+    /// only some of them pushed a transcript entry. Rather than patch each one,
+    /// the turn records its own ending here, where every path converges. The
+    /// reasoning accumulated across the turn rides along, because the live
+    /// history is pruned and this is the only durable copy.
+    fn record_turn_end(
+        &mut self,
+        transcript_len_before: usize,
+        result: &Result<AgentReply, RuntimeError>,
+    ) {
+        let Ok(reply) = result else { return };
+        let already_recorded = self
+            .transcript
+            .iter()
+            .skip(transcript_len_before)
+            .any(|entry| matches!(entry, AgentTranscriptEntry::Assistant { .. }));
+        if already_recorded {
+            return;
+        }
+        let reasoning = closing_reasoning(&self.turn_reasoning);
+        self.transcript.push(AgentTranscriptEntry::Assistant {
+            content: reply.content.clone(),
+            response_id: reply.response_id.clone(),
+            reasoning,
+        });
     }
 
     pub fn respond_with_runtime_host<H: AgentToolHost + ?Sized>(
@@ -1286,6 +1357,7 @@ impl AgentSession {
             transcript: snapshot.transcript,
             completed_turns: snapshot.completed_turns,
             estimated_tokens: snapshot.estimated_tokens,
+            turn_reasoning: Vec::new(),
             reasoning_only_strikes: snapshot.reasoning_only_strikes,
             empty_response_strikes: 0,
             require_end_tool: snapshot.require_end_tool,
@@ -1766,6 +1838,20 @@ fn extract_json_objects(text: &str) -> Vec<Value> {
 /// `target` and fails with "target is required". Only a bare envelope is peeled
 /// (keys limited to `node_id`/`payload_json`), so a plugin that genuinely takes
 /// a `payload_json` argument keeps it.
+/// Every reasoning string of the turn, joined, capped so a runaway model cannot
+/// balloon the snapshot.
+fn closing_reasoning(parts: &[String]) -> Option<String> {
+    if parts.is_empty() {
+        return None;
+    }
+    let joined = parts.join("\n\n---\n\n");
+    const CAP: usize = 8000;
+    if joined.chars().count() <= CAP {
+        return Some(joined);
+    }
+    Some(joined.chars().take(CAP).collect())
+}
+
 fn peel_envelope(value: &Value) -> Value {
     let mut current = value.clone();
     loop {
