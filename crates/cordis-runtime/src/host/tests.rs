@@ -3,14 +3,12 @@ use super::{
     dir_is_older_than, dir_size_bytes, ensure_scaffold_integration_edits, extract_warning_blocks,
     render_child_plugin_core, render_child_plugin_test, sanitize_child_plugin_segment,
     snapshot_staging_lock, sort_plugin_context_paths, staged_artifact_root_is_removable,
-    warning_diagnostics_for_changed_paths, AgentSessionKind, AgentStartOptions,
-    RuntimeHost, ScaffoldedChildRegistration, SnapshotGcReport,
+    warning_diagnostics_for_changed_paths, AgentSessionKind, AgentStartOptions, RuntimeHost,
+    ScaffoldedChildRegistration, SnapshotGcReport,
 };
 use crate::core::error::RuntimeError;
 use crate::core::models::NodeOutcome;
-use crate::kernel::plugin_iteration::{
-    PluginEditOpKind, PluginEditOperation,
-};
+use crate::kernel::plugin_iteration::{PluginEditOpKind, PluginEditOperation};
 use serial_test::serial;
 use std::collections::BTreeMap;
 use std::fs;
@@ -855,7 +853,6 @@ fn scaffold_integration_edits_require_host_source_or_tests() {
     });
     assert!(ensure_scaffold_integration_edits(&scaffolded_children, &integrated).is_ok());
 }
-
 
 #[test]
 fn validated_verification_command_accepts_short_check_and_test_aliases() {

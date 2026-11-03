@@ -5,13 +5,13 @@ use cordis_runtime::core::error::RuntimeError;
 use cordis_runtime::execution::engine::ExecutionOutput;
 use cordis_runtime::host::*;
 use cordis_runtime::kernel::plugin_iteration::*;
-use cordis_runtime::kernel::verifier::{hash_source_tree, CommandVerifier, VerificationReport, VerifyOptions};
+use cordis_runtime::kernel::verifier::{
+    hash_source_tree, CommandVerifier, VerificationReport, VerifyOptions,
+};
 use cordis_runtime::plugin::abi::PluginResponse;
 use cordis_runtime::plugin::builder::plugin_builder;
 use serde_json::{Map, Value};
 use std::collections::BTreeSet;
-
-
 
 use cordis_runtime::iteration_api::IterationHost;
 
@@ -20,7 +20,6 @@ const BLOCKED_NO_CANARY_EVIDENCE: &str = "this change has no canary evidence: no
 recent invocation replayed cleanly and no verifier node is declared, so the \
 behaviour is unproven. Ask an operator to approve this iteration (approve_iteration).";
 
-
 pub fn start_plugin_iteration_agent_session<H: IterationHost>(
     host: &H,
     prepared: PreparedPluginIteration,
@@ -28,8 +27,6 @@ pub fn start_plugin_iteration_agent_session<H: IterationHost>(
 ) -> Result<String, RuntimeError> {
     host.start_iteration_session(prepared, context_paths)
 }
-
-
 
 pub fn iterate_plugins<H: IterationHost>(
     host: &H,
@@ -54,8 +51,8 @@ pub fn iterate_plugins<H: IterationHost>(
             // `cfg(test)`, so gating this out would make the injection
             // unreachable from the crate's own tests. The flag is false unless
             // a test sets it.
-            let injected =
-                cordis_runtime::host::TEST_ITERATION_PANIC_INJECTION.swap(false, std::sync::atomic::Ordering::SeqCst);
+            let injected = cordis_runtime::host::TEST_ITERATION_PANIC_INJECTION
+                .swap(false, std::sync::atomic::Ordering::SeqCst);
             assert!(!injected, "test panic injection: plugin iteration");
             let mut state = PluginIterationRunState::new(prepared.clone());
 
@@ -163,7 +160,8 @@ pub fn iterate_plugins<H: IterationHost>(
                     })
                     .unwrap_or_else(|| Err(plugin_iteration_missing_rollback_error()))
                     .and_then(|()| {
-                        let builder = plugin_builder().ok_or_else(cordis_runtime::plugin::builder::missing_builder_error)?;
+                        let builder = plugin_builder()
+                            .ok_or_else(cordis_runtime::plugin::builder::missing_builder_error)?;
                         builder.rebuild_plugin(host.fixtures_root(), &plugin_path)
                     });
                 match rebuilt {
@@ -342,8 +340,7 @@ pub fn run_plugin_iteration_agent<H: IterationHost>(
         &prepared.target_plugin_paths,
     );
     let context_paths = collected?;
-    let session_id =
-        start_plugin_iteration_agent_session(host, prepared.clone(), context_paths)?;
+    let session_id = start_plugin_iteration_agent_session(host, prepared.clone(), context_paths)?;
     let input = prepared
         .instruction
         .clone()
@@ -641,8 +638,7 @@ pub fn finalize_plugin_iteration<H: IterationHost>(
             match host.promote_candidate_matching(staged_candidate_id) {
                 Ok(_) => PluginIterationFinalVerdict::Promoted,
                 Err(err) => {
-                    let candidate_rollback =
-                        host.rollback_candidate_if_staged(staged_candidate_id);
+                    let candidate_rollback = host.rollback_candidate_if_staged(staged_candidate_id);
                     let workspace_restore = restore_plugin_iteration_workspace(
                         host.fixtures_root(),
                         host.snapshot_root(),
@@ -688,8 +684,6 @@ pub fn finalize_plugin_iteration<H: IterationHost>(
     state.final_verdict = Some(final_verdict);
     Ok(final_verdict)
 }
-
-
 
 pub fn fail_stage<H: IterationHost>(
     host: &H,

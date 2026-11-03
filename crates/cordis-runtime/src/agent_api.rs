@@ -28,7 +28,11 @@ pub trait AgentToolHost {
     ///
     /// Default: refused. Only a real host can route between sessions; a double
     /// says so instead of pretending.
-    fn agent_send_to_session(&self, _session_id: &str, _input: &str) -> Result<Value, RuntimeError> {
+    fn agent_send_to_session(
+        &self,
+        _session_id: &str,
+        _input: &str,
+    ) -> Result<Value, RuntimeError> {
         Err(RuntimeError::Invariant {
             message: "this host cannot route messages between sessions".to_string(),
         })
@@ -126,7 +130,6 @@ pub trait AgentToolHost {
         })
     }
 }
-
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct AgentSessionStatus {

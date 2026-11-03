@@ -1,5 +1,5 @@
-use cordis_runtime::agent_api::AgentToolEvent;
 use cordis_agent::ShellAgentReply;
+use cordis_runtime::agent_api::AgentToolEvent;
 use cordis_runtime::context::ContextRegistry;
 use cordis_runtime::core::error::RuntimeError;
 use cordis_runtime::host::{
@@ -539,8 +539,6 @@ where
         }
     }
 }
-
-
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ServeMode {
@@ -1215,7 +1213,9 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                             // calls no tool simply says nothing.
                             let sent = outbound_replies(&reply.tool_events);
                             if sent.is_empty() {
-                                eprintln!("inbox: [{session_key}] turn produced no tool call → silent");
+                                eprintln!(
+                                    "inbox: [{session_key}] turn produced no tool call → silent"
+                                );
                             } else {
                                 eprintln!(
                                     "inbox: [{session_key}] sent {} message(s) through tools",
@@ -3100,7 +3100,6 @@ mod batch_tests {
         assert!(!with_role("member").caller_is_admin());
         assert!(!with_role("").caller_is_admin());
     }
-
 }
 
 #[cfg(test)]
@@ -3326,7 +3325,6 @@ mod inbox_framing_tests {
         let twice = wrap_inbox_batch(&once);
         assert_eq!(twice.matches("CURRENT_INCOMING_BATCH_START").count(), 2);
     }
-
 }
 
 #[cfg(test)]
@@ -3899,4 +3897,3 @@ mod startup_invocation_tests {
         let _ = std::fs::remove_dir_all(&temp);
     }
 }
-

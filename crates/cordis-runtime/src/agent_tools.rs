@@ -1311,4 +1311,3 @@ pub struct SessionCaller {
     /// approval policy stays in the plugin layer.
     pub can_approve_iteration: bool,
 }
-

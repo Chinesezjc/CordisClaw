@@ -17,8 +17,6 @@ pub struct PluginIterationAgentBackend<'a> {
     pub state: &'a mut PluginIterationAgentState,
 }
 
-
-
 impl<'a> PluginIterationAgentBackend<'a> {
     pub fn phase(&self) -> &'static str {
         if self.state.recorded_summary.is_some() {
@@ -48,7 +46,10 @@ impl<'a> PluginIterationAgentBackend<'a> {
             .values()
             .cloned()
             .collect::<BTreeSet<_>>();
-        cordis_runtime::kernel::plugin_iteration::validate_reserved_child_keyword_identifiers(&combined_operations, &writable_roots)?;
+        cordis_runtime::kernel::plugin_iteration::validate_reserved_child_keyword_identifiers(
+            &combined_operations,
+            &writable_roots,
+        )?;
 
         let executor = PluginEditExecutor::new(self.host.fixtures_root());
         let mut local_rollback = PluginEditRollback::empty(self.host.fixtures_root());

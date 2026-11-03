@@ -1,7 +1,6 @@
 use crate::agent_api::AgentSessionSnapshot;
 use crate::agent_api::{
-    AgentReply, AgentSessionStatus, AgentToolExecutionSummary,
-    AgentTranscriptEntry,
+    AgentReply, AgentSessionStatus, AgentToolExecutionSummary, AgentTranscriptEntry,
 };
 use crate::config::{LlmApiConfig, PluginConfigFile, RuntimeConfig};
 use crate::context::RuntimeContext;
@@ -22,15 +21,12 @@ use crate::kernel::auto_update::{
 use crate::kernel::evaluator::VerificationInput;
 use crate::kernel::memory::{ChangeMemory, ChangeRecord};
 use crate::kernel::plugin_iteration::{
-    normalize_rel_path, now_ms,
-    CanaryReport, KernelPluginIssue, KernelPluginIssueSource,
-    KernelPluginIssueStatus, KernelPluginIterationRequest, PluginEditOpKind,
-    PluginEditOperation, PluginEditPlan, PluginEditRollback, PluginIterationFinalVerdict,
-    PluginIterationHistoryEntry, PluginIterationPolicy, PluginIterationStatus, VerifierVerdict,
+    normalize_rel_path, now_ms, CanaryReport, KernelPluginIssue, KernelPluginIssueSource,
+    KernelPluginIssueStatus, KernelPluginIterationRequest, PluginEditOpKind, PluginEditOperation,
+    PluginEditPlan, PluginEditRollback, PluginIterationFinalVerdict, PluginIterationHistoryEntry,
+    PluginIterationPolicy, PluginIterationStatus, VerifierVerdict,
 };
-use crate::kernel::verifier::{
-    VerificationProfile, VerificationReport,
-};
+use crate::kernel::verifier::{VerificationProfile, VerificationReport};
 use crate::plugin::abi::PluginResponse;
 use crate::plugin::builder::{missing_builder_error, plugin_builder};
 use crate::plugin::invoke::invoke_registered_plugin_with_settings;
@@ -691,7 +687,6 @@ pub struct AgentStartOptions {
     pub require_end_tool: bool,
 }
 
-
 /// Per-session profile fallback state. `desired` is the profile the
 /// session was started with; `degraded` is true while requests are being
 /// served by that profile's fallback instead.
@@ -1106,105 +1101,105 @@ fn sensitive_path_keyword(path: &str) -> Option<&'static str> {
 
 impl RuntimeHost {
     pub(crate) fn plugin_iteration_agent_snapshot(
-    &self,
-    session_id: &str,
-) -> Result<PluginIterationAgentRun, RuntimeError> {
-    let guard = self
-        .agent_sessions
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner());
-    let managed = guard
-        .get(session_id)
-        .ok_or_else(|| RuntimeError::AgentSessionNotFound {
-            session_id: session_id.to_string(),
-        })?;
-    let ManagedAgentState::PluginIteration(state) = &managed.state else {
-        return Err(RuntimeError::InvalidArgument {
-            message: format!("agent session {session_id} is not a plugin iteration session"),
-        });
-    };
-    Ok(PluginIterationAgentRun {
-        llm_driven: true,
-        session_id: Some(session_id.to_string()),
-        tool_summary: None,
-        transcript_excerpt: Vec::new(),
-        recorded_summary: state.recorded_summary.clone(),
-        requires_approval: state.requires_approval,
-        changed_paths: state.derived_edit_plan().changed_paths(),
-        rollback: state.rollback.clone(),
-        derived_edit_plan: state.derived_edit_plan(),
-    })
-}
+        &self,
+        session_id: &str,
+    ) -> Result<PluginIterationAgentRun, RuntimeError> {
+        let guard = self
+            .agent_sessions
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let managed = guard
+            .get(session_id)
+            .ok_or_else(|| RuntimeError::AgentSessionNotFound {
+                session_id: session_id.to_string(),
+            })?;
+        let ManagedAgentState::PluginIteration(state) = &managed.state else {
+            return Err(RuntimeError::InvalidArgument {
+                message: format!("agent session {session_id} is not a plugin iteration session"),
+            });
+        };
+        Ok(PluginIterationAgentRun {
+            llm_driven: true,
+            session_id: Some(session_id.to_string()),
+            tool_summary: None,
+            transcript_excerpt: Vec::new(),
+            recorded_summary: state.recorded_summary.clone(),
+            requires_approval: state.requires_approval,
+            changed_paths: state.derived_edit_plan().changed_paths(),
+            rollback: state.rollback.clone(),
+            derived_edit_plan: state.derived_edit_plan(),
+        })
+    }
 
     pub fn record_invocation_sample(
-    &self,
-    plugin_path: &str,
-    node_id: &str,
-    payload: &str,
-    response_payload: &str,
-) {
-    let payload =
-        serde_json::from_str(payload).unwrap_or_else(|_| Value::String(payload.to_string()));
-    let response = parse_response_payload(response_payload);
-    let mut samples = self
-        .invocation_samples
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner());
-    samples.push_front(InvocationSample {
-        plugin_path: plugin_path.to_string(),
-        node_id: node_id.to_string(),
-        payload,
-        response,
-        observed_at_ms: now_ms(),
-    });
-    while samples.len() > 64 {
-        samples.pop_back();
+        &self,
+        plugin_path: &str,
+        node_id: &str,
+        payload: &str,
+        response_payload: &str,
+    ) {
+        let payload =
+            serde_json::from_str(payload).unwrap_or_else(|_| Value::String(payload.to_string()));
+        let response = parse_response_payload(response_payload);
+        let mut samples = self
+            .invocation_samples
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        samples.push_front(InvocationSample {
+            plugin_path: plugin_path.to_string(),
+            node_id: node_id.to_string(),
+            payload,
+            response,
+            observed_at_ms: now_ms(),
+        });
+        while samples.len() > 64 {
+            samples.pop_back();
+        }
     }
-}
 
     pub(crate) fn observe_snapshot_plugin_issues(
-    &self,
-    snapshot: &RuntimeSnapshot,
-    report: &ReloadReport,
-    stage: &str,
-) {
-    for (plugin_path, plugin) in snapshot.plugin_registry().iter() {
-        let changed_reasons = report
-            .changed_plugin_reasons
-            .get(&plugin_path)
-            .cloned()
-            .unwrap_or_default();
-        match plugin.load_result {
-            PluginLoadResult::Unavailable(reason) => {
-                let source = match reason {
-                    PluginUnavailableReason::ContractViolation => {
-                        KernelPluginIssueSource::DocsDrift
-                    }
-                    _ => KernelPluginIssueSource::LoadFailure,
-                };
-                self.kernel.observe_plugin_issue(
-                    source,
-                    plugin_path.clone(),
-                    format!("{stage} observed plugin {plugin_path} unavailable: {reason:?}"),
-                );
-            }
-            PluginLoadResult::Loaded => {
-                if changed_reasons.iter().any(|reason| {
-                    matches!(reason.as_str(), "docs_changed" | "fingerprint_diff_changed")
-                }) {
+        &self,
+        snapshot: &RuntimeSnapshot,
+        report: &ReloadReport,
+        stage: &str,
+    ) {
+        for (plugin_path, plugin) in snapshot.plugin_registry().iter() {
+            let changed_reasons = report
+                .changed_plugin_reasons
+                .get(&plugin_path)
+                .cloned()
+                .unwrap_or_default();
+            match plugin.load_result {
+                PluginLoadResult::Unavailable(reason) => {
+                    let source = match reason {
+                        PluginUnavailableReason::ContractViolation => {
+                            KernelPluginIssueSource::DocsDrift
+                        }
+                        _ => KernelPluginIssueSource::LoadFailure,
+                    };
                     self.kernel.observe_plugin_issue(
-                        KernelPluginIssueSource::DocsDrift,
+                        source,
                         plugin_path.clone(),
-                        format!(
-                            "{stage} detected docs/contract drift for {plugin_path}: {}",
-                            changed_reasons.join(", ")
-                        ),
+                        format!("{stage} observed plugin {plugin_path} unavailable: {reason:?}"),
                     );
+                }
+                PluginLoadResult::Loaded => {
+                    if changed_reasons.iter().any(|reason| {
+                        matches!(reason.as_str(), "docs_changed" | "fingerprint_diff_changed")
+                    }) {
+                        self.kernel.observe_plugin_issue(
+                            KernelPluginIssueSource::DocsDrift,
+                            plugin_path.clone(),
+                            format!(
+                                "{stage} detected docs/contract drift for {plugin_path}: {}",
+                                changed_reasons.join(", ")
+                            ),
+                        );
+                    }
                 }
             }
         }
     }
-}
 
     pub fn iterate_plugins(
         &self,
@@ -1245,7 +1240,11 @@ impl RuntimeHost {
                     },
                     session,
                     state: ManagedAgentState::PluginIteration(Box::new(
-                        PluginIterationAgentState::new(prepared, context_paths, &self.fixtures_root),
+                        PluginIterationAgentState::new(
+                            prepared,
+                            context_paths,
+                            &self.fixtures_root,
+                        ),
                     )),
                 },
             );
@@ -1297,9 +1296,8 @@ impl RuntimeHost {
         // embedding) is usable; an embedding crate may replace it before this
         // runs, and `install_agent_loop` keeps the first one.
         #[cfg(test)]
-        let _ = crate::agent_loop::install_agent_loop(Box::new(
-            crate::agent_loop::test_loop::TestLoop,
-        ));
+        let _ =
+            crate::agent_loop::install_agent_loop(Box::new(crate::agent_loop::test_loop::TestLoop));
 
         let fixtures_root = fixtures_root.as_ref().to_path_buf();
         let config = RuntimeConfig::load(&fixtures_root)?;
@@ -1549,7 +1547,11 @@ impl RuntimeHost {
     /// Best-effort save of a session snapshot to `data/sessions/<id>.json`.
     /// Uses atomic temp-file-then-rename.  Errors are logged but never
     /// propagated — an auto-save failure must not break the agent response.
-    fn auto_save_session(&self, session_id: &str, session: &dyn crate::agent_loop::AgentSessionApi) {
+    fn auto_save_session(
+        &self,
+        session_id: &str,
+        session: &dyn crate::agent_loop::AgentSessionApi,
+    ) {
         let sessions_dir = self.data_dir().join("sessions");
         if let Err(e) = std::fs::create_dir_all(&sessions_dir) {
             let subject = format!("failed to create sessions dir {}", sessions_dir.display());
@@ -3042,8 +3044,6 @@ impl ManagedAgentSession {
     }
 }
 
-
-
 pub fn parse_agent_args<T>(arguments: Value, tool_name: &str) -> Result<T, RuntimeError>
 where
     T: DeserializeOwned,
@@ -3097,8 +3097,21 @@ pub fn canary_payload_serialize_error(err: &serde_json::Error) -> RuntimeError {
 /// pity) and its response is usually the very thing the edit changes.
 fn node_declares_side_effects_in(nodes: &[cordis_plugin_sdk::NodeDoc], node_id: &str) -> bool {
     const MUTATING: [&str; 15] = [
-        "consum", "mutat", "persist", "delete", "remove", "increment", "decrement", "save",
-        "update", "create", "spend", "charge", "grant", "file", "disk",
+        "consum",
+        "mutat",
+        "persist",
+        "delete",
+        "remove",
+        "increment",
+        "decrement",
+        "save",
+        "update",
+        "create",
+        "spend",
+        "charge",
+        "grant",
+        "file",
+        "disk",
     ];
     nodes
         .iter()

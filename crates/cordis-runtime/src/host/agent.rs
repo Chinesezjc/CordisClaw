@@ -177,11 +177,11 @@ impl RuntimeHost {
             .agent_sessions
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        let managed = guard.get_mut(session_id).ok_or_else(|| {
-            RuntimeError::InvalidArgument {
+        let managed = guard
+            .get_mut(session_id)
+            .ok_or_else(|| RuntimeError::InvalidArgument {
                 message: format!("agent session {session_id} is not live"),
-            }
-        })?;
+            })?;
         managed.address = Some(address.to_string());
         Ok(())
     }

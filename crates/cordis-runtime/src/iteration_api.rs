@@ -80,16 +80,12 @@ pub trait IterationHost: Send + Sync {
         &self,
         session_id: &str,
     ) -> Result<Vec<crate::agent_api::AgentTranscriptEntry>, RuntimeError>;
-    fn reload_candidate(
-        &self,
-    ) -> Result<crate::host::CandidateSnapshotStatus, RuntimeError>;
+    fn reload_candidate(&self) -> Result<crate::host::CandidateSnapshotStatus, RuntimeError>;
     fn promote_candidate_matching(
         &self,
         expected_candidate_snapshot_id: Option<&str>,
     ) -> Result<crate::host::ReloadReport, RuntimeError>;
-    fn rollback_candidate(
-        &self,
-    ) -> Result<crate::host::CandidateSnapshotStatus, RuntimeError>;
+    fn rollback_candidate(&self) -> Result<crate::host::CandidateSnapshotStatus, RuntimeError>;
     fn recent_invocation_samples(&self) -> Vec<crate::host::InvocationSample>;
     fn iteration_agent_snapshot(
         &self,

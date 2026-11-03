@@ -1,4 +1,3 @@
-
 #[ctor::ctor]
 fn _install_agent_loop() {
     let _ = cordis_agent::install();

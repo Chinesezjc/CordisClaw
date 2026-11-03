@@ -1,8 +1,8 @@
-use cordis_runtime::config::LlmApiConfig;
+use chrono::Local;
 use cordis_runtime::agent_api::{AgentSessionSnapshot, LlmProvider};
 use cordis_runtime::agent_tools::*;
+use cordis_runtime::config::LlmApiConfig;
 use cordis_runtime::core::error::RuntimeError;
-use chrono::Local;
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeSet, VecDeque};
 use std::env;
@@ -55,14 +55,11 @@ const EMPTY_RESPONSE_RETRIES: usize = 1;
 const AGENT_HISTORY_MESSAGE_LIMIT: usize = 8192;
 const AGENT_MAX_TOOL_TURNS: usize = 96;
 
-
-
 /// 一次模型补全的执行者。
 ///
 /// 这是 agent 循环（机制）与供应商传输（可覆写）之间的接缝。循环只要求拿回
 /// **结构化的** `tool_calls`——它在本轮中途就要据此分派工具，因此只回文本的
 /// provider 无法驱动工具调用。
-
 
 #[derive(Debug, Clone)]
 pub struct AgentSession {
@@ -394,7 +391,6 @@ impl AgentSession {
                 });
             }
 
-
             // P1-37: unify the two timeout budgets. `timeout_ms` (per
             // HTTP request) and `stream_timeout_secs * 5` (per-stream
             // overall) were checked independently — a session where
@@ -440,7 +436,6 @@ impl AgentSession {
                 }
             }
 
-
             emit_agent_diagnostic(format!(
                 "agent_turn_start kind={} turn={} elapsed_ms={} messages={} tools={}",
                 self.kind,
@@ -474,42 +469,43 @@ impl AgentSession {
                 // json_object` forbids tool calls outright, which is what made
                 // the model answer with whitespace and stop.
             });
-            let parts = match provider.complete(request_body, sink.clone(), self.config.to_transport())
-            {
-                Ok(parts) => parts,
-                // A single unsupported image poisons the whole history: every
-                // later request replays it and gets the same 400. Drop the image
-                // parts and try the turn again — text survives, pictures do not.
-                Err(err)
-                    if !self.image_parts_stripped
-                        && err.to_string().contains("image") =>
-                {
-                    self.image_parts_stripped = true;
-                    emit_agent_diagnostic(format!(
-                        "agent_image_rejected kind={} turn={} err={:?}",
-                        self.kind, turn, err.to_string()
-                    ));
-                    strip_image_parts(&mut messages);
-                    strip_image_parts(&mut self.history);
-                    self.empty_response_strikes = 0;
-                    continue;
-                }
-                // A provider failure after the message went out is not a
-                // reason to replay the whole turn: the room already heard it.
-                Err(err) if !tool_events.is_empty() => {
-                    emit_agent_diagnostic(format!(
-                        "agent_provider_failed_after_delivery kind={} turn={} err={:?}",
-                        self.kind, turn, err.to_string()
-                    ));
-                    self.completed_turns += 1;
-                    return Ok(AgentReply {
-                        response_id: None,
-                        content: String::new(),
-                        tool_events,
-                    });
-                }
-                Err(err) => return Err(err),
-            };
+            let parts =
+                match provider.complete(request_body, sink.clone(), self.config.to_transport()) {
+                    Ok(parts) => parts,
+                    // A single unsupported image poisons the whole history: every
+                    // later request replays it and gets the same 400. Drop the image
+                    // parts and try the turn again — text survives, pictures do not.
+                    Err(err) if !self.image_parts_stripped && err.to_string().contains("image") => {
+                        self.image_parts_stripped = true;
+                        emit_agent_diagnostic(format!(
+                            "agent_image_rejected kind={} turn={} err={:?}",
+                            self.kind,
+                            turn,
+                            err.to_string()
+                        ));
+                        strip_image_parts(&mut messages);
+                        strip_image_parts(&mut self.history);
+                        self.empty_response_strikes = 0;
+                        continue;
+                    }
+                    // A provider failure after the message went out is not a
+                    // reason to replay the whole turn: the room already heard it.
+                    Err(err) if !tool_events.is_empty() => {
+                        emit_agent_diagnostic(format!(
+                            "agent_provider_failed_after_delivery kind={} turn={} err={:?}",
+                            self.kind,
+                            turn,
+                            err.to_string()
+                        ));
+                        self.completed_turns += 1;
+                        return Ok(AgentReply {
+                            response_id: None,
+                            content: String::new(),
+                            tool_events,
+                        });
+                    }
+                    Err(err) => return Err(err),
+                };
             let (message, response_id, finish_reason) =
                 (parts.message, parts.response_id, parts.finish_reason);
 
@@ -1427,46 +1423,6 @@ fn llm_message_to_request(message: &cordis_plugin_sdk::llm::LlmMessage) -> Value
     Value::Object(out)
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 struct RuntimeShellAgentBackend<'a, H: AgentToolHost + ?Sized> {
     host: &'a H,
     session_id: &'a str,
@@ -1522,7 +1478,8 @@ impl<'a, H: AgentToolHost + ?Sized> AgentBackend for RuntimeShellAgentBackend<'a
             }
             cordis_runtime::agent_tools::AGENT_TOOL_SEND_TO_SESSION => {
                 let args = parse_tool_value_arguments::<SendToSessionArgs>(arguments, name)?;
-                self.host.agent_send_to_session(&args.session_id, &args.message)
+                self.host
+                    .agent_send_to_session(&args.session_id, &args.message)
             }
             AGENT_TOOL_GET_RUNTIME_STATUS => {
                 parse_tool_value_arguments::<EmptyArgs>(arguments, name)?;
@@ -1680,7 +1637,8 @@ impl<'a, H: AgentToolHost + ?Sized> AgentBackend for RuntimeShellAgentBackend<'a
 fn end_turn_tool_spec() -> AgentToolSpec {
     AgentToolSpec {
         name: AGENT_TOOL_END_TURN,
-        description: "End this turn. Call it after your last message; text alone never ends a turn.",
+        description:
+            "End this turn. Call it after your last message; text alone never ends a turn.",
         parameters: json!({"type": "object", "properties": {}, "additionalProperties": false}),
     }
 }
@@ -1999,7 +1957,6 @@ fn dsml_protocol_prompt(specs: &[AgentToolSpec], require_end_tool: bool) -> Stri
     }
     text
 }
-
 
 /// Arguments for `send_to_session`.
 #[derive(serde::Deserialize)]
@@ -2403,12 +2360,6 @@ fn emit_agent_diagnostic(message: String) {
     }
 }
 
-
-
-
-
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2668,7 +2619,11 @@ mod tests {
             }]
         }
 
-        fn agent_send_to_session(&self, session_id: &str, input: &str) -> Result<Value, RuntimeError> {
+        fn agent_send_to_session(
+            &self,
+            session_id: &str,
+            input: &str,
+        ) -> Result<Value, RuntimeError> {
             self.routed
                 .lock()
                 .expect("routed")
@@ -3256,7 +3211,12 @@ mod tests {
         ]);
         let mut session = ShellAgentSession::new(LlmApiConfig::default()).expect("build session");
         let reply = session
-            .respond_via(&EMPTY_FAKE_HOST, "test-session-summary", "iterate", &provider)
+            .respond_via(
+                &EMPTY_FAKE_HOST,
+                "test-session-summary",
+                "iterate",
+                &provider,
+            )
             .expect("turn");
         assert_eq!(session.status().completed_turns, 1);
         assert_eq!(provider.seen_bodies.lock().expect("bodies").len(), 1);
@@ -3284,8 +3244,8 @@ mod tests {
     #[test]
     fn a_picture_leaves_a_note_in_history() {
         let provider = FakeLlmProvider::new(vec![assistant_reply("看起来是个抽卡游戏")]);
-        let mut session = AgentSession::new(LlmApiConfig::default(), "runtime_shell")
-            .expect("build session");
+        let mut session =
+            AgentSession::new(LlmApiConfig::default(), "runtime_shell").expect("build session");
         session
             .respond_with_runtime_host_via_images(
                 &EMPTY_FAKE_HOST,
@@ -3344,8 +3304,8 @@ mod tests {
     #[test]
     fn an_unsupported_image_is_dropped_and_the_turn_retried() {
         let provider = FailOnceImageProvider::new(vec![assistant_reply("我能看到图片了")]);
-        let mut session = AgentSession::new(LlmApiConfig::default(), "runtime_shell")
-            .expect("build session");
+        let mut session =
+            AgentSession::new(LlmApiConfig::default(), "runtime_shell").expect("build session");
         let reply = session
             .respond_with_runtime_host_via_images(
                 &EMPTY_FAKE_HOST,
@@ -3360,7 +3320,10 @@ mod tests {
         assert_eq!(reply.content, "我能看到图片了");
         assert_eq!(*provider.calls.lock().expect("calls"), 2, "one retry");
         let history = serde_json::to_string(&session.history).expect("history json");
-        assert!(!history.contains("broken.png"), "the image is gone: {history}");
+        assert!(
+            !history.contains("broken.png"),
+            "the image is gone: {history}"
+        );
     }
 
     /// Pictures stay in history: a later turn must still be able to look at

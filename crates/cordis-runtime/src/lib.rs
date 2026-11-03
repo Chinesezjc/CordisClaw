@@ -1,8 +1,7 @@
 pub mod agent_api;
-pub mod agent_tools;
 pub mod agent_loop;
-pub mod iteration_api;
 pub mod agent_toolchain;
+pub mod agent_tools;
 pub mod command_router;
 pub mod config;
 pub mod context;
@@ -12,6 +11,7 @@ pub mod guard;
 pub mod host;
 pub mod image_input;
 pub mod iteration;
+pub mod iteration_api;
 pub mod kernel;
 pub mod llm_sink;
 pub mod plugin;

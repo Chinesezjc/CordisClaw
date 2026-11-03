@@ -14,24 +14,19 @@ fn _install_agent_loop() {
 
 mod support;
 
+use cordis_plugin_sdk::{AbiFingerprint, NodeDoc, NodeType, PluginDocs};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering::SeqCst;
 use std::sync::Arc;
-use cordis_plugin_sdk::{AbiFingerprint, NodeDoc, NodeType, PluginDocs};
 
-use cordis_plugin_sdk::llm::LlmToolCall;
-use cordis_runtime::core::error::RuntimeError;
-use cordis_runtime::kernel::verifier::VerificationProfile;
-use cordis_runtime::kernel::plugin_iteration::{CanaryVerdict, KernelPluginIssueSource, PluginIterationFinalVerdict, VerifierVerdict,PluginEditOpKind, PluginEditOperation};
-use cordis_runtime::host::ScaffoldChildPluginArgs;
-use serde_json::Map;
-use serial_test::serial;
-use cordis_runtime::agent_api::{AgentBackend, AgentToolHost};
 use cordis_agent::iteration::backend::PluginIterationAgentBackend;
+use cordis_plugin_sdk::llm::LlmToolCall;
+use cordis_runtime::agent_api::{AgentBackend, AgentToolHost};
+use cordis_runtime::core::error::RuntimeError;
+use cordis_runtime::host::ScaffoldChildPluginArgs;
 use cordis_runtime::host::{
-    InvocationSample, TEST_ITERATION_ENOSPC_INJECTION, TEST_ITERATION_PANIC_INJECTION,
-    plugin_iteration_journal_path,  PluginIterationAgentState,
+    plugin_iteration_journal_path, InvocationSample, PluginIterationAgentState,
     PluginIterationContextPaths, PreparedPluginIteration, RuntimeHost,
     PLUGIN_AGENT_TOOL_CREATE_FILE, PLUGIN_AGENT_TOOL_DELETE_FILE,
     PLUGIN_AGENT_TOOL_INSPECT_PLUGIN_CATALOG, PLUGIN_AGENT_TOOL_LIST_CONTEXT_FILES,
@@ -39,13 +34,20 @@ use cordis_runtime::host::{
     PLUGIN_AGENT_TOOL_REPLACE_FILES_EXACT, PLUGIN_AGENT_TOOL_REPLACE_FILE_EXACT,
     PLUGIN_AGENT_TOOL_RUN_PLUGIN_CHECK, PLUGIN_AGENT_TOOL_RUN_PLUGIN_TEST,
     PLUGIN_AGENT_TOOL_SCAFFOLD_CHILD_PLUGIN, PLUGIN_AGENT_TOOL_TOML_SET,
+    TEST_ITERATION_ENOSPC_INJECTION, TEST_ITERATION_PANIC_INJECTION,
 };
-use serde_json::{json, Value};
-use tempfile::TempDir;
 use cordis_runtime::kernel::plugin_iteration::KernelPluginIterationRequest;
+use cordis_runtime::kernel::plugin_iteration::{
+    CanaryVerdict, KernelPluginIssueSource, PluginEditOpKind, PluginEditOperation,
+    PluginIterationFinalVerdict, VerifierVerdict,
+};
+use cordis_runtime::kernel::verifier::VerificationProfile;
+use serde_json::Map;
+use serde_json::{json, Value};
+use serial_test::serial;
+use tempfile::TempDir;
 
 use cordis_agent::iteration::policy::{is_test_path, iteration_changes_docs_only, test_changes};
-
 
 /// A backend bound to a hermetic empty-fixture host.
 fn with_backend<R>(
@@ -57,8 +59,7 @@ fn with_backend<R>(
         focus_paths: Vec::new(),
         all_paths: Vec::new(),
     };
-    let mut state =
-        PluginIterationAgentState::new(prepared, context_paths, host.fixtures_root());
+    let mut state = PluginIterationAgentState::new(prepared, context_paths, host.fixtures_root());
     let mut backend = PluginIterationAgentBackend {
         host,
         state: &mut state,
@@ -171,7 +172,8 @@ fn setup_verify_node_json_fixture() -> (TempDir, PathBuf) {
         serde_json::to_vec_pretty(&artifact_value).expect("serialize artifact"),
     )
     .expect("write artifact");
-    let sha256 = cordis_runtime::plugin::artifact::sha256_file(&artifact_path).expect("hash svc artifact");
+    let sha256 =
+        cordis_runtime::plugin::artifact::sha256_file(&artifact_path).expect("hash svc artifact");
     let index_value = json!({
         "schema_version": 2,
         "generated_at": "2026-07-25T00:00:00Z",
@@ -209,7 +211,6 @@ fn wedge_journal_as_dir(host: &RuntimeHost) {
     fs::write(journal.join("blocker.txt"), b"x").expect("nonempty dir");
 }
 
-
 struct TestAgentRun;
 impl TestAgentRun {
     fn with_requires_approval(flag: bool) -> cordis_runtime::host::PluginIterationAgentRun {
@@ -221,7 +222,9 @@ impl TestAgentRun {
             recorded_summary: Some("test".to_string()),
             requires_approval: flag,
             changed_paths: Vec::new(),
-            rollback: cordis_runtime::kernel::plugin_iteration::PluginEditRollback::empty(std::path::Path::new(".")),
+            rollback: cordis_runtime::kernel::plugin_iteration::PluginEditRollback::empty(
+                std::path::Path::new("."),
+            ),
             derived_edit_plan: cordis_runtime::kernel::plugin_iteration::PluginEditPlan {
                 issue_id: "issue".to_string(),
                 patch_id: "patch".to_string(),
@@ -659,7 +662,6 @@ fn backend_apply_operations_second_op_failure_enriches_error() {
     );
 }
 
-
 // ── pipeline-level tests (moved from the kernel) ──────────────────
 
 #[test]
@@ -667,7 +669,8 @@ fn backend_apply_operations_second_op_failure_enriches_error() {
 fn run_plugin_canary_returns_partial_without_evidence() {
     let (_temp, host) = empty_host();
     let state = cordis_runtime::host::PluginIterationRunState::new(prepared_for("mini", &["mini"]));
-    let report = cordis_agent::iteration::driver::run_plugin_canary(&host, &state).expect("canary runs");
+    let report =
+        cordis_agent::iteration::driver::run_plugin_canary(&host, &state).expect("canary runs");
     assert_eq!(report.verdict, CanaryVerdict::Partial);
     assert_eq!(report.mode, "no_canary_evidence");
     assert!(report.plugin_path.is_none());
@@ -681,7 +684,8 @@ fn run_plugin_canary_skips_samples_for_other_plugins() {
     // arm skips it, and with no candidate we fall through to Partial.
     let _ = host.recent_invocation_samples();
     let state = cordis_runtime::host::PluginIterationRunState::new(prepared_for("mini", &["mini"]));
-    let report = cordis_agent::iteration::driver::run_plugin_canary(&host, &state).expect("canary runs");
+    let report =
+        cordis_agent::iteration::driver::run_plugin_canary(&host, &state).expect("canary runs");
     assert_eq!(report.verdict, CanaryVerdict::Partial);
     assert_eq!(report.mode, "no_canary_evidence");
 }
@@ -690,7 +694,8 @@ fn run_plugin_canary_skips_samples_for_other_plugins() {
 
 fn finalize_stage_error_short_circuits_to_rolled_back() {
     let (_temp, host) = empty_host();
-    let mut state = cordis_runtime::host::PluginIterationRunState::new(prepared_for("mini", &["mini"]));
+    let mut state =
+        cordis_runtime::host::PluginIterationRunState::new(prepared_for("mini", &["mini"]));
     state.stage_error = Some("rebuild blew up".to_string());
     let verdict = cordis_agent::iteration::driver::finalize_plugin_iteration(&host, &mut state)
         .expect("finalize returns RolledBack for a stage error");
@@ -706,7 +711,8 @@ fn finalize_stage_error_short_circuits_to_rolled_back() {
 
 fn finalize_verifier_fail_rolls_back_without_candidate() {
     let (_temp, host) = empty_host();
-    let mut state = cordis_runtime::host::PluginIterationRunState::new(prepared_for("mini", &["mini"]));
+    let mut state =
+        cordis_runtime::host::PluginIterationRunState::new(prepared_for("mini", &["mini"]));
     state.verifier_verdict = Some(VerifierVerdict::Fail);
     // A concrete Fail canary (not the Partial default) so the `else`
     // rollback arm — not the Partial-canary Blocked arm — is selected.
@@ -731,7 +737,8 @@ fn finalize_verifier_fail_rolls_back_without_candidate() {
 
 fn finalize_partial_canary_does_not_block_an_agent_change() {
     let (_temp, host) = empty_host();
-    let mut state = cordis_runtime::host::PluginIterationRunState::new(prepared_for("mini", &["mini"]));
+    let mut state =
+        cordis_runtime::host::PluginIterationRunState::new(prepared_for("mini", &["mini"]));
     state.agent = Some(TestAgentRun::with_requires_approval(false));
     state.verifier_verdict = Some(VerifierVerdict::Pass);
     state.canary = Some(cordis_runtime::kernel::plugin_iteration::CanaryReport {
@@ -759,7 +766,8 @@ fn finalize_partial_canary_does_not_block_an_agent_change() {
 
 fn finalize_partial_canary_blocks_a_blind_change() {
     let (_temp, host) = empty_host();
-    let mut state = cordis_runtime::host::PluginIterationRunState::new(prepared_for("mini", &["mini"]));
+    let mut state =
+        cordis_runtime::host::PluginIterationRunState::new(prepared_for("mini", &["mini"]));
     state.verifier_verdict = Some(VerifierVerdict::Pass);
     state.canary = Some(cordis_runtime::kernel::plugin_iteration::CanaryReport {
         verdict: CanaryVerdict::Partial,
@@ -784,7 +792,8 @@ fn finalize_partial_canary_blocks_a_blind_change() {
 
 fn finalize_blocks_a_change_that_edits_an_existing_test() {
     let (_temp, host) = empty_host();
-    let mut state = cordis_runtime::host::PluginIterationRunState::new(prepared_for("mini", &["mini"]));
+    let mut state =
+        cordis_runtime::host::PluginIterationRunState::new(prepared_for("mini", &["mini"]));
     state.verifier_verdict = Some(VerifierVerdict::Pass);
     state.agent = Some(TestAgentRun::with_requires_approval(true));
     let verdict = cordis_agent::iteration::driver::finalize_plugin_iteration(&host, &mut state)
@@ -824,7 +833,8 @@ fn run_plugin_canary_replay_divergence_yields_fail() {
     // NOT match what the candidate echoes ({"ok":true}) → divergence Fail.
     host.record_invocation_sample("svc", "svc_verify", "{}", "{\"ok\":false}");
     let state = cordis_runtime::host::PluginIterationRunState::new(prepared_for("svc", &["svc"]));
-    let report = cordis_agent::iteration::driver::run_plugin_canary(&host, &state).expect("canary replay runs");
+    let report = cordis_agent::iteration::driver::run_plugin_canary(&host, &state)
+        .expect("canary replay runs");
     assert_eq!(report.verdict, CanaryVerdict::Fail);
     assert_eq!(report.mode, "recent_successful_invocation_replay");
     assert!(report
@@ -838,7 +848,8 @@ fn finalize_promote_failure_pass_pass_arm_returns_err_and_records_reason() {
     let (_temp, host) = empty_host();
     host.reload_candidate().expect("stage candidate");
     wedge_journal_as_dir(&host);
-    let mut state = cordis_runtime::host::PluginIterationRunState::new(prepared_for("mini", &["mini"]));
+    let mut state =
+        cordis_runtime::host::PluginIterationRunState::new(prepared_for("mini", &["mini"]));
     state.verifier_verdict = Some(VerifierVerdict::Pass);
     state.canary = Some(cordis_runtime::kernel::plugin_iteration::CanaryReport {
         verdict: CanaryVerdict::Pass,
@@ -878,7 +889,8 @@ fn finalize_manual_approval_promotes_a_test_editing_change() {
 
 fn finalize_toctou_drift_downgrades_pass_to_rolled_back() {
     let (_temp, host) = empty_host();
-    let mut state = cordis_runtime::host::PluginIterationRunState::new(prepared_for("mini", &["mini"]));
+    let mut state =
+        cordis_runtime::host::PluginIterationRunState::new(prepared_for("mini", &["mini"]));
     state.verifier_verdict = Some(VerifierVerdict::Pass);
     state.canary = Some(cordis_runtime::kernel::plugin_iteration::CanaryReport {
         verdict: CanaryVerdict::Pass,
@@ -936,7 +948,8 @@ fn finalize_baseline_hash_failure_downgrades_pass_to_rolled_back() {
     // tree did not change, so it is downgraded exactly like a re-hash
     // failure before promote.
     let (_temp, host) = empty_host();
-    let mut state = cordis_runtime::host::PluginIterationRunState::new(prepared_for("mini", &["mini"]));
+    let mut state =
+        cordis_runtime::host::PluginIterationRunState::new(prepared_for("mini", &["mini"]));
     state.verifier_verdict = Some(VerifierVerdict::Pass);
     state.canary = Some(cordis_runtime::kernel::plugin_iteration::CanaryReport {
         verdict: CanaryVerdict::Pass,
@@ -1146,8 +1159,10 @@ fn run_plugin_canary_continues_when_candidate_lacks_target_plugin() {
     // is NOT in the candidate registry → the `let Some(plugin) = ... else
     // { continue }` arm fires, then falls through to Partial.
     host.reload_candidate().expect("stage empty candidate");
-    let state = cordis_runtime::host::PluginIterationRunState::new(prepared_for("ghost", &["ghost"]));
-    let report = cordis_agent::iteration::driver::run_plugin_canary(&host, &state).expect("canary runs");
+    let state =
+        cordis_runtime::host::PluginIterationRunState::new(prepared_for("ghost", &["ghost"]));
+    let report =
+        cordis_agent::iteration::driver::run_plugin_canary(&host, &state).expect("canary runs");
     assert_eq!(report.verdict, CanaryVerdict::Partial);
     assert_eq!(report.mode, "no_canary_evidence");
 }
@@ -1161,10 +1176,15 @@ fn plugin_iteration_agent_snapshot_returns_state_for_an_iteration_session() {
         focus_paths: Vec::new(),
         all_paths: Vec::new(),
     };
-    let session_id = cordis_agent::iteration::driver::start_plugin_iteration_agent_session(&host, prepared.clone(), context_paths)
-        .expect("start an iteration session");
+    let session_id = cordis_agent::iteration::driver::start_plugin_iteration_agent_session(
+        &host,
+        prepared.clone(),
+        context_paths,
+    )
+    .expect("start an iteration session");
 
-    let snapshot = host.iteration_agent_snapshot(&session_id)
+    let snapshot = host
+        .iteration_agent_snapshot(&session_id)
         .expect("iteration session yields a snapshot");
     // A freshly started session has recorded no summary yet, so the derived
     // plan falls back to the prepared summary.
@@ -1240,16 +1260,18 @@ fn genuine_stage_failure_still_rolls_back() {
     // 这是插件侧的真实失败，必须仍判 RolledBack。
     let mut request = empty_plan_request();
     if let Some(plan) = request.edit_plan.as_mut() {
-        plan.operations = vec![cordis_runtime::kernel::plugin_iteration::PluginEditOperation {
-            path: "crates/cordis-runtime/src/lib.rs".to_string(),
-            kind: cordis_runtime::kernel::plugin_iteration::PluginEditOpKind::ReplaceExact,
-            expected_old_string: Some("pub".to_string()),
-            expected_sha256: None,
-            new_content: Some("mod".to_string()),
-            pointer: None,
-            dotted_key: None,
-            value: None,
-        }];
+        plan.operations = vec![
+            cordis_runtime::kernel::plugin_iteration::PluginEditOperation {
+                path: "crates/cordis-runtime/src/lib.rs".to_string(),
+                kind: cordis_runtime::kernel::plugin_iteration::PluginEditOpKind::ReplaceExact,
+                expected_old_string: Some("pub".to_string()),
+                expected_sha256: None,
+                new_content: Some("mod".to_string()),
+                pointer: None,
+                dotted_key: None,
+                value: None,
+            },
+        ];
     }
 
     let before = host.kernel().status();
@@ -1357,7 +1379,6 @@ fn iterate_plugins_panic_is_caught_and_rolls_back_candidate_and_clears_journal()
         "injection flag must be reset after the follow-up fires"
     );
 }
-
 
 #[test]
 

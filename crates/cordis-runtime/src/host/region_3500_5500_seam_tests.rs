@@ -48,8 +48,8 @@ fn llm_response_invalid_message_labels_other_variants() {
 use super::{
     enrich_plugin_iteration_edit_error, format_agent_transcript_excerpt, parse_agent_args,
     transcript_excerpt, AgentSessionHandle, AgentSessionKind, AgentStartOptions,
-    ManagedAgentSession, ManagedAgentState, ReloadReport,
-    ReplaceFilesExactArgs, RetiredSnapshot, RuntimeHost, PLUGIN_AGENT_TOOL_REPLACE_FILES_EXACT,
+    ManagedAgentSession, ManagedAgentState, ReloadReport, ReplaceFilesExactArgs, RetiredSnapshot,
+    RuntimeHost, PLUGIN_AGENT_TOOL_REPLACE_FILES_EXACT,
 };
 use crate::agent_api::AgentTranscriptEntry;
 use crate::core::error::RuntimeError;
@@ -88,13 +88,11 @@ fn setup_empty_fixture() -> (TempDir, PathBuf) {
     (temp, fixtures)
 }
 
-
 fn empty_host() -> (TempDir, RuntimeHost) {
     let (temp, fixtures) = setup_empty_fixture();
     let host = RuntimeHost::boot(&fixtures).expect("boot on empty index");
     (temp, host)
 }
-
 
 // ───────────────────────── pure functions ────────────────────────────
 
@@ -479,11 +477,7 @@ fn reload_report_from_snapshots_records_removed_plugin() {
 
 // ─────────────── run_plugin_canary no-evidence path ──────────────────
 
-
-
 // ─────────────── finalize_plugin_iteration arms ──────────────────────
-
-
 
 // An agent-driven change carries its own evidence (a transcript and a tool
 // summary), so a Partial canary must not block it — random plugins made the
@@ -491,7 +485,6 @@ fn reload_report_from_snapshots_records_removed_plugin() {
 
 // A blind edit has no transcript to vouch for it, so unproven behaviour waits
 // for an operator instead of riding on the tests alone.
-
 
 // Editing an existing test stages the change for approval instead of
 // promoting it (tests are the contract).
@@ -535,8 +528,14 @@ fn agent_addresses_resolve_and_unknown_ones_are_refused() {
     );
 
     // An id resolves to itself, an address to its session.
-    assert_eq!(host.agent_resolve_session(&first).as_deref(), Some(&first[..]));
-    assert_eq!(host.agent_resolve_session("qq:group:1").as_deref(), Some(&first[..]));
+    assert_eq!(
+        host.agent_resolve_session(&first).as_deref(),
+        Some(&first[..])
+    );
+    assert_eq!(
+        host.agent_resolve_session("qq:group:1").as_deref(),
+        Some(&first[..])
+    );
     assert_eq!(host.agent_resolve_session("qq:group:2"), None);
 
     // Registering on a dead id is refused rather than silently ignored.
@@ -555,25 +554,6 @@ fn rollback_candidate_if_staged_is_none_without_candidate() {
 }
 
 // ─────────────── PluginIterationAgentBackend methods ─────────────────
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 // ─────────────── ManagedAgentSession::compact_history wrapper ────────
 
@@ -605,9 +585,6 @@ fn managed_session_compact_history_wrapper_is_noop_below_threshold() {
 }
 
 // ─────────────── canary declared-verifier-node (JSON candidate) ──────
-
-
-
 
 // ─────────── R2: cleanup_retired_snapshots pinned-snapshot eviction ──
 
@@ -738,28 +715,18 @@ fn evict_retired_snapshots_removes_dead_prefix_entries() {
 
 // ─────────── finalize promote-failure arms (Pass/Pass) ───────────────
 
-
-
 // Manual approval is what unblocks a test-editing change: it promotes
 // through the same arm (and reports a promote failure the same way).
 
 // ─────────── finalize TOCTOU source-drift downgrade ──────────────────
 
-
-
 // ─────────── apply_operations partial-batch rollback error ───────────
-
 
 // ─────────── run_plugin_iteration_agent edit_plan (no LLM) path ──────
 
-
 // ─────────── verify_plugin_iteration wiring (cheap commands) ─────────
 
-
-
 // ─────────── finalize manual-approved promote SUCCESS ────────────────
-
-
 
 // ─────────── R3: promote/rollback/approve 候选身份校验 ──────────────
 
@@ -871,7 +838,6 @@ fn double_reload_candidate_retires_previous_candidate() {
 }
 
 // ─────────── run_plugin_canary candidate loop continue arm ───────────
-
 
 // ─────────── session-lookup / wrong-kind error arms ───────────
 //

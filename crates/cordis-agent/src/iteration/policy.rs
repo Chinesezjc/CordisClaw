@@ -4,7 +4,6 @@
 //! a decision over plain data, which makes the whole policy table unit-testable
 //! and keeps `host.rs` free of scattered rules.
 
-
 use cordis_runtime::kernel::plugin_iteration::{
     CanaryVerdict, PluginEditOpKind, PluginEditOperation, PluginIterationFinalVerdict,
     VerifierVerdict,
@@ -94,13 +93,23 @@ pub fn canary_probe_verdict(
 /// also skipped plain terminal I/O (`reads stdin`, `writes stdout`) — exactly
 /// the nodes worth replaying. Only effects that touch persistent state, files
 /// or consumables disqualify a sample.
-pub fn node_declares_side_effects_in(
-    nodes: &[cordis_plugin_sdk::NodeDoc],
-    node_id: &str,
-) -> bool {
+pub fn node_declares_side_effects_in(nodes: &[cordis_plugin_sdk::NodeDoc], node_id: &str) -> bool {
     const MUTATING: [&str; 15] = [
-        "consum", "mutat", "persist", "delete", "remove", "increment", "decrement", "save",
-        "update", "create", "spend", "charge", "grant", "file", "disk",
+        "consum",
+        "mutat",
+        "persist",
+        "delete",
+        "remove",
+        "increment",
+        "decrement",
+        "save",
+        "update",
+        "create",
+        "spend",
+        "charge",
+        "grant",
+        "file",
+        "disk",
     ];
     nodes
         .iter()
@@ -274,7 +283,10 @@ mod canary_probe_tests {
         // Terminal I/O is not mutation: replaying `echo` twice is harmless,
         // and skipping it left the canary with no evidence at all.
         let io_nodes = vec![
-            node("shell_entry", vec!["reads stdin".to_string(), "writes stdout".to_string()]),
+            node(
+                "shell_entry",
+                vec!["reads stdin".to_string(), "writes stdout".to_string()],
+            ),
             node("writes_files", vec!["writes files".to_string()]),
         ];
         assert!(!node_declares_side_effects_in(&io_nodes, "shell_entry"));

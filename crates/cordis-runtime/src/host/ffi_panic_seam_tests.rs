@@ -1,6 +1,4 @@
-use super::{
-    RuntimeHost, TEST_AGENT_RESPOND_PANIC_INJECTION, TEST_STOP_HANDLER_PANIC_INJECTION,
-};
+use super::{RuntimeHost, TEST_AGENT_RESPOND_PANIC_INJECTION, TEST_STOP_HANDLER_PANIC_INJECTION};
 use crate::core::error::RuntimeError;
 use cordis_plugin_sdk::{AbiFingerprint, NodeDoc, NodeType, PluginDocs};
 use serde_json::json;
@@ -175,8 +173,6 @@ fn setup_task_plugin_fixture() -> (TempDir, PathBuf) {
 
     (temp, fixtures)
 }
-
-
 
 /// 磁盘满必须被判成 `InfrastructureFailure`，而不是 `RolledBack`。
 ///
