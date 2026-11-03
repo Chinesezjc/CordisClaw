@@ -1056,10 +1056,69 @@ impl AgentSession {
         sink: Option<std::sync::Arc<dyn cordis_runtime::llm_sink::TokenSink>>,
     ) -> Result<AgentReply, RuntimeError> {
         let transcript_len_before = self.transcript.len();
+        let history_len_before = self.history.len();
         let result = self.respond_inner(backend, user_input, images, notes, provider, sink);
         self.repair_transcript_on_error(transcript_len_before, &result);
         self.record_turn_end(transcript_len_before, &result);
+        self.remember_if_unrecorded(&result, user_input, images, history_len_before);
         result
+    }
+
+    /// Record the exchange for a turn the loop did not record itself.
+    ///
+    /// A channel turn that sends through a tool never reaches the branch that
+    /// calls `remember_exchange`, so its history stayed empty and the bot could
+    /// not answer "what did you just say". What it actually said is in the
+    /// turn's tool calls, so the transcript slice is the source.
+    fn remember_if_unrecorded(
+        &mut self,
+        result: &Result<AgentReply, RuntimeError>,
+        user_input: &str,
+        images: &[Value],
+        history_len_before: usize,
+    ) {
+        if self.history.len() > history_len_before {
+            return;
+        }
+        let Ok(reply) = result else { return };
+        let said: Vec<String> = reply
+            .tool_events
+            .iter()
+            .filter_map(|event| {
+                let arguments = &event.arguments;
+                arguments
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .or_else(|| {
+                        arguments
+                            .get("payload_json")
+                            .and_then(|payload| payload.get("message"))
+                            .and_then(Value::as_str)
+                    })
+                    .map(str::to_string)
+            })
+            .filter(|message| !message.trim().is_empty())
+            .collect();
+        let assistant = if said.is_empty() {
+            "{\"action\":\"suspend\"}".to_string()
+        } else {
+            json!({ "action": "respond", "message": said.join("\n") }).to_string()
+        };
+        let reasoning = closing_reasoning(&self.turn_reasoning);
+        let remembered = if images.is_empty() {
+            user_input.to_string()
+        } else {
+            format!(
+                "{user_input}\n[附图 {} 张，我在这一轮已经看过它们的内容]",
+                images.len()
+            )
+        };
+        self.remember_exchange(
+            &remembered,
+            &assistant,
+            reasoning.as_deref(),
+            history_images(images, self.image_parts_stripped),
+        );
     }
 
     /// Guarantee one assistant entry per turn.
@@ -1155,6 +1214,11 @@ impl AgentSession {
 
     pub fn history_len(&self) -> usize {
         self.history.len()
+    }
+
+    /// One entry of the live history, for tests that assert what the model saw.
+    pub fn history_value(&self, index: usize) -> Option<&Value> {
+        self.history.get(index)
     }
 
     pub fn compact_history(&mut self) -> (usize, usize) {
@@ -3613,6 +3677,38 @@ mod tests {
             provider.seen_bodies.lock().expect("bodies").len(),
             1,
             "the first suspend is honoured"
+        );
+    }
+
+    /// A channel turn that sent through a tool must still land in history.
+    ///
+    /// It never reaches the branch that calls `remember_exchange`, so the bot
+    /// could not answer "what did you just say" about its own previous message.
+    #[test]
+    fn a_tool_sent_channel_turn_is_remembered() {
+        let provider = FakeLlmProvider::new(vec![
+            assistant_reply(
+                "<|DSML|tool_calls>\n{\"node_id\": \"invoke_plugin\", \"payload_json\": {\"plugin_path\": \"qq\", \"node_id\": \"qq_send\", \"payload_json\": {\"message\": \"鸡窝是吧\"}}}\n</|DSML|tool_calls>",
+            ),
+            assistant_reply("<|DSML|tool_calls>\n{\"node_id\": \"suspend\"}\n</|DSML|tool_calls>"),
+        ]);
+        let mut session = ShellAgentSession::new(LlmApiConfig::default()).expect("build session");
+        session.set_require_end_tool(true);
+        session
+            .respond_via(&EMPTY_FAKE_HOST, "test-session-remember", "在吗", &provider)
+            .expect("turn");
+        assert_eq!(
+            session.status().stored_messages,
+            2,
+            "the batch and the reply are both in history"
+        );
+        let assistant = session
+            .inner
+            .history_value(session.inner.history_len() - 1)
+            .expect("assistant message");
+        assert!(
+            assistant.to_string().contains("鸡窝是吧"),
+            "the bot's own words are in history: {assistant}"
         );
     }
 
