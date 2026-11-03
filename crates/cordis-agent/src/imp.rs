@@ -565,8 +565,11 @@ impl AgentSession {
                 if end_requested && message.tool_calls.is_empty() {
                     // Ending a channel turn without having done anything is the
                     // silent-bot failure: the model calls the end marker and
-                    // nothing was ever sent. Ask once, concretely.
-                    if tool_events.is_empty() && self.no_end_strikes < 3 {
+                    // nothing was ever sent. Ask once, concretely — once is the
+                    // correction for a forgotten send. Asking repeatedly just
+                    // argues with a model that meant to stay quiet, and the way
+                    // out of that argument is an invented message.
+                    if tool_events.is_empty() && self.no_end_strikes < 1 {
                         self.no_end_strikes += 1;
                         emit_agent_diagnostic(format!(
                             "agent_ended_without_action kind={} attempt={}",
@@ -3591,6 +3594,31 @@ mod tests {
             provider.seen_bodies.lock().expect("bodies").len(),
             5,
             "four nudges then the marker: no cap at three"
+        );
+    }
+
+    /// A model that means to stay quiet gets one nudge, not an argument.
+    ///
+    /// The first suspend may be a forgotten send, so it is questioned once. The
+    /// second one is a decision: forcing it to speak again is how an invented
+    /// message gets into the room.
+    #[test]
+    fn a_repeated_suspend_ends_the_turn_silently() {
+        let provider = FakeLlmProvider::new(vec![
+            assistant_reply("<|DSML|tool_calls>\n{\"node_id\": \"suspend\"}\n</|DSML|tool_calls>"),
+            assistant_reply("<|DSML|tool_calls>\n{\"node_id\": \"suspend\"}\n</|DSML|tool_calls>"),
+        ]);
+        let mut session = ShellAgentSession::new(LlmApiConfig::default()).expect("build session");
+        session.set_require_end_tool(true);
+        let reply = session
+            .respond_via(&EMPTY_FAKE_HOST, "test-session-quiet", "hi", &provider)
+            .expect("a quiet turn is a success");
+        assert!(reply.tool_events.is_empty(), "nothing was sent");
+        assert_eq!(session.status().completed_turns, 1);
+        assert_eq!(
+            provider.seen_bodies.lock().expect("bodies").len(),
+            2,
+            "one nudge, then the second suspend is honoured"
         );
     }
 
