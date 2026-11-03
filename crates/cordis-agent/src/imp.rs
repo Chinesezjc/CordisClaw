@@ -563,23 +563,18 @@ impl AgentSession {
                     end_requested = true;
                 }
                 if end_requested && message.tool_calls.is_empty() {
-                    // Ending a channel turn without having done anything is the
-                    // silent-bot failure: the model calls the end marker and
-                    // nothing was ever sent. Ask once, concretely — once is the
-                    // correction for a forgotten send. Asking repeatedly just
-                    // argues with a model that meant to stay quiet, and the way
-                    // out of that argument is an invented message.
-                    if tool_events.is_empty() && self.no_end_strikes < 1 {
-                        self.no_end_strikes += 1;
+                    // `suspend` is a decision, not a draft: it ends the turn
+                    // even when nothing was sent. A model that had nothing to
+                    // say and said so must not be argued with — the reply it
+                    // invents under pressure is worse than silence. A model
+                    // that merely stopped talking is still caught below, where
+                    // no marker arrived at all.
+                    if tool_events.is_empty() {
                         emit_agent_diagnostic(format!(
-                            "agent_ended_without_action kind={} attempt={}",
-                            self.kind, self.no_end_strikes
+                            "agent_suspended_silently kind={} transcript={}",
+                            self.kind,
+                            self.transcript.len()
                         ));
-                        messages.push(json!({
-                            "role": "user",
-                            "content": "[system] 你还没有把任何内容发出去。先用工具完成动作（例如调用 qq_send 把要说的话发出去），再调用 suspend 结束这一轮。",
-                        }));
-                        continue;
                     }
                     self.no_end_strikes = 0;
                     self.completed_turns += 1;
@@ -3597,17 +3592,16 @@ mod tests {
         );
     }
 
-    /// A model that means to stay quiet gets one nudge, not an argument.
+    /// A suspend is a decision, not a draft.
     ///
-    /// The first suspend may be a forgotten send, so it is questioned once. The
-    /// second one is a decision: forcing it to speak again is how an invented
-    /// message gets into the room.
+    /// One suspend with nothing sent ends the turn. There is no "are you sure"
+    /// pass: a model that meant to stay quiet and said so must not be pushed
+    /// into speaking, because what it invents under pressure is worse.
     #[test]
-    fn a_repeated_suspend_ends_the_turn_silently() {
-        let provider = FakeLlmProvider::new(vec![
-            assistant_reply("<|DSML|tool_calls>\n{\"node_id\": \"suspend\"}\n</|DSML|tool_calls>"),
-            assistant_reply("<|DSML|tool_calls>\n{\"node_id\": \"suspend\"}\n</|DSML|tool_calls>"),
-        ]);
+    fn a_suspend_ends_the_turn_silently() {
+        let provider = FakeLlmProvider::new(vec![assistant_reply(
+            "<|DSML|tool_calls>\n{\"node_id\": \"suspend\"}\n</|DSML|tool_calls>",
+        )]);
         let mut session = ShellAgentSession::new(LlmApiConfig::default()).expect("build session");
         session.set_require_end_tool(true);
         let reply = session
@@ -3617,8 +3611,8 @@ mod tests {
         assert_eq!(session.status().completed_turns, 1);
         assert_eq!(
             provider.seen_bodies.lock().expect("bodies").len(),
-            2,
-            "one nudge, then the second suspend is honoured"
+            1,
+            "the first suspend is honoured"
         );
     }
 
