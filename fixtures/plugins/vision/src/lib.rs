@@ -646,22 +646,22 @@ mod tests {
         // The guard resolves symlinks before comparing, so the path has to
         // exist *and* sit outside the temp dir. Fixture tests also run inside a
         // temporary workspace copy, which makes the crate dir itself a temp
-        // path — hence the fallback that plants a file next to the temp root.
+        // path — so in that case fall back to an existing file outside the temp
+        // root. Writing a new file next to the temp root is not an option: on a
+        // CI runner that is `/`, which is not writable by the test user.
         let temp_root = std::fs::canonicalize(std::env::temp_dir()).expect("resolve temp dir");
         let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let planted = manifest.starts_with(&temp_root).then(|| {
-            let outside = temp_root
-                .parent()
-                .expect("temp dir has a parent")
-                .join(format!("cordis-vision-outside-{}.png", std::process::id()));
-            std::fs::write(&outside, b"x").expect("plant outside file");
-            outside
-        });
-        let outside = planted.clone().unwrap_or_else(|| manifest.join("Cargo.toml"));
+        let outside = if manifest.starts_with(&temp_root) {
+            [std::env::var_os("HOME"), Some("/etc/hostname".into())]
+                .into_iter()
+                .flatten()
+                .map(std::path::PathBuf::from)
+                .find(|path| path.exists() && !path.starts_with(&temp_root))
+                .unwrap_or_else(|| manifest.join("Cargo.toml"))
+        } else {
+            manifest.join("Cargo.toml")
+        };
         let err = read_local_image(outside.to_str().expect("utf-8 path")).unwrap_err();
-        if let Some(path) = planted {
-            let _ = std::fs::remove_file(path);
-        }
         assert!(
             err.contains("path outside temp dir"),
             "expected temp-dir rejection, got: {err}"
