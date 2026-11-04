@@ -1118,11 +1118,22 @@ impl AgentSession {
             said.join("\n")
         };
         let reasoning = closing_reasoning(&self.turn_reasoning);
+        // Only the batch body belongs in history. The channel's one-shot
+        // context (reply policy, reply target, group memory) rides in front of
+        // it and must not be replayed: it becomes stale the moment the policy
+        // changes, and it added ~100 bytes to every one of hundreds of entries.
+        let body = user_input
+            .split_once("CURRENT_INCOMING_BATCH_START\n")
+            .and_then(|(_, rest)| {
+                rest.rsplit_once("\nCURRENT_INCOMING_BATCH_END")
+                    .map(|(body, _)| body)
+            })
+            .unwrap_or(user_input);
         let remembered = if images.is_empty() {
-            user_input.to_string()
+            body.to_string()
         } else {
             format!(
-                "{user_input}\n[附图 {} 张，我在这一轮已经看过它们的内容]",
+                "{body}\n[附图 {} 张，我在这一轮已经看过它们的内容]",
                 images.len()
             )
         };
@@ -1601,7 +1612,7 @@ impl<'a, H: AgentToolHost + ?Sized> AgentBackend for RuntimeShellAgentBackend<'a
     /// every channel. Plugin hints still land last so channel mechanics keep
     /// the highest recency.
     fn system_prompt(&self) -> String {
-        let mut prompt = shell_agent_system_prompt();
+        let mut prompt = shell_agent_system_prompt(!self.soul_key.is_empty());
         // Channel sessions always carry a persona: the room's own soul when it
         // has one, the built-in default otherwise. Shell sessions (no soul_key)
         // stay persona-free.
@@ -2482,11 +2493,29 @@ answer in one short line and ask what should change. If it keeps repeating, \
 staying silent is a valid reply — never send the same wording twice in a row.
 ";
 
-fn shell_agent_system_prompt() -> String {
+/// The base prompt. `chat` selects the identity paragraph: a channel session is
+/// a participant in a room, not a REPL operator, and saying "you are a shell
+/// agent running inside the REPL" to a group chat made the bot answer like a
+/// developer tool.
+fn shell_agent_system_prompt(chat: bool) -> String {
     let today = Local::now().format("%Y-%m-%d").to_string();
     let mut prompt = format!("Today's date is {today}.\n\n");
-    prompt.push_str("\
+    if chat {
+        prompt.push_str(
+            "\
+You are a participant in this conversation, talking through the channel tools below.\n\
+The persona section below is who you are and how you talk; this section only covers the tools.\n\
+You are not an operator console: nobody wants to read tool names or internal state.\n\
+",
+        );
+    } else {
+        prompt.push_str(
+            "\
 You are the Cordis shell agent running inside the cordis-runtime serve REPL.\n\
+",
+        );
+    }
+    prompt.push_str("\
 You can read source files, list directories, search code, inspect runtime status, list plugins/nodes, invoke plugins, execute targets, run plugin tests, and reload the runtime.\n\
 To modify plugin source code, use `request_iteration` to start a safe PluginIteration session (supports rollback).\n\
 \n\
@@ -3083,6 +3112,37 @@ mod tests {
     /// 拼装顺序契约：base → persona（先免责声明再正文）→ conduct → hints。
     /// persona 只调语气，conduct 必须压过它，渠道 hints 仍留最末（recency）。
     #[test]
+    /// A channel session is told it is a participant, not a REPL operator.
+    ///
+    /// The identity paragraph used to say "You are the Cordis shell agent running
+    /// inside the cordis-runtime serve REPL" for every session, which is why a
+    /// group chat got answers about plugins and tool names.
+    #[test]
+    fn a_channel_session_gets_the_chat_identity() {
+        let host = FakeHost {
+            persona: Some("毒舌运维".to_string()),
+            hints: Vec::new(),
+            caller: None,
+            routed: std::sync::Mutex::new(Vec::new()),
+        };
+        let channel = RuntimeShellAgentBackend {
+            host: &host,
+            session_id: "chat",
+            soul_key: "qq:group:1".to_string(),
+        };
+        let chat = channel.system_prompt();
+        assert!(chat.contains("You are a participant in this conversation"));
+        assert!(!chat.contains("running inside the cordis-runtime serve REPL"));
+
+        let ops = RuntimeShellAgentBackend {
+            host: &host,
+            session_id: "ops",
+            soul_key: String::new(),
+        };
+        let shell = ops.system_prompt();
+        assert!(shell.contains("running inside the cordis-runtime serve REPL"));
+    }
+
     /// A missing capability is work, not a refusal.
     ///
     /// The bot answered "邀请链接我点不了" when the invite carried no tool: the

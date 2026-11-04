@@ -1843,6 +1843,23 @@ fn build_envelope(msg: &IncomingMessage) -> String {
     // round trip on every such turn.
     let reply_target = format!("{}:{}", msg.message_type, msg.sender_id);
     let mut notes = format!("[reply policy: {mode} — {policy}] [reply target: {reply_target}]");
+    // 群记忆每轮注入：它是"这个群怎么说话"的唯一来源，靠模型主动去读等于没有。
+    // 一次性上下文，不进 history，所以不会随轮次累积。
+    // 群记忆每轮注入：它是"这个群怎么说话"的唯一来源，靠模型主动去读等于没有。
+    // 一次性上下文，不进 history，所以不会随轮次累积。
+    if let Some(memory) = group_memory(
+        None,
+        msg.message_type
+            .eq("group")
+            .then_some(msg.sender_id.as_str()),
+    )
+    .map(|memory| memory.trim().to_string())
+    .filter(|memory| !memory.is_empty())
+    {
+        notes.push_str(" [group memory: ");
+        notes.push_str(&memory);
+        notes.push(']');
+    }
     // A group ban is folded into the per-message context: the model must know
     // it cannot speak before it decides to, not after a failed send.
     if let Some(until) = group
@@ -4487,11 +4504,12 @@ mod reply_policy_tests {
             let env: Value = serde_json::from_str(&build_envelope(&sample_msg())).expect("env");
             let notes = env["notes"].as_str().unwrap_or_default().to_string();
             assert!(notes.starts_with("[reply policy: chatty — "), "{notes}");
-            // Group memory is pull-based: even once written it is NOT injected
-            // into the message envelope — the agent reads it with
-            // qq_get_group_memory when it needs it.
-            let leaks_memory = notes.contains("[group memory");
-            assert!(!leaks_memory, "memory must stay out of notes: {notes}");
+            // Memory is injected every turn: it is the only description of how
+            // this group talks, and a model that has to go read it never does.
+            assert!(
+                notes.contains("[group memory: 喜欢玩笑]"),
+                "memory belongs in the notes: {notes}"
+            );
             let read_back =
                 group_memory(Some(data_dir.to_str().unwrap_or_default()), Some("123456"));
             assert_eq!(read_back.as_deref(), Some("喜欢玩笑"));
