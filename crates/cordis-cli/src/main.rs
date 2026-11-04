@@ -374,7 +374,10 @@ fn extract_user_text(display: &str) -> &str {
 fn outbound_replies(tool_events: &[AgentToolEvent]) -> Vec<String> {
     tool_events
         .iter()
-        .filter(|event| event.name == "invoke_plugin")
+        // A rejected call sent nothing: counting it said "sent 2 messages" for
+        // one delivery, and the duplicate landed in history as if the bot had
+        // said it twice.
+        .filter(|event| event.name == "invoke_plugin" && event.ok)
         .filter_map(|event| {
             event
                 .arguments
@@ -3263,7 +3266,34 @@ mod session_index_tests {
 
 #[cfg(test)]
 mod inbox_framing_tests {
-    use super::wrap_inbox_batch;
+    use super::{outbound_replies, wrap_inbox_batch};
+    use cordis_runtime::agent_api::AgentToolEvent;
+    use serde_json::json;
+
+    /// A rejected call sent nothing, so it must not count as a reply.
+    ///
+    /// Counting it reported "sent 2 message(s)" for a single delivery and put
+    /// the same sentence into history twice.
+    #[test]
+    fn a_rejected_send_is_not_a_reply() {
+        let events = vec![
+            AgentToolEvent {
+                name: "invoke_plugin".to_string(),
+                arguments: json!({"payload_json": {"message": "群我就不进了"}}),
+                ok: false,
+                output: None,
+                error: Some("invalid target".to_string()),
+            },
+            AgentToolEvent {
+                name: "invoke_plugin".to_string(),
+                arguments: json!({"payload_json": {"message": "群我就不进了"}}),
+                ok: true,
+                output: None,
+                error: None,
+            },
+        ];
+        assert_eq!(outbound_replies(&events), vec!["群我就不进了".to_string()]);
+    }
 
     // Channel-neutral markers frame a plain single-line batch, with the
     // scope instruction and the exact suspend token present.

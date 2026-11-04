@@ -1084,6 +1084,7 @@ impl AgentSession {
         let said: Vec<String> = reply
             .tool_events
             .iter()
+            .filter(|event| event.ok)
             .filter_map(|event| {
                 let arguments = &event.arguments;
                 arguments

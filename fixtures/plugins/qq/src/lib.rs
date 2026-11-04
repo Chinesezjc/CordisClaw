@@ -1820,7 +1820,11 @@ fn build_envelope(msg: &IncomingMessage) -> String {
     // 策略放进 `notes`：kernel 只把它随**本次**请求发给模型，不写进 history。
     // 群记忆**不注入**——那是 agent 自己的备忘，需要时用 `qq_get_group_memory` 去读，
     // 每条消息都塞进来只会让绝大多数请求白付 token。
-    let mut notes = format!("[reply policy: {mode} — {policy}]");
+    // The literal target, not a placeholder: the model used to copy the header's
+    // bare uid and got "expected 'group:<id>' or 'private:<id>'", burning a
+    // round trip on every such turn.
+    let reply_target = format!("{}:{}", msg.message_type, msg.sender_id);
+    let mut notes = format!("[reply policy: {mode} — {policy}] [reply target: {reply_target}]");
     // A group ban is folded into the per-message context: the model must know
     // it cannot speak before it decides to, not after a failed send.
     if let Some(until) = group
@@ -1830,7 +1834,6 @@ fn build_envelope(msg: &IncomingMessage) -> String {
         notes.push(' ');
         notes.push_str(&mute_note(until, now_ms()));
     }
-    let reply_target = format!("{}:{}", msg.message_type, msg.sender_id);
     let session_key = format!("qq:{reply_target}");
     // 有展示名就带上（群名片/昵称，已清洗）；没有则保持旧格式。名字插在
     // `(user <uid>` 之后、`)` 之前，所以 runtime 按 "(user " 切分还原 gid 的
@@ -3869,6 +3872,13 @@ mod chain_tests {
         assert_eq!(env["reply_to"], "42");
         // minori 的 notes/images 字段在有名字时也必须原样保留。
         assert!(env["notes"].as_str().unwrap().contains("[reply policy: "));
+        // The literal target rides along: copying the header's bare uid is what
+        // produced "invalid target '1751557948'".
+        assert!(
+            env["notes"].as_str().unwrap().contains("[reply target: group:123456]"),
+            "{}",
+            env["notes"]
+        );
         assert!(env["images"].as_array().is_some());
     }
 
