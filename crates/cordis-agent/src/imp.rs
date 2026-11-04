@@ -1084,7 +1084,7 @@ impl AgentSession {
         let said: Vec<String> = reply
             .tool_events
             .iter()
-            .filter(|event| event.ok)
+            .filter(|event| event.delivered())
             .filter_map(|event| {
                 let arguments = &event.arguments;
                 arguments
@@ -2549,6 +2549,14 @@ When the user asks you to add a feature or fix a bug in a plugin:\n\
 3. Inside the iteration, edit, build, test, and reload using iteration tools.\n\
 4. The iteration auto-commits on success or rolls back on failure.\n\
 You cannot edit plugin code directly — always use request_iteration.\n\
+\n\
+Missing a capability is a task, not a refusal.\n\
+When the thing asked for has no tool, do not answer \"I cannot do that\". Build the tool:\n\
+1. Find the plugin that owns the area: list_plugins, then read_file under plugins/<name>/src/.\n\
+2. New plugin: create_plugin. Existing plugin: request_iteration(plugin_path, instruction).\n\
+3. run_plugin_test, then reload_runtime, then do the original thing with the new tool.\n\
+The channel plugin talks to OneBot in plugins/qq/src/lib.rs — copy its HTTP and payload shape.\n\
+Answering \"I have no way to do this\" while a plugin could do it is a failure, not an answer.\n\
 Prefer concise, operator-friendly replies. Mention important tool outcomes plainly.\n\
 Do not invent runtime state or claim a command succeeded unless a tool confirmed it.\n\
 \n\
@@ -3045,6 +3053,34 @@ mod tests {
     /// 拼装顺序契约：base → persona（先免责声明再正文）→ conduct → hints。
     /// persona 只调语气，conduct 必须压过它，渠道 hints 仍留最末（recency）。
     #[test]
+    /// A missing capability is work, not a refusal.
+    ///
+    /// The bot answered "邀请链接我点不了" when the invite carried no tool: the
+    /// prompt listed its tools but never said that a missing one can be built.
+    #[test]
+    fn system_prompt_says_a_missing_tool_can_be_built() {
+        let host = FakeHost {
+            persona: None,
+            hints: Vec::new(),
+            caller: None,
+            routed: std::sync::Mutex::new(Vec::new()),
+        };
+        let backend = RuntimeShellAgentBackend {
+            host: &host,
+            session_id: "prompt-build",
+            soul_key: String::new(),
+        };
+        let prompt = backend.system_prompt();
+        for marker in [
+            "Missing a capability is a task, not a refusal",
+            "create_plugin",
+            "request_iteration(plugin_path, instruction)",
+            "reload_runtime, then do the original thing",
+        ] {
+            assert!(prompt.contains(marker), "missing {marker}: {prompt}");
+        }
+    }
+
     fn system_prompt_orders_persona_conduct_hints() {
         let host = FakeHost {
             persona: Some("毒舌运维".to_string()),

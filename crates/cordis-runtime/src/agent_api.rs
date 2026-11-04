@@ -159,6 +159,28 @@ pub struct AgentToolEvent {
     pub error: Option<String>,
 }
 
+impl AgentToolEvent {
+    /// Whether this call actually delivered something.
+    ///
+    /// A channel tool reports delivery failure inside its payload while the call
+    /// itself succeeded — `{"ok":true,"result":{"payload":{"ok":false,…}}}` when
+    /// OneBot refuses the connection. Counting that as a sent message reports a
+    /// delivery that never happened and puts text in history the room never saw.
+    pub fn delivered(&self) -> bool {
+        if !self.ok {
+            return false;
+        }
+        self.output
+            .as_ref()
+            .and_then(|output| output.get("result"))
+            .and_then(|result| result.get("payload"))
+            .and_then(|payload| payload.get("ok"))
+            .and_then(Value::as_bool)
+            // No payload verdict: the call's own ok stands.
+            .unwrap_or(true)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AgentTranscriptEntry {

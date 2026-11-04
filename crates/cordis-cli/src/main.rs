@@ -377,7 +377,7 @@ fn outbound_replies(tool_events: &[AgentToolEvent]) -> Vec<String> {
         // A rejected call sent nothing: counting it said "sent 2 messages" for
         // one delivery, and the duplicate landed in history as if the bot had
         // said it twice.
-        .filter(|event| event.name == "invoke_plugin" && event.ok)
+        .filter(|event| event.name == "invoke_plugin" && event.delivered())
         .filter_map(|event| {
             event
                 .arguments
@@ -1215,7 +1215,14 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                             // post, and no format-retry to run: a turn that
                             // calls no tool simply says nothing.
                             let sent = outbound_replies(&reply.tool_events);
-                            if sent.is_empty() {
+                            if sent.is_empty() && !reply.tool_events.is_empty() {
+                                // The call ran and the channel refused it; saying
+                                // "no tool call" here hides a dead transport.
+                                eprintln!(
+                                    "inbox: [{session_key}] {} tool call(s) delivered nothing → silent",
+                                    reply.tool_events.len()
+                                );
+                            } else if sent.is_empty() {
                                 eprintln!(
                                     "inbox: [{session_key}] turn produced no tool call → silent"
                                 );
@@ -3293,6 +3300,27 @@ mod inbox_framing_tests {
             },
         ];
         assert_eq!(outbound_replies(&events), vec!["群我就不进了".to_string()]);
+    }
+
+    /// The call succeeded but the plugin reported that nothing left the box.
+    ///
+    /// OneBot was down and every send came back
+    /// `{"ok":true,"result":{"payload":{"ok":false,…"Connection refused"}}}`;
+    /// the log still said "sent 1 message(s)" and history recorded a message the
+    /// room never saw.
+    #[test]
+    fn a_send_the_plugin_refused_is_not_a_reply() {
+        let events = vec![AgentToolEvent {
+            name: "invoke_plugin".to_string(),
+            arguments: json!({"payload_json": {"message": "在吗"}}),
+            ok: true,
+            output: Some(json!({
+                "ok": true,
+                "result": {"payload": {"ok": false, "node_id": "error", "error": "Connection refused"}}
+            })),
+            error: None,
+        }];
+        assert!(outbound_replies(&events).is_empty());
     }
 
     // Channel-neutral markers frame a plain single-line batch, with the
