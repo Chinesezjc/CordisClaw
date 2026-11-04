@@ -195,6 +195,9 @@ struct IncomingMessage {
     /// `None` = the event carried no role.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     sender_role: Option<String>,
+    /// When the channel says this message was sent, unix ms.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sent_at_ms: Option<i64>,
     /// Raw OneBot event for debugging
     #[serde(skip_serializing_if = "Option::is_none")]
     raw_event: Option<Value>,
@@ -220,6 +223,11 @@ struct OneBotEvent {
     sender: Option<OneBotSender>,
     #[serde(default)]
     raw_message: Option<String>,
+    /// OneBot v11 event time, unix seconds. The model needs to know *when* a
+    /// message was sent: without it, a two-hundred-message history is a flat
+    /// wall and "你呢" can be attached to something said hours ago.
+    #[serde(default)]
+    time: Option<i64>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -1026,6 +1034,7 @@ fn handle_onebot_event(event: &OneBotEvent) {
         reply_to_msg_id,
         sender_name,
         sender_role,
+        sent_at_ms: event.time.map(|seconds| seconds * 1000),
         raw_event: Some(serde_json::to_value(event).unwrap_or_default()),
     };
 
@@ -1492,6 +1501,15 @@ fn node_str_arg(payload: Option<&Value>, top_level: Option<&str>, key: &str) -> 
     }
 }
 
+/// `MM-DD HH:MM` in local time, for the batch header.
+fn format_sent_at(ms: i64) -> String {
+    use chrono::{Local, TimeZone};
+    match Local.timestamp_millis_opt(ms).single() {
+        Some(stamp) => stamp.format("%m-%d %H:%M").to_string(),
+        None => String::new(),
+    }
+}
+
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1845,14 +1863,21 @@ fn build_envelope(msg: &IncomingMessage) -> String {
         .message_id
         .map(|id| format!(" msg={id}"))
         .unwrap_or_default();
+    // When the channel reports a send time, it rides right after the header:
+    // without it the model cannot tell a message from two minutes ago from one
+    // from yesterday, and a bare follow-up gets attached to the wrong thread.
+    let sent_at = msg
+        .sent_at_ms
+        .map(|ms| format!(" {}", format_sent_at(ms)))
+        .unwrap_or_default();
     let display = match msg.sender_name.as_deref() {
         Some(name) => format!(
-            "[QQ {} from {} (user {}{}, name \"{}\")]: {}",
-            msg.message_type, msg.sender_id, msg.user_id, msg_id, name, msg.message
+            "[QQ {} from {} (user {}{}, name \"{}\"){}]: {}",
+            msg.message_type, msg.sender_id, msg.user_id, msg_id, name, sent_at, msg.message
         ),
         None => format!(
-            "[QQ {} from {} (user {}{})]: {}",
-            msg.message_type, msg.sender_id, msg.user_id, msg_id, msg.message
+            "[QQ {} from {} (user {}{}){}]: {}",
+            msg.message_type, msg.sender_id, msg.user_id, msg_id, sent_at, msg.message
         ),
     };
 
@@ -3817,6 +3842,7 @@ mod chain_tests {
             reply_to_msg_id: None,
             sender_name: None,
             sender_role: None,
+            sent_at_ms: None,
             raw_event: None,
         };
         let env: Value = serde_json::from_str(&build_envelope(&msg)).unwrap();
@@ -3839,6 +3865,38 @@ mod chain_tests {
         );
     }
 
+    // 渠道报了发送时间就写进 header：没有它，两百条历史是一堵平墙，
+    // 模型分不出"两分钟前"和"昨天"，会把一句追问接到旧话题上。
+    #[test]
+    fn build_envelope_carries_the_send_time() {
+        let msg = IncomingMessage {
+            message_type: "group".to_string(),
+            sender_id: "123456".to_string(),
+            user_id: "789".to_string(),
+            message: "hello".to_string(),
+            message_id: Some(42),
+            reply_to_msg_id: None,
+            sender_name: None,
+            sender_role: None,
+            sent_at_ms: Some(1_793_300_000_000),
+            raw_event: None,
+        };
+        let env: Value = serde_json::from_str(&build_envelope(&msg)).unwrap();
+        let display = env["display"].as_str().unwrap();
+        assert!(display.ends_with("]: hello"), "{display}");
+        // Local time, so assert the shape rather than a literal date.
+        let stamp = display
+            .split("]: ")
+            .next()
+            .and_then(|header| header.rsplit_once(") "))
+            .map(|(_, stamp)| stamp)
+            .expect("timestamp after the header");
+        assert_eq!(stamp.len(), 11, "MM-DD HH:MM expected: {display}");
+        assert_eq!(&stamp[2..3], "-", "{display}");
+        assert_eq!(&stamp[5..6], " ", "{display}");
+        assert_eq!(&stamp[8..9], ":", "{display}");
+    }
+
     // 有 sender_name 时 display 带上发言人展示名，其余路由字段不变。
     #[test]
     fn build_envelope_carries_speaker_name() {
@@ -3851,6 +3909,7 @@ mod chain_tests {
             reply_to_msg_id: Some(7),
             sender_name: Some("小明".to_string()),
             sender_role: None,
+            sent_at_ms: None,
             raw_event: None,
         };
         let env: Value = serde_json::from_str(&build_envelope(&msg)).unwrap();
@@ -3895,6 +3954,7 @@ mod chain_tests {
             reply_to_msg_id: None,
             sender_name: None,
             sender_role: Some("admin".to_string()),
+            sent_at_ms: None,
             raw_event: None,
         };
         let env: Value = serde_json::from_str(&build_envelope(&msg)).unwrap();
@@ -4167,6 +4227,7 @@ mod reply_policy_tests {
             reply_to_msg_id: None,
             sender_name: None,
             sender_role: None,
+            sent_at_ms: None,
             raw_event: None,
         }
     }
@@ -4924,6 +4985,7 @@ mod image_url_tests {
             reply_to_msg_id: None,
             sender_name: None,
             sender_role: None,
+            sent_at_ms: None,
             raw_event: None,
         }
     }
