@@ -479,6 +479,9 @@ impl AgentSession {
                 // json_object` forbids tool calls outright, which is what made
                 // the model answer with whitespace and stop.
             });
+            if env::var("CORDIS_LLM_DUMP").ok().as_deref() == Some("1") {
+                dump_request(&request_body);
+            }
             let parts =
                 match provider.complete(request_body, sink.clone(), self.config.to_transport()) {
                     Ok(parts) => parts,
@@ -1105,10 +1108,14 @@ impl AgentSession {
             })
             .filter(|message| !message.trim().is_empty())
             .collect();
+        // Store what the room saw, not the harness's own action JSON. A history
+        // full of `{"action":"respond",…}` taught the model to answer with that
+        // JSON — a protocol no prompt line asks for — and it is why replies kept
+        // arriving as plain text that the channel then dropped.
         let assistant = if said.is_empty() {
-            "{\"action\":\"suspend\"}".to_string()
+            r#"{"node_id":"suspend"}"#.to_string()
         } else {
-            json!({ "action": "respond", "message": said.join("\n") }).to_string()
+            said.join("\n")
         };
         let reasoning = closing_reasoning(&self.turn_reasoning);
         let remembered = if images.is_empty() {
@@ -2579,6 +2586,24 @@ pass a custom command for specific tests, e.g. `cargo test -p gacha`).\n\
 For plugin node calls: always use invoke_plugin(plugin_path, node_id, payload_json)."
     );
     prompt
+}
+
+/// Write the exact request body to `data/llm-debug/` when asked.
+///
+/// Reasoning about "what did the model see" from the code is how the harness got
+/// its own behaviour wrong more than once; the dump is the record.
+fn dump_request(body: &Value) {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let dir = std::path::Path::new("data/llm-debug");
+    if std::fs::create_dir_all(dir).is_err() {
+        return;
+    }
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis())
+        .unwrap_or_default();
+    let path = dir.join(format!("request-{millis}.json"));
+    let _ = std::fs::write(path, serde_json::to_string_pretty(body).unwrap_or_default());
 }
 
 fn emit_agent_diagnostic(message: String) {
