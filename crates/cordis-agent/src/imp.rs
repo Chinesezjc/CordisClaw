@@ -865,6 +865,17 @@ impl AgentSession {
                         tool_events,
                     });
                 }
+                // The model's own text has to stay in the conversation. Without
+                // it the model sees the same ask repeated with no record of the
+                // answers it already gave, and answers identically every time —
+                // one live turn repeated a 119-character reply 44 times.
+                if let Some(text) = message
+                    .content
+                    .as_deref()
+                    .filter(|text| !text.trim().is_empty())
+                {
+                    messages.push(json!({ "role": "assistant", "content": text }));
+                }
                 let nudge = if tool_events.is_empty() {
                     "[system] 这一轮还没结束：你还没有发出任何消息。先调用 qq_send 把要说的话发出去，再调用 suspend。正文不会发给任何人。"
                 } else {
