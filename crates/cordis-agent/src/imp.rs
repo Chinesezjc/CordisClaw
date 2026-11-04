@@ -832,30 +832,6 @@ impl AgentSession {
                 });
             }
 
-            // Text without a tool call does not end a channel turn: nudge the
-            // model to keep working or to close the turn explicitly.
-            // Once something actually went out, a text reply closes the turn.
-            // Pushing for the marker at that point made the model repeat the
-            // same message, which the room saw as duplicate replies.
-            if !tool_events.is_empty() {
-                self.no_end_strikes = 0;
-                self.completed_turns += 1;
-                // This is how a channel turn normally closes: something went
-                // out, then the model stopped. The assistant entry is the only
-                // place the reasoning survives, because history is pruned.
-                let closing = message.content.unwrap_or_default();
-                self.transcript.push(AgentTranscriptEntry::Assistant {
-                    content: closing.clone(),
-                    response_id: response_id.clone(),
-                    reasoning: closing_reasoning(&self.turn_reasoning),
-                });
-                return Ok(AgentReply {
-                    response_id,
-                    content: closing,
-                    tool_events,
-                });
-            }
-
             if self.require_end_tool {
                 // A channel turn ends on `suspend` and nothing else. Asking a
                 // bounded number of times turned a model that forgot the marker
@@ -868,14 +844,33 @@ impl AgentSession {
                     self.no_end_strikes,
                     !tool_events.is_empty()
                 ));
-                // One ask, and only for a missing ending: nothing has been sent
-                // and no marker arrived, so the turn has no conclusion. Nothing
-                // here tells the model how many messages it may send — a turn
-                // that already delivered something ends by itself above.
-                messages.push(json!({
-                    "role": "user",
-                    "content": "[system] 这一轮还没结束：你还没有发出任何消息。先调用 qq_send 把要说的话发出去，再调用 suspend。正文不会发给任何人。",
-                }));
+                // Only `suspend` ends a channel turn — sending does not. The
+                // ask states the ending protocol and nothing else: how many
+                // messages the turn contains is the model's call.
+                //
+                // But an ask can be answered with the same text again: one turn
+                // repeated an identical 119-character reply 44 times, each round
+                // a billed call. Once something has gone out there is nothing
+                // left to salvage, so stop asking and close the turn.
+                if !tool_events.is_empty() && self.no_end_strikes > 3 {
+                    emit_agent_diagnostic(format!(
+                        "agent_marker_never_came kind={} attempts={}",
+                        self.kind, self.no_end_strikes
+                    ));
+                    self.no_end_strikes = 0;
+                    self.completed_turns += 1;
+                    return Ok(AgentReply {
+                        response_id,
+                        content: String::new(),
+                        tool_events,
+                    });
+                }
+                let nudge = if tool_events.is_empty() {
+                    "[system] 这一轮还没结束：你还没有发出任何消息。先调用 qq_send 把要说的话发出去，再调用 suspend。正文不会发给任何人。"
+                } else {
+                    "[system] 消息已经发出去了，但这一轮还没结束：调用 suspend 结束这一轮（想继续说也可以继续发）。"
+                };
+                messages.push(json!({ "role": "user", "content": nudge }));
                 continue;
             }
 
@@ -3748,10 +3743,36 @@ mod tests {
         );
     }
 
-    /// Once a message went out, the next text reply closes the turn. Pushing
-    /// for the marker there made the model send the same message twice.
+    /// A delivered turn stops asking once the marker never comes.
+    ///
+    /// One live turn replied with the same 119-character text 44 times, each
+    /// round a billed model call, because every nudge was answered with the same
+    /// message. Nothing is lost by closing: the reply already went out.
     #[test]
-    fn a_turn_that_sent_something_closes_on_text() {
+    fn a_delivered_turn_stops_asking_for_the_marker() {
+        let mut replies = vec![assistant_reply(
+            "<|DSML|tool_calls>\n{\"node_id\": \"invoke_plugin\", \"payload_json\": {\"plugin_path\": \"qq\", \"node_id\": \"qq_send\", \"payload_json\": {\"message\": \"hi\"}}}\n</|DSML|tool_calls>",
+        )];
+        // The model keeps answering the nudge with the same chatter.
+        replies.extend((0..10).map(|_| assistant_reply("说完了")));
+        let provider = FakeLlmProvider::new(replies);
+        let mut session = ShellAgentSession::new(LlmApiConfig::default()).expect("build session");
+        session.set_require_end_tool(true);
+        let reply = session
+            .respond_via(&EMPTY_FAKE_HOST, "test-session-spin", "hi", &provider)
+            .expect("turn");
+        assert_eq!(reply.tool_events.len(), 1, "the message still went out");
+        let calls = provider.seen_bodies.lock().expect("bodies").len();
+        assert!(calls <= 5, "the turn must stop asking, got {calls} calls");
+    }
+
+    /// Sending does not end the turn: only `suspend` does.
+    ///
+    /// The harness once closed a channel turn on any text after a send. That is
+    /// a rule about the model's behaviour, not about the protocol, and it cut
+    /// turns short when the model still had something to say.
+    #[test]
+    fn a_send_does_not_end_the_turn() {
         let provider = FakeLlmProvider::new(vec![
             assistant_reply(
                 "<|DSML|tool_calls>\n{\"node_id\": \"invoke_plugin\", \"payload_json\":                  {\"plugin_path\": \"qq\", \"node_id\": \"qq_send\", \"payload_json\":                  {\"message\": \"hi\"}}}\n</|DSML|tool_calls>",
@@ -3768,8 +3789,8 @@ mod tests {
         assert_eq!(reply.tool_events.len(), 1, "exactly one tool ran");
         assert_eq!(
             provider.seen_bodies.lock().expect("bodies").len(),
-            2,
-            "the text reply after a send ends the turn"
+            3,
+            "the turn runs until the marker, not until the text after a send"
         );
     }
 
