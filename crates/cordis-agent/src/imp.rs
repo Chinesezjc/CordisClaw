@@ -868,15 +868,14 @@ impl AgentSession {
                     self.no_end_strikes,
                     !tool_events.is_empty()
                 ));
-                // Two different asks: before anything is sent, push it to act;
-                // after it acted, stop it from sending the same thing again —
-                // "keep working" made the model repeat its message.
-                let nudge = if tool_events.is_empty() {
-                    "[system] 这一轮还没结束：你还没有发出任何消息。先调用 qq_send 把要说的话发出去，再调用 suspend。正文不会发给任何人。"
-                } else {
-                    "[system] 消息已经发出去了。不要再发第二条；直接调用 suspend 结束这一轮。"
-                };
-                messages.push(json!({ "role": "user", "content": nudge }));
+                // One ask, and only for a missing ending: nothing has been sent
+                // and no marker arrived, so the turn has no conclusion. Nothing
+                // here tells the model how many messages it may send — a turn
+                // that already delivered something ends by itself above.
+                messages.push(json!({
+                    "role": "user",
+                    "content": "[system] 这一轮还没结束：你还没有发出任何消息。先调用 qq_send 把要说的话发出去，再调用 suspend。正文不会发给任何人。",
+                }));
                 continue;
             }
 
