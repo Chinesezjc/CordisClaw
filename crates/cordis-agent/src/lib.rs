@@ -43,42 +43,6 @@ impl AgentLoop for CargoAgentLoop {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{install, CargoAgentLoop};
-    use cordis_runtime::agent_loop::{agent_loop, AgentLoop};
-    use cordis_runtime::config::LlmApiConfig;
-    use std::sync::Once;
-
-    /// The registry is process-global, so the tests share one install.
-    static INIT: Once = Once::new();
-
-    fn ensure_installed() {
-        INIT.call_once(|| {
-            let _ = install();
-        });
-    }
-
-    // The crate's whole contract: installing it makes the process use this
-    // loop, and that loop can build a session.
-    #[test]
-    fn installing_makes_the_process_use_this_loop() {
-        ensure_installed();
-        assert!(agent_loop().is_some());
-        let session = CargoAgentLoop
-            .create(LlmApiConfig::default(), "runtime_shell")
-            .expect("create a session");
-        assert_eq!(session.kind(), "runtime_shell");
-    }
-
-    // A second install is a no-op, matching `install_plugin_builder`.
-    #[test]
-    fn a_second_install_is_ignored() {
-        ensure_installed();
-        assert!(!install());
-    }
-}
-
 impl cordis_runtime::agent_loop::AgentSessionApi for imp::AgentSession {
     fn kind(&self) -> &str {
         imp::AgentSession::kind(self)
@@ -167,5 +131,41 @@ impl cordis_runtime::agent_loop::AgentSessionApi for imp::AgentSession {
             provider,
             sink,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{install, CargoAgentLoop};
+    use cordis_runtime::agent_loop::{agent_loop, AgentLoop};
+    use cordis_runtime::config::LlmApiConfig;
+    use std::sync::Once;
+
+    /// The registry is process-global, so the tests share one install.
+    static INIT: Once = Once::new();
+
+    fn ensure_installed() {
+        INIT.call_once(|| {
+            let _ = install();
+        });
+    }
+
+    // The crate's whole contract: installing it makes the process use this
+    // loop, and that loop can build a session.
+    #[test]
+    fn installing_makes_the_process_use_this_loop() {
+        ensure_installed();
+        assert!(agent_loop().is_some());
+        let session = CargoAgentLoop
+            .create(LlmApiConfig::default(), "runtime_shell")
+            .expect("create a session");
+        assert_eq!(session.kind(), "runtime_shell");
+    }
+
+    // A second install is a no-op, matching `install_plugin_builder`.
+    #[test]
+    fn a_second_install_is_ignored() {
+        ensure_installed();
+        assert!(!install());
     }
 }

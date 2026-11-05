@@ -38,8 +38,14 @@ jobs:
       - name: rustfmt
         run: cargo fmt --all --check
 
+      # `--workspace` 是 clippy 门禁必须的：`cordis-agent` 不在
+      # default-members 里（它是 `cordis-cli` 的依赖，不是默认构建目标），
+      # 只跑 default-members 时它的 lib/test/integration 目标完全不会被
+      # 编译检查——一个 `clippy::items_after_test_module` 和整片 unused
+      # import 就这样在门禁外活了下来。coverage workflow 早就用
+      # `--workspace` 跑，这里对齐。
       - name: clippy
-        run: cargo clippy --all-targets --locked -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: build
         run: cargo build --all-targets --locked

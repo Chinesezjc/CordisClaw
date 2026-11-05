@@ -21,20 +21,14 @@ use std::sync::atomic::Ordering::SeqCst;
 use std::sync::Arc;
 
 use cordis_agent::iteration::backend::PluginIterationAgentBackend;
-use cordis_plugin_sdk::llm::LlmToolCall;
-use cordis_runtime::agent_api::{AgentBackend, AgentToolHost};
+use cordis_runtime::agent_api::AgentBackend;
 use cordis_runtime::core::error::RuntimeError;
 use cordis_runtime::host::ScaffoldChildPluginArgs;
 use cordis_runtime::host::{
-    plugin_iteration_journal_path, InvocationSample, PluginIterationAgentState,
-    PluginIterationContextPaths, PreparedPluginIteration, RuntimeHost,
-    PLUGIN_AGENT_TOOL_CREATE_FILE, PLUGIN_AGENT_TOOL_DELETE_FILE,
-    PLUGIN_AGENT_TOOL_INSPECT_PLUGIN_CATALOG, PLUGIN_AGENT_TOOL_LIST_CONTEXT_FILES,
-    PLUGIN_AGENT_TOOL_READ_CONTEXT_FILES, PLUGIN_AGENT_TOOL_RECORD_ITERATION_SUMMARY,
-    PLUGIN_AGENT_TOOL_REPLACE_FILES_EXACT, PLUGIN_AGENT_TOOL_REPLACE_FILE_EXACT,
-    PLUGIN_AGENT_TOOL_RUN_PLUGIN_CHECK, PLUGIN_AGENT_TOOL_RUN_PLUGIN_TEST,
-    PLUGIN_AGENT_TOOL_SCAFFOLD_CHILD_PLUGIN, PLUGIN_AGENT_TOOL_TOML_SET,
-    TEST_ITERATION_ENOSPC_INJECTION, TEST_ITERATION_PANIC_INJECTION,
+    plugin_iteration_journal_path, PluginIterationAgentState, PluginIterationContextPaths,
+    PreparedPluginIteration, RuntimeHost, PLUGIN_AGENT_TOOL_RECORD_ITERATION_SUMMARY,
+    PLUGIN_AGENT_TOOL_REPLACE_FILES_EXACT, TEST_ITERATION_ENOSPC_INJECTION,
+    TEST_ITERATION_PANIC_INJECTION,
 };
 use cordis_runtime::kernel::plugin_iteration::KernelPluginIterationRequest;
 use cordis_runtime::kernel::plugin_iteration::{
@@ -42,12 +36,8 @@ use cordis_runtime::kernel::plugin_iteration::{
     PluginIterationFinalVerdict, VerifierVerdict,
 };
 use cordis_runtime::kernel::verifier::VerificationProfile;
-use serde_json::Map;
 use serde_json::{json, Value};
-use serial_test::serial;
 use tempfile::TempDir;
-
-use cordis_agent::iteration::policy::{is_test_path, iteration_changes_docs_only, test_changes};
 
 /// A backend bound to a hermetic empty-fixture host.
 fn with_backend<R>(
@@ -206,7 +196,7 @@ fn setup_verify_node_json_fixture() -> (TempDir, PathBuf) {
 }
 
 fn wedge_journal_as_dir(host: &RuntimeHost) {
-    let journal = cordis_runtime::host::plugin_iteration_journal_path(&host.snapshot_root());
+    let journal = cordis_runtime::host::plugin_iteration_journal_path(host.snapshot_root());
     fs::create_dir_all(&journal).expect("create journal-as-dir");
     fs::write(journal.join("blocker.txt"), b"x").expect("nonempty dir");
 }
@@ -1321,7 +1311,7 @@ fn iterate_plugins_panic_is_caught_and_rolls_back_candidate_and_clears_journal()
         marker_rel,
         Some(b"original".to_vec()),
     );
-    let journal_path = plugin_iteration_journal_path(&host.snapshot_root());
+    let journal_path = plugin_iteration_journal_path(host.snapshot_root());
     rollback
         .persist_journal(&journal_path, "seam-iteration")
         .expect("persist journal");
