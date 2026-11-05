@@ -276,31 +276,29 @@ fn decode_char(byte: u8) -> Option<u8> {
     }
 }
 
-/// 占位符文本。形状照 DSH：
-/// `[image omitted to fit request byte budget; sha256:<前8位>; <W>x<H> <fmt>]`。
+/// 占位符文本。形状照 DSH，并追加一段可取回的缓存地址：
+/// `[image omitted to fit request byte budget; sha256:<前8位>; <W>x<H> <fmt>; path data/media/<sha256>]`。
 ///
-/// 拿不到尺寸或格式时只写 sha256；连字节都解不出来时只写 omitted——占位符
-/// 只说「这张图被预算挤掉了」，不猜内容。
+/// 拿不到尺寸或格式时只写 sha256 与 path；连字节都解不出来时只写 omitted——
+/// 占位符只说「这张图被预算挤掉了」，不猜内容。
+///
+/// `path` 段是**内容寻址**的：kernel 下载图片时已把原始字节按同一个 sha256
+/// 落在 `data/media/`（见 [`crate::image_cache`]），所以模型调 `view_image`
+/// 就能把这张图重新挂回请求。这里仍保持纯函数——路径由摘要推出来，不查盘。
 fn placeholder_for(uri: &str) -> String {
     const PREFIX: &str = "[image omitted to fit request byte budget";
     let Some(bytes) = data_uri_payload(uri).and_then(base64_decode) else {
         return format!("{PREFIX}]");
     };
-    let digest = sha256(&bytes);
+    let digest = crate::image_cache::digest_hex(&bytes);
     let short = &digest[..8];
+    let path = crate::image_cache::placeholder_path(&digest);
     match (dimensions(&bytes), sniff_format(&bytes)) {
         (Some((width, height)), Some(format)) => {
-            format!("{PREFIX}; sha256:{short}; {width}x{height} {format}]")
+            format!("{PREFIX}; sha256:{short}; {width}x{height} {format}; path {path}]")
         }
-        _ => format!("{PREFIX}; sha256:{short}]"),
+        _ => format!("{PREFIX}; sha256:{short}; path {path}]"),
     }
-}
-
-fn sha256(bytes: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    hex::encode(hasher.finalize())
 }
 
 /// 图片格式短名（`png` / `jpeg` / `gif` / `webp`），来自魔数嗅探。
@@ -681,13 +679,54 @@ mod tests {
         let bytes = png_header(640, 480);
         let uri = format!("data:image/png;base64,{}", base64_encode(&bytes));
         let placeholder = placeholder_for(&uri);
+        let digest = crate::image_cache::digest_hex(&bytes);
         assert_eq!(
             placeholder,
             format!(
-                "[image omitted to fit request byte budget; sha256:{}; 640x480 png]",
-                &sha256(&bytes)[..8]
+                "[image omitted to fit request byte budget; sha256:{}; 640x480 png; path data/media/{digest}]",
+                &digest[..8]
             )
         );
+    }
+
+    /// 占位符里的 `path` 必须与缓存地址一致：模型据此调 `view_image` 取回。
+    #[test]
+    fn placeholder_path_is_the_content_addressed_cache_address() {
+        let bytes = png_header(2, 2);
+        let uri = format!("data:image/png;base64,{}", base64_encode(&bytes));
+        let placeholder = placeholder_for(&uri);
+        let expected =
+            crate::image_cache::placeholder_path(&crate::image_cache::digest_hex(&bytes));
+        assert!(
+            placeholder.contains(&format!("; path {expected}]")),
+            "{placeholder}"
+        );
+    }
+
+    /// 占位符里的 `path` 必须真的能被缓存读回：预算剥图 → 从占位符文本里
+    /// 抠出地址 → `view_image` 的读取实现解出同一张图。
+    #[test]
+    fn placeholder_path_round_trips_through_the_cache_reader() {
+        let bytes = png_header(640, 480);
+        let uri = format!("data:image/png;base64,{}", base64_encode(&bytes));
+        let placeholder = placeholder_for(&uri);
+
+        // 模型看到的形态：`…; path data/media/<sha256>]`
+        let start = placeholder.find("; path ").expect("path segment") + "; path ".len();
+        let rel = &placeholder[start..placeholder.len() - 1];
+        assert_eq!(
+            rel,
+            crate::image_cache::placeholder_path(&crate::image_cache::digest_hex(&bytes))
+        );
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let media = dir.path().join("media");
+        crate::image_cache::store(&media, &bytes).expect("store the original bytes");
+        let (attached, part) = crate::image_cache::load_part(&media, Some(rel), None)
+            .expect("load by placeholder path");
+        assert_eq!(attached, rel);
+        assert_eq!(part["type"], "image_url");
+        assert_eq!(part["image_url"]["url"], uri);
     }
 
     #[test]
@@ -695,6 +734,7 @@ mod tests {
         let uri = format!("data:image/png;base64,{}", base64_encode(b"not an image"));
         let placeholder = placeholder_for(&uri);
         assert!(placeholder.contains("sha256:"));
+        assert!(placeholder.contains("; path data/media/"), "{placeholder}");
         assert!(!placeholder.contains('x'), "{placeholder}");
         assert!(placeholder.ends_with(']'));
     }
@@ -709,14 +749,6 @@ mod tests {
             placeholder_for("data:image/png;base64,!!!"),
             "[image omitted to fit request byte budget]"
         );
-    }
-
-    #[test]
-    fn sha256_matches_known_vectors() {
-        // 64 位十六进制；前 8 位与 FIPS 180-4 的向量一致。
-        assert_eq!(&sha256(b"")[..8], "e3b0c442");
-        assert_eq!(&sha256(b"abc")[..8], "ba7816bf");
-        assert_eq!(sha256(b"abc").len(), 64);
     }
 
     #[test]

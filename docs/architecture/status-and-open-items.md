@@ -767,6 +767,46 @@ LRU 淘汰时同步删除。
 动机：`agent.rs` 4585 行、是仓库唯一被 coverage 排除的面，而这一晚所有的行为改动
 （B1 回滚、DSML 协议、end-tool 语义）都必须改 kernel + 全量重建 + 重启。
 
+### 3.38 被预算剥掉的图片可以取回：`view_image` + 内容寻址缓存（2026-11-05）
+
+**问题**：请求体字节预算把超预算的历史图片换成一行占位符
+（`[image omitted to fit request byte budget; sha256:<8位>; <W>x<H> <fmt>]`），
+占位符只带摘要前 8 位与尺寸——模型从此**永远**看不到那张图，也没有任何"取回"的
+通道。图片在请求装配时被剥掉、原始字节随之丢弃，这是 `image_budget` 上线后遗留的
+单向门。
+
+**实现**（kernel）：
+
+1. **内容寻址缓存**（新模块 `cordis-runtime/src/image_cache.rs`）：kernel 下载入站
+   图片时把原始字节写到 `data/media/<sha256>`，同名文件已存在就跳过（`store`，
+   临时文件 + rename）。下载入口是 `RuntimeHost::image_parts_for_batch` 注入的
+   `image_cache::caching_fetcher`。
+2. **占位符带地址**：`placeholder_for` 追加 `path data/media/<sha256>`（**全量**摘要，
+   相对仓库工作目录），于是占位符本身就是缓存地址；`sha256:<8位>` 仍保留给人和
+   `sha256` 前缀查选用。占位符仍是纯函数——路径由摘要推出来，不查盘。
+3. **新工具 `view_image`**（kernel 工具，加入 `shell_agent_tools()` 与
+   `RuntimeShellAgentBackend::execute_tool`）：入参 `{"path": "..."}` 或
+   `{"sha256": "<8~64 位十六进制前缀>"}` 二选一；路径必须是 `data/media/<name>` 形状
+   （绝对路径、`..`、子目录一律拒），摘要前缀在缓存目录里必须唯一。返回
+   `{"ok":true,"attached":"data/media/<sha256>"}`，并把该图放进 backend 的
+   `attached` 队列。
+4. **下一次请求带回来**：循环在每次工具轮结束、准备 `continue` 之前取走队列
+   （`attach_recovered_images`），作为一条 user 消息追加，然后对整个 `messages`
+   重跑 `enforce_image_budget`——**先扣本轮新图、再扣队列**，装不下的图丢弃并在
+   附言里写明张数，整条请求仍 ≤ `INLINE_IMAGE_BUDGET_BYTES`。队列绑定在一次
+   `respond` 上（backend 生命周期），回合结束即丢，因此不会跨轮泄漏图片。
+5. **vision 插件**：`read_local_image` 从"只许 `/tmp`"放宽到"`/tmp` 或
+   `data/media/` 下的文件"（先拒 `..`，再 canonicalize 后判断形状），
+   `load_source(path=…)` 因此也能读回占位符里的地址。
+
+**边界**：取回是**一次性**的——图片只出现在取回后的那一次请求里，不进 history；
+模型需要再看一次就再调一次 `view_image`。这是有意的：历史里只保留可寻址的占位符，
+避免"取回"变成绕开字节预算的后门。
+
+**验证**：runtime 963 lib 测试（`image_cache` 16 条、`image_tools` 3 条）、agent 81 条
+（端到端：占位符 → 调 `view_image` → 下一次请求里图回来）、vision 11 条；clippy
+`-D warnings` 干净。
+
 ## 4. 部分完成
 
 ### 4.1 Execution engine 有正式入口，数据面验证不足

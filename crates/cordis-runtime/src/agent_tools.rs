@@ -136,6 +136,8 @@ pub const AGENT_TOOL_INVOKE_PLUGIN: &str = "invoke_plugin";
 pub const AGENT_TOOL_EXECUTE_TARGET: &str = "execute_target";
 pub const AGENT_TOOL_READ_FILE: &str = "read_file";
 pub const AGENT_TOOL_LIST_DIRECTORY: &str = "list_directory";
+/// 取回一张被请求体预算剥成占位符的图片（内容寻址缓存 `data/media/<sha256>`）。
+pub const AGENT_TOOL_VIEW_IMAGE: &str = "view_image";
 pub const AGENT_TOOL_SEARCH_CODE: &str = "search_code";
 pub const AGENT_TOOL_WRITE_FILE: &str = "write_file";
 pub const AGENT_TOOL_REPLACE_IN_FILE: &str = "replace_in_file";
@@ -476,6 +478,24 @@ impl AgentToolHost for RuntimeHost {
             "path": path,
             "entries": entries,
         }))
+    }
+
+    /// 取回一张被预算剥成占位符的图片：读 `data/media/` 下的内容寻址缓存。
+    ///
+    /// 校验与读取都在 [`crate::image_cache`]（纯函数 + 注入的目录），这里只
+    /// 把 host 的 data 目录接进去，因此测试可以用临时目录跑而完全不动仓库的
+    /// `data/`。
+    fn agent_view_image(
+        &self,
+        path: Option<&str>,
+        sha256: Option<&str>,
+    ) -> Result<(String, Value), RuntimeError> {
+        let media_dir = self.data_dir().join("media");
+        crate::image_cache::load_part(&media_dir, path, sha256).map_err(|message| {
+            RuntimeError::InvalidArgument {
+                message: format!("view_image: {message}"),
+            }
+        })
     }
 
     fn agent_search_code(&self, pattern: &str, path: Option<&str>) -> Result<Value, RuntimeError> {
@@ -1073,6 +1093,15 @@ pub struct ListDirectoryArgs {
     #[serde(default)]
     pub path: Option<String>,
 }
+/// `view_image` 的入参：`path`（占位符里那一段）或 `sha256`（摘要前缀），
+/// 二选一。两者都给或都不给由 [`crate::image_cache::load_part`] 拒绝。
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct ViewImageArgs {
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub sha256: Option<String>,
+}
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct SearchCodeArgs {
     pub pattern: String,
@@ -1310,4 +1339,101 @@ pub struct SessionCaller {
     /// the envelope decides (operator allowlist, room owner/admin, …), so the
     /// approval policy stays in the plugin layer.
     pub can_approve_iteration: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent_api::AgentToolHost;
+    use std::fs;
+    use tempfile::TempDir;
+
+    /// 空 fixtures 树（零插件的 artifacts/index.json）+ 钉在 TempDir 里的
+    /// snapshot root：boot 完全不碰仓库，也不往全局临时目录堆快照。
+    fn empty_host() -> (TempDir, RuntimeHost) {
+        let temp = TempDir::new().expect("tempdir");
+        let fixtures = temp.path().join("fixtures");
+        let artifacts = fixtures.join("artifacts");
+        fs::create_dir_all(&artifacts).expect("artifacts dir");
+        fs::write(
+            artifacts.join("index.json"),
+            r#"{
+  "schema_version": 2,
+  "generated_at": "2026-07-24T00:00:00Z",
+  "topo_order": [],
+  "entries": []
+}
+"#,
+        )
+        .expect("empty artifact index");
+        let config = fixtures.parent().expect("parent").join("config");
+        fs::create_dir_all(&config).expect("config dir");
+        fs::write(
+            config.join("runtime.yaml"),
+            format!(
+                "runtime:\n  snapshot_root: {}\n",
+                temp.path().join("snapshots").display()
+            ),
+        )
+        .expect("runtime.yaml");
+        let host = RuntimeHost::boot(&fixtures).expect("host boots on an empty index");
+        (temp, host)
+    }
+
+    const PNG: &[u8] = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR";
+
+    #[test]
+    #[serial_test::serial]
+    fn view_image_tool_reads_the_data_media_cache_by_path_and_prefix() {
+        let (_temp, host) = empty_host();
+        let media = host.data_dir().join("media");
+        fs::create_dir_all(&media).expect("media dir");
+        let digest = crate::image_cache::digest_hex(PNG);
+        fs::write(media.join(&digest), PNG).expect("cache the image");
+
+        let (rel, part) =
+            AgentToolHost::agent_view_image(&host, Some(&format!("data/media/{digest}")), None)
+                .expect("by path");
+        assert_eq!(rel, format!("data/media/{digest}"));
+        assert_eq!(part["type"], "image_url");
+        assert_eq!(
+            part["image_url"]["url"],
+            format!(
+                "data:image/png;base64,{}",
+                crate::image_input::base64_encode(PNG)
+            )
+        );
+
+        let (by_prefix, _) = AgentToolHost::agent_view_image(&host, None, Some(&digest[..8]))
+            .expect("by digest prefix");
+        assert_eq!(by_prefix, rel);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn view_image_tool_rejects_an_uncached_path() {
+        let (_temp, host) = empty_host();
+        fs::create_dir_all(host.data_dir().join("media")).expect("media dir");
+        let err = AgentToolHost::agent_view_image(&host, Some("data/media/deadbeef"), None)
+            .expect_err("nothing cached");
+        let text = err.to_string();
+        assert!(text.contains("view_image: read "), "err={text}");
+    }
+
+    #[test]
+    fn view_image_args_accept_one_selector_and_default_the_other() {
+        let by_path: ViewImageArgs =
+            serde_json::from_value(json!({ "path": "data/media/ab" })).expect("path");
+        assert_eq!(by_path.path.as_deref(), Some("data/media/ab"));
+        assert_eq!(by_path.sha256, None);
+
+        let by_digest: ViewImageArgs =
+            serde_json::from_value(json!({ "sha256": "ab12" })).expect("sha");
+        assert_eq!(by_digest.path, None);
+        assert_eq!(by_digest.sha256.as_deref(), Some("ab12"));
+
+        let neither: ViewImageArgs = serde_json::from_value(json!({})).expect("empty");
+        assert_eq!(neither.path, None);
+        assert_eq!(neither.sha256, None);
+    }
 }

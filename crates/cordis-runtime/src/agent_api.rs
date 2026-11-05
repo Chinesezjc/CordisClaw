@@ -70,6 +70,16 @@ pub trait AgentToolHost {
         limit: Option<usize>,
     ) -> Result<Value, RuntimeError>;
     fn agent_list_directory(&self, path: &str) -> Result<Value, RuntimeError>;
+    /// 把一张**已被请求体预算剥成占位符**的图片取回来（`view_image` 的后端）。
+    ///
+    /// `path` 是占位符里给出的 `data/media/<sha256>` 相对路径，`sha256` 是
+    /// 摘要前缀，二选一。返回 `(相对路径, image_url content part)`：part 由
+    /// 调用方挂到下一次请求上，路径原样回给模型。
+    fn agent_view_image(
+        &self,
+        path: Option<&str>,
+        sha256: Option<&str>,
+    ) -> Result<(String, Value), RuntimeError>;
     fn agent_search_code(&self, pattern: &str, path: Option<&str>) -> Result<Value, RuntimeError>;
     fn agent_write_file(&self, path: &str, content: &str) -> Result<Value, RuntimeError>;
     fn agent_replace_in_file(
@@ -236,6 +246,13 @@ pub trait AgentBackend {
     }
     fn tool_scope_label(&self) -> String {
         "agent".to_string()
+    }
+    /// 取走本轮 `view_image` 攒下的待附加图片（`image_url` content part）。
+    ///
+    /// 默认空：只有能读内容寻址缓存的 backend 才会往里放东西。Agent 循环在
+    /// 每次工具轮结束后取一次，把图片挂到下一次请求上再清空。
+    fn take_attached_images(&mut self) -> Vec<Value> {
+        Vec::new()
     }
 }
 

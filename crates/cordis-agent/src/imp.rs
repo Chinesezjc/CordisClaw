@@ -946,6 +946,14 @@ impl AgentSession {
                         tool_events,
                     });
                 }
+                // `view_image` 取回的图片进下一次请求：作为一条新的 user 消息
+                // 追加在工具结果之后，模型下一次调用就能重新看到原图。
+                attach_recovered_images(
+                    backend,
+                    &mut messages,
+                    images,
+                    cordis_runtime::image_budget::INLINE_IMAGE_BUDGET_BYTES,
+                );
                 continue;
             }
 
@@ -1313,6 +1321,7 @@ impl AgentSession {
             host,
             session_id,
             soul_key,
+            attached: Vec::new(),
         };
         self.respond(&mut backend, user_input)
     }
@@ -1335,6 +1344,7 @@ impl AgentSession {
             host,
             session_id,
             soul_key,
+            attached: Vec::new(),
         };
         self.respond_with_provider(&mut backend, user_input, provider, sink)
     }
@@ -1359,6 +1369,7 @@ impl AgentSession {
             host,
             session_id,
             soul_key,
+            attached: Vec::new(),
         };
         self.respond_with_provider_images(&mut backend, user_input, images, notes, provider, sink)
     }
@@ -1557,11 +1568,14 @@ impl AgentSession {
     /// 不复制构造逻辑），live history 本身不动。
     ///
     /// **后果（有意接受，必须写清楚）**：快照里没有 base64，所以进程重启后
-    /// 恢复出来的会话只剩占位符 —— 模型**不能再"看"这些历史图片**，只能看到
-    /// `[image omitted to fit request byte budget; sha256:<前8位>; <W>x<H> <fmt>]`
-    /// 这类标记（拿不到尺寸时只有 sha256，连字节都解不出时只有 omitted）。
-    /// 占位符仍能标识"这里曾有一张图、它是什么"，但重启不是无损恢复：需要看
-    /// 那张图时必须让用户重发。这是 47 MB 快照换来的取舍。
+    /// 恢复出来的会话只剩占位符：
+    /// `[image omitted to fit request byte budget; sha256:<前8位>; <W>x<H> <fmt>; path data/media/<sha256>]`
+    /// （拿不到尺寸时省掉尺寸段，连字节都解不出时只有 omitted）。占位符不再是
+    /// 单向门——模型可以调 `view_image` 按 `path`（或 sha256 前缀）把原图取回
+    /// 下一次请求（见 [`attach_recovered_images`]）。前提是原始字节当初落进了
+    /// 内容寻址缓存（`cordis_runtime::image_cache`，入站下载时写入）；缓存被
+    /// 手工清掉或图片早于缓存机制存在时，仍然只能请用户重发。
+    /// 这是 47 MB 快照换来的取舍。
     ///
     /// `estimated_tokens` 也按剥图后的 history 重算：恢复出来的会话看到的是
     /// 占位符，若沿用 live 的（含几十万 / 上百万图片 token 的）估算，恢复后
@@ -1763,6 +1777,13 @@ struct RuntimeShellAgentBackend<'a, H: AgentToolHost + ?Sized> {
     session_id: &'a str,
     /// O批: soul scope of the owning session ("" = none).
     soul_key: String,
+    /// 本轮 `view_image` 取回的图片（`image_url` content part）。
+    ///
+    /// 队列的生命周期就是一次 `respond`：backend 由
+    /// `respond_with_runtime_host*` 逐轮构造，循环在每次工具轮之后取走并挂到
+    /// 下一次请求上。回合结束时还没取走的（例如紧接着就 `suspend`）随
+    /// backend 一起丢掉——已经没有谁需要看它了。
+    attached: Vec<Value>,
 }
 
 impl<'a, H: AgentToolHost + ?Sized> AgentBackend for RuntimeShellAgentBackend<'a, H> {
@@ -1870,6 +1891,15 @@ impl<'a, H: AgentToolHost + ?Sized> AgentBackend for RuntimeShellAgentBackend<'a
                 self.host
                     .agent_list_directory(args.path.as_deref().unwrap_or("."))
             }
+            // 取回一张被请求体预算剥成占位符的图片：进队列，下一次请求带上它。
+            AGENT_TOOL_VIEW_IMAGE => {
+                let args = parse_tool_value_arguments::<ViewImageArgs>(arguments, name)?;
+                let (attached, part) = self
+                    .host
+                    .agent_view_image(args.path.as_deref(), args.sha256.as_deref())?;
+                self.attached.push(part);
+                Ok(json!({ "ok": true, "attached": attached }))
+            }
             AGENT_TOOL_SEARCH_CODE => {
                 let args = parse_tool_value_arguments::<SearchCodeArgs>(arguments, name)?;
                 self.host
@@ -1955,6 +1985,11 @@ impl<'a, H: AgentToolHost + ?Sized> AgentBackend for RuntimeShellAgentBackend<'a
     fn tool_scope_label(&self) -> String {
         "runtime_shell".to_string()
     }
+
+    /// `view_image` 攒下的待附加图片，取走即清空（见 [`attach_recovered_images`]）。
+    fn take_attached_images(&mut self) -> Vec<Value> {
+        std::mem::take(&mut self.attached)
+    }
 }
 
 /// A serialised tool call the provider wrote into the content stream.
@@ -1976,6 +2011,57 @@ fn end_turn_tool_spec() -> AgentToolSpec {
             "End this turn. Call it after your last message; text alone never ends a turn.",
         parameters: json!({"type": "object", "properties": {}, "additionalProperties": false}),
     }
+}
+
+/// 把本轮 `view_image` 取回的图片挂到下一次请求上，并清空队列。
+///
+/// 预算口径与历史图片同一把尺子，**先扣本轮新图、再扣队列**：两者都进同一个
+/// 请求体，历史图片只能吃剩下的额度。队列里放不下的直接丢弃（工具调用早已
+/// 返回，没法再改口），并在附言里写明丢了几张——否则模型会以为图已经看过。
+///
+/// 返回实际附上的张数。
+fn attach_recovered_images<B: AgentBackend + ?Sized>(
+    backend: &mut B,
+    messages: &mut Vec<Value>,
+    new_images: &[Value],
+    budget: usize,
+) -> usize {
+    let recovered = backend.take_attached_images();
+    if recovered.is_empty() {
+        return 0;
+    }
+    let requested = recovered.len();
+    // 先扣本轮新图：它们已经在这条请求里了，比队列里的图更"当前"。
+    let available =
+        budget.saturating_sub(cordis_runtime::image_budget::image_parts_bytes(new_images));
+    let mut used = 0usize;
+    let mut attached: Vec<Value> = Vec::new();
+    for part in recovered {
+        let bytes = cordis_runtime::image_budget::image_parts_bytes(std::slice::from_ref(&part));
+        if used.saturating_add(bytes) > available {
+            continue;
+        }
+        used += bytes;
+        attached.push(part);
+    }
+    let dropped = requested - attached.len();
+    let text = match (attached.len(), dropped) {
+        (0, dropped) => format!(
+            "[view_image] {dropped} requested image(s) could not be attached: this request already holds the inline image byte budget."
+        ),
+        (count, 0) => format!("[view_image] {count} recovered image(s) attached below."),
+        (count, dropped) => format!(
+            "[view_image] {count} recovered image(s) attached below; {dropped} skipped over the inline image byte budget."
+        ),
+    };
+    messages.push(json!({
+        "role": "user",
+        "content": cordis_runtime::image_input::user_content_with_images(&text, &attached),
+    }));
+    // 整条请求（历史 + 本轮新图 + 取回的图）仍要落回预算内：超了就从最老的
+    // 历史图片开始剥，规则与 `respond_inner` 开头的裁剪完全一致。
+    cordis_runtime::image_budget::enforce_image_budget(messages, budget);
+    attached.len()
 }
 
 /// Remove every image content part from a message list, turning multimodal
@@ -2519,6 +2605,19 @@ fn shell_agent_tools() -> Vec<AgentToolSpec> {
             }),
         },
         AgentToolSpec {
+            name: AGENT_TOOL_VIEW_IMAGE,
+            description: "Reload an image that was omitted from the request by the inline byte budget. The [image omitted ...] placeholder carries either `path data/media/<sha256>` (pass it as `path`) or `sha256:<8 hex>` (pass the prefix as `sha256`). The picture is attached to your NEXT request in this turn, so call it and then continue.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Cache path from the placeholder, e.g. data/media/<sha256>." },
+                    "sha256": { "type": "string", "description": "sha256 prefix from the placeholder (8+ hex chars); must be unique in the cache." }
+                },
+                "required": [],
+                "additionalProperties": false,
+            }),
+        },
+        AgentToolSpec {
             name: AGENT_TOOL_SEARCH_CODE,
             description: "Search for a text pattern across source files in the fixtures workspace. Returns up to 40 matches with file path, line number, and line text.",
             parameters: json!({
@@ -3042,6 +3141,9 @@ mod tests {
         caller: Option<SessionCaller>,
         /// Session-to-session deliveries, as `"<id>:<message>"`.
         routed: std::sync::Mutex<Vec<String>>,
+        /// Content-addressed image cache the `view_image` fake reads from.
+        /// Tests point it at a TempDir so the repo's `data/` is never touched.
+        media_dir: std::path::PathBuf,
     }
 
     /// Reference host for backends that never consult soul/hints.
@@ -3050,6 +3152,7 @@ mod tests {
         hints: Vec::new(),
         caller: None,
         routed: std::sync::Mutex::new(Vec::new()),
+        media_dir: std::path::PathBuf::new(),
     };
 
     impl AgentToolHost for FakeHost {
@@ -3153,6 +3256,21 @@ mod tests {
                 "path": path,
                 "entries": [{"name": "lib.rs", "kind": "file"}],
             }))
+        }
+
+        /// 跑真的缓存读取：路径校验/解码/编码都在 kernel 的
+        /// [`cordis_runtime::image_cache`] 里，测试只需要把 `media_dir` 指向
+        /// 临时目录。
+        fn agent_view_image(
+            &self,
+            path: Option<&str>,
+            sha256: Option<&str>,
+        ) -> Result<(String, Value), RuntimeError> {
+            cordis_runtime::image_cache::load_part(&self.media_dir, path, sha256).map_err(
+                |message| RuntimeError::InvalidArgument {
+                    message: format!("view_image: {message}"),
+                },
+            )
         }
 
         fn agent_search_code(
@@ -3285,11 +3403,13 @@ mod tests {
             hints: Vec::new(),
             caller: None,
             routed: std::sync::Mutex::new(Vec::new()),
+            media_dir: std::path::PathBuf::new(),
         };
         let channel = RuntimeShellAgentBackend {
             host: &host,
             session_id: "chat",
             soul_key: "qq:group:1".to_string(),
+            attached: Vec::new(),
         };
         let chat = channel.system_prompt();
         assert!(chat.contains("You are a participant in this conversation"));
@@ -3299,6 +3419,7 @@ mod tests {
             host: &host,
             session_id: "ops",
             soul_key: String::new(),
+            attached: Vec::new(),
         };
         let shell = ops.system_prompt();
         assert!(shell.contains("running inside the cordis-runtime serve REPL"));
@@ -3315,11 +3436,13 @@ mod tests {
             hints: Vec::new(),
             caller: None,
             routed: std::sync::Mutex::new(Vec::new()),
+            media_dir: std::path::PathBuf::new(),
         };
         let backend = RuntimeShellAgentBackend {
             host: &host,
             session_id: "prompt-build",
             soul_key: String::new(),
+            attached: Vec::new(),
         };
         let prompt = backend.system_prompt();
         for marker in [
@@ -3341,11 +3464,13 @@ mod tests {
             hints: vec!["HINT-MARK".to_string()],
             caller: None,
             routed: std::sync::Mutex::new(Vec::new()),
+            media_dir: std::path::PathBuf::new(),
         };
         let backend = RuntimeShellAgentBackend {
             host: &host,
             session_id: "prompt-order",
             soul_key: "user#private".to_string(),
+            attached: Vec::new(),
         };
         let prompt = backend.system_prompt();
 
@@ -3389,6 +3514,7 @@ mod tests {
             host: &host,
             session_id: "no-overlay",
             soul_key: String::new(),
+            attached: Vec::new(),
         };
         let prompt = backend.system_prompt();
         assert!(prompt.contains("--- Conduct (hard boundaries) ---"));
@@ -3444,6 +3570,7 @@ mod tests {
             host: &host,
             session_id: "approve-dispatch",
             soul_key: String::new(),
+            attached: Vec::new(),
         };
         let err = backend
             .execute_tool(
@@ -3461,6 +3588,7 @@ mod tests {
             host,
             session_id: "soul-gate",
             soul_key: "qq:group:777".to_string(),
+            attached: Vec::new(),
         };
         backend.execute_tool(AGENT_TOOL_SET_SOUL, json!({ "persona": "新人格" }))
     }
@@ -4132,11 +4260,13 @@ mod tests {
             hints: Vec::new(),
             caller: None,
             routed: std::sync::Mutex::new(Vec::new()),
+            media_dir: std::path::PathBuf::new(),
         };
         let mut backend = RuntimeShellAgentBackend {
             host: &host,
             session_id: "s1",
             soul_key: String::new(),
+            attached: Vec::new(),
         };
         let listed = AgentBackend::execute_tool(
             &mut backend,
@@ -4795,5 +4925,286 @@ mod tests {
         ];
         let filtered = filter_kernel_introspection_messages(&turn);
         assert_eq!(filtered, turn, "ordinary turn must be unchanged");
+    }
+
+    // -----------------------------------------------------------------
+    // view_image：把被预算剥掉的图片取回下一次请求
+    // -----------------------------------------------------------------
+
+    fn tool_call_message(
+        id: &str,
+        name: &str,
+        arguments: Value,
+    ) -> cordis_plugin_sdk::llm::LlmMessage {
+        cordis_plugin_sdk::llm::LlmMessage {
+            tool_calls: vec![cordis_plugin_sdk::llm::LlmToolCall {
+                id: id.to_string(),
+                call_type: "function".to_string(),
+                function: cordis_plugin_sdk::llm::LlmToolFunction {
+                    name: name.to_string(),
+                    arguments: arguments.to_string(),
+                },
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// 一张 `len` 字节的 PNG content part（只要求魔数与长度）。
+    fn png_part(len: usize) -> Value {
+        let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+        bytes.resize(len.max(8), 0);
+        json!({
+            "type": "image_url",
+            "image_url": {
+                "url": format!(
+                    "data:image/png;base64,{}",
+                    cordis_runtime::image_input::base64_encode(&bytes)
+                ),
+            },
+        })
+    }
+
+    fn backend_with_attachments(parts: Vec<Value>) -> RuntimeShellAgentBackend<'static, FakeHost> {
+        RuntimeShellAgentBackend {
+            host: &EMPTY_FAKE_HOST,
+            session_id: "attach",
+            soul_key: String::new(),
+            attached: parts,
+        }
+    }
+
+    #[test]
+    fn view_image_tool_is_advertised_with_both_selectors() {
+        let tools = shell_agent_tools();
+        let spec = tools
+            .iter()
+            .find(|tool| tool.name == AGENT_TOOL_VIEW_IMAGE)
+            .expect("view_image must be advertised");
+        assert_eq!(spec.parameters["additionalProperties"], json!(false));
+        let properties = spec.parameters["properties"].to_string();
+        assert!(properties.contains("path"), "{properties}");
+        assert!(properties.contains("sha256"), "{properties}");
+    }
+
+    /// 端到端：第一轮模型调 `view_image`，**下一次请求**里就带上了原图。
+    #[test]
+    fn view_image_returns_the_cached_picture_on_the_next_request() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let media = dir.path().join("media");
+        std::fs::create_dir_all(&media).expect("media dir");
+        let png: &[u8] = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR";
+        let digest = cordis_runtime::image_cache::digest_hex(png);
+        std::fs::write(media.join(&digest), png).expect("cache the image");
+        let host = FakeHost {
+            media_dir: media,
+            ..FakeHost::default()
+        };
+
+        let placeholder_path = format!("data/media/{digest}");
+        let provider = FakeLlmProvider::new(vec![
+            tool_call_message(
+                "call_view",
+                AGENT_TOOL_VIEW_IMAGE,
+                json!({ "path": placeholder_path }),
+            ),
+            assistant_reply("我看过了，是一只猫。"),
+        ]);
+        let mut session = ShellAgentSession::new(LlmApiConfig::default()).expect("session");
+        let reply = session
+            .respond_via(&host, "view-image", "刚才那张图里是什么？", &provider)
+            .expect("agent reply");
+
+        assert_eq!(reply.content, "我看过了，是一只猫。");
+        assert_eq!(reply.tool_events.len(), 1);
+        assert_eq!(reply.tool_events[0].name, AGENT_TOOL_VIEW_IMAGE);
+        let output = reply.tool_events[0].output.clone().expect("tool output");
+        assert_eq!(output["ok"], json!(true));
+        assert_eq!(output["attached"], json!(placeholder_path));
+
+        // 第二次请求：占位符之外，原图作为 image part 又回到了请求里。
+        let bodies = provider.seen_bodies.lock().expect("bodies");
+        assert_eq!(bodies.len(), 2);
+        let second = bodies[1].to_string();
+        assert!(second.contains("data:image/png;base64,"), "{second}");
+        assert!(
+            second.contains("[view_image] 1 recovered image(s) attached below."),
+            "{second}"
+        );
+        // 第三轮不存在：图片只在取回后的那一次请求里出现。
+        drop(bodies);
+        assert_eq!(
+            session.inner.history_len(),
+            2,
+            "the recovered picture stays out of history"
+        );
+    }
+
+    /// `sha256` 前缀也能取回（占位符里只印了前 8 位）。
+    #[test]
+    fn view_image_tool_accepts_a_digest_prefix() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let media = dir.path().join("media");
+        std::fs::create_dir_all(&media).expect("media dir");
+        let png: &[u8] = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR";
+        let digest = cordis_runtime::image_cache::digest_hex(png);
+        std::fs::write(media.join(&digest), png).expect("cache the image");
+        let host = FakeHost {
+            media_dir: media,
+            ..FakeHost::default()
+        };
+        // 同一张图换个前缀取两次：第二次仍然命中（缓存不消费）。
+        let provider = FakeLlmProvider::new(vec![
+            tool_call_message(
+                "call_prefix",
+                AGENT_TOOL_VIEW_IMAGE,
+                json!({ "sha256": &digest[..8] }),
+            ),
+            assistant_reply("取回来了。"),
+        ]);
+        let mut session = ShellAgentSession::new(LlmApiConfig::default()).expect("session");
+        let reply = session
+            .respond_via(&host, "view-image-prefix", "再看一眼", &provider)
+            .expect("agent reply");
+        assert_eq!(
+            reply.tool_events[0].output.as_ref().expect("output")["attached"],
+            json!(format!("data/media/{digest}"))
+        );
+    }
+
+    /// 非法路径（`..` 逃逸）在工具层就被拒，不会进队列。
+    #[test]
+    fn view_image_tool_rejects_an_escape_attempt() {
+        let host = FakeHost::default();
+        let mut backend = RuntimeShellAgentBackend {
+            host: &host,
+            session_id: "escape",
+            soul_key: String::new(),
+            attached: Vec::new(),
+        };
+        let err = backend
+            .execute_tool(
+                AGENT_TOOL_VIEW_IMAGE,
+                json!({ "path": "data/media/../secret.png" }),
+            )
+            .expect_err("must reject the escape");
+        assert!(
+            err.to_string().contains("path must be data/media/<sha256>"),
+            "err={err}"
+        );
+        assert!(backend.attached.is_empty(), "nothing may be queued");
+    }
+
+    /// 空队列：不改动消息，也不写附言。
+    #[test]
+    fn attach_recovered_images_does_nothing_without_a_queue() {
+        let mut backend = backend_with_attachments(Vec::new());
+        let mut messages = vec![json!({ "role": "user", "content": "hi" })];
+        assert_eq!(
+            attach_recovered_images(&mut backend, &mut messages, &[], 1 << 20),
+            0
+        );
+        assert_eq!(messages.len(), 1);
+    }
+
+    /// 默认实现（不覆盖 `take_attached_images` 的 backend）同样安全。
+    #[test]
+    fn a_backend_without_a_queue_attaches_nothing() {
+        let mut backend = TerminalTestBackend {
+            executed_tools: Vec::new(),
+        };
+        let mut messages: Vec<Value> = Vec::new();
+        assert_eq!(
+            attach_recovered_images(&mut backend, &mut messages, &[], 1 << 20),
+            0
+        );
+        assert!(messages.is_empty());
+    }
+
+    /// 队列内容同样受预算约束：装不下的丢掉，并在附言里说清楚。
+    #[test]
+    fn attach_recovered_images_drops_what_does_not_fit() {
+        // 1024 字节 → 内联后 1368 字节。
+        let mut backend = backend_with_attachments(vec![png_part(1024), png_part(1024)]);
+        let mut messages: Vec<Value> = Vec::new();
+        assert_eq!(
+            attach_recovered_images(&mut backend, &mut messages, &[], 1400),
+            1
+        );
+        let content = messages[0]["content"].as_array().expect("text + image");
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[1]["type"], "image_url");
+        assert!(
+            messages[0]["content"].to_string().contains(
+                "1 recovered image(s) attached below; 1 skipped over the inline image byte budget."
+            ),
+            "{messages:?}"
+        );
+        // 队列已清空：同一 backend 再取一次什么也没有。
+        assert_eq!(
+            attach_recovered_images(&mut backend, &mut messages, &[], 1 << 20),
+            0
+        );
+        assert_eq!(messages.len(), 1);
+    }
+
+    /// 一张都装不下时也要给出明确附言，否则模型会以为图已经看过了。
+    #[test]
+    fn attach_recovered_images_reports_a_fully_dropped_queue() {
+        let mut backend = backend_with_attachments(vec![png_part(1024)]);
+        let mut messages: Vec<Value> = Vec::new();
+        assert_eq!(
+            attach_recovered_images(&mut backend, &mut messages, &[], 10),
+            0
+        );
+        let text = messages[0]["content"].as_str().expect("plain text");
+        assert!(text.contains("could not be attached"), "{text}");
+    }
+
+    /// 先扣本轮新图、再扣队列：新图占掉额度后队列里的图就进不来了。
+    #[test]
+    fn attach_recovered_images_pays_for_the_new_batch_first() {
+        let new_image = png_part(1024);
+        let mut backend = backend_with_attachments(vec![png_part(1024)]);
+        let mut messages: Vec<Value> = Vec::new();
+        assert_eq!(
+            attach_recovered_images(
+                &mut backend,
+                &mut messages,
+                std::slice::from_ref(&new_image),
+                2200
+            ),
+            0
+        );
+        let text = messages[0]["content"].as_str().expect("plain text");
+        assert!(text.contains("could not be attached"), "{text}");
+    }
+
+    /// 取回的图片把请求顶出预算时，从最老的历史图片开始剥（附图自身留下）。
+    #[test]
+    fn attach_recovered_images_strips_history_instead_of_the_recovered_picture() {
+        let mut backend = backend_with_attachments(vec![png_part(1024)]);
+        let mut messages = vec![json!({
+            "role": "user",
+            "content": [
+                { "type": "text", "text": "很久以前的一张图" },
+                png_part(1024),
+            ],
+        })];
+        assert_eq!(
+            attach_recovered_images(&mut backend, &mut messages, &[], 2000),
+            1
+        );
+        assert!(
+            messages[0]["content"]
+                .to_string()
+                .contains("image omitted to fit request byte budget"),
+            "the oldest history picture must make room: {messages:?}"
+        );
+        assert_eq!(
+            messages.last().expect("appended")["content"]
+                .as_array()
+                .expect("array")[1]["type"],
+            "image_url"
+        );
     }
 }

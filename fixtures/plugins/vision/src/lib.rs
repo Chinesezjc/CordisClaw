@@ -9,7 +9,10 @@
 //! What remains is the image-source layer those nodes were built on:
 //!
 //! - a short-lived, SSRF-guarded HTTP download with a URL→bytes cache;
-//! - a local-file reader restricted to the system temp directory.
+//! - a local-file reader restricted to the system temp directory and to the
+//!   kernel's content-addressed image cache (`data/media/<sha256>`), which is
+//!   where `[image omitted …]` placeholders point after the request byte budget
+//!   strips a picture.
 //!
 //! Both are `pub` library API (covered by the tests at the bottom) rather than
 //! agent-callable nodes: no node dispatches to them any more, so `pub` is what
@@ -24,6 +27,7 @@ use serde::Deserialize;
 use serde_json::json;
 use std::collections::HashMap;
 use std::io::Read;
+use std::path::{Component, Path};
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
@@ -155,24 +159,46 @@ pub fn download_image(url_str: &str) -> Result<Vec<u8>, String> {
 // Local file source (P2: consume feishu_fetch_resource temp files)
 // ---------------------------------------------------------------------------
 
-/// Read a local image file. Access is restricted to the system temp directory
-/// so callers can only hand off files that a trusted producer (e.g. the feishu
-/// plugin's `feishu_fetch_resource`) placed under `std::env::temp_dir()`.
+/// Read a local image file.
 ///
-/// On macOS both `/tmp` and `/var/folders/...` are symlinks, so the requested
-/// path and the temp-dir prefix are each canonicalized before comparison.
+/// Two allowed locations, both canonicalized before comparison:
+///
+/// - the system **temp directory**, where a trusted producer (e.g. the feishu
+///   plugin's `feishu_fetch_resource`) drops files;
+/// - the kernel's **content-addressed image cache** (`…/data/media/<sha256>`).
+///   When the request byte budget strips an inline picture it leaves
+///   `[image omitted …; path data/media/<sha256>]` in its place, so this is the
+///   address the agent hands back to reload the original bytes.
+///
+/// `..` is rejected before any filesystem work (so the error names the real
+/// cause) and symlinks are resolved by `canonicalize`, so a link that points
+/// outside both roots is refused like any other outside path.
+///
+/// On macOS both `/tmp` and `/var/folders/...` are symlinks, which is why the
+/// requested path and the temp-dir prefix are each canonicalized.
 pub fn read_local_image(path: &str) -> Result<Vec<u8>, String> {
+    if Path::new(path)
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        return Err(format!("path traversal is not allowed: {path}"));
+    }
+
     let real = std::fs::canonicalize(path).map_err(|e| format!("resolve path {path}: {e}"))?;
 
-    let temp_root = std::fs::canonicalize(std::env::temp_dir())
-        .map_err(|e| format!("resolve temp dir: {e}"))?;
-
-    if !real.starts_with(&temp_root) {
-        return Err(format!(
-            "path outside temp dir: {} (must be under {})",
-            real.display(),
-            temp_root.display()
-        ));
+    // The media cache is checked first: its files usually live outside the temp
+    // directory, and a `data/media` file inside the temp dir must still be
+    // recognized as a cache entry rather than as a trusted temp drop.
+    if !is_media_cache_file(&real) {
+        let temp_root = std::fs::canonicalize(std::env::temp_dir())
+            .map_err(|e| format!("resolve temp dir: {e}"))?;
+        if !real.starts_with(&temp_root) {
+            return Err(format!(
+                "path outside temp dir and data/media cache: {} (must be under {} or a data/media directory)",
+                real.display(),
+                temp_root.display()
+            ));
+        }
     }
 
     let meta = std::fs::metadata(&real).map_err(|e| format!("stat {}: {e}", real.display()))?;
@@ -184,6 +210,28 @@ pub fn read_local_image(path: &str) -> Result<Vec<u8>, String> {
     }
 
     std::fs::read(&real).map_err(|e| format!("read {}: {e}", real.display()))
+}
+
+/// Is this canonical path a file sitting directly in a `data/media` directory?
+///
+/// Shape check rather than a configured root: the workspace root is not known to
+/// a plugin, and the cache is a convention (`data/media/<sha256>`) shared with
+/// the kernel's placeholder text. A subdirectory, a sibling `media/`, or a
+/// `data/` file all fail.
+fn is_media_cache_file(path: &Path) -> bool {
+    let Some(dir) = path.parent() else {
+        return false;
+    };
+    let Some(dir_name) = dir.file_name() else {
+        return false;
+    };
+    let Some(parent) = dir.parent() else {
+        return false;
+    };
+    let Some(parent_name) = parent.file_name() else {
+        return false;
+    };
+    dir_name == "media" && parent_name == "data"
 }
 
 /// Load image bytes from exactly one of `url` or `path`. Supplying both is an
@@ -284,6 +332,51 @@ mod tests {
             err.contains("path outside temp dir"),
             "expected temp-dir rejection, got: {err}"
         );
+    }
+
+    #[test]
+    fn read_local_image_rejects_parent_dir_components() {
+        // Rejected before any filesystem work, so a non-existent path still
+        // reports the real cause instead of "resolve path".
+        let err = read_local_image("data/media/../../etc/passwd").unwrap_err();
+        assert!(
+            err.contains("path traversal is not allowed"),
+            "expected traversal rejection, got: {err}"
+        );
+    }
+
+    /// 占位符里的 `data/media/<sha256>` 是缓存地址：内核把被预算剥掉的图片
+    /// 原始字节存在那里，这里必须能读回来。
+    #[test]
+    fn read_local_image_reads_data_media_cache_files() {
+        let dir = unique_temp_path("media_cache");
+        let media = dir.join("data").join("media");
+        std::fs::create_dir_all(&media).expect("create data/media");
+        let path = media.join("ab12cd34");
+        let payload: &[u8] = b"\x89PNG\r\n\x1a\nrecovered image bytes";
+        std::fs::write(&path, payload).expect("write cached image");
+
+        let result = read_local_image(path.to_str().expect("utf-8 path"));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(result.expect("cache file reads back"), payload);
+    }
+
+    /// 只有**直接**落在 `data/media/` 里的文件算缓存地址：同名目录、子目录、
+    /// 兄弟 `media/` 与 `data/` 下的文件都不算。
+    #[test]
+    fn is_media_cache_file_requires_a_file_directly_in_data_media() {
+        assert!(is_media_cache_file(Path::new(
+            "/workspace/data/media/ab12cd34"
+        )));
+        assert!(!is_media_cache_file(Path::new("/workspace/data/media")));
+        assert!(!is_media_cache_file(Path::new(
+            "/workspace/data/media/nested/ab12cd34"
+        )));
+        assert!(!is_media_cache_file(Path::new("/workspace/media/ab12cd34")));
+        assert!(!is_media_cache_file(Path::new("/workspace/data/ab12cd34")));
+        assert!(!is_media_cache_file(Path::new("/ab12cd34")));
+        assert!(!is_media_cache_file(Path::new("")));
     }
 
     #[test]
