@@ -1843,10 +1843,9 @@ fn build_envelope(msg: &IncomingMessage) -> String {
     // round trip on every such turn.
     let reply_target = format!("{}:{}", msg.message_type, msg.sender_id);
     let mut notes = format!("[reply policy: {mode} — {policy}] [reply target: {reply_target}]");
-    // 群记忆每轮注入：它是"这个群怎么说话"的唯一来源，靠模型主动去读等于没有。
-    // 一次性上下文，不进 history，所以不会随轮次累积。
-    // 群记忆每轮注入：它是"这个群怎么说话"的唯一来源，靠模型主动去读等于没有。
-    // 一次性上下文，不进 history，所以不会随轮次累积。
+    // 群记忆按需取用：只在 notes 里留一个指针，正文由模型自己调
+    // qq_get_group_memory 读。它无长度上限，无条件注入迟早把上下文撑爆；
+    // 但完全不提又等于不存在，所以指针里带上长度，让模型知道值不值得读。
     if let Some(memory) = group_memory(
         None,
         msg.message_type
@@ -1856,9 +1855,10 @@ fn build_envelope(msg: &IncomingMessage) -> String {
     .map(|memory| memory.trim().to_string())
     .filter(|memory| !memory.is_empty())
     {
-        notes.push_str(" [group memory: ");
-        notes.push_str(&memory);
-        notes.push(']');
+        notes.push_str(&format!(
+            " [group memory: {} 字已保存,需要了解这个群时用 qq_get_group_memory 读]",
+            memory.chars().count()
+        ));
     }
     // A group ban is folded into the per-message context: the model must know
     // it cannot speak before it decides to, not after a failed send.
@@ -4504,11 +4504,17 @@ mod reply_policy_tests {
             let env: Value = serde_json::from_str(&build_envelope(&sample_msg())).expect("env");
             let notes = env["notes"].as_str().unwrap_or_default().to_string();
             assert!(notes.starts_with("[reply policy: chatty — "), "{notes}");
-            // Memory is injected every turn: it is the only description of how
-            // this group talks, and a model that has to go read it never does.
+            // Memory is on demand: the notes carry a pointer with its size, not
+            // the text. Unconditional injection would eventually blow the
+            // context up (memory has no length cap), and saying nothing means
+            // the model never knows it exists.
             assert!(
-                notes.contains("[group memory: 喜欢玩笑]"),
-                "memory belongs in the notes: {notes}"
+                notes.contains("[group memory: 4 字已保存") && notes.contains("qq_get_group_memory"),
+                "a pointer belongs in the notes: {notes}"
+            );
+            assert!(
+                !notes.contains("喜欢玩笑"),
+                "the memory text itself must not be injected: {notes}"
             );
             let read_back =
                 group_memory(Some(data_dir.to_str().unwrap_or_default()), Some("123456"));
