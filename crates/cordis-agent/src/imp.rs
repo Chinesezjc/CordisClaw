@@ -60,9 +60,17 @@ const AGENT_HISTORY_MESSAGE_LIMIT: usize = 8192;
 /// Counting messages never fired: a busy group reached 1079 messages and the
 /// provider answered 413 Payload Too Large, so the bot could not speak at all
 /// and the message was spilled to pending. `estimated_tokens` tracks the real
-/// weight (chars/2), so the same 1079 short chats that fit stay, while a session
-/// bloated with long texts and pictures gets trimmed.
+/// weight (text at chars/2, inline images at base64 length/4), so the same 1079
+/// short chats that fit stay, while a session bloated with long texts and
+/// pictures gets trimmed.
 const AGENT_HISTORY_TOKEN_LIMIT: usize = 120_000;
+
+/// What one inline picture costs in the token budget.
+///
+/// Images are priced per picture by the provider, not per byte; byte size is the
+/// separate `image_budget` channel. 1024 matches the upper end of a vision
+/// model's per-image charge.
+const IMAGE_TOKEN_ESTIMATE: usize = 1024;
 const AGENT_MAX_TOOL_TURNS: usize = 96;
 
 /// 一次模型补全的执行者。
@@ -78,7 +86,8 @@ pub struct AgentSession {
     history: Vec<Value>,
     transcript: Vec<AgentTranscriptEntry>,
     completed_turns: usize,
-    /// Conservative estimate of total tokens in history (chars / 2).
+    /// Conservative estimate of total tokens in history: text at chars / 2,
+    /// inline images at base64 length / 4 (see [`estimate_message_tokens`]).
     estimated_tokens: usize,
     /// Reasoning produced by every model call of the turn in progress.
     ///
@@ -138,6 +147,87 @@ pub struct ShellAgentSession {
 /// Chinese text which is more token-dense than English).
 fn estimate_tokens(s: &str) -> usize {
     s.chars().count() / 2
+}
+
+/// 一条消息的 token 估算：文本按 chars/2，内联图片按 base64 折 token。
+///
+/// 图片为什么必须计入：`estimate_tokens` 只吃 `&str`，而带图消息的 `content`
+/// 是 `[{type:"text"},{type:"image_url"}]` 数组，图片 part 的 base64 因此对
+/// `estimated_tokens` 完全不可见——按 token 的历史裁剪对图失效，只剩
+/// `image_budget` 的字节预算兜底。这里把 base64 长度折成 token：
+/// `inline_image_bytes` 给出 `ceil(raw_bytes/3)*4` 个字符，每 4 个字符算
+/// 1 token，即 `ceil(raw_bytes/3)`，是保守上界。
+///
+/// 远程 `https://` 图片不占内联字节，计 0；`reasoning_content` 是历史里真实
+/// 存在的文本，一并计入。
+pub fn estimate_message_tokens(message: &Value) -> usize {
+    let content = match message.get("content") {
+        Some(Value::String(text)) => estimate_tokens(text),
+        Some(Value::Array(parts)) => parts.iter().map(estimate_content_part_tokens).sum(),
+        _ => 0,
+    };
+    let reasoning = message
+        .get("reasoning_content")
+        .and_then(Value::as_str)
+        .map(estimate_tokens)
+        .unwrap_or(0);
+    content + reasoning
+}
+
+/// 一条消息在压缩摘要里的正文：文本 part 拼接，内联图片只记张数。
+///
+/// 带图消息的 `content` 是 `[{type:"text"},{type:"image_url"}]` 数组，旧实现
+/// 只读 `content.as_str()`，于是整条消息在摘要里变成空行——既不摘要也不丢弃。
+/// 这里遍历数组：text part 按顺序拼接（历史里已被字节预算换成占位符的也是
+/// text part，因此占位符原文保留），image_url part 只留一个 `[图片 N 张]`
+/// 标记——摘要不需要 base64。
+///
+/// 返回 `(text, image_count)`，由调用方决定怎么截断与拼标记。
+fn summarize_message_content(content: &Value) -> (String, usize) {
+    match content {
+        Value::String(text) => (text.clone(), 0),
+        Value::Array(parts) => {
+            let mut text = String::new();
+            let mut images = 0;
+            for part in parts {
+                match part.get("type").and_then(Value::as_str) {
+                    Some("text") => {
+                        if let Some(part_text) = part.get("text").and_then(Value::as_str) {
+                            text.push_str(part_text);
+                        }
+                    }
+                    Some("image_url") => images += 1,
+                    _ => {}
+                }
+            }
+            (text, images)
+        }
+        _ => (String::new(), 0),
+    }
+}
+
+/// `content` 数组里的一个 part：文本按 chars/2，内联图片按 base64 长度 / 4。
+fn estimate_content_part_tokens(part: &Value) -> usize {
+    match part.get("type").and_then(Value::as_str) {
+        Some("text") => part
+            .get("text")
+            .and_then(Value::as_str)
+            .map(estimate_tokens)
+            .unwrap_or(0),
+        // A picture costs roughly a vision-token budget, not its byte size: the
+        // provider prices it as one image (a few hundred to ~1k tokens), while
+        // the bytes are a separate channel handled by `image_budget`. Charging
+        // bytes here made a single 2 MB picture look like 500k tokens, so the
+        // whole user+assistant pair was pruned the moment it arrived.
+        Some("image_url") => part
+            .get("image_url")
+            .and_then(|image| image.get("url"))
+            .and_then(Value::as_str)
+            .and_then(cordis_runtime::image_budget::inline_image_bytes)
+            .map(|_| IMAGE_TOKEN_ESTIMATE)
+            .unwrap_or(0),
+        _ => 0,
+    }
 }
 
 impl AgentSession {
@@ -344,8 +434,9 @@ impl AgentSession {
             let _ = self.compact_history();
         }
 
-        // 图片按字节计，不按 token 计：`estimate_tokens` 完全看不到它们，所以
-        // 带图历史能一路攒到 47 MB 请求体才被网关 413 拒收（见
+        // 图片除 token 估算外还有一条独立的**字节**约束：保守的 token 折算
+        // 不等于网关的请求体长度上限，所以仍按精确 base64 字节把历史里最老的
+        // 图剥到 `INLINE_IMAGE_BUDGET_BYTES` 以内（见
         // `cordis_runtime::image_budget` 的模块文档）。
         //
         // 两件事同时发生：这一轮新消息里的图片先占掉预算（它们不进 history，
@@ -359,6 +450,9 @@ impl AgentSession {
             history_image_budget,
         );
         if !image_plan.is_empty() {
+            // 占位符替掉了 base64，token 估算要跟着降；不重算的话
+            // estimated_tokens 会一直按原图的重量触发裁剪 / 压缩。
+            self.estimated_tokens = self.history.iter().map(estimate_message_tokens).sum();
             emit_agent_diagnostic(format!(
                 "agent_image_budget kind={} omitted={} image_bytes_before={} image_bytes_after={} budget={} pending={}",
                 self.kind,
@@ -1056,12 +1150,9 @@ impl AgentSession {
             // snapshots) so the LLM doesn't imitate diagnostic call patterns.
             let recovered = filter_kernel_introspection_messages(&recovered);
             for msg in &recovered {
-                let content_est = msg
-                    .get("content")
-                    .and_then(|v| v.as_str())
-                    .map(estimate_tokens)
-                    .unwrap_or(0);
-                self.estimated_tokens = self.estimated_tokens.saturating_add(content_est);
+                self.estimated_tokens = self
+                    .estimated_tokens
+                    .saturating_add(estimate_message_tokens(msg));
             }
             self.history.extend(recovered);
         }
@@ -1302,8 +1393,10 @@ impl AgentSession {
         let mut summary_lines: Vec<String> = Vec::new();
         for msg in &old_messages {
             let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("");
-            let content = msg.get("content").and_then(|v| v.as_str()).unwrap_or("");
-            if content.is_empty() {
+            let (content, images) =
+                summarize_message_content(msg.get("content").unwrap_or(&Value::Null));
+            // 空文本 + 没图 = 没有可摘要的内容。
+            if content.is_empty() && images == 0 {
                 continue;
             }
             // P1-33: `content.chars().take(500)` is char-based, but the
@@ -1314,7 +1407,13 @@ impl AgentSession {
             let char_count = content.chars().count();
             let short: String = content.chars().take(500).collect();
             let suffix = if char_count > 500 { "…" } else { "" };
-            summary_lines.push(format!("[{role}]: {short}{suffix}"));
+            // 图片标记放在截断之后：即使正文超过 500 字，`[图片 N 张]` 也不会
+            // 被 `…` 吃掉，摘要里始终能看出这条消息带过图。
+            let marker = match images {
+                0 => String::new(),
+                count => format!(" [图片 {count} 张]"),
+            };
+            summary_lines.push(format!("[{role}]: {short}{suffix}{marker}"));
         }
         let summary = summary_lines.join("\n");
         self.history.insert(
@@ -1333,15 +1432,10 @@ impl AgentSession {
         // would trip every subsequent request forever — but compact
         // then early-exited (history.len() <= COMPACT_AT_MSGS) and did
         // nothing, making the whole compact path a permanent no-op.
-        // Rebuild the estimate from what actually remains in `history`.
-        self.estimated_tokens = self
-            .history
-            .iter()
-            .map(|msg| {
-                let content = msg.get("content").and_then(|v| v.as_str()).unwrap_or("");
-                estimate_tokens(content)
-            })
-            .sum();
+        // Rebuild the estimate from what actually remains in `history`, using
+        // the same text + inline-image estimator as `remember_exchange`:
+        // a surviving array-content message must not be silently estimated at 0.
+        self.estimated_tokens = self.history.iter().map(estimate_message_tokens).sum();
         eprintln!(
             "agent: compacted {} old messages into summary ({} chars), keeping {} recent",
             old_messages.len(),
@@ -1406,23 +1500,30 @@ impl AgentSession {
         // Pictures stay in the history so later turns can look at them again;
         // only the newest few turns keep them (token cost, and one bad image
         // poisons every request that replays it).
-        let content = cordis_runtime::image_input::user_content_with_images(user_input, images);
-        self.history.push(json!({
+        let user_msg = json!({
             "role": "user",
-            "content": content,
-        }));
+            "content": cordis_runtime::image_input::user_content_with_images(user_input, images),
+        });
+        // 图片 base64 也计进 estimated_tokens。旧实现只加 user_input /
+        // assistant_output 的字符串长度，数组 content 里的图片对估算完全不可见，
+        // 按 token 的裁剪因此永远看不到图（见 `estimate_message_tokens`）。
+        self.estimated_tokens +=
+            estimate_message_tokens(&user_msg) + estimate_message_tokens(&assistant_msg);
+        self.history.push(user_msg);
         self.history.push(assistant_msg);
-        // Update token estimate.
-        self.estimated_tokens += estimate_tokens(user_input)
-            + estimate_tokens(assistant_output)
-            + reasoning.map(estimate_tokens).unwrap_or(0);
 
-        // Drop oldest user+assistant pairs if we exceed the limit.
-        while self.history.len() > AGENT_HISTORY_MESSAGE_LIMIT
-            || self.estimated_tokens > AGENT_HISTORY_TOKEN_LIMIT
+        // Drop oldest user+assistant pairs if we exceed the limit. 每丢一对就把
+        // 它占的估算减掉：否则带图消息被裁掉后 estimated_tokens 会永久停在
+        // 高位，把之后每一次裁剪 / 压缩判断都带偏。`!is_empty()` 兜住恢复出来
+        // 的陈旧估算（history 已空但计数仍超限），避免空转的无限循环。
+        while !self.history.is_empty()
+            && (self.history.len() > AGENT_HISTORY_MESSAGE_LIMIT
+                || self.estimated_tokens > AGENT_HISTORY_TOKEN_LIMIT)
         {
             // Always remove in pairs (user + assistant).
-            self.history.drain(0..2.min(self.history.len()));
+            let drained: Vec<Value> = self.history.drain(0..2.min(self.history.len())).collect();
+            let freed: usize = drained.iter().map(estimate_message_tokens).sum();
+            self.estimated_tokens = self.estimated_tokens.saturating_sub(freed);
         }
     }
 
@@ -1447,14 +1548,35 @@ impl AgentSession {
     }
 
     /// Create a serializable snapshot of the current session state.
+    ///
+    /// **落盘前剥图**：live history 里的内联图片仍带着几十 MB 的 base64
+    /// （`image_budget` 只把历史压到 10 MiB 内联字节，仍是很大的 JSON），
+    /// `to_snapshot` 是 `data/sessions/<id>.json` 的唯一来源，原样写盘既慢又
+    /// 撑爆磁盘。这里在**克隆**上把每张内联图换成
+    /// [`cordis_runtime::image_budget`] 的短占位符（复用 `placeholder_for`，
+    /// 不复制构造逻辑），live history 本身不动。
+    ///
+    /// **后果（有意接受，必须写清楚）**：快照里没有 base64，所以进程重启后
+    /// 恢复出来的会话只剩占位符 —— 模型**不能再"看"这些历史图片**，只能看到
+    /// `[image omitted to fit request byte budget; sha256:<前8位>; <W>x<H> <fmt>]`
+    /// 这类标记（拿不到尺寸时只有 sha256，连字节都解不出时只有 omitted）。
+    /// 占位符仍能标识"这里曾有一张图、它是什么"，但重启不是无损恢复：需要看
+    /// 那张图时必须让用户重发。这是 47 MB 快照换来的取舍。
+    ///
+    /// `estimated_tokens` 也按剥图后的 history 重算：恢复出来的会话看到的是
+    /// 占位符，若沿用 live 的（含几十万 / 上百万图片 token 的）估算，恢复后
+    /// 第一轮就会误触发裁剪与压缩。
     pub fn to_snapshot(&self) -> AgentSessionSnapshot {
+        let mut history = self.history.clone();
+        cordis_runtime::image_budget::strip_inline_images(&mut history);
+        let estimated_tokens = history.iter().map(estimate_message_tokens).sum();
         AgentSessionSnapshot {
             kind: self.kind.clone(),
             config: self.config.clone(),
-            history: self.history.clone(),
+            history,
             transcript: self.transcript.clone(),
             completed_turns: self.completed_turns,
-            estimated_tokens: self.estimated_tokens,
+            estimated_tokens,
             reasoning_only_strikes: self.reasoning_only_strikes,
             empty_response_strikes: 0,
             require_end_tool: self.require_end_tool,
@@ -1468,6 +1590,10 @@ impl AgentSession {
     ///
     /// 磁盘 schema 未变：快照本就不存 HTTP client（拆分前是从 config 重建，
     /// 现在传输在插件里、连重建都不需要了）。
+    ///
+    /// 注意：快照里的内联图片已在 [`Self::to_snapshot`] 落盘前换成占位符，
+    /// 所以恢复出来的会话**看不到**那些历史图片（只剩 sha256 / 尺寸标记）；
+    /// 要再看那张图只能让用户重发。
     ///
     /// P2-33 + P0-25: `api_key` is `#[serde(skip_serializing)]`, so a
     /// recovered snapshot arrives with `config.api_key = None`. 保持 None——
@@ -3742,8 +3868,11 @@ mod tests {
         );
     }
 
-    /// 一张 `size` 字节的内联 PNG part（640x480 IHDR + 填充），用来跨过预算。
-    /// 图片字节本身不参与 `estimated_tokens`，所以只有字节预算能拦住它。
+    /// 一张 `size` 字节的内联 PNG part（640x480 IHDR + 填充），用来跨过字节预算。
+    ///
+    /// 注意：图片现在也进 `estimated_tokens`（base64 长度 / 4），所以这种
+    /// 数 MiB 的图不能走 `remember_exchange`——它会被 120k 的 token 上限立刻
+    /// 裁掉。测字节预算的用例用 [`seed_history_exchange`] 直接构造 history。
     fn inline_png_part(size: usize) -> Value {
         let mut bytes = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR".to_vec();
         bytes.extend_from_slice(&640u32.to_be_bytes());
@@ -3758,6 +3887,24 @@ mod tests {
                 ),
             },
         })
+    }
+
+    /// 直接往 history 里放一对带图消息，绕过 `remember_exchange` 的 token 裁剪。
+    ///
+    /// 数 MiB 的图按 token 折算是几十万起步，`remember_exchange` 会立刻把整对
+    /// 消息裁掉；字节预算要测的却是「history 里已经有图」时怎么剥。直接构造
+    /// history 等价于旧版本留下的、或从快照恢复出来的会话。
+    fn seed_history_exchange(session: &mut AgentSession, text: &str, image: &Value) {
+        let content = cordis_runtime::image_input::user_content_with_images(
+            text,
+            std::slice::from_ref(image),
+        );
+        session
+            .history
+            .push(json!({ "role": "user", "content": content }));
+        session
+            .history
+            .push(json!({ "role": "assistant", "content": "收到" }));
     }
 
     /// 请求体里所有消息的内联图片字节。
@@ -3780,14 +3927,18 @@ mod tests {
     /// 图片攒到超预算时，最老的那些必须换成占位符，而且**写回 history**：
     /// 只做一次性替换等于下一轮又从原图重算。这条用例钉住 47 MB 请求体被
     /// 413 拒收的那条线上回归。
+    ///
+    /// 断言看的是**本轮请求体**：图片 token 现在也计入 `estimated_tokens`，
+    /// 数 MiB 的图在回合末会被 token 上限整对裁掉，所以回合后的 history 不能
+    /// 用来验证字节预算（那只证明 token 裁剪生效，不证明字节预算写回了请求）。
     #[test]
     fn history_images_over_the_byte_budget_become_durable_placeholders() {
         const MIB: usize = 1024 * 1024;
         let huge = inline_png_part(6 * MIB);
         let mut session =
             AgentSession::new(LlmApiConfig::default(), "runtime_shell").expect("build session");
-        session.remember_exchange("第一张图", "收到", None, std::slice::from_ref(&huge));
-        session.remember_exchange("第二张图", "收到", None, std::slice::from_ref(&huge));
+        seed_history_exchange(&mut session, "第一张图", &huge);
+        seed_history_exchange(&mut session, "第二张图", &huge);
         assert_eq!(session.history_len(), 4);
 
         let provider = FakeLlmProvider::new(vec![assistant_reply("好")]);
@@ -3803,9 +3954,18 @@ mod tests {
             )
             .expect("turn");
 
-        // 最老的那张变成占位符，并留在 history 里（不是只在请求里临时换）。
-        let oldest = session.history_value(0).expect("oldest user message");
-        let oldest_text = oldest["content"].to_string();
+        // 请求体是在预算写回 history 之后装配的，所以它同时证明了：
+        // 最老的那张已变成占位符、最新的一张仍带着 base64 发给模型。
+        let body = provider.seen_bodies.lock().expect("seen_bodies")[0].clone();
+        let body_text = body.to_string();
+        assert_eq!(
+            body_text.matches("data:image/png;base64,").count(),
+            1,
+            "only the newest image may go out"
+        );
+        // messages[0] 与 [1] 是两条 system prompt，history 从 [2] 开始。
+        let oldest = &body["messages"][2]["content"];
+        let oldest_text = oldest.to_string();
         assert!(!oldest_text.contains("image_url"), "{oldest_text}");
         assert!(
             oldest_text.contains("image omitted to fit request byte budget"),
@@ -3813,17 +3973,6 @@ mod tests {
         );
         assert!(oldest_text.contains("sha256:"), "{oldest_text}");
         assert!(oldest_text.contains("640x480 png"), "{oldest_text}");
-        // 最新的一张还在，模型仍能看图。
-        let newest = session.history_value(2).expect("newest user message");
-        assert!(newest["content"].to_string().contains("image_url"));
-
-        // 发出去的请求体里也只有一张图：占位符是历史的一部分，不是一次性的。
-        let body = provider.seen_bodies.lock().expect("seen_bodies")[0].clone();
-        assert_eq!(
-            body.to_string().matches("data:image/png;base64,").count(),
-            1
-        );
-        assert!(body.to_string().contains("image omitted to fit"));
     }
 
     /// 这一轮新消息里的图片还没进 history，但同样占请求体，必须先扣掉预算。
@@ -3834,7 +3983,7 @@ mod tests {
         let pending = inline_png_part(6 * MIB);
         let mut session =
             AgentSession::new(LlmApiConfig::default(), "runtime_shell").expect("build session");
-        session.remember_exchange("历史图", "收到", None, std::slice::from_ref(&historical));
+        seed_history_exchange(&mut session, "历史图", &historical);
 
         let provider = FakeLlmProvider::new(vec![assistant_reply("这张也看到了")]);
         session
@@ -3849,15 +3998,17 @@ mod tests {
             )
             .expect("turn");
 
-        // 6 MiB 新图只给历史留 4 MiB，5 MiB 的历史图必须让位。
-        let stripped = session.history_value(0).expect("history user message");
-        assert!(!stripped["content"].to_string().contains("image_url"));
+        // 6 MiB 新图只给历史留 2 MiB，5 MiB 的历史图必须让位；占位符在装配
+        // 请求体之前就写回了 history（messages[0]/[1] 是 system prompt）。
         let body = provider.seen_bodies.lock().expect("seen_bodies")[0].clone();
         assert_eq!(
             request_inline_image_bytes(&body),
             cordis_runtime::image_budget::inline_base64_len(6 * MIB),
             "only the pending image survives"
         );
+        let history_text = body["messages"][2]["content"].to_string();
+        assert!(!history_text.contains("image_url"), "{history_text}");
+        assert!(history_text.contains("image omitted"), "{history_text}");
         assert!(
             request_inline_image_bytes(&body)
                 <= cordis_runtime::image_budget::INLINE_IMAGE_BUDGET_BYTES
@@ -3885,6 +4036,92 @@ mod tests {
             .expect("turn");
         let kept = session.history_value(0).expect("user message");
         assert!(kept["content"].to_string().contains("image_url"));
+    }
+
+    /// 一张图按整图计价，不按字节：字节是 `image_budget` 那条独立通道的事。
+    #[test]
+    fn remember_exchange_counts_inline_image_tokens() {
+        let mut session = AgentSession::new(test_config(), "runtime_shell").unwrap();
+        session.remember_exchange("看图", "收到", None, &[inline_png_part(3 * 1024)]);
+        // 文本「看图」「收到」各 1 token，图片 1024。
+        assert_eq!(session.estimated_tokens, 2 + super::IMAGE_TOKEN_ESTIMATE);
+        assert_eq!(session.history_len(), 2);
+    }
+
+    /// 大图不再把整对消息挤掉。
+    ///
+    /// 图片按字节折 token 时，一张 6 MiB 的图等于 200 万 token，`remember_exchange`
+    /// 会立刻把用户的话和回复一起丢掉——正是这个计价方式逼出来的行为。现在图片按
+    /// 整图计价，历史留得住，字节由 `image_budget` 在发送前处理。
+    #[test]
+    fn a_large_inline_image_does_not_prune_the_pair() {
+        const MIB: usize = 1024 * 1024;
+        let mut session = AgentSession::new(test_config(), "runtime_shell").unwrap();
+        session.remember_exchange("大图", "收到", None, &[inline_png_part(6 * MIB)]);
+        assert_eq!(session.history_len(), 2, "the pair survives");
+        assert!(session.estimated_tokens < AGENT_HISTORY_TOKEN_LIMIT);
+    }
+
+    /// 恢复出来的会话可能带着与 history 不一致的陈旧估算；history 已空时
+    /// 裁剪循环必须退出，不能空转。
+    #[test]
+    fn remember_exchange_does_not_spin_on_a_stale_estimate() {
+        let mut session = AgentSession::new(test_config(), "runtime_shell").unwrap();
+        session.estimated_tokens = 500_000;
+        session.remember_exchange("hi", "ok", None, &[]);
+        assert_eq!(session.history_len(), 0);
+    }
+
+    /// 快照落盘前必须把内联 base64 换成占位符：46 张图的会话历史有几十 MB，
+    /// 原样写 `data/sessions/*.json` 既慢又撑爆磁盘。文本必须完整，**live
+    /// history 不能被改**（进程内还要看图），重启后则只剩占位符。
+    #[test]
+    fn snapshot_strips_inline_images_and_keeps_the_text() {
+        let image = inline_png_part(64 * 1024);
+        let mut session = AgentSession::new(test_config(), "runtime_shell").unwrap();
+        session.remember_exchange(
+            "这张图里是什么",
+            "是一只猫",
+            None,
+            std::slice::from_ref(&image),
+        );
+        let live_json = serde_json::to_string(&session.history).expect("live history json");
+        assert!(live_json.contains("data:image/png;base64,"));
+        let live_tokens = session.estimated_tokens;
+
+        let snapshot = session.to_snapshot();
+        let json = serde_json::to_string(&snapshot).expect("snapshot json");
+        assert!(!json.contains("base64"), "no inline bytes on disk: {json}");
+        assert!(
+            json.contains("image omitted to fit request byte budget"),
+            "{json}"
+        );
+        assert!(json.contains("sha256:"), "{json}");
+        assert!(json.contains("这张图里是什么"), "{json}");
+        assert!(json.contains("是一只猫"), "{json}");
+        let tiny = json.len() < 1024;
+        assert!(tiny, "snapshot should be tiny, got {} bytes", json.len());
+        let shrunk = json.len() * 50 < live_json.len();
+        assert!(shrunk, "snapshot must be far smaller than live history");
+        // live history 原样保留：剥图只发生在落盘副本上。
+        assert_eq!(
+            serde_json::to_string(&session.history).expect("live json"),
+            live_json
+        );
+        // 快照里的估算按占位符重算，不能把原图的几十万 token 带进恢复会话。
+        assert!(
+            snapshot.estimated_tokens < live_tokens,
+            "snapshot estimate {} must shrink from {}",
+            snapshot.estimated_tokens,
+            live_tokens
+        );
+
+        // 典型重启路径：恢复出来的会话只有占位符，模型不能再"看"这张图。
+        let restored = AgentSession::from_snapshot(snapshot).expect("restore");
+        let restored_json = serde_json::to_string(&restored.history).expect("restored json");
+        assert!(restored_json.contains("image omitted to fit request byte budget"));
+        assert!(restored_json.contains("这张图里是什么"));
+        assert!(restored.estimated_tokens < 100);
     }
 
     /// A session can see its siblings and hand a message to one of them.
@@ -4305,6 +4542,144 @@ mod tests {
         let small = estimate_tokens("hello world");
         let large = estimate_tokens(&"hello world ".repeat(100));
         assert!(large > small * 50, "large={large} small={small}");
+    }
+
+    /// 带图消息的 content 是数组，旧的 `as_str()` 路径会把它摘要成空行。
+    /// 新摘要必须同时保留文本、历史里已有的占位符原文和图片标记。
+    #[test]
+    fn compact_summary_keeps_text_placeholder_and_image_marker() {
+        let mut session = AgentSession::new(test_config(), "runtime_shell").unwrap();
+        // 空 content：必须被跳过，不产生空摘要行。
+        session
+            .history
+            .push(json!({ "role": "assistant", "content": "" }));
+        // 文本 + 已被字节预算替换的占位符 + 两张图。
+        session.history.push(json!({
+            "role": "user",
+            "content": [
+                { "type": "text", "text": "看看这两张图" },
+                { "type": "text", "text": "[image omitted to fit request byte budget; sha256:deadbeef]" },
+                { "type": "image_url", "image_url": { "url": "data:image/png;base64,Zm9v" } },
+                { "type": "image_url", "image_url": { "url": "data:image/png;base64,Zm8=" } },
+            ],
+        }));
+        // 纯图消息（text 为空、图非空）：不能因为「文本空」被当成空消息跳过。
+        session.history.push(json!({
+            "role": "user",
+            "content": [
+                { "type": "image_url", "image_url": { "url": "data:image/png;base64,Zm9v" } },
+            ],
+        }));
+        // 超长文本：验证 500 字截断仍然按 char 计，且 `…` 存在。
+        session
+            .history
+            .push(json!({ "role": "user", "content": "长".repeat(600) }));
+        for i in 0..4000 {
+            session
+                .history
+                .push(json!({ "role": "user", "content": format!("请求{i}") }));
+        }
+
+        let (before, after) = session.compact_history();
+        assert_eq!(before, 4004);
+        assert!(after < before);
+
+        let summary = session.history_value(0).expect("summary message")["content"]
+            .as_str()
+            .expect("summary text")
+            .to_string();
+        assert!(summary.contains("看看这两张图"), "{summary}");
+        assert!(
+            summary.contains("[image omitted to fit request byte budget; sha256:deadbeef]"),
+            "placeholder text must survive verbatim: {summary}"
+        );
+        assert!(summary.contains("[图片 2 张]"), "{summary}");
+        assert!(
+            summary.contains("[图片 1 张]"),
+            "image-only message must not be skipped: {summary}"
+        );
+        assert!(
+            summary.contains('…'),
+            "long text must be truncated: {summary}"
+        );
+        assert!(!summary.contains("base64"), "{summary}");
+        assert!(
+            !summary.contains("[assistant]:"),
+            "empty content must be skipped: {summary}"
+        );
+    }
+
+    /// `estimate_message_tokens` 的每条分支：字符串 / 数组 content、文本 /
+    /// 内联图 / 远程图 / 坏 part、`reasoning_content`、非消息值。
+    #[test]
+    fn estimate_message_tokens_counts_text_images_and_reasoning() {
+        assert_eq!(
+            estimate_message_tokens(&json!({ "role": "user", "content": "abcd" })),
+            2
+        );
+        let parts = json!([
+            { "type": "text", "text": "abcd" },
+            // 一张图按整图计价（IMAGE_TOKEN_ESTIMATE），与字节无关。
+            { "type": "image_url", "image_url": { "url": "data:image/png;base64,Zm9v" } },
+            // 远程图不占内联字节。
+            { "type": "image_url", "image_url": { "url": "https://example.com/a.png" } },
+            // 坏 url / 缺 url / 缺 text / 未知 part 都是 0。
+            { "type": "image_url", "image_url": { "url": 7 } },
+            { "type": "image_url" },
+            { "type": "text" },
+            { "type": "text", "text": 7 },
+            { "type": "audio" },
+        ]);
+        assert_eq!(
+            estimate_message_tokens(&json!({ "role": "user", "content": parts })),
+            2 + super::IMAGE_TOKEN_ESTIMATE
+        );
+        // 推理文本也是历史里的真实重量。
+        assert_eq!(
+            estimate_message_tokens(&json!({
+                "role": "assistant",
+                "content": "ab",
+                "reasoning_content": "cdef",
+            })),
+            3
+        );
+        assert_eq!(
+            estimate_message_tokens(&json!({ "role": "user", "content": 42 })),
+            0
+        );
+        assert_eq!(
+            estimate_message_tokens(&json!({ "role": "user", "content": Value::Null })),
+            0
+        );
+        assert_eq!(estimate_message_tokens(&json!({ "role": "user" })), 0);
+        assert_eq!(estimate_message_tokens(&json!("not a message")), 0);
+    }
+
+    /// `summarize_message_content` 的逐分支单测：字符串、数组里 text /
+    /// image_url / 其它 part、空数组、非 content 值。
+    #[test]
+    fn summary_of_content_handles_strings_arrays_and_unknown_parts() {
+        assert_eq!(
+            summarize_message_content(&Value::String("纯文本".to_string())),
+            ("纯文本".to_string(), 0)
+        );
+        let content = json!([
+            { "type": "text", "text": "看图：" },
+            { "type": "text", "text": "[image omitted to fit request byte budget; sha256:deadbeef]" },
+            { "type": "image_url", "image_url": { "url": "data:image/png;base64,Zm9v" } },
+            { "type": "image_url", "image_url": { "url": "https://x/y.png" } },
+            { "type": "text" },
+            { "type": "audio" },
+        ]);
+        assert_eq!(
+            summarize_message_content(&content),
+            (
+                "看图：[image omitted to fit request byte budget; sha256:deadbeef]".to_string(),
+                2
+            )
+        );
+        assert_eq!(summarize_message_content(&json!([])), (String::new(), 0));
+        assert_eq!(summarize_message_content(&json!(42)), (String::new(), 0));
     }
 
     /// A turn consisting solely of a kernel introspection call and its

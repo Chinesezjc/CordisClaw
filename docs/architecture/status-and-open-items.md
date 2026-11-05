@@ -885,6 +885,52 @@ LRU 淘汰时同步删除。
 - [x] **Plugin iteration symlink 逃逸**（P0-20）— `PluginEditExecutor::execute` 在写入前调用新 helper `resolve_under_workspace`：canonicalize 结果必须仍在 workspace_root 下。plugins 内的 symlink 指向 `/etc/passwd` 之类无法被写入。
 - [x] **Verifier shell 拼接**（P0-21）— 已随 A 批 P0-1 修复。`discover_rust_workspace_manifest` 输出的字符串被 `shell_words` 解析成 argv，空格 / `$` / `;` 无法被解释。
 
+### 5.2.57 图片计入 token 估算 + 快照剥掉 base64（2026-11-05 已闭合）
+
+**现象**：两条与图片相关的计量 / 持久化缺陷。
+
+1. `compact_history` 只读 `message["content"].as_str()`。带图消息的 `content` 是
+   `[{type:"text"},{type:"image_url"}]` 数组，`as_str()` 返回 `None`，于是这条
+   消息在摘要里变成空行——既不摘要也不丢弃。
+2. `estimate_tokens(text) = chars/2` 只吃字符串，图片 part 的 base64 完全不进
+   `estimated_tokens`，按 token 的裁剪对图无效；`to_snapshot` 又把 `history` 里
+   几十 MB 的 base64 原样写进 `data/sessions/*.json`（auto-save 的唯一来源；
+   shutdown memory 只写 session 状态，不写 history）。
+
+**改动**：
+- `crates/cordis-agent/src/imp.rs` 新增 `estimate_message_tokens(&Value)`：
+  `content` 是字符串时按 chars/2；是数组时逐 part 累加（text 按 chars/2，
+  `image_url` 按 base64 长度 / 4，即 `ceil(raw/3)`，等价于
+  `ceil(base64_len/3)*4/4`）；`reasoning_content` 一并计入。`remember_exchange`、
+  `compact_history` 的重算、96 轮 overflow 的 partial history 都改用它。
+- `remember_exchange` 的裁剪循环每丢一对就减掉该对的估算，并加 `!is_empty()`
+  守卫，避免恢复出的陈旧估算在空 history 上空转。
+- `compact_history` 新增 `summarize_message_content(&Value)`：遍历数组 content，
+  text part 按序拼接（字节预算写回的占位符原文保留），image part 折成
+  `[图片 N 张]` 标记并放在 500 字截断**之后**，长文本也不会吃掉标记。
+- `crates/cordis-runtime/src/image_budget.rs` 新增
+  `strip_inline_images(&mut [Value]) -> usize`（等价于零预算的
+  `enforce_image_budget`，复用 `placeholder_for`，不复制实现）。
+- `to_snapshot` 在 history 的**克隆**上调用它，把内联 base64 换成占位符，并按
+  剥图后的 history 重算 `estimated_tokens`；live history 不变。
+- **重启后果（有意接受）**：快照里只有占位符，恢复出的会话不能再"看"历史图片，
+  只能看到 `[image omitted ...; sha256:<前8位>; <W>x<H> <fmt>]`（拿不到尺寸时
+  只有 sha256）。这是 47 MB 快照换来的取舍，`to_snapshot` 的代码注释写明了。
+
+**体积估算**：46 张图的会话快照原来 ~47.6 MB（与线上请求体同量级），每张换成
+~80 字节的占位符后约 `46 × 80 B ≈ 3.7 KB`，加上文本历史仍是 KB 级——约
+**47.6 MB → 4 KB**（降四个数量级）。
+
+**验证**：`cargo clippy --all-targets -- -D warnings` 零 warning；
+`cargo test -p cordis-agent --lib` 71 项、`cargo test -p cordis-runtime --lib`
+941 项全绿；新增 agent 单测 7 项、runtime 单测 1 项。
+
+**已知残余**：内联图按 token 折算后单张就常超过 `AGENT_HISTORY_TOKEN_LIMIT`
+（120k ≈ 360 KB 原始字节），`remember_exchange` 会把**整对**消息裁掉——含大图
+的用户文本与回复一起丢；`image_budget` 的历史剥离路径在正常会话里因此几乎不再
+触发（只剩旧快照 / 恢复会话这类入口）。后续应改为「超限时先把图片 part 换成
+占位符、仍超限才丢消息」，或给图片单独一个 token 预算。
+
 ### 5.2.56 发送前的图片字节预算（2026-11-05 已闭合）
 
 **现象**：一个 1081 条消息的群会话请求体长到 47.6 MB（46 条带 `image_url`，最大
@@ -895,6 +941,9 @@ LRU 淘汰时同步删除。
 **根因**：`estimate_tokens(text) = chars/2` 只看文本，图片字节完全不计入，所以
 `AGENT_HISTORY_TOKEN_LIMIT` 对图永远不触发；`remember_exchange` 又把带图消息原样
 push 进 `history`，base64 常驻。
+
+> 2026-11-05 后续（5.2.57）：图片已计入 `estimated_tokens`，快照也剥掉 base64；
+> 本节这条字节预算继续负责**精确的请求体字节上限**（token 折算不等于字节上限）。
 
 **改动**：
 - 新增 `crates/cordis-runtime/src/image_budget.rs`（纯函数，无 I/O）：输入按时间

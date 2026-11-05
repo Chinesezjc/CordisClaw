@@ -1,9 +1,9 @@
 //! 发送前的图片字节预算：内联图片攒到超预算时，决定剥掉哪些。
 //!
-//! 为什么需要本模块：`estimated_tokens` 只按文本字符数（chars / 2）估算，
-//! 图片字节完全不计入，所以 `AGENT_HISTORY_TOKEN_LIMIT` 对图片永远不触发。
-//! 线上一个 1081 条消息的群会话因此攒到 47.6 MB 请求体（46 条带
-//! `image_url`，最大 5 条各 2.7–4.2 MB），被网关 413
+//! 为什么需要本模块：`estimated_tokens` 是**保守的请求重量**估算（图片按
+//! base64 折 token），而网关拒收看的是**请求体字节**——两者是不同的旋钮，
+//! 谁也不能代替谁。线上一个 1081 条消息的群会话曾攒到 47.6 MB 请求体（46 条
+//! 带 `image_url`，最大 5 条各 2.7–4.2 MB），被网关 413
 //! `Failed to buffer the request body: length limit exceeded` 拒收，消息落进
 //! `data/pending/` 重放队列，机器人整轮发不出话。
 //!
@@ -170,6 +170,16 @@ pub fn enforce_image_budget(messages: &mut [Value], budget: usize) -> ImageBudge
     let plan = plan_image_omissions(messages, budget);
     apply_image_omissions(messages, &plan);
     plan
+}
+
+/// 把消息里**所有**内联图片换成占位符，返回替换的张数。
+///
+/// 等价于预算为零的 [`enforce_image_budget`]，但意图更直白：调用方要的是
+/// 「一条内联 base64 都不留」，而不是「预算恰好是 0」。会话快照落盘前用它把
+/// `history` 里几十 MB 的 base64 换成短占位符；远程 `https://` 图片不是内联
+/// 字节，不会被替换。占位符构造仍走 [`placeholder_for`]，不复制实现。
+pub fn strip_inline_images(messages: &mut [Value]) -> usize {
+    enforce_image_budget(messages, 0).omitted()
 }
 
 /// 一个 content part 的 `image_url.url`（不是图片 part 就返回 `None`）。
@@ -633,6 +643,37 @@ mod tests {
         let second = enforce_image_budget(&mut messages, 0);
         assert!(second.is_empty());
         assert_eq!(second.bytes_before, 0);
+    }
+
+    /// 快照落盘前的入口：所有内联图变成占位符，远程 URL 原样保留，再来一次
+    /// 没有可剥的东西（幂等）。
+    #[test]
+    fn strip_inline_images_replaces_every_inline_picture() {
+        let mut messages = vec![
+            user_message("看图", &[image_part(b"aaa"), image_part(&png_header(2, 2))]),
+            json!({
+                "role": "user",
+                "content": [
+                    { "type": "text", "text": "远程图" },
+                    { "type": "image_url", "image_url": { "url": "https://x/y.png" } },
+                ],
+            }),
+        ];
+        assert_eq!(strip_inline_images(&mut messages), 2);
+        let first = messages[0]["content"].to_string();
+        assert_eq!(
+            first
+                .matches("image omitted to fit request byte budget")
+                .count(),
+            2
+        );
+        assert!(!first.contains("base64"));
+        assert!(messages[1]["content"]
+            .to_string()
+            .contains("https://x/y.png"));
+        // 已经没有内联图了，再剥一次是 no-op。
+        assert_eq!(strip_inline_images(&mut messages), 0);
+        assert!(plan_image_omissions(&messages, 0).is_empty());
     }
 
     #[test]
