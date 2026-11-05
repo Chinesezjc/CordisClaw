@@ -9,6 +9,7 @@ pub mod core;
 pub mod execution;
 pub mod guard;
 pub mod host;
+pub mod image_budget;
 pub mod image_input;
 pub mod iteration;
 pub mod iteration_api;

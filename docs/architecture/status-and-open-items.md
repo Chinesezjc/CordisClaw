@@ -885,6 +885,50 @@ LRU 淘汰时同步删除。
 - [x] **Plugin iteration symlink 逃逸**（P0-20）— `PluginEditExecutor::execute` 在写入前调用新 helper `resolve_under_workspace`：canonicalize 结果必须仍在 workspace_root 下。plugins 内的 symlink 指向 `/etc/passwd` 之类无法被写入。
 - [x] **Verifier shell 拼接**（P0-21）— 已随 A 批 P0-1 修复。`discover_rust_workspace_manifest` 输出的字符串被 `shell_words` 解析成 argv，空格 / `$` / `;` 无法被解释。
 
+### 5.2.56 发送前的图片字节预算（2026-11-05 已闭合）
+
+**现象**：一个 1081 条消息的群会话请求体长到 47.6 MB（46 条带 `image_url`，最大
+5 条各 2.7–4.2 MB），网关返回 413
+`Failed to buffer the request body: length limit exceeded`；消息落进
+`data/pending/` 重放队列，机器人整轮发不出话。
+
+**根因**：`estimate_tokens(text) = chars/2` 只看文本，图片字节完全不计入，所以
+`AGENT_HISTORY_TOKEN_LIMIT` 对图永远不触发；`remember_exchange` 又把带图消息原样
+push 进 `history`，base64 常驻。
+
+**改动**：
+- 新增 `crates/cordis-runtime/src/image_budget.rs`（纯函数，无 I/O）：输入按时间
+  顺序的 messages + 字节预算，从**最老的图片**开始规划剥离；base64 大小按
+  `ceil(len/3)*4` 从 payload 反解出的原始字节数精确折算（不用 URI 字符串长度
+  近似），只认 `data:...;base64,` 内联 URI（远程 URL 不占内联字节）。
+  占位符形状 `[image omitted to fit request byte budget; sha256:<前8位>; <W>x<H> <fmt>]`
+  ——`WxH`/`fmt` 从 PNG IHDR、JPEG SOF、GIF LSD、WEBP VP8X/VP8 头读；拿不到尺寸或
+  格式时只写 sha256；连字节都解不出时只写 omitted。
+- `crates/cordis-agent/src/imp.rs` 的 `respond_inner` 在装配 `messages` 之前调用
+  `enforce_image_budget(&mut self.history, 预算 − 本轮新图字节)`，占位符**就地写回
+  `history`**（下一轮不必从原图重算），已发出的消息不受影响。
+- 预算常量 `INLINE_IMAGE_BUDGET_BYTES = 10 MiB`（对齐 DSH inline 20 MiB 的一半）。
+- `fixtures/plugins/llm_openai`：413 或 400+`INVALID_REQUEST` 时把剩余内联图片预算
+  减半、剥掉最老一批后**重试一次**（`images_shrunk` 保证只剥一次，不无限循环），
+  避免整轮失败进 pending。
+
+**验证**：`cargo clippy --all-targets -- -D warnings` 零 warning；
+`cargo test -p cordis-runtime --lib`、`cargo test -p cordis-agent --lib` 全绿；
+新增单测 image_budget 22 项、agent 3 项、llm_openai 7 项（含真实 413→SSE 的本地
+HTTP 重试用例）；`crates/cordis-runtime/src/image_budget.rs` 行覆盖 100%。
+
+**顺带修复**：`imp.rs` 里两条测试的 `#[test]` 属性被错位到上一条测试的文档之后
+（bad merge），使 `system_prompt_orders_persona_conduct_hints` 与
+`a_channel_turn_ends_only_on_the_suspend_call` 从未运行，test target 也在
+`-D warnings` 下因 `duplicated attribute` / `dead code` 报错。属性已归位、两条
+用例重新跑通（它们的行覆盖也重新计入 CI 门槛）。
+
+**未修（另行报告）**：`cargo clippy -p cordis-agent --all-targets` 另有**既有**红点
+——`crates/cordis-agent/src/lib.rs:47` 的 `items_after_test_module`（`mod tests` 之后
+还有 `impl`）与 `crates/cordis-agent/tests/iteration_pipeline.rs` 的 6 处 unused
+import / 2 处 needless borrow。根命令 `cargo clippy --all-targets` 不选
+`cordis-agent`（它不在 `default-members` 里），所以那两处不在门禁路径上。
+
 ### 5.2.55 删除 vision 的 OCR / 视觉 LLM 节点（2026-11-05 已闭合）
 
 **动机**：agent 已原生支持图片输入（kernel `image_input` 下载后内联成 `image_url`

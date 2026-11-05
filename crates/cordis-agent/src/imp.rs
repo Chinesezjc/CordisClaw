@@ -52,7 +52,17 @@ fn drain_inject_queue() -> Vec<String> {
 /// nothing (no content, no tool calls) before reporting a failure.
 const EMPTY_RESPONSE_RETRIES: usize = 1;
 
+/// Hard ceiling on message count, as a backstop.
 const AGENT_HISTORY_MESSAGE_LIMIT: usize = 8192;
+
+/// Prune by size, not by count.
+///
+/// Counting messages never fired: a busy group reached 1079 messages and the
+/// provider answered 413 Payload Too Large, so the bot could not speak at all
+/// and the message was spilled to pending. `estimated_tokens` tracks the real
+/// weight (chars/2), so the same 1079 short chats that fit stay, while a session
+/// bloated with long texts and pictures gets trimmed.
+const AGENT_HISTORY_TOKEN_LIMIT: usize = 120_000;
 const AGENT_MAX_TOOL_TURNS: usize = 96;
 
 /// 一次模型补全的执行者。
@@ -334,6 +344,32 @@ impl AgentSession {
             let _ = self.compact_history();
         }
 
+        // 图片按字节计，不按 token 计：`estimate_tokens` 完全看不到它们，所以
+        // 带图历史能一路攒到 47 MB 请求体才被网关 413 拒收（见
+        // `cordis_runtime::image_budget` 的模块文档）。
+        //
+        // 两件事同时发生：这一轮新消息里的图片先占掉预算（它们不进 history，
+        // 但照样进请求体），剩下的额度给历史里最老的图片；占位符**就地写回
+        // history**，否则下一轮又从同一批原图重算、白费一遍。
+        let pending_image_bytes = cordis_runtime::image_budget::image_parts_bytes(images);
+        let history_image_budget = cordis_runtime::image_budget::INLINE_IMAGE_BUDGET_BYTES
+            .saturating_sub(pending_image_bytes);
+        let image_plan = cordis_runtime::image_budget::enforce_image_budget(
+            &mut self.history,
+            history_image_budget,
+        );
+        if !image_plan.is_empty() {
+            emit_agent_diagnostic(format!(
+                "agent_image_budget kind={} omitted={} image_bytes_before={} image_bytes_after={} budget={} pending={}",
+                self.kind,
+                image_plan.omitted(),
+                image_plan.bytes_before,
+                image_plan.bytes_after,
+                history_image_budget,
+                pending_image_bytes,
+            ));
+        }
+
         let mut tool_specs = backend.tool_specs();
         if self.require_end_tool {
             tool_specs.push(end_turn_tool_spec());
@@ -360,8 +396,8 @@ impl AgentSession {
                 .filter(|message| !is_outage_notice_text(message))
                 .cloned(),
         );
-        // 一次性上下文（策略/记忆行）与图片都只随这一条新消息进请求；
-        // history 里只留纯文本，否则每一轮都会重发同一份噪声。
+        // 一次性上下文（策略/记忆行）只随这一条新消息进请求，绝不进 history；
+        // 历史里的图片则由上面的字节预算裁剪（越老的图越先被换成占位符）。
         let request_text = if notes.trim().is_empty() {
             trimmed.to_string()
         } else {
@@ -1382,7 +1418,9 @@ impl AgentSession {
             + reasoning.map(estimate_tokens).unwrap_or(0);
 
         // Drop oldest user+assistant pairs if we exceed the limit.
-        while self.history.len() > AGENT_HISTORY_MESSAGE_LIMIT {
+        while self.history.len() > AGENT_HISTORY_MESSAGE_LIMIT
+            || self.estimated_tokens > AGENT_HISTORY_TOKEN_LIMIT
+        {
             // Always remove in pairs (user + assistant).
             self.history.drain(0..2.min(self.history.len()));
         }
@@ -3109,9 +3147,6 @@ mod tests {
         }
     }
 
-    /// 拼装顺序契约：base → persona（先免责声明再正文）→ conduct → hints。
-    /// persona 只调语气，conduct 必须压过它，渠道 hints 仍留最末（recency）。
-    #[test]
     /// A channel session is told it is a participant, not a REPL operator.
     ///
     /// The identity paragraph used to say "You are the Cordis shell agent running
@@ -3171,6 +3206,9 @@ mod tests {
         }
     }
 
+    /// 拼装顺序契约：base → persona（先免责声明再正文）→ conduct → hints。
+    /// persona 只调语气，conduct 必须压过它，渠道 hints 仍留最末（recency）。
+    #[test]
     fn system_prompt_orders_persona_conduct_hints() {
         let host = FakeHost {
             persona: Some("毒舌运维".to_string()),
@@ -3527,9 +3565,6 @@ mod tests {
         );
     }
 
-    // A channel turn is not over when the model stops calling tools: it needs
-    // an explicit `suspend`. A text-only step is nudged and the turn continues.
-    #[test]
     // The iteration prompt promises the summary "ends the session
     // immediately"; without this the loop asked for another turn and the run
     // failed on "exited without calling record_iteration_summary".
@@ -3705,6 +3740,151 @@ mod tests {
             history.contains("keep.png"),
             "the picture must survive into later turns: {history}"
         );
+    }
+
+    /// 一张 `size` 字节的内联 PNG part（640x480 IHDR + 填充），用来跨过预算。
+    /// 图片字节本身不参与 `estimated_tokens`，所以只有字节预算能拦住它。
+    fn inline_png_part(size: usize) -> Value {
+        let mut bytes = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR".to_vec();
+        bytes.extend_from_slice(&640u32.to_be_bytes());
+        bytes.extend_from_slice(&480u32.to_be_bytes());
+        bytes.resize(size, 0);
+        json!({
+            "type": "image_url",
+            "image_url": {
+                "url": format!(
+                    "data:image/png;base64,{}",
+                    cordis_runtime::image_input::base64_encode(&bytes)
+                ),
+            },
+        })
+    }
+
+    /// 请求体里所有消息的内联图片字节。
+    fn request_inline_image_bytes(body: &Value) -> usize {
+        body["messages"]
+            .as_array()
+            .expect("messages array")
+            .iter()
+            .map(|message| {
+                cordis_runtime::image_budget::image_parts_bytes(
+                    message["content"]
+                        .as_array()
+                        .map(Vec::as_slice)
+                        .unwrap_or(&[]),
+                )
+            })
+            .sum()
+    }
+
+    /// 图片攒到超预算时，最老的那些必须换成占位符，而且**写回 history**：
+    /// 只做一次性替换等于下一轮又从原图重算。这条用例钉住 47 MB 请求体被
+    /// 413 拒收的那条线上回归。
+    #[test]
+    fn history_images_over_the_byte_budget_become_durable_placeholders() {
+        const MIB: usize = 1024 * 1024;
+        let huge = inline_png_part(6 * MIB);
+        let mut session =
+            AgentSession::new(LlmApiConfig::default(), "runtime_shell").expect("build session");
+        session.remember_exchange("第一张图", "收到", None, std::slice::from_ref(&huge));
+        session.remember_exchange("第二张图", "收到", None, std::slice::from_ref(&huge));
+        assert_eq!(session.history_len(), 4);
+
+        let provider = FakeLlmProvider::new(vec![assistant_reply("好")]);
+        session
+            .respond_with_runtime_host_via_images(
+                &EMPTY_FAKE_HOST,
+                "s-budget",
+                "现在呢",
+                &[],
+                "",
+                &provider,
+                None,
+            )
+            .expect("turn");
+
+        // 最老的那张变成占位符，并留在 history 里（不是只在请求里临时换）。
+        let oldest = session.history_value(0).expect("oldest user message");
+        let oldest_text = oldest["content"].to_string();
+        assert!(!oldest_text.contains("image_url"), "{oldest_text}");
+        assert!(
+            oldest_text.contains("image omitted to fit request byte budget"),
+            "{oldest_text}"
+        );
+        assert!(oldest_text.contains("sha256:"), "{oldest_text}");
+        assert!(oldest_text.contains("640x480 png"), "{oldest_text}");
+        // 最新的一张还在，模型仍能看图。
+        let newest = session.history_value(2).expect("newest user message");
+        assert!(newest["content"].to_string().contains("image_url"));
+
+        // 发出去的请求体里也只有一张图：占位符是历史的一部分，不是一次性的。
+        let body = provider.seen_bodies.lock().expect("seen_bodies")[0].clone();
+        assert_eq!(
+            body.to_string().matches("data:image/png;base64,").count(),
+            1
+        );
+        assert!(body.to_string().contains("image omitted to fit"));
+    }
+
+    /// 这一轮新消息里的图片还没进 history，但同样占请求体，必须先扣掉预算。
+    #[test]
+    fn the_new_message_images_are_reserved_before_the_history_budget() {
+        const MIB: usize = 1024 * 1024;
+        let historical = inline_png_part(5 * MIB);
+        let pending = inline_png_part(6 * MIB);
+        let mut session =
+            AgentSession::new(LlmApiConfig::default(), "runtime_shell").expect("build session");
+        session.remember_exchange("历史图", "收到", None, std::slice::from_ref(&historical));
+
+        let provider = FakeLlmProvider::new(vec![assistant_reply("这张也看到了")]);
+        session
+            .respond_with_runtime_host_via_images(
+                &EMPTY_FAKE_HOST,
+                "s-pending",
+                "这张新的呢",
+                std::slice::from_ref(&pending),
+                "",
+                &provider,
+                None,
+            )
+            .expect("turn");
+
+        // 6 MiB 新图只给历史留 4 MiB，5 MiB 的历史图必须让位。
+        let stripped = session.history_value(0).expect("history user message");
+        assert!(!stripped["content"].to_string().contains("image_url"));
+        let body = provider.seen_bodies.lock().expect("seen_bodies")[0].clone();
+        assert_eq!(
+            request_inline_image_bytes(&body),
+            cordis_runtime::image_budget::inline_base64_len(6 * MIB),
+            "only the pending image survives"
+        );
+        assert!(
+            request_inline_image_bytes(&body)
+                <= cordis_runtime::image_budget::INLINE_IMAGE_BUDGET_BYTES
+        );
+    }
+
+    /// 一张过小的图不该被剥掉：预算只在真的超了才动手。
+    #[test]
+    fn a_small_inline_image_survives_the_byte_budget() {
+        let small = inline_png_part(1024);
+        let mut session =
+            AgentSession::new(LlmApiConfig::default(), "runtime_shell").expect("build session");
+        session.remember_exchange("小图", "收到", None, std::slice::from_ref(&small));
+        let provider = FakeLlmProvider::new(vec![assistant_reply("好")]);
+        session
+            .respond_with_runtime_host_via_images(
+                &EMPTY_FAKE_HOST,
+                "s-small",
+                "继续",
+                &[],
+                "",
+                &provider,
+                None,
+            )
+            .expect("turn");
+        let kept = session.history_value(0).expect("user message");
+        assert!(kept["content"].to_string().contains("image_url"));
     }
 
     /// A session can see its siblings and hand a message to one of them.
@@ -3890,6 +4070,9 @@ mod tests {
         );
     }
 
+    // A channel turn is not over when the model stops calling tools: it needs
+    // an explicit `suspend`. A text-only step is nudged and the turn continues.
+    #[test]
     fn a_channel_turn_ends_only_on_the_suspend_call() {
         let provider = FakeLlmProvider::new(vec![
             assistant_reply("我先说一句"),
