@@ -1516,7 +1516,16 @@ impl RuntimeHost {
         if soul_key.is_empty() {
             return Ok(None);
         }
-        self.soul_provider().get(soul_key)
+        if let Some(soul) = self.soul_provider().get(soul_key)? {
+            return Ok(Some(soul));
+        }
+        // Older rows key group souls as `qq:<group>#group` while the channel now
+        // asks for `qq:group:<group>`. Without the fallback a persona that exists
+        // is never found, so every group falls back to the default assistant.
+        if let Some(group) = soul_key.strip_prefix("qq:group:") {
+            return self.soul_provider().get(&format!("qq:{group}#group"));
+        }
+        Ok(None)
     }
 
     pub fn set_soul(&self, soul_key: &str, soul: &crate::soul::Soul) -> Result<(), RuntimeError> {
