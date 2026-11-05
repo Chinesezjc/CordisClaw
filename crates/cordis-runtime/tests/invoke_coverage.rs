@@ -284,10 +284,10 @@ fn loaded_dylib_invoke_preserves_explicit_node_id() {
     assert_eq!(value.get("ok").and_then(|v| v.as_bool()), Some(true));
 }
 
-// A Task node keeps its dylib alive after invocation. `vision_ocr` is a Task
+// A Task node keeps its dylib alive after invocation. `feishu_send` is a Task
 // node; called with an empty payload it fails fast inside the plugin
-// ("either url or path is required") *before* touching the network or
-// tesseract, so it deterministically exercises the is_task keep-alive branch.
+// ("target is required for feishu_send …") *before* touching the network or
+// any config, so it deterministically exercises the is_task keep-alive branch.
 // The fixture exports no `_cordis_create_service`, so the vtable sub-branch is
 // skipped (documented as unreachable without a custom service dylib).
 #[test]
@@ -295,12 +295,12 @@ fn loaded_dylib_task_node_keeps_alive_and_returns() {
     let registry = PluginRegistry::default();
     register_loaded_dylib(
         &registry,
-        "vision",
-        &artifacts_dir().join(format!("vision{}", std::env::consts::DLL_SUFFIX)),
+        "feishu",
+        &artifacts_dir().join(format!("feishu{}", std::env::consts::DLL_SUFFIX)),
     );
 
-    let resp = invoke_registered_plugin(&registry, "vision", "vision_ocr", "{}".to_string())
-        .expect("vision_ocr should return a structured error, not fail the invoke");
+    let resp = invoke_registered_plugin(&registry, "feishu", "feishu_send", "{}".to_string())
+        .expect("feishu_send should return a structured error, not fail the invoke");
     let value: serde_json::Value = serde_json::from_str(&resp.payload).expect("json");
     // Plugin-level failure is reported in-band (ok:false), not as a
     // RuntimeError — the invoke itself succeeded.
@@ -308,7 +308,7 @@ fn loaded_dylib_task_node_keeps_alive_and_returns() {
 
     // Invoking the same Task node again must still succeed (re-entrant
     // keep-alive replaces the handle in-place rather than erroring).
-    let resp2 = invoke_registered_plugin(&registry, "vision", "vision_ocr", "{}".to_string())
+    let resp2 = invoke_registered_plugin(&registry, "feishu", "feishu_send", "{}".to_string())
         .expect("second invoke");
     assert!(!resp2.payload.is_empty());
 }
@@ -327,13 +327,13 @@ fn unregister_task_library_is_idempotent_noop_for_unknown() {
     let registry = PluginRegistry::default();
     register_loaded_dylib(
         &registry,
-        "vision",
-        &artifacts_dir().join(format!("vision{}", std::env::consts::DLL_SUFFIX)),
+        "feishu",
+        &artifacts_dir().join(format!("feishu{}", std::env::consts::DLL_SUFFIX)),
     );
-    let _ = invoke_registered_plugin(&registry, "vision", "vision_ocr", "{}".to_string())
+    let _ = invoke_registered_plugin(&registry, "feishu", "feishu_send", "{}".to_string())
         .expect("task invoke");
-    unregister_task_library("vision");
-    unregister_task_library("vision");
+    unregister_task_library("feishu");
+    unregister_task_library("feishu");
 }
 
 // ---------------------------------------------------------------------------

@@ -2,7 +2,7 @@
 
 ## 1. 判定口径
 
-- 本文基于当前仓库现状整理，最近更新：2026-11-02。
+- 本文基于当前仓库现状整理，最近更新：2026-11-05。
 - 历史规划蓝图已经吸收进 [design-blueprint.md](./design-blueprint.md)，因此本文结论来自三类证据的交叉比对：
   - 设计蓝图：[design-blueprint.md](./design-blueprint.md)
   - 架构文档：[system-overview.md](./system-overview.md)、[contracts-and-loading.md](./contracts-and-loading.md)、[runtime-semantics.md](./runtime-semantics.md)、[maintenance-guide.md](./maintenance-guide.md)
@@ -885,6 +885,31 @@ LRU 淘汰时同步删除。
 - [x] **Plugin iteration symlink 逃逸**（P0-20）— `PluginEditExecutor::execute` 在写入前调用新 helper `resolve_under_workspace`：canonicalize 结果必须仍在 workspace_root 下。plugins 内的 symlink 指向 `/etc/passwd` 之类无法被写入。
 - [x] **Verifier shell 拼接**（P0-21）— 已随 A 批 P0-1 修复。`discover_rust_workspace_manifest` 输出的字符串被 `shell_words` 解析成 argv，空格 / `$` / `;` 无法被解释。
 
+### 5.2.55 删除 vision 的 OCR / 视觉 LLM 节点（2026-11-05 已闭合）
+
+**动机**：agent 已原生支持图片输入（kernel `image_input` 下载后内联成 `image_url`
+content part），"先把图发给视觉模型转成文字"这条路只会让模型舍近求远。删除
+`vision_ocr`（tesseract）与 `vision_describe`（OpenAI 兼容视觉 API）两个节点。
+
+**改动**：
+- `fixtures/plugins/vision`：删掉两个节点函数、`guess_mime` / `describe_text_from_response`
+  / `vision_max_tokens` 等专属辅助、`match` 分发臂、`prompt` / `lang` 请求字段与 3 个
+  describe 响应单测；`declared_nodes = []`，docs 节点列表清空。图片下载缓存、
+  `read_local_image` / `load_source` 保留为 `pub` 库 API（已无节点消费，靠单测覆盖，
+  否则会变成 dead code）。
+- `fixtures/plugins/feishu`：`system_hint` 删掉 "Then pass that path to
+  vision_ocr / vision_describe for images."（否则模型仍会去调已删除的节点）。
+- `crates/cordis-runtime/tests/invoke_coverage.rs`：Task-node keep-alive 用例改用
+  `feishu_send`（空 payload 在插件内 fail-fast，语义与原来的 `vision_ocr` 相同）。
+- `fixtures/artifacts` 与 `docs/agent/interfaces.json` 经 `prepare-artifacts` 重生成。
+
+**验证**：`cargo clippy --all-targets -- -D warnings` 零 warning；
+`cargo test --manifest-path fixtures/plugins/Cargo.toml -p vision` 8 项全绿；
+`cargo test -p cordis-agent --lib` 全绿；`prepare-artifacts fixtures` 重建 vision 成功。
+
+**注**：本文 5.2.51 / 5.2.52 / 5.2.35 等历史条目里的 `vision_ocr` / `vision_describe`
+是当时的记录；这两个节点已在本批删除，当前状态以本节为准。
+
 ### 5.2.54 fixtures 测试接入 CI 门禁（2026-10-27）
 
 **背景**：CI 只跑主 workspace 的 `cargo test --locked`，fixtures 的测试一个都不在门禁里：
@@ -964,7 +989,7 @@ workspace（`prepare-artifacts` 会开始把它们当插件扫描，需先验证
 
 **残余**：缓存只在进程内，重启即失效；同一图片跨重启后的追问仍可能遇到过期链接（届时按新指引请用户重发）。
 
-### 5.2.51 图片理解：历史图片可查、视觉工具对 agent 开放（2026-10-26 已闭合）
+### 5.2.51 图片理解：历史图片可查、视觉工具对 agent 开放（2026-10-26 已闭合；两个视觉节点已于 2026-11-05 删除，见 5.2.55）
 
 **现象**：群友发了一张图，随后另一人 `@bot 你看得到这张图片吗`，机器人回"能看到图片的下载链接，但拿到的是原始文件字节，我这边没有识图能力"。实际上它既没有拿到字节，也不是没有识图能力。
 
@@ -1260,7 +1285,8 @@ Loaded plugins:
 
 **验证**：`cargo build` 零 warning；`cargo clippy --all-targets -- -D warnings` 干净；新增单测 `image_input` 12 项（4 种 mime + 未知类型 + 超字节 + 超张数 + 下载失败 + 禁用 + base64 三种 chunk 长度 + 无图纯字符串 + text-first 数组 + transport 失败臂）、envelope 2 项、集成 2 项（`inbound_image_is_inlined_as_a_multimodal_content_part` 断言请求体里是 `data:image/png;base64,` 的数组；`no_images_keeps_the_plain_string_content` 钉住无图仍是字符串）、qq 插件 6 项。线上以真实群图片复核（见部署记录）。
 
-**未做/后续**：`vision_ocr` / `vision_describe` 仍是 `agent_accessible: false`（原生看图已经覆盖主路径，OCR 只在需要抽文字时才有价值；要开的话是 vision 插件一行 flag + 重编，并依赖 `OPENAI_API_KEY`/`tesseract`）。
+**未做/后续（2026-11-05 更新）**：原本打算给 `vision_ocr` / `vision_describe` 打开
+`agent_accessible`；这两个节点已随 5.2.55 整体删除，这条后续不再存在。
 
 ### 5.2.41b host.rs 三处安全硬化（2026-08-09 已闭合；main 侧条目，编号与 run 分支 5.2.41 重复故加 b 后缀）
 

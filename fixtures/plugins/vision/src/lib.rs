@@ -1,29 +1,35 @@
-//! Vision plugin — OCR and AI image understanding.
+//! Vision plugin — image source helpers.
 //!
-//! Nodes:
-//! - `vision_ocr`      — download an image URL and run tesseract OCR (text extraction)
-//! - `vision_describe` — send image to OpenAI-compatible vision API for AI description
+//! The agent now consumes images natively: the kernel downloads a batch's
+//! image URLs and inlines them as `image_url` content parts (see
+//! `cordis_runtime::image_input`). There is therefore no reason to ship the old
+//! "send the image to a vision model / OCR it, then read the text" nodes, and
+//! this plugin no longer declares any node.
+//!
+//! What remains is the image-source layer those nodes were built on:
+//!
+//! - a short-lived, SSRF-guarded HTTP download with a URL→bytes cache;
+//! - a local-file reader restricted to the system temp directory.
+//!
+//! Both are `pub` library API (covered by the tests at the bottom) rather than
+//! agent-callable nodes: no node dispatches to them any more, so `pub` is what
+//! keeps them alive instead of dead code.
 //!
 //! Safety: only http/https URLs are allowed; localhost and private IPs blocked.
 
-use base64::Engine;
 use cordis_plugin_sdk::{
-    export_plugin_api, json_response, plugin_docs, task_node_doc, AbiFingerprint, PluginRequest,
-    PluginResponse,
+    export_plugin_api, json_response, plugin_docs, AbiFingerprint, PluginRequest, PluginResponse,
 };
-use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde::Deserialize;
+use serde_json::json;
 use std::collections::HashMap;
 use std::io::Read;
-use std::process::{Command, Stdio};
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
-/// Downloading a QQ CDN image is fast; the vision model is not: a
-/// reasoning-capable model needs ~10-15s for one image, so a 10s API timeout
-/// made `vision_describe` fail (or, worse, appear to succeed with no answer).
+/// Downloading a QQ CDN image is fast; the download timeout only has to cover
+/// the HTTP fetch now that inference no longer happens in this plugin.
 const DOWNLOAD_TIMEOUT_SECS: u64 = 10;
-const API_TIMEOUT_SECS: u64 = 60;
 const MAX_IMAGE_BYTES: usize = 20 * 1024 * 1024; // 20 MB
 
 // ---------------------------------------------------------------------------
@@ -87,55 +93,12 @@ fn cache_store(
 use cordis_net::check_url_safety;
 
 // ---------------------------------------------------------------------------
-// Request / Response
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Deserialize)]
-struct VisionRequest {
-    /// "vision_ocr" | "vision_describe"
-    node_id: String,
-
-    /// Image URL to download and process
-    #[serde(default)]
-    url: Option<String>,
-
-    /// Local image file path. Must resolve to a location inside the system
-    /// temp directory. Mutually exclusive with `url`.
-    #[serde(default)]
-    path: Option<String>,
-
-    /// For vision_describe: optional prompt override (default: "Describe this image in detail")
-    #[serde(default)]
-    prompt: Option<String>,
-
-    /// For vision_ocr: language override (default "chi_sim+eng")
-    #[serde(default)]
-    lang: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct VisionResponse {
-    ok: bool,
-    node_id: String,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    text: Option<String>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    truncated: Option<bool>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    model: Option<String>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<String>,
-}
-
-// ---------------------------------------------------------------------------
 // Image download
 // ---------------------------------------------------------------------------
 
-fn download_image(url_str: &str) -> Result<Vec<u8>, String> {
+/// Download an image over HTTP, reusing recently fetched bytes for the same
+/// URL so an expiring signed link is not fetched twice.
+pub fn download_image(url_str: &str) -> Result<Vec<u8>, String> {
     // A repeat call for the same (expiring) link must reuse the bytes the bot
     // already saw instead of a second download that may 400.
     {
@@ -198,7 +161,7 @@ fn download_image(url_str: &str) -> Result<Vec<u8>, String> {
 ///
 /// On macOS both `/tmp` and `/var/folders/...` are symlinks, so the requested
 /// path and the temp-dir prefix are each canonicalized before comparison.
-fn read_local_image(path: &str) -> Result<Vec<u8>, String> {
+pub fn read_local_image(path: &str) -> Result<Vec<u8>, String> {
     let real = std::fs::canonicalize(path).map_err(|e| format!("resolve path {path}: {e}"))?;
 
     let temp_root = std::fs::canonicalize(std::env::temp_dir())
@@ -226,7 +189,7 @@ fn read_local_image(path: &str) -> Result<Vec<u8>, String> {
 /// Load image bytes from exactly one of `url` or `path`. Supplying both is an
 /// error; supplying neither is an error. `path` reads a local temp-dir file,
 /// `url` goes through the SSRF-guarded HTTP download.
-fn load_source(url: Option<&str>, path: Option<&str>) -> Result<Vec<u8>, String> {
+pub fn load_source(url: Option<&str>, path: Option<&str>) -> Result<Vec<u8>, String> {
     let url = url.map(str::trim).filter(|s| !s.is_empty());
     let path = path.map(str::trim).filter(|s| !s.is_empty());
     match (url, path) {
@@ -238,294 +201,23 @@ fn load_source(url: Option<&str>, path: Option<&str>) -> Result<Vec<u8>, String>
 }
 
 // ---------------------------------------------------------------------------
-// vision_ocr — tesseract
-// ---------------------------------------------------------------------------
-
-fn guess_mime(data: &[u8]) -> &'static str {
-    if data.len() >= 4 && &data[..4] == b"\x89PNG" {
-        "png"
-    } else if data.len() >= 3 && &data[..3] == b"\xFF\xD8\xFF" {
-        "jpg"
-    } else if data.len() >= 4
-        && &data[..4] == b"RIFF"
-        && data.len() >= 12
-        && &data[8..12] == b"WEBP"
-    {
-        "webp"
-    } else if data.len() >= 3 && &data[..3] == b"GIF" {
-        "gif"
-    } else if data.len() >= 2 && &data[..2] == b"BM" {
-        "bmp"
-    } else {
-        "png" // default
-    }
-}
-
-fn vision_ocr(url: Option<&str>, path: Option<&str>, lang: &str) -> Result<String, String> {
-    let data = load_source(url, path)?;
-    let ext = guess_mime(&data);
-
-    // P0-27: previously `cordis_ocr_<pid>.<ext>` — concurrent callers within
-    // the same process clobber each other's file, so agent A reads agent B's
-    // image. Append a monotonic in-process counter + a nanosecond timestamp
-    // so every filename is unique.
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let tmp_dir = std::env::temp_dir();
-    let tmp_path = tmp_dir.join(format!(
-        "cordis_ocr_{}_{seq:x}_{nanos:x}.{ext}",
-        std::process::id()
-    ));
-    std::fs::write(&tmp_path, &data).map_err(|e| format!("write temp file: {e}"))?;
-
-    // Run tesseract
-    let child = Command::new("tesseract")
-        .arg(&tmp_path)
-        .arg("stdout")
-        .arg("-l")
-        .arg(lang)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("spawn tesseract (is it installed?): {e}"))?;
-
-    let output = child
-        .wait_with_output()
-        .map_err(|e| format!("wait tesseract: {e}"))?;
-
-    // Clean up temp file
-    let _ = std::fs::remove_file(&tmp_path);
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("tesseract failed: {stderr}"));
-    }
-
-    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
-
-    if text.is_empty() {
-        return Err(
-            "tesseract returned no text (maybe no text in image, or language pack missing)"
-                .to_string(),
-        );
-    }
-
-    Ok(text)
-}
-
-// ---------------------------------------------------------------------------
-// vision_describe — OpenAI-compatible vision API
-// ---------------------------------------------------------------------------
-
-/// How many tokens the vision model may spend. A reasoning-capable model
-/// spends part of this on `reasoning_content` before writing `content`; with
-/// the old 1024 budget a detailed image exhausted it and the reply came back
-/// with an empty `content` (finish_reason=length), which looked like "the
-/// model saw nothing".
-fn vision_max_tokens() -> u32 {
-    std::env::var("VISION_MAX_TOKENS")
-        .ok()
-        .and_then(|value| value.trim().parse::<u32>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(4096)
-}
-
-/// Pull the answer out of a vision API response, or explain why there is none.
-fn describe_text_from_response(body: &str) -> Result<String, String> {
-    let json: Value =
-        serde_json::from_str(body).map_err(|e| format!("parse response JSON: {e}"))?;
-    let choice = &json["choices"][0];
-    let text = choice["message"]["content"]
-        .as_str()
-        .unwrap_or_default()
-        .trim()
-        .to_string();
-    if !text.is_empty() {
-        return Ok(text);
-    }
-    let finish = choice["finish_reason"].as_str().unwrap_or("unknown");
-    let reasoning_chars = choice["message"]["reasoning_content"]
-        .as_str()
-        .map(str::chars)
-        .map(Iterator::count)
-        .unwrap_or(0);
-    Err(format!(
-        "vision model returned an empty answer (finish_reason={finish}, \
-         reasoning_chars={reasoning_chars}, max_tokens={}); raise VISION_MAX_TOKENS or retry",
-        vision_max_tokens()
-    ))
-}
-
-fn vision_describe(
-    url: Option<&str>,
-    path: Option<&str>,
-    prompt: &str,
-) -> Result<(String, String), String> {
-    let api_key = std::env::var("OPENAI_API_KEY")
-        .or_else(|_| std::env::var("VISION_API_KEY"))
-        .map_err(|_| "OPENAI_API_KEY or VISION_API_KEY environment variable not set".to_string())?;
-
-    let base_url = std::env::var("OPENAI_BASE_URL")
-        .or_else(|_| std::env::var("VISION_BASE_URL"))
-        .unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
-
-    let model = std::env::var("VISION_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string());
-
-    let data = load_source(url, path)?;
-    let mime = guess_mime(&data);
-    let data_url = format!(
-        "data:image/{};base64,{}",
-        mime,
-        base64::engine::general_purpose::STANDARD.encode(&data)
-    );
-
-    let body = json!({
-        "model": model,
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": prompt
-                    },
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": data_url,
-                            "detail": "auto"
-                        }
-                    }
-                ]
-            }
-        ],
-        "max_tokens": vision_max_tokens()
-    });
-
-    let body_str = serde_json::to_string(&body).map_err(|e| format!("serialize request: {e}"))?;
-
-    let resp = ureq::AgentBuilder::new()
-        .timeout(Duration::from_secs(API_TIMEOUT_SECS))
-        .build()
-        .post(&format!("{base_url}/chat/completions"))
-        .set("Authorization", &format!("Bearer {api_key}"))
-        .set("Content-Type", "application/json")
-        .send_string(&body_str)
-        .map_err(|e| format!("API request: {e}"))?;
-
-    let status = resp.status();
-    let mut resp_body = String::new();
-    resp.into_reader()
-        .read_to_string(&mut resp_body)
-        .map_err(|e| format!("read response: {e}"))?;
-
-    if status != 200 {
-        return Err(format!("API error ({status}): {resp_body}"));
-    }
-
-    let text = describe_text_from_response(&resp_body)?;
-
-    Ok((text, model))
-}
-
-#[cfg(test)]
-mod describe_response_tests {
-    use super::{describe_text_from_response, vision_max_tokens};
-
-    // A reasoning model can exhaust the token budget before writing `content`.
-    // That must be an error, not a successful empty description — an empty
-    // "ok" made the assistant believe it had no visual information at all.
-    #[test]
-    fn empty_content_is_an_error_that_explains_why() {
-        let body = r#"{"choices":[{"finish_reason":"length","message":{"role":"assistant","content":"","reasoning_content":"thinking..."}}]}"#;
-        let err = describe_text_from_response(body).expect_err("empty content must fail");
-        assert!(err.contains("finish_reason=length"), "err: {err}");
-        assert!(err.contains("VISION_MAX_TOKENS"), "err: {err}");
-        assert!(
-            err.contains(&format!("max_tokens={}", vision_max_tokens())),
-            "err: {err}"
-        );
-    }
-
-    #[test]
-    fn non_empty_content_is_returned_trimmed() {
-        let body =
-            r#"{"choices":[{"finish_reason":"stop","message":{"content":"  一只猫在键盘上  "}}]}"#;
-        assert_eq!(
-            describe_text_from_response(body).expect("content"),
-            "一只猫在键盘上"
-        );
-    }
-
-    #[test]
-    fn malformed_response_is_reported() {
-        let err = describe_text_from_response("not json").expect_err("must fail");
-        assert!(err.contains("parse response JSON"), "err: {err}");
-        // A response with no `choices` at all is an empty answer, not a panic.
-        let err = describe_text_from_response("{}").expect_err("must fail");
-        assert!(err.contains("empty answer"), "err: {err}");
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
-fn handle(req: &VisionRequest) -> Result<VisionResponse, String> {
-    match req.node_id.as_str() {
-        "vision_ocr" => {
-            let lang = req.lang.as_deref().unwrap_or("chi_sim+eng");
-            match vision_ocr(req.url.as_deref(), req.path.as_deref(), lang) {
-                Ok(text) => Ok(VisionResponse {
-                    ok: true,
-                    node_id: "vision_ocr".to_string(),
-                    text: Some(text),
-                    truncated: None,
-                    model: None,
-                    error: None,
-                }),
-                Err(e) => Ok(VisionResponse {
-                    ok: false,
-                    node_id: "vision_ocr".to_string(),
-                    text: None,
-                    truncated: None,
-                    model: None,
-                    error: Some(e),
-                }),
-            }
-        }
-        "vision_describe" => {
-            let prompt = req
-                .prompt
-                .as_deref()
-                .unwrap_or("Describe this image in detail. What do you see? Reply in Chinese if the image contains Chinese text or context.");
-            match vision_describe(req.url.as_deref(), req.path.as_deref(), prompt) {
-                Ok((text, model)) => Ok(VisionResponse {
-                    ok: true,
-                    node_id: "vision_describe".to_string(),
-                    text: Some(text),
-                    truncated: None,
-                    model: Some(model),
-                    error: None,
-                }),
-                Err(e) => Ok(VisionResponse {
-                    ok: false,
-                    node_id: "vision_describe".to_string(),
-                    text: None,
-                    truncated: None,
-                    model: None,
-                    error: Some(e),
-                }),
-            }
-        }
-        other => Err(format!("unknown node_id: {other}")),
-    }
+#[derive(Debug, Deserialize)]
+struct NodeRequest {
+    node_id: String,
+}
+
+fn api_handle(req: PluginRequest) -> PluginResponse {
+    // The plugin declares no nodes any more, so every payload gets the same
+    // structured in-band failure the old dispatcher returned for an unknown
+    // node_id. A malformed payload keeps its parse-error message.
+    let error = match serde_json::from_str::<NodeRequest>(&req.payload) {
+        Ok(request) => format!("unknown node_id: {}", request.node_id),
+        Err(e) => format!("vision plugin: {e}"),
+    };
+    json_response(&json!({ "ok": false, "node_id": "error", "error": error }))
 }
 
 // ---------------------------------------------------------------------------
@@ -533,87 +225,13 @@ fn handle(req: &VisionRequest) -> Result<VisionResponse, String> {
 // ---------------------------------------------------------------------------
 
 fn docs_value() -> cordis_plugin_sdk::PluginDocs {
-    plugin_docs(
-        "vision",
-        "vision",
-        "0.1.0",
-        None,
-        vec![
-            task_node_doc(
-                "vision_ocr",
-                "Run tesseract OCR on an image to extract text. Supply the image with either `url` (downloaded over HTTP) or `path` (a local file under the system temp directory); provide exactly one of them. Requires tesseract installed on the system. Default language: chi_sim+eng.",
-                json!({
-                    "type": "object",
-                    "required": ["node_id"],
-                    "properties": {
-                        "node_id": { "type": "string", "const": "vision_ocr" },
-                        "url": { "type": "string", "description": "Image URL to OCR (provide url or path, not both)" },
-                        "path": { "type": "string", "description": "Absolute path to a local image file. Must be located under the system temp directory. Provide url or path, not both." },
-                        "lang": { "type": "string", "description": "Tesseract language code (default: chi_sim+eng)" }
-                    }
-                }),
-                json!({
-                    "type": "object",
-                    "properties": {
-                        "ok": { "type": "boolean" },
-                        "text": { "type": ["string", "null"] },
-                        "error": { "type": ["string", "null"] }
-                    }
-                }),
-                &["reads image from url or local temp path", "runs tesseract OCR"],
-                &["tesseract not installed", "network error", "language pack missing", "no text in image", "path outside temp dir"],
-            )
-            .with_agent_accessible(),
-            task_node_doc(
-                "vision_describe",
-                "Send an image to an OpenAI-compatible vision API (default: gpt-4o-mini) for AI-powered description. Supply the image with either `url` (downloaded over HTTP) or `path` (a local file under the system temp directory); provide exactly one of them. Requires OPENAI_API_KEY (or VISION_API_KEY) env var. Supports OPENAI_BASE_URL for custom endpoints.",
-                json!({
-                    "type": "object",
-                    "required": ["node_id"],
-                    "properties": {
-                        "node_id": { "type": "string", "const": "vision_describe" },
-                        "url": { "type": "string", "description": "Image URL to analyze (provide url or path, not both)" },
-                        "path": { "type": "string", "description": "Absolute path to a local image file. Must be located under the system temp directory. Provide url or path, not both." },
-                        "prompt": { "type": "string", "description": "Custom prompt for the vision model" }
-                    }
-                }),
-                json!({
-                    "type": "object",
-                    "properties": {
-                        "ok": { "type": "boolean" },
-                        "text": { "type": ["string", "null"] },
-                        "model": { "type": ["string", "null"] },
-                        "error": { "type": ["string", "null"] }
-                    }
-                }),
-                &["reads image from url or local temp path", "sends to OpenAI-compatible vision API"],
-                &["API key not set", "network error", "rate limited", "API quota exceeded", "image too large", "path outside temp dir"],
-            )
-            .with_agent_accessible(),
-        ],
-    None
-    )
+    // No agent-callable nodes: native image input covers "look at the picture",
+    // and the download/local-read helpers above are internal plumbing.
+    plugin_docs("vision", "vision", "0.1.0", None, Vec::new(), None)
 }
 
 fn abi_fingerprint_value() -> AbiFingerprint {
     AbiFingerprint::current_build("crate_vision_v1", "api_v2")
-}
-
-fn api_handle(req: PluginRequest) -> PluginResponse {
-    match serde_json::from_str::<VisionRequest>(&req.payload)
-        .map_err(|e| format!("vision plugin: {e}"))
-        .and_then(|r| handle(&r))
-    {
-        Ok(resp) => json_response(&resp),
-        Err(e) => json_response(&VisionResponse {
-            ok: false,
-            node_id: "error".to_string(),
-            text: None,
-            truncated: None,
-            model: None,
-            error: Some(e),
-        }),
-    }
 }
 
 export_plugin_api! {
