@@ -1,0 +1,298 @@
+//! The seam between the agent loop and the host.
+//!
+//! Everything here is interface: the traits a channel/host implements, and the
+//! data crossing the boundary. The loop itself lives elsewhere so the kernel can
+//! stay a scheduler + loader — nothing in this module decides policy.
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use crate::agent_tools::SessionCaller;
+use crate::config::LlmApiConfig;
+use crate::core::error::RuntimeError;
+
+pub trait AgentToolHost {
+    fn agent_runtime_status(&self) -> Result<Value, RuntimeError>;
+    fn agent_list_plugins(&self) -> Result<Value, RuntimeError>;
+    fn agent_list_nodes(&self) -> Result<Value, RuntimeError>;
+    fn agent_kernel_status(&self) -> Result<Value, RuntimeError>;
+    fn agent_kernel_issues(&self) -> Result<Value, RuntimeError>;
+    /// Sessions that are alive right now, so one session can address another.
+    ///
+    /// Default: none. A host without a session map (the loop's test doubles)
+    /// simply has nothing to list.
+    fn agent_live_sessions(&self) -> Vec<AgentSessionStatus> {
+        Vec::new()
+    }
+    /// Deliver a message into another live session's inbox.
+    ///
+    /// Default: refused. Only a real host can route between sessions; a double
+    /// says so instead of pretending.
+    fn agent_send_to_session(
+        &self,
+        _session_id: &str,
+        _input: &str,
+    ) -> Result<Value, RuntimeError> {
+        Err(RuntimeError::Invariant {
+            message: "this host cannot route messages between sessions".to_string(),
+        })
+    }
+    fn agent_reload_runtime(&self, plugin_path: &str) -> Result<Value, RuntimeError>;
+    fn agent_build_plugins(&self, plugin_name: &str) -> Result<Value, RuntimeError>;
+    /// Collect system_hint strings from all loaded plugins. The Agent's
+    /// system prompt should include these so that plugin-specific usage
+    /// conventions (e.g. chat mode vs suspend for a messaging plugin) are
+    /// injected automatically without hardcoding them in the kernel.
+    fn agent_plugin_hints(&self) -> Vec<String>;
+    fn agent_invoke_plugin(
+        &self,
+        plugin_path: &str,
+        node_id: &str,
+        payload_json: Value,
+    ) -> Result<Value, RuntimeError>;
+    /// 把本轮的渠道元数据注入插件 payload（`__meta`）。
+    ///
+    /// 默认原样返回：只有真实 host 才有"这一轮是谁在说话"的概念，测试用的
+    /// 假 host 不必实现。模型自己塞进 payload 的 `__meta` 会被真实实现覆盖，
+    /// 所以插件可以把它当可信身份用于鉴权。
+    fn inject_turn_meta(&self, _session_id: &str, payload: Value) -> Value {
+        payload
+    }
+    fn agent_execute_target(
+        &self,
+        node_fqn: &str,
+        payload_json: Value,
+    ) -> Result<Value, RuntimeError>;
+    fn agent_read_file(
+        &self,
+        path: &str,
+        offset: Option<usize>,
+        limit: Option<usize>,
+    ) -> Result<Value, RuntimeError>;
+    fn agent_list_directory(&self, path: &str) -> Result<Value, RuntimeError>;
+    /// 把一张**已被请求体预算剥成占位符**的图片取回来（`view_image` 的后端）。
+    ///
+    /// `path` 是占位符里给出的 `data/media/<sha256>` 相对路径，`sha256` 是
+    /// 摘要前缀，二选一。返回 `(相对路径, image_url content part)`：part 由
+    /// 调用方挂到下一次请求上，路径原样回给模型。
+    fn agent_view_image(
+        &self,
+        path: Option<&str>,
+        sha256: Option<&str>,
+    ) -> Result<(String, Value), RuntimeError>;
+    fn agent_search_code(&self, pattern: &str, path: Option<&str>) -> Result<Value, RuntimeError>;
+    fn agent_write_file(&self, path: &str, content: &str) -> Result<Value, RuntimeError>;
+    fn agent_replace_in_file(
+        &self,
+        path: &str,
+        find: &str,
+        replace: &str,
+    ) -> Result<Value, RuntimeError>;
+    fn agent_run_command(&self, command: &str) -> Result<Value, RuntimeError>;
+    fn agent_revert_changes(&self) -> Result<Value, RuntimeError>;
+    fn agent_delete_file(&self, path: &str) -> Result<Value, RuntimeError>;
+    fn agent_rename_file(&self, path: &str, new_path: &str) -> Result<Value, RuntimeError>;
+    fn agent_move_file(&self, path: &str, new_path: &str) -> Result<Value, RuntimeError>;
+    fn agent_copy_file(&self, path: &str, new_path: &str) -> Result<Value, RuntimeError>;
+    fn agent_compact_context(&self, session_id: &str) -> Result<Value, RuntimeError>;
+    fn agent_append_file(&self, path: &str, content: &str) -> Result<Value, RuntimeError>;
+    fn agent_run_plugin_test(&self, command: Option<&str>) -> Result<Value, RuntimeError>;
+    fn agent_request_iteration(
+        &self,
+        plugin_path: &str,
+        instruction: &str,
+    ) -> Result<Value, RuntimeError>;
+    /// Promote a staged (blocked) iteration. The approval *policy* is the
+    /// channel plugin's: it reports the capability per session, the kernel only
+    /// enforces it.
+    fn agent_approve_iteration(
+        &self,
+        session_id: &str,
+        iteration_id: &str,
+    ) -> Result<Value, RuntimeError>;
+    fn agent_create_plugin(
+        &self,
+        name: &str,
+        description: Option<&str>,
+    ) -> Result<Value, RuntimeError>;
+    fn agent_send_warning_to_test_groups(&self, message: &str);
+    /// O批: persona overlay text for the given soul scope, if any.
+    /// Default None keeps non-runtime hosts (tests) working unchanged.
+    fn agent_soul_overlay(&self, _soul_key: &str) -> Option<String> {
+        None
+    }
+    /// P4: caller role flags for `session_id`, when the host tracks them.
+    /// `None` = host cannot tell (no restriction applied).
+    fn agent_session_caller(&self, _session_id: &str) -> Option<SessionCaller> {
+        None
+    }
+    /// O批: update the soul for a scope key. The KEY IS NOT LLM-SUPPLIED —
+    /// callers must pass the current session's own soul_key so one user
+    /// can never edit another user's persona.
+    fn agent_set_soul(
+        &self,
+        _soul_key: &str,
+        _persona: Option<&str>,
+        _profile: Option<&str>,
+    ) -> Result<Value, RuntimeError> {
+        Err(RuntimeError::InvalidArgument {
+            message: "soul storage is not available on this host".to_string(),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct AgentSessionStatus {
+    pub kind: String,
+    pub provider: String,
+    pub model: String,
+    pub completed_turns: usize,
+    pub stored_messages: usize,
+    pub transcript_events: usize,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct AgentReply {
+    pub response_id: Option<String>,
+    pub content: String,
+    pub tool_events: Vec<AgentToolEvent>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct AgentToolEvent {
+    pub name: String,
+    pub arguments: Value,
+    pub ok: bool,
+    #[serde(default)]
+    pub output: Option<Value>,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+impl AgentToolEvent {
+    /// Whether this call actually delivered something.
+    ///
+    /// A channel tool reports delivery failure inside its payload while the call
+    /// itself succeeded — `{"ok":true,"result":{"payload":{"ok":false,…}}}` when
+    /// OneBot refuses the connection. Counting that as a sent message reports a
+    /// delivery that never happened and puts text in history the room never saw.
+    pub fn delivered(&self) -> bool {
+        if !self.ok {
+            return false;
+        }
+        self.output
+            .as_ref()
+            .and_then(|output| output.get("result"))
+            .and_then(|result| result.get("payload"))
+            .and_then(|payload| payload.get("ok"))
+            .and_then(Value::as_bool)
+            // No payload verdict: the call's own ok stands.
+            .unwrap_or(true)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AgentTranscriptEntry {
+    User {
+        content: String,
+    },
+    Assistant {
+        content: String,
+        #[serde(default)]
+        response_id: Option<String>,
+        /// What the model reasoned before answering, when the provider sent it.
+        ///
+        /// Kept in the transcript because the live history is pruned: without
+        /// this, "why did it say that" is unanswerable the moment the turn
+        /// falls out of the window.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning: Option<String>,
+    },
+    Tool {
+        name: String,
+        arguments: Value,
+        ok: bool,
+        #[serde(default)]
+        output: Option<Value>,
+        #[serde(default)]
+        error: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentToolExecutionSummary {
+    pub total_calls: usize,
+    pub successful_calls: usize,
+    pub failed_calls: usize,
+    pub tool_names: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AgentToolSpec {
+    pub name: &'static str,
+    pub description: &'static str,
+    pub parameters: Value,
+}
+
+pub trait AgentBackend {
+    type Host: AgentToolHost + ?Sized;
+    fn system_prompt(&self) -> String;
+    fn tool_specs(&self) -> Vec<AgentToolSpec>;
+    fn execute_tool(&mut self, name: &str, arguments: Value) -> Result<Value, RuntimeError>;
+    fn host(&self) -> &Self::Host;
+    fn terminal_tool_reply(&self, _name: &str, _output: &Value) -> Option<String> {
+        None
+    }
+    fn tool_scope_label(&self) -> String {
+        "agent".to_string()
+    }
+    /// 取走本轮 `view_image` 攒下的待附加图片（`image_url` content part）。
+    ///
+    /// 默认空：只有能读内容寻址缓存的 backend 才会往里放东西。Agent 循环在
+    /// 每次工具轮结束后取一次，把图片挂到下一次请求上再清空。
+    fn take_attached_images(&mut self) -> Vec<Value> {
+        Vec::new()
+    }
+}
+
+pub trait LlmProvider {
+    /// `sink` 为 `Some` 时 provider **可以**逐段推送增量；忽略它也必须正确工作，
+    /// 权威结果始终是本函数的返回值。
+    fn complete(
+        &self,
+        body: Value,
+        sink: Option<std::sync::Arc<dyn crate::llm_sink::TokenSink>>,
+        transport: cordis_plugin_sdk::llm::LlmTransportConfig,
+    ) -> Result<LlmCompletionParts, RuntimeError>;
+}
+
+#[derive(Debug)]
+pub struct LlmCompletionParts {
+    pub message: cordis_plugin_sdk::llm::LlmMessage,
+    pub response_id: Option<String>,
+    pub finish_reason: Option<String>,
+}
+
+/// Serializable snapshot of a session, for crash recovery.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentSessionSnapshot {
+    pub kind: String,
+    pub config: LlmApiConfig,
+    pub history: Vec<Value>,
+    pub transcript: Vec<AgentTranscriptEntry>,
+    pub completed_turns: usize,
+    pub estimated_tokens: usize,
+    pub reasoning_only_strikes: usize,
+    /// Missing from snapshots written before the retry existed.
+    #[serde(default)]
+    pub empty_response_strikes: usize,
+    #[serde(default)]
+    pub require_end_tool: bool,
+    #[serde(default)]
+    pub no_end_strikes: usize,
+    pub unknown_tool_strikes: usize,
+    /// `#[serde(default)]` keeps pre-O批 snapshots deserializable.
+    #[serde(default)]
+    pub soul_key: String,
+}

@@ -85,7 +85,7 @@ The point is to make the architecture legible before making it maximally flexibl
 Load and interact with the runtime:
 
 ```bash
-cargo run -p cordis-runtime -- serve fixtures
+cargo run -p cordis-cli -- serve fixtures
 ```
 
 Inside `serve`, three modes are available:
@@ -123,7 +123,7 @@ $ help
 One-shot CLI invocation:
 
 ```bash
-cargo run -p cordis-runtime -- execute expr::expr_entry --payload-json='{"expression":"1 + 2 * 3"}'
+cargo run -p cordis-cli -- execute expr::expr_entry --payload-json='{"expression":"1 + 2 * 3"}'
 ```
 
 ## Repository Shape
@@ -132,7 +132,9 @@ cargo run -p cordis-runtime -- execute expr::expr_entry --payload-json='{"expres
 .
 ├── crates/
 │   ├── cordis-plugin-sdk/   # shared ABI, docs types, NodeType, export helpers
-│   └── cordis-runtime/      # runtime, plugin, context, execution, kernel, service, agent
+│   ├── cordis-runtime/      # runtime, plugin, context, execution, kernel, service, agent
+│   ├── cordis-tooling/      # build system: prepare/rebuild artifacts, index/docs refresh
+│   └── cordis-cli/          # process entry (binary name unchanged: cordis-runtime)
 ├── config.example/          # checked-in config templates
 ├── config/                  # local runtime/kernel/LLM/plugin YAML config (gitignored)
 ├── docs/                    # architecture and maintenance docs

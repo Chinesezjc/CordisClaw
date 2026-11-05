@@ -29,7 +29,7 @@ use cordis_runtime::core::models::{
 };
 use cordis_runtime::plugin::dynamic::LoadedDylibApi;
 use cordis_runtime::plugin::invoke::{
-    invoke_registered_plugin, unregister_task_library, PluginInvoker,
+    invoke_registered_plugin, retained_task_library_count, unregister_task_library, PluginInvoker,
 };
 use cordis_runtime::plugin::registry::PluginRegistry;
 use std::collections::BTreeSet;
@@ -284,10 +284,10 @@ fn loaded_dylib_invoke_preserves_explicit_node_id() {
     assert_eq!(value.get("ok").and_then(|v| v.as_bool()), Some(true));
 }
 
-// A Task node keeps its dylib alive after invocation. `vision_ocr` is a Task
+// A Task node keeps its dylib alive after invocation. `feishu_send` is a Task
 // node; called with an empty payload it fails fast inside the plugin
-// ("either url or path is required") *before* touching the network or
-// tesseract, so it deterministically exercises the is_task keep-alive branch.
+// ("target is required for feishu_send …") *before* touching the network or
+// any config, so it deterministically exercises the is_task keep-alive branch.
 // The fixture exports no `_cordis_create_service`, so the vtable sub-branch is
 // skipped (documented as unreachable without a custom service dylib).
 #[test]
@@ -295,12 +295,12 @@ fn loaded_dylib_task_node_keeps_alive_and_returns() {
     let registry = PluginRegistry::default();
     register_loaded_dylib(
         &registry,
-        "vision",
-        &artifacts_dir().join(format!("vision{}", std::env::consts::DLL_SUFFIX)),
+        "feishu",
+        &artifacts_dir().join(format!("feishu{}", std::env::consts::DLL_SUFFIX)),
     );
 
-    let resp = invoke_registered_plugin(&registry, "vision", "vision_ocr", "{}".to_string())
-        .expect("vision_ocr should return a structured error, not fail the invoke");
+    let resp = invoke_registered_plugin(&registry, "feishu", "feishu_send", "{}".to_string())
+        .expect("feishu_send should return a structured error, not fail the invoke");
     let value: serde_json::Value = serde_json::from_str(&resp.payload).expect("json");
     // Plugin-level failure is reported in-band (ok:false), not as a
     // RuntimeError — the invoke itself succeeded.
@@ -308,7 +308,7 @@ fn loaded_dylib_task_node_keeps_alive_and_returns() {
 
     // Invoking the same Task node again must still succeed (re-entrant
     // keep-alive replaces the handle in-place rather than erroring).
-    let resp2 = invoke_registered_plugin(&registry, "vision", "vision_ocr", "{}".to_string())
+    let resp2 = invoke_registered_plugin(&registry, "feishu", "feishu_send", "{}".to_string())
         .expect("second invoke");
     assert!(!resp2.payload.is_empty());
 }
@@ -327,13 +327,13 @@ fn unregister_task_library_is_idempotent_noop_for_unknown() {
     let registry = PluginRegistry::default();
     register_loaded_dylib(
         &registry,
-        "vision",
-        &artifacts_dir().join(format!("vision{}", std::env::consts::DLL_SUFFIX)),
+        "feishu",
+        &artifacts_dir().join(format!("feishu{}", std::env::consts::DLL_SUFFIX)),
     );
-    let _ = invoke_registered_plugin(&registry, "vision", "vision_ocr", "{}".to_string())
+    let _ = invoke_registered_plugin(&registry, "feishu", "feishu_send", "{}".to_string())
         .expect("task invoke");
-    unregister_task_library("vision");
-    unregister_task_library("vision");
+    unregister_task_library("feishu");
+    unregister_task_library("feishu");
 }
 
 // ---------------------------------------------------------------------------
@@ -1059,6 +1059,43 @@ fn task_service_vtable_start_is_invoked() {
     std::env::remove_var("COV_SVC_OUT");
     // Release the keep-alive dylib handle registered by the Task invoke.
     unregister_task_library("svcmini");
+}
+
+// A reload replaces a Task-node plugin's keep-alive handle. The old dylib must
+// be *retained*, not dlclosed: a plugin's stop handler is not required to join
+// its threads, and unmapping a dylib that a live thread still executes is
+// exactly how `reload /qq` used to SIGSEGV (its message poller never stopped).
+#[test]
+#[serial_test::serial]
+fn task_library_handles_are_retained_instead_of_unloaded() {
+    let Some((temp, dylib)) = build_svcmini_dylib() else {
+        return; // skip: toolchain unavailable
+    };
+    let registry = PluginRegistry::default();
+    register_loaded_dylib(&registry, "svcmini", &dylib);
+    std::env::set_var("COV_SVC_OUT", temp.path().join("retain.marker"));
+
+    let before = retained_task_library_count();
+    // Two Task invokes: the second replaces the keep-alive handle.
+    invoke_registered_plugin(&registry, "svcmini", "svc_task", "{}".to_string())
+        .expect("first task invoke");
+    invoke_registered_plugin(&registry, "svcmini", "svc_task", "{}".to_string())
+        .expect("second task invoke");
+    assert!(
+        retained_task_library_count() > before,
+        "the replaced handle must be retained, not dropped"
+    );
+
+    // The reload path calls this; it must retire the handle instead of freeing it.
+    let before_unregister = retained_task_library_count();
+    unregister_task_library("svcmini");
+    assert_eq!(
+        retained_task_library_count(),
+        before_unregister + 1,
+        "unregister_task_library must retain the mapping"
+    );
+
+    std::env::remove_var("COV_SVC_OUT");
 }
 
 // The null-vtable sub-branch: a Task node whose `_cordis_create_service`

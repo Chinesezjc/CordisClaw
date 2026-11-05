@@ -10,6 +10,16 @@
 | `crates/cordis-plugin-sdk/src/llm.rs` | kernel↔provider 插件的 LLM 契约类型；只以 JSON 过 payload，不改 vtable 布局故无需 ABI bump | `LlmCompletionRequest`、`LlmCompletion`、`LlmMessage`、`LlmStreamFrame` |
 | `crates/cordis-plugin-sdk/src/workflow.rs` | 非宏 async workflow 作者接口：受控 await 原语、wait 句柄、runtime 提交/轮询/取消边界 | `WorkflowRuntime`、`WorkflowSession`、`WaitSpec`、`WaitFuture` |
 
+## 1b. 构建系统 (`crates/cordis-tooling`)
+
+构建逻辑已整体移出 runtime（5.2.48）：runtime 只保留加载期要用的 artifact 读取与 `PluginBuilder` 接缝，本 crate 由 `cordis-cli` 在启动时注入。
+
+| 文件 | 职责定位 | 关键入口 |
+|---|---|---|
+| `crates/cordis-tooling/src/lib.rs` | 构建系统全部实现（原 `cordis-runtime/src/plugin/tooling.rs`）：manifest/metadata 解析、dirty 指纹与 input probe、构建锁、`cargo` 子进程（超时/offline/proxy 清理）、`artifacts/index.json` 生成、`interfaces.json` 回写、dylib 工件构建；并通过 `CargoBuilder` 实现 runtime 的 `PluginBuilder` 接缝 | `prepare_artifacts()`、`rebuild_fixture_artifacts()`、`rebuild_plugin_workspace()`、`refresh_artifact_index()`、`CargoBuilder` |
+| `crates/cordis-tooling/tests/tooling.rs` | 构建系统验收（原 `crates/cordis-runtime/tests/tooling.rs`）：docs 回写、artifact index 刷新、dirty/增量/全量重建、构建锁、cargo 失败臂 | `refresh_artifact_index_*`、`prepare_artifacts_*` |
+| `crates/cordis-tooling/tests/support/mod.rs` | 本 crate 集成测试的 fixtures 根与宿主原生 dylib 探针 | `fixtures_root()`、`linux_dylib_artifacts_available()` |
+
 ## 2. Core 层 (`crates/cordis-runtime/src/core`)
 
 | 文件 | 职责定位 | 关键入口 |
@@ -24,12 +34,12 @@
 | 文件 | 职责定位 | 关键入口 |
 |---|---|---|
 | `crates/cordis-runtime/src/plugin/abi.rs` | runtime 侧 ABI 聚合：重导出共享函数表契约，并保留 host 本地元数据/trait | `RustPluginApiV2` |
-| `crates/cordis-runtime/src/plugin/artifact.rs` | 预构建工件索引读取与哈希计算 | `load_artifact_index()`、`sha256_file()` |
+| `crates/cordis-runtime/src/plugin/artifact.rs` | 预构建工件索引读取与哈希计算；加载期 docs 读取（dylib `docs()` / JSON artifact）与进程存活探活 | `load_artifact_index()`、`sha256_file()`、`read_plugin_docs()`、`lock_pid_is_live()` |
+| `crates/cordis-runtime/src/plugin/builder.rs` | 构建系统的唯一 trait 接缝：runtime 只调用、嵌入方注入实现；未安装时的统一错误文本 | `PluginBuilder`、`PreparedArtifacts`、`install_plugin_builder()`、`plugin_builder()`、`missing_builder_error()` |
 | `crates/cordis-runtime/src/plugin/dynamic.rs` | 动态库加载与固定符号解析 | `LoadedDylibApi::open()` |
 | `crates/cordis-runtime/src/plugin/package.rs` | Phase A：按 direct-children metadata 递归发现并做 fail-fast 校验 | `PackageResolver::resolve()` |
 | `crates/cordis-runtime/src/plugin/loader.rs` | Phase B：实例化、注册、required/optional 传播与禁回退策略；dylib 在 dlopen 前做宿主 target_triple 预检（不匹配 → AbiMismatch），docs 读取失败 → SymbolMissing 不回落；shell 与整棵 expr 子树现在都走 dylib 路径 | `Loader::load()` |
 | `crates/cordis-runtime/src/plugin/invoke.rs` | 运行时插件调用桥：按统一入口执行 dylib 或外部进程插件 | `PluginInvoker::invoke()` |
-| `crates/cordis-runtime/src/plugin/tooling.rs` | 工具化命令：从 dylib `docs()` 回写 `interfaces.json`，并刷新 artifact index 的哈希 | `sync_plugin_docs()`、`refresh_artifact_index()` |
 | `crates/cordis-runtime/src/plugin/registry.rs` | 插件/节点注册中心，维护唯一性与状态 | `PluginRegistry`、`NodeRegistry` |
 | `crates/cordis-runtime/src/plugin/mod.rs` | Plugin 模块导出聚合 | `pub mod abi/artifact/...` |
 
@@ -68,7 +78,26 @@
 
 > **已删除**: `kernel/loop.rs`（9 阶段 Petri Net 替换为 agent loop）、`kernel/planner.rs`（独立 LLM 路径合并到 AgentSession）
 
-## 6b. Agent 层 (`crates/cordis-runtime/src/agent.rs`)
+## 6a. 插件迭代管线 (`crates/cordis-agent/src/iteration/`)
+
+> 2026-11-01 从 kernel 迁入。kernel 只保留接缝（`iteration_api::IterationRunner`）
+> 与工具层需要的报告词汇（`crates/cordis-runtime/src/iteration/report.rs`）。
+
+| 文件 | 职责 | 关键入口 |
+|---|---|---|
+| `policy.rs` | 纯策略：晋升判定、canary 探针比较、副作用/测试变更分类 | `promotion_verdict()`、`canary_probe_verdict()`、`test_changes()`、`node_declares_side_effects_in()` |
+| `driver.rs` | 迭代状态机：agent → edit → rebuild → stage → verify → canary → promote/rollback；泛型于 `IterationHost` | `iterate_plugins()`、`run_plugin_canary()`、`finalize_plugin_iteration()` |
+| `backend.rs` | 迭代 agent 后端：scaffold/edit/verify 工具集与状态记录 | `PluginIterationAgentBackend`、`impl AgentBackend` |
+| `mod.rs` | 接缝实现 | `CargoIterationRunner`（cli 安装） |
+
+## 6b. Agent 层 (`crates/cordis-agent/src/`、`crates/cordis-runtime/src/agent_tools.rs`、`agent_toolchain.rs`)
+
+> **2026-10-31 已移出 kernel**：循环本体（`AgentSession`、`ShellAgentSession`、
+> DSML 解析、prompt 组装、工具分派）住在 `crates/cordis-agent/src/imp.rs`；
+> 接缝留在 `crates/cordis-runtime/src/agent_api.rs`（traits + DTOs）与
+> `agent_loop.rs`（`AgentLoop` + 注册表 + 测试替身）。kernel 不再默认安装任何
+> loop——由 `cordis-cli` 调 `cordis_agent::install()` 注入，与
+> `install_plugin_builder` 同一形状。
 
 > **不含 LLM 传输**：与供应商对话的 HTTP/SSE、鉴权、重试、wire format 已整体
 > 移出到 `fixtures/plugins/llm_openai`（2026-08-05）。本层只构造请求体、经
@@ -76,7 +105,11 @@
 
 | 职责定位 | 关键入口 |
 |---|---|
-| 统一的 LLM agent 会话：SSE 流解析、tool-calling loop（最多 96 轮，overflow 保留 partial history P1-31）、重试/超时管理（4xx 不重试 P1-35，budget 合并 P1-37）、消息历史（compact 后重算 estimated_tokens P1-32、UTF-8 char/byte 一致 P1-33）、orphan-User cleanup（P2-31）、内核自省工具（get_runtime_status/list_plugins/list_nodes/get_kernel_status/get_kernel_issues）的 tool call/result 不写入跨轮持久化历史（5.2.36）；两个后端：`RuntimeShellAgentBackend`（20 个交互式工具；P2-1 边界收敛待做）和 `PluginIterationAgentBackend`（scaffold/edit/verify 工具集） | `AgentSession::respond` / `respond_inner`、`ShellAgentSession`、`AgentToolHost` trait、`PendingSessionAction`（P1-25 self-lookup 侧信道） |
+| 统一的 LLM agent 会话：SSE 流解析、tool-calling loop（最多 96 轮，overflow 保留 partial history P1-31）、重试/超时管理（4xx 不重试 P1-35，budget 合并 P1-37）、消息历史（compact 后重算 estimated_tokens P1-32、UTF-8 char/byte 一致 P1-33、图片按 base64 折 token 计入 estimate 且压缩摘要保留图片标记 5.2.57）、快照落盘前把内联图片换成带缓存地址的占位符（5.2.57/3.38，模型可用 `view_image` 取回）、orphan-User cleanup（P2-31）、内核自省工具（get_runtime_status/list_plugins/list_nodes/get_kernel_status/get_kernel_issues）的 tool call/result 不写入跨轮持久化历史（5.2.36）；两个后端：`RuntimeShellAgentBackend`（22 个交互式工具，含 `view_image`；P2-1 边界收敛待做）和 `PluginIterationAgentBackend`（scaffold/edit/verify 工具集） | `AgentSession::respond` / `respond_inner`、`ShellAgentSession`、`AgentToolHost` trait、`estimate_message_tokens()`、`summarize_message_content()`、`PendingSessionAction`（P1-25 self-lookup 侧信道） |
+| `image_input.rs`：入站图片 → 多模态 content part（纯逻辑 + 注入式 fetch）。魔数嗅探 png/jpeg/webp/gif、base64 内联、按 `runtime.images` 预算做张数/字节/超时裁剪并把跳过原因交给调用方打日志；`user_content_with_images` 在无图时返回纯字符串，保证既有请求体形状不变（5.2.41） | `plan_image_parts()`、`plan_for_settings()`、`user_content_with_images()`、`fetch_http()` |
+| `image_budget.rs`：**发送前**的图片字节预算（纯函数，无 I/O）。输入按时间顺序的 messages + 字节预算，从最老的图片开始规划剥离直到总量 ≤ 预算；base64 大小按 `ceil(len/3)*4` 精确折算，占位符带 `sha256:<前8位>`、`<W>x<H> <fmt>`（拿不到就退化）与可取回的 `path data/media/<sha256>`。调用方是 agent 的 `respond_inner` 与 `to_snapshot`（落盘前 `strip_inline_images` 剥掉全部 base64），占位符就地写回 history（5.2.56 字节预算 / 5.2.57 快照） | `plan_image_omissions()`、`apply_image_omissions()`、`enforce_image_budget()`、`strip_inline_images()`、`image_parts_bytes()`、`INLINE_IMAGE_BUDGET_BYTES` |
+| `image_cache.rs`：**内容寻址**的图片缓存 `data/media/<sha256>`。下载入口 `caching_fetcher` 把入站图片原始字节落盘（已存在则跳过写，临时文件 + rename）；`load_part` 支撑 `view_image` 工具把被预算剥成占位符的图片按路径或摘要前缀取回成 `image_url` part（只接受 `data/media/<name>` 形状，绝对路径/`..`/子目录一律拒）。测试全部注入临时目录，不碰仓库 `data/`（3.38） | `store()`、`fetch_and_cache()`、`caching_fetcher()`、`load_part()`、`digest_hex()`、`placeholder_path()`、`MEDIA_DIR` |
+| `agent_toolchain.rs`：请求前的 tool_calls 链**整形**（纯函数，无 I/O）。两遍：先按「紧跟其后的连续 `tool` 消息」过滤 assistant 的 `tool_calls`、整条删除一个结果都没有的 assistant；再删除 `tool_call_id` 已无人引用的孤儿 `tool` 消息。幂等，返回 `RepairStats` 供 `[tool_calls repair]` 诊断行使用（5.2.40：链破形会让 DeepSeek 整轮 400） | `sanitize_tool_chains()`、`RepairStats` |
 
 ## 6c. Soul 与指令路由（`crates/cordis-runtime/src/soul.rs`、`command_router.rs`）
 
@@ -102,7 +135,14 @@
 | `crates/cordis-runtime/src/testutil.rs` | `#[cfg(test)]` 单测公共工具：全 crate 唯一的 euid 特权探测点，root 下声明式跳过文件权限故障注入测试 | `skip_if_root()` |
 | `crates/cordis-runtime/src/llm_sink.rs` | token 流式旁路的 host 侧：TCP 回环监听、行分隔 JSON 帧解析、握手校验。帧判定与超时判定抽成纯函数以便全覆盖 | `SinkListener::bind()`、`classify_frame()`、`TokenSink` |
 | `crates/cordis-runtime/src/host.rs` | 常驻宿主：持有当前快照、执行原子 `reload`、保留 kernel 状态并清理 retired snapshots；snapshot 目录 GC（跨 hash 目录孤儿回收 + 退出时回收 live staged root） | `RuntimeHost::boot()`、`RuntimeHost::reload()`、`cleanup_orphaned_snapshot_roots()`、`RuntimeHost::cleanup_live_snapshot()` |
-| `crates/cordis-runtime/src/main.rs` | 运行入口示例（加载 fixtures、`serve`、通用 invoke、导出图 HTML、运行 auto-update、`gc` 回收 snapshot 目录） | `main()` |
+| `crates/cordis-runtime/src/guard.rs` | 确定性危机护栏（Kernel 机制；纯函数、无 I/O、无 LLM）：高精度危机短语命中即返回固定求助回复（含真实热线），`FLOOD_WARNING` 供 prompt 层复用；模糊片段（`想死你了`/`笑死`）刻意不收，避免误报把日常玩笑当求助。重复/刷屏判定已交给 prompt 层 conduct 规则，本模块不再有代码级 repeat brake | `crisis_reply()`、`CRISIS_REPLY`、`FLOOD_WARNING` |
+| `crates/cordis-cli/src/main.rs` | 进程入口（原 `crates/cordis-runtime/src/main.rs`）：加载 fixtures、`serve`、通用 invoke、导出图 HTML、运行 auto-update、`gc` 回收 snapshot 目录、prepare/sync/refresh 构建命令；`main()` 一开始把 `cordis_tooling::CargoBuilder` 注入 runtime 的 `PluginBuilder` 接缝 | `main()` |
+
+## 8b. CLI crate (`crates/cordis-cli`)
+
+| 文件 | 职责定位 | 关键入口 |
+|---|---|---|
+| `crates/cordis-cli/Cargo.toml` | 二进制 crate：`[[bin]] name = "cordis-runtime"`（**二进制名保持不变**，systemd / `scripts/*.sh` 仍按 `target/debug/cordis-runtime` 调用）；依赖 `cordis-runtime` + `cordis-tooling` | — |
 
 ## 9. Runtime 测试 (`crates/cordis-runtime/tests`)
 
@@ -113,7 +153,7 @@
 | `crates/cordis-runtime/tests/actor_executor.rs` | Actor 执行批次和并发上限行为 | `actor_executor_respects_parallel_limit_and_order` |
 | `crates/cordis-runtime/tests/auto_update.rs` | 自动更新行为验收：应用成功保留、验证失败回滚、路径越界拒绝 | `auto_update_*` |
 | `crates/cordis-runtime/tests/shell_plugin.rs` | 外部 shell 插件验收：loader 注册、generic invoke、交互 REPL、Expr 分发 | `shell_plugin_*` |
-| `crates/cordis-runtime/tests/tooling.rs` | 工具链验收：自动回写 `interfaces.json` 与自动刷新 artifact index 哈希 | `sync_plugin_docs_*`、`refresh_artifact_index_*` |
+| `crates/cordis-tooling/tests/tooling.rs` | 工具链验收（5.2.48 起随构建系统搬到 `cordis-tooling`）：构建时自动回写 `interfaces.json` 与自动刷新 artifact index 哈希 | `refresh_artifact_index_*`、`prepare_artifacts_*` |
 | `crates/cordis-runtime/tests/runtime_host.rs` | RuntimeHost 验收：boot/invoke、reload、旧快照隔离、agent 迭代、rollback、canary、serve CLI、YAML config | `runtime_host_*`、`serve_mode_*` |
 
 > **已删除**: `tests/kernel.rs`（测试已删除的 SelfIterationKernel）、`tests/llm_auto_update.rs`（测试已删除的 LlmPatchPlanner）
@@ -181,6 +221,16 @@
 | `fixtures/plugins/qq/src/lib.rs` | QQ 适配器 dylib：OneBot v11 协议。入站事件接收走 HTTP webhook（`qq_serve`）+ WebSocket 服务器（`qq_ws_serve` Task 节点，tungstenite 接收线上 Napcat ws 端口事件，bind 竞态修复 + stop 关 listener/join 线程优雅停机）；出站走 HTTP API，支持 configure/send/status/call | `onebot_call()`、`parse_target()`、`handle_qq_ws_serve()`、`start_ws_server()` |
 | `fixtures/plugins/qq/tests/test_parse.rs` | QQ 适配器测试：target 字符串解析 | `test_parse_target` |
 
+## 13.0 QQ 官方协议插件 (`fixtures/plugins/qqbot`)
+
+| 文件 | 职责 | 关键项 |
+| --- | --- | --- |
+| `fixtures/plugins/qqbot/src/lib.rs` | 节点分发与 ABI 出口：configure/status/serve/send/ask/send_media/download_media/set_policy/ack | `api_handle()`、`handle_serve()`、`handle_send()` |
+| `fixtures/plugins/qqbot/src/api.rs` | token 缓存 + 401 重试一次 + 业务 API 调用 | `Api::access_token()`、`Api::call()` |
+| `fixtures/plugins/qqbot/src/gateway.rs` / `serve.rs` | 官方 Gateway 线协议与帧循环（Identify/Resume/Heartbeat → 门控 → `agent_trigger`） | `decode_frame()`、`pump()`、`AgentSink` |
+| `fixtures/plugins/qqbot/src/inbound.rs` / `envelope.rs` | 事件解析、白黑名单与 @ 门控、去重、kernel envelope | `parse_message_event()`、`build_envelope()`、`Dedup` |
+| `fixtures/plugins/qqbot/src/outbound.rs` / `interaction.rs` / `media.rs` | 分片/流式/按钮消息，交互回执，富媒体收发与下载 | `send_text()`、`send_stream_c2c()`、`send_media()` |
+
 ## 13.1 Feishu Adapter 插件 (`fixtures/plugins/feishu`)
 
 | 文件 | 职责定位 | 关键入口 |
@@ -204,7 +254,8 @@
 2. `core/models.rs` + `core/error.rs`（runtime 专属契约与错误语义）。
 3. `plugin/package.rs` + `plugin/loader.rs`（发现/解析/实例化主流程）。
 4. `context/mod.rs`（注入链、overlay、CAS、Service 生命周期）。
-5. `agent.rs`（agent 会话、工具执行、轮次编排；传输已移出至 provider 插件）。
+5. `crates/cordis-agent/src/imp.rs`（agent 会话、工具执行、轮次编排）+
+   `crates/cordis-runtime/src/agent_api.rs`（接缝：trait 与 DTO）。
 6. `host.rs`（常驻宿主、iterate_plugins、自迭代 agent loop、回退安全网）。
 7. `execution/net.rs` + `execution/gate.rs` + `execution/actor.rs`（执行语义骨架）。
 8. `execution/engine.rs` + `execution/router.rs`（CPN 运行时集成与子图边界）。
@@ -212,3 +263,11 @@
 10. `tests/*.rs`（对照验收场景）。
 
 ## 16. 覆盖声明
+
+## `crates/cordis-runtime/src/host/`
+
+`host/mod.rs` holds the runtime host (loader wiring, snapshots, reload,
+plugin-iteration pipeline, agent tools). Its test modules live in sibling
+files (`*_tests.rs`, `tests.rs`) so the production file stays navigable;
+`crates/cordis-runtime/src/iteration/` holds the iteration policy and result
+reporting as pure functions.

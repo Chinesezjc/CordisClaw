@@ -1,24 +1,91 @@
-//! Vision plugin — OCR and AI image understanding.
+//! Vision plugin — image source helpers.
 //!
-//! Nodes:
-//! - `vision_ocr`      — download an image URL and run tesseract OCR (text extraction)
-//! - `vision_describe` — send image to OpenAI-compatible vision API for AI description
+//! The agent now consumes images natively: the kernel downloads a batch's
+//! image URLs and inlines them as `image_url` content parts (see
+//! `cordis_runtime::image_input`). There is therefore no reason to ship the old
+//! "send the image to a vision model / OCR it, then read the text" nodes, and
+//! this plugin no longer declares any node.
+//!
+//! What remains is the image-source layer those nodes were built on:
+//!
+//! - a short-lived, SSRF-guarded HTTP download with a URL→bytes cache;
+//! - a local-file reader restricted to the system temp directory and to the
+//!   kernel's content-addressed image cache (`data/media/<sha256>`), which is
+//!   where `[image omitted …]` placeholders point after the request byte budget
+//!   strips a picture.
+//!
+//! Both are `pub` library API (covered by the tests at the bottom) rather than
+//! agent-callable nodes: no node dispatches to them any more, so `pub` is what
+//! keeps them alive instead of dead code.
 //!
 //! Safety: only http/https URLs are allowed; localhost and private IPs blocked.
 
-use base64::Engine;
 use cordis_plugin_sdk::{
-    export_plugin_api, json_response, plugin_docs, task_node_doc, AbiFingerprint, PluginRequest,
-    PluginResponse,
+    export_plugin_api, json_response, plugin_docs, AbiFingerprint, PluginRequest, PluginResponse,
 };
-use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde::Deserialize;
+use serde_json::json;
+use std::collections::HashMap;
 use std::io::Read;
-use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::path::{Component, Path};
+use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
-const TIMEOUT_SECS: u64 = 10;
+/// Downloading a QQ CDN image is fast; the download timeout only has to cover
+/// the HTTP fetch now that inference no longer happens in this plugin.
+const DOWNLOAD_TIMEOUT_SECS: u64 = 10;
 const MAX_IMAGE_BYTES: usize = 20 * 1024 * 1024; // 20 MB
+
+// ---------------------------------------------------------------------------
+// Short-lived download cache
+// ---------------------------------------------------------------------------
+//
+// QQ/Tencent image links are signed and expire within minutes (and a given
+// link may be effectively one-shot). A follow-up question about the same
+// picture ("这张呢" / "这是谁") would otherwise re-download the same URL,
+// fail with HTTP 400, and lose the image the bot already saw. Cache the bytes
+// for a few minutes so replies stay consistent within one conversation.
+const URL_CACHE_TTL: Duration = Duration::from_secs(600);
+const URL_CACHE_CAPACITY: usize = 8;
+
+type UrlCache = Mutex<HashMap<String, (Vec<u8>, Instant)>>;
+
+static URL_CACHE: LazyLock<UrlCache> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn cache_lookup(
+    cache: &mut HashMap<String, (Vec<u8>, Instant)>,
+    url: &str,
+    now: Instant,
+) -> Option<Vec<u8>> {
+    match cache.get(url) {
+        Some((bytes, at)) if now.saturating_duration_since(*at) <= URL_CACHE_TTL => {
+            Some(bytes.clone())
+        }
+        Some(_) => {
+            cache.remove(url);
+            None
+        }
+        None => None,
+    }
+}
+
+fn cache_store(
+    cache: &mut HashMap<String, (Vec<u8>, Instant)>,
+    url: &str,
+    bytes: &[u8],
+    now: Instant,
+) {
+    if cache.len() >= URL_CACHE_CAPACITY && !cache.contains_key(url) {
+        if let Some(oldest) = cache
+            .iter()
+            .min_by_key(|(_, (_, at))| *at)
+            .map(|(key, _)| key.clone())
+        {
+            cache.remove(&oldest);
+        }
+    }
+    cache.insert(url.to_string(), (bytes.to_vec(), now));
+}
 
 // ---------------------------------------------------------------------------
 // SSRF guard (P0-22)
@@ -30,62 +97,27 @@ const MAX_IMAGE_BYTES: usize = 20 * 1024 * 1024; // 20 MB
 use cordis_net::check_url_safety;
 
 // ---------------------------------------------------------------------------
-// Request / Response
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Deserialize)]
-struct VisionRequest {
-    /// "vision_ocr" | "vision_describe"
-    node_id: String,
-
-    /// Image URL to download and process
-    #[serde(default)]
-    url: Option<String>,
-
-    /// Local image file path. Must resolve to a location inside the system
-    /// temp directory. Mutually exclusive with `url`.
-    #[serde(default)]
-    path: Option<String>,
-
-    /// For vision_describe: optional prompt override (default: "Describe this image in detail")
-    #[serde(default)]
-    prompt: Option<String>,
-
-    /// For vision_ocr: language override (default "chi_sim+eng")
-    #[serde(default)]
-    lang: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct VisionResponse {
-    ok: bool,
-    node_id: String,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    text: Option<String>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    truncated: Option<bool>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    model: Option<String>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<String>,
-}
-
-// ---------------------------------------------------------------------------
 // Image download
 // ---------------------------------------------------------------------------
 
-fn download_image(url_str: &str) -> Result<Vec<u8>, String> {
+/// Download an image over HTTP, reusing recently fetched bytes for the same
+/// URL so an expiring signed link is not fetched twice.
+pub fn download_image(url_str: &str) -> Result<Vec<u8>, String> {
+    // A repeat call for the same (expiring) link must reuse the bytes the bot
+    // already saw instead of a second download that may 400.
+    {
+        let mut cache = URL_CACHE.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(bytes) = cache_lookup(&mut cache, url_str, Instant::now()) {
+            return Ok(bytes);
+        }
+    }
     // P0-22: full SSRF check (see the module-level guard for coverage).
     // Note: `ureq::AgentBuilder` here does not follow redirects by default
     // for `.call()`, so a single check on `url_str` covers the wire path.
     check_url_safety(url_str)?;
 
     let resp = ureq::AgentBuilder::new()
-        .timeout(Duration::from_secs(TIMEOUT_SECS))
+        .timeout(Duration::from_secs(DOWNLOAD_TIMEOUT_SECS))
         .redirects(0) // block redirects; caller must re-issue if needed
         .build()
         .get(url_str)
@@ -116,6 +148,10 @@ fn download_image(url_str: &str) -> Result<Vec<u8>, String> {
         ));
     }
 
+    {
+        let mut cache = URL_CACHE.lock().unwrap_or_else(|p| p.into_inner());
+        cache_store(&mut cache, url_str, &bytes, Instant::now());
+    }
     Ok(bytes)
 }
 
@@ -123,24 +159,46 @@ fn download_image(url_str: &str) -> Result<Vec<u8>, String> {
 // Local file source (P2: consume feishu_fetch_resource temp files)
 // ---------------------------------------------------------------------------
 
-/// Read a local image file. Access is restricted to the system temp directory
-/// so callers can only hand off files that a trusted producer (e.g. the feishu
-/// plugin's `feishu_fetch_resource`) placed under `std::env::temp_dir()`.
+/// Read a local image file.
 ///
-/// On macOS both `/tmp` and `/var/folders/...` are symlinks, so the requested
-/// path and the temp-dir prefix are each canonicalized before comparison.
-fn read_local_image(path: &str) -> Result<Vec<u8>, String> {
+/// Two allowed locations, both canonicalized before comparison:
+///
+/// - the system **temp directory**, where a trusted producer (e.g. the feishu
+///   plugin's `feishu_fetch_resource`) drops files;
+/// - the kernel's **content-addressed image cache** (`…/data/media/<sha256>`).
+///   When the request byte budget strips an inline picture it leaves
+///   `[image omitted …; path data/media/<sha256>]` in its place, so this is the
+///   address the agent hands back to reload the original bytes.
+///
+/// `..` is rejected before any filesystem work (so the error names the real
+/// cause) and symlinks are resolved by `canonicalize`, so a link that points
+/// outside both roots is refused like any other outside path.
+///
+/// On macOS both `/tmp` and `/var/folders/...` are symlinks, which is why the
+/// requested path and the temp-dir prefix are each canonicalized.
+pub fn read_local_image(path: &str) -> Result<Vec<u8>, String> {
+    if Path::new(path)
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        return Err(format!("path traversal is not allowed: {path}"));
+    }
+
     let real = std::fs::canonicalize(path).map_err(|e| format!("resolve path {path}: {e}"))?;
 
-    let temp_root = std::fs::canonicalize(std::env::temp_dir())
-        .map_err(|e| format!("resolve temp dir: {e}"))?;
-
-    if !real.starts_with(&temp_root) {
-        return Err(format!(
-            "path outside temp dir: {} (must be under {})",
-            real.display(),
-            temp_root.display()
-        ));
+    // The media cache is checked first: its files usually live outside the temp
+    // directory, and a `data/media` file inside the temp dir must still be
+    // recognized as a cache entry rather than as a trusted temp drop.
+    if !is_media_cache_file(&real) {
+        let temp_root = std::fs::canonicalize(std::env::temp_dir())
+            .map_err(|e| format!("resolve temp dir: {e}"))?;
+        if !real.starts_with(&temp_root) {
+            return Err(format!(
+                "path outside temp dir and data/media cache: {} (must be under {} or a data/media directory)",
+                real.display(),
+                temp_root.display()
+            ));
+        }
     }
 
     let meta = std::fs::metadata(&real).map_err(|e| format!("stat {}: {e}", real.display()))?;
@@ -154,10 +212,32 @@ fn read_local_image(path: &str) -> Result<Vec<u8>, String> {
     std::fs::read(&real).map_err(|e| format!("read {}: {e}", real.display()))
 }
 
+/// Is this canonical path a file sitting directly in a `data/media` directory?
+///
+/// Shape check rather than a configured root: the workspace root is not known to
+/// a plugin, and the cache is a convention (`data/media/<sha256>`) shared with
+/// the kernel's placeholder text. A subdirectory, a sibling `media/`, or a
+/// `data/` file all fail.
+fn is_media_cache_file(path: &Path) -> bool {
+    let Some(dir) = path.parent() else {
+        return false;
+    };
+    let Some(dir_name) = dir.file_name() else {
+        return false;
+    };
+    let Some(parent) = dir.parent() else {
+        return false;
+    };
+    let Some(parent_name) = parent.file_name() else {
+        return false;
+    };
+    dir_name == "media" && parent_name == "data"
+}
+
 /// Load image bytes from exactly one of `url` or `path`. Supplying both is an
 /// error; supplying neither is an error. `path` reads a local temp-dir file,
 /// `url` goes through the SSRF-guarded HTTP download.
-fn load_source(url: Option<&str>, path: Option<&str>) -> Result<Vec<u8>, String> {
+pub fn load_source(url: Option<&str>, path: Option<&str>) -> Result<Vec<u8>, String> {
     let url = url.map(str::trim).filter(|s| !s.is_empty());
     let path = path.map(str::trim).filter(|s| !s.is_empty());
     match (url, path) {
@@ -169,222 +249,23 @@ fn load_source(url: Option<&str>, path: Option<&str>) -> Result<Vec<u8>, String>
 }
 
 // ---------------------------------------------------------------------------
-// vision_ocr — tesseract
-// ---------------------------------------------------------------------------
-
-fn guess_mime(data: &[u8]) -> &'static str {
-    if data.len() >= 4 && &data[..4] == b"\x89PNG" {
-        "png"
-    } else if data.len() >= 3 && &data[..3] == b"\xFF\xD8\xFF" {
-        "jpg"
-    } else if data.len() >= 4
-        && &data[..4] == b"RIFF"
-        && data.len() >= 12
-        && &data[8..12] == b"WEBP"
-    {
-        "webp"
-    } else if data.len() >= 3 && &data[..3] == b"GIF" {
-        "gif"
-    } else if data.len() >= 2 && &data[..2] == b"BM" {
-        "bmp"
-    } else {
-        "png" // default
-    }
-}
-
-fn vision_ocr(url: Option<&str>, path: Option<&str>, lang: &str) -> Result<String, String> {
-    let data = load_source(url, path)?;
-    let ext = guess_mime(&data);
-
-    // P0-27: previously `cordis_ocr_<pid>.<ext>` — concurrent callers within
-    // the same process clobber each other's file, so agent A reads agent B's
-    // image. Append a monotonic in-process counter + a nanosecond timestamp
-    // so every filename is unique.
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let tmp_dir = std::env::temp_dir();
-    let tmp_path = tmp_dir.join(format!(
-        "cordis_ocr_{}_{seq:x}_{nanos:x}.{ext}",
-        std::process::id()
-    ));
-    std::fs::write(&tmp_path, &data).map_err(|e| format!("write temp file: {e}"))?;
-
-    // Run tesseract
-    let child = Command::new("tesseract")
-        .arg(&tmp_path)
-        .arg("stdout")
-        .arg("-l")
-        .arg(lang)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("spawn tesseract (is it installed?): {e}"))?;
-
-    let output = child
-        .wait_with_output()
-        .map_err(|e| format!("wait tesseract: {e}"))?;
-
-    // Clean up temp file
-    let _ = std::fs::remove_file(&tmp_path);
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("tesseract failed: {stderr}"));
-    }
-
-    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
-
-    if text.is_empty() {
-        return Err(
-            "tesseract returned no text (maybe no text in image, or language pack missing)"
-                .to_string(),
-        );
-    }
-
-    Ok(text)
-}
-
-// ---------------------------------------------------------------------------
-// vision_describe — OpenAI-compatible vision API
-// ---------------------------------------------------------------------------
-
-fn vision_describe(
-    url: Option<&str>,
-    path: Option<&str>,
-    prompt: &str,
-) -> Result<(String, String), String> {
-    let api_key = std::env::var("OPENAI_API_KEY")
-        .or_else(|_| std::env::var("VISION_API_KEY"))
-        .map_err(|_| "OPENAI_API_KEY or VISION_API_KEY environment variable not set".to_string())?;
-
-    let base_url = std::env::var("OPENAI_BASE_URL")
-        .or_else(|_| std::env::var("VISION_BASE_URL"))
-        .unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
-
-    let model = std::env::var("VISION_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string());
-
-    let data = load_source(url, path)?;
-    let mime = guess_mime(&data);
-    let data_url = format!(
-        "data:image/{};base64,{}",
-        mime,
-        base64::engine::general_purpose::STANDARD.encode(&data)
-    );
-
-    let body = json!({
-        "model": model,
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": prompt
-                    },
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": data_url,
-                            "detail": "auto"
-                        }
-                    }
-                ]
-            }
-        ],
-        "max_tokens": 1024
-    });
-
-    let body_str = serde_json::to_string(&body).map_err(|e| format!("serialize request: {e}"))?;
-
-    let resp = ureq::AgentBuilder::new()
-        .timeout(Duration::from_secs(TIMEOUT_SECS))
-        .build()
-        .post(&format!("{base_url}/chat/completions"))
-        .set("Authorization", &format!("Bearer {api_key}"))
-        .set("Content-Type", "application/json")
-        .send_string(&body_str)
-        .map_err(|e| format!("API request: {e}"))?;
-
-    let status = resp.status();
-    let mut resp_body = String::new();
-    resp.into_reader()
-        .read_to_string(&mut resp_body)
-        .map_err(|e| format!("read response: {e}"))?;
-
-    if status != 200 {
-        return Err(format!("API error ({status}): {resp_body}"));
-    }
-
-    let json: Value =
-        serde_json::from_str(&resp_body).map_err(|e| format!("parse response JSON: {e}"))?;
-
-    let text = json["choices"][0]["message"]["content"]
-        .as_str()
-        .ok_or_else(|| "unexpected API response format".to_string())?
-        .to_string();
-
-    Ok((text, model))
-}
-
-// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
-fn handle(req: &VisionRequest) -> Result<VisionResponse, String> {
-    match req.node_id.as_str() {
-        "vision_ocr" => {
-            let lang = req.lang.as_deref().unwrap_or("chi_sim+eng");
-            match vision_ocr(req.url.as_deref(), req.path.as_deref(), lang) {
-                Ok(text) => Ok(VisionResponse {
-                    ok: true,
-                    node_id: "vision_ocr".to_string(),
-                    text: Some(text),
-                    truncated: None,
-                    model: None,
-                    error: None,
-                }),
-                Err(e) => Ok(VisionResponse {
-                    ok: false,
-                    node_id: "vision_ocr".to_string(),
-                    text: None,
-                    truncated: None,
-                    model: None,
-                    error: Some(e),
-                }),
-            }
-        }
-        "vision_describe" => {
-            let prompt = req
-                .prompt
-                .as_deref()
-                .unwrap_or("Describe this image in detail. What do you see? Reply in Chinese if the image contains Chinese text or context.");
-            match vision_describe(req.url.as_deref(), req.path.as_deref(), prompt) {
-                Ok((text, model)) => Ok(VisionResponse {
-                    ok: true,
-                    node_id: "vision_describe".to_string(),
-                    text: Some(text),
-                    truncated: None,
-                    model: Some(model),
-                    error: None,
-                }),
-                Err(e) => Ok(VisionResponse {
-                    ok: false,
-                    node_id: "vision_describe".to_string(),
-                    text: None,
-                    truncated: None,
-                    model: None,
-                    error: Some(e),
-                }),
-            }
-        }
-        other => Err(format!("unknown node_id: {other}")),
-    }
+#[derive(Debug, Deserialize)]
+struct NodeRequest {
+    node_id: String,
+}
+
+fn api_handle(req: PluginRequest) -> PluginResponse {
+    // The plugin declares no nodes any more, so every payload gets the same
+    // structured in-band failure the old dispatcher returned for an unknown
+    // node_id. A malformed payload keeps its parse-error message.
+    let error = match serde_json::from_str::<NodeRequest>(&req.payload) {
+        Ok(request) => format!("unknown node_id: {}", request.node_id),
+        Err(e) => format!("vision plugin: {e}"),
+    };
+    json_response(&json!({ "ok": false, "node_id": "error", "error": error }))
 }
 
 // ---------------------------------------------------------------------------
@@ -392,85 +273,13 @@ fn handle(req: &VisionRequest) -> Result<VisionResponse, String> {
 // ---------------------------------------------------------------------------
 
 fn docs_value() -> cordis_plugin_sdk::PluginDocs {
-    plugin_docs(
-        "vision",
-        "vision",
-        "0.1.0",
-        None,
-        vec![
-            task_node_doc(
-                "vision_ocr",
-                "Run tesseract OCR on an image to extract text. Supply the image with either `url` (downloaded over HTTP) or `path` (a local file under the system temp directory); provide exactly one of them. Requires tesseract installed on the system. Default language: chi_sim+eng.",
-                json!({
-                    "type": "object",
-                    "required": ["node_id"],
-                    "properties": {
-                        "node_id": { "type": "string", "const": "vision_ocr" },
-                        "url": { "type": "string", "description": "Image URL to OCR (provide url or path, not both)" },
-                        "path": { "type": "string", "description": "Absolute path to a local image file. Must be located under the system temp directory. Provide url or path, not both." },
-                        "lang": { "type": "string", "description": "Tesseract language code (default: chi_sim+eng)" }
-                    }
-                }),
-                json!({
-                    "type": "object",
-                    "properties": {
-                        "ok": { "type": "boolean" },
-                        "text": { "type": ["string", "null"] },
-                        "error": { "type": ["string", "null"] }
-                    }
-                }),
-                &["reads image from url or local temp path", "runs tesseract OCR"],
-                &["tesseract not installed", "network error", "language pack missing", "no text in image", "path outside temp dir"],
-            ),
-            task_node_doc(
-                "vision_describe",
-                "Send an image to an OpenAI-compatible vision API (default: gpt-4o-mini) for AI-powered description. Supply the image with either `url` (downloaded over HTTP) or `path` (a local file under the system temp directory); provide exactly one of them. Requires OPENAI_API_KEY (or VISION_API_KEY) env var. Supports OPENAI_BASE_URL for custom endpoints.",
-                json!({
-                    "type": "object",
-                    "required": ["node_id"],
-                    "properties": {
-                        "node_id": { "type": "string", "const": "vision_describe" },
-                        "url": { "type": "string", "description": "Image URL to analyze (provide url or path, not both)" },
-                        "path": { "type": "string", "description": "Absolute path to a local image file. Must be located under the system temp directory. Provide url or path, not both." },
-                        "prompt": { "type": "string", "description": "Custom prompt for the vision model" }
-                    }
-                }),
-                json!({
-                    "type": "object",
-                    "properties": {
-                        "ok": { "type": "boolean" },
-                        "text": { "type": ["string", "null"] },
-                        "model": { "type": ["string", "null"] },
-                        "error": { "type": ["string", "null"] }
-                    }
-                }),
-                &["reads image from url or local temp path", "sends to OpenAI-compatible vision API"],
-                &["API key not set", "network error", "rate limited", "API quota exceeded", "image too large", "path outside temp dir"],
-            ),
-        ],
-    None
-    )
+    // No agent-callable nodes: native image input covers "look at the picture",
+    // and the download/local-read helpers above are internal plumbing.
+    plugin_docs("vision", "vision", "0.1.0", None, Vec::new(), None)
 }
 
 fn abi_fingerprint_value() -> AbiFingerprint {
     AbiFingerprint::current_build("crate_vision_v1", "api_v2")
-}
-
-fn api_handle(req: PluginRequest) -> PluginResponse {
-    match serde_json::from_str::<VisionRequest>(&req.payload)
-        .map_err(|e| format!("vision plugin: {e}"))
-        .and_then(|r| handle(&r))
-    {
-        Ok(resp) => json_response(&resp),
-        Err(e) => json_response(&VisionResponse {
-            ok: false,
-            node_id: "error".to_string(),
-            text: None,
-            truncated: None,
-            model: None,
-            error: Some(e),
-        }),
-    }
 }
 
 export_plugin_api! {
@@ -500,13 +309,74 @@ mod tests {
 
     #[test]
     fn read_local_image_rejects_path_outside_temp_dir() {
-        // Cargo.toml lives in the crate directory, not the temp dir.
-        let outside = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml");
-        let err = read_local_image(outside).unwrap_err();
+        // The guard resolves symlinks before comparing, so the path has to
+        // exist *and* sit outside the temp dir. Fixture tests also run inside a
+        // temporary workspace copy, which makes the crate dir itself a temp
+        // path — so in that case fall back to an existing file outside the temp
+        // root. Writing a new file next to the temp root is not an option: on a
+        // CI runner that is `/`, which is not writable by the test user.
+        let temp_root = std::fs::canonicalize(std::env::temp_dir()).expect("resolve temp dir");
+        let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let outside = if manifest.starts_with(&temp_root) {
+            [std::env::var_os("HOME"), Some("/etc/hostname".into())]
+                .into_iter()
+                .flatten()
+                .map(std::path::PathBuf::from)
+                .find(|path| path.exists() && !path.starts_with(&temp_root))
+                .unwrap_or_else(|| manifest.join("Cargo.toml"))
+        } else {
+            manifest.join("Cargo.toml")
+        };
+        let err = read_local_image(outside.to_str().expect("utf-8 path")).unwrap_err();
         assert!(
             err.contains("path outside temp dir"),
             "expected temp-dir rejection, got: {err}"
         );
+    }
+
+    #[test]
+    fn read_local_image_rejects_parent_dir_components() {
+        // Rejected before any filesystem work, so a non-existent path still
+        // reports the real cause instead of "resolve path".
+        let err = read_local_image("data/media/../../etc/passwd").unwrap_err();
+        assert!(
+            err.contains("path traversal is not allowed"),
+            "expected traversal rejection, got: {err}"
+        );
+    }
+
+    /// 占位符里的 `data/media/<sha256>` 是缓存地址：内核把被预算剥掉的图片
+    /// 原始字节存在那里，这里必须能读回来。
+    #[test]
+    fn read_local_image_reads_data_media_cache_files() {
+        let dir = unique_temp_path("media_cache");
+        let media = dir.join("data").join("media");
+        std::fs::create_dir_all(&media).expect("create data/media");
+        let path = media.join("ab12cd34");
+        let payload: &[u8] = b"\x89PNG\r\n\x1a\nrecovered image bytes";
+        std::fs::write(&path, payload).expect("write cached image");
+
+        let result = read_local_image(path.to_str().expect("utf-8 path"));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(result.expect("cache file reads back"), payload);
+    }
+
+    /// 只有**直接**落在 `data/media/` 里的文件算缓存地址：同名目录、子目录、
+    /// 兄弟 `media/` 与 `data/` 下的文件都不算。
+    #[test]
+    fn is_media_cache_file_requires_a_file_directly_in_data_media() {
+        assert!(is_media_cache_file(Path::new(
+            "/workspace/data/media/ab12cd34"
+        )));
+        assert!(!is_media_cache_file(Path::new("/workspace/data/media")));
+        assert!(!is_media_cache_file(Path::new(
+            "/workspace/data/media/nested/ab12cd34"
+        )));
+        assert!(!is_media_cache_file(Path::new("/workspace/media/ab12cd34")));
+        assert!(!is_media_cache_file(Path::new("/workspace/data/ab12cd34")));
+        assert!(!is_media_cache_file(Path::new("/ab12cd34")));
+        assert!(!is_media_cache_file(Path::new("")));
     }
 
     #[test]
@@ -558,5 +428,45 @@ mod tests {
         let _ = std::fs::remove_file(&path);
 
         assert_eq!(result.expect("load_source path branch"), payload);
+    }
+
+    #[test]
+    fn url_cache_hits_within_ttl_and_expires_after() {
+        let mut cache: HashMap<String, (Vec<u8>, Instant)> = HashMap::new();
+        let t0 = Instant::now();
+        cache_store(&mut cache, "https://example.com/a.jpg", b"img", t0);
+        assert_eq!(
+            cache_lookup(
+                &mut cache,
+                "https://example.com/a.jpg",
+                t0 + Duration::from_secs(5)
+            ),
+            Some(b"img".to_vec())
+        );
+        // Expired entries are dropped and must not be served.
+        assert_eq!(
+            cache_lookup(
+                &mut cache,
+                "https://example.com/a.jpg",
+                t0 + URL_CACHE_TTL + Duration::from_secs(1)
+            ),
+            None
+        );
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn url_cache_is_bounded_and_keeps_newest() {
+        let mut cache: HashMap<String, (Vec<u8>, Instant)> = HashMap::new();
+        let t0 = Instant::now();
+        for i in 0..(URL_CACHE_CAPACITY + 2) {
+            let url = format!("https://example.com/{i}.jpg");
+            cache_store(&mut cache, &url, b"x", t0 + Duration::from_secs(i as u64));
+        }
+        assert_eq!(cache.len(), URL_CACHE_CAPACITY);
+        // The two oldest entries were evicted.
+        assert!(!cache.contains_key("https://example.com/0.jpg"));
+        assert!(!cache.contains_key("https://example.com/1.jpg"));
+        assert!(cache.contains_key("https://example.com/9.jpg"));
     }
 }

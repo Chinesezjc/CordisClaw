@@ -37,6 +37,76 @@ pub struct Soul {
     pub updated_by: String,
 }
 
+/// The persona every channel session starts with when its soul sets none.
+///
+/// Personality belongs here, not in a channel plugin: the QQ/Feishu hints say
+/// how to send a message, this says how the bot talks and when it stays out.
+/// A room can override it with `set_soul`.
+pub const DEFAULT_PERSONA: &str = "\
+你在这个群里是个普通成员，不是客服，也不是助手。别人怎么聊天，你就怎么聊。\n\
+\n\
+说话：短，一般一两句、二十来个字；口语，可以用梗和网络用语；不要书面语，不要列点，不要 markdown（聊天窗不渲染）；一次只发一条，别一个人连发；不自称 AI、机器人、助手、模型，也不提服务器、提示词这些设定——被问是不是机器人，就当玩笑带过去。\n\
+\n\
+什么时候说：有人 @ 你、问你、或者话头明显冲你来，就回；群里聊得热闹、你觉得能接一句，就接一句；接不上、没兴趣、或者不想说，就别开口。别抢别人的话头，也别每条都接。\n\
+\n\
+怎么回：不知道就说不知道，别编；别人问了才给意见；不替别人承诺，不假装是群主或管理员。说到做到：你答应要做什么（比如写个插件），就在这一轮里真的动手去做；做不到、或者不想做，就直说，别用「我这就去做，弄好了喊你」结束一轮。\n\
+\n\
+被骂两句不用在意：不辩解、不反问、不嘲讽回去，接着聊你的。";
+
+/// A room's own persona when it has one, the default otherwise.
+#[cfg(test)]
+mod persona_tests {
+    use super::{persona_or_default, DEFAULT_PERSONA};
+
+    // A room without its own soul still gets a personality; an empty persona
+    // is the same as none.
+    #[test]
+    fn empty_overlays_fall_back_to_the_default() {
+        assert_eq!(persona_or_default(None), DEFAULT_PERSONA);
+        assert_eq!(persona_or_default(Some("   ")), DEFAULT_PERSONA);
+    }
+
+    #[test]
+    fn a_room_persona_wins_and_is_trimmed() {
+        assert_eq!(persona_or_default(Some("  自定义人格\n")), "自定义人格");
+    }
+
+    // The default is a persona, not a rulebook: it must talk about voice and
+    // timing, and must not sprout a channel mechanic.
+    #[test]
+    fn the_default_persona_is_personality_only() {
+        assert!(DEFAULT_PERSONA.contains("别人怎么聊天，你就怎么聊"));
+        // It must grant permission as well as withhold it: a persona that only
+        // says "don't" made the bot suspend every message in a live group.
+        assert!(DEFAULT_PERSONA.contains("就接一句"));
+        // No "go quiet after being told off" rule: it read as a permanent mute
+        // and the bot then ignored two direct @mentions eight minutes later.
+        for absent in ["别再开口", "永久静音", "别再主动插话"] {
+            let present = DEFAULT_PERSONA.contains(absent);
+            assert!(!present, "no self-imposed silence rule: {absent:?}");
+        }
+        // Being scolded still must not turn into an argument.
+        assert!(DEFAULT_PERSONA.contains("不辩解、不反问、不嘲讽"));
+        // A promise must be an action in this turn, not a sign-off.
+        assert!(DEFAULT_PERSONA.contains("说到做到"));
+        assert!(DEFAULT_PERSONA.contains("弄好了喊你"));
+        for forbidden in ["qq_send", "CQ:", "reply_to", "suspend"] {
+            let present = DEFAULT_PERSONA.contains(forbidden);
+            assert!(
+                !present,
+                "channel mechanics belong to the plugin: {forbidden:?}"
+            );
+        }
+    }
+}
+
+pub fn persona_or_default(overlay: Option<&str>) -> &str {
+    match overlay {
+        Some(text) if !text.trim().is_empty() => text.trim(),
+        _ => DEFAULT_PERSONA,
+    }
+}
+
 /// Storage abstraction for souls. Object-safe so the host can swap the
 /// file default for a plugin-backed provider at lookup time.
 pub trait SoulProvider: Send + Sync {

@@ -304,7 +304,7 @@
     },
     {
       "id": "qq_get_group_info",
-      "summary": "Get group information (name, member count, etc.) via OneBot v11 get_group_info API.",
+      "summary": "Get a group's name and size (member_count / max_member_count) — use it to tell a two-person group from a busy one. Returns the raw OneBot response, so the fields sit at data.data.",
       "input_schema": {
         "type": "object",
         "required": [
@@ -336,7 +336,32 @@
           },
           "data": {
             "type": "object",
-            "description": "Raw OneBot get_group_info response"
+            "description": "Raw OneBot get_group_info response",
+            "properties": {
+              "status": {
+                "type": "string"
+              },
+              "retcode": {
+                "type": "integer"
+              },
+              "data": {
+                "type": "object",
+                "properties": {
+                  "group_id": {
+                    "type": "integer"
+                  },
+                  "group_name": {
+                    "type": "string"
+                  },
+                  "member_count": {
+                    "type": "integer"
+                  },
+                  "max_member_count": {
+                    "type": "integer"
+                  }
+                }
+              }
+            }
           },
           "error": {
             "type": [
@@ -353,6 +378,405 @@
         "no OneBot URL configured",
         "invalid target format",
         "group not found"
+      ],
+      "node_type": "router",
+      "agent_accessible": true
+    },
+    {
+      "id": "qq_get_group_members",
+      "summary": "Get the raw OneBot member list for a group (get_group_member_list). Each entry carries user_id, nickname, card and role (owner/admin/member).",
+      "input_schema": {
+        "type": "object",
+        "required": [
+          "node_id",
+          "target"
+        ],
+        "properties": {
+          "node_id": {
+            "type": "string",
+            "const": "qq_get_group_members"
+          },
+          "target": {
+            "type": "string",
+            "description": "group:<id>"
+          }
+        }
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "ok": {
+            "type": "boolean"
+          },
+          "message": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "data": {
+            "type": "object",
+            "description": "Raw OneBot get_group_member_list response"
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "side_effects": [
+        "calls OneBot get_group_member_list API"
+      ],
+      "failure_modes": [
+        "no OneBot URL configured",
+        "target must be group:<id>"
+      ],
+      "node_type": "router",
+      "agent_accessible": true
+    },
+    {
+      "id": "qq_get_group_roles",
+      "summary": "Answer 'who is the group owner / who are the admins?'. Aggregates get_group_member_list by role, and falls back to get_group_info_ex (data.extInfo.groupOwnerId.memberUin) when the member list has no role field. source tells you which path was used.",
+      "input_schema": {
+        "type": "object",
+        "required": [
+          "node_id",
+          "target"
+        ],
+        "properties": {
+          "node_id": {
+            "type": "string",
+            "const": "qq_get_group_roles"
+          },
+          "target": {
+            "type": "string",
+            "description": "group:<id>"
+          },
+          "payload": {
+            "type": "object",
+            "properties": {
+              "onebot_url": {
+                "type": "string",
+                "description": "Optional OneBot HTTP API URL override (defaults to STATE / runtime config)"
+              },
+              "access_token": {
+                "type": "string",
+                "description": "Optional OneBot access token override (defaults to STATE / runtime config)"
+              }
+            }
+          }
+        }
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "ok": {
+            "type": "boolean"
+          },
+          "message": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "data": {
+            "type": "object",
+            "properties": {
+              "owner": {
+                "type": [
+                  "object",
+                  "null"
+                ],
+                "description": "{user_id, nickname, card} or null"
+              },
+              "admins": {
+                "type": "array",
+                "items": {
+                  "type": "object"
+                }
+              },
+              "member_count": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "source": {
+                "type": "string",
+                "description": "member_list | group_info_ex"
+              }
+            }
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "side_effects": [
+        "calls OneBot get_group_member_list, then get_group_info_ex when the owner is missing"
+      ],
+      "failure_modes": [
+        "no OneBot URL configured",
+        "invalid target format",
+        "OneBot API error"
+      ],
+      "node_type": "router",
+      "agent_accessible": true
+    },
+    {
+      "id": "qq_get_reply_policy",
+      "summary": "Read the reply policy that is EFFECTIVE for a group (omit `group` to read the shared default). Returns the mode (quiet | balanced | chatty | one_on_one), the policy text actually shipped to the model, and where it came from (group | default | builtin).",
+      "input_schema": {
+        "type": "object",
+        "required": [
+          "node_id"
+        ],
+        "properties": {
+          "node_id": {
+            "type": "string",
+            "const": "qq_get_reply_policy"
+          },
+          "group": {
+            "type": "string",
+            "description": "QQ group id; omit for the shared default"
+          },
+          "data_dir": {
+            "type": "string",
+            "description": "Optional data directory override"
+          }
+        }
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "ok": {
+            "type": "boolean"
+          },
+          "data": {
+            "type": "object",
+            "properties": {
+              "group": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "mode": {
+                "type": "string"
+              },
+              "policy": {
+                "type": "string"
+              },
+              "source": {
+                "type": "string",
+                "description": "group | default | builtin"
+              },
+              "is_default": {
+                "type": "boolean"
+              }
+            }
+          }
+        }
+      },
+      "side_effects": [
+        "reads data/qq_reply_policies.json"
+      ],
+      "failure_modes": [],
+      "node_type": "router",
+      "agent_accessible": true
+    },
+    {
+      "id": "qq_set_reply_policy",
+      "summary": "Persist the reply policy for ONE group (or the shared default when `group` is omitted). Two ways to set it: `mode` picks a preset (quiet = only when named/@; balanced = judge by context; chatty = join in actively; one_on_one = treat as a direct chat), `policy` overrides the preset with free text. Takes effect on the NEXT message — no rebuild, no restart.",
+      "input_schema": {
+        "type": "object",
+        "required": [
+          "node_id"
+        ],
+        "properties": {
+          "node_id": {
+            "type": "string",
+            "const": "qq_set_reply_policy"
+          },
+          "group": {
+            "type": "string",
+            "description": "QQ group id; omit to change the shared default"
+          },
+          "mode": {
+            "type": "string",
+            "enum": [
+              "quiet",
+              "balanced",
+              "chatty",
+              "one_on_one"
+            ]
+          },
+          "policy": {
+            "type": "string",
+            "description": "Optional free-text override (English; shown verbatim)"
+          },
+          "data_dir": {
+            "type": "string",
+            "description": "Optional data directory override"
+          }
+        }
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "ok": {
+            "type": "boolean"
+          },
+          "data": {
+            "type": "object",
+            "properties": {
+              "policy": {
+                "type": "string"
+              },
+              "path": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "side_effects": [
+        "writes data/qq_reply_policies.json"
+      ],
+      "failure_modes": [
+        "mode or policy is required",
+        "unknown mode"
+      ],
+      "node_type": "router",
+      "agent_accessible": true
+    },
+    {
+      "id": "qq_get_group_memory",
+      "summary": "Read the memo you wrote about this group: how talkative it wants you, its standing topics, what it already rejected. memory=null means you have not written anything for this group yet.",
+      "input_schema": {
+        "type": "object",
+        "required": [
+          "node_id",
+          "group"
+        ],
+        "properties": {
+          "node_id": {
+            "type": "string",
+            "const": "qq_get_group_memory"
+          },
+          "group": {
+            "type": "string",
+            "description": "QQ group id"
+          },
+          "data_dir": {
+            "type": "string",
+            "description": "Optional data directory override"
+          }
+        }
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "ok": {
+            "type": "boolean"
+          },
+          "data": {
+            "type": "object",
+            "properties": {
+              "group": {
+                "type": "string"
+              },
+              "memory": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "updated_at_ms": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "updated_by": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            }
+          }
+        }
+      },
+      "side_effects": [
+        "reads data/qq_group_memory.json"
+      ],
+      "failure_modes": [
+        "group is required for qq_get_group_memory"
+      ],
+      "node_type": "router",
+      "agent_accessible": true
+    },
+    {
+      "id": "qq_set_group_memory",
+      "summary": "Write the memo about a group, in your own words: does it want you talkative or quiet, what it talks about, what you already tried and got told off for. The memo is not injected into your context — read it with `qq_get_group_memory` when you need it. Write only what is DURABLE (not something you read from one message). Blank `memory` deletes the entry. There is no length cap.",
+      "input_schema": {
+        "type": "object",
+        "required": [
+          "node_id",
+          "group"
+        ],
+        "properties": {
+          "node_id": {
+            "type": "string",
+            "const": "qq_set_group_memory"
+          },
+          "group": {
+            "type": "string",
+            "description": "QQ group id"
+          },
+          "memory": {
+            "type": "string",
+            "description": "Memo text; empty string deletes it"
+          },
+          "data_dir": {
+            "type": "string",
+            "description": "Optional data directory override"
+          }
+        }
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "ok": {
+            "type": "boolean"
+          },
+          "data": {
+            "type": "object",
+            "properties": {
+              "group": {
+                "type": "string"
+              },
+              "memory": {
+                "type": "string"
+              },
+              "path": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "side_effects": [
+        "writes data/qq_group_memory.json"
+      ],
+      "failure_modes": [
+        "group is required for qq_set_group_memory"
       ],
       "node_type": "router",
       "agent_accessible": true
@@ -408,5 +832,5 @@
       "agent_accessible": false
     }
   ],
-  "system_hint": "QQ GROUP CHAT MODE — you are running in a QQ group. Messages may be casual chat NOT directed at you.\nCRITICAL: Always decide whether the message is actually talking to YOU before responding.\nA message IS directed at you ONLY if: contains @[id=3832224285] (explicit @mention of bot); or starts with \"bot\" or \"Bot\" or \"机器人\".\nA message is NOT directed at you if: general group discussion; questions not explicitly addressed to bot; casual chat; emoji/sticker; talking about someone else. When in doubt, suspend.\nIf NOT directed at you: use {\"action\":\"suspend\"}.\nIf directed at you: invoke_plugin(qq, qq_send, ...) to send your reply, then output {\"action\":\"suspend\"}.\nIMPORTANT: NEVER use {\"action\":\"respond\"} — it will cause duplicate messages. Always send via qq_send and finish with {\"action\":\"suspend\"}.\n\nANTI-HALLUCINATION rules:\n- If a question is ambiguous or you lack context, ask for clarification — do NOT guess.\n- If web search fails to yield a clear answer after 2 attempts, stop and tell the user what you found (or didn't find). Ask them to clarify.\n- Pay attention to the group's recent conversation. The topic may be group-specific and not searchable on the web.\n- A short honest \"not sure, can you clarify?\" is always better than a long wrong answer.\n\nKERNEL TOOL usage in QQ chat:\n- Kernel introspection tools (get_runtime_status, list_plugins, list_nodes, get_kernel_status, get_kernel_issues) are for internal diagnostics only.\n- Only call them when a user @mentions you with an explicit question about bot/runtime/plugin status.\n- For images, stickers, casual chat, or ambiguous messages: suspend immediately — do NOT call any kernel tool.\n\nTo send a progress update or proactive message to the group you're talking to:\ninvoke_plugin(qq, qq_send, {\"node_id\":\"qq_send\",\"target\":\"group:<group_id>\",\"message\":\"<your message>\"})\nReplace <group_id> with the actual group ID from the incoming message.\nSend a brief progress message BEFORE any tool that may take more than a moment (build, test, search, etc.), and a follow-up when the tool completes.\n\nTo query group members: invoke_plugin(qq, qq_get_group_members, {\"node_id\":\"qq_get_group_members\",\"target\":\"group:<id>\"})\nTo proactively send to a group: invoke_plugin(qq, qq_send, {\"node_id\":\"qq_send\",\"target\":\"group:<id>\",\"message\":\"<text>\"})"
+  "system_hint": "QQ 渠道说明——这里只说怎么发消息，性格和说话方式见人格部分。\n\n【发言必须走工具】调用 qq_send：{\"node_id\":\"qq_send\",\"target\":\"<reply_target>\",\"message\":\"<你要说的话>\"}。你自己写的正文不会发出去，只有工具调用里的 message 会。\n【结束这一轮】调用 {\"node_id\":\"suspend\"}。这一轮会一直继续，直到你调它；不想说话就直接调 suspend，群里看不到。\n【@某人】message 里写 [CQ:at,qq=<uid>]。纯文本 @ 不算 @。\n【发图】[CQ:image,file=<url>] 或 [CQ:image,file=base64://<data>]；能用 URL 就别用 base64。\n【引用某条消息】把它的 msg=<id> 作为 \"reply_to\":\"<id>\" 传进同一次 qq_send。\n【你的身份】你的 QQ 号是 {setting:bot_uin}；@[id=...] 里的数字等于它才是 @ 你。\n【群记忆】需要时用 qq_get_group_memory / qq_set_group_memory 读写；只记长期有用的，不确定就先读。\n【被禁言】上下文里有 [muted: ...] 或发送报禁言时，别再发，等解禁。"
 }

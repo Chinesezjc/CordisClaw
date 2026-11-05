@@ -5,8 +5,8 @@ use cordis_runtime::core::models::{ArtifactKind, PluginLoadResult, PluginUnavail
 use cordis_runtime::plugin::invoke::PluginInvoker;
 use cordis_runtime::plugin::loader::{default_loader_config, Loader};
 use cordis_runtime::plugin::registry::{NodeRegistry, PluginRegistry};
-use cordis_runtime::plugin::tooling::{prepare_artifacts, PrepareMode};
 use cordis_runtime::service::graph_registry::GraphRegistry;
+use cordis_tooling::{prepare_artifacts, PrepareMode};
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
 use std::fs;

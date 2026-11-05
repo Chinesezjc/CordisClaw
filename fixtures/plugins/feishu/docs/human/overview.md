@@ -9,6 +9,7 @@
 | `feishu_serve` | Task | 事件接入。`mode:"ws"`(默认):长连接,主动连飞书 `/callback/ws/endpoint`,事件走 WSS protobuf 帧,帧内 ACK,自动心跳/合包/重连,无需公网回调、verification_token、encrypt_key。`mode:"webhook"`:HTTP server(默认 :8100),`POST /feishu/event`,challenge 握手 + token 校验 +(可选)AES 解密。两种模式共用:去重、访问策略、poller → envelope → agent。 |
 | `feishu_send` | Router | 出站:发文本 / interactive card,可 `reply_to` 引用回复。target = `chat:<chat_id>` 或 `user:<open_id>`。若该 target 有待更新的"思考中"卡片则 PATCH 更新之(两段式);`payload.update_message_id` 可显式指定更新目标。 |
 | `feishu_entry` | Router | `configure`(写凭证与策略)/ `status` / `approve_pairing`(payload.code)/ `list_pending`。 |
+| `feishu_get_chat_members` | Router | 列群成员(`im/v1/chats/{chat_id}/members`,`member_id_type=open_id`),可选 `page_size`(1-100)/ `page_token`,返回原始 `data`(`items[]` 含 `member_id` 与 `name`)。用于把 envelope 里的 `open_id` 对到人。需 `im:chat.members:read` 权限。 |
 
 ## 配置
 
@@ -32,10 +33,20 @@ invoke feishu feishu_entry --payload-json='{"node_id":"feishu_entry","action":"c
 
 runtime 是协议无关的:poller 发的 envelope 带 `source_plugin=feishu`/`reply_node=feishu_send`/`session_key=feishu:chat:<id>`/`reply_target`/`reply_to`,runtime inbox 按 session_key 分 session,agent `respond` 时自动回调 `feishu_send`。见 `docs/architecture/status-and-open-items.md` 消息路由解耦一节。
 
+### 说话人名字
+
+飞书消息事件只带发送者 `open_id`,没有昵称。入站解析时按 `{chat_id}:{open_id}` best-effort 查一次群成员列表(`page_size=100`,2s 超时),进程内静态 TTL 缓存 30 分钟(上限 512 条,溢出整体清空);命中不发请求。清洗规则:控制字符与 ``[ ] " ` '`` 转空格、空白折叠、按字符截断到 24;结果为空则视为无名字。
+
+- 有名字:`[Feishu group from <chat_id> (user <open_id>, name "<name>")]: <text>`
+- 无名字:保持旧格式 `[Feishu group from <chat_id> (user <open_id>)]: <text>`
+- 媒体消息仍在身份括号后带 `msg=<message_id>`。
+
+名字只是 display 提示,不进 envelope 的其它字段;查不到(无凭证 / 缺权限 / 网络失败)静默降级为无名字,不影响投递。需要按 `open_id` 反查人时可显式调 `feishu_get_chat_members`。
+
 ## 部署(长连接模式,推荐)
 
 1. [飞书开放平台](https://open.feishu.cn)建**企业自建应用**,记下 App ID / App Secret。
-2. 权限管理:开通 `im:message`(读写消息)、`im:message:send_as_bot`;启用机器人能力。
+2. 权限管理:开通 `im:message`(读写消息)、`im:message:send_as_bot`;需要显示说话人名字或调 `feishu_get_chat_members` 时再开通 `im:chat.members:read`(缺权限只是没名字,不影响收发)。启用机器人能力。
 3. 事件订阅:订阅方式选择**"使用长连接接收事件"**(无需回调 URL / Verification Token / Encrypt Key),添加事件 `im.message.receive_v1`。
 4. 版本管理与发布:创建版本并发布(企业内可用)。
 5. 服务器上 `feishu_entry` configure 写入 `app_id`/`app_secret`/`bot_open_id`(bot 的 open_id 可从首条群消息日志或开放平台 API 获得)。

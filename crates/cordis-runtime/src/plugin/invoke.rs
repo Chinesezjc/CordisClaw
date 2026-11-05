@@ -21,9 +21,22 @@ use std::sync::{Mutex, OnceLock};
 /// P0-16: was `Mutex<Vec<LoadedDylibApi>>` which pushed one fresh entry per
 /// invocation — a Task node called N times would keep N copies of its dylib
 /// mapped. Now keyed by plugin path so re-entrant invokes replace the
-/// existing handle in-place, and reloads drop the old one via
-/// `unregister_task_library`.
+/// existing handle in-place.
+///
+/// The replaced handle is **retained, not dropped** (see
+/// `RETAINED_TASK_LIBRARIES`): dropping it would `dlclose` a dylib whose
+/// detached threads may still be running plugin code. That is exactly how a
+/// `reload /qq` used to take the process down with SIGSEGV — the old
+/// `qq.so` was unmapped while its message-poller thread kept sleeping in it.
+/// There is no portable way to know a plugin's threads are gone (stop
+/// handlers are not required to join them), so the mapping is kept until
+/// process exit. Cost: one mapping per reload of a Task-node plugin.
 static TASK_LIBRARIES: OnceLock<Mutex<HashMap<String, LoadedDylibApi>>> = OnceLock::new();
+
+/// Handles retired from `TASK_LIBRARIES` (replaced by a newer generation or
+/// removed on reload). Never dropped while the process runs — dropping would
+/// unmap a dylib that plugin-owned threads may still execute.
+static RETAINED_TASK_LIBRARIES: OnceLock<Mutex<Vec<LoadedDylibApi>>> = OnceLock::new();
 
 /// Access the task-library map with a tolerant lock policy: a poisoned lock
 /// is recovered (the underlying data is invariant-free — it's a keep-alive
@@ -36,11 +49,31 @@ fn task_libraries_lock() -> std::sync::MutexGuard<'static, HashMap<String, Loade
         .unwrap_or_else(|poison| poison.into_inner())
 }
 
-/// Drop the keep-alive handle for a plugin. Called by the reload path when a
-/// Task-node plugin is being replaced — otherwise the dylib grows unbounded
-/// across reloads.
+fn retained_task_libraries_lock() -> std::sync::MutexGuard<'static, Vec<LoadedDylibApi>> {
+    RETAINED_TASK_LIBRARIES
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+}
+
+/// Move a keep-alive handle out of the live map without unloading the dylib.
+///
+/// Called by the reload path when a Task-node plugin is being replaced. The
+/// handle goes to the retained list instead of being dropped: `dlclose` on a
+/// dylib whose threads are still alive is undefined behaviour (SIGSEGV in
+/// practice), and a plugin's `stop` handler is not required to join every
+/// thread it ever spawned.
 pub fn unregister_task_library(plugin_path: &str) {
-    let _ = task_libraries_lock().remove(plugin_path);
+    let retired = task_libraries_lock().remove(plugin_path);
+    retired
+        .into_iter()
+        .for_each(|dylib| retained_task_libraries_lock().push(dylib));
+}
+
+/// Number of retired Task-node dylibs still mapped. Exposed for tests that
+/// assert a reload keeps the old mapping alive instead of unloading it.
+pub fn retained_task_library_count() -> usize {
+    retained_task_libraries_lock().len()
 }
 use std::process::{Command, Stdio};
 
@@ -91,6 +124,28 @@ pub fn invoke_registered_plugin(
     plugin_path: &str,
     node_id: &str,
     payload: String,
+) -> Result<PluginResponse, RuntimeError> {
+    invoke_registered_plugin_with_settings(plugin_registry, plugin_path, node_id, payload, None)
+}
+
+/// [`invoke_registered_plugin`] plus the plugin's `settings` block from
+/// `config/plugins/<name>.yaml`.
+///
+/// The settings are merged into the payload for dylib plugins, so a plugin
+/// reads its configuration from the config layer instead of hard-coding paths
+/// or limits in source. Keys the caller already supplied win: the invocation
+/// payload is what the agent/tool explicitly asked for, and the config layer
+/// only fills fields the caller left absent.
+///
+/// JSON/process artifacts are deliberately excluded: they receive the caller's
+/// stdin bytes verbatim, so merging settings would mean parsing (and possibly
+/// rejecting) input those plugins treat as opaque.
+pub fn invoke_registered_plugin_with_settings(
+    plugin_registry: &PluginRegistry,
+    plugin_path: &str,
+    node_id: &str,
+    payload: String,
+    settings: Option<&serde_json::Value>,
 ) -> Result<PluginResponse, RuntimeError> {
     let plugin =
         plugin_registry
@@ -208,14 +263,21 @@ pub fn invoke_registered_plugin(
         });
     }
 
-    // Inject node_id into the payload so plugins don't need to duplicate it.
+    // Merge configured `settings` and the node id into the payload so plugins
+    // don't have to duplicate them or hard-code machine-specific values.
     // P2-21: reject malformed payload instead of silently converting to
-    // `null` — a downstream node_id-injection would otherwise vanish and
-    // the plugin would see just `null` with no clue why.
+    // `null` — a downstream settings/node_id injection would otherwise vanish
+    // and the plugin would see just `null` with no clue why.
+    //
+    // This is the dylib path on purpose: a JSON/process artifact receives the
+    // caller's stdin bytes verbatim (see `invoke_json_artifact`), and rewriting
+    // that into a parsed object would break process plugins that take
+    // non-JSON stdin.
     let mut payload_value: serde_json::Value =
         serde_json::from_str(&payload).map_err(|err| RuntimeError::InvalidArgument {
             message: format!("plugin invoke payload was not valid JSON: {err}"),
         })?;
+    inject_plugin_settings(&mut payload_value, settings);
     if let Some(obj) = payload_value.as_object_mut() {
         obj.entry("node_id")
             .or_insert_with(|| serde_json::json!(node_id));
@@ -263,8 +325,13 @@ pub fn invoke_registered_plugin(
             }
         }
         // Keep dylib alive — Task nodes spawn background threads. Keyed by
-        // plugin_path so repeated invocations don't leak fresh copies.
-        task_libraries_lock().insert(plugin_path.to_string(), dylib);
+        // plugin_path so repeated invocations don't leak fresh copies; a
+        // replaced handle is retained (never dlclosed) for the same reason
+        // `unregister_task_library` retains instead of dropping.
+        let replaced = task_libraries_lock().insert(plugin_path.to_string(), dylib);
+        replaced
+            .into_iter()
+            .for_each(|old| retained_task_libraries_lock().push(old));
     }
 
     Ok(response)
@@ -301,6 +368,34 @@ fn payload_reserialize_invariant(err: serde_json::Error) -> RuntimeError {
     RuntimeError::Invariant {
         message: format!("plugin invoke payload re-serialize failed: {err}"),
     }
+}
+
+/// Merge the plugin's configured `settings` into the invocation payload.
+///
+/// `map`/`for_each` rather than `if let`, so a non-object payload (a bare
+/// string or array) simply keeps its shape instead of leaving an
+/// uncovered not-taken arm on the closing brace. Caller-supplied keys win:
+/// the tool/agent payload is the explicit request, and config only fills
+/// what the caller left absent.
+///
+/// Empty settings (`settings: {}` is `PluginConfigFile`'s default) are not
+/// injected at all: a plugin yaml that only toggles `enabled` must not alter
+/// the payload every plugin receives.
+fn inject_plugin_settings(payload: &mut serde_json::Value, settings: Option<&serde_json::Value>) {
+    let Some(settings) = settings else {
+        return;
+    };
+    let is_empty = match settings {
+        serde_json::Value::Null => true,
+        serde_json::Value::Object(map) => map.is_empty(),
+        _ => false,
+    };
+    if is_empty {
+        return;
+    }
+    payload.as_object_mut().into_iter().for_each(|obj| {
+        obj.entry("settings").or_insert_with(|| settings.clone());
+    });
 }
 
 fn invoke_json_artifact(
@@ -655,6 +750,7 @@ mod panic_isolation_tests {
 #[cfg(test)]
 mod error_mapper_tests {
     use super::*;
+    use serde_json::json;
 
     // A serde_json::Error is only constructible via a failing parse/serialize.
     fn json_error() -> serde_json::Error {
@@ -695,5 +791,63 @@ mod error_mapper_tests {
             matches!(&err, RuntimeError::Invariant { message } if message.starts_with("plugin invoke payload re-serialize failed: ")),
             "wrong variant: {err:?}"
         );
+    }
+
+    // No configured settings → payload passes through byte-for-byte.
+    #[test]
+    fn inject_plugin_settings_without_settings_is_a_noop() {
+        let mut payload = json!({"path": "/tmp/x"});
+        inject_plugin_settings(&mut payload, None);
+        assert_eq!(payload, json!({"path": "/tmp/x"}));
+    }
+
+    // `settings: {}` is `PluginConfigFile`'s default for a yaml that only sets
+    // `plugin`/`enabled`; injecting it would add noise to every plugin's
+    // payload, so empty settings are skipped (null likewise).
+    #[test]
+    fn inject_plugin_settings_skips_empty_settings() {
+        let mut payload = json!({"path": "/tmp/x"});
+        inject_plugin_settings(&mut payload, Some(&json!({})));
+        assert_eq!(payload, json!({"path": "/tmp/x"}));
+
+        inject_plugin_settings(&mut payload, Some(&json!(null)));
+        assert_eq!(payload, json!({"path": "/tmp/x"}));
+
+        // Non-object settings are not "empty": whatever the operator wrote is
+        // handed to the plugin as-is.
+        inject_plugin_settings(&mut payload, Some(&json!(42)));
+        assert_eq!(payload, json!({"path": "/tmp/x", "settings": 42}));
+    }
+
+    // Configured settings land under the `settings` key.
+    #[test]
+    fn inject_plugin_settings_inserts_configured_settings() {
+        let mut payload = json!({"path": "/tmp/x"});
+        let settings = json!({"read_roots": ["/tmp/root"]});
+        inject_plugin_settings(&mut payload, Some(&settings));
+        assert_eq!(
+            payload,
+            json!({"path": "/tmp/x", "settings": {"read_roots": ["/tmp/root"]}})
+        );
+    }
+
+    // A caller-supplied `settings` wins: config only fills what is absent, so
+    // an explicit tool argument can never be silently overridden by a file.
+    #[test]
+    fn inject_plugin_settings_keeps_caller_settings() {
+        let mut payload = json!({"settings": {"read_roots": ["/caller"]}});
+        let settings = json!({"read_roots": ["/config"]});
+        inject_plugin_settings(&mut payload, Some(&settings));
+        assert_eq!(payload, json!({"settings": {"read_roots": ["/caller"]}}));
+    }
+
+    // Non-object payloads keep their shape — there is no place to hang a
+    // `settings` key, and rewriting the payload would change the plugin's
+    // view of what the caller sent.
+    #[test]
+    fn inject_plugin_settings_leaves_non_object_payload_alone() {
+        let mut payload = json!([1, 2, 3]);
+        inject_plugin_settings(&mut payload, Some(&json!({"read_roots": ["/config"]})));
+        assert_eq!(payload, json!([1, 2, 3]));
     }
 }

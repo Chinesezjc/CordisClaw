@@ -15,7 +15,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.1
 
       - name: cold build
         run: cargo build --all-targets --locked
@@ -23,7 +25,7 @@ jobs:
       - name: cold fixture artifacts
         run: |
           cargo fetch --manifest-path fixtures/plugins/Cargo.toml
-          cargo run --locked -p cordis-runtime -- prepare-artifacts fixtures
+          cargo run --locked -p cordis-cli -- prepare-artifacts fixtures
 
   # 依赖过期报告：只输出到日志，不作为失败条件。
   outdated:
@@ -32,7 +34,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.1
 
       - uses: taiki-e/install-action@v2
         with:

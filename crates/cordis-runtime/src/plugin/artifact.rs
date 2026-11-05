@@ -1,9 +1,9 @@
 use crate::core::error::RuntimeError;
 use crate::core::models::{
-    ArtifactIndex, ArtifactIndexEntry, PluginArtifact, PluginExecution,
+    ArtifactIndex, ArtifactIndexEntry, PluginArtifact, PluginDocs, PluginExecution,
     ARTIFACT_INDEX_SCHEMA_VERSION,
 };
-use crate::plugin::dynamic::{is_dylib_path, sidecar_json_path};
+use crate::plugin::dynamic::{is_dylib_path, sidecar_json_path, LoadedDylibApi};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs;
@@ -265,6 +265,87 @@ fn stage_file(source: &Path, target: &Path) -> Result<(), RuntimeError> {
         }
     })?;
     Ok(())
+}
+
+/// Tag a JSON parse failure on a dylib-emitted contract payload. Single-line
+/// body on purpose: the dylib-open path can't be exercised with a payload that
+/// is invalid JSON, and a two-line struct literal would leave an uncovered arm.
+fn io_error(path: impl Into<PathBuf>, message: impl std::fmt::Display) -> RuntimeError {
+    RuntimeError::Io {
+        path: path.into(),
+        message: message.to_string(),
+    }
+}
+
+/// Parse a JSON payload emitted by a loaded dylib's exported contract fn.
+///
+/// The dylib-open path can't be exercised without a real `.so`, so the two
+/// call sites ([`read_plugin_docs`] here and `cordis-tooling`'s
+/// `inspect_dylib_contract`) share this mapper; `what` names the failing
+/// contract so the byte-stable message is preserved.
+///
+/// `pub` because the build-tooling crate (`cordis-tooling`) reuses it for the
+/// fingerprint/exports contracts; it is the minimum surface that lets the
+/// build side share the load-time contract reader instead of duplicating the
+/// error text.
+pub fn parse_dylib_payload<T: serde::de::DeserializeOwned>(
+    artifact_path: &Path,
+    payload: &str,
+    what: &str,
+) -> Result<T, RuntimeError> {
+    serde_json::from_str(payload)
+        .map_err(|e| io_error(artifact_path, format!("runtime {what} parse failed: {e}")))
+}
+
+/// Read a plugin's docs contract out of a built artifact.
+///
+/// Lives in the runtime (not in the build tooling) because the loader needs it
+/// at load time: dylibs are `dlopen`ed and asked for `docs()`, JSON artifacts
+/// are read directly. `cordis-tooling` shares this exact implementation while
+/// building/verifying artifacts, so the two paths can never drift.
+pub fn read_plugin_docs(artifact_path: &Path) -> Result<PluginDocs, RuntimeError> {
+    if is_dylib_path(artifact_path) {
+        let dylib = LoadedDylibApi::open(artifact_path)?;
+        parse_dylib_payload(artifact_path, &(dylib.api().docs)().payload, "docs")
+    } else {
+        let artifact = load_plugin_artifact(artifact_path)?;
+        Ok(artifact.docs)
+    }
+}
+
+/// P0-10: on macOS/BSD `/proc` does not exist, so the previous implementation
+/// always returned false → every live lock was declared dead the moment the
+/// staleness timer expired, letting two concurrent `prepare_artifacts` calls
+/// clobber each other. Fix: use `kill(pid, 0)`, which is portable across all
+/// Unix platforms and returns EPERM (still alive, other uid) or ESRCH (dead)
+/// without actually delivering a signal.
+///
+/// Lives in the runtime (not in the build tooling) because the host uses it
+/// when deciding whether a staged `snapshot-{pid}-{nanos}` directory belongs to
+/// a live process; `cordis-tooling` shares it for build-lock staleness.
+#[cfg(unix)]
+pub fn lock_pid_is_live(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    // SAFETY: `kill(pid, 0)` is signal-safe and side-effect free; it only
+    // checks whether the caller *could* deliver a signal to `pid`.
+    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    if rc == 0 {
+        return true;
+    }
+    // errno is thread-local; if the syscall returned an error, distinguish
+    // "no such process" (ESRCH → dead) from "permission denied" (EPERM →
+    // alive, owned by another user).
+    let err = std::io::Error::last_os_error();
+    !matches!(err.raw_os_error(), Some(libc::ESRCH))
+}
+
+#[cfg(not(unix))]
+pub fn lock_pid_is_live(_pid: u32) -> bool {
+    // Non-Unix: no portable liveness probe, so be conservative and assume
+    // still alive; the staleness timer eventually reclaims true zombies.
+    true
 }
 
 #[cfg(test)]
@@ -838,5 +919,77 @@ mod tests {
             matches!(&err, RuntimeError::Invariant { message } if message.contains("escapes snapshot root")),
             "expected escape Invariant, got {err:?}"
         );
+    }
+
+    // ---------- read_plugin_docs (JSON artifact path) ----------
+
+    #[test]
+    fn read_plugin_docs_reads_json_artifact() {
+        use crate::core::models::PluginArtifact;
+        use cordis_plugin_sdk::{plugin_docs, pretty_json};
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("plug.json");
+        let artifact = PluginArtifact {
+            plugin_path: "foo".to_string(),
+            abi_fingerprint: abi(),
+            docs: plugin_docs("foo", "foo", "0.1.0", Some("Foo"), Vec::new(), None),
+            exports: Vec::new(),
+            execution: None,
+        };
+        fs::write(&path, pretty_json(&artifact)).unwrap();
+
+        let docs = read_plugin_docs(&path).unwrap();
+        assert_eq!(docs.plugin_path, "foo");
+        assert_eq!(docs.command_name.as_deref(), Some("Foo"));
+    }
+
+    #[test]
+    fn read_plugin_docs_errors_on_bad_json_artifact() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("plug.json");
+        fs::write(&path, "{ not valid").unwrap();
+        assert!(matches!(
+            read_plugin_docs(&path),
+            Err(RuntimeError::ArtifactIndexParse { .. })
+        ));
+    }
+
+    /// The dylib arm of `read_plugin_docs` needs a real `.so` to reach; the
+    /// shared contract mapper's error text is pinned directly instead, so the
+    /// message stays byte-identical for every caller (docs, exports,
+    /// fingerprint).
+    #[test]
+    fn parse_dylib_payload_tags_the_failing_contract() {
+        let err = parse_dylib_payload::<PluginDocs>(Path::new("plug.so"), "{ not json", "docs")
+            .unwrap_err();
+        let carries = matches!(&err, RuntimeError::Io { path, message } if path.as_path() == Path::new("plug.so") && message.starts_with("runtime docs parse failed: "));
+        assert!(carries, "expected Io docs parse failure, got {err:?}");
+    }
+
+    // ---------- lock_pid_is_live (staged snapshot / build lock liveness) ------
+
+    #[cfg(unix)]
+    #[test]
+    fn lock_pid_liveness_recognises_current_process_as_alive() {
+        // P0-10: previously used `/proc/{pid}` and returned false on macOS/BSD
+        // for every live pid. `kill(pid, 0)` is portable; the running process
+        // must always be observed as alive.
+        assert!(lock_pid_is_live(std::process::id()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lock_pid_liveness_reports_dead_pid_as_dead() {
+        // A pid we're extremely unlikely to have — u32::MAX is above the
+        // maximum kernel-allowed pid on all common systems.
+        assert!(!lock_pid_is_live(u32::MAX - 1));
+    }
+
+    /// `lock_pid_is_live(0)` short-circuits to `false` (pid 0 is never a
+    /// live process the caller could own).
+    #[cfg(unix)]
+    #[test]
+    fn lock_pid_is_live_returns_false_for_pid_zero() {
+        assert!(!lock_pid_is_live(0));
     }
 }

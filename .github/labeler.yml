@@ -7,6 +7,14 @@ sdk:
   - changed-files:
       - any-glob-to-any-file: 'crates/cordis-plugin-sdk/**'
 
+tooling:
+  - changed-files:
+      - any-glob-to-any-file: 'crates/cordis-tooling/**'
+
+cli:
+  - changed-files:
+      - any-glob-to-any-file: 'crates/cordis-cli/**'
+
 plugin-host:
   - changed-files:
       - any-glob-to-any-file: 'crates/cordis-plugin-host/**'

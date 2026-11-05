@@ -1,0 +1,10 @@
+# qq: OneBot v11 适配器。
+#
+# bot_uin 只在 system prompt 里出现（渲染成 "you are qq user <id>"），模型据此判断
+# "这条 @ 的是不是我"。它不参与鉴权，也不会发到群里。
+# 换号时改这里 + `/reload /qq`（不需要重启，也不用重新编译插件）。
+plugin: qq
+enabled: true
+settings:
+  # 机器人自己的 QQ 号（必填；留空时提示词里会保留 {setting:bot_uin} 占位符）。
+  bot_uin: "3832224285"

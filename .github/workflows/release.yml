@@ -13,12 +13,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.1
 
       - uses: Swatinem/rust-cache@v2
 
       - name: build release binary
-        run: cargo build --release --locked -p cordis-runtime
+        run: cargo build --release --locked -p cordis-cli
 
       - name: package
         run: |

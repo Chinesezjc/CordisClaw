@@ -2,7 +2,7 @@
 
 ## 1. 判定口径
 
-- 本文基于当前仓库现状整理，最近更新：2026-08-09。
+- 本文基于当前仓库现状整理，最近更新：2026-11-05。
 - 历史规划蓝图已经吸收进 [design-blueprint.md](./design-blueprint.md)，因此本文结论来自三类证据的交叉比对：
   - 设计蓝图：[design-blueprint.md](./design-blueprint.md)
   - 架构文档：[system-overview.md](./system-overview.md)、[contracts-and-loading.md](./contracts-and-loading.md)、[runtime-semantics.md](./runtime-semantics.md)、[maintenance-guide.md](./maintenance-guide.md)
@@ -18,18 +18,42 @@
 | Execution engine | 部分完成 | 语义与库实现已完成，`execute` / `serve execute` 入口可用；仍缺更真实的数据面验证 |
 | 自迭代（Agent Loop） | 已完成基础 | 固定 9 阶段 Petri Net 已替换为 open-ended agent loop；agent 可读代码、写文件、跑编译测试并验证 |
 | 交互式 Agent 对话 | 已完成 | 流式输出、18 个工具（含 run_plugin_test、append_file）、readline 编辑、Ctrl+C draft 安全、`/捷径`、工具调用结果日志 |
-| Agent 错误恢复 | 已完成 | JSON 解析失败反馈到 agent 自修复、LLM 请求失败 notify 到群、所有 HTTP 错误重试、unknown-tool guard（strike=1 立即停止）、tool_calls 链诊断日志 |
+| Agent 错误恢复 | 已完成 | JSON 解析失败反馈到 agent 自修复、LLM 请求失败 notify 到群、所有 HTTP 错误重试、unknown-tool guard（strike=1 立即停止）、tool_calls 链**整形**（`agent_toolchain::sanitize_tool_chains`，5.2.40 取代只打日志的旧修复臂） |
 | 优雅退出 + data/ 持久化 | 已完成 | SIGTERM→SIGINT 转发优雅退出、`data/memory/shutdown.json` 退出快照、`data/` 沙箱扩展（agent 可访问 workspace 根级目录） |
 | QQ 插件消息解析 | 已完成 | JSON 卡片透传、合并转发 ID 提取、回复 msg_id 提示 |
 | QQ 入站传输 | 已完成 | HTTP webhook（`qq_serve`）+ WebSocket 服务器（`qq_ws_serve` Task 节点，接收线上 Napcat ws 端口的 OneBot v11 事件，优雅停机）；出站走 HTTP API |
+| QQ 回复门控 / 群角色 / 死信治理 | 已完成 | 门控策略外置为 `data/qq_reply_policy.json` 并逐条下发 `[reply policy: …]` 行（`qq_get/set_reply_policy`，改规则不用重编插件）；`qq_get_group_roles` 直接给出群主/管理员；spill 7 天 TTL + 归档、失败出口限流提示（5.2.40） |
 | Agent 安全加固 | 已完成 | secret 不可见（token 不进入 prompt）、移除 `run_command`、敏感路径黑名单、工具防火墙（`agent_accessible`）、按群隔离 session、`build_plugins` 白名单命令、工具失败自动告警 |
 | Service 生命周期 | 部分完成 | `Service` trait + `ServiceRegistry` + `NodeType::Task` 已实现；plugin load 时自动 start 尚未接入 |
 | 插件封装形态蓝图 | 部分完成 | `dylib` + JSON artifact + process 已落地；`cdylib` / `WASM` 未实现 |
 | 更真实的运行入口与服务化边界 | 部分完成 | `RuntimeHost`、`serve` REPL、agent chat、shell console 可用；尚未稳定化为外部服务边界 |
 | YAML 配置入口 | 已完成 | runtime / kernel / llm_api / plugins 配置模型完整 |
-| CI | 已完成 | GitHub Actions（`.github/workflows/ci.yml`）：push main + PR 触发，ubuntu-latest 上执行 fmt / clippy `-D warnings` / prepare-artifacts / build / test（并行）；x86_64-linux 门控恒真，dylib 集成测试全量执行，fixture 插件经 `prepare-artifacts` 预构建并由 rust-cache 缓存。并行安全：snapshot 目录名带创建者 pid，boot 的 stale 清理只删已死进程的残留（`cleanup_stale_snapshot_dirs`）；mock LLM server accept 超时 CI 下 900s / 本地 30s（`mock_llm_accept_timeout`，冷缓存 runner 上迭代测试中途 cargo build 远超 30s） |
+| CI | 已完成 | GitHub Actions（`.github/workflows/ci.yml`）：push main + PR 触发，ubuntu-latest 上执行 fmt / clippy `-D warnings` / prepare-artifacts / build / test（并行）；x86_64-linux 门控恒真，dylib 集成测试全量执行，fixture 插件经 `prepare-artifacts` 预构建并由 rust-cache 缓存。并行安全：snapshot 目录名带创建者 pid，boot 的 stale 清理只删已死进程的残留（`cleanup_stale_snapshot_dirs`）；mock LLM server accept 超时 CI 下 900s / 本地 30s（`mock_llm_accept_timeout`，冷缓存 runner 上迭代测试中途 cargo build 远超 30s）。工具链由 `rust-toolchain.toml` 钉在 1.97.1，CI 同步 `toolchain: 1.97.1`（见 5.2.53）；fixtures 测试（12 个 member + 10 个 excluded expr 子 crate + root 占位）由 `scripts/test-fixtures.sh` 跑进同一 job（见 5.2.54） |
 
 ## 3. 已完成
+
+### 3.0a Agent loop 已移出 kernel（2026-10-31）
+
+循环不再是 kernel 的一部分：
+
+- 新增 `crates/cordis-agent`：`imp.rs`（原 `agent.rs` 的 3303 行循环本体 + 其 36 个
+  单测）、`lib.rs`（`CargoAgentLoop` + `install()` + `impl AgentSessionApi`）；
+- kernel 只保留接缝：`agent_api`（trait + DTO）、`agent_loop`（`AgentLoop` /
+  `AgentSessionApi` / 注册表 / 测试替身）、`agent_tools`（工具 ABI）；
+- `cordis-cli` 在 `main()` 里 `install_agent_loop`，与 `install_plugin_builder` 同形；
+  `boot` 不再默认安装，仅在 `cfg(test)` 装测试替身；
+- 需要真实回合的集成测试随代码迁入 `crates/cordis-agent/tests/`（10 个文件）。
+
+同一批还修了四个真 bug：工具目录只算一次（迭代 summary 永远不可调用）、
+`vision` 测试假设工作区不在 `/tmp`、`Partial` canary 与盲改的门控、
+以及 **canary Fail 会晋升**（回放已证明改坏仍然 promote）。
+
+插件迭代管线同样接了缝：`iteration_api::IterationRunner`（kernel 默认实现）+ 
+`IterationHost`（16 个能力），管线已泛型化为 `fn f<H: IterationHost>(host: &H, …)`，
+不再访问任何宿主私有字段。**管线已于 2026-11-01 完成迁入**：`crates/cordis-agent/src/iteration/` 存放
+policy / driver / backend，`CargoIterationRunner` 实现 kernel 的 `IterationRunner`
+并由 CLI 安装；kernel 只保留接缝、报告词汇与一行委托。42 个管线/后端测试随代码搬入
+`crates/cordis-agent/tests/iteration_pipeline.rs`。
 
 ### 3.0 覆盖率治理战役（2026-07-23 ~ 07-27，已收官）
 
@@ -113,13 +137,675 @@ Agent 现在可以自主完成：读代码 → 理解结构 → 写/改文件 �
 - `RuntimeHost::start_service()` 公开 API
 - TODO: 插件加载时自动遍历 Task 节点并 start
 
-### 3.7 插件样例已扩展
+#### 3.6.x QQ 官方协议插件 `qqbot`（新增，2026-10-28）
+
+与 `qq`（OneBot v11 / Napcat）**并存**的第二条 QQ 渠道：直接对接官方开放平台 API v2，
+没有 OneBot 中转，也没有任何闭源 SDK 依赖（对比 `@tencent-connect/dsh-qqbot` 的
+`qqbot-connector` 是 UNLICENSED）。
+
+- 已完成：access token 缓存与提前刷新（`protocol/token.rs` + `api.rs` 的 401 重试一次）、
+  gateway 握手/心跳/续连（`gateway.rs`、`serve.rs` 的 `pump`）、`C2C_MESSAGE_CREATE` /
+  `GROUP_AT_MESSAGE_CREATE` / `INTERACTION_CREATE` 解析、群白黑名单与 @ 门控、事件 id 去重、
+  envelope 构造（`session_key = qqbot:group:<gid>` / `qqbot:c2c:<openid>`、`reply_to = 事件 id`）、
+  文本分片、私聊流式（`/v2/users/{openid}/stream_messages`，群聊协议无此端点故退化分片）、
+  按钮 markdown + 点击回执（`PUT /interactions/{id}`）、富媒体按 URL 收发、附件下载落盘。
+- 节点：`qqbot_configure` / `qqbot_status` / `qqbot_serve`（Task，`payload.stop` 停机）/
+  `qqbot_send` / `qqbot_ask` / `qqbot_send_media` / `qqbot_download_media` / `qqbot_set_policy` / `qqbot_ack`。
+- 测试与覆盖率：116 个单测 + 2 个集成测试（`tests/scaffold.rs`、`tests/docs.rs`）；
+  `cargo llvm-cov -p qqbot --lib --lcov` 报 **3395/3395 行、0 未覆盖（100%）**，
+  `clippy --all-targets -D warnings` 与 `fmt --check` 均干净。节点成功路径靠 **线程局部 transport 注入缝**
+  （`api::tests_support`）驱动，`qqbot_serve` 的线程体被抽成具名 `gateway_loop` 直接单测，
+  `WsSocket` 用本地 tungstenite stub + 手写帧覆盖非文本/断开帧臂。
+- 脚手架：新插件必须带 `tests/`、`docs/human/overview.md`、`docs/agent/interfaces.json`，
+  否则 `prepare-artifacts` / `sync-plugin-docs` 与 `cordis-runtime --test architecture` 都会
+  报 `missing plugin scaffold`；`interfaces.json` 由 `tests/docs.rs` 与 `docs_value()` 对拍，
+  改了节点文档必须重跑 `cargo run -p cordis-cli -- prepare-artifacts fixtures`。
+- 未完成：**分片上传**（`upload_prepare` / `upload_part_finish` 链路，当前只走协议允许的
+  `url` 直传）、扫码绑定（官方协议无此流程，凭据走 `qqbot_configure` 或 `QQBOT_APPID`/`QQBOT_SECRET`）、
+  真机联调（需要 appId/secret）。
+
+## 3.7 插件样例已扩展
 
 - `expr` — 递归下降四则运算 + 取模 (`%`) + 幂 (`^`)，6 个运算符子插件
 - `shell` — 命令 catalog 分发（Nonebot console 模式）
 - `qq` — OneBot v11 QQ 适配器（configure/send/status/call/JSON卡片透传/转发/回复）
+- `qqbot` — QQ 官方开放平台（API v2）适配器，与 `qq` 并存：token/gateway/消息/富媒体/按钮全部按官方线协议自实现，不依赖任何腾讯 SDK
 - `gacha` — 原神抽卡模拟器（角色/武器池、软硬保底、50/50、data/ 持久化）
 - `root` / `root/child` — scaffold 占位
+
+### 3.8 `config/plugins/*.yaml` 的 `enabled` + `settings` 已接线，reload 会重读配置（2026-10-27）
+
+之前只有"解析 + 数个数"：`PluginConfigFile.settings` 进 `RuntimeKernel.plugin_configs` 后只贡献
+`plugin_config_count`，`enabled` 没有任何代码读，`invoke` 只往 payload 注入 `node_id`；`reload`
+也不会重读 `config/`（`RuntimeConfig::load` 全仓只有 `boot` 一处调用）。现在：
+
+- **`settings` 下发**：快照携带 `plugin 名 → settings`，`RuntimeSnapshot::invoke` 调
+  `invoke_registered_plugin_with_settings` 合并进 payload 的 `settings` 键（调用方同名键优先，
+  空 `{}`/`null` 不注入，仅 dylib 插件生效——JSON/process 工件的 stdin 保持原样字节）。
+- **`enabled: false` 在 load 阶段过滤**：`Loader::with_disabled` 不 stage、不 dlopen、不注册，
+  Task 服务自然不启动；reload 丢掉某插件时其服务在换快照前 stop。`KernelStatus.plugin_disabled_count`
+  与 `LoaderMetrics.disabled_plugins_skipped` 可观测。
+- **配置热重载**：`reload_internal` / `reload_candidate` 先 `RuntimeConfig::load`，再用新配置
+  建快照；`promote_candidate` 安装候选快照携带的配置。坏配置 → `ReloadAttemptReport.failed`
+  （`failure_summary` 带文件与原因），旧快照继续服务。不热生效项：`runtime.snapshot_root`
+  （进程内 staging 根已定，保留 boot 值并打日志）、`kernel.change_history_limit`（构造时生效）。
+- **首个使用者**：`filesystem` 插件的读取白名单改由 `settings.read_roots` 下发，源码里的
+  `/root/Cstar`、`/root/PJSKBot`、`/root/HCIProj` 硬编码整段删除（其中 `/root/Cstar` 早已不存在，
+  每次 canonicalize 失败后被静默跳过）。缺省不回落任何内置目录；相对路径条目被丢弃；不存在的
+  条目跳过。模板见 `config.example/plugins/filesystem.yaml`。
+
+### 3.9 reload 不再卸载 Task 插件的 dylib（2026-10-27，修 SIGSEGV）
+
+线上 `reload /qq` 成功后 1 秒进程 SIGSEGV。链路：`reload_subtree` 停完服务（WS/HTTP 线程都 join 了）
+→ `unregister_task_library("qq")` → `dlclose` 旧 `qq.so`；而 qq 还有一条**永不停止**的 detached
+线程（`start_agent_poller`，没有 shutdown flag、没有 join），它下一次醒来执行的就是已 unmap 的代码。
+
+- kernel：`TASK_LIBRARIES` 里被替换/摘除的句柄现在移入 `RETAINED_TASK_LIBRARIES`，**永不 drop**
+  （`unregister_task_library` 语义改为"退役"）。`retained_task_library_count()` 供测试断言。
+  代价：每次 reload 一个 Task 插件泄漏一份映射（qq.so ~18MB），进程退出才回收。理由：插件的
+  `stop` 契约不要求 join 所有线程，无法安全判定何时可以 `dlclose`。
+- qq：poller 加 `POLLER_SHUTDOWN` + 句柄 join（`stop_agent_poller`，在 `qq_serve` / `qq_ws_serve`
+  的 stop 分支调用并复位 `POLLER_STARTED`），sleep 拆 100ms 分片以便快速退出；否则 reload 后
+  旧 poller 与新 poller 会双 drain / 双 `agent_trigger`。
+
+### 3.10 关停不再回滚 `fixtures/plugins/`（2026-10-27）
+
+`cordis-runtime serve` 的 SIGTERM/SIGINT 处理器原本调 `save_draft_and_revert(.., "signal")`，
+它把未提交的 `plugins/` diff 存成 `fixtures/.cordis-drafts/draft-*.patch` 之后**再执行
+`git checkout -- plugins/`**。后果：任何人 `systemctl restart` 一次，工作区里所有未提交的插件改动
+（不只是 agent 自己改的）都会被还原——2026-10-27 两次重启就把刚落的 qq / filesystem 改动冲掉，
+只能从 draft 里 `git apply` 回来。
+
+现在信号路径只调 `save_draft`：写草稿、**不碰工作树**（`draft_tests::save_draft_leaves_working_tree_untouched`
+锁住这个行为）。`save_draft_and_revert` 保留给 agent 出错路径——那里丢弃 agent 自己写了一半的改动
+才是目的。
+
+### 3.11 运维通道：`reload` 不再需要重启进程（2026-10-28）
+
+`systemctl restart` 会断掉 QQ/飞书连接、重载全部插件、从磁盘恢复会话；只改了一个插件（尤其只是
+`qq.so`）时这是过重的操作。现在运行中的 host 会在
+`/run/cordis-runtime-<uid>/<hash>.sock`（目录 0700、socket 0600、`SO_PEERCRED` 校验同 uid）
+监听一个控制通道，只接受两种请求：
+
+- `{"action":"reload","plugin_path":"/qq"}` → 在 **inbox 线程**上执行 `reload_with_diagnostics`
+  （与 agent 回合同一线程，不会并发），然后**重放 `fixtures/startup_invoke.json` 里属于该插件的
+  startup invocation**——reload 会停掉插件的 Task 服务，不重放的话 `reload /qq` 会让 bot 变成
+  聋子（8099/8002 不再监听）。
+- `{"action":"status"}` → `host.status()`。
+
+CLI：`cordis-runtime reload [plugin_path] [--fixtures-root=<dir>]`。返回 JSON 里带
+`report` 与 `services`（每个 startup invocation 的 ok/message）。socket 默认放 `/run`（service 的
+`/tmp` 是私有命名空间，放在 `/tmp` 里外部进程看不见），不可写时回落到 `temp_dir`。
+
+**startup invocation 由 host 重放**（2026-10-28 补齐）：CLI 启动时把
+`fixtures/startup_invoke.json` 交给 `RuntimeHost::set_startup_invocations`；`reload_subtree`
+（按插件 reload，agent 工具与控制通道都走它）在停完目标服务后、`reload_internal`（`/` 全量）
+在停完"被删除/文档变更"的插件后，各自调用 `restart_services_for` 重放对应条目。因此
+agent 的 `reload_runtime` 与控制通道两条路径行为一致，不会再出现"reload 完 qq/feishu 不再监听"。
+
+### 3.12 出站消息只透传 CQ 码，不再做标记转换（2026-10-28）
+
+一开始给 `qq_send` 加了两套"糖"：`@[id=<qq>]` → `[CQ:at,qq=…]`、`[image: <url>]` →
+`[CQ:image,file=…]`。线上日志证明这是多此一举：模型本来就会直接写 `[CQ:image,file=…]`，
+客户端也照常渲染成图（2026-10-28 15:36，retcode 0，看图成功）。而且第二套语法还带来了自己的
+解析器、它自己的拒绝规则（禁 `file://`）和与原生语义不一致的风险。
+
+现在 `build_reply_message` 只做一件事：有 `reply_to` 时在前面加 `[CQ:reply,id=…]`，其余字节原样
+透传；hint 改成教模型写 CQ 码（`[CQ:at,qq=<uid>]`、`[CQ:image,file=<https url>]`），并明确
+最终输出必须是 JSON、聊天文本只能出现在 `qq_send` 的 `message` 里。
+
+**注意**：入站的 `@[id=<qq>,self,…]` 标记也已移除（见 3.14）——模型改成拿 @ 的 id 与
+system prompt 里"你的 QQ 号"比对，插件不再逐条消息打标记。
+
+### 3.13 reload 现在会把插件重指向新工件（2026-10-28，修 QQ 掉线）
+
+`reload_subtree` 之前只更新 registry 里的 docs / fingerprint，**不更新 `artifact_path`**，而 invoke
+打开的是 `plugin.artifact_path`——也就是 boot 时 staged 的那份旧 `.so`。后果：
+
+- rebuild 之后 reload，插件表面"重载"了，实际仍在跑旧代码；
+- 一旦新 docs 与旧 dylib 不一致，invoke 直接 `ContractViolation`（2026-10-28 15:43 就是这样：
+  reload 停掉了 qq 的 8099/8002，重放启动项时撞 ContractViolation，QQ 掉线约 1 分钟，直到手动重启）。
+
+现在 `Prepared` 带上本次校验过的 `resolved` 路径，`PluginRegistry::reload_plugin_entry_with_artifact`
+把它写回条目（`reload_plugin_entry` 保留，委托为"只刷 docs"）。测试：
+`reload_plugin_entry_with_artifact_repoints_the_path`。
+
+### 3.14 模型自己的 QQ 号来自 config + system prompt 插值（2026-10-28）
+
+之前为了让模型知道"这条 @ 的是不是我"，入站消息里的 @ 会被改写成
+`@[id=<qq>,self,name=…]`（每条被 @ 的消息多 5 个字符）。这仍然是"插件替模型判"，
+而且标记只在该条消息里出现。
+
+现在改成"模型自己判"：
+
+- `config/plugins/qq.yaml` 的 `settings.bot_uin` 写机器人自己的号；
+- system hint 里写成 `you are qq user {setting:bot_uin}`；
+- `RuntimeHost` 组装 agent system prompt 时，用**该插件自己的 settings** 把
+  `{setting:<key>}` 插值（`RuntimeSnapshot::render_system_hint` +
+  `interpolate_hint_settings`）。未配置/非标量/畸形占位符原样保留，不会静默吞掉整句；
+- 入站 @ 恢复成原始渲染 `@[id=<qq>,name=…]`，不再打 `self` 标记（`OneBotEvent.self_id`
+  的解析与 `mark_self_mentions` 一并删除）。
+
+好处：id 只在 system prompt 里出现一次（天然被缓存），每条消息零额外 token；换号 = 改
+`config/plugins/qq.yaml` + `/reload /qq`（重读 config），不用重编插件。
+
+### 3.15 新插件迭代的三处卡点（2026-10-28）
+
+线上让 agent 自己写插件时，8 次 iteration 全部回滚，最后它得出"我没有写插件的通道"的错误结论。
+日志显示真正的卡点是三处，全部已修：
+
+1. **新插件在构建前校验上是死锁的**：`create_plugin` 只生成 `Cargo.toml` + `src/lib.rs`，而
+   `validate_scaffold` 要求 `tests/`、`docs/human/overview.md`，默认还要求
+   `docs/agent/interfaces.json`（构建产物、策略又禁止手写）→ 想构建缺文件、想补文件被拒。
+   现在模板自带 `tests/<name>.rs`、`docs/human/overview.md`，并在
+   `[package.metadata.cordis]` 里写 `allow_generated_docs = true`（配合模板已有的
+   `crate-type = ["rlib","dylib"]`）。
+2. **迭代读不到 `plugins/Cargo.toml`**：新插件要进 workspace members，策略允许带 `expected_sha256`
+   改它，但可读集合不含这个文件 → 算不出 sha，edit 被 `stale edit precondition` 拒。
+   现在 `collect_plugin_context_paths` 把它放进 `all_paths`。
+3. **`request_iteration` 的坏路径没有可操作信息**：`plugin_path` 空/未知时只报
+   `plugin subtree not found for `。现在空根给出"传 "/<plugin>" 或 "/" 加可用插件列表"的提示，
+   `agent_request_iteration` 也会容忍 `plugins/<name>` 写法并列出已加载插件。
+
+测试：`create_plugin_scaffolds_what_the_build_requires`、`iteration_context_includes_the_workspace_manifest`、
+`begin_plugin_iteration_explains_a_missing_issue_root`。
+
+另外清掉了失败迭代留下的空壳：`fixtures/plugins/qqbot`（有 src 无 docs/tests，移到
+`/root/cordis-wip/`，未删源码）、`fixtures/plugins/imggen`（只剩一个生成的 interfaces.json）、
+`fixtures/plugins/tmp`（迭代测试产出的 PNG）。
+
+### 3.16 群记忆由 agent 自己写、且不设长度上限（2026-10-28）
+
+之前每群记忆（`data/qq_group_memory.json`）和回复策略共用同一道判权：
+`authorize_policy_write` 要求写的人必须是群主/管理员/操作员。于是普通成员说话时，agent 就算
+看出"这个群喜欢玩笑"也写不进去——它只能等被明确要求、而对方恰好有权限。
+
+现在拆成两条规则：
+
+- **记忆**（`qq_set_group_memory`）：agent 自己的备忘，只要目标群 == 这条消息来源群就允许
+  （跨群仍拒，CLI 运维无 `__meta` 视为操作员）。不再要求群主/管理员。
+- **策略**（`qq_set_reply_policy`）：保持 owner/admin/operator 判定——它改变的是群里所有人
+  看到的行为。
+
+同时去掉 800 字符上限：整条记忆原样保存，`dropped_chars` 字段一并删除。提示词改成"这份备忘
+由你自己维护"：被纠正、明确偏好、固定话题、踩过的坑都该写，不用征求同意也不用问"要不要记"；
+同时提醒它"这段会随每条消息下发，所以写短一点"（建议，不是硬限制）。
+
+测试：`memory_roundtrips_without_a_length_cap`（5 万字符原样保存）、
+`agent_may_write_memory_for_the_originating_group_only`（同群允许、跨群拒绝）、
+`memory_is_self_written_but_policy_stays_gated`（普通成员可写记忆、仍不能改策略）。
+
+**踩到的坑（未修，记在这里）**：重建工件后如果先跑 `sync-plugin-docs` 再跑
+`prepare-artifacts`，索引里的 docs 会来自旧 `.so`，`reload` 会以
+`ABI mismatch … diff=["docs mismatch: expected 13 nodes, got 13"]` 失败；而且 reload 在失败前
+已经停掉了目标插件的服务，于是 QQ 监听直接没了（17:12 就发生过，靠重启恢复）。正确顺序是
+`prepare-artifacts` → `sync-plugin-docs` → `reload`；代码层面还应收敛成
+"reload 失败也要把已停的服务拉回来"。
+
+### 3.17 群记忆改为拉取式（2026-10-28）
+
+`[group memory: …]` 之前随每条消息注入 `notes`。它是有用的，但绝大多数消息用不上，等于每条
+prompt 都替模型付一遍 token；上限 800 字符也只是在压这个成本。
+
+现在改为**拉取**：
+
+- `build_envelope` 只注入 `[reply policy: mode — text]`，不再注入记忆；
+- 提示词明确说"记忆不会被注入，需要时用 `qq_get_group_memory` 读"，并给了读的时机
+  （话题延续之前的讨论、写之前先读避免覆盖）；
+- 写入规则不变：自己主动写、覆盖式、无长度上限。
+
+顺带修了 reload 的 docs 判等：`reload_subtree` Phase 1 之前把 dylib 的 docs 和索引条目逐字段比，
+重建后只要改过 summary/schema 文案就报
+`ABI mismatch … diff=["docs mismatch: expected 13 nodes, got 13"]`（17:12 掉线就是这个）。
+现在只把**节点集合**（id + node_type）变化当契约变更，文案漂移直接采纳（工件是它自己 docs 的来源）。
+测试：`only_a_changed_node_set_is_a_contract_change`。
+
+### 3.18 新插件"写不进第一行代码"的两个真卡点（2026-10-29）
+
+bot 报告说 `request_iteration` 返回 `verdict=Pass` 却一个字节都没落地、并据此得出"我没有写文件的
+动作、只能拿 `fs_write` 绕过"。日志反驳了这个结论：同一轮迭代里 `replace_file_exact` /
+`create_file` 对 `plugins/bili_watch/...` 全部返回 `ok` 且 `changed_paths` 有内容，bili_watch 的
+代码确实落地了。真正的卡点是另外两个：
+
+1. **未加载的插件不能被迭代**。`begin_plugin_iteration` 只用 plugin registry 解析 root，
+   `determine_root_plugin_path` 对不在 registry 里的路径直接报
+   `target plugin paths do not share a loaded subtree root: lpl`。而新建插件在第一次构建成功前必然
+   不在 registry 里——于是"写第一行代码"这一步永远被拒（21:24、21:26 两次
+   `plugin subtree not found for lpl` 就是这个）。现在：目标在 `plugins/<name>` 存在但未加载时，
+   直接把它当自己的 root 迭代（`allowed_plugin_roots` = `plugins/<name>`，上下文照常收集）。
+2. **新插件 reload 是静默 no-op**。`reload /lpl` 在 snapshot 里找不到目标时直接返回
+   `status=reloaded, changed_plugins=[]`，看起来成功、其实什么都没加载，于是 `list_plugins`
+   永远缺 lpl、内核问题里挂着 `load_failure HashMismatch`。现在：目标在 artifact index 里、
+   但不在当前 snapshot 时，回落到整快照 reload（`reload_internal`），新插件因此能被加载。
+
+测试：`iteration_accepts_a_plugin_that_exists_only_on_disk`、
+`reload_of_a_brand_new_plugin_falls_back_to_a_full_reload`。
+
+**给 bot 的建议路径**（不要再走 `fs_write`）：`request_iteration({"plugin_path":"/lpl", …})` →
+`run_plugin_check` / `run_plugin_test` → `record_iteration_summary` → `reload /lpl`。
+
+### 3.19 抽卡：每人一个池子，默认池跟真实卡池（2026-10-29）
+
+之前 `data/gacha/state.json` 是**全局单份**：谁抽都写同一个保底，`setbanner` 也没有任何权限
+判断（只有一把防并发写的 `STATE_LOCK`）。于是"池子被谁改了""谁都能改"都是真的。
+
+现在：
+
+- **按人分池**：`data/gacha/users/<uid>.json` 存 `{state, banner}`，`uid` 来自内核注入的
+  `__meta.actor`（`qq:1751557948` → `1751557948`），CLI/运维用 `default`。老的
+  `state.json` 作为 `default` 的兼容读入口，首次写入后迁移到 `users/default.json`。
+- **默认池 = 真实卡池**：内置 `real_banner()`（当前写的是 玛薇卡 + 班尼特/迪奥娜/卡齐娜），
+  `data/gacha/banner.json` 可覆盖，无需重编。
+- **权限**：操作员（`data/qq_operators.json`，或无 `__meta` 的 CLI）的 `setbanner` 改**默认池**；
+  其他人只能改**自己那份**，`user` 参数只对操作员生效——普通玩家没法改别人的池。
+- **UP/歪计数**：`GachaState` 新增 `char_5_featured_count` / `char_4_featured_count` /
+  `char_4_off_banner_count`，`pull`/`status` 返回 `stats`，报告必须用这三项。按名字统计是错的
+  （常驻四星池里就有 UP 的名字），4★ 的 UP 期望也是 **75%**（50% + 歪一次保底），不是 50/50。
+
+测试（`cargo test -p gacha`，8 个）：`per_player_pools_are_independent_and_banner_comes_from_the_real_default`
+（两人保底互不影响、默认池继承、玩家改自己、玩家劫持 `user` 无害、玩家改不动 `banner.json`）、
+`featured_counters_match_the_four_star_total`、`legacy_state_file_seeds_the_default_player`。
+
+部署：`prepare-artifacts` + `sync-plugin-docs` + `reload /gacha`（10:54，**不需要重启**——
+正是 3.17 里那个 docs 漂移修复让 reload 能过）。
+
+### 3.20 往期卡池：本地库 + 搜索 + 套用（2026-10-29）
+
+"搜往期池子"做成确定性查询，不做现场网页解析：
+
+- `data/gacha/banners.json`：`[{id, version, phase?, from, to, featured_5[], featured_4[],
+  source?}]`；`search <关键词>` 按 id/版本/日期/角色名匹配，返回命中的卡池；
+- `setbanner <id>` 把某期记录套到**自己的池**（操作员套到默认池），之后正常抽；
+- `history_add` 写库，**只允许操作员**（`data/qq_operators.json` 或 CLI）——否则普通玩家能让
+  bot 灌假历史，其他人再搜到假池子；录入时角色必须是 `list` 里的真名，保证套用后能抽；
+- 库里没收录时，`search` 明确回"没有收录 + 用 history_add 录入"，不会瞎猜。
+
+库初始为空：`history_add` 由操作员录入（保留 `source` URL），也可以让 agent 用它自己的
+`web_search` 查完后写入——那一步走的是它的搜索通道，不依赖本机的 web 搜索配置。
+
+测试（`cargo test -p gacha`，9 个）：`historical_banners_are_operator_recorded_searchable_and_applicable`
+（玩家录入被拒、按版本/角色/日期命中、未命中、套用到自己的池、默认池不被玩家改动、未知 id 报错、
+未知角色被拒、缺 banner 对象被拒）。
+
+部署：`prepare-artifacts` + `sync-plugin-docs` + `reload /gacha`（10:59，无重启）。
+
+### 3.21 往期卡池库已灌入真实数据（2026-10-29）
+
+`data/gacha/banners.json` 现在有 **184 条**记录（1.0 上 ~ 7.0 下，覆盖 105 个版本相位；同期双池拆成
+`<版本>-<相位>a/b`，例如 `5.3-1a` / `5.3-1b`）。每条带 `source`：
+
+`https://github.com/SleepCloudMX/genshin-wish-almanac/blob/main/data/UP.json`
+
+（fandom 的 `Wish/List` 从这台机器连不上——`curl` 直连超时，`web_fetch` 也 `fetch failed`；GitHub
+raw 可达，所以用了这份镜像数据集。）
+
+同时把角色库补全：新增 15 个五星（伊涅芙/兹白/哥伦比娅/奈芙尔/奥黛塔/尼可/杜林/枫原万叶/桑多涅/
+法尔伽/洛恩/瓦雷莎/莉奈娅/菈乌玛/菲林斯）和 7 个四星（叶洛亚/塔利雅/布伦妮/爱诺/赛索斯/阿罗夏/
+雅珂达），使 105 个相位全部能解析、能套用（插件只接受角色库里的真名）。
+
+已知近似：镜像数据是"每个相位一份四星三件套"，同期两池共用同一组四星；真实游戏里 5.x 之后两池
+四星常常不同。要精确到池，用操作员身份 `history_add` 覆盖对应 id（`same id` 会替换）。
+
+### 3.22 迭代"成功"的假象：真正的判定没回给 agent（2026-10-29）
+
+bot 两次"撤销映射"都报了成功（`record_iteration_summary` 通过、`changed_paths` 有值、测试通过），
+但文件还是老样子。查日志后确认：那两次迭代的**最终判定是 `RolledBack`**——canary 用录制的
+invocation 回放了新构建，响应变了（这正是"改行为"），于是 `finalize_plugin_iteration` 走了
+"验证失败 → `restore_plugin_iteration_workspace`"，把文件还原了；而 `request_iteration` 只把
+**verifier_verdict（Pass）** 回给 agent，所以它以为成功、去读文件发现没变，只能说"空判定/没工具"。
+
+现在 `request_iteration` 的返回是真实的最终状态：
+
+```json
+{"ok": false, "verdict": "RolledBack", "final_verdict": "RolledBack",
+ "verifier_verdict": "Pass", "canary_verdict": "Fail",
+ "changed_paths": [...], "summary": "...",
+ "rolled_back": true,
+ "error": "iteration did not promote (RolledBack): <原因>. the canary replayed recorded
+           invocations ... so the workspace was restored. Changing behavior intentionally
+           needs operator approval ... Do NOT report the change as done."}
+```
+
+- `ok` 只在 **Promoted** 时为 true；
+- Blocked（候选已暂存、`working tree` 里有改动但没生效）也会说明"等操作员批准"，不会说成成功；
+- 代码：`iteration_result_json`（纯函数，3 个单测覆盖 Promoted / RolledBack+canary Fail / Blocked）。
+
+**仍未闭合**（见 4.9）：agent 目前**没有**批准通道——`approve_blocked_iteration` 只存在于 host
+API/CLI。所以"会改变行为"的修改只能由操作员在宿主侧批准；bot 现在至少会如实报"需要批准"，
+而不是谎称已改或反复重试。
+
+### 3.23 canary 不再拿随机节点当证据（2026-10-29）
+
+上一版 canary 会把**最近一次成功调用**（请求+响应）录制下来，重建后回放比对。问题：
+
+- `gacha_entry{pull}` 这类节点**带随机性**：同一 payload 两次结果不同 → 回放必然不匹配 →
+  canary=Fail → 任何动到该插件的迭代都被回滚（"改行为"永远落不了地）；
+- 回放还有副作用：为比对而再抽一次卡，会真的消耗保底（bot 报过"保底从 24 变 34"）。
+
+现在：
+
+1. **声明了 side_effects 的节点不参与回放**（`node_declares_side_effects`，读节点 docs）；
+2. 其余样本先做**确定性探测**：同一 payload 连跑两次，两次不一致 → 判为非确定性，跳过该样本
+   （`canary_probe_verdict` 返回 `None`）；
+3. 只有确定性样本才与录制基线比对 → Pass/Fail。
+
+效果：随机/副作用节点不再把迭代拖进回滚，确定性节点的行为变化仍会被拦。
+测试：`canary_probe_tests`（非确定性→无证据、确定性一致→Pass、确定性但变了→Fail、声明副作用被跳过）。
+
+### 3.24 迭代批准通道（策略在插件，机制在 kernel）（2026-10-29）
+
+`Blocked` 的迭代原来没有任何 agent 侧入口能批准（`approve_blocked_iteration` 只存在于 host API）。
+现在加了 `approve_iteration` 工具，但**判权不写在 runtime 里**：
+
+- **策略在插件**：qq 插件在 envelope 里给出 `caller_can_approve` ——
+  操作员名单（`data/qq_operators.json`）**或**该群 owner/admin 时为 true（
+  `approve_iteration_decision`，有单测）；别的渠道插件可以按自己的规则给值；
+- **机制在 kernel**：CLI 把该字段存进会话（`refresh_session_caller(..., can_approve)`），
+  `SessionCaller::can_approve_iteration` 暴露给工具层；`agent_approve_iteration` 只做
+  "渠道给了这个能力吗"的判定（`approve_iteration_permission`），通过才调
+  `approve_blocked_iteration`。
+
+工具描述明确要求"仅当对方明确批准这次改动时使用"，模型自批无意义（它拿不到别人会话的能力位）。
+测试：`approve_iteration_gate_tests`（未知会话拒绝、无能力拒绝、有能力放行）、
+`approve_iteration_tool_is_advertised_and_dispatched`（工具在列表里、分发到 host）、
+qq 侧 `approve_iteration_capability_follows_operator_list_and_room_role`。
+
+### 3.25 迭代闸门改成"测试说了算"（2026-10-29）
+
+canary 回放是不靠谱的代理（随机、副作用、录制时机都能左右它）。现在闸门就三条：
+
+1. **代码改动必须带测试**：`record_iteration_summary` 会检查本次迭代的编辑里是否包含
+   `plugins/<p>/tests/**`（或 `*_test.rs`/`tests.rs`）的新增/修改；没有就直接拒绝摘要并给出
+   "先补测试、跑 run_plugin_test 再记录"的可操作提示。**纯文档改动豁免**（只动 `docs/**` 或 `*.md`）。
+2. **测试不过不能落地**：最终判定只看 verifier（它跑 `cargo test`）是否 Pass；Fail 就
+   `RolledBack` 并恢复工作区。
+3. **改既有测试要审批**：如果改动里包含对**已存在**测试文件的修改/删除（`CreateFile` 之外的
+   kind），迭代会在测试通过后停在 `Blocked`（候选保留、工作区保留），必须由
+   `approve_iteration`（3.24，渠道侧判权）批准才 promote。
+   canary 仍会记录，但只作诊断，不再参与判定。
+
+测试：`test_change_policy_tests`（测试路径识别、新增/修改分类、docs-only 豁免）、
+`finalize_blocks_a_change_that_edits_an_existing_test`、
+`finalize_manual_approval_promotes_a_test_editing_change`、
+`finalize_partial_canary_does_not_block_a_tested_change`。
+
+### 3.26 重构第一步：迭代策略独立成模块（2026-10-29）
+
+原来"这次改动能落地吗"的判断散在三处（summary 工具里查测试、finalize 里读 `requires_approval`、
+agent 工具层做批准门控），加一条规则要改 6 个地方。现在收进 `crates/cordis-runtime/src/iteration/`：
+
+- `policy.rs` —— 纯函数，不碰文件系统/时钟/host：
+  `test_changes` / `is_test_path` / `iteration_changes_docs_only` / `summary_rejection` /
+  `canary_probe_verdict` / `node_declares_side_effects_in` / `promotion_verdict` /
+  `BLOCKED_EDITS_EXISTING_TEST`。判据表就是一个 `match`，组合全覆盖；
+- `report.rs` —— 结果措辞与批准门控：`iteration_result_json`（Promoted/Blocked/RolledBack 的
+  真实回报）与 `approve_iteration_permission`（渠道给的能力位）。
+
+`host.rs` 的 summary 与 finalize 现在只做副作用（落盘、恢复、promote），判定全部委托给
+`iteration::policy`；`agent.rs` 只剩工具分发。测试随之搬家（policy 7 条、report 4 条）。
+
+行数变化：`agent.rs` 4340 → 4144，`host.rs` 17106 → 16893，新增 `iteration/` 490 行。
+
+**提交后继续做的**：去掉 `PluginIterationAgentSnapshot` 中间层（agent 阶段的结果现在直接是
+`PluginIterationAgentRun`，字段不再抄两份）——迭代状态结构从 6 个降到 5 个。
+
+**后续（未做）**：
+
+1. 把 6 个迭代状态结构（Prepared/AgentState/AgentSnapshot/AgentRun/RunState/KernelResult）合成
+   一个 `IterationRecord`；
+2. 拆 `host.rs`（loader / snapshot / reload / iteration / tools / observability）；
+3. 插件 ABI 引入 `&mut PluginInstance`（store/clock/logger 注入），去掉进程级 static；
+4. 工件内容寻址 + 单一派生索引，`interfaces.json` 只作投影缓存。
+
+### 3.27 host.rs 拆分（2026-10-29）
+
+`crates/cordis-runtime/src/host.rs` **16,897 行** → `host/mod.rs` **6,861 行** + 子模块：
+
+| 文件 | 行数 | 内容 |
+|---|---|---|
+| `host/mod.rs` | 6,861 | RuntimeHost 主体（boot/invoke/agent/tools） |
+| `host/reload.rs` | 823 | reload / candidate / promote / rollback / approve / startup 重放 |
+| `host/iteration_agent.rs` | 729 | 插件迭代 agent 的工具面（PluginIterationAgentBackend + AgentBackend） |
+| `host/kernel.rs` | 632 | `impl RuntimeKernel` |
+| `host/*_tests.rs`（19 个） | ~6,000 | 原先内联在 host.rs 里的测试 |
+
+做法：`host.rs` → `host/mod.rs`；测试模块改 `#[cfg(test)] mod X;` 指向 `host/X.rs`；impl 块整块搬到子模块并把方法改成 `pub(crate)`/`pub(super)`（集成测试用到的保留 `pub`）。
+
+工具经验：按大括号计数找模块末尾会被字符串里的 `{}` 带偏（第一版截断了 3 个文件）；稳妥做法是"下一个列 0 的顶层项之前、最后一个 `}` 行"。
+
+验证：`cargo test -p cordis-runtime --lib` 986、`--test host_reload_arms` 14、
+`-p cordis-cli` 48；fmt/clippy 干净。
+
+### 3.28 B1 试过了，已回滚：工具调用回到回复通道（2026-10-30）
+
+**试过的方案**：把"回复"从工具调用改成"助手正文即消息"，删掉 `{"action":...}` envelope 与整个
+JSON 解析/重试回路。动机是 DSML 泄漏——模型把 `invoke_plugin(qq, qq_send, …)` 序列化成文本，
+provider 没解析成 `tool_calls`，inbox 看到没有 `action` 的 JSON 就丢弃重试并刷屏。
+
+**为什么回滚**：换掉回复通道后，"不说话"失去结构性表达。先是用 `[silence]` 标记，模型把它翻译成
+`[寂静]`/`[沉默]`；改成 `[SILENCE]` + 识别本地化方括号后，仍然要在一个可翻译的自然语言通道里
+编码一个符号。随后试的"回复闸门"（独立一次 YES/NO 调用）也不被接受：多一次模型调用，而且把
+判断从主模型挪走了。
+
+**现在的契约**（回到 dd56e41 的状态）：回复走工具调用 `invoke_plugin(qq, qq_send, …)`，
+`{"action":"suspend"}` 表示本轮结束/不说话，`{"action":"respond","message":…}` 仍可用；
+inbox 解析首个 JSON 值，未知 action 只写日志（不再往群里发横幅），格式异常横幅按会话节流。
+
+**教训**：把"回复"从工具调用里拿出来，等于把"不说话"变成一种需要在正文里编码的符号；只要它是
+符号，模型就会翻译它。结构化的东西（工具调用）才扛得住多语言与改写。
+
+### 3.29 DSML：把被序列化的工具调用捞回来（2026-10-30）
+
+DSML 泄漏是 provider 侧的低频行为（本地连打 8 次探针都是正常结构化 `tool_calls`，线上却偶发）。
+既然格式无法先验确定，就在**协议层**做结构化恢复，而不是在 CLI 猜意图：
+
+- `looks_like_serialized_call`：只有正文里出现 DSML 标记（`dsml` / `｜｜` / `<invoke` / `<tool_call`）
+  才考虑，普通回复里出现 JSON 一律不动；
+- `extract_json_objects`：按括号配对 + 字符串/转义感知，抽出正文里所有顶层 JSON 对象；
+- `serialized_call_to_tool_call`：每个对象带 `node_id` 就还原成一次 `invoke_plugin` 调用
+  （`payload_json` 就是该对象）；缺少 `plugin_path` 时由 `RuntimeHost::plugin_for_node` 在已加载
+  快照里按节点唯一解析，找不到/有歧义就报明确错误；
+- 命中时把 `content` 清空（那本来是序列化的调用，不是要发出去的话），并打
+  `agent_dsml_salvage` 诊断（含完整原文），下一次真实泄漏就能留下确切样本。
+
+验证：`cargo test -p cordis-runtime --lib` 990（新增 4 条 DSML 用例：还原、纯文本不误伤、
+多对象保序、嵌套/转义提取），cli 49、qq 71、feishu 57，clippy 干净。
+
+### 3.30 被禁言时 bot 自己知道（2026-10-30）
+
+**症状**：bot 在群里被禁言后照旧"回复"，OneBot 每次返回失败，模型只知道"发送失败"，于是继续
+尝试——它不知道自己被禁言了。
+
+**做法**（qq 插件，全在渠道侧，kernel 不动）：
+
+- `onebot_send_group_msg` 失败时向 OneBot 求证：`get_login_info` 拿自己的 uin →
+  `get_group_member_info` 读 `shut_up_timestamp`（秒，0 表示未禁言），得到权威解禁时间；
+- 求证不到但错误文案含 禁言 / mute / shut up 时，按 10 分钟兜底记录（至少让行为正确）；
+- 记录进 `MUTE_UNTIL`（group → 解禁毫秒）：禁言期内 `qq_send` **直接拒绝**并返回
+  `你在本群被禁言，消息未发送（…）。[muted: 约 N 分钟后解禁]`，不再打 API；
+- 下一条入站消息的 `notes` 追加同一句 `[muted: ...]`——模型在**决定要不要说之前**就知道，
+  而不是说完才看到失败；
+- 发送成功即清除记录；提示词新增 MUTED 规则（不要重试、保持安静、解禁后自动恢复）。
+
+验证：qq 75 单测（新增 4 条：文案识别、`shut_up_timestamp` 换算、分钟数四舍五入、表的记录/过期/清除），
+kernel 990、cli 49、clippy 干净；16:28 重启，8099/8002 正常。
+
+### 3.31 移除 `sync-plugin-docs`（2026-10-30）
+
+**它做什么**：读 `artifacts/index.json`，把每个插件的 `docs` 再写成
+`fixtures/plugins/<名>/docs/agent/interfaces.json`。
+
+**为什么删**：
+
+- `prepare_artifacts` 在构建 dylib 插件时**已经**写同一个文件
+  （`cordis-tooling/src/lib.rs`：`write_pretty_json(&docs_path, &docs)`），所以它是同一个文件的
+  第二个写入者，且唯一能做的事是"不重建、只刷新镜像"——恰好是镜像最容易与源码脱节的时刻；
+- 运行时**不读**这份镜像：docs 的真相在 `artifacts/index.json`（loader 从那里取），镜像的唯一
+  消费者是 tooling 的 `collect_files(include_docs)`，把它当迭代上下文文件塞进去，且缺失也容忍；
+- 它带维护税：文档里被写成固定流程、每次要跑一次、忘了就陈旧，还制造了
+  "每次重写都吃掉文件末尾换行"的 git 噪音。
+
+**顺带修掉的换行根因**：`cordis_plugin_sdk::pretty_json` 直接返回
+`to_string_pretty`，不带结尾换行，于是每次写盘都把文件的换行吃掉。现在它补一个 `\n`
+（有单测断言"以且仅以一个换行结尾"），所有由它写出的文件（docs 镜像、artifact index）
+从此不再产生 `\ No newline at end of file` 噪音。
+
+**历史记录说明**：本文档早前章节（3.x）里的 `prepare-artifacts → sync-plugin-docs → reload`
+流程描述保留原样，作为当时的部署记录；**现在请只跑 `prepare-artifacts`**。
+
+### 3.32 失败不再靠"等下一条消息"：空补全与就地重试（2026-10-30）
+
+**症状**：群里 bot 发「⚠️ LLM 请求失败（消息已暂存待重放）: LLM response invalid:
+agent response had neither tool_calls nor final content」。一轮对话因为一次**空补全**
+被整体丢弃，消息进 `pending`，而 `pending` 只在下一条消息到来时才重放——于是没人再说话，
+它就永远不回了。另外群里出现过「我这边刚才调用模型失败了，你的消息我记下了，稍后会自动重试。」：
+那是 cli 的 `OUTAGE_NOTICE`（`main.rs`），在失败落盘后按 10 分钟窗口节流发到群里，
+不是客户端注入——早期判断错了，2026-10-30 更正。它进了历史后会被模型原样复读，所以现在
+**不再发到群里**（只写日志），并从请求历史里过滤掉。
+
+**两处改动**：
+
+1. kernel（`agent.rs`）：空补全（既无正文也无 tool_calls）**不是**契约违规，是 provider 抖动。
+   同一请求最多重发 `EMPTY_RESPONSE_RETRIES = 2` 次；拿到真回复即清零，只有连续失败才报错
+   （错误文本带 after N retries）。
+2. cli（`main.rs`）：`agent_send` 失败后**就地重试**（2s / 5s / 15s，共 3 次），而不是立刻写
+   `pending` 等别人开口；三次都失败才 spill + 告示。`with_retries` 的 sleep 是注入的，策略可单测。
+
+顺带：`is_client_notice_text` 把那条客户端告示（以及模型对它的复读）从请求历史里滤掉——它不含
+对话内容，只提供模仿样本；只匹配 ≤120 字的短文本，真人长篇引用不受影响。
+
+验证：runtime 993（空→真两次请求成功、持续空 2+1 次后失败、告示识别）、cli 52（重试成功/首次即成
+功不等待/耗尽返回最后错误），clippy 干净；18:3x 重启，8099/8002 正常。
+
+### 3.33 群图归档：入站图片落盘（2026-10-31）
+
+**背景**：QQ 图片此前只有一个去处——`image_input` 下载字节、base64 内联进请求，看完即弃；
+`[image: <url>]` 里的 QQ 链接还带时效，等于群里的图从来留不下来。
+
+**实现**（`fixtures/plugins/qq`）：收到群消息时把图存到 `data/media/<群号>/`，文件名
+`<时间戳>-<user>-<msg_id>-<序号>.<ext>`；配置 `data/qq_media_archive.json`
+（默认启用、`groups: ["*"]`、`dir` 可改），私聊不存。
+
+三条边界：
+
+1. **旁路**：下载在独立线程（`spawn_media_archive` 真的 spawn），单张失败只记
+   `[qq] media archive: …`，消息照常入队；单张 10s 超时 + 20MB 上限。
+2. **去重前提**：放在事件去重之后，重复投递不会重复下载。
+3. **可测**：`media_archive_dir` 公开给集成测试；下载线程本体 `media_archive_fetch_all`
+   用本地 stub 服务直接单测（成功落盘 / 一张失败仍继续）。
+
+### 3.34 房间 ↔ session 绑定持久化（2026-10-31）
+
+**问题**：会话对象与快照本来就有（`data/sessions/*.json`，启动时 crash recovery 会读回），
+但 cli 里 `session_key → session_id` 的映射是**纯内存**的，每次重启都为房间新建 session：
+上下文断掉，磁盘快照变孤儿（实测积累了 675 个）。
+
+**实现**：`data/sessions/index.json` 持久化绑定，tmp+rename 原子写；启动时读回并用
+`agent_status` 探测，宿主没恢复的条目直接丢弃（同时重写索引）；新建会话时写入，
+LRU 淘汰时同步删除。
+
+**验证**：重启后同一房间仍是 `agent-session-1793381492493-1`，快照数不变（677），
+重启后 16 条消息继续走同一个会话。
+
+### 3.35 工具调用改走 DSML 文本协议（2026-10-31）
+
+**动机**：`response_format: json_object` 与工具调用互斥——模型一想调工具就退化成
+"只有空白 delta、`finish_reason=stop`、0 正文 0 调用"，一轮里重试 12 次全是同一请求。
+同时 DeepSeek 本来就会把调用序列化成 DSML 文本（早期就靠 `salvage_serialized_tool_calls` 打捞）。
+
+**改法**：请求里**不再发** `tools` / `tool_choice` / `response_format`；改为第二条 system
+消息描述协议，并附一份紧凑工具目录（`node_id` + 一句话 + 参数名）：
+
+```
+<|DSML|tool_calls>
+{"node_id": "read_file", "payload_json": {"path": "..."}}
+</|DSML|tool_calls>
+```
+
+插件节点统一走 `invoke_plugin`（`payload_json` 内带 `plugin_path`/`node_id`/`payload_json`）。
+
+**解析**：`salvage_serialized_tool_calls(content, tools)` 把块里的每个 JSON 对象变成
+`LlmToolCall`：
+
+- `plugin_path` 为空且 `node_id` 命中内核工具 → **直接调用**该工具（参数取 `payload_json`）；
+- 否则包成 `invoke_plugin`（`plugin_path` 可为空，由 host 按节点反查插件）；
+- id 为 `dsml-<序号>-<node>`，同一轮重复调同一节点不会撞 id。
+
+**验证**：向 qq 插件 HTTP 端口注入一条签名事件（群 867130587），日志出现
+`⚙ invoke_plugin {"plugin_path":"","node_id":"qq_send",…} -> ok sent`，且模型先调
+`get_runtime_status` 拿到了真实状态——内核工具与插件节点两条路都通。
+
+**副作用**：`session` 快照新增 `empty_response_strikes` 字段漏了 `#[serde(default)]`，
+导致启动时 653 个旧快照解析失败被跳过；已补默认值，恢复 `recovered 677, skipped 1`。
+
+### 3.36 回合结束改由 `suspend` 工具决定（2026-10-31）
+
+**语义**：渠道会话的回合**不会因为模型停下来而结束**。模型只能通过工具说话（`qq_send`），
+自己写的正文不发送；只有调用 `suspend` 才结束这一轮。这样"沉默"和"没写完"不再混淆。
+
+**实现**：
+
+- `AgentStartOptions.require_end_tool`（渠道 = true，shell = false），随会话快照持久化；
+- 循环里把 `suspend` 从待执行调用里摘掉：它是标记，不是工具；
+- 没有调用且没有标记 → 推一条 `[system] 这一轮还没结束…`，最多 3 次，仍不结束才报
+  `agent turn never called the end tool (suspend)`；
+- 协议提示里同步写明：正文不会发给任何人，结束时调用 `{"node_id":"suspend"}`。
+
+**同时删掉的东西**：cli 侧的 JSON 信封（`parse_first_json` / `respond` / `suspend` 动作 /
+格式错误重试 / `⚠️ 回复格式异常` 横幅 / `OUTAGE_NOTFY_WINDOW` 节流表）。正文即丢弃，
+`outbound_replies` 只从工具调用里取真正发出的文本。
+
+**验证**：注入签名事件后日志为 `⚙ invoke_plugin … qq_send → ok sent`，随后
+`sent 1 message(s) through tools`，全程没有正文被发到群里。
+
+### 3.37 agent loop 移出 kernel（进行中，2026-10-31）
+
+目标与分阶段计划见 [agent-loop-extraction.md](agent-loop-extraction.md)。第一步（抽
+`agent_api` 接缝类型）已完成并提交（`ac4d055`）；后续步骤是 `AgentLoop` 注入点、
+`crates/cordis-agent` 建 crate 搬运循环、以及 `iteration/` 随之迁出。
+
+动机：`agent.rs` 4585 行、是仓库唯一被 coverage 排除的面，而这一晚所有的行为改动
+（B1 回滚、DSML 协议、end-tool 语义）都必须改 kernel + 全量重建 + 重启。
+
+### 3.38 被预算剥掉的图片可以取回：`view_image` + 内容寻址缓存（2026-11-05）
+
+**问题**：请求体字节预算把超预算的历史图片换成一行占位符
+（`[image omitted to fit request byte budget; sha256:<8位>; <W>x<H> <fmt>]`），
+占位符只带摘要前 8 位与尺寸——模型从此**永远**看不到那张图，也没有任何"取回"的
+通道。图片在请求装配时被剥掉、原始字节随之丢弃，这是 `image_budget` 上线后遗留的
+单向门。
+
+**实现**（kernel）：
+
+1. **内容寻址缓存**（新模块 `cordis-runtime/src/image_cache.rs`）：kernel 下载入站
+   图片时把原始字节写到 `data/media/<sha256>`，同名文件已存在就跳过（`store`，
+   临时文件 + rename）。下载入口是 `RuntimeHost::image_parts_for_batch` 注入的
+   `image_cache::caching_fetcher`。
+2. **占位符带地址**：`placeholder_for` 追加 `path data/media/<sha256>`（**全量**摘要，
+   相对仓库工作目录），于是占位符本身就是缓存地址；`sha256:<8位>` 仍保留给人和
+   `sha256` 前缀查选用。占位符仍是纯函数——路径由摘要推出来，不查盘。
+3. **新工具 `view_image`**（kernel 工具，加入 `shell_agent_tools()` 与
+   `RuntimeShellAgentBackend::execute_tool`）：入参 `{"path": "..."}` 或
+   `{"sha256": "<8~64 位十六进制前缀>"}` 二选一；路径必须是 `data/media/<name>` 形状
+   （绝对路径、`..`、子目录一律拒），摘要前缀在缓存目录里必须唯一。返回
+   `{"ok":true,"attached":"data/media/<sha256>"}`，并把该图放进 backend 的
+   `attached` 队列。
+4. **下一次请求带回来**：循环在每次工具轮结束、准备 `continue` 之前取走队列
+   （`attach_recovered_images`），作为一条 user 消息追加，然后对整个 `messages`
+   重跑 `enforce_image_budget`——**先扣本轮新图、再扣队列**，装不下的图丢弃并在
+   附言里写明张数，整条请求仍 ≤ `INLINE_IMAGE_BUDGET_BYTES`。队列绑定在一次
+   `respond` 上（backend 生命周期），回合结束即丢，因此不会跨轮泄漏图片。
+5. **vision 插件**：`read_local_image` 从"只许 `/tmp`"放宽到"`/tmp` 或
+   `data/media/` 下的文件"（先拒 `..`，再 canonicalize 后判断形状），
+   `load_source(path=…)` 因此也能读回占位符里的地址。
+
+**边界**：取回是**一次性**的——图片只出现在取回后的那一次请求里，不进 history；
+模型需要再看一次就再调一次 `view_image`。这是有意的：历史里只保留可寻址的占位符，
+避免"取回"变成绕开字节预算的后门。
+
+**验证**：runtime 963 lib 测试（`image_cache` 16 条、`image_tools` 3 条）、agent 81 条
+（端到端：占位符 → 调 `view_image` → 下一次请求里图回来）、vision 11 条；clippy
+`-D warnings` 干净。
 
 ## 4. 部分完成
 
@@ -203,7 +889,7 @@ Agent 现在可以自主完成：读代码 → 理解结构 → 写/改文件 �
 
 ### 5.1.1 lib 单测 snapshot root 共享导致并行互踩（2026-07-23 发现，2026-07-24 已闭合）
 
-- [x] 根因：共享 repo fixtures 的测试派生同一 `default_snapshot_root`，boot 无条件删除目录下所有 `snapshot-*`，并行 boot 互删对方 in-flight staging（`rename staging -> target failed`，x86_64-linux 实测 5 例）。修复：snapshot 目录名改为 `snapshot-{pid}-{nanos}`，boot 清理抽为 `cleanup_stale_snapshot_dirs`，按目录名 pid 段经 `lock_pid_is_live`（tooling.rs，`kill(pid,0)` 探活，改 `pub(crate)` 复用）只删已死进程的残留；同进程并行测试线程共享活 pid 不再互删，旧格式 `snapshot-{nanos}` 视为 stale。配套单测 `stale_snapshot_cleanup_keeps_live_pid_dirs`（活 pid 保留 / 已死子进程 pid 删除 / 旧格式删除 / 非 snapshot 目录与普通文件不动）。CI 的 `--test-threads=1` 串行开关随之移除。
+- [x] 根因：共享 repo fixtures 的测试派生同一 `default_snapshot_root`，boot 无条件删除目录下所有 `snapshot-*`，并行 boot 互删对方 in-flight staging（`rename staging -> target failed`，x86_64-linux 实测 5 例）。修复：snapshot 目录名改为 `snapshot-{pid}-{nanos}`，boot 清理抽为 `cleanup_stale_snapshot_dirs`，按目录名 pid 段经 `lock_pid_is_live`（现 `plugin/artifact.rs`，`kill(pid,0)` 探活；5.2.48 拆出 tooling 后由 `pub(crate)` 放宽为 `pub`，供 `cordis-tooling` 复用）只删已死进程的残留；同进程并行测试线程共享活 pid 不再互删，旧格式 `snapshot-{nanos}` 视为 stale。配套单测 `stale_snapshot_cleanup_keeps_live_pid_dirs`（活 pid 保留 / 已死子进程 pid 删除 / 旧格式删除 / 非 snapshot 目录与普通文件不动）。CI 的 `--test-threads=1` 串行开关随之移除。
 
 ### 5.2 执行引擎缺口闭合（2026-06-05 大部分已闭合）
 
@@ -239,13 +925,509 @@ Agent 现在可以自主完成：读代码 → 理解结构 → 写/改文件 �
 - [x] **Plugin iteration symlink 逃逸**（P0-20）— `PluginEditExecutor::execute` 在写入前调用新 helper `resolve_under_workspace`：canonicalize 结果必须仍在 workspace_root 下。plugins 内的 symlink 指向 `/etc/passwd` 之类无法被写入。
 - [x] **Verifier shell 拼接**（P0-21）— 已随 A 批 P0-1 修复。`discover_rust_workspace_manifest` 输出的字符串被 `shell_words` 解析成 argv，空格 / `$` / `;` 无法被解释。
 
-### 5.2.41 host.rs 三处安全硬化（2026-08-09 已闭合）
+### 5.2.57 图片计入 token 估算 + 快照剥掉 base64（2026-11-05 已闭合）
+
+**现象**：两条与图片相关的计量 / 持久化缺陷。
+
+1. `compact_history` 只读 `message["content"].as_str()`。带图消息的 `content` 是
+   `[{type:"text"},{type:"image_url"}]` 数组，`as_str()` 返回 `None`，于是这条
+   消息在摘要里变成空行——既不摘要也不丢弃。
+2. `estimate_tokens(text) = chars/2` 只吃字符串，图片 part 的 base64 完全不进
+   `estimated_tokens`，按 token 的裁剪对图无效；`to_snapshot` 又把 `history` 里
+   几十 MB 的 base64 原样写进 `data/sessions/*.json`（auto-save 的唯一来源；
+   shutdown memory 只写 session 状态，不写 history）。
+
+**改动**：
+- `crates/cordis-agent/src/imp.rs` 新增 `estimate_message_tokens(&Value)`：
+  `content` 是字符串时按 chars/2；是数组时逐 part 累加（text 按 chars/2，
+  `image_url` 按 base64 长度 / 4，即 `ceil(raw/3)`，等价于
+  `ceil(base64_len/3)*4/4`）；`reasoning_content` 一并计入。`remember_exchange`、
+  `compact_history` 的重算、96 轮 overflow 的 partial history 都改用它。
+- `remember_exchange` 的裁剪循环每丢一对就减掉该对的估算，并加 `!is_empty()`
+  守卫，避免恢复出的陈旧估算在空 history 上空转。
+- `compact_history` 新增 `summarize_message_content(&Value)`：遍历数组 content，
+  text part 按序拼接（字节预算写回的占位符原文保留），image part 折成
+  `[图片 N 张]` 标记并放在 500 字截断**之后**，长文本也不会吃掉标记。
+- `crates/cordis-runtime/src/image_budget.rs` 新增
+  `strip_inline_images(&mut [Value]) -> usize`（等价于零预算的
+  `enforce_image_budget`，复用 `placeholder_for`，不复制实现）。
+- `to_snapshot` 在 history 的**克隆**上调用它，把内联 base64 换成占位符，并按
+  剥图后的 history 重算 `estimated_tokens`；live history 不变。
+- **重启后果（有意接受）**：快照里只有占位符，恢复出的会话不能再"看"历史图片，
+  只能看到 `[image omitted ...; sha256:<前8位>; <W>x<H> <fmt>]`（拿不到尺寸时
+  只有 sha256）。这是 47 MB 快照换来的取舍，`to_snapshot` 的代码注释写明了。
+
+**体积估算**：46 张图的会话快照原来 ~47.6 MB（与线上请求体同量级），每张换成
+~80 字节的占位符后约 `46 × 80 B ≈ 3.7 KB`，加上文本历史仍是 KB 级——约
+**47.6 MB → 4 KB**（降四个数量级）。
+
+**验证**：`cargo clippy --all-targets -- -D warnings` 零 warning；
+`cargo test -p cordis-agent --lib` 71 项、`cargo test -p cordis-runtime --lib`
+941 项全绿；新增 agent 单测 7 项、runtime 单测 1 项。
+
+**已知残余**：内联图按 token 折算后单张就常超过 `AGENT_HISTORY_TOKEN_LIMIT`
+（120k ≈ 360 KB 原始字节），`remember_exchange` 会把**整对**消息裁掉——含大图
+的用户文本与回复一起丢；`image_budget` 的历史剥离路径在正常会话里因此几乎不再
+触发（只剩旧快照 / 恢复会话这类入口）。后续应改为「超限时先把图片 part 换成
+占位符、仍超限才丢消息」，或给图片单独一个 token 预算。
+
+### 5.2.56 发送前的图片字节预算（2026-11-05 已闭合）
+
+**现象**：一个 1081 条消息的群会话请求体长到 47.6 MB（46 条带 `image_url`，最大
+5 条各 2.7–4.2 MB），网关返回 413
+`Failed to buffer the request body: length limit exceeded`；消息落进
+`data/pending/` 重放队列，机器人整轮发不出话。
+
+**根因**：`estimate_tokens(text) = chars/2` 只看文本，图片字节完全不计入，所以
+`AGENT_HISTORY_TOKEN_LIMIT` 对图永远不触发；`remember_exchange` 又把带图消息原样
+push 进 `history`，base64 常驻。
+
+> 2026-11-05 后续（5.2.57）：图片已计入 `estimated_tokens`，快照也剥掉 base64；
+> 本节这条字节预算继续负责**精确的请求体字节上限**（token 折算不等于字节上限）。
+
+**改动**：
+- 新增 `crates/cordis-runtime/src/image_budget.rs`（纯函数，无 I/O）：输入按时间
+  顺序的 messages + 字节预算，从**最老的图片**开始规划剥离；base64 大小按
+  `ceil(len/3)*4` 从 payload 反解出的原始字节数精确折算（不用 URI 字符串长度
+  近似），只认 `data:...;base64,` 内联 URI（远程 URL 不占内联字节）。
+  占位符形状 `[image omitted to fit request byte budget; sha256:<前8位>; <W>x<H> <fmt>]`
+  ——`WxH`/`fmt` 从 PNG IHDR、JPEG SOF、GIF LSD、WEBP VP8X/VP8 头读；拿不到尺寸或
+  格式时只写 sha256；连字节都解不出时只写 omitted。
+- `crates/cordis-agent/src/imp.rs` 的 `respond_inner` 在装配 `messages` 之前调用
+  `enforce_image_budget(&mut self.history, 预算 − 本轮新图字节)`，占位符**就地写回
+  `history`**（下一轮不必从原图重算），已发出的消息不受影响。
+- 预算常量 `INLINE_IMAGE_BUDGET_BYTES = 10 MiB`（对齐 DSH inline 20 MiB 的一半）。
+- `fixtures/plugins/llm_openai`：413 或 400+`INVALID_REQUEST` 时把剩余内联图片预算
+  减半、剥掉最老一批后**重试一次**（`images_shrunk` 保证只剥一次，不无限循环），
+  避免整轮失败进 pending。
+
+**验证**：`cargo clippy --all-targets -- -D warnings` 零 warning；
+`cargo test -p cordis-runtime --lib`、`cargo test -p cordis-agent --lib` 全绿；
+新增单测 image_budget 22 项、agent 3 项、llm_openai 7 项（含真实 413→SSE 的本地
+HTTP 重试用例）；`crates/cordis-runtime/src/image_budget.rs` 行覆盖 100%。
+
+**顺带修复**：`imp.rs` 里两条测试的 `#[test]` 属性被错位到上一条测试的文档之后
+（bad merge），使 `system_prompt_orders_persona_conduct_hints` 与
+`a_channel_turn_ends_only_on_the_suspend_call` 从未运行，test target 也在
+`-D warnings` 下因 `duplicated attribute` / `dead code` 报错。属性已归位、两条
+用例重新跑通（它们的行覆盖也重新计入 CI 门槛）。
+
+**未修（另行报告）**：`cargo clippy -p cordis-agent --all-targets` 另有**既有**红点
+——`crates/cordis-agent/src/lib.rs:47` 的 `items_after_test_module`（`mod tests` 之后
+还有 `impl`）与 `crates/cordis-agent/tests/iteration_pipeline.rs` 的 6 处 unused
+import / 2 处 needless borrow。根命令 `cargo clippy --all-targets` 不选
+`cordis-agent`（它不在 `default-members` 里），所以那两处不在门禁路径上。
+
+### 5.2.55 删除 vision 的 OCR / 视觉 LLM 节点（2026-11-05 已闭合）
+
+**动机**：agent 已原生支持图片输入（kernel `image_input` 下载后内联成 `image_url`
+content part），"先把图发给视觉模型转成文字"这条路只会让模型舍近求远。删除
+`vision_ocr`（tesseract）与 `vision_describe`（OpenAI 兼容视觉 API）两个节点。
+
+**改动**：
+- `fixtures/plugins/vision`：删掉两个节点函数、`guess_mime` / `describe_text_from_response`
+  / `vision_max_tokens` 等专属辅助、`match` 分发臂、`prompt` / `lang` 请求字段与 3 个
+  describe 响应单测；`declared_nodes = []`，docs 节点列表清空。图片下载缓存、
+  `read_local_image` / `load_source` 保留为 `pub` 库 API（已无节点消费，靠单测覆盖，
+  否则会变成 dead code）。
+- `fixtures/plugins/feishu`：`system_hint` 删掉 "Then pass that path to
+  vision_ocr / vision_describe for images."（否则模型仍会去调已删除的节点）。
+- `crates/cordis-runtime/tests/invoke_coverage.rs`：Task-node keep-alive 用例改用
+  `feishu_send`（空 payload 在插件内 fail-fast，语义与原来的 `vision_ocr` 相同）。
+- `fixtures/artifacts` 与 `docs/agent/interfaces.json` 经 `prepare-artifacts` 重生成。
+
+**验证**：`cargo clippy --all-targets -- -D warnings` 零 warning；
+`cargo test --manifest-path fixtures/plugins/Cargo.toml -p vision` 8 项全绿；
+`cargo test -p cordis-agent --lib` 全绿；`prepare-artifacts fixtures` 重建 vision 成功。
+
+**注**：本文 5.2.51 / 5.2.52 / 5.2.35 等历史条目里的 `vision_ocr` / `vision_describe`
+是当时的记录；这两个节点已在本批删除，当前状态以本节为准。
+
+### 5.2.54 fixtures 测试接入 CI 门禁（2026-10-27）
+
+**背景**：CI 只跑主 workspace 的 `cargo test --locked`，fixtures 的测试一个都不在门禁里：
+12 个 workspace member、10 个 expr 子 crate（在 fixtures workspace 的 `exclude` 里，各自
+独立 manifest）、以及 root 占位 crate。后果是 `expr/lexer/tests/lexer.rs` 里一条从 HEAD
+起就红着的断言（拿 `1 + a` 当词法错误，但 `a` 是合法标识符）一直活到 5.2.53 才被发现。
+
+**改动**：
+
+- [x] **`scripts/test-fixtures.sh`** — 唯一入口（CI 与本地共用）：member 走
+  `cargo test --locked --manifest-path fixtures/plugins/Cargo.toml`；10 个 expr 子 crate +
+  root 逐个 manifest 跑，统一 `CARGO_TARGET_DIR=fixtures/plugins/target` 只编一次
+  cordis-plugin-sdk（实测 154s → 22s）。这些独立 manifest **不能**加 `--locked`：它们的
+  lock 被 `.gitignore` 的 `fixtures/plugins/**/Cargo.lock` 忽略，干净 checkout 上锁文件
+  根本不存在，加了必失败。
+- [x] **CI** — `ci.yml` 在 `test` 之后加一步 `fixtures tests`，失败时按现有风格打
+  `::error::` 注解。放在 `prepare-artifacts` 之后：插件已构建，实测热身 **7s**（从零冷跑
+  64s，含 12 个插件的构建）。`rust-cache` 的 `workspaces` 无需改动（共享的
+  `fixtures/plugins` 已在列表里）。
+- [x] **`root` 占位 crate 归档** — 它此前既不是 member 也不在 `exclude`，cargo 直接报
+  "current package believes it's in a workspace when it's not"，连自己的测试都跑不起来；
+  而 `Cargo.toml` 里又声明了 `abi_kind = "rust"` / `declared_nodes = ["root_entry"]`，
+  看着像真插件（`src/lib.rs` 里其实只有一个 marker 函数，没有 `export_plugin_api!`）。
+  现在：列进 `exclude` + 加空 `[workspace]` 表让它能独立构建、在 Cargo.toml 顶部注明
+  "无 ABI 导出、不是可加载插件"；原先的空断言测试 `fn root_scaffold_marker() {}` 换成
+  `assert_eq!(root::root_plugin_marker(), "root")`，至少保证它还能被独立编译。
+
+**验证**：`bash scripts/test-fixtures.sh` 冷 64s / 热 7s 全绿（member 194 项 + 11 个独立
+manifest）；`ci.yml` 通过 YAML 解析且 steps 顺序正确；本批不碰 `crates/`，主 workspace 的
+`cargo test --locked` 不受影响。
+
+**不在本批**：fixtures 覆盖率统计（fixtures 是样例插件，不进 100% 行覆盖门槛；要统计需
+另设计 lcov 合并）、fixtures 的 `clippy` / `fmt` 门禁（`fixtures/plugins/vision/src/lib.rs`
+在 HEAD 上就有一处 fmt 漂移，接门禁前必须先修）、把 10 个 expr 子 crate 并进 fixtures
+workspace（`prepare-artifacts` 会开始把它们当插件扫描，需先验证 tooling 的行为）。
+
+### 5.2.53 工具链 pin 与词法层非有限数守卫（2026-10-27）
+
+两个互不相干的硬化，都不动运行时语义：
+
+- [x] **工具链 pin（构建期预防）**：新增 `rust-toolchain.toml`（`channel = "1.97.1"`，
+  含 `clippy`/`rustfmt`）。插件 ABI 是 Rust ABI（`fn` 指针 + 按值 `String`），宿主与
+  dylib 必须由同一个 rustc 编译；`AbiFingerprint` 只在加载期兜底，缺实例时表现为
+  加载期 undefined symbol。CI 六个 `dtolnay/rust-toolchain` 步骤同步从 `@stable` 改为
+  `@master` + `toolchain: 1.97.1`，避免"pin 了文件、CI 却装另一个 stable"的错配。
+  升级方式：改 `channel` → 同步改 5 个 workflow → `prepare-artifacts --full` 重建
+  成品（工件的 rustc 指纹随之变化）。
+- [x] **词法层拦非有限字面量**：`f64::from_str` 对超大数字**不报错**而是返回 `inf`，
+  而 `inf`/`NaN` 会被 `serde_json` 序列化成 `null`——`/expr` 于是把"无限大"当成一个
+  正常的 `null` 回给调用方，排查时看不到任何线索。现在 `lexer/src/core.rs` 在 parse
+  成功后校验 `is_finite()`，非有限即 `LexError::InvalidNumber`（与 `.` 这类本就非法的
+  字面量走同一条错误路径）；边界内的大数（如 10^308）仍照常通过。
+
+**顺带修掉一个一直红着的测试**：`expr/lexer/tests/lexer.rs::rejects_unexpected_character`
+原来拿 `1 + a` 断言词法错误，但 `a` 是合法标识符（`pi`/`e` 在 parser 里才解析成常量）。
+`expr/lexer` 在 `fixtures/plugins` workspace 的 `exclude` 名单里，而 CI 只跑主 workspace
+的 `cargo test --locked`，所以这条早已失败的断言从没被门禁发现。现在改成 `1 + @`，并补
+`lexes_unknown_identifier_as_token` 把"词法层接受标识符、语法层才拒绝"这条边界固定下来。
+
+**验证**：`expr` 集成测试 22 项、`expr/lexer` 6 项全过；两 crate 的
+`cargo clippy --all-targets -- -D warnings` 与 `rustfmt --check` 干净；
+`rustup show active-toolchain` 在仓库内解析为
+`1.97.1-x86_64-unknown-linux-gnu (overridden by 'rust-toolchain.toml')`。
+
+### 5.2.52 图片追问：链接会过期，缓存 + 追问指引（2026-10-26 已闭合）
+
+**现象**：同一张表情包，第一次问"写了什么"时机器人准确读出文字并描述画面；紧接着问"这是谁"，它回"又试了一次看图，这次图片链接直接 400 取不到，所以没法核实"——它刚刚才看过这张图。
+
+**根因**：QQ/腾讯的图片链接是签名 URL，有效期只有几分钟（部分链接近似一次性）。`vision_describe` 每次调用都重新下载 URL；第一次成功、第二次已过期 → HTTP 400。而模型没有"用自己上一条描述回答"的指引，于是把过期失败当成"没法核实"。
+
+**修复**：
+- [x] **视觉插件缓存下载字节** — `vision` 增加 10 分钟 / 8 条的进程内 URL→bytes 缓存（最旧优先淘汰），重复 describe/OCR 同一链接不再重新下载；单测覆盖 TTL 命中/过期删除/容量上限与淘汰顺序。
+- [x] **qq hint 增加追问指引** — 对已经描述过的图片（"这张呢"/"这是谁"）先用自己之前的描述回答；只有没看过才重新取图；若链接过期返回 400，明确说"链接过期了，请重发图片"，**不得**说"我看不到图片"。
+- [x] **工件与文档同步** — qq / vision 的 `.so` 重建，`docs/agent/interfaces.json` 按新 docs 重新生成。
+
+**验证**：`cargo test -p vision` 8 个测试全绿（含 2 个缓存单测）；`prepare-artifacts` 重建 qq/vision 成功；artifact docs 中 `IMAGE FOLLOW-UPS` 与 `agent_accessible=true` 均在位。
+
+**残余**：缓存只在进程内，重启即失效；同一图片跨重启后的追问仍可能遇到过期链接（届时按新指引请用户重发）。
+
+### 5.2.51 图片理解：历史图片可查、视觉工具对 agent 开放（2026-10-26 已闭合；两个视觉节点已于 2026-11-05 删除，见 5.2.55）
+
+**现象**：群友发了一张图，随后另一人 `@bot 你看得到这张图片吗`，机器人回"能看到图片的下载链接，但拿到的是原始文件字节，我这边没有识图能力"。实际上它既没有拿到字节，也不是没有识图能力。
+
+**根因（四条叠加）**：
+1. kernel 只把**当前批次**的图片内联成 `image_url` part（`image_input`），历史消息里只剩 `[image: <url>]` 文本占位符——图是上一条消息发的，问话是另一批，模型自然看不到画面。
+2. `vision_ocr` / `vision_describe` 两个节点**没有 `agent_accessible`**，模型调不到，只能干说"没有识图能力"。
+3. 生产环境只有 `DEEPSEEK_API_KEY`：`vision_describe` 需要 `OPENAI_API_KEY`/`VISION_API_KEY`；tesseract 未安装，OCR 也不可用。
+4. qq 的 system_hint 没有任何"图片占位符可以用视觉工具查"的指引。
+
+**修复**：
+- [x] **视觉节点对 agent 开放** — `vision_ocr` / `vision_describe` 加 `with_agent_accessible()`，模型可通过 `invoke_plugin(vision, vision_describe, {url})` 查任意历史图片。
+- [x] **qq hint 增补 IMAGES 段** — 遇到 `[image: <url>]`（本批或历史）被问画面内容时，调用 `vision_describe`（文本截图用 `vision_ocr`），**不得**未尝试就声称无法识图；工具报错就如实转述错误，不要猜内容。
+- [x] **视觉后端接到 DeepSeek** — 生产 env 增加 `VISION_API_KEY` / `VISION_BASE_URL=https://api.deepseek.com/beta` / `VISION_MODEL=deepseek-flash`；实测该端点接受 `image_url` 输入（HTTP 200），当前批次图片仍由 kernel 直接内联。
+- [x] **OCR 可用** — 安装 `tesseract-ocr` + `tesseract-ocr-chi-sim`（chi_sim+eng）。
+
+**验证**：
+- 直接 `invoke vision vision_describe`（httpbin 图片）返回 `ok=true`，说明下载 + DeepSeek 视觉调用链路通。
+- 隔离环境真机重放：梨生单独发图（该批没有任何 @）→ 另一人下一批 `bot 你看得到刚才那张图吗？描述一下画面内容` → 机器人调用视觉工具，准确描述"黑背胡狼、马鞍状黑灰斑纹、干旱沙石地面、右上方强光、左下方投影"等细节（原图正是 jackal 照片），**历史图片路径打通**。
+- 同批图片仍由 kernel 内联给模型，无需工具。
+
+**运维注意**：重启（SIGTERM）时 `save_draft_and_revert` 会把未提交的 `fixtures/plugins` 改动保存到 `.cordis-drafts/draft-*-signal.patch` 并 `git checkout -- plugins/`。本次操作期间 gacha 的未提交改动（P3-45 per-user state）就是这样被保存到 `draft-1793029118-signal.patch` 的；需要恢复时 `cd fixtures && git apply .cordis-drafts/draft-1793029118-signal.patch`。
+
+### 5.2.50 合并 origin/main：消除 4 个月双线偏移（2026-10-26 已闭合）
+
+生产线 `run-main` 与主仓 `origin/main` 的共同祖先停在 2026-06-05（`022f890`）：main 有 212 个提交不在生产线上（安全硬化、R1–R9 并发/锁序、argv 化命令执行、覆盖率波次、敏感路径组件匹配、候选身份校验、退役快照驱逐），生产线有 218 个不在 main 上（`cordis-cli`/`cordis-tooling` 拆分、每群策略+记忆、notes、图片多模态、群角色/`__meta`、房间级人格、说话人名、conduct、危机短路、出站回复入历史）。本次一次性合并，冲突 55 个文件 / 272 处。
+
+- **方向**：`origin/main` 合进 `run-main`（生产吸收仓库修复），合并后 `origin/main` 成为 `run-main` 的祖先，主仓可用一次快进对齐。
+- **结构**：旧 `crates/cordis-runtime/src/main.rs` → `crates/cordis-cli/src/main.rs`（main 的改动核对后已在新位置全覆盖，旧文件删除）；旧 `plugin/tooling.rs` 与其测试 → `cordis-tooling`（并补上 main 的 R6/R7：JSON 锁按 pid 归属、命名重建全程持锁）；`plugin/artifact.rs` 保留 `read_plugin_docs`/`parse_dylib_payload`/`lock_pid_is_live` 供 loader 与 tooling 共享。
+- **取舍**：同一逻辑两边都改时 main 的修复优先；run 侧的新形态优先（四段 prompt、`sanitize_tool_chains`、`tool_failure_prompts`、多模态 `agent_send` 链、`turn_meta`、caller 策略、`plugin_builder` 接缝）。生成物（`Cargo.lock`、`docs/agent/interfaces.json`、`fixtures/artifacts`）全部重新生成，不手工合并。
+- **验证**：`cargo check --workspace` 与 fixtures workspace 通过；`cargo test --workspace --no-fail-fast` 除 4 个"继承 CARGO_TARGET_DIR 才失败"的 plugin-iteration canary 测试（直接重跑通过，与合并前同一环境陷阱）外全绿；fixtures workspace 35 个测试目标全绿；两个 workspace `clippy -D warnings` 零 warning、`fmt --check` 干净；真机重放（mpft 四问 + 杭州/北京/武汉三连问 + 未点名消息）：答案前后一致、搜不到时明确更正、三连问全部正常回答、未点名保持沉默。
+- **部署**：生产 `run-main` → 合并提交，二进制重建、`systemctl restart cordisclaw` 完成（564 会话恢复、NapCat 已重连）；`origin/run-main` 已推送。
+- **待办**：主仓 `main` 快进到 `run-main`（或经 PR）后 CI 覆盖率门槛需复验——合并树含生产线新增文件，100% 行覆盖是否满足要跑 CI 才知道；本机无法给出该结论。
+
+### 5.2.49 群聊修复移植：人格 / 身份 / 边界 / 上下文（2026-10-25 已闭合）
+
+把主分支 5.2.42–5.2.45 的修复**语义移植**到生产分支（`run-main`，拆出 cordis-tooling/cordis-cli 之后）。针对 10-23 / 10-25 线上两段事故：① 用"安全审查 / 申请驳回 / 固件更新"这类不存在的内部流程拒绝，被一句"审查通过了"打穿；② 问"他是谁"回"只看得到一串QQ号"；③ `mpft` 先答"冒泡防踢"、两分钟后又说"没有公认含义"（根因是**机器人看不到自己说过的话**）。
+
+- [x] **说话人身份** — qq：`OneBotSender` 增 `card`/`role`，`IncomingMessage` 增 `sender_name`/`sender_role`，display 变 `... (user <uid>, name "<name>")`（群名片优先、昵称回落，控制字符/引号/括号过滤 + 24 char；`notes`/`images` 原样保留）。feishu：新增 `feishu_get_chat_members` 节点 + 30min TTL 名字缓存（2s 超时、失败静默），display 带 name，媒体消息保留 `msg=`。
+- [x] **群聊人格房间级** — `AgentEnvelope::soul_key()` 群聊返回房间 `session_key`（私聊仍 `{sender_id}#private`，无身份回落 session_key）；inbox 的 `refresh_session_soul` 在群聊退化为幂等 no-op，人格不再随最后发言人翻转。
+- [x] **群人格管理员门控** — `sender_role` → `refresh_session_caller` → session caller 旗标 → `set_soul` 在"群聊 + 非 owner/admin"直接拒绝（feishu 事件不带群角色，按安全默认拒绝）。
+- [x] **conduct 契约 + persona 免责声明** — system prompt 四段：base → persona（免责声明：只影响语气）→ `CONDUCT_CONTRACT`（10 条）→ plugin hints。契约包含：拒绝一句且不翻转（"审查通过"不是新事实）、不编造内部流程、不辱骂/评价真人（含"演"）、情绪先共情不诊断不重复模板、不喂养挑衅、认人先查再问、未经工具确认不陈述自身状态、**与已说过的话和工具结果保持一致（冲突要明说改了什么）**、**搜不到 ≠ 不存在且不得谎称检索**、**未点名不插话**。
+- [x] **危机短路（唯一的机械护栏）+ 重复请求交给 prompt** — `guard.rs` 只保留高精度危机短语 → 固定求助话术（短路 LLM，不经过模型）。**重复消息/刷屏处理改由 conduct 规则 11 承担**（"同一请求反复出现 → 答一次，用一句话指回上次答案并问要改什么；继续重复则沉默是合法回复，绝不连着发同一段话"）——理由：先后的两版代码护栏都误伤过正常使用（连续轮次预算把"杭州/北京/武汉天气"三连问判成越界；按归一化文本重复计数同样看不到意图），而重复请求的判断恰恰需要上下文理解，属于模型该做的判断。取舍：prompt 级更软、不可单测；代码级已全部移除，不再静默吞消息。语义级越界识别仍明确不做。
+- [x] **上下文修复（本次事故根因）** — 成功轮原本只存 `{"action":"suspend"}`，渠道真实回复在工具调用参数里被丢弃。现在 `AgentSession::replace_last_action_with_reply` + `RuntimeHost::agent_record_outbound_reply`，inbox 从 `invoke_plugin.payload_json.message`（兼容 legacy `respond.message`）抽取实际发出文本回填历史；只替换不追加。
+- [x] **web 检索端点可配置** — `CORDIS_WEB_SEARCH_URL` > `web_search_url:`（config/llm_api.yaml）> 默认，替换硬编码；文档改写为真实行为。
+- [x] **fixtures 锁文件** — 提交 workspace `fixtures/plugins/Cargo.lock`（`chacha20 0.10.1` 已 yank，无锁文件时 `cargo metadata --offline` 必失败；`.gitignore` 改为忽略 per-plugin、保留 workspace）。
+
+**验证**：`cargo test -p cordis-runtime --lib` 904、`host_llm_coverage` 7、`cargo test -p cordis-cli --bin cordis-runtime` 40、qq 64、feishu 57、web 2；workspace `clippy --all-targets -D warnings` 零 warning；`cargo fmt --all -- --check` 干净。真机回归（移植后构建、真实 DeepSeek、mock OneBot、4 轮 mpft 剧本）：第 2 轮显式"我先更正一下：上一条我只列了 NHS…"，第 3 轮准确复述自己前两轮回答并总结"以冒泡防踢为准"，未点名的闲聊保持沉默。
+
+**运维注意**：`serve` 收到 SIGTERM 时 `save_draft_and_revert` 会把 `fixtures/plugins` 的未提交改动存成 `fixtures/.cordis-drafts/draft-*.patch` 并 `git checkout -- plugins/`。在**脏 worktree** 里做真机重放后必须用该补丁恢复；生产 worktree 部署后再重启不受影响（已提交、无 diff）。
+
+### 5.2.48 拆出 cordis-tooling / cordis-cli（2026-10-23）
+
+**动机**：构建系统（`prepare_artifacts` / `rebuild_fixture_artifacts` /
+`rebuild_plugin_workspace` / `sync_plugin_docs` / `refresh_artifact_index`，连同
+dirty 指纹、input probe、构建锁、`cargo` 子进程）一直长在 `cordis-runtime` 的
+`plugin/tooling.rs` 里，可它**不是运行时机制**：runtime 只需要读已经存在的工件。
+把它留在 lib 里，等于让"只读运行时"隐含地依赖 `cargo`、可写的 fixtures 源码树和
+构建期临时目录。这次是**纯搬运式重构**：除"没装 builder 时的报错"这一处新接缝，
+所有对外签名 / 错误文本 / 文件路径 / 日志文本逐字节不变。
+
+**结构**
+
+```
+crates/
+  cordis-plugin-sdk/   不变
+  cordis-runtime/      lib：加载期 artifact 读取 + PluginBuilder 接缝，无构建逻辑
+  cordis-tooling/      构建系统（原 plugin/tooling.rs 的构建部分 + 它的 111 个单测）
+  cordis-cli/          二进制入口（[[bin]] name = "cordis-runtime" 保持不变）
+```
+
+依赖方向（无环）：`cordis-cli -> {cordis-runtime, cordis-tooling}`、
+`cordis-tooling -> cordis-runtime`；`cordis-runtime` **不依赖** `cordis-tooling`
+（只在 `[dev-dependencies]` 里依赖它，供测试构建 fixture 工件并安装真实 builder；
+Cargo 允许这种 dev-dep 环）。
+
+**留在 runtime 的少数加载期函数**（`crates/cordis-runtime/src/plugin/artifact.rs`）：
+
+- `read_plugin_docs()` — loader 在 dlopen 之后/读 JSON 工件时都要用；
+- `lock_pid_is_live()` — host 判断 `snapshot-{pid}-{nanos}` 目录属主是否存活；
+- `parse_dylib_payload()` — 上面两个 + tooling 的 `inspect_dylib_contract` 共用的
+  docs/fingerprint 解析与错误文本（`runtime {what} parse failed: …`）。
+
+**trait 接缝**（`crates/cordis-runtime/src/plugin/builder.rs`，构建系统的唯一入口）：
+
+```rust
+pub trait PluginBuilder: Send + Sync {
+    fn prepare(&self, fixtures_root: &Path, full: bool) -> Result<PreparedArtifacts, RuntimeError>;
+    fn rebuild_all(&self, fixtures_root: &Path) -> Result<Vec<(String, String)>, RuntimeError>;
+    fn rebuild_plugin(&self, workspace_root: &Path, plugin_path: &str) -> Result<Vec<(String, String)>, RuntimeError>;
+}
+```
+
+- 全局 `OnceLock<Box<dyn PluginBuilder>>` + `install_plugin_builder()`（幂等，
+  第二次返回 `false`）/ `plugin_builder()`（未安装 → `None`）；
+- 未安装时统一错误 `missing_builder_error()`：
+  `internal invariant broken: no plugin builder installed (this build has no build tooling)`
+  （测试逐字节断言 message 与 Display 两种形态）；
+- `cordis-tooling::CargoBuilder` 实现该 trait，三个方法分别转调
+  `prepare_artifacts(.., PrepareMode::Full/Incremental)`、`rebuild_fixture_artifacts`、
+  `rebuild_plugin_workspace`；
+- host 的三个调用点（iteration step 3、`rebuild_plugin_workspace` agent tool、
+  crash-recovery `restore_plugin_iteration_workspace`）从直接调 tooling 改成
+  `plugin_builder().ok_or_else(missing_builder_error)?.rebuild_plugin(..)`，
+  `workspace_root` / `plugin_path` 语义（`/` = 全部插件、`/qq` = 只重建 qq）不变。
+
+**嵌入方（cordis-cli）**：`main()` 在参数收集之后、任何 boot 之前安装一次
+`install_plugin_builder(Box::new(cordis_tooling::CargoBuilder))`；`--runtime-only`
+同样安装（自迭代随时可能要用）。二进制名仍是 `cordis-runtime`（systemd
+`ExecStart` / `scripts/*.sh` 按 `target/debug/cordis-runtime` 调用），只是产它的
+package 换成 `cordis-cli`；`default-members` 同步加了两个新 crate，保证
+`cargo build` 仍然产出这个路径。
+
+**可见性放宽清单**（仅两处，都是"tooling 需要 runtime 的加载期 helper"）：
+
+| 项 | 原 | 现 | 理由 |
+|---|---|---|---|
+| `plugin::artifact::lock_pid_is_live` | `pub(crate)` | `pub` | tooling 的构建锁 stale 判定也要用它，避免 `kill(pid,0)` 逻辑复制一份 |
+| `plugin::artifact::parse_dylib_payload` | private | `pub` | `read_plugin_docs` 搬进 runtime 后，tooling 的 `inspect_dylib_contract` 仍需同一解析器/错误文本 |
+
+其余项（模型、`PackageResolver`、`load_artifact_index` / `sha256_file` /
+`load_plugin_artifact` / `resolve_artifact_path` / `artifact_index_map`、
+`LoadedDylibApi`、`is_dylib_path`）在拆分前就已经是 `pub`，没有额外放宽。
+
+**测试侧改动**（不改生产行为）：
+
+- `crates/cordis-runtime/tests/tooling.rs`（1282 行，30 个集成用例）整体搬到
+  `crates/cordis-tooling/tests/tooling.rs`，import 改 `cordis_tooling::…`，
+  `read_plugin_docs` 改 `cordis_runtime::plugin::artifact::…`；配套新建最小
+  `crates/cordis-tooling/tests/support/mod.rs`（fixtures 根 + 宿主 dylib 探针）；
+- runtime 集成测试里原先 `use cordis_runtime::plugin::tooling::…` 的地方全部改成
+  `cordis_tooling::…`（`support/mod.rs` 的 `ensure_fixture_artifacts` 同样）；
+- runtime 测试要驱动构建路径时必须装 builder：`tests/support/mod.rs` 新增
+  `install_cargo_builder()`（`Once` 幂等），由 `fixtures_root()` 与
+  `pin_private_snapshot_root()` 调用——这两个 helper 覆盖了所有会 iteration /
+  restore / 重建的用例；
+- 三个 `env!("CARGO_BIN_EXE_cordis-runtime")` 用例（`runtime_host.rs` ×2、
+  `shell_plugin.rs` ×1）改为 `support::cli_binary()`：`CARGO_BIN_EXE_*` 只提供给
+  "声明该 bin 的 package" 的测试，二进制搬走后要从测试可执行文件上两级
+  （`<target>/<profile>/`）找，找不到时给出"先 `cargo build`"的明确报错；
+- runtime lib 单测里的 builder registry 测试用**本地** `TestBuilder` 而非
+  `cordis_tooling::CargoBuilder`：dev-dep 环会让 `cordis-tooling` 链到
+  **非 cfg(test)** 的 runtime，trait 不是同一个（真实 `CargoBuilder` 的装配由
+  集成测试覆盖）。
+
+**覆盖率排除路径变化**：`main.rs` 现在在 `crates/cordis-cli/src/main.rs`，
+`coverage.yml` / `CLAUDE.md` 的正则从
+`'cordis-runtime/src/(main|agent)\.rs'` 改为
+`'cordis-(runtime|cli)/src/(main|agent)\.rs'`（llvm-cov 对完整路径做正则
+search，绝对路径与 crate 相对路径两种上报形态都能命中），同时仍排除
+`cordis-runtime/src/agent.rs`。CI 里 `cargo run -p cordis-runtime --
+prepare-artifacts` / `cargo build -p cordis-runtime` 统一改成 `-p cordis-cli`
+（package 变了，产物路径 `target/{debug,release}/cordis-runtime` 不变）。
+
+**验证**：`cargo build` 零 warning；`cargo clippy --all-targets -- -D warnings`
+干净；`cargo fmt --all --check` 干净；`cargo test -p cordis-runtime --lib` **890**
+通过；`cargo test -p cordis-tooling` **111** 个 lib 单测 + **29** 个构建链集成用例
+全绿；`cargo test -p cordis-cli` **35** 通过；runtime 集成套件
+`architecture`(17)、`host_iterate_stages`(9)、`host_boot_session_arms`(22)、
+`host_build_coverage`(8)、`shell_plugin`(8)、`host_coverage`(38)、
+`host_coverage_rest`(34)、`crash_recovery`(9)、`host_ops_arms`(7) 全绿；
+`runtime_host` 30/31 —— 唯一失败项
+`runtime_host_iterate_plugins_agent_retries_on_warning_and_promotes` 是本地
+mock-LLM 的 accept 预算（本地 30s / CI 900s）短于冷缓存下 iterate 中途的
+fixture `cargo test`（本次实测 ~197s），`CI=1` 时 207s 通过；该用例本身与本次
+拆分无关（文件未改）。覆盖率抽检（lib 单测）：`plugin/builder.rs` 71 行、
+`plugin/artifact.rs` 641 行、`CargoBuilder` 新增段均无未覆盖行。
+
+### 5.2.47 策略/记忆写权限：kernel 只转交身份，规则在插件（2026-10-23）
+
+**问题**：`qq_set_reply_policy` / `qq_set_group_memory` 只收到模型传的 `{group, mode}`——插件不知道是谁在要求，等于群里任何人说一句就能让 bot 改自己群的行为（还改得动别的群）。
+
+**位置划分**（用户拍板"规则不该在 kernel"）：
+- **谁能改** → qq 插件（kernel 不认识"群主/管理员"）；
+- **"这一轮是谁在说话"这个事实** → kernel（只有它有 envelope 的 `sender_id`），并且**模型伪造不了**。
+
+**改动**：
+- [x] kernel 新增**通用的一次性元数据通道**（不含任何 QQ 知识）：`agent_send_with_turn_meta(..., &BTreeMap<String,String>)` 把渠道元数据挂在 session 上，`inject_turn_meta` 在每次 `invoke_plugin` 时把它写进 `payload["__meta"]`，**覆盖**模型自己塞的同名字段；发送结束（含失败）清空。`AgentToolHost::inject_turn_meta` 给了 no-op 默认实现，测试假 host 不受影响。
+- [x] inbox 填入 `actor`（`qq:<uid>`）/ `conversation` / `target`（`group:<gid>`）。
+- [x] qq 插件判权 `authorize_policy_write`：
+  - 没有 `__meta`（CLI/运维直接 invoke）→ 视为操作员，放行，审计 `by=operator-cli`；
+  - 改某个群 → 必须是该群 **owner/admin**（`get_group_member_list` + 10 分钟角色缓存），或 `data/qq_operators.json` 白名单；
+  - 改**全局 default** → 只认白名单（文件缺失=空名单=谁都不许）；
+  - 只能改「这条消息来自的那个群」（`__meta.target` vs 参数 `group`），拦住"诱导它改别的群"；
+  - 角色查不到（bot 无权限/接口失败）→ **拒绝**（fail closed）；
+  - 审计行带 actor：`qq policy: … by=<actor> …` / `qq memory: … by=<actor>`。
+- [x] 白名单 `data/qq_operators.json` 已按当前群主 QQ 号播种（`1751557948`）。
+
+**上线时踩到的两个接缝**（都已补测试钉住）：
+1. `AgentToolHost::inject_turn_meta` 在 **trait** 上有 no-op 默认实现，`RuntimeHost` 的 trait impl 必须显式转发到真实方法——漏了转发，插件收不到 `__meta`，鉴权会**静默退化成"当作 CLI 操作员放行"**（线上第一次验证就是这样被放行的，审计行 `by=operator-cli`）；
+2. kernel 把 `__meta` 塞在 payload 对象的**顶层**，所以插件必须从 `NodeRequest.__meta`（`#[serde(rename = "__meta")]`）读，而不是 `payload.__meta`——读错位置同样表现为"永远 operator-cli"。
+
+两处都有回归测试：集成 `trusted_turn_meta_reaches_the_plugin_payload`（回显型 process 插件把 payload 原样回给模型，断言 `__meta`/actor 到达；**去掉转发后该用例必失败**，已反向验证）、单测 `meta_is_read_from_the_top_level_and_from_payload`（顶层与嵌套两种形状都认）。
+
+**验证**：kernel lib **993** + bin 35 全绿（新增 `turn_meta_tests` 三例：对象注入、**覆盖伪造的 `__meta`**、非对象 payload 包进 `value`）；qq 插件 **59** 单测（新增 7 例：CLI 放行、owner/admin 放行、普通群员拒绝且不落盘、未知角色 fail closed、跨群改写被拒、全局 default 需白名单、记忆写同样受控）；`clippy -D warnings` 与 `fmt --check` 干净。
+
+### 5.2.46 把 node 文档真正喂进 prompt（工具文档此前没进上下文，2026-10-23）
+
+**诊断**（用户提出，查证属实）：`docs.nodes[].summary / input_schema / output_schema` 早在工件里，但 kernel 拼插件目录时**只列 node id**：
+
+```
+Loaded plugins:
+  qq → qq_entry, qq_send, qq_get_group_info, qq_get_group_roles, …
+```
+
+于是模型知道"有个节点叫 `qq_get_group_info`"，却不知道它返回 `member_count` —— 插件只能在 `system_hint` 里手写一遍同样的事实（还会和实现漂移）。这是提示词问题，但也有一半是文档问题：`qq_get_group_info` 的 `output_schema.data` 当时是个空 object，连字段名都没声明。
+
+**改动**：
+- [x] **新模块 `plugin/node_catalog.rs`**：把 agent 可见节点渲染成一行一个——`id — summary (in: required…) → out: ok,data{field,…}`；摘要截断 160 字符，每层最多列 8 个字段，嵌套对象展开两层（`data{…data{…}}`，正好覆盖 OneBot 的 `data.data.member_count`）。目录头明说"本目录由工件文档生成，是各节点参数/返回值的唯一事实来源"。
+- [x] `agent_plugin_hints` 改用该渲染器（原本只拼 id 列表）。实测 34 个 agent 可见节点、摘要合计 5 KB ≈ 1.3k token——可以接受（5.2.44 刚用 notes 省掉 ~150 KB）。
+- [x] **补齐 `qq_get_group_info` 的 output schema**：`data{status,retcode,data{group_id,group_name,member_count,max_member_count}}`，摘要也写明"字段在 data.data"。
+- [x] **hint 反向瘦身**：`SMALL GROUPS` 与 `WRITING MEMORY` 两段里手写的 JSON payload 例子删掉，改成"参数照目录里的 schema 来"。文档进 prompt 后这些就是重复信息，而且容易与实现不一致。
+
+**验证**：`node_catalog` 7 单测（摘要截断、in/out 渲染、两层展开、无摘要只剩 id、required 回退 properties、目录头、字段数上限）；qq 插件 52 单测（新增 `group_info_documents_its_output_fields` 断言 `data.data.{group_name,member_count,max_member_count}` 已声明；`hint_says_how_to_detect_a_small_group` 改为断言"指向 plugin catalog + one_on_one"）；kernel lib 全绿；`clippy -D warnings` 与 `fmt --check` 干净。
+
+### 5.2.45 小群自动降级为私聊：交给 agent 自己判断（B 方案，2026-10-23）
+
+**问题**：`one_on_one` 模式早就存在，但没有任何东西告诉模型"这个群其实只有两个人"。插件不下发群规模，hint 里 `member_count` 一次都没出现——所以小群永远不会自动变成私聊。
+
+**选了 B（纯自主）**，理由是用户明确要"由 agent 自己总结"而不是插件贴硬规则：hint 里加一段 `SMALL GROUPS` 指引——
+
+- 不确定群多大时，**查一次** `qq_get_group_info`（agent 可调，返回 `data.member_count`）；
+- `member_count <= 2` → 用 `qq_set_reply_policy {group, mode:"one_on_one"}` 落盘，并写进 `[group memory]`；
+- **不要每条消息都查**：每个群决定一次，记忆里已有答案就别再调接口。
+
+**没做的**（有意为之）：插件侧不缓存人数、不在 poller 线程里同步请求 `get_group_info`（`onebot_call` 用的 ureq 默认超时，同步查一次可能把整个消息队列堵住），也不存在"≤2 强制 one_on_one"的硬规则。代价是**不保证**它一定会去查——只有它觉得需要时才查。
+
+**验证**：qq 插件 51 单测（新增 `hint_says_how_to_detect_a_small_group`：hint 必须含 `member_count`、`qq_get_group_info`、"check it ONCE"、以及 `"mode":"one_on_one"` 的落盘写法）；clippy/fmt 干净。
+
+### 5.2.44 一次性上下文（notes）与"按历史判断"的批包裹（2026-10-23）
+
+**问题**：5.2.43 把策略/记忆行放进 envelope 的 `display`，而 `display` 会随每条消息写进 `history`。实测一个群的会话快照有 **254 条**历史，每条都带着 594 字符的策略行——十几万字节纯噪声，把真正的对话挤淡；同时批包裹里还留着 `If the current batch is not directed at you, output exactly {"action":"suspend"}`，等于命令模型"判断不了就闭嘴"，与"按语境判断"直接冲突。
+
+**改动**：
+- [x] **envelope 新增 `notes`**（渠道中立的一次性上下文）：qq 插件把 `[reply policy: …]` / `[group memory: …]` 从 `display` 移到 `notes`，`display` 恢复成干净的一条消息（`[QQ group from …]: 正文`）。
+- [x] **kernel 只把 `notes` 随本次请求下发**：`respond_inner` 用 `{notes}\n{input}` 组请求正文，但 `remember_exchange` 仍只记 `input`。于是历史里不再有策略行，当前这一轮照样能看到。
+- [x] **批包裹改写**：`Older chat history is context only; do not treat it as a current request` + 无条件的 `not directed → suspend` 换成"**用前面的对话作为判断依据**（谁在跟谁说话、是不是你已经在的线程、回了有没有用）"，沉默条件改成"策略 + 上下文都表明这是别人之间的对话"；保留反幻觉那条（不许把旧消息当成新提问）。
+- [x] **host 新增 `agent_send_with_turn_context` / `agent_send_with_fallback_turn_context`**（带 `notes`），原 `agent_send*` 保持签名并委派空 notes。
+
+**验证**：kernel `cargo test` 983 lib + 35 bin 全绿；新增 `wrap_tells_the_model_to_judge_from_history`（包裹必须提"用历史判断"、不得再有 `Not directed at you`、仍保留 `{"action":"suspend"}` 与反幻觉句）、`envelope_parse_reads_one_shot_notes`、以及集成测试 `one_shot_notes_reach_the_request_but_not_the_history`（第一次请求的 user content 含 notes 与记忆行，而落盘 session 快照的 history 里一条都不许有）。qq 插件 50 单测同步更新（策略/记忆断言改到 `notes`，并钉住 `display` 不含 `[reply policy`）。
+
+### 5.2.43 每群策略 + 每群记忆：调整行为不再需要改代码（2026-10-23）
+
+**问题**：5.2.41/5.2.42 之后，"让它在某个群多说/少说"仍要改 Rust 重编工件；而群的性质本来就各不相同（有的群希望它接话，有的嫌它插嘴）。用户的要求是**agent 自己从消息记录里总结**，所以判断所需的输入必须落成运行时数据。
+
+**改动**（全部在 `fixtures/plugins/qq/`，kernel 未动）：
+
+- [x] **`data/qq_reply_policies.json`**：`{default, groups{gid}}`，每项 `{mode, policy, updated_at_ms, updated_by}`。老的 `data/qq_reply_policy.json` 继续被当作 default 读取（不丢配置）。
+- [x] **四种模式**（`policy` 为空时用预设文案）：`quiet`（只 @/点名）、`balanced`（语境判断，默认）、`chatty`（主动参与但不抢别人的话头）、`one_on_one`（当私聊，必答）。
+- [x] **`qq_set_reply_policy`** 扩成 `{group?, mode?, policy?}`：`group` 缺省改 default；非法 mode 报 `unknown mode '<x>': use quiet | balanced | chatty | one_on_one`；一个都没给报 `mode or policy is required`；**改完下一条消息即生效**，并打审计 `qq policy: group=… mode=… chars=… by=agent source=…`。
+- [x] **`qq_get_reply_policy`** 返回该群**实际生效**的 `{mode, policy, source}`（`group|default|builtin`）。
+- [x] **每群记忆 `data/qq_group_memory.json`**：`{gid: {memory, updated_at_ms, updated_by}}`，上限 800 字符（超出截断并回报 `dropped_chars`），空串删除。新增节点 `qq_get_group_memory` / `qq_set_group_memory`（agent 可调，审计 `qq memory: group=… chars=… dropped=… by=agent`）。
+- [x] **下发**：每条入站消息首行 `[reply policy: <mode> — <text>]`，写过记忆的群再多一行 `[group memory: …]`（没写过就不出现，省 token）。
+- [x] **hint 重写**：四种模式各自该多积极；**用对话历史判断**（"谁在跟谁说话、是不是你已经在的线程"）；`[group memory: …]` 是它自己写的备忘；**只在学到稳定偏好时才写记忆**（`DURABLE`），别每条都写。
+
+**为什么这样设计**：真正需要频繁调整的是"这个群该多话还是少话"，它天然是数据而不是代码。现在 agent 在群里被要求"以后多做/少做"时可以直接 `qq_set_reply_policy`/`qq_set_group_memory` 落盘，下一条消息生效——不需要我改 Rust、不需要重建工件、更不需要重启。
+
+**验证**：qq 插件 50 单测全绿（新增：路径解析、builtin→default→group 三级回落、群覆盖优先于 default、自由文本不重置模式、非法 mode/空更新拒绝、get 的 source、老文件迁移、记忆往返/截断/删除/缺 group、envelope 的 mode 行与 memory 行、坏 JSON 回落、创建/写入失败臂、dispatch 四个节点、hint 断言包含四种模式+记忆行+`DURABLE`+"use the conversation history"）；`cargo clippy -p qq --all-targets -- -D warnings` 干净；`cargo fmt --check` 干净。
+
+### 5.2.42 去掉 hint 里的"沉默默认"（2026-10-23）
+
+**症状**：5.2.41 把回复策略改成语境判断后，线上仍然"像只会 @bot 才回"。真实流量统计（Oct 22 19:00 → Oct 23 12:00，113 回合）：明确 @ 的 3 次回 2 次、含 bot/机器人的 10 次回 9 次、普通聊天 100 次只回 3 次；再往前一天（8 小时窗口）8 次 @ 只回 3 次，漏答的那几条都是 **1.5 秒内直接 `{"action":"suspend"}`、零工具调用**。
+
+**根因**：门控已经不看 @ 了（喊 "bot" 就回，13/13），但 hint 里同时留着两句"偏沉默"的话，而且都在策略段**之后**（越靠后越强势）：
+
+- `A message is NOT directed at you if: … casual chat; …`（表述太宽）
+- `For images, stickers, casual chat, or ambiguous messages: suspend immediately — do NOT call any kernel tool.`
+
+模型因此把"沉默"当成默认动作——连 @ 都被吞。
+
+**本批只做前半段**（用户确认）：把第二条改成
+`For images, stickers, or casual chat: do NOT call any kernel introspection tool. Whether to reply is still the reply policy's call — silence is allowed there, but it is NOT the default.`
+——保留"这类消息别调内核自省工具"的护栏，去掉"立即挂起"的命令。`A message is NOT directed…` 那条与 `[directed:]` 结构化标记留待下一批（会明显提高插话率，需单独决定）。
+
+**验证**：qq 插件 45 单测（新增 `hint_does_not_treat_silence_as_the_default` 断言 hint 不含 `suspend immediately`、含 `NOT the default`、且仍保留内核工具护栏；`hint_still_points_at_the_reply_policy` 钉住策略行仍是唯一权威）。
+
+### 5.2.41 入站图片走多模态 provider（不走 vision 插件）+ 回复策略改为语境判断（2026-10-21）
+
+**动机**：群里有人发图问 bot，bot 答"我这边也没有图像识别节点"——这句在当时是**真的**（`vision_ocr`/`vision_describe` 都是 `agent_accessible: false`），但绕开它的正确办法不是打开 vision 插件，而是让 agent 自己"看"：现在 `deepseek-flash` 原生支持多模态输入。
+
+**实测前提**（对 `https://api.deepseek.com/beta/chat/completions`）：
+- `content: [{"type":"text"},{"type":"image_url"}]` 形状被接受；
+- `image_url.url` 用 base64 `data:image/png;base64,…` → **200**，模型确实在图里找信息；
+- 用远程 URL 也可，但**由供应商侧下载**：实测一张 wikimedia 图直接 `400 Failed to download image`。QQ 图片是 `multimedia.nt.qq.com.cn/...&rkey=...` 这种带时效地址，所以必须**我方下载后内联**。
+
+**改动**：
+- [x] **qq 插件**：正文里的 `[image: <url>]` 保持占位符，同时 `collect_image_urls` 把 URL 放进 envelope 的 `images` 数组（渠道中立字段，插件不碰多模态 wire format）。
+- [x] **envelope**：`AgentEnvelope.images`（`serde(default)`，旧包无此字段照样解析）；inbox 合并本批图片后走新的 `agent_send_with_fallback_images`。
+- [x] **kernel/`image_input.rs`**（新模块）：魔数嗅探 png/jpeg/webp/gif、自写 base64（不新增依赖）、`plan_for_settings` 按 `runtime.images` 预算裁剪，跳过原因（张数/字节/下载失败/非图片）交给调用方打 `image_input: skip …`；**只降级不失败**。
+- [x] **host**：`image_parts_for_batch()` 读 `runtime.images` + 真实 `fetch_http`（reqwest，8s 超时）；`agent_send` / `agent_send_with_fallback` 保持原签名（委派空图，行为逐字节不变），新增 `*_with_images` 变体。
+- [x] **agent**：新 user 消息的 `content` 由 `user_content_with_images` 组装——**无图仍是纯字符串**（既有请求体形状不变），有图是 `[{"type":"text"},{"type":"image_url"}…]`；图片只进当前这一轮，`history` 里只留文本占位符，避免每轮重发。
+- [x] **配置**：`runtime.images`（`enabled=true` / `max_bytes=4 MiB` / `max_per_batch=2` / `timeout_ms=8000`）。
+- [x] **回复策略默认值改为语境判断**：插件里的 `DEFAULT_REPLY_POLICY` 从"必须喊 bot / @ / 明确要你回答"的清单式改成"你自己按对话语境判断是否需要回答"，并保留"拿不准就沉默、不抢别人的话头"。线上已经先通过 `qq_set_reply_policy` 把同一条策略写进 `data/qq_reply_policy.json`（改运行时策略不需要重编），本批把它变成缺省值，免得文件被删就退回旧行为。
+
+**验证**：`cargo build` 零 warning；`cargo clippy --all-targets -- -D warnings` 干净；新增单测 `image_input` 12 项（4 种 mime + 未知类型 + 超字节 + 超张数 + 下载失败 + 禁用 + base64 三种 chunk 长度 + 无图纯字符串 + text-first 数组 + transport 失败臂）、envelope 2 项、集成 2 项（`inbound_image_is_inlined_as_a_multimodal_content_part` 断言请求体里是 `data:image/png;base64,` 的数组；`no_images_keeps_the_plain_string_content` 钉住无图仍是字符串）、qq 插件 6 项。线上以真实群图片复核（见部署记录）。
+
+**未做/后续（2026-11-05 更新）**：原本打算给 `vision_ocr` / `vision_describe` 打开
+`agent_accessible`；这两个节点已随 5.2.55 整体删除，这条后续不再存在。
+
+### 5.2.41b host.rs 三处安全硬化（2026-08-09 已闭合；main 侧条目，编号与 run 分支 5.2.41 重复故加 b 后缀）
 
 - [x] **`resolve_sandboxed_path` 悬空 symlink 逃逸** — 原实现只对"最近已存在祖先"做 canonicalize 校验，最终分量若是悬空 symlink（目标不存在或指向 root 外）即放行，调用方 `fs::write` 会跟随链接在沙箱外创建/覆写文件。现在：最终分量存在时对完整 resolved 路径 canonicalize 校验包含性；最终分量是 symlink 时解析其目标（read_link + canonicalize，相对目标按链接父目录拼接）并要求目标在 root 内；悬空链接直接拒绝（`path is a dangling symlink: <rel>`）。指向 root 内的 symlink 仍允许（原有语义）。`crates/cordis-runtime/src/host.rs::resolve_sandboxed_path`。回归测试见 `tests/host_boot_session_arms.rs`（dangling-abs / dangling-rel / inside-link / inside-abs / ext-link）。
 - [x] **敏感路径/命令子串黑名单绕过** — 原 `lower.contains(kw)` 子串匹配被 `/etc//passwd`、`/proc//self`、`apikey` / `api-key` 等变体绕过。`check_sensitive_path` 先做纯词法路径规范化（折叠重复 `/`、去尾部 `/`、词法解析 `.`/`..`，不做 fs 操作），再按组件链匹配 `etc/passwd`、`etc/shadow`，按根级组件边界匹配 `proc`/`sys`，按组件前缀匹配 `.ssh`/`.env`/`id_rsa`/`credentials`/`auth.json` 等，并对 `access_token`/`api_key`/`api_secret`/`private_key` 做 `-`、` ` → `_` 归一化（含去下划线紧凑形，拦截 `api-key`/`apikey` 变体）；归一化只作用于这些关键词，`plugins/x/api-utils.rs` 不误伤。`check_sensitive_command` 保留原始子串检查，另加 argv token 级路径门（shell_words 分词，形如路径的 token 跑敏感路径匹配，拦 `head /etc/passwd`、`cat /etc//shadow`、`~/.ssh/` 访问）与 shell 解释器拦截（argv[0] ∈ {sh,bash,dash,ksh,zsh,fish} 且含 `-c`/`-lc`/`--command` → `blocked: shell interpreter invocation`）。
 - [x] **Plugin-iteration 验证命令去 shell**（对齐 P0-17）— `validated_verification_command` 的 `trimmed.starts_with(required_prefix)` 前缀白名单可被 `cargo check && curl x|sh` 绕过，默认命令 `format!("… -p {pp}")` 把 LLM 可控的 plugin_path 拼进 `bash -lc` 字符串。现在：新增共享 argv 门 `validate_verification_argv`（`shell_words::split` 分词、`argv[0]=="cargo"`、`argv[1]` 为所需 op、任何 argv 元素含 `; & | \` $ < > 换行` 即拒），`run_checked_command` 不再经 shell，直接 `Command::new("cargo").args(...)`；默认命令改为 argv 构造 `verification_default_command`，plugin_path 经 `verification_package_segment` 校验（剥离前缀 `/`、拒绝空、拒绝白名单外字符与 `..`，失败返回 InvalidArgument）后作为独立 `["-p", pp]` argv 元素追加；裸别名 `check`/`test` 仍映射到默认 argv。错误文本保持逐字节兼容（`verification tool only allows commands starting with …`）。
 
-### 5.2.40 插件工件体积：exclude 清单里的插件收不到 strip profile（2026-08-06）
+### 5.2.40b 插件工件体积：exclude 清单里的插件收不到 strip profile（2026-08-06；main 侧条目，同上编号重复故加 b 后缀）
 
 **背景**：22 个 `.so` 合计 234 MB，dlopen 全加载时这些体积同时进内存。
 
@@ -275,6 +1457,24 @@ libc/libgcc）。已实测：`-C prefer-dynamic` 加上把 SDK 做成 dylib 后�
 可降到 0.20 MB，但需要宿主同步改造、解决 `libstd-<hash>.so` 的运行时查找，
 并补 `rust-toolchain.toml`——当前 ABI 用 Rust `fn` 指针与按值 `String`，
 本就与 rustc 版本硬耦合却没有锁定。
+
+### 5.2.40 QQ 通道止血：会话身份 / tool_calls 链完整性 / 死信治理（2026-10-21）
+
+线上事故复盘：10-20 23:39 群里发 `bot，写个插件…` 之后 bot 再无回应，用户以为它已经死掉。systemd 日志显示 runtime 全程存活——三个独立故障叠加：
+
+- [x] **会话身份丢失（每句话一个新会话）。** 线上 `fixtures/artifacts/qq.so` 是 9-02 的旧构建，`build_envelope` 还是纯文本 trigger，不带 `session_key`/`sender_id`/`conversation_kind`（`strings qq.so | grep -c session_key` = 0），kernel 因此回落到 `AgentEnvelope::soul_key()` 的原文兜底——`inbox: [[QQ group from …]: 死了]` 里的 session_key 就是消息正文。后果：**没有跨消息记忆**、soul/persona 永远命中不到（只有同一句话才同一个 key）、pending 重放按原文 key 匹配基本靠撞、`data/sessions` 涨到 780 个文件、boot 时 `crash-recovery recovered 661 session(s)`。修法不是改代码而是**重建工件**：当前源码的 envelope 已带完整身份，`prepare-artifacts fixtures` 重建 qq 工件后会话 key 变成 `qq:group:<gid>`（`--runtime-only` 启动会跳过 prepare，这正是旧工件一直没被刷新的原因）。
+- [x] **tool_calls 链破形 → DeepSeek 400 → 整轮丢弃。** 两处成因：① 失败提示就地 `push` 成 user 消息，正好落在**同一个 assistant 的两条 tool 结果之间**；② unknown-tool 的错误消息同样插在 assistant(tool_calls) 与 tool 结果之间。旧 `[tool_calls repair]` 扫到 user 就 `break`，只裁 assistant 的 `tool_calls`，留下的 `tool` 结果变孤儿，请求依旧非法 → `400 Messages with role 'tool' must be a response to a preceding message with 'tool_calls'`，且 400 不重试，用户消息只落进 pending。修法：新增纯函数模块 `agent_toolchain.rs`（两遍整形：先按「紧跟其后的连续 tool 消息」过滤 assistant 的 `tool_calls`、整条删除无结果的 assistant；再删 id 已无人引用的孤儿 `tool` 消息，幂等），并把两类提示都收集进 `tool_failure_prompts`，在**本轮全部 tool 结果 push 完之后**由 `flush_tool_failure_prompts()` 合并成一条 user 消息（措辞逐字节不变）。
+- [x] **静默失败 + 死信坟场。** 失败只写 pending、无日志、无群内提示；`data/pending` 堆了 4599 个 7 天以上的死信（20 MB），而 `pending::load` 只按原文 key 命中，09:59 那次重放的其实是一条 10-12 的陈年消息。修法：`pending: spilled/cleared/ignoring stale spill` 日志；失败后经 `send_via` 发固定文案，并**按 session 10 分钟限流**（`should_notify` 纯函数）；`pending::archive_stale` 在启动时把 7 天以上（含坏 JSON）死信 `rename` 进 `data/pending.archive/`（**绝不删除**，重名追加数字后缀）；`load` 对超龄 spill 返回 None。第二个失败出口（格式反馈后的重试 `agent_send_with_fallback`）原先 `if let Ok` 把 Err 静默吞掉，现同样落 `spill_and_notify`。
+- [x] **`invoke_plugin` 的拼写容错。** 模型把 plugin_path 写成 `"/qq"` 时整轮直接失败。新增 `normalize_plugin_path`（trim / 折叠 `//` / 去首尾 `/`），在唯一咽喉 `PluginRegistry::get` 生效，`check_agent_accessible` 同时受益；`insert_*` / `mark_*` / `reload_plugin_entry` 这些写路径也一并归一，否则 `mark_runtime_unavailable("/qq")` 会静默 no-op，把坏插件继续标成 `Loaded`。错误文本仍回显调用方的原始拼写。
+- [x] **回复门控可配 + 群角色节点。** 门控规则从插件 `system_hint` 里硬编码的 `IS directed at you ONLY if … When in doubt, suspend` 改为**运行时策略**：`data/qq_reply_policy.json`（`qq_get/set_reply_policy`，路径解析复用 soul_store 的 `$CORDIS_FIXTURES_ROOT/../data` → cwd 相对 `data/`），每条入站消息首行下发 `[reply policy: …]`，hint 只负责「按那一行判断」。新增 `qq_get_group_roles`（`get_group_member_list` 聚合 owner/admins/member_count，owner 缺失回退 `get_group_info_ex` 的 `extInfo.groupOwnerId.memberUin`），并给 `qq_get_group_members` 补上 node_doc 且标 `agent_accessible`——10-20 那句「接口对我没开放权限」的真身是 `Agent is not allowed to call qq::qq_get_group_members`。
+- [x] **构建管线去硬编码。** `fixtures/plugins/{qq,feishu,gacha,soul_store}/build.rs` 曾把 `target/debug/lib<name>.so` `cp` 到写死的 `/root/CordisClaw/fixtures/artifacts/` 并手改 index.json——在 minori checkout 里 `cargo build -p qq` 会覆盖**另一个仓库**的工件与索引。现四个 build.rs 只留 `rerun-if-changed`，工件暂存统一由 `prepare_artifacts` 负责。同类硬编码另清两处：filesystem 插件的 `base_dir()` 回落（原 `/root/CordisClaw`，注释却写「default to the process cwd」）与 qq 的 `runtime_config_path()` 回落。
+
+**验证**：`cargo build` 零 warning；`cargo clippy --all-targets -- -D warnings` 干净；`cargo test` 全绿；行覆盖 100%（`main.rs`/`agent.rs` 文件级排除不变，新模块 `agent_toolchain.rs` 每行由 8 个单测覆盖）。新增测试：`agent_toolchain` 8 项 + 集成 `agent_toolchain_400` 2 项（含修复前必失败的反向验证）、plugin registry 22 项（含 host 层 `check_agent_accessible("/qq")`）、inbox/pending 8 项、qq 插件 22 项（含 OneBot stub 的 `group_info_ex` 回退与 transport 失败臂）。
+
+**运维注意事项（本批踩过）**：`serve` 的 SIGTERM handler 会调 `save_draft_and_revert`——把 `fixtures/` 下 `git diff -- plugins/` 存成 `.cordis-drafts/draft-<ts>-signal.patch`，然后**回滚 `fixtures/plugins/` 里全部未提交改动**（这是为了把 agent 自迭代改坏的插件拉回干净树）。所以：
+
+1. 重启前必须**先提交**插件侧改动，否则 `systemctl restart` 会把它们收进 draft 补丁并从工作树抹掉（本批在 14:40 的重启中真实丢过一次 qq 插件源码，靠 draft 补丁恢复）。
+2. 回滚只覆盖 `plugins/`，`fixtures/artifacts/`（gitignored）不受影响——于是出现过"源码回滚了、工件还是新的"的错位：下次 `prepare-artifacts` 会用回滚后的源码重建出**旧**工件。源码恢复后要重跑 `prepare-artifacts fixtures` 再重启。
 
 ### 5.2.39 mock LLM server 空转导致 CI 4 倍变慢（2026-08-05）
 
@@ -471,7 +1671,7 @@ Review 交叉验证发现 loader 对 dylib 工件的两处静默失效，本批�
 - 指令 admin 白名单层（当前 = 渠道 policy）。
 - fallback 探测冷却（当前每次 send 都探测，降级期吞吐减半）。
 - 用户自助 soul 编辑指令（当前走 agent 工具，涉及提示词注入面需单独评估）。
-- pending spill 的容量上限与过期清理。
+- ~~pending spill 的容量上限与过期清理~~ → 5.2.40 已闭合（7 天 TTL + `data/pending.archive/` 归档，仍无容量上限）。
 
 ### 5.2.31 飞书 WSS 长连接 + openclaw 风格策略面 + 卡片两段式（I 批，2026-07-21）
 
@@ -522,8 +1722,8 @@ H 批的 feishu 插件源码曾因 sshfs 静默丢失事故从 checkout 消失�
 D 批（QQ 对话链路 E2E 验证，5.2.25）记录、移交给 runtime 的三个问题，全部修完：
 
 1. **`CORDIS_CONFIG_DIR` 显式覆盖**（[config.rs `discover_config_dir`](../../crates/cordis-runtime/src/config.rs)）：原逻辑靠 `fixtures_root.parent()/config` 的兄弟目录启发式定位 `llm_api.yaml`，但 fixtures 被拷到临时目录（测试、`config/` 被 gitignore 的 git worktree）时失效。新增环境变量优先级最高，空值忽略。已验证 `CORDIS_CONFIG_DIR=/tmp/altconfig` 下 invoke 正常。
-2. **inbox 背压**（[main.rs `AGENT_TRIGGER_TX`](../../crates/cordis-runtime/src/main.rs)）：inbox 消费者阻塞在 LLM 往返上，原 unbounded `mpsc::channel` 在 DeepSeek 慢于消息速率时无限增长。改为 `sync_channel(256)` 有界通道；溢出时 `try_send` 失败，丢**最新**消息并计数（qq 插件上游已去重+批处理，持续过载下有界丢失优于无限内存增长）；前 5 次 + 之后每 50 次打一条 stderr。
-3. **`_cordis_agent_trigger` 调试残留移除**（[main.rs](../../crates/cordis-runtime/src/main.rs)）：每次 trigger 都 `fs::write("/tmp/trigger_called.txt", ...)`，多实例互相覆盖、生产环境无意义。直接删除。
+2. **inbox 背压**（[main.rs `AGENT_TRIGGER_TX`](../../crates/cordis-cli/src/main.rs)）：inbox 消费者阻塞在 LLM 往返上，原 unbounded `mpsc::channel` 在 DeepSeek 慢于消息速率时无限增长。改为 `sync_channel(256)` 有界通道；溢出时 `try_send` 失败，丢**最新**消息并计数（qq 插件上游已去重+批处理，持续过载下有界丢失优于无限内存增长）；前 5 次 + 之后每 50 次打一条 stderr。
+3. **`_cordis_agent_trigger` 调试残留移除**（[main.rs](../../crates/cordis-cli/src/main.rs)）：每次 trigger 都 `fs::write("/tmp/trigger_called.txt", ...)`，多实例互相覆盖、生产环境无意义。直接删除。
 
 `cargo build` + lib 89 测试全绿；runtime-only serve 冒烟正常。
 
@@ -557,7 +1757,7 @@ D 批修掉 `tests/architecture.rs` 的编译错误后暴露的 11 项运行失�
 
 ### 5.2.24 REPL / serve 收尾正确性（E 批任务 C，2026-07-20）
 
-批处理式 `cat cmds | cordis-runtime serve fixtures` 时，`kernel iterate-plugins` 的最终结果 JSON 会被后面排队的 `quit` 打断（5.2.22 E2E 二轮复验里 run log 停在第二次 reload 的 `[snapshot] detected`，`final_verdict` 缺失）。改动仅限 [crates/cordis-runtime/src/main.rs](../../crates/cordis-runtime/src/main.rs)：
+批处理式 `cat cmds | cordis-runtime serve fixtures` 时，`kernel iterate-plugins` 的最终结果 JSON 会被后面排队的 `quit` 打断（5.2.22 E2E 二轮复验里 run log 停在第二次 reload 的 `[snapshot] detected`，`final_verdict` 缺失）。改动仅限 [crates/cordis-cli/src/main.rs](../../crates/cordis-cli/src/main.rs)：
 
 - **根因**：serve 主循环里，每条命令的 stdout flush 只发生在 `handle_serve_command` 内部末尾（`io::stdout().flush()`）与主循环的 `Err` 分支；而 `quit`/`exit` 走 `Ok(false) => return Ok(false)`，在到达那个 flush **之前**就 `break` 出循环。批处理模式下 stdout 连到 pipe（全缓冲，非行缓冲），`iterate-plugins` 那一坨大 JSON 还躺在用户态缓冲区里没落地，`quit` 一 break、`run_serve` 返回、进程退出，缓冲区内容随之丢失 → 输出截断。（并非 stdin 并发消费，也非内部 reload 调 `process::exit`——排查过 `iterate_plugins` 全链路：rebuild 子进程用 `Stdio::null()` 接 stdin，两次 reload 与 promote/rollback 都不碰 `process::exit`。）
 - **修法**：把主循环尾部改成"先算 `keep_going`，**无条件 `io::stdout().flush()?`，再决定是否 break**"。这样退出路径（`Ok(false)`）与正常路径、错误路径统一都在读下一条 stdin 前 flush 完；命令处理中途不允许 `process::exit`（现状本就没有）。
@@ -646,7 +1846,7 @@ D 批修掉 `tests/architecture.rs` 的编译错误后暴露的 11 项运行失�
 
 紧跟 5.2.21 E2E smoke 的两条 finding，一次修完：
 
-- **`rebuild_plugin_workspace` 后同步 `index.json` 里 `entry.sha256`**（[plugin/tooling.rs:246-278](../../crates/cordis-runtime/src/plugin/tooling.rs#L246-L278)）：stage-swap 完 `.so` 后，直接读回新文件 sha256，只更新受本次 rebuild 影响的 entry（避免对未 build 的 entry 也刷新，从而误 unlock 一些"stale 但 required"的检测）。原子写回 `index.json`。这条修复消除了 5.2.21 里 verifier 判 `HashMismatch → rolled_back` 的假失败。
+- **`rebuild_plugin_workspace` 后同步 `index.json` 里 `entry.sha256`**（[plugin/tooling.rs（现 `cordis-tooling/src/lib.rs`）](../../crates/cordis-tooling/src/lib.rs)）：stage-swap 完 `.so` 后，直接读回新文件 sha256，只更新受本次 rebuild 影响的 entry（避免对未 build 的 entry 也刷新，从而误 unlock 一些"stale 但 required"的检测）。原子写回 `index.json`。这条修复消除了 5.2.21 里 verifier 判 `HashMismatch → rolled_back` 的假失败。
 - **插件 `handle` panic 隔离**（[plugin/invoke.rs:230, 350-425](../../crates/cordis-runtime/src/plugin/invoke.rs#L230)、[cordis-plugin-host/src/lib.rs:347-370](../../crates/cordis-plugin-host/src/lib.rs#L347-L370)）：`api.handle` 是普通 `fn`（不是 `extern "C"`），Rust 允许 panic 跨帧 unwind，直接把 runtime 撕成 corrupted 状态。两处调用点都包 `catch_unwind(AssertUnwindSafe(...))`，捕获后转 `RuntimeError::InvalidArgument` / `PluginHostError::PluginInvocationFailed`，plugin_path 一并带出。**Service `start`/`stop`（`extern "C" fn`）不在此覆盖范围**：modern rustc 会在任何 panic 尝试 unwind 过 C ABI 时自动 `abort()`，runtime 侧的 `catch_unwind` 拦不住；后续要做 SDK 侧的服务包装。lib.rs 里 code comment 已注明这条边界。
 
 新增单测：`plugin::invoke::panic_isolation_tests` +2（handle panic 转 Err、正常 handle 透传）。lib 测试 87 → 89，全 pass。
@@ -772,6 +1972,7 @@ cd fixtures/plugins/expr/lexer && cargo test --lib  # excluded, external tests o
 - [x] **P2-12 QQ 硬编码路径**（部分修）— 新 `runtime_config_path()` 从 `$CORDIS_FIXTURES_ROOT` 派生；env 未设置时回退到历史 `/root/CordisClaw/...`。
 - [x] **serve 加 `--no-startup-invoke`（本地测试劫持线上流量修复，2026-07-22）** — serve 启动段原先无条件执行 `startup_invoke.json`（起 qq HTTP 8099 + 连真实飞书 WSS）；本地落地测试实例与线上 bot 共用渠道凭证，测试期间飞书把用户消息推给测试实例，实例发出"思考中"两段式占位卡片后被测试脚本 exit 杀掉，内存 `PENDING_CARDS` 丢失，用户侧卡片永久停留（已实际发生）。新增 `--no-startup-invoke` flag + `CORDIS_NO_STARTUP_INVOKE` 环境变量：跳过启动段全部自动 invoke 并打印明确日志，插件加载 / invoke / execute / REPL 不受影响。`parse_root_and_runtime_only` 重构为 `parse_serve_args`（env 读取在外壳，内层纯函数可测），main.rs 补 4 个参数解析单测。约定：本地落地测试一律带该开关。
 - [x] **P2-13 fingerprint per-build**（fixture 迁移完成）— 21 个 fixture 插件的 `abi_fingerprint_value()` 全部从硬编码 `AbiFingerprint { rustc_version: "1.85.1", target_triple: "x86_64-unknown-linux-gnu", ... }` 迁移到 `AbiFingerprint::current_build(crate_hash, api_hash)`；Cargo.toml 的 `[package.metadata.cordis.abi_fingerprint]` 删除 rustc_version/target_triple 两行（SDK 的 `AbiFingerprint` 加 serde default，缺省时填当前工具链值，显式声明仍生效）；host.rs 两处插件脚手架模板与 agent.rs 的插件创建 prompt 同步。修复动机：硬编码 linux triple 导致 macOS 等非 linux-x86 宿主上所有 dylib 插件被 target_triple 预检拒载（`Unavailable(AbiMismatch)`），serve 无法冷启动。SDK 补 serde-default 单测；macOS (aarch64-apple-darwin) 实机 serve + invoke 验证通过。
+
 - [x] **R6 ArtifactBuildLock 陈旧锁回收 + Drop 归属判定**（2026-08-09）— 两处构建锁缺陷：(a) `maybe_remove_stale_lock_with_fs` 原判据 `!lock_pid_is_live(pid) || age > 300s` 是 OR 条件——持有者进程仍存活、只是构建超过 5 分钟（默认构建超时 20min）锁就被后来者 unlink 接管；(b) `ArtifactBuildLock` 的 `Drop` 无条件 `remove_file`——A 的锁被 B 夺走后 A 结束时的 Drop 会把 B 的锁文件删掉。修复：可解析 JSON 锁只按 `!lock_pid_is_live(state.pid)` 回收，去掉 age 闸门（`STALE_LOCK_TIMEOUT` 常量删除；300s 语义注释改写为 pid 复用风险的取舍——死进程 pid 被 OS 复用到无关进程时陈旧锁会保留到该 pid 死亡，属有意的安全优先取舍；legacy / 无法解析文件仍走 mtime 路径 `LEGACY_STALE_LOCK_TIMEOUT` 不动）；`ArtifactBuildLock` 增加 `pid: u32` 字段（acquire 成功时记录 `process::id()`），`Drop` 改为读回锁文件解析 `ArtifactBuildLockState`，仅当 `parsed.pid == self.pid`（或文件已不存在）才删除，文件已是他人 pid → 不删（锁已被接管），读失败 / 解析失败 → 保守不删 + eprintln 诊断（避免误删他人锁；残留文件可由 legacy mtime 路径兜底回收）。测试：新增 5 个单测（live pid + 超龄 JSON 锁必须保留 / Drop 时他人 pid 不删 / Drop 时不可解析不删 / Drop 时文件已缺失 no-op / Drop 时文件不可读 EISDIR 不删）。
 - [x] **R7 rebuild_plugin_workspace 补 ArtifactBuildLock**（2026-08-09）— agent 工具入口（host.rs 直调）此前完全绕过 `prepare_artifacts` 的构建锁：stage dylib 后对 index.json 做 load-修改-整文件写回，与并发 prepare_artifacts 互踩 artifacts 与 index.json（读-改-写丢对方更新，full_rebuild 时 artifacts 目录还会被 remove_dir_all）。修复：命名插件路径在入口处（"/" 委托检查之后）获取同一个 `ArtifactBuildLock`（与 prepare_artifacts 共用 fixtures root 下的 `.artifacts-build.lock`），作用域持有到函数结束，超时按 `ArtifactBuildLockTimeout` 传播。"/" 全量路径委托 `rebuild_fixture_artifacts` → `prepare_artifacts`（内部已取锁），此处若再取锁会自死锁（同进程同 pid 锁重入），调用图确认 prepare_artifacts 不会回调 rebuild_plugin_workspace。测试：新增 2 个集成测试（rebuild 期间锁文件存在且记录本进程 pid（线程 + 轮询断言，锁持有到返回后文件消失）/ 预先埋入 dead-pid 陈旧锁时 rebuild 会回收并最终释放），既有全部 rebuild / prepare 集成测试照常通过。
 - [x] **R1 agent_send 摘除-重插窗口**（2026-08-09）— `agent_send` 把 session 从 `agent_sessions` remove 出来、锁外跑 `respond`（可能很长）、最后无条件插回，存在三个缺陷：(a) respond panic 时插回永不执行，会话永久丢失；(b) respond 期间 `drop_session` 只删到快照，结束后会话被复活且 auto_save 重写快照；(c) 并发第二个 agent_send 误报 `AgentSessionNotFound`，消息静默丢失。修复：`RuntimeHost` 新增 `inflight_sessions` / `dropped_during_turn` 两个 `BTreeSet`（struct 字段 + boot 初始化同步）；`agent_send` 摘除与 inflight 标记在 `inflight → agent_sessions` 锁序下原子完成（无"已 remove 未标记"窗口），respond 用 `catch_unwind(AssertUnwindSafe(..))` 包裹，panic 也走收尾（会话不丢失，返回 `Invariant` 错误）；收尾在 inflight 锁下原子完成"检查 dropped → auto_save → 插回 → 摘除标记"，与 `drop_session` 的标记互斥，杜绝复活竞态；`drop_session` 对 in-flight 会话标记 `dropped_during_turn` 而非只删快照；`agent_start_with` 对新会话做防御性 `mark_dropped_if_inflight`（当前 id 由 `normalize_request_id` 生成不会撞车）。`core/error.rs` 新增 `AgentSessionBusy { session_id }`（文本风格与 `AgentSessionNotFound` 一致）。测试：单测 4 个（respond panic 后会话仍在且可继续使用 / panic 错误文本三载荷逐字节 / mark_dropped_if_inflight 双臂 / AgentSessionBusy 变体文本）＋ 集成 2 个（阻塞 mock server 控制时序：respond 期间 drop_session → turn 结束不复活不重写快照；并发第二个 send 得 `AgentSessionBusy` 而非 `NotFound`）。
@@ -975,7 +2176,7 @@ cd fixtures/plugins/expr/lexer && cargo test --lib  # excluded, external tests o
 
 ### 5.6.1 覆盖率文件级豁免清理（2026-08-03 实测，待开工）
 
-`coverage.yml` 的 `--ignore-filename-regex 'cordis-runtime/src/(main|agent)\.rs'` 声称理由是
+`coverage.yml` 的 `--ignore-filename-regex 'cordis-runtime/src/(main|agent)\.rs'`（5.2.48 后为 `'.*crates/cordis-(runtime|cli)/src/(main|agent)\.rs'`，因为 `main.rs` 随二进制搬到了 `cordis-cli`）声称理由是
 "进程/网络边界"，但**实测该理由对绝大部分内容并不成立**——去掉排除后跑一次全量覆盖：
 
 ```
@@ -1041,3 +2242,21 @@ cd fixtures/plugins/expr/lexer && cargo test --lib  # excluded, external tests o
 - **工作流 SDK 已就绪，运行时适配层缺失** — `WorkflowRuntime` trait 与 6 种原语在 SDK 中有定义和测试，但运行时桥接层尚未实现。
 - **金丝雀发布只有单次回放，无流量分层和自动晋升。**
 - 未完成的主要是：执行语义闭合、产品化、服务化、更多插件形态和金丝雀闭环。
+
+### 4.6 一次性 `invoke` CLI 不注入 `settings`
+
+`settings` 的注入点在 `RuntimeSnapshot::invoke`（`RuntimeHost` 路径：agent 工具、console/REPL、
+`execute_target`）。调试用的 `cordis-runtime invoke <plugin> <node>` 走 `PluginInvoker`，它只加载
+插件、不读 `config/plugins/`，所以同一个 `filesystem` 插件在调试 CLI 里只认 fixtures 根，对配置
+出来的目录会报 `access denied`。补齐方式是让 `PluginInvoker::load` 也加载 `RuntimeConfig` 并同样
+注入，属独立小批。
+
+### 4.7 `runtime.snapshot_root` / `kernel.change_history_limit` 不支持热重载
+
+前者决定 staging 根，进程内已固定；后者在 `RuntimeKernel::new` 时写进 `ChangeMemory`。两者在
+reload 时保留 boot 值（`snapshot_root` 会打日志说明），要改只能重启。若要支持，需要定义
+"换 staging 根时旧快照与 retired 目录怎么回收"的语义。
+
+
+### 4.9 ~~agent 没有迭代批准通道~~（2026-10-29 已闭合，见 3.24）
+

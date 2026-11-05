@@ -22,8 +22,25 @@ fn lexes_expression_tokens() {
 
 #[test]
 fn rejects_unexpected_character() {
-    let err = lex("1 + a").expect_err("must fail");
+    // `$` is not part of the grammar. (This test used to pass `1 + a` and
+    // demand a failure, but `a` is a legal identifier — the lexer was right
+    // and the assertion was stale.)
+    let err = lex("1 + $").expect_err("must fail");
     assert_eq!(err, LexError::UnexpectedToken { position: 4 });
+}
+
+#[test]
+fn lexes_identifiers() {
+    let tokens = lex("1 + a").expect("identifiers are legal");
+    let kinds = tokens.into_iter().map(|t| t.kind).collect::<Vec<_>>();
+    assert_eq!(
+        kinds,
+        vec![
+            TokenKind::Number(1.0),
+            TokenKind::Plus,
+            TokenKind::Identifier("a".to_string()),
+        ]
+    );
 }
 
 #[test]
