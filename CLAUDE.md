@@ -10,7 +10,7 @@ CordisClaw — 基于有色 Petri 网 (CPN) 的契约驱动插件树运行时。
 
 **默认起 10 个命名 teammate 并行工作。** 实施批准后的 plan 时，默认将任务拆给 10 个命名 agent 并行推进（任务本身粒度不足 10 份时按实际拆分）。要求：任务边界切干净；并行改文件时用 worktree 隔离；汇合后由主会话统一验证（cargo build/test/clippy）再落盘。
 
-**任何提交必须保持 `cargo clippy --all-targets -- -D warnings` 通过（零 warning 规范）。** 确需豁免时用带理由注释的 `#[expect(lint)]`，禁止裸 `#[allow]`。
+**任何提交必须保持 `cargo clippy --workspace --all-targets -- -D warnings` 通过（零 warning 规范）。** 确需豁免时用带理由注释的 `#[expect(lint)]`，禁止裸 `#[allow]`。
 
 **任何提交必须保持 CI coverage 门槛通过（行覆盖 100%，coverage workflow 对 PR 自动跑）。** 全仓已达 100%（26497/26497），**不使用任何覆盖率排除注释**（无 `COV_EXCL` / `#[coverage(off)]`）。文件级排除仅 `main.rs`（REPL/signal/exit）与 `agent.rs`（LLM 流式 I/O），属进程/网络边界。**`main.rs` 现在位于 `crates/cordis-cli/src/main.rs`**（二进制随 `cordis-cli` 拆出，crate 名仍是 `cordis-cli`、二进制名仍是 `cordis-runtime`），所以排除正则要同时覆盖 `cordis-runtime` 与 `cordis-cli` 两个 crate。禁止用降门槛、加排除注释或加文件排除消化缺口。
 
@@ -132,7 +132,7 @@ cargo build                           # 编译（零 warning）
 cargo test                            # 全部测试
 cargo test --test semantics           # 引擎语义测试
 cargo test --test architecture        # 架构集成测试
-cargo clippy --all-targets -- -D warnings  # lint：必须零 warning（warning 即失败）
+cargo clippy --workspace --all-targets -- -D warnings  # lint：必须零 warning（warning 即失败）
 ```
 
 ## 提交格式
