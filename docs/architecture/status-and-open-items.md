@@ -2,7 +2,7 @@
 
 ## 1. 判定口径
 
-- 本文基于当前仓库现状整理，最近更新：2026-11-05。
+- 本文基于当前仓库现状整理，最近更新：2026-11-09。
 - 历史规划蓝图已经吸收进 [design-blueprint.md](./design-blueprint.md)，因此本文结论来自三类证据的交叉比对：
   - 设计蓝图：[design-blueprint.md](./design-blueprint.md)
   - 架构文档：[system-overview.md](./system-overview.md)、[contracts-and-loading.md](./contracts-and-loading.md)、[runtime-semantics.md](./runtime-semantics.md)、[maintenance-guide.md](./maintenance-guide.md)
@@ -707,7 +707,7 @@ LRU 淘汰时同步删除。
 **验证**：重启后同一房间仍是 `agent-session-1793381492493-1`，快照数不变（677），
 重启后 16 条消息继续走同一个会话。
 
-### 3.35 工具调用改走 DSML 文本协议（2026-10-31）
+### 3.35 工具调用改走 DSML 文本协议（2026-10-31，协议形状已被 3.39 取代）
 
 **动机**：`response_format: json_object` 与工具调用互斥——模型一想调工具就退化成
 "只有空白 delta、`finish_reason=stop`、0 正文 0 调用"，一轮里重试 12 次全是同一请求。
@@ -806,6 +806,42 @@ LRU 淘汰时同步删除。
 **验证**：runtime 963 lib 测试（`image_cache` 16 条、`image_tools` 3 条）、agent 81 条
 （端到端：占位符 → 调 `view_image` → 下一次请求里图回来）、vision 11 条；clippy
 `-D warnings` 干净。
+
+### 3.39 工具调用改成模型自己写的 DSML 方言（2026-11-09）
+
+**动机**：3.35 让模型把 JSON 塞进 `<|DSML|tool_calls>`。可它几乎不这么写——
+685 个快照里有 93 轮写的是另一种形状：
+
+```
+<｜｜DSML｜｜calls>
+<｜｜DSML｜｜invoke name="search_code">
+<｜｜DSML｜｜parameter name="path" string="true">plugins</｜｜DSML｜｜parameter>
+</｜｜DSML｜｜invoke>
+</｜｜DSML｜｜calls>
+```
+
+JSON 扫描器读不懂它，于是那一轮**一个调用都没有**：渠道会话不调 `suspend`，
+一直 nudge 到上限，机器人沉默。与其继续纠正模型，不如把它的写法变成官方协议。
+
+**改法**：`crates/cordis-agent/src/dsml.rs` 成为唯一的协议实现。
+
+- `parse` 接受 `<|DSML|calls>` / `<|DSML|invoke name=…>` / `<|DSML|parameter name=…>`，
+  管道符两种宽度（`|` 与全角 `｜`）都收，标签名后允许空格；
+- 参数值是字面文本；`string="true"` 标记保持字符串，否则若像 JSON 字面量则按 JSON 解析；
+- `render` 产出同一种形状，提示词与历史都由它渲染——**模型模仿的是历史**；
+- 解析结果仍走原来的 `serialized_call_to_tool_call_at` 解析：内核工具直呼、
+  `invoke_plugin` 拆内层节点、裸插件节点走 `invoke_plugin`；
+- 旧的 `<|DSML|tool_calls>{"node_id":…}` 与裸 JSON 仍能解析，仅用于重放旧快照。
+
+**同时清掉的两处陈旧指令**：`shell_agent_system_prompt` 仍写着
+"Your final output must be `{"action":"suspend"}`"，`wrap_inbox_batch` 仍写着
+"output exactly `{"action":"suspend"}`"——两条都在教一个不存在的 JSON 协议，
+与 DSML 提示词互相矛盾，已改为「调用 suspend 工具」。
+
+**验证**：`a_dsml_invoke_block_ends_the_turn`（只有文本标记、没有结构化
+`tool_calls`，回合仍结束）与 `a_dsml_plugin_node_reaches_the_host`（插件节点被解析成
+真实调用）两个端到端用例；另有 12 条解析单测覆盖全角/双管道、无闭合标签、
+JSON 参数、单引号属性、渲染往返。
 
 ## 4. 部分完成
 

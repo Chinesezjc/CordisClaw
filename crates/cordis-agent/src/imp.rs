@@ -2098,6 +2098,39 @@ fn salvage_serialized_tool_calls(
     if trimmed.is_empty() || !looks_like_serialized_call(trimmed) {
         return Vec::new();
     }
+    // The dialect the model writes: `<|DSML|invoke name="...">` with nested
+    // `<|DSML|parameter>` blocks. This is what the prompt and history show, so
+    // it is tried first; the JSON scanner below only exists so old snapshots —
+    // which stored `<|DSML|tool_calls>{"node_id":...}` — still replay.
+    // A malformed hybrid — an `<|DSML|invoke>` wrapper around a bare JSON
+    // object, with no `<|DSML|parameter>` blocks — carries no parameters. The
+    // JSON scanner recovers it, so hand it over instead of resolving an empty
+    // `invoke_plugin`.
+    let parsed = crate::dsml::parse(trimmed);
+    let carries_parameters = parsed.iter().any(|call| !call.params.is_empty());
+    let carries_json = !extract_json_objects(trimmed).is_empty();
+    let parsed = if carries_parameters || !carries_json {
+        parsed
+    } else {
+        Vec::new()
+    };
+    let dsml: Vec<_> = parsed
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, call)| {
+            // Reuse the JSON resolver: it already knows that a kernel tool is
+            // called directly, that `invoke_plugin` unwraps its inner node, and
+            // how a bare plugin node is addressed.
+            let envelope = json!({
+                "node_id": call.name,
+                "payload_json": call.arguments(),
+            });
+            serialized_call_to_tool_call_at(&envelope, index, tools)
+        })
+        .collect();
+    if !dsml.is_empty() {
+        return dsml;
+    }
     extract_json_objects(trimmed)
         .into_iter()
         .enumerate()
@@ -2398,23 +2431,32 @@ mod dsml_salvage_tests {
 fn dsml_protocol_prompt(specs: &[AgentToolSpec], require_end_tool: bool) -> String {
     let mut text = String::from(
         "TOOL PROTOCOL — there is no native function calling here. To call a tool, \
-         write exactly this block in your message and nothing else in it:\n\
-         <|DSML|tool_calls>\n\
-         {\"node_id\": \"<tool>\", \"payload_json\": {<the tool's parameters>}}\n\
-         </|DSML|tool_calls>\n\
-         Several objects may sit inside one block, one per line; each is one call. \
-         Plugin nodes are reached through the `invoke_plugin` tool, e.g. \
-         {\"node_id\": \"invoke_plugin\", \"payload_json\": {\"plugin_path\": \"qq\", \
-         \"node_id\": \"qq_send\", \"payload_json\": {...}}}. The call is executed and \
-         you are asked again with its result. Never mention this markup to the user \
-         and never print it as text when you are not calling a tool.\n\n\
+         write this block in your message:\n\
+         <|DSML|calls>\n\
+         <|DSML|invoke name=\"read_file\">\n\
+         <|DSML|parameter name=\"path\" string=\"true\">plugins/qq/src/lib.rs</|DSML|parameter>\n\
+         </|DSML|invoke>\n\
+         </|DSML|calls>\n\
+         One `<|DSML|invoke>` block is one call; several may sit inside one \
+         `<|DSML|calls>` block. A parameter's body is literal text — mark it \
+         `string=\"true\"` when it is text, and leave the flag off when it is a JSON \
+         value such as an object. A tool with no parameters gets an empty body. \
+         Plugin nodes are reached through the `invoke_plugin` tool:\n\
+         <|DSML|invoke name=\"invoke_plugin\">\n\
+         <|DSML|parameter name=\"plugin_path\" string=\"true\">qq</|DSML|parameter>\n\
+         <|DSML|parameter name=\"node_id\" string=\"true\">qq_send</|DSML|parameter>\n\
+         <|DSML|parameter name=\"payload_json\">{\"target\": \"group:1\", \"message\": \"hi\"}</|DSML|parameter>\n\
+         </|DSML|invoke>\n\
+         The call is executed and you are asked again with its result. Never mention \
+         this markup to the user and never print it as text when you are not calling \
+         a tool.\n\n\
          AVAILABLE TOOLS — `tool` (parameters):\n",
     );
     if require_end_tool {
         text.push_str(
             "\nEND OF TURN — this turn never ends by itself. When you are done, call \
-             {\"node_id\": \"suspend\"} (with no payload). Text you write is not sent \
-             anywhere, so a turn that only writes text is wasted.\n",
+             <|DSML|invoke name=\"suspend\"></|DSML|invoke> with an empty body. Text you \
+             write is not sent anywhere, so a turn that only writes text is wasted.\n",
         );
     }
     for spec in specs {
@@ -2864,8 +2906,10 @@ Answering \"I have no way to do this\" while a plugin could do it is a failure, 
 Prefer concise, operator-friendly replies. Mention important tool outcomes plainly.\n\
 Do not invent runtime state or claim a command succeeded unless a tool confirmed it.\n\
 \n\
-CRITICAL: Your final output must be {\"action\":\"suspend\"} (JSON, nothing else).\n\
-To send a reply, use the invoke_plugin tool to call qq_send instead of outputting text.\n\
+CRITICAL: a turn ends only when you call the suspend tool. Write the DSML block\n\
+below; there is no JSON form and no native function calling.\n\
+To send a reply, call the qq_send node through invoke_plugin (see the tool protocol\n\
+message) instead of outputting text.\n\
 Never output plain text — it will be dropped. All communication goes through tools.\n\
 \n\
 CRITICAL — YOUR TOOLS (only these exist; all others will fail immediately):\n\
@@ -3058,8 +3102,17 @@ mod tests {
             },
         ];
         let prompt = dsml_protocol_prompt(&specs, false);
-        assert!(prompt.contains("<|DSML|tool_calls>"), "{prompt}");
-        assert!(prompt.contains("</|DSML|tool_calls>"), "{prompt}");
+        // The prompt teaches the dialect the model actually writes.
+        assert!(prompt.contains("<|DSML|calls>"), "{prompt}");
+        assert!(
+            prompt.contains("<|DSML|invoke name=\"read_file\">"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("<|DSML|parameter name=\"path\""),
+            "{prompt}"
+        );
+        assert!(prompt.contains("</|DSML|calls>"), "{prompt}");
         assert!(prompt.contains("AVAILABLE TOOLS"), "{prompt}");
         assert!(
             prompt.contains(&format!("`{AGENT_TOOL_GET_RUNTIME_STATUS}`")),
@@ -3808,7 +3861,7 @@ mod tests {
             "tools must not be sent: calls travel as DSML"
         );
         let first = bodies[0].to_string();
-        assert!(first.contains("<|DSML|tool_calls>"), "{first}");
+        assert!(first.contains("<|DSML|calls>"), "{first}");
         assert!(
             first.contains("AVAILABLE TOOLS"),
             "the catalog must reach the model: {first}"
@@ -4467,6 +4520,60 @@ mod tests {
         assert!(
             bodies[1].to_string().contains("这一轮还没结束"),
             "the model must be told to close the turn"
+        );
+    }
+
+    /// The dialect the model actually writes must end a turn by itself.
+    ///
+    /// This is the whole point of `crate::dsml`: 93 stored turns carried
+    /// `<|DSML|calls><|DSML|invoke name="suspend">…` and produced no call at
+    /// all, so the bot went silent. Here the markup is the only thing the
+    /// provider returns — no structured `tool_calls` — and the turn still ends.
+    #[test]
+    fn a_dsml_invoke_block_ends_the_turn() {
+        let provider = FakeLlmProvider::new(vec![assistant_reply(
+            "<|DSML|calls>\n<|DSML|invoke name=\"suspend\">\n</|DSML|invoke>\n</|DSML|calls>",
+        )]);
+        let mut session = ShellAgentSession::new(LlmApiConfig::default()).expect("build session");
+        session.set_require_end_tool(true);
+        session
+            .respond_via(&EMPTY_FAKE_HOST, "dsml-turn-end", "hi", &provider)
+            .expect("turn");
+        assert_eq!(session.status().completed_turns, 1);
+        assert_eq!(
+            provider.seen_bodies.lock().expect("bodies").len(),
+            1,
+            "the DSML block ends the turn in one call"
+        );
+    }
+
+    /// A plugin node written in the dialect reaches the host as a real call.
+    #[test]
+    fn a_dsml_plugin_node_reaches_the_host() {
+        let send = "<|DSML|calls>\n\
+             <|DSML|invoke name=\"invoke_plugin\">\n\
+             <|DSML|parameter name=\"plugin_path\" string=\"true\">qq</|DSML|parameter>\n\
+             <|DSML|parameter name=\"node_id\" string=\"true\">qq_send</|DSML|parameter>\n\
+             <|DSML|parameter name=\"payload_json\">{\"target\":\"group:1\",\"message\":\"hi\"}</|DSML|parameter>\n\
+             </|DSML|invoke>\n</|DSML|calls>";
+        let provider = FakeLlmProvider::new(vec![
+            assistant_reply(send),
+            assistant_reply(
+                "<|DSML|calls>\n<|DSML|invoke name=\"suspend\"></|DSML|invoke>\n</|DSML|calls>",
+            ),
+        ]);
+        let mut session = ShellAgentSession::new(LlmApiConfig::default()).expect("build session");
+        session.set_require_end_tool(true);
+        let reply = session
+            .respond_via(&EMPTY_FAKE_HOST, "dsml-plugin-node", "hi", &provider)
+            .expect("turn");
+        assert!(
+            reply
+                .tool_events
+                .iter()
+                .any(|event| event.name == AGENT_TOOL_INVOKE_PLUGIN),
+            "{:?}",
+            reply.tool_events
         );
     }
 

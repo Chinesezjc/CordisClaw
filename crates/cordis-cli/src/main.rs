@@ -435,7 +435,8 @@ fn wrap_inbox_batch(combined: &str) -> String {
          Do not re-answer an older message as if it were a new request, \
          and do not claim someone is asking you a question unless the question is in this batch or in the thread it continues. \
          Whether to answer is decided by the `[reply policy: ...]` line (see the plugin instructions) plus that context — \
-         if the message is clearly between other people, output exactly {{\"action\":\"suspend\"}}."
+         if the message is clearly between other people, end the turn by calling the suspend tool \
+         (the DSML block described in the tool protocol) and send nothing."
     )
 }
 
@@ -3331,7 +3332,7 @@ mod inbox_framing_tests {
         assert!(wrapped.starts_with("CURRENT_INCOMING_BATCH_START\n"));
         assert!(wrapped.contains("\n[user A]: 你好\n"));
         assert!(wrapped.contains("CURRENT_INCOMING_BATCH_END\n"));
-        assert!(wrapped.contains(r#"{"action":"suspend"}"#));
+        assert!(wrapped.contains("the suspend tool"));
         // Channel-neutral: no protocol name leaks into runtime framing.
         assert!(!wrapped.contains("QQ"));
         assert!(!wrapped.contains("Feishu"));

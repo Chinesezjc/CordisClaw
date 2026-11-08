@@ -7,6 +7,7 @@
 
 use cordis_runtime::agent_loop::{install_agent_loop, AgentLoop};
 
+pub mod dsml;
 pub mod iteration;
 
 mod imp;
