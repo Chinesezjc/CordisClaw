@@ -749,6 +749,11 @@ fn main() {
         }
         return;
     }
+    if args.first().map(|x| x.as_str()) == Some("gate") {
+        run_gate(&args[1..]);
+        return;
+    }
+
     if args.first().map(|x| x.as_str()) == Some("selfcheck") {
         run_selfcheck(&args[1..]);
         return;
@@ -2603,9 +2608,14 @@ fn reflect_on_failures(host: &cordis_runtime::host::RuntimeHost) {
     let instruction = format!(
         "{}\n\nYou may act on this now. If the cause is in a plugin, call \
          request_iteration with a precise instruction. If it is in the harness itself, \
-         write a proposal to data/proposals/{}.md describing the fix and the test that \
-         proves it. Never change a test to match a bug. End the turn with suspend.",
+         write a machine-checkable proposal to data/proposals/{}/: a unified diff at \
+         patch.diff (against the repo root) and proposal.json with \
+         {{\"signature\":\"{}\",\"summary\":\"one line\",\"package\":\"cordis-agent\",\
+         \"test\":\"<test name filtered by --exact>\",\"patch\":\"patch.diff\"}}. Your test \
+         must fail without the patch and pass with it; a test that passes either way is \
+         refused. Never change a test to match a bug. End the turn with suspend.",
         report.instruction(signature),
+        signature.id(),
         signature.id(),
     );
     eprintln!(
@@ -2631,10 +2641,23 @@ fn reflect_on_failures(host: &cordis_runtime::host::RuntimeHost) {
         Ok(reply) => reply.content.clone(),
         Err(error) => format!("reflection failed: {error}"),
     };
-    let proposal_dir = host.data_dir().join("proposals");
+    let proposal_dir = host.data_dir().join("proposals").join(signature.id());
     let _ = std::fs::create_dir_all(&proposal_dir);
+    // A proposal that ships a patch is judged before it is believed.
+    let verdict = if proposal_dir.join("proposal.json").is_file() {
+        gate_proposal(&proposal_dir)
+    } else {
+        None
+    };
+    if let Some(verdict) = &verdict {
+        eprintln!(
+            "self-check: gate {} -> {}",
+            signature.id(),
+            serde_json::to_string(verdict).unwrap_or_default()
+        );
+    }
     let _ = std::fs::write(
-        proposal_dir.join(format!("{}.md", signature.id())),
+        proposal_dir.join("report.md"),
         format!(
             "# {}\n\n## Report\n\n{}\n\n## Reflection\n\n{}\n",
             signature.id(),
@@ -2657,6 +2680,75 @@ fn reflect_on_failures(host: &cordis_runtime::host::RuntimeHost) {
         proposal_dir.display(),
         signature.id()
     );
+}
+
+/// Judge a self-proposed patch against a clean worktree.
+///
+/// A proposal only counts when its regression test fails without the patch and
+/// passes with it — otherwise the test proves nothing and the patch is refused.
+fn run_gate(args: &[String]) {
+    let Some(dir) = args.first() else {
+        eprintln!("usage: cordis-runtime gate <proposal-dir>");
+        std::process::exit(2);
+    };
+    let dir = std::path::Path::new(dir);
+    let proposal = match cordis_agent::gate::Proposal::load(dir) {
+        Ok(proposal) => proposal,
+        Err(error) => {
+            eprintln!("gate: {error}");
+            std::process::exit(1);
+        }
+    };
+    let Some(verdict) = gate_proposal(dir) else {
+        eprintln!("gate: could not create a scratch worktree");
+        std::process::exit(1);
+    };
+    let report = serde_json::to_string_pretty(&verdict).unwrap_or_default();
+    println!("{report}");
+    if verdict.is_verified() {
+        let patch = proposal.patch_path(dir);
+        let applied = std::process::Command::new("git")
+            .args(["apply"])
+            .arg(&patch)
+            .status();
+        match applied {
+            Ok(status) if status.success() => {
+                println!(
+                    "applied {} to the working tree; review with `git diff`",
+                    patch.display()
+                );
+            }
+            _ => eprintln!("gate: verified, but applying {} failed", patch.display()),
+        }
+    }
+}
+
+/// Judge a proposal in a throwaway worktree.
+///
+/// `None` when the worktree could not be created; the caller reports that.
+fn gate_proposal(dir: &std::path::Path) -> Option<cordis_agent::gate::Verdict> {
+    let proposal = cordis_agent::gate::Proposal::load(dir).ok()?;
+    let scratch = scratch_worktree(&proposal.signature)?;
+    let verdict =
+        cordis_agent::gate::verify(&cordis_agent::gate::ShellRunner, &scratch, dir, &proposal);
+    let _ = std::process::Command::new("git")
+        .args(["worktree", "remove", "--force"])
+        .arg(&scratch)
+        .status();
+    Some(verdict)
+}
+
+/// A detached checkout of HEAD, so applying a patch cannot disturb the operator.
+fn scratch_worktree(signature: &str) -> Option<std::path::PathBuf> {
+    let root = std::env::temp_dir().join(format!("cordis-gate-{signature}"));
+    let _ = std::fs::remove_dir_all(&root);
+    let status = std::process::Command::new("git")
+        .args(["worktree", "add", "--detach"])
+        .arg(&root)
+        .arg("HEAD")
+        .status()
+        .ok()?;
+    status.success().then_some(root)
 }
 
 /// Report what the bot keeps getting wrong, from its own transcripts.
