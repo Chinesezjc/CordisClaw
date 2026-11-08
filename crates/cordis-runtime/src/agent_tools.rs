@@ -235,9 +235,8 @@ impl AgentToolHost for RuntimeHost {
         // The scan walks every snapshot; a session asks on every turn, so the
         // answer is cached and refreshed slowly.
         /// Cached digest plus the moment it was taken.
-        type DigestCache = std::sync::OnceLock<
-            std::sync::Mutex<Option<(std::time::Instant, Option<String>)>>,
-        >;
+        type DigestCache =
+            std::sync::OnceLock<std::sync::Mutex<Option<(std::time::Instant, Option<String>)>>>;
         static CACHE: DigestCache = std::sync::OnceLock::new();
         let cache = CACHE.get_or_init(|| std::sync::Mutex::new(None));
         let mut guard = cache.lock().unwrap_or_else(|poison| poison.into_inner());
@@ -884,10 +883,17 @@ impl AgentToolHost for RuntimeHost {
         // it drains and applies before reinserting the session after the
         // turn ends. Returns `{"deferred": true}` so the LLM knows the
         // action is scheduled rather than failed.
+        // provider 在拿会话锁之前解析：压缩必须走与会话相同的 llm_complete
+        // 接缝，而不是在 kernel 里另开 HTTP。没有 provider 插件时传 None，
+        // 压缩退回截断拼贴兜底，但依然绝不清空历史。
+        let provider = self.compact_provider();
         {
             let mut guard = self.agent_sessions_mut();
             if let Some(session) = guard.get_mut(session_id) {
-                let (old_len, new_len) = session.compact_history();
+                let provider = provider
+                    .as_ref()
+                    .map(|provider| provider as &dyn crate::agent_api::LlmProvider);
+                let (old_len, new_len) = session.compact_history(provider);
                 return Ok(json!({
                     "compacted": true,
                     "old_messages": old_len,

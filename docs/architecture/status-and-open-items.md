@@ -22,7 +22,7 @@
 | 优雅退出 + data/ 持久化 | 已完成 | SIGTERM→SIGINT 转发优雅退出、`data/memory/shutdown.json` 退出快照、`data/` 沙箱扩展（agent 可访问 workspace 根级目录） |
 | QQ 插件消息解析 | 已完成 | JSON 卡片透传、合并转发 ID 提取、回复 msg_id 提示 |
 | QQ 入站传输 | 已完成 | HTTP webhook（`qq_serve`）+ WebSocket 服务器（`qq_ws_serve` Task 节点，接收线上 Napcat ws 端口的 OneBot v11 事件，优雅停机）；出站走 HTTP API |
-| QQ 回复门控 / 群角色 / 死信治理 | 已完成 | 门控策略外置为 `data/qq_reply_policy.json` 并逐条下发 `[reply policy: …]` 行（`qq_get/set_reply_policy`，改规则不用重编插件）；`qq_get_group_roles` 直接给出群主/管理员；spill 7 天 TTL + 归档、失败出口限流提示（5.2.40） |
+| QQ 回复门控 / 群角色 / 死信治理 | 已完成 | 门控外置为 `data/qq_reply_policies.json`（`enabled` 布尔开关；默认 false = 只读）并逐条下发 `[reply policy: <enabled|disabled> — …]`；禁用群入站只写 history、不调模型（5.2.58）；`qq_get/set_reply_policy` 改规则不用重编插件；`qq_get_group_roles` 直接给出群主/管理员；spill 7 天 TTL + 归档、失败出口限流提示（5.2.40） |
 | Agent 安全加固 | 已完成 | secret 不可见（token 不进入 prompt）、移除 `run_command`、敏感路径黑名单、工具防火墙（`agent_accessible`）、按群隔离 session、`build_plugins` 白名单命令、工具失败自动告警 |
 | Service 生命周期 | 部分完成 | `Service` trait + `ServiceRegistry` + `NodeType::Task` 已实现；plugin load 时自动 start 尚未接入 |
 | 插件封装形态蓝图 | 部分完成 | `dylib` + JSON artifact + process 已落地；`cdylib` / `WASM` 未实现 |
@@ -349,7 +349,7 @@ prompt 都替模型付一遍 token；上限 800 字符也只是在压这个成�
 
 现在改为**拉取**：
 
-- `build_envelope` 只注入 `[reply policy: mode — text]`，不再注入记忆；
+- `build_envelope` 只注入 `[reply policy: <enabled|disabled> — text]`，不再注入记忆；
 - 提示词明确说"记忆不会被注入，需要时用 `qq_get_group_memory` 读"，并给了读的时机
   （话题延续之前的讨论、写之前先读避免覆盖）；
 - 写入规则不变：自己主动写、覆盖式、无长度上限。
@@ -961,6 +961,98 @@ JSON 参数、单引号属性、渲染往返。
 - [x] **Plugin iteration symlink 逃逸**（P0-20）— `PluginEditExecutor::execute` 在写入前调用新 helper `resolve_under_workspace`：canonicalize 结果必须仍在 workspace_root 下。plugins 内的 symlink 指向 `/etc/passwd` 之类无法被写入。
 - [x] **Verifier shell 拼接**（P0-21）— 已随 A 批 P0-1 修复。`discover_rust_workspace_manifest` 输出的字符串被 `shell_words` 解析成 argv，空格 / `$` / `;` 无法被解释。
 
+### 5.2.58 只读群只看不说：disabled 群入站不调模型（2026-11-09）
+
+**语义**（用户原话）："可以让它看，但是不要让它发言"。`enabled=false` 的群照常收消息、
+照常进该会话的 history，但**根本不起轮**——不调 provider、不产生回复；被禁言的群仍照常
+起轮（能看、能想、能读历史），只是 `qq_send` 被拒。两种"不能说话"都在发送端再拦一次，
+防"一轮中途被关 / 被禁言"的竞态。
+
+**为什么把拦截点前移**：旧方案在 `qq_send` 拒绝，模型仍会为一个注定不能发言的群付一次
+完整 LLM 轮次；只读群的正确代价是零模型调用。
+
+**改动**：
+- qq 插件 `build_envelope` 新增 `policy_enabled: bool`。它是**渠道事实**，只交给 runtime
+  决定唤醒与否；不进 `notes` 文案，也不进 history。只读群的短消息不再被
+  `should_process` 噪音过滤丢掉（`should_trigger`）：它们不会起轮，但属于 history。
+- CLI inbox（`crates/cordis-cli/src/main.rs`）新增 `batch_is_read_only`：整批
+  `policy_enabled=false` 时调 `host.agent_ingest(&sid, &combined)` 后 `continue`，不进入
+  LLM 分支；混合批（策略刚翻转）只要有一条 allowed 仍按正常轮次。`AgentEnvelope` 的
+  `policy_enabled` 缺省 `true`，所以 feishu 等不认识该字段的渠道行为不变。
+- kernel：`AgentSessionApi::ingest_user_message` 只追加一条 user 消息（无 assistant
+  回复），`RuntimeHost::agent_ingest` 写完 history 立即 `auto_save_session`；`trim_history`
+  从 `remember_exchange` 提取复用；它只做条数极端兜底，体积由 `compact_history` 按 token 压缩
+  （见 5.2.59）。
+- 发送端防线：`qq_send` / `qq_system_notify` 在 `send_group_msg` 之前依次检查
+  `enabled` 与当轮禁言探测。拒绝文案分别是
+  `read-only channel: reply policy is disabled for group <id>; you can read but must not send.`
+  与 `muted in group <id> until <HH:MM> (N minutes left).`，都带
+  `Do not retry this turn — end with suspend.`，且都不发 `send_group_msg`。
+- 禁言探测改三态 `NotMuted | Muted(until) | Unknown`，30 秒 TTL 缓存；每次发送前重探：
+  `shut_up_timestamp == 0` 清掉记录，未来时间戳记为禁言，探测失败（`Unknown`）放行。
+  删掉了"探测失败就记 10 分钟假禁言"的旧分支；`[muted: …]` notes 只来自确认过的
+  `Muted` 记录，解禁后下一轮自动消失。
+- 数据：`data/qq_reply_policies.json` 的 `mode` 迁移为 `enabled`
+  （quiet/one_on_one→false，balanced/chatty→true），迁移前已备份为
+  `data/qq_reply_policies.json.bak-20261109-010303`。默认
+  `enabled=false`：没有显式 `enabled=true` 的群一律只读。旧 `mode` 入参仍作为兼容别名
+  （quiet/one_on_one→false，balanced/chatty→true），新写入一律用 `enabled`。
+- docs：历史条目（5.2.43 / 5.2.45 / 5.2.46）里的 quiet/balanced/chatty/one_on_one 是旧
+  `mode` 名，现仅作兼容别名；现行行为统一用 enabled/disabled 描述。
+
+**验证**：`cargo clippy --workspace --all-targets -- -D warnings` 零 warning；qq 插件
+`95` 单测、`cordis-agent` `111` 单测、`cordis-runtime` `983` 单测、`cordis-cli` `54`
+bin 单测全绿（`cordis-cli` 没有 lib target，`--lib` 会报
+`no library targets found`）。新增测试覆盖：disabled 群 `qq_send` 被拒且不触网、muted
+被拒并带分钟数、禁言从未来变 0 后能发、探测失败放行、30 秒探测缓存命中/过期、只读批只写
+history 且 provider 调用次数为 0、启用后下一轮能看到之前的历史、`qq_system_notify` 的
+disabled/muted/send-failure/config-url 回落分支、私聊不受群策略影响。新增生产代码行经
+`cargo llvm-cov -p qq --lib` / `-p cordis-agent --lib` / `-p cordis-runtime --lib` 核对
+均有覆盖（qq 插件整体基线仍非 100%，`handle_qq_get_group_info` 等历史函数未在本批新增
+测试；本批新增行无未覆盖）。
+
+**遗留**：
+- `data/qq_reply_policies.json` 里 975594881 的自由文本仍写着"先按 quiet"，现在只作为
+  人工备忘保留（该群 `enabled=false`，文本不会到达模型；将来开启前应改写）。
+- 禁言探测发生在**发送前**；如果模型完全信任上一轮的 `[muted: …]` 而不尝试发送，就不会
+  触发重探。提示词已改成"本轮最多试一次，被拒即 suspend"，让每轮都有一次探测机会。
+- `cargo test -p cordis-cli --lib` 没有 lib target（该 crate 只有 `src/main.rs`），实际
+  可跑的是 `cargo test -p cordis-cli`（bin 单测）。
+
+### 5.2.59 历史压缩重做：一个阈值、一次真摘要、永不清空（2026-11-09 已闭合）
+
+**理由**：旧 `compact_history` 有三处硬伤——摘要其实是"每条取前 500 字拼起来"，
+不是真摘要；阈值有四套（`AGENT_HISTORY_MESSAGE_LIMIT` / `AGENT_HISTORY_TOKEN_LIMIT`
+/ `COMPACT_AT_MSGS` / `KEEP_RECENT`）互相打架，其中条数两套基本不触发；`remember_exchange`
+按 `estimated_tokens` 裁剪，恢复出虚高计数时会一路 drain 到 history 为空。
+
+**语义**：
+- 单一触发条件：`estimated_tokens > COMPACT_AT_TOKENS`。`COMPACT_AT_TOKENS` 由
+  `CONTEXT_WINDOW_TOKENS = 1_000_000` 推导（`* 8 / 10` = 800k），`KEEP_RECENT_TOKENS`
+  同样推导（`* 3 / 10` = 300k），全仓不再有第二处 800k 字面量。`respond_inner` 原有的
+  800k 预检合并进同一次 `compact_history` 调用，不再各自为政。
+- 真摘要：最近 300k token 原样保留；更早的消息渲染成文本（保留 role / 内容，tool 结果
+  截到 2000 字，图片只留张数），经 `LlmProvider::complete` 这条既有接缝要一段中文摘要
+  （提示要求保留人物、事实、决定、未解决问题、当前任务，≤1500 字）。结果以
+  `{"role":"assistant","content":"[早前对话摘要] …"}` 放回历史开头。
+- 失败兜底：provider 报错 / 返回空 / 根本没有 provider 时，退回 500 字截断拼贴，但保留
+  最后 `max(20 条, 8k token)`，打一行 `agent_compact_failed reason=… kept=…`，**绝不清空**。
+  历史本身不足 20 条时保留下限覆盖全部消息，此时保持原样（不会压成一条空记忆）。
+- 计数诚实：`estimate_message_tokens` 计入 tool 消息 content、图片（1024/张）、
+  `reasoning_content` 与原生 `tool_calls` 的名字/参数；压缩后按新历史重算。
+- 幂等：压缩结果写回 `history` 并随快照持久化；压完回落到 300k 附近，重复调用直接
+  no-op，不重复调用 provider。
+- 条数：`AGENT_HISTORY_MESSAGE_LIMIT = 8192` 只作极端兜底，`trim_history` 不再按 token
+  裁剪（旧测试 `remember_exchange_does_not_spin_on_a_stale_estimate` 固化了"清空到 0 条"
+  的行为，与新语义冲突，已改为 `remember_exchange_never_clears_history_on_a_stale_estimate`
+  并断言陈旧计数下两条消息都还在——理由：清空正是要修的 bug，不能继续当契约）。
+
+**验证**：`cargo clippy --workspace --all-targets -- -D warnings` 零 warning；
+`cargo test -p cordis-agent --lib` 112 passed；`cargo test -p cordis-runtime --lib`
+983 passed。新增用例覆盖：越阈值触发一次摘要且历史非空、摘要进入历史开头、失败/空返回/
+无 provider 三种兜底与诊断行、未越阈值 provider 调用 0 次、连续两次只压一次、
+tool 消息与图片计入估算、摘要 1500 字截断、单条超大消息与"只剩记忆"的 no-op。
+
 ### 5.2.57 图片计入 token 估算 + 快照剥掉 base64（2026-11-05 已闭合）
 
 **现象**：两条与图片相关的计量 / 持久化缺陷。
@@ -1371,7 +1463,7 @@ Loaded plugins:
 - [x] **补齐 `qq_get_group_info` 的 output schema**：`data{status,retcode,data{group_id,group_name,member_count,max_member_count}}`，摘要也写明"字段在 data.data"。
 - [x] **hint 反向瘦身**：`SMALL GROUPS` 与 `WRITING MEMORY` 两段里手写的 JSON payload 例子删掉，改成"参数照目录里的 schema 来"。文档进 prompt 后这些就是重复信息，而且容易与实现不一致。
 
-**验证**：`node_catalog` 7 单测（摘要截断、in/out 渲染、两层展开、无摘要只剩 id、required 回退 properties、目录头、字段数上限）；qq 插件 52 单测（新增 `group_info_documents_its_output_fields` 断言 `data.data.{group_name,member_count,max_member_count}` 已声明；`hint_says_how_to_detect_a_small_group` 改为断言"指向 plugin catalog + one_on_one"）；kernel lib 全绿；`clippy -D warnings` 与 `fmt --check` 干净。
+**验证**：`node_catalog` 7 单测（摘要截断、in/out 渲染、两层展开、无摘要只剩 id、required 回退 properties、目录头、字段数上限）；qq 插件 52 单测（新增 `group_info_documents_its_output_fields` 断言 `data.data.{group_name,member_count,max_member_count}` 已声明；`hint_says_how_to_detect_a_small_group` 改为断言"指向 plugin catalog + one_on_one"）；kernel lib 全绿；`clippy -D warnings` 与 `fmt --check` 干净。（`one_on_one` 是旧 mode 名；5.2.58 起小群的落盘写法是 `enabled:false`，见该条。）
 
 ### 5.2.45 小群自动降级为私聊：交给 agent 自己判断（B 方案，2026-10-23）
 
@@ -1380,7 +1472,7 @@ Loaded plugins:
 **选了 B（纯自主）**，理由是用户明确要"由 agent 自己总结"而不是插件贴硬规则：hint 里加一段 `SMALL GROUPS` 指引——
 
 - 不确定群多大时，**查一次** `qq_get_group_info`（agent 可调，返回 `data.member_count`）；
-- `member_count <= 2` → 用 `qq_set_reply_policy {group, mode:"one_on_one"}` 落盘，并写进 `[group memory]`；
+- `member_count <= 2` → 用 `qq_set_reply_policy {group, mode:"one_on_one"}` 落盘，并写进 `[group memory]`（5.2.58 起 mode 只剩兼容别名，小群应写 `enabled:false`：允许看、不允许发言）；
 - **不要每条消息都查**：每个群决定一次，记忆里已有答案就别再调接口。
 
 **没做的**（有意为之）：插件侧不缓存人数、不在 poller 线程里同步请求 `get_group_info`（`onebot_call` 用的 ureq 默认超时，同步查一次可能把整个消息队列堵住），也不存在"≤2 强制 one_on_one"的硬规则。代价是**不保证**它一定会去查——只有它觉得需要时才查。
@@ -1406,8 +1498,8 @@ Loaded plugins:
 **改动**（全部在 `fixtures/plugins/qq/`，kernel 未动）：
 
 - [x] **`data/qq_reply_policies.json`**：`{default, groups{gid}}`，每项 `{mode, policy, updated_at_ms, updated_by}`。老的 `data/qq_reply_policy.json` 继续被当作 default 读取（不丢配置）。
-- [x] **四种模式**（`policy` 为空时用预设文案）：`quiet`（只 @/点名）、`balanced`（语境判断，默认）、`chatty`（主动参与但不抢别人的话头）、`one_on_one`（当私聊，必答）。
-- [x] **`qq_set_reply_policy`** 扩成 `{group?, mode?, policy?}`：`group` 缺省改 default；非法 mode 报 `unknown mode '<x>': use quiet | balanced | chatty | one_on_one`；一个都没给报 `mode or policy is required`；**改完下一条消息即生效**，并打审计 `qq policy: group=… mode=… chars=… by=agent source=…`。
+- [x] **四种模式**（`policy` 为空时用预设文案）：`quiet`（只 @/点名）、`balanced`（语境判断，默认）、`chatty`（主动参与但不抢别人的话头）、`one_on_one`（当私聊，必答）。**（5.2.58 起这四个 mode 名只作兼容别名；现行语义是 `enabled: true|false`，默认 false = 只读。）**
+- [x] **`qq_set_reply_policy`** 扩成 `{group?, mode?, policy?}`：`group` 缺省改 default；非法 mode 报 `unknown mode '<x>': use quiet | balanced | chatty | one_on_one`；一个都没给报 `mode or policy is required`（5.2.58 起为 `enabled is required`，写入用 `enabled`）；**改完下一条消息即生效**，并打审计 `qq policy: group=… mode=… chars=… by=agent source=…`。
 - [x] **`qq_get_reply_policy`** 返回该群**实际生效**的 `{mode, policy, source}`（`group|default|builtin`）。
 - [x] **每群记忆 `data/qq_group_memory.json`**：`{gid: {memory, updated_at_ms, updated_by}}`，上限 800 字符（超出截断并回报 `dropped_chars`），空串删除。新增节点 `qq_get_group_memory` / `qq_set_group_memory`（agent 可调，审计 `qq memory: group=… chars=… dropped=… by=agent`）。
 - [x] **下发**：每条入站消息首行 `[reply policy: <mode> — <text>]`，写过记忆的群再多一行 `[group memory: …]`（没写过就不出现，省 token）。

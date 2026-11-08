@@ -571,7 +571,7 @@ fn staged_root_removable_rejects_empty_and_out_of_tree_paths() {
 // booting so the shared host always sees a consistent index.
 static SHARED_HOST: OnceLock<RuntimeHost> = OnceLock::new();
 
-fn shared_host() -> &'static RuntimeHost {
+pub(crate) fn shared_host() -> &'static RuntimeHost {
     SHARED_HOST.get_or_init(|| {
         let root = repo_fixtures_root();
         cordis_tooling::refresh_artifact_index(&root)
@@ -907,6 +907,44 @@ fn drop_session_clears_all_maps() {
     assert_eq!(host.debug_session_map_sizes(), (a0 + 1, p0, f0 + 1));
     host.drop_session(&session_id);
     assert_eq!(host.debug_session_map_sizes(), (a0, p0, f0));
+}
+
+#[test]
+#[serial]
+fn agent_ingest_writes_history_and_snapshot_without_a_turn() {
+    let host = shared_host();
+    let handle = host
+        .agent_start_with(AgentSessionKind::RuntimeShell, AgentStartOptions::default())
+        .expect("agent should start");
+    let session_id = handle.session_id;
+    let before = host
+        .agent_status(&session_id)
+        .expect("status")
+        .stored_messages;
+
+    host.agent_ingest(&session_id, "read-only message")
+        .expect("ingest must succeed");
+
+    let after = host.agent_status(&session_id).expect("status");
+    assert_eq!(after.stored_messages, before + 1, "one user message");
+    // The transcript content assertion lives in cordis-agent's
+    // `ingest_user_message_records_context_without_calling_the_provider`: the
+    // kernel test double keeps no transcript. Here we pin the kernel contract:
+    // history grew and the snapshot was written.
+    // The whole point of ingest is that a read-only room may never get another
+    // turn: its context has to be on disk already.
+    let snapshot = host
+        .data_dir()
+        .join("sessions")
+        .join(format!("{session_id}.json"));
+    assert!(snapshot.is_file(), "ingest must auto-save the snapshot");
+
+    let err = host
+        .agent_ingest("no-such-session", "x")
+        .expect_err("unknown session must be reported like agent_send");
+    assert!(matches!(err, RuntimeError::AgentSessionNotFound { .. }));
+
+    host.drop_session(&session_id);
 }
 
 #[test]

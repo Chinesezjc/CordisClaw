@@ -53,17 +53,65 @@ fn drain_inject_queue() -> Vec<String> {
 const EMPTY_RESPONSE_RETRIES: usize = 1;
 
 /// Hard ceiling on message count, as a backstop.
+///
+/// This is the **only** count-based limit left, and it is an extreme backstop
+/// that normal sessions never reach. History is governed by size (see
+/// [`COMPACT_AT_TOKENS`]); a session that keeps 8192 messages without ever
+/// crossing the token threshold is small enough to keep, and one that crosses
+/// the token threshold is compacted long before the count matters.
 const AGENT_HISTORY_MESSAGE_LIMIT: usize = 8192;
 
-/// Prune by size, not by count.
+/// The provider's context window.
 ///
-/// Counting messages never fired: a busy group reached 1079 messages and the
-/// provider answered 413 Payload Too Large, so the bot could not speak at all
-/// and the message was spilled to pending. `estimated_tokens` tracks the real
-/// weight (text at chars/2, inline images at base64 length/4), so the same 1079
-/// short chats that fit stay, while a session bloated with long texts and
-/// pictures gets trimmed.
-const AGENT_HISTORY_TOKEN_LIMIT: usize = 120_000;
+/// Everything size-related derives from this one number so the thresholds can
+/// never drift apart again. DeepSeek currently serves 1M tokens.
+pub const CONTEXT_WINDOW_TOKENS: usize = 1_000_000;
+
+/// Compact once the estimated history weight reaches this water line.
+///
+/// This is the **single** trigger for compaction: `estimated_tokens` above
+/// this value. 80% of the window keeps a 200k-token margin for the reply, the
+/// DSML protocol prompt and the current turn's tool output.
+pub const COMPACT_AT_TOKENS: usize = CONTEXT_WINDOW_TOKENS * 8 / 10;
+
+/// How much recent history compaction leaves untouched, as raw messages.
+///
+/// 30% of the window: after compaction the session sits around 300k tokens,
+/// leaving 500k of headroom before [`COMPACT_AT_TOKENS`] fires again — so
+/// compaction is a rare event, not something every turn brushes against.
+pub const KEEP_RECENT_TOKENS: usize = CONTEXT_WINDOW_TOKENS * 3 / 10;
+
+/// Failure fallback: never keep fewer than this many recent messages...
+const COMPACT_FAILURE_KEEP_MESSAGES: usize = 20;
+/// ...and never keep fewer than this many recent tokens (whichever is larger).
+const COMPACT_FAILURE_KEEP_TOKENS: usize = 8_000;
+
+/// One tool result in the summary request is clipped to this many chars.
+///
+/// Tool output is where the bulk of a long history lives (file dumps, command
+/// output); keeping the head is enough to summarise the decision it supported.
+const SUMMARY_TOOL_RESULT_CHARS: usize = 2_000;
+
+/// One message in the failure collage keeps at most this many chars.
+///
+/// This is the old truncate-and-paste behaviour, kept only as a fallback when
+/// the provider cannot produce a real summary.
+const SUMMARY_COLLAGE_MESSAGE_CHARS: usize = 500;
+
+/// Hard cap on the memory text handed back to the model, in chars.
+///
+/// The prompt asks for at most 1500 Chinese characters; a provider that
+/// overruns is clipped so one bad completion cannot refill the window.
+const SUMMARY_MAX_CHARS: usize = 1_500;
+
+/// Prefix marking the single assistant message that holds compacted memory.
+const COMPACT_MEMORY_PREFIX: &str = "[早前对话摘要]";
+
+/// What the summary provider is asked to do.
+const SUMMARY_SYSTEM_PROMPT: &str =
+    "你是对话记忆压缩器。把给你的早期对话压缩成一段可继续使用的记忆。\
+必须保留：出现过的人物与称呼、事实、已做出的决定、尚未解决的问题、当前正在进行的任务。\
+丢掉寒暄与重复。用中文写，不超过 1500 字，直接输出记忆正文，不要标题或解释。";
 
 /// What one inline picture costs in the token budget.
 ///
@@ -149,17 +197,18 @@ fn estimate_tokens(s: &str) -> usize {
     s.chars().count() / 2
 }
 
-/// 一条消息的 token 估算：文本按 chars/2，内联图片按 base64 折 token。
+/// 一条消息的 token 估算：文本按 chars/2，内联图片按 [`IMAGE_TOKEN_ESTIMATE`]。
 ///
-/// 图片为什么必须计入：`estimate_tokens` 只吃 `&str`，而带图消息的 `content`
-/// 是 `[{type:"text"},{type:"image_url"}]` 数组，图片 part 的 base64 因此对
-/// `estimated_tokens` 完全不可见——按 token 的历史裁剪对图失效，只剩
-/// `image_budget` 的字节预算兜底。这里把 base64 长度折成 token：
-/// `inline_image_bytes` 给出 `ceil(raw_bytes/3)*4` 个字符，每 4 个字符算
-/// 1 token，即 `ceil(raw_bytes/3)`，是保守上界。
+/// 计数必须**保守**：压缩阈值是"真实水位"，宁可高估也不能漏算，否则历史会
+/// 在阈值之下悄悄撑爆 provider 的上下文窗口。因此这里逐项计入：
 ///
-/// 远程 `https://` 图片不占内联字节，计 0；`reasoning_content` 是历史里真实
-/// 存在的文本，一并计入。
+/// - `content`：字符串按 chars/2；数组遍历每个 part（文本按 chars/2，内联图片
+///   按张计价；远程 `https://` 图片与坏 part 计 0）。
+/// - `reasoning_content`：推理文本同样占用 provider 的上下文，计入。
+/// - `tool_calls[].function.{name,arguments}`：历史恢复出来的原生 tool call
+///   带着参数 JSON，也是真实请求的一部分，计入。
+/// - `role == "tool"` 的消息没有特殊分支：它的 `content` 走上面同一条字符串
+///   路径，因此工具结果（往往是最重的一段）不会被漏掉。
 pub fn estimate_message_tokens(message: &Value) -> usize {
     let content = match message.get("content") {
         Some(Value::String(text)) => estimate_tokens(text),
@@ -171,7 +220,31 @@ pub fn estimate_message_tokens(message: &Value) -> usize {
         .and_then(Value::as_str)
         .map(estimate_tokens)
         .unwrap_or(0);
-    content + reasoning
+    let tool_calls = message
+        .get("tool_calls")
+        .and_then(Value::as_array)
+        .map(|calls| calls.iter().map(estimate_tool_call_tokens).sum())
+        .unwrap_or(0);
+    content + reasoning + tool_calls
+}
+
+/// 一个原生 tool call 的重量：函数名 + 未解析的参数 JSON。
+///
+/// 参数是模型写出来的真实文本，会随历史一起重发；名字很短但同样计入。
+/// 缺字段的调用计 0，坏形状不会让估算 panic。
+fn estimate_tool_call_tokens(call: &Value) -> usize {
+    let function = call.get("function");
+    let name = function
+        .and_then(|function| function.get("name"))
+        .and_then(Value::as_str)
+        .map(estimate_tokens)
+        .unwrap_or(0);
+    let arguments = function
+        .and_then(|function| function.get("arguments"))
+        .and_then(Value::as_str)
+        .map(estimate_tokens)
+        .unwrap_or(0);
+    name + arguments
 }
 
 /// 一条消息在压缩摘要里的正文：文本 part 拼接，内联图片只记张数。
@@ -206,7 +279,7 @@ fn summarize_message_content(content: &Value) -> (String, usize) {
     }
 }
 
-/// `content` 数组里的一个 part：文本按 chars/2，内联图片按 base64 长度 / 4。
+/// `content` 数组里的一个 part：文本按 chars/2，内联图片按张计价。
 fn estimate_content_part_tokens(part: &Value) -> usize {
     match part.get("type").and_then(Value::as_str) {
         Some("text") => part
@@ -228,6 +301,141 @@ fn estimate_content_part_tokens(part: &Value) -> usize {
             .unwrap_or(0),
         _ => 0,
     }
+}
+
+/// 截断到 `max` 个字符；超长时补一个 `…` 表示后面还有内容。
+///
+/// 按字符而不是字节判断，中文与 ASCII 走同一条规则，不会在半个 UTF-8
+/// 字符上切开。
+fn truncate_chars(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let mut clipped: String = text.chars().take(max).collect();
+    clipped.push('…');
+    clipped
+}
+
+/// 最近消息的起点：从尾部往前累加，保留不超过 `budget` token 的原文。
+///
+/// 至少保留一条消息：单条就超过预算时也留住它，否则压缩会把对话清空。
+fn keep_recent_start(history: &[Value], budget: usize) -> usize {
+    let mut start = history.len();
+    let mut spent = 0;
+    while start > 0 {
+        let cost = estimate_message_tokens(&history[start - 1]);
+        if spent > 0 && spent + cost > budget {
+            break;
+        }
+        spent += cost;
+        start -= 1;
+    }
+    start
+}
+
+/// 失败兜底时的保留起点：`[`COMPACT_FAILURE_KEEP_MESSAGES`]` 条与
+/// `[`COMPACT_FAILURE_KEEP_TOKENS`]` token **取较大者**。
+///
+/// 这是"绝不清空"的最后一道闸：摘要调用失败时，即使旧消息一条都压不动，
+/// 这 20 条 / 8k token 也一定还在。
+fn fallback_keep_start(history: &[Value]) -> usize {
+    let mut start = history.len();
+    let mut spent = 0;
+    while start > 0 && history.len() - start < COMPACT_FAILURE_KEEP_MESSAGES {
+        spent += estimate_message_tokens(&history[start - 1]);
+        start -= 1;
+    }
+    while start > 0 && spent < COMPACT_FAILURE_KEEP_TOKENS {
+        spent += estimate_message_tokens(&history[start - 1]);
+        start -= 1;
+    }
+    start
+}
+
+/// 把一段旧消息渲染成摘要请求里的纯文本：保留 role 与内容。
+///
+/// 工具结果是历史里最占地方的部分，截到 [`SUMMARY_TOOL_RESULT_CHARS`] 字；
+/// 其余消息原样保留（模型要据此提炼人物、决定与未解决的问题）。图片只留
+/// 张数标记，base64 不进摘要请求。空消息跳过，避免摘要里出现空行。
+fn render_for_summary(messages: &[Value]) -> String {
+    let mut lines = Vec::new();
+    for message in messages {
+        let role = message
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let (content, images) =
+            summarize_message_content(message.get("content").unwrap_or(&Value::Null));
+        if content.is_empty() && images == 0 {
+            continue;
+        }
+        let content = if role == "tool" {
+            truncate_chars(&content, SUMMARY_TOOL_RESULT_CHARS)
+        } else {
+            content
+        };
+        let marker = match images {
+            0 => String::new(),
+            count => format!(" [图片 {count} 张]"),
+        };
+        lines.push(format!("[{role}] {content}{marker}"));
+    }
+    lines.join("\n")
+}
+
+/// 摘要调用失败时的旧式截断拼贴：每条旧消息取前
+/// [`SUMMARY_COLLAGE_MESSAGE_CHARS`] 字，按 role 拼起来。
+///
+/// 只在 provider 不可用 / 报错 / 返回空时使用；真正的摘要走
+/// [`AgentSession::request_summary`]。
+fn collage_summary(messages: &[Value]) -> String {
+    let mut lines = Vec::new();
+    for message in messages {
+        let role = message
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let (content, images) =
+            summarize_message_content(message.get("content").unwrap_or(&Value::Null));
+        if content.is_empty() && images == 0 {
+            continue;
+        }
+        let marker = match images {
+            0 => String::new(),
+            count => format!(" [图片 {count} 张]"),
+        };
+        lines.push(format!(
+            "[{role}] {}{marker}",
+            truncate_chars(&content, SUMMARY_COLLAGE_MESSAGE_CHARS)
+        ));
+    }
+    lines.join("\n")
+}
+
+/// 历史开头那条记忆消息：`assistant` + `[早前对话摘要]` 前缀。
+fn memory_message(content: &str) -> Value {
+    json!({
+        "role": "assistant",
+        "content": format!("{COMPACT_MEMORY_PREFIX} {content}"),
+    })
+}
+
+/// 这条消息是否已经是上一次压缩留下的记忆。
+///
+/// 用来防止"只剩记忆 + 一条超预算消息"时反复把记忆再摘要一遍——那种历史
+/// 已经没有可压缩的原文，再调用 provider 只会烧钱并丢掉细节。
+fn is_compact_memory(message: &Value) -> bool {
+    message
+        .get("content")
+        .and_then(Value::as_str)
+        .is_some_and(|content| content.starts_with(COMPACT_MEMORY_PREFIX))
+}
+
+/// 失败诊断行的唯一格式：`agent_compact_failed reason=… kept=…`。
+///
+/// `kept` 是压缩后 `history` 的条数（含那条记忆消息），用来证明"没有清空"。
+fn compact_failure_line(reason: &str, kept: usize) -> String {
+    format!("agent_compact_failed reason={reason} kept={kept}")
 }
 
 impl AgentSession {
@@ -429,10 +637,10 @@ impl AgentSession {
             });
         }
 
-        // If this message would push us over the threshold, compact first.
-        if self.estimated_tokens + estimate_tokens(trimmed) > 800_000 {
-            let _ = self.compact_history();
-        }
+        // 单一触发条件：`estimated_tokens` 超过 COMPACT_AT_TOKENS 就压缩一次。
+        // 判断在 compact_history 内部，未超阈值时连 provider 都不会碰；请求前
+        // 检查的是**已持久化的历史重量**，不含这一轮还没落库的输入与工具输出。
+        let _ = self.compact_history(Some(provider));
 
         // 图片除 token 估算外还有一条独立的**字节**约束：保守的 token 折算
         // 不等于网关的请求体长度上限，所以仍按精确 base64 字节把历史里最老的
@@ -1383,77 +1591,120 @@ impl AgentSession {
         self.history.get(index)
     }
 
-    pub fn compact_history(&mut self) -> (usize, usize) {
-        // Trigger at ~800K tokens (DeepSeek has 1M context).
-        const COMPACT_AT_MSGS: usize = 4000;
-        const KEEP_RECENT: usize = 2000;
-
-        let before_len = self.history.len();
-        if self.history.len() <= COMPACT_AT_MSGS {
-            return (before_len, before_len);
+    /// 压缩历史：一个阈值、一次真摘要、永不清空。
+    ///
+    /// 触发条件只有一条——`estimated_tokens > COMPACT_AT_TOKENS`。超过时把
+    /// "最老的那部分"（最近 [`KEEP_RECENT_TOKENS`] 之前的全部）渲染成文本交给
+    /// `provider` 摘要，用一条 assistant 记忆替换掉它们；最近的消息原样保留。
+    ///
+    /// `provider` 为 `None` 或摘要调用失败 / 返回空时，退回旧的截断拼贴，但保留
+    /// 最后 [`COMPACT_FAILURE_KEEP_MESSAGES`] 条与
+    /// [`COMPACT_FAILURE_KEEP_TOKENS`] token 中较大的那部分，**绝不清空
+    /// history**，并打一行 `agent_compact_failed reason=… kept=…`。
+    ///
+    /// 幂等：压完后的估算回落到 [`KEEP_RECENT_TOKENS`] 附近，远低于阈值，重复
+    /// 调用直接 no-op，不会再次调用 provider。
+    pub fn compact_history(&mut self, provider: Option<&dyn LlmProvider>) -> (usize, usize) {
+        let before = self.history.len();
+        if self.estimated_tokens <= COMPACT_AT_TOKENS {
+            return (before, before);
         }
-
-        let discard = self.history.len() - KEEP_RECENT;
-        let split_at = discard.next_multiple_of(2);
-        let split_at = split_at.min(self.history.len().saturating_sub(2));
-        if split_at == 0 {
-            return (before_len, before_len);
+        let keep_from = keep_recent_start(&self.history, KEEP_RECENT_TOKENS);
+        // 0 条可压（单条消息就超过保留预算），或旧消息只剩上次的记忆：再压
+        // 只会把记忆本身摘要一遍，没有新信息可提炼。
+        if keep_from == 0 || (keep_from == 1 && is_compact_memory(&self.history[0])) {
+            return (before, before);
         }
-
-        let old_messages: Vec<_> = self.history.drain(0..split_at).collect();
-        let mut summary_lines: Vec<String> = Vec::new();
-        for msg in &old_messages {
-            let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("");
-            let (content, images) =
-                summarize_message_content(msg.get("content").unwrap_or(&Value::Null));
-            // 空文本 + 没图 = 没有可摘要的内容。
-            if content.is_empty() && images == 0 {
-                continue;
-            }
-            // P1-33: `content.chars().take(500)` is char-based, but the
-            // `content.len() > 500` guard was byte-based. For Chinese /
-            // multi-byte text the `…` suffix would fire inconsistently
-            // (byte length always > char length here). Compare chars on
-            // both sides so behaviour is uniform.
-            let char_count = content.chars().count();
-            let short: String = content.chars().take(500).collect();
-            let suffix = if char_count > 500 { "…" } else { "" };
-            // 图片标记放在截断之后：即使正文超过 500 字，`[图片 N 张]` 也不会
-            // 被 `…` 吃掉，摘要里始终能看出这条消息带过图。
-            let marker = match images {
-                0 => String::new(),
-                count => format!(" [图片 {count} 张]"),
-            };
-            summary_lines.push(format!("[{role}]: {short}{suffix}{marker}"));
+        let transcript = render_for_summary(&self.history[..keep_from]);
+        // 旧消息没有任何可读文本：摘要没有素材，保持原样优于塞一条空记忆。
+        if transcript.trim().is_empty() {
+            return (before, before);
         }
-        let summary = summary_lines.join("\n");
-        self.history.insert(
-            0,
-            json!({
-                "role": "system",
-                "content": format!(
-                    "[Compressed history — {} earlier messages summarized below]\n{}",
-                    old_messages.len(),
-                    summary
-                ),
-            }),
-        );
-        // P1-32: `estimated_tokens` was only ever incremented in
-        // `remember_exchange`, so once it crossed the 800K guard it
-        // would trip every subsequent request forever — but compact
-        // then early-exited (history.len() <= COMPACT_AT_MSGS) and did
-        // nothing, making the whole compact path a permanent no-op.
-        // Rebuild the estimate from what actually remains in `history`, using
-        // the same text + inline-image estimator as `remember_exchange`:
-        // a surviving array-content message must not be silently estimated at 0.
-        self.estimated_tokens = self.history.iter().map(estimate_message_tokens).sum();
+        let tokens_before = self.estimated_tokens;
+        let summary = match provider {
+            Some(provider) => match self.request_summary(provider, &transcript) {
+                Ok(summary) if !summary.is_empty() => summary,
+                Ok(_) => return self.apply_fallback("empty_summary"),
+                Err(_) => return self.apply_fallback("provider_error"),
+            },
+            None => return self.apply_fallback("no_provider"),
+        };
+        let memory = truncate_chars(&summary, SUMMARY_MAX_CHARS);
+        let after = self.install_memory(keep_from, &memory);
         eprintln!(
-            "agent: compacted {} old messages into summary ({} chars), keeping {} recent",
-            old_messages.len(),
-            summary.len(),
-            self.history.len() - 1
+            "agent_compact kind={} removed={} kept={} tokens_before={} tokens_after={} summary_chars={}",
+            self.kind,
+            keep_from,
+            after,
+            tokens_before,
+            self.estimated_tokens,
+            memory.chars().count(),
         );
-        (before_len, self.history.len())
+        (before, after)
+    }
+
+    /// 摘要调用失败的兜底：截断拼贴 + 保留最后 20 条 / 8k token。
+    ///
+    /// 若历史本身不到 20 条（例如十几条超大消息），"保留下限"会覆盖全部消息，
+    /// 此时没有可替换的旧段——保持原样好过把全部内容压成一条空记忆。
+    fn apply_fallback(&mut self, reason: &str) -> (usize, usize) {
+        let before = self.history.len();
+        let keep_from = fallback_keep_start(&self.history);
+        if keep_from == 0 {
+            return self.report_fallback(reason, before, before);
+        }
+        let memory = collage_summary(&self.history[..keep_from]);
+        let after = self.install_memory(keep_from, &memory);
+        self.report_fallback(reason, before, after)
+    }
+
+    /// 打一行失败诊断并原样返回计数。
+    fn report_fallback(&self, reason: &str, before: usize, after: usize) -> (usize, usize) {
+        let line = compact_failure_line(reason, after);
+        eprintln!("{line}");
+        #[cfg(test)]
+        record_compact_diagnostic(&line);
+        (before, after)
+    }
+
+    /// 把 `history[..keep_from]` 换成一条记忆消息，保留其后的原文。
+    ///
+    /// 返回值是压缩后的条数；调用方用它打诊断。`estimated_tokens` 在这里按新的
+    /// history 重算，绝不让压缩前的旧计数留到下一轮。
+    fn install_memory(&mut self, keep_from: usize, memory: &str) -> usize {
+        let mut next = Vec::with_capacity(self.history.len() - keep_from + 1);
+        next.push(memory_message(memory));
+        next.extend(self.history.drain(keep_from..));
+        self.history = next;
+        self.recount_tokens();
+        self.history.len()
+    }
+
+    /// 按当前 `history` 重算估算。
+    fn recount_tokens(&mut self) {
+        self.estimated_tokens = self.history.iter().map(estimate_message_tokens).sum();
+    }
+
+    /// 通过既有 provider 接缝要一段真摘要。
+    ///
+    /// 只发一条 system 指令 + 一段渲染好的旧对话；不挂 sink（压缩是内部动作，
+    /// 不向用户流式展示），transport 与会话请求取自同一份配置。
+    fn request_summary(
+        &self,
+        provider: &dyn LlmProvider,
+        transcript: &str,
+    ) -> Result<String, RuntimeError> {
+        let body = json!({
+            "model": self.config.model,
+            "messages": [
+                { "role": "system", "content": SUMMARY_SYSTEM_PROMPT },
+                { "role": "user", "content": transcript },
+            ],
+            "temperature": 0.2,
+            "max_tokens": 2000,
+        });
+        let parts = provider.complete(body, None, self.config.to_transport())?;
+        Ok(parts.message.content.unwrap_or_default().trim().to_string())
     }
 
     /// P6: messaging channels send their visible reply through a tool call
@@ -1522,16 +1773,20 @@ impl AgentSession {
             estimate_message_tokens(&user_msg) + estimate_message_tokens(&assistant_msg);
         self.history.push(user_msg);
         self.history.push(assistant_msg);
+        self.trim_history();
+    }
 
-        // Drop oldest user+assistant pairs if we exceed the limit. 每丢一对就把
-        // 它占的估算减掉：否则带图消息被裁掉后 estimated_tokens 会永久停在
-        // 高位，把之后每一次裁剪 / 压缩判断都带偏。`!is_empty()` 兜住恢复出来
-        // 的陈旧估算（history 已空但计数仍超限），避免空转的无限循环。
-        while !self.history.is_empty()
-            && (self.history.len() > AGENT_HISTORY_MESSAGE_LIMIT
-                || self.estimated_tokens > AGENT_HISTORY_TOKEN_LIMIT)
-        {
-            // Always remove in pairs (user + assistant).
+    /// 条数兜底：只有历史超过 [`AGENT_HISTORY_MESSAGE_LIMIT`] 时才丢最老的
+    /// 一对消息。
+    ///
+    /// 这是**极端兜底**，正常永远碰不到：体积由 `compact_history` 在
+    /// [`COMPACT_AT_TOKENS`] 处按 token 压缩。这里不再按 `estimated_tokens`
+    /// 裁剪——那条路径会在计数虚高时一路 drain 到 history 为空。每丢一对仍把
+    /// 它占的估算减掉，免得计数停在旧水位。
+    fn trim_history(&mut self) {
+        while self.history.len() > AGENT_HISTORY_MESSAGE_LIMIT {
+            // Always remove in pairs (user + assistant); a read-only history can
+            // be odd-length, so the last single message is removed on its own.
             let drained: Vec<Value> = self.history.drain(0..2.min(self.history.len())).collect();
             let freed: usize = drained.iter().map(estimate_message_tokens).sum();
             self.estimated_tokens = self.estimated_tokens.saturating_sub(freed);
@@ -1551,6 +1806,27 @@ impl AgentSession {
             response_id: None,
             reasoning: None,
         });
+    }
+
+    /// Append one user message and **no** assistant reply.
+    ///
+    /// This is the read-only channel path: a disabled group still accrues the
+    /// conversation, so when the policy is turned back on the next turn sees
+    /// everything that was said meanwhile. No provider is touched here, which
+    /// is the whole point — nothing is billed and nothing is said.
+    pub fn ingest_user_message(&mut self, user_input: &str) {
+        let user_msg = json!({
+            "role": "user",
+            "content": user_input,
+        });
+        self.estimated_tokens = self
+            .estimated_tokens
+            .saturating_add(estimate_message_tokens(&user_msg));
+        self.history.push(user_msg);
+        self.transcript.push(AgentTranscriptEntry::User {
+            content: user_input.to_string(),
+        });
+        self.trim_history();
     }
 
     /// Channels end a turn explicitly, on a `suspend` call.
@@ -2970,6 +3246,27 @@ fn emit_agent_diagnostic(message: String) {
     }
 }
 
+// 压缩失败诊断的测试侧记录。
+//
+// 线上诊断直接 `eprintln!`（压缩是罕见事件，一行值得留在 stderr）；测试无法
+// 在同一进程里捕获 stderr，所以在 `cfg(test)` 下再记一份到线程本地，让用例
+// 能断言"确实打了那一行"。
+#[cfg(test)]
+thread_local! {
+    static COMPACT_DIAGNOSTICS: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+fn record_compact_diagnostic(line: &str) {
+    COMPACT_DIAGNOSTICS.with(|log| log.borrow_mut().push(line.to_string()));
+}
+
+#[cfg(test)]
+fn take_compact_diagnostics() -> Vec<String> {
+    COMPACT_DIAGNOSTICS.with(|log| std::mem::take(&mut *log.borrow_mut()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4262,17 +4559,87 @@ mod tests {
         let mut session = AgentSession::new(test_config(), "runtime_shell").unwrap();
         session.remember_exchange("大图", "收到", None, &[inline_png_part(6 * MIB)]);
         assert_eq!(session.history_len(), 2, "the pair survives");
-        assert!(session.estimated_tokens < AGENT_HISTORY_TOKEN_LIMIT);
+        assert!(session.estimated_tokens < COMPACT_AT_TOKENS);
     }
 
-    /// 恢复出来的会话可能带着与 history 不一致的陈旧估算；history 已空时
-    /// 裁剪循环必须退出，不能空转。
+    /// 恢复出来的会话可能带着与 history 不一致的陈旧估算。旧实现会在
+    /// `remember_exchange` 里按这个虚高计数一路 drain 到 history 为空；现在
+    /// 条数兜底不看 token，陈旧计数不会吃掉任何一条消息。
     #[test]
-    fn remember_exchange_does_not_spin_on_a_stale_estimate() {
+    fn remember_exchange_never_clears_history_on_a_stale_estimate() {
         let mut session = AgentSession::new(test_config(), "runtime_shell").unwrap();
-        session.estimated_tokens = 500_000;
+        session.estimated_tokens = CONTEXT_WINDOW_TOKENS * 2;
         session.remember_exchange("hi", "ok", None, &[]);
-        assert_eq!(session.history_len(), 0);
+        assert_eq!(session.history_len(), 2);
+        assert_eq!(
+            session.history_value(0).expect("user")["content"].as_str(),
+            Some("hi")
+        );
+    }
+
+    /// 条数上限是极端兜底：超过 `AGENT_HISTORY_MESSAGE_LIMIT` 才丢最老的一对，
+    /// 并把它们的估算减掉，不会因为 token 计数一路清空。
+    #[test]
+    fn remember_exchange_prunes_by_message_count_backstop_only() {
+        let mut session = AgentSession::new(test_config(), "runtime_shell").unwrap();
+        for i in 0..4200 {
+            session.remember_exchange(&format!("u{i}"), &format!("a{i}"), None, &[]);
+        }
+        assert_eq!(session.history_len(), AGENT_HISTORY_MESSAGE_LIMIT);
+        assert!(session.estimated_tokens > 0);
+        // 留下的是最新的消息，不是被清空。
+        let last = session
+            .history_value(session.history_len() - 1)
+            .expect("last message");
+        assert_eq!(last["content"].as_str(), Some("a4199"));
+    }
+
+    /// 只读群：ingest 只追加一条 user 消息，**不调用 provider**；策略恢复后
+    /// 的下一轮请求能看到这条历史。
+    #[test]
+    fn ingest_user_message_records_context_without_calling_the_provider() {
+        let mut session = AgentSession::new(test_config(), "runtime_shell").unwrap();
+        let provider = FakeLlmProvider::new(vec![assistant_reply("现在可以说了")]);
+        session.ingest_user_message("[QQ group from 1 (user 2)]: 只读群里的消息");
+
+        assert_eq!(
+            session.history_len(),
+            1,
+            "one user message, no assistant reply"
+        );
+        assert!(
+            provider.seen_bodies.lock().expect("bodies").is_empty(),
+            "ingest must not call the provider"
+        );
+        let transcript = session.transcript();
+        assert!(matches!(
+            transcript.last(),
+            Some(AgentTranscriptEntry::User { content }) if content.contains("只读群里的消息")
+        ));
+
+        // The next real turn sees the ingested text and then adds its own pair.
+        session
+            .respond_with_runtime_host_via_images(
+                &EMPTY_FAKE_HOST,
+                "s-ingest",
+                "现在能说话了吗",
+                &[],
+                "",
+                &provider,
+                None,
+            )
+            .expect("real turn");
+        assert_eq!(session.history_len(), 3);
+        let bodies = provider.seen_bodies.lock().expect("bodies");
+        assert_eq!(bodies.len(), 1, "exactly one model call for the real turn");
+        let body = bodies[0].clone();
+        // messages[0] / [1] are the system prompts; history starts at [2].
+        assert_eq!(body["messages"][2]["role"], "user");
+        assert!(body["messages"][2]["content"]
+            .as_str()
+            .expect("history content is text")
+            .contains("只读群里的消息"));
+        assert_eq!(body["messages"][3]["content"], "现在能说话了吗");
     }
 
     /// 快照落盘前必须把内联 base64 换成占位符：46 张图的会话历史有几十 MB，
@@ -4752,47 +5119,259 @@ mod tests {
         }
     }
 
-    /// P1-32: compact_history must be a no-op below COMPACT_AT_MSGS
-    /// and return (before_len, before_len).
-    #[test]
-    fn compact_history_is_noop_below_threshold() {
+    /// 造一段真实超过 [`COMPACT_AT_TOKENS`] 的历史：旧消息大、最近消息小。
+    ///
+    /// 80 条 x 20k 字（每条 10k token）= 80 万，再加 10 条 x 20k 字 = 10 万，
+    /// 总量 900k；最近 300k token 的保留线落在旧消息中间，所以压缩确实有
+    /// "最老的那部分"可摘要。
+    fn heavy_session() -> AgentSession {
         let mut session = AgentSession::new(test_config(), "runtime_shell").unwrap();
-        // Add far fewer than COMPACT_AT_MSGS (4000).
+        for i in 0..80 {
+            session.history.push(json!({
+                "role": "user",
+                "content": format!("{}旧消息{i}", "甲".repeat(20_000)),
+            }));
+        }
+        for i in 0..10 {
+            session.history.push(json!({
+                "role": "assistant",
+                "content": format!("{}最近{i}", "乙".repeat(20_000)),
+            }));
+        }
+        session.recount_tokens();
+        session
+    }
+
+    /// 单一阈值 + 真摘要：超过 COMPACT_AT_TOKENS 时只调用一次 provider，把最老
+    /// 的部分换成一条 assistant 记忆，历史显著变短且**非空**。
+    #[test]
+    fn compact_over_threshold_summarizes_oldest_and_keeps_history_nonempty() {
+        let mut session = heavy_session();
+        let before = session.history_len();
+        assert!(
+            session.estimated_tokens > COMPACT_AT_TOKENS,
+            "sanity: {} > {}",
+            session.estimated_tokens,
+            COMPACT_AT_TOKENS
+        );
+        let provider = FakeLlmProvider::new(vec![assistant_reply(
+            "人物：甲。事实：乙。决定：丙。未解决：丁。当前任务：戊。",
+        )]);
+
+        let (old_len, new_len) = session.compact_history(Some(&provider));
+
+        assert_eq!(old_len, before);
+        assert!(new_len < old_len, "expected shrink: {new_len} < {old_len}");
+        assert!(new_len > 0, "history must never be cleared");
+        let head = session.history_value(0).expect("memory message");
+        assert_eq!(head["role"].as_str(), Some("assistant"));
+        let head_text = head["content"].as_str().expect("memory text");
+        assert!(head_text.starts_with(COMPACT_MEMORY_PREFIX), "{head_text}");
+        assert!(head_text.contains("当前任务：戊"), "{head_text}");
+        // 只调用一次 provider。
+        assert_eq!(provider.seen_bodies.lock().expect("seen").len(), 1);
+        // 计数按压缩后的 history 重算，并且回落到阈值以下。
+        let recounted: usize = session.history.iter().map(estimate_message_tokens).sum();
+        assert_eq!(session.estimated_tokens, recounted);
+        assert!(session.estimated_tokens < COMPACT_AT_TOKENS);
+        assert!(session.estimated_tokens > 0);
+        // 最近消息原样保留：最后一条仍是压缩前最后一条。
+        let tail = session
+            .history_value(session.history_len() - 1)
+            .expect("tail");
+        assert!(tail["content"]
+            .as_str()
+            .expect("tail text")
+            .contains("最近9"));
+        // 摘要请求 = system 指令 + 渲染后的旧对话（保留 role 与内容）。
+        let body = provider.seen_bodies.lock().expect("seen")[0].clone();
+        let system = body["messages"][0]["content"].as_str().expect("system");
+        assert!(system.contains("1500"), "{system}");
+        let transcript = body["messages"][1]["content"].as_str().expect("transcript");
+        assert!(transcript.contains("[user] 甲"), "roles preserved");
+        assert!(transcript.contains("旧消息0"), "oldest message summarised");
+        assert!(
+            !transcript.contains("最近0"),
+            "recent messages must stay raw: {transcript}"
+        );
+    }
+
+    /// 摘要调用失败（provider 报错 / 返回空）或根本没有 provider 时：保留最近
+    /// 部分、绝不清空、并打出 `agent_compact_failed reason=… kept=…`。
+    #[test]
+    fn compact_failure_keeps_recent_history_and_reports_diagnostic() {
+        let providers = [
+            ("provider_error", FakeLlmProvider::new(Vec::new())),
+            (
+                "empty_summary",
+                FakeLlmProvider::new(vec![assistant_reply("   ")]),
+            ),
+        ];
+        for (reason, provider) in providers {
+            let _ = take_compact_diagnostics();
+            let mut session = heavy_session();
+            let before = session.history_len();
+
+            let (old_len, new_len) = session.compact_history(Some(&provider));
+
+            assert_eq!(old_len, before);
+            assert!(new_len < old_len, "expected shrink: {new_len} < {old_len}");
+            assert!(new_len > 0, "history must never be cleared");
+            assert!(
+                new_len > COMPACT_FAILURE_KEEP_MESSAGES,
+                "must keep at least the failure floor: {new_len}"
+            );
+            let head = session.history_value(0).expect("memory message");
+            assert!(head["content"]
+                .as_str()
+                .expect("memory text")
+                .starts_with(COMPACT_MEMORY_PREFIX));
+            assert_eq!(
+                take_compact_diagnostics(),
+                vec![compact_failure_line(reason, new_len)],
+                "diagnostic must name the reason and the kept count"
+            );
+            // 最近的消息没被丢掉。
+            assert!(session.history_value(new_len - 1).expect("tail")["content"]
+                .as_str()
+                .expect("tail text")
+                .contains("最近9"));
+            // 兜底后同样重算计数（按 tool 消息在内的估算）。
+            assert_eq!(
+                session.estimated_tokens,
+                session
+                    .history
+                    .iter()
+                    .map(estimate_message_tokens)
+                    .sum::<usize>()
+            );
+        }
+
+        // 没有 provider：同样走兜底，绝不清空。
+        let _ = take_compact_diagnostics();
+        let mut session = heavy_session();
+        let (_, new_len) = session.compact_history(None);
+        assert!(new_len > 0);
+        assert_eq!(
+            take_compact_diagnostics(),
+            vec![compact_failure_line("no_provider", new_len)]
+        );
+
+        // 历史本身不到 20 条：保留下限覆盖全部消息，没有可替换的旧段，保持
+        // 原样（不是压成一条空记忆）。
+        let _ = take_compact_diagnostics();
+        let mut few = AgentSession::new(test_config(), "runtime_shell").unwrap();
+        for i in 0..15 {
+            few.history.push(json!({
+                "role": "user",
+                "content": format!("{}巨{i}", "大".repeat(120_000)),
+            }));
+        }
+        few.recount_tokens();
+        assert!(few.estimated_tokens > COMPACT_AT_TOKENS);
+        let provider = FakeLlmProvider::new(Vec::new());
+        let (old_len, new_len) = few.compact_history(Some(&provider));
+        assert_eq!((old_len, new_len), (15, 15));
+        assert_eq!(few.history_len(), 15, "nothing may be dropped");
+        assert_eq!(
+            take_compact_diagnostics(),
+            vec![compact_failure_line("provider_error", 15)]
+        );
+    }
+
+    /// 未超阈值时连 provider 都不能碰：断言调用次数为 0。
+    #[test]
+    fn compact_below_threshold_never_calls_the_provider() {
+        let mut session = AgentSession::new(test_config(), "runtime_shell").unwrap();
         for i in 0..10 {
             session.remember_exchange(&format!("u{i}"), &format!("a{i}"), None, &[]);
         }
-        let before = session.status().stored_messages;
-        let (old_len, new_len) = session.compact_history();
-        assert_eq!(old_len, before);
-        assert_eq!(new_len, before);
+        let provider = FakeLlmProvider::new(vec![assistant_reply("不应被调用")]);
+        let before = session.history_len();
+
+        let (old_len, new_len) = session.compact_history(Some(&provider));
+
+        assert_eq!((old_len, new_len), (before, before));
+        assert!(provider.seen_bodies.lock().expect("seen").is_empty());
+        assert!(session.estimated_tokens <= COMPACT_AT_TOKENS);
     }
 
-    /// P1-32 + P1-33: after crossing threshold, compact returns
-    /// (before > after) and resets `estimated_tokens` to sum of what
-    /// remains. Also verifies char-based truncation for multi-byte
-    /// text.
+    /// 幂等：压过一次之后仍在阈值以下，第二次调用不产生变化、不重复摘要。
     #[test]
-    fn compact_history_shrinks_and_resets_estimated_tokens() {
-        let mut session = AgentSession::new(test_config(), "runtime_shell").unwrap();
-        // 4000+ msgs to cross COMPACT_AT_MSGS; include some Chinese
-        // text so the char/byte guard (P1-33) is exercised.
-        for i in 0..2200 {
-            session.remember_exchange(&format!("请求{i}"), &format!("回复{i}"), None, &[]);
-        }
-        let before = session.status().stored_messages;
-        assert!(before > 4000, "sanity: {before} messages");
-        let (old_len, new_len) = session.compact_history();
-        assert_eq!(old_len, before);
-        assert!(new_len < old_len);
-        assert!(new_len > 0);
-        // estimated_tokens should be non-zero but bounded by the
-        // remaining history — no runaway accumulation.
-        let est = session.to_snapshot().estimated_tokens;
-        assert!(
-            est < old_len * 200, // upper-bound sanity check
-            "estimated_tokens={est}, expected < {}",
-            old_len * 200
+    fn compact_is_idempotent_after_one_summary() {
+        let mut session = heavy_session();
+        let provider = FakeLlmProvider::new(vec![
+            assistant_reply("第一次摘要"),
+            assistant_reply("第二次不应发生"),
+        ]);
+
+        let (_, first) = session.compact_history(Some(&provider));
+        let after_first = serde_json::to_string(&session.history).expect("history json");
+
+        let (old_len, second) = session.compact_history(Some(&provider));
+
+        assert_eq!(old_len, first);
+        assert_eq!(second, first);
+        assert_eq!(provider.seen_bodies.lock().expect("seen").len(), 1);
+        assert_eq!(
+            serde_json::to_string(&session.history).expect("history json"),
+            after_first
         );
+    }
+
+    /// 摘要正文超过 1500 字时硬截断，避免一次不听话的补全重新撑满窗口。
+    #[test]
+    fn compact_clips_overlong_summary_to_the_char_cap() {
+        let mut session = heavy_session();
+        let provider = FakeLlmProvider::new(vec![assistant_reply(&"密".repeat(2_000))]);
+
+        session.compact_history(Some(&provider));
+
+        let head = session.history_value(0).expect("memory message")["content"]
+            .as_str()
+            .expect("memory text")
+            .to_string();
+        assert!(head.ends_with('…'), "clipped summary gets an ellipsis");
+        assert_eq!(
+            head.chars().count(),
+            COMPACT_MEMORY_PREFIX.chars().count() + 1 + SUMMARY_MAX_CHARS + 1
+        );
+    }
+
+    /// 没有可压缩的旧原文时保持原样：单条消息就超预算、旧消息只剩上次的记忆、
+    /// 或旧消息全是没有正文的空消息。
+    #[test]
+    fn compact_is_a_noop_when_there_is_nothing_old_to_summarize() {
+        let huge = json!({ "role": "user", "content": "巨".repeat(2_000_000) });
+
+        let mut single = AgentSession::new(test_config(), "runtime_shell").unwrap();
+        single.history.push(huge.clone());
+        single.recount_tokens();
+        assert!(single.estimated_tokens > COMPACT_AT_TOKENS);
+        let provider = FakeLlmProvider::new(vec![assistant_reply("不应被调用")]);
+        let (old_len, new_len) = single.compact_history(Some(&provider));
+        assert_eq!(old_len, new_len);
+        assert_eq!(single.history_len(), 1);
+        assert!(provider.seen_bodies.lock().expect("seen").is_empty());
+
+        let mut memory = AgentSession::new(test_config(), "runtime_shell").unwrap();
+        memory.history.push(memory_message("上一轮的记忆"));
+        memory.history.push(huge.clone());
+        memory.recount_tokens();
+        assert!(memory.estimated_tokens > COMPACT_AT_TOKENS);
+        let provider = FakeLlmProvider::new(vec![assistant_reply("不应被调用")]);
+        let (old_len, new_len) = memory.compact_history(Some(&provider));
+        assert_eq!(old_len, new_len);
+        assert!(provider.seen_bodies.lock().expect("seen").is_empty());
+
+        let mut empty = AgentSession::new(test_config(), "runtime_shell").unwrap();
+        empty.history.push(json!({ "role": "user", "content": "" }));
+        empty.history.push(huge);
+        empty.recount_tokens();
+        let provider = FakeLlmProvider::new(vec![assistant_reply("不应被调用")]);
+        let (old_len, new_len) = empty.compact_history(Some(&provider));
+        assert_eq!(old_len, new_len);
+        assert!(provider.seen_bodies.lock().expect("seen").is_empty());
     }
 
     #[test]
@@ -4803,10 +5382,10 @@ mod tests {
         assert!(large > small * 50, "large={large} small={small}");
     }
 
-    /// 带图消息的 content 是数组，旧的 `as_str()` 路径会把它摘要成空行。
-    /// 新摘要必须同时保留文本、历史里已有的占位符原文和图片标记。
+    /// 摘要失败时的截断拼贴必须保留文本、历史里已有的占位符原文和图片标记，
+    /// 并跳过没有正文的空消息。
     #[test]
-    fn compact_summary_keeps_text_placeholder_and_image_marker() {
+    fn compact_fallback_collage_keeps_text_placeholder_and_image_marker() {
         let mut session = AgentSession::new(test_config(), "runtime_shell").unwrap();
         // 空 content：必须被跳过，不产生空摘要行。
         session
@@ -4833,19 +5412,32 @@ mod tests {
         session
             .history
             .push(json!({ "role": "user", "content": "长".repeat(600) }));
-        for i in 0..4000 {
-            session
-                .history
-                .push(json!({ "role": "user", "content": format!("请求{i}") }));
+        // 让历史真的越过阈值：75 条 x 20k 字 = 75 万 token，再加最近 10 条
+        // x 20k 字 = 10 万，总量超过 COMPACT_AT_TOKENS，保留下限之外确实有
+        // 旧消息可拼贴。
+        for i in 0..75 {
+            session.history.push(json!({
+                "role": "user",
+                "content": format!("{}旧{i}", "甲".repeat(20_000)),
+            }));
         }
+        for i in 0..10 {
+            session.history.push(json!({
+                "role": "assistant",
+                "content": format!("{}近{i}", "乙".repeat(20_000)),
+            }));
+        }
+        session.recount_tokens();
 
-        let (before, after) = session.compact_history();
-        assert_eq!(before, 4004);
+        let before = session.history_len();
+        // 没有 provider：走截断拼贴兜底（不是真摘要）。
+        let (old_len, after) = session.compact_history(None);
+        assert_eq!(old_len, before);
         assert!(after < before);
 
-        let summary = session.history_value(0).expect("summary message")["content"]
+        let summary = session.history_value(0).expect("memory message")["content"]
             .as_str()
-            .expect("summary text")
+            .expect("memory text")
             .to_string();
         assert!(summary.contains("看看这两张图"), "{summary}");
         assert!(
@@ -4863,7 +5455,7 @@ mod tests {
         );
         assert!(!summary.contains("base64"), "{summary}");
         assert!(
-            !summary.contains("[assistant]:"),
+            !summary.lines().any(|line| line == "[assistant]"),
             "empty content must be skipped: {summary}"
         );
     }
@@ -4912,6 +5504,186 @@ mod tests {
         );
         assert_eq!(estimate_message_tokens(&json!({ "role": "user" })), 0);
         assert_eq!(estimate_message_tokens(&json!("not a message")), 0);
+    }
+
+    /// 计数诚实：tool 消息的 content、原生 tool call 的参数、图片（1024/张）
+    /// 与 reasoning 都进 `estimated_tokens`，压缩后的重算也吃同一套规则。
+    #[test]
+    fn estimate_message_tokens_counts_tool_messages_images_and_tool_calls() {
+        // tool 消息的 content 与 user/assistant 一样计入。
+        assert_eq!(
+            estimate_message_tokens(&json!({
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "content": "abcd",
+            })),
+            2
+        );
+        // 原生 tool call：函数名 + 未解析的参数 JSON。
+        assert_eq!(
+            estimate_message_tokens(&json!({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": { "name": "read_file", "arguments": "{\"path\":\"a\"}" },
+                }],
+            })),
+            estimate_tokens("read_file") + estimate_tokens("{\"path\":\"a\"}")
+        );
+        // 只有名字 / 只有参数也各算一半；坏形状计 0。
+        assert_eq!(
+            estimate_message_tokens(&json!({ "tool_calls": [{ "function": { "name": "abcd" } }] })),
+            2
+        );
+        assert_eq!(
+            estimate_message_tokens(
+                &json!({ "tool_calls": [{ "function": { "arguments": "abcd" } }] })
+            ),
+            2
+        );
+        assert_eq!(
+            estimate_message_tokens(&json!({ "role": "assistant", "tool_calls": "nope" })),
+            0
+        );
+        assert_eq!(
+            estimate_message_tokens(&json!({ "role": "assistant", "tool_calls": [{}] })),
+            0
+        );
+        // 图片按张计价（1024/张），reasoning 也计入。
+        assert_eq!(
+            estimate_message_tokens(&json!({
+                "role": "assistant",
+                "content": [
+                    { "type": "image_url", "image_url": { "url": "data:image/png;base64,Zm9v" } },
+                ],
+                "reasoning_content": "cdef",
+            })),
+            IMAGE_TOKEN_ESTIMATE + 2
+        );
+        // 压缩后的重算把 tool 消息算进去。
+        let mut session = AgentSession::new(test_config(), "runtime_shell").unwrap();
+        session
+            .history
+            .push(json!({ "role": "tool", "content": "abcd" }));
+        session.recount_tokens();
+        assert_eq!(session.estimated_tokens, 2);
+    }
+
+    /// `truncate_chars`：不超限原样返回，超限按字符截断并补 `…`。
+    #[test]
+    fn truncate_chars_never_splits_a_character() {
+        assert_eq!(truncate_chars("abc", 5), "abc");
+        assert_eq!(truncate_chars("abcdef", 3), "abc…");
+        assert_eq!(truncate_chars("中文内容", 2), "中文…");
+    }
+
+    /// `keep_recent_start`：至少保留一条；单条就超预算时也留住它。
+    #[test]
+    fn keep_recent_start_always_keeps_at_least_one_message() {
+        assert_eq!(keep_recent_start(&[], 10), 0);
+        let two = vec![
+            json!({ "role": "user", "content": "abcd" }),
+            json!({ "role": "user", "content": "efgh" }),
+        ];
+        assert_eq!(keep_recent_start(&two, 100), 0);
+        assert_eq!(keep_recent_start(&two, 2), 1);
+        let one_huge = vec![
+            json!({ "role": "user", "content": "abcd" }),
+            json!({ "role": "user", "content": "x".repeat(4_000) }),
+        ];
+        assert_eq!(keep_recent_start(&one_huge, 0), 1);
+    }
+
+    /// `fallback_keep_start`：20 条与 8k token 取较大者。
+    #[test]
+    fn fallback_keep_start_keeps_twenty_messages_or_eight_thousand_tokens() {
+        // 100 条 x 100 token：条数下限 20 条先满足，token 下限继续往前扩到 80 条。
+        let uniform: Vec<Value> = (0..100)
+            .map(|_| json!({ "role": "user", "content": "x".repeat(200) }))
+            .collect();
+        assert_eq!(fallback_keep_start(&uniform), 20);
+        // 最后一条本身就超过 8k token：token 下限已满足，只保留 20 条。
+        let mut heavy = uniform;
+        heavy.push(json!({ "role": "user", "content": "y".repeat(20_000) }));
+        assert_eq!(
+            fallback_keep_start(&heavy),
+            heavy.len() - COMPACT_FAILURE_KEEP_MESSAGES
+        );
+        assert_eq!(fallback_keep_start(&[]), 0);
+    }
+
+    /// `render_for_summary`：保留 role 与正文，工具结果截到 2000 字，图片只留
+    /// 张数标记，空消息跳过，缺 role 记 unknown。
+    #[test]
+    fn render_for_summary_keeps_roles_and_clips_tool_results() {
+        let messages = vec![
+            json!({ "role": "user", "content": "你好" }),
+            json!({ "role": "tool", "content": "t".repeat(2_500) }),
+            json!({
+                "role": "assistant",
+                "content": [
+                    { "type": "image_url", "image_url": { "url": "data:image/png;base64,Zm9v" } },
+                ],
+            }),
+            json!({ "role": "user", "content": "" }),
+            json!({ "content": "没有 role" }),
+        ];
+        let rendered = render_for_summary(&messages);
+        let lines: Vec<&str> = rendered.lines().collect();
+        assert_eq!(lines.len(), 4, "{rendered}");
+        assert_eq!(lines[0], "[user] 你好");
+        assert!(lines[1].starts_with("[tool] tttt"));
+        assert_eq!(
+            lines[1].chars().count(),
+            "[tool] ".chars().count() + SUMMARY_TOOL_RESULT_CHARS + 1
+        );
+        assert_eq!(lines[2], "[assistant]  [图片 1 张]");
+        assert_eq!(lines[3], "[unknown] 没有 role");
+    }
+
+    /// `collage_summary`：每条消息截到 500 字，图片只留标记，空消息跳过。
+    #[test]
+    fn collage_summary_truncates_each_message_and_marks_images() {
+        let messages = vec![
+            json!({ "role": "user", "content": "长".repeat(600) }),
+            json!({
+                "role": "assistant",
+                "content": [
+                    { "type": "image_url", "image_url": { "url": "data:image/png;base64,Zm9v" } },
+                ],
+            }),
+            json!({ "role": "user", "content": "" }),
+        ];
+        let collage = collage_summary(&messages);
+        let lines: Vec<&str> = collage.lines().collect();
+        assert_eq!(lines.len(), 2, "{collage}");
+        assert_eq!(
+            lines[0].chars().count(),
+            "[user] ".chars().count() + SUMMARY_COLLAGE_MESSAGE_CHARS + 1
+        );
+        assert_eq!(lines[1], "[assistant]  [图片 1 张]");
+        assert!(!collage.contains("base64"));
+    }
+
+    /// 记忆消息与诊断行的形状固定，便于日志 grep 与测试断言。
+    #[test]
+    fn compaction_memory_and_diagnostic_shapes_are_stable() {
+        let memory = memory_message("旧对话");
+        assert_eq!(memory["role"].as_str(), Some("assistant"));
+        assert_eq!(memory["content"].as_str(), Some("[早前对话摘要] 旧对话"));
+        assert!(is_compact_memory(&memory));
+        assert!(!is_compact_memory(
+            &json!({ "role": "user", "content": "hi" })
+        ));
+        assert!(!is_compact_memory(
+            &json!({ "role": "user", "content": 42 })
+        ));
+        assert_eq!(
+            compact_failure_line("provider_error", 7),
+            "agent_compact_failed reason=provider_error kept=7"
+        );
     }
 
     /// `summarize_message_content` 的逐分支单测：字符串、数组里 text /

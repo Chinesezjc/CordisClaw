@@ -297,7 +297,14 @@ impl RuntimeHost {
             for action in pending {
                 match action {
                     PendingSessionAction::CompactHistory => {
-                        let (old, new) = session.session.compact_history();
+                        // 队列里的压缩在 turn 结束后执行，此时 provider 插件
+                        // 仍按会话同一条 llm_complete 接缝解析；没有 provider
+                        // 就传 None，走截断拼贴兜底。
+                        let provider = self.compact_provider();
+                        let provider = provider
+                            .as_ref()
+                            .map(|provider| provider as &dyn crate::agent_api::LlmProvider);
+                        let (old, new) = session.session.compact_history(provider);
                         eprintln!(
                             "[pending-action] compact_history for session {session_id}: {old} -> {new}"
                         );
@@ -549,6 +556,33 @@ impl RuntimeHost {
         session
             .session
             .inject_exchange(user_input, assistant_output);
+        Ok(())
+    }
+
+    /// Append a user message to a session's history **without running a turn**.
+    ///
+    /// A read-only channel (a group whose reply policy is disabled) uses this:
+    /// the text still lands in history and in the snapshot, but no provider is
+    /// called and no assistant reply exists. When the policy is turned back on,
+    /// the next real turn sees everything that accumulated.
+    pub fn agent_ingest(&self, session_id: &str, input: &str) -> Result<(), RuntimeError> {
+        let mut guard = self
+            .agent_sessions
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let managed =
+            guard
+                .get_mut(session_id)
+                .ok_or_else(|| RuntimeError::AgentSessionNotFound {
+                    session_id: session_id.to_string(),
+                })?;
+        managed.session.ingest_user_message(input);
+        // Persist immediately for the same reason `agent_send` does: a read-only
+        // group may never get another turn, and the whole point is that its
+        // context survives a restart.
+        if matches!(managed.state, ManagedAgentState::RuntimeShell) {
+            self.auto_save_session(session_id, managed.session.as_ref());
+        }
         Ok(())
     }
 

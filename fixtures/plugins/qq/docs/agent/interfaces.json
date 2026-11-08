@@ -297,7 +297,9 @@
       "failure_modes": [
         "no OneBot URL configured",
         "invalid target format",
-        "message is empty"
+        "message is empty",
+        "read-only channel: reply policy is disabled for group <id>; you can read but must not send",
+        "muted in group <id> until <HH:MM> (N minutes left)"
       ],
       "node_type": "router",
       "agent_accessible": true
@@ -530,7 +532,7 @@
     },
     {
       "id": "qq_get_reply_policy",
-      "summary": "Read the reply policy that is EFFECTIVE for a group (omit `group` to read the shared default). Returns the mode (quiet | balanced | chatty | one_on_one), the policy text actually shipped to the model, and where it came from (group | default | builtin).",
+      "summary": "Read the reply policy that is EFFECTIVE for a group (omit `group` to read the shared default). Returns whether the bot is allowed to speak (`enabled`: true) or must stay silent (`enabled`: false), the policy text actually shipped to the model, and where it came from (group | default | builtin).",
       "input_schema": {
         "type": "object",
         "required": [
@@ -566,8 +568,9 @@
                   "null"
                 ]
               },
-              "mode": {
-                "type": "string"
+              "enabled": {
+                "type": "boolean",
+                "description": "false = this group is permanently silent"
               },
               "policy": {
                 "type": "string"
@@ -592,7 +595,7 @@
     },
     {
       "id": "qq_set_reply_policy",
-      "summary": "Persist the reply policy for ONE group (or the shared default when `group` is omitted). Two ways to set it: `mode` picks a preset (quiet = only when named/@; balanced = judge by context; chatty = join in actively; one_on_one = treat as a direct chat), `policy` overrides the preset with free text. Takes effect on the NEXT message — no rebuild, no restart.",
+      "summary": "Persist the reply policy for ONE group (or the shared default when `group` is omitted). `enabled: true` ALLOWS the bot to speak but does NOT require it to answer: being @-mentioned or named is not a reason to speak; it should talk only when it genuinely adds information others lack, corrects a mistake, or the message is actually asking it — otherwise stay silent. `enabled: false` (the default) means permanent silence in this group. `policy` overrides the preset text with free text. The legacy `mode` argument still works (quiet/one_on_one = false, balanced/chatty = true) but new calls should use `enabled`. Takes effect on the NEXT message — no rebuild, no restart.",
       "input_schema": {
         "type": "object",
         "required": [
@@ -607,6 +610,10 @@
             "type": "string",
             "description": "QQ group id; omit to change the shared default"
           },
+          "enabled": {
+            "type": "boolean",
+            "description": "true = allowed to speak (not required to); false = permanent silence"
+          },
           "mode": {
             "type": "string",
             "enum": [
@@ -614,11 +621,12 @@
               "balanced",
               "chatty",
               "one_on_one"
-            ]
+            ],
+            "description": "Legacy alias for enabled; kept for old callers"
           },
           "policy": {
             "type": "string",
-            "description": "Optional free-text override (English; shown verbatim)"
+            "description": "Optional free-text override (shown verbatim)"
           },
           "data_dir": {
             "type": "string",
@@ -635,6 +643,9 @@
           "data": {
             "type": "object",
             "properties": {
+              "enabled": {
+                "type": "boolean"
+              },
               "policy": {
                 "type": "string"
               },
@@ -649,8 +660,9 @@
         "writes data/qq_reply_policies.json"
       ],
       "failure_modes": [
-        "mode or policy is required",
-        "unknown mode"
+        "enabled is required",
+        "unknown mode",
+        "enabled must be true or false"
       ],
       "node_type": "router",
       "agent_accessible": true
@@ -783,7 +795,7 @@
     },
     {
       "id": "qq_system_notify",
-      "summary": "Kernel notification handler — receives system messages and forwards to configured test groups.",
+      "summary": "Kernel notification handler — receives system messages and forwards to configured test groups. Groups whose reply policy is disabled or that are currently muted are refused; the response lists `sent` and `refused` groups.",
       "input_schema": {
         "type": "object",
         "required": [
@@ -826,11 +838,12 @@
       ],
       "failure_modes": [
         "no OneBot URL configured",
-        "no test_groups configured"
+        "no test_groups configured",
+        "no test group accepted the notification (read-only or muted)"
       ],
       "node_type": "router",
       "agent_accessible": false
     }
   ],
-  "system_hint": "QQ 渠道说明——这里只说怎么发消息，性格和说话方式见人格部分。\n\n【发言必须走工具】调用 qq_send：{\"node_id\":\"qq_send\",\"target\":\"<reply_target>\",\"message\":\"<你要说的话>\"}。你自己写的正文不会发出去，只有工具调用里的 message 会。\n【结束这一轮】调用 {\"node_id\":\"suspend\"}。这一轮会一直继续，直到你调它；不想说话就直接调 suspend，群里看不到。\n【@某人】message 里写 [CQ:at,qq=<uid>]。纯文本 @ 不算 @。\n【发图】[CQ:image,file=<url>] 或 [CQ:image,file=base64://<data>]；能用 URL 就别用 base64。\n【引用某条消息】把它的 msg=<id> 作为 \"reply_to\":\"<id>\" 传进同一次 qq_send。\n【你的身份】你的 QQ 号是 {setting:bot_uin}；@[id=...] 里的数字等于它才是 @ 你。\n【群记忆】需要时用 qq_get_group_memory / qq_set_group_memory 读写；只记长期有用的，不确定就先读。\n【被禁言】上下文里有 [muted: ...] 或发送报禁言时，别再发，等解禁。"
+  "system_hint": "QQ 渠道说明——这里只说怎么发消息，性格和说话方式见人格部分。\n\n【发言必须走工具】调用 qq_send：{\"node_id\":\"qq_send\",\"target\":\"<reply_target>\",\"message\":\"<你要说的话>\"}。你自己写的正文不会发出去，只有工具调用里的 message 会。\n【结束这一轮】调用 {\"node_id\":\"suspend\"}。这一轮会一直继续，直到你调它；不想说话就直接调 suspend，群里看不到。\n【@某人】message 里写 [CQ:at,qq=<uid>]。纯文本 @ 不算 @。\n【发图】[CQ:image,file=<url>] 或 [CQ:image,file=base64://<data>]；能用 URL 就别用 base64。\n【引用某条消息】把它的 msg=<id> 作为 \"reply_to\":\"<id>\" 传进同一次 qq_send。\n【你的身份】你的 QQ 号是 {setting:bot_uin}；@[id=...] 里的数字等于它才是 @ 你。\n【群记忆】需要时用 qq_get_group_memory / qq_set_group_memory 读写；只记长期有用的，不确定就先读。\n【被禁言】[muted: ...] 只是上一轮的探测结果；qq_send 被拒时会说明原因（muted … / read-only …）。同一轮不要重试，直接调 suspend 结束；禁言是否解除以每次 qq_send 的探测为准。"
 }

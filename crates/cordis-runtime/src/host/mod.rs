@@ -1497,6 +1497,21 @@ impl RuntimeHost {
     ///
     /// 这不影响冷启动：boot / REPL / `command_router` 都不经此路径，无插件时
     /// 它们照常工作，只有 `agent_send` 会失败（与今天"LLM 不可达"同构）。
+    /// Resolve the provider used by history compaction.
+    ///
+    /// Compaction must call the same `llm_complete` seam as a normal turn, and
+    /// both call sites (the `compact_context` tool and the deferred
+    /// post-turn action) need it outside the agent-session lock. Extracted so
+    /// the resolution itself is directly testable and the two call sites stay
+    /// one line each.
+    pub(crate) fn compact_provider(&self) -> Option<PluginLlmProvider<'_>> {
+        self.llm_provider_plugin()
+            .map(|plugin_path| PluginLlmProvider {
+                host: self,
+                plugin_path,
+            })
+    }
+
     pub(crate) fn llm_provider_plugin(&self) -> Option<String> {
         let snapshot = self.current_snapshot();
         for (plugin_path, plugin) in snapshot.plugin_registry().iter() {
@@ -3005,9 +3020,12 @@ pub struct RecordIterationSummaryArgs {
 }
 
 impl ManagedAgentSession {
-    pub(crate) fn compact_history(&mut self) -> (usize, usize) {
+    pub(crate) fn compact_history(
+        &mut self,
+        provider: Option<&dyn crate::agent_api::LlmProvider>,
+    ) -> (usize, usize) {
         let old = self.session.history_len();
-        self.session.compact_history();
+        self.session.compact_history(provider);
         (old, self.session.history_len())
     }
 

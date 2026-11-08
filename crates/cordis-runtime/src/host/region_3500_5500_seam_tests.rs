@@ -51,7 +51,7 @@ use super::{
     ManagedAgentSession, ManagedAgentState, ReloadReport, ReplaceFilesExactArgs, RetiredSnapshot,
     RuntimeHost, PLUGIN_AGENT_TOOL_REPLACE_FILES_EXACT,
 };
-use crate::agent_api::AgentTranscriptEntry;
+use crate::agent_api::{AgentToolHost, AgentTranscriptEntry};
 use crate::core::error::RuntimeError;
 use crate::core::models::PluginUnavailableReason;
 use crate::kernel::plugin_iteration::{
@@ -582,8 +582,32 @@ fn managed_session_compact_history_wrapper_is_noop_below_threshold() {
             .expect("build agent session"),
         state: ManagedAgentState::RuntimeShell,
     };
-    let (old, new) = managed.compact_history();
+    let (old, new) = managed.compact_history(None);
     assert_eq!(old, new, "no compaction below threshold");
+}
+
+/// `agent_compact_context` 走真实会话：provider 从已加载的 `llm_complete`
+/// 插件解析（`compact_provider`），压缩阈值之下返回原样计数。
+#[test]
+#[serial]
+fn agent_compact_context_uses_the_llm_provider_seam() {
+    let host = crate::host::tests::shared_host();
+    let handle = host
+        .agent_start(AgentSessionKind::RuntimeShell)
+        .expect("start a runtime-shell session");
+
+    let value = host
+        .agent_compact_context(&handle.session_id)
+        .expect("compact below threshold must succeed");
+
+    assert_eq!(value["compacted"], true);
+    assert_eq!(value["old_messages"], 0);
+    assert_eq!(value["new_messages"], 0);
+    assert!(
+        host.agent_sessions_mut().contains_key(&handle.session_id),
+        "the session must stay addressable"
+    );
+    host.drop_session(&handle.session_id);
 }
 
 // ─────────────── canary declared-verifier-node (JSON candidate) ──────

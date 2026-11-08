@@ -84,6 +84,16 @@ struct AgentEnvelope {
     /// 每轮重发同一份会白烧几十万字节上下文，还会盖住真正的对话。
     #[serde(default)]
     notes: String,
+    /// 渠道侧事实：本会话的策略是否允许发言。缺省 `true`，所以不认识这个
+    /// 字段的渠道（feishu 等）行为完全不变；qq 的只读群显式报 `false`。
+    /// 为 `false` 时本批**只写 history，不调模型**。
+    #[serde(default = "policy_enabled_default")]
+    policy_enabled: bool,
+}
+
+/// Legacy / non-policy channels default to a normal turn.
+fn policy_enabled_default() -> bool {
+    true
 }
 
 impl AgentEnvelope {
@@ -105,6 +115,7 @@ impl AgentEnvelope {
                 caller_can_approve: false,
                 images: Vec::new(),
                 notes: String::new(),
+                policy_enabled: true,
             },
         }
     }
@@ -438,6 +449,13 @@ fn wrap_inbox_batch(combined: &str) -> String {
          if the message is clearly between other people, end the turn by calling the suspend tool \
          (the DSML block described in the tool protocol) and send nothing."
     )
+}
+
+/// A batch is read-only when every message says its channel forbids a reply
+/// (a group whose reply policy is disabled). Such a batch is recorded in
+/// history but must never reach the model: no LLM call, no reply.
+fn batch_is_read_only(envs: &[AgentEnvelope]) -> bool {
+    !envs.iter().any(|env| env.policy_enabled)
 }
 
 /// Parse only the FIRST JSON value from `s`, ignoring any trailing content
@@ -1115,6 +1133,20 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     let _ = host.agent_set_session_address(&sid, session_key);
                     // Call sites take `&str`; shadow the owned id.
                     let sid = sid.as_str();
+                    // Read-only channel (qq `enabled=false`): the messages are
+                    // context, not a request. Record them and skip the model
+                    // entirely — no provider call, no reply, no tool gate.
+                    if batch_is_read_only(&normals) {
+                        eprintln!(
+                            "inbox: [{session_key}] read-only channel — ingesting {} message(s) without a model call",
+                            normals.len()
+                        );
+                        match host.agent_ingest(sid, &combined) {
+                            Ok(()) => pending::clear(&data_dir, session_key),
+                            Err(e) => eprintln!("inbox: [{session_key}] ingest failed: {e}"),
+                        }
+                        continue;
+                    }
                     // H1: re-scope the soul to THIS batch's speaker before
                     // sending. Idempotent — a cheap no-op when unchanged, and
                     // also covers the just-created session. Errors ignored
@@ -2825,7 +2857,7 @@ mod serve_args_tests {
 
 #[cfg(test)]
 mod envelope_tests {
-    use super::AgentEnvelope;
+    use super::{batch_is_read_only, AgentEnvelope};
 
     // 旧 envelope（无身份字段）必须照常解析，soul_key 回落 session_key。
     #[test]
@@ -2880,6 +2912,37 @@ mod envelope_tests {
         assert_eq!(env.display, "plain text trigger");
         assert!(!env.can_reply());
         assert_eq!(env.soul_key(), "plain text trigger");
+    }
+
+    // 渠道不认识 policy_enabled（feishu / 老 envelope）→ 正常起轮。
+    #[test]
+    fn envelope_parse_defaults_policy_enabled_to_true() {
+        let raw = r#"{"session_key":"feishu:chat:1","display":"hi"}"#;
+        let env = AgentEnvelope::parse(raw);
+        assert!(env.policy_enabled);
+        assert!(!batch_is_read_only(std::slice::from_ref(&env)));
+    }
+
+    // qq 只读群显式报 false：整批只写历史，不调模型。
+    #[test]
+    fn envelope_parse_reads_policy_enabled_false() {
+        let raw = r#"{"session_key":"qq:group:1","display":"hi","policy_enabled":false}"#;
+        let env = AgentEnvelope::parse(raw);
+        assert!(!env.policy_enabled);
+        assert!(batch_is_read_only(std::slice::from_ref(&env)));
+    }
+
+    // 一批里只要有一条允许发言，就仍按正常轮次处理（策略刚翻转的混合批）。
+    #[test]
+    fn a_batch_is_read_only_only_when_every_message_is_disabled() {
+        let disabled = r#"{"session_key":"qq:group:1","display":"a","policy_enabled":false}"#;
+        let enabled = r#"{"session_key":"qq:group:1","display":"b","policy_enabled":true}"#;
+        let mixed = [
+            AgentEnvelope::parse(disabled),
+            AgentEnvelope::parse(enabled),
+        ];
+        assert!(!batch_is_read_only(&mixed));
+        assert!(batch_is_read_only(&[AgentEnvelope::parse(disabled)]));
     }
 }
 

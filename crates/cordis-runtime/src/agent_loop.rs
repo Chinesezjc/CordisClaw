@@ -36,7 +36,13 @@ pub trait AgentSessionApi: Send {
     fn kind(&self) -> &str;
     fn status(&self) -> AgentSessionStatus;
     fn history_len(&self) -> usize;
-    fn compact_history(&mut self) -> (usize, usize);
+    /// Compact the stored history when it outgrows its token budget.
+    ///
+    /// `provider` is the same `llm_complete` seam a turn uses; the loop asks it
+    /// for one real summary and replaces the oldest messages with that memory.
+    /// `None` (no provider plugin) degrades to the truncation fallback, which
+    /// still never empties the history. Returns `(before_len, after_len)`.
+    fn compact_history(&mut self, provider: Option<&dyn LlmProvider>) -> (usize, usize);
     fn swap_config(&mut self, config: LlmApiConfig) -> Result<(), RuntimeError>;
     fn set_soul_key(&mut self, key: String);
     fn set_require_end_tool(&mut self, require: bool);
@@ -48,6 +54,13 @@ pub trait AgentSessionApi: Send {
     fn transcript(&self) -> Vec<AgentTranscriptEntry>;
     fn replace_last_action_with_reply(&mut self, reply: &str) -> bool;
     fn inject_exchange(&mut self, user_input: &str, assistant_output: &str);
+    /// Append one **user** message without producing an assistant reply.
+    ///
+    /// A read-only channel uses this to keep collecting the conversation it
+    /// may speak about once the policy allows it: the text becomes history
+    /// (and therefore visible to the next real turn) but no model call is
+    /// made, so nothing is billed and nothing is said.
+    fn ingest_user_message(&mut self, user_input: &str);
     fn to_snapshot(&self) -> AgentSessionSnapshot;
     /// Run one turn against `host`, using `provider` for completions.
     // Eight parameters is the honest shape of a turn: host, identity, input,
@@ -122,7 +135,7 @@ pub mod test_loop {
     use super::{AgentLoop, AgentSessionApi};
     use crate::agent_api::{
         AgentReply, AgentSessionSnapshot, AgentSessionStatus, AgentToolExecutionSummary,
-        AgentToolHost, AgentTranscriptEntry,
+        AgentToolHost, AgentTranscriptEntry, LlmProvider,
     };
     use crate::config::LlmApiConfig;
     use crate::core::error::RuntimeError;
@@ -155,7 +168,7 @@ pub mod test_loop {
         fn history_len(&self) -> usize {
             self.history_len
         }
-        fn compact_history(&mut self) -> (usize, usize) {
+        fn compact_history(&mut self, _provider: Option<&dyn LlmProvider>) -> (usize, usize) {
             (self.history_len, self.history_len)
         }
         fn swap_config(&mut self, config: LlmApiConfig) -> Result<(), RuntimeError> {
@@ -191,6 +204,9 @@ pub mod test_loop {
             false
         }
         fn inject_exchange(&mut self, _user_input: &str, _assistant_output: &str) {}
+        fn ingest_user_message(&mut self, _user_input: &str) {
+            self.history_len += 1;
+        }
         fn to_snapshot(&self) -> AgentSessionSnapshot {
             AgentSessionSnapshot {
                 kind: self.kind.clone(),

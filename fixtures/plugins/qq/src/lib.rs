@@ -61,16 +61,35 @@ static STATE: Mutex<QqState> = Mutex::new(QqState {
 /// Per-group "the bot may not speak until" table (group_id → unix ms).
 ///
 /// A group ban does not stop the agent from *trying*: OneBot answers the send
-/// with a failure and the model never learns why. Recording the ban lets the
-/// next turn tell the model it is muted, and lets `qq_send` refuse early
-/// instead of hammering the API.
+/// with a failure and the model never learns why. A **confirmed** ban is
+/// recorded here so the next turn can tell the model it is muted; the entry is
+/// cleared as soon as a probe reports `shut_up_timestamp == 0`.
 static MUTE_UNTIL: Mutex<Vec<(i64, i64)>> = Mutex::new(Vec::new());
 
-/// Does OneBot's failure wording describe a group ban?
-fn looks_like_mute_error(wording: &str) -> bool {
-    let lowered = wording.to_lowercase();
-    lowered.contains("禁言") || lowered.contains("mute") || lowered.contains("shut up")
+/// What OneBot says about the bot's ban in one group.
+///
+/// The old `Option<i64>` conflated "not muted" with "the probe failed", which
+/// is where the fake ten-minute bans came from: a transient HTTP failure was
+/// recorded as a ban. `Unknown` is explicitly not evidence of a ban.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GroupMute {
+    /// `shut_up_timestamp` is 0 (or already in the past): the bot may speak.
+    NotMuted,
+    /// Banned until this unix-ms deadline.
+    Muted(i64),
+    /// OneBot could not answer. **Never** treat this as a ban.
+    Unknown,
 }
+
+/// Probe results are reused for this long so a busy group does not multiply
+/// `get_login_info` + `get_group_member_info` calls. The ban is re-probed
+/// before every send, so 30 s is short enough to notice an early unmute
+/// without hammering the local OneBot HTTP API.
+const MUTE_PROBE_TTL_MS: u64 = 30_000;
+
+/// (group_id, probed_at_ms, result). Bounded by the number of groups the bot
+/// has tried to speak in; entries are overwritten in place per group.
+static MUTE_PROBE_CACHE: Mutex<Vec<(i64, u64, GroupMute)>> = Mutex::new(Vec::new());
 
 /// Mute deadline in ms from OneBot's `shut_up_timestamp` (seconds, 0 = not muted).
 fn mute_deadline_ms(now_ms: u64, shut_up_seconds: i64) -> Option<i64> {
@@ -78,9 +97,14 @@ fn mute_deadline_ms(now_ms: u64, shut_up_seconds: i64) -> Option<i64> {
     (until > now_ms as i64).then_some(until)
 }
 
+/// Whole minutes the model still has to wait, rounded up.
+fn minutes_until(until_ms: i64, now_ms: u64) -> i64 {
+    ((until_ms - now_ms as i64).max(0) + 59_999) / 60_000
+}
+
 /// Human note for the model: how long it cannot speak here.
 fn mute_note(until_ms: i64, now_ms: u64) -> String {
-    let minutes = ((until_ms - now_ms as i64).max(0) + 59_999) / 60_000;
+    let minutes = minutes_until(until_ms, now_ms);
     format!("[muted: 你在本群被禁言，约 {minutes} 分钟后解禁；在解禁前不要发言]")
 }
 
@@ -110,6 +134,38 @@ fn clear_mute(group_id: i64) {
         .lock()
         .unwrap_or_else(|poison| poison.into_inner())
         .retain(|(group, _)| *group != group_id);
+}
+
+/// Drop any cached probe for `group_id`, forcing the next send to re-probe.
+/// Used after a send failure: the pre-send answer was evidently wrong/stale.
+fn forget_mute_probe(group_id: i64) {
+    MUTE_PROBE_CACHE
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .retain(|(group, _, _)| *group != group_id);
+}
+
+/// A probe result younger than [`MUTE_PROBE_TTL_MS`], if any.
+fn cached_mute_probe(group_id: i64, now: u64) -> Option<GroupMute> {
+    MUTE_PROBE_CACHE
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .iter()
+        .find(|(group, at, _)| *group == group_id && now.saturating_sub(*at) < MUTE_PROBE_TTL_MS)
+        .map(|(_, _, result)| *result)
+}
+
+fn cache_mute_probe(group_id: i64, now: u64, result: GroupMute) {
+    let mut cache = MUTE_PROBE_CACHE
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    match cache.iter_mut().find(|(group, _, _)| *group == group_id) {
+        Some(entry) => {
+            entry.1 = now;
+            entry.2 = result;
+        }
+        None => cache.push((group_id, now, result)),
+    }
 }
 
 /// ⚠ CRITICAL — incoming message queue. Populated by handle_onebot_event,
@@ -310,7 +366,12 @@ struct NodeRequest {
     /// shared default entry.
     #[serde(default)]
     group: Option<String>,
-    /// Policy mode: `quiet` | `balanced` | `chatty` | `one_on_one`.
+    /// Reply-policy switch as a top-level field (same dual-accept rationale as
+    /// `mode`). Booleans and the strings `"true"`/`"false"` are both accepted.
+    #[serde(default)]
+    enabled: Option<Value>,
+    /// Legacy policy mode: `quiet` | `balanced` | `chatty` | `one_on_one`.
+    /// Read-only compatibility — it maps to `enabled`; new writes use `enabled`.
     #[serde(default)]
     mode: Option<String>,
     /// Free-text per-group memory (agent-authored).
@@ -405,14 +466,6 @@ fn onebot_send_group_msg(
     reply_to: Option<i64>,
     token: Option<&str>,
 ) -> Result<Value, String> {
-    // Refuse early while a recorded ban is still in force: hammering the API
-    // produces the same failure and gives the model nothing to act on.
-    if let Some(until) = mute_until_for(group_id) {
-        return Err(format!(
-            "你在本群被禁言，消息未发送。{}",
-            mute_note(until, now_ms())
-        ));
-    }
     let full_message = build_reply_message(message, reply_to);
     let params = json!({ "group_id": group_id, "message": full_message });
     match onebot_call(base_url, "send_group_msg", &params, token) {
@@ -421,46 +474,68 @@ fn onebot_send_group_msg(
             Ok(value)
         }
         Err(err) => {
-            // OneBot does not name the reason, so ask the authoritative source:
-            // the bot's own member record carries `shut_up_timestamp`.
-            match probe_group_mute(base_url, group_id, token) {
-                Some(until) => {
-                    record_mute(group_id, until);
-                    Err(format!(
-                        "你在本群被禁言，消息未发送（OneBot: {err}）。{}",
-                        mute_note(until, now_ms())
-                    ))
-                }
-                None if looks_like_mute_error(&err) => {
-                    // The wording says ban but the member record was unreadable:
-                    // assume a short ban so the bot at least behaves.
-                    let until = now_ms() as i64 + 10 * 60 * 1000;
-                    record_mute(group_id, until);
-                    Err(format!(
-                        "你在本群被禁言，消息未发送（OneBot: {err}）。{}",
-                        mute_note(until, now_ms())
-                    ))
-                }
-                None => Err(err),
-            }
+            // The pre-send probe said the bot was not muted, but the send just
+            // failed: drop that cached answer so the next attempt re-probes
+            // instead of trusting a stale NotMuted/Unknown for another 30 s.
+            forget_mute_probe(group_id);
+            Err(err)
         }
     }
 }
 
-/// The bot's own ban deadline in `group_id`, read from OneBot.
-fn probe_group_mute(base_url: &str, group_id: i64, token: Option<&str>) -> Option<i64> {
-    let login = onebot_call(base_url, "get_login_info", &json!({}), token).ok()?;
-    let bot_uin = login
+/// Ask OneBot whether the bot is banned in `group_id` (cached for
+/// [`MUTE_PROBE_TTL_MS`]).
+fn probe_group_mute(base_url: &str, group_id: i64, token: Option<&str>) -> GroupMute {
+    probe_group_mute_at(base_url, group_id, token, now_ms())
+}
+
+/// [`probe_group_mute`] with the clock injected, so the cache TTL is testable.
+fn probe_group_mute_at(
+    base_url: &str,
+    group_id: i64,
+    token: Option<&str>,
+    now: u64,
+) -> GroupMute {
+    if let Some(cached) = cached_mute_probe(group_id, now) {
+        return cached;
+    }
+    let result = probe_group_mute_live(base_url, group_id, token, now);
+    cache_mute_probe(group_id, now, result);
+    result
+}
+
+/// One uncached round-trip: login → the bot's own member record.
+fn probe_group_mute_live(
+    base_url: &str,
+    group_id: i64,
+    token: Option<&str>,
+    now: u64,
+) -> GroupMute {
+    let login = onebot_call(base_url, "get_login_info", &json!({}), token).ok();
+    let member = login.as_ref().and_then(onebot_user_id).and_then(|bot_uin| {
+        let params = json!({ "group_id": group_id, "user_id": bot_uin });
+        onebot_call(base_url, "get_group_member_info", &params, token).ok()
+    });
+    match member.as_ref().and_then(onebot_shut_up) {
+        Some(shut_up) => {
+            mute_deadline_ms(now, shut_up).map_or(GroupMute::NotMuted, GroupMute::Muted)
+        }
+        None => GroupMute::Unknown,
+    }
+}
+
+fn onebot_user_id(value: &Value) -> Option<i64> {
+    value
         .get("data")
         .and_then(|data| data.get("user_id"))
-        .and_then(Value::as_i64)?;
-    let params = json!({ "group_id": group_id, "user_id": bot_uin });
-    let member = onebot_call(base_url, "get_group_member_info", &params, token).ok()?;
-    let shut_up = member
+        .and_then(Value::as_i64)
+}
+
+fn onebot_shut_up(value: &Value) -> Option<i64> {
+    value
         .get("data")
         .and_then(|data| data.get("shut_up_timestamp"))
-        .and_then(Value::as_i64)?;
-    mute_deadline_ms(now_ms(), shut_up)
+        .and_then(Value::as_i64)
 }
 
 /// Prepend a OneBot reply segment when reply_to is Some.
@@ -1277,6 +1352,27 @@ fn should_process(text: &str) -> bool {
     text.len() > 2
 }
 
+/// The reply-policy switch that applies to this message.
+///
+/// A private chat has no group switch, so it is always allowed; a group with no
+/// policy row falls back to the store's default (`enabled=false` after the
+/// 5.2.58 migration).
+fn message_policy_enabled(msg: &IncomingMessage) -> bool {
+    match (msg.message_type == "group").then_some(msg.sender_id.as_str()) {
+        Some(group) => effective_policy(None, Some(group)).0,
+        None => true,
+    }
+}
+
+/// Whether a message should reach the runtime inbox at all.
+///
+/// Short noise ("ok", "哈哈") normally does not deserve a turn. A read-only
+/// group never gets a turn, and every message is context the model may need
+/// once the policy is turned back on, so the noise filter must not drop it.
+fn should_trigger(msg: &IncomingMessage) -> bool {
+    should_process(&msg.message) || !message_policy_enabled(msg)
+}
+
 // ---------------------------------------------------------------------------
 // Reply policy (WS-4) — runtime-configurable reply gating
 // ---------------------------------------------------------------------------
@@ -1285,43 +1381,52 @@ fn should_process(text: &str) -> bool {
 //
 // 历史：门控最早硬编码在 `system_hint` 里，改"多说/少说"要改 Rust 重编工件。
 // 现在拆成三层，全部是数据：
-//   `data/qq_reply_policies.json` — 默认策略 + 每群覆盖（模式 + 自由文本）
+//   `data/qq_reply_policies.json` — 默认策略 + 每群覆盖（布尔开关 + 自由文本）
 //   `data/qq_group_memory.json`   — 每群记忆（agent 自己总结、自己写）
 // 每条入站消息把它们随 envelope 下发成
-//   `[reply policy: <mode> — <text>]`
+//   `[reply policy: <enabled|disabled> — <text>]`
 //   `[group memory: <text>]`（只有写过才出现）
 // 于是"调整它在该群的行为"不需要重编、更不需要重启。
 
-/// 保守默认文案（模型逐字读，保持英文）。
-const DEFAULT_REPLY_POLICY: &str = "像群里的普通成员：有人找你、话题明显在你身上，就说；别人的闲聊、斗图、互怼，别插嘴。";
+/// `enabled = false` 时的文案（模型逐字读）。
+const POLICY_TEXT_DISABLED: &str = "本群不允许你发言。保持沉默，不要调用 qq_send。";
 
-/// 四种模式。`policy` 为空时用这里的预设文案。
-const MODE_QUIET: &str = "quiet";
-const MODE_BALANCED: &str = "balanced";
-const MODE_CHATTY: &str = "chatty";
-const MODE_ONE_ON_ONE: &str = "one_on_one";
+/// `enabled = true` 时的文案：允许发言，但**不要求**回应。
+const POLICY_TEXT_ENABLED: &str = "本群允许你发言，但不要求你回应。被 @ 或被点名不是发言理由：只有当你确实能补充别人不知道的信息、纠正一个错误、或这句话正是在问你时才说；没有正面价值就保持沉默。";
 
-/// 没有任何配置时的模式。
-const DEFAULT_MODE: &str = MODE_BALANCED;
+/// 没有任何配置时的开关：默认关闭（本群永久沉默）。
+const DEFAULT_ENABLED: bool = false;
 
-fn mode_preset(mode: &str) -> Option<&'static str> {
-    match mode {
-        MODE_QUIET => Some("只在被 @ 或被点名时说话；其他时候别插嘴。"),
-        MODE_BALANCED => Some(DEFAULT_REPLY_POLICY),
-        MODE_CHATTY => Some("这个群愿意你多说：能接的话就接一句，但别每条都回、别抢别人的话头。"),
-        MODE_ONE_ON_ONE => Some("把这个群当私聊：找你说话就回，别因为它是群就装没看见。"),
-        _ => None,
+/// 开关对应的预设文案（`policy` 为空时使用）。
+fn policy_text(enabled: bool) -> &'static str {
+    if enabled {
+        POLICY_TEXT_ENABLED
+    } else {
+        POLICY_TEXT_DISABLED
     }
 }
 
-fn valid_mode(mode: &str) -> bool {
-    mode_preset(mode).is_some()
+/// 旧 `mode` 入参 → 布尔开关（兼容写法）。`quiet` / `one_on_one` → false，
+/// `balanced` / `chatty` → true；未知值报错并引导改用 `enabled`。
+fn enabled_from_mode(mode: &str) -> Result<bool, String> {
+    match mode {
+        "quiet" | "one_on_one" => Ok(false),
+        "balanced" | "chatty" => Ok(true),
+        other => Err(format!(
+            "unknown mode '{other}': use enabled (true | false) instead"
+        )),
+    }
 }
 
 /// 一条策略记录（默认项或某群的覆盖项）。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct PolicyEntry {
+    /// 新语义：`true` = 允许发言（但不要求回应），`false` = 本群永久沉默。
     #[serde(default)]
+    enabled: Option<bool>,
+    /// 旧字段（`quiet` | `balanced` | `chatty` | `one_on_one`）。只用于读老文件：
+    /// 没有 `enabled` 时按它映射；新写入一律清空，不再驱动行为。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     mode: String,
     #[serde(default)]
     policy: String,
@@ -1329,6 +1434,25 @@ struct PolicyEntry {
     updated_at_ms: u64,
     #[serde(default)]
     updated_by: String,
+}
+
+impl PolicyEntry {
+    /// `enabled` 有值就用它；否则按旧 `mode` 映射；都没有 → `DEFAULT_ENABLED`。
+    fn is_enabled(&self) -> bool {
+        if let Some(enabled) = self.enabled {
+            return enabled;
+        }
+        match self.mode.trim() {
+            "quiet" | "one_on_one" => false,
+            "" => DEFAULT_ENABLED,
+            _ => true,
+        }
+    }
+
+    /// 这一项有没有被显式配置过（决定回落是 `default` 还是 `builtin`）。
+    fn is_configured(&self) -> bool {
+        self.enabled.is_some() || !self.mode.is_empty() || !self.policy.is_empty()
+    }
 }
 
 /// `data/qq_reply_policies.json` 的形状。
@@ -1406,7 +1530,9 @@ fn load_policy_store(data_dir: Option<&str>) -> PolicyStore {
             if !policy.is_empty() {
                 return PolicyStore {
                     default: PolicyEntry {
-                        mode: DEFAULT_MODE.to_string(),
+                        // 旧单策略文件等价于旧的 `balanced`（语境判断）→ 开启。
+                        enabled: Some(true),
+                        mode: String::new(),
                         policy,
                         updated_at_ms: rec.updated_at_ms,
                         updated_by: rec.updated_by,
@@ -1431,33 +1557,25 @@ fn save_policy_store(
     Ok(path)
 }
 
-/// 该群实际生效的 `(mode, policy_text, source)`，`source ∈ group|default|builtin`。
+/// 该群实际生效的 `(enabled, policy_text, source)`，`source ∈ group|default|builtin`。
 ///
-/// 解析顺序：`groups[gid]` → `default` → 内置 `balanced`。**永不失败**：
-/// 策略文件缺失/损坏只会得到内置默认，envelope 构造不会因此中断。
-fn effective_policy(data_dir: Option<&str>, group: Option<&str>) -> (String, String, &'static str) {
+/// 解析顺序：`groups[gid]` → `default` → 内置 `disabled`。**永不失败**：
+/// 策略文件缺失/损坏只会得到内置默认（关闭），envelope 构造不会因此中断。
+fn effective_policy(data_dir: Option<&str>, group: Option<&str>) -> (bool, String, &'static str) {
     let store = load_policy_store(data_dir);
     let group_entry = group.and_then(|g| store.groups.get(g));
     let (entry, source) = match group_entry {
         Some(entry) => (entry, "group"),
-        None if !store.default.mode.is_empty() || !store.default.policy.is_empty() => {
-            (&store.default, "default")
-        }
+        None if store.default.is_configured() => (&store.default, "default"),
         None => (&store.default, "builtin"),
     };
-    let mode = if entry.mode.trim().is_empty() {
-        DEFAULT_MODE.to_string()
-    } else {
-        entry.mode.trim().to_string()
-    };
+    let enabled = entry.is_enabled();
     let text = if !entry.policy.trim().is_empty() {
         entry.policy.trim().to_string()
     } else {
-        mode_preset(&mode)
-            .unwrap_or(DEFAULT_REPLY_POLICY)
-            .to_string()
+        policy_text(enabled).to_string()
     };
-    (mode, text, source)
+    (enabled, text, source)
 }
 
 fn load_memory_store(data_dir: Option<&str>) -> MemoryStore {
@@ -1501,6 +1619,35 @@ fn node_str_arg(payload: Option<&Value>, top_level: Option<&str>, key: &str) -> 
     }
 }
 
+/// 布尔参数：接受 JSON 布尔，也接受字符串 `"true"` / `"false"`（大小写无关，
+/// 两端空白忽略）。`null` 视同未给。返回值外层 `None` = 没传。
+fn node_bool_arg(
+    payload: Option<&Value>,
+    top_level: Option<&Value>,
+    key: &str,
+) -> Result<Option<bool>, String> {
+    let raw = payload
+        .and_then(|p| p.get(key))
+        .or(top_level)
+        .filter(|value| !value.is_null());
+    match raw {
+        Some(value) => Ok(Some(parse_bool_value(value, key)?)),
+        None => Ok(None),
+    }
+}
+
+fn parse_bool_value(value: &Value, key: &str) -> Result<bool, String> {
+    match value {
+        Value::Bool(flag) => Ok(*flag),
+        Value::String(text) => match text.trim().to_ascii_lowercase().as_str() {
+            "true" => Ok(true),
+            "false" => Ok(false),
+            other => Err(format!("{key} must be true or false, got '{other}'")),
+        },
+        other => Err(format!("{key} must be true or false, got {other}")),
+    }
+}
+
 /// `MM-DD HH:MM` in local time, for the batch header.
 fn format_sent_at(ms: i64) -> String {
     use chrono::{Local, TimeZone};
@@ -1508,6 +1655,16 @@ fn format_sent_at(ms: i64) -> String {
         Some(stamp) => stamp.format("%m-%d %H:%M").to_string(),
         None => String::new(),
     }
+}
+
+/// Clock-only local time (`HH:MM`) for a mute deadline.
+fn format_clock(ms: i64) -> String {
+    use chrono::{Local, TimeZone};
+    Local
+        .timestamp_millis_opt(ms)
+        .single()
+        .map(|stamp| stamp.format("%H:%M").to_string())
+        .unwrap_or_default()
 }
 
 fn now_ms() -> u64 {
@@ -1831,10 +1988,15 @@ fn approve_iteration_decision(role: Option<&str>, user_id: &str, operators: &[St
 /// sender_id is "group:<gid>" or "private:<uid>"; the actual person is
 /// user_id, so identity is "qq:<user_id>".
 fn build_envelope(msg: &IncomingMessage) -> String {
-    // 每条消息都带上「本群生效的模式 + 策略」。配置缺失/损坏只会回落到内置默认，
-    // 所以这里永远构造成功（envelope 失败会丢整条消息）。
+    // 每条消息都带上「本群生效的开关 + 策略」。配置缺失/损坏只会回落到内置默认
+    // （关闭），所以这里永远构造成功（envelope 失败会丢整条消息）。
     let group = (msg.message_type == "group").then_some(msg.sender_id.as_str());
-    let (mode, policy, _source) = effective_policy(None, group);
+    // 群策略只约束群；私聊没有"群开关"，永远按可发言处理。否则新默认
+    // `enabled=false` 会把私聊也变成只读。
+    let (enabled, policy, _source) = match group {
+        Some(group) => effective_policy(None, Some(group)),
+        None => (true, POLICY_TEXT_ENABLED.to_string(), "private"),
+    };
     // 策略放进 `notes`：kernel 只把它随**本次**请求发给模型，不写进 history。
     // 群记忆**不注入**——那是 agent 自己的备忘，需要时用 `qq_get_group_memory` 去读，
     // 每条消息都塞进来只会让绝大多数请求白付 token。
@@ -1842,7 +2004,8 @@ fn build_envelope(msg: &IncomingMessage) -> String {
     // bare uid and got "expected 'group:<id>' or 'private:<id>'", burning a
     // round trip on every such turn.
     let reply_target = format!("{}:{}", msg.message_type, msg.sender_id);
-    let mut notes = format!("[reply policy: {mode} — {policy}] [reply target: {reply_target}]");
+    let state = if enabled { "enabled" } else { "disabled" };
+    let mut notes = format!("[reply policy: {state} — {policy}] [reply target: {reply_target}]");
     // 群记忆按需取用：只在 notes 里留一个指针，正文由模型自己调
     // qq_get_group_memory 读。它无长度上限，无条件注入迟早把上下文撑爆；
     // 但完全不提又等于不存在，所以指针里带上长度，让模型知道值不值得读。
@@ -1908,6 +2071,9 @@ fn build_envelope(msg: &IncomingMessage) -> String {
         "conversation_kind": msg.message_type,
         // 缺省空串：渠道报不出群角色时 runtime 按普通成员处理（安全默认）。
         "sender_role": msg.sender_role.clone().unwrap_or_default(),
+        // 渠道侧事实：本群策略是否允许发言。runtime 据此决定"只看"还是起轮；
+        // 它**不进** notes（机器事实不该占提示词），也绝不写进 history。
+        "policy_enabled": enabled,
         // 批准迭代是渠道侧策略（操作员名单 / 群主管理员），runtime 只执行这个事实。
         "caller_can_approve": caller_can_approve_iteration(msg),
         // 图片地址交给 kernel 处理（下载 + 内联），插件不碰多模态 wire format。
@@ -1950,7 +2116,7 @@ fn start_agent_poller() {
                 queue.drain(..).collect()
             };
             for msg in msgs {
-                if !should_process(&msg.message) {
+                if !should_trigger(&msg) {
                     continue;
                 }
                 cordis_plugin_sdk::agent_trigger(&build_envelope(&msg));
@@ -2631,25 +2797,22 @@ fn handle_qq_set_reply_policy(req: &NodeRequest) -> Result<NodeResponse, String>
     let group = node_str_arg(payload, req.group.as_deref(), "group")
         .map(|g| g.trim().to_string())
         .filter(|g| !g.is_empty());
+    let enabled_arg = node_bool_arg(payload, req.enabled.as_ref(), "enabled")?;
     let mode_raw = node_str_arg(payload, req.mode.as_deref(), "mode");
     let policy_raw = node_str_arg(payload, req.policy.as_deref(), "policy");
 
-    let mode = match mode_raw.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
-        Some(raw) => {
-            if !valid_mode(raw) {
-                return Err(format!(
-                    "unknown mode '{raw}': use quiet | balanced | chatty | one_on_one"
-                ));
-            }
-            Some(raw.to_string())
-        }
-        None => None,
+    // `enabled` 是新的唯一开关；`mode` 只是旧的写法，照样接受并映射过去。
+    let legacy_mode = mode_raw.as_deref().map(str::trim).filter(|m| !m.is_empty());
+    let enabled = match (enabled_arg, legacy_mode) {
+        (Some(value), _) => Some(value),
+        (None, Some(raw)) => Some(enabled_from_mode(raw)?),
+        (None, None) => None,
     };
     let policy = policy_raw
         .map(|p| p.trim().to_string())
         .filter(|p| !p.is_empty());
-    if mode.is_none() && policy.is_none() {
-        return Err("mode or policy is required".to_string());
+    if enabled.is_none() && policy.is_none() {
+        return Err("enabled is required".to_string());
     }
     let actor = authorize_policy_write(req, data_dir.as_deref(), group.as_deref(), "reply policy")?;
 
@@ -2659,8 +2822,10 @@ fn handle_qq_set_reply_policy(req: &NodeRequest) -> Result<NodeResponse, String>
             Some(gid) => store.groups.entry(gid.to_string()).or_default(),
             None => &mut store.default,
         };
-        if let Some(m) = &mode {
-            entry.mode = m.clone();
+        if let Some(value) = enabled {
+            entry.enabled = Some(value);
+            // 旧字段只读：一旦写入新开关就清掉，避免两份真相。
+            entry.mode.clear();
         }
         if let Some(p) = &policy {
             entry.policy = p.clone();
@@ -2669,12 +2834,12 @@ fn handle_qq_set_reply_policy(req: &NodeRequest) -> Result<NodeResponse, String>
         entry.updated_by = "agent".to_string();
     }
     let path = save_policy_store(data_dir.as_deref(), &store)?;
-    let (effective_mode, effective_text, source) =
+    let (effective_enabled, effective_text, source) =
         effective_policy(data_dir.as_deref(), group.as_deref());
     eprintln!(
-        "qq policy: group={} mode={} chars={} by={} source={}",
+        "qq policy: group={} enabled={} chars={} by={} source={}",
         group.as_deref().unwrap_or("<default>"),
-        effective_mode,
+        effective_enabled,
         effective_text.chars().count(),
         actor,
         source
@@ -2686,7 +2851,7 @@ fn handle_qq_set_reply_policy(req: &NodeRequest) -> Result<NodeResponse, String>
         message: Some(format!("reply policy updated at {}", path.display())),
         data: Some(json!({
             "group": group,
-            "mode": effective_mode,
+            "enabled": effective_enabled,
             "policy": effective_text,
             "source": source,
             "path": path.display().to_string(),
@@ -2702,7 +2867,7 @@ fn handle_qq_get_reply_policy(req: &NodeRequest) -> Result<NodeResponse, String>
     let group = node_str_arg(payload, req.group.as_deref(), "group")
         .map(|g| g.trim().to_string())
         .filter(|g| !g.is_empty());
-    let (mode, policy, source) = effective_policy(data_dir.as_deref(), group.as_deref());
+    let (enabled, policy, source) = effective_policy(data_dir.as_deref(), group.as_deref());
     Ok(NodeResponse {
         ok: true,
         node_id: "qq_get_reply_policy".to_string(),
@@ -2710,7 +2875,7 @@ fn handle_qq_get_reply_policy(req: &NodeRequest) -> Result<NodeResponse, String>
         message: None,
         data: Some(json!({
             "group": group,
-            "mode": mode,
+            "enabled": enabled,
             "policy": policy,
             "source": source,
             "is_default": source != "group",
@@ -2814,23 +2979,32 @@ fn handle_qq_system_notify(req: &NodeRequest) -> Result<NodeResponse, String> {
         return Err("no test_groups configured".to_string());
     }
 
-    let base_url = STATE
-        .lock()
-        .ok()
-        .and_then(|s| s.onebot_url.clone())
+    let base_url = req
+        .payload
+        .as_ref()
+        .and_then(|p| p.get("onebot_url"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| STATE.lock().ok().and_then(|s| s.onebot_url.clone()))
         .or_else(|| {
             load_runtime_config().and_then(|c| c.get("onebot_url")?.as_str().map(|s| s.to_string()))
         })
         .ok_or("no OneBot URL configured")?;
-    let token = STATE
-        .lock()
-        .ok()
-        .and_then(|s| s.access_token.clone())
+    let token = req
+        .payload
+        .as_ref()
+        .and_then(|p| p.get("access_token"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| STATE.lock().ok().and_then(|s| s.access_token.clone()))
         .or_else(|| {
             load_runtime_config()
                 .and_then(|c| c.get("access_token")?.as_str().map(|s| s.to_string()))
         });
 
+    let data_dir = node_str_arg(req.payload.as_ref(), req.data_dir.as_deref(), "data_dir");
+    let mut sent: Vec<i64> = Vec::new();
+    let mut refused: Vec<Value> = Vec::new();
     for gid in &test_groups {
         // P1-26: was `.parse().unwrap_or(0)` — a mis-typed / non-numeric
         // group id in the config silently routed the system notify to
@@ -2838,7 +3012,23 @@ fn handle_qq_system_notify(req: &NodeRequest) -> Result<NodeResponse, String> {
         // the real world. Skip bad entries with a warning instead.
         match gid.parse::<i64>() {
             Ok(id) if id > 0 => {
-                let _ = onebot_send_group_msg(&base_url, id, msg, None, token.as_deref());
+                // Same gate as `qq_send`: a disabled or currently muted group
+                // is refused without a `send_group_msg` request.
+                if !policy_allows_group(data_dir.as_deref(), id) {
+                    refused.push(json!({
+                        "group": id,
+                        "error": policy_disabled_error(id),
+                    }));
+                    continue;
+                }
+                if let Some(error) = group_mute_refusal(&base_url, id, token.as_deref()) {
+                    refused.push(json!({ "group": id, "error": error }));
+                    continue;
+                }
+                match onebot_send_group_msg(&base_url, id, msg, None, token.as_deref()) {
+                    Ok(_) => sent.push(id),
+                    Err(error) => refused.push(json!({ "group": id, "error": error })),
+                }
             }
             _ => {
                 eprintln!("[qq_system_notify] skipping invalid group id in test_groups: {gid}");
@@ -2846,13 +3036,19 @@ fn handle_qq_system_notify(req: &NodeRequest) -> Result<NodeResponse, String> {
         }
     }
 
+    let delivered = sent.len();
+    let rejected = refused.len();
     Ok(NodeResponse {
-        ok: true,
+        ok: delivered > 0,
         node_id: "qq_system_notify".to_string(),
         messages: None,
-        message: Some(format!("notified {} groups", test_groups.len())),
-        data: None,
-        error: None,
+        message: Some(format!(
+            "notified {delivered} group(s), refused {rejected}"
+        )),
+        data: Some(json!({ "sent": sent, "refused": refused })),
+        error: (delivered == 0).then(|| {
+            "no test group accepted the notification (read-only or muted)".to_string()
+        }),
     })
 }
 
@@ -2909,6 +3105,63 @@ fn handle_qq_get_group_info(req: &NodeRequest) -> Result<NodeResponse, String> {
     })
 }
 
+/// Suffix on every channel-side refusal: the model must end the turn instead
+/// of retrying `qq_send` until the gate lets it through.
+const STOP_RETRY: &str = "Do not retry this turn — end with suspend.";
+
+/// The reply policy is off: the bot may read this group but never speak.
+fn policy_disabled_error(group_id: i64) -> String {
+    format!(
+        "read-only channel: reply policy is disabled for group {group_id}; \
+         you can read but must not send. {STOP_RETRY}"
+    )
+}
+
+/// The bot is banned in this group until `until_ms`.
+fn muted_error(group_id: i64, until_ms: i64, now_ms: u64) -> String {
+    format!(
+        "muted in group {group_id} until {} ({} minutes left). {STOP_RETRY}",
+        format_clock(until_ms),
+        minutes_until(until_ms, now_ms)
+    )
+}
+
+/// A refusal in the shape the kernel/model expects (`ok:false` + `error`),
+/// rather than a bare `Err` that loses the node id.
+fn refusal(node_id: &str, error: String) -> NodeResponse {
+    NodeResponse {
+        ok: false,
+        node_id: node_id.to_string(),
+        messages: None,
+        message: None,
+        data: None,
+        error: Some(error),
+    }
+}
+
+/// Does the group's reply policy allow speaking at all?
+fn policy_allows_group(data_dir: Option<&str>, group_id: i64) -> bool {
+    effective_policy(data_dir, Some(&group_id.to_string())).0
+}
+
+/// Probe now and turn a confirmed ban into the refusal the model sees.
+///
+/// `NotMuted` clears the recorded ban, so the `[muted: …]` note stops after the
+/// ban is lifted; `Unknown` is not evidence of a ban, so the send is allowed.
+fn group_mute_refusal(base_url: &str, group_id: i64, token: Option<&str>) -> Option<String> {
+    match probe_group_mute(base_url, group_id, token) {
+        GroupMute::Muted(until) => {
+            record_mute(group_id, until);
+            Some(muted_error(group_id, until, now_ms()))
+        }
+        GroupMute::NotMuted => {
+            clear_mute(group_id);
+            None
+        }
+        GroupMute::Unknown => None,
+    }
+}
+
 fn handle_qq_send(req: &NodeRequest) -> Result<NodeResponse, String> {
     let target = req.target.as_deref().unwrap_or("").trim();
     let message = req.message.as_deref().unwrap_or("").trim();
@@ -2919,6 +3172,14 @@ fn handle_qq_send(req: &NodeRequest) -> Result<NodeResponse, String> {
     }
     if message.is_empty() {
         return Err("message is required for qq_send".to_string());
+    }
+
+    let (kind, id) = parse_target(target)?;
+    let data_dir = node_str_arg(req.payload.as_ref(), req.data_dir.as_deref(), "data_dir");
+    // Policy first: a disabled group is refused even when no OneBot URL is
+    // configured, and the refusal is decided without touching the network.
+    if kind == TargetKind::Group && !policy_allows_group(data_dir.as_deref(), id) {
+        return Ok(refusal("qq_send", policy_disabled_error(id)));
     }
 
     // Read config: payload → STATE → config file (persisted by qq_serve).
@@ -2945,7 +3206,14 @@ fn handle_qq_send(req: &NodeRequest) -> Result<NodeResponse, String> {
                 .and_then(|c| c.get("access_token")?.as_str().map(|s| s.to_string()))
         });
 
-    let (kind, id) = parse_target(target)?;
+    // The ban is re-probed before every send: a cached "muted" answer would
+    // otherwise keep the bot silent long after OneBot lifted it.
+    if kind == TargetKind::Group {
+        if let Some(error) = group_mute_refusal(&base_url, id, token.as_deref()) {
+            return Ok(refusal("qq_send", error));
+        }
+    }
+
     let data = match kind {
         TargetKind::Group => {
             onebot_send_group_msg(&base_url, id, message, reply_to, token.as_deref())?
@@ -3221,7 +3489,13 @@ fn docs_value() -> cordis_plugin_sdk::PluginDocs {
                     }
                 }),
                 &["sends HTTP request to OneBot API"],
-                &["no OneBot URL configured", "invalid target format", "message is empty"],
+                &[
+                    "no OneBot URL configured",
+                    "invalid target format",
+                    "message is empty",
+                    "read-only channel: reply policy is disabled for group <id>; you can read but must not send",
+                    "muted in group <id> until <HH:MM> (N minutes left)",
+                ],
     ).with_agent_accessible(),
             node_doc(
                 "qq_get_group_info",
@@ -3322,7 +3596,7 @@ fn docs_value() -> cordis_plugin_sdk::PluginDocs {
             ).with_agent_accessible(),
             node_doc(
                 "qq_get_reply_policy",
-                "Read the reply policy that is EFFECTIVE for a group (omit `group` to read the shared default). Returns the mode (quiet | balanced | chatty | one_on_one), the policy text actually shipped to the model, and where it came from (group | default | builtin).",
+                "Read the reply policy that is EFFECTIVE for a group (omit `group` to read the shared default). Returns whether the bot is allowed to speak (`enabled`: true) or must stay silent (`enabled`: false), the policy text actually shipped to the model, and where it came from (group | default | builtin).",
                 json!({
                     "type": "object", "required": ["node_id"],
                     "properties": {
@@ -3339,7 +3613,7 @@ fn docs_value() -> cordis_plugin_sdk::PluginDocs {
                             "type": "object",
                             "properties": {
                                 "group": { "type": ["string", "null"] },
-                                "mode": { "type": "string" },
+                                "enabled": { "type": "boolean", "description": "false = this group is permanently silent" },
                                 "policy": { "type": "string" },
                                 "source": { "type": "string", "description": "group | default | builtin" },
                                 "is_default": { "type": "boolean" }
@@ -3352,14 +3626,15 @@ fn docs_value() -> cordis_plugin_sdk::PluginDocs {
             ).with_agent_accessible(),
             node_doc(
                 "qq_set_reply_policy",
-                "Persist the reply policy for ONE group (or the shared default when `group` is omitted). Two ways to set it: `mode` picks a preset (quiet = only when named/@; balanced = judge by context; chatty = join in actively; one_on_one = treat as a direct chat), `policy` overrides the preset with free text. Takes effect on the NEXT message — no rebuild, no restart.",
+                "Persist the reply policy for ONE group (or the shared default when `group` is omitted). `enabled: true` ALLOWS the bot to speak but does NOT require it to answer: being @-mentioned or named is not a reason to speak; it should talk only when it genuinely adds information others lack, corrects a mistake, or the message is actually asking it — otherwise stay silent. `enabled: false` (the default) means permanent silence in this group. `policy` overrides the preset text with free text. The legacy `mode` argument still works (quiet/one_on_one = false, balanced/chatty = true) but new calls should use `enabled`. Takes effect on the NEXT message — no rebuild, no restart.",
                 json!({
                     "type": "object", "required": ["node_id"],
                     "properties": {
                         "node_id": { "type": "string", "const": "qq_set_reply_policy" },
                         "group": { "type": "string", "description": "QQ group id; omit to change the shared default" },
-                        "mode": { "type": "string", "enum": ["quiet", "balanced", "chatty", "one_on_one"] },
-                        "policy": { "type": "string", "description": "Optional free-text override (English; shown verbatim)" },
+                        "enabled": { "type": "boolean", "description": "true = allowed to speak (not required to); false = permanent silence" },
+                        "mode": { "type": "string", "enum": ["quiet", "balanced", "chatty", "one_on_one"], "description": "Legacy alias for enabled; kept for old callers" },
+                        "policy": { "type": "string", "description": "Optional free-text override (shown verbatim)" },
                         "data_dir": { "type": "string", "description": "Optional data directory override" }
                     }
                 }),
@@ -3370,6 +3645,7 @@ fn docs_value() -> cordis_plugin_sdk::PluginDocs {
                         "data": {
                             "type": "object",
                             "properties": {
+                                "enabled": { "type": "boolean" },
                                 "policy": { "type": "string" },
                                 "path": { "type": "string" }
                             }
@@ -3377,7 +3653,7 @@ fn docs_value() -> cordis_plugin_sdk::PluginDocs {
                     }
                 }),
                 &["writes data/qq_reply_policies.json"],
-                &["mode or policy is required", "unknown mode"],
+                &["enabled is required", "unknown mode", "enabled must be true or false"],
             ).with_agent_accessible(),
             node_doc(
                 "qq_get_group_memory",
@@ -3439,7 +3715,7 @@ fn docs_value() -> cordis_plugin_sdk::PluginDocs {
             ).with_agent_accessible(),
             node_doc(
                 "qq_system_notify",
-                "Kernel notification handler — receives system messages and forwards to configured test groups.",
+                "Kernel notification handler — receives system messages and forwards to configured test groups. Groups whose reply policy is disabled or that are currently muted are refused; the response lists `sent` and `refused` groups.",
                 json!({
                     "type": "object", "required": ["node_id", "message"],
                     "properties": {
@@ -3456,7 +3732,11 @@ fn docs_value() -> cordis_plugin_sdk::PluginDocs {
                     }
                 }),
                 &["sends QQ message to all configured test_groups"],
-                &["no OneBot URL configured", "no test_groups configured"],
+                &[
+                    "no OneBot URL configured",
+                    "no test_groups configured",
+                    "no test group accepted the notification (read-only or muted)",
+                ],
             ),
         ],
     Some("\
@@ -3469,7 +3749,7 @@ QQ 渠道说明——这里只说怎么发消息，性格和说话方式见人�
 【引用某条消息】把它的 msg=<id> 作为 \"reply_to\":\"<id>\" 传进同一次 qq_send。\n\
 【你的身份】你的 QQ 号是 {setting:bot_uin}；@[id=...] 里的数字等于它才是 @ 你。\n\
 【群记忆】需要时用 qq_get_group_memory / qq_set_group_memory 读写；只记长期有用的，不确定就先读。\n\
-【被禁言】上下文里有 [muted: ...] 或发送报禁言时，别再发，等解禁。")
+【被禁言】[muted: ...] 只是上一轮的探测结果；qq_send 被拒时会说明原因（muted … / read-only …）。同一轮不要重试，直接调 suspend 结束；禁言是否解除以每次 qq_send 的探测为准。")
     )
 }
 
@@ -3882,6 +4162,27 @@ mod chain_tests {
         );
     }
 
+    // 私聊没有群开关：即使群默认被禁用，私聊也必须能起轮。
+    #[test]
+    fn private_messages_stay_writable_when_the_group_default_is_disabled() {
+        let msg = IncomingMessage {
+            message_type: "private".to_string(),
+            sender_id: "789".to_string(),
+            user_id: "789".to_string(),
+            message: "私聊".to_string(),
+            message_id: Some(7),
+            reply_to_msg_id: None,
+            sender_name: None,
+            sender_role: None,
+            sent_at_ms: None,
+            raw_event: None,
+        };
+        let env: Value = serde_json::from_str(&build_envelope(&msg)).expect("env");
+        assert_eq!(env["policy_enabled"], true);
+        let notes = env["notes"].as_str().unwrap_or_default();
+        assert!(notes.starts_with("[reply policy: enabled — "), "{notes}");
+    }
+
     // 渠道报了发送时间就写进 header：没有它，两百条历史是一堵平墙，
     // 模型分不出"两分钟前"和"昨天"，会把一句追问接到旧话题上。
     #[test]
@@ -4207,6 +4508,23 @@ mod reply_policy_tests {
         serde_json::from_value(value).expect("NodeRequest")
     }
 
+    fn set_enabled(
+        node: &str,
+        dir: &std::path::Path,
+        group: Option<&str>,
+        enabled: bool,
+    ) -> NodeRequest {
+        let mut value = json!({
+            "node_id": node,
+            "data_dir": dir.to_str().unwrap_or_default(),
+            "enabled": enabled,
+        });
+        if let Some(g) = group {
+            value["group"] = json!(g);
+        }
+        serde_json::from_value(value).expect("NodeRequest")
+    }
+
     fn set_policy(
         node: &str,
         dir: &std::path::Path,
@@ -4285,51 +4603,51 @@ mod reply_policy_tests {
         });
     }
 
-    // 没有任何配置 → builtin/balanced；显式 default 之后 → default。
+    // 没有任何配置 → builtin/disabled（默认关闭）；显式 default 之后 → default。
     #[test]
     fn effective_policy_falls_back_to_builtin_then_default() {
         let dir = temp_dir();
         let dir_s = dir.to_str().unwrap_or_default();
-        let (mode, text, source) = effective_policy(Some(dir_s), Some("123"));
-        assert_eq!(mode, DEFAULT_MODE);
-        assert_eq!(text, DEFAULT_REPLY_POLICY);
+        let (enabled, text, source) = effective_policy(Some(dir_s), Some("123"));
+        assert!(!enabled, "builtin default must be disabled");
+        assert_eq!(text, POLICY_TEXT_DISABLED);
         assert_eq!(source, "builtin");
 
-        // 显式设置 default 的模式 → 所有没有覆盖的群都跟着走。
+        // 显式把 default 打开 → 所有没有覆盖的群都跟着走。
         let resp =
-            handle_qq_set_reply_policy(&set_mode("qq_set_reply_policy", &dir, None, MODE_QUIET))
-                .expect("set default mode");
+            handle_qq_set_reply_policy(&set_enabled("qq_set_reply_policy", &dir, None, true))
+                .expect("set default enabled");
         assert!(resp.ok);
-        let (mode, text, source) = effective_policy(Some(dir_s), Some("123"));
-        assert_eq!(mode, MODE_QUIET);
+        let (enabled, text, source) = effective_policy(Some(dir_s), Some("123"));
+        assert!(enabled);
         assert_eq!(source, "default");
-        assert!(text.contains("只在被 @"), "preset text: {text}");
+        assert_eq!(text, POLICY_TEXT_ENABLED);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // 群覆盖优先于 default，并且自由文本覆盖模式预设。
+    // 群覆盖优先于 default，并且自由文本覆盖预设文案。
     #[test]
     fn group_override_beats_default_and_free_text_beats_preset() {
         let dir = temp_dir();
         let dir_s = dir.to_str().unwrap_or_default();
-        handle_qq_set_reply_policy(&set_mode("qq_set_reply_policy", &dir, None, MODE_QUIET))
-            .expect("default quiet");
-        handle_qq_set_reply_policy(&set_mode(
+        handle_qq_set_reply_policy(&set_enabled("qq_set_reply_policy", &dir, None, false))
+            .expect("default disabled");
+        handle_qq_set_reply_policy(&set_enabled(
             "qq_set_reply_policy",
             &dir,
             Some("777"),
-            MODE_CHATTY,
+            true,
         ))
-        .expect("group chatty");
-        let (mode, text, source) = effective_policy(Some(dir_s), Some("777"));
-        assert_eq!(mode, MODE_CHATTY);
+        .expect("group enabled");
+        let (enabled, text, source) = effective_policy(Some(dir_s), Some("777"));
+        assert!(enabled);
         assert_eq!(source, "group");
-        assert!(text.contains("这个群愿意你多说"), "{text}");
+        assert_eq!(text, POLICY_TEXT_ENABLED);
         // 别的群仍然吃 default。
-        let (other_mode, _, other_source) = effective_policy(Some(dir_s), Some("888"));
-        assert_eq!(other_mode, MODE_QUIET);
+        let (other_enabled, _, other_source) = effective_policy(Some(dir_s), Some("888"));
+        assert!(!other_enabled);
         assert_eq!(other_source, "default");
-        // 自由文本覆盖预设文案（模式不变）。
+        // 自由文本覆盖预设文案（开关不变）。
         handle_qq_set_reply_policy(&set_policy(
             "qq_set_reply_policy",
             &dir,
@@ -4337,49 +4655,77 @@ mod reply_policy_tests {
             "只回技术问题",
         ))
         .expect("free text");
-        let (mode, text, _) = effective_policy(Some(dir_s), Some("777"));
-        assert_eq!(mode, MODE_CHATTY, "free text must not reset the mode");
+        let (enabled, text, _) = effective_policy(Some(dir_s), Some("777"));
+        assert!(enabled, "free text must not reset the switch");
         assert_eq!(text, "只回技术问题");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // 非法 mode / 两个参数都缺 → 报错，且不落盘。
+    // 非法 mode / 非法 enabled / 两个参数都缺 → 报错，且不落盘。
     #[test]
     fn set_rejects_unknown_mode_and_empty_update() {
         let dir = temp_dir();
+        let dir_s = dir.to_str().unwrap_or_default();
         let err = handle_qq_set_reply_policy(&set_mode("qq_set_reply_policy", &dir, None, "loud"))
             .expect_err("unknown mode");
         assert!(err.starts_with("unknown mode 'loud'"), "err: {err}");
+        assert!(err.contains("use enabled"), "err must point at enabled: {err}");
         let empty: NodeRequest = serde_json::from_value(json!({
             "node_id": "qq_set_reply_policy",
-            "data_dir": dir.to_str().unwrap_or_default(),
+            "data_dir": dir_s,
         }))
         .expect("NodeRequest");
         let err = handle_qq_set_reply_policy(&empty).expect_err("nothing to set");
-        assert_eq!(err, "mode or policy is required");
-        let untouched = !policies_path(Some(dir.to_str().unwrap_or_default())).exists();
+        assert_eq!(err, "enabled is required");
+        // `null` 视同没给。
+        let null_enabled: NodeRequest = serde_json::from_value(json!({
+            "node_id": "qq_set_reply_policy",
+            "data_dir": dir_s,
+            "payload": { "enabled": null },
+        }))
+        .expect("NodeRequest");
+        let err = handle_qq_set_reply_policy(&null_enabled).expect_err("null is not a value");
+        assert_eq!(err, "enabled is required");
+        // 非布尔值给出可读错误。
+        let bad_string: NodeRequest = serde_json::from_value(json!({
+            "node_id": "qq_set_reply_policy",
+            "data_dir": dir_s,
+            "payload": { "enabled": "yes" },
+        }))
+        .expect("NodeRequest");
+        let err = handle_qq_set_reply_policy(&bad_string).expect_err("bad string");
+        assert_eq!(err, "enabled must be true or false, got 'yes'");
+        let bad_number: NodeRequest = serde_json::from_value(json!({
+            "node_id": "qq_set_reply_policy",
+            "data_dir": dir_s,
+            "payload": { "enabled": 1 },
+        }))
+        .expect("NodeRequest");
+        let err = handle_qq_set_reply_policy(&bad_number).expect_err("bad number");
+        assert_eq!(err, "enabled must be true or false, got 1");
+        let untouched = !policies_path(Some(dir_s)).exists();
         assert!(untouched, "a rejected set must not create the file");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // get 先给 builtin，set 之后给 group，并带上 source。
+    // get 先给 builtin（disabled），set 之后给 group，并带上 source。
     #[test]
-    fn get_reports_effective_mode_and_source() {
+    fn get_reports_effective_enabled_and_source() {
         let dir = temp_dir();
         let before =
             handle_qq_get_reply_policy(&policy_req("qq_get_reply_policy", &dir)).expect("get");
-        assert_eq!(data_of(&before)["mode"], DEFAULT_MODE);
+        assert_eq!(data_of(&before)["enabled"], false);
         assert_eq!(data_of(&before)["source"], "builtin");
         assert_eq!(data_of(&before)["is_default"], true);
 
-        let mut req = set_mode("qq_set_reply_policy", &dir, Some("555"), MODE_ONE_ON_ONE);
+        let mut req = set_enabled("qq_set_reply_policy", &dir, Some("555"), true);
         req.node_id = "qq_set_reply_policy".to_string();
-        handle_qq_set_reply_policy(&req).expect("set group mode");
+        handle_qq_set_reply_policy(&req).expect("set group enabled");
 
         let mut get = policy_req("qq_get_reply_policy", &dir);
         get.group = Some("555".to_string());
         let after = handle_qq_get_reply_policy(&get).expect("get group");
-        assert_eq!(data_of(&after)["mode"], MODE_ONE_ON_ONE);
+        assert_eq!(data_of(&after)["enabled"], true);
         assert_eq!(data_of(&after)["source"], "group");
         assert_eq!(data_of(&after)["is_default"], false);
         let _ = std::fs::remove_dir_all(&dir);
@@ -4394,9 +4740,10 @@ mod reply_policy_tests {
             r#"{"policy":"旧规则","updated_by":"agent"}"#,
         )
         .expect("write legacy");
-        let (mode, text, source) = effective_policy(Some(dir.to_str().unwrap_or_default()), None);
+        let (enabled, text, source) = effective_policy(Some(dir.to_str().unwrap_or_default()), None);
         assert_eq!(text, "旧规则");
-        assert_eq!(mode, DEFAULT_MODE);
+        // 旧文件等价于旧的 balanced（语境判断），迁移后是开启。
+        assert!(enabled);
         assert_eq!(source, "default");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -4466,9 +4813,9 @@ mod reply_policy_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // 下发：策略行带 mode 前缀；没写记忆时没有 memory 行；写了就多一行。
+    // 下发：策略行带 enabled/disabled 状态；没写记忆时没有 memory 行；写了就多一行。
     #[test]
-    fn envelope_carries_mode_and_memory_lines() {
+    fn envelope_carries_policy_state_and_memory_lines() {
         with_isolated_fixtures(|root| {
             let data_dir = root.join("data");
             // 策略/记忆放在 envelope 的 `notes` 里（kernel 只随本次请求下发，
@@ -4476,23 +4823,26 @@ mod reply_policy_tests {
             let env: Value = serde_json::from_str(&build_envelope(&sample_msg())).expect("env");
             let notes = env["notes"].as_str().unwrap_or_default().to_string();
             assert!(
-                notes.starts_with(&format!("[reply policy: {DEFAULT_MODE} — ")),
+                notes.starts_with("[reply policy: disabled — "),
                 "notes: {notes}"
             );
+            assert!(notes.contains("保持沉默"), "notes: {notes}");
             assert!(!notes.contains("[group memory:"), "no memory yet: {notes}");
+            // The wake-up decision travels as a machine fact, not as prompt text.
+            assert_eq!(env["policy_enabled"], false);
             let display = display_of(&build_envelope(&sample_msg()));
             let clean = !display.contains("[reply policy");
             assert!(clean, "display must stay clean: {display}");
             let user_text = display.rsplit_once("]: ").map(|(_, t)| t).unwrap_or("");
             assert_eq!(user_text, "hello");
 
-            handle_qq_set_reply_policy(&set_mode(
+            handle_qq_set_reply_policy(&set_enabled(
                 "qq_set_reply_policy",
                 &data_dir,
                 Some("123456"),
-                MODE_CHATTY,
+                true,
             ))
-            .expect("set chatty");
+            .expect("set enabled");
             handle_qq_set_group_memory(&set_memory(
                 "qq_set_group_memory",
                 &data_dir,
@@ -4502,8 +4852,13 @@ mod reply_policy_tests {
             .expect("set memory");
 
             let env: Value = serde_json::from_str(&build_envelope(&sample_msg())).expect("env");
+            assert_eq!(env["policy_enabled"], true);
             let notes = env["notes"].as_str().unwrap_or_default().to_string();
-            assert!(notes.starts_with("[reply policy: chatty — "), "{notes}");
+            assert!(notes.starts_with("[reply policy: enabled — "), "{notes}");
+            assert!(
+                notes.contains("被 @ 或被点名不是发言理由"),
+                "the enabled text must not treat a mention as a reason: {notes}"
+            );
             // Memory is on demand: the notes carry a pointer with its size, not
             // the text. Unconditional injection would eventually blow the
             // context up (memory has no length cap), and saying nothing means
@@ -4529,9 +4884,9 @@ mod reply_policy_tests {
         std::fs::write(dir.join("qq_reply_policies.json"), b"{not json").expect("bad policies");
         std::fs::write(dir.join("qq_group_memory.json"), b"{also bad").expect("bad memory");
         let dir_s = dir.to_str().unwrap_or_default();
-        let (mode, text, source) = effective_policy(Some(dir_s), Some("1"));
-        assert_eq!(mode, DEFAULT_MODE);
-        assert_eq!(text, DEFAULT_REPLY_POLICY);
+        let (enabled, text, source) = effective_policy(Some(dir_s), Some("1"));
+        assert!(!enabled);
+        assert_eq!(text, POLICY_TEXT_DISABLED);
         assert_eq!(source, "builtin");
         assert!(group_memory(Some(dir_s), Some("1")).is_none());
         let _ = std::fs::remove_dir_all(&dir);
@@ -4544,11 +4899,11 @@ mod reply_policy_tests {
         let blocker = dir.join("blocker");
         std::fs::write(&blocker, b"not a directory").expect("write blocker file");
         let unreachable = blocker.join("sub");
-        let err = handle_qq_set_reply_policy(&set_mode(
+        let err = handle_qq_set_reply_policy(&set_enabled(
             "qq_set_reply_policy",
             &unreachable,
             None,
-            MODE_QUIET,
+            false,
         ))
         .expect_err("create_dir_all under a regular file must fail");
         let is_create_error = err.starts_with("create data dir:");
@@ -4562,7 +4917,7 @@ mod reply_policy_tests {
         let dir = temp_dir();
         std::fs::create_dir_all(dir.join("qq_reply_policies.json")).expect("occupy target path");
         let err =
-            handle_qq_set_reply_policy(&set_mode("qq_set_reply_policy", &dir, None, MODE_QUIET))
+            handle_qq_set_reply_policy(&set_enabled("qq_set_reply_policy", &dir, None, false))
                 .expect_err("writing over a directory must fail");
         let is_write_error = err.starts_with("write reply policies:");
         assert!(is_write_error, "err: {err}");
@@ -4850,23 +5205,9 @@ mod role_tests {
 #[cfg(test)]
 mod mute_tests {
     use super::{
-        clear_mute, looks_like_mute_error, mute_deadline_ms, mute_note, mute_until_for, record_mute,
+        cache_mute_probe, cached_mute_probe, clear_mute, forget_mute_probe, minutes_until,
+        mute_deadline_ms, mute_note, mute_until_for, record_mute, GroupMute, MUTE_PROBE_TTL_MS,
     };
-
-    #[test]
-    fn wording_recognises_a_group_ban() {
-        for wording in [
-            "你已被禁言",
-            "该群全员禁言中",
-            "bot is muted",
-            "shut up",
-        ] {
-            assert!(looks_like_mute_error(wording), "{wording}");
-        }
-        for wording in ["bad request", "retcode=100", "invalid token"] {
-            assert!(!looks_like_mute_error(wording), "{wording}");
-        }
-    }
 
     // `shut_up_timestamp` is in seconds; 0 means "not muted".
     #[test]
@@ -4887,6 +5228,14 @@ mod mute_tests {
     }
 
     #[test]
+    fn minutes_round_up_and_never_go_negative() {
+        assert_eq!(minutes_until(1_000_000, 1_000_000), 0);
+        assert_eq!(minutes_until(1_060_000, 1_000_000), 1);
+        assert_eq!(minutes_until(1_060_001, 1_000_000), 2);
+        assert_eq!(minutes_until(999_000, 1_000_000), 0);
+    }
+
+    #[test]
     fn table_remembers_expires_and_clears() {
         let group = 987_654_321;
         clear_mute(group);
@@ -4899,6 +5248,525 @@ mod mute_tests {
         assert_eq!(mute_until_for(group), None, "expired entries are ignored");
         clear_mute(group);
         assert_eq!(mute_until_for(group), None);
+    }
+
+    // The probe cache keeps a fresh answer, drops a stale one, and a new group
+    // starts empty. This is the TTL that stops a busy group from probing every
+    // single message.
+    #[test]
+    fn probe_cache_honours_the_ttl_and_is_per_group() {
+        let group = 987_654_322;
+        let other = 987_654_323;
+        forget_mute_probe(group);
+        forget_mute_probe(other);
+        assert_eq!(cached_mute_probe(group, 10_000), None, "cold cache");
+
+        cache_mute_probe(group, 10_000, GroupMute::NotMuted);
+        assert_eq!(cached_mute_probe(group, 10_000), Some(GroupMute::NotMuted));
+        assert_eq!(
+            cached_mute_probe(group, 10_000 + MUTE_PROBE_TTL_MS - 1),
+            Some(GroupMute::NotMuted),
+            "within the TTL the cached answer wins"
+        );
+        assert_eq!(
+            cached_mute_probe(group, 10_000 + MUTE_PROBE_TTL_MS),
+            None,
+            "at the TTL the answer is stale"
+        );
+        assert_eq!(cached_mute_probe(other, 10_000), None);
+
+        // Overwriting an existing entry does not append a duplicate.
+        cache_mute_probe(group, 20_000, GroupMute::Muted(99_000));
+        assert_eq!(cached_mute_probe(group, 20_000), Some(GroupMute::Muted(99_000)));
+        forget_mute_probe(group);
+        assert_eq!(cached_mute_probe(group, 20_000), None);
+        forget_mute_probe(other);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// 发送闸门：disabled / muted 必须在 `qq_send` 这一层被拒，且不触网。
+// 这里用一个本地 tiny_http 假 OneBot 覆盖三态探测（0 / 未来时间戳 / 探测失败），
+// 不连任何真实地址。
+// ═══════════════════════════════════════════════════════════════════════
+#[cfg(test)]
+mod send_gate_tests {
+    use super::test_support::{temp_dir, with_isolated_fixtures};
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    /// What the fake OneBot answers for the probe endpoints.
+    #[derive(Clone, Copy)]
+    enum ProbeAnswer {
+        /// Well-formed login + member record; the timestamp comes from the atom.
+        Ok,
+        /// Login succeeds but carries no `user_id`.
+        NoUser,
+        /// Member record succeeds but carries no `shut_up_timestamp`.
+        NoTimestamp,
+        /// `get_login_info` answers `status: failed`.
+        Failed,
+    }
+
+    struct FakeOneBot {
+        url: String,
+        paths: Arc<Mutex<Vec<String>>>,
+        shut_up: Arc<AtomicI64>,
+        probe: Arc<Mutex<ProbeAnswer>>,
+        send_fails: Arc<AtomicBool>,
+    }
+
+    impl FakeOneBot {
+        fn spawn(shut_up_seconds: i64) -> Self {
+            let server = tiny_http::Server::http("127.0.0.1:0").expect("bind fake OneBot");
+            let port = server
+                .server_addr()
+                .to_ip()
+                .expect("fake server must listen on an IP socket")
+                .port();
+            let paths = Arc::new(Mutex::new(Vec::new()));
+            let shut_up = Arc::new(AtomicI64::new(shut_up_seconds));
+            let probe = Arc::new(Mutex::new(ProbeAnswer::Ok));
+            let send_fails = Arc::new(AtomicBool::new(false));
+            let (paths2, shut_up2, probe2, send_fails2) = (
+                paths.clone(),
+                shut_up.clone(),
+                probe.clone(),
+                send_fails.clone(),
+            );
+            thread::spawn(move || {
+                for request in server.incoming_requests() {
+                    paths2
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner())
+                        .push(request.url().to_string());
+                    let mode = *probe2.lock().unwrap_or_else(|poison| poison.into_inner());
+                    let reply = fake_reply(
+                        request.url(),
+                        mode,
+                        shut_up2.load(Ordering::SeqCst),
+                        send_fails2.load(Ordering::SeqCst),
+                    );
+                    let header =
+                        tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
+                            .expect("static header is valid");
+                    let _ = request.respond(tiny_http::Response::from_string(reply.to_string()).with_header(header));
+                }
+            });
+            Self {
+                url: format!("http://127.0.0.1:{port}"),
+                paths,
+                shut_up,
+                probe,
+                send_fails,
+            }
+        }
+
+        fn requests(&self) -> Vec<String> {
+            self.paths
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .clone()
+        }
+
+        fn sent(&self) -> bool {
+            self.requests()
+                .iter()
+                .any(|path| path.ends_with("/send_group_msg"))
+        }
+
+        fn set_shut_up(&self, seconds: i64) {
+            self.shut_up.store(seconds, Ordering::SeqCst);
+        }
+
+        fn set_probe(&self, answer: ProbeAnswer) {
+            *self.probe.lock().unwrap_or_else(|poison| poison.into_inner()) = answer;
+        }
+
+        fn fail_sends(&self) {
+            self.send_fails.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn fake_reply(
+        url: &str,
+        probe: ProbeAnswer,
+        shut_up: i64,
+        send_fails: bool,
+    ) -> Value {
+        if url.ends_with("/get_login_info") {
+            return match probe {
+                ProbeAnswer::Failed => {
+                    json!({"status":"failed","retcode":1404,"wording":"no login info"})
+                }
+                ProbeAnswer::NoUser => json!({"status":"ok","retcode":0,"data":{}}),
+                _ => json!({"status":"ok","retcode":0,"data":{"user_id":10000}}),
+            };
+        }
+        if url.ends_with("/get_group_member_info") {
+            return match probe {
+                ProbeAnswer::NoTimestamp => json!({"status":"ok","retcode":0,"data":{}}),
+                _ => json!({"status":"ok","retcode":0,"data":{"shut_up_timestamp":shut_up}}),
+            };
+        }
+        if url.ends_with("/send_group_msg") {
+            return if send_fails {
+                json!({"status":"failed","retcode":100,"wording":"send failed"})
+            } else {
+                json!({"status":"ok","retcode":0,"data":{"message_id":1}})
+            };
+        }
+        json!({"status":"ok","retcode":0,"data":{}})
+    }
+
+    fn set_policy(dir: &std::path::Path, group: i64, enabled: bool) {
+        let req: NodeRequest = serde_json::from_value(json!({
+            "node_id": "qq_set_reply_policy",
+            "data_dir": dir.to_str().unwrap_or_default(),
+            "group": group.to_string(),
+            "enabled": enabled,
+        }))
+        .expect("NodeRequest");
+        handle_qq_set_reply_policy(&req).expect("policy write");
+    }
+
+    fn send_req(dir: &std::path::Path, url: &str, group: i64) -> NodeRequest {
+        serde_json::from_value(json!({
+            "node_id": "qq_send",
+            "data_dir": dir.to_str().unwrap_or_default(),
+            "target": format!("group:{group}"),
+            "message": "hello",
+            "payload": {"onebot_url": url},
+        }))
+        .expect("NodeRequest")
+    }
+
+    fn refusal_error(resp: NodeResponse) -> String {
+        assert!(!resp.ok);
+        assert_eq!(resp.node_id, "qq_send");
+        resp.error.expect("refusal carries an error")
+    }
+
+    // disabled：返回 read-only 文案，且连 OneBot 都不连（URL 指向必然拒绝的端口）。
+    #[test]
+    fn disabled_group_is_refused_before_any_network() {
+        let dir = temp_dir();
+        let group = 910_000_001;
+        set_policy(&dir, group, false);
+        let resp = handle_qq_send(&send_req(&dir, "http://127.0.0.1:1", group)).expect("refusal");
+        let error = refusal_error(resp);
+        assert!(error.starts_with(&format!(
+            "read-only channel: reply policy is disabled for group {group}; you can read but must not send"
+        )));
+        assert!(error.ends_with(STOP_RETRY), "{error}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // muted：拒绝文案带 HH:MM 与剩余分钟数，且没有 send_group_msg 请求。
+    #[test]
+    fn muted_group_is_refused_with_minutes_and_no_send() {
+        let dir = temp_dir();
+        let group = 910_000_002;
+        set_policy(&dir, group, true);
+        let now = now_ms();
+        let fake = FakeOneBot::spawn((now / 1000 + 600) as i64);
+        forget_mute_probe(group);
+        let error = refusal_error(handle_qq_send(&send_req(&dir, &fake.url, group)).expect("refusal"));
+        assert!(error.starts_with(&format!("muted in group {group} until ")), "{error}");
+        assert!(error.contains(" minutes left). "), "{error}");
+        assert!(error.ends_with(STOP_RETRY), "{error}");
+        let minutes: i64 = error
+            .split('(')
+            .nth(1)
+            .and_then(|rest| rest.split(' ').next())
+            .and_then(|n| n.parse().ok())
+            .expect("minutes left");
+        assert!((9..=10).contains(&minutes), "{error}");
+        assert!(mute_until_for(group).is_some(), "confirmed ban is recorded");
+        assert!(!fake.sent(), "no send_group_msg may be attempted: {:?}", fake.requests());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // B：禁言从未来变 0 之后，下一次发送会重新探测并真的发出去。
+    #[test]
+    fn lifting_the_ban_lets_the_next_send_through() {
+        let dir = temp_dir();
+        let group = 910_000_003;
+        set_policy(&dir, group, true);
+        let fake = FakeOneBot::spawn((now_ms() / 1000 + 600) as i64);
+        forget_mute_probe(group);
+        let error = refusal_error(handle_qq_send(&send_req(&dir, &fake.url, group)).expect("refusal"));
+        assert!(error.contains("muted in group"), "{error}");
+        assert!(!fake.sent());
+
+        fake.set_shut_up(0);
+        forget_mute_probe(group);
+        let resp = handle_qq_send(&send_req(&dir, &fake.url, group)).expect("send");
+        assert!(resp.ok, "{:?}", resp.error);
+        assert!(fake.sent(), "the lifted ban must allow send_group_msg");
+        assert_eq!(mute_until_for(group), None, "the recorded ban is cleared");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // 只读群没有起轮这回事，短消息（"ok"/"哈哈"）也必须进 history；
+    // 可发言的群仍由噪音过滤挡掉，私聊同理。
+    #[test]
+    fn read_only_groups_keep_short_messages_as_history() {
+        with_isolated_fixtures(|root| {
+            let data_dir = root.join("data");
+            std::fs::create_dir_all(&data_dir).expect("data dir");
+            std::fs::write(
+                data_dir.join("qq_reply_policies.json"),
+                json!({
+                    "default": {"enabled": false},
+                    "groups": {"111": {"enabled": true}}
+                })
+                .to_string(),
+            )
+            .expect("write policy");
+            let message = |kind: &str, group: &str, text: &str| IncomingMessage {
+                message_type: kind.to_string(),
+                sender_id: group.to_string(),
+                user_id: "789".to_string(),
+                message: text.to_string(),
+                message_id: Some(1),
+                reply_to_msg_id: None,
+                sender_name: None,
+                sender_role: None,
+                sent_at_ms: None,
+                raw_event: None,
+            };
+            assert!(
+                should_trigger(&message("group", "123456", "ok")),
+                "a read-only group keeps short messages as history"
+            );
+            assert!(
+                !should_trigger(&message("group", "111", "ok")),
+                "an enabled group still filters noise"
+            );
+            assert!(
+                should_trigger(&message("group", "111", "这是一条正常消息")),
+                "a normal message always triggers"
+            );
+            assert!(
+                !should_trigger(&message("private", "789", "ok")),
+                "private short noise is still filtered"
+            );
+        });
+    }
+
+    // 私聊不受群策略/禁言闸门影响（群号相同的策略行也不该拦 private）。
+    #[test]
+    fn private_targets_bypass_the_group_gate() {
+        let dir = temp_dir();
+        set_policy(&dir, 910_000_009, false);
+        let fake = FakeOneBot::spawn(0);
+        let req: NodeRequest = serde_json::from_value(json!({
+            "node_id": "qq_send",
+            "data_dir": dir.to_str().unwrap_or_default(),
+            "target": "private:12345",
+            "message": "hello",
+            "payload": {"onebot_url": fake.url},
+        }))
+        .expect("NodeRequest");
+        let resp = handle_qq_send(&req).expect("private send");
+        assert!(resp.ok, "{:?}", resp.error);
+        assert!(fake
+            .requests()
+            .iter()
+            .any(|path| path.ends_with("/send_private_msg")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // 探测失败（OneBot 不可用）不是禁言证据：照常发送。
+    #[test]
+    fn unknown_probe_allows_the_send() {
+        let dir = temp_dir();
+        let group = 910_000_004;
+        set_policy(&dir, group, true);
+        let fake = FakeOneBot::spawn(0);
+        fake.set_probe(ProbeAnswer::Failed);
+        forget_mute_probe(group);
+        let resp = handle_qq_send(&send_req(&dir, &fake.url, group)).expect("send");
+        assert!(resp.ok, "{:?}", resp.error);
+        assert!(fake.sent());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // 三态：0 → NotMuted；未来时间戳 → Muted；缺字段 / 接口失败 → Unknown。
+    #[test]
+    fn probe_returns_the_three_states() {
+        let now = 1_700_000_000_000u64;
+
+        let ok = FakeOneBot::spawn(0);
+        let group = 910_000_005;
+        forget_mute_probe(group);
+        assert_eq!(probe_group_mute_at(&ok.url, group, None, now), GroupMute::NotMuted);
+        let until = (now / 1000 + 60) * 1000;
+        ok.set_shut_up((now / 1000 + 60) as i64);
+        // Within the TTL the cached `NotMuted` wins even though OneBot would
+        // now report a ban; after the TTL the fresh answer is used.
+        assert_eq!(
+            probe_group_mute_at(&ok.url, group, None, now + 1_000),
+            GroupMute::NotMuted
+        );
+        assert_eq!(
+            probe_group_mute_at(&ok.url, group, None, now + MUTE_PROBE_TTL_MS),
+            GroupMute::Muted(until as i64)
+        );
+
+        let no_user = FakeOneBot::spawn(0);
+        no_user.set_probe(ProbeAnswer::NoUser);
+        let group = 910_000_006;
+        forget_mute_probe(group);
+        assert_eq!(probe_group_mute_at(&no_user.url, group, None, now), GroupMute::Unknown);
+
+        let no_stamp = FakeOneBot::spawn(0);
+        no_stamp.set_probe(ProbeAnswer::NoTimestamp);
+        let group = 910_000_007;
+        forget_mute_probe(group);
+        assert_eq!(probe_group_mute_at(&no_stamp.url, group, None, now), GroupMute::Unknown);
+
+        let failed = FakeOneBot::spawn(0);
+        failed.set_probe(ProbeAnswer::Failed);
+        let group = 910_000_008;
+        forget_mute_probe(group);
+        assert_eq!(probe_group_mute_at(&failed.url, group, None, now), GroupMute::Unknown);
+    }
+
+    // 文案本身：disabled / muted 都要明确说"本轮不要再试"。
+    #[test]
+    fn refusal_text_names_the_group_and_forbids_retrying() {
+        assert_eq!(
+            policy_disabled_error(42),
+            "read-only channel: reply policy is disabled for group 42; you can read but must not send. Do not retry this turn — end with suspend."
+        );
+        let until = 1_700_000_000_000i64;
+        let muted = muted_error(42, until, (until - 37 * 60_000) as u64);
+        assert!(muted.starts_with("muted in group 42 until "), "{muted}");
+        assert!(muted.ends_with("(37 minutes left). Do not retry this turn — end with suspend."), "{muted}");
+        assert_eq!(format_clock(until).len(), 5);
+        assert_eq!(&format_clock(until)[2..3], ":");
+    }
+
+    fn write_runtime_config(root: &std::path::Path, groups: &[i64]) {
+        write_runtime_config_with_url(root, groups, "");
+    }
+
+    fn write_runtime_config_with_url(root: &std::path::Path, groups: &[i64], url: &str) {
+        let dir = root.join("fixtures").join(".cordis-drafts");
+        std::fs::create_dir_all(&dir).expect("runtime config dir");
+        let groups: Vec<String> = groups.iter().map(i64::to_string).collect();
+        let mut config = json!({ "test_groups": groups });
+        if !url.is_empty() {
+            config["onebot_url"] = json!(url);
+        }
+        std::fs::write(
+            dir.join("qq_runtime_config.json"),
+            config.to_string(),
+        )
+        .expect("write runtime config");
+    }
+
+    fn notify_req(dir: &std::path::Path, url: &str) -> NodeRequest {
+        serde_json::from_value(json!({
+            "node_id": "qq_system_notify",
+            "message": "notice",
+            "payload": {
+                "onebot_url": url,
+                "data_dir": dir.to_str().unwrap_or_default(),
+            },
+        }))
+        .expect("NodeRequest")
+    }
+
+    // 系统通知同样被 disabled 闸门拦下，且不触网。
+    #[test]
+    fn system_notify_refuses_disabled_groups_without_network() {
+        with_isolated_fixtures(|root| {
+            write_runtime_config(root, &[920_000_001, 0]);
+            let data_dir = root.join("data");
+            set_policy(&data_dir, 920_000_001, false);
+            let resp = handle_qq_system_notify(&notify_req(&data_dir, "http://127.0.0.1:1"))
+                .expect("notify");
+            assert!(!resp.ok);
+            assert!(resp.error.unwrap_or_default().contains("read-only or muted"));
+            let data = resp.data.expect("data");
+            assert!(data["sent"].as_array().unwrap().is_empty());
+            let refused = data["refused"].as_array().expect("refused");
+            assert_eq!(refused.len(), 1);
+            assert!(refused[0]["error"].as_str().unwrap().starts_with("read-only channel:"));
+        });
+    }
+
+    // 系统通知：禁言时拒发；解禁后真的发出去。
+    #[test]
+    fn system_notify_skips_muted_then_sends_after_the_ban_lifts() {
+        with_isolated_fixtures(|root| {
+            write_runtime_config(root, &[920_000_002]);
+            let data_dir = root.join("data");
+            set_policy(&data_dir, 920_000_002, true);
+            let fake = FakeOneBot::spawn((now_ms() / 1000 + 600) as i64);
+            forget_mute_probe(920_000_002);
+            let refused = handle_qq_system_notify(&notify_req(&data_dir, &fake.url))
+                .expect("notify");
+            assert!(!refused.ok);
+            let data = refused.data.expect("data");
+            let errors = data["refused"].as_array().expect("refused");
+            assert!(errors[0]["error"].as_str().unwrap().starts_with("muted in group"));
+            assert!(!fake.sent());
+
+            fake.set_shut_up(0);
+            forget_mute_probe(920_000_002);
+            let sent = handle_qq_system_notify(&notify_req(&data_dir, &fake.url)).expect("notify");
+            assert!(sent.ok, "{:?}", sent.error);
+            let data = sent.data.expect("data");
+            assert_eq!(data["sent"], json!([920_000_002]));
+            assert!(data["refused"].as_array().unwrap().is_empty());
+            assert!(fake.sent());
+        });
+    }
+
+    // 没给 payload.onebot_url 时回落到 runtime config 的地址。
+    #[test]
+    fn system_notify_falls_back_to_the_runtime_config_url() {
+        with_isolated_fixtures(|root| {
+            let fake = FakeOneBot::spawn(0);
+            write_runtime_config_with_url(root, &[920_000_004], &fake.url);
+            let data_dir = root.join("data");
+            set_policy(&data_dir, 920_000_004, true);
+            forget_mute_probe(920_000_004);
+            let req: NodeRequest = serde_json::from_value(json!({
+                "node_id": "qq_system_notify",
+                "message": "notice",
+                "payload": { "data_dir": data_dir.to_str().unwrap_or_default() },
+            }))
+            .expect("NodeRequest");
+            let resp = handle_qq_system_notify(&req).expect("notify");
+            assert!(resp.ok, "{:?}", resp.error);
+            assert!(fake.sent());
+        });
+    }
+
+    // 系统通知：OneBot 发送失败也要落到 refused，而不是静默成功。
+    #[test]
+    fn system_notify_reports_send_failures() {
+        with_isolated_fixtures(|root| {
+            write_runtime_config(root, &[920_000_003]);
+            let data_dir = root.join("data");
+            set_policy(&data_dir, 920_000_003, true);
+            let fake = FakeOneBot::spawn(0);
+            fake.fail_sends();
+            forget_mute_probe(920_000_003);
+            let resp = handle_qq_system_notify(&notify_req(&data_dir, &fake.url)).expect("notify");
+            assert!(!resp.ok);
+            let data = resp.data.expect("data");
+            assert!(data["sent"].as_array().unwrap().is_empty());
+            let refused = data["refused"].as_array().expect("refused");
+            assert!(refused[0]["error"].as_str().unwrap().contains("OneBot API error"));
+            let _ = std::fs::remove_dir_all(&data_dir);
+        });
     }
 }
 
@@ -5052,17 +5920,20 @@ mod image_url_tests {
         assert!(urls.is_empty());
     }
 
-    // 默认策略必须是"按语境判断"，而不是旧的清单式 ONLY if。
+    // 默认文案是"本群不允许发言"；开启后的文案明确"被 @ 不是发言理由"。
     #[test]
-    fn default_policy_is_context_based() {
-        let policy = DEFAULT_REPLY_POLICY;
-        // One line, in the room's voice: the mode no longer ships a manual.
-        assert!(policy.contains("像群里的普通成员"), "{policy}");
-        assert!(policy.chars().count() < 80, "policy must stay short: {policy}");
-        assert!(
-            !policy.contains("Otherwise stay silent."),
-            "旧清单式收尾不应再出现: {policy}"
-        );
+    fn default_policy_text_matches_the_boolean_switch() {
+        let disabled = policy_text(false);
+        assert_eq!(disabled, POLICY_TEXT_DISABLED);
+        assert!(disabled.contains("不允许你发言"), "{disabled}");
+        assert!(disabled.contains("不要调用 qq_send"), "{disabled}");
+
+        let enabled = policy_text(true);
+        assert_eq!(enabled, POLICY_TEXT_ENABLED);
+        assert!(enabled.contains("允许你发言"), "{enabled}");
+        assert!(enabled.contains("不要求你回应"), "{enabled}");
+        assert!(enabled.contains("被 @ 或被点名不是发言理由"), "{enabled}");
+        assert!(enabled.contains("没有正面价值就保持沉默"), "{enabled}");
     }
 }
 

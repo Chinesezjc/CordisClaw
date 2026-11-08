@@ -54,8 +54,11 @@ impl cordis_runtime::agent_loop::AgentSessionApi for imp::AgentSession {
     fn history_len(&self) -> usize {
         imp::AgentSession::history_len(self)
     }
-    fn compact_history(&mut self) -> (usize, usize) {
-        imp::AgentSession::compact_history(self)
+    fn compact_history(
+        &mut self,
+        provider: Option<&dyn cordis_runtime::agent_api::LlmProvider>,
+    ) -> (usize, usize) {
+        imp::AgentSession::compact_history(self, provider)
     }
     fn swap_config(
         &mut self,
@@ -92,6 +95,9 @@ impl cordis_runtime::agent_loop::AgentSessionApi for imp::AgentSession {
     }
     fn inject_exchange(&mut self, user_input: &str, assistant_output: &str) {
         imp::AgentSession::inject_exchange(self, user_input, assistant_output)
+    }
+    fn ingest_user_message(&mut self, user_input: &str) {
+        imp::AgentSession::ingest_user_message(self, user_input)
     }
     fn to_snapshot(&self) -> cordis_runtime::agent_api::AgentSessionSnapshot {
         imp::AgentSession::to_snapshot(self)
@@ -168,5 +174,27 @@ mod tests {
     fn a_second_install_is_ignored() {
         ensure_installed();
         assert!(!install());
+    }
+
+    // The trait delegate for compaction must reach the real session (not just
+    // the inherent method the agent tests call).
+    #[test]
+    fn trait_compact_history_delegates_to_the_session() {
+        let mut session = CargoAgentLoop
+            .create(LlmApiConfig::default(), "runtime_shell")
+            .expect("create a session");
+        assert_eq!(session.compact_history(None), (0, 0));
+    }
+
+    // The trait delegate for read-only ingestion must reach the real session
+    // (not just the inherent method the agent tests call).
+    #[test]
+    fn trait_ingest_delegates_to_the_session() {
+        let mut session = CargoAgentLoop
+            .create(LlmApiConfig::default(), "runtime_shell")
+            .expect("create a session");
+        assert_eq!(session.history_len(), 0);
+        session.ingest_user_message("read-only channel context");
+        assert_eq!(session.history_len(), 1);
     }
 }
