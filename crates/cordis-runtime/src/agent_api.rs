@@ -23,6 +23,15 @@ pub trait AgentToolHost {
     /// The answer is evidence, not a summary: each signature carries how often
     /// it happens, which sessions hit it, and one example. That is what an
     /// iteration needs to act on a failure instead of guessing at it.
+    /// A short, cacheable summary of the failures that repeat most, for the
+    /// system prompt. `None` when there is nothing worth saying.
+    ///
+    /// This is what couples the report to the model: without it the check only
+    /// answers when asked, and a model that never asks learns nothing.
+    fn agent_self_check_digest(&self) -> Option<String> {
+        None
+    }
+
     fn agent_self_check(&self) -> Result<Value, RuntimeError> {
         Err(RuntimeError::InvalidArgument {
             message: "this host cannot inspect agent transcripts".to_string(),

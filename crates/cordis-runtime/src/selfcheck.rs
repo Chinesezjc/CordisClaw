@@ -158,6 +158,45 @@ impl SelfCheck {
     }
 }
 
+/// A short block for the system prompt: the failures worth naming every turn.
+///
+/// Counted from the bot's own transcripts, so it is a fact about this instance
+/// rather than a generic rule. Kept to a few lines: it rides on every request,
+/// and a long report would cost more than it teaches.
+pub fn digest(report: &SelfCheck, top: usize) -> Option<String> {
+    let mut lines: Vec<String> = report
+        .signatures
+        .iter()
+        .filter(|signature| signature.count >= 5)
+        .take(top)
+        .map(|signature| {
+            format!(
+                "- {} × {} ({})",
+                signature.kind.as_str(),
+                signature.count,
+                match signature.kind {
+                    Kind::Empty => "turns that produced nothing at all",
+                    Kind::NoToolCall => "replies with no tool call, so nothing was sent",
+                    Kind::UnparsedDsml => "turns of tool markup that did not parse",
+                    Kind::ProviderError => "provider failures recorded as turns",
+                    Kind::Repeated => "the same reply repeated verbatim",
+                }
+            )
+        })
+        .collect();
+    if lines.is_empty() {
+        return None;
+    }
+    let mut text = String::from(
+        "--- Your own failure record ---\n\n\
+         These are counted from your past turns in this deployment, not rules:\n",
+    );
+    text.push_str(&lines.join("\n"));
+    text.push_str("\n\nAvoid repeating them. Call `get_self_check` when you want the examples.\n");
+    lines.clear();
+    Some(text)
+}
+
 /// Classify one assistant turn, if it is a failure.
 pub fn classify(content: &str) -> Option<(Kind, String)> {
     let trimmed = content.trim();
@@ -503,6 +542,40 @@ mod tests {
         let text = report.instruction(&signature);
         assert!(text.contains("Already tried"), "{text}");
         assert!(text.contains("prompt rewrite"), "{text}");
+    }
+
+    #[test]
+    fn the_digest_names_only_the_failures_worth_naming() {
+        let report = SelfCheck {
+            signatures: vec![
+                Signature {
+                    kind: Kind::Empty,
+                    excerpt: "(empty)".to_string(),
+                    count: 1636,
+                    sessions: Vec::new(),
+                    first_turn: 0,
+                    last_turn: 0,
+                },
+                Signature {
+                    kind: Kind::NoToolCall,
+                    excerpt: "hi".to_string(),
+                    count: 2,
+                    sessions: Vec::new(),
+                    first_turn: 0,
+                    last_turn: 0,
+                },
+            ],
+            ..SelfCheck::default()
+        };
+        let text = digest(&report, 3).expect("digest");
+        assert!(text.contains("empty × 1636"), "{text}");
+        assert!(!text.contains("no_tool_call"), "{text}");
+        assert!(text.contains("get_self_check"), "{text}");
+    }
+
+    #[test]
+    fn no_failures_means_no_digest() {
+        assert!(digest(&SelfCheck::default(), 3).is_none());
     }
 
     #[test]

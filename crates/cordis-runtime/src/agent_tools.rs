@@ -231,6 +231,28 @@ impl AgentToolHost for RuntimeHost {
         to_json_value("kernel issues", self.kernel().plugin_issues())
     }
 
+    fn agent_self_check_digest(&self) -> Option<String> {
+        // The scan walks every snapshot; a session asks on every turn, so the
+        // answer is cached and refreshed slowly.
+        /// Cached digest plus the moment it was taken.
+        type DigestCache = std::sync::OnceLock<
+            std::sync::Mutex<Option<(std::time::Instant, Option<String>)>>,
+        >;
+        static CACHE: DigestCache = std::sync::OnceLock::new();
+        let cache = CACHE.get_or_init(|| std::sync::Mutex::new(None));
+        let mut guard = cache.lock().unwrap_or_else(|poison| poison.into_inner());
+        if let Some((when, digest)) = guard.as_ref() {
+            if when.elapsed() < std::time::Duration::from_secs(600) {
+                return digest.clone();
+            }
+        }
+        let root = crate::host::RuntimeHost::data_dir(self).join("sessions");
+        let report = crate::selfcheck::scan(&root);
+        let digest = crate::selfcheck::digest(&report, 3);
+        *guard = Some((std::time::Instant::now(), digest.clone()));
+        digest
+    }
+
     fn agent_self_check(&self) -> Result<Value, RuntimeError> {
         let root = crate::host::RuntimeHost::data_dir(self).join("sessions");
         let report = crate::selfcheck::scan(&root);

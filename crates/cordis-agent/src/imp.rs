@@ -1810,6 +1810,12 @@ impl<'a, H: AgentToolHost + ?Sized> AgentBackend for RuntimeShellAgentBackend<'a
         }
         prompt.push_str("\n\n--- Conduct (hard boundaries) ---\n\n");
         prompt.push_str(CONDUCT_CONTRACT.trim_end());
+        // The bot's own failure record rides last: it is the most specific
+        // instruction in the prompt and the one most easily ignored if buried.
+        if let Some(digest) = self.host.agent_self_check_digest() {
+            prompt.push_str("\n\n--- Your own failure record ---\n\n");
+            prompt.push_str(digest.trim_start_matches("--- Your own failure record ---\n\n"));
+        }
         let hints = self.host.agent_plugin_hints();
         if !hints.is_empty() {
             prompt.push_str("\n\n--- Plugin-specific instructions ---\n\n");
