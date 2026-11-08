@@ -1857,6 +1857,10 @@ impl<'a, H: AgentToolHost + ?Sized> AgentBackend for RuntimeShellAgentBackend<'a
                 parse_tool_value_arguments::<EmptyArgs>(arguments, name)?;
                 self.host.agent_kernel_issues()
             }
+            AGENT_TOOL_GET_SELF_CHECK => {
+                parse_tool_value_arguments::<EmptyArgs>(arguments, name)?;
+                self.host.agent_self_check()
+            }
             AGENT_TOOL_RELOAD_RUNTIME => {
                 let args = parse_tool_value_arguments::<ReloadRuntimeArgs>(arguments, name)?;
                 self.host.agent_reload_runtime(&args.plugin_path)
@@ -2564,6 +2568,15 @@ fn shell_agent_tools() -> Vec<AgentToolSpec> {
             }),
         },
         AgentToolSpec {
+            name: AGENT_TOOL_GET_SELF_CHECK,
+            description: "Read your own failure report: which mistakes repeat across past turns, how often, with an example and the sessions that hit them. Check it when something keeps going wrong instead of guessing.",
+            parameters: json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false,
+            }),
+        },
+        AgentToolSpec {
             name: AGENT_TOOL_RELOAD_RUNTIME,
             description: "Reload the runtime snapshot and return the full reload diagnostics report. Use '/' to reload all plugins, or '/<path>' to reload a specific subtree (e.g. '/qq', '/expr'). Task services are gracefully restarted.",
             parameters: json!({
@@ -2905,6 +2918,8 @@ The channel plugin talks to OneBot in plugins/qq/src/lib.rs — copy its HTTP an
 Answering \"I have no way to do this\" while a plugin could do it is a failure, not an answer.\n\
 Prefer concise, operator-friendly replies. Mention important tool outcomes plainly.\n\
 Do not invent runtime state or claim a command succeeded unless a tool confirmed it.\n\
+When the same mistake keeps happening, call get_self_check: it ranks your own\n\
+repeated failures from past turns and shows an example of each.\n\
 \n\
 CRITICAL: a turn ends only when you call the suspend tool. Write the DSML block\n\
 below; there is no JSON form and no native function calling.\n\
@@ -2914,6 +2929,7 @@ Never output plain text — it will be dropped. All communication goes through t
 \n\
 CRITICAL — YOUR TOOLS (only these exist; all others will fail immediately):\n\
   get_runtime_status, list_plugins, list_nodes, get_kernel_status, get_kernel_issues,\n\
+  get_self_check,\n\
   reload_runtime, build_plugins, invoke_plugin, execute_target, read_file, search_code,\n\
   compact_context, list_directory, run_plugin_test, request_iteration\n\
 \n\

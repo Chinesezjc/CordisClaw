@@ -22,6 +22,8 @@ pub const AGENT_TOOL_LIST_PLUGINS: &str = "list_plugins";
 pub const AGENT_TOOL_LIST_NODES: &str = "list_nodes";
 pub const AGENT_TOOL_GET_KERNEL_STATUS: &str = "get_kernel_status";
 pub const AGENT_TOOL_GET_KERNEL_ISSUES: &str = "get_kernel_issues";
+/// What the bot itself keeps getting wrong, read from its own transcripts.
+pub const AGENT_TOOL_GET_SELF_CHECK: &str = "get_self_check";
 pub const AGENT_TOOL_RELOAD_RUNTIME: &str = "reload_runtime";
 /// Session-to-session: list the live sessions.
 pub const AGENT_TOOL_LIST_SESSIONS: &str = "list_sessions";
@@ -39,6 +41,7 @@ pub const KERNEL_INTROSPECTION_TOOLS: &[&str] = &[
     AGENT_TOOL_LIST_NODES,
     AGENT_TOOL_GET_KERNEL_STATUS,
     AGENT_TOOL_GET_KERNEL_ISSUES,
+    AGENT_TOOL_GET_SELF_CHECK,
 ];
 /// Returns true if `name` is one of the kernel introspection tools.
 pub fn is_kernel_introspection(name: &str) -> bool {
@@ -226,6 +229,33 @@ impl AgentToolHost for RuntimeHost {
 
     fn agent_kernel_issues(&self) -> Result<Value, RuntimeError> {
         to_json_value("kernel issues", self.kernel().plugin_issues())
+    }
+
+    fn agent_self_check(&self) -> Result<Value, RuntimeError> {
+        let root = crate::host::RuntimeHost::data_dir(self).join("sessions");
+        let report = crate::selfcheck::scan(&root);
+        let open: Vec<Value> = report
+            .open()
+            .into_iter()
+            .take(10)
+            .map(|signature| {
+                serde_json::json!({
+                    "id": signature.id(),
+                    "kind": signature.kind.as_str(),
+                    "count": signature.count,
+                    "score": signature.score(),
+                    "sessions": signature.sessions.iter().take(5).collect::<Vec<_>>(),
+                    "excerpt": signature.excerpt,
+                })
+            })
+            .collect();
+        Ok(serde_json::json!({
+            "ok": true,
+            "scanned_sessions": report.scanned_sessions,
+            "scanned_turns": report.scanned_turns,
+            "open": open,
+            "instruction": report.open().first().map(|signature| report.instruction(signature)),
+        }))
     }
 
     fn agent_live_sessions(&self) -> Vec<crate::agent_api::AgentSessionStatus> {

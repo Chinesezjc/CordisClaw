@@ -731,6 +731,11 @@ fn main() {
         }
         return;
     }
+    if args.first().map(|x| x.as_str()) == Some("selfcheck") {
+        run_selfcheck(&args[1..]);
+        return;
+    }
+
     if args.first().map(|x| x.as_str()) == Some("prepare-artifacts") {
         if let Err(err) = run_prepare_artifacts(&args[1..]) {
             eprintln!("prepare-artifacts failed: {err}");
@@ -1282,6 +1287,7 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         // process dies (e.g. a test runner that spawned us), stdin gets
         // a hangup.  Exiting cleanly prevents orphaned zombie processes
         // with their own health-check loops from piling up.
+        let mut ticks: u64 = 0;
         loop {
             std::thread::sleep(std::time::Duration::from_secs(30));
             let mut pfd = libc::pollfd {
@@ -1294,6 +1300,10 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!("runtime-only: stdin hangup (parent exited), shutting down");
                 park_host.write_shutdown_memory();
                 std::process::exit(0);
+            }
+            ticks += 1;
+            if ticks.is_multiple_of(SELF_CHECK_TICKS) {
+                reflect_on_failures(&park_host);
             }
         }
     }
@@ -2515,6 +2525,138 @@ fn runtime_mode_error(
         .into();
     }
     Box::new(err)
+}
+
+/// How many 30-second parks between reflection turns (6 hours).
+const SELF_CHECK_TICKS: u64 = 6 * 60 * 2;
+
+/// Give the agent a turn to look at its own failures and act on one.
+///
+/// Off unless `CORDIS_SELF_CHECK=1`: it costs a model turn, so it is the
+/// operator's decision to pay for it. When on, the agent sees the ranked
+/// failure report, may start a plugin iteration itself, and otherwise writes a
+/// proposal under `data/proposals/` for a human to apply. Every signature it
+/// has looked at is recorded, so it moves on instead of looping on the same
+/// failure.
+fn reflect_on_failures(host: &cordis_runtime::host::RuntimeHost) {
+    if std::env::var("CORDIS_SELF_CHECK").as_deref() != Ok("1") {
+        return;
+    }
+    let root = host.data_dir().join("sessions");
+    let report = cordis_runtime::selfcheck::scan(&root);
+    let ledger_path = host.data_dir().join("selfcheck.json");
+    let mut ledger: serde_json::Value = std::fs::read_to_string(&ledger_path)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_else(|| serde_json::json!({"attempted": []}));
+    let attempted: Vec<String> = ledger
+        .get("attempted")
+        .and_then(|value| value.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    let Some(signature) = report
+        .signatures
+        .iter()
+        .filter(|signature| !attempted.contains(&signature.id()))
+        .max_by_key(|signature| signature.score())
+    else {
+        return;
+    };
+
+    let instruction = format!(
+        "{}\n\nYou may act on this now. If the cause is in a plugin, call \
+         request_iteration with a precise instruction. If it is in the harness itself, \
+         write a proposal to data/proposals/{}.md describing the fix and the test that \
+         proves it. Never change a test to match a bug. End the turn with suspend.",
+        report.instruction(signature),
+        signature.id(),
+    );
+    eprintln!(
+        "self-check: reflecting on {} (×{})",
+        signature.id(),
+        signature.count
+    );
+    let started = host.agent_start_with(
+        cordis_runtime::host::AgentSessionKind::RuntimeShell,
+        cordis_runtime::host::AgentStartOptions {
+            profile: None,
+            soul_key: String::new(),
+            require_end_tool: false,
+        },
+    );
+    let Ok(session) = started else {
+        eprintln!("self-check: could not start a reflection session");
+        return;
+    };
+    let outcome = host.agent_send(&session.session_id, &instruction);
+    host.drop_session(&session.session_id);
+    let summary = match &outcome {
+        Ok(reply) => reply.content.clone(),
+        Err(error) => format!("reflection failed: {error}"),
+    };
+    let proposal_dir = host.data_dir().join("proposals");
+    let _ = std::fs::create_dir_all(&proposal_dir);
+    let _ = std::fs::write(
+        proposal_dir.join(format!("{}.md", signature.id())),
+        format!(
+            "# {}\n\n## Report\n\n{}\n\n## Reflection\n\n{}\n",
+            signature.id(),
+            report.instruction(signature),
+            summary
+        ),
+    );
+    if let Some(list) = ledger
+        .get_mut("attempted")
+        .and_then(|value| value.as_array_mut())
+    {
+        list.push(serde_json::Value::String(signature.id()));
+    }
+    let _ = std::fs::write(
+        &ledger_path,
+        serde_json::to_string_pretty(&ledger).unwrap_or_default(),
+    );
+    eprintln!(
+        "self-check: wrote {}/{}.md",
+        proposal_dir.display(),
+        signature.id()
+    );
+}
+
+/// Report what the bot keeps getting wrong, from its own transcripts.
+///
+/// `selfcheck [sessions_dir]` prints the ranked signatures and the instruction
+/// an iteration would start from. This is the observation half of the loop the
+/// audit found missing: every fix so far came from a human reading a chat log.
+fn run_selfcheck(args: &[String]) {
+    let root = args.first().map(String::as_str).unwrap_or("data/sessions");
+    let report = cordis_runtime::selfcheck::scan(std::path::Path::new(root));
+    println!(
+        "scanned {} sessions / {} assistant turns from {root}",
+        report.scanned_sessions, report.scanned_turns
+    );
+    let open = report.open();
+    if open.is_empty() {
+        println!("no unattempted failure signature");
+        return;
+    }
+    for (index, signature) in open.iter().take(10).enumerate() {
+        println!(
+            "{:>2}. {:<14} × {:<4} score {:>4}  sessions {}",
+            index + 1,
+            signature.kind.as_str(),
+            signature.count,
+            signature.score(),
+            signature.sessions.len(),
+        );
+        println!("    {}", signature.excerpt);
+    }
+    println!("\n--- instruction for the top signature ---\n");
+    println!("{}", report.instruction(open[0]));
 }
 
 fn usage() -> String {

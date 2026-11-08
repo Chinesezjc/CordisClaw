@@ -17,6 +17,17 @@ pub trait AgentToolHost {
     fn agent_list_nodes(&self) -> Result<Value, RuntimeError>;
     fn agent_kernel_status(&self) -> Result<Value, RuntimeError>;
     fn agent_kernel_issues(&self) -> Result<Value, RuntimeError>;
+
+    /// What this bot keeps getting wrong, derived from its own transcripts.
+    ///
+    /// The answer is evidence, not a summary: each signature carries how often
+    /// it happens, which sessions hit it, and one example. That is what an
+    /// iteration needs to act on a failure instead of guessing at it.
+    fn agent_self_check(&self) -> Result<Value, RuntimeError> {
+        Err(RuntimeError::InvalidArgument {
+            message: "this host cannot inspect agent transcripts".to_string(),
+        })
+    }
     /// Sessions that are alive right now, so one session can address another.
     ///
     /// Default: none. A host without a session map (the loop's test doubles)

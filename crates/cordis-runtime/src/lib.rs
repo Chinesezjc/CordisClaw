@@ -17,5 +17,6 @@ pub mod iteration_api;
 pub mod kernel;
 pub mod llm_sink;
 pub mod plugin;
+pub mod selfcheck;
 pub mod service;
 pub mod soul;
