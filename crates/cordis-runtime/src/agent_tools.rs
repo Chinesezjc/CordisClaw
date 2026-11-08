@@ -1255,12 +1255,18 @@ pub struct SetSoulArgs {
 pub struct ReloadRuntimeArgs {
     pub plugin_path: String,
 }
+/// 执行一次模型要求的工具调用，把结果包成 [`AgentToolEvent`] 与展示文本。
+///
+/// `unknown_tool_strikes` 与 `attachments` 都属于**回合**状态：前者是
+/// hallucination guard 的计数，后者是 `view_image` 的待附加图片队列。本函数
+/// 只借用它们，不保存——保存会让它们活过回合。
 pub fn execute_agent_tool_call<B: AgentBackend + ?Sized>(
     backend: &mut B,
     available_tools: &BTreeSet<String>,
     session_kind: &str,
     tool_call: &cordis_plugin_sdk::llm::LlmToolCall,
     unknown_tool_strikes: &mut usize,
+    attachments: &mut Vec<Value>,
 ) -> (AgentToolEvent, String) {
     let tool_name = tool_call.function.name.clone();
     if !available_tools.contains(&tool_name) {
@@ -1350,7 +1356,7 @@ pub fn execute_agent_tool_call<B: AgentBackend + ?Sized>(
         }
     };
 
-    match backend.execute_tool(&tool_name, args_json.clone()) {
+    match backend.execute_tool(&tool_name, args_json.clone(), attachments) {
         Ok(output) => {
             let wrapped = json!({
                 "ok": true,

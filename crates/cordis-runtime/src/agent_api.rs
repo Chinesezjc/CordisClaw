@@ -259,20 +259,24 @@ pub trait AgentBackend {
     type Host: AgentToolHost + ?Sized;
     fn system_prompt(&self) -> String;
     fn tool_specs(&self) -> Vec<AgentToolSpec>;
-    fn execute_tool(&mut self, name: &str, arguments: Value) -> Result<Value, RuntimeError>;
+    /// 执行一次工具调用。
+    ///
+    /// `attachments` 是本轮的 `view_image` 待附加队列（`image_url` content
+    /// part）。队列由**调用方**（回合状态）持有，backend 只负责往里 push：
+    /// 把队列收进 `self` 会让它活过回合，而回合状态一旦有跨轮的生命周期，
+    /// 下一轮就会读到上一轮留下的东西。不产出图片的 backend 忽略它即可。
+    fn execute_tool(
+        &mut self,
+        name: &str,
+        arguments: Value,
+        attachments: &mut Vec<Value>,
+    ) -> Result<Value, RuntimeError>;
     fn host(&self) -> &Self::Host;
     fn terminal_tool_reply(&self, _name: &str, _output: &Value) -> Option<String> {
         None
     }
     fn tool_scope_label(&self) -> String {
         "agent".to_string()
-    }
-    /// 取走本轮 `view_image` 攒下的待附加图片（`image_url` content part）。
-    ///
-    /// 默认空：只有能读内容寻址缓存的 backend 才会往里放东西。Agent 循环在
-    /// 每次工具轮结束后取一次，把图片挂到下一次请求上再清空。
-    fn take_attached_images(&mut self) -> Vec<Value> {
-        Vec::new()
     }
 }
 
@@ -295,6 +299,16 @@ pub struct LlmCompletionParts {
 }
 
 /// Serializable snapshot of a session, for crash recovery.
+///
+/// **只存跨轮状态**。一轮之内的临时状态（`no_end_strikes` /
+/// `unknown_tool_strikes` / `empty_response_strikes` / `reasoning_only_strikes`
+/// 以及 `turn_reasoning`、`image_parts_stripped`、`attached`）不属于快照：
+/// 它们随回合开始创建、随回合结束丢弃，写进快照只会把上一轮的计数偷偷带回
+/// 下一轮（见 `cordis-agent` 的 `Turn`）。
+///
+/// 旧快照仍带这些字段也无妨：serde 默认忽略未知字段，所以
+/// [`AgentSession`](crate::agent_loop::AgentSessionApi) 的 `from_snapshot`
+/// 照常解析、只是不再恢复它们。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentSessionSnapshot {
     pub kind: String,
@@ -303,15 +317,8 @@ pub struct AgentSessionSnapshot {
     pub transcript: Vec<AgentTranscriptEntry>,
     pub completed_turns: usize,
     pub estimated_tokens: usize,
-    pub reasoning_only_strikes: usize,
-    /// Missing from snapshots written before the retry existed.
-    #[serde(default)]
-    pub empty_response_strikes: usize,
     #[serde(default)]
     pub require_end_tool: bool,
-    #[serde(default)]
-    pub no_end_strikes: usize,
-    pub unknown_tool_strikes: usize,
     /// `#[serde(default)]` keeps pre-O批 snapshots deserializable.
     #[serde(default)]
     pub soul_key: String,

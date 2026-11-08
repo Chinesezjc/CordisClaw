@@ -215,11 +215,7 @@ pub mod test_loop {
                 transcript: Vec::new(),
                 completed_turns: 0,
                 estimated_tokens: 0,
-                reasoning_only_strikes: 0,
-                empty_response_strikes: 0,
                 require_end_tool: false,
-                no_end_strikes: 0,
-                unknown_tool_strikes: 0,
                 soul_key: String::new(),
             }
         }

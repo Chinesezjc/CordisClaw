@@ -558,7 +558,12 @@ Do not attempt to modify runtime crates, repository root manifests, config, .git
         tools
     }
 
-    fn execute_tool(&mut self, name: &str, arguments: Value) -> Result<Value, RuntimeError> {
+    fn execute_tool(
+        &mut self,
+        name: &str,
+        arguments: Value,
+        _attachments: &mut Vec<Value>,
+    ) -> Result<Value, RuntimeError> {
         match name {
             PLUGIN_AGENT_TOOL_LIST_CONTEXT_FILES => {
                 let args = parse_agent_args::<ListContextFilesArgs>(arguments, name)?;

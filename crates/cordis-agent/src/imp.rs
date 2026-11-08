@@ -137,28 +137,8 @@ pub struct AgentSession {
     /// Conservative estimate of total tokens in history: text at chars / 2,
     /// inline images at base64 length / 4 (see [`estimate_message_tokens`]).
     estimated_tokens: usize,
-    /// Reasoning produced by every model call of the turn in progress.
-    ///
-    /// A channel turn takes several calls (act, then close), and the reasoning
-    /// that explains the reply belongs to the call that produced it — not to the
-    /// last one, which is just "I already answered". The transcript keeps them
-    /// all, joined, because history is pruned.
-    turn_reasoning: Vec<String>,
-    /// Consecutive reasoning-only responses (no content, no tool_calls).
-    reasoning_only_strikes: usize,
-    /// Consecutive degenerate completions (no content, no tool calls) for this
-    /// turn. The provider occasionally finishes with nothing; that is a glitch
-    /// to retry, not a contract violation that kills the turn.
-    empty_response_strikes: usize,
     /// When set, the turn only ends on an explicit `suspend` call.
     require_end_tool: bool,
-    /// Set once a turn dropped unsupported image parts, so a 400 that merely
-    /// mentions the word cannot loop forever.
-    image_parts_stripped: bool,
-    /// Consecutive turns that produced no tool call and no end marker.
-    no_end_strikes: usize,
-    /// Consecutive calls to tools that don't exist in this session (LLM hallucination guard).
-    unknown_tool_strikes: usize,
     /// O批: soul scope key ({sender_id}#{conversation_kind}) this session
     /// serves. Empty = no per-user soul (REPL, legacy callers).
     soul_key: String,
@@ -169,6 +149,49 @@ pub struct AgentSession {
     caller_is_admin: bool,
     /// Channel-provided: this speaker may approve a staged iteration.
     can_approve_iteration: bool,
+}
+
+/// 一次 `respond` 的全部临时状态。回合开始创建，结束即丢弃。
+///
+/// 回合由 [`AgentSession::respond_inner`] 用 `Turn::default()` 打开，随返回值
+/// 交给收尾步骤，然后被丢弃——**没有任何一条路径把它写回 [`AgentSession`]**。
+/// 于是"上一轮的计数漏进下一轮"不再是可能发生的 bug：下一轮拿到的是全新的
+/// 零值对象，而不是会话上残留的字段。
+///
+/// 只放**每轮**状态。`history` / `transcript` / `estimated_tokens` /
+/// `completed_turns` 是跨轮状态，仍留在 [`AgentSession`] 上。
+struct Turn {
+    /// 回合起点，用于总时长预算（`timeout_ms` / `stream_timeout_secs`）。
+    started: Instant,
+    /// 连续"没有调用结束标记"的次数（渠道会话）。
+    no_end_strikes: usize,
+    /// 连续调用不存在工具的次数。
+    unknown_tool_strikes: usize,
+    /// 连续空补全的次数（provider 抖动，重试而非报错）。
+    empty_response_strikes: usize,
+    /// 连续"只有推理、没有正文也没有工具"的次数。
+    reasoning_only_strikes: usize,
+    /// 本轮每次模型调用产出的推理；收尾时并入转录（转录比 history 活得久）。
+    reasoning: Vec<String>,
+    /// 本轮已经因 400 剥掉过图片 part，避免同一轮无限重试。
+    images_stripped: bool,
+    /// `view_image` 取回、待附加到下一次请求的图片（`image_url` content part）。
+    attached: Vec<Value>,
+}
+
+impl Default for Turn {
+    fn default() -> Self {
+        Self {
+            started: Instant::now(),
+            no_end_strikes: 0,
+            unknown_tool_strikes: 0,
+            empty_response_strikes: 0,
+            reasoning_only_strikes: 0,
+            reasoning: Vec::new(),
+            images_stripped: false,
+            attached: Vec::new(),
+        }
+    }
 }
 
 pub type ShellAgentStatus = AgentSessionStatus;
@@ -450,13 +473,7 @@ impl AgentSession {
             transcript: Vec::new(),
             completed_turns: 0,
             estimated_tokens: 0,
-            turn_reasoning: Vec::new(),
-            reasoning_only_strikes: 0,
-            empty_response_strikes: 0,
             require_end_tool: false,
-            image_parts_stripped: false,
-            no_end_strikes: 0,
-            unknown_tool_strikes: 0,
             soul_key: String::new(),
             is_group: false,
             caller_is_admin: false,
@@ -604,11 +621,14 @@ impl AgentSession {
         }
     }
 
-    /// `provider` 承担这一轮所有的模型调用；`sink` 决定增量 token 去哪。
+    /// 一个回合：在回合起点创建 [`Turn`]（四个计数、推理、剥图标记与附件
+    /// 队列因此全部归零），跑完循环后补齐转录与历史收尾。
     ///
-    /// 两者都作为参数传入而非存进 `AgentSession`：该结构体 derive 了
-    /// `Debug + Clone` 并会被快照序列化，塞 `dyn Trait` 会同时破坏这三者。
-    /// 这也与既有的 `backend` 参数保持一致。
+    /// 返回 `Turn` 只为让调用方在**同一回合内**做收尾（[`Self::record_turn_end`]
+    /// / [`Self::remember_if_unrecorded`]）；生产入口
+    /// [`Self::respond_with_provider_images`] 取走 `Result` 后立即丢弃它。
+    /// 没有任何一条路径把 `Turn` 的字段写回 `self`，所以下一轮不可能读到
+    /// 这一轮的计数。
     fn respond_inner<B: AgentBackend + ?Sized>(
         &mut self,
         backend: &mut B,
@@ -619,8 +639,41 @@ impl AgentSession {
         notes: &str,
         provider: &dyn LlmProvider,
         sink: Option<std::sync::Arc<dyn cordis_runtime::llm_sink::TokenSink>>,
+    ) -> (Result<AgentReply, RuntimeError>, Turn) {
+        let transcript_len_before = self.transcript.len();
+        let history_len_before = self.history.len();
+        // 回合开始：本轮的每个计数都在这里归零。上一轮留下的东西不可能被
+        // 这一轮读到——它们已经随上一轮的 `Turn` 一起丢弃了。
+        let mut turn = Turn::default();
+        let result = self.respond_loop(
+            &mut turn, backend, user_input, images, notes, provider, sink,
+        );
+        self.repair_transcript_on_error(transcript_len_before, &result);
+        self.record_turn_end(transcript_len_before, &result, &turn);
+        self.remember_if_unrecorded(&result, user_input, images, history_len_before, &turn);
+        (result, turn)
+    }
+
+    /// 回合的循环本体。每轮状态全在 `turn` 里；`self` 只被读写跨轮字段
+    /// （`history` / `transcript` / `estimated_tokens` / `completed_turns`）。
+    ///
+    /// `provider` 承担这一轮所有的模型调用；`sink` 决定增量 token 去哪。
+    /// 两者都作为参数传入而非存进 `AgentSession`：该结构体 derive 了
+    /// `Debug + Clone` 并会被快照序列化，塞 `dyn Trait` 会同时破坏这三者。
+    /// 这也与既有的 `backend` 参数保持一致。
+    // 8 个参数都是"这一轮发给模型的输入 + 这一轮的状态"；拆成结构体只是把
+    // 参数换成字段，不减少任何耦合（与 registry::insert_loaded 同一判断）。
+    #[expect(clippy::too_many_arguments)]
+    fn respond_loop<B: AgentBackend + ?Sized>(
+        &mut self,
+        turn: &mut Turn,
+        backend: &mut B,
+        user_input: &str,
+        images: &[Value],
+        notes: &str,
+        provider: &dyn LlmProvider,
+        sink: Option<std::sync::Arc<dyn cordis_runtime::llm_sink::TokenSink>>,
     ) -> Result<AgentReply, RuntimeError> {
-        self.turn_reasoning.clear();
         let trimmed = user_input.trim();
         if trimmed.is_empty() {
             return Err(RuntimeError::InvalidArgument {
@@ -713,11 +766,12 @@ impl AgentSession {
             content: trimmed.to_string(),
         });
 
-        self.image_parts_stripped = false;
-        let turn_started = Instant::now();
+        // 预算从"请求即将发出"开始计：前面的压缩（可能含一次摘要调用）不算
+        // 在这一轮的响应预算里——与拆分前 `turn_started` 的起点逐字节一致。
+        turn.started = Instant::now();
         let mut tool_events = Vec::new();
 
-        for turn in 0..AGENT_MAX_TOOL_TURNS {
+        for round in 0..AGENT_MAX_TOOL_TURNS {
             // The backend's tool list is phase dependent: the iteration
             // summary only becomes callable once a verification succeeded, and
             // that happens *inside* this loop. Re-read it every turn and keep
@@ -752,12 +806,12 @@ impl AgentSession {
             let per_request_ms = self.config.timeout_ms;
             let stream_budget_ms = self.config.stream_timeout_secs.saturating_mul(1000 * 5);
             let effective_budget_ms = per_request_ms.max(stream_budget_ms);
-            if turn_started.elapsed() >= Duration::from_millis(effective_budget_ms) {
+            if turn.started.elapsed() >= Duration::from_millis(effective_budget_ms) {
                 return Err(RuntimeError::LlmResponseInvalid {
                     message: format!(
                         "agent exceeded total response budget after {} tool turns; elapsed_ms={} effective_budget_ms={} (timeout_ms={} stream_secs={})",
-                        turn,
-                        turn_started.elapsed().as_millis(),
+                        round,
+                        turn.started.elapsed().as_millis(),
                         effective_budget_ms,
                         self.config.timeout_ms,
                         self.config.stream_timeout_secs,
@@ -775,7 +829,7 @@ impl AgentSession {
                     emit_agent_diagnostic(format!(
                         "agent_inject kind={} turn={} len={}",
                         self.kind,
-                        turn + 1,
+                        round + 1,
                         m.len()
                     ));
                     messages.push(json!({"role": "user", "content": &m}));
@@ -787,8 +841,8 @@ impl AgentSession {
             emit_agent_diagnostic(format!(
                 "agent_turn_start kind={} turn={} elapsed_ms={} messages={} tools={}",
                 self.kind,
-                turn + 1,
-                turn_started.elapsed().as_millis(),
+                round + 1,
+                turn.started.elapsed().as_millis(),
                 messages.len(),
                 tool_specs.len(),
             ));
@@ -826,17 +880,17 @@ impl AgentSession {
                     // A single unsupported image poisons the whole history: every
                     // later request replays it and gets the same 400. Drop the image
                     // parts and try the turn again — text survives, pictures do not.
-                    Err(err) if !self.image_parts_stripped && err.to_string().contains("image") => {
-                        self.image_parts_stripped = true;
+                    Err(err) if !turn.images_stripped && err.to_string().contains("image") => {
+                        turn.images_stripped = true;
                         emit_agent_diagnostic(format!(
                             "agent_image_rejected kind={} turn={} err={:?}",
                             self.kind,
-                            turn,
+                            round,
                             err.to_string()
                         ));
                         strip_image_parts(&mut messages);
                         strip_image_parts(&mut self.history);
-                        self.empty_response_strikes = 0;
+                        turn.empty_response_strikes = 0;
                         continue;
                     }
                     // A provider failure after the message went out is not a
@@ -845,7 +899,7 @@ impl AgentSession {
                         emit_agent_diagnostic(format!(
                             "agent_provider_failed_after_delivery kind={} turn={} err={:?}",
                             self.kind,
-                            turn,
+                            round,
                             err.to_string()
                         ));
                         self.completed_turns += 1;
@@ -863,7 +917,7 @@ impl AgentSession {
             emit_agent_diagnostic(format!(
                 "agent_turn_result kind={} turn={} response_id={} tool_calls={} content_chars={} reasoning_chars={} finish_reason={}",
                 self.kind,
-                turn + 1,
+                round + 1,
                 response_id.as_deref().unwrap_or("-"),
                 message.tool_calls.len(),
                 message.content.as_deref().map(str::len).unwrap_or(0),
@@ -917,13 +971,13 @@ impl AgentSession {
                             self.transcript.len()
                         ));
                     }
-                    self.no_end_strikes = 0;
+                    turn.no_end_strikes = 0;
                     self.completed_turns += 1;
                     // The transcript keeps the model's reasoning: the live
                     // history is pruned, so without it "why did it say that"
                     // becomes unanswerable once the turn leaves the window.
                     let closing = message.content.unwrap_or_default();
-                    let reasoning = closing_reasoning(&self.turn_reasoning);
+                    let reasoning = closing_reasoning(&turn.reasoning);
                     self.transcript.push(AgentTranscriptEntry::Assistant {
                         content: closing.clone(),
                         response_id: response_id.clone(),
@@ -951,7 +1005,7 @@ impl AgentSession {
                 .as_deref()
                 .filter(|reasoning| !reasoning.trim().is_empty())
             {
-                self.turn_reasoning.push(reasoning.to_string());
+                turn.reasoning.push(reasoning.to_string());
             }
 
             if !message.tool_calls.is_empty() {
@@ -986,22 +1040,22 @@ impl AgentSession {
                 let mut tool_failure_prompts: Vec<String> = Vec::new();
                 for tool_call in &unknown_calls {
                     let tool_name = &tool_call.function.name;
-                    self.unknown_tool_strikes += 1;
+                    turn.unknown_tool_strikes += 1;
                     let tool_list = available_tools
                         .iter()
                         .cloned()
                         .collect::<Vec<_>>()
                         .join(", ");
-                    let err_msg = if self.unknown_tool_strikes >= UNKNOWN_TOOL_STRIKE_LIMIT {
+                    let err_msg = if turn.unknown_tool_strikes >= UNKNOWN_TOOL_STRIKE_LIMIT {
                         format!(
                             "STOP — tool '{tool_name}' does not exist. Strike {}/{}. You are in a {} session. Your ONLY tools: {}",
-                            self.unknown_tool_strikes, UNKNOWN_TOOL_STRIKE_LIMIT,
+                            turn.unknown_tool_strikes, UNKNOWN_TOOL_STRIKE_LIMIT,
                             backend.tool_scope_label(), tool_list,
                         )
                     } else {
                         format!(
                             "Tool '{tool_name}' does not exist (strike {}/{}). Available tools: {}",
-                            self.unknown_tool_strikes, UNKNOWN_TOOL_STRIKE_LIMIT, tool_list,
+                            turn.unknown_tool_strikes, UNKNOWN_TOOL_STRIKE_LIMIT, tool_list,
                         )
                     };
                     let _ = writeln!(
@@ -1038,7 +1092,8 @@ impl AgentSession {
                         &available_tools,
                         &self.kind,
                         tool_call,
-                        &mut self.unknown_tool_strikes,
+                        &mut turn.unknown_tool_strikes,
+                        &mut turn.attached,
                     );
                     let event_name = event.name.clone();
                     let terminal_reply = event
@@ -1067,7 +1122,7 @@ impl AgentSession {
                     tool_events.push(event);
                     // Reset unknown-tool strikes when a legitimate tool succeeds.
                     if tool_ok {
-                        self.unknown_tool_strikes = 0;
+                        turn.unknown_tool_strikes = 0;
                     }
                     messages.push(json!({
                         "role": "tool",
@@ -1118,13 +1173,13 @@ impl AgentSession {
                             trimmed,
                             &reply_content,
                             message.reasoning_content.as_deref(),
-                            history_images(images, self.image_parts_stripped),
+                            history_images(images, turn.images_stripped),
                         );
                         self.completed_turns += 1;
                         self.transcript.push(AgentTranscriptEntry::Assistant {
                             content: reply_content.clone(),
                             response_id: response_id.clone(),
-                            reasoning: closing_reasoning(&self.turn_reasoning),
+                            reasoning: closing_reasoning(&turn.reasoning),
                         });
                         return Ok(AgentReply {
                             response_id,
@@ -1139,10 +1194,10 @@ impl AgentSession {
                 // assistant and break the chain).
                 flush_tool_failure_prompts(&mut messages, &mut tool_failure_prompts);
                 if ends_after_tools {
-                    self.no_end_strikes = 0;
+                    turn.no_end_strikes = 0;
                     self.completed_turns += 1;
                     let closing = message.content.unwrap_or_default();
-                    let reasoning = closing_reasoning(&self.turn_reasoning);
+                    let reasoning = closing_reasoning(&turn.reasoning);
                     self.transcript.push(AgentTranscriptEntry::Assistant {
                         content: closing.clone(),
                         response_id: response_id.clone(),
@@ -1157,7 +1212,7 @@ impl AgentSession {
                 // `view_image` 取回的图片进下一次请求：作为一条新的 user 消息
                 // 追加在工具结果之后，模型下一次调用就能重新看到原图。
                 attach_recovered_images(
-                    backend,
+                    &mut *turn,
                     &mut messages,
                     images,
                     cordis_runtime::image_budget::INLINE_IMAGE_BUDGET_BYTES,
@@ -1166,13 +1221,13 @@ impl AgentSession {
             }
 
             if end_requested {
-                self.no_end_strikes = 0;
+                turn.no_end_strikes = 0;
                 self.completed_turns += 1;
                 let closing = message.content.unwrap_or_default();
                 self.transcript.push(AgentTranscriptEntry::Assistant {
                     content: closing.clone(),
                     response_id: response_id.clone(),
-                    reasoning: closing_reasoning(&self.turn_reasoning),
+                    reasoning: closing_reasoning(&turn.reasoning),
                 });
                 return Ok(AgentReply {
                     response_id,
@@ -1186,11 +1241,11 @@ impl AgentSession {
                 // bounded number of times turned a model that forgot the marker
                 // into "LLM outage" spills, so keep asking — `AGENT_MAX_TOOL_TURNS`
                 // remains the only bound.
-                self.no_end_strikes += 1;
+                turn.no_end_strikes += 1;
                 emit_agent_diagnostic(format!(
                     "agent_missing_end_tool kind={} attempt={} acted={}",
                     self.kind,
-                    self.no_end_strikes,
+                    turn.no_end_strikes,
                     !tool_events.is_empty()
                 ));
                 // Only `suspend` ends a channel turn — sending does not. The
@@ -1201,12 +1256,12 @@ impl AgentSession {
                 // repeated an identical 119-character reply 44 times, each round
                 // a billed call. Once something has gone out there is nothing
                 // left to salvage, so stop asking and close the turn.
-                if !tool_events.is_empty() && self.no_end_strikes > 3 {
+                if !tool_events.is_empty() && turn.no_end_strikes > 3 {
                     emit_agent_diagnostic(format!(
                         "agent_marker_never_came kind={} attempts={}",
-                        self.kind, self.no_end_strikes
+                        self.kind, turn.no_end_strikes
                     ));
-                    self.no_end_strikes = 0;
+                    turn.no_end_strikes = 0;
                     self.completed_turns += 1;
                     return Ok(AgentReply {
                         response_id,
@@ -1268,13 +1323,13 @@ impl AgentSession {
                     &remembered,
                     content,
                     message.reasoning_content.as_deref(),
-                    history_images(images, self.image_parts_stripped),
+                    history_images(images, turn.images_stripped),
                 );
                 self.completed_turns += 1;
                 self.transcript.push(AgentTranscriptEntry::Assistant {
                     content: content.to_string(),
                     response_id: response_id.clone(),
-                    reasoning: closing_reasoning(&self.turn_reasoning),
+                    reasoning: closing_reasoning(&turn.reasoning),
                 });
                 return Ok(AgentReply {
                     response_id,
@@ -1289,13 +1344,13 @@ impl AgentSession {
                 .is_some_and(|value| !value.trim().is_empty())
             {
                 messages.push(llm_message_to_request(&message));
-                self.reasoning_only_strikes += 1;
-                if self.reasoning_only_strikes >= 3 {
+                turn.reasoning_only_strikes += 1;
+                if turn.reasoning_only_strikes >= 3 {
                     backend.host().agent_send_warning_to_test_groups(
                         "⚠ Agent produced 3 consecutive reasoning-only responses — may be stuck.",
                     );
-                    self.reasoning_only_strikes = 0;
-                    self.empty_response_strikes = 0;
+                    turn.reasoning_only_strikes = 0;
+                    turn.empty_response_strikes = 0;
                 }
                 messages.push(json!({
                     "role": "user",
@@ -1303,15 +1358,15 @@ impl AgentSession {
                 }));
                 continue;
             }
-            self.reasoning_only_strikes = 0;
+            turn.reasoning_only_strikes = 0;
 
             // A completion with no content and no tool calls is a provider
             // glitch (the adapter on the other side of this seam may also emit
             // one). Retry the identical request a couple of times before
             // giving up: failing here spills the user's message and shows a
             // failure notice for something a second attempt usually fixes.
-            self.empty_response_strikes += 1;
-            if self.empty_response_strikes <= EMPTY_RESPONSE_RETRIES {
+            turn.empty_response_strikes += 1;
+            if turn.empty_response_strikes <= EMPTY_RESPONSE_RETRIES {
                 // Change the request: re-sending the identical body after a
                 // deterministic empty reply can only fail again, and the CLI
                 // retries below multiply that into a dozen wasted calls.
@@ -1322,11 +1377,11 @@ impl AgentSession {
                 }));
                 emit_agent_diagnostic(format!(
                     "agent_empty_response_retry kind={} attempt={}",
-                    self.kind, self.empty_response_strikes
+                    self.kind, turn.empty_response_strikes
                 ));
                 continue;
             }
-            self.empty_response_strikes = 0;
+            turn.empty_response_strikes = 0;
             // If a message already went out this turn, the turn succeeded even
             // though the closing reply was empty. Returning an error here made
             // the channel spill the message to `pending` and replay it later —
@@ -1406,13 +1461,9 @@ impl AgentSession {
         provider: &dyn LlmProvider,
         sink: Option<std::sync::Arc<dyn cordis_runtime::llm_sink::TokenSink>>,
     ) -> Result<AgentReply, RuntimeError> {
-        let transcript_len_before = self.transcript.len();
-        let history_len_before = self.history.len();
-        let result = self.respond_inner(backend, user_input, images, notes, provider, sink);
-        self.repair_transcript_on_error(transcript_len_before, &result);
-        self.record_turn_end(transcript_len_before, &result);
-        self.remember_if_unrecorded(&result, user_input, images, history_len_before);
-        result
+        // 回合结束：`Turn` 在这里被丢弃。它的任何一个字段都没有写回会话。
+        self.respond_inner(backend, user_input, images, notes, provider, sink)
+            .0
     }
 
     /// Record the exchange for a turn the loop did not record itself.
@@ -1427,6 +1478,7 @@ impl AgentSession {
         user_input: &str,
         images: &[Value],
         history_len_before: usize,
+        turn: &Turn,
     ) {
         if self.history.len() > history_len_before {
             return;
@@ -1460,7 +1512,7 @@ impl AgentSession {
         } else {
             said.join("\n")
         };
-        let reasoning = closing_reasoning(&self.turn_reasoning);
+        let reasoning = closing_reasoning(&turn.reasoning);
         // Only the batch body belongs in history. The channel's one-shot
         // context (reply policy, reply target, group memory) rides in front of
         // it and must not be replayed: it becomes stale the moment the policy
@@ -1484,7 +1536,7 @@ impl AgentSession {
             &remembered,
             &assistant,
             reasoning.as_deref(),
-            history_images(images, self.image_parts_stripped),
+            history_images(images, turn.images_stripped),
         );
     }
 
@@ -1500,6 +1552,7 @@ impl AgentSession {
         &mut self,
         transcript_len_before: usize,
         result: &Result<AgentReply, RuntimeError>,
+        turn: &Turn,
     ) {
         let Ok(reply) = result else { return };
         let already_recorded = self
@@ -1510,7 +1563,7 @@ impl AgentSession {
         if already_recorded {
             return;
         }
-        let reasoning = closing_reasoning(&self.turn_reasoning);
+        let reasoning = closing_reasoning(&turn.reasoning);
         self.transcript.push(AgentTranscriptEntry::Assistant {
             content: reply.content.clone(),
             response_id: reply.response_id.clone(),
@@ -1529,7 +1582,6 @@ impl AgentSession {
             host,
             session_id,
             soul_key,
-            attached: Vec::new(),
         };
         self.respond(&mut backend, user_input)
     }
@@ -1547,14 +1599,33 @@ impl AgentSession {
         provider: &dyn LlmProvider,
         sink: Option<std::sync::Arc<dyn cordis_runtime::llm_sink::TokenSink>>,
     ) -> Result<AgentReply, RuntimeError> {
+        self.respond_capturing_turn(host, session_id, user_input, provider, sink)
+            .0
+    }
+
+    /// 测试用入口：跑完一轮，把这一轮的 [`Turn`] 一并交回。
+    ///
+    /// 生产路径（[`Self::respond_with_provider_images`]）取走 `Result` 就把
+    /// `Turn` 丢掉；这里保留它只为断言"这一轮的计数从哪里开始、到哪里结束"，
+    /// 以及证明回合之间没有任何交接。
+    ///
+    /// 后端构造与 [`Self::respond_with_runtime_host_via`] 完全一致。
+    #[cfg(test)]
+    fn respond_capturing_turn<H: AgentToolHost + ?Sized>(
+        &mut self,
+        host: &H,
+        session_id: &str,
+        user_input: &str,
+        provider: &dyn LlmProvider,
+        sink: Option<std::sync::Arc<dyn cordis_runtime::llm_sink::TokenSink>>,
+    ) -> (Result<AgentReply, RuntimeError>, Turn) {
         let soul_key = self.soul_key.clone();
         let mut backend = RuntimeShellAgentBackend {
             host,
             session_id,
             soul_key,
-            attached: Vec::new(),
         };
-        self.respond_with_provider(&mut backend, user_input, provider, sink)
+        self.respond_inner(&mut backend, user_input, &[], "", provider, sink)
     }
 
     /// 同 [`respond_with_runtime_host_via`]，但这次用户消息带图片
@@ -1577,7 +1648,6 @@ impl AgentSession {
             host,
             session_id,
             soul_key,
-            attached: Vec::new(),
         };
         self.respond_with_provider_images(&mut backend, user_input, images, notes, provider, sink)
     }
@@ -1867,11 +1937,7 @@ impl AgentSession {
             transcript: self.transcript.clone(),
             completed_turns: self.completed_turns,
             estimated_tokens,
-            reasoning_only_strikes: self.reasoning_only_strikes,
-            empty_response_strikes: 0,
             require_end_tool: self.require_end_tool,
-            no_end_strikes: 0,
-            unknown_tool_strikes: self.unknown_tool_strikes,
             soul_key: self.soul_key.clone(),
         }
     }
@@ -1889,6 +1955,11 @@ impl AgentSession {
     /// recovered snapshot arrives with `config.api_key = None`. 保持 None——
     /// provider 插件在请求时按 `api_key_env` 从环境读，恢复出来的会话因此拿到
     /// 本次启动的密钥，而不是烧在磁盘文件里的旧值。
+    ///
+    /// 旧快照里的 `no_end_strikes` / `unknown_tool_strikes` /
+    /// `empty_response_strikes` / `reasoning_only_strikes` 会被 serde 当作未知
+    /// 字段忽略（`AgentSessionSnapshot` 没有 `deny_unknown_fields`），因此老
+    /// 文件照常解析；这些计数本来就不该跨轮，恢复时一律从零开始。
     pub fn from_snapshot(snapshot: AgentSessionSnapshot) -> Result<Self, RuntimeError> {
         Ok(Self {
             kind: snapshot.kind,
@@ -1897,13 +1968,7 @@ impl AgentSession {
             transcript: snapshot.transcript,
             completed_turns: snapshot.completed_turns,
             estimated_tokens: snapshot.estimated_tokens,
-            turn_reasoning: Vec::new(),
-            reasoning_only_strikes: snapshot.reasoning_only_strikes,
-            empty_response_strikes: 0,
             require_end_tool: snapshot.require_end_tool,
-            image_parts_stripped: false,
-            no_end_strikes: snapshot.no_end_strikes,
-            unknown_tool_strikes: snapshot.unknown_tool_strikes,
             soul_key: snapshot.soul_key,
             // P4: caller flags are per-batch facts, not session state — a
             // recovered session starts unpinned and is rebound by the next
@@ -2053,13 +2118,6 @@ struct RuntimeShellAgentBackend<'a, H: AgentToolHost + ?Sized> {
     session_id: &'a str,
     /// O批: soul scope of the owning session ("" = none).
     soul_key: String,
-    /// 本轮 `view_image` 取回的图片（`image_url` content part）。
-    ///
-    /// 队列的生命周期就是一次 `respond`：backend 由
-    /// `respond_with_runtime_host*` 逐轮构造，循环在每次工具轮之后取走并挂到
-    /// 下一次请求上。回合结束时还没取走的（例如紧接着就 `suspend`）随
-    /// backend 一起丢掉——已经没有谁需要看它了。
-    attached: Vec<Value>,
 }
 
 impl<'a, H: AgentToolHost + ?Sized> AgentBackend for RuntimeShellAgentBackend<'a, H> {
@@ -2107,7 +2165,12 @@ impl<'a, H: AgentToolHost + ?Sized> AgentBackend for RuntimeShellAgentBackend<'a
         shell_agent_tools()
     }
 
-    fn execute_tool(&mut self, name: &str, arguments: Value) -> Result<Value, RuntimeError> {
+    fn execute_tool(
+        &mut self,
+        name: &str,
+        arguments: Value,
+        attachments: &mut Vec<Value>,
+    ) -> Result<Value, RuntimeError> {
         match name {
             cordis_runtime::agent_tools::AGENT_TOOL_LIST_SESSIONS => {
                 parse_tool_value_arguments::<EmptyArgs>(arguments, name)?;
@@ -2177,13 +2240,14 @@ impl<'a, H: AgentToolHost + ?Sized> AgentBackend for RuntimeShellAgentBackend<'a
                 self.host
                     .agent_list_directory(args.path.as_deref().unwrap_or("."))
             }
-            // 取回一张被请求体预算剥成占位符的图片：进队列，下一次请求带上它。
+            // 取回一张被请求体预算剥成占位符的图片：进本轮的附件队列（由
+            // [`Turn`] 持有），下一次请求带上它。
             AGENT_TOOL_VIEW_IMAGE => {
                 let args = parse_tool_value_arguments::<ViewImageArgs>(arguments, name)?;
                 let (attached, part) = self
                     .host
                     .agent_view_image(args.path.as_deref(), args.sha256.as_deref())?;
-                self.attached.push(part);
+                attachments.push(part);
                 Ok(json!({ "ok": true, "attached": attached }))
             }
             AGENT_TOOL_SEARCH_CODE => {
@@ -2271,11 +2335,6 @@ impl<'a, H: AgentToolHost + ?Sized> AgentBackend for RuntimeShellAgentBackend<'a
     fn tool_scope_label(&self) -> String {
         "runtime_shell".to_string()
     }
-
-    /// `view_image` 攒下的待附加图片，取走即清空（见 [`attach_recovered_images`]）。
-    fn take_attached_images(&mut self) -> Vec<Value> {
-        std::mem::take(&mut self.attached)
-    }
 }
 
 /// A serialised tool call the provider wrote into the content stream.
@@ -2305,14 +2364,16 @@ fn end_turn_tool_spec() -> AgentToolSpec {
 /// 请求体，历史图片只能吃剩下的额度。队列里放不下的直接丢弃（工具调用早已
 /// 返回，没法再改口），并在附言里写明丢了几张——否则模型会以为图已经看过。
 ///
+/// 队列取自本回合的 [`Turn`]：取走即清空，回合结束随 `Turn` 一起消失。
+///
 /// 返回实际附上的张数。
-fn attach_recovered_images<B: AgentBackend + ?Sized>(
-    backend: &mut B,
+fn attach_recovered_images(
+    turn: &mut Turn,
     messages: &mut Vec<Value>,
     new_images: &[Value],
     budget: usize,
 ) -> usize {
-    let recovered = backend.take_attached_images();
+    let recovered = std::mem::take(&mut turn.attached);
     if recovered.is_empty() {
         return 0;
     }
@@ -3781,7 +3842,6 @@ mod tests {
             host: &host,
             session_id: "chat",
             soul_key: "qq:group:1".to_string(),
-            attached: Vec::new(),
         };
         let chat = channel.system_prompt();
         assert!(chat.contains("You are a participant in this conversation"));
@@ -3791,7 +3851,6 @@ mod tests {
             host: &host,
             session_id: "ops",
             soul_key: String::new(),
-            attached: Vec::new(),
         };
         let shell = ops.system_prompt();
         assert!(shell.contains("running inside the cordis-runtime serve REPL"));
@@ -3814,7 +3873,6 @@ mod tests {
             host: &host,
             session_id: "prompt-build",
             soul_key: String::new(),
-            attached: Vec::new(),
         };
         let prompt = backend.system_prompt();
         for marker in [
@@ -3842,7 +3900,6 @@ mod tests {
             host: &host,
             session_id: "prompt-order",
             soul_key: "user#private".to_string(),
-            attached: Vec::new(),
         };
         let prompt = backend.system_prompt();
 
@@ -3886,7 +3943,6 @@ mod tests {
             host: &host,
             session_id: "no-overlay",
             soul_key: String::new(),
-            attached: Vec::new(),
         };
         let prompt = backend.system_prompt();
         assert!(prompt.contains("--- Conduct (hard boundaries) ---"));
@@ -3942,12 +3998,12 @@ mod tests {
             host: &host,
             session_id: "approve-dispatch",
             soul_key: String::new(),
-            attached: Vec::new(),
         };
         let err = backend
             .execute_tool(
                 AGENT_TOOL_APPROVE_ITERATION,
                 json!({ "iteration_id": "it-1" }),
+                &mut Vec::new(),
             )
             .expect_err("the fake host must refuse");
         assert!(err.to_string().contains("cannot approve"), "err: {err}");
@@ -3960,9 +4016,12 @@ mod tests {
             host,
             session_id: "soul-gate",
             soul_key: "qq:group:777".to_string(),
-            attached: Vec::new(),
         };
-        backend.execute_tool(AGENT_TOOL_SET_SOUL, json!({ "persona": "新人格" }))
+        backend.execute_tool(
+            AGENT_TOOL_SET_SOUL,
+            json!({ "persona": "新人格" }),
+            &mut Vec::new(),
+        )
     }
 
     fn caller(is_group: bool, is_admin: bool) -> Option<SessionCaller> {
@@ -4129,7 +4188,12 @@ mod tests {
             ]
         }
 
-        fn execute_tool(&mut self, name: &str, _arguments: Value) -> Result<Value, RuntimeError> {
+        fn execute_tool(
+            &mut self,
+            name: &str,
+            _arguments: Value,
+            _attachments: &mut Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
             self.executed_tools.push(name.to_string());
             Ok(json!({ "tool": name }))
         }
@@ -4708,12 +4772,12 @@ mod tests {
             host: &host,
             session_id: "s1",
             soul_key: String::new(),
-            attached: Vec::new(),
         };
         let listed = AgentBackend::execute_tool(
             &mut backend,
             cordis_runtime::agent_tools::AGENT_TOOL_LIST_SESSIONS,
             json!({}),
+            &mut Vec::new(),
         )
         .expect("list");
         assert_eq!(listed["sessions"].as_array().expect("array").len(), 1);
@@ -4721,6 +4785,7 @@ mod tests {
             &mut backend,
             cordis_runtime::agent_tools::AGENT_TOOL_SEND_TO_SESSION,
             json!({"session_id": "s2", "message": "hi"}),
+            &mut Vec::new(),
         )
         .expect("send");
         assert_eq!(sent["session_id"], "s2");
@@ -5865,12 +5930,11 @@ mod tests {
         })
     }
 
-    fn backend_with_attachments(parts: Vec<Value>) -> RuntimeShellAgentBackend<'static, FakeHost> {
-        RuntimeShellAgentBackend {
-            host: &EMPTY_FAKE_HOST,
-            session_id: "attach",
-            soul_key: String::new(),
+    /// 本轮的附件队列只存在于 `Turn` 上：测试直接构造一个带队列的回合。
+    fn turn_with_attachments(parts: Vec<Value>) -> Turn {
+        Turn {
             attached: parts,
+            ..Turn::default()
         }
     }
 
@@ -5972,7 +6036,7 @@ mod tests {
         );
     }
 
-    /// 非法路径（`..` 逃逸）在工具层就被拒，不会进队列。
+    /// 非法路径（`..` 逃逸）在工具层就被拒，不会进本轮的附件队列。
     #[test]
     fn view_image_tool_rejects_an_escape_attempt() {
         let host = FakeHost::default();
@@ -5980,42 +6044,41 @@ mod tests {
             host: &host,
             session_id: "escape",
             soul_key: String::new(),
-            attached: Vec::new(),
         };
+        let mut attachments: Vec<Value> = Vec::new();
         let err = backend
             .execute_tool(
                 AGENT_TOOL_VIEW_IMAGE,
                 json!({ "path": "data/media/../secret.png" }),
+                &mut attachments,
             )
             .expect_err("must reject the escape");
         assert!(
             err.to_string().contains("path must be data/media/<sha256>"),
             "err={err}"
         );
-        assert!(backend.attached.is_empty(), "nothing may be queued");
+        assert!(attachments.is_empty(), "nothing may be queued");
     }
 
     /// 空队列：不改动消息，也不写附言。
     #[test]
     fn attach_recovered_images_does_nothing_without_a_queue() {
-        let mut backend = backend_with_attachments(Vec::new());
+        let mut turn = turn_with_attachments(Vec::new());
         let mut messages = vec![json!({ "role": "user", "content": "hi" })];
         assert_eq!(
-            attach_recovered_images(&mut backend, &mut messages, &[], 1 << 20),
+            attach_recovered_images(&mut turn, &mut messages, &[], 1 << 20),
             0
         );
         assert_eq!(messages.len(), 1);
     }
 
-    /// 默认实现（不覆盖 `take_attached_images` 的 backend）同样安全。
+    /// 没有队列的回合同样安全：不产出附言，也不动消息。
     #[test]
-    fn a_backend_without_a_queue_attaches_nothing() {
-        let mut backend = TerminalTestBackend {
-            executed_tools: Vec::new(),
-        };
+    fn a_turn_without_a_queue_attaches_nothing() {
+        let mut turn = Turn::default();
         let mut messages: Vec<Value> = Vec::new();
         assert_eq!(
-            attach_recovered_images(&mut backend, &mut messages, &[], 1 << 20),
+            attach_recovered_images(&mut turn, &mut messages, &[], 1 << 20),
             0
         );
         assert!(messages.is_empty());
@@ -6025,10 +6088,10 @@ mod tests {
     #[test]
     fn attach_recovered_images_drops_what_does_not_fit() {
         // 1024 字节 → 内联后 1368 字节。
-        let mut backend = backend_with_attachments(vec![png_part(1024), png_part(1024)]);
+        let mut turn = turn_with_attachments(vec![png_part(1024), png_part(1024)]);
         let mut messages: Vec<Value> = Vec::new();
         assert_eq!(
-            attach_recovered_images(&mut backend, &mut messages, &[], 1400),
+            attach_recovered_images(&mut turn, &mut messages, &[], 1400),
             1
         );
         let content = messages[0]["content"].as_array().expect("text + image");
@@ -6040,9 +6103,9 @@ mod tests {
             ),
             "{messages:?}"
         );
-        // 队列已清空：同一 backend 再取一次什么也没有。
+        // 队列已清空：同一回合再取一次什么也没有。
         assert_eq!(
-            attach_recovered_images(&mut backend, &mut messages, &[], 1 << 20),
+            attach_recovered_images(&mut turn, &mut messages, &[], 1 << 20),
             0
         );
         assert_eq!(messages.len(), 1);
@@ -6051,10 +6114,10 @@ mod tests {
     /// 一张都装不下时也要给出明确附言，否则模型会以为图已经看过了。
     #[test]
     fn attach_recovered_images_reports_a_fully_dropped_queue() {
-        let mut backend = backend_with_attachments(vec![png_part(1024)]);
+        let mut turn = turn_with_attachments(vec![png_part(1024)]);
         let mut messages: Vec<Value> = Vec::new();
         assert_eq!(
-            attach_recovered_images(&mut backend, &mut messages, &[], 10),
+            attach_recovered_images(&mut turn, &mut messages, &[], 10),
             0
         );
         let text = messages[0]["content"].as_str().expect("plain text");
@@ -6065,11 +6128,11 @@ mod tests {
     #[test]
     fn attach_recovered_images_pays_for_the_new_batch_first() {
         let new_image = png_part(1024);
-        let mut backend = backend_with_attachments(vec![png_part(1024)]);
+        let mut turn = turn_with_attachments(vec![png_part(1024)]);
         let mut messages: Vec<Value> = Vec::new();
         assert_eq!(
             attach_recovered_images(
-                &mut backend,
+                &mut turn,
                 &mut messages,
                 std::slice::from_ref(&new_image),
                 2200
@@ -6083,7 +6146,7 @@ mod tests {
     /// 取回的图片把请求顶出预算时，从最老的历史图片开始剥（附图自身留下）。
     #[test]
     fn attach_recovered_images_strips_history_instead_of_the_recovered_picture() {
-        let mut backend = backend_with_attachments(vec![png_part(1024)]);
+        let mut turn = turn_with_attachments(vec![png_part(1024)]);
         let mut messages = vec![json!({
             "role": "user",
             "content": [
@@ -6092,7 +6155,7 @@ mod tests {
             ],
         })];
         assert_eq!(
-            attach_recovered_images(&mut backend, &mut messages, &[], 2000),
+            attach_recovered_images(&mut turn, &mut messages, &[], 2000),
             1
         );
         assert!(
@@ -6107,5 +6170,259 @@ mod tests {
                 .expect("array")[1]["type"],
             "image_url"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // 每轮状态（`Turn`）：跨轮不泄漏
+    // -----------------------------------------------------------------
+
+    fn reasoning_reply(content: &str, reasoning: &str) -> cordis_plugin_sdk::llm::LlmMessage {
+        cordis_plugin_sdk::llm::LlmMessage {
+            content: Some(content.to_string()),
+            reasoning_content: Some(reasoning.to_string()),
+            ..Default::default()
+        }
+    }
+
+    /// 审计确认的泄漏：四个 strike 计数以前挂在 `AgentSession` 上，回合起点
+    /// 不归零。一次瞬态空回复会让下一条用户消息直接 `2 > 1` 失败。
+    ///
+    /// 这里逐轮跑真实的 `respond_inner`：回合一确实留下一次计数，而回合二
+    /// 的四个计数从 0 开始；回合三再遇到一次空回复仍然只是"重试一次"。
+    #[test]
+    fn a_second_turn_starts_with_zero_strike_counters() {
+        let mut session = ShellAgentSession::new(LlmApiConfig::default()).expect("build session");
+
+        // 回合一：先空补全（重试一次），再正常答复。回合结束时
+        // `empty_response_strikes` 是 1——旧实现把它留在了会话上。
+        let first_provider = FakeLlmProvider::new(vec![
+            cordis_plugin_sdk::llm::LlmMessage::default(),
+            assistant_reply("第一轮答复"),
+        ]);
+        let (first, turn1) = session.inner.respond_capturing_turn(
+            &EMPTY_FAKE_HOST,
+            "leak-1",
+            "第一轮",
+            &first_provider,
+            None,
+        );
+        assert!(first.is_ok());
+        assert_eq!(
+            turn1.empty_response_strikes, EMPTY_RESPONSE_RETRIES,
+            "回合一确实留下了一次计数"
+        );
+
+        // 回合二：一次正常答复不产生任何计数。四个计数（连同从上一轮继承
+        // 的可能性）都必须停在 0——`Turn::default()` 保证的就是这件事。
+        let second_provider = FakeLlmProvider::new(vec![assistant_reply("第二轮答复")]);
+        let (second, turn2) = session.inner.respond_capturing_turn(
+            &EMPTY_FAKE_HOST,
+            "leak-2",
+            "第二轮",
+            &second_provider,
+            None,
+        );
+        assert!(second.is_ok());
+        assert_eq!(
+            (
+                turn2.no_end_strikes,
+                turn2.unknown_tool_strikes,
+                turn2.empty_response_strikes,
+                turn2.reasoning_only_strikes,
+            ),
+            (0, 0, 0, 0),
+            "第二轮开始时 Turn 的四个计数都是 0"
+        );
+
+        // 回合三：同样的"空一次再答复"脚本。旧实现带着前两轮的 1，第二次
+        // 空补全就是 2 > 1，直接失败；新实现从 0 开始，重试一次后成功。
+        let third_provider = FakeLlmProvider::new(vec![
+            cordis_plugin_sdk::llm::LlmMessage::default(),
+            assistant_reply("第三轮答复"),
+        ]);
+        let (third, turn3) = session.inner.respond_capturing_turn(
+            &EMPTY_FAKE_HOST,
+            "leak-3",
+            "第三轮",
+            &third_provider,
+            None,
+        );
+        assert!(
+            third.is_ok(),
+            "第三轮不得继承前两轮的 empty_response 计数: {third:?}"
+        );
+        assert_eq!(
+            turn3.empty_response_strikes, EMPTY_RESPONSE_RETRIES,
+            "第三轮只看到自己那一次空回复"
+        );
+    }
+
+    /// `turn_reasoning` 以前只在回合开头 clear；现在它随 `Turn` 一起重建，
+    /// 第二轮的推理不可能包含第一轮的内容。转录仍保留两轮——那是跨轮历史。
+    #[test]
+    fn reasoning_is_not_carried_into_the_next_turn() {
+        let mut session = ShellAgentSession::new(LlmApiConfig::default()).expect("build session");
+
+        let first_provider = FakeLlmProvider::new(vec![reasoning_reply("答复一", "第一轮推理")]);
+        let (first, turn1) = session.inner.respond_capturing_turn(
+            &EMPTY_FAKE_HOST,
+            "reason-1",
+            "第一轮",
+            &first_provider,
+            None,
+        );
+        assert!(first.is_ok());
+        assert!(
+            turn1.reasoning.iter().any(|r| r.contains("第一轮推理")),
+            "第一轮的 Turn 应当收到自己的推理: {:?}",
+            turn1.reasoning
+        );
+
+        let second_provider = FakeLlmProvider::new(vec![reasoning_reply("答复二", "第二轮推理")]);
+        let (second, turn2) = session.inner.respond_capturing_turn(
+            &EMPTY_FAKE_HOST,
+            "reason-2",
+            "第二轮",
+            &second_provider,
+            None,
+        );
+        assert!(second.is_ok());
+        assert!(
+            turn2.reasoning.iter().all(|r| !r.contains("第一轮推理")),
+            "第二轮不得带上第一轮的推理: {:?}",
+            turn2.reasoning
+        );
+        assert!(
+            turn2.reasoning.iter().any(|r| r.contains("第二轮推理")),
+            "第二轮的 Turn 应当收到自己的推理: {:?}",
+            turn2.reasoning
+        );
+
+        // 转录是跨轮状态：两轮的推理都在，`Turn` 只是不再负责保存它们。
+        let transcripts: Vec<String> = session
+            .inner
+            .transcript()
+            .iter()
+            .filter_map(|entry| match entry {
+                AgentTranscriptEntry::Assistant { reasoning, .. } => reasoning.clone(),
+                _ => None,
+            })
+            .collect();
+        assert!(transcripts.iter().any(|r| r.contains("第一轮推理")));
+        assert!(transcripts.iter().any(|r| r.contains("第二轮推理")));
+    }
+
+    /// `view_image` 的队列以前挂在 backend 上；现在它是 `Turn` 的字段：
+    /// 工具只往调用方的队列里 push，第二轮拿到的是一个空队列。
+    #[test]
+    fn a_second_turn_starts_with_an_empty_attachment_queue() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let media = dir.path().join("media");
+        std::fs::create_dir_all(&media).expect("media dir");
+        let png: &[u8] = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR";
+        let digest = cordis_runtime::image_cache::digest_hex(png);
+        std::fs::write(media.join(&digest), png).expect("cache the image");
+        let host = FakeHost {
+            media_dir: media,
+            ..FakeHost::default()
+        };
+
+        // 队列属于调用方：`view_image` 把图片交给传进去的那个 `Vec`。
+        let mut queue: Vec<Value> = Vec::new();
+        let mut tool_backend = RuntimeShellAgentBackend {
+            host: &host,
+            session_id: "attach-direct",
+            soul_key: String::new(),
+        };
+        let output = tool_backend
+            .execute_tool(
+                AGENT_TOOL_VIEW_IMAGE,
+                json!({ "sha256": &digest[..8] }),
+                &mut queue,
+            )
+            .expect("view_image must find the cached picture");
+        assert_eq!(output["attached"], json!(format!("data/media/{digest}")));
+        assert_eq!(queue.len(), 1, "工具把图片放进调用方的队列");
+
+        // 回合一：`view_image` 之后正常答复——图片被挂到下一次请求上。
+        let first_provider = FakeLlmProvider::new(vec![
+            tool_call_message(
+                "call_view",
+                AGENT_TOOL_VIEW_IMAGE,
+                json!({ "path": format!("data/media/{digest}") }),
+            ),
+            assistant_reply("我看过了。"),
+        ]);
+        let mut session = ShellAgentSession::new(LlmApiConfig::default()).expect("build session");
+        let (first, turn1) = session.inner.respond_capturing_turn(
+            &host,
+            "attach-1",
+            "看看这张图",
+            &first_provider,
+            None,
+        );
+        assert!(first.is_ok());
+        let bodies = first_provider.seen_bodies.lock().expect("bodies");
+        assert_eq!(bodies.len(), 2);
+        assert!(
+            bodies[1].to_string().contains("data:image/png;base64,"),
+            "第一轮取回的图片必须挂到下一次请求上"
+        );
+        drop(bodies);
+        assert!(turn1.attached.is_empty(), "队列在第一轮内已被取走");
+
+        // 回合二：全新 `Turn`，队列为空，上一轮的图片也不会跟着请求走。
+        let second_provider = FakeLlmProvider::new(vec![assistant_reply("第二轮答复")]);
+        let (second, turn2) =
+            session
+                .inner
+                .respond_capturing_turn(&host, "attach-2", "继续", &second_provider, None);
+        assert!(second.is_ok());
+        assert!(turn2.attached.is_empty(), "第二轮开始时队列为空");
+        let bodies = second_provider.seen_bodies.lock().expect("bodies");
+        assert!(
+            !bodies[0].to_string().contains("data:image/png;base64,"),
+            "上一轮的图片不得跟着下一轮的请求"
+        );
+    }
+
+    /// 旧快照兼容：字段被移走后，带同名字段的 JSON 仍必须解析成功，只是那些
+    /// 计数被忽略；新快照也不再写它们。
+    #[test]
+    fn old_snapshots_with_turn_fields_still_restore() {
+        let legacy = json!({
+            "kind": "runtime_shell",
+            "config": serde_json::to_value(LlmApiConfig::default()).expect("config json"),
+            "history": [],
+            "transcript": [],
+            "completed_turns": 3,
+            "estimated_tokens": 0,
+            "reasoning_only_strikes": 2,
+            "empty_response_strikes": 1,
+            "require_end_tool": true,
+            "no_end_strikes": 4,
+            "unknown_tool_strikes": 5,
+            "soul_key": "u#private",
+        });
+        let snapshot: AgentSessionSnapshot =
+            serde_json::from_value(legacy).expect("旧快照必须仍然解析成功");
+        let session = AgentSession::from_snapshot(snapshot).expect("restore the session");
+        assert_eq!(session.status().completed_turns, 3);
+        assert_eq!(session.soul_key(), "u#private");
+        assert!(session.require_end_tool);
+
+        // 新快照不再携带每轮计数：它们是 `Turn` 的字段，不跨轮。
+        let fresh = serde_json::to_value(session.to_snapshot()).expect("fresh snapshot");
+        for field in [
+            "no_end_strikes",
+            "unknown_tool_strikes",
+            "empty_response_strikes",
+            "reasoning_only_strikes",
+        ] {
+            assert!(
+                fresh.get(field).is_none(),
+                "{field} 不属于快照，不得被写出: {fresh}"
+            );
+        }
     }
 }

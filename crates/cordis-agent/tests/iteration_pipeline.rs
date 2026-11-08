@@ -284,6 +284,7 @@ fn backend_replace_files_exact_success_arm_applies_batch() {
                     "new_content": "NEW contents\n"
                 }]
             }),
+            &mut Vec::new(),
         )
         .expect("non-empty replace_files_exact batch succeeds");
         // apply_operations returns a JSON summary; the operation is recorded.
@@ -310,6 +311,7 @@ fn backend_run_plugin_check_builds_single_plugin_default_command() {
             backend,
             "run_plugin_check",
             json!({ "plugin_path": "/mini" }),
+            &mut Vec::new(),
         )
         .expect("run_plugin_check returns Ok even when cargo exits nonzero");
         assert_eq!(out.get("stage").and_then(Value::as_str), Some("check"));
@@ -325,9 +327,13 @@ fn backend_run_plugin_check_builds_whole_workspace_default_command() {
     let (_temp, host) = empty_host();
     with_backend(&host, |backend| {
         // plugin_path "/" → whole-workspace default (no `-p`).
-        let out =
-            AgentBackend::execute_tool(backend, "run_plugin_check", json!({ "plugin_path": "/" }))
-                .expect("run_plugin_check Ok");
+        let out = AgentBackend::execute_tool(
+            backend,
+            "run_plugin_check",
+            json!({ "plugin_path": "/" }),
+            &mut Vec::new(),
+        )
+        .expect("run_plugin_check Ok");
         let cmd = out.get("command").and_then(Value::as_str).expect("command");
         assert!(cmd.contains("cargo check"));
         assert!(!cmd.contains("-p "), "whole-workspace default: {cmd}");
@@ -396,6 +402,7 @@ fn backend_execute_tool_empty_replace_batch_errors() {
             backend,
             PLUGIN_AGENT_TOOL_REPLACE_FILES_EXACT,
             json!({ "edits": [] }),
+            &mut Vec::new(),
         );
         assert!(matches!(
             out,
@@ -410,7 +417,7 @@ fn backend_execute_tool_empty_replace_batch_errors() {
 fn backend_execute_tool_unsupported_name_errors() {
     let (_temp, host) = empty_host();
     with_backend(&host, |backend| {
-        let out = AgentBackend::execute_tool(backend, "no_such_tool", json!({}));
+        let out = AgentBackend::execute_tool(backend, "no_such_tool", json!({}), &mut Vec::new());
         assert!(matches!(
             out,
             Err(RuntimeError::InvalidArgument { message })
@@ -429,6 +436,7 @@ fn backend_record_iteration_summary_requires_edits_and_verification() {
             backend,
             PLUGIN_AGENT_TOOL_RECORD_ITERATION_SUMMARY,
             json!({ "summary": "x" }),
+            &mut Vec::new(),
         );
         assert!(matches!(
             out,
@@ -544,6 +552,7 @@ fn backend_run_plugin_check_rejects_metachar_command_injection() {
             backend,
             "run_plugin_check",
             json!({ "command": "cargo check && curl x|sh" }),
+            &mut Vec::new(),
         )
         .expect_err("shell metacharacters must be rejected");
         assert_eq!(
@@ -555,6 +564,7 @@ fn backend_run_plugin_check_rejects_metachar_command_injection() {
             backend,
             "run_plugin_check",
             json!({ "command": "cargo check ;ls" }),
+            &mut Vec::new(),
         )
         .expect_err("a semicolon tail must be rejected");
         assert_eq!(
@@ -577,6 +587,7 @@ fn backend_run_plugin_check_rejects_plugin_path_injection() {
                 backend,
                 "run_plugin_check",
                 json!({ "plugin_path": bad }),
+                &mut Vec::new(),
             )
             .expect_err("an unsafe plugin_path must be rejected");
             assert_eq!(
@@ -598,6 +609,7 @@ fn backend_run_plugin_check_accepts_bare_check_alias() {
             backend,
             "run_plugin_check",
             json!({ "plugin_path": "/mini", "command": "check" }),
+            &mut Vec::new(),
         )
         .expect("bare check alias should run the default command");
         let cmd = out.get("command").and_then(Value::as_str).expect("command");
@@ -1390,8 +1402,9 @@ fn backend_run_plugin_test_uses_prepared_tests_command_fallback() {
     };
     // No explicit command → the `.or_else(prepared.tests_command)` fallback
     // arm supplies the prepared command.
-    let out = AgentBackend::execute_tool(&mut backend, "run_plugin_test", json!({}))
-        .expect("run_plugin_test Ok");
+    let out =
+        AgentBackend::execute_tool(&mut backend, "run_plugin_test", json!({}), &mut Vec::new())
+            .expect("run_plugin_test Ok");
     let cmd = out.get("command").and_then(Value::as_str).expect("command");
     assert_eq!(cmd, "cargo test --quiet -p mini --lib");
 }
