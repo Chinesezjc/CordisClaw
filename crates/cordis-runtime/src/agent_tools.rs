@@ -270,12 +270,30 @@ impl AgentToolHost for RuntimeHost {
                 })
             })
             .collect();
+        // What was already tried, so the agent does not propose the same fix
+        // again — the cheapest form of learning this system has.
+        let ledger_path = crate::host::RuntimeHost::data_dir(self).join("selfcheck.json");
+        let ledger = crate::selfcheck::Ledger::load(&ledger_path);
+        let lessons: Vec<serde_json::Value> = ledger
+            .lessons
+            .iter()
+            .rev()
+            .take(5)
+            .map(|lesson| {
+                serde_json::json!({
+                    "signature": lesson.signature,
+                    "fix": lesson.fix,
+                    "outcome": lesson.outcome,
+                })
+            })
+            .collect();
         Ok(serde_json::json!({
             "ok": true,
             "scanned_sessions": report.scanned_sessions,
             "scanned_turns": report.scanned_turns,
             "open": open,
             "instruction": report.open().first().map(|signature| report.instruction(signature)),
+            "lessons": lessons,
         }))
     }
 

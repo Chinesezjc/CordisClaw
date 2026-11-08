@@ -2580,26 +2580,15 @@ fn reflect_on_failures(host: &cordis_runtime::host::RuntimeHost) {
         return;
     }
     let root = host.data_dir().join("sessions");
-    let report = cordis_runtime::selfcheck::scan(&root);
     let ledger_path = host.data_dir().join("selfcheck.json");
-    let mut ledger: serde_json::Value = std::fs::read_to_string(&ledger_path)
-        .ok()
-        .and_then(|text| serde_json::from_str(&text).ok())
-        .unwrap_or_else(|| serde_json::json!({"attempted": []}));
-    let attempted: Vec<String> = ledger
-        .get("attempted")
-        .and_then(|value| value.as_array())
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(|item| item.as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default();
+    let mut ledger = cordis_runtime::selfcheck::Ledger::load(&ledger_path);
+    // Past attempts ride along, so the instruction can say "this was already
+    // tried and did not work" instead of proposing the same fix again.
+    let report = cordis_runtime::selfcheck::scan(&root).with_lessons(ledger.lessons.clone());
     let Some(signature) = report
         .signatures
         .iter()
-        .filter(|signature| !attempted.contains(&signature.id()))
+        .filter(|signature| !ledger.has_attempted(&signature.id()))
         .max_by_key(|signature| signature.score())
     else {
         return;
@@ -2665,16 +2654,27 @@ fn reflect_on_failures(host: &cordis_runtime::host::RuntimeHost) {
             summary
         ),
     );
-    if let Some(list) = ledger
-        .get_mut("attempted")
-        .and_then(|value| value.as_array_mut())
-    {
-        list.push(serde_json::Value::String(signature.id()));
-    }
-    let _ = std::fs::write(
-        &ledger_path,
-        serde_json::to_string_pretty(&ledger).unwrap_or_default(),
+    ledger.record_attempt(&signature.id());
+    let outcome = match &verdict {
+        Some(verdict) => serde_json::to_string(verdict).unwrap_or_default(),
+        None => "no machine-checkable proposal was produced".to_string(),
+    };
+    ledger.push_lesson(
+        cordis_runtime::selfcheck::Lesson {
+            signature: signature.id(),
+            symptom: signature.excerpt.clone(),
+            fix: summary.chars().take(400).collect(),
+            outcome,
+            learned_at_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_millis() as u64)
+                .unwrap_or(0),
+        },
+        20,
     );
+    if let Err(error) = ledger.save(&ledger_path) {
+        eprintln!("self-check: {error}");
+    }
     eprintln!(
         "self-check: wrote {}/{}.md",
         proposal_dir.display(),

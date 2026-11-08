@@ -88,6 +88,53 @@ pub struct Lesson {
     pub learned_at_ms: u64,
 }
 
+/// What has already been tried, kept on disk between reflection turns.
+///
+/// Without it the loop re-attempts the same signature every six hours, and with
+/// it the instruction can say "this fix was already tried and failed", which is
+/// the difference between learning and spinning.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Ledger {
+    #[serde(default)]
+    pub attempted: Vec<String>,
+    #[serde(default)]
+    pub lessons: Vec<Lesson>,
+}
+
+impl Ledger {
+    /// Load `data/selfcheck.json`; a missing or broken file starts empty.
+    pub fn load(path: &Path) -> Self {
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn save(&self, path: &Path) -> Result<(), String> {
+        let text = serde_json::to_string_pretty(self).map_err(|error| error.to_string())?;
+        std::fs::write(path, text).map_err(|error| format!("write {}: {error}", path.display()))
+    }
+
+    pub fn has_attempted(&self, signature: &str) -> bool {
+        self.attempted.iter().any(|id| id == signature)
+    }
+
+    pub fn record_attempt(&mut self, signature: &str) {
+        if !self.has_attempted(signature) {
+            self.attempted.push(signature.to_string());
+        }
+    }
+
+    /// Keep the most recent `keep` lessons; the prompt only needs the tail.
+    pub fn push_lesson(&mut self, lesson: Lesson, keep: usize) {
+        self.lessons.push(lesson);
+        if self.lessons.len() > keep {
+            let excess = self.lessons.len() - keep;
+            self.lessons.drain(0..excess);
+        }
+    }
+}
+
 /// The whole picture: what is failing, and what has already been tried.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SelfCheck {
@@ -101,6 +148,12 @@ pub struct SelfCheck {
 }
 
 impl SelfCheck {
+    /// Put the recorded lessons in front of the next attempt.
+    pub fn with_lessons(mut self, lessons: Vec<Lesson>) -> Self {
+        self.lessons = lessons;
+        self
+    }
+
     /// Signatures nobody has tried to fix yet, best first.
     pub fn open(&self) -> Vec<&Signature> {
         let mut open: Vec<&Signature> = self
@@ -576,6 +629,81 @@ mod tests {
     #[test]
     fn no_failures_means_no_digest() {
         assert!(digest(&SelfCheck::default(), 3).is_none());
+    }
+
+    #[test]
+    fn a_ledger_round_trips_through_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("selfcheck.json");
+        let mut ledger = Ledger::default();
+        ledger.record_attempt("empty-abc123");
+        ledger.push_lesson(
+            Lesson {
+                signature: "empty-abc123".to_string(),
+                symptom: "history was cleared".to_string(),
+                fix: "keep a floor".to_string(),
+                outcome: "verified".to_string(),
+                learned_at_ms: 1,
+            },
+            10,
+        );
+        ledger.save(&path).unwrap();
+        let loaded = Ledger::load(&path);
+        assert_eq!(loaded, ledger);
+        assert!(loaded.has_attempted("empty-abc123"));
+    }
+
+    #[test]
+    fn a_missing_or_broken_ledger_starts_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            Ledger::load(&dir.path().join("none.json")),
+            Ledger::default()
+        );
+        let broken = dir.path().join("broken.json");
+        std::fs::write(&broken, "{not json").unwrap();
+        assert_eq!(Ledger::load(&broken), Ledger::default());
+    }
+
+    #[test]
+    fn recording_an_attempt_twice_keeps_one_entry() {
+        let mut ledger = Ledger::default();
+        ledger.record_attempt("a");
+        ledger.record_attempt("a");
+        assert_eq!(ledger.attempted.len(), 1);
+    }
+
+    #[test]
+    fn lessons_keep_only_the_most_recent() {
+        let mut ledger = Ledger::default();
+        for index in 0..5 {
+            ledger.push_lesson(
+                Lesson {
+                    signature: format!("s{index}"),
+                    symptom: String::new(),
+                    fix: String::new(),
+                    outcome: String::new(),
+                    learned_at_ms: index as u64,
+                },
+                3,
+            );
+        }
+        assert_eq!(ledger.lessons.len(), 3);
+        assert_eq!(ledger.lessons[0].signature, "s2");
+        assert_eq!(ledger.lessons[2].signature, "s4");
+    }
+
+    #[test]
+    fn a_scan_can_carry_recorded_lessons() {
+        let lesson = Lesson {
+            signature: "empty-abc".to_string(),
+            symptom: "cleared".to_string(),
+            fix: "floor".to_string(),
+            outcome: "failed".to_string(),
+            learned_at_ms: 0,
+        };
+        let report = SelfCheck::default().with_lessons(vec![lesson.clone()]);
+        assert_eq!(report.lessons, vec![lesson]);
     }
 
     #[test]
