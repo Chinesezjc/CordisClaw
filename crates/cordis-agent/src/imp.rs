@@ -1511,29 +1511,14 @@ impl AgentSession {
         // really searched or is about to claim it did. History used to record
         // only the text, which is why the bot both invented "I looked it up"
         // and later denied a search it had run: it had no record either way.
-        let performed: Vec<String> = reply
-            .tool_events
-            .iter()
-            .map(|event| {
-                let status = if event.delivered() {
-                    ""
-                } else {
-                    "（失败）"
-                };
-                // A plugin node arrives as `invoke_plugin`; the node name is
-                // what the reader needs to know it actually searched.
-                let name = event
-                    .arguments
-                    .get("node_id")
-                    .and_then(Value::as_str)
-                    .unwrap_or(&event.name);
-                format!("{name}{status}")
-            })
-            .collect();
+        // The call, its arguments and its result — not just the name. The bot
+        // argued with itself about whether it had searched; a record it can
+        // re-read answers that, and an argument-less summary cannot.
+        let performed: Vec<String> = reply.tool_events.iter().map(render_recorded_call).collect();
         let actions = if performed.is_empty() {
             "[本轮未调用工具]".to_string()
         } else {
-            format!("[本轮执行] {}", performed.join("、"))
+            performed.join("\n")
         };
         let assistant = if said.is_empty() {
             format!("{actions}（没有发言）")
@@ -2437,6 +2422,50 @@ fn attach_recovered_images(
     // 历史图片开始剥，规则与 `respond_inner` 开头的裁剪完全一致。
     cordis_runtime::image_budget::enforce_image_budget(messages, budget);
     attached.len()
+}
+
+/// How much of a tool result is kept in history.
+///
+/// The full text of a `read_file` on a large file is megabytes; replaying it on
+/// every later request would cost the context window and trip the provider's
+/// body limit. The excerpt keeps the answer recognisable and says what was cut.
+const RECORDED_RESULT_CHARS: usize = 4000;
+
+/// One tool call as it is written back into history.
+///
+/// Shape: `[tool] name {arguments} → result`. A plugin node is named by its node
+/// (`web_search`), not by the `invoke_plugin` wrapper: the node is what answers
+/// "did I actually look this up".
+fn render_recorded_call(event: &cordis_runtime::agent_api::AgentToolEvent) -> String {
+    let name = event
+        .arguments
+        .get("node_id")
+        .and_then(Value::as_str)
+        .unwrap_or(&event.name);
+    let arguments = event
+        .arguments
+        .get("payload_json")
+        .filter(|_| event.name == cordis_runtime::agent_tools::AGENT_TOOL_INVOKE_PLUGIN)
+        .unwrap_or(&event.arguments);
+    let heading = format!(
+        "[tool] {name} {}",
+        truncate_chars(&arguments.to_string(), 400)
+    );
+    match (&event.output, event.ok) {
+        (Some(output), true) => format!(
+            "{heading} → {}",
+            truncate_chars(&output.to_string(), RECORDED_RESULT_CHARS)
+        ),
+        (Some(output), false) => format!(
+            "{heading} → 失败: {}",
+            truncate_chars(&output.to_string(), RECORDED_RESULT_CHARS)
+        ),
+        (None, true) => heading,
+        (None, false) => format!(
+            "{heading} → 失败: {}",
+            truncate_chars(event.error.as_deref().unwrap_or("unknown error"), 600)
+        ),
+    }
 }
 
 /// Remove every image content part from a message list, turning multimodal
@@ -6249,8 +6278,10 @@ mod tests {
             .map(|message| message["content"].as_str().unwrap_or_default().to_string())
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(recorded.contains("[本轮执行]"), "{recorded}");
-        assert!(recorded.contains("web_search"), "{recorded}");
+        // The call, its arguments and its result all survive.
+        assert!(recorded.contains("[tool] web_search"), "{recorded}");
+        assert!(recorded.contains("\"query\":\"worlds 2026\""), "{recorded}");
+        assert!(recorded.contains("→"), "{recorded}");
     }
 
     #[test]
