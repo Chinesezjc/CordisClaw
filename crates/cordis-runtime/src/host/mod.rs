@@ -1680,12 +1680,8 @@ impl RuntimeHost {
             if path.extension().and_then(|e| e.to_str()) != Some("json") {
                 continue;
             }
-            // Skip temp files.
-            if path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with('.'))
-            {
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+            if !is_session_snapshot_file(name) {
                 continue;
             }
             // Read → parse → reconstruct, each step logging its own message and
@@ -5281,6 +5277,16 @@ fn io_ctx(path: PathBuf, what: &str, e: impl std::fmt::Display) -> RuntimeError 
 /// on-disk snapshot can force (every field round-trips and reqwest accepts any
 /// timeout), so the message shape is pinned by a unit test instead of by a
 /// fixture. Byte-identical to the inline `format!` it replaces.
+/// Which files in `data/sessions/` are session snapshots.
+///
+/// The binding index lives in the same directory. Treating it as a session made
+/// every boot log `parse failed for data/sessions/index.json: missing field
+/// kind` and count it as a skipped session; temp files are written next to the
+/// snapshot they are about to replace.
+fn is_session_snapshot_file(name: &str) -> bool {
+    name.ends_with(".json") && !name.starts_with('.') && name != "index.json"
+}
+
 fn crash_recovery_reconstruct_log_line(path: &Path, err: &dyn std::fmt::Display) -> String {
     let subject = format!("reconstruct failed for {}", path.display());
     RuntimeHost::host_io_log_line("crash-recovery", &subject, err)

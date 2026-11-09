@@ -417,6 +417,16 @@ fn host_io_log_line_formats_stage_subject_and_error() {
     );
 }
 
+/// The binding index sits in the same directory as the snapshots. Parsing it as
+/// a session produced a spurious "parse failed" on every boot.
+#[test]
+fn crash_recovery_skips_the_binding_index() {
+    assert!(!super::is_session_snapshot_file("index.json"));
+    assert!(super::is_session_snapshot_file("agent-session-1.json"));
+    assert!(!super::is_session_snapshot_file(".agent-session-1.json.tmp"));
+    assert!(!super::is_session_snapshot_file("notes.txt"));
+}
+
 /// The reconstruct-failure line in `detect_crash_and_recover`'s hydration
 /// chain. `AgentSession::from_snapshot` only fails when reqwest cannot build
 /// an HTTP client — no on-disk snapshot can force that (every field
