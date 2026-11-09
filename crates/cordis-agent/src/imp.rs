@@ -1507,10 +1507,38 @@ impl AgentSession {
         // full of `{"action":"respond",…}` taught the model to answer with that
         // JSON — a protocol no prompt line asks for — and it is why replies kept
         // arriving as plain text that the channel then dropped.
-        let assistant = if said.is_empty() {
-            r#"{"node_id":"suspend"}"#.to_string()
+        // What the turn actually did, so a later turn can tell whether it
+        // really searched or is about to claim it did. History used to record
+        // only the text, which is why the bot both invented "I looked it up"
+        // and later denied a search it had run: it had no record either way.
+        let performed: Vec<String> = reply
+            .tool_events
+            .iter()
+            .map(|event| {
+                let status = if event.delivered() {
+                    ""
+                } else {
+                    "（失败）"
+                };
+                // A plugin node arrives as `invoke_plugin`; the node name is
+                // what the reader needs to know it actually searched.
+                let name = event
+                    .arguments
+                    .get("node_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or(&event.name);
+                format!("{name}{status}")
+            })
+            .collect();
+        let actions = if performed.is_empty() {
+            "[本轮未调用工具]".to_string()
         } else {
-            said.join("\n")
+            format!("[本轮执行] {}", performed.join("、"))
+        };
+        let assistant = if said.is_empty() {
+            format!("{actions}（没有发言）")
+        } else {
+            format!("{}\n\n{actions}", said.join("\n"))
         };
         let reasoning = closing_reasoning(&turn.reasoning);
         // Only the batch body belongs in history. The channel's one-shot
@@ -6194,6 +6222,37 @@ mod tests {
     ///
     /// 这里逐轮跑真实的 `respond_inner`：回合一确实留下一次计数，而回合二
     /// 的四个计数从 0 开始；回合三再遇到一次空回复仍然只是"重试一次"。
+    /// History must say what the turn did, not only what it said: without it a
+    /// later turn cannot tell whether it searched before claiming to have.
+    #[test]
+    fn history_records_the_tools_a_turn_ran() {
+        let provider = FakeLlmProvider::new(vec![
+            assistant_reply(
+                "<|DSML|calls>\n\
+                 <|DSML|invoke name=\"web_search\">\n\
+                 <|DSML|parameter name=\"query\" string=\"true\">worlds 2026</|DSML|parameter>\n\
+                 </|DSML|invoke>\n</|DSML|calls>",
+            ),
+            assistant_reply(
+                "<|DSML|calls>\n<|DSML|invoke name=\"suspend\"></|DSML|invoke>\n</|DSML|calls>",
+            ),
+        ]);
+        let mut session = ShellAgentSession::new(LlmApiConfig::default()).expect("build session");
+        session.set_require_end_tool(true);
+        session
+            .respond_via(&EMPTY_FAKE_HOST, "records-tools", "查一下", &provider)
+            .expect("turn");
+        let recorded: String = session
+            .inner
+            .history
+            .iter()
+            .map(|message| message["content"].as_str().unwrap_or_default().to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(recorded.contains("[本轮执行]"), "{recorded}");
+        assert!(recorded.contains("web_search"), "{recorded}");
+    }
+
     #[test]
     fn a_second_turn_starts_with_zero_strike_counters() {
         let mut session = ShellAgentSession::new(LlmApiConfig::default()).expect("build session");
