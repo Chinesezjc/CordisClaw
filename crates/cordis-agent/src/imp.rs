@@ -2128,13 +2128,20 @@ fn llm_message_to_request(message: &cordis_plugin_sdk::llm::LlmMessage) -> Value
             }
         });
     out.insert("content".to_string(), content_value);
+    // DeepSeek's thinking mode rejects a request whose assistant turns do not
+    // carry `reasoning_content`: "The `reasoning_content` in the thinking mode
+    // must be passed back to the API." An assistant message that called a tool
+    // therefore echoes the field even when the reasoning came back empty.
     if let Some(reasoning_content) = message.reasoning_content.as_ref() {
-        if !reasoning_content.trim().is_empty() {
-            out.insert(
-                "reasoning_content".to_string(),
-                Value::String(reasoning_content.clone()),
-            );
-        }
+        out.insert(
+            "reasoning_content".to_string(),
+            Value::String(reasoning_content.clone()),
+        );
+    } else if !message.tool_calls.is_empty() {
+        out.insert(
+            "reasoning_content".to_string(),
+            Value::String(String::new()),
+        );
     }
     if !message.tool_calls.is_empty() {
         out.insert(
