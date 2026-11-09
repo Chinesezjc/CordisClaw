@@ -23,6 +23,16 @@ pub trait AgentToolHost {
     /// The answer is evidence, not a summary: each signature carries how often
     /// it happens, which sessions hit it, and one example. That is what an
     /// iteration needs to act on a failure instead of guessing at it.
+    /// Write a large tool result somewhere the agent can read it back.
+    ///
+    /// Returns the path, or an error when this host has nowhere to put it —
+    /// callers must then keep the content inline rather than drop it.
+    fn agent_spill(&self, tool: &str, _text: &str) -> Result<String, RuntimeError> {
+        Err(RuntimeError::InvalidArgument {
+            message: format!("this host cannot spill {tool} output"),
+        })
+    }
+
     /// A short, cacheable summary of the failures that repeat most, for the
     /// system prompt. `None` when there is nothing worth saying.
     ///

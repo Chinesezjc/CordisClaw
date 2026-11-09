@@ -10,6 +10,7 @@ use cordis_runtime::agent_loop::{install_agent_loop, AgentLoop};
 pub mod dsml;
 pub mod gate;
 pub mod iteration;
+pub mod spill;
 
 mod imp;
 pub use imp::*;

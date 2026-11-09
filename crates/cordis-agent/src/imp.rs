@@ -650,7 +650,14 @@ impl AgentSession {
         );
         self.repair_transcript_on_error(transcript_len_before, &result);
         self.record_turn_end(transcript_len_before, &result, &turn);
-        self.remember_if_unrecorded(&result, user_input, images, history_len_before, &turn);
+        self.remember_if_unrecorded(
+            &result,
+            user_input,
+            images,
+            history_len_before,
+            &turn,
+            backend.host(),
+        );
         (result, turn)
     }
 
@@ -1472,13 +1479,14 @@ impl AgentSession {
     /// calls `remember_exchange`, so its history stayed empty and the bot could
     /// not answer "what did you just say". What it actually said is in the
     /// turn's tool calls, so the transcript slice is the source.
-    fn remember_if_unrecorded(
+    fn remember_if_unrecorded<H: crate::AgentToolHost + ?Sized>(
         &mut self,
         result: &Result<AgentReply, RuntimeError>,
         user_input: &str,
         images: &[Value],
         history_len_before: usize,
         turn: &Turn,
+        host: &H,
     ) {
         if self.history.len() > history_len_before {
             return;
@@ -1514,7 +1522,11 @@ impl AgentSession {
         // The call, its arguments and its result — not just the name. The bot
         // argued with itself about whether it had searched; a record it can
         // re-read answers that, and an argument-less summary cannot.
-        let performed: Vec<String> = reply.tool_events.iter().map(render_recorded_call).collect();
+        let performed: Vec<String> = reply
+            .tool_events
+            .iter()
+            .map(|event| render_recorded_call(event, host))
+            .collect();
         let actions = if performed.is_empty() {
             "[本轮未调用工具]".to_string()
         } else {
@@ -2436,7 +2448,10 @@ const RECORDED_RESULT_CHARS: usize = 4000;
 /// Shape: `[tool] name {arguments} → result`. A plugin node is named by its node
 /// (`web_search`), not by the `invoke_plugin` wrapper: the node is what answers
 /// "did I actually look this up".
-fn render_recorded_call(event: &cordis_runtime::agent_api::AgentToolEvent) -> String {
+fn render_recorded_call<H: crate::AgentToolHost + ?Sized>(
+    event: &cordis_runtime::agent_api::AgentToolEvent,
+    host: &H,
+) -> String {
     let name = event
         .arguments
         .get("node_id")
@@ -2451,20 +2466,35 @@ fn render_recorded_call(event: &cordis_runtime::agent_api::AgentToolEvent) -> St
         "[tool] {name} {}",
         truncate_chars(&arguments.to_string(), 400)
     );
-    match (&event.output, event.ok) {
-        (Some(output), true) => format!(
-            "{heading} → {}",
-            truncate_chars(&output.to_string(), RECORDED_RESULT_CHARS)
+    let (result, failed) = match (&event.output, event.ok) {
+        (Some(output), true) => (output.to_string(), false),
+        (Some(output), false) => (output.to_string(), true),
+        (None, true) => return heading,
+        (None, false) => (
+            event
+                .error
+                .as_deref()
+                .unwrap_or("unknown error")
+                .to_string(),
+            true,
         ),
-        (Some(output), false) => format!(
-            "{heading} → 失败: {}",
-            truncate_chars(&output.to_string(), RECORDED_RESULT_CHARS)
-        ),
-        (None, true) => heading,
-        (None, false) => format!(
-            "{heading} → 失败: {}",
-            truncate_chars(event.error.as_deref().unwrap_or("unknown error"), 600)
-        ),
+    };
+    // A result too big to replay is written to disk; the context keeps its
+    // head, its tail and a pointer. Truncating it instead spent the tokens and
+    // lost the content, which is the worst of both.
+    let result = if crate::spill::needs_spill(&result) {
+        match host.agent_spill(name, &result) {
+            Ok(path) => crate::spill::bound(&result, &path)
+                .unwrap_or_else(|| truncate_chars(&result, RECORDED_RESULT_CHARS)),
+            Err(_) => truncate_chars(&result, RECORDED_RESULT_CHARS),
+        }
+    } else {
+        truncate_chars(&result, RECORDED_RESULT_CHARS)
+    };
+    if failed {
+        format!("{heading} → 失败: {result}")
+    } else {
+        format!("{heading} → {result}")
     }
 }
 

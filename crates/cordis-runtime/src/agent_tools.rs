@@ -231,6 +231,28 @@ impl AgentToolHost for RuntimeHost {
         to_json_value("kernel issues", self.kernel().plugin_issues())
     }
 
+    fn agent_spill(&self, tool: &str, text: &str) -> Result<String, RuntimeError> {
+        let dir = crate::host::RuntimeHost::data_dir(self).join("spill");
+        std::fs::create_dir_all(&dir).map_err(|error| RuntimeError::Io {
+            path: dir.clone(),
+            message: error.to_string(),
+        })?;
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_millis())
+            .unwrap_or(0);
+        let safe: String = tool
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect();
+        let path = dir.join(format!("{safe}-{stamp}.txt"));
+        std::fs::write(&path, text).map_err(|error| RuntimeError::Io {
+            path: path.clone(),
+            message: error.to_string(),
+        })?;
+        Ok(path.display().to_string())
+    }
+
     fn agent_self_check_digest(&self) -> Option<String> {
         // The scan walks every snapshot; a session asks on every turn, so the
         // answer is cached and refreshed slowly.
