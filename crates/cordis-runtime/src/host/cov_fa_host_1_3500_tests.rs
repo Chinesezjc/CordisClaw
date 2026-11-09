@@ -423,7 +423,9 @@ fn host_io_log_line_formats_stage_subject_and_error() {
 fn crash_recovery_skips_the_binding_index() {
     assert!(!super::is_session_snapshot_file("index.json"));
     assert!(super::is_session_snapshot_file("agent-session-1.json"));
-    assert!(!super::is_session_snapshot_file(".agent-session-1.json.tmp"));
+    assert!(!super::is_session_snapshot_file(
+        ".agent-session-1.json.tmp"
+    ));
     assert!(!super::is_session_snapshot_file("notes.txt"));
 }
 

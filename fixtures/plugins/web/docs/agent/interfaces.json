@@ -7,7 +7,7 @@
   "nodes": [
     {
       "id": "web_search",
-      "summary": "Search the web using DeepSeek Anthropic-compatible API. Returns structured results (title + URL per result) plus an AI summary. Use web_fetch to verify specific pages.",
+      "summary": "Search the web. Returns ranked results with title, URL, date and a summary written for a model to read. Use it to check a fact instead of answering from memory; follow up with web_fetch for a full page.",
       "input_schema": {
         "type": "object",
         "required": [
@@ -47,7 +47,7 @@
         }
       },
       "side_effects": [
-        "makes HTTP request to DeepSeek Anthropic-compatible endpoint with native web_search tool"
+        "makes a POST to the DeepSeek Search API"
       ],
       "failure_modes": [
         "api key not configured",
@@ -59,7 +59,7 @@
     },
     {
       "id": "web_fetch",
-      "summary": "Fetch a web page and return plain-text content (HTML tags stripped). Max 8000 chars. Only http/https allowed.",
+      "summary": "Read one web page. Uses the DeepSeek Fetch API (clean Markdown, max 8000 chars) and falls back to a local fetch. Only http/https allowed; private addresses are refused.",
       "input_schema": {
         "type": "object",
         "required": [
@@ -101,7 +101,7 @@
         }
       },
       "side_effects": [
-        "makes HTTP GET request to the target URL"
+        "makes a POST to the DeepSeek Fetch API, then an HTTP GET if it refuses"
       ],
       "failure_modes": [
         "invalid URL",

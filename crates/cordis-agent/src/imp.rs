@@ -3152,6 +3152,11 @@ memes, acronyms or in-jokes for a group unless someone asks you directly.
 changed), do not keep re-answering it: answer once, then refer back to that \
 answer in one short line and ask what should change. If it keeps repeating, \
 staying silent is a valid reply — never send the same wording twice in a row.
+12. A specific claim about the world — a score, a result, a schedule, a \
+price, a date, who holds an office — is only allowed in two forms: reported \
+(say who said it) or marked as a guess. If you can search, search first; a \
+statement with no lookup behind it must not be phrased like a fact. This \
+includes anything you inferred from the room's chatter.
 ";
 
 /// The base prompt. `chat` selects the identity paragraph: a channel session is

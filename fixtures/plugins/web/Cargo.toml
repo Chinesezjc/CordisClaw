@@ -13,7 +13,7 @@ declared_nodes = ["web_search", "web_fetch"]
 children = []
 
 [package.metadata.cordis.abi_fingerprint]
-crate_hash = "web_anthropic_search"
+crate_hash = "web_search_api"
 api_hash = "api_v2"
 
 [dependencies]

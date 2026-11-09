@@ -1,16 +1,18 @@
 //! Web access plugin — search and fetch.
 //!
 //! Nodes:
-//! - `web_search`  — search the web using DeepSeek Anthropic-compatible API
-//!   (returns structured results: title + URL per result)
-//! - `web_fetch`   — fetch a URL and return plain-text content
+//! - `web_search`  — search the web through DeepSeek's Search API
+//!   (`POST /v1/tools/search`): title, URL, date and a summary per result
+//! - `web_fetch`   — read one page through DeepSeek's Fetch API
+//!   (`POST /v1/tools/fetch`), which returns Markdown; falls back to a local
+//!   fetch when the vendor cannot serve the page
 //!
 //! Safety: only http/https URLs are allowed; localhost, loopback, and private
-//! network addresses are blocked.
+//! network addresses are blocked before a URL is sent to the vendor.
 //!
-//! Backend:
-//! DeepSeek Anthropic-compatible endpoint with native web_search server tool.
-//! Returns structured search results the agent can verify with web_fetch.
+//! Backend: plain JSON endpoints, not a model-mediated tool — searching does not
+//! cost a chat completion, and the result carries no model-written prose that
+//! could be mistaken for a fact.
 
 use cordis_plugin_sdk::{
     export_plugin_api, json_response, node_doc, plugin_docs, AbiFingerprint, PluginRequest,
@@ -23,10 +25,10 @@ use std::time::Duration;
 
 const TIMEOUT_SECS: u64 = 60;
 
-/// Default Anthropic-compatible endpoint used for web search.
-const DEFAULT_SEARCH_URL: &str = "https://api.deepseek.com/anthropic/messages";
 /// Environment override (highest priority).
 const SEARCH_URL_ENV: &str = "CORDIS_WEB_SEARCH_URL";
+/// Environment override for the Fetch API endpoint.
+const FETCH_URL_ENV: &str = "CORDIS_WEB_FETCH_URL";
 
 /// Read `web_search_url:` from the same flat config file the rest of the
 /// plugin parses (kept dependency-free on purpose).
@@ -40,17 +42,15 @@ fn config_search_url(text: &str) -> Option<String> {
     })
 }
 
-/// Resolve the search endpoint: env override > config override > default.
-/// The endpoint is deliberately separate from `base_url`: providers often
-/// expose the Anthropic-compatible surface under a different path than the
-/// OpenAI-compatible one used for chat.
-fn resolve_search_url(env_url: Option<&str>, config_text: Option<&str>) -> String {
-    env_url
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
-        .or_else(|| config_text.and_then(config_search_url))
-        .unwrap_or_else(|| DEFAULT_SEARCH_URL.to_string())
+/// Read `web_fetch_url:` from the same flat config file.
+fn config_fetch_url(text: &str) -> Option<String> {
+    text.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix("web_fetch_url:")
+            .map(|value| value.trim().trim_matches('"'))
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+    })
 }
 
 const MAX_FETCH_CHARS: usize = 8000;
@@ -77,8 +77,8 @@ struct WebRequest {
     #[serde(default)]
     query: Option<String>,
 
+    /// How many results to ask for; the Search API caps this at 50.
     #[serde(default)]
-    #[allow(dead_code)]
     max_results: Option<usize>,
 
     #[serde(default)]
@@ -101,7 +101,7 @@ struct WebResponse {
 }
 
 // ---------------------------------------------------------------------------
-// Web search — DeepSeek Anthropic-compatible API (native web_search tool)
+// Web search — DeepSeek Search API
 // ---------------------------------------------------------------------------
 
 fn read_llm_config() -> Option<(String, String, String)> {
@@ -127,99 +127,165 @@ fn read_llm_config() -> Option<(String, String, String)> {
     ))
 }
 
-fn web_search_anthropic(query: &str) -> Result<String, String> {
-    let (api_key, model, _base_url) =
+/// Search endpoint derived from the configured base, unless overridden.
+///
+/// DeepSeek exposes the Search API as a plain JSON endpoint
+/// (`POST /v1/tools/search`), not as a model-mediated tool: the model does not
+/// have to run a turn to find something out.
+fn search_endpoint(base_url: &str, override_url: Option<&str>) -> String {
+    match override_url.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(url) => url.to_string(),
+        None => format!("{}/v1/tools/search", origin_of(base_url)),
+    }
+}
+
+/// Scheme and host only.
+///
+/// The chat base URL is `https://api.deepseek.com/beta`; appending the tools
+/// path to it produced `/beta/v1/tools/search` and a 404. The tools live at the
+/// origin, not under the chat path.
+fn origin_of(base_url: &str) -> String {
+    let trimmed = base_url.trim().trim_end_matches('/');
+    let Some(scheme_end) = trimmed.find("://") else {
+        return trimmed.to_string();
+    };
+    let after_scheme = &trimmed[scheme_end + 3..];
+    let host_end = after_scheme.find('/').unwrap_or(after_scheme.len());
+    format!("{}{}", &trimmed[..scheme_end + 3], &after_scheme[..host_end])
+}
+
+/// Fetch endpoint derived from the configured base.
+fn fetch_endpoint(base_url: &str, override_url: Option<&str>) -> String {
+    match override_url.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(url) => url.to_string(),
+        None => format!("{}/v1/tools/fetch", origin_of(base_url)),
+    }
+}
+
+/// Search the web through DeepSeek's Search API.
+///
+/// Results carry a `summary` written for a model to read; the snippet is the
+/// fallback when the summary is missing.
+fn web_search(query: &str, count: usize, ori_question: Option<&str>) -> Result<String, String> {
+    let (api_key, _model, base_url) =
         read_llm_config().ok_or("no api_key found in config/llm_api.yaml".to_string())?;
+    let config_text = std::fs::read_to_string("config/llm_api.yaml").ok();
+    let config_url = config_text.as_deref().and_then(config_search_url);
+    let url = search_endpoint(
+        &base_url,
+        std::env::var(SEARCH_URL_ENV).ok().as_deref().or(config_url.as_deref()),
+    );
+
+    let mut body = json!({"query": query, "count": count});
+    if let Some(question) = ori_question.filter(|value| !value.trim().is_empty()) {
+        body["ori_question"] = json!(question);
+    }
 
     let client = Client::builder()
         .timeout(Duration::from_secs(TIMEOUT_SECS))
         .build()
         .map_err(|e| format!("build HTTP client: {e}"))?;
-
-    // Use DeepSeek's Anthropic-compatible endpoint with web_search server tool.
-    let body = json!({
-        "model": model,
-        "max_tokens": 2048,
-        "messages": [{"role": "user", "content": query}],
-        "tools": [{"type": "web_search_20250305", "name": "web_search"}]
-    });
-
-    let config_text = std::fs::read_to_string("config/llm_api.yaml").ok();
-    let search_url = resolve_search_url(
-        std::env::var(SEARCH_URL_ENV).ok().as_deref(),
-        config_text.as_deref(),
-    );
     let resp = client
-        .post(&search_url)
-        .header("x-api-key", &api_key)
-        .header("anthropic-version", "2023-06-01")
+        .post(&url)
+        .header("Authorization", format!("Bearer {api_key}"))
         .header("Content-Type", "application/json")
         .json(&body)
         .send()
-        .map_err(|e| format!("Anthropic HTTP request: {e}"))?;
+        .map_err(|e| format!("search request: {e}"))?;
 
     let status = resp.status();
-    let resp_body = resp
-        .text()
-        .map_err(|e| format!("Anthropic read body: {e}"))?;
-
+    let text = resp.text().map_err(|e| format!("search read body: {e}"))?;
     if !status.is_success() {
         return Err(format!(
-            "Anthropic API error ({}): {}",
+            "search API error ({}): {}",
             status.as_u16(),
-            resp_body.chars().take(500).collect::<String>()
+            text.chars().take(300).collect::<String>()
         ));
     }
+    let json: Value = serde_json::from_str(&text).map_err(|e| format!("search parse JSON: {e}"))?;
+    Ok(format_search_results(&json))
+}
 
-    let json: Value =
-        serde_json::from_str(&resp_body).map_err(|e| format!("Anthropic parse JSON: {e}"))?;
-
-    // Extract structured search results + model text from content blocks.
-    let content_blocks = json["content"].as_array().ok_or_else(|| {
-        format!(
-            "unexpected response format: {}",
-            resp_body.chars().take(500).collect::<String>()
-        )
-    })?;
-
-    let mut results: Vec<String> = Vec::new();
-    let mut model_text = String::new();
-
-    for block in content_blocks {
-        let block_type = block["type"].as_str().unwrap_or("");
-        match block_type {
-            "web_search_tool_result" => {
-                if let Some(items) = block["content"].as_array() {
-                    for (i, item) in items.iter().enumerate() {
-                        let title = item["title"].as_str().unwrap_or("(no title)");
-                        let item_url = item["url"].as_str().unwrap_or("");
-                        results.push(format!("{}. **{}**\n   {}", i + 1, title, item_url));
-                    }
-                }
-            }
-            "text" => {
-                if let Some(t) = block["text"].as_str() {
-                    model_text.push_str(t);
-                }
-            }
-            _ => {}
+/// Render `{"results": [...]}` for a model to read.
+fn format_search_results(json: &Value) -> String {
+    let Some(results) = json["results"].as_array() else {
+        return "No results found.".to_string();
+    };
+    if results.is_empty() {
+        return "No results found.".to_string();
+    }
+    let mut out = format!("## Search results ({})\n\n", results.len());
+    for (index, item) in results.iter().enumerate() {
+        let title = item["title"].as_str().unwrap_or("(no title)");
+        let url = item["url"].as_str().unwrap_or("");
+        out.push_str(&format!("{}. **{}**\n   {}\n", index + 1, title, url));
+        if let Some(date) = item["date"].as_str().filter(|value| !value.is_empty()) {
+            out.push_str(&format!("   {date}\n"));
         }
+        if let Some(summary) = item["summary"]
+            .as_str()
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| item["snippet"].as_str())
+        {
+            out.push_str(&format!("   {summary}\n"));
+        }
+        out.push('\n');
     }
+    out
+}
 
-    let mut out = String::new();
-    if !results.is_empty() {
-        out.push_str(&format!("## Search results ({})\n\n", results.len()));
-        out.push_str(&results.join("\n\n"));
-        out.push_str("\n\n---\n\n");
+/// Fetch a page through DeepSeek's Fetch API: clean Markdown, no HTML stripping.
+///
+/// Falls back to the local fetcher when the API cannot serve the page (403 for
+/// a blocked target, 404 for an unextractable page), so a refusal by the vendor
+/// does not turn into a missing tool.
+fn fetch_via_api(url_str: &str) -> Result<(String, bool), String> {
+    // Still refuse internal targets: the URL travels to the vendor.
+    check_url_safety(url_str)?;
+    let (api_key, _model, base_url) =
+        read_llm_config().ok_or("no api_key found in config/llm_api.yaml".to_string())?;
+    let config_text = std::fs::read_to_string("config/llm_api.yaml").ok();
+    let config_url = config_text.as_deref().and_then(config_fetch_url);
+    let url = fetch_endpoint(
+        &base_url,
+        std::env::var(FETCH_URL_ENV).ok().as_deref().or(config_url.as_deref()),
+    );
+    let client = Client::builder()
+        .timeout(Duration::from_secs(TIMEOUT_SECS))
+        .build()
+        .map_err(|e| format!("build HTTP client: {e}"))?;
+    let resp = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {api_key}"))
+        .header("Content-Type", "application/json")
+        .json(&json!({ "url": url_str }))
+        .send()
+        .map_err(|e| format!("fetch request: {e}"))?;
+    let status = resp.status();
+    let text = resp.text().map_err(|e| format!("fetch read body: {e}"))?;
+    if !status.is_success() {
+        return Err(format!(
+            "fetch API error ({}): {}",
+            status.as_u16(),
+            text.chars().take(300).collect::<String>()
+        ));
     }
-    if !model_text.is_empty() {
-        out.push_str("**Summary:** ");
-        out.push_str(&model_text);
-    } else {
-        out.push_str("No results found.");
+    let json: Value = serde_json::from_str(&text).map_err(|e| format!("fetch parse JSON: {e}"))?;
+    let title = json["title"].as_str().unwrap_or("");
+    let body = json["content"].as_str().unwrap_or("");
+    if body.trim().is_empty() {
+        return Err("fetch API returned no content".to_string());
     }
-
-    Ok(out)
+    let mut rendered = String::new();
+    if !title.is_empty() {
+        rendered.push_str(&format!("# {title}\n\n"));
+    }
+    rendered.push_str(body);
+    let truncated = rendered.chars().count() > MAX_FETCH_CHARS;
+    Ok((
+        rendered.chars().take(MAX_FETCH_CHARS).collect(),
+        truncated,
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -318,7 +384,8 @@ fn handle(req: &WebRequest) -> Result<WebResponse, String> {
             if query.is_empty() {
                 return Err("query is required for web_search".to_string());
             }
-            let text = web_search_anthropic(query)?;
+            let count = req.max_results.unwrap_or(8).clamp(1, 50);
+            let text = web_search(query, count, None)?;
             Ok(WebResponse {
                 ok: true,
                 node_id: "web_search".to_string(),
@@ -332,7 +399,7 @@ fn handle(req: &WebRequest) -> Result<WebResponse, String> {
             if url.is_empty() {
                 return Err("url is required for web_fetch".to_string());
             }
-            match web_fetch(url) {
+            match fetch_via_api(url).or_else(|_| web_fetch(url)) {
                 Ok((text, truncated)) => Ok(WebResponse {
                     ok: true,
                     node_id: "web_fetch".to_string(),
@@ -366,7 +433,7 @@ fn docs_value() -> cordis_plugin_sdk::PluginDocs {
         vec![
             node_doc(
                 "web_search",
-                "Search the web using DeepSeek Anthropic-compatible API. Returns structured results (title + URL per result) plus an AI summary. Use web_fetch to verify specific pages.",
+                "Search the web. Returns ranked results with title, URL, date and a summary written for a model to read. Use it to check a fact instead of answering from memory; follow up with web_fetch for a full page.",
                 json!({
                     "type": "object",
                     "required": ["node_id", "query"],
@@ -383,12 +450,12 @@ fn docs_value() -> cordis_plugin_sdk::PluginDocs {
                         "error": { "type": ["string", "null"] }
                     }
                 }),
-                &["makes HTTP request to DeepSeek Anthropic-compatible endpoint with native web_search tool"],
+                &["makes a POST to the DeepSeek Search API"],
                 &["api key not configured", "network unavailable", "rate limited"],
             ).with_agent_accessible(),
             node_doc(
                 "web_fetch",
-                "Fetch a web page and return plain-text content (HTML tags stripped). Max 8000 chars. Only http/https allowed.",
+                "Read one web page. Uses the DeepSeek Fetch API (clean Markdown, max 8000 chars) and falls back to a local fetch. Only http/https allowed; private addresses are refused.",
                 json!({
                     "type": "object",
                     "required": ["node_id", "url"],
@@ -406,7 +473,7 @@ fn docs_value() -> cordis_plugin_sdk::PluginDocs {
                         "error": { "type": ["string", "null"] }
                     }
                 }),
-                &["makes HTTP GET request to the target URL"],
+                &["makes a POST to the DeepSeek Fetch API, then an HTTP GET if it refuses"],
                 &["invalid URL", "network timeout", "localhost/private IP blocked"],
             ).with_agent_accessible(),
         ],
@@ -415,7 +482,7 @@ fn docs_value() -> cordis_plugin_sdk::PluginDocs {
 }
 
 fn abi_fingerprint_value() -> AbiFingerprint {
-    AbiFingerprint::current_build("web_anthropic_search", "api_v2")
+    AbiFingerprint::current_build("web_search_api", "api_v2")
 }
 
 fn api_handle(req: PluginRequest) -> PluginResponse {
@@ -445,25 +512,46 @@ export_plugin_api! {
 
 #[cfg(test)]
 mod tests {
-    use super::{config_search_url, resolve_search_url, DEFAULT_SEARCH_URL};
+    use super::{config_fetch_url, config_search_url, fetch_endpoint, origin_of, search_endpoint};
 
-    // 端点解析优先级：env > config `web_search_url:` > 默认。
     #[test]
-    fn search_url_prefers_env_then_config_then_default() {
-        let cfg = "api_key: sk-x\nweb_search_url: https://cfg.example/anthropic/messages\n";
+    fn endpoints_derive_from_the_configured_base() {
         assert_eq!(
-            resolve_search_url(Some("https://env.example/v1"), Some(cfg)),
-            "https://env.example/v1"
+            search_endpoint("https://api.deepseek.com", None),
+            "https://api.deepseek.com/v1/tools/search"
         );
         assert_eq!(
-            resolve_search_url(Some("   "), Some(cfg)),
-            "https://cfg.example/anthropic/messages"
+            fetch_endpoint("https://api.deepseek.com/", None),
+            "https://api.deepseek.com/v1/tools/fetch"
+        );
+        // The chat base carries a path (`/beta`); the tools live at the origin.
+        assert_eq!(
+            search_endpoint("https://api.deepseek.com/beta", None),
+            "https://api.deepseek.com/v1/tools/search"
         );
         assert_eq!(
-            resolve_search_url(None, Some("api_key: sk-x\n")),
-            DEFAULT_SEARCH_URL
+            fetch_endpoint("https://api.deepseek.com/beta/", None),
+            "https://api.deepseek.com/v1/tools/fetch"
         );
-        assert_eq!(resolve_search_url(None, None), DEFAULT_SEARCH_URL);
+        assert_eq!(origin_of("not a url"), "not a url");
+        // An override wins, because a self-hosted base may not follow the path.
+        assert_eq!(
+            search_endpoint("https://api.deepseek.com", Some("https://proxy.example/s")),
+            "https://proxy.example/s"
+        );
+        assert_eq!(
+            fetch_endpoint("https://api.deepseek.com", Some("  ")),
+            "https://api.deepseek.com/v1/tools/fetch"
+        );
+    }
+
+    #[test]
+    fn the_config_can_override_both_endpoints() {
+        let cfg = "api_key: sk-x\nweb_search_url: https://cfg.example/s\nweb_fetch_url: https://cfg.example/f\n";
+        assert_eq!(config_search_url(cfg), Some("https://cfg.example/s".to_string()));
+        assert_eq!(config_fetch_url(cfg), Some("https://cfg.example/f".to_string()));
+        assert_eq!(config_search_url("api_key: sk-x\n"), None);
+        assert_eq!(config_fetch_url("api_key: sk-x\n"), None);
     }
 
     // config 里的空值 / 缺键不覆盖默认，引号会被剥掉。

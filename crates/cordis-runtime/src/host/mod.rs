@@ -1680,7 +1680,10 @@ impl RuntimeHost {
             if path.extension().and_then(|e| e.to_str()) != Some("json") {
                 continue;
             }
-            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default();
             if !is_session_snapshot_file(name) {
                 continue;
             }
