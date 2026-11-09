@@ -20,3 +20,4 @@ pub mod plugin;
 pub mod selfcheck;
 pub mod service;
 pub mod soul;
+pub mod spill_cleanup;

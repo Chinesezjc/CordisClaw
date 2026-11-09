@@ -814,6 +814,7 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let host = std::sync::Arc::new(
         RuntimeHost::boot(&root).map_err(|err| runtime_mode_error(err, &root, runtime_only))?,
     );
+    sweep_spilled_results(&host);
     let agent_session = host.agent_start(AgentSessionKind::RuntimeShell)?;
     let mut state = ServeState {
         agent_session_id: agent_session.session_id,
@@ -2680,6 +2681,24 @@ fn reflect_on_failures(host: &cordis_runtime::host::RuntimeHost) {
         proposal_dir.display(),
         signature.id()
     );
+}
+
+/// Drop spilled tool results older than the retention window.
+///
+/// Spill files are written for the model to read back; nothing reads them
+/// automatically, so only this sweep keeps the directory from growing forever.
+/// Age, not size: a size cap would delete an arbitrary subset, while an age
+/// makes "too old to still be there" predictable.
+fn sweep_spilled_results(host: &cordis_runtime::host::RuntimeHost) {
+    let Some(report) = cordis_runtime::spill_cleanup::sweep_data_dir(&host.data_dir()) else {
+        return;
+    };
+    if report.removed > 0 || report.failed > 0 {
+        eprintln!(
+            "spill: swept {} expired result(s), kept {}, failed {}",
+            report.removed, report.kept, report.failed
+        );
+    }
 }
 
 /// Judge a self-proposed patch against a clean worktree.
