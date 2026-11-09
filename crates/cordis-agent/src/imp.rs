@@ -1532,6 +1532,13 @@ impl AgentSession {
         } else {
             performed.join("\n")
         };
+        // A turn that neither spoke nor called anything leaves no trace. Writing
+        // "[no tools called] (said nothing)" into history taught the model that
+        // silence is what its past looks like, and it started opening turns with
+        // `suspend` on its own.
+        if said.is_empty() && performed.is_empty() {
+            return;
+        }
         let assistant = if said.is_empty() {
             format!("{actions}（没有发言）")
         } else {
