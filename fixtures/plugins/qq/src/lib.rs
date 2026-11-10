@@ -803,15 +803,32 @@ fn handle_call(req: QqRequest) -> Result<QqResponse, String> {
         .get("endpoint")
         .and_then(|v| v.as_str())
         .ok_or("payload must contain 'endpoint' string")?;
-    let params = payload.get("params").cloned().unwrap_or(json!({}));
-    let base_url = {
+    // The model writes `body`; older callers wrote `params`. Accept both.
+    let params = payload
+        .get("params")
+        .or_else(|| payload.get("body"))
+        .cloned()
+        .unwrap_or(json!({}));
+    // The token is required as soon as the OneBot server has one configured:
+    // forwarding without it made every `call` action fail with
+    // "token verify failed", so the tool looked broken for no visible reason.
+    let (base_url, token) = {
         let state = STATE.lock().map_err(|e| format!("lock: {e}"))?;
-        state
+        let base_url = state
             .onebot_url
             .clone()
-            .ok_or("no OneBot URL configured; use 'configure' first")?
+            .ok_or("no OneBot URL configured; use 'configure' first")?;
+        // Fall back to the file the serve payload was written from: a process
+        // that started before this code ran has no token in memory.
+        let token = state.access_token.clone().or_else(|| {
+            load_runtime_config()?
+                .get("access_token")
+                .and_then(|value| value.as_str())
+                .map(str::to_string)
+        });
+        (base_url, token)
     };
-    let data = onebot_call(&base_url, endpoint, &params, None)?;
+    let data = onebot_call(&base_url, endpoint, &params, token.as_deref())?;
     Ok(QqResponse {
         ok: true,
         action: "call".to_string(),
