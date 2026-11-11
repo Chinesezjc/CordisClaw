@@ -210,14 +210,76 @@ impl AgentToolEvent {
         if !self.ok {
             return false;
         }
-        self.output
-            .as_ref()
-            .and_then(|output| output.get("result"))
-            .and_then(|result| result.get("payload"))
+        // The plugin's verdict sits at `payload.ok`; a wrapped host puts it
+        // under `result.payload.ok`. Reading only the wrapped path made every
+        // top-level `payload: {ok: false}` — a refused send — count as
+        // delivered, so history recorded a message as spoken that never left
+        // the process.
+        let Some(output) = self.output.as_ref() else {
+            return true;
+        };
+        let payload = output.get("payload").or_else(|| {
+            output
+                .get("result")
+                .and_then(|result| result.get("payload"))
+        });
+        match payload
             .and_then(|payload| payload.get("ok"))
             .and_then(Value::as_bool)
+        {
+            Some(ok) => ok,
             // No payload verdict: the call's own ok stands.
-            .unwrap_or(true)
+            None => true,
+        }
+    }
+}
+
+#[cfg(test)]
+mod delivered_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn event(output: Value) -> AgentToolEvent {
+        AgentToolEvent {
+            name: "invoke_plugin".to_string(),
+            arguments: json!({}),
+            ok: true,
+            output: Some(output),
+            error: None,
+        }
+    }
+
+    #[test]
+    fn a_refused_send_is_not_delivered() {
+        // The shape a plugin node returns: the verdict sits at `payload.ok`.
+        let refused = event(json!({
+            "plugin_path": "qq",
+            "node_id": "qq_send",
+            "payload": {"ok": false, "error": "muted until 13:47"}
+        }));
+        assert!(!refused.delivered());
+    }
+
+    #[test]
+    fn a_wrapped_refusal_is_not_delivered() {
+        let refused = event(json!({"result": {"payload": {"ok": false}}}));
+        assert!(!refused.delivered());
+    }
+
+    #[test]
+    fn a_delivered_send_is_delivered() {
+        let sent = event(json!({"payload": {"ok": true, "message": "sent"}}));
+        assert!(sent.delivered());
+    }
+
+    #[test]
+    fn a_call_without_a_verdict_falls_back_to_its_own_ok() {
+        assert!(event(json!({"payload": {}})).delivered());
+        let failed = AgentToolEvent {
+            ok: false,
+            ..event(json!({"payload": {"ok": true}}))
+        };
+        assert!(!failed.delivered());
     }
 }
 
