@@ -223,14 +223,11 @@ impl AgentToolEvent {
                 .get("result")
                 .and_then(|result| result.get("payload"))
         });
-        match payload
+        // No payload verdict: the call's own ok stands.
+        payload
             .and_then(|payload| payload.get("ok"))
             .and_then(Value::as_bool)
-        {
-            Some(ok) => ok,
-            // No payload verdict: the call's own ok stands.
-            None => true,
-        }
+            .unwrap_or(true)
     }
 }
 
