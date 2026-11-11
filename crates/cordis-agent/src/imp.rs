@@ -615,6 +615,7 @@ impl AgentSession {
         if has_user_without_assistant {
             self.transcript.push(AgentTranscriptEntry::Assistant {
                 content: format!("[error] {err}"),
+                tools: Vec::new(),
                 response_id: None,
                 reasoning: None,
             });
@@ -987,6 +988,7 @@ impl AgentSession {
                     let reasoning = closing_reasoning(&turn.reasoning);
                     self.transcript.push(AgentTranscriptEntry::Assistant {
                         content: closing.clone(),
+                        tools: tool_names(&tool_events),
                         response_id: response_id.clone(),
                         reasoning,
                     });
@@ -1185,6 +1187,7 @@ impl AgentSession {
                         self.completed_turns += 1;
                         self.transcript.push(AgentTranscriptEntry::Assistant {
                             content: reply_content.clone(),
+                            tools: tool_names(&tool_events),
                             response_id: response_id.clone(),
                             reasoning: closing_reasoning(&turn.reasoning),
                         });
@@ -1207,6 +1210,7 @@ impl AgentSession {
                     let reasoning = closing_reasoning(&turn.reasoning);
                     self.transcript.push(AgentTranscriptEntry::Assistant {
                         content: closing.clone(),
+                        tools: tool_names(&tool_events),
                         response_id: response_id.clone(),
                         reasoning,
                     });
@@ -1233,6 +1237,7 @@ impl AgentSession {
                 let closing = message.content.unwrap_or_default();
                 self.transcript.push(AgentTranscriptEntry::Assistant {
                     content: closing.clone(),
+                    tools: tool_names(&tool_events),
                     response_id: response_id.clone(),
                     reasoning: closing_reasoning(&turn.reasoning),
                 });
@@ -1335,6 +1340,7 @@ impl AgentSession {
                 self.completed_turns += 1;
                 self.transcript.push(AgentTranscriptEntry::Assistant {
                     content: content.to_string(),
+                    tools: tool_names(&tool_events),
                     response_id: response_id.clone(),
                     reasoning: closing_reasoning(&turn.reasoning),
                 });
@@ -1598,6 +1604,7 @@ impl AgentSession {
         let reasoning = closing_reasoning(&turn.reasoning);
         self.transcript.push(AgentTranscriptEntry::Assistant {
             content: reply.content.clone(),
+            tools: tool_names(&reply.tool_events),
             response_id: reply.response_id.clone(),
             reasoning,
         });
@@ -1905,6 +1912,7 @@ impl AgentSession {
         });
         self.transcript.push(AgentTranscriptEntry::Assistant {
             content: assistant_output.to_string(),
+            tools: Vec::new(),
             response_id: None,
             reasoning: None,
         });
@@ -2448,6 +2456,24 @@ fn attach_recovered_images(
     // 历史图片开始剥，规则与 `respond_inner` 开头的裁剪完全一致。
     cordis_runtime::image_budget::enforce_image_budget(messages, budget);
     attached.len()
+}
+
+/// Node names of the tools a turn ran, for the transcript.
+///
+/// A plugin call arrives as `invoke_plugin`; the node is the part that says what
+/// actually happened.
+fn tool_names(events: &[cordis_runtime::agent_api::AgentToolEvent]) -> Vec<String> {
+    events
+        .iter()
+        .map(|event| {
+            event
+                .arguments
+                .get("node_id")
+                .and_then(Value::as_str)
+                .unwrap_or(&event.name)
+                .to_string()
+        })
+        .collect()
 }
 
 /// How much of a tool result is kept in history.

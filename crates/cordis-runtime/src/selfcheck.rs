@@ -376,6 +376,20 @@ pub fn scan(root: &Path) -> SelfCheck {
             }
             scanned_turns += 1;
             let content = entry.get("content").and_then(|c| c.as_str()).unwrap_or("");
+            // A channel turn speaks through a tool, so its content is empty
+            // even when it answered. Without this check every such turn was
+            // counted as "produced nothing", and the top failure signature was
+            // an artefact of the protocol rather than a defect.
+            // Entries written before `tools` existed cannot tell speech from
+            // silence, so they are not evidence either way. Counting them made
+            // "empty" the top signature with thousands of turns that had in
+            // fact answered through `qq_send`.
+            let Some(tools) = entry.get("tools").and_then(|value| value.as_array()) else {
+                continue;
+            };
+            if !tools.is_empty() {
+                continue;
+            }
             // Repetition matters only for output that achieved nothing; a
             // `suspend` that repeats every turn is the protocol working.
             if !content.trim().is_empty() && classify(content).is_some() {
@@ -438,7 +452,9 @@ mod tests {
     fn write_session(root: &Path, name: &str, turns: &[&str]) {
         let transcript: Vec<serde_json::Value> = turns
             .iter()
-            .map(|content| serde_json::json!({"kind": "assistant", "content": content}))
+            .map(
+                |content| serde_json::json!({"kind": "assistant", "content": content, "tools": []}),
+            )
             .collect();
         let snapshot = serde_json::json!({"kind": "runtime_shell", "transcript": transcript});
         std::fs::write(root.join(name), serde_json::to_string(&snapshot).unwrap()).unwrap();
@@ -704,6 +720,30 @@ mod tests {
         };
         let report = SelfCheck::default().with_lessons(vec![lesson.clone()]);
         assert_eq!(report.lessons, vec![lesson]);
+    }
+
+    /// A turn that answered through a tool has empty content and is not a
+    /// failure; counting it made "empty" the top signature by a wide margin.
+    #[test]
+    fn a_turn_that_ran_a_tool_is_not_an_empty_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = serde_json::json!([
+            {"kind": "assistant", "content": "", "tools": ["qq_send"]},
+            {"kind": "assistant", "content": "", "tools": []},
+            {"kind": "assistant", "content": ""}
+        ]);
+        std::fs::write(
+            dir.path().join("a.json"),
+            serde_json::to_string(&serde_json::json!({"transcript": transcript})).unwrap(),
+        )
+        .unwrap();
+        let report = scan(dir.path());
+        let empty = report
+            .signatures
+            .iter()
+            .find(|signature| signature.kind == Kind::Empty)
+            .expect("one genuine empty turn");
+        assert_eq!(empty.count, 1);
     }
 
     #[test]

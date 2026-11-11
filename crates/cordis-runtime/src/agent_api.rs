@@ -229,6 +229,14 @@ pub enum AgentTranscriptEntry {
     },
     Assistant {
         content: String,
+        /// Tools this turn actually ran, by node name.
+        ///
+        /// A channel turn speaks through a tool, so its `content` is empty even
+        /// when it answered. Without this the transcript cannot tell "said
+        /// nothing" from "said it through qq_send", and every quiet-looking
+        /// turn reads as a failure.
+        #[serde(default)]
+        tools: Vec<String>,
         #[serde(default)]
         response_id: Option<String>,
         /// What the model reasoned before answering, when the provider sent it.
