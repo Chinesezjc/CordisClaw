@@ -987,7 +987,7 @@ impl AgentSession {
                     let closing = message.content.unwrap_or_default();
                     let reasoning = closing_reasoning(&turn.reasoning);
                     self.transcript.push(AgentTranscriptEntry::Assistant {
-                        content: closing.clone(),
+                        content: delivered_text(&tool_events, &closing),
                         tools: tool_names(&tool_events),
                         response_id: response_id.clone(),
                         reasoning,
@@ -1186,7 +1186,7 @@ impl AgentSession {
                         );
                         self.completed_turns += 1;
                         self.transcript.push(AgentTranscriptEntry::Assistant {
-                            content: reply_content.clone(),
+                            content: delivered_text(&tool_events, &reply_content),
                             tools: tool_names(&tool_events),
                             response_id: response_id.clone(),
                             reasoning: closing_reasoning(&turn.reasoning),
@@ -1209,7 +1209,7 @@ impl AgentSession {
                     let closing = message.content.unwrap_or_default();
                     let reasoning = closing_reasoning(&turn.reasoning);
                     self.transcript.push(AgentTranscriptEntry::Assistant {
-                        content: closing.clone(),
+                        content: delivered_text(&tool_events, &closing),
                         tools: tool_names(&tool_events),
                         response_id: response_id.clone(),
                         reasoning,
@@ -1236,7 +1236,7 @@ impl AgentSession {
                 self.completed_turns += 1;
                 let closing = message.content.unwrap_or_default();
                 self.transcript.push(AgentTranscriptEntry::Assistant {
-                    content: closing.clone(),
+                    content: delivered_text(&tool_events, &closing),
                     tools: tool_names(&tool_events),
                     response_id: response_id.clone(),
                     reasoning: closing_reasoning(&turn.reasoning),
@@ -1339,7 +1339,7 @@ impl AgentSession {
                 );
                 self.completed_turns += 1;
                 self.transcript.push(AgentTranscriptEntry::Assistant {
-                    content: content.to_string(),
+                    content: delivered_text(&tool_events, content),
                     tools: tool_names(&tool_events),
                     response_id: response_id.clone(),
                     reasoning: closing_reasoning(&turn.reasoning),
@@ -1603,7 +1603,7 @@ impl AgentSession {
         }
         let reasoning = closing_reasoning(&turn.reasoning);
         self.transcript.push(AgentTranscriptEntry::Assistant {
-            content: reply.content.clone(),
+            content: delivered_text(&reply.tool_events, &reply.content),
             tools: tool_names(&reply.tool_events),
             response_id: reply.response_id.clone(),
             reasoning,
@@ -2456,6 +2456,39 @@ fn attach_recovered_images(
     // 历史图片开始剥，规则与 `respond_inner` 开头的裁剪完全一致。
     cordis_runtime::image_budget::enforce_image_budget(messages, budget);
     attached.len()
+}
+
+/// The text a turn actually delivered, or `fallback` when it delivered none.
+///
+/// The transcript is the record of what happened in the room, so it must hold
+/// what the room saw. It used to hold the model's raw output — a `suspend`
+/// marker or a DSML block — which made every transcript look like silence and
+/// forced any later review to reconstruct the reply from tool arguments.
+fn delivered_text(events: &[cordis_runtime::agent_api::AgentToolEvent], fallback: &str) -> String {
+    let said: Vec<String> = events
+        .iter()
+        .filter(|event| event.delivered())
+        .filter_map(|event| {
+            event
+                .arguments
+                .get("message")
+                .and_then(Value::as_str)
+                .or_else(|| {
+                    event
+                        .arguments
+                        .get("payload_json")
+                        .and_then(|payload| payload.get("message"))
+                        .and_then(Value::as_str)
+                })
+                .map(str::to_string)
+        })
+        .filter(|message| !message.trim().is_empty())
+        .collect();
+    if said.is_empty() {
+        fallback.to_string()
+    } else {
+        said.join("\n")
+    }
 }
 
 /// Node names of the tools a turn ran, for the transcript.
@@ -6352,6 +6385,46 @@ mod tests {
         assert!(recorded.contains("[tool] web_search"), "{recorded}");
         assert!(recorded.contains("\"query\":\"worlds 2026\""), "{recorded}");
         assert!(recorded.contains("→"), "{recorded}");
+    }
+
+    /// The transcript is the room's record, so it must hold what the room saw,
+    /// not the `suspend` marker the model wrote to end the turn.
+    #[test]
+    fn the_transcript_records_what_was_delivered() {
+        let provider = FakeLlmProvider::new(vec![
+            assistant_reply(
+                "<|DSML|calls>\n\
+                 <|DSML|invoke name=\"qq_send\">\n\
+                 <|DSML|parameter name=\"target\" string=\"true\">group:1</|DSML|parameter>\n\
+                 <|DSML|parameter name=\"message\" string=\"true\">在的</|DSML|parameter>\n\
+                 </|DSML|invoke>\n</|DSML|calls>",
+            ),
+            assistant_reply(
+                "<|DSML|calls>\n<|DSML|invoke name=\"suspend\"></|DSML|invoke>\n</|DSML|calls>",
+            ),
+        ]);
+        let mut session = ShellAgentSession::new(LlmApiConfig::default()).expect("build session");
+        session.set_require_end_tool(true);
+        session
+            .respond_via(&EMPTY_FAKE_HOST, "transcript-delivered", "hi", &provider)
+            .expect("turn");
+        let assistant: Vec<&str> = session
+            .inner
+            .transcript
+            .iter()
+            .filter_map(|entry| match entry {
+                AgentTranscriptEntry::Assistant { content, .. } => Some(content.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            assistant.iter().any(|content| content.contains("在的")),
+            "{assistant:?}"
+        );
+        assert!(
+            !assistant.iter().any(|content| content.contains("suspend")),
+            "{assistant:?}"
+        );
     }
 
     #[test]
