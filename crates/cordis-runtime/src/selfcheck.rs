@@ -29,12 +29,6 @@ pub enum Kind {
     ProviderError,
     /// The same reply, word for word, more than once.
     Repeated,
-    /// Someone objected to how the bot said something, not to what it said.
-    ///
-    /// This is the only signature that is not a machine failure: the answer can
-    /// be correct and still land badly. It is read from the messages that follow
-    /// a reply, which is the only place that judgement exists.
-    StyleComplaint,
 }
 
 impl Kind {
@@ -45,7 +39,6 @@ impl Kind {
             Kind::UnparsedDsml => "unparsed_dsml",
             Kind::ProviderError => "provider_error",
             Kind::Repeated => "repeated",
-            Kind::StyleComplaint => "style_complaint",
         }
     }
 
@@ -57,9 +50,6 @@ impl Kind {
             Kind::ProviderError => 3,
             Kind::Empty => 2,
             Kind::Repeated => 1,
-            // Worth fixing: a correct answer delivered badly still costs the
-            // room, and unlike a crash it never shows up anywhere else.
-            Kind::StyleComplaint => 6,
         }
     }
 }
@@ -213,20 +203,10 @@ impl SelfCheck {
             }
             text.push('\n');
         }
-        if signature.kind == Kind::StyleComplaint {
-            text.push_str(
-                "This is a manner problem, not a code defect; there is no failing test to write. \
-                 Propose one concrete change to how you talk — a sentence for the persona, or a \
-                 conduct rule — and say which sentence it replaces and what would be different \
-                 afterwards. Write it to `persona.md` in this proposal directory.",
-            );
-        } else {
-            text.push_str(
-                "Steps: read the code that produces this output, write a failing test that \
-                 reproduces the example, fix it, and make the test pass. Do not change the test to \
-                 match the bug.",
-            );
-        }
+        text.push_str(
+            "Steps: read the code that produces this output, write a failing test that reproduces \
+             the example, fix it, and make the test pass. Do not change the test to match the bug.",
+        );
         text
     }
 }
@@ -253,7 +233,6 @@ pub fn digest(report: &SelfCheck, top: usize) -> Option<String> {
                     Kind::UnparsedDsml => "turns of tool markup that did not parse",
                     Kind::ProviderError => "provider failures recorded as turns",
                     Kind::Repeated => "the same reply repeated verbatim",
-                    Kind::StyleComplaint => "replies someone objected to the tone of",
                 }
             )
         })
@@ -269,6 +248,124 @@ pub fn digest(report: &SelfCheck, top: usize) -> Option<String> {
     text.push_str("\n\nAvoid repeating them. Call `get_self_check` when you want the examples.\n");
     lines.clear();
     Some(text)
+}
+
+/// One reply and what came back after it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Exchange {
+    pub session: String,
+    /// What the bot said, as the room saw it.
+    pub reply: String,
+    /// The first message(s) after it, verbatim.
+    pub after: Vec<String>,
+}
+
+/// The most recent exchanges across all sessions, oldest first.
+///
+/// There is no classifier here on purpose. Whether a reply landed badly is a
+/// judgement about meaning, and a list of words cannot make it: the same phrase
+/// is friendly in one room and insulting in another. The recent conversations
+/// are handed to the model to judge instead of being pre-sorted by a
+/// hand-written vocabulary.
+pub fn recent_exchanges(root: &Path, max: usize) -> Vec<Exchange> {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut paths: Vec<_> = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("json"))
+        .filter(|path| path.file_name().and_then(|n| n.to_str()) != Some("index.json"))
+        .collect();
+    paths.sort_by_key(|path| {
+        path.metadata()
+            .and_then(|meta| meta.modified())
+            .unwrap_or(std::time::UNIX_EPOCH)
+    });
+
+    let mut exchanges = Vec::new();
+    for path in paths {
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(snapshot) = serde_json::from_str::<serde_json::Value>(&text) else {
+            continue;
+        };
+        let Some(history) = snapshot.get("history").and_then(|value| value.as_array()) else {
+            continue;
+        };
+        let session = path
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+        for (index, message) in history.iter().enumerate() {
+            if message.get("role").and_then(|role| role.as_str()) != Some("assistant") {
+                continue;
+            }
+            let reply = message
+                .get("content")
+                .and_then(|c| c.as_str())
+                .unwrap_or("");
+            // Only the spoken text: the `[tool] …` records are machinery.
+            let spoken: String = reply
+                .lines()
+                .filter(|line| !line.trim_start().starts_with("[tool]"))
+                .collect::<Vec<_>>()
+                .join("\n")
+                .trim()
+                .to_string();
+            if spoken.is_empty() {
+                continue;
+            }
+            let after: Vec<String> = history
+                .iter()
+                .skip(index + 1)
+                .take(3)
+                .filter(|next| next.get("role").and_then(|role| role.as_str()) == Some("user"))
+                .filter_map(|next| next.get("content").and_then(|c| c.as_str()))
+                .map(str::to_string)
+                .collect();
+            exchanges.push(Exchange {
+                session: session.clone(),
+                reply: spoken,
+                after,
+            });
+        }
+    }
+    let skip = exchanges.len().saturating_sub(max);
+    exchanges.split_off(skip)
+}
+
+/// A prompt that asks the model to judge its own recent conversations.
+///
+/// The question is deliberately open: "which of these landed badly" is not a
+/// property of words, so it cannot be answered by matching them.
+pub fn review_prompt(exchanges: &[Exchange]) -> String {
+    let mut text = String::from(
+        "Below are your recent replies, each followed by what people said next. \
+         Judge them as a reader would, not as a log analyser:\n\n\
+         - Which replies landed badly — irritated someone, read as lecturing, \
+           answered a question nobody asked, or were right but rude?\n\
+         - What was the moment that turned? Quote it.\n\
+         - What would you say differently, in one sentence of persona?\n\n\
+         Do not look for failure codes; there are none. This is about how you talk.\n\n",
+    );
+    for exchange in exchanges {
+        text.push_str("---\n[你说] ");
+        text.push_str(exchange.reply.trim());
+        text.push('\n');
+        for after in &exchange.after {
+            text.push_str("[对方] ");
+            text.push_str(after.trim());
+            text.push('\n');
+        }
+    }
+    text.push_str(
+        "\nWrite your finding and the persona sentence you would change to \
+         `data/reviews/`. If nothing landed badly, say so and stop.",
+    );
+    text
 }
 
 /// Classify one assistant turn, if it is a failure.
@@ -310,39 +407,6 @@ fn is_legacy_call(text: &str) -> bool {
     };
     object.contains_key("node_id") || object.contains_key("action")
 }
-
-/// Wording that means "the answer was fine, the delivery was not".
-///
-/// Deliberately narrow: only direct objections about how the bot talks, so a
-/// room full of ordinary swearing does not read as a complaint about the bot.
-const COMPLAINT_MARKERS: &[&str] = &[
-    "换个",
-    "人设",
-    "说教",
-    "别说了",
-    "闭嘴",
-    "不说话",
-    "太难听",
-    "阴阳",
-    "恶心",
-    "受不了",
-    "烦死",
-    "什么态度",
-    "傻逼",
-    "傻b",
-    "sb",
-];
-
-/// Does this message object to the bot's manner?
-fn is_complaint(text: &str) -> bool {
-    let lowered = text.to_lowercase();
-    COMPLAINT_MARKERS
-        .iter()
-        .any(|marker| lowered.contains(marker))
-}
-
-/// How many messages after a reply still count as a reaction to it.
-const REACTION_WINDOW: usize = 3;
 
 /// Keep the shape of a failure, drop the varying parts.
 ///
@@ -427,34 +491,6 @@ pub fn scan(root: &Path) -> SelfCheck {
         for (index, entry) in transcript.iter().enumerate() {
             if entry.get("kind").and_then(|k| k.as_str()) != Some("assistant") {
                 continue;
-            }
-            // A reply the room objected to is a failure of manner, and the only
-            // record of that judgement is what people say next.
-            if let Some(reaction) = transcript
-                .iter()
-                .skip(index + 1)
-                .take(REACTION_WINDOW)
-                .find(|next| next.get("kind").and_then(|k| k.as_str()) == Some("user"))
-                .and_then(|next| next.get("content"))
-                .and_then(|content| content.as_str())
-            {
-                if is_complaint(reaction) {
-                    let said = entry.get("content").and_then(|c| c.as_str()).unwrap_or("");
-                    let key = (Kind::StyleComplaint, normalise(said));
-                    let signature = signatures.entry(key).or_insert_with(|| Signature {
-                        kind: Kind::StyleComplaint,
-                        excerpt: normalise(said),
-                        count: 0,
-                        sessions: Vec::new(),
-                        first_turn: index,
-                        last_turn: index,
-                    });
-                    signature.count += 1;
-                    if !signature.sessions.contains(&session) {
-                        signature.sessions.push(session.clone());
-                    }
-                    signature.last_turn = index;
-                }
             }
             scanned_turns += 1;
             let content = entry.get("content").and_then(|c| c.as_str()).unwrap_or("");
@@ -828,47 +864,57 @@ mod tests {
         assert_eq!(empty.count, 1);
     }
 
-    /// A correct answer that lands badly is a failure the machine cannot see;
-    /// the reaction after it is the only evidence.
     #[test]
-    fn a_reply_the_room_objected_to_becomes_a_style_signature() {
+    fn recent_exchanges_pair_a_reply_with_what_followed_it() {
         let dir = tempfile::tempdir().unwrap();
-        let transcript = serde_json::json!([
-            {"kind": "assistant", "content": "先当假的看", "tools": ["qq_send"]},
-            {"kind": "user", "content": "你能不能换个说话方式"},
-        ]);
+        let snapshot = serde_json::json!({
+            "history": [
+                {"role": "user", "content": "你怎么看"},
+                {"role": "assistant", "content": "先当假的看\n\n[tool] qq_send {}"},
+                {"role": "user", "content": "你能不能换个说法"}
+            ]
+        });
         std::fs::write(
             dir.path().join("a.json"),
-            serde_json::to_string(&serde_json::json!({"transcript": transcript})).unwrap(),
+            serde_json::to_string(&snapshot).unwrap(),
         )
         .unwrap();
-        let report = scan(dir.path());
-        let style = report
-            .signatures
-            .iter()
-            .find(|signature| signature.kind == Kind::StyleComplaint)
-            .expect("style signature");
-        assert_eq!(style.count, 1);
-        assert!(style.excerpt.contains("先当假的看"), "{}", style.excerpt);
+        let exchanges = recent_exchanges(dir.path(), 10);
+        assert_eq!(exchanges.len(), 1);
+        assert_eq!(exchanges[0].reply, "先当假的看");
+        assert_eq!(exchanges[0].after, vec!["你能不能换个说法".to_string()]);
     }
 
     #[test]
-    fn ordinary_swearing_between_people_is_not_a_complaint() {
+    fn a_review_prompt_carries_the_conversation_and_asks_for_judgement() {
+        let exchanges = vec![Exchange {
+            session: "s".to_string(),
+            reply: "先当假的看".to_string(),
+            after: vec!["换个说法".to_string()],
+        }];
+        let prompt = review_prompt(&exchanges);
+        assert!(prompt.contains("先当假的看"), "{prompt}");
+        assert!(prompt.contains("换个说法"), "{prompt}");
+        assert!(prompt.contains("persona"), "{prompt}");
+        // No classifier vocabulary: the question is about judgement.
+        assert!(prompt.contains("Judge"), "{prompt}");
+    }
+
+    #[test]
+    fn exchanges_without_speech_are_skipped() {
         let dir = tempfile::tempdir().unwrap();
-        let transcript = serde_json::json!([
-            {"kind": "assistant", "content": "收到了", "tools": ["qq_send"]},
-            {"kind": "user", "content": "这把我打吐了"},
-        ]);
+        let snapshot = serde_json::json!({
+            "history": [
+                {"role": "assistant", "content": "[tool] qq_send {}"},
+                {"role": "user", "content": "嗯"}
+            ]
+        });
         std::fs::write(
             dir.path().join("a.json"),
-            serde_json::to_string(&serde_json::json!({"transcript": transcript})).unwrap(),
+            serde_json::to_string(&snapshot).unwrap(),
         )
         .unwrap();
-        let report = scan(dir.path());
-        assert!(report
-            .signatures
-            .iter()
-            .all(|signature| signature.kind != Kind::StyleComplaint));
+        assert!(recent_exchanges(dir.path(), 10).is_empty());
     }
 
     #[test]

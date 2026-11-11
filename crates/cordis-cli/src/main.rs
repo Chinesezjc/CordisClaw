@@ -1325,6 +1325,10 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         // process dies (e.g. a test runner that spawned us), stdin gets
         // a hangup.  Exiting cleanly prevents orphaned zombie processes
         // with their own health-check loops from piling up.
+        // A one-shot run, for verifying the loop without waiting six hours.
+        if std::env::var("CORDIS_SELF_CHECK_NOW").as_deref() == Ok("1") {
+            reflect_on_failures(&park_host);
+        }
         let mut ticks: u64 = 0;
         loop {
             std::thread::sleep(std::time::Duration::from_secs(30));
@@ -2586,6 +2590,13 @@ fn reflect_on_failures(host: &cordis_runtime::host::RuntimeHost) {
     // Past attempts ride along, so the instruction can say "this was already
     // tried and did not work" instead of proposing the same fix again.
     let report = cordis_runtime::selfcheck::scan(&root).with_lessons(ledger.lessons.clone());
+    // A review of how it talks runs first if one is due: mechanical signatures
+    // will otherwise consume every cycle, and the room's judgement is not a
+    // mechanical fact.
+    if review_is_due(host) {
+        review_recent_conversations(host, &root);
+        return;
+    }
     let Some(signature) = report
         .signatures
         .iter()
@@ -2701,6 +2712,67 @@ fn sweep_spilled_results(host: &cordis_runtime::host::RuntimeHost) {
             report.removed, report.kept, report.failed
         );
     }
+}
+
+/// How often the bot looks back over how it talks.
+const REVIEW_INTERVAL_HOURS: u64 = 12;
+
+/// Whether a conversation review is due.
+fn review_is_due(host: &cordis_runtime::host::RuntimeHost) -> bool {
+    let marker = host.data_dir().join("reviews").join("last");
+    let Ok(meta) = std::fs::metadata(&marker) else {
+        return true;
+    };
+    let Ok(modified) = meta.modified() else {
+        return true;
+    };
+    modified
+        .elapsed()
+        .map(|age| age.as_secs() / 3600 >= REVIEW_INTERVAL_HOURS)
+        .unwrap_or(true)
+}
+
+/// Hand the model its own recent conversations and let it judge them.
+///
+/// No keyword list decides what "landed badly" means: the same sentence is
+/// warm in one room and insulting in another, and only a reader can tell. The
+/// output is a note under `data/reviews/` — a persona change for the operator to
+/// weigh, never an automatic edit to how it talks.
+fn review_recent_conversations(
+    host: &cordis_runtime::host::RuntimeHost,
+    sessions: &std::path::Path,
+) {
+    let exchanges = cordis_runtime::selfcheck::recent_exchanges(sessions, 40);
+    if exchanges.is_empty() {
+        return;
+    }
+    let prompt = cordis_runtime::selfcheck::review_prompt(&exchanges);
+    let started = host.agent_start_with(
+        cordis_runtime::host::AgentSessionKind::RuntimeShell,
+        cordis_runtime::host::AgentStartOptions {
+            profile: None,
+            soul_key: String::new(),
+            require_end_tool: false,
+        },
+    );
+    let Ok(session) = started else {
+        return;
+    };
+    let outcome = host.agent_send(&session.session_id, &prompt);
+    host.drop_session(&session.session_id);
+    let reply = match outcome {
+        Ok(reply) => reply.content,
+        Err(error) => format!("review failed: {error}"),
+    };
+    let dir = host.data_dir().join("reviews");
+    let _ = std::fs::create_dir_all(&dir);
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0);
+    let _ = std::fs::write(dir.join(format!("{stamp}.md")), reply);
+    let _ = std::fs::write(dir.join("last"), "");
+    eprintln!("self-check: wrote a conversation review");
 }
 
 /// Judge a self-proposed patch against a clean worktree.
