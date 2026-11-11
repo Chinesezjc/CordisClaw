@@ -2603,7 +2603,9 @@ fn reflect_on_failures(host: &cordis_runtime::host::RuntimeHost) {
          {{\"signature\":\"{}\",\"summary\":\"one line\",\"package\":\"cordis-agent\",\
          \"test\":\"<test name filtered by --exact>\",\"patch\":\"patch.diff\"}}. Your test \
          must fail without the patch and pass with it; a test that passes either way is \
-         refused. Never change a test to match a bug. End the turn with suspend.",
+         refused. If this signature is `style_complaint`, do not write a patch: write \
+         `persona.md` with the sentence to change and why. Never change a test to match a \
+         bug. End the turn with suspend.",
         report.instruction(signature),
         signature.id(),
         signature.id(),

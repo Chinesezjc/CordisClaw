@@ -29,6 +29,12 @@ pub enum Kind {
     ProviderError,
     /// The same reply, word for word, more than once.
     Repeated,
+    /// Someone objected to how the bot said something, not to what it said.
+    ///
+    /// This is the only signature that is not a machine failure: the answer can
+    /// be correct and still land badly. It is read from the messages that follow
+    /// a reply, which is the only place that judgement exists.
+    StyleComplaint,
 }
 
 impl Kind {
@@ -39,6 +45,7 @@ impl Kind {
             Kind::UnparsedDsml => "unparsed_dsml",
             Kind::ProviderError => "provider_error",
             Kind::Repeated => "repeated",
+            Kind::StyleComplaint => "style_complaint",
         }
     }
 
@@ -50,6 +57,9 @@ impl Kind {
             Kind::ProviderError => 3,
             Kind::Empty => 2,
             Kind::Repeated => 1,
+            // Worth fixing: a correct answer delivered badly still costs the
+            // room, and unlike a crash it never shows up anywhere else.
+            Kind::StyleComplaint => 6,
         }
     }
 }
@@ -203,10 +213,20 @@ impl SelfCheck {
             }
             text.push('\n');
         }
-        text.push_str(
-            "Steps: read the code that produces this output, write a failing test that reproduces \
-             the example, fix it, and make the test pass. Do not change the test to match the bug.",
-        );
+        if signature.kind == Kind::StyleComplaint {
+            text.push_str(
+                "This is a manner problem, not a code defect; there is no failing test to write. \
+                 Propose one concrete change to how you talk — a sentence for the persona, or a \
+                 conduct rule — and say which sentence it replaces and what would be different \
+                 afterwards. Write it to `persona.md` in this proposal directory.",
+            );
+        } else {
+            text.push_str(
+                "Steps: read the code that produces this output, write a failing test that \
+                 reproduces the example, fix it, and make the test pass. Do not change the test to \
+                 match the bug.",
+            );
+        }
         text
     }
 }
@@ -233,6 +253,7 @@ pub fn digest(report: &SelfCheck, top: usize) -> Option<String> {
                     Kind::UnparsedDsml => "turns of tool markup that did not parse",
                     Kind::ProviderError => "provider failures recorded as turns",
                     Kind::Repeated => "the same reply repeated verbatim",
+                    Kind::StyleComplaint => "replies someone objected to the tone of",
                 }
             )
         })
@@ -289,6 +310,39 @@ fn is_legacy_call(text: &str) -> bool {
     };
     object.contains_key("node_id") || object.contains_key("action")
 }
+
+/// Wording that means "the answer was fine, the delivery was not".
+///
+/// Deliberately narrow: only direct objections about how the bot talks, so a
+/// room full of ordinary swearing does not read as a complaint about the bot.
+const COMPLAINT_MARKERS: &[&str] = &[
+    "换个",
+    "人设",
+    "说教",
+    "别说了",
+    "闭嘴",
+    "不说话",
+    "太难听",
+    "阴阳",
+    "恶心",
+    "受不了",
+    "烦死",
+    "什么态度",
+    "傻逼",
+    "傻b",
+    "sb",
+];
+
+/// Does this message object to the bot's manner?
+fn is_complaint(text: &str) -> bool {
+    let lowered = text.to_lowercase();
+    COMPLAINT_MARKERS
+        .iter()
+        .any(|marker| lowered.contains(marker))
+}
+
+/// How many messages after a reply still count as a reaction to it.
+const REACTION_WINDOW: usize = 3;
 
 /// Keep the shape of a failure, drop the varying parts.
 ///
@@ -373,6 +427,34 @@ pub fn scan(root: &Path) -> SelfCheck {
         for (index, entry) in transcript.iter().enumerate() {
             if entry.get("kind").and_then(|k| k.as_str()) != Some("assistant") {
                 continue;
+            }
+            // A reply the room objected to is a failure of manner, and the only
+            // record of that judgement is what people say next.
+            if let Some(reaction) = transcript
+                .iter()
+                .skip(index + 1)
+                .take(REACTION_WINDOW)
+                .find(|next| next.get("kind").and_then(|k| k.as_str()) == Some("user"))
+                .and_then(|next| next.get("content"))
+                .and_then(|content| content.as_str())
+            {
+                if is_complaint(reaction) {
+                    let said = entry.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                    let key = (Kind::StyleComplaint, normalise(said));
+                    let signature = signatures.entry(key).or_insert_with(|| Signature {
+                        kind: Kind::StyleComplaint,
+                        excerpt: normalise(said),
+                        count: 0,
+                        sessions: Vec::new(),
+                        first_turn: index,
+                        last_turn: index,
+                    });
+                    signature.count += 1;
+                    if !signature.sessions.contains(&session) {
+                        signature.sessions.push(session.clone());
+                    }
+                    signature.last_turn = index;
+                }
             }
             scanned_turns += 1;
             let content = entry.get("content").and_then(|c| c.as_str()).unwrap_or("");
@@ -744,6 +826,49 @@ mod tests {
             .find(|signature| signature.kind == Kind::Empty)
             .expect("one genuine empty turn");
         assert_eq!(empty.count, 1);
+    }
+
+    /// A correct answer that lands badly is a failure the machine cannot see;
+    /// the reaction after it is the only evidence.
+    #[test]
+    fn a_reply_the_room_objected_to_becomes_a_style_signature() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = serde_json::json!([
+            {"kind": "assistant", "content": "先当假的看", "tools": ["qq_send"]},
+            {"kind": "user", "content": "你能不能换个说话方式"},
+        ]);
+        std::fs::write(
+            dir.path().join("a.json"),
+            serde_json::to_string(&serde_json::json!({"transcript": transcript})).unwrap(),
+        )
+        .unwrap();
+        let report = scan(dir.path());
+        let style = report
+            .signatures
+            .iter()
+            .find(|signature| signature.kind == Kind::StyleComplaint)
+            .expect("style signature");
+        assert_eq!(style.count, 1);
+        assert!(style.excerpt.contains("先当假的看"), "{}", style.excerpt);
+    }
+
+    #[test]
+    fn ordinary_swearing_between_people_is_not_a_complaint() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = serde_json::json!([
+            {"kind": "assistant", "content": "收到了", "tools": ["qq_send"]},
+            {"kind": "user", "content": "这把我打吐了"},
+        ]);
+        std::fs::write(
+            dir.path().join("a.json"),
+            serde_json::to_string(&serde_json::json!({"transcript": transcript})).unwrap(),
+        )
+        .unwrap();
+        let report = scan(dir.path());
+        assert!(report
+            .signatures
+            .iter()
+            .all(|signature| signature.kind != Kind::StyleComplaint));
     }
 
     #[test]
