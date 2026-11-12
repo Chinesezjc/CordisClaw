@@ -2569,8 +2569,12 @@ fn runtime_mode_error(
     Box::new(err)
 }
 
-/// How many 30-second parks between reflection turns (6 hours).
-const SELF_CHECK_TICKS: u64 = 6 * 60 * 2;
+/// How many 30-second parks between checks (10 minutes).
+///
+/// The check is cheap — it reads two marker files — while the two things it may
+/// start are gated separately: a conversation review every hour, a mechanical
+/// fix every six.
+const SELF_CHECK_TICKS: u64 = 10 * 2;
 
 /// Give the agent a turn to look at its own failures and act on one.
 ///
@@ -2595,6 +2599,9 @@ fn reflect_on_failures(host: &cordis_runtime::host::RuntimeHost) {
     // mechanical fact.
     if review_is_due(host) {
         review_recent_conversations(host, &root);
+        return;
+    }
+    if !signature_work_is_due(host) {
         return;
     }
     let Some(signature) = report
@@ -2689,6 +2696,9 @@ fn reflect_on_failures(host: &cordis_runtime::host::RuntimeHost) {
     if let Err(error) = ledger.save(&ledger_path) {
         eprintln!("self-check: {error}");
     }
+    // The mechanical path has its own cadence; without this marker it would run
+    // on every check while the review waits hours.
+    let _ = std::fs::write(host.data_dir().join("selfcheck-last"), "");
     eprintln!(
         "self-check: wrote {}/{}.md",
         proposal_dir.display(),
@@ -2714,8 +2724,26 @@ fn sweep_spilled_results(host: &cordis_runtime::host::RuntimeHost) {
     }
 }
 
+/// How often a mechanical failure may be worked on.
+const SIGNATURE_INTERVAL_HOURS: u64 = 6;
+
+/// Whether the mechanical path may run.
+fn signature_work_is_due(host: &cordis_runtime::host::RuntimeHost) -> bool {
+    let marker = host.data_dir().join("selfcheck-last");
+    let Ok(meta) = std::fs::metadata(&marker) else {
+        return true;
+    };
+    let Ok(modified) = meta.modified() else {
+        return true;
+    };
+    modified
+        .elapsed()
+        .map(|age| age.as_secs() / 3600 >= SIGNATURE_INTERVAL_HOURS)
+        .unwrap_or(true)
+}
+
 /// How often the bot looks back over how it talks.
-const REVIEW_INTERVAL_HOURS: u64 = 12;
+const REVIEW_INTERVAL_HOURS: u64 = 1;
 
 /// Whether a conversation review is due.
 fn review_is_due(host: &cordis_runtime::host::RuntimeHost) -> bool {
