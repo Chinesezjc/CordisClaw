@@ -23,20 +23,6 @@ pub trait AgentToolHost {
     /// The answer is evidence, not a summary: each signature carries how often
     /// it happens, which sessions hit it, and one example. That is what an
     /// iteration needs to act on a failure instead of guessing at it.
-    /// The session's last turns, reasoning included.
-    ///
-    /// The reasoning is stored in the transcript and nowhere else, so this is
-    /// the only way the agent can answer "why did you stay silent then".
-    fn agent_read_transcript(
-        &self,
-        session_id: &str,
-        _limit: usize,
-    ) -> Result<Value, RuntimeError> {
-        Err(RuntimeError::InvalidArgument {
-            message: format!("this host cannot read the transcript of {session_id}"),
-        })
-    }
-
     /// Write a large tool result somewhere the agent can read it back.
     ///
     /// Returns the path, or an error when this host has nowhere to put it —

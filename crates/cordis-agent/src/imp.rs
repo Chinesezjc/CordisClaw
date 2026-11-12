@@ -2259,11 +2259,6 @@ impl<'a, H: AgentToolHost + ?Sized> AgentBackend for RuntimeShellAgentBackend<'a
                 parse_tool_value_arguments::<EmptyArgs>(arguments, name)?;
                 self.host.agent_self_check()
             }
-            AGENT_TOOL_READ_TRANSCRIPT => {
-                let args = parse_tool_value_arguments::<ReadTranscriptArgs>(arguments, name)?;
-                self.host
-                    .agent_read_transcript(self.session_id, args.limit.unwrap_or(8).clamp(1, 50))
-            }
             AGENT_TOOL_RELOAD_RUNTIME => {
                 let args = parse_tool_value_arguments::<ReloadRuntimeArgs>(arguments, name)?;
                 self.host.agent_reload_runtime(&args.plugin_path)
@@ -2500,26 +2495,6 @@ fn delivered_text(events: &[cordis_runtime::agent_api::AgentToolEvent], fallback
     } else {
         said.join("\n")
     }
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct ReadTranscriptArgs {
-    // The model writes this as text as often as a number; accept both.
-    #[serde(default, deserialize_with = "de_optional_usize")]
-    limit: Option<usize>,
-}
-
-fn de_optional_usize<'de, D>(deserializer: D) -> Result<Option<usize>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value = <Option<Value> as serde::Deserialize>::deserialize(deserializer)?;
-    Ok(match value {
-        None | Some(Value::Null) => None,
-        Some(Value::Number(number)) => number.as_u64().map(|n| n as usize),
-        Some(Value::String(text)) => text.trim().parse::<usize>().ok(),
-        Some(_) => None,
-    })
 }
 
 /// Node names of the tools a turn ran, for the transcript.
@@ -3102,17 +3077,6 @@ fn shell_agent_tools() -> Vec<AgentToolSpec> {
             }),
         },
         AgentToolSpec {
-            name: AGENT_TOOL_READ_TRANSCRIPT,
-            description: "Read your own last turns, including the reasoning you did not say out loud. Use it when you are unsure why you did or did not answer something earlier: the reasoning is the only record of that.",
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "limit": {"type": "integer", "description": "How many turns to read back (default 8, max 50)."}
-                },
-                "additionalProperties": false,
-            }),
-        },
-        AgentToolSpec {
             name: AGENT_TOOL_GET_SELF_CHECK,
             description: "Read your own failure report: which mistakes repeat across past turns, how often, with an example and the sessions that hit them. Check it when something keeps going wrong instead of guessing.",
             parameters: json!({
@@ -3339,9 +3303,8 @@ refusal, answer with the same one line or not at all; no meta-commentary about b
 prefix, recent messages, group-member lookups — before saying you cannot tell. Ask only \
 after a lookup fails.
 7. Never state your own runtime state, capabilities, or history unless a tool \
-confirmed it. If you are unsure why you said or skipped something — including \
-why you stayed silent — call `read_transcript` and read your own reasoning back; \
-do not reconstruct it from memory.
+confirmed it. Your own reasoning from earlier turns is in the conversation; read \
+it there rather than reconstructing it from memory.
 8. Stay consistent with what you already told this conversation and with what a \
 tool already returned. Never silently overwrite it: if new evidence contradicts an \
 earlier answer, say plainly which answer changed and why (earlier I said X, the \
