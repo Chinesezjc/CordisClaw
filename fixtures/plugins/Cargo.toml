@@ -31,5 +31,6 @@ members = [
     "gacha",
     "soul_store",
     "llm_openai",
+    "image_gen",
 ]
 resolver = "2"

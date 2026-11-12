@@ -1,0 +1,89 @@
+{
+  "plugin_id": "image_gen",
+  "plugin_path": "image_gen",
+  "plugin_version": "0.1.0",
+  "abi_version": 2,
+  "command_name": null,
+  "nodes": [
+    {
+      "id": "generate_image",
+      "summary": "Generate one image from a text prompt through the gpt-image-2.5 image API and save it on this host. Returns the absolute path and a ready-to-send [CQ:image,file=<path>] snippet; pass that snippet to qq_send to show the picture.",
+      "input_schema": {
+        "type": "object",
+        "required": [
+          "node_id",
+          "prompt"
+        ],
+        "properties": {
+          "node_id": {
+            "type": "string",
+            "const": "generate_image"
+          },
+          "prompt": {
+            "type": "string",
+            "description": "What to draw: subject, style, composition, wording of any text."
+          },
+          "model": {
+            "type": "string",
+            "description": "Optional image model: 'flare' (default) or 'sunburst'; a full model id is also accepted."
+          },
+          "size": {
+            "type": "string",
+            "description": "Optional pixel size, e.g. 1024x1024 (default)."
+          },
+          "quality": {
+            "type": "string",
+            "description": "Optional quality hint passed to the API (e.g. low, medium, high)."
+          }
+        }
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "ok": {
+            "type": "boolean"
+          },
+          "model": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string",
+            "description": "Absolute path of the rendered file on this host"
+          },
+          "cq_image": {
+            "type": "string",
+            "description": "[CQ:image,file=<path>] ready for qq_send's message"
+          },
+          "bytes": {
+            "type": "integer"
+          },
+          "format": {
+            "type": "string"
+          },
+          "revised_prompt": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "error": {
+            "type": "string"
+          }
+        }
+      },
+      "side_effects": [
+        "writes one image file under the configured output directory",
+        "makes a POST to the image API"
+      ],
+      "failure_modes": [
+        "token environment variable not configured",
+        "upstream rejected the request (HTTP error)",
+        "request timed out",
+        "output directory not writable"
+      ],
+      "node_type": "router",
+      "agent_accessible": true
+    }
+  ],
+  "system_hint": "生图（image_gen）：有人要你画图、生成图片、做图时用它。\n【调用】invoke_plugin {\"plugin_path\":\"image_gen\",\"node_id\":\"generate_image\",\"payload_json\":{\"prompt\":\"<画面描述：主体、风格、构图、要出现的文字>\",\"model\":\"flare\"}}\n【模型】model 可选 flare（默认）或 sunburst，是两种不同的出图模型；对方没指定就用默认，指定了另一种就换。\n【结果】ok=true 时返回 path（本机绝对路径）和 cq_image（[CQ:image,file=<path>]）。\n【发图】把 cq_image 原样放进 qq_send 的 message，可以和说明文字同一条；不要只发路径、不要自己拼 base64、不要拿网图冒充。\n【失败】ok=false 时 error 写明原因（token 未配置 / 上游拒绝 / 超时）。把原因简短告诉对方，同一轮不要反复重试同一条。"
+}
