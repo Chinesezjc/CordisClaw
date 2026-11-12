@@ -939,6 +939,16 @@ impl AgentSession {
             // than dropping the turn (a lost reply) or posting the markup
             // (garbage in the room).
             let mut message = message;
+            // Collect the reasoning before any branch returns. A turn that ends
+            // on `suspend` leaves before the tool path, and this is the only
+            // record of why it stayed silent.
+            if let Some(reasoning) = message
+                .reasoning_content
+                .as_deref()
+                .filter(|reasoning| !reasoning.trim().is_empty())
+            {
+                turn.reasoning.push(reasoning.to_string());
+            }
             if message.tool_calls.is_empty() {
                 let raw = message.content.clone().unwrap_or_default();
                 let salvaged = salvage_serialized_tool_calls(&raw, &tool_specs);
@@ -1008,14 +1018,6 @@ impl AgentSession {
                 .tool_calls
                 .iter()
                 .any(|call| call.function.name == AGENT_TOOL_RECORD_ITERATION_SUMMARY);
-
-            if let Some(reasoning) = message
-                .reasoning_content
-                .as_deref()
-                .filter(|reasoning| !reasoning.trim().is_empty())
-            {
-                turn.reasoning.push(reasoning.to_string());
-            }
 
             if !message.tool_calls.is_empty() {
                 let available_tools = tool_specs
@@ -1538,19 +1540,23 @@ impl AgentSession {
         } else {
             performed.join("\n")
         };
-        // A turn that neither spoke nor called anything leaves no trace. Writing
-        // "[no tools called] (said nothing)" into history taught the model that
-        // silence is what its past looks like, and it started opening turns with
-        // `suspend` on its own.
-        if said.is_empty() && performed.is_empty() {
+        // A silent turn still leaves its reasoning behind. The model has to be
+        // able to see why it said nothing; without that it invents a reason the
+        // next time someone asks. What it must not leave is a sentence saying
+        // "I said nothing" — that taught it to open turns with `suspend`.
+        let reasoning_text = closing_reasoning(&turn.reasoning);
+        if said.is_empty() && performed.is_empty() && reasoning_text.is_none() {
             return;
         }
         let assistant = if said.is_empty() {
-            format!("{actions}（没有发言）")
+            if performed.is_empty() {
+                String::new()
+            } else {
+                actions
+            }
         } else {
             format!("{}\n\n{actions}", said.join("\n"))
         };
-        let reasoning = closing_reasoning(&turn.reasoning);
         // Only the batch body belongs in history. The channel's one-shot
         // context (reply policy, reply target, group memory) rides in front of
         // it and must not be replayed: it becomes stale the moment the policy
@@ -1573,7 +1579,7 @@ impl AgentSession {
         self.remember_exchange(
             &remembered,
             &assistant,
-            reasoning.as_deref(),
+            reasoning_text.as_deref(),
             history_images(images, turn.images_stripped),
         );
     }
@@ -6464,6 +6470,35 @@ mod tests {
             !assistant.iter().any(|content| content.contains("suspend")),
             "{assistant:?}"
         );
+    }
+
+    /// Silence has to leave its reason behind: asked later why it did not
+    /// answer, the bot invented one when the reasoning was nowhere it could read.
+    #[test]
+    fn a_silent_turn_records_the_reasoning_behind_it() {
+        let reasoning = "这个问题没有事实答案，但也不该沉默";
+        let provider = FakeLlmProvider::new(vec![cordis_plugin_sdk::llm::LlmMessage {
+            content: Some(
+                "<|DSML|calls>\n<|DSML|invoke name=\"suspend\"></|DSML|invoke>\n</|DSML|calls>"
+                    .to_string(),
+            ),
+            reasoning_content: Some(reasoning.to_string()),
+            ..Default::default()
+        }]);
+        let mut session = ShellAgentSession::new(LlmApiConfig::default()).expect("build session");
+        session.set_require_end_tool(true);
+        session
+            .respond_via(
+                &EMPTY_FAKE_HOST,
+                "silent-reasoning",
+                "他们问你个问题",
+                &provider,
+            )
+            .expect("turn");
+        let recorded = session.inner.history.iter().any(|message| {
+            message.get("reasoning_content").and_then(Value::as_str) == Some(reasoning)
+        });
+        assert!(recorded, "{:?}", session.inner.history);
     }
 
     #[test]
