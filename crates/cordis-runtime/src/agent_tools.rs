@@ -24,6 +24,8 @@ pub const AGENT_TOOL_GET_KERNEL_STATUS: &str = "get_kernel_status";
 pub const AGENT_TOOL_GET_KERNEL_ISSUES: &str = "get_kernel_issues";
 /// What the bot itself keeps getting wrong, read from its own transcripts.
 pub const AGENT_TOOL_GET_SELF_CHECK: &str = "get_self_check";
+/// The bot's own last turns, reasoning included.
+pub const AGENT_TOOL_READ_TRANSCRIPT: &str = "read_transcript";
 pub const AGENT_TOOL_RELOAD_RUNTIME: &str = "reload_runtime";
 /// Session-to-session: list the live sessions.
 pub const AGENT_TOOL_LIST_SESSIONS: &str = "list_sessions";
@@ -42,6 +44,7 @@ pub const KERNEL_INTROSPECTION_TOOLS: &[&str] = &[
     AGENT_TOOL_GET_KERNEL_STATUS,
     AGENT_TOOL_GET_KERNEL_ISSUES,
     AGENT_TOOL_GET_SELF_CHECK,
+    AGENT_TOOL_READ_TRANSCRIPT,
 ];
 /// Returns true if `name` is one of the kernel introspection tools.
 pub fn is_kernel_introspection(name: &str) -> bool {
@@ -229,6 +232,38 @@ impl AgentToolHost for RuntimeHost {
 
     fn agent_kernel_issues(&self) -> Result<Value, RuntimeError> {
         to_json_value("kernel issues", self.kernel().plugin_issues())
+    }
+
+    fn agent_read_transcript(&self, session_id: &str, limit: usize) -> Result<Value, RuntimeError> {
+        let entries = crate::host::RuntimeHost::agent_transcript(self, session_id)?;
+        let tail: Vec<Value> = entries
+            .iter()
+            .rev()
+            .take(limit)
+            .map(|entry| match entry {
+                crate::agent_api::AgentTranscriptEntry::User { content } => {
+                    serde_json::json!({"role": "user", "content": content})
+                }
+                crate::agent_api::AgentTranscriptEntry::Assistant {
+                    content,
+                    tools,
+                    reasoning,
+                    ..
+                } => serde_json::json!({
+                    "role": "assistant",
+                    "content": content,
+                    "tools": tools,
+                    "reasoning": reasoning.clone().unwrap_or_default(),
+                }),
+                crate::agent_api::AgentTranscriptEntry::Tool { .. } => {
+                    serde_json::json!({"role": "tool"})
+                }
+            })
+            .collect();
+        Ok(serde_json::json!({
+            "ok": true,
+            "turns": tail.into_iter().rev().collect::<Vec<_>>(),
+        }))
     }
 
     fn agent_spill(&self, tool: &str, text: &str) -> Result<String, RuntimeError> {
