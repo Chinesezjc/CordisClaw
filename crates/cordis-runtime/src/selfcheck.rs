@@ -592,7 +592,10 @@ fn change_section(changes: &[Change]) -> String {
 
 fn review_body(exchanges: &[Exchange]) -> String {
     let mut text = String::from(
-        "Below are your recent replies, each followed by what people said next. \
+        "Answer in prose, then put **exactly one** ```json fenced block at the very \\
+         end. Do not wrap anything in `{\"action\":\"respond\"}` or any other \\
+         envelope: that protocol no longer exists.\n\n\
+         Below are your recent replies, each followed by what people said next. \
          Judge them as a reader would, not as a log analyser:\n\n\
          - Which replies landed badly — irritated someone, read as lecturing, \
            answered a question nobody asked, or were right but rude?\n\
