@@ -851,8 +851,9 @@ JSON 参数、单引号属性、渲染往返。
 
 **改法**（`crates/cordis-runtime/src/selfcheck.rs` + `crates/cordis-cli/src/main.rs` 接线）：
 
-- 新增 `ChangeTarget{Persona,Policy,Memory,Code}`、`ChangeState{Applied,Kept,Reverted}`
-  与 `Change{id,target,summary,expectation,applied_at_ms,rollback,state}`，落
+- 新增 `ChangeTarget{Persona,Policy,Memory,Code,Capability}`、
+  `ChangeState{Applied,Kept,Reverted}` 与
+  `Change{id,target,summary,expectation,applied_at_ms,rollback,state}`，落
   `data/changes.json`（数组，原子写）。
 - `review_prompt_after` 末尾要求模型给一个 ```json 代码块：
   `{"changes":[{target,scope,summary,expectation,value}],"verdicts":[{id,state,reason}]}`。
@@ -871,15 +872,29 @@ JSON 参数、单引号属性、渲染往返。
 - `code` 道不自动应用：写到 `data/proposals/<id>/proposal.json` + `patch.diff`，
   交给既有 `cordis-agent/src/gate.rs`；回归测试“改前必失败、改后必通过”才
   `git apply`。没有 patch 则记录 `no machine-checkable proposal`，不产生 `Change`。
+- `capability` 道记录“这件事我做不到，因为缺某个工具/系统能力”，同样不自动应用：
+  - 复盘提示词在格式说明之后、对话之前新增一段，要求逐条说出“哪些请求因为缺能力
+    没能服务、缺什么、值不值得补”，值得补就给 `target:"capability"` 的改动。
+    判断完全交给模型，不用关键词匹配“我说了我做不到”。
+  - 给了 `package`+`test`+`patch` 就与 `code` 同路径过门禁；没给则由
+    `stage_capability` 写 `data/proposals/<id>/report.md`（“尚无实现”+summary/
+    expectation），并在 `changes.json` 留一条 `Capability` 记录（`Applied`、
+    `rollback` 为空对象），下轮复盘仍能看到缺口。
+  - `reconcile_verdicts`：`reverted` = 评估后不值得补，置 `Reverted` 且不恢复任何
+    东西（`revert_change` 对 `Capability` 是 no-op）；`kept` = 确实值得补，置 `Kept`。
 
 **验证**：`cargo test -p cordis-runtime --lib selfcheck` 覆盖解析（无块/坏 JSON/
 多 changes/多块/非 kept-reverted 判定）、三种数据道的应用与回滚、备份先于写入、
-原子写失败臂、代码提案形态；CLI 侧只做接线。
+原子写失败臂、代码提案形态、`capability` 的解析/无 patch 报告/有 patch 提案形态/
+报告写入失败臂/`reverted` 不动文件；CLI 侧只做接线。
 
 **仍未闭环**：code 改动的回滚依赖 `git apply --reverse` 与提案文件仍在原处；如果
 工作树在两次复盘之间被手工改过，reverse 会失败并保持 `Applied`（不会误报成功）。
 另外 `persona` 的旧键（`qq:<gid>#group`）在 host 回落读取时能读到，但回滚写入的是
-新键 `qq:group:<gid>`，旧行本身不会被删除。
+新键 `qq:group:<gid>`，旧行本身不会被删除。`capability` 被判定 `kept` 后状态是
+`Kept`，而 `Change::pending` 只挑 `Applied`，所以“值得补但还没造”的缺口下一轮
+不会再出现在待判定列表里——若要它持续可见，需要让 `pending` 也保留这类记录，或在
+`kept` 后另开一个待办状态。
 
 ## 4. 部分完成
 
@@ -2330,7 +2345,7 @@ cd fixtures/plugins/expr/lexer && cargo test --lib  # excluded, external tests o
 > (`fixtures/plugins/web/` 和 `fixtures/plugins/git/`)，符合 Kernel 提供机制、Plugin 提供能力的原则。
 
 当前 agent 有 15 个工具（read/write/search/run/revert/runtime ops），Kernel 自省 6 个，其余能力通过插件提供：
-- [x] Web fetch / search — `web` 插件 (`web_search` 支持 Brave + Bing 双后端自动切换, `web_fetch` 节点)
+- [x] Web fetch / search — `web` 插件 (`web_search` 支持 Brave + Bing 双后端自动切换, `web_fetch` 节点；`web_fetch` 支持 `readable` / `raw` 两种模式，`raw: true` 返回未处理的 HTML 源码，用于提取 `<img src>` 图片地址)
 - [x] Git 操作 — `git` 插件 (`git_diff`, `git_log`, `git_status`, `git_commit` 节点)
 - [ ] 多文件 diff 预览（改动前展示将要修改的内容）
 

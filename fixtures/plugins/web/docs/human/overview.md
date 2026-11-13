@@ -21,8 +21,23 @@ often expose the Anthropic-compatible surface under a different path than the
 OpenAI-compatible one used for chat.
 
 ### `web_fetch`
-Fetch a web page and return its plain-text content with HTML tags stripped.
-Limited to 8000 characters. http/https only; localhost and private IPs are blocked.
+Fetch a web page in one of two modes; the response carries `mode` so the
+caller knows what it got.
+
+- **`raw: false` (default, `mode: "readable"`)** — the DeepSeek Fetch API
+  returns extracted Markdown (title + body, images and other markup already
+  stripped), falling back to a local GET that strips HTML. Cut at 8000
+  characters. Best for reading prose.
+- **`raw: true` (`mode: "raw"`)** — skips the vendor and returns the local
+  HTTP response body untouched: the HTML source, including `<img src>`,
+  `<meta>` tags and JSON-LD. Use it when the URLs on the page matter (image
+  addresses, canonical/OG links, structured data). The whole body is returned
+  with `truncated: false`; there is no character cut, because a cut page
+  silently loses the very markup that was asked for. Oversized tool results
+  go through the generic spill mechanism (`data/spill/`), and only a 16 MiB
+  in-memory safety valve refuses outright.
+
+Both modes are http/https only; localhost and private IPs are blocked.
 
 ## Configuration
 
