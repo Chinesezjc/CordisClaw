@@ -2764,21 +2764,33 @@ fn review_is_due(host: &cordis_runtime::host::RuntimeHost) -> bool {
 ///
 /// No keyword list decides what "landed badly" means: the same sentence is
 /// warm in one room and insulting in another, and only a reader can tell. The
-/// output is a note under `data/reviews/` — a persona change for the operator to
-/// weigh, never an automatic edit to how it talks.
+/// reply is kept verbatim under `data/reviews/`; its trailing ```json block is
+/// applied (with a backup) and checked by the next review. That is the
+/// difference between a diary and a control loop.
 fn review_recent_conversations(
     host: &cordis_runtime::host::RuntimeHost,
     sessions: &std::path::Path,
 ) {
+    use cordis_runtime::selfcheck::{
+        apply_review_data, parse_review, reconcile_verdicts, review_prompt_after, upsert_change,
+        Change, ChangeTarget,
+    };
+
     let exchanges = cordis_runtime::selfcheck::recent_exchanges(sessions, 40);
     if exchanges.is_empty() {
         return;
     }
+    let data_dir = host.data_dir();
+    let reviews_dir = data_dir.join("reviews");
     // Its own last conclusions ride in front, so a review checks whether it did
     // what the previous one said instead of starting from nothing every hour.
-    let reviews_dir = host.data_dir().join("reviews");
     let previous = cordis_runtime::selfcheck::previous_reviews(&reviews_dir, 3);
-    let prompt = cordis_runtime::selfcheck::review_prompt_after(&exchanges, &previous);
+    let changes_path = data_dir.join("changes.json");
+    let mut changes = Change::load(&changes_path);
+    // Only unsettled changes are worth asking about; a settled verdict would
+    // otherwise be re-asked every hour forever.
+    let pending: Vec<Change> = Change::pending(&changes).into_iter().cloned().collect();
+    let prompt = review_prompt_after(&exchanges, &previous, &pending);
     let started = host.agent_start_with(
         cordis_runtime::host::AgentSessionKind::RuntimeShell,
         cordis_runtime::host::AgentStartOptions {
@@ -2796,15 +2808,174 @@ fn review_recent_conversations(
         Ok(reply) => reply.content,
         Err(error) => format!("review failed: {error}"),
     };
-    let dir = host.data_dir().join("reviews");
-    let _ = std::fs::create_dir_all(&dir);
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_secs())
-        .unwrap_or(0);
-    let _ = std::fs::write(dir.join(format!("{stamp}.md")), reply);
-    let _ = std::fs::write(dir.join("last"), "");
+    // Store the raw review before parsing: if the model wrote prose but no
+    // machine-readable block, its judgement is still worth keeping.
+    let _ = std::fs::create_dir_all(&reviews_dir);
+    let stamp = wall_clock_ms() / 1000;
+    let _ = std::fs::write(reviews_dir.join(format!("{stamp}.md")), &reply);
+    let _ = std::fs::write(reviews_dir.join("last"), "");
+    let Some(review) = parse_review(&reply) else {
+        eprintln!("self-check: review carried no structured changes");
+        return;
+    };
+    let now_ms = wall_clock_ms();
+    let souls = HostSouls { host };
+    let patches = WorkingTreePatches {
+        root: workspace_root(host),
+    };
+    let notes = reconcile_verdicts(&data_dir, &mut changes, &review.verdicts, &souls, &patches);
+    let applied = apply_review_data(&data_dir, &review.changes, now_ms, &souls);
+    for change in &applied.applied {
+        eprintln!(
+            "self-check: applied {} ({})",
+            change.id,
+            change.target.as_str()
+        );
+    }
+    for change in applied.applied {
+        upsert_change(&mut changes, change);
+    }
+    for note in notes.into_iter().chain(applied.notes) {
+        eprintln!("self-check: {note}");
+    }
+    // The code lane is never auto-applied: it goes through the existing gate,
+    // and only a patch whose regression test fails before and passes after is
+    // written to the working tree.
+    for proposal in review
+        .changes
+        .iter()
+        .filter(|proposal| proposal.target == ChangeTarget::Code)
+    {
+        apply_code_proposal(&data_dir, &patches.root, proposal, now_ms, &mut changes);
+    }
+    if let Err(error) = Change::save(&changes_path, &changes) {
+        eprintln!("self-check: {error}");
+    }
     eprintln!("self-check: wrote a conversation review");
+}
+
+/// Apply one code proposal through the gate.
+///
+/// A proposal without a patch, or one the gate refuses, never becomes a
+/// `Change`; the reason is recorded next to the proposal instead.
+fn apply_code_proposal(
+    data_dir: &std::path::Path,
+    root: &std::path::Path,
+    proposal: &cordis_runtime::selfcheck::ProposedChange,
+    now_ms: u64,
+    changes: &mut Vec<cordis_runtime::selfcheck::Change>,
+) {
+    use cordis_runtime::selfcheck::{
+        change_id, code_change, upsert_change, write_code_proposal, ChangeTarget,
+    };
+
+    let id = change_id(
+        ChangeTarget::Code,
+        &proposal.scope,
+        &proposal.summary,
+        &proposal.value,
+    );
+    let dir = match write_code_proposal(data_dir, proposal, &id) {
+        Ok(dir) => dir,
+        Err(error) => {
+            // A proposal the model described in prose only is still a recorded
+            // fact: the next review can see that nothing machine-checkable came
+            // out of it instead of guessing why no patch exists.
+            let dir = data_dir.join("proposals").join(&id);
+            let _ = std::fs::create_dir_all(&dir);
+            let _ = std::fs::write(dir.join("report.md"), format!("# {id}\n\n{error}\n"));
+            eprintln!("self-check: {error}");
+            return;
+        }
+    };
+    let Some(verdict) = gate_proposal(&dir) else {
+        eprintln!("self-check: gate could not create a scratch worktree for {id}");
+        return;
+    };
+    if !verdict.is_verified() {
+        let reason = verdict.reason().unwrap_or("not verified");
+        let _ = std::fs::write(
+            dir.join("report.md"),
+            format!("# {id}\n\nno machine-checkable proposal: gate refused: {reason}\n"),
+        );
+        eprintln!("self-check: gate refused {id}: {reason}");
+        return;
+    }
+    if let Err(error) = run_git(root, &["apply"], &dir.join("patch.diff")) {
+        eprintln!("self-check: {error}");
+        return;
+    }
+    upsert_change(changes, code_change(&id, proposal, now_ms));
+    eprintln!("self-check: applied code change {id}");
+}
+
+/// Persona writes go through the host, so the authoritative store stays
+/// whatever the loaded provider is: `soul_store`'s SQLite when present, the
+/// kernel's `data/souls/*.json` otherwise. The CLI never opens the database.
+struct HostSouls<'a> {
+    host: &'a cordis_runtime::host::RuntimeHost,
+}
+
+impl cordis_runtime::selfcheck::PersonaSink for HostSouls<'_> {
+    fn persona(&self, soul_key: &str) -> Result<Option<String>, String> {
+        self.host
+            .get_soul(soul_key)
+            .map(|soul| soul.map(|soul| soul.persona))
+            .map_err(|error| error.to_string())
+    }
+
+    fn set_persona(&self, soul_key: &str, persona: &str) -> Result<(), String> {
+        let mut soul = self
+            .host
+            .get_soul(soul_key)
+            .map_err(|error| error.to_string())?
+            .unwrap_or_default();
+        soul.persona = persona.to_string();
+        soul.updated_at_ms = wall_clock_ms();
+        soul.updated_by = "selfcheck".to_string();
+        self.host
+            .set_soul(soul_key, &soul)
+            .map_err(|error| error.to_string())
+    }
+}
+
+/// Reverses a verified code patch in the working tree.
+struct WorkingTreePatches {
+    root: std::path::PathBuf,
+}
+
+impl cordis_runtime::selfcheck::PatchReverter for WorkingTreePatches {
+    fn revert(&self, patch: &std::path::Path) -> Result<(), String> {
+        run_git(&self.root, &["apply", "--reverse"], patch)
+    }
+}
+
+fn run_git(root: &std::path::Path, args: &[&str], patch: &std::path::Path) -> Result<(), String> {
+    let status = std::process::Command::new("git")
+        .current_dir(root)
+        .args(args)
+        .arg(patch)
+        .status()
+        .map_err(|error| format!("git {}: {error}", args.join(" ")))?;
+    if status.success() {
+        return Ok(());
+    }
+    Err(format!("git {} {} failed", args.join(" "), patch.display()))
+}
+
+fn workspace_root(host: &cordis_runtime::host::RuntimeHost) -> std::path::PathBuf {
+    let data_dir = host.data_dir();
+    data_dir
+        .parent()
+        .map(|parent| parent.to_path_buf())
+        .unwrap_or(data_dir)
+}
+
+fn wall_clock_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// Judge a self-proposed patch against a clean worktree.

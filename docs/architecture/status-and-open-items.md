@@ -2,7 +2,7 @@
 
 ## 1. 判定口径
 
-- 本文基于当前仓库现状整理，最近更新：2026-11-09。
+- 本文基于当前仓库现状整理，最近更新：2026-11-13。
 - 历史规划蓝图已经吸收进 [design-blueprint.md](./design-blueprint.md)，因此本文结论来自三类证据的交叉比对：
   - 设计蓝图：[design-blueprint.md](./design-blueprint.md)
   - 架构文档：[system-overview.md](./system-overview.md)、[contracts-and-loading.md](./contracts-and-loading.md)、[runtime-semantics.md](./runtime-semantics.md)、[maintenance-guide.md](./maintenance-guide.md)
@@ -842,6 +842,44 @@ JSON 扫描器读不懂它，于是那一轮**一个调用都没有**：渠道�
 `tool_calls`，回合仍结束）与 `a_dsml_plugin_node_reaches_the_host`（插件节点被解析成
 真实调用）两个端到端用例；另有 12 条解析单测覆盖全角/双管道、无闭合标签、
 JSON 参数、单引号属性、渲染往返。
+
+### 3.40 反思从“写日记”变成可应用、可复核、可回滚的改动（2026-11-13）
+
+**问题**：`reflect_on_failures` 每 10 分钟看机械失败签名，`review_recent_conversations`
+每小时让模型读自己的对话并把结论写进 `data/reviews/`。但结论只是文字：下一小时
+的复盘看不到自己上小时改了什么，更无法判断“改好了没有”。这不是自我改进，是日记。
+
+**改法**（`crates/cordis-runtime/src/selfcheck.rs` + `crates/cordis-cli/src/main.rs` 接线）：
+
+- 新增 `ChangeTarget{Persona,Policy,Memory,Code}`、`ChangeState{Applied,Kept,Reverted}`
+  与 `Change{id,target,summary,expectation,applied_at_ms,rollback,state}`，落
+  `data/changes.json`（数组，原子写）。
+- `review_prompt_after` 末尾要求模型给一个 ```json 代码块：
+  `{"changes":[{target,scope,summary,expectation,value}],"verdicts":[{id,state,reason}]}`。
+  `parse_review` 是纯函数：无代码块 / JSON 坏掉 → `None`（原始复盘仍落盘），
+  多块与多 changes 合并，未知 verdict 丢弃。
+- 数据道应用前把旧值写进 `data/changes-backup/<id>-<ts>.json`（`rollback` 同份），
+  再原子写目标：
+  - `persona` → `RuntimeHost::set_soul`。**权威存储由 host 每次解析**：加载了
+    `soul_store` 插件（`data/souls.db` SQLite）时走插件，否则回落 kernel 的
+    `data/souls/*.json`；CLI 不链 rusqlite。
+  - `policy` → 只改 `data/qq_reply_policies.json` 的 `groups[<gid>].policy`，`enabled` 不动。
+  - `memory` → 追加到 `data/qq_group_memory.json` 对应群的 `memory`。
+- 下一次复盘把仍处于 `Applied` 的改动连预期一起放进提示词，要求逐条回答
+  `kept` / `reverted` + 理由。`reverted` 用 `rollback` 恢复后置 `Reverted`；`kept`
+  置 `Kept`；没有判断保持 `Applied` 下轮再问。
+- `code` 道不自动应用：写到 `data/proposals/<id>/proposal.json` + `patch.diff`，
+  交给既有 `cordis-agent/src/gate.rs`；回归测试“改前必失败、改后必通过”才
+  `git apply`。没有 patch 则记录 `no machine-checkable proposal`，不产生 `Change`。
+
+**验证**：`cargo test -p cordis-runtime --lib selfcheck` 覆盖解析（无块/坏 JSON/
+多 changes/多块/非 kept-reverted 判定）、三种数据道的应用与回滚、备份先于写入、
+原子写失败臂、代码提案形态；CLI 侧只做接线。
+
+**仍未闭环**：code 改动的回滚依赖 `git apply --reverse` 与提案文件仍在原处；如果
+工作树在两次复盘之间被手工改过，reverse 会失败并保持 `Applied`（不会误报成功）。
+另外 `persona` 的旧键（`qq:<gid>#group`）在 host 回落读取时能读到，但回滚写入的是
+新键 `qq:group:<gid>`，旧行本身不会被删除。
 
 ## 4. 部分完成
 
