@@ -2774,7 +2774,11 @@ fn review_recent_conversations(
     if exchanges.is_empty() {
         return;
     }
-    let prompt = cordis_runtime::selfcheck::review_prompt(&exchanges);
+    // Its own last conclusions ride in front, so a review checks whether it did
+    // what the previous one said instead of starting from nothing every hour.
+    let reviews_dir = host.data_dir().join("reviews");
+    let previous = cordis_runtime::selfcheck::previous_reviews(&reviews_dir, 3);
+    let prompt = cordis_runtime::selfcheck::review_prompt_after(&exchanges, &previous);
     let started = host.agent_start_with(
         cordis_runtime::host::AgentSessionKind::RuntimeShell,
         cordis_runtime::host::AgentStartOptions {

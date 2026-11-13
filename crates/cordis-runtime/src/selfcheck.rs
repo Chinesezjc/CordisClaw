@@ -337,11 +337,72 @@ pub fn recent_exchanges(root: &Path, max: usize) -> Vec<Exchange> {
     exchanges.split_off(skip)
 }
 
+/// The conclusions of its own last reviews, newest first.
+///
+/// Without them every review starts from nothing: the model writes "next time
+/// say half a sentence first", and the next hour it has no idea it ever said
+/// that. The notes are its own words, so they are cheap to carry.
+pub fn previous_reviews(dir: &Path, max: usize) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut paths: Vec<_> = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|extension| extension.to_str()) == Some("md"))
+        .collect();
+    paths.sort();
+    paths
+        .into_iter()
+        .rev()
+        .take(max)
+        .filter_map(|path| std::fs::read_to_string(path).ok())
+        .map(|text| unwrap_envelope(&text))
+        .filter(|text| !text.trim().is_empty())
+        .collect()
+}
+
+/// The text of a review, whether or not the model wrapped it in the retired
+/// `{"action":"respond","message":…}` envelope.
+fn unwrap_envelope(text: &str) -> String {
+    let trimmed = text.trim();
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        if let Some(message) = value.get("message").and_then(|message| message.as_str()) {
+            return message.to_string();
+        }
+    }
+    trimmed.to_string()
+}
+
 /// A prompt that asks the model to judge its own recent conversations.
 ///
 /// The question is deliberately open: "which of these landed badly" is not a
 /// property of words, so it cannot be answered by matching them.
 pub fn review_prompt(exchanges: &[Exchange]) -> String {
+    review_prompt_after(exchanges, &[])
+}
+
+/// The review prompt, with the model's own earlier conclusions in front.
+pub fn review_prompt_after(exchanges: &[Exchange], previous: &[String]) -> String {
+    let mut text = String::new();
+    if !previous.is_empty() {
+        text.push_str(
+            "These are your own conclusions from earlier reviews, newest first. \
+             First judge whether you actually did them; say plainly if you did not.\n\n",
+        );
+        for (index, note) in previous.iter().enumerate() {
+            text.push_str(&format!(
+                "--- 上次复盘 {} ---\n{}\n\n",
+                index + 1,
+                note.trim()
+            ));
+        }
+    }
+    text.push_str(&review_body(exchanges));
+    text
+}
+
+fn review_body(exchanges: &[Exchange]) -> String {
     let mut text = String::from(
         "Below are your recent replies, each followed by what people said next. \
          Judge them as a reader would, not as a log analyser:\n\n\
@@ -915,6 +976,40 @@ mod tests {
         )
         .unwrap();
         assert!(recent_exchanges(dir.path(), 10).is_empty());
+    }
+
+    #[test]
+    fn previous_reviews_are_read_newest_first_and_unwrapped() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("1.md"), "第一条结论").unwrap();
+        std::fs::write(
+            dir.path().join("2.md"),
+            r#"{"action":"respond","message":"第二条结论"}"#,
+        )
+        .unwrap();
+        // The marker file is not a review.
+        std::fs::write(dir.path().join("last"), "").unwrap();
+        let notes = previous_reviews(dir.path(), 2);
+        assert_eq!(notes.len(), 2);
+        assert_eq!(notes[0], "第二条结论");
+        assert_eq!(notes[1], "第一条结论");
+    }
+
+    #[test]
+    fn a_review_prompt_carries_the_earlier_conclusions() {
+        let exchanges = vec![Exchange {
+            session: "s".to_string(),
+            reply: "嗯".to_string(),
+            after: vec!["你怎么不说话".to_string()],
+        }];
+        let prompt = review_prompt_after(&exchanges, &["下次先接半句".to_string()]);
+        assert!(prompt.contains("下次先接半句"), "{prompt}");
+        assert!(
+            prompt.contains("judge whether you actually did them"),
+            "{prompt}"
+        );
+        // The conversation is still there.
+        assert!(prompt.contains("你怎么不说话"), "{prompt}");
     }
 
     #[test]
