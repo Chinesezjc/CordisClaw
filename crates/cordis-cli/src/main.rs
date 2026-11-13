@@ -816,6 +816,11 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     );
     sweep_spilled_results(&host);
     let agent_session = host.agent_start(AgentSessionKind::RuntimeShell)?;
+    // The main session is the root of the organisation tree: every channel
+    // room and background sub-agent hangs off it. Registering it here is what
+    // lets `my_team` say "spawned_by: null" for the boot session and gives
+    // iteration sessions a fallback parent.
+    host.set_main_session(&agent_session.session_id)?;
     let mut state = ServeState {
         agent_session_id: agent_session.session_id,
         mode: ServeMode::Command,
@@ -1137,6 +1142,10 @@ fn run_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     // generated session id. Idempotent, so restored sessions
                     // get their address too.
                     let _ = host.agent_set_session_address(&sid, session_key);
+                    // Channel rooms are children of the main session. This is
+                    // the only structural claim the code makes about them —
+                    // what a room is responsible for is not encoded anywhere.
+                    let _ = host.attach_session_to_main(&sid);
                     // Call sites take `&str`; shadow the owned id.
                     let sid = sid.as_str();
                     // Read-only channel (qq `enabled=false`): the messages are
@@ -1441,6 +1450,7 @@ fn handle_serve_command(
         }
         "agent reset" => {
             let session = host.agent_start(AgentSessionKind::RuntimeShell)?;
+            host.set_main_session(&session.session_id)?;
             state.agent_session_id = session.session_id;
             println!("agent session reset");
         }
@@ -1597,6 +1607,7 @@ fn handle_agent_chat_line(
         }
         "/reset" => {
             let session = host.agent_start(AgentSessionKind::RuntimeShell)?;
+            host.set_main_session(&session.session_id)?;
             state.agent_session_id = session.session_id;
             println!("agent session reset");
         }
@@ -2645,6 +2656,9 @@ fn reflect_on_failures(host: &cordis_runtime::host::RuntimeHost) {
         eprintln!("self-check: could not start a reflection session");
         return;
     };
+    // A background reflection is a sub-agent of the main session, not a new
+    // root: it exists because the main session's runtime noticed something.
+    let _ = host.attach_session_to_main(&session.session_id);
     let outcome = host.agent_send(&session.session_id, &instruction);
     host.drop_session(&session.session_id);
     let summary = match &outcome {
@@ -2773,7 +2787,7 @@ fn review_recent_conversations(
 ) {
     use cordis_runtime::selfcheck::{
         apply_review_data, parse_review, reconcile_verdicts, review_prompt_after, upsert_change,
-        Change, ChangeTarget,
+        Change,
     };
 
     let exchanges = cordis_runtime::selfcheck::recent_exchanges(sessions, 40);
@@ -2802,6 +2816,9 @@ fn review_recent_conversations(
     let Ok(session) = started else {
         return;
     };
+    // Same as the reflection session above: a review is run by the runtime on
+    // behalf of the main session, so it hangs off it.
+    let _ = host.attach_session_to_main(&session.session_id);
     let outcome = host.agent_send(&session.session_id, &prompt);
     host.drop_session(&session.session_id);
     let reply = match outcome {
@@ -2838,15 +2855,15 @@ fn review_recent_conversations(
     for note in notes.into_iter().chain(applied.notes) {
         eprintln!("self-check: {note}");
     }
-    // The code lane is never auto-applied: it goes through the existing gate,
-    // and only a patch whose regression test fails before and passes after is
-    // written to the working tree.
+    // The code and capability lanes are never auto-applied: they go through
+    // the existing gate, and only a patch whose regression test fails before
+    // and passes after is written to the working tree.
     for proposal in review
         .changes
         .iter()
-        .filter(|proposal| proposal.target == ChangeTarget::Code)
+        .filter(|proposal| proposal.target.needs_gate())
     {
-        apply_code_proposal(&data_dir, &patches.root, proposal, now_ms, &mut changes);
+        apply_gated_proposal(&data_dir, &patches.root, proposal, now_ms, &mut changes);
     }
     if let Err(error) = Change::save(&changes_path, &changes) {
         eprintln!("self-check: {error}");
@@ -2854,11 +2871,13 @@ fn review_recent_conversations(
     eprintln!("self-check: wrote a conversation review");
 }
 
-/// Apply one code proposal through the gate.
+/// Apply one gated proposal (`code` or `capability`) through the gate.
 ///
 /// A proposal without a patch, or one the gate refuses, never becomes a
-/// `Change`; the reason is recorded next to the proposal instead.
-fn apply_code_proposal(
+/// verified change; the reason is recorded next to the proposal instead. A
+/// capability with no implementation is still recorded — as an open todo item —
+/// so the next review can see the gap is unresolved.
+fn apply_gated_proposal(
     data_dir: &std::path::Path,
     root: &std::path::Path,
     proposal: &cordis_runtime::selfcheck::ProposedChange,
@@ -2866,27 +2885,46 @@ fn apply_code_proposal(
     changes: &mut Vec<cordis_runtime::selfcheck::Change>,
 ) {
     use cordis_runtime::selfcheck::{
-        change_id, code_change, upsert_change, write_code_proposal, ChangeTarget,
+        capability_change, change_id, code_change, stage_capability, upsert_change,
+        write_code_proposal, ChangeTarget, StagedCapability,
     };
 
     let id = change_id(
-        ChangeTarget::Code,
+        proposal.target,
         &proposal.scope,
         &proposal.summary,
         &proposal.value,
     );
-    let dir = match write_code_proposal(data_dir, proposal, &id) {
-        Ok(dir) => dir,
-        Err(error) => {
-            // A proposal the model described in prose only is still a recorded
-            // fact: the next review can see that nothing machine-checkable came
-            // out of it instead of guessing why no patch exists.
-            let dir = data_dir.join("proposals").join(&id);
-            let _ = std::fs::create_dir_all(&dir);
-            let _ = std::fs::write(dir.join("report.md"), format!("# {id}\n\n{error}\n"));
-            eprintln!("self-check: {error}");
-            return;
-        }
+    let dir = match proposal.target {
+        ChangeTarget::Capability => match stage_capability(data_dir, proposal, &id) {
+            Ok(StagedCapability::Proposal(dir)) => dir,
+            Ok(StagedCapability::Report(dir)) => {
+                eprintln!(
+                    "self-check: capability {id} has no implementation yet; noted in {}",
+                    dir.display()
+                );
+                upsert_change(changes, capability_change(&id, proposal, now_ms));
+                return;
+            }
+            Err(error) => {
+                eprintln!("self-check: {error}");
+                return;
+            }
+        },
+        _ => match write_code_proposal(data_dir, proposal, &id) {
+            Ok(dir) => dir,
+            Err(error) => {
+                // A proposal the model described in prose only is still a
+                // recorded fact: the next review can see that nothing
+                // machine-checkable came out of it instead of guessing why no
+                // patch exists.
+                let dir = data_dir.join("proposals").join(&id);
+                let _ = std::fs::create_dir_all(&dir);
+                let _ = std::fs::write(dir.join("report.md"), format!("# {id}\n\n{error}\n"));
+                eprintln!("self-check: {error}");
+                return;
+            }
+        },
     };
     let Some(verdict) = gate_proposal(&dir) else {
         eprintln!("self-check: gate could not create a scratch worktree for {id}");
@@ -2905,8 +2943,16 @@ fn apply_code_proposal(
         eprintln!("self-check: {error}");
         return;
     }
-    upsert_change(changes, code_change(&id, proposal, now_ms));
-    eprintln!("self-check: applied code change {id}");
+    let change = if proposal.target == ChangeTarget::Capability {
+        capability_change(&id, proposal, now_ms)
+    } else {
+        code_change(&id, proposal, now_ms)
+    };
+    upsert_change(changes, change);
+    eprintln!(
+        "self-check: applied {} change {id}",
+        proposal.target.as_str()
+    );
 }
 
 /// Persona writes go through the host, so the authoritative store stays

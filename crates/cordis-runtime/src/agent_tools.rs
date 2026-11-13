@@ -26,9 +26,9 @@ pub const AGENT_TOOL_GET_KERNEL_ISSUES: &str = "get_kernel_issues";
 pub const AGENT_TOOL_GET_SELF_CHECK: &str = "get_self_check";
 
 pub const AGENT_TOOL_RELOAD_RUNTIME: &str = "reload_runtime";
-/// Session-to-session: list the live sessions.
-pub const AGENT_TOOL_LIST_SESSIONS: &str = "list_sessions";
-/// Session-to-session: deliver a message into another live session.
+/// Session organisation: the caller's structural neighbourhood.
+pub const AGENT_TOOL_MY_TEAM: &str = "my_team";
+/// Session organisation: deliver a message to a session in `my_team`.
 pub const AGENT_TOOL_SEND_TO_SESSION: &str = "send_to_session";
 /// Kernel introspection tools — their output describes the agent's own
 /// internal state (plugin counts, snapshot ids, kernel counters), not
@@ -320,26 +320,17 @@ impl AgentToolHost for RuntimeHost {
         }))
     }
 
-    fn agent_live_sessions(&self) -> Vec<crate::agent_api::AgentSessionStatus> {
-        crate::host::RuntimeHost::agent_list_sessions(self)
+    fn agent_my_team(&self, session_id: &str) -> Result<Value, RuntimeError> {
+        crate::host::RuntimeHost::agent_my_team(self, session_id)
     }
 
-    fn agent_send_to_session(&self, session_id: &str, input: &str) -> Result<Value, RuntimeError> {
-        // Accept an id or a registered address. An unknown target is refused
-        // explicitly: silently creating a session would let one room's agent
-        // seed conversations elsewhere.
-        let resolved = self.agent_resolve_session(session_id).ok_or_else(|| {
-            RuntimeError::InvalidArgument {
-                message: format!("no live agent session or address {session_id}"),
-            }
-        })?;
-        let reply = self.agent_send(&resolved, input)?;
-        Ok(serde_json::json!({
-            "ok": true,
-            "session_id": resolved,
-            "reply_chars": reply.content.chars().count(),
-            "tool_calls": reply.tool_events.len(),
-        }))
+    fn agent_send_to_session(
+        &self,
+        caller_session_id: &str,
+        target: &str,
+        input: &str,
+    ) -> Result<Value, RuntimeError> {
+        crate::host::RuntimeHost::agent_send_to_session(self, caller_session_id, target, input)
     }
 
     fn agent_reload_runtime(&self, plugin_path: &str) -> Result<Value, RuntimeError> {

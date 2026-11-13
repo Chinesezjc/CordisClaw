@@ -47,26 +47,23 @@ pub trait AgentToolHost {
             message: "this host cannot inspect agent transcripts".to_string(),
         })
     }
-    /// Sessions that are alive right now, so one session can address another.
+    /// The structural facts about `session_id`'s neighbourhood.
     ///
-    /// Default: none. A host without a session map (the loop's test doubles)
-    /// simply has nothing to list.
-    fn agent_live_sessions(&self) -> Vec<AgentSessionStatus> {
-        Vec::new()
-    }
-    /// Deliver a message into another live session's inbox.
+    /// Returned shape: `{ me, spawned_by, created, same_room, reachable }`.
+    /// Hosts are expected to answer: the loop's doubles return a fixed
+    /// neighbour rather than relying on a default, because a default that
+    /// silently pretends there is no tree would make the tool lie.
+    fn agent_my_team(&self, session_id: &str) -> Result<Value, RuntimeError>;
+    /// Deliver a message to a session the caller has been introduced to.
     ///
-    /// Default: refused. Only a real host can route between sessions; a double
-    /// says so instead of pretending.
+    /// `caller_session_id` is the sender, `target` an id or address that must
+    /// appear in the caller's most recent `agent_my_team` reply.
     fn agent_send_to_session(
         &self,
-        _session_id: &str,
-        _input: &str,
-    ) -> Result<Value, RuntimeError> {
-        Err(RuntimeError::Invariant {
-            message: "this host cannot route messages between sessions".to_string(),
-        })
-    }
+        caller_session_id: &str,
+        target: &str,
+        input: &str,
+    ) -> Result<Value, RuntimeError>;
     fn agent_reload_runtime(&self, plugin_path: &str) -> Result<Value, RuntimeError>;
     fn agent_build_plugins(&self, plugin_name: &str) -> Result<Value, RuntimeError>;
     /// Collect system_hint strings from all loaded plugins. The Agent's

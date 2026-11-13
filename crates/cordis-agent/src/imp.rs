@@ -2225,15 +2225,14 @@ impl<'a, H: AgentToolHost + ?Sized> AgentBackend for RuntimeShellAgentBackend<'a
         attachments: &mut Vec<Value>,
     ) -> Result<Value, RuntimeError> {
         match name {
-            cordis_runtime::agent_tools::AGENT_TOOL_LIST_SESSIONS => {
+            cordis_runtime::agent_tools::AGENT_TOOL_MY_TEAM => {
                 parse_tool_value_arguments::<EmptyArgs>(arguments, name)?;
-                let sessions = self.host.agent_live_sessions();
-                Ok(json!({ "sessions": sessions }))
+                self.host.agent_my_team(self.session_id)
             }
             cordis_runtime::agent_tools::AGENT_TOOL_SEND_TO_SESSION => {
                 let args = parse_tool_value_arguments::<SendToSessionArgs>(arguments, name)?;
                 self.host
-                    .agent_send_to_session(&args.session_id, &args.message)
+                    .agent_send_to_session(self.session_id, &args.target, &args.message)
             }
             AGENT_TOOL_GET_RUNTIME_STATUS => {
                 parse_tool_value_arguments::<EmptyArgs>(arguments, name)?;
@@ -3003,15 +3002,16 @@ fn dsml_protocol_prompt(specs: &[AgentToolSpec], require_end_tool: bool) -> Stri
 /// Arguments for `send_to_session`.
 #[derive(serde::Deserialize)]
 struct SendToSessionArgs {
-    session_id: String,
+    /// An id from the caller's most recent `my_team` reply (or its address).
+    target: String,
     message: String,
 }
 
 fn shell_agent_tools() -> Vec<AgentToolSpec> {
     vec![
         AgentToolSpec {
-            name: cordis_runtime::agent_tools::AGENT_TOOL_LIST_SESSIONS,
-            description: "List the live agent sessions (id, kind, message counts). Use it before messaging another session.",
+            name: cordis_runtime::agent_tools::AGENT_TOOL_MY_TEAM,
+            description: "Your place in the session tree: who created you, who you created, who shares your kind of room, and the ids you may message. Structure only — who is responsible for what is something you ask, not something declared here.",
             parameters: json!({
                 "type": "object",
                 "properties": {},
@@ -3020,14 +3020,14 @@ fn shell_agent_tools() -> Vec<AgentToolSpec> {
         },
         AgentToolSpec {
             name: cordis_runtime::agent_tools::AGENT_TOOL_SEND_TO_SESSION,
-            description: "Deliver a message into another live session and wait for its reply.",
+            description: "Deliver a message to a session listed in your latest my_team reachable set, then return its reply.",
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "session_id": {"type": "string"},
+                    "target": {"type": "string"},
                     "message": {"type": "string"}
                 },
-                "required": ["session_id", "message"],
+                "required": ["target", "message"],
                 "additionalProperties": false,
             }),
         },
@@ -3762,27 +3762,27 @@ mod tests {
     };
 
     impl AgentToolHost for FakeHost {
-        fn agent_live_sessions(&self) -> Vec<cordis_runtime::agent_api::AgentSessionStatus> {
-            vec![cordis_runtime::agent_api::AgentSessionStatus {
-                kind: "qq:group:2".to_string(),
-                provider: "p".to_string(),
-                model: "m".to_string(),
-                completed_turns: 1,
-                stored_messages: 2,
-                transcript_events: 3,
-            }]
+        fn agent_my_team(&self, session_id: &str) -> Result<Value, RuntimeError> {
+            Ok(json!({
+                "me": session_id,
+                "spawned_by": "root",
+                "created": [],
+                "same_room": [],
+                "reachable": ["s2"],
+            }))
         }
 
         fn agent_send_to_session(
             &self,
-            session_id: &str,
+            caller_session_id: &str,
+            target: &str,
             input: &str,
         ) -> Result<Value, RuntimeError> {
             self.routed
                 .lock()
                 .expect("routed")
-                .push(format!("{session_id}:{input}"));
-            Ok(json!({ "ok": true, "session_id": session_id }))
+                .push(format!("{caller_session_id}->{target}:{input}"));
+            Ok(json!({ "ok": true, "session_id": target }))
         }
 
         fn agent_runtime_status(&self) -> Result<Value, RuntimeError> {
@@ -4933,7 +4933,7 @@ mod tests {
 
     /// A session can see its siblings and hand a message to one of them.
     #[test]
-    fn a_session_can_list_and_message_another_session() {
+    fn a_session_can_inspect_its_tree_and_message_a_neighbour() {
         let host = FakeHost {
             persona: None,
             hints: Vec::new(),
@@ -4946,23 +4946,27 @@ mod tests {
             session_id: "s1",
             soul_key: String::new(),
         };
-        let listed = AgentBackend::execute_tool(
+        let team = AgentBackend::execute_tool(
             &mut backend,
-            cordis_runtime::agent_tools::AGENT_TOOL_LIST_SESSIONS,
+            cordis_runtime::agent_tools::AGENT_TOOL_MY_TEAM,
             json!({}),
             &mut Vec::new(),
         )
-        .expect("list");
-        assert_eq!(listed["sessions"].as_array().expect("array").len(), 1);
+        .expect("team");
+        assert_eq!(team["me"], "s1");
+        assert_eq!(team["reachable"], json!(["s2"]));
         let sent = AgentBackend::execute_tool(
             &mut backend,
             cordis_runtime::agent_tools::AGENT_TOOL_SEND_TO_SESSION,
-            json!({"session_id": "s2", "message": "hi"}),
+            json!({"target": "s2", "message": "hi"}),
             &mut Vec::new(),
         )
         .expect("send");
         assert_eq!(sent["session_id"], "s2");
-        assert_eq!(host.routed.lock().expect("routed").as_slice(), &["s2:hi"]);
+        assert_eq!(
+            host.routed.lock().expect("routed").as_slice(),
+            &["s1->s2:hi"]
+        );
     }
 
     /// A turn that delivered a message must not come back as an error: the

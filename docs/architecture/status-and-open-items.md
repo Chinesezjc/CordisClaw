@@ -17,6 +17,7 @@
 | 文档契约、Graph/Doc helper、tooling | 已完成 | docs 回写、artifact index 刷新、注册图导出都可运行 |
 | Execution engine | 部分完成 | 语义与库实现已完成，`execute` / `serve execute` 入口可用；仍缺更真实的数据面验证 |
 | 自迭代（Agent Loop） | 已完成基础 | 固定 9 阶段 Petri Net 已替换为 open-ended agent loop；agent 可读代码、写文件、跑编译测试并验证 |
+| 会话组织树 / 渐进式披露 | 已完成 | 代码只给结构边（`spawned_by` + room kind）；`my_team` 只回调用方邻居、不含角色标签，`send_to_session` 只接受最近一次 `my_team` 披露过的目标（见 3.0b） |
 | 交互式 Agent 对话 | 已完成 | 流式输出、18 个工具（含 run_plugin_test、append_file）、readline 编辑、Ctrl+C draft 安全、`/捷径`、工具调用结果日志 |
 | Agent 错误恢复 | 已完成 | JSON 解析失败反馈到 agent 自修复、LLM 请求失败 notify 到群、所有 HTTP 错误重试、unknown-tool guard（strike=1 立即停止）、tool_calls 链**整形**（`agent_toolchain::sanitize_tool_chains`，5.2.40 取代只打日志的旧修复臂） |
 | 优雅退出 + data/ 持久化 | 已完成 | SIGTERM→SIGINT 转发优雅退出、`data/memory/shutdown.json` 退出快照、`data/` 沙箱扩展（agent 可访问 workspace 根级目录） |
@@ -54,6 +55,51 @@
 policy / driver / backend，`CargoIterationRunner` 实现 kernel 的 `IterationRunner`
 并由 CLI 安装；kernel 只保留接缝、报告词汇与一行委托。42 个管线/后端测试随代码搬入
 `crates/cordis-agent/tests/iteration_pipeline.rs`。
+
+### 3.0b 会话组织树与渐进式披露（2026-11-13）
+
+**问题**：`list_sessions` 把会话表整张倒给模型。`boot` 的 crash recovery 会把
+`data/sessions/*.json` 全部读回 `agent_sessions`（线上 688 个，其中大量是三天没人
+用的历史会话），所以模型每次调用都拿到 684/688 条几乎全是死人的"名单"；同时
+`send_to_session` 对任意 id 都放行——模型既看不出谁创建了谁，也可以对任意会话
+发消息。
+
+**设计**：代码只给结构边，分工由模型自己问。
+
+- `ManagedAgentSession` 增加 `spawned_by: Option<String>`（主会话 = `None`）。
+- `RuntimeHost` 维护一棵进程内的节点树
+  `session_nodes: BTreeMap<String, SessionNode>`（`kind` / `address` / `spawned_by` /
+  `live`）。它与会话表分开存放，因为 `agent_send` 在跑 turn 期间会把会话从
+  `agent_sessions` 里摘出来，而工具调用恰恰发生在那一刻；节点树必须在那时仍能
+  回答"我是谁、我认识谁"。
+- 边从三处赋值：主会话（`cordis-cli` 启动的那个，`spawned_by = None`）、群会话
+  （`agent_set_session_address` + `attach_session_to_main` → 主会话）、迭代/子代理
+  （`start_iteration_session`；拿不到发起者时挂主会话，见第 5 节待补）。
+- 工具：删除 `list_sessions`，新增 `my_team`（无参数）——返回
+  `{me, spawned_by, created, same_room, reachable}`。字段名全是中性结构词，
+  **不含** `role` / `peer` / `supervisor` / `manager` / `sibling` / "上级" / "同级"
+  之类的标签（单测递归逐键断言）。`send_to_session(target, message)` 的 `target`
+  必须出现在调用方**最近一次** `my_team` 的 `reachable` 里，否则拒绝并提示先
+  `my_team`；同级直连允许，不做层级限制。
+- `same_room` 的判据是"room kind 完全相同"：地址去掉最后一段
+  （`qq:group:867130587` → `qq:group`、`qq:private:9` → `qq:private`），没有地址时
+  退回会话 kind 标签；**绝不做** `qq:group:*` 前缀匹配。
+
+**"活着"的判据**：节点树的 `live` 位。crash-recovery 恢复的会话以 `live = false`
+进入节点树（只有历史快照，没有可对话的 agent），所以**不出现在任何人的
+`my_team` 里**；本进程启动、被渠道注册地址、或跑过一次 turn 的会话才翻成
+`live = true`。这把 688 条全量恢复收敛成"真正在本进程里活过的会话"。
+
+**闭合的审计项：684/688 会话全量恢复暴露。** 该暴露面的唯一入口是 `list_sessions`
+的全表返回；工具删除后，`my_team` 只返回调用方的邻居（父 / 子 / 同 room）且只含
+`live` 会话，历史孤儿不可见；`send_to_session` 也不再接受"记得住的任意 id"，
+只接受刚被披露过的目标。
+
+**测试**：`host/session_tree_tests.rs`（13 个单测）——主会话是根 / 群会话挂主会话 /
+迭代会话挂主会话（无主会话时是根）/ 只回邻居不回全表 / `reachable` 去重且不含自己 /
+JSON 无角色键 / `send_to_session` 对未披露 id 拒绝（逐字节断言错误文本）/ 对
+`reachable` 内 id 与地址成功 / 恢复会话在未使用前不可见、注册地址或跑 turn 后加入 /
+工具通过 `AgentToolHost` trait 而不是 inherent 方法转发到会话树。
 
 ### 3.0 覆盖率治理战役（2026-07-23 ~ 07-27，已收官）
 
@@ -979,6 +1025,18 @@ JSON 参数、单引号属性、渲染往返。
 ### 5.1.1 lib 单测 snapshot root 共享导致并行互踩（2026-07-23 发现，2026-07-24 已闭合）
 
 - [x] 根因：共享 repo fixtures 的测试派生同一 `default_snapshot_root`，boot 无条件删除目录下所有 `snapshot-*`，并行 boot 互删对方 in-flight staging（`rename staging -> target failed`，x86_64-linux 实测 5 例）。修复：snapshot 目录名改为 `snapshot-{pid}-{nanos}`，boot 清理抽为 `cleanup_stale_snapshot_dirs`，按目录名 pid 段经 `lock_pid_is_live`（现 `plugin/artifact.rs`，`kill(pid,0)` 探活；5.2.48 拆出 tooling 后由 `pub(crate)` 放宽为 `pub`，供 `cordis-tooling` 复用）只删已死进程的残留；同进程并行测试线程共享活 pid 不再互删，旧格式 `snapshot-{nanos}` 视为 stale。配套单测 `stale_snapshot_cleanup_keeps_live_pid_dirs`（活 pid 保留 / 已死子进程 pid 删除 / 旧格式删除 / 非 snapshot 目录与普通文件不动）。CI 的 `--test-threads=1` 串行开关随之移除。
+
+### 5.1.2 会话组织树的两条待补（2026-11-13）
+
+- [ ] **迭代会话的真实发起者** — `KernelPluginIterationRequest` 不带发起会话 id，
+  `start_iteration_session` 只能把 `spawned_by` 挂到主会话。要把调用方
+  `session_id` 从 `agent_request_iteration` 一路传进 runner（或给 request 加
+  `origin_session_id`），迭代会话才能挂到真正发起它的会话下。当前回退见 3.0b。
+- [ ] **"活着"的可靠判据** — 现在用"本进程启动 / 注册地址 / 跑过 turn"
+  （`SessionNode.live`）近似。重启后尚未说过话的历史会话对 `my_team` 不可见，
+  直到它被渠道重新注册或跑一轮；这是可接受的收敛，但不是线程级真实存活。
+  若将来需要恢复会话立即可达，应改为"快照里的 agent 可恢复且未被淘汰"这类
+  判据，而不是进程内标记。
 
 ### 5.2 执行引擎缺口闭合（2026-06-05 大部分已闭合）
 

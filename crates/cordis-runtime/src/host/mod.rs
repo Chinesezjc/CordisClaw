@@ -628,6 +628,15 @@ pub struct RuntimeHost {
     last_reload_attempt: Mutex<Option<ReloadAttemptReport>>,
     last_candidate_reload_attempt: Mutex<Option<ReloadAttemptReport>>,
     agent_sessions: Mutex<BTreeMap<String, ManagedAgentSession>>,
+    /// 会话组织树：进程内注册过的会话的结构事实（父边 / 地址 / 是否活过）。
+    /// 与 `agent_sessions` 分开存放，因为后者在 `agent_send` 期间会短暂
+    /// 移除正在跑 turn 的会话，而工具调用恰恰发生在那一刻。
+    session_nodes: Mutex<BTreeMap<String, SessionNode>>,
+    /// 每个会话最近一次 `my_team` 看到的 `reachable` 集合，`send_to_session`
+    /// 用它做门禁：没先问过就不认识任何 id。
+    team_snapshots: Mutex<BTreeMap<String, BTreeSet<String>>>,
+    /// `cordis-cli` 启动时创建的主会话 id。迭代会话拿不到发起者时挂到它下面。
+    main_session_id: Mutex<Option<String>>,
     inflight_sessions: Mutex<BTreeSet<String>>,
     dropped_during_turn: Mutex<BTreeSet<String>>,
     pending_session_actions: Mutex<BTreeMap<String, Vec<PendingSessionAction>>>,
@@ -872,6 +881,13 @@ pub(crate) struct ManagedAgentSession {
     /// Where this session can be reached from the outside, e.g.
     /// `qq:group:867130587`. `None` until whoever created it says so.
     address: Option<String>,
+    /// The one structural edge this session has: which session created it.
+    ///
+    /// `None` for the main session (`cordis-cli`'s `serve` session) and for
+    /// sessions recovered from disk, whose creator is not persisted. This is
+    /// the only thing the code knows about organisation — who reports to whom
+    /// and what each one is responsible for is asked, not encoded.
+    spawned_by: Option<String>,
 }
 
 impl std::fmt::Debug for ManagedAgentSession {
@@ -881,6 +897,49 @@ impl std::fmt::Debug for ManagedAgentSession {
             .field("kind", &self.session.kind())
             .field("state", &self.state)
             .finish()
+    }
+}
+
+/// One node of the in-process session organisation tree.
+///
+/// The map holding these is the *only* place `my_team` reads. A node exists
+/// while the session is registered in this process, and it survives the
+/// remove/reinsert window of `agent_send` (a session is briefly absent from
+/// `agent_sessions` while its turn runs), so a session can ask about its own
+/// tree position from inside a tool call.
+///
+/// `live` is the liveness judgement: true once this process has registered or
+/// used the session, false for sessions crash-recovery merely read back from
+/// `data/sessions/`. The historical 688-session pile is recovered but never
+/// used, so it stays `live == false` and is invisible to `my_team`.
+#[derive(Debug)]
+pub(crate) struct SessionNode {
+    /// Session kind label (`runtime_shell` / `plugin_iteration`).
+    kind: String,
+    /// Externally meaningful address (`qq:group:<id>`, …), if registered.
+    address: Option<String>,
+    /// The session that created this one; `None` for the main session.
+    spawned_by: Option<String>,
+    /// Registered or used in this process (see the struct doc).
+    live: bool,
+}
+
+impl SessionNode {
+    /// The room this node belongs to.
+    ///
+    /// An address contributes its kind: `qq:group:867130587` → `qq:group`,
+    /// `qq:private:123` → `qq:private`. Without an address the session kind
+    /// label stands in (`runtime_shell`). Comparison is whole-string equality —
+    /// deliberately *not* a `qq:group:*` prefix match, so two different rooms
+    /// never count as the same room.
+    fn room_kind(&self) -> String {
+        let Some(address) = &self.address else {
+            return self.kind.clone();
+        };
+        address
+            .rsplit_once(':')
+            .map(|(kind, _)| kind.to_string())
+            .unwrap_or_else(|| address.clone())
     }
 }
 
@@ -1227,6 +1286,22 @@ impl RuntimeHost {
         let session = crate::agent_loop::agent_loop()
             .ok_or_else(crate::agent_loop::missing_loop_error)?
             .create(llm_config, "plugin_iteration")?;
+        // The iteration request does not carry the session that asked for it,
+        // so the edge falls back to the main session. Recorded as an open item
+        // in docs/architecture/status-and-open-items.md.
+        let spawned_by = self.main_session_id();
+        self.session_nodes
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .insert(
+                session_id.clone(),
+                SessionNode {
+                    kind: "plugin_iteration".to_string(),
+                    address: None,
+                    spawned_by: spawned_by.clone(),
+                    live: true,
+                },
+            );
         self.agent_sessions
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
@@ -1234,6 +1309,7 @@ impl RuntimeHost {
                 session_id.clone(),
                 ManagedAgentSession {
                     address: None,
+                    spawned_by,
                     handle: AgentSessionHandle {
                         session_id: session_id.clone(),
                         kind: AgentSessionKind::PluginIteration,
@@ -1350,6 +1426,9 @@ impl RuntimeHost {
             last_reload_attempt: Mutex::new(None),
             last_candidate_reload_attempt: Mutex::new(None),
             agent_sessions: Mutex::new(BTreeMap::new()),
+            session_nodes: Mutex::new(BTreeMap::new()),
+            team_snapshots: Mutex::new(BTreeMap::new()),
+            main_session_id: Mutex::new(None),
             inflight_sessions: Mutex::new(BTreeSet::new()),
             dropped_during_turn: Mutex::new(BTreeSet::new()),
             pending_session_actions: Mutex::new(BTreeMap::new()),
@@ -1747,6 +1826,24 @@ impl RuntimeHost {
                 session_id: session_id.clone(),
                 kind: session_kind,
             };
+            let recovered_kind = session.kind().to_string();
+            // A recovered session is history, not a live teammate: it enters
+            // the node map with `live: false` so nobody's `my_team` lists it.
+            // It flips to live the moment this process registers an address
+            // for it or runs a turn through it (see `agent_set_session_address`
+            // / `agent_send_inner`).
+            self.session_nodes
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .insert(
+                    session_id.clone(),
+                    SessionNode {
+                        kind: recovered_kind,
+                        address: None,
+                        spawned_by: None,
+                        live: false,
+                    },
+                );
             self.agent_sessions
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner())
@@ -1754,6 +1851,7 @@ impl RuntimeHost {
                     session_id,
                     ManagedAgentSession {
                         address: None,
+                        spawned_by: None,
                         handle,
                         session,
                         state: agent_state,
@@ -5620,6 +5718,12 @@ mod reload;
 
 #[cfg(test)]
 mod turn_meta_tests;
+
+/// The session organisation tree and the progressive-disclosure tools built on
+/// it (`my_team` / `send_to_session`). Kept in its own module so concurrent
+/// edits to `mod tests` do not collide.
+#[cfg(test)]
+mod session_tree_tests;
 
 #[cfg(test)]
 mod tests;

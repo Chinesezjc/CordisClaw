@@ -497,16 +497,29 @@ fn reload_report_from_snapshots_records_removed_plugin() {
 
 #[test]
 #[serial]
-fn agent_list_sessions_reports_every_live_session() {
+fn agent_my_team_sees_the_sessions_registered_in_this_process() {
     let (_temp, host) = empty_host();
-    assert!(host.agent_list_sessions().is_empty());
     let started = host
         .agent_start_with(AgentSessionKind::RuntimeShell, AgentStartOptions::default())
         .expect("start a session");
-    let listed = host.agent_list_sessions();
-    assert_eq!(listed.len(), 1);
-    assert_eq!(listed[0].kind, "runtime_shell");
-    let _ = started;
+    let team = host.agent_my_team(&started.session_id).expect("team");
+    assert_eq!(team["me"], started.session_id);
+    assert_eq!(team["spawned_by"], serde_json::Value::Null);
+    assert_eq!(team["created"].as_array().expect("array").len(), 0);
+    // No address: the room kind falls back to the session kind label, so a
+    // second address-less shell session is a same-room neighbour.
+    let sibling = host
+        .agent_start_with(AgentSessionKind::RuntimeShell, AgentStartOptions::default())
+        .expect("second session");
+    let team = host.agent_my_team(&started.session_id).expect("team");
+    assert_eq!(
+        team["same_room"],
+        serde_json::json!([sibling.session_id.clone()])
+    );
+    assert_eq!(
+        team["reachable"],
+        serde_json::json!([sibling.session_id.clone()])
+    );
 }
 
 #[test]
@@ -574,6 +587,7 @@ fn managed_session_compact_history_wrapper_is_noop_below_threshold() {
     // Below the compaction threshold: wrapper returns (old, old) unchanged.
     let mut managed = ManagedAgentSession {
         address: None,
+        spawned_by: None,
         handle: AgentSessionHandle {
             session_id: "s-1".to_string(),
             kind: AgentSessionKind::RuntimeShell,

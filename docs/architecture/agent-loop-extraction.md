@@ -897,23 +897,32 @@ lib 不带 `cfg(test)`，否则这些分支在新位置不可达。
 
 ## 下一步：多 session 与 session 间通信
 
-已落地的最小闭环：
+已落地的最小闭环（2026-11-13 起是**会话组织树 + 渐进式披露**，见
+[status-and-open-items.md](./status-and-open-items.md) 3.0b）：
 
-- `RuntimeHost::agent_list_sessions()` — 列出活着的会话（id/kind/计数）；
-- `AgentToolHost::agent_live_sessions()` / `agent_send_to_session()` — 接缝；
-- 两个工具 `list_sessions`、`send_to_session`（未知 id 直接拒绝，不隐式建会话）。
+- `RuntimeHost::agent_my_team(session_id)` — 只回调用方的结构邻居：
+  `{me, spawned_by, created, same_room, reachable}`，不含任何角色标签；
+- `AgentToolHost::agent_my_team()` / `agent_send_to_session(caller, target, message)`
+  — 接缝；
+- 两个工具 `my_team`（无参数）、`send_to_session(target, message)`。target 必须是
+  调用方**最近一次** `my_team` 的 `reachable` 成员（id 或地址解析后落在集合里），
+  否则拒绝并提示先 `my_team`；不隐式建会话。同级直连允许，没有层级限制。
 
 已完成：
 
 - **寻址**（`bfd8afb`）：会话可以带一个地址，QQ 循环为每个新建/恢复的会话注册
   `qq:group:<id>`；`send_to_session` 接受 id 或地址。**id 优先于地址**，所以注册一个
   撞车的地址无法遮蔽活着的会话；给已死 id 注册会被拒绝。
+- **组织树**：`ManagedAgentSession.spawned_by` + `RuntimeHost` 的进程内节点树
+  （`kind` / `address` / `spawned_by` / `live`）。节点树比会话表活得久：`agent_send`
+  跑 turn 期间会把会话摘出 `agent_sessions`，而工具调用正发生在那一刻。crash-recovery
+  恢复的历史会话以 `live = false` 进树，因此不会出现在任何人的 `my_team` 里。
 - **投递语义**：无需新机制——`agent_send` 对正在跑的会话直接返回
   `AgentSessionBusy`（`runtime_host.rs` 的 R1(c) 已覆盖），所以两个会话互相发消息
   不会死锁，而是**快速失败**并把错误交给模型。
 
 仍需设计：
 
-- **网络**：跨进程/跨机器需要把 `list_sessions` + `send_to_session` 变成可序列化的
+- **网络**：跨进程/跨机器需要把 `my_team` + `send_to_session` 变成可序列化的
   帧走 interconnect；kernel 只保留 trait，实现由 cli 提供。要点是地址即路由键，
-  所以帧里只需要 `{address, message}` 与一个 `sessions` 快照，不需要传 session id。
+  所以帧里只需要 `{address, message}` 与一个 `team` 快照，不需要传 session id。

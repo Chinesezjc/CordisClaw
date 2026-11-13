@@ -143,6 +143,9 @@ pub enum ChangeTarget {
     Policy,
     Memory,
     Code,
+    /// Something the bot could not do for lack of a tool or system ability.
+    /// Never applied by the data lane: it is a todo item, not an edit.
+    Capability,
 }
 
 impl ChangeTarget {
@@ -152,7 +155,13 @@ impl ChangeTarget {
             ChangeTarget::Policy => "policy",
             ChangeTarget::Memory => "memory",
             ChangeTarget::Code => "code",
+            ChangeTarget::Capability => "capability",
         }
+    }
+
+    /// Whether this change is applied only through the gate, never directly.
+    pub fn needs_gate(self) -> bool {
+        matches!(self, ChangeTarget::Code | ChangeTarget::Capability)
     }
 }
 
@@ -232,14 +241,15 @@ pub struct ProposedChange {
     #[serde(default)]
     pub expectation: String,
     /// New value: a persona sentence, a reply policy, a memory note, or (for
-    /// `code`) a one-line description of the patch.
+    /// `code` and `capability`) a one-line description of the patch.
     #[serde(default)]
     pub value: String,
     /// Which room/soul this applies to: a group id, a `qq:group:<id>` key, or
     /// a full soul key. Empty is an error for the data lanes.
     #[serde(default)]
     pub scope: String,
-    /// Code lane only: cargo package and exact test name the gate runs.
+    /// Code and capability lanes: cargo package and exact test name the gate
+    /// runs.
     #[serde(default)]
     pub package: String,
     #[serde(default)]
@@ -595,6 +605,10 @@ fn review_body(exchanges: &[Exchange]) -> String {
         "Answer in prose, then put **exactly one** ```json fenced block at the very \\
          end. Do not wrap anything in `{\"action\":\"respond\"}` or any other \\
          envelope: that protocol no longer exists.\n\n\
+         另外指出：这一轮里有哪些请求你**因为缺少工具或能力而没能服务**\
+         （例如“看视频”“读某个站点的图”）。对每一条说明：他们要什么、\
+         你缺什么、值不值得补。值得补就给出 `target:\"capability\"` 的改动，\
+         并在 `summary` 里写清要造什么。\n\n\
          Below are your recent replies, each followed by what people said next. \
          Judge them as a reader would, not as a log analyser:\n\n\
          - Which replies landed badly — irritated someone, read as lecturing, \
@@ -615,7 +629,7 @@ fn review_body(exchanges: &[Exchange]) -> String {
     }
     text.push_str(
         "\nEnd your reply with exactly one ```json block of this shape:\n\
-         {\"changes\":[{\"target\":\"persona|policy|memory|code\",\
+         {\"changes\":[{\"target\":\"persona|policy|memory|code|capability\",\
          \"scope\":\"<group id or soul key>\",\"summary\":\"one line\",\
          \"expectation\":\"an outcome that can be checked next time\",\
          \"value\":\"the new text\"}],\
@@ -624,8 +638,11 @@ fn review_body(exchanges: &[Exchange]) -> String {
          Use `\"changes\":[]` or `\"verdicts\":[]` when you have none. \
          A `code` change is not applied by you: it needs \"package\", \"test\" \
          and a unified \"patch\" diff; without those it is not machine-checkable \
-         and is recorded as such. If nothing landed badly and nothing needs a \
-         verdict, say so and stop.",
+         and is recorded as such. A `capability` change names something you \
+         cannot do for lack of a tool or system ability: it is not applied by \
+         you either, so give \"package\", \"test\" and a \"patch\" to have it \
+         built, or it is recorded as an open gap. If nothing landed badly and \
+         nothing needs a verdict, say so and stop.",
     );
     text
 }
@@ -981,9 +998,11 @@ pub fn apply_proposed(
         ChangeTarget::Persona => apply_persona(data_dir, proposal, &id, now_ms, souls)?,
         ChangeTarget::Policy => apply_policy(data_dir, proposal, &id, now_ms)?,
         ChangeTarget::Memory => apply_memory(data_dir, proposal, &id, now_ms)?,
-        ChangeTarget::Code => {
+        _ => {
+            // `code` and `capability` are applied only by the gate, never here.
             return Err(format!(
-                "code change {id} must pass the gate before it is applied"
+                "{} change {id} must pass the gate before it is applied",
+                proposal.target.as_str()
             ));
         }
     };
@@ -1015,9 +1034,10 @@ pub fn apply_review_data(
 ) -> AppliedReview {
     let mut outcome = AppliedReview::default();
     for proposal in proposals {
-        if proposal.target == ChangeTarget::Code {
+        if proposal.target.needs_gate() {
             outcome.notes.push(format!(
-                "code change {:?} is left to the gate",
+                "{} change {:?} is left to the gate",
+                proposal.target.as_str(),
                 proposal.summary
             ));
             continue;
@@ -1121,6 +1141,9 @@ pub fn revert_change(
             };
             patches.revert(&patch)
         }
+        // A capability record is a todo item, not an edit to the live data:
+        // `reverted` means "not worth building", so nothing is restored.
+        ChangeTarget::Capability => Ok(()),
     }
 }
 
@@ -1165,7 +1188,8 @@ pub fn reconcile_verdicts(
     notes
 }
 
-/// Write a code proposal in the shape the existing gate reads.
+/// Write a gate-ready proposal (a `code` or `capability` change) in the shape
+/// the existing gate reads.
 ///
 /// Refusing a patch-less proposal here (rather than letting the gate fail on a
 /// missing file) is what makes "no machine-checkable proposal" a recorded fact
@@ -1209,6 +1233,59 @@ pub fn code_change(id: &str, proposal: &ProposedChange, now_ms: u64) -> Change {
             "kind": "code",
             "patch": format!("proposals/{}/patch.diff", sanitize_id_part(id)),
         }),
+        state: ChangeState::Applied,
+    }
+}
+
+/// What staging a capability proposal produced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StagedCapability {
+    /// Package + test + patch: ready for the gate to judge.
+    Proposal(PathBuf),
+    /// No machine-checkable proposal: only a note, so the gap stays visible.
+    Report(PathBuf),
+}
+
+/// Stage a capability proposal in the directory the gate reads.
+///
+/// A complete proposal goes to the gate. An incomplete one becomes a
+/// `report.md` note instead of vanishing: "I cannot do this" has to survive
+/// into the next review as an open gap, or the bot forgets its own limits.
+pub fn stage_capability(
+    data_dir: &Path,
+    proposal: &ProposedChange,
+    id: &str,
+) -> Result<StagedCapability, String> {
+    match write_code_proposal(data_dir, proposal, id) {
+        Ok(dir) => Ok(StagedCapability::Proposal(dir)),
+        Err(error) => {
+            let dir = data_dir.join("proposals").join(sanitize_id_part(id));
+            std::fs::create_dir_all(&dir).map_err(|error| write_error("create", &dir, &error))?;
+            let mut note = format!("# {id}\n\n尚无实现：{error}\n\n");
+            note.push_str("- summary: ");
+            note.push_str(&proposal.summary);
+            note.push_str("\n- expectation: ");
+            note.push_str(&proposal.expectation);
+            note.push('\n');
+            atomic_write_text(&dir.join("report.md"), &note)?;
+            Ok(StagedCapability::Report(dir))
+        }
+    }
+}
+
+/// Record a capability gap as a todo item.
+///
+/// There is nothing to roll back: this is a note that the bot cannot do
+/// something, not an edit to the live data. Keeping it in `changes.json` is
+/// what lets the next review ask "is this gap still worth closing?".
+pub fn capability_change(id: &str, proposal: &ProposedChange, now_ms: u64) -> Change {
+    Change {
+        id: id.to_string(),
+        target: ChangeTarget::Capability,
+        summary: proposal.summary.clone(),
+        expectation: proposal.expectation.clone(),
+        applied_at_ms: now_ms,
+        rollback: serde_json::json!({}),
         state: ChangeState::Applied,
     }
 }
@@ -1819,6 +1896,23 @@ mod tests {
     }
 
     #[test]
+    fn a_review_prompt_asks_which_requests_were_out_of_reach() {
+        let exchanges = vec![Exchange {
+            session: "s".to_string(),
+            reply: "我没有工具看视频".to_string(),
+            after: vec!["那你能看这个图吗".to_string()],
+        }];
+        let prompt = review_prompt(&exchanges);
+        assert!(prompt.contains("因为缺少工具或能力而没能服务"), "{prompt}");
+        assert!(prompt.contains("target:\"capability\""), "{prompt}");
+        assert!(prompt.contains("值不值得补"), "{prompt}");
+        // It is part of the opening instructions, before the conversation.
+        let asked = prompt.find("因为缺少工具或能力而没能服务").unwrap();
+        let conversation = prompt.find("Below are your recent replies").unwrap();
+        assert!(asked < conversation, "{prompt}");
+    }
+
+    #[test]
     fn no_pending_change_means_no_verdict_section() {
         assert!(change_section(&[]).is_empty());
     }
@@ -1927,6 +2021,10 @@ mod tests {
         assert_eq!(ChangeTarget::Policy.as_str(), "policy");
         assert_eq!(ChangeTarget::Memory.as_str(), "memory");
         assert_eq!(ChangeTarget::Code.as_str(), "code");
+        assert_eq!(ChangeTarget::Capability.as_str(), "capability");
+        assert!(ChangeTarget::Code.needs_gate());
+        assert!(ChangeTarget::Capability.needs_gate());
+        assert!(!ChangeTarget::Persona.needs_gate());
         assert_eq!(ChangeState::Applied.as_str(), "applied");
         assert_eq!(ChangeState::Kept.as_str(), "kept");
         assert_eq!(ChangeState::Reverted.as_str(), "reverted");
@@ -1939,6 +2037,7 @@ mod tests {
             ChangeTarget::Policy,
             ChangeTarget::Memory,
             ChangeTarget::Code,
+            ChangeTarget::Capability,
         ] {
             let text = serde_json::to_string(&target).unwrap();
             assert_eq!(serde_json::from_str::<ChangeTarget>(&text).unwrap(), target);
@@ -1989,11 +2088,13 @@ mod tests {
             ChangeTarget::Policy,
             ChangeTarget::Memory,
             ChangeTarget::Code,
+            ChangeTarget::Capability,
         ];
         let states = [
             ChangeState::Applied,
             ChangeState::Kept,
             ChangeState::Reverted,
+            ChangeState::Applied,
             ChangeState::Applied,
         ];
         let items: Vec<Change> = targets
@@ -2484,12 +2585,18 @@ mod tests {
             proposed(ChangeTarget::Policy, "1", "新"),
             proposed(ChangeTarget::Memory, " ", "坏"),
             proposed(ChangeTarget::Code, "1", "x"),
+            proposed(ChangeTarget::Capability, "", "看视频"),
         ];
         let outcome = apply_review_data(dir.path(), &proposals, 3, &TestSouls::default());
         assert_eq!(outcome.applied.len(), 1);
-        assert_eq!(outcome.notes.len(), 2);
+        assert_eq!(outcome.notes.len(), 3);
         assert!(outcome.notes[0].contains("no scope"), "{:?}", outcome.notes);
         assert!(outcome.notes[1].contains("gate"), "{:?}", outcome.notes);
+        assert!(
+            outcome.notes[2].contains("capability change"),
+            "{:?}",
+            outcome.notes
+        );
     }
 
     #[test]
@@ -2970,6 +3077,139 @@ mod tests {
         assert_eq!(item.target, ChangeTarget::Code);
         assert_eq!(item.state, ChangeState::Applied);
         assert_eq!(item.rollback["patch"], "proposals/code-1-abc/patch.diff");
+    }
+
+    #[test]
+    fn a_capability_change_is_parsed_as_its_own_target() {
+        let reply = "```json\n{\"changes\":[{\"target\":\"capability\",\
+            \"summary\":\"能读视频\",\"expectation\":\"看懂短视频\",\
+            \"value\":\"抽帧+转写\",\"scope\":\"\"}]}\n```";
+        let review = parse_review(reply).expect("capability change");
+        assert_eq!(review.changes.len(), 1);
+        assert_eq!(review.changes[0].target, ChangeTarget::Capability);
+        assert_eq!(review.changes[0].summary, "能读视频");
+        assert_eq!(review.changes[0].expectation, "看懂短视频");
+    }
+
+    #[test]
+    fn a_capability_without_a_patch_gets_a_report_and_a_todo() {
+        let dir = tempfile::tempdir().unwrap();
+        let proposal = proposed(ChangeTarget::Capability, "", "抽帧+转写");
+        let id = change_id(
+            ChangeTarget::Capability,
+            &proposal.scope,
+            &proposal.summary,
+            &proposal.value,
+        );
+        assert!(id.starts_with("capability--"), "{id}");
+        let expected = dir.path().join("proposals").join(&id);
+        let staged = stage_capability(dir.path(), &proposal, &id).unwrap();
+        // Formatting executes the derived `Debug` arms.
+        assert!(!format!("{staged:?}").is_empty());
+        assert_eq!(staged, StagedCapability::Report(expected.clone()));
+        let note = std::fs::read_to_string(expected.join("report.md")).unwrap();
+        assert!(note.contains("尚无实现"), "{note}");
+        assert!(note.contains("一句话"), "{note}");
+        assert!(note.contains("六小时内变好"), "{note}");
+        assert!(!expected.join("proposal.json").exists());
+        let item = capability_change(&id, &proposal, 5);
+        assert_eq!(item.target, ChangeTarget::Capability);
+        assert_eq!(item.state, ChangeState::Applied);
+        assert_eq!(item.rollback, serde_json::json!({}));
+        assert_eq!(item.applied_at_ms, 5);
+        assert_eq!(item.summary, "一句话");
+    }
+
+    #[test]
+    fn a_capability_with_a_patch_is_staged_for_the_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut proposal = proposed(ChangeTarget::Capability, "", "抽帧+转写");
+        proposal.package = "cordis-runtime".to_string();
+        proposal.test = "tests::x".to_string();
+        proposal.patch = "diff --git a/x b/x".to_string();
+        let id = change_id(
+            ChangeTarget::Capability,
+            "",
+            &proposal.summary,
+            &proposal.value,
+        );
+        let expected = dir.path().join("proposals").join(&id);
+        assert_eq!(
+            stage_capability(dir.path(), &proposal, &id).unwrap(),
+            StagedCapability::Proposal(expected.clone())
+        );
+        assert!(expected.join("patch.diff").is_file());
+        assert!(expected.join("proposal.json").is_file());
+        assert!(!expected.join("report.md").exists());
+    }
+
+    #[test]
+    fn a_capability_report_that_cannot_be_written_reports_the_path() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("proposals"), "x").unwrap();
+        let error = stage_capability(
+            dir.path(),
+            &proposed(ChangeTarget::Capability, "", "x"),
+            "capability--abc",
+        )
+        .unwrap_err();
+        assert!(error.contains("create"), "{error}");
+    }
+
+    #[test]
+    fn a_capability_change_is_never_applied_by_the_data_lane() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = apply_proposed(
+            dir.path(),
+            &proposed(ChangeTarget::Capability, "1", "看视频"),
+            1,
+            &TestSouls::default(),
+        )
+        .unwrap_err();
+        assert!(error.contains("capability change"), "{error}");
+        assert!(error.contains("gate"), "{error}");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn a_reverted_capability_restores_nothing_and_a_kept_one_is_settled() {
+        let dir = tempfile::tempdir().unwrap();
+        let reverter = RecordingReverter::default();
+        let mut changes = vec![change(ChangeTarget::Capability, serde_json::json!({}))];
+        changes[0].id = "cap-reverted".to_string();
+        let notes = reconcile_verdicts(
+            dir.path(),
+            &mut changes,
+            &[Judgement {
+                id: "cap-reverted".to_string(),
+                state: ChangeState::Reverted,
+                reason: "不值得".to_string(),
+            }],
+            &TestSouls::default(),
+            &reverter,
+        );
+        assert!(notes.is_empty(), "{notes:?}");
+        assert_eq!(changes[0].state, ChangeState::Reverted);
+        assert!(reverter.seen.borrow().is_empty());
+        // Nothing was restored, so the data directory stayed empty.
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+
+        let mut kept = vec![change(ChangeTarget::Capability, serde_json::json!({}))];
+        kept[0].id = "cap-kept".to_string();
+        let notes = reconcile_verdicts(
+            dir.path(),
+            &mut kept,
+            &[Judgement {
+                id: "cap-kept".to_string(),
+                state: ChangeState::Kept,
+                reason: "值得".to_string(),
+            }],
+            &TestSouls::default(),
+            &reverter,
+        );
+        assert!(notes.is_empty(), "{notes:?}");
+        assert_eq!(kept[0].state, ChangeState::Kept);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 
     /// The acceptance demo: one review applies a policy change, the next one
