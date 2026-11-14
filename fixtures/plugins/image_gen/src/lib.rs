@@ -20,6 +20,10 @@
 //! - `CORDIS_IMAGE_MODEL` … default model id, default `gpt-image-2.5-flare`.
 //! - `CORDIS_IMAGE_OUTPUT_DIR` … output directory, default `data/images`
 //!   (relative to the service working directory).
+//! - `CORDIS_IMAGE_MEDIA_DIR` … content-addressed cache, default `data/media`.
+//!   Every rendered image is also written there as `<sha256>.png`, so the
+//!   agent can ask the kernel's `view_image` tool for `sha256:<digest>` even
+//!   though it has no filesystem write access of its own.
 //! - `CORDIS_IMAGE_TIMEOUT_SECS` … per-request timeout, default 300.
 //!
 //! # Delivery to QQ
@@ -44,6 +48,8 @@ const DEFAULT_BASE_URL: &str = "http://127.0.0.1:8792/v1";
 const DEFAULT_KEY_ENV: &str = "DEEPSEEK_GATEWAY_TOKEN";
 const DEFAULT_MODEL: &str = "gpt-image-2.5-flare";
 const DEFAULT_OUTPUT_DIR: &str = "data/images";
+/// The kernel's `view_image` cache (see `cordis_runtime::image_cache`).
+const DEFAULT_MEDIA_DIR: &str = "data/media";
 const DEFAULT_TIMEOUT_SECS: u64 = 300;
 /// Refuse absurd responses instead of writing multi-hundred-MB files.
 const MAX_IMAGE_BYTES: usize = 32 * 1024 * 1024;
@@ -74,6 +80,7 @@ struct Config {
     key_env: String,
     default_model: String,
     output_dir: PathBuf,
+    media_dir: PathBuf,
     timeout: Duration,
 }
 
@@ -84,6 +91,7 @@ impl Config {
             key_env: env_or("CORDIS_IMAGE_API_KEY_ENV", DEFAULT_KEY_ENV),
             default_model: env_or("CORDIS_IMAGE_MODEL", DEFAULT_MODEL),
             output_dir: PathBuf::from(env_or("CORDIS_IMAGE_OUTPUT_DIR", DEFAULT_OUTPUT_DIR)),
+            media_dir: PathBuf::from(env_or("CORDIS_IMAGE_MEDIA_DIR", DEFAULT_MEDIA_DIR)),
             timeout: Duration::from_secs(
                 env_or("CORDIS_IMAGE_TIMEOUT_SECS", &DEFAULT_TIMEOUT_SECS.to_string())
                     .parse()
@@ -153,6 +161,132 @@ fn image_extension(bytes: &[u8]) -> &'static str {
     } else {
         "bin"
     }
+}
+
+/// SHA-256 of the rendered bytes, lowercase hex.
+///
+/// Hand-rolled for the same reason `image_input::base64_encode` is: the plugin
+/// workspace already pays for base64 and HTTP, and content addressing needs
+/// exactly one hash — not a new crate. The tests pin the FIPS 180-4 vectors,
+/// which also keeps this byte-compatible with the kernel's `sha2`-based
+/// `image_cache::digest_hex`.
+fn sha256_hex(bytes: &[u8]) -> String {
+    const K: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+        0xc67178f2,
+    ];
+    let mut state: [u32; 8] = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+        0x5be0cd19,
+    ];
+    let bit_len = (bytes.len() as u64).wrapping_mul(8);
+    let mut padded = Vec::with_capacity(bytes.len() + 72);
+    padded.extend_from_slice(bytes);
+    padded.push(0x80);
+    while padded.len() % 64 != 56 {
+        padded.push(0);
+    }
+    padded.extend_from_slice(&bit_len.to_be_bytes());
+    for block in padded.chunks_exact(64) {
+        let mut schedule = [0u32; 64];
+        for (index, word) in schedule.iter_mut().take(16).enumerate() {
+            let offset = index * 4;
+            *word = u32::from_be_bytes([
+                block[offset],
+                block[offset + 1],
+                block[offset + 2],
+                block[offset + 3],
+            ]);
+        }
+        for index in 16..64 {
+            let previous = schedule[index - 15];
+            let recent = schedule[index - 2];
+            let s0 = previous.rotate_right(7) ^ previous.rotate_right(18) ^ (previous >> 3);
+            let s1 = recent.rotate_right(17) ^ recent.rotate_right(19) ^ (recent >> 10);
+            schedule[index] = schedule[index - 16]
+                .wrapping_add(s0)
+                .wrapping_add(schedule[index - 7])
+                .wrapping_add(s1);
+        }
+        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = state;
+        for (index, word) in schedule.iter().enumerate() {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let choose = (e & f) ^ ((!e) & g);
+            let temp1 = h
+                .wrapping_add(s1)
+                .wrapping_add(choose)
+                .wrapping_add(K[index])
+                .wrapping_add(*word);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let majority = (a & b) ^ (a & c) ^ (b & c);
+            let temp2 = s0.wrapping_add(majority);
+            h = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(temp1);
+            d = c;
+            c = b;
+            b = a;
+            a = temp1.wrapping_add(temp2);
+        }
+        state[0] = state[0].wrapping_add(a);
+        state[1] = state[1].wrapping_add(b);
+        state[2] = state[2].wrapping_add(c);
+        state[3] = state[3].wrapping_add(d);
+        state[4] = state[4].wrapping_add(e);
+        state[5] = state[5].wrapping_add(f);
+        state[6] = state[6].wrapping_add(g);
+        state[7] = state[7].wrapping_add(h);
+    }
+    let mut out = String::with_capacity(64);
+    for word in state {
+        out.push_str(&format!("{word:08x}"));
+    }
+    out
+}
+
+/// `data/media/<sha256>.png` — the address `view_image` resolves by hash.
+fn media_cache_file(media_dir: &Path, digest: &str) -> PathBuf {
+    media_dir.join(format!("{digest}.png"))
+}
+
+/// Same-directory staging name for the write-then-rename dance.
+///
+/// The `.tmp` suffix cannot collide with a 64-hex cache name, and the pid keeps
+/// two processes from sharing a staging file.
+fn media_staging_file(media_dir: &Path, digest: &str) -> PathBuf {
+    media_dir.join(format!(".{digest}.png.tmp.{}", std::process::id()))
+}
+
+/// Cache one rendered image by content address.
+///
+/// Same bytes → same digest → same name, so a repeated generation is a pure
+/// `is_file` stat. The write goes through a staging file and a rename, so a
+/// concurrent `view_image` never sees a half-written PNG. A failure is
+/// returned to the caller, which logs it and still returns the image: the
+/// cache is a "look at it again" aid, not a precondition for sending the
+/// picture.
+fn store_media(media_dir: &Path, digest: &str, bytes: &[u8]) -> Result<PathBuf, String> {
+    let path = media_cache_file(media_dir, digest);
+    if path.is_file() {
+        return Ok(path);
+    }
+    std::fs::create_dir_all(media_dir)
+        .map_err(|error| format!("create media dir {}: {error}", media_dir.display()))?;
+    let staging = media_staging_file(media_dir, digest);
+    std::fs::write(&staging, bytes)
+        .map_err(|error| format!("write {}: {error}", staging.display()))?;
+    std::fs::rename(&staging, &path)
+        .map_err(|error| format!("rename {}: {error}", path.display()))?;
+    Ok(path)
 }
 
 fn now_millis() -> u128 {
@@ -320,6 +454,16 @@ fn generate_image(config: &Config, request: &NodeRequest) -> Value {
         Ok(path) => path,
         Err(error) => return json!({ "ok": false, "error": error, "model": model }),
     };
+    let digest = sha256_hex(&bytes);
+    let media_cached = match store_media(&config.media_dir, &digest, &bytes) {
+        Ok(_) => true,
+        Err(error) => {
+            // Cache failure is a diagnostic, never a generation failure: the
+            // picture already exists and is about to be sent.
+            eprintln!("image_gen: media cache write failed for sha256:{digest}: {error}");
+            false
+        }
+    };
     let absolute = path.display().to_string();
     json!({
         "ok": true,
@@ -327,6 +471,9 @@ fn generate_image(config: &Config, request: &NodeRequest) -> Value {
         "model": model,
         "path": absolute,
         "cq_image": format!("[CQ:image,file={absolute}]"),
+        "sha256": digest,
+        "media_path": media_cache_file(&config.media_dir, &digest).display().to_string(),
+        "media_cached": media_cached,
         "bytes": bytes.len(),
         "format": image_extension(&bytes),
         "revised_prompt": datum.revised_prompt,
@@ -351,7 +498,7 @@ fn docs_value() -> cordis_plugin_sdk::PluginDocs {
         None,
         vec![node_doc(
             "generate_image",
-            "Generate one image from a text prompt through the gpt-image-2.5 image API and save it on this host. Returns the absolute path and a ready-to-send [CQ:image,file=<path>] snippet; pass that snippet to qq_send to show the picture.",
+            "Generate one image from a text prompt through the gpt-image-2.5 image API and save it on this host. Returns the absolute path and a ready-to-send [CQ:image,file=<path>] snippet; pass that snippet to qq_send to show the picture. The same bytes are also cached at data/media/<sha256>.png, and the returned sha256 lets the agent re-read the picture with view_image.",
             json!({
                 "type": "object",
                 "required": ["node_id", "prompt"],
@@ -370,18 +517,26 @@ fn docs_value() -> cordis_plugin_sdk::PluginDocs {
                     "model": { "type": "string" },
                     "path": { "type": "string", "description": "Absolute path of the rendered file on this host" },
                     "cq_image": { "type": "string", "description": "[CQ:image,file=<path>] ready for qq_send's message" },
+                    "sha256": { "type": "string", "description": "Lowercase SHA-256 of the rendered bytes; pass it to view_image as sha256:<digest>" },
+                    "media_path": { "type": "string", "description": "Cache address of the same bytes, e.g. data/media/<sha256>.png" },
+                    "media_cached": { "type": "boolean", "description": "Whether the media cache write succeeded; false is diagnostic only and the generated image is still returned" },
                     "bytes": { "type": "integer" },
                     "format": { "type": "string" },
                     "revised_prompt": { "type": ["string", "null"] },
                     "error": { "type": "string" }
                 }
             }),
-            &["writes one image file under the configured output directory", "makes a POST to the image API"],
+            &[
+                "writes one image file under the configured output directory",
+                "writes the same bytes to the content-addressed media cache data/media/<sha256>.png",
+                "makes a POST to the image API",
+            ],
             &[
                 "token environment variable not configured",
                 "upstream rejected the request (HTTP error)",
                 "request timed out",
                 "output directory not writable",
+                "media cache not writable (logged as a diagnostic; the image is still returned)",
             ],
         )
         .with_agent_accessible()],
@@ -389,8 +544,9 @@ fn docs_value() -> cordis_plugin_sdk::PluginDocs {
             "生图（image_gen）：有人要你画图、生成图片、做图时用它。\n\
 【调用】invoke_plugin {\"plugin_path\":\"image_gen\",\"node_id\":\"generate_image\",\"payload_json\":{\"prompt\":\"<画面描述：主体、风格、构图、要出现的文字>\",\"model\":\"flare\"}}\n\
 【模型】model 可选 flare（默认）或 sunburst，是两种不同的出图模型；对方没指定就用默认，指定了另一种就换。\n\
-【结果】ok=true 时返回 path（本机绝对路径）和 cq_image（[CQ:image,file=<path>]）。\n\
+【结果】ok=true 时返回 path（本机绝对路径）、cq_image（[CQ:image,file=<path>]）和 sha256（这张图的内容摘要）。\n\
 【发图】把 cq_image 原样放进 qq_send 的 message，可以和说明文字同一条；不要只发路径、不要自己拼 base64、不要拿网图冒充。\n\
+【自查】生成时同一份字节已按内容寻址写进 data/media/<sha256>.png。想确认画面有没有崩，调 view_image {\"sha256\":\"sha256:<sha256>\"}（或 {\"path\":\"data/media/<sha256>.png\"}），图会挂到下一轮请求上。view_image 只读这台机器上已缓存的图片，不接受 URL；这条通道不是文件读取权限，也不给你写文件的能力。\n\
 【失败】ok=false 时 error 写明原因（token 未配置 / 上游拒绝 / 超时）。把原因简短告诉对方，同一轮不要反复重试同一条。",
         ),
     )
@@ -429,6 +585,9 @@ mod tests {
 
     /// 1x1 transparent PNG.
     const TINY_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+    /// SHA-256 of the decoded `TINY_PNG_B64` bytes (cross-checked with `sha256sum`).
+    const TINY_PNG_SHA256: &str =
+        "c414cd0e204de974f73753c7e28d7638e7b3691bb8b1a2bab6b25bb7fed7ce77";
 
     fn temp_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -488,11 +647,13 @@ mod tests {
     }
 
     fn test_config(base_url: String, output_dir: PathBuf, key_env: &str) -> Config {
+        let media_dir = output_dir.join("media");
         Config {
             base_url,
             key_env: key_env.to_string(),
             default_model: DEFAULT_MODEL.to_string(),
             output_dir,
+            media_dir,
             timeout: Duration::from_secs(10),
         }
     }
@@ -541,6 +702,76 @@ mod tests {
     }
 
     #[test]
+    fn sha256_matches_fips_vectors() {
+        assert_eq!(
+            sha256_hex(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        // 56-byte message: padding spans a second 512-bit block.
+        assert_eq!(
+            sha256_hex(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"),
+            "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
+        );
+        // Exactly one block of input: the 0x80 byte forces a second block.
+        assert_eq!(
+            sha256_hex(&[0u8; 64]),
+            "f5a5fd42d16a20302798ef6ed309979b43003d2320d9f0e8ea9831a92759fb4b"
+        );
+        assert_eq!(sha256_hex(&decode_png()), TINY_PNG_SHA256);
+    }
+
+    #[test]
+    fn media_cache_is_content_addressed_and_idempotent() {
+        let dir = temp_dir("media-ok");
+        let bytes = decode_png();
+        let path = store_media(&dir, TINY_PNG_SHA256, &bytes).expect("store");
+
+        assert_eq!(path, dir.join(format!("{TINY_PNG_SHA256}.png")));
+        assert_eq!(std::fs::read(&path).expect("read back"), bytes);
+        // Same content again: the `is_file` short-circuit keeps one file.
+        let again = store_media(&dir, TINY_PNG_SHA256, &bytes).expect("store again");
+        assert_eq!(again, path);
+        assert_eq!(std::fs::read(&again).expect("read back"), bytes);
+        assert_eq!(std::fs::read_dir(&dir).expect("dir").count(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn media_cache_reports_an_uncreatable_directory_without_panicking() {
+        let dir = temp_dir("media-create-fail");
+        let blocker = dir.join("blocked");
+        std::fs::write(&blocker, b"not a directory").expect("squatter");
+
+        let error = store_media(&blocker, TINY_PNG_SHA256, b"bytes").expect_err("must fail");
+        assert!(error.starts_with("create media dir "), "error={error}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn media_cache_reports_write_and_rename_failures_without_panicking() {
+        let dir = temp_dir("media-write-fail");
+        // 1) The staging name is occupied by a directory → the write fails.
+        let staging = media_staging_file(&dir, TINY_PNG_SHA256);
+        std::fs::create_dir_all(&staging).expect("staging squatter");
+        let error = store_media(&dir, TINY_PNG_SHA256, b"bytes").expect_err("write must fail");
+        assert!(error.starts_with("write "), "error={error}");
+
+        // 2) The final name is occupied by a directory → the rename fails.
+        std::fs::remove_dir_all(&staging).expect("clear staging");
+        std::fs::create_dir_all(media_cache_file(&dir, TINY_PNG_SHA256)).expect("final squatter");
+        let error = store_media(&dir, TINY_PNG_SHA256, b"bytes").expect_err("rename must fail");
+        assert!(error.starts_with("rename "), "error={error}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn generates_and_writes_the_image() {
         let body = format!(
             r#"{{"created":1,"data":[{{"b64_json":"{TINY_PNG_B64}","revised_prompt":"a red apple"}}]}}"#
@@ -564,8 +795,54 @@ mod tests {
             json!(format!("[CQ:image,file={}]", path.display()))
         );
         assert_eq!(output["revised_prompt"], json!("a red apple"));
+        assert_eq!(output["sha256"], json!(TINY_PNG_SHA256));
+        assert_eq!(output["media_cached"], json!(true));
+        let media = dir.join("media").join(format!("{TINY_PNG_SHA256}.png"));
+        assert_eq!(
+            output["media_path"],
+            json!(media.display().to_string()),
+            "media_path must be the cache address"
+        );
+        assert_eq!(
+            std::fs::read(&media).expect("read media cache"),
+            decode_png()
+        );
 
         std::env::remove_var("IMAGE_GEN_TEST_TOKEN_OK_SET");
+        let _ = std::fs::remove_dir_all(&dir);
+        handle.join().expect("mock server thread");
+    }
+
+    /// 缓存写失败只是诊断：生图仍然成功，图片仍然可用。
+    #[test]
+    fn media_cache_failure_does_not_fail_generation() {
+        let body = format!(r#"{{"created":1,"data":[{{"b64_json":"{TINY_PNG_B64}"}}]}}"#);
+        let (base_url, handle) = mock_server("200 OK", body);
+        let dir = temp_dir("media-gen-fail");
+        let media_dir = dir.join("media");
+        std::fs::write(&media_dir, b"not a directory").expect("media squatter");
+        let config = Config {
+            media_dir: media_dir.clone(),
+            ..test_config(base_url, dir.clone(), "IMAGE_GEN_TEST_TOKEN_MEDIA_FAIL_SET")
+        };
+        std::env::set_var("IMAGE_GEN_TEST_TOKEN_MEDIA_FAIL_SET", "test-token");
+
+        let output = generate_image(&config, &request("a red apple", None));
+
+        assert_eq!(output["ok"], json!(true), "output: {output}");
+        assert_eq!(output["sha256"], json!(TINY_PNG_SHA256));
+        assert_eq!(output["media_cached"], json!(false));
+        assert_eq!(
+            output["media_path"],
+            json!(media_dir
+                .join(format!("{TINY_PNG_SHA256}.png"))
+                .display()
+                .to_string())
+        );
+        let path = PathBuf::from(output["path"].as_str().expect("path"));
+        assert_eq!(std::fs::read(&path).expect("read image"), decode_png());
+
+        std::env::remove_var("IMAGE_GEN_TEST_TOKEN_MEDIA_FAIL_SET");
         let _ = std::fs::remove_dir_all(&dir);
         handle.join().expect("mock server thread");
     }
@@ -651,5 +928,15 @@ mod tests {
         })
         .expect_err("unknown node must fail");
         assert!(error.contains("unknown node_id"));
+    }
+
+    /// 检入的 `docs/agent/interfaces.json` 必须与 dylib 导出的 docs 逐字段一致：
+    /// 它由构建期回写，手工改错会让 agent 看到过期 schema。
+    #[test]
+    fn checked_in_interfaces_json_matches_the_exported_docs() {
+        let expected: Value =
+            serde_json::from_str(include_str!("../docs/agent/interfaces.json")).expect("json");
+        let actual = serde_json::to_value(docs_value()).expect("serialize docs");
+        assert_eq!(actual, expected);
     }
 }

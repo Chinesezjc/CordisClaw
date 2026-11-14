@@ -29,5 +29,30 @@ fn docs_declare_an_agent_accessible_generate_image_node() {
     assert!(required.contains(&Value::from("node_id")));
 
     let hint = docs["system_hint"].as_str().expect("system_hint");
-    assert!(hint.contains("cq_image"), "the hint must say how to send the file");
+    assert!(
+        hint.contains("cq_image"),
+        "the hint must say how to send the file"
+    );
+    assert!(
+        hint.contains("view_image") && hint.contains("sha256"),
+        "the hint must say how the agent re-reads its own picture"
+    );
+
+    let outputs = &node["output_schema"]["properties"];
+    assert!(
+        outputs.get("sha256").is_some(),
+        "the result must carry the digest"
+    );
+    assert!(outputs.get("media_path").is_some());
+    assert!(outputs.get("media_cached").is_some());
+    assert!(
+        node["side_effects"]
+            .as_array()
+            .expect("side effects")
+            .iter()
+            .any(|effect| effect
+                .as_str()
+                .is_some_and(|text| text.contains("data/media/"))),
+        "the cache write must be declared as a side effect"
+    );
 }

@@ -10,9 +10,10 @@
 //! 读侧永远看不到半截文件。
 //!
 //! **取**：`view_image` 只接受 `data/media/<name>` 形状的相对路径（拒绝绝对
-//! 路径、`..`、子目录），或摘要选择器 `sha256:<hex>` / 裸 `<hex>`：完整 64 位
-//! 摘要精确定位 `<media>/<hex>.png`（兼容入站缓存的旧名 `<hex>`），8~63 位
-//! 前缀仍在缓存目录里唯一匹配。
+//! 路径、`..`、子目录；`<name>` 是完整摘要时自动回退到 `<name>.png`），或摘要
+//! 选择器 `sha256:<hex>` / 裸 `<hex>`：完整 64 位摘要精确定位
+//! `<media>/<hex>.png`（兼容入站缓存的旧名 `<hex>`），8~63 位前缀仍在缓存
+//! 目录里唯一匹配。
 //!
 //! **生图落盘**：`image_gen` 插件生成成功后把同一份 PNG 字节写成
 //! `<media>/<sha256>.png` 并在结果里回传 `sha256`，因此 bot 不需要任何文件
@@ -97,7 +98,7 @@ pub fn load_part(
     sha256: Option<&str>,
 ) -> Result<(String, Value), String> {
     let file = match (path, sha256) {
-        (Some(path), None) => media_dir.join(media_relative(path)?),
+        (Some(path), None) => resolve_path(media_dir, path)?,
         (None, Some(digest)) => resolve_sha256(media_dir, digest)?,
         (Some(_), Some(_)) => return Err("provide either path or sha256, not both".to_string()),
         (None, None) => return Err("either path or sha256 is required".to_string()),
@@ -144,6 +145,29 @@ fn media_relative(path: &str) -> Result<String, String> {
         ) if first == "data" && second == "media" => Ok(name.to_string_lossy().into_owned()),
         _ => Err(invalid()),
     }
+}
+
+/// 解析 `data/media/<name>` 路径；`<name>` 是完整 64 位摘要时再试一次
+/// `<name>.png`。
+///
+/// 为什么需要这一次回退：预算占位符里的路径是由摘要推出来的
+/// `data/media/<sha256>`（无扩展名），而生图插件写的是 `<sha256>.png`。没有
+/// 回退，模型照着占位符调 `path` 就找不到刚生成的那张图；`sha256` 选择器不受
+/// 影响，但两条入口都该能走通。
+fn resolve_path(root: &Path, path: &str) -> Result<PathBuf, String> {
+    let name = media_relative(path)?;
+    let direct = root.join(&name);
+    if direct.is_file() {
+        return Ok(direct);
+    }
+    if name.len() == 64 && name.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        let png = root.join(format!("{name}.png"));
+        if png.is_file() {
+            return Ok(png);
+        }
+    }
+    // 不存在时返回原始地址，让调用方的 `read` 错误带出用户给的那条路径。
+    Ok(direct)
 }
 
 /// 解析 `view_image` 的摘要选择器。
@@ -423,6 +447,10 @@ mod tests {
             "the prefix is only stripped when it really is sha256:"
         );
         assert_eq!(strip_sha256_prefix("sha512:abc"), "sha512:abc");
+        assert!(
+            parse_sha256("https://example.com/x.png").is_err(),
+            "a URL is not a digest"
+        );
     }
 
     #[test]
@@ -438,9 +466,13 @@ mod tests {
         let (by_bare, _) = load_part(&root, None, Some(&digest)).expect("bare");
         let (by_path, _) =
             load_part(&root, Some(&format!("data/media/{digest}.png")), None).expect("path");
+        let (by_placeholder_path, _) =
+            load_part(&root, Some(&format!("data/media/{digest}")), None)
+                .expect("placeholder path");
         assert_eq!(by_prefixed, format!("data/media/{digest}.png"));
         assert_eq!(by_bare, by_prefixed);
         assert_eq!(by_path, by_prefixed);
+        assert_eq!(by_placeholder_path, by_prefixed);
         assert_eq!(part["type"], "image_url");
         assert_eq!(
             part["image_url"]["url"],
@@ -469,6 +501,10 @@ mod tests {
         let digest = "a".repeat(64);
         let err = load_part(&root, None, Some(&format!("sha256:{digest}"))).expect_err("missing");
         assert_eq!(err, format!("no media file for {digest}"));
+        // 同一个摘要走 path 入口：`.png` 也不存在时保留原来的 `read` 错误。
+        let err = load_part(&root, Some(&format!("data/media/{digest}")), None)
+            .expect_err("missing path");
+        assert!(err.starts_with("read "), "err={err}");
     }
 
     #[test]
@@ -492,6 +528,7 @@ mod tests {
             "data/media/sub/x.png",
             "media/x.png",
             "data/other/x.png",
+            "https://example.com/x.png",
         ] {
             let err = load_part(&root, Some(path), None).expect_err(path);
             assert!(

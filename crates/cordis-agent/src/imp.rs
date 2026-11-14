@@ -1963,7 +1963,8 @@ impl AgentSession {
     /// 恢复出来的会话只剩占位符：
     /// `[image omitted to fit request byte budget; sha256:<前8位>; <W>x<H> <fmt>; path data/media/<sha256>]`
     /// （拿不到尺寸时省掉尺寸段，连字节都解不出时只有 omitted）。占位符不再是
-    /// 单向门——模型可以调 `view_image` 按 `path`（或 sha256 前缀）把原图取回
+    /// 单向门——模型可以调 `view_image` 按 `path`（或 `sha256:<hex>` / 裸摘要）
+    /// 把原图取回
     /// 下一次请求（见 [`attach_recovered_images`]）。前提是原始字节当初落进了
     /// 内容寻址缓存（`cordis_runtime::image_cache`，入站下载时写入）；缓存被
     /// 手工清掉或图片早于缓存机制存在时，仍然只能请用户重发。
