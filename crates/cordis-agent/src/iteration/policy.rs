@@ -9,9 +9,11 @@ use cordis_runtime::kernel::plugin_iteration::{
     VerifierVerdict,
 };
 
-/// Tests an iteration touched. Tests are the promotion contract: a code change
-/// must ship with one, and editing an *existing* test needs human approval
-/// (otherwise a model could "fix" the failing test instead of the code).
+/// Tests an iteration touched. Tests are the promotion contract, enforced at
+/// verification time (a failing `cargo test` rolls the iteration back), and
+/// editing an *existing* test needs human approval (otherwise a model could
+/// "fix" the failing test instead of the code). Note that merely *adding* a
+/// test is not required to record a summary — see [`promotion_verdict`].
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct TestChanges {
     pub(crate) added: Vec<String>,
@@ -40,30 +42,6 @@ pub fn test_changes(operations: &[PluginEditOperation]) -> TestChanges {
     changes.added.dedup();
     changes.modified.dedup();
     changes
-}
-
-/// A docs-only iteration does not need a test: nothing executable changed.
-pub fn iteration_changes_docs_only(operations: &[PluginEditOperation]) -> bool {
-    !operations.is_empty()
-        && operations
-            .iter()
-            .all(|operation| operation.path.starts_with("docs/") || operation.path.ends_with(".md"))
-}
-
-/// Why an iteration cannot record its summary yet (`None` = fine to record).
-pub fn summary_rejection(operations: &[PluginEditOperation]) -> Option<&'static str> {
-    let changes = test_changes(operations);
-    if iteration_changes_docs_only(operations)
-        || !changes.added.is_empty()
-        || !changes.modified.is_empty()
-    {
-        return None;
-    }
-    Some(
-        "every code change must come with a test: add or update a file under \
-         plugins/<plugin>/tests/ (a docs-only change is exempt). Add the test, run \
-         run_plugin_test, then record the summary again.",
-    )
 }
 
 /// Canary evidence is only meaningful for a *deterministic* invocation: a node
@@ -205,28 +183,14 @@ mod test_change_policy_tests {
             )]),
             TestChanges::default()
         );
-    }
-
-    #[test]
-    fn docs_only_changes_are_exempt_from_the_test_requirement() {
-        assert!(iteration_changes_docs_only(&[
-            op(
-                "plugins/gacha/docs/human/overview.md",
-                PluginEditOpKind::ReplaceExact
-            ),
-            op(
-                "docs/architecture/status-and-open-items.md",
-                PluginEditOpKind::ReplaceExact
-            ),
-        ]));
-        assert!(!iteration_changes_docs_only(&[
-            op(
-                "plugins/gacha/docs/human/overview.md",
-                PluginEditOpKind::ReplaceExact
-            ),
-            op("plugins/gacha/src/lib.rs", PluginEditOpKind::ReplaceExact),
-        ]));
-        assert!(!iteration_changes_docs_only(&[]));
+        // A manifest-only change has no test evidence either — which is why
+        // requiring one at summary time used to reject such iterations even
+        // though they are perfectly verifiable. The requirement now lives in
+        // `promotion_verdict` (verifier failure → rollback).
+        assert_eq!(
+            test_changes(&[op("plugins/gacha/Cargo.toml", PluginEditOpKind::TomlSet)]),
+            TestChanges::default()
+        );
     }
 }
 
@@ -304,6 +268,11 @@ mod promotion_verdict_tests {
     #[test]
     fn tests_decide_and_existing_test_edits_need_approval() {
         use PluginIterationFinalVerdict::{Blocked, Promoted, RolledBack};
+        // This is where the "a code change must ship with a test" contract now
+        // lives: the verdict sees only the verifier's answer (it has no access
+        // to the operations, so it cannot care whether a test was added). A
+        // failing `cargo test` rolls back a manifest-only change just as
+        // surely as a source one.
         // Tests fail → always rolled back, approved or not.
         assert_eq!(
             promotion_verdict(VerifierVerdict::Fail, false, false),

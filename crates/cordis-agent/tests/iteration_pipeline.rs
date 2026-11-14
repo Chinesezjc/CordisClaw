@@ -489,6 +489,56 @@ fn backend_record_iteration_summary_requires_edits_and_verification() {
 
 #[test]
 
+fn backend_record_iteration_summary_accepts_a_manifest_only_change() {
+    let (_temp, host) = empty_host();
+    with_backend(&host, |backend| {
+        // The write-time "a non-doc code change must ship with a test" gate is
+        // gone: a manifest-only patch cannot carry a test of its own, yet it
+        // is perfectly verifiable, so it must be able to record a summary and
+        // reach the verifier (which decides promote vs rollback). This is the
+        // `/web` feature-edit iteration that used to roll back forever.
+        backend.state.operations.push(PluginEditOperation {
+            path: "plugins/mini/Cargo.toml".to_string(),
+            kind: PluginEditOpKind::TomlSet,
+            expected_old_string: None,
+            expected_sha256: Some("sha".to_string()),
+            new_content: None,
+            pointer: None,
+            dotted_key: Some("package.metadata.cordis.features.gzip".to_string()),
+            value: Some(json!(true)),
+        });
+        // The two guards that remain: at least one edit, at least one
+        // successful verification step.
+        backend.state.verification_attempts = 1;
+        backend.state.verification_successes = 1;
+        // Nothing about this change is a test — which is exactly the point.
+        assert_eq!(
+            cordis_agent::iteration::policy::test_changes(&backend.state.operations),
+            cordis_agent::iteration::policy::TestChanges::default()
+        );
+        let out = AgentBackend::execute_tool(
+            backend,
+            PLUGIN_AGENT_TOOL_RECORD_ITERATION_SUMMARY,
+            json!({ "summary": "add a gzip feature to the mini manifest" }),
+            &mut Vec::new(),
+        )
+        .expect("a manifest-only change may record its summary");
+        assert_eq!(
+            out.get("summary").and_then(Value::as_str),
+            Some("add a gzip feature to the mini manifest")
+        );
+        assert_eq!(
+            backend.state.recorded_summary.as_deref(),
+            Some("add a gzip feature to the mini manifest")
+        );
+        // Not adding a test needs no approval: approval is about *editing* an
+        // existing test, not about test coverage (that is the verifier's job).
+        assert!(!backend.state.requires_approval);
+    });
+}
+
+#[test]
+
 fn backend_scaffold_child_plugin_rejects_parent_outside_subtree() {
     let (_temp, host) = empty_host();
     with_backend(&host, |backend| {
@@ -753,6 +803,10 @@ fn finalize_stage_error_short_circuits_to_rolled_back() {
 #[test]
 
 fn finalize_verifier_fail_rolls_back_without_candidate() {
+    // The retained "verification still gates promotion" proof: after the
+    // write-time "code change needs a test" gate was removed from
+    // `record_iteration_summary`, a failing verifier is what rolls back — and
+    // it does so regardless of whether the change touched a test.
     let (_temp, host) = empty_host();
     let mut state =
         cordis_runtime::host::PluginIterationRunState::new(prepared_for("mini", &["mini"]));

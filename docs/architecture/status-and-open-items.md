@@ -560,9 +560,13 @@ qq 侧 `approve_iteration_capability_follows_operator_list_and_room_role`。
 
 canary 回放是不靠谱的代理（随机、副作用、录制时机都能左右它）。现在闸门就三条：
 
-1. **代码改动必须带测试**：`record_iteration_summary` 会检查本次迭代的编辑里是否包含
-   `plugins/<p>/tests/**`（或 `*_test.rs`/`tests.rs`）的新增/修改；没有就直接拒绝摘要并给出
-   "先补测试、跑 run_plugin_test 再记录"的可操作提示。**纯文档改动豁免**（只动 `docs/**` 或 `*.md`）。
+1. **代码改动必须带测试 → 已下移到验证阶段（2026-11-14）**：原先
+   `record_iteration_summary` 会检查本次迭代的编辑里是否包含
+   `plugins/<p>/tests/**`（或 `*_test.rs`/`tests.rs`）的新增/修改，没有就直接拒绝摘要。
+   这条写入门槛已删除：它会挡住本来就无法自带测试的清单类改动（例如只改 `Cargo.toml`），
+   现在由第 2 条的 verifier 对所有改动一视同仁地把关，细节见 3.41。
+   `record_iteration_summary` 仍要求"至少一次编辑 + 至少一次成功验证"，并保留
+   scaffold 子插件的宿主集成检查（`ensure_scaffold_integration_edits`）。
 2. **测试不过不能落地**：最终判定只看 verifier（它跑 `cargo test`）是否 Pass；Fail 就
    `RolledBack` 并恢复工作区。
 3. **改既有测试要审批**：如果改动里包含对**已存在**测试文件的修改/删除（`CreateFile` 之外的
@@ -570,7 +574,7 @@ canary 回放是不靠谱的代理（随机、副作用、录制时机都能左�
    `approve_iteration`（3.24，渠道侧判权）批准才 promote。
    canary 仍会记录，但只作诊断，不再参与判定。
 
-测试：`test_change_policy_tests`（测试路径识别、新增/修改分类、docs-only 豁免）、
+测试：`test_change_policy_tests`（测试路径识别、新增/修改分类）、
 `finalize_blocks_a_change_that_edits_an_existing_test`、
 `finalize_manual_approval_promotes_a_test_editing_change`、
 `finalize_partial_canary_does_not_block_a_tested_change`。
@@ -581,9 +585,11 @@ canary 回放是不靠谱的代理（随机、副作用、录制时机都能左�
 agent 工具层做批准门控），加一条规则要改 6 个地方。现在收进 `crates/cordis-runtime/src/iteration/`：
 
 - `policy.rs` —— 纯函数，不碰文件系统/时钟/host：
-  `test_changes` / `is_test_path` / `iteration_changes_docs_only` / `summary_rejection` /
-  `canary_probe_verdict` / `node_declares_side_effects_in` / `promotion_verdict` /
+  `test_changes` / `is_test_path` / `canary_probe_verdict` /
+  `node_declares_side_effects_in` / `promotion_verdict` /
   `BLOCKED_EDITS_EXISTING_TEST`。判据表就是一个 `match`，组合全覆盖；
+  （`iteration_changes_docs_only` / `summary_rejection` 已于 2026-11-14 随写入门槛删除，
+  见 3.41。）
 - `report.rs` —— 结果措辞与批准门控：`iteration_result_json`（Promoted/Blocked/RolledBack 的
   真实回报）与 `approve_iteration_permission`（渠道给的能力位）。
 
@@ -833,7 +839,8 @@ LRU 淘汰时同步删除。
 3. **新工具 `view_image`**（kernel 工具，加入 `shell_agent_tools()` 与
    `RuntimeShellAgentBackend::execute_tool`）：入参 `{"path": "..."}` 或
    `{"sha256": "..."}` 二选一；路径必须是 `data/media/<name>` 形状
-   （绝对路径、`..`、子目录一律拒）。`sha256` 接受 `sha256:<hex>` 或裸 hex：
+   （绝对路径、`..`、子目录一律拒；`<name>` 是完整摘要时自动回退
+   `<name>.png`）。`sha256` 接受 `sha256:<hex>` 或裸 hex：
    完整 64 位精确定位内容寻址的 `data/media/<hex>.png`（找不到再回退到入站缓存
    沿用的无扩展名 `<hex>`），8~63 位仍在缓存目录里做唯一前缀匹配。返回
    `{"ok":true,"attached":"data/media/<sha256>"}`，并把该图放进 backend 的
@@ -853,6 +860,12 @@ LRU 淘汰时同步删除。
    缓存写失败只记一行 `eprintln!` 并回 `media_cached:false`，生图本身仍然成功。
    该通道只解析本机 `data/media/` 缓存，**不接受 URL**，因此不是 SSRF 入口，
    也不扩大文件读权限（只能读到已在缓存里的图）。
+
+**验证（2026-11-14 补充）**：`image_cache` 新增 4 条（`sha256:` 与裸 hex 同路径、
+非法 hex/长度拒绝、缺失报 `no media file for <hash>`、`.png` 与旧无扩展名回退），
+`image_gen` 新增 6 条（FIPS 向量、内容寻址幂等落盘、目录不可建、写/rename 失败、
+缓存失败不影响生图、检入 docs 与导出 schema 逐字段一致），agent 端到端新增 1 条；
+两个 workspace 的 clippy `-D warnings` 均干净。
 
 **边界**：取回是**一次性**的——图片只出现在取回后的那一次请求里，不进 history；
 模型需要再看一次就再调一次 `view_image`。这是有意的：历史里只保留可寻址的占位符，
@@ -981,13 +994,18 @@ JSON 参数、单引号属性、渲染往返。
 最后一条 assistant 选取）+ 3 个 driver 集成用例（无 summary 有改动继续、无改动失败、
 显式优先）。
 
+**后续修正（2026-11-14）**："任何非 docs 代码改动都必须带测试"这条约束已从
+`record_iteration_summary` 的写入门槛（`policy::summary_rejection`）**下移到验证阶段**：
+`verify_plugin_iteration` 跑 `cargo test`，`promotion_verdict` 在
+`VerifierVerdict::Fail` 时回滚。理由：写 summary 时校验会挡住本来就无法自带测试的
+改动——只改清单文件（例如给 web 插件加 gzip feature 只动 `Cargo.toml`）的迭代永远
+无法显式记录 summary；而验证阶段对所有改动一视同仁。`record_iteration_summary` 仍保留
+两条拒绝：至少一次改动 + 至少一次成功验证；scaffold 子插件必须有一条宿主侧集成改动
+（`ensure_scaffold_integration_edits`）。
+
 **未一并处理的相邻缺口**（单列，不在本次改动内）：
 
-- `record_iteration_summary` 的 `summary_rejection` 要求任何非 docs 代码改动都带测试；
-  只改 `Cargo.toml`（例如给 web 插件加 gzip feature）的迭代因此**永远无法显式记录
-  summary**。合成路径不经过这条检查，所以这类改动现在能走到验证，代价是"必须带测试"
-  的门槛被绕过。
-- 合成路径也不经过 `ensure_scaffold_integration_edits`，也不重算
+- 合成路径不经过 `ensure_scaffold_integration_edits`，也不重算
   `requires_approval`；若 agent 改了既有测试却以文本收尾，审批门不会亮。
 - `tests_command` / `safety_command` 在 `PluginIterationAgentRun` 里本就没有字段，
   driver 的 `state.tests_command` 从未被 agent 的 summary 填充（既有缺口）。

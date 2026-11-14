@@ -1,6 +1,6 @@
 //! The backend a plugin-iteration session talks to.
 
-use crate::iteration::policy::{summary_rejection, test_changes};
+use crate::iteration::policy::test_changes;
 use cordis_runtime::agent_api::{AgentBackend, AgentToolSpec};
 use cordis_runtime::core::error::RuntimeError;
 use cordis_runtime::host::*;
@@ -711,13 +711,17 @@ Do not attempt to modify runtime crates, repository root manifests, config, .git
                         message: "record_iteration_summary requires at least one edit and one successful verification step".to_string(),
                     });
                 }
-                // The promotion policy lives in `iteration::policy`: this call
-                // site only reports its answer.
-                if let Some(reason) = summary_rejection(&self.state.operations) {
-                    return Err(RuntimeError::InvalidArgument {
-                        message: reason.to_string(),
-                    });
-                }
+                // The "a non-doc code change must ship with a test" gate used
+                // to live right here (`policy::summary_rejection`). It moved to
+                // verification: `verify_plugin_iteration` runs `cargo test` and
+                // `promotion_verdict` rolls the iteration back when the
+                // verifier fails, so the constraint is still enforced — just
+                // uniformly. The write-time gate was strictly worse because it
+                // also rejected changes that *cannot* carry a test of their own
+                // (a manifest-only patch such as a `Cargo.toml` feature edit),
+                // blocking them before the verifier ever saw them. Recording a
+                // summary is bookkeeping: it reports what changed and what was
+                // verified, it does not decide whether the change is good.
                 self.state.requires_approval =
                     !test_changes(&self.state.operations).modified.is_empty();
                 let integration = ensure_scaffold_integration_edits(

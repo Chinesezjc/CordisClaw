@@ -1083,7 +1083,7 @@ fn iterate_plugins_agent_walks_execute_tool_surface_and_promotes() {
             json!({ "path": scratch_rel, "expected_sha256": scratch_sha_after }),
         ),
         // 13) a real lib.rs edit so the crate still compiles after the manifest
-        //     version bump; also the behaviour edit for the record guard.
+        //     version bump.
         one_tool_turn(
             "iter_13",
             "c_lib_edit",
@@ -1121,19 +1121,9 @@ fn iterate_plugins_agent_walks_execute_tool_surface_and_promotes() {
                 "command": "cargo test --quiet --manifest-path plugins/mini/Cargo.toml"
             }),
         ),
-        // 17) a code change must come with a test, so add one before asking
-        // for the summary — the summary tool rejects the whole iteration
-        // otherwise.
-        one_tool_turn(
-            "iter_17a",
-            "c_add_test",
-            "create_file",
-            json!({
-                "path": "plugins/mini/tests/agent_walk.rs",
-                "new_content": "#[test]\nfn agent_walk_smoke() {}\n"
-            }),
-        ),
-        // 18) record_iteration_summary ends the session.
+        // 17) record_iteration_summary ends the session. No test file is
+        //     added for this walk: the write-time "code change needs a test"
+        //     gate is gone, and the verifier is what decides promotion.
         one_tool_turn(
             "iter_17",
             "c_record",
@@ -1162,7 +1152,7 @@ fn iterate_plugins_agent_walks_execute_tool_surface_and_promotes() {
     handle.join().expect("join mock server");
     assert_eq!(
         requests.len(),
-        18,
+        17,
         "record_iteration_summary must end the session on the last turn"
     );
 
@@ -1207,9 +1197,9 @@ fn iterate_plugins_agent_walks_execute_tool_surface_and_promotes() {
         summary.failed_calls >= 4,
         "the four deliberately-failing calls should be recorded: {summary:?}"
     );
-    // One more than the tool-surface turns: the script also creates the test
-    // file the change needs.
-    assert_eq!(summary.total_calls, 18);
+    // One call per tool-surface turn: the script adds no test file because
+    // recording a summary no longer requires one.
+    assert_eq!(summary.total_calls, 17);
 
     // The manifest version bump and lib.rs edit both landed in changed_paths.
     assert!(result
