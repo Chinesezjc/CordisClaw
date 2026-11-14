@@ -99,9 +99,11 @@ pub trait AgentToolHost {
     fn agent_list_directory(&self, path: &str) -> Result<Value, RuntimeError>;
     /// 把一张**已被请求体预算剥成占位符**的图片取回来（`view_image` 的后端）。
     ///
-    /// `path` 是占位符里给出的 `data/media/<sha256>` 相对路径，`sha256` 是
-    /// 摘要前缀，二选一。返回 `(相对路径, image_url content part)`：part 由
-    /// 调用方挂到下一次请求上，路径原样回给模型。
+    /// `path` 是占位符里给出的 `data/media/<sha256>` 相对路径；`sha256` 是
+    /// `sha256:<hex>` 或裸 `<hex>` 摘要选择器（完整 64 位精确定位
+    /// `data/media/<hex>.png`，8~63 位按唯一前缀匹配），二选一。返回
+    /// `(相对路径, image_url content part)`：part 由调用方挂到下一次请求上，
+    /// 路径原样回给模型。只读本机 `data/media/`，不接受 URL。
     fn agent_view_image(
         &self,
         path: Option<&str>,

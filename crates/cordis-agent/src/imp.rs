@@ -2602,13 +2602,42 @@ fn history_images(images: &[Value], stripped: bool) -> &[Value] {
     }
 }
 
+/// The whole message is one JSON object naming a tool the session offers —
+/// that is the call, not a reply mentioning one.
+///
+/// Channel hints teach this exact form (`{"node_id":"suspend"}`), so the model
+/// writes the payload the hint showed instead of DSML markup. Dropped as text,
+/// the send never happened and the turn never reached its end tool. The bar
+/// stays high: the message must be nothing but that object and `node_id` must
+/// name a tool in `tools`, so a sentence, an example, or a fenced code block is
+/// still text.
+fn bare_tool_object_call(
+    content: &str,
+    tools: &[AgentToolSpec],
+) -> Option<cordis_plugin_sdk::llm::LlmToolCall> {
+    if !content.starts_with('{') || !content.ends_with('}') {
+        return None;
+    }
+    let value: Value = serde_json::from_str(content).ok()?;
+    let node_id = value.get("node_id").and_then(Value::as_str)?;
+    if !tools.iter().any(|tool| tool.name == node_id) {
+        return None;
+    }
+    serialized_call_to_tool_call_at(&value, 0, tools)
+}
+
 fn salvage_serialized_tool_calls(
     content: &str,
     tools: &[AgentToolSpec],
 ) -> Vec<cordis_plugin_sdk::llm::LlmToolCall> {
     let trimmed = content.trim();
-    if trimmed.is_empty() || !looks_like_serialized_call(trimmed) {
+    if trimmed.is_empty() {
         return Vec::new();
+    }
+    if !looks_like_serialized_call(trimmed) {
+        // Not DSML markup: the only remaining shape that is still a call is a
+        // message that is nothing but one JSON object naming a known tool.
+        return bare_tool_object_call(trimmed, tools).into_iter().collect();
     }
     // The dialect the model writes: `<|DSML|invoke name="...">` with nested
     // `<|DSML|parameter>` blocks. This is what the prompt and history show, so
@@ -2831,6 +2860,26 @@ mod dsml_salvage_tests {
             description: "Read a file.",
             parameters: serde_json::json!({"type":"object","properties":{}}),
         }]
+    }
+
+    // The channel hint teaches the JSON form (`{"node_id":"suspend"}`,
+    // `{"node_id":"qq_send",...}`). A message that is exactly that object is
+    // the call itself: treating it as text left the send undone and the turn
+    // without its end tool.
+    #[test]
+    fn a_bare_json_object_naming_a_known_tool_is_the_call() {
+        let mut tools = specs();
+        tools.push(super::end_turn_tool_spec());
+        let calls = salvage_serialized_tool_calls(r#"{"node_id":"suspend"}"#, &tools);
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert_eq!(calls[0].function.name, super::AGENT_TOOL_END_TURN);
+
+        let calls = salvage_serialized_tool_calls(
+            r#"{"node_id":"read_file","payload_json":{"path":"/tmp/a"}}"#,
+            &specs(),
+        );
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert_eq!(calls[0].function.name, "read_file");
     }
 
     // The provider serialises the call into the content stream; the JSON is the
@@ -3170,12 +3219,12 @@ fn shell_agent_tools() -> Vec<AgentToolSpec> {
         },
         AgentToolSpec {
             name: AGENT_TOOL_VIEW_IMAGE,
-            description: "Reload an image that was omitted from the request by the inline byte budget. The [image omitted ...] placeholder carries either `path data/media/<sha256>` (pass it as `path`) or `sha256:<8 hex>` (pass the prefix as `sha256`). The picture is attached to your NEXT request in this turn, so call it and then continue.",
+            description: "Reload an image that was omitted from the request by the inline byte budget, or one you just generated with image_gen. The placeholder carries `path data/media/<sha256>` (pass it as `path`) and `sha256:<8 hex>`; image_gen returns a full `sha256` digest. Pass either `sha256:<hex>` or a bare `<64 hex>` digest as `sha256`, or a `data/media/<name>` path. Reads only the local data/media cache — never a URL. The picture is attached to your NEXT request in this turn, so call it and then continue.",
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string", "description": "Cache path from the placeholder, e.g. data/media/<sha256>." },
-                    "sha256": { "type": "string", "description": "sha256 prefix from the placeholder (8+ hex chars); must be unique in the cache." }
+                    "path": { "type": "string", "description": "Cache path from a placeholder or image_gen result, e.g. data/media/<sha256>.png." },
+                    "sha256": { "type": "string", "description": "`sha256:<hex>` or bare hex: a full 64-char digest from image_gen, or an 8+ char prefix from a placeholder. Must be unique in the cache." }
                 },
                 "required": [],
                 "additionalProperties": false,
@@ -6210,6 +6259,38 @@ mod tests {
         assert_eq!(
             reply.tool_events[0].output.as_ref().expect("output")["attached"],
             json!(format!("data/media/{digest}"))
+        );
+    }
+
+    /// 生图插件把字节写成 `data/media/<sha256>.png` 并在结果里回传完整摘要；
+    /// 模型用 `sha256:<digest>` 就能把刚画的那张图挂回下一次请求。
+    #[test]
+    fn view_image_tool_accepts_the_prefixed_full_sha256_from_image_gen() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let media = dir.path().join("media");
+        std::fs::create_dir_all(&media).expect("media dir");
+        let png: &[u8] = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR";
+        let digest = cordis_runtime::image_cache::digest_hex(png);
+        std::fs::write(media.join(format!("{digest}.png")), png).expect("cache the image");
+        let host = FakeHost {
+            media_dir: media,
+            ..FakeHost::default()
+        };
+        let provider = FakeLlmProvider::new(vec![
+            tool_call_message(
+                "call_full_hash",
+                AGENT_TOOL_VIEW_IMAGE,
+                json!({ "sha256": format!("sha256:{digest}") }),
+            ),
+            assistant_reply("我看到自己刚画的那张图了。"),
+        ]);
+        let mut session = ShellAgentSession::new(LlmApiConfig::default()).expect("session");
+        let reply = session
+            .respond_via(&host, "view-image-full-hash", "看看你刚画的图", &provider)
+            .expect("agent reply");
+        assert_eq!(
+            reply.tool_events[0].output.as_ref().expect("output")["attached"],
+            json!(format!("data/media/{digest}.png"))
         );
     }
 

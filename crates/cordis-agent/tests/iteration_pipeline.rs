@@ -21,14 +21,14 @@ use std::sync::atomic::Ordering::SeqCst;
 use std::sync::Arc;
 
 use cordis_agent::iteration::backend::PluginIterationAgentBackend;
-use cordis_runtime::agent_api::AgentBackend;
+use cordis_runtime::agent_api::{AgentBackend, AgentTranscriptEntry};
 use cordis_runtime::core::error::RuntimeError;
 use cordis_runtime::host::ScaffoldChildPluginArgs;
 use cordis_runtime::host::{
-    plugin_iteration_journal_path, PluginIterationAgentState, PluginIterationContextPaths,
-    PreparedPluginIteration, RuntimeHost, PLUGIN_AGENT_TOOL_RECORD_ITERATION_SUMMARY,
-    PLUGIN_AGENT_TOOL_REPLACE_FILES_EXACT, TEST_ITERATION_ENOSPC_INJECTION,
-    TEST_ITERATION_PANIC_INJECTION,
+    plugin_iteration_journal_path, PluginIterationAgentRun, PluginIterationAgentState,
+    PluginIterationContextPaths, PluginIterationRunState, PreparedPluginIteration, RuntimeHost,
+    PLUGIN_AGENT_TOOL_RECORD_ITERATION_SUMMARY, PLUGIN_AGENT_TOOL_REPLACE_FILES_EXACT,
+    TEST_ITERATION_ENOSPC_INJECTION, TEST_ITERATION_PANIC_INJECTION,
 };
 use cordis_runtime::kernel::plugin_iteration::KernelPluginIterationRequest;
 use cordis_runtime::kernel::plugin_iteration::{
@@ -203,8 +203,8 @@ fn wedge_journal_as_dir(host: &RuntimeHost) {
 
 struct TestAgentRun;
 impl TestAgentRun {
-    fn with_requires_approval(flag: bool) -> cordis_runtime::host::PluginIterationAgentRun {
-        cordis_runtime::host::PluginIterationAgentRun {
+    fn with_requires_approval(flag: bool) -> PluginIterationAgentRun {
+        PluginIterationAgentRun {
             llm_driven: true,
             session_id: None,
             tool_summary: None,
@@ -222,6 +222,47 @@ impl TestAgentRun {
                 operations: Vec::new(),
             },
         }
+    }
+}
+
+/// An agent run as `run_plugin_iteration_agent` would hand it to the driver.
+fn agent_run(
+    recorded_summary: Option<&str>,
+    changed_paths: &[&str],
+    transcript_excerpt: Vec<AgentTranscriptEntry>,
+) -> PluginIterationAgentRun {
+    PluginIterationAgentRun {
+        llm_driven: true,
+        session_id: Some("plugin-agent-session-test".to_string()),
+        tool_summary: None,
+        transcript_excerpt,
+        recorded_summary: recorded_summary.map(|summary| summary.to_string()),
+        requires_approval: false,
+        changed_paths: changed_paths
+            .iter()
+            .map(|path| (*path).to_string())
+            .collect(),
+        rollback: cordis_runtime::kernel::plugin_iteration::PluginEditRollback::empty(
+            std::path::Path::new("."),
+        ),
+        derived_edit_plan: cordis_runtime::kernel::plugin_iteration::PluginEditPlan {
+            issue_id: "issue".to_string(),
+            patch_id: "patch".to_string(),
+            summary: "prepared summary".to_string(),
+            operations: changed_paths
+                .iter()
+                .map(|path| PluginEditOperation {
+                    path: (*path).to_string(),
+                    kind: PluginEditOpKind::ReplaceExact,
+                    expected_old_string: None,
+                    expected_sha256: None,
+                    new_content: None,
+                    pointer: None,
+                    dotted_key: None,
+                    value: None,
+                })
+                .collect(),
+        },
     }
 }
 
@@ -1194,6 +1235,81 @@ fn plugin_iteration_agent_snapshot_returns_state_for_an_iteration_session() {
     assert_eq!(snapshot.derived_edit_plan.summary, prepared.summary);
     assert!(snapshot.changed_paths.is_empty());
     drop(temp);
+}
+
+#[test]
+fn agent_turn_that_ends_without_a_summary_keeps_its_changes() {
+    let (_temp, host) = empty_host();
+    let mut state = PluginIterationRunState::new(prepared_for("mini", &["mini"]));
+    let run = agent_run(
+        None,
+        &["plugins/mini/src/lib.rs"],
+        vec![AgentTranscriptEntry::Assistant {
+            content: "  patched lib.rs  ".to_string(),
+            tools: Vec::new(),
+            response_id: None,
+            reasoning: None,
+        }],
+    );
+
+    cordis_agent::iteration::driver::record_agent_outcome(&host, &mut state, run);
+
+    assert!(
+        state.stage_error.is_none(),
+        "unexpected agent failure: {:?}",
+        state.stage_error
+    );
+    let agent = state.agent.as_ref().expect("the run is kept");
+    assert_eq!(agent.recorded_summary.as_deref(), Some("patched lib.rs"));
+    assert_eq!(agent.derived_edit_plan.summary, "patched lib.rs");
+}
+
+#[test]
+fn agent_turn_with_no_changes_fails_with_the_new_reason() {
+    let (_temp, host) = empty_host();
+    let mut state = PluginIterationRunState::new(prepared_for("mini", &["mini"]));
+    let run = agent_run(None, &[], Vec::new());
+
+    cordis_agent::iteration::driver::record_agent_outcome(&host, &mut state, run);
+
+    let reason = state
+        .stage_error
+        .as_deref()
+        .expect("an iteration with no change must fail");
+    let expected = "LLM response invalid: plugin iteration iter-seam-3500 ended without changing any file: there is nothing to promote";
+    assert_eq!(reason, expected);
+    assert!(!reason.contains("record_iteration_summary"));
+    assert!(state.agent.is_some(), "the run stays for diagnostics");
+}
+
+#[test]
+fn an_explicit_summary_wins_over_synthesis() {
+    let (_temp, host) = empty_host();
+    let mut state = PluginIterationRunState::new(prepared_for("mini", &["mini"]));
+    let run = agent_run(
+        Some("hand-written summary"),
+        &["plugins/mini/src/lib.rs"],
+        vec![AgentTranscriptEntry::Assistant {
+            content: "chatter that must not become the summary".to_string(),
+            tools: Vec::new(),
+            response_id: None,
+            reasoning: None,
+        }],
+    );
+
+    cordis_agent::iteration::driver::record_agent_outcome(&host, &mut state, run);
+
+    assert!(
+        state.stage_error.is_none(),
+        "unexpected agent failure: {:?}",
+        state.stage_error
+    );
+    let agent = state.agent.as_ref().expect("the run is kept");
+    assert_eq!(
+        agent.recorded_summary.as_deref(),
+        Some("hand-written summary")
+    );
+    assert_eq!(agent.derived_edit_plan.summary, "hand-written summary");
 }
 
 #[test]

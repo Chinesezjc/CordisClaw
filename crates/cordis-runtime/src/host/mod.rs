@@ -5351,16 +5351,6 @@ fn flock_failure_line(path: &Path) -> String {
     )
 }
 
-/// Error for an agent session that ran to completion without ever calling
-/// `record_iteration_summary` — the iteration cannot be finalized without it.
-pub fn missing_summary_error(session_id: &str) -> RuntimeError {
-    RuntimeError::LlmResponseInvalid {
-        message: format!(
-            "plugin iteration agent session {session_id} exited without calling record_iteration_summary"
-        ),
-    }
-}
-
 /// Single-line `Invariant` constructor mirroring [`host_io_error`].
 fn host_invariant(message: String) -> RuntimeError {
     RuntimeError::Invariant { message }

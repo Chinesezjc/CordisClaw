@@ -1183,8 +1183,10 @@ pub struct ListDirectoryArgs {
     #[serde(default)]
     pub path: Option<String>,
 }
-/// `view_image` 的入参：`path`（占位符里那一段）或 `sha256`（摘要前缀），
-/// 二选一。两者都给或都不给由 [`crate::image_cache::load_part`] 拒绝。
+/// `view_image` 的入参：`path`（占位符里那一段）或 `sha256`（`sha256:<hex>`
+/// 或裸 `<hex>` 摘要选择器），二选一。两者都给或都不给由
+/// [`crate::image_cache::load_part`] 拒绝。摘要通道只解析本机
+/// `data/media/` 缓存，不接受 URL。
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct ViewImageArgs {
     #[serde(default)]

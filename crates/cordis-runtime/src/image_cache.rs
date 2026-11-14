@@ -10,7 +10,16 @@
 //! 读侧永远看不到半截文件。
 //!
 //! **取**：`view_image` 只接受 `data/media/<name>` 形状的相对路径（拒绝绝对
-//! 路径、`..`、子目录），或 8~64 位十六进制摘要前缀（在缓存目录里唯一匹配）。
+//! 路径、`..`、子目录），或摘要选择器 `sha256:<hex>` / 裸 `<hex>`：完整 64 位
+//! 摘要精确定位 `<media>/<hex>.png`（兼容入站缓存的旧名 `<hex>`），8~63 位
+//! 前缀仍在缓存目录里唯一匹配。
+//!
+//! **生图落盘**：`image_gen` 插件生成成功后把同一份 PNG 字节写成
+//! `<media>/<sha256>.png` 并在结果里回传 `sha256`，因此 bot 不需要任何文件
+//! 写权限就能用 `view_image("sha256:<digest>")` 重新看到自己刚画的图。
+//!
+//! **边界**：通道只认上述两种本机缓存地址，**不接受 URL**——它不是下载器，
+//! 也不该变成 SSRF 入口；路径模式同样被限制在 `data/media/` 的单个文件名。
 //!
 //! 测试不碰仓库里的 `data/`：所有落盘根目录都由调用方注入（测试传临时目录）。
 
@@ -89,7 +98,7 @@ pub fn load_part(
 ) -> Result<(String, Value), String> {
     let file = match (path, sha256) {
         (Some(path), None) => media_dir.join(media_relative(path)?),
-        (None, Some(digest)) => resolve_by_prefix(media_dir, digest.trim())?,
+        (None, Some(digest)) => resolve_sha256(media_dir, digest)?,
         (Some(_), Some(_)) => return Err("provide either path or sha256, not both".to_string()),
         (None, None) => return Err("either path or sha256 is required".to_string()),
     };
@@ -137,11 +146,61 @@ fn media_relative(path: &str) -> Result<String, String> {
     }
 }
 
+/// 解析 `view_image` 的摘要选择器。
+///
+/// 两种写法等价：`sha256:<hex>` 与裸 `<hex>`。完整 64 位按内容地址精确定位
+/// `<media>/<hex>.png`；8~63 位保留原有语义（占位符里只印前 8 位），在缓存
+/// 目录里做唯一前缀匹配。短于 8 位或超过 64 位、含非十六进制字符一律拒绝。
+fn parse_sha256(input: &str) -> Result<String, String> {
+    let trimmed = input.trim();
+    let body = strip_sha256_prefix(trimmed);
+    if body.is_empty() || !body.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(format!("sha256 must be hexadecimal: {trimmed}"));
+    }
+    if body.len() < 8 {
+        return Err(format!(
+            "sha256 must be at least 8 hex characters: {trimmed}"
+        ));
+    }
+    if body.len() > 64 {
+        return Err(format!(
+            "sha256 must be at most 64 hex characters: {trimmed}"
+        ));
+    }
+    Ok(body.to_ascii_lowercase())
+}
+
+/// 去掉可选的 `sha256:` 前缀（大小写不敏感）；没有前缀就原样返回。
+fn strip_sha256_prefix(input: &str) -> &str {
+    match input.split_once(':') {
+        Some((head, body)) if head.eq_ignore_ascii_case("sha256") => body,
+        _ => input,
+    }
+}
+
+/// 把摘要选择器解析成缓存文件。
+///
+/// 完整摘要先找内容寻址的 `<hex>.png`（生图插件写的就是它），再回退到入站
+/// 缓存沿用的无扩展名 `<hex>`；两者都没有时报 `no media file for <hex>`。
+/// 短前缀走 [`resolve_by_prefix`]。
+fn resolve_sha256(root: &Path, input: &str) -> Result<PathBuf, String> {
+    let digest = parse_sha256(input)?;
+    if digest.len() == 64 {
+        let png = root.join(format!("{digest}.png"));
+        if png.is_file() {
+            return Ok(png);
+        }
+        let legacy = root.join(&digest);
+        if legacy.is_file() {
+            return Ok(legacy);
+        }
+        return Err(format!("no media file for {digest}"));
+    }
+    resolve_by_prefix(root, &digest)
+}
+
 /// 按摘要前缀在缓存目录里找唯一匹配；0 个或多个都报错。
 fn resolve_by_prefix(root: &Path, prefix: &str) -> Result<PathBuf, String> {
-    if prefix.is_empty() || !prefix.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err(format!("sha256 must be hexadecimal: {prefix}"));
-    }
     let entries =
         std::fs::read_dir(root).map_err(|err| format!("read {}: {err}", root.display()))?;
     let mut hits: Vec<PathBuf> = Vec::new();
@@ -158,7 +217,7 @@ fn resolve_by_prefix(root: &Path, prefix: &str) -> Result<PathBuf, String> {
         hits.push(entry.path());
     }
     match hits.len() {
-        0 => Err(format!("no cached image matches sha256 prefix {prefix}")),
+        0 => Err(format!("no media file for {prefix}")),
         1 => Ok(hits.remove(0)),
         _ => Err(format!(
             "sha256 prefix {prefix} matches {} cached images; use more characters",
@@ -326,16 +385,90 @@ mod tests {
     fn load_part_by_digest_rejects_ambiguous_and_missing_prefixes() {
         let dir = media_root();
         let root = dir.path().join("media");
-        std::fs::write(root.join("aa11"), PNG).expect("write a");
-        std::fs::write(root.join("aa22"), PNG).expect("write b");
-        let err = load_part(&root, None, Some("aa")).expect_err("ambiguous");
+        std::fs::write(root.join("aa11bbbb1111"), PNG).expect("write a");
+        std::fs::write(root.join("aa11bbbb2222"), PNG).expect("write b");
+        let err = load_part(&root, None, Some("aa11bbbb")).expect_err("ambiguous");
         assert!(err.contains("matches 2 cached images"), "err={err}");
-        let err = load_part(&root, None, Some("ff")).expect_err("missing");
-        assert!(err.contains("no cached image"), "err={err}");
-        let err = load_part(&root, None, Some("zz")).expect_err("not hex");
+        let err = load_part(&root, None, Some("ffffffff")).expect_err("missing");
+        assert!(err.contains("no media file for ffffffff"), "err={err}");
+        let err = load_part(&root, None, Some("zzzzzzzz")).expect_err("not hex");
         assert!(err.contains("must be hexadecimal"), "err={err}");
         let err = load_part(&root, None, Some("")).expect_err("empty");
         assert!(err.contains("must be hexadecimal"), "err={err}");
+        let err = load_part(&root, None, Some("abc")).expect_err("too short");
+        assert!(err.contains("at least 8"), "err={err}");
+        let err = load_part(&root, None, Some(&"a".repeat(65))).expect_err("too long");
+        assert!(err.contains("at most 64"), "err={err}");
+    }
+
+    #[test]
+    fn parse_sha256_accepts_prefixed_and_bare_forms() {
+        let digest = digest_hex(PNG);
+        assert_eq!(parse_sha256(&digest).expect("bare"), digest);
+        assert_eq!(
+            parse_sha256(&format!("sha256:{digest}")).expect("prefixed"),
+            digest
+        );
+        assert_eq!(
+            parse_sha256(&format!("SHA256:{}", digest.to_uppercase())).expect("upper"),
+            digest
+        );
+        assert_eq!(
+            parse_sha256(&format!("  {}  ", &digest[..8])).expect("prefix"),
+            digest[..8]
+        );
+        assert_eq!(
+            strip_sha256_prefix("sha256:abc"),
+            "abc",
+            "the prefix is only stripped when it really is sha256:"
+        );
+        assert_eq!(strip_sha256_prefix("sha512:abc"), "sha512:abc");
+    }
+
+    #[test]
+    fn load_part_by_sha256_resolves_the_generated_png() {
+        let dir = media_root();
+        let root = dir.path().join("media");
+        let digest = digest_hex(PNG);
+        let cached = root.join(format!("{digest}.png"));
+        std::fs::write(&cached, PNG).expect("write png cache");
+
+        let (by_prefixed, part) =
+            load_part(&root, None, Some(&format!("sha256:{digest}"))).expect("prefixed");
+        let (by_bare, _) = load_part(&root, None, Some(&digest)).expect("bare");
+        let (by_path, _) =
+            load_part(&root, Some(&format!("data/media/{digest}.png")), None).expect("path");
+        assert_eq!(by_prefixed, format!("data/media/{digest}.png"));
+        assert_eq!(by_bare, by_prefixed);
+        assert_eq!(by_path, by_prefixed);
+        assert_eq!(part["type"], "image_url");
+        assert_eq!(
+            part["image_url"]["url"],
+            format!(
+                "data:image/png;base64,{}",
+                crate::image_input::base64_encode(PNG)
+            )
+        );
+    }
+
+    /// 入站图片仍以无扩展名的 `<sha256>` 落盘；完整摘要要能回退到旧名。
+    #[test]
+    fn load_part_by_sha256_falls_back_to_the_untyped_cache_name() {
+        let dir = media_root();
+        let root = dir.path().join("media");
+        let digest = digest_hex(PNG);
+        std::fs::write(root.join(&digest), PNG).expect("write legacy cache");
+        let (rel, _) = load_part(&root, None, Some(&format!("sha256:{digest}"))).expect("legacy");
+        assert_eq!(rel, format!("data/media/{digest}"));
+    }
+
+    #[test]
+    fn load_part_reports_a_missing_media_file_for_a_full_digest() {
+        let dir = media_root();
+        let root = dir.path().join("media");
+        let digest = "a".repeat(64);
+        let err = load_part(&root, None, Some(&format!("sha256:{digest}"))).expect_err("missing");
+        assert_eq!(err, format!("no media file for {digest}"));
     }
 
     #[test]

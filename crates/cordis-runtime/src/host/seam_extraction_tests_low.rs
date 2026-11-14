@@ -23,16 +23,6 @@ fn flock_failure_line_names_path_and_errno() {
 }
 
 #[test]
-fn missing_summary_error_names_the_session() {
-    let err = super::missing_summary_error("sess-9");
-    assert!(
-        matches!(&err, crate::core::error::RuntimeError::LlmResponseInvalid { message }
-                if message == "plugin iteration agent session sess-9 exited without calling record_iteration_summary"),
-        "got: {err:?}"
-    );
-}
-
-#[test]
 fn host_io_error_carries_path_and_message_verbatim() {
     let path = PathBuf::from("/root/plugins/foo/src");
     let err = host_io_error(

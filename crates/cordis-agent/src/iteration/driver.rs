@@ -1,6 +1,7 @@
 //! The plugin-iteration driver.
 
 use crate::iteration::policy::{promotion_verdict, test_changes};
+use cordis_runtime::agent_api::AgentTranscriptEntry;
 use cordis_runtime::core::error::RuntimeError;
 use cordis_runtime::execution::engine::ExecutionOutput;
 use cordis_runtime::host::*;
@@ -58,16 +59,7 @@ pub fn iterate_plugins<H: IterationHost>(
 
             // Step 1: Run the agent loop — the agent freely decides what to do.
             match run_plugin_iteration_agent(host, &state.prepared) {
-                Ok(agent) => {
-                    state.changed_paths = agent.changed_paths.clone();
-                    state.rollback = Some(agent.rollback.clone());
-                    if agent.recorded_summary.is_none() {
-                        let sid = agent.session_id.as_deref().unwrap_or("unknown-session");
-                        let err = missing_summary_error(sid);
-                        fail_stage(host, &mut state, "agent", &err);
-                    }
-                    state.agent = Some(agent);
-                }
+                Ok(agent) => record_agent_outcome(host, &mut state, agent),
                 Err(err) => {
                     fail_stage(host, &mut state, "agent", &err);
                 }
@@ -292,6 +284,99 @@ pub fn iterate_plugins<H: IterationHost>(
             Err(plugin_iteration_panic_error(&panic_payload))
         }
     }
+}
+
+/// Fold the agent phase's result into the run state.
+///
+/// The summary is resolved here, not inside the session, because the summary
+/// tool is bookkeeping: a turn that ended any other way — a plain-text close, a
+/// `suspend` the model tried, a dropped tool call — still leaves the driver
+/// with the changed paths and the agent's last words. Only "nothing changed"
+/// fails the agent stage, and its error says exactly that.
+pub fn record_agent_outcome<H: IterationHost>(
+    host: &H,
+    state: &mut PluginIterationRunState,
+    mut agent: PluginIterationAgentRun,
+) {
+    state.changed_paths = agent.changed_paths.clone();
+    state.rollback = Some(agent.rollback.clone());
+    let resolution = resolve_iteration_summary(
+        agent.recorded_summary.as_deref(),
+        &agent.changed_paths,
+        last_assistant_message(&agent.transcript_excerpt),
+        &state.prepared.iteration_id,
+    );
+    match resolution {
+        Ok(args) => {
+            // Carry the adopted summary into the plan the result reports, so a
+            // synthesised summary is not silently replaced by the request's
+            // original summary. A hand-written summary was already there.
+            agent.derived_edit_plan.summary = args.summary.clone();
+            agent.recorded_summary = Some(args.summary);
+        }
+        Err(err) => fail_stage(host, state, "agent", &err),
+    }
+    state.agent = Some(agent);
+}
+
+/// How much of the agent's closing message a synthesised summary keeps.
+const SYNTHESISED_SUMMARY_CHARS: usize = 500;
+
+/// The last assistant message in a transcript excerpt, if any.
+fn last_assistant_message(entries: &[AgentTranscriptEntry]) -> Option<&str> {
+    entries.iter().rev().find_map(|entry| match entry {
+        AgentTranscriptEntry::Assistant { content, .. } => Some(content.as_str()),
+        _ => None,
+    })
+}
+
+/// Where an iteration's summary comes from.
+///
+/// The explicit `record_iteration_summary` call always wins: the model wrote
+/// it, so it is used verbatim. Without one, a turn that changed files still
+/// carries its own evidence — the driver knows which paths moved and what the
+/// agent said last — so the summary is synthesised instead of failing the
+/// iteration on bookkeeping. No changed path is the only real failure: there
+/// is no change to verify, hence nothing to promote.
+pub fn resolve_iteration_summary(
+    recorded: Option<&str>,
+    changed_paths: &[String],
+    last_message: Option<&str>,
+    iteration_id: &str,
+) -> Result<RecordIterationSummaryArgs, RuntimeError> {
+    if let Some(summary) = recorded {
+        return Ok(RecordIterationSummaryArgs {
+            summary: summary.to_string(),
+            tests_command: None,
+            safety_command: None,
+        });
+    }
+    if changed_paths.is_empty() {
+        return Err(RuntimeError::LlmResponseInvalid {
+            message: format!(
+                "plugin iteration {iteration_id} ended without changing any file: there is nothing to promote"
+            ),
+        });
+    }
+    let changed = changed_paths.len();
+    let summary = last_message
+        .map(str::trim)
+        .filter(|message| !message.is_empty())
+        .map(|message| {
+            message
+                .chars()
+                .take(SYNTHESISED_SUMMARY_CHARS)
+                .collect::<String>()
+        })
+        .unwrap_or_else(|| format!("iteration {iteration_id}: {changed} file(s) changed"));
+    eprintln!(
+        "iteration {iteration_id}: no summary tool call; synthesised from {changed} changed paths"
+    );
+    Ok(RecordIterationSummaryArgs {
+        summary,
+        tests_command: None,
+        safety_command: None,
+    })
 }
 
 pub fn run_plugin_iteration_agent<H: IterationHost>(
@@ -731,4 +816,103 @@ pub fn observe_plugin_iteration_failure<H: IterationHost>(
             prepared.root_plugin_path
         ),
     );
+}
+
+#[cfg(test)]
+mod summary_resolution_tests {
+    use super::*;
+
+    fn assistant(content: &str) -> AgentTranscriptEntry {
+        AgentTranscriptEntry::Assistant {
+            content: content.to_string(),
+            tools: Vec::new(),
+            response_id: None,
+            reasoning: None,
+        }
+    }
+
+    fn path(value: &str) -> String {
+        value.to_string()
+    }
+
+    #[test]
+    fn explicit_summary_is_used_verbatim() {
+        let paths = [path("plugins/mini/src/lib.rs")];
+        let args = resolve_iteration_summary(
+            Some("hand-written summary"),
+            &paths,
+            Some("the model's closing chatter"),
+            "iter-explicit",
+        )
+        .expect("an explicit summary always resolves");
+        assert_eq!(args.summary, "hand-written summary");
+        assert!(args.tests_command.is_none());
+        assert!(args.safety_command.is_none());
+    }
+
+    #[test]
+    fn changed_paths_synthesise_a_summary_from_the_closing_message() {
+        let paths = [path("plugins/web/Cargo.toml")];
+        let args = resolve_iteration_summary(
+            None,
+            &paths,
+            Some("  Added gzip/deflate to the web fetch client.  "),
+            "iter-synth",
+        )
+        .expect("a change without a summary still resolves");
+        assert_eq!(args.summary, "Added gzip/deflate to the web fetch client.");
+        assert!(args.tests_command.is_none());
+        assert!(args.safety_command.is_none());
+    }
+
+    #[test]
+    fn a_long_closing_message_is_cut_to_the_character_limit() {
+        let paths = [path("plugins/mini/src/lib.rs")];
+        let long = "界".repeat(SYNTHESISED_SUMMARY_CHARS + 25);
+        let args = resolve_iteration_summary(None, &paths, Some(&long), "iter-long")
+            .expect("a long closing message still resolves");
+        assert_eq!(args.summary.chars().count(), SYNTHESISED_SUMMARY_CHARS);
+    }
+
+    #[test]
+    fn a_missing_or_blank_closing_message_falls_back_to_the_path_count() {
+        let paths = [path("plugins/mini/src/a.rs"), path("plugins/mini/src/b.rs")];
+        let expected = "iteration iter-fallback: 2 file(s) changed";
+        let missing = resolve_iteration_summary(None, &paths, None, "iter-fallback")
+            .expect("no closing message still resolves");
+        let blank = resolve_iteration_summary(None, &paths, Some("   \n "), "iter-fallback")
+            .expect("a blank closing message still resolves");
+        assert_eq!(missing.summary, expected);
+        assert_eq!(blank.summary, expected);
+    }
+
+    #[test]
+    fn no_changed_paths_is_an_error_that_says_why() {
+        let err = resolve_iteration_summary(None, &[], Some("nothing to do here"), "iter-empty")
+            .expect_err("an iteration with no change cannot be promoted");
+        assert_eq!(
+            err.to_string(),
+            "LLM response invalid: plugin iteration iter-empty ended without changing any file: there is nothing to promote"
+        );
+        assert!(!err.to_string().contains("record_iteration_summary"));
+    }
+
+    #[test]
+    fn the_last_assistant_message_skips_later_tool_entries() {
+        let entries = vec![
+            AgentTranscriptEntry::User {
+                content: "user".to_string(),
+            },
+            assistant("first reply"),
+            AgentTranscriptEntry::Tool {
+                name: "run_plugin_test".to_string(),
+                arguments: serde_json::json!({}),
+                ok: true,
+                output: None,
+                error: None,
+            },
+        ];
+        assert_eq!(last_assistant_message(&entries), Some("first reply"));
+        assert_eq!(last_assistant_message(&[]), None);
+    }
 }

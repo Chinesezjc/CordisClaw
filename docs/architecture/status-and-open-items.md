@@ -2,7 +2,7 @@
 
 ## 1. 判定口径
 
-- 本文基于当前仓库现状整理，最近更新：2026-11-13。
+- 本文基于当前仓库现状整理，最近更新：2026-11-14。
 - 历史规划蓝图已经吸收进 [design-blueprint.md](./design-blueprint.md)，因此本文结论来自三类证据的交叉比对：
   - 设计蓝图：[design-blueprint.md](./design-blueprint.md)
   - 架构文档：[system-overview.md](./system-overview.md)、[contracts-and-loading.md](./contracts-and-loading.md)、[runtime-semantics.md](./runtime-semantics.md)、[maintenance-guide.md](./maintenance-guide.md)
@@ -832,8 +832,10 @@ LRU 淘汰时同步删除。
    `sha256` 前缀查选用。占位符仍是纯函数——路径由摘要推出来，不查盘。
 3. **新工具 `view_image`**（kernel 工具，加入 `shell_agent_tools()` 与
    `RuntimeShellAgentBackend::execute_tool`）：入参 `{"path": "..."}` 或
-   `{"sha256": "<8~64 位十六进制前缀>"}` 二选一；路径必须是 `data/media/<name>` 形状
-   （绝对路径、`..`、子目录一律拒），摘要前缀在缓存目录里必须唯一。返回
+   `{"sha256": "..."}` 二选一；路径必须是 `data/media/<name>` 形状
+   （绝对路径、`..`、子目录一律拒）。`sha256` 接受 `sha256:<hex>` 或裸 hex：
+   完整 64 位精确定位内容寻址的 `data/media/<hex>.png`（找不到再回退到入站缓存
+   沿用的无扩展名 `<hex>`），8~63 位仍在缓存目录里做唯一前缀匹配。返回
    `{"ok":true,"attached":"data/media/<sha256>"}`，并把该图放进 backend 的
    `attached` 队列。
 4. **下一次请求带回来**：循环在每次工具轮结束、准备 `continue` 之前取走队列
@@ -844,6 +846,13 @@ LRU 淘汰时同步删除。
 5. **vision 插件**：`read_local_image` 从"只许 `/tmp`"放宽到"`/tmp` 或
    `data/media/` 下的文件"（先拒 `..`，再 canonicalize 后判断形状），
    `load_source(path=…)` 因此也能读回占位符里的地址。
+6. **生图也落进同一个缓存（2026-11-14）**：`image_gen` 插件生成成功后把 PNG
+   字节写成 `data/media/<sha256>.png`，并在结果里回传 `sha256` / `media_path` /
+   `media_cached`；bot 没有文件写权限，但可以直接
+   `view_image {"sha256":"sha256:<digest>"}` 看自己刚画的图，自查画面是否崩坏。
+   缓存写失败只记一行 `eprintln!` 并回 `media_cached:false`，生图本身仍然成功。
+   该通道只解析本机 `data/media/` 缓存，**不接受 URL**，因此不是 SSRF 入口，
+   也不扩大文件读权限（只能读到已在缓存里的图）。
 
 **边界**：取回是**一次性**的——图片只出现在取回后的那一次请求里，不进 history；
 模型需要再看一次就再调一次 `view_image`。这是有意的：历史里只保留可寻址的占位符，
@@ -941,6 +950,47 @@ JSON 参数、单引号属性、渲染往返。
 `Kept`，而 `Change::pending` 只挑 `Applied`，所以“值得补但还没造”的缺口下一轮
 不会再出现在待判定列表里——若要它持续可见，需要让 `pending` 也保留这类记录，或在
 `kept` 后另开一个待办状态。
+
+### 3.41 迭代不再要求特定的 summary 工具调用（2026-11-14）
+
+**症状**：线上 `iteration_total=19`、`promote=0`；每次都在 agent 阶段回滚，错误固定为
+`plugin iteration agent session … exited without calling record_iteration_summary`。
+
+**确认的机制**（不是 `suspend` 本身）：
+
+- 迭代会话由 `start_iteration_session` 创建时没有设置 `require_end_tool`，所以
+  `suspend` 根本不在它的工具目录里；迭代会话靠**任何一条纯文本回合**结束（或显式
+  `record_iteration_summary`）。模型试 `suspend` 只会收到 unknown-tool 提示，随后
+  通常以纯文本收尾。
+- `record_iteration_summary` 只在 `verification_successes > 0` 后才出现在目录里，
+  且自身还有"代码改动必须带测试"的门槛。模型没调到或被拒后以文本收尾，driver 就把
+  "没有 summary 工具调用"当成整轮失败。
+
+**改法**（`crates/cordis-agent/src/iteration/driver.rs`）：
+
+- 抽出 `resolve_iteration_summary(recorded, changed_paths, last_message, iteration_id)`：
+  显式 summary 优先；没有时若有改动，用 agent 最后一条 assistant 文本（前 500 字符，
+  空则 `iteration <id>: <n> file(s) changed`）合成 `RecordIterationSummaryArgs`；
+  无改动则返回 `ended without changing any file: there is nothing to promote`。
+- `record_agent_outcome` 在 driver 的 agent 阶段调用它；合成时 `eprintln!`
+  `iteration <id>: no summary tool call; synthesised from <n> changed paths`，并把
+  合成文本写回 `derived_edit_plan.summary`。
+- 删除 `host::missing_summary_error`（旧误导文案的唯一来源）。
+
+**测试**：6 个纯函数单测（显式优先 / 文本合成 / 500 字符截断 / 空文本回退 / 无改动报错 /
+最后一条 assistant 选取）+ 3 个 driver 集成用例（无 summary 有改动继续、无改动失败、
+显式优先）。
+
+**未一并处理的相邻缺口**（单列，不在本次改动内）：
+
+- `record_iteration_summary` 的 `summary_rejection` 要求任何非 docs 代码改动都带测试；
+  只改 `Cargo.toml`（例如给 web 插件加 gzip feature）的迭代因此**永远无法显式记录
+  summary**。合成路径不经过这条检查，所以这类改动现在能走到验证，代价是"必须带测试"
+  的门槛被绕过。
+- 合成路径也不经过 `ensure_scaffold_integration_edits`，也不重算
+  `requires_approval`；若 agent 改了既有测试却以文本收尾，审批门不会亮。
+- `tests_command` / `safety_command` 在 `PluginIterationAgentRun` 里本就没有字段，
+  driver 的 `state.tests_command` 从未被 agent 的 summary 填充（既有缺口）。
 
 ## 4. 部分完成
 
