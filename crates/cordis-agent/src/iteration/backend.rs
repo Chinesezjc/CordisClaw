@@ -37,6 +37,12 @@ impl<'a> PluginIterationAgentBackend<'a> {
         summary: &str,
         operations: Vec<PluginEditOperation>,
     ) -> Result<Value, RuntimeError> {
+        eprintln!(
+            "iteration {}: edit call with {} operation(s) at phase={}",
+            self.state.prepared.iteration_id,
+            operations.len(),
+            self.phase()
+        );
         let mut combined_operations = self.state.operations.clone();
         combined_operations.extend(operations.clone());
         let writable_roots = self
@@ -92,7 +98,20 @@ impl<'a> PluginIterationAgentBackend<'a> {
         );
         persisted?;
 
+        // Every edit the agent makes passes through here, so this is the one
+        // place that can say what a failed iteration actually did. Without it a
+        // rollback reporting "no files changed" is indistinguishable from an
+        // agent whose edits were refused, and the difference matters: one is a
+        // policy rejection, the other is the agent editing through a tool that
+        // does not record operations at all.
+        let applied = operations.len();
         self.state.operations.extend(operations.clone());
+        let phase = self.phase();
+        eprintln!(
+            "iteration {}: applied {applied} operation(s), {} total, phase={phase}",
+            self.state.prepared.iteration_id,
+            self.state.operations.len(),
+        );
         for path in operations.into_iter().map(|operation| operation.path) {
             if should_track_context_file(&path) {
                 self.state.focus_context_paths.push(path.clone());
