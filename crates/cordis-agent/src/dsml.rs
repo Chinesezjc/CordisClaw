@@ -465,4 +465,111 @@ mod tests {
         assert_eq!(calls[0].name, "read_file");
         assert_eq!(calls[0].arguments(), serde_json::json!({"path": "/tmp/a"}));
     }
+
+    /// A parameter the model did not mark as a string still stays text when it
+    /// is not a JSON literal — chat text must not be reinterpreted.
+    #[test]
+    fn unmarked_plain_text_parameters_stay_text() {
+        let calls = parse(
+            "<|DSML|invoke name=\"qq_send\">\
+             <|DSML|parameter name=\"message\">hello</|DSML|parameter>\
+             </|DSML|invoke>",
+        );
+        assert_eq!(
+            calls[0].arguments(),
+            serde_json::json!({"message": "hello"})
+        );
+    }
+
+    /// Something that opens like a JSON object but does not parse falls back to
+    /// the raw text instead of being dropped.
+    #[test]
+    fn a_structured_looking_value_that_is_not_json_stays_text() {
+        let calls = parse(
+            "<|DSML|invoke name=\"qq_send\">\
+             <|DSML|parameter name=\"message\">{oops</|DSML|parameter>\
+             </|DSML|invoke>",
+        );
+        assert_eq!(
+            calls[0].arguments(),
+            serde_json::json!({"message": "{oops"})
+        );
+    }
+
+    /// An empty value is not a number and not JSON, so it stays an empty string.
+    #[test]
+    fn an_empty_parameter_value_stays_text() {
+        let calls = parse(
+            "<|DSML|invoke name=\"qq_send\">\
+             <|DSML|parameter name=\"message\"></|DSML|parameter>\
+             </|DSML|invoke>",
+        );
+        assert_eq!(calls[0].arguments(), serde_json::json!({"message": ""}));
+    }
+
+    /// A truncated `<|DSML|invoke` with no closing `>` cannot name a tool, so
+    /// the scan stops rather than inventing one.
+    #[test]
+    fn an_open_tag_without_a_closing_angle_bracket_is_ignored() {
+        assert!(parse("<|DSML|invoke name=\"read_file\"").is_empty());
+    }
+
+    /// An unterminated invoke body runs to the next invoke, not to the end of
+    /// the text: the second call must still be seen.
+    #[test]
+    fn a_truncated_invoke_stops_at_the_next_invoke() {
+        let calls = parse(
+            "<|DSML|invoke name=\"first\">one\
+             <|DSML|invoke name=\"second\">two",
+        );
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "first");
+        assert_eq!(calls[1].name, "second");
+        assert!(calls[0].params.is_empty());
+    }
+
+    /// A `<|DSML|calls>` wrapper nested inside an invoke body is a container
+    /// tag, not a parameter, so it is skipped instead of becoming a parameter
+    /// named `calls`.
+    #[test]
+    fn a_nested_calls_tag_is_not_a_parameter() {
+        let calls = parse("<|DSML|invoke name=\"suspend\"><|DSML|calls></|DSML|invoke>");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "suspend");
+        assert!(calls[0].params.is_empty());
+    }
+
+    /// A parameter whose closing tag is missing keeps the rest of the body as
+    /// its value, because a truncated stream is the common case.
+    #[test]
+    fn an_unterminated_parameter_keeps_the_rest_of_the_body() {
+        let calls = parse("<|DSML|invoke name=\"read_file\"><|DSML|parameter name=\"path\">/tmp/a");
+        assert_eq!(calls[0].arguments(), serde_json::json!({"path": "/tmp/a"}));
+    }
+
+    /// A parameter tag cut off before its own `>` cannot be read at all, so the
+    /// body scan stops instead of treating the fragment as a parameter.
+    #[test]
+    fn a_parameter_tag_without_a_closing_angle_bracket_stops_the_scan() {
+        let calls = parse("<|DSML|invoke name=\"suspend\">text <|DSML|parameter");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "suspend");
+        assert!(calls[0].params.is_empty());
+    }
+
+    /// An attribute whose value is not quoted cannot be read, so the invoke has
+    /// no name and is skipped rather than guessed at.
+    #[test]
+    fn an_unquoted_attribute_value_is_not_read() {
+        assert!(parse("<|DSML|invoke name=read_file>").is_empty());
+    }
+
+    /// Rendering is defined for any JSON value, including one that is not an
+    /// object: such a call renders with no parameters at all.
+    #[test]
+    fn rendering_a_non_object_argument_emits_no_parameters() {
+        let text = render(&[("weird".to_string(), serde_json::json!([1, 2]))]);
+        assert!(text.contains("<|DSML|invoke name=\"weird\">"), "{text}");
+        assert!(!text.contains("<|DSML|parameter"), "{text}");
+    }
 }

@@ -906,4 +906,22 @@ mod load_tests {
         assert!(pc.plugin.is_empty());
         assert!(pc.settings.is_object());
     }
+
+    // `runtime.images` with only `enabled` spelled out still has to default the
+    // budget fields, and a bare `{}` must default `enabled` to `true` (the
+    // `default_true` serde default) rather than to `bool`'s `false`, which
+    // would silently drop every inbound image.
+    #[test]
+    fn image_settings_without_enabled_defaults_to_enabled() {
+        let bare: ImageSettings = serde_json::from_str("{}").expect("empty image settings");
+        assert!(bare.enabled);
+        assert_eq!(bare.max_bytes, default_image_max_bytes());
+        assert_eq!(bare.max_per_batch, default_image_max_per_batch());
+        assert_eq!(bare.timeout_ms, default_image_timeout_ms());
+
+        let explicit: ImageSettings =
+            serde_json::from_str(r#"{"enabled": false}"#).expect("explicit image settings");
+        assert!(!explicit.enabled);
+        assert_eq!(explicit.max_bytes, default_image_max_bytes());
+    }
 }

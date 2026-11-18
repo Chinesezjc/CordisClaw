@@ -26,29 +26,32 @@ pub fn iteration_result_json(result: &crate::host::KernelPluginIterationResult) 
         "changed_paths": result.changed_paths,
         "summary": result.summary,
     });
+    // Resolved for every verdict, not only for the non-promoted ones: the
+    // `Promoted` arm is part of the same exhaustive match, so folding it into
+    // the `if` below would leave an arm no input can reach.
+    let hint = match (final_verdict, canary_verdict) {
+        (PluginIterationFinalVerdict::RolledBack, Some(CanaryVerdict::Fail)) => {
+            "the canary replayed recorded invocations against the new build and their \
+             responses changed, so the workspace was restored. Changing behavior \
+             intentionally needs operator approval; ask them to approve this iteration."
+        }
+        (PluginIterationFinalVerdict::RolledBack, _) => {
+            "verification failed, so the workspace was restored (your edits are gone)."
+        }
+        (PluginIterationFinalVerdict::Blocked, _) => {
+            "the iteration is staged as a candidate and is waiting for operator approval; \
+             the working tree still holds your edits, but they are NOT live."
+        }
+        (PluginIterationFinalVerdict::InfrastructureFailure, _) => {
+            "an infrastructure failure (disk, IO) aborted the iteration."
+        }
+        (PluginIterationFinalVerdict::Promoted, _) => "",
+    };
     if !promoted {
         let reason = result
             .blocked_reason
             .clone()
             .unwrap_or_else(|| "no reason recorded".to_string());
-        let hint = match (final_verdict, canary_verdict) {
-            (PluginIterationFinalVerdict::RolledBack, Some(CanaryVerdict::Fail)) => {
-                "the canary replayed recorded invocations against the new build and their \
-                 responses changed, so the workspace was restored. Changing behavior \
-                 intentionally needs operator approval; ask them to approve this iteration."
-            }
-            (PluginIterationFinalVerdict::RolledBack, _) => {
-                "verification failed, so the workspace was restored (your edits are gone)."
-            }
-            (PluginIterationFinalVerdict::Blocked, _) => {
-                "the iteration is staged as a candidate and is waiting for operator approval; \
-                 the working tree still holds your edits, but they are NOT live."
-            }
-            (PluginIterationFinalVerdict::InfrastructureFailure, _) => {
-                "an infrastructure failure (disk, IO) aborted the iteration."
-            }
-            (PluginIterationFinalVerdict::Promoted, _) => "",
-        };
         value["error"] = serde_json::json!(format!(
             "iteration did not promote ({final_verdict:?}): {reason}. {hint} \
              Do NOT report the change as done."
@@ -158,6 +161,45 @@ mod tests {
         let error = value["error"].as_str().expect("error");
         assert!(error.contains("approval"), "error: {error}");
         assert_eq!(value["rolled_back"], false);
+    }
+
+    // A rollback without a canary failure is a plain verification failure: the
+    // canary-specific hint must not be used, or the agent is told to ask for an
+    // approval that would not have saved the change.
+    #[test]
+    fn rolled_back_without_a_canary_failure_blames_verification() {
+        let mut rolled_back = result(PluginIterationFinalVerdict::RolledBack);
+        rolled_back.canary = None;
+        rolled_back.blocked_reason = Some("tests failed".to_string());
+        let value = iteration_result_json(&rolled_back);
+        assert_eq!(value["ok"], false);
+        assert_eq!(value["rolled_back"], true);
+        let error = value["error"].as_str().expect("error");
+        assert!(error.contains("verification failed"), "error: {error}");
+        assert!(!error.contains("canary"), "error: {error}");
+    }
+
+    // A disk/IO abort restored the workspace for infrastructure reasons; it must
+    // not be reported as a verification failure the agent could retry away.
+    #[test]
+    fn infrastructure_failure_blames_the_disk_not_the_agent() {
+        let value =
+            iteration_result_json(&result(PluginIterationFinalVerdict::InfrastructureFailure));
+        assert_eq!(value["ok"], false);
+        assert_eq!(value["rolled_back"], false);
+        let error = value["error"].as_str().expect("error");
+        assert!(error.contains("infrastructure failure"), "error: {error}");
+    }
+
+    // `blocked_reason: None` still has to explain itself rather than render an
+    // empty reason into the error text.
+    #[test]
+    fn a_missing_blocked_reason_says_so() {
+        let mut blocked = result(PluginIterationFinalVerdict::Blocked);
+        blocked.blocked_reason = None;
+        let value = iteration_result_json(&blocked);
+        let error = value["error"].as_str().expect("error");
+        assert!(error.contains("no reason recorded"), "error: {error}");
     }
 
     #[test]

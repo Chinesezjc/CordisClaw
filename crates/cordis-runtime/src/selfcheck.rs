@@ -3329,4 +3329,172 @@ mod tests {
         assert_eq!(stored["groups"]["42"]["policy"], "旧策略");
         assert_eq!(stored["groups"]["42"]["enabled"], true);
     }
+
+    // -----------------------------------------------------------------------
+    // The observer's own edges: every kind, every unreadable shape, every
+    // truncation. Each of these paths has a caller in production, but only on
+    // input a throwing-together test never produces.
+    // -----------------------------------------------------------------------
+
+    /// Both lookups exist for every kind; `provider_error` in particular only
+    /// ever came from a real provider failure, so neither arm had a caller.
+    #[test]
+    fn every_kind_names_and_weighs_itself() {
+        let named: Vec<(&str, usize)> = [
+            Kind::Empty,
+            Kind::NoToolCall,
+            Kind::UnparsedDsml,
+            Kind::ProviderError,
+            Kind::Repeated,
+        ]
+        .iter()
+        .map(|kind| (kind.as_str(), kind.weight()))
+        .collect();
+        assert_eq!(
+            named,
+            vec![
+                ("empty", 2),
+                ("no_tool_call", 4),
+                ("unparsed_dsml", 5),
+                ("provider_error", 3),
+                ("repeated", 1),
+            ]
+        );
+    }
+
+    /// The digest explains each kind in prose. Only `empty` had ever been
+    /// formatted, so the other four wordings were dead letters.
+    #[test]
+    fn the_digest_names_every_kind_it_counts() {
+        let signatures: Vec<Signature> = [
+            Kind::Empty,
+            Kind::NoToolCall,
+            Kind::UnparsedDsml,
+            Kind::ProviderError,
+            Kind::Repeated,
+        ]
+        .iter()
+        .map(|kind| Signature {
+            kind: *kind,
+            excerpt: format!("{kind:?}"),
+            count: 5,
+            sessions: vec!["s".to_string()],
+            first_turn: 0,
+            last_turn: 4,
+        })
+        .collect();
+        let report = SelfCheck {
+            scanned_sessions: 1,
+            scanned_turns: 5,
+            signatures,
+            lessons: Vec::new(),
+            attempted: Vec::new(),
+        };
+        let text = digest(&report, 5).expect("a digest");
+        for wording in [
+            "turns that produced nothing at all",
+            "replies with no tool call, so nothing was sent",
+            "turns of tool markup that did not parse",
+            "provider failures recorded as turns",
+            "the same reply repeated verbatim",
+        ] {
+            assert!(text.contains(wording), "{wording} missing from {text}");
+        }
+    }
+
+    #[test]
+    fn a_missing_exchange_directory_reads_to_nothing() {
+        assert!(recent_exchanges(Path::new("/nonexistent/selfcheck-exchanges"), 10).is_empty());
+    }
+
+    /// Every shape a sessions directory can contain: a subdirectory that looks
+    /// like a snapshot, a truncated json file, and json that is not a snapshot.
+    /// The two readable sessions still come back, so one bad entry cannot hide
+    /// the rest.
+    #[test]
+    fn exchange_scanning_survives_every_unreadable_shape() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["a.json", "b.json"] {
+            let snapshot = serde_json::json!({
+                "history": [{"role": "assistant", "content": "先说一句"}]
+            });
+            std::fs::write(
+                dir.path().join(name),
+                serde_json::to_string(&snapshot).unwrap(),
+            )
+            .unwrap();
+        }
+        // A directory whose name ends in `.json`: reading it fails.
+        std::fs::create_dir(dir.path().join("c.json")).unwrap();
+        std::fs::write(dir.path().join("d.json"), "{not json").unwrap();
+        std::fs::write(dir.path().join("e.json"), "{}").unwrap();
+        let exchanges = recent_exchanges(dir.path(), 10);
+        assert_eq!(exchanges.len(), 2);
+        for exchange in &exchanges {
+            assert_eq!(exchange.reply, "先说一句");
+        }
+    }
+
+    #[test]
+    fn a_missing_review_directory_reads_to_nothing() {
+        assert!(previous_reviews(Path::new("/nonexistent/selfcheck-reviews"), 5).is_empty());
+    }
+
+    /// A review that parses as json but carries no `message` key keeps its
+    /// literal text: `{"action":"respond"}` is a body, not an envelope.
+    #[test]
+    fn a_json_review_without_a_message_is_kept_verbatim() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("1.md"), r#"{"action":"respond"}"#).unwrap();
+        assert_eq!(
+            previous_reviews(dir.path(), 1),
+            vec![r#"{"action":"respond"}"#.to_string()]
+        );
+    }
+
+    /// Parses as json but is not an object, so it is not a retired call either.
+    #[test]
+    fn a_json_scalar_is_not_a_legacy_call() {
+        assert_eq!(
+            classify("123").map(|(kind, _)| kind),
+            Some(Kind::NoToolCall)
+        );
+    }
+
+    /// An excerpt stops growing at the limit, so one enormous failure cannot
+    /// carry the whole transcript into the instruction.
+    #[test]
+    fn a_very_long_failure_stops_at_the_excerpt_limit() {
+        let excerpt = normalise(&"a".repeat(300));
+        assert_eq!(excerpt.chars().count(), 200);
+    }
+
+    /// One scan over a directory holding only shapes it must skip: a directory
+    /// named like a snapshot, json without a transcript, and a transcript whose
+    /// assistant turn is a call (not a failure).
+    #[test]
+    fn scanning_skips_what_it_cannot_use() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("a.json")).unwrap();
+        std::fs::write(dir.path().join("b.json"), "{}").unwrap();
+        let snapshot = serde_json::json!({
+            "transcript": [
+                {"kind": "user", "content": "在吗", "tools": []},
+                {
+                    "kind": "assistant",
+                    "content": "<|DSML|calls><|DSML|invoke name=\"suspend\">",
+                    "tools": [],
+                },
+            ]
+        });
+        std::fs::write(
+            dir.path().join("c.json"),
+            serde_json::to_string(&snapshot).unwrap(),
+        )
+        .unwrap();
+        let report = scan(dir.path());
+        assert_eq!(report.scanned_sessions, 1);
+        assert_eq!(report.scanned_turns, 1);
+        assert!(report.signatures.is_empty());
+    }
 }

@@ -284,6 +284,284 @@ mod delivered_tests {
         };
         assert!(!failed.delivered());
     }
+
+    /// A call that succeeded and returned nothing still ran: only a *verdict*
+    /// against delivery may downgrade it.
+    #[test]
+    fn a_successful_call_with_no_output_counts_as_delivered() {
+        let bare = AgentToolEvent {
+            output: None,
+            ..event(json!({}))
+        };
+        assert!(bare.delivered());
+    }
+}
+
+/// The trait's default bodies have no caller in any production host: every
+/// host overrides them, because a default would silently pretend the host
+/// cannot do something it actually can. `BareHost` overrides nothing, so it is
+/// the only path through those defaults — and the test below walks it.
+#[cfg(test)]
+mod default_seam_tests {
+    use super::*;
+
+    struct BareHost;
+
+    fn unsupported<T>() -> Result<T, RuntimeError> {
+        Err(RuntimeError::InvalidArgument {
+            message: "the bare test host supports no tools".to_string(),
+        })
+    }
+
+    impl AgentToolHost for BareHost {
+        fn agent_runtime_status(&self) -> Result<Value, RuntimeError> {
+            unsupported()
+        }
+        fn agent_list_plugins(&self) -> Result<Value, RuntimeError> {
+            unsupported()
+        }
+        fn agent_list_nodes(&self) -> Result<Value, RuntimeError> {
+            unsupported()
+        }
+        fn agent_kernel_status(&self) -> Result<Value, RuntimeError> {
+            unsupported()
+        }
+        fn agent_kernel_issues(&self) -> Result<Value, RuntimeError> {
+            unsupported()
+        }
+        fn agent_my_team(&self, _session_id: &str) -> Result<Value, RuntimeError> {
+            unsupported()
+        }
+        fn agent_send_to_session(
+            &self,
+            _caller_session_id: &str,
+            _target: &str,
+            _input: &str,
+        ) -> Result<Value, RuntimeError> {
+            unsupported()
+        }
+        fn agent_reload_runtime(&self, _plugin_path: &str) -> Result<Value, RuntimeError> {
+            unsupported()
+        }
+        fn agent_build_plugins(&self, _plugin_name: &str) -> Result<Value, RuntimeError> {
+            unsupported()
+        }
+        fn agent_plugin_hints(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn agent_invoke_plugin(
+            &self,
+            _session_id: &str,
+            _plugin_path: &str,
+            _node_id: &str,
+            _payload_json: Value,
+        ) -> Result<Value, RuntimeError> {
+            unsupported()
+        }
+        fn agent_execute_target(
+            &self,
+            _node_fqn: &str,
+            _payload_json: Value,
+        ) -> Result<Value, RuntimeError> {
+            unsupported()
+        }
+        fn agent_read_file(
+            &self,
+            _path: &str,
+            _offset: Option<usize>,
+            _limit: Option<usize>,
+        ) -> Result<Value, RuntimeError> {
+            unsupported()
+        }
+        fn agent_list_directory(&self, _path: &str) -> Result<Value, RuntimeError> {
+            unsupported()
+        }
+        fn agent_view_image(
+            &self,
+            _path: Option<&str>,
+            _sha256: Option<&str>,
+        ) -> Result<(String, Value), RuntimeError> {
+            unsupported()
+        }
+        fn agent_search_code(
+            &self,
+            _pattern: &str,
+            _path: Option<&str>,
+        ) -> Result<Value, RuntimeError> {
+            unsupported()
+        }
+        fn agent_write_file(&self, _path: &str, _content: &str) -> Result<Value, RuntimeError> {
+            unsupported()
+        }
+        fn agent_replace_in_file(
+            &self,
+            _path: &str,
+            _find: &str,
+            _replace: &str,
+        ) -> Result<Value, RuntimeError> {
+            unsupported()
+        }
+        fn agent_run_command(&self, _command: &str) -> Result<Value, RuntimeError> {
+            unsupported()
+        }
+        fn agent_revert_changes(&self) -> Result<Value, RuntimeError> {
+            unsupported()
+        }
+        fn agent_delete_file(&self, _path: &str) -> Result<Value, RuntimeError> {
+            unsupported()
+        }
+        fn agent_rename_file(&self, _path: &str, _new_path: &str) -> Result<Value, RuntimeError> {
+            unsupported()
+        }
+        fn agent_move_file(&self, _path: &str, _new_path: &str) -> Result<Value, RuntimeError> {
+            unsupported()
+        }
+        fn agent_copy_file(&self, _path: &str, _new_path: &str) -> Result<Value, RuntimeError> {
+            unsupported()
+        }
+        fn agent_compact_context(&self, _session_id: &str) -> Result<Value, RuntimeError> {
+            unsupported()
+        }
+        fn agent_append_file(&self, _path: &str, _content: &str) -> Result<Value, RuntimeError> {
+            unsupported()
+        }
+        fn agent_run_plugin_test(&self, _command: Option<&str>) -> Result<Value, RuntimeError> {
+            unsupported()
+        }
+        fn agent_request_iteration(
+            &self,
+            _session_id: &str,
+            _plugin_path: &str,
+            _instruction: &str,
+        ) -> Result<Value, RuntimeError> {
+            unsupported()
+        }
+        fn agent_approve_iteration(
+            &self,
+            _session_id: &str,
+            _iteration_id: &str,
+        ) -> Result<Value, RuntimeError> {
+            unsupported()
+        }
+        fn agent_create_plugin(
+            &self,
+            _name: &str,
+            _description: Option<&str>,
+        ) -> Result<Value, RuntimeError> {
+            unsupported()
+        }
+        fn agent_send_warning_to_test_groups(&self, _message: &str) {}
+    }
+
+    /// A backend that overrides neither default, so `tool_scope_label` and
+    /// `terminal_tool_reply` answer for every backend that does not care.
+    struct BareBackend(BareHost);
+
+    impl AgentBackend for BareBackend {
+        type Host = BareHost;
+
+        fn system_prompt(&self) -> String {
+            String::new()
+        }
+
+        fn tool_specs(&self) -> Vec<AgentToolSpec> {
+            Vec::new()
+        }
+
+        fn execute_tool(
+            &mut self,
+            _name: &str,
+            _arguments: Value,
+            _attachments: &mut Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            unsupported()
+        }
+
+        fn host(&self) -> &Self::Host {
+            &self.0
+        }
+    }
+
+    #[test]
+    fn a_host_that_overrides_nothing_answers_only_its_own_boundaries() {
+        let host = BareHost;
+        assert_eq!(
+            host.agent_spill("read_file", "x").unwrap_err().to_string(),
+            "invalid argument: this host cannot spill read_file output"
+        );
+        assert_eq!(
+            host.agent_self_check().unwrap_err().to_string(),
+            "invalid argument: this host cannot inspect agent transcripts"
+        );
+        assert_eq!(
+            host.agent_set_soul("soul", None, None)
+                .unwrap_err()
+                .to_string(),
+            "invalid argument: soul storage is not available on this host"
+        );
+        assert_eq!(host.agent_self_check_digest(), None);
+        assert_eq!(host.agent_soul_overlay("soul"), None);
+        assert_eq!(host.agent_session_caller("session"), None);
+        let payload = serde_json::json!({"target": "group:1"});
+        assert_eq!(host.inject_turn_meta("session", payload.clone()), payload);
+    }
+
+    /// Every required method is present only so the trait compiles; the bare
+    /// host says "cannot" instead of fabricating a success.
+    #[test]
+    fn a_host_that_overrides_nothing_supports_no_tool() {
+        let host = BareHost;
+        assert!(host.agent_runtime_status().is_err());
+        assert!(host.agent_list_plugins().is_err());
+        assert!(host.agent_list_nodes().is_err());
+        assert!(host.agent_kernel_status().is_err());
+        assert!(host.agent_kernel_issues().is_err());
+        assert!(host.agent_my_team("session").is_err());
+        assert!(host.agent_send_to_session("session", "peer", "hi").is_err());
+        assert!(host.agent_reload_runtime("plugin").is_err());
+        assert!(host.agent_build_plugins("plugin").is_err());
+        assert!(host.agent_plugin_hints().is_empty());
+        let payload = serde_json::json!({"node_id": "suspend"});
+        assert!(host
+            .agent_invoke_plugin("session", "plugin", "node", payload.clone())
+            .is_err());
+        assert!(host
+            .agent_execute_target("plugin::node", payload.clone())
+            .is_err());
+        assert!(host.agent_read_file("a.rs", None, None).is_err());
+        assert!(host.agent_list_directory(".").is_err());
+        assert!(host.agent_view_image(None, Some("sha256:abc")).is_err());
+        assert!(host.agent_search_code("pattern", None).is_err());
+        assert!(host.agent_write_file("a.rs", "text").is_err());
+        assert!(host.agent_replace_in_file("a.rs", "a", "b").is_err());
+        assert!(host.agent_run_command("true").is_err());
+        assert!(host.agent_revert_changes().is_err());
+        assert!(host.agent_delete_file("a.rs").is_err());
+        assert!(host.agent_rename_file("a.rs", "b.rs").is_err());
+        assert!(host.agent_move_file("a.rs", "b.rs").is_err());
+        assert!(host.agent_copy_file("a.rs", "b.rs").is_err());
+        assert!(host.agent_compact_context("session").is_err());
+        assert!(host.agent_append_file("a.rs", "text").is_err());
+        assert!(host.agent_run_plugin_test(None).is_err());
+        assert!(host.agent_request_iteration("s", "p", "i").is_err());
+        assert!(host.agent_approve_iteration("s", "iter").is_err());
+        assert!(host.agent_create_plugin("mini", None).is_err());
+        host.agent_send_warning_to_test_groups("nobody");
+    }
+
+    #[test]
+    fn a_backend_that_overrides_nothing_is_generic_and_not_terminal() {
+        let mut backend = BareBackend(BareHost);
+        assert_eq!(backend.tool_scope_label(), "agent");
+        let output = serde_json::json!({"ok": true});
+        assert_eq!(backend.terminal_tool_reply("invoke_plugin", &output), None);
+        assert!(backend.system_prompt().is_empty());
+        assert!(backend.tool_specs().is_empty());
+        assert_eq!(backend.host().agent_plugin_hints(), Vec::<String>::new());
+        assert!(backend
+            .execute_tool("invoke_plugin", output, &mut Vec::new())
+            .is_err());
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

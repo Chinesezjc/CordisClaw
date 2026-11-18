@@ -136,6 +136,16 @@ mod tests {
         assert!(spill(&big(20_000), &blocked, "x.txt").is_none());
     }
 
+    /// The spill directory is usable but the target *name* is already occupied
+    /// by a directory, so the write itself is refused. The content must stay
+    /// inline rather than being lost.
+    #[test]
+    fn a_target_name_occupied_by_a_directory_keeps_the_content_inline() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("occupied.txt")).unwrap();
+        assert!(spill(&big(20_000), dir.path(), "occupied.txt").is_none());
+    }
+
     #[test]
     fn head_and_tail_split_the_ends() {
         let (head, tail) = split_head_tail("abcdefghij", 3);

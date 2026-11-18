@@ -204,4 +204,20 @@ mod tests {
         session.ingest_user_message("read-only channel context");
         assert_eq!(session.history_len(), 1);
     }
+
+    // Same for the caller-policy / approval-capability pairs: the agent tests
+    // call the inherent `AgentSession` methods, so the trait delegates need
+    // their own exercise.
+    #[test]
+    fn trait_caller_policy_and_approval_capability_delegate_to_the_session() {
+        let mut session = CargoAgentLoop
+            .create(LlmApiConfig::default(), "runtime_shell")
+            .expect("create a session");
+        assert_eq!(session.caller_policy(), (false, false));
+        assert!(!session.can_approve_iteration());
+        session.set_caller_policy(true, true);
+        session.set_approval_capability(true);
+        assert_eq!(session.caller_policy(), (true, true));
+        assert!(session.can_approve_iteration());
+    }
 }

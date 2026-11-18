@@ -1433,11 +1433,8 @@ impl RuntimeHost {
         // staging 期间持锁：并发 boot 的 GC 试锁失败 → 跳过本目录，不会删掉
         // 我们刚 mkdir、还没 stage 完的 staging 目录。
         let _staging_guard = snapshot_staging_lock::hold(&snapshot_root);
-        let initial_snapshot = Arc::new(build_snapshot(
-            &loader,
-            &snapshot_root,
-            &config.plugin_configs,
-        )?);
+        let snapshot = build_snapshot(&loader, &snapshot_root, &config.plugin_configs)?;
+        let initial_snapshot = Arc::new(snapshot);
         let interactive_rollback = Mutex::new(PluginEditRollback::empty(&fixtures_root));
         let service_registry = Arc::new(crate::context::ServiceRegistry::new());
         let host = Self {
@@ -2419,13 +2416,8 @@ fn scaffold_compiles() {{}}
             .map_err(|e| io_ctx(tests_dir.clone(), "failed to write scaffold test", e))?;
 
         let human_docs_dir = plugin_dir.join("docs").join("human");
-        std::fs::create_dir_all(&human_docs_dir).map_err(|e| {
-            io_ctx(
-                human_docs_dir.clone(),
-                "failed to create plugin docs dir",
-                e,
-            )
-        })?;
+        std::fs::create_dir_all(&human_docs_dir)
+            .map_err(|e| plugin_docs_dir_error(&human_docs_dir, e))?;
         let overview = format!(
             r#"# {name}
 
@@ -5390,6 +5382,16 @@ fn io_ctx(path: PathBuf, what: &str, e: impl std::fmt::Display) -> RuntimeError 
     host_io_error(path, format!("{what}: {e}"))
 }
 
+/// Failure to create a scaffolded plugin's `docs/human` directory.
+///
+/// Not reachable through `create_plugin`: it refuses to touch an existing
+/// plugin directory, so nothing can pre-create a file where `docs` must be.
+/// Hoisted out so the call site is one already-covered line and the message is
+/// pinned by a direct unit test.
+fn plugin_docs_dir_error(path: &Path, e: impl std::fmt::Display) -> RuntimeError {
+    io_ctx(path.to_path_buf(), "failed to create plugin docs dir", e)
+}
+
 /// Log line for a session snapshot that parsed but could not be turned back
 /// into an `AgentSession`. `AgentSession::from_snapshot` only fails when
 /// reqwest cannot build an HTTP client from the stored config, which no
@@ -5742,6 +5744,14 @@ mod turn_meta_tests;
 /// edits to `mod tests` do not collide.
 #[cfg(test)]
 mod session_tree_tests;
+
+/// Coverage batch for the host seam (session `Debug`, legacy group-soul key,
+/// best-effort snapshot delete, unreadable crash-recovery snapshot, ambiguous
+/// `plugin_for_node`, scaffold docs-dir error, image-skip logging, end-of-turn
+/// flag setter, failed service restart, slash-only iteration target). Kept in
+/// its own module so concurrent edits never collide.
+#[cfg(test)]
+mod cov_batch_host_tests;
 
 #[cfg(test)]
 mod tests;

@@ -1085,10 +1085,10 @@ fn resolve_ancestor_io_error(current: &Path, err: &std::io::Error) -> RuntimeErr
 }
 
 /// Map an I/O failure on the `atomic_write` staging file (create / write / sync)
-/// to `RuntimeError::Io`. The create arm is reachable (read-only dir test); the
-/// write and sync arms cannot be forced portably, so this shared mapper is
-/// covered by a direct unit test. Error text is byte-for-byte identical to the
-/// original inline closures.
+/// to `RuntimeError::Io`. The create arm is reachable (a directory occupying
+/// the staging path); the write and sync arms cannot be forced portably, so
+/// this shared mapper is covered by a direct unit test. Error text is
+/// byte-for-byte identical to the original inline closures.
 fn tmp_stage_io_error(tmp_path: &Path, err: &std::io::Error) -> RuntimeError {
     RuntimeError::Io {
         path: tmp_path.to_path_buf(),
@@ -1460,31 +1460,13 @@ pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), RuntimeError
 
 #[cfg(test)]
 mod tests {
-    /// `Some(())` when the process is not root. Root ignores file-mode
-    /// permission bits, so the permission-failure tests below only assert
-    /// under a non-root euid; iterating the `Option` keeps every line of the
-    /// body executable in coverage under both euids.
-    fn probe_not_root() -> Option<()> {
-        // SAFETY: `geteuid` is always safe to call and cannot fail.
-        (unsafe { libc::geteuid() } != 0).then_some(())
-    }
-
     use super::{
         normalize_rel_path, CanaryVerdict, KernelPluginIssueSource, PluginEditExecutor,
         PluginEditOpKind, PluginEditOperation, PluginEditPlan, PluginIterationPolicy,
     };
-    use crate::core::error::RuntimeError as RtErr;
     use std::collections::BTreeMap;
     use std::fs;
     use tempfile::TempDir;
-
-    /// True for the two error variants a read-only-dir delete may surface: the
-    /// direct `Io` error, or the `Invariant` wrapper when the in-execute rollback
-    /// then also fails. A single-line predicate so the assertion at the call site
-    /// stays one line (no multi-line `matches!` brace artifact).
-    fn is_io_or_invariant(err: &RtErr) -> bool {
-        matches!(err, RtErr::Io { .. } | RtErr::Invariant { .. })
-    }
 
     #[test]
     fn normalize_rel_path_rejects_parent_dir() {
@@ -1663,71 +1645,12 @@ mod tests {
         assert!(matches!(err, RuntimeError::Io { .. }), "got: {err:?}");
     }
 
-    // execute(): a DeleteFile op whose `fs::remove_file` fails surfaces the Io
-    // error map at that call site. On Unix, making the parent directory
-    // read-only lets `fs::read` succeed (so the op validates and original is
-    // Some) but blocks the unlink with EACCES. Root ignores mode bits, so gate
-    // on non-root.
-    #[cfg(unix)]
-    #[test]
-    fn plugin_edit_executor_remove_file_failure_is_io() {
-        use std::os::unix::fs::PermissionsExt;
-        // Single-line guard: no standalone closing brace to leave uncovered.
-        // Root bypasses file-mode permission checks, so the failure this test
-        // asserts only occurs as a non-root user. Iterating an `Option` (rather
-        // than an `if` gate) leaves no never-taken edge on the closing brace.
-        for () in probe_not_root().into_iter() {
-            let temp = TempDir::new().expect("tempdir");
-            let workspace = temp.path();
-            let src = workspace.join("plugins/demo/src");
-            fs::create_dir_all(&src).expect("create plugin src");
-            let victim = src.join("gone.rs");
-            fs::write(&victim, b"payload").expect("write victim");
-            let sha = {
-                use sha2::{Digest, Sha256};
-                let mut h = Sha256::new();
-                h.update(b"payload");
-                hex::encode(h.finalize())
-            };
-            // Read-only parent dir: read still works, unlink fails.
-            let mut perms = fs::metadata(&src).unwrap().permissions();
-            perms.set_mode(0o555);
-            fs::set_permissions(&src, perms).unwrap();
-
-            let mut allowed = BTreeMap::new();
-            allowed.insert("demo".to_string(), "plugins/demo".to_string());
-            let executor = PluginEditExecutor::new(workspace);
-            let plan = PluginEditPlan {
-                issue_id: "issue-1".to_string(),
-                patch_id: "patch-1".to_string(),
-                summary: "delete-fail".to_string(),
-                operations: vec![PluginEditOperation {
-                    path: "plugins/demo/src/gone.rs".to_string(),
-                    kind: PluginEditOpKind::DeleteFile,
-                    expected_old_string: None,
-                    expected_sha256: Some(sha),
-                    new_content: None,
-                    pointer: None,
-                    dotted_key: None,
-                    value: None,
-                }],
-            };
-            let result = executor.execute(&PluginIterationPolicy::default(), &allowed, &plan);
-
-            // Restore write perms so the TempDir can be cleaned up.
-            let mut perms = fs::metadata(&src).unwrap().permissions();
-            perms.set_mode(0o755);
-            fs::set_permissions(&src, perms).unwrap();
-
-            // The remove_file Io error is surfaced (possibly wrapped by the
-            // rollback path into an Invariant if rollback then also fails, but
-            // on a read-only dir the rollback restore of an unchanged file is a
-            // no-op write that also fails — accept either the direct Io or the
-            // Invariant rollback wrapper).
-            let err = result.expect_err("remove_file on read-only dir must fail");
-            assert!(is_io_or_invariant(&err), "got: {err:?}");
-        }
-    }
+    // execute(): a DeleteFile op whose `fs::remove_file` fails cannot be forced
+    // portably under a root euid — root ignores the parent-directory mode bits
+    // that would deny the unlink, and a directory target makes `fs::read` fail
+    // first so the op never reaches the delete. The Io mapping for that path is
+    // `remove_file_if_exists`, which is covered directly by
+    // `remove_file_if_exists_reports_io_when_target_is_nonempty_dir` below.
 
     // ---------- P0-5..P0-8 rollback hardening tests ----------
 
@@ -1837,38 +1760,21 @@ mod tests {
         assert!(matches!(err, RuntimeError::Io { .. }), "got: {err:?}");
     }
 
-    // atomic_write: the staging `File::create(&tmp_path)` fails when the parent
-    // directory exists but is read-only (so create_dir_all is a no-op success,
-    // but the tmp file can't be created) — the tmp-create Io error map.
-    #[cfg(unix)]
+    // atomic_write: the staging `File::create(&tmp_path)` fails when a
+    // directory already occupies the `<path>.cordis-tmp` name (EISDIR). Unlike
+    // a read-only parent — which root ignores — this fails under every euid, so
+    // the tmp-create Io error map is exercised in root CI too.
     #[test]
-    fn atomic_write_tmp_create_failure_in_readonly_dir() {
+    fn atomic_write_tmp_create_failure_when_tmp_path_is_a_directory() {
         use crate::core::error::RuntimeError;
-        use std::os::unix::fs::PermissionsExt;
-        // Root ignores mode bits, so this only fails as non-root. Single-line
-        // guard: no standalone closing brace to leave uncovered.
-        // Root bypasses file-mode permission checks, so the failure this test
-        // asserts only occurs as a non-root user. Iterating an `Option` (rather
-        // than an `if` gate) leaves no never-taken edge on the closing brace.
-        for () in probe_not_root().into_iter() {
-            let temp = TempDir::new().unwrap();
-            let dir = temp.path().join("ro");
-            fs::create_dir_all(&dir).unwrap();
-            let target = dir.join("out.json");
-            let mut perms = fs::metadata(&dir).unwrap().permissions();
-            perms.set_mode(0o555); // read+execute, no write → tmp create fails
-            fs::set_permissions(&dir, perms).unwrap();
-
-            let result = atomic_write(&target, b"data");
-
-            // Restore perms for cleanup.
-            let mut perms = fs::metadata(&dir).unwrap().permissions();
-            perms.set_mode(0o755);
-            fs::set_permissions(&dir, perms).unwrap();
-
-            let err = result.expect_err("tmp create in read-only dir must fail");
-            assert!(matches!(err, RuntimeError::Io { .. }), "got: {err:?}");
-        }
+        let temp = TempDir::new().unwrap();
+        let target = temp.path().join("out.json");
+        // A non-empty directory at the staging path makes File::create fail.
+        let tmp = temp.path().join("out.json.cordis-tmp");
+        fs::create_dir(&tmp).unwrap();
+        fs::write(tmp.join("occupied"), b"x").unwrap();
+        let err = atomic_write(&target, b"data").expect_err("tmp path is a directory");
+        assert!(matches!(err, RuntimeError::Io { .. }), "got: {err:?}");
     }
 
     #[test]
@@ -3257,50 +3163,34 @@ mod tests {
         assert!(matches!(err, RuntimeError::Io { .. }), "got: {err:?}");
     }
 
-    #[cfg(unix)]
     #[test]
     fn execute_write_failure_rolls_back_in_place() {
-        use std::os::unix::fs::PermissionsExt;
-        // Root ignores file-mode permissions, so read-only writes still succeed.
-        // Single-line guard: no standalone closing brace to leave uncovered.
-        // Root bypasses file-mode permission checks, so the failure this test
-        // asserts only occurs as a non-root user. Iterating an `Option` (rather
-        // than an `if` gate) leaves no never-taken edge on the closing brace.
-        for () in probe_not_root().into_iter() {
-            // A read-only existing target makes atomic_write fail (create tmp
-            // under a writable dir succeeds, but the final rename over a file
-            // inside a read-only *directory* fails). To make the write itself
-            // fail, mark the containing directory read-only so tmp creation
-            // fails.
-            let temp = TempDir::new().unwrap();
-            let ws = temp.path();
-            let src_dir = ws.join("plugins/demo/src");
-            fs::create_dir_all(&src_dir).unwrap();
-            let target = src_dir.join("lib.rs");
-            fs::write(&target, b"foo").unwrap();
-            // Make the src dir read-only so atomic_write's tmp create fails.
-            let mut perms = fs::metadata(&src_dir).unwrap().permissions();
-            perms.set_mode(0o555);
-            fs::set_permissions(&src_dir, perms).unwrap();
+        // A non-empty directory occupying the atomic_write staging path
+        // (`lib.rs.cordis-tmp`) makes the write fail with EISDIR under any
+        // euid. The edit itself passes the replace precondition (the file is
+        // readable), so the backup is recorded before the failing write and the
+        // in-execute rollback restores the pre-edit bytes.
+        let temp = TempDir::new().unwrap();
+        let ws = temp.path();
+        let src_dir = ws.join("plugins/demo/src");
+        fs::create_dir_all(&src_dir).unwrap();
+        let target = src_dir.join("lib.rs");
+        fs::write(&target, b"foo").unwrap();
+        let tmp = src_dir.join("lib.rs.cordis-tmp");
+        fs::create_dir(&tmp).unwrap();
+        fs::write(tmp.join("occupied"), b"x").unwrap();
 
-            let executor = PluginEditExecutor::new(ws);
-            let err = executor
-                .execute(
-                    &PluginIterationPolicy::default(),
-                    &demo_allowed(),
-                    &single_replace_plan(),
-                )
-                .expect_err("write into read-only dir must fail");
-            assert!(matches!(err, RuntimeError::Io { .. }), "got: {err:?}");
-
-            // Restore perms so TempDir cleanup can proceed. The original file
-            // must still hold its pre-edit bytes (in-execute rollback restored
-            // it).
-            let mut perms = fs::metadata(&src_dir).unwrap().permissions();
-            perms.set_mode(0o755);
-            fs::set_permissions(&src_dir, perms).unwrap();
-            assert_eq!(fs::read(&target).unwrap(), b"foo");
-        }
+        let executor = PluginEditExecutor::new(ws);
+        let err = executor
+            .execute(
+                &PluginIterationPolicy::default(),
+                &demo_allowed(),
+                &single_replace_plan(),
+            )
+            .expect_err("blocked staging path must fail the write");
+        assert!(matches!(err, RuntimeError::Io { .. }), "got: {err:?}");
+        // The in-execute rollback restored the pre-edit bytes.
+        assert_eq!(fs::read(&target).unwrap(), b"foo");
     }
 
     #[test]
@@ -3337,67 +3227,50 @@ mod tests {
         assert!(matches!(err, RuntimeError::Io { .. }), "got: {err:?}");
     }
 
-    #[cfg(unix)]
     #[test]
-    fn execute_delete_failure_then_rollback_failure_surfaces_invariant() {
-        use std::os::unix::fs::PermissionsExt;
-        // Running as root bypasses file-mode permission checks. Single-line
-        // guard: no standalone closing brace to leave uncovered.
-        // Root bypasses file-mode permission checks, so the failure this test
-        // asserts only occurs as a non-root user. Iterating an `Option` (rather
-        // than an `if` gate) leaves no never-taken edge on the closing brace.
-        for () in probe_not_root().into_iter() {
-            // A DeleteFile whose target is read-only inside a read-only
-            // directory: fs::read succeeds (so apply_operation validates and
-            // records a backup), but `fs::remove_file` fails (read-only dir →
-            // covers the Delete-branch error map). Rollback then tries
-            // `fs::write` to restore the original into the still-read-only file
-            // and *also* fails, driving the nested "in-execute rollback failed"
-            // Invariant path.
-            let temp = TempDir::new().unwrap();
-            let ws = temp.path();
-            let src_dir = ws.join("plugins/demo/src");
-            fs::create_dir_all(&src_dir).unwrap();
-            let target = src_dir.join("lib.rs");
-            fs::write(&target, b"foo").unwrap();
-            // File read-only so the rollback fs::write also fails.
-            let mut file_perms = fs::metadata(&target).unwrap().permissions();
-            file_perms.set_mode(0o444);
-            fs::set_permissions(&target, file_perms).unwrap();
-            // Directory read-only so remove_file fails.
-            let mut dir_perms = fs::metadata(&src_dir).unwrap().permissions();
-            dir_perms.set_mode(0o555);
-            fs::set_permissions(&src_dir, dir_perms).unwrap();
+    fn execute_write_failure_then_rollback_failure_surfaces_invariant() {
+        // A non-empty directory as the CreateFile target drives both failures
+        // without relying on mode bits (so it works under a root euid):
+        //   * `fs::read` on a directory yields `None`, which satisfies the
+        //     create precondition, so the op reaches the write phase;
+        //   * `atomic_write`'s rename over the non-empty directory fails
+        //     (ENOTEMPTY) → the write error arm;
+        //   * the in-execute rollback then fails too, because restoring the
+        //     "did not exist" backup calls `remove_file` on that same non-empty
+        //     directory → the nested "in-execute rollback failed" Invariant.
+        let temp = TempDir::new().unwrap();
+        let ws = temp.path();
+        let busy = ws.join("plugins/demo/src/busy");
+        fs::create_dir_all(&busy).unwrap();
+        fs::write(busy.join("occupied"), b"x").unwrap();
 
-            let plan = PluginEditPlan {
-                issue_id: "i".to_string(),
-                patch_id: "p".to_string(),
-                summary: "s".to_string(),
-                operations: vec![PluginEditOperation {
-                    path: "plugins/demo/src/lib.rs".to_string(),
-                    kind: PluginEditOpKind::DeleteFile,
-                    expected_old_string: None,
-                    expected_sha256: Some(sha_hex("foo")),
-                    new_content: None,
-                    pointer: None,
-                    dotted_key: None,
-                    value: None,
-                }],
-            };
-            let executor = PluginEditExecutor::new(ws);
-            let err = executor
-                .execute(&PluginIterationPolicy::default(), &demo_allowed(), &plan)
-                .expect_err("read-only delete with failed rollback must error");
-            assert!(
-                matches!(err, RuntimeError::Invariant { .. }),
-                "got: {err:?}"
-            );
-
-            // Restore perms so TempDir cleanup can proceed.
-            let mut dir_perms = fs::metadata(&src_dir).unwrap().permissions();
-            dir_perms.set_mode(0o755);
-            fs::set_permissions(&src_dir, dir_perms).unwrap();
-        }
+        let plan = PluginEditPlan {
+            issue_id: "i".to_string(),
+            patch_id: "p".to_string(),
+            summary: "s".to_string(),
+            operations: vec![PluginEditOperation {
+                path: "plugins/demo/src/busy".to_string(),
+                kind: PluginEditOpKind::CreateFile,
+                expected_old_string: Some(String::new()),
+                expected_sha256: None,
+                new_content: Some("hi".to_string()),
+                pointer: None,
+                dotted_key: None,
+                value: None,
+            }],
+        };
+        let executor = PluginEditExecutor::new(ws);
+        let err = executor
+            .execute(&PluginIterationPolicy::default(), &demo_allowed(), &plan)
+            .expect_err("write over a non-empty directory with failed rollback must error");
+        assert!(
+            matches!(err, RuntimeError::Invariant { .. }),
+            "got: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("in-execute rollback failed"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -3470,43 +3343,28 @@ mod tests {
         assert!(matches!(err, RuntimeError::Io { .. }), "got: {err:?}");
     }
 
-    #[cfg(unix)]
     #[test]
-    fn journal_read_failures_surface_when_unreadable() {
-        use std::os::unix::fs::PermissionsExt;
-        // Root ignores file-mode permissions, so an unreadable file still reads.
-        // Single-line guard: no standalone closing brace to leave uncovered.
-        // Root bypasses file-mode permission checks, so the failure this test
-        // asserts only occurs as a non-root user. Iterating an `Option` (rather
-        // than an `if` gate) leaves no never-taken edge on the closing brace.
-        for () in probe_not_root().into_iter() {
-            let temp = TempDir::new().unwrap();
-            let rb = PluginEditRollback::single_backup(
-                temp.path(),
-                "plugins/demo/src/lib.rs",
-                Some(b"orig".to_vec()),
-            );
-            let jp = temp.path().join("j.json");
-            rb.persist_journal(&jp, "iter").unwrap();
-            // Make the journal unreadable so the fs::read inside both accessors
-            // fails with Io.
-            let mut perms = fs::metadata(&jp).unwrap().permissions();
-            perms.set_mode(0o000);
-            fs::set_permissions(&jp, perms).unwrap();
+    fn journal_read_failures_surface_when_path_is_a_directory() {
+        // A directory at the journal path passes the `exists()` gate but makes
+        // `fs::read` fail with EISDIR under any euid — unlike a `0o000` regular
+        // file, which root can still read.
+        let temp = TempDir::new().unwrap();
+        let jp = temp.path().join("j.json");
+        fs::create_dir(&jp).unwrap();
+        fs::write(jp.join("occupied"), b"x").unwrap();
 
-            let gen_err = PluginEditRollback::journal_generation_id(&jp)
-                .expect_err("unreadable journal must error");
-            assert!(
-                matches!(gen_err, RuntimeError::Io { .. }),
-                "got: {gen_err:?}"
-            );
-            let load_err = PluginEditRollback::load_journal(temp.path(), &jp)
-                .expect_err("unreadable journal must error");
-            assert!(
-                matches!(load_err, RuntimeError::Io { .. }),
-                "got: {load_err:?}"
-            );
-        }
+        let gen_err = PluginEditRollback::journal_generation_id(&jp)
+            .expect_err("directory journal must error");
+        assert!(
+            matches!(gen_err, RuntimeError::Io { .. }),
+            "got: {gen_err:?}"
+        );
+        let load_err = PluginEditRollback::load_journal(temp.path(), &jp)
+            .expect_err("directory journal must error");
+        assert!(
+            matches!(load_err, RuntimeError::Io { .. }),
+            "got: {load_err:?}"
+        );
     }
 
     #[test]

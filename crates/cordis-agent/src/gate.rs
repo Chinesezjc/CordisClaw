@@ -400,4 +400,72 @@ mod tests {
         assert!(verdict.is_verified());
         assert!(verdict.reason().is_none());
     }
+
+    // The success half of `Proposal::load` and `validate`: every other test
+    // above only ever sees a refusal.
+    #[test]
+    fn a_complete_proposal_loads_and_keeps_its_patch_path() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("patch.diff"), "diff --git a b\n").unwrap();
+        std::fs::write(
+            dir.path().join("proposal.json"),
+            r#"{"signature":"s","summary":"x","package":"cordis-agent","test":"t","patch":"patch.diff"}"#,
+        )
+        .unwrap();
+        let proposal = Proposal::load(dir.path()).expect("a complete proposal loads");
+        assert_eq!(proposal.signature, "s");
+        assert_eq!(proposal.test, "t");
+        assert_eq!(
+            proposal.patch_path(dir.path()),
+            dir.path().join("patch.diff")
+        );
+    }
+
+    // `ShellRunner` is the only `Runner` that touches a real process, so its
+    // two arms need a real command each: one that spawns, one that does not.
+    #[test]
+    fn the_shell_runner_reports_a_real_command_and_a_missing_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let (succeeded, output) = ShellRunner.run(dir.path(), "echo", &["hello"]);
+        assert!(succeeded, "echo should succeed: {output}");
+        assert!(output.contains("hello"), "{output}");
+        let (succeeded, output) = ShellRunner.run(dir.path(), "cordis-no-such-program-zzz", &[]);
+        assert!(!succeeded);
+        assert!(output.contains("cordis-no-such-program-zzz"), "{output}");
+    }
+
+    // `Verdict::reason` for the arm the other cases never select.
+    #[test]
+    fn a_patch_rejected_verdict_reports_the_git_output() {
+        let verdict = Verdict::PatchRejected {
+            reason: "error: patch does not apply".to_string(),
+        };
+        assert!(!verdict.is_verified());
+        assert_eq!(verdict.reason(), Some("error: patch does not apply"));
+    }
+
+    // The patch applied to a clean checkout but not to the tree the failing
+    // test left behind: rejected, and the test is not run a second time.
+    #[test]
+    fn a_patch_that_stops_applying_after_the_test_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let proposal = temp_proposal(dir.path());
+        let runner = Scripted::new(vec![
+            (true, String::new()),
+            (false, "FAILED".to_string()),
+            (false, "error: patch does not apply".to_string()),
+        ]);
+        let verdict = verify(&runner, Path::new("/scratch"), dir.path(), &proposal);
+        assert_eq!(
+            verdict,
+            Verdict::PatchRejected {
+                reason: "error: patch does not apply".to_string(),
+            }
+        );
+        assert_eq!(
+            runner.calls().len(),
+            3,
+            "the test must not run again after a failed apply"
+        );
+    }
 }

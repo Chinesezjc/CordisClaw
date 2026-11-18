@@ -25,10 +25,11 @@ use cordis_runtime::agent_api::{AgentBackend, AgentTranscriptEntry};
 use cordis_runtime::core::error::RuntimeError;
 use cordis_runtime::host::ScaffoldChildPluginArgs;
 use cordis_runtime::host::{
-    plugin_iteration_journal_path, PluginIterationAgentRun, PluginIterationAgentState,
-    PluginIterationContextPaths, PluginIterationRunState, PreparedPluginIteration, RuntimeHost,
-    PLUGIN_AGENT_TOOL_RECORD_ITERATION_SUMMARY, PLUGIN_AGENT_TOOL_REPLACE_FILES_EXACT,
-    TEST_ITERATION_ENOSPC_INJECTION, TEST_ITERATION_PANIC_INJECTION,
+    plugin_iteration_journal_path, ContextFilesScope, PluginIterationAgentRun,
+    PluginIterationAgentState, PluginIterationContextPaths, PluginIterationRunState,
+    PreparedPluginIteration, RuntimeHost, PLUGIN_AGENT_TOOL_RECORD_ITERATION_SUMMARY,
+    PLUGIN_AGENT_TOOL_REPLACE_FILES_EXACT, TEST_ITERATION_ENOSPC_INJECTION,
+    TEST_ITERATION_PANIC_INJECTION,
 };
 use cordis_runtime::kernel::plugin_iteration::KernelPluginIterationRequest;
 use cordis_runtime::kernel::plugin_iteration::{
@@ -151,6 +152,49 @@ fn invalid_argument_message(err: &RuntimeError) -> String {
         RuntimeError::InvalidArgument { message } => message.clone(),
         other => panic!("expected InvalidArgument, got {other:?}"),
     }
+}
+
+/// A file outside the structural focus shortlist is refused with the
+/// "hidden behind the shortlist" error until `list_context_files(scope=all)`
+/// expands the visible set — then the same file reads cleanly.
+#[test]
+fn a_context_file_outside_the_focus_shortlist_is_hidden_until_the_scope_expands() {
+    let (_temp, host) = empty_host();
+    let visible = "plugins/mini/src/lib.rs".to_string();
+    let hidden = "plugins/mini/src/nested/deep.rs".to_string();
+    let absolute = host.fixtures_root().join(&hidden);
+    fs::create_dir_all(absolute.parent().expect("parent")).expect("mkdir nested");
+    fs::write(&absolute, "deep\n").expect("seed hidden file");
+
+    let prepared = prepared_for("mini", &["mini"]);
+    let context_paths = PluginIterationContextPaths {
+        focus_paths: vec![visible.clone()],
+        all_paths: vec![visible, hidden.clone()],
+    };
+    let mut state = PluginIterationAgentState::new(prepared, context_paths, host.fixtures_root());
+    let mut backend = PluginIterationAgentBackend {
+        host: &host,
+        state: &mut state,
+        session_id: "iteration-session-hidden-context",
+    };
+
+    // Not expanded yet: the focus shortlist governs what is readable.
+    let err = backend
+        .read_context_files(std::slice::from_ref(&hidden))
+        .expect_err("a file behind the shortlist must be refused");
+    assert!(
+        invalid_argument_message(&err).contains("hidden behind the structural focus shortlist"),
+        "got {err}"
+    );
+
+    let listed = backend.list_context_files(ContextFilesScope::All);
+    assert_eq!(listed["scope_expanded"], json!(true));
+    assert_eq!(listed["hidden_count"], json!(0));
+
+    let read = backend
+        .read_context_files(&[hidden])
+        .expect("the same file is readable once the scope is expanded");
+    assert_eq!(read["files"][0]["content"], json!("deep\n"));
 }
 
 fn iteration_request() -> KernelPluginIterationRequest {
@@ -860,6 +904,156 @@ fn run_plugin_canary_skips_samples_for_other_plugins() {
         cordis_agent::iteration::driver::run_plugin_canary(&host, &state).expect("canary runs");
     assert_eq!(report.verdict, CanaryVerdict::Partial);
     assert_eq!(report.mode, "no_canary_evidence");
+}
+
+/// A `svc` plugin with two canary-hostile nodes: `svc_pull` declares a mutating
+/// side effect, and `svc_flap` answers differently on every call (`$$` is the
+/// shell's pid). Both must be skipped as evidence rather than replayed.
+fn setup_canary_json_fixture() -> (TempDir, PathBuf) {
+    let temp = TempDir::new().expect("tempdir");
+    let fixtures = temp.path().join("fixtures");
+    let artifacts = fixtures.join("artifacts");
+    fs::create_dir_all(&artifacts).expect("artifacts dir");
+
+    let flapping = artifacts.join("svc_canary.sh");
+    fs::write(
+        &flapping,
+        "#!/bin/sh\ncat >/dev/null\nprintf '{\"ok\":true,\"pid\":%s}' $$\n",
+    )
+    .expect("write flapping script");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&flapping).expect("meta").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&flapping, perms).expect("chmod flapping script");
+    }
+
+    let node = |id: &str, summary: &str, effects: &[&str]| NodeDoc {
+        id: id.to_string(),
+        summary: summary.to_string(),
+        input_schema: json!({ "type": "object" }),
+        output_schema: json!({ "type": "object" }),
+        side_effects: effects.iter().map(|effect| effect.to_string()).collect(),
+        failure_modes: Vec::new(),
+        node_type: NodeType::Task,
+        agent_accessible: false,
+    };
+    let abi = AbiFingerprint::current_build("crate_svc_v1", "api_v2");
+    let docs = PluginDocs {
+        plugin_id: "svc".to_string(),
+        plugin_path: "svc".to_string(),
+        plugin_version: "0.1.0".to_string(),
+        abi_version: 2,
+        command_name: Some("Svc".to_string()),
+        nodes: vec![
+            node("svc_pull", "consumes a pull charge", &["consumes pity"]),
+            node("svc_flap", "returns a fresh value on every call", &[]),
+        ],
+        system_hint: None,
+    };
+    let execution = json!({ "kind": "process", "command": "svc_canary.sh", "args": [] });
+    let artifact_value = json!({
+        "plugin_path": "svc",
+        "abi_fingerprint": abi,
+        "docs": docs,
+        "exports": [],
+        "execution": execution,
+    });
+    let artifact_path = artifacts.join("svc.json");
+    fs::write(
+        &artifact_path,
+        serde_json::to_vec_pretty(&artifact_value).expect("serialize artifact"),
+    )
+    .expect("write artifact");
+    let sha256 =
+        cordis_runtime::plugin::artifact::sha256_file(&artifact_path).expect("hash svc artifact");
+    let index_value = json!({
+        "schema_version": 2,
+        "generated_at": "2026-07-25T00:00:00Z",
+        "topo_order": ["svc"],
+        "entries": [{
+            "plugin_path": "svc",
+            "version": "0.1.0",
+            "abi_fingerprint": abi,
+            "artifact_path": "svc.json",
+            "sha256": sha256,
+            "built_at": "0",
+            "parent": null,
+            "required": true,
+            "grants_from_parent": [],
+            "docs": docs,
+            "exports": [],
+            "execution": execution,
+            "artifact_kind": "json",
+            "build_fingerprint": "bf",
+            "input_probe": { "files": [] },
+            "local_path_deps": []
+        }]
+    });
+    fs::write(
+        artifacts.join("index.json"),
+        serde_json::to_vec_pretty(&index_value).expect("serialize index"),
+    )
+    .expect("write index");
+    (temp, fixtures)
+}
+
+/// A recorded sample for a node that declares a mutating side effect is not
+/// evidence: replaying it would consume the charge twice. The canary must skip
+/// it and fall through to "no evidence".
+#[test]
+
+fn run_plugin_canary_skips_a_sample_whose_node_declares_side_effects() {
+    let (_temp, fixtures) = setup_canary_json_fixture();
+    let host = RuntimeHost::boot(&fixtures).expect("boot on svc fixture");
+    host.record_invocation_sample("svc", "svc_pull", "{}", "{\"ok\":true,\"pid\":0}");
+    let state = cordis_runtime::host::PluginIterationRunState::new(prepared_for("svc", &["svc"]));
+    let report =
+        cordis_agent::iteration::driver::run_plugin_canary(&host, &state).expect("canary runs");
+    assert_eq!(report.verdict, CanaryVerdict::Partial);
+    assert_eq!(report.mode, "no_canary_evidence");
+    assert!(
+        report.node_id.is_none(),
+        "a mutating node must not be replayed as evidence"
+    );
+}
+
+/// A node whose answer changes between two runs of the same build cannot serve
+/// as evidence either: the canary probes it twice, sees the disagreement, and
+/// skips it instead of failing the iteration on a random node.
+#[test]
+
+fn run_plugin_canary_skips_a_replay_that_disagrees_with_itself() {
+    let (_temp, fixtures) = setup_canary_json_fixture();
+    let host = RuntimeHost::boot(&fixtures).expect("boot on svc fixture");
+    // A candidate is required for the replay probe to have anything to invoke.
+    host.reload_candidate().expect("stage candidate");
+    host.record_invocation_sample("svc", "svc_flap", "{}", "{\"ok\":true,\"pid\":0}");
+    let state = cordis_runtime::host::PluginIterationRunState::new(prepared_for("svc", &["svc"]));
+    let report =
+        cordis_agent::iteration::driver::run_plugin_canary(&host, &state).expect("canary runs");
+    assert_eq!(report.verdict, CanaryVerdict::Partial);
+    assert_eq!(report.mode, "no_canary_evidence");
+    assert!(
+        report.node_id.is_none(),
+        "a self-disagreeing replay must not be reported as evidence"
+    );
+}
+
+/// The crate's `IterationRunner` is the seam the kernel calls. `approve` must
+/// reach the host's blocked-iteration table (here: reject an unknown id).
+#[test]
+fn the_iteration_runner_approves_through_the_host() {
+    use cordis_runtime::iteration_api::IterationRunner;
+    let (_temp, host) = empty_host();
+    let runner = cordis_agent::iteration::CargoIterationRunner;
+    let err = IterationRunner::approve(&runner, &host, "no-such-iteration")
+        .expect_err("nothing is blocked under that id");
+    assert!(
+        matches!(&err, RuntimeError::PluginIterationStatusNotFound { iteration_id } if iteration_id.as_str() == "no-such-iteration"),
+        "got {err}"
+    );
 }
 
 #[test]

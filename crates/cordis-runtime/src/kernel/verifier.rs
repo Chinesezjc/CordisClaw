@@ -1551,35 +1551,22 @@ mod tests {
         );
     }
 
-    /// `Some(())` when the current euid is not root, else `None`.
-    ///
-    /// Tests that drive a file-mode permission failure need this: root bypasses
-    /// mode bits, so a 0o000 file still reads. Returning an `Option` lets the
-    /// caller gate with `for`-over-`Option`, which — unlike an `if` gate or an
-    /// early `return` — has no not-taken arm to leave permanently uncovered.
-    #[cfg(unix)]
-    fn probe_not_root() -> Option<()> {
-        // SAFETY: `geteuid` is always safe to call and cannot fail.
-        (unsafe { libc::geteuid() } != 0).then_some(())
-    }
-
+    /// A symlink whose target is a *directory* is collected by the walk (the
+    /// entry is a symlink) but `fs::read` on it fails with `EISDIR`. Unlike a
+    /// `0o000` regular file — which root can still read, since root bypasses
+    /// mode bits — this is a genuine read failure under every euid, so the
+    /// read-error arm is exercised in root CI too.
     #[cfg(unix)]
     #[test]
     fn hash_source_tree_read_failure_surfaces_io() {
-        use std::os::unix::fs::PermissionsExt;
-        // Root ignores file-mode permissions, so an unreadable file still reads;
-        // the assertions only hold for a non-root euid.
-        for () in probe_not_root().into_iter() {
-            let temp = TempDir::new().expect("tempdir");
-            let secret = temp.path().join("secret.txt");
-            fs::write(&secret, "top secret").unwrap();
-            let mut perms = fs::metadata(&secret).unwrap().permissions();
-            perms.set_mode(0o000);
-            fs::set_permissions(&secret, perms).unwrap();
-            // The walk lists the file, but the read inside hash_source_tree fails.
-            let err = hash_source_tree(temp.path()).expect_err("unreadable file must error");
-            assert!(matches!(err, RuntimeError::Io { .. }), "got: {err:?}");
-        }
+        let temp = TempDir::new().expect("tempdir");
+        let directory = temp.path().join("a-directory");
+        fs::create_dir_all(&directory).unwrap();
+        std::os::unix::fs::symlink(&directory, temp.path().join("link-to-dir"))
+            .expect("create symlink");
+        // The walk lists the symlink, but reading it (a directory) fails.
+        let err = hash_source_tree(temp.path()).expect_err("unreadable entry must error");
+        assert!(matches!(err, RuntimeError::Io { .. }), "got: {err:?}");
     }
 
     /// A dangling symlink makes the walk collect the entry but `fs::read`
@@ -1613,36 +1600,34 @@ mod tests {
         );
     }
 
-    /// The 0o000 variant of the same guarantee, gated on a non-root euid
-    /// (root bypasses file-mode bits and would read the file anyway).
+    /// The verify-level counterpart of the read-failure above: a symlink to a
+    /// directory inside the source tree makes the baseline hash fail, which
+    /// must surface as an explicit `hash_error` (never a silent `None` hash),
+    /// so the caller can refuse to promote. Works under any euid.
     #[cfg(unix)]
     #[test]
-    fn verify_records_hash_error_when_source_tree_has_unreadable_file() {
-        use std::os::unix::fs::PermissionsExt;
-        for () in probe_not_root().into_iter() {
-            let temp = TempDir::new().expect("tempdir");
-            let secret = temp.path().join("secret.txt");
-            fs::write(&secret, "top secret").unwrap();
-            let mut perms = fs::metadata(&secret).unwrap().permissions();
-            perms.set_mode(0o000);
-            fs::set_permissions(&secret, perms).unwrap();
-            let report = CommandVerifier::verify(
-                temp.path(),
-                VerificationProfile::Default,
-                Some("true"),
-                Some("true"),
-                None,
-            )
-            .expect("verify still returns a report when hashing fails");
-            assert!(report.input.tests_passed);
-            assert!(report.source_tree_hash.is_none(), "report: {report:?}");
-            let reason = report
-                .hash_error
-                .expect("hash_error must record the baseline hash failure");
-            assert!(
-                reason.contains("hash_source_tree read failed"),
-                "unexpected reason: {reason}"
-            );
-        }
+    fn verify_records_hash_error_when_source_tree_entry_is_unreadable() {
+        let temp = TempDir::new().expect("tempdir");
+        let directory = temp.path().join("a-directory");
+        fs::create_dir_all(&directory).unwrap();
+        std::os::unix::fs::symlink(&directory, temp.path().join("link-to-dir"))
+            .expect("create symlink");
+        let report = CommandVerifier::verify(
+            temp.path(),
+            VerificationProfile::Default,
+            Some("true"),
+            Some("true"),
+            None,
+        )
+        .expect("verify still returns a report when hashing fails");
+        assert!(report.input.tests_passed);
+        assert!(report.source_tree_hash.is_none(), "report: {report:?}");
+        let reason = report
+            .hash_error
+            .expect("hash_error must record the baseline hash failure");
+        assert!(
+            reason.contains("hash_source_tree read failed"),
+            "unexpected reason: {reason}"
+        );
     }
 }

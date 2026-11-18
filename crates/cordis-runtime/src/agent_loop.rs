@@ -286,3 +286,132 @@ pub mod test_loop {
         }
     }
 }
+
+#[cfg(test)]
+mod seam_tests {
+    use super::test_loop::TestLoop;
+    use super::{missing_loop_error, AgentLoop, LlmProvider};
+    use crate::agent_api::LlmCompletionParts;
+    use crate::config::LlmApiConfig;
+    use crate::core::error::RuntimeError;
+    use crate::host::{
+        PluginIterationAgentState, PluginIterationContextPaths, PreparedPluginIteration,
+        RuntimeHost,
+    };
+    use crate::llm_sink::TokenSink;
+    use serde_json::Value;
+    use serial_test::serial;
+    use std::collections::BTreeMap;
+    use std::path::Path;
+    use std::sync::Arc;
+
+    /// The loop's double ignores the provider, so a provider that always fails
+    /// proves the turn never reaches the transport.
+    struct UnusedProvider;
+
+    impl LlmProvider for UnusedProvider {
+        fn complete(
+            &self,
+            _body: Value,
+            _sink: Option<Arc<dyn TokenSink>>,
+            _transport: cordis_plugin_sdk::llm::LlmTransportConfig,
+        ) -> Result<LlmCompletionParts, RuntimeError> {
+            Err(RuntimeError::NoLlmProvider)
+        }
+    }
+
+    /// A host that boots on an empty artifact index: the double only needs a
+    /// `&RuntimeHost`, it never calls into it.
+    fn bare_host(temp: &Path) -> RuntimeHost {
+        let fixtures = temp.join("fixtures");
+        std::fs::create_dir_all(fixtures.join("artifacts")).unwrap();
+        let index = serde_json::json!({
+            "schema_version": 2,
+            "generated_at": "2026-07-25T00:00:00Z",
+            "topo_order": [],
+            "entries": [],
+        });
+        std::fs::write(
+            fixtures.join("artifacts/index.json"),
+            serde_json::to_string(&index).unwrap(),
+        )
+        .unwrap();
+        RuntimeHost::boot(&fixtures).expect("boot on an empty index")
+    }
+
+    fn iteration_state() -> PluginIterationAgentState {
+        let prepared = PreparedPluginIteration {
+            iteration_id: "iter-agent-loop".to_string(),
+            issue_id: "issue-agent-loop".to_string(),
+            root_plugin_path: "mini".to_string(),
+            target_plugin_paths: vec!["mini".to_string()],
+            source: None,
+            summary: "agent loop seam".to_string(),
+            manual_approved: false,
+            tests_command: None,
+            safety_command: None,
+            verify_profile: crate::kernel::verifier::VerificationProfile::RustWorkspace,
+            quality_score: None,
+            edit_plan: None,
+            instruction: None,
+            allowed_plugin_roots: BTreeMap::from([(
+                "mini".to_string(),
+                "plugins/mini".to_string(),
+            )]),
+        };
+        PluginIterationAgentState::new(
+            prepared,
+            PluginIterationContextPaths {
+                focus_paths: Vec::new(),
+                all_paths: Vec::new(),
+            },
+            Path::new("."),
+        )
+    }
+
+    /// The uniform error is the whole answer when no loop is installed. It is
+    /// asserted byte for byte because callers match on the text.
+    #[test]
+    fn a_missing_loop_reports_its_own_text() {
+        assert_eq!(
+            missing_loop_error().to_string(),
+            "internal invariant broken: no agent loop installed (this build has no agent loop)"
+        );
+    }
+
+    /// Every method of the test double, including the plugin-iteration turn
+    /// shape that only a provider-backed iteration session reaches.
+    #[test]
+    #[serial]
+    fn the_test_loop_session_answers_both_turn_shapes() {
+        let temp = tempfile::tempdir().unwrap();
+        let host = bare_host(temp.path());
+        let mut session = TestLoop
+            .create(LlmApiConfig::default(), "plugin_iteration")
+            .expect("create a session");
+        let mut state = iteration_state();
+        let provider = UnusedProvider;
+
+        // The double never reaches the transport. Asking the stub directly is
+        // what pins its failure shape, so a later double that did call it
+        // could not pass by accident.
+        assert!(matches!(
+            provider.complete(Value::Null, None, Default::default()),
+            Err(RuntimeError::NoLlmProvider)
+        ));
+        let reply = session
+            .respond(&host, "session", "hi", &[], "", &provider, None)
+            .expect("a shell turn");
+        assert_eq!(reply.content, "");
+        let reply = session
+            .respond_with_iteration(&host, "session", &mut state, "hi", &[], "", &provider, None)
+            .expect("an iteration turn");
+        assert_eq!(reply.content, "");
+        assert!(reply.tool_events.is_empty());
+
+        assert_eq!(session.kind(), "plugin_iteration");
+        assert_eq!(session.tool_execution_summary().total_calls, 0);
+        assert!(session.transcript().is_empty());
+        assert!(!session.replace_last_action_with_reply("a reply"));
+    }
+}

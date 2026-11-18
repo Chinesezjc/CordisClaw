@@ -15,11 +15,54 @@
 //! as if it were a file. Anything unexpected is skipped, and every failure is
 //! counted rather than fatal.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Default retention for spill files.
 pub const DEFAULT_RETENTION_DAYS: u64 = 30;
+
+/// Test-only fault injection: the path whose next sweep stat must fail.
+///
+/// Nothing but a unit test ever writes here. A *path* rather than a global
+/// flag, so parallel tests cannot consume each other's injection; a real
+/// filesystem offers no deterministic way to make `symlink_metadata` fail on an
+/// entry `read_dir` just listed (that needs a race), and the arm it guards
+/// ("the entry vanished mid-sweep") is exactly the one that must not delete
+/// anything on a guess.
+static TEST_STAT_FAILURE: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+/// Test-only fault injection: the path whose next sweep `remove_file` must
+/// fail. Same shape and reason as [`TEST_STAT_FAILURE`] — an unlink of an
+/// existing file succeeds for every caller, root included.
+static TEST_REMOVE_FAILURE: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+/// Is `path` the pending injection target in `slot`? Consumes the injection.
+fn take_injected_failure(slot: &Mutex<Option<PathBuf>>, path: &Path) -> bool {
+    let mut pending = slot.lock().unwrap_or_else(|poison| poison.into_inner());
+    if pending.as_deref() == Some(path) {
+        *pending = None;
+        true
+    } else {
+        false
+    }
+}
+
+/// `symlink_metadata` for one sweep entry.
+fn entry_metadata(path: &Path) -> std::io::Result<std::fs::Metadata> {
+    if take_injected_failure(&TEST_STAT_FAILURE, path) {
+        return Err(std::io::Error::other("injected stat failure"));
+    }
+    std::fs::symlink_metadata(path)
+}
+
+/// `remove_file` for one expired sweep entry.
+fn remove_entry(path: &Path) -> std::io::Result<()> {
+    if take_injected_failure(&TEST_REMOVE_FAILURE, path) {
+        return Err(std::io::Error::other("injected remove failure"));
+    }
+    std::fs::remove_file(path)
+}
 
 /// What a sweep did.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -61,7 +104,7 @@ pub fn sweep(root: &Path, cutoff: u64) -> SweepReport {
     let mut directories: Vec<std::path::PathBuf> = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
-        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+        let Ok(metadata) = entry_metadata(&path) else {
             report.failed += 1;
             continue;
         };
@@ -85,7 +128,7 @@ pub fn sweep(root: &Path, cutoff: u64) -> SweepReport {
             .map(|elapsed| elapsed.as_millis() as u64);
         match mtime {
             Some(mtime) if mtime < cutoff => {
-                if std::fs::remove_file(&path).is_ok() {
+                if remove_entry(&path).is_ok() {
                     report.removed += 1;
                 } else {
                     report.failed += 1;
@@ -130,18 +173,23 @@ pub fn sweep_data_dir(data_dir: &Path) -> Option<SweepReport> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use std::fs::FileTimes;
     use std::time::Duration;
 
-    /// Set a file's mtime to `age` before now.
-    fn age_file(path: &Path, age: Duration) {
+    /// Give `path` the mtime `when`.
+    fn set_mtime(path: &Path, when: SystemTime) {
         let file = std::fs::OpenOptions::new()
             .write(true)
             .open(path)
             .expect("open");
-        let when = SystemTime::now() - age;
         file.set_times(FileTimes::new().set_modified(when))
             .expect("set mtime");
+    }
+
+    /// Set a file's mtime to `age` before now.
+    fn age_file(path: &Path, age: Duration) {
+        set_mtime(path, SystemTime::now() - age);
     }
 
     #[test]
@@ -164,6 +212,68 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let report = sweep(&dir.path().join("nope"), cutoff_ms(now_ms(), 30));
         assert_eq!(report, SweepReport::default());
+    }
+
+    /// An entry that disappears between `read_dir` and the stat must be counted
+    /// as failed, never guessed at. The race is injected by path because it
+    /// cannot be produced deterministically on a real filesystem.
+    #[test]
+    fn an_entry_that_vanishes_before_the_stat_is_counted_as_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gone.txt");
+        std::fs::write(&path, "x").unwrap();
+        *TEST_STAT_FAILURE.lock().unwrap() = Some(path.clone());
+        let report = sweep(dir.path(), cutoff_ms(now_ms(), 30));
+        assert_eq!(report.removed, 0);
+        assert_eq!(report.failed, 1);
+        assert!(
+            path.exists(),
+            "an entry nothing is known about is left alone"
+        );
+        assert!(
+            TEST_STAT_FAILURE.lock().unwrap().is_none(),
+            "the injected stat failure must have been consumed"
+        );
+    }
+
+    /// An expired entry whose unlink is refused is counted as failed and stays
+    /// on disk — the unlink is injected because it succeeds for every caller on
+    /// a real filesystem, root included.
+    #[test]
+    fn an_unlink_that_is_refused_is_counted_as_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.txt");
+        std::fs::write(&path, "x").unwrap();
+        age_file(&path, Duration::from_secs(40 * 24 * 3600));
+        *TEST_REMOVE_FAILURE.lock().unwrap() = Some(path.clone());
+        let report = sweep(dir.path(), cutoff_ms(now_ms(), 30));
+        assert_eq!(report.removed, 0);
+        assert_eq!(report.failed, 1);
+        assert!(path.exists(), "a refused unlink leaves the file in place");
+        assert!(
+            TEST_REMOVE_FAILURE.lock().unwrap().is_none(),
+            "the injected unlink failure must have been consumed"
+        );
+    }
+
+    /// A file whose age cannot be expressed relative to the epoch is neither
+    /// removed nor silently kept: it is reported as failed.
+    #[test]
+    fn an_entry_older_than_the_epoch_is_counted_as_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ancient.txt");
+        std::fs::write(&path, "x").unwrap();
+        let before_epoch = UNIX_EPOCH
+            .checked_sub(Duration::from_secs(3600))
+            .expect("an instant before the epoch is representable on this host");
+        set_mtime(&path, before_epoch);
+        let report = sweep(dir.path(), cutoff_ms(now_ms(), 30));
+        assert_eq!(report.removed, 0);
+        assert_eq!(report.failed, 1);
+        assert!(
+            path.exists(),
+            "an age that cannot be read is not a reason to delete"
+        );
     }
 
     #[test]
@@ -220,9 +330,12 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn cleanup_can_be_disabled_by_the_environment() {
-        // Serialized by the test harness's default single-threaded run for env
-        // vars in this crate; the value is restored immediately.
+        // Seeded with the default window so the restore branch below also runs
+        // while any concurrent sweep keeps its normal behaviour. `serial`
+        // because the variable is process-wide.
+        std::env::set_var("CORDIS_SPILL_RETENTION_DAYS", "30");
         let previous = std::env::var("CORDIS_SPILL_RETENTION_DAYS").ok();
         std::env::set_var("CORDIS_SPILL_RETENTION_DAYS", "0");
         assert_eq!(retention_days(), 0);
@@ -231,9 +344,25 @@ mod tests {
         if let Some(previous) = previous {
             std::env::set_var("CORDIS_SPILL_RETENTION_DAYS", previous);
         }
+        assert_eq!(retention_days(), DEFAULT_RETENTION_DAYS);
+        // Leave the environment exactly as the other tests expect it.
+        std::env::remove_var("CORDIS_SPILL_RETENTION_DAYS");
+    }
+
+    /// Retention `0` disables the sweep outright rather than sweeping with an
+    /// always-old cutoff.
+    #[test]
+    #[serial]
+    fn sweeping_a_data_dir_is_skipped_when_cleanup_is_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("CORDIS_SPILL_RETENTION_DAYS", "0");
+        let report = sweep_data_dir(dir.path());
+        std::env::remove_var("CORDIS_SPILL_RETENTION_DAYS");
+        assert!(report.is_none(), "retention 0 must not sweep");
     }
 
     #[test]
+    #[serial]
     fn sweeping_a_data_dir_without_spill_files_does_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let report = sweep_data_dir(dir.path()).expect("cleanup enabled by default");

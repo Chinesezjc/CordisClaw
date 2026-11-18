@@ -315,9 +315,12 @@ impl RuntimeHost {
                     // 检查 stop 的返回值：handler 报 ok=false 或 invoke 出错时
                     // 给出诊断，而不是静默丢弃。
                     let outcome = this.invoke(plugin_id, node_id, payload);
-                    if let Some(diag) = stop_result_diagnostic(&fqn, &outcome) {
-                        eprintln!("{diag}");
-                    }
+                    // Every step is a plain call: the diagnostic is silent for a
+                    // successful stop, and `for_each` keeps that silent case from
+                    // leaving a not-taken arm behind.
+                    stop_result_diagnostic(&fqn, &outcome)
+                        .into_iter()
+                        .for_each(|diag| eprintln!("{diag}"));
                 }));
                 if let Err(err) = result {
                     let msg = reload_stop_handler_panic_message(err.as_ref());

@@ -296,20 +296,32 @@ fn std_meta_modified(metadata: &fs::Metadata) -> std::io::Result<SystemTime> {
     metadata.modified()
 }
 
+fn std_fs_remove_file(path: &Path) -> std::io::Result<()> {
+    fs::remove_file(path)
+}
+
 /// Injection seam for the mtime-reading paths (`build_input_probe`,
 /// `maybe_remove_stale_lock`). `metadata` covers the initial stat; `modified`
 /// covers the `Metadata::modified()` read whose failure arm falls back to
-/// `SystemTime::now()` after logging.
+/// `SystemTime::now()` after logging; `remove_file` covers the two stale-lock
+/// unlink arms (`NotFound` tolerated, anything else mapped to `Io`).
+///
+/// `remove_file` is in the seam because the unlink of an *existing* lock file
+/// succeeds for any caller, root included — a real filesystem offers no
+/// deterministic failure to exercise the error arms with. Binding it here keeps
+/// `MetaOps::STD` byte-for-byte equivalent to calling `fs::remove_file`.
 #[derive(Clone, Copy)]
 struct MetaOps {
     metadata: fn(&Path) -> std::io::Result<fs::Metadata>,
     modified: fn(&fs::Metadata) -> std::io::Result<SystemTime>,
+    remove_file: fn(&Path) -> std::io::Result<()>,
 }
 
 impl MetaOps {
     const STD: MetaOps = MetaOps {
         metadata: std_meta_read,
         modified: std_meta_modified,
+        remove_file: std_fs_remove_file,
     };
 }
 
@@ -1592,9 +1604,11 @@ fn maybe_remove_stale_lock(path: &Path) -> Result<(), RuntimeError> {
 
 /// Fs-parameterized core of `maybe_remove_stale_lock`. The public entry
 /// injects `MetaOps::STD`. Tests inject a failing `modified` op to reach the
-/// lock-mtime read-failure fallback (`eprintln` + `SystemTime::now()`), which
-/// a real filesystem won't surface on a lock file that stat'd successfully.
-/// Default behaviour is byte-for-byte identical.
+/// lock-mtime read-failure fallback (`eprintln` + `SystemTime::now()`), and a
+/// failing `remove_file` op to reach the two unlink error arms (`NotFound` is
+/// tolerated, anything else becomes `Io`) — neither is surfaceable from a real
+/// filesystem once the lock stat'd successfully. Default behaviour is
+/// byte-for-byte identical.
 fn maybe_remove_stale_lock_with_fs(path: &Path, ops: MetaOps) -> Result<(), RuntimeError> {
     let metadata = match (ops.metadata)(path) {
         Ok(metadata) => metadata,
@@ -1631,7 +1645,7 @@ fn maybe_remove_stale_lock_with_fs(path: &Path, ops: MetaOps) -> Result<(), Runt
         // newcomer's wait timeout, never stolen from a live builder). Legacy /
         // unparsable files still fall back to the mtime window below.
         if !lock_pid_is_live(state.pid) {
-            match fs::remove_file(path) {
+            match (ops.remove_file)(path) {
                 Ok(()) => {}
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
                 Err(err) => return Err(io_error(path, err)),
@@ -1645,7 +1659,7 @@ fn maybe_remove_stale_lock_with_fs(path: &Path, ops: MetaOps) -> Result<(), Runt
         .unwrap_or_default()
         > LEGACY_STALE_LOCK_TIMEOUT
     {
-        match fs::remove_file(path) {
+        match (ops.remove_file)(path) {
             Ok(()) => {}
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
             Err(err) => return Err(io_error(path, err)),
@@ -1726,58 +1740,6 @@ fn absolute_path(path: &Path) -> Result<PathBuf, RuntimeError> {
 
 #[cfg(test)]
 mod tests {
-    /// `true` when the process can be blocked by file-mode permission bits.
-    /// Root bypasses them, so a "deny write/read then expect an I/O error"
-    /// injection succeeds instead of failing there.
-    #[cfg(unix)]
-    fn permission_bits_are_enforced() -> bool {
-        // SAFETY: `geteuid` is always safe to call and cannot fail.
-        (unsafe { libc::geteuid() }) != 0
-    }
-
-    /// Verdict for a permission-denied fault injection: when mode bits bind
-    /// (non-root) the call must fail the way `is_expected_error` says; when
-    /// they do not (root) the call must have succeeded instead.
-    ///
-    /// Taking `enforced` as a parameter rather than reading the euid inside
-    /// keeps both directions reachable from a unit test — an inline
-    /// `if enforced { .. } else { .. }` in each test body would leave whichever
-    /// branch the current euid does not take permanently uncovered.
-    #[cfg(unix)]
-    fn permission_fault_holds<T: std::fmt::Debug>(
-        enforced: bool,
-        outcome: &Result<T, cordis_runtime::core::error::RuntimeError>,
-        is_expected_error: impl FnOnce(&cordis_runtime::core::error::RuntimeError) -> bool,
-    ) -> bool {
-        match (enforced, outcome) {
-            (true, Err(err)) => is_expected_error(err),
-            (true, Ok(_)) => false,
-            (false, res) => res.is_ok(),
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn permission_fault_holds_covers_both_euid_directions() {
-        use cordis_runtime::core::error::RuntimeError;
-        let io = RuntimeError::Io {
-            path: "/x".into(),
-            message: "create tmp: denied".to_string(),
-        };
-        let is_create_tmp = |e: &RuntimeError| matches!(e, RuntimeError::Io { message, .. } if message.starts_with("create tmp: "));
-        // Enforced: the expected error passes, a mismatched error and an
-        // unexpected success both fail.
-        let denied: Result<(), RuntimeError> = Err(io);
-        assert!(permission_fault_holds(true, &denied, is_create_tmp));
-        let other: Result<(), RuntimeError> = Err(super::invariant("nope".to_string()));
-        assert!(!permission_fault_holds(true, &other, is_create_tmp));
-        let ok: Result<(), RuntimeError> = Ok(());
-        assert!(!permission_fault_holds(true, &ok, is_create_tmp));
-        // Not enforced (root): success is required, failure is not accepted.
-        assert!(permission_fault_holds(false, &ok, is_create_tmp));
-        assert!(!permission_fault_holds(false, &denied, is_create_tmp));
-    }
-
     use super::{cargo_command_prefers_offline, prepare_local_cargo_args};
 
     #[test]
@@ -2869,32 +2831,28 @@ exports = ["svc_a", "svc_b"]
         );
     }
 
-    // ---------- IO-arm fault injection (read-only dir / parent-is-file) ----------
+    // ---------- IO-arm fault injection (occupied tmp path / non-directory) ----------
 
-    /// P1-17 durable-write create-tmp arm: when the target directory cannot
-    /// be written (read-only), `fs::File::create(&tmp)` fails and maps to Io.
-    #[cfg(unix)]
+    /// P1-17 durable-write create-tmp arm: when the staging tmp path is already
+    /// occupied by a directory, `fs::File::create(&tmp)` fails with `EISDIR` and
+    /// maps to Io. A directory (not a mode-bit trick) is used because a
+    /// read-only parent still lets a root caller create files.
     #[test]
-    fn write_pretty_json_errors_when_tmp_create_fails_in_readonly_dir() {
+    fn write_pretty_json_errors_when_tmp_path_is_a_directory() {
         use super::write_pretty_json;
         use cordis_runtime::core::error::RuntimeError;
-        use std::os::unix::fs::PermissionsExt;
         use tempfile::TempDir;
         let dir = TempDir::new().unwrap();
-        let ro = dir.path().join("ro");
-        std::fs::create_dir(&ro).unwrap();
-        // Directory exists (so create_dir_all is a no-op) but is not writable,
-        // so the staging tmp file cannot be created.
-        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o555)).unwrap();
-        let target = ro.join("index.json");
+        let target = dir.path().join("index.json");
+        // `write_pretty_json` stages at `<name>.cordis-tmp.<pid>`; occupy it.
+        let tmp = dir
+            .path()
+            .join(format!("index.json.cordis-tmp.{}", std::process::id()));
+        std::fs::create_dir(&tmp).unwrap();
         let err = write_pretty_json(&target, &serde_json::json!({"k": 1}));
-        // Restore perms so TempDir cleanup succeeds regardless of outcome.
-        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(
-            permission_fault_holds(permission_bits_are_enforced(), &err, |e| {
-                matches!(e, RuntimeError::Io { message, .. } if message.starts_with("create tmp: "))
-            }),
-            "unexpected outcome for a read-only staging dir: {err:?}"
+            matches!(&err, Err(RuntimeError::Io { message, .. }) if message.starts_with("create tmp: ")),
+            "unexpected outcome for an occupied staging path: {err:?}"
         );
     }
 
@@ -2916,29 +2874,23 @@ exports = ["svc_a", "svc_b"]
         ));
     }
 
-    /// `stage_then_rename_file` create-tmp arm: read-only destination dir
-    /// makes `File::create(&tmp)` fail.
-    #[cfg(unix)]
+    /// `stage_then_rename_file` create-tmp arm: an occupied `<dst>.cordis-tmp`
+    /// directory makes `File::create(&tmp)` fail with `EISDIR`.
     #[test]
-    fn stage_then_rename_errors_when_tmp_create_fails_in_readonly_dir() {
+    fn stage_then_rename_errors_when_tmp_path_is_a_directory() {
         use super::stage_then_rename_file;
         use cordis_runtime::core::error::RuntimeError;
-        use std::os::unix::fs::PermissionsExt;
         use tempfile::TempDir;
         let dir = TempDir::new().unwrap();
         let src = dir.path().join("src.so");
         std::fs::write(&src, b"bytes").unwrap();
-        let ro = dir.path().join("ro");
-        std::fs::create_dir(&ro).unwrap();
-        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o555)).unwrap();
-        let dst = ro.join("out.so");
+        let dst = dir.path().join("out.so");
+        // `stage_then_rename_file` stages at `<dst>.cordis-tmp`; occupy it.
+        std::fs::create_dir(dir.path().join("out.so.cordis-tmp")).unwrap();
         let err = stage_then_rename_file(&src, &dst);
-        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(
-            permission_fault_holds(permission_bits_are_enforced(), &err, |e| {
-                matches!(e, RuntimeError::Io { message, .. } if message.starts_with("create tmp: "))
-            }),
-            "unexpected outcome for a read-only staging dir: {err:?}"
+            matches!(&err, Err(RuntimeError::Io { message, .. }) if message.starts_with("create tmp: ")),
+            "unexpected outcome for an occupied staging path: {err:?}"
         );
     }
 
@@ -2958,53 +2910,47 @@ exports = ["svc_a", "svc_b"]
         ));
     }
 
-    /// `cleanup_fixture_lockfiles` read_dir arm (opt-in enabled): a read-only
-    /// (unreadable) plugins root makes the top-level `read_dir` fail.
-    #[cfg(unix)]
+    /// `cleanup_fixture_lockfiles` read_dir arm (opt-in enabled): a regular
+    /// file where the plugins root belongs makes the top-level `read_dir` fail
+    /// with `ENOTDIR` — the same arm a permission-denied directory would hit,
+    /// but independent of the effective uid.
     #[test]
     #[serial_test::serial]
-    fn cleanup_fixture_lockfiles_errors_when_root_unreadable() {
+    fn cleanup_fixture_lockfiles_errors_when_root_is_a_file() {
         use super::cleanup_fixture_lockfiles;
         use cordis_runtime::core::error::RuntimeError;
-        use std::os::unix::fs::PermissionsExt;
         use tempfile::TempDir;
         let dir = TempDir::new().unwrap();
         let plugins_root = dir.path().join("plugins");
-        std::fs::create_dir(&plugins_root).unwrap();
-        // Deny read/exec so read_dir fails.
-        std::fs::set_permissions(&plugins_root, std::fs::Permissions::from_mode(0o000)).unwrap();
+        std::fs::write(&plugins_root, b"not a directory").unwrap();
         std::env::set_var("CORDIS_CLEAN_FIXTURE_LOCKFILES", "1");
         let err = cleanup_fixture_lockfiles(&plugins_root);
         std::env::remove_var("CORDIS_CLEAN_FIXTURE_LOCKFILES");
-        std::fs::set_permissions(&plugins_root, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(
-            permission_fault_holds(permission_bits_are_enforced(), &err, |e| {
-                matches!(e, RuntimeError::Io { .. })
-            }),
-            "unexpected outcome for a permission-denied path: {err:?}"
+            matches!(&err, Err(RuntimeError::Io { .. })),
+            "unexpected outcome for a non-directory plugins root: {err:?}"
         );
     }
 
-    /// `remove_lockfiles_recursively` read_dir arm: an unreadable subdirectory
-    /// makes the recursive `read_dir` fail.
+    /// `remove_lockfiles_recursively` read_dir arm: a path that is not a
+    /// regular file but also not a directory (a unix socket) falls through to
+    /// `read_dir`, which fails with `ENOTDIR`.
     #[cfg(unix)]
     #[test]
-    fn remove_lockfiles_recursively_errors_when_subdir_unreadable() {
+    fn remove_lockfiles_recursively_errors_when_path_is_not_a_directory() {
         use super::remove_lockfiles_recursively;
         use cordis_runtime::core::error::RuntimeError;
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::net::UnixListener;
         use tempfile::TempDir;
         let dir = TempDir::new().unwrap();
-        let sub = dir.path().join("locked");
-        std::fs::create_dir(&sub).unwrap();
-        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o000)).unwrap();
-        let err = remove_lockfiles_recursively(&sub);
-        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let socket = dir.path().join("not-a-dir");
+        // `metadata.is_file()` is false for a socket, so the walk reaches
+        // `read_dir` — which refuses anything that is not a directory.
+        let _listener = UnixListener::bind(&socket).unwrap();
+        let err = remove_lockfiles_recursively(&socket);
         assert!(
-            permission_fault_holds(permission_bits_are_enforced(), &err, |e| {
-                matches!(e, RuntimeError::Io { .. })
-            }),
-            "unexpected outcome for a permission-denied path: {err:?}"
+            matches!(&err, Err(RuntimeError::Io { .. })),
+            "unexpected outcome for a non-directory path: {err:?}"
         );
     }
 
@@ -3076,68 +3022,82 @@ exports = ["svc_a", "svc_b"]
 
     // ---------- maybe_remove_stale_lock remove_file error arms ----------
 
-    /// JSON stale-lock path: a dead-pid JSON lock is slated for removal, but a
-    /// read-only parent dir makes `fs::remove_file` fail (EACCES != NotFound),
-    /// exercising the Io error arm rather than the Ok/NotFound arms.
-    #[cfg(unix)]
+    /// A `remove_file` op that always reports a non-`NotFound` failure, so the
+    /// stale-lock unlink error arm becomes reachable regardless of uid.
+    fn failing_remove(_path: &std::path::Path) -> std::io::Result<()> {
+        Err(std::io::Error::other("injected remove failure"))
+    }
+
+    /// A `remove_file` op that reports the lock already being gone.
+    fn vanished_remove(_path: &std::path::Path) -> std::io::Result<()> {
+        Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+    }
+
+    /// JSON stale-lock path: a dead-pid JSON lock is slated for removal. The
+    /// injected `remove_file` covers both unlink arms — a non-`NotFound`
+    /// failure maps to `Io`, and `NotFound` is tolerated.
     #[test]
     fn maybe_remove_stale_lock_json_remove_failure_maps_to_io() {
         use super::current_epoch_ms;
-        use super::{maybe_remove_stale_lock, ArtifactBuildLockState};
+        use super::{maybe_remove_stale_lock_with_fs, ArtifactBuildLockState, MetaOps};
         use cordis_runtime::core::error::RuntimeError;
-        use std::os::unix::fs::PermissionsExt;
         use tempfile::TempDir;
         let dir = TempDir::new().unwrap();
-        let holder = dir.path().join("holder");
-        std::fs::create_dir(&holder).unwrap();
-        let path = holder.join("dead.lock");
+        let path = dir.path().join("dead.lock");
         let dead = ArtifactBuildLockState {
             pid: u32::MAX - 1,
             created_at_ms: current_epoch_ms(),
         };
         std::fs::write(&path, serde_json::to_vec(&dead).unwrap()).unwrap();
-        // Deny write on the parent dir so unlink of the lock file is refused.
-        std::fs::set_permissions(&holder, std::fs::Permissions::from_mode(0o555)).unwrap();
-        let err = maybe_remove_stale_lock(&path);
-        std::fs::set_permissions(&holder, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let ops = MetaOps {
+            remove_file: failing_remove,
+            ..MetaOps::STD
+        };
+        let err = maybe_remove_stale_lock_with_fs(&path, ops);
         assert!(
-            permission_fault_holds(permission_bits_are_enforced(), &err, |e| {
-                matches!(e, RuntimeError::Io { .. })
-            }),
-            "unexpected outcome for a permission-denied path: {err:?}"
+            matches!(&err, Err(RuntimeError::Io { message, .. }) if message.contains("injected remove failure")),
+            "unexpected outcome for a refused unlink: {err:?}"
         );
+        let ops = MetaOps {
+            remove_file: vanished_remove,
+            ..MetaOps::STD
+        };
+        maybe_remove_stale_lock_with_fs(&path, ops)
+            .expect("a lock that is already gone is not an error");
     }
 
     /// Legacy (non-JSON) stale-lock path: an ancient non-JSON lock is slated
-    /// for removal, but a read-only parent dir makes `fs::remove_file` fail,
-    /// exercising the legacy Io error arm.
-    #[cfg(unix)]
+    /// for removal, so the injected `remove_file` reaches the legacy unlink
+    /// arms (non-`NotFound` maps to `Io`, `NotFound` is tolerated).
     #[test]
     fn maybe_remove_stale_lock_legacy_remove_failure_maps_to_io() {
-        use super::maybe_remove_stale_lock;
+        use super::{maybe_remove_stale_lock_with_fs, MetaOps};
         use cordis_runtime::core::error::RuntimeError;
-        use std::os::unix::fs::PermissionsExt;
         use std::time::{Duration, SystemTime};
         use tempfile::TempDir;
         let dir = TempDir::new().unwrap();
-        let holder = dir.path().join("holder");
-        std::fs::create_dir(&holder).unwrap();
-        let path = holder.join("legacy.lock");
+        let path = dir.path().join("legacy.lock");
         std::fs::write(&path, "not json at all").unwrap();
         // Backdate mtime past LEGACY_STALE_LOCK_TIMEOUT so removal is attempted.
         let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
         file.set_modified(SystemTime::now() - Duration::from_secs(120))
             .unwrap();
         drop(file);
-        std::fs::set_permissions(&holder, std::fs::Permissions::from_mode(0o555)).unwrap();
-        let err = maybe_remove_stale_lock(&path);
-        std::fs::set_permissions(&holder, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let ops = MetaOps {
+            remove_file: failing_remove,
+            ..MetaOps::STD
+        };
+        let err = maybe_remove_stale_lock_with_fs(&path, ops);
         assert!(
-            permission_fault_holds(permission_bits_are_enforced(), &err, |e| {
-                matches!(e, RuntimeError::Io { .. })
-            }),
-            "unexpected outcome for a permission-denied path: {err:?}"
+            matches!(&err, Err(RuntimeError::Io { message, .. }) if message.contains("injected remove failure")),
+            "unexpected outcome for a refused legacy unlink: {err:?}"
         );
+        let ops = MetaOps {
+            remove_file: vanished_remove,
+            ..MetaOps::STD
+        };
+        maybe_remove_stale_lock_with_fs(&path, ops)
+            .expect("a legacy lock that is already gone is not an error");
     }
 
     // ---------- run_command_with_timeout spawn failure ----------
