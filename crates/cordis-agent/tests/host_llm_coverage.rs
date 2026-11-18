@@ -326,11 +326,15 @@ fn spawn_scripted_server(steps: Vec<ServerStep>) -> (String, std::thread::JoinHa
                         "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
                     )
                     .expect("headers");
+                    // The client may hang up before the body is finished — a
+                    // scenario the test is about, since it asserts on the
+                    // primary connection failing. A reset here is the client's
+                    // doing, not a broken reply, so it cannot be a panic.
                     for (_, chunk) in assistant_reply("scripted", &content) {
-                        write!(stream, "{:X}\r\n{}\r\n", chunk.len(), chunk).expect("chunk");
+                        let _ = write!(stream, "{:X}\r\n{}\r\n", chunk.len(), chunk);
                     }
-                    write!(stream, "0\r\n\r\n").expect("chunked end");
-                    stream.flush().expect("flush");
+                    let _ = write!(stream, "0\r\n\r\n");
+                    let _ = stream.flush();
                 }
             }
         }
