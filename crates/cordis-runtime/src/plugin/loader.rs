@@ -183,16 +183,15 @@ impl Loader {
                 );
                 metrics.plugin_unavailable_total += 1;
                 metrics.dylib_no_fallback_total += 1;
-                if entry.required {
-                    self.propagate_parent_failure(
-                        plugin_path,
-                        &index_map,
-                        &plugin_registry,
-                        &mut node_registry,
-                        &mut context,
-                        started_at,
-                    )?;
-                }
+                let blocked = self.propagate_parent_failure(
+                    entry,
+                    &index_map,
+                    &plugin_registry,
+                    &mut node_registry,
+                    &mut context,
+                    started_at,
+                );
+                blocked?;
                 continue;
             }
 
@@ -225,16 +224,15 @@ impl Loader {
                         );
                         metrics.plugin_unavailable_total += 1;
                         metrics.dylib_no_fallback_total += 1;
-                        if entry.required {
-                            self.propagate_parent_failure(
-                                plugin_path,
-                                &index_map,
-                                &plugin_registry,
-                                &mut node_registry,
-                                &mut context,
-                                started_at,
-                            )?;
-                        }
+                        let blocked = self.propagate_parent_failure(
+                            entry,
+                            &index_map,
+                            &plugin_registry,
+                            &mut node_registry,
+                            &mut context,
+                            started_at,
+                        );
+                        blocked?;
                         continue;
                     }
                 }
@@ -256,16 +254,15 @@ impl Loader {
                     );
                     metrics.plugin_unavailable_total += 1;
                     metrics.dylib_no_fallback_total += 1;
-                    if entry.required {
-                        self.propagate_parent_failure(
-                            plugin_path,
-                            &index_map,
-                            &plugin_registry,
-                            &mut node_registry,
-                            &mut context,
-                            started_at,
-                        )?;
-                    }
+                    let blocked = self.propagate_parent_failure(
+                        entry,
+                        &index_map,
+                        &plugin_registry,
+                        &mut node_registry,
+                        &mut context,
+                        started_at,
+                    );
+                    blocked?;
                     continue;
                 }
             }
@@ -298,16 +295,15 @@ impl Loader {
                 metrics.plugin_unavailable_total += 1;
                 metrics.dylib_abi_mismatch_total += 1;
                 metrics.dylib_no_fallback_total += 1;
-                if entry.required {
-                    self.propagate_parent_failure(
-                        plugin_path,
-                        &index_map,
-                        &plugin_registry,
-                        &mut node_registry,
-                        &mut context,
-                        started_at,
-                    )?;
-                }
+                let blocked = self.propagate_parent_failure(
+                    entry,
+                    &index_map,
+                    &plugin_registry,
+                    &mut node_registry,
+                    &mut context,
+                    started_at,
+                );
+                blocked?;
                 continue;
             }
 
@@ -346,16 +342,15 @@ impl Loader {
                     );
                     metrics.plugin_unavailable_total += 1;
                     metrics.dylib_no_fallback_total += 1;
-                    if entry.required {
-                        self.propagate_parent_failure(
-                            plugin_path,
-                            &index_map,
-                            &plugin_registry,
-                            &mut node_registry,
-                            &mut context,
-                            started_at,
-                        )?;
-                    }
+                    let blocked = self.propagate_parent_failure(
+                        entry,
+                        &index_map,
+                        &plugin_registry,
+                        &mut node_registry,
+                        &mut context,
+                        started_at,
+                    );
+                    blocked?;
                     continue;
                 }
 
@@ -375,16 +370,15 @@ impl Loader {
                     metrics.plugin_unavailable_total += 1;
                     metrics.dylib_abi_mismatch_total += 1;
                     metrics.dylib_no_fallback_total += 1;
-                    if entry.required {
-                        self.propagate_parent_failure(
-                            plugin_path,
-                            &index_map,
-                            &plugin_registry,
-                            &mut node_registry,
-                            &mut context,
-                            started_at,
-                        )?;
-                    }
+                    let blocked = self.propagate_parent_failure(
+                        entry,
+                        &index_map,
+                        &plugin_registry,
+                        &mut node_registry,
+                        &mut context,
+                        started_at,
+                    );
+                    blocked?;
                     continue;
                 }
 
@@ -433,16 +427,15 @@ impl Loader {
                         );
                         metrics.plugin_unavailable_total += 1;
                         metrics.dylib_no_fallback_total += 1;
-                        if entry.required {
-                            self.propagate_parent_failure(
-                                plugin_path,
-                                &index_map,
-                                &plugin_registry,
-                                &mut node_registry,
-                                &mut context,
-                                started_at,
-                            )?;
-                        }
+                        let blocked = self.propagate_parent_failure(
+                            entry,
+                            &index_map,
+                            &plugin_registry,
+                            &mut node_registry,
+                            &mut context,
+                            started_at,
+                        );
+                        blocked?;
                         continue;
                     }
                 }
@@ -484,32 +477,35 @@ impl Loader {
         // `InitFailed` with its nodes removed.
         for plugin_path in &index.topo_order {
             self.ensure_not_timed_out(started_at)?;
-            let Some(entry) = index_map.get(plugin_path) else {
-                continue;
-            };
-            let Some(parent) = entry.parent.as_ref() else {
-                continue;
-            };
-            let Some(parent_plugin) = plugin_registry.get(parent) else {
-                continue;
-            };
-            if matches!(parent_plugin.load_result, PluginLoadResult::Loaded) {
-                continue;
-            }
-            // Every `topo_order` entry was registered by the load loop above,
-            // so the `None` case is structurally unreachable; `into_iter` on
-            // the owned `Option` keeps the loop body a single covered region.
-            for plugin in plugin_registry.get(plugin_path).into_iter() {
-                if matches!(plugin.load_result, PluginLoadResult::Unavailable(..)) {
+            // Every `topo_order` entry comes from `entries`, so the `None` case
+            // is structurally unreachable; `into_iter` on the owned `Option`
+            // keeps the loop body a single covered region.
+            for entry in index_map.get(plugin_path).into_iter() {
+                let Some(parent) = entry.parent.as_ref() else {
+                    continue;
+                };
+                let Some(parent_plugin) = plugin_registry.get(parent) else {
+                    continue;
+                };
+                if matches!(parent_plugin.load_result, PluginLoadResult::Loaded) {
                     continue;
                 }
-                plugin_registry.mark_unavailable(plugin_path, PluginUnavailableReason::InitFailed);
-                node_registry.remove_by_plugin(plugin_path);
-                context.set_plugin_state(
-                    plugin_path,
-                    PluginLoadResult::Unavailable(PluginUnavailableReason::InitFailed),
-                );
-                metrics.plugin_unavailable_total += 1;
+                // Every `topo_order` entry was registered by the load loop above,
+                // so the `None` case is structurally unreachable; `into_iter` on
+                // the owned `Option` keeps the loop body a single covered region.
+                for plugin in plugin_registry.get(plugin_path).into_iter() {
+                    if matches!(plugin.load_result, PluginLoadResult::Unavailable(..)) {
+                        continue;
+                    }
+                    plugin_registry
+                        .mark_unavailable(plugin_path, PluginUnavailableReason::InitFailed);
+                    node_registry.remove_by_plugin(plugin_path);
+                    context.set_plugin_state(
+                        plugin_path,
+                        PluginLoadResult::Unavailable(PluginUnavailableReason::InitFailed),
+                    );
+                    metrics.plugin_unavailable_total += 1;
+                }
             }
         }
 
@@ -574,18 +570,23 @@ impl Loader {
         })
     }
 
+    /// `failed` carries both the parent link and the `required` flag, so a
+    /// non-required child's failure is a no-op inside the walk instead of an
+    /// `if` at each of the seven call sites — those guards left their
+    /// implicit-else line uncovered.
     fn propagate_parent_failure(
         &self,
-        failed_plugin_path: &str,
+        failed: &ArtifactIndexEntry,
         entries: &BTreeMap<String, ArtifactIndexEntry>,
         plugin_registry: &PluginRegistry,
         node_registry: &mut NodeRegistry,
         context: &mut RuntimeContext,
         started_at: Instant,
     ) -> Result<(), RuntimeError> {
-        let mut current = entries
-            .get(failed_plugin_path)
-            .and_then(|entry| entry.parent.clone());
+        if !failed.required {
+            return Ok(());
+        }
+        let mut current = failed.parent.clone();
         // P4-3: bounded walk. `detect_parent_cycle` rejects cyclic indexes
         // before the load loop, so a revisit here means the entries map was
         // mutated between the two passes — the visited set still guarantees
@@ -1533,7 +1534,7 @@ mod loader_flow_tests {
         let mut context = RuntimeContext::default();
         loader
             .propagate_parent_failure(
-                "a",
+                &entries["a"],
                 &entries,
                 &registry,
                 &mut node_registry,
