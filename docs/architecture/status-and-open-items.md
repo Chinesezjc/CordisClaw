@@ -33,6 +33,58 @@
 
 ## 3. 已完成
 
+### 3.0c 构建产物体积治理（2026-11-18）
+
+**症状**：13 天内根分区可用空间 34G → 14G，其中 `target/` 从 9.5G 涨到 22.4G
+（debug 12G + llvm-cov 5.4G），另有 `fixtures/plugins/target` 5.4G 与 `fixtures`
+下 12 个嵌套 target 2.5G——`cargo clean` 只管前者。
+
+**诊断**：cargo 的 unit hash 由依赖图状态决定，本仓每个 target 名有 8–9 个变体
+（`lib-cordis_runtime` 8 个、`test-lib-cordis_runtime` 9 个、每个集成测试 8 个）。
+8 个 lib 变体的 rustc hash、`path` 字段、依赖数（13）完全相同，**只有各依赖的
+metadata hash 不同**。据此排除了三类"配置变更"解释：工具链未换（569 个 fingerprint
+的 rustc hash 全部一致）、`Cargo.lock` 未变（已入库、未被忽略、11-12 之后无提交）、
+`.cargo/config.toml` 未改（10 月起无改动）。剩下的唯一输入是**依赖图状态**：历史上
+依赖版本更迭 + 不同 cargo 调用形态（`--workspace` / `-p` / `--all-targets` /
+`--lib`）下 feature 统一结果不同，都会让整条下游链换 hash。cargo 只保证"当前
+hash 的产物在"，旧 hash 的 rlib / rmeta / 测试二进制 / incremental 目录一律留着，
+于是每变一次就压一整套。
+
+还有第四个、纯工程性的增长源：并行 agent 用 `CARGO_TARGET_DIR=target-<name>` 在仓库
+根隔离构建，`cargo clean` 只认 workspace 的 `target/`，对这些目录完全无感——实测
+仓库根同时存在过 `target-cov-imp` 19G + `target-imgagent` 4.6G，且因为它们不匹配
+`.gitignore` 里的 `target/`，会以 untracked 身份出现在 `git status` 里。
+
+**治理（三条）**：
+
+1. **CI 关增量**：`ci` / `coverage` / `release` / `cold-check` 四个构建 job 加
+   `CARGO_INCREMENTAL: "0"`。CI 每次都在 rust-cache 的干净状态上重建，增量必然
+   不命中；覆盖率构建尤其明显——cargo-llvm-cov 的 rustc wrapper 只追加
+   `-C instrument-coverage --cfg=coverage`，**不会**关掉增量（本地实测
+   `target/llvm-cov-target/debug/incremental` 已到 900M）。
+2. **dev profile 降 debuginfo**：根 `Cargo.toml` 增 `[profile.dev] debug =
+   "line-tables-only"`。本仓硬门禁只需要**行**覆盖，行表（`.debug_line`）足够
+   llvm-cov 映射，变量/类型信息纯属体积。实测 `libcordis_runtime.rlib`
+   112M → 50M、集成测试二进制 193M → 82–98M。需要逐变量调试时用
+   `CARGO_PROFILE_DEV_DEBUG=2 cargo build` 临时覆盖。
+3. **一键回收**：新增 `scripts/clean-build-artifacts.sh`，默认 dry-run，`--yes`
+   执行；清 `target/`、仓库根的 `target-*/`、`fixtures/plugins/target`、`fixtures`
+   下所有嵌套 target、以及 `/tmp` 里超过 10 分钟且无进程占用的测试副本。有
+   cargo/rustc 在跑时默认拒绝（`--force` 越过），避免删掉正在编译的产物。不挂
+   cron——重置时机由人决定。同时给 `.gitignore` 补 `/target-*/`，让隔离构建目录
+   不再以 untracked 身份污染 `git status`。
+
+**为什么不引入 `cargo-sweep`**：已 unmaintained（README 首行警告）；实测 `--time 1`
+与 `--time 7` 都回收 **0 字节**（开发密度高时所有产物都在一天内被动过）；
+`--maxsize` 在本书会退化——尺寸基线取整个 `target/`（含 incremental），而删除集
+不含 incremental，于是每次都删光 deps 仍达不到目标，且会把当前构建一起删掉。
+
+**未做**：把 fixture 构建的 target 移出仓库（`crates/cordis-tooling/src/lib.rs:493`
+硬编码 `plugins/target/debug`）。它要改 `run_command` 的 runner 抽象（当前签名
+`Fn(program, args, cwd)` 没有 env 位）或改 `built_dylib_path` 的路径推导，牵连
+`DependencySnapshot.target_directory` 与 3 个测试；收益仅是"`cargo clean` 顺手清"，
+已由脚本覆盖，不再单独立项。
+
 ### 3.0a Agent loop 已移出 kernel（2026-10-31）
 
 循环不再是 kernel 的一部分：

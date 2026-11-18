@@ -12,6 +12,10 @@ jobs:
   cold-build:
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    # 这个 job 本来就刻意不挂 rust-cache，增量编译更是必然不会命中；显式关掉，
+    # 避免冷环境里额外生成几百 MB 的 incremental 目录。
+    env:
+      CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v4
 

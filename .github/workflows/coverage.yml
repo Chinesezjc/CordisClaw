@@ -15,6 +15,12 @@ jobs:
     runs-on: ubuntu-latest
     # 插桩后的串行全量测试比普通 CI 慢，放宽超时。
     timeout-minutes: 120
+    # 覆盖率构建有自己的 target 目录（`target/llvm-cov-target`），本地实测其中
+    # incremental 已涨到 900M：cargo-llvm-cov 的 rustc wrapper 只是追加
+    # `-C instrument-coverage --cfg=coverage`，并不会关掉增量。CI 上每次都是
+    # 一次性的全量插桩构建，增量纯属浪费，这里显式关闭。
+    env:
+      CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v4
 

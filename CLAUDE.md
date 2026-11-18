@@ -37,6 +37,21 @@ CordisClaw — 基于有色 Petri 网 (CPN) 的契约驱动插件树运行时。
 cargo llvm-cov --fail-under-lines 100 --ignore-filename-regex 'cordis-(runtime|cli)/src/(main|agent)\.rs' -- --test-threads=1
 ```
 
+清理构建产物（`target/`、仓库根的 `target-*/`、`fixtures/plugins/target`、
+`fixtures` 下嵌套 target、`/tmp` 里的测试副本）。默认 dry-run，`--yes` 才删；
+有 cargo/rustc 在跑时默认拒绝：
+
+```bash
+bash scripts/clean-build-artifacts.sh          # 只看能回收多少
+bash scripts/clean-build-artifacts.sh --yes    # 真正执行
+```
+
+为什么需要它：cargo 不回收旧 unit hash 的产物，`cargo-sweep` 又跳过 incremental
+（且已 unmaintained），实测 13 天涨 19G；并行 agent 用
+`CARGO_TARGET_DIR=target-<name>` 隔离出来的构建树 `cargo clean` 也完全看不到
+（实测同时存在过 19G + 4.6G）。dev profile 已改 `debug = "line-tables-only"`
+压体积；需要逐变量调试时用 `CARGO_PROFILE_DEV_DEBUG=2 cargo build`。
+
 ## 关键文档
 
 修改代码前后应参考：

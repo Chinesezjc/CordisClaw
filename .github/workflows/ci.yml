@@ -18,6 +18,11 @@ jobs:
   ci:
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    # CI 每次都在 rust-cache 的干净状态上重建，增量编译目录（`target/debug/
+    # incremental`，本地实测单棵树 4G 级）只会在缓存里白占体积、拖慢恢复，
+    # 不会命中上一次的中间结果。这里显式关掉，与本地开发（保留增量）分开。
+    env:
+      CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v4
 

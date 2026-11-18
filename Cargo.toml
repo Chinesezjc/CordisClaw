@@ -33,3 +33,12 @@ thiserror = "2"
 sha2 = "0.10"
 hex = "0.4"
 libloading = "0.8"
+
+# 体积治理（2026-11-18）：dev profile 默认带完整 debuginfo，实测单个集成测试
+# 二进制 193M、`libcordis_runtime.rlib` 112M、`target/` 单次全量构建就到 9G。
+# 本仓的硬门禁只需要**行**覆盖，行表（.debug_line）就足够 llvm-cov 做映射，
+# 变量/类型信息纯属体积负担。改成 `line-tables-only` 后仍能定位到行，只是调试
+# 时看不到局部变量值——需要逐变量调试时用环境变量临时覆盖：
+#   CARGO_PROFILE_DEV_DEBUG=2 cargo build
+[profile.dev]
+debug = "line-tables-only"
