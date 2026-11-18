@@ -1563,18 +1563,14 @@ mod tests {
         let fullwidth = format!(
             "{lt}{fw}{fw}DSML{fw}{fw} calls{gt}{nl}{lt}{fw}{fw}DSML{fw}{fw} invoke name={q}suspend{q}{gt}",
         );
-        let spaced = format!(
-            "{lt}|DSML|calls{gt}{nl}{lt}|DSML|invoke name={q}suspend{q}{gt}",
-        );
+        let spaced = format!("{lt}|DSML|calls{gt}{nl}{lt}|DSML|invoke name={q}suspend{q}{gt}",);
         for call in [fullwidth, spaced] {
             assert!(
                 classify(&call).is_none(),
                 "a call the parser reads is not a failure: {call}"
             );
         }
-        let broken = format!(
-            "{lt}|DSML|calls{gt}{nl}{lt}|DSML|call name={q}suspend{q}{gt}",
-        );
+        let broken = format!("{lt}|DSML|calls{gt}{nl}{lt}|DSML|call name={q}suspend{q}{gt}",);
         assert_eq!(classify(&broken).expect("failure").0, Kind::UnparsedDsml);
     }
 

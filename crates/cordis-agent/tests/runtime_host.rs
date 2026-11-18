@@ -1656,10 +1656,7 @@ fn runtime_host_iterate_plugins_agent_retries_on_raw_mod_identifier_and_promotes
     // The iteration used to roll back here only because the summary tool was
     // never called; the driver now derives the summary from the changed paths,
     // so a change that verifies is promoted.
-    assert_eq!(
-        result.final_verdict,
-        PluginIterationFinalVerdict::Promoted
-    );
+    assert_eq!(result.final_verdict, PluginIterationFinalVerdict::Promoted);
     // It promotes, so nothing is blocked. The candidate is consumed by the
     // promotion, which is why no snapshot is left behind — the same assertion
     // held before, but for the opposite reason.

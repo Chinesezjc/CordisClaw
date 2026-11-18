@@ -37,15 +37,51 @@ pub fn set_agent_inject_queue(q: Arc<Mutex<VecDeque<String>>>) {
 
 /// Drain queued messages for injection into the current Agent turn.
 fn drain_inject_queue() -> Vec<String> {
-    let guard = AGENT_INJECT_QUEUE.lock().unwrap_or_else(|p| p.into_inner());
-    if let Some(ref q) = *guard {
-        q.lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .drain(..)
-            .collect()
-    } else {
-        Vec::new()
+    // 测试线程的私有注入优先：进程级队列被整个测试进程共享，塞进去的消息会被
+    // 别的用例的 drain 抢走，"回合中途插话"因此无法确定性重放。
+    #[cfg(test)]
+    if let Some(queued) = take_test_injection() {
+        return queued;
     }
+    let guard = AGENT_INJECT_QUEUE.lock().unwrap_or_else(|p| p.into_inner());
+    drain_queue(guard.as_ref())
+}
+
+// 测试线程的一次性注入队列；非测试构建里根本不存在。
+#[cfg(test)]
+thread_local! {
+    static TEST_INJECTION: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+fn queue_test_injection(messages: Vec<String>) {
+    TEST_INJECTION.with(|slot| *slot.borrow_mut() = messages);
+}
+
+/// 取走当前线程的注入；空队列当作"没有"，于是落回进程级队列。
+#[cfg(test)]
+fn take_test_injection() -> Option<Vec<String>> {
+    TEST_INJECTION.with(|slot| {
+        let queued = std::mem::take(&mut *slot.borrow_mut());
+        (!queued.is_empty()).then_some(queued)
+    })
+}
+
+/// Drain one injection queue; nothing at all when no queue is installed.
+///
+/// Split out from [`drain_inject_queue`] so the "a queue with content" half can
+/// be tested without installing a process-wide queue that another test's turn
+/// might drain first.
+fn drain_queue(queue: Option<&Arc<Mutex<VecDeque<String>>>>) -> Vec<String> {
+    let Some(queue) = queue else {
+        return Vec::new();
+    };
+    queue
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .drain(..)
+        .collect()
 }
 
 /// How many times one turn re-issues a request the provider answered with
@@ -662,6 +698,39 @@ impl AgentSession {
         (result, turn)
     }
 
+    /// 把回合中途到达的消息追加到本次请求，并记入转录。
+    ///
+    /// 返回值是"队列里有没有东西"，调用方据此决定是否重入循环——即使整批都是
+    /// 空串也重入，因为是渠道把一次空推送当成了消息。空串本身丢弃：它进请求
+    /// 只会让模型回一句"你想说什么"。
+    ///
+    /// 提成具名方法而不是内联在循环里，是为了让"插话真的进了请求"这件事可以
+    /// 直接单测：进程级注入队列由整个测试进程共享，跑一轮真实的插话无法与其它
+    /// 用例的 drain 互斥。
+    fn push_injected(
+        &mut self,
+        messages: &mut Vec<Value>,
+        queued: Vec<String>,
+        round: usize,
+    ) -> bool {
+        let had_any = !queued.is_empty();
+        for m in queued {
+            if m.trim().is_empty() {
+                continue;
+            }
+            emit_agent_diagnostic(format!(
+                "agent_inject kind={} turn={} len={}",
+                self.kind,
+                round + 1,
+                m.len()
+            ));
+            messages.push(json!({"role": "user", "content": &m}));
+            self.transcript
+                .push(AgentTranscriptEntry::User { content: m });
+        }
+        had_any
+    }
+
     /// 回合的循环本体。每轮状态全在 `turn` 里；`self` 只被读写跨轮字段
     /// （`history` / `transcript` / `estimated_tokens` / `completed_turns`）。
     ///
@@ -828,23 +897,7 @@ impl AgentSession {
             }
 
             // Check for new messages since last turn and inject them.
-            {
-                let new_msgs = drain_inject_queue();
-                for m in new_msgs {
-                    if m.trim().is_empty() {
-                        continue;
-                    }
-                    emit_agent_diagnostic(format!(
-                        "agent_inject kind={} turn={} len={}",
-                        self.kind,
-                        round + 1,
-                        m.len()
-                    ));
-                    messages.push(json!({"role": "user", "content": &m}));
-                    self.transcript
-                        .push(AgentTranscriptEntry::User { content: m });
-                }
-            }
+            self.push_injected(&mut messages, drain_inject_queue(), round);
 
             emit_agent_diagnostic(format!(
                 "agent_turn_start kind={} turn={} elapsed_ms={} messages={} tools={}",
@@ -879,9 +932,11 @@ impl AgentSession {
                 // json_object` forbids tool calls outright, which is what made
                 // the model answer with whitespace and stop.
             });
-            if env::var("CORDIS_LLM_DUMP").ok().as_deref() == Some("1") {
-                dump_request(&request_body);
-            }
+            dump_request(
+                env::var("CORDIS_LLM_DUMP").ok().as_deref(),
+                std::path::Path::new("data/llm-debug"),
+                &request_body,
+            );
             let parts =
                 match provider.complete(request_body, sink.clone(), self.config.to_transport()) {
                     Ok(parts) => parts,
@@ -1057,18 +1112,13 @@ impl AgentSession {
                         .cloned()
                         .collect::<Vec<_>>()
                         .join(", ");
-                    let err_msg = if turn.unknown_tool_strikes >= UNKNOWN_TOOL_STRIKE_LIMIT {
-                        format!(
-                            "STOP — tool '{tool_name}' does not exist. Strike {}/{}. You are in a {} session. Your ONLY tools: {}",
-                            turn.unknown_tool_strikes, UNKNOWN_TOOL_STRIKE_LIMIT,
-                            backend.tool_scope_label(), tool_list,
-                        )
-                    } else {
-                        format!(
-                            "Tool '{tool_name}' does not exist (strike {}/{}). Available tools: {}",
-                            turn.unknown_tool_strikes, UNKNOWN_TOOL_STRIKE_LIMIT, tool_list,
-                        )
-                    };
+                    let err_msg = unknown_tool_message(
+                        tool_name,
+                        turn.unknown_tool_strikes,
+                        UNKNOWN_TOOL_STRIKE_LIMIT,
+                        &backend.tool_scope_label(),
+                        &tool_list,
+                    );
                     let _ = writeln!(
                         std::io::stdout(),
                         "⚙ {} (rejected — unknown tool)",
@@ -1165,39 +1215,29 @@ impl AgentSession {
                             });
                         }
                         // Check for late-arriving messages before replying.
-                        let new_msgs = drain_inject_queue();
-                        if !new_msgs.is_empty() {
-                            // Flush before continuing: this exit skips the
-                            // post-loop flush, so the warnings would be lost.
-                            flush_tool_failure_prompts(&mut messages, &mut tool_failure_prompts);
-                            for m in new_msgs {
-                                if m.trim().is_empty() {
-                                    continue;
-                                }
-                                messages.push(json!({"role": "user", "content": &m}));
-                                self.transcript
-                                    .push(AgentTranscriptEntry::User { content: m });
-                            }
-                            continue;
+                        // Flush first: this exit skips the post-loop flush, so
+                        // the warnings would be lost.
+                        flush_tool_failure_prompts(&mut messages, &mut tool_failure_prompts);
+                        if !self.push_injected(&mut messages, drain_inject_queue(), round) {
+                            self.remember_exchange(
+                                trimmed,
+                                &reply_content,
+                                message.reasoning_content.as_deref(),
+                                history_images(images, turn.images_stripped),
+                            );
+                            self.completed_turns += 1;
+                            self.transcript.push(AgentTranscriptEntry::Assistant {
+                                content: delivered_text(&tool_events, &reply_content),
+                                tools: tool_names(&tool_events),
+                                response_id: response_id.clone(),
+                                reasoning: closing_reasoning(&turn.reasoning),
+                            });
+                            return Ok(AgentReply {
+                                response_id,
+                                content: reply_content,
+                                tool_events,
+                            });
                         }
-                        self.remember_exchange(
-                            trimmed,
-                            &reply_content,
-                            message.reasoning_content.as_deref(),
-                            history_images(images, turn.images_stripped),
-                        );
-                        self.completed_turns += 1;
-                        self.transcript.push(AgentTranscriptEntry::Assistant {
-                            content: delivered_text(&tool_events, &reply_content),
-                            tools: tool_names(&tool_events),
-                            response_id: response_id.clone(),
-                            reasoning: closing_reasoning(&turn.reasoning),
-                        });
-                        return Ok(AgentReply {
-                            response_id,
-                            content: reply_content,
-                            tool_events,
-                        });
                     }
                 }
                 // Every tool result of this turn is pushed: merge the collected
@@ -1231,23 +1271,6 @@ impl AgentSession {
                     cordis_runtime::image_budget::INLINE_IMAGE_BUDGET_BYTES,
                 );
                 continue;
-            }
-
-            if end_requested {
-                turn.no_end_strikes = 0;
-                self.completed_turns += 1;
-                let closing = message.content.unwrap_or_default();
-                self.transcript.push(AgentTranscriptEntry::Assistant {
-                    content: delivered_text(&tool_events, &closing),
-                    tools: tool_names(&tool_events),
-                    response_id: response_id.clone(),
-                    reasoning: closing_reasoning(&turn.reasoning),
-                });
-                return Ok(AgentReply {
-                    response_id,
-                    content: closing,
-                    tool_events,
-                });
             }
 
             if self.require_end_tool {
@@ -1303,25 +1326,84 @@ impl AgentSession {
                 continue;
             }
 
-            if let Some(content) = message
+            // 正文为空才可能是"只有推理"或 provider 空补全；有正文的答复在
+            // 本回合最后一段统一收尾（那里也是唯一需要处理"回合中途插话"的
+            // 文本出口，放在最后才能用落出代码块代替 `continue`）。
+            let Some(content) = message
                 .content
                 .as_deref()
                 .map(str::trim)
                 .filter(|content| !content.is_empty())
-            {
-                // Before returning, check if new messages arrived during this turn.
-                let new_msgs = drain_inject_queue();
-                if !new_msgs.is_empty() {
-                    for m in new_msgs {
-                        if m.trim().is_empty() {
-                            continue;
-                        }
-                        messages.push(json!({"role": "user", "content": &m}));
-                        self.transcript
-                            .push(AgentTranscriptEntry::User { content: m });
+            else {
+                if message
+                    .reasoning_content
+                    .as_deref()
+                    .is_some_and(|value| !value.trim().is_empty())
+                {
+                    messages.push(llm_message_to_request(&message));
+                    turn.reasoning_only_strikes += 1;
+                    if turn.reasoning_only_strikes >= 3 {
+                        backend.host().agent_send_warning_to_test_groups(
+                            "⚠ Agent produced 3 consecutive reasoning-only responses — may be stuck.",
+                        );
+                        turn.reasoning_only_strikes = 0;
+                        turn.empty_response_strikes = 0;
                     }
-                    continue; // re-enter loop with new messages
+                    messages.push(json!({
+                        "role": "user",
+                        "content": "[system] You produced reasoning but no response. Please output your answer or call a tool.",
+                    }));
+                    continue;
                 }
+                turn.reasoning_only_strikes = 0;
+
+                // A completion with no content and no tool calls is a provider
+                // glitch (the adapter on the other side of this seam may also emit
+                // one). Retry the identical request a couple of times before
+                // giving up: failing here spills the user's message and shows a
+                // failure notice for something a second attempt usually fixes.
+                turn.empty_response_strikes += 1;
+                if turn.empty_response_strikes <= EMPTY_RESPONSE_RETRIES {
+                    // Change the request: re-sending the identical body after a
+                    // deterministic empty reply can only fail again, and the CLI
+                    // retries below multiply that into a dozen wasted calls.
+                    messages.push(json!({
+                        "role": "user",
+                        "content": "[system] Your previous reply was empty. Answer now: \
+                                    call a tool, or write the message body.",
+                    }));
+                    emit_agent_diagnostic(format!(
+                        "agent_empty_response_retry kind={} attempt={}",
+                        self.kind, turn.empty_response_strikes
+                    ));
+                    continue;
+                }
+                turn.empty_response_strikes = 0;
+                // If a message already went out this turn, the turn succeeded even
+                // though the closing reply was empty. Returning an error here made
+                // the channel spill the message to `pending` and replay it later —
+                // the same sentence arriving twice, sometimes a day apart.
+                if !tool_events.is_empty() {
+                    self.completed_turns += 1;
+                    return Ok(AgentReply {
+                        response_id,
+                        content: String::new(),
+                        tool_events,
+                    });
+                }
+                return Err(RuntimeError::LlmResponseInvalid {
+                    message: format!(
+                        "agent response had neither tool_calls nor final content \
+                         (after {} retries)",
+                        EMPTY_RESPONSE_RETRIES
+                    ),
+                });
+            };
+
+            // A message that arrived while the model was answering outranks the
+            // answer: re-enter the loop so the next request carries it. This is
+            // the round's last branch, so falling out of the `if` is `continue`.
+            if !self.push_injected(&mut messages, drain_inject_queue(), round) {
                 // Keep the fact that pictures came with this message: history
                 // used to store the text alone, so the next turn saw "no image"
                 // and answered as if nothing had been sent.
@@ -1352,70 +1434,6 @@ impl AgentSession {
                     tool_events,
                 });
             }
-
-            if message
-                .reasoning_content
-                .as_deref()
-                .is_some_and(|value| !value.trim().is_empty())
-            {
-                messages.push(llm_message_to_request(&message));
-                turn.reasoning_only_strikes += 1;
-                if turn.reasoning_only_strikes >= 3 {
-                    backend.host().agent_send_warning_to_test_groups(
-                        "⚠ Agent produced 3 consecutive reasoning-only responses — may be stuck.",
-                    );
-                    turn.reasoning_only_strikes = 0;
-                    turn.empty_response_strikes = 0;
-                }
-                messages.push(json!({
-                    "role": "user",
-                    "content": "[system] You produced reasoning but no response. Please output your answer or call a tool.",
-                }));
-                continue;
-            }
-            turn.reasoning_only_strikes = 0;
-
-            // A completion with no content and no tool calls is a provider
-            // glitch (the adapter on the other side of this seam may also emit
-            // one). Retry the identical request a couple of times before
-            // giving up: failing here spills the user's message and shows a
-            // failure notice for something a second attempt usually fixes.
-            turn.empty_response_strikes += 1;
-            if turn.empty_response_strikes <= EMPTY_RESPONSE_RETRIES {
-                // Change the request: re-sending the identical body after a
-                // deterministic empty reply can only fail again, and the CLI
-                // retries below multiply that into a dozen wasted calls.
-                messages.push(json!({
-                    "role": "user",
-                    "content": "[system] Your previous reply was empty. Answer now: \
-                                call a tool, or write the message body.",
-                }));
-                emit_agent_diagnostic(format!(
-                    "agent_empty_response_retry kind={} attempt={}",
-                    self.kind, turn.empty_response_strikes
-                ));
-                continue;
-            }
-            turn.empty_response_strikes = 0;
-            // If a message already went out this turn, the turn succeeded even
-            // though the closing reply was empty. Returning an error here made
-            // the channel spill the message to `pending` and replay it later —
-            // the same sentence arriving twice, sometimes a day apart.
-            if !tool_events.is_empty() {
-                self.completed_turns += 1;
-                return Ok(AgentReply {
-                    response_id,
-                    content: String::new(),
-                    tool_events,
-                });
-            }
-            return Err(RuntimeError::LlmResponseInvalid {
-                message: format!(
-                    "agent response had neither tool_calls nor final content \
-                     (after {} retries)",
-                    EMPTY_RESPONSE_RETRIES
-                ),
-            });
         }
 
         // P1-31: on turn overflow, preserve what was accumulated across
@@ -1423,25 +1441,25 @@ impl AgentSession {
         // context. The 1-slot skip accounts for the leading system prompt
         // that `messages` starts with; `self.history` doesn't include it.
         let system_prompt_offset = 1;
-        if messages.len() > self.history.len() + system_prompt_offset {
-            let recovered: Vec<_> = messages
-                .iter()
-                .skip(system_prompt_offset)
-                .skip(self.history.len())
-                .cloned()
-                .collect();
-            // Kernel introspection tool call/result pairs describe the
-            // agent's own internal state; drop them before they reach
-            // cross-turn history (and, via `to_snapshot`, on-disk recovery
-            // snapshots) so the LLM doesn't imitate diagnostic call patterns.
-            let recovered = filter_kernel_introspection_messages(&recovered);
-            for msg in &recovered {
-                self.estimated_tokens = self
-                    .estimated_tokens
-                    .saturating_add(estimate_message_tokens(msg));
-            }
-            self.history.extend(recovered);
+        // `skip` 链在没有新消息时本来就产出空序列，因此不需要"要不要恢复"的
+        // 分支：空的那一次 extend 是 no-op。
+        let recovered: Vec<_> = messages
+            .iter()
+            .skip(system_prompt_offset)
+            .skip(self.history.len())
+            .cloned()
+            .collect();
+        // Kernel introspection tool call/result pairs describe the
+        // agent's own internal state; drop them before they reach
+        // cross-turn history (and, via `to_snapshot`, on-disk recovery
+        // snapshots) so the LLM doesn't imitate diagnostic call patterns.
+        let recovered = filter_kernel_introspection_messages(&recovered);
+        for msg in &recovered {
+            self.estimated_tokens = self
+                .estimated_tokens
+                .saturating_add(estimate_message_tokens(msg));
         }
+        self.history.extend(recovered);
         Err(RuntimeError::LlmResponseInvalid {
             message: format!(
                 "agent exceeded safety turn limit {} without producing a final response",
@@ -2087,6 +2105,28 @@ impl ShellAgentSession {
         self.inner
             .remember_exchange(user_input, assistant_output, None, &[]);
         self.inner.completed_turns += 1;
+    }
+}
+
+/// 一个不存在的工具名要回给模型的纠正语。
+///
+/// 连续踩到 `limit` 次就把措辞换成"停手"，因为模型反复编造工具名时，温和的
+/// 提示会被它当成又一次可用工具说明。两段文本逐字节固定，并各有单测钉住。
+fn unknown_tool_message(
+    tool_name: &str,
+    strikes: usize,
+    limit: usize,
+    scope_label: &str,
+    tool_list: &str,
+) -> String {
+    if strikes >= limit {
+        format!(
+            "STOP — tool '{tool_name}' does not exist. Strike {strikes}/{limit}. You are in a {scope_label} session. Your ONLY tools: {tool_list}",
+        )
+    } else {
+        format!(
+            "Tool '{tool_name}' does not exist (strike {strikes}/{limit}). Available tools: {tool_list}",
+        )
     }
 }
 
@@ -3517,9 +3557,15 @@ For plugin node calls: always use invoke_plugin(plugin_path, node_id, payload_js
 ///
 /// Reasoning about "what did the model see" from the code is how the harness got
 /// its own behaviour wrong more than once; the dump is the record.
-fn dump_request(body: &Value) {
+///
+/// `enabled` is the raw `CORDIS_LLM_DUMP` value and `dir` the target directory;
+/// both are passed in so the writer can be exercised (including its two silent
+/// failure paths) without touching the repo's `data/`.
+fn dump_request(enabled: Option<&str>, dir: &std::path::Path, body: &Value) {
     use std::time::{SystemTime, UNIX_EPOCH};
-    let dir = std::path::Path::new("data/llm-debug");
+    if enabled != Some("1") {
+        return;
+    }
     if std::fs::create_dir_all(dir).is_err() {
         return;
     }
@@ -3532,7 +3578,16 @@ fn dump_request(body: &Value) {
 }
 
 fn emit_agent_diagnostic(message: String) {
-    if env::var(LLM_DEBUG_ENV).ok().as_deref() == Some("1") {
+    let enabled = env::var(LLM_DEBUG_ENV).ok().as_deref() == Some("1");
+    write_diagnostic(enabled, &message);
+}
+
+/// 真正写一行诊断。
+///
+/// 开关由调用方算好再传进来：这样"开启"分支可以直接单测，而不必在测试进程里
+/// 改进程级环境变量（多线程下修改环境并不安全）。
+fn write_diagnostic(enabled: bool, message: &str) {
+    if enabled {
         eprintln!("{message}");
     }
 }
@@ -3807,6 +3862,12 @@ mod tests {
         /// Content-addressed image cache the `view_image` fake reads from.
         /// Tests point it at a TempDir so the repo's `data/` is never touched.
         media_dir: std::path::PathBuf,
+        /// `agent_spill` answer: None keeps the trait default (this host cannot
+        /// spill), `Some(path)` pretends the full text landed there.
+        spill_path: Option<String>,
+        /// `agent_self_check_digest` answer: the failure record a real host
+        /// would fold into the system prompt.
+        digest: Option<String>,
     }
 
     /// Reference host for backends that never consult soul/hints.
@@ -3816,6 +3877,8 @@ mod tests {
         caller: None,
         routed: std::sync::Mutex::new(Vec::new()),
         media_dir: std::path::PathBuf::new(),
+        spill_path: None,
+        digest: None,
     };
 
     impl AgentToolHost for FakeHost {
@@ -4030,6 +4093,21 @@ mod tests {
 
         fn agent_send_warning_to_test_groups(&self, _message: &str) {}
 
+        /// 默认与真实宿主相反：这里没有可写目录，故返回 trait 默认的 Err。
+        /// 需要验证"结果确实落盘了"的用例用 `spill_path` 指定一个路径。
+        fn agent_spill(&self, tool: &str, _text: &str) -> Result<String, RuntimeError> {
+            match &self.spill_path {
+                Some(path) => Ok(path.clone()),
+                None => Err(RuntimeError::InvalidArgument {
+                    message: format!("this host cannot spill {tool} output"),
+                }),
+            }
+        }
+
+        fn agent_self_check_digest(&self) -> Option<String> {
+            self.digest.clone()
+        }
+
         fn agent_build_plugins(&self, _plugin_name: &str) -> Result<Value, RuntimeError> {
             Ok(json!({ "ok": true, "exit_code": 0 }))
         }
@@ -4069,6 +4147,8 @@ mod tests {
             caller: None,
             routed: std::sync::Mutex::new(Vec::new()),
             media_dir: std::path::PathBuf::new(),
+            spill_path: None,
+            digest: None,
         };
         let channel = RuntimeShellAgentBackend {
             host: &host,
@@ -4100,6 +4180,8 @@ mod tests {
             caller: None,
             routed: std::sync::Mutex::new(Vec::new()),
             media_dir: std::path::PathBuf::new(),
+            spill_path: None,
+            digest: None,
         };
         let backend = RuntimeShellAgentBackend {
             host: &host,
@@ -4127,6 +4209,8 @@ mod tests {
             caller: None,
             routed: std::sync::Mutex::new(Vec::new()),
             media_dir: std::path::PathBuf::new(),
+            spill_path: None,
+            digest: None,
         };
         let backend = RuntimeShellAgentBackend {
             host: &host,
@@ -4999,6 +5083,8 @@ mod tests {
             caller: None,
             routed: std::sync::Mutex::new(Vec::new()),
             media_dir: std::path::PathBuf::new(),
+            spill_path: None,
+            digest: None,
         };
         let mut backend = RuntimeShellAgentBackend {
             host: &host,
@@ -6826,5 +6912,924 @@ mod tests {
                 "{field} 不属于快照，不得被写出: {fresh}"
             );
         }
+    }
+
+    // -----------------------------------------------------------------
+    // 行覆盖补齐：会话表面（访问器、委派、诊断、注入队列）
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn session_accessors_report_what_was_set() {
+        let mut session =
+            AgentSession::new(LlmApiConfig::default(), "accessor-test").expect("build session");
+        assert_eq!(session.caller_policy(), (false, false));
+        session.set_caller_policy(true, true);
+        assert_eq!(session.caller_policy(), (true, true));
+        assert!(!session.can_approve_iteration());
+        session.set_approval_capability(true);
+        assert!(session.can_approve_iteration());
+        session.set_soul_key("qq:group:1");
+        assert_eq!(session.soul_key(), "qq:group:1");
+
+        // 换配置（profile fallback）不动历史：对话必须无缝接上。
+        session.inject_exchange("问题", "答复");
+        let swapped = LlmApiConfig {
+            model: "另一个模型".to_string(),
+            ..LlmApiConfig::default()
+        };
+        session.swap_config(swapped).expect("swap config");
+        assert_eq!(session.status().model, "另一个模型");
+        assert_eq!(session.status().stored_messages, 2, "换配置不清历史");
+    }
+
+    #[test]
+    fn tool_execution_summary_counts_success_and_failure() {
+        let mut session =
+            AgentSession::new(LlmApiConfig::default(), "summary-test").expect("build session");
+        session.transcript.push(AgentTranscriptEntry::User {
+            content: "hi".to_string(),
+        });
+        session.transcript.push(AgentTranscriptEntry::Tool {
+            name: "read_file".to_string(),
+            arguments: json!({"path": "a"}),
+            ok: true,
+            output: Some(json!({"ok": true})),
+            error: None,
+        });
+        session.transcript.push(AgentTranscriptEntry::Tool {
+            name: "write_file".to_string(),
+            arguments: json!({"path": "b"}),
+            ok: false,
+            output: None,
+            error: Some("denied".to_string()),
+        });
+        let summary = session.tool_execution_summary();
+        assert_eq!(summary.total_calls, 2);
+        assert_eq!(summary.successful_calls, 1);
+        assert_eq!(summary.failed_calls, 1);
+        assert_eq!(
+            summary.tool_names,
+            vec!["read_file".to_string(), "write_file".to_string()],
+            "工具名去重后按字典序"
+        );
+
+        // ShellAgentSession 的委派读的是同一个转录：只有 history 变了。
+        let mut shell = ShellAgentSession::new(LlmApiConfig::default()).expect("build shell");
+        shell.remember_exchange("u", "a");
+        assert_eq!(shell.status().stored_messages, 2);
+        assert_eq!(shell.tool_execution_summary().total_calls, 0);
+        assert!(shell.transcript().is_empty());
+    }
+
+    #[test]
+    fn a_shell_session_without_a_provider_reports_no_llm() {
+        let mut session = ShellAgentSession::new(LlmApiConfig::default()).expect("build session");
+        let err = session
+            .respond(&EMPTY_FAKE_HOST, "no-provider", "hi")
+            .expect_err("kernel has no built-in transport");
+        assert!(matches!(err, RuntimeError::NoLlmProvider), "{err:?}");
+        assert!(session.transcript().is_empty());
+        assert_eq!(session.status().completed_turns, 0);
+    }
+
+    #[test]
+    fn the_process_wide_inject_queue_is_installed() {
+        set_agent_inject_queue(Arc::new(Mutex::new(VecDeque::new())));
+        assert!(drain_inject_queue().is_empty(), "空队列排空后什么都没有");
+    }
+
+    #[test]
+    fn a_queued_injection_is_drained_once() {
+        // 进程级队列由整个测试进程共享，跑一轮真实的插话无法与其它用例的
+        // drain 互斥；这里直接测排空函数本身。
+        let queue = Arc::new(Mutex::new(VecDeque::new()));
+        assert!(drain_queue(None).is_empty(), "没安装队列时为空");
+        queue
+            .lock()
+            .expect("queue")
+            .push_back("晚到的消息".to_string());
+        assert_eq!(drain_queue(Some(&queue)), vec!["晚到的消息".to_string()]);
+        assert!(drain_queue(Some(&queue)).is_empty(), "只取一次");
+    }
+
+    #[test]
+    fn a_message_that_arrives_mid_turn_joins_the_live_request() {
+        let mut session =
+            AgentSession::new(LlmApiConfig::default(), "inject-test").expect("build session");
+        let mut messages = vec![json!({"role": "system", "content": "协议"})];
+
+        assert!(
+            !session.push_injected(&mut messages, Vec::new(), 0),
+            "空队列不重入循环"
+        );
+        assert_eq!(messages.len(), 1);
+
+        // 整批都是空白：丢弃它们，但仍然算"有插话"——调用方据此重入循环。
+        assert!(session.push_injected(&mut messages, vec!["   ".to_string()], 0));
+        assert_eq!(messages.len(), 1, "空白插话不进请求");
+        assert!(session.transcript().is_empty());
+
+        assert!(session.push_injected(&mut messages, vec!["插话".to_string()], 2));
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1], json!({"role": "user", "content": "插话"}));
+        assert_eq!(
+            session.transcript(),
+            [AgentTranscriptEntry::User {
+                content: "插话".to_string()
+            }]
+        );
+    }
+
+    #[test]
+    fn a_request_dump_is_written_only_when_asked() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let body = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]});
+
+        // 没开启时一个文件都不写。
+        dump_request(None, dir.path(), &body);
+        dump_request(Some("0"), dir.path(), &body);
+        assert_eq!(
+            std::fs::read_dir(dir.path()).expect("read dir").count(),
+            0,
+            "未开启时不得落盘"
+        );
+
+        // 开启时写一份完整请求体。
+        dump_request(Some("1"), dir.path(), &body);
+        let dumps: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("read dir")
+            .filter_map(|entry| entry.ok())
+            .collect();
+        assert_eq!(dumps.len(), 1);
+        let text = std::fs::read_to_string(dumps[0].path()).expect("read dump");
+        assert_eq!(serde_json::from_str::<Value>(&text).expect("json"), body);
+
+        // 目录被同名文件占住时静默跳过，绝不 panic。
+        let blocked = dir.path().join("occupied");
+        std::fs::write(&blocked, "x").expect("block the path");
+        dump_request(Some("1"), &blocked, &body);
+    }
+
+    #[test]
+    fn a_diagnostic_line_is_written_only_when_enabled() {
+        write_diagnostic(false, "关掉时不该出现");
+        write_diagnostic(true, "agent_debug_probe");
+    }
+
+    #[test]
+    fn a_recorded_exchange_needs_the_last_entry_to_be_an_action_placeholder() {
+        // 最后一条不是 assistant：不动。
+        let mut session = session_for_reply_tests();
+        session
+            .history
+            .push(json!({"role": "user", "content": "{\"action\":\"x\"}"}));
+        assert!(!session.replace_last_action_with_reply("新回复"));
+
+        // assistant 但正文不是字符串：没有占位符可换。
+        let mut session = session_for_reply_tests();
+        session.history.push(json!({
+            "role": "assistant",
+            "content": [{"type": "text", "text": "数组正文"}],
+        }));
+        assert!(!session.replace_last_action_with_reply("新回复"));
+        assert_eq!(
+            session.history.last().expect("last")["content"][0]["text"],
+            json!("数组正文")
+        );
+    }
+
+    #[test]
+    fn a_message_with_nothing_at_all_serialises_null_content() {
+        let message = cordis_plugin_sdk::llm::LlmMessage::default();
+        let request = llm_message_to_request(&message);
+        assert_eq!(request["role"], json!("assistant"));
+        assert!(request["content"].is_null(), "没有正文就是 null");
+        assert!(request.get("reasoning_content").is_none());
+        assert!(request.get("tool_calls").is_none());
+    }
+
+    #[test]
+    fn the_system_prompt_carries_the_failure_record_once() {
+        let host = FakeHost {
+            digest: Some("--- Your own failure record ---\n\n重复了 3 次空搜索。".to_string()),
+            ..FakeHost::default()
+        };
+        let backend = RuntimeShellAgentBackend {
+            host: &host,
+            session_id: "digest",
+            soul_key: String::new(),
+        };
+        let prompt = backend.system_prompt();
+        assert!(
+            prompt.contains("--- Your own failure record ---\n\n重复了 3 次空搜索。"),
+            "{prompt}"
+        );
+        assert_eq!(
+            prompt.matches("--- Your own failure record ---").count(),
+            1,
+            "标记只出现一次: {prompt}"
+        );
+
+        let bare = RuntimeShellAgentBackend {
+            host: &EMPTY_FAKE_HOST,
+            session_id: "digest",
+            soul_key: String::new(),
+        };
+        assert!(!bare.system_prompt().contains("Your own failure record"));
+    }
+
+    #[test]
+    fn the_runtime_shell_backend_dispatches_every_kernel_tool() {
+        let host = FakeHost::default();
+        let mut backend = RuntimeShellAgentBackend {
+            host: &host,
+            session_id: "dispatch-all",
+            soul_key: String::new(),
+        };
+        let mut attachments = Vec::new();
+        let cases: Vec<(&str, Value)> = vec![
+            (AGENT_TOOL_LIST_PLUGINS, json!({})),
+            (AGENT_TOOL_LIST_NODES, json!({})),
+            (AGENT_TOOL_GET_KERNEL_STATUS, json!({})),
+            (AGENT_TOOL_GET_KERNEL_ISSUES, json!({})),
+            (AGENT_TOOL_RELOAD_RUNTIME, json!({"plugin_path": "/"})),
+            (AGENT_TOOL_BUILD_PLUGINS, json!({"plugin_name": "all"})),
+            (
+                AGENT_TOOL_EXECUTE_TARGET,
+                json!({"node_fqn": "expr::expr_entry", "payload_json": {"x": 1}}),
+            ),
+            (
+                AGENT_TOOL_READ_FILE,
+                json!({"path": "src/lib.rs", "offset": 0, "limit": 2}),
+            ),
+            (AGENT_TOOL_LIST_DIRECTORY, json!({})),
+            (AGENT_TOOL_LIST_DIRECTORY, json!({"path": "src"})),
+            (
+                AGENT_TOOL_SEARCH_CODE,
+                json!({"pattern": "fn", "path": "src"}),
+            ),
+            (
+                AGENT_TOOL_WRITE_FILE,
+                json!({"path": "a.rs", "content": "x"}),
+            ),
+            (
+                AGENT_TOOL_REPLACE_IN_FILE,
+                json!({"path": "a.rs", "find": "x", "replace": "y"}),
+            ),
+            (AGENT_TOOL_REVERT_CHANGES, json!({})),
+            (AGENT_TOOL_DELETE_FILE, json!({"path": "a.rs"})),
+            (
+                AGENT_TOOL_RENAME_FILE,
+                json!({"path": "a.rs", "new_path": "b.rs"}),
+            ),
+            (
+                AGENT_TOOL_MOVE_FILE,
+                json!({"path": "a.rs", "new_path": "b.rs"}),
+            ),
+            (
+                AGENT_TOOL_COPY_FILE,
+                json!({"path": "a.rs", "new_path": "b.rs"}),
+            ),
+            (AGENT_TOOL_COMPACT_CONTEXT, json!({})),
+            (AGENT_TOOL_RUN_PLUGIN_TEST, json!({})),
+            (
+                AGENT_TOOL_RUN_PLUGIN_TEST,
+                json!({"command": "cargo test -p gacha"}),
+            ),
+            (
+                AGENT_TOOL_REQUEST_ITERATION,
+                json!({"plugin_path": "/web", "instruction": "加一个节点"}),
+            ),
+            (
+                AGENT_TOOL_CREATE_PLUGIN,
+                json!({"name": "fresh", "description": "新插件"}),
+            ),
+            (AGENT_TOOL_CREATE_PLUGIN, json!({"name": "bare"})),
+        ];
+        for (name, arguments) in cases {
+            let output = backend
+                .execute_tool(name, arguments, &mut attachments)
+                .unwrap_or_else(|err| panic!("{name} must dispatch: {err}"));
+            assert!(!output.is_null(), "{name} returned null");
+        }
+        assert!(attachments.is_empty(), "这些工具都不挂图片");
+
+        // `get_self_check` 由宿主默认实现报"做不到"：分派本身仍然走通。
+        let err = backend
+            .execute_tool(AGENT_TOOL_GET_SELF_CHECK, json!({}), &mut attachments)
+            .expect_err("the fake host cannot inspect transcripts");
+        assert!(
+            err.to_string().contains("cannot inspect agent transcripts"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn the_runtime_shell_backend_refuses_a_tool_it_does_not_have() {
+        let host = FakeHost::default();
+        let mut backend = RuntimeShellAgentBackend {
+            host: &host,
+            session_id: "unknown-tool",
+            soul_key: String::new(),
+        };
+        let err = backend
+            .execute_tool("qq_send", json!({}), &mut Vec::new())
+            .expect_err("qq_send is a plugin node, not a kernel tool");
+        assert!(
+            err.to_string()
+                .contains("runtime shell agent does not support tool qq_send"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn run_command_and_append_file_reach_the_host() {
+        let host = FakeHost::default();
+        let ran = host.agent_run_command("echo hi").expect("run command");
+        assert_eq!(ran["exit_code"], json!(0));
+        let appended = host.agent_append_file("a.rs", "追加").expect("append file");
+        assert_eq!(appended["appended_bytes"], json!("追加".len()));
+    }
+
+    // -----------------------------------------------------------------
+    // 行覆盖补齐：回合循环的各个出口
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn empty_input_and_an_unknown_provider_are_refused_before_the_provider_runs() {
+        let provider = FakeLlmProvider::new(vec![assistant_reply("never")]);
+        let mut session = ShellAgentSession::new(LlmApiConfig::default()).expect("build session");
+        let err = session
+            .respond_via(&EMPTY_FAKE_HOST, "empty-input", "   ", &provider)
+            .expect_err("empty input must be refused");
+        assert!(err.to_string().contains("must not be empty"), "{err}");
+
+        let mut unsupported = ShellAgentSession::new(LlmApiConfig {
+            provider: "anthropic".to_string(),
+            ..LlmApiConfig::default()
+        })
+        .expect("build session");
+        let err = unsupported
+            .respond_via(&EMPTY_FAKE_HOST, "bad-provider", "hi", &provider)
+            .expect_err("unknown provider must be refused");
+        assert!(
+            matches!(err, RuntimeError::UnsupportedLlmProvider { .. }),
+            "{err:?}"
+        );
+        assert!(
+            provider.seen_bodies.lock().expect("bodies").is_empty(),
+            "两种拒绝都不得碰 provider"
+        );
+    }
+
+    #[test]
+    fn one_shot_notes_ride_along_with_the_request_but_never_enter_history() {
+        let provider = FakeLlmProvider::new(vec![assistant_reply("收到")]);
+        let mut session = ShellAgentSession::new(LlmApiConfig::default()).expect("build session");
+        let reply = session
+            .inner
+            .respond_with_runtime_host_via_images(
+                &EMPTY_FAKE_HOST,
+                "notes",
+                "用户的问题",
+                &[],
+                "策略：只回答一句话",
+                &provider,
+                None,
+            )
+            .expect("agent reply");
+        assert_eq!(reply.content, "收到");
+
+        let bodies = provider.seen_bodies.lock().expect("bodies");
+        let messages = bodies[0]["messages"].as_array().expect("messages");
+        let last = messages.last().expect("the user message");
+        assert_eq!(
+            last["content"],
+            json!("策略：只回答一句话\n用户的问题"),
+            "一次性上下文只随这一条消息进请求"
+        );
+        drop(bodies);
+        assert_eq!(session.inner.history_len(), 2);
+        assert_eq!(
+            session.inner.history_value(0).expect("user")["content"],
+            json!("用户的问题"),
+            "history 不存策略行"
+        );
+    }
+
+    #[test]
+    fn an_exhausted_response_budget_fails_the_turn_before_the_request() {
+        let config = LlmApiConfig {
+            timeout_ms: 0,
+            stream_timeout_secs: 0,
+            ..LlmApiConfig::default()
+        };
+        let mut session = ShellAgentSession::new(config).expect("build session");
+        let provider = FakeLlmProvider::new(vec![assistant_reply("never")]);
+        let err = session
+            .respond_via(&EMPTY_FAKE_HOST, "budget", "hi", &provider)
+            .expect_err("a zero budget is already exhausted");
+        let text = err.to_string();
+        assert!(text.contains("exceeded total response budget"), "{text}");
+        assert!(text.contains("effective_budget_ms=0"), "{text}");
+        assert!(
+            provider.seen_bodies.lock().expect("bodies").is_empty(),
+            "预算用尽时不得发请求"
+        );
+    }
+
+    #[test]
+    fn a_broken_tool_chain_is_repaired_before_the_request() {
+        let provider = FakeLlmProvider::new(vec![assistant_reply("修好了")]);
+        let mut session = ShellAgentSession::new(LlmApiConfig::default()).expect("build session");
+        // 历史里留着一条没有对应 tool 结果的 assistant tool_call：整轮会 400。
+        session.inner.history.push(json!({
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "id": "orphan-call",
+                "type": "function",
+                "function": {"name": "read_file", "arguments": "{\"path\":\"a\"}"}
+            }],
+        }));
+        session
+            .inner
+            .history
+            .push(json!({"role": "user", "content": "继续"}));
+
+        let reply = session
+            .respond_via(&EMPTY_FAKE_HOST, "repair", "在吗", &provider)
+            .expect("reply");
+        assert_eq!(reply.content, "修好了");
+        let bodies = provider.seen_bodies.lock().expect("bodies");
+        let sent = bodies[0]["messages"].to_string();
+        assert!(
+            !sent.contains("orphan-call"),
+            "孤立的 tool_call 必须被丢掉: {sent}"
+        );
+    }
+
+    #[test]
+    fn a_provider_failure_before_any_delivery_fails_the_turn() {
+        let provider = FakeLlmProvider::new(Vec::new());
+        let mut session = ShellAgentSession::new(LlmApiConfig::default()).expect("build session");
+        let err = session
+            .respond_via(&EMPTY_FAKE_HOST, "provider-down", "hi", &provider)
+            .expect_err("the script is exhausted");
+        assert!(
+            matches!(err, RuntimeError::LlmRequestFailed { .. }),
+            "{err:?}"
+        );
+        // 转录补一条描述错误的 Assistant 占位，下一轮不会看到孤立的 User。
+        let transcript = session.transcript();
+        assert_eq!(transcript.len(), 2);
+        assert!(matches!(transcript[0], AgentTranscriptEntry::User { .. }));
+        assert!(matches!(
+            &transcript[1],
+            AgentTranscriptEntry::Assistant { content, .. } if content.starts_with("[error] ")
+        ));
+    }
+
+    #[test]
+    fn an_unknown_tool_is_reported_and_the_turn_goes_on() {
+        let provider = FakeLlmProvider::new(vec![
+            tool_call_message("call_bogus", "no_such_tool", json!({})),
+            assistant_reply("我改用 read_file。"),
+        ]);
+        let mut session = ShellAgentSession::new(LlmApiConfig::default()).expect("build session");
+        let reply = session
+            .respond_via(&EMPTY_FAKE_HOST, "bogus-tool", "hi", &provider)
+            .expect("the turn continues after a bogus tool name");
+        assert_eq!(reply.content, "我改用 read_file。");
+        assert!(reply.tool_events.is_empty(), "不存在的工具不进 tool_events");
+
+        let bodies = provider.seen_bodies.lock().expect("bodies");
+        let second = bodies[1].to_string();
+        assert!(
+            second.contains("STOP — tool 'no_such_tool' does not exist"),
+            "{second}"
+        );
+        assert!(second.contains("Your ONLY tools:"), "{second}");
+    }
+
+    #[test]
+    fn a_failing_tool_is_reported_and_the_turn_continues() {
+        let provider = FakeLlmProvider::new(vec![
+            tool_call_message(
+                "call_approve",
+                AGENT_TOOL_APPROVE_ITERATION,
+                json!({"iteration_id": "it-1"}),
+            ),
+            assistant_reply("工具失败了。"),
+        ]);
+        let mut session = ShellAgentSession::new(LlmApiConfig::default()).expect("build session");
+        let reply = session
+            .respond_via(&EMPTY_FAKE_HOST, "tool-fail", "hi", &provider)
+            .expect("the turn continues after a failed tool");
+        assert_eq!(reply.content, "工具失败了。");
+        assert_eq!(reply.tool_events.len(), 1);
+        assert!(!reply.tool_events[0].ok);
+
+        let bodies = provider.seen_bodies.lock().expect("bodies");
+        let second = bodies[1].to_string();
+        assert!(second.contains("FAILED: "), "{second}");
+        assert!(second.contains("cannot approve it-1"), "{second}");
+        assert!(
+            second.contains("Do NOT proceed as if it succeeded"),
+            "失败必须被显式告知: {second}"
+        );
+        // 失败的调用记进转录，后续复盘能看到。
+        assert!(session
+            .transcript()
+            .iter()
+            .any(|entry| matches!(entry, AgentTranscriptEntry::Tool { ok: false, .. })));
+    }
+
+    #[test]
+    fn three_reasoning_only_replies_trigger_a_stuck_warning() {
+        let provider = FakeLlmProvider::new(vec![
+            reasoning_reply("", "推理一"),
+            reasoning_reply("", "推理二"),
+            reasoning_reply("", "推理三"),
+            assistant_reply("终于有正文了"),
+        ]);
+        let mut session = ShellAgentSession::new(LlmApiConfig::default()).expect("build session");
+        let (result, turn) = session.inner.respond_capturing_turn(
+            &EMPTY_FAKE_HOST,
+            "reasoning-only",
+            "hi",
+            &provider,
+            None,
+        );
+        let reply = result.expect("the fourth round answers");
+        assert_eq!(reply.content, "终于有正文了");
+        assert_eq!(turn.reasoning_only_strikes, 0, "警告之后计数归零");
+        assert!(
+            turn.reasoning
+                .iter()
+                .any(|reason| reason.contains("推理三")),
+            "三条推理都留在回合记录里: {:?}",
+            turn.reasoning
+        );
+
+        let bodies = provider.seen_bodies.lock().expect("bodies");
+        assert_eq!(bodies.len(), 4);
+        assert!(
+            bodies[2].to_string().contains("reasoning but no response"),
+            "每一条只有推理的回复都要被追问"
+        );
+    }
+
+    #[test]
+    fn a_delivered_turn_survives_persistent_empty_replies() {
+        let provider = FakeLlmProvider::new(vec![
+            tool_call_message(
+                "call_send",
+                AGENT_TOOL_SEND_TO_SESSION,
+                json!({"target": "s2", "message": "在的"}),
+            ),
+            cordis_plugin_sdk::llm::LlmMessage::default(),
+            cordis_plugin_sdk::llm::LlmMessage::default(),
+        ]);
+        let mut session = ShellAgentSession::new(LlmApiConfig::default()).expect("build session");
+        let reply = session
+            .respond_via(&EMPTY_FAKE_HOST, "empty-after-send", "hi", &provider)
+            .expect("a delivered turn is not a failure");
+        assert_eq!(reply.content, "");
+        assert_eq!(reply.tool_events.len(), 1);
+        assert_eq!(session.status().completed_turns, 1);
+    }
+
+    #[test]
+    fn the_safety_turn_limit_preserves_what_the_turn_collected() {
+        let replies: Vec<_> = (0..AGENT_MAX_TOOL_TURNS)
+            .map(|index| {
+                tool_call_message(
+                    &format!("call_{index}"),
+                    AGENT_TOOL_GET_RUNTIME_STATUS,
+                    json!({}),
+                )
+            })
+            .collect();
+        let provider = FakeLlmProvider::new(replies);
+        let mut session = ShellAgentSession::new(LlmApiConfig::default()).expect("build session");
+        let err = session
+            .respond_via(&EMPTY_FAKE_HOST, "turn-limit", "hi", &provider)
+            .expect_err("no final answer ever came");
+        assert!(
+            err.to_string().contains("exceeded safety turn limit"),
+            "{err}"
+        );
+        // 溢出时把这一轮攒下的消息并入 history，重试才有上下文。
+        let kept = session.inner.history_len();
+        assert!(
+            kept >= 2,
+            "history must keep what the turn collected, got {kept}"
+        );
+        assert!(session.inner.history_value(0).is_some());
+    }
+
+    #[test]
+    fn a_turn_that_was_not_recorded_keeps_the_batch_body_and_the_image_note() {
+        let mut session =
+            AgentSession::new(LlmApiConfig::default(), "remember-test").expect("build session");
+        let event = AgentToolEvent {
+            name: AGENT_TOOL_SEND_TO_SESSION.to_string(),
+            arguments: json!({"target": "s2", "message": "在的"}),
+            ok: true,
+            output: Some(json!({"ok": true})),
+            error: None,
+        };
+        let result = Ok(AgentReply {
+            response_id: None,
+            content: String::new(),
+            tool_events: vec![event],
+        });
+        let input = "策略：只回一句\nCURRENT_INCOMING_BATCH_START\n真正的问题\nCURRENT_INCOMING_BATCH_END\n尾巴";
+        let images = vec![png_part(64)];
+
+        session.remember_if_unrecorded(
+            &result,
+            input,
+            &images,
+            0,
+            &Turn::default(),
+            &EMPTY_FAKE_HOST,
+        );
+
+        assert_eq!(session.history_len(), 2);
+        let user = session.history_value(0).expect("user").to_string();
+        assert!(user.contains("真正的问题"), "{user}");
+        assert!(
+            !user.contains("策略：只回一句"),
+            "策略行不进 history: {user}"
+        );
+        assert!(!user.contains("尾巴"), "批次外的内容不进 history: {user}");
+        assert!(user.contains("[附图 1 张"), "图片张数要留住: {user}");
+        let assistant = session.history_value(1).expect("assistant").to_string();
+        assert!(assistant.contains("在的"), "{assistant}");
+        assert!(assistant.contains("[tool] send_to_session"), "{assistant}");
+    }
+
+    /// 按脚本回放补全，并在第一次补全**之后**往当前线程的注入队列塞一条消息。
+    ///
+    /// 这正是"模型还在想，inbox 又推来一句"的时序：消息必须在下一轮进请求，
+    /// 而不是被旧答复盖过去。
+    struct LateInjectingProvider {
+        inner: FakeLlmProvider,
+        injected: std::sync::Mutex<bool>,
+    }
+
+    impl LateInjectingProvider {
+        fn new(replies: Vec<cordis_plugin_sdk::llm::LlmMessage>) -> Self {
+            Self {
+                inner: FakeLlmProvider::new(replies),
+                injected: std::sync::Mutex::new(false),
+            }
+        }
+    }
+
+    impl LlmProvider for LateInjectingProvider {
+        fn complete(
+            &self,
+            body: Value,
+            sink: Option<std::sync::Arc<dyn cordis_runtime::llm_sink::TokenSink>>,
+            transport: cordis_plugin_sdk::llm::LlmTransportConfig,
+        ) -> Result<LlmCompletionParts, RuntimeError> {
+            let parts = self.inner.complete(body, sink, transport)?;
+            let mut injected = self.injected.lock().expect("injected");
+            if !*injected {
+                *injected = true;
+                queue_test_injection(vec!["晚到的插话".to_string()]);
+            }
+            Ok(parts)
+        }
+    }
+
+    #[test]
+    fn a_late_message_reenters_the_round_instead_of_being_answered_over() {
+        let provider = LateInjectingProvider::new(vec![
+            assistant_reply("第一版答复"),
+            assistant_reply("带上插话的答复"),
+        ]);
+        let mut session = ShellAgentSession::new(LlmApiConfig::default()).expect("build session");
+        let reply = session
+            .respond_via(&EMPTY_FAKE_HOST, "late-inject", "hi", &provider)
+            .expect("the second round answers");
+        assert_eq!(
+            reply.content, "带上插话的答复",
+            "插话优先：旧答复不得直接收尾"
+        );
+
+        let bodies = provider.inner.seen_bodies.lock().expect("bodies");
+        assert_eq!(bodies.len(), 2, "循环必须因为插话重入一次");
+        let second_request = bodies[1].to_string();
+        drop(bodies);
+        assert!(
+            second_request.contains("晚到的插话"),
+            "插话要进第二轮请求: {second_request}"
+        );
+
+        let in_transcript = session
+            .transcript()
+            .iter()
+            .any(|entry| matches!(entry, AgentTranscriptEntry::User { content } if content == "晚到的插话"));
+        assert!(in_transcript, "插话也要进转录: {:?}", session.transcript());
+    }
+
+    #[test]
+    fn a_late_message_wins_over_a_terminal_tool_reply() {
+        // 终止工具已经产出了收尾答复，插话仍然优先：这一轮重入，答复留给下一轮。
+        let provider = LateInjectingProvider::new(vec![
+            tool_call_message("call_summary", TEST_TOOL_RECORD, json!({})),
+            assistant_reply("第二轮答复"),
+        ]);
+        let mut backend = TerminalTestBackend {
+            executed_tools: Vec::new(),
+        };
+        let mut session =
+            AgentSession::new(LlmApiConfig::default(), "terminal-inject").expect("build session");
+        let (result, turn) = session.respond_inner(&mut backend, "hi", &[], "", &provider, None);
+        let reply = result.expect("the second round answers");
+        assert_eq!(reply.content, "第二轮答复");
+        assert_eq!(backend.executed_tools, vec![TEST_TOOL_RECORD.to_string()]);
+        assert!(turn.attached.is_empty());
+    }
+
+    // -----------------------------------------------------------------
+    // 行覆盖补齐：纯函数
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn both_unknown_tool_messages_are_stable() {
+        assert_eq!(
+            unknown_tool_message("no_such_tool", 1, 1, "runtime_shell", "read_file, suspend"),
+            "STOP — tool 'no_such_tool' does not exist. Strike 1/1. You are in a runtime_shell session. Your ONLY tools: read_file, suspend"
+        );
+        // 未到上限时的措辞（`UNKNOWN_TOOL_STRIKE_LIMIT` 现在是 1，因此这条
+        // 分支只有直接调函数才走得到，但它是给上限调大后准备的）。
+        assert_eq!(
+            unknown_tool_message("no_such_tool", 1, 3, "runtime_shell", "read_file"),
+            "Tool 'no_such_tool' does not exist (strike 1/3). Available tools: read_file"
+        );
+    }
+
+    #[test]
+    fn a_recorded_tool_call_marks_failures_and_spills_big_results() {
+        let host = FakeHost::default();
+        let failed = AgentToolEvent {
+            name: "read_file".to_string(),
+            arguments: json!({"path": "a"}),
+            ok: false,
+            output: None,
+            error: None,
+        };
+        let rendered = render_recorded_call(&failed, &host);
+        assert!(rendered.ends_with("→ 失败: unknown error"), "{rendered}");
+
+        let failed_with_output = AgentToolEvent {
+            ok: false,
+            output: Some(json!({"error": "boom"})),
+            error: Some("ignored when output exists".to_string()),
+            ..failed.clone()
+        };
+        let rendered = render_recorded_call(&failed_with_output, &host);
+        assert!(
+            rendered.ends_with(r#"→ 失败: {"error":"boom"}"#),
+            "{rendered}"
+        );
+
+        // 成功但没有结果体：只留调用本身，不写箭头。
+        let ok_without_output = AgentToolEvent {
+            name: "approve_iteration".to_string(),
+            arguments: json!({"iteration_id": "it-1"}),
+            ok: true,
+            output: None,
+            error: None,
+        };
+        let rendered = render_recorded_call(&ok_without_output, &host);
+        assert!(
+            rendered.starts_with("[tool] approve_iteration "),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains('→'),
+            "没有结果时只留调用本身: {rendered}"
+        );
+
+        let big = "结果行\n".repeat(20_000);
+        let big_event = AgentToolEvent {
+            name: "read_file".to_string(),
+            arguments: json!({"path": "big"}),
+            ok: true,
+            output: Some(Value::String(big.clone())),
+            error: None,
+        };
+        // 宿主没有地方落盘：绝不能被"溢出"吞掉，退回内联截断。
+        let rendered = render_recorded_call(&big_event, &host);
+        assert!(
+            !rendered.contains("完整结果"),
+            "宿主无处落盘时退回内联: {rendered}"
+        );
+        assert!(rendered.chars().count() < 5_000);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let spilling = FakeHost {
+            spill_path: Some(dir.path().join("spill.txt").display().to_string()),
+            ..FakeHost::default()
+        };
+        let rendered = render_recorded_call(&big_event, &spilling);
+        assert!(
+            rendered.contains("完整结果"),
+            "溢出的结果必须指向落盘文件: {rendered}"
+        );
+        assert!(
+            rendered.chars().count() < big.chars().count(),
+            "落盘后上下文里只留头尾"
+        );
+
+        // 路径长到连预览都装不下：`bound` 返回 None，退回内联截断。
+        let tiny_preview = FakeHost {
+            spill_path: Some("x".repeat(30_000)),
+            ..FakeHost::default()
+        };
+        let rendered = render_recorded_call(&big_event, &tiny_preview);
+        assert!(!rendered.contains("完整结果"), "{rendered}");
+        assert!(rendered.chars().count() < 5_000, "退回内联截断");
+    }
+
+    #[test]
+    fn the_extractor_understands_escaped_characters_inside_strings() {
+        let text = r#"前缀 {"path":"C:\\tmp\\x","q":"a\"b"} 后缀"#;
+        let values = extract_json_objects(text);
+        assert_eq!(values.len(), 1, "{values:?}");
+        assert_eq!(values[0]["path"], json!(r"C:\tmp\x"));
+        assert_eq!(values[0]["q"], json!("a\"b"));
+    }
+
+    #[test]
+    fn closing_reasoning_is_capped_so_a_runaway_model_cannot_balloon_a_snapshot() {
+        let long = "推".repeat(9_000);
+        let clipped = closing_reasoning(std::slice::from_ref(&long)).expect("some reasoning");
+        assert_eq!(clipped.chars().count(), 8_000);
+        assert!(closing_reasoning(&[]).is_none());
+    }
+
+    #[test]
+    fn peeling_an_envelope_stops_at_a_non_object() {
+        let scalar = json!("不是对象");
+        assert_eq!(peel_envelope(&scalar), scalar);
+
+        // 两层裸信封都剥掉，直到剩下节点真正的参数。
+        let nested = json!({
+            "node_id": "qq_send",
+            "payload_json": {"node_id": "qq_send", "payload_json": {"target": "u1"}},
+        });
+        assert_eq!(
+            peel_envelope(&nested),
+            json!({"target": "u1"}),
+            "剥到不再是裸信封为止"
+        );
+        // 参数里带别的键就不再是信封，一个字节都不动。
+        let real_arguments =
+            json!({"node_id": "qq_send", "payload_json": {"target": "u1"}, "target": "u1"});
+        assert_eq!(peel_envelope(&real_arguments), real_arguments);
+    }
+
+    #[test]
+    fn a_wrapped_kernel_tool_keeps_its_nested_arguments() {
+        let tools = vec![AgentToolSpec {
+            name: AGENT_TOOL_END_TURN,
+            description: "end the turn",
+            parameters: json!({"type": "object"}),
+        }];
+        let wrapped = json!({
+            "node_id": AGENT_TOOL_INVOKE_PLUGIN,
+            "payload_json": {
+                "node_id": AGENT_TOOL_END_TURN,
+                "payload_json": {"reason": "done"},
+            },
+        });
+        let call = serialized_call_to_tool_call_at(&wrapped, 2, &tools).expect("resolved");
+        assert_eq!(call.function.name, AGENT_TOOL_END_TURN);
+        assert_eq!(
+            call.function.arguments,
+            json!({"reason": "done"}).to_string()
+        );
+        assert_eq!(call.id, format!("dsml-2-{AGENT_TOOL_END_TURN}"));
+
+        // 内层名字不是本会话的工具：不能当直接调用，落回 invoke_plugin 包装。
+        let unknown_inner = json!({
+            "node_id": AGENT_TOOL_INVOKE_PLUGIN,
+            "payload_json": {"node_id": "not_a_tool"},
+        });
+        let call = serialized_call_to_tool_call_at(&unknown_inner, 0, &tools).expect("wrapped");
+        assert_eq!(call.function.name, AGENT_TOOL_INVOKE_PLUGIN);
+
+        // payload 里根本没有内层 node_id：同样落回 invoke_plugin 包装。
+        let no_inner = json!({"node_id": AGENT_TOOL_INVOKE_PLUGIN});
+        let call = serialized_call_to_tool_call_at(&no_inner, 1, &tools).expect("wrapped");
+        assert_eq!(call.function.name, AGENT_TOOL_INVOKE_PLUGIN);
+        assert_eq!(call.id, format!("dsml-1-{AGENT_TOOL_INVOKE_PLUGIN}"));
     }
 }
