@@ -1302,8 +1302,12 @@ pub fn classify(content: &str) -> Option<(Kind, String)> {
     if trimmed == "(empty)" {
         return Some((Kind::Empty, "(empty)".to_string()));
     }
-    // A call the parser can read is not a failure, whatever else is in the text.
-    if trimmed.contains("<|DSML|invoke") {
+    // A call the parser reads is not a failure, whatever else is in the text.
+    // The parser folds the spellings the model mixes — the fullwidth pipe
+    // (U+FF5C), a doubled bar and the space after the tag name — so ask the
+    // same question. Matching the ASCII spelling alone reported every such
+    // call as dropped markup even though it ran and the turn answered.
+    if has_readable_call(trimmed) {
         return None;
     }
     // The retired single-object form (`{"node_id":"suspend"}`) still replays as
@@ -1328,6 +1332,31 @@ fn is_legacy_call(text: &str) -> bool {
         return false;
     };
     object.contains_key("node_id") || object.contains_key("action")
+}
+
+/// Does this text carry a call the DSML parser can actually read?
+///
+/// The parser folds the spellings the model mixes before it looks for a tag:
+/// the fullwidth pipe (U+FF5C) becomes ASCII, a doubled bar becomes one, and
+/// the space after the tag name is dropped. Folding only the whitespace here
+/// would still miss the first two, which is what made a readable call look
+/// like dropped markup.
+fn has_readable_call(text: &str) -> bool {
+    let mut folded = String::new();
+    for ch in text.to_ascii_lowercase().chars() {
+        let ch = if ch as u32 == 0xff5c { '|' } else { ch };
+        if ch.is_whitespace() {
+            continue;
+        }
+        if ch == '|' && folded.ends_with('|') {
+            continue;
+        }
+        folded.push(ch);
+    }
+    let needle: String = ['|', 'd', 's', 'm', 'l', '|', 'i', 'n', 'v', 'o', 'k', 'e']
+        .iter()
+        .collect();
+    folded.contains(&needle)
 }
 
 /// Keep the shape of a failure, drop the varying parts.
@@ -1516,6 +1545,37 @@ mod tests {
     fn markup_without_a_call_is_unparsed() {
         let (kind, _) = classify("<｜｜DSML｜｜ calls>").expect("failure");
         assert_eq!(kind, Kind::UnparsedDsml);
+    }
+
+    /// A call the parser reads is never an unparsed_dsml failure.
+    ///
+    /// The parser folds the fullwidth pipe (U+FF5C), a doubled tag bar and the
+    /// space after the tag name; this check matched the ASCII spelling only, so
+    /// a call written the other way was reported as dropped markup even though
+    /// its call ran and the turn answered.
+    #[test]
+    fn a_call_the_parser_reads_is_not_an_unparsed_failure() {
+        let lt = char::from_u32(0x3c).unwrap();
+        let gt = char::from_u32(0x3e).unwrap();
+        let q = char::from_u32(0x22).unwrap();
+        let fw = char::from_u32(0xff5c).unwrap();
+        let nl = char::from_u32(0x0a).unwrap();
+        let fullwidth = format!(
+            "{lt}{fw}{fw}DSML{fw}{fw} calls{gt}{nl}{lt}{fw}{fw}DSML{fw}{fw} invoke name={q}suspend{q}{gt}",
+        );
+        let spaced = format!(
+            "{lt}|DSML|calls{gt}{nl}{lt}|DSML|invoke name={q}suspend{q}{gt}",
+        );
+        for call in [fullwidth, spaced] {
+            assert!(
+                classify(&call).is_none(),
+                "a call the parser reads is not a failure: {call}"
+            );
+        }
+        let broken = format!(
+            "{lt}|DSML|calls{gt}{nl}{lt}|DSML|call name={q}suspend{q}{gt}",
+        );
+        assert_eq!(classify(&broken).expect("failure").0, Kind::UnparsedDsml);
     }
 
     #[test]

@@ -640,6 +640,12 @@ pub struct RuntimeHost {
     inflight_sessions: Mutex<BTreeSet<String>>,
     dropped_during_turn: Mutex<BTreeSet<String>>,
     pending_session_actions: Mutex<BTreeMap<String, Vec<PendingSessionAction>>>,
+    /// Inputs that arrived while a session was mid-turn. `send_to_session`
+    /// cannot deliver into a running turn, so it parks the message here and
+    /// the next `agent_send` folds it into that turn's opening user message.
+    /// Bounded per session (oldest dropped first) so a chatty peer cannot grow
+    /// the map without limit.
+    session_mailbox: Mutex<BTreeMap<String, VecDeque<String>>>,
     turn_meta: Mutex<BTreeMap<String, BTreeMap<String, String>>>,
     profile_fallback: Mutex<BTreeMap<String, ProfileFallbackEntry>>,
     pub service_registry: Arc<crate::context::ServiceRegistry>,
@@ -1264,19 +1270,39 @@ impl RuntimeHost {
         &self,
         request: crate::kernel::plugin_iteration::KernelPluginIterationRequest,
     ) -> Result<KernelPluginIterationResult, crate::core::error::RuntimeError> {
+        self.iterate_plugins_from(None, request)
+    }
+
+    /// [`RuntimeHost::iterate_plugins`] on behalf of a session.
+    ///
+    /// `origin_session_id` is who asked (`agent_request_iteration` passes the
+    /// caller). The iteration session becomes its child so the iteration can
+    /// report back, instead of every iteration hanging off main.
+    pub fn iterate_plugins_from(
+        &self,
+        origin_session_id: Option<&str>,
+        request: crate::kernel::plugin_iteration::KernelPluginIterationRequest,
+    ) -> Result<KernelPluginIterationResult, crate::core::error::RuntimeError> {
         let runner = crate::iteration_api::iteration_runner()
             .ok_or_else(crate::iteration_api::missing_runner_error)?;
-        runner.iterate(self, request)
+        runner.iterate(self, request, origin_session_id)
     }
 
     /// Start a plugin-iteration agent session and register it in the map.
     ///
     /// Kept on the host (not in the pipeline) so the pipeline only needs a
     /// named capability instead of reaching into `agent_sessions`.
+    ///
+    /// `origin_session_id` is the session that asked for the iteration. The
+    /// new session hangs off it, which is what lets an iteration report back
+    /// through `send_to_session`. An unknown or absent origin (a CLI run, a
+    /// recovered session) falls back to main; with no main either, the
+    /// iteration stays a root rather than failing the pipeline.
     pub fn start_iteration_session(
         &self,
         prepared: PreparedPluginIteration,
         context_paths: PluginIterationContextPaths,
+        origin_session_id: Option<&str>,
     ) -> Result<String, RuntimeError> {
         let session_id = normalize_request_id(None, "plugin-agent-session");
         let mut llm_config = self.config_value().llm_api.clone();
@@ -1286,10 +1312,10 @@ impl RuntimeHost {
         let session = crate::agent_loop::agent_loop()
             .ok_or_else(crate::agent_loop::missing_loop_error)?
             .create(llm_config, "plugin_iteration")?;
-        // The iteration request does not carry the session that asked for it,
-        // so the edge falls back to the main session. Recorded as an open item
-        // in docs/architecture/status-and-open-items.md.
-        let spawned_by = self.main_session_id();
+        let spawned_by = origin_session_id
+            .filter(|origin| self.session_is_live(origin))
+            .map(str::to_string)
+            .or_else(|| self.main_session_id());
         self.session_nodes
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
@@ -1432,6 +1458,7 @@ impl RuntimeHost {
             inflight_sessions: Mutex::new(BTreeSet::new()),
             dropped_during_turn: Mutex::new(BTreeSet::new()),
             pending_session_actions: Mutex::new(BTreeMap::new()),
+            session_mailbox: Mutex::new(BTreeMap::new()),
             turn_meta: Mutex::new(BTreeMap::new()),
             profile_fallback: Mutex::new(BTreeMap::new()),
             service_registry,
@@ -3162,6 +3189,7 @@ impl ManagedAgentSession {
             ),
             ManagedAgentState::PluginIteration(state) => self.session.respond_with_iteration(
                 host,
+                &self.handle.session_id,
                 state.as_mut(),
                 input,
                 images,

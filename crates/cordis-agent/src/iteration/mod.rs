@@ -17,8 +17,9 @@ impl IterationRunner for CargoIterationRunner {
         &self,
         host: &RuntimeHost,
         request: KernelPluginIterationRequest,
+        origin_session_id: Option<&str>,
     ) -> Result<KernelPluginIterationResult, RuntimeError> {
-        driver::iterate_plugins(host, request)
+        driver::iterate_plugins(host, request, origin_session_id)
     }
 
     fn approve(

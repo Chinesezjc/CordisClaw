@@ -88,6 +88,7 @@ pub trait AgentSessionApi: Send {
     fn respond_with_iteration(
         &mut self,
         host: &crate::host::RuntimeHost,
+        session_id: &str,
         state: &mut crate::host::PluginIterationAgentState,
         input: &str,
         images: &[Value],
@@ -238,6 +239,7 @@ pub mod test_loop {
         fn respond_with_iteration(
             &mut self,
             _host: &crate::host::RuntimeHost,
+            _session_id: &str,
             _state: &mut crate::host::PluginIterationAgentState,
             _input: &str,
             _images: &[Value],

@@ -25,13 +25,15 @@ pub fn start_plugin_iteration_agent_session<H: IterationHost>(
     host: &H,
     prepared: PreparedPluginIteration,
     context_paths: PluginIterationContextPaths,
+    origin_session_id: Option<&str>,
 ) -> Result<String, RuntimeError> {
-    host.start_iteration_session(prepared, context_paths)
+    host.start_iteration_session(prepared, context_paths, origin_session_id)
 }
 
 pub fn iterate_plugins<H: IterationHost>(
     host: &H,
     request: KernelPluginIterationRequest,
+    origin_session_id: Option<&str>,
 ) -> Result<KernelPluginIterationResult, RuntimeError> {
     let snapshot = host.current_snapshot();
     let prepared = host
@@ -58,7 +60,7 @@ pub fn iterate_plugins<H: IterationHost>(
             let mut state = PluginIterationRunState::new(prepared.clone());
 
             // Step 1: Run the agent loop — the agent freely decides what to do.
-            match run_plugin_iteration_agent(host, &state.prepared) {
+            match run_plugin_iteration_agent(host, &state.prepared, origin_session_id) {
                 Ok(agent) => record_agent_outcome(host, &mut state, agent),
                 Err(err) => {
                     fail_stage(host, &mut state, "agent", &err);
@@ -382,6 +384,7 @@ pub fn resolve_iteration_summary(
 pub fn run_plugin_iteration_agent<H: IterationHost>(
     host: &H,
     prepared: &PreparedPluginIteration,
+    origin_session_id: Option<&str>,
 ) -> Result<PluginIterationAgentRun, RuntimeError> {
     if let Some(plan) = &prepared.edit_plan {
         host.kernel()
@@ -425,7 +428,13 @@ pub fn run_plugin_iteration_agent<H: IterationHost>(
         &prepared.target_plugin_paths,
     );
     let context_paths = collected?;
-    let session_id = start_plugin_iteration_agent_session(host, prepared.clone(), context_paths)?;
+    let session = start_plugin_iteration_agent_session(
+        host,
+        prepared.clone(),
+        context_paths,
+        origin_session_id,
+    );
+    let session_id = session?;
     let input = prepared
         .instruction
         .clone()

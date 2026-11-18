@@ -2275,8 +2275,12 @@ impl<'a, H: AgentToolHost + ?Sized> AgentBackend for RuntimeShellAgentBackend<'a
                 let payload = self
                     .host
                     .inject_turn_meta(self.session_id, args.payload_json);
-                self.host
-                    .agent_invoke_plugin(&args.plugin_path, &args.node_id, payload)
+                self.host.agent_invoke_plugin(
+                    self.session_id,
+                    &args.plugin_path,
+                    &args.node_id,
+                    payload,
+                )
             }
             AGENT_TOOL_EXECUTE_TARGET => {
                 let args = parse_tool_value_arguments::<ExecuteTargetArgs>(arguments, name)?;
@@ -2347,8 +2351,11 @@ impl<'a, H: AgentToolHost + ?Sized> AgentBackend for RuntimeShellAgentBackend<'a
             }
             AGENT_TOOL_REQUEST_ITERATION => {
                 let args = parse_tool_value_arguments::<RequestIterationArgs>(arguments, name)?;
-                self.host
-                    .agent_request_iteration(&args.plugin_path, &args.instruction)
+                self.host.agent_request_iteration(
+                    self.session_id,
+                    &args.plugin_path,
+                    &args.instruction,
+                )
             }
             AGENT_TOOL_APPROVE_ITERATION => {
                 let args = parse_tool_value_arguments::<ApproveIterationArgs>(arguments, name)?;
@@ -3070,7 +3077,7 @@ fn shell_agent_tools() -> Vec<AgentToolSpec> {
         },
         AgentToolSpec {
             name: cordis_runtime::agent_tools::AGENT_TOOL_SEND_TO_SESSION,
-            description: "Deliver a message to a session listed in your latest my_team reachable set, then return its reply.",
+            description: "Deliver a message to a session listed in your latest my_team reachable set, then return its reply. If the target is mid-turn the message is queued for its next turn (queued:true) instead of being dropped.",
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -3872,6 +3879,7 @@ mod tests {
 
         fn agent_invoke_plugin(
             &self,
+            _session_id: &str,
             plugin_path: &str,
             node_id: &str,
             payload_json: Value,
@@ -3995,6 +4003,7 @@ mod tests {
 
         fn agent_request_iteration(
             &self,
+            _session_id: &str,
             _plugin_path: &str,
             _instruction: &str,
         ) -> Result<Value, RuntimeError> {
@@ -6176,6 +6185,38 @@ mod tests {
         let properties = spec.parameters["properties"].to_string();
         assert!(properties.contains("path"), "{properties}");
         assert!(properties.contains("sha256"), "{properties}");
+    }
+
+    /// A room-facing session keeps its voice. Channel send nodes are plugin
+    /// nodes (`qq_send`, `feishu_send`, …), reached through the `invoke_plugin`
+    /// gateway — the kernel catalogue deliberately stays free of
+    /// plugin-discovered names. Guard that gateway: removing it would silence
+    /// every room, which is exactly the regression an over-eager "drop the
+    /// channel tools" filter could cause.
+    #[test]
+    fn a_room_session_keeps_its_channel_gateway() {
+        let tools = shell_agent_tools();
+        assert!(
+            tools
+                .iter()
+                .any(|tool| tool.name == AGENT_TOOL_INVOKE_PLUGIN),
+            "a room session must keep invoke_plugin"
+        );
+        assert!(
+            tools
+                .iter()
+                .any(|tool| tool.name == cordis_runtime::agent_tools::AGENT_TOOL_SEND_TO_SESSION),
+            "a room session must keep send_to_session"
+        );
+        // The node it speaks through is still classified as a channel voice;
+        // only plugin-iteration sessions are refused it by the runtime.
+        assert!(cordis_runtime::agent_tools::is_channel_speak_tool(
+            "qq_send", "qq"
+        ));
+        assert!(cordis_runtime::agent_tools::is_channel_speak_tool(
+            "feishu_send",
+            "feishu"
+        ));
     }
 
     /// 端到端：第一轮模型调 `view_image`，**下一次请求**里就带上了原图。

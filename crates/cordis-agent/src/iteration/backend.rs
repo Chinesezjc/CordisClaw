@@ -15,6 +15,17 @@ use std::process::Command;
 pub struct PluginIterationAgentBackend<'a> {
     pub host: &'a RuntimeHost,
     pub state: &'a mut PluginIterationAgentState,
+    /// The session this backend runs. `my_team` / `send_to_session` are
+    /// answered for it, and it is the identity every plugin call carries.
+    pub session_id: &'a str,
+}
+
+/// Arguments for `send_to_session`.
+#[derive(serde::Deserialize)]
+struct SendToSessionArgs {
+    /// An id from the caller's most recent `my_team` reply (or its address).
+    target: String,
+    message: String,
 }
 
 impl<'a> PluginIterationAgentBackend<'a> {
@@ -494,13 +505,30 @@ Use rebuild_plugin_workspace to refresh artifacts and generated docs after edits
 If a child plugin path uses a Rust keyword such as `mod`, keep that keyword in filesystem and `plugin_path` positions like `expr/evaluator/mod`. Type names such as `ModPlugin` and `ModError` are valid, but raw lower-case source identifiers such as a field, local, parameter, alias, or member named `mod` are invalid; prefer names like `modulo` or `mod_plugin` for those Rust identifiers.\n\
 Replace placeholder scaffold implementations, tests, and docs together once the behavior is real, and do not stop after scaffolding a child plugin without wiring or testing it from the host subtree.\n\
 When the iteration is ready, call record_iteration_summary with a concise summary and any recommended verification commands. record_iteration_summary must be your last tool call and it ends the session immediately.\n\
+You are not in the room this iteration was requested from. To report back, call my_team and then send_to_session to the session that started you; never try to post into the room yourself.\n\
 Do not attempt to modify runtime crates, repository root manifests, config, .git, target, or generated docs under docs/agent.",
             self.state.prepared.root_plugin_path
         )
     }
 
     fn tool_specs(&self) -> Vec<AgentToolSpec> {
+        // This is an allowlist of kernel tools. A channel tool
+        // (`<plugin>_send`, see `is_channel_speak_tool`) must never be added
+        // here: an iteration session reports to the session that started it
+        // through `send_to_session`, and the front desk decides what the room
+        // hears. The runtime refuses such a call at the invoke seam as well,
+        // so this list and that guard cannot drift apart silently.
         let mut tools = vec![
+            AgentToolSpec {
+                name: cordis_runtime::agent_tools::AGENT_TOOL_MY_TEAM,
+                description: "Your place in the session tree: who created you, who you created, who shares your kind of room, and the ids you may message. An iteration reports to the session that started it; it does not speak into that room itself.",
+                parameters: json!({"type":"object","properties":{},"additionalProperties":false}),
+            },
+            AgentToolSpec {
+                name: cordis_runtime::agent_tools::AGENT_TOOL_SEND_TO_SESSION,
+                description: "Deliver a message to a session listed in your latest my_team reachable set, then return its reply. If the target is mid-turn the message is queued for its next turn (queued:true) instead of being dropped. Use this to hand the outcome back to the session that started the iteration; the receiver decides whether the room hears it.",
+                parameters: json!({"type":"object","properties":{"target":{"type":"string"},"message":{"type":"string"}},"required":["target","message"],"additionalProperties":false}),
+            },
             AgentToolSpec {
                 name: PLUGIN_AGENT_TOOL_LIST_CONTEXT_FILES,
                 description: "List readable context files for the selected plugin subtree. Defaults to the structural focus shortlist; use scope=all to expand the visible context set.",
@@ -584,6 +612,18 @@ Do not attempt to modify runtime crates, repository root manifests, config, .git
         _attachments: &mut Vec<Value>,
     ) -> Result<Value, RuntimeError> {
         match name {
+            // The one channel an iteration session has: the session that
+            // started it. `my_team` reveals it (its `spawned_by`), and
+            // `send_to_session` delivers to it like any other teammate.
+            cordis_runtime::agent_tools::AGENT_TOOL_MY_TEAM => {
+                let _: Value = parse_agent_args::<Value>(arguments, name)?;
+                self.host.agent_my_team(self.session_id)
+            }
+            cordis_runtime::agent_tools::AGENT_TOOL_SEND_TO_SESSION => {
+                let args = parse_agent_args::<SendToSessionArgs>(arguments, name)?;
+                self.host
+                    .agent_send_to_session(self.session_id, &args.target, &args.message)
+            }
             PLUGIN_AGENT_TOOL_LIST_CONTEXT_FILES => {
                 let args = parse_agent_args::<ListContextFilesArgs>(arguments, name)?;
                 let scope = parse_context_files_scope(args.scope.as_deref())?;

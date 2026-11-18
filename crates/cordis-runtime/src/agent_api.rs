@@ -71,8 +71,14 @@ pub trait AgentToolHost {
     /// conventions (e.g. chat mode vs suspend for a messaging plugin) are
     /// injected automatically without hardcoding them in the kernel.
     fn agent_plugin_hints(&self) -> Vec<String>;
+    /// Invoke a plugin node on behalf of `session_id`.
+    ///
+    /// The caller's identity is part of the contract: a plugin-iteration
+    /// session may not speak into a room, and only the invoker knows which
+    /// session is calling.
     fn agent_invoke_plugin(
         &self,
+        session_id: &str,
         plugin_path: &str,
         node_id: &str,
         payload_json: Value,
@@ -128,6 +134,7 @@ pub trait AgentToolHost {
     fn agent_run_plugin_test(&self, command: Option<&str>) -> Result<Value, RuntimeError>;
     fn agent_request_iteration(
         &self,
+        session_id: &str,
         plugin_path: &str,
         instruction: &str,
     ) -> Result<Value, RuntimeError>;

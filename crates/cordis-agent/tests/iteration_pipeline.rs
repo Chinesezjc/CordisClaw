@@ -53,8 +53,87 @@ fn with_backend<R>(
     let mut backend = PluginIterationAgentBackend {
         host,
         state: &mut state,
+        session_id: "iteration-session-test",
     };
     f(&mut backend)
+}
+
+/// The iteration session is not a room participant. Its catalogue is an
+/// allowlist of kernel tools plus the one channel it is allowed: the session
+/// that started it.
+#[test]
+fn an_iteration_session_has_the_team_tools_but_no_channel_speak_tool() {
+    let (_temp, host) = empty_host();
+    with_backend(&host, |backend| {
+        let specs = AgentBackend::tool_specs(backend);
+        let names: Vec<&str> = specs.iter().map(|spec| spec.name).collect();
+        assert!(names.contains(&"my_team"), "names={names:?}");
+        assert!(names.contains(&"send_to_session"), "names={names:?}");
+        // Per-name assertion: every outbound channel node is absent. The
+        // runtime refuses these at the invoke seam too, so this is the
+        // catalogue half of the same rule.
+        for name in ["qq_send", "feishu_send", "feishu_send_image"] {
+            assert!(
+                !names.contains(&name),
+                "{name} leaked into the iteration catalogue: {names:?}"
+            );
+        }
+    });
+}
+
+/// The iteration's only conversation channel: it can see the session that
+/// started it (`my_team`) and hand a result back (`send_to_session`). The
+/// send fails here only because this hermetic host has no LLM provider — the
+/// point is that the tool reaches the host under the iteration's own id.
+#[test]
+fn an_iteration_session_can_see_its_origin_and_report_back() {
+    let (_temp, host) = empty_host();
+    let origin = host
+        .agent_start(cordis_runtime::host::AgentSessionKind::RuntimeShell)
+        .expect("origin session")
+        .session_id;
+    let prepared = prepared_for("mini", &["mini"]);
+    let context_paths = PluginIterationContextPaths {
+        focus_paths: Vec::new(),
+        all_paths: Vec::new(),
+    };
+    let session_id = host
+        .start_iteration_session(prepared.clone(), context_paths, Some(&origin))
+        .expect("iteration session");
+    let mut state = PluginIterationAgentState::new(
+        prepared,
+        PluginIterationContextPaths {
+            focus_paths: Vec::new(),
+            all_paths: Vec::new(),
+        },
+        host.fixtures_root(),
+    );
+    let mut backend = PluginIterationAgentBackend {
+        host: &host,
+        state: &mut state,
+        session_id: &session_id,
+    };
+
+    let team = AgentBackend::execute_tool(&mut backend, "my_team", json!({}), &mut Vec::new())
+        .expect("my_team answers for the iteration session");
+    assert_eq!(team["me"], session_id);
+    assert_eq!(team["spawned_by"], origin);
+    assert!(team["reachable"]
+        .as_array()
+        .expect("reachable")
+        .contains(&json!(origin)));
+
+    let err = AgentBackend::execute_tool(
+        &mut backend,
+        "send_to_session",
+        json!({ "target": origin, "message": "the iteration finished" }),
+        &mut Vec::new(),
+    )
+    .expect_err("no provider on this host");
+    assert!(
+        err.to_string().contains("no LLM provider plugin loaded"),
+        "got {err}"
+    );
 }
 
 /// Seed a writable `plugins/mini/src/<name>` file inside the host's tree.
@@ -1114,7 +1193,7 @@ fn run_plugin_iteration_agent_applies_edit_plan_without_llm() {
             value: None,
         }],
     });
-    let run = cordis_agent::iteration::driver::run_plugin_iteration_agent(&host, &prepared)
+    let run = cordis_agent::iteration::driver::run_plugin_iteration_agent(&host, &prepared, None)
         .expect("edit-plan path runs without any LLM call");
     // No agent session in the edit-plan branch.
     assert!(run.session_id.is_none());
@@ -1277,6 +1356,7 @@ fn plugin_iteration_agent_snapshot_returns_state_for_an_iteration_session() {
         &host,
         prepared.clone(),
         context_paths,
+        None,
     )
     .expect("start an iteration session");
 
@@ -1501,7 +1581,7 @@ fn iterate_plugins_panic_is_caught_and_rolls_back_candidate_and_clears_journal()
 
     // Arm the injection and drive the iteration.
     TEST_ITERATION_PANIC_INJECTION.store(true, SeqCst);
-    let result = cordis_agent::iteration::driver::iterate_plugins(&host, iteration_request());
+    let result = cordis_agent::iteration::driver::iterate_plugins(&host, iteration_request(), None);
 
     // The panic was caught: iterate_plugins returns an Invariant error
     // whose message carries the injected panic text.
@@ -1538,7 +1618,8 @@ fn iterate_plugins_panic_is_caught_and_rolls_back_candidate_and_clears_journal()
     // unarmed, edit-plan-less iteration would otherwise call out to the
     // configured LLM endpoint).
     TEST_ITERATION_PANIC_INJECTION.store(true, SeqCst);
-    let followup = cordis_agent::iteration::driver::iterate_plugins(&host, iteration_request());
+    let followup =
+        cordis_agent::iteration::driver::iterate_plugins(&host, iteration_request(), None);
     let followup_msg = followup
         .expect_err("re-armed follow-up must also surface as Err")
         .to_string();
@@ -1569,6 +1650,7 @@ fn backend_run_plugin_test_uses_prepared_tests_command_fallback() {
     let mut backend = PluginIterationAgentBackend {
         host: &host,
         state: &mut state,
+        session_id: "iteration-session-test",
     };
     // No explicit command → the `.or_else(prepared.tests_command)` fallback
     // arm supplies the prepared command.

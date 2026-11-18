@@ -9,6 +9,7 @@
 //! `send_to_session` only addresses ids that appeared in the caller's latest
 //! `my_team` reply.
 
+use super::agent::{mailbox_overflow_diagnostic, merge_queued_inputs, MAX_SESSION_MAILBOX};
 use super::*;
 use crate::agent_api::AgentToolHost;
 use crate::core::models::{ArtifactIndexEntry, ArtifactKind, PluginArtifact};
@@ -138,12 +139,18 @@ fn prepared_iteration() -> PreparedPluginIteration {
 }
 
 fn start_iteration(host: &RuntimeHost) -> String {
+    start_iteration_from(host, None)
+}
+
+/// Start an iteration session on behalf of `origin_session_id`.
+fn start_iteration_from(host: &RuntimeHost, origin_session_id: Option<&str>) -> String {
     host.start_iteration_session(
         prepared_iteration(),
         PluginIterationContextPaths {
             focus_paths: Vec::new(),
             all_paths: Vec::new(),
         },
+        origin_session_id,
     )
     .expect("start an iteration session")
 }
@@ -242,6 +249,66 @@ fn an_iteration_session_hangs_off_the_main_session() {
 
     let team = host.agent_my_team(&main).expect("main team");
     assert!(strings(&team["created"]).contains(&iteration));
+}
+
+#[test]
+#[serial]
+fn an_iteration_session_hangs_off_the_session_that_started_it() {
+    let (_temp, host) = provider_host();
+    let main = start(&host);
+    host.set_main_session(&main).expect("main");
+    let room = start(&host);
+    host.agent_set_session_address(&room, "qq:group:867130587")
+        .expect("address");
+    host.attach_session_to_main(&room).expect("attach");
+
+    let iteration = start_iteration_from(&host, Some(&room));
+
+    // The requester is the parent, not main. This is what makes the
+    // iteration able to report back to the conversation that asked for it.
+    assert_eq!(
+        host.session_parent(&iteration).as_deref(),
+        Some(room.as_str())
+    );
+    let team = host.agent_my_team(&iteration).expect("iteration team");
+    assert_eq!(team["spawned_by"], room);
+    assert!(strings(&team["reachable"]).contains(&room));
+
+    // ...and it really can hand a result back. The delivery carries the
+    // marker that tells the front desk this is not a room member talking.
+    let sent = host
+        .agent_send_to_session(&iteration, &room, "the iteration finished")
+        .expect("iteration reports to its origin");
+    assert_eq!(sent["session_id"], room);
+    let delivered = sent["delivered_input"]
+        .as_str()
+        .expect("delivered input is reported");
+    assert!(
+        delivered.starts_with(&format!(
+            "[forwarded from plugin_iteration session {iteration}]\n"
+        )),
+        "got {delivered:?}"
+    );
+
+    // Main did not create the iteration: it hangs off the room instead.
+    let main_team = host.agent_my_team(&main).expect("main team");
+    assert!(!strings(&main_team["created"]).contains(&iteration));
+}
+
+#[test]
+#[serial]
+fn an_unknown_iteration_origin_falls_back_to_main() {
+    let (_temp, host) = empty_host();
+    let main = start(&host);
+    host.set_main_session(&main).expect("main");
+
+    // A stale id (or a recovered session) is not a parent: the edge falls
+    // back to main exactly as if no origin had been given.
+    let iteration = start_iteration_from(&host, Some("agent-session-gone"));
+    assert_eq!(
+        host.session_parent(&iteration).as_deref(),
+        Some(main.as_str())
+    );
 }
 
 #[test]
@@ -471,6 +538,11 @@ fn send_to_session_is_refused_until_my_team_reveals_the_target() {
         .expect("reachable by address");
     assert_eq!(by_address["ok"], true);
     assert_eq!(by_address["session_id"], room);
+    // An idle target is still served immediately; queueing is only for a
+    // receiver that is mid-turn.
+    assert_eq!(by_address["delivered"], true);
+    assert_eq!(by_address["queued"], false);
+    assert!(host.debug_mailbox(&room).is_empty());
 }
 
 /// The tools reach the tree through the `AgentToolHost` trait, not through the
@@ -577,4 +649,249 @@ fn a_recovered_room_session_joins_the_tree_when_its_address_is_registered() {
     );
     let team = host.agent_my_team("agent-session-room-1").expect("live");
     assert_eq!(team["spawned_by"], main);
+}
+
+#[test]
+fn forwarded_input_names_the_sender_kind_and_id() {
+    assert_eq!(
+        super::agent::forwarded_session_input("plugin_iteration", "plugin-agent-session-7", "done"),
+        "[forwarded from plugin_iteration session plugin-agent-session-7]\ndone"
+    );
+    // An unknown kind still names the id, so the receiver knows this was not
+    // something it said itself.
+    assert_eq!(
+        super::agent::forwarded_session_input("session", "s1", ""),
+        "[forwarded from session session s1]\n"
+    );
+}
+
+// ─────────────── the mailbox for mid-turn targets ───────────────────
+
+/// Put a session into exactly the state `agent_send` leaves it in while a
+/// turn runs: out of `agent_sessions`, present in the node tree, marked
+/// in-flight.
+fn make_busy(host: &RuntimeHost, session_id: &str) -> ManagedAgentSession {
+    let session = host
+        .agent_sessions
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .remove(session_id)
+        .expect("live session");
+    host.inflight_sessions
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .insert(session_id.to_string());
+    session
+}
+
+#[test]
+#[serial]
+fn a_busy_target_queues_the_forwarded_input_instead_of_failing() {
+    let (_temp, host) = empty_host();
+    let main = start(&host);
+    host.set_main_session(&main).expect("main");
+    let room = start(&host);
+    host.agent_set_session_address(&room, "qq:group:1")
+        .expect("address");
+    host.attach_session_to_main(&room).expect("attach");
+    host.agent_my_team(&main).expect("reveal the room");
+    // Mid-turn sessions are out of the session map but still live nodes, so
+    // both the id and the address must resolve to the queued target.
+    let _busy = make_busy(&host, &room);
+    assert_eq!(
+        host.agent_resolve_session(&room).as_deref(),
+        Some(room.as_str())
+    );
+    assert_eq!(
+        host.agent_resolve_session("qq:group:1").as_deref(),
+        Some(room.as_str())
+    );
+
+    let sent = host
+        .agent_send_to_session(&main, &room, "the iteration finished")
+        .expect("a busy target queues instead of failing");
+    assert_eq!(sent["delivered"], false);
+    assert_eq!(sent["queued"], true);
+    assert_eq!(sent["dropped_oldest"], false);
+    assert_eq!(
+        sent["delivered_input"],
+        format!("[forwarded from runtime_shell session {main}]\nthe iteration finished")
+    );
+    assert_eq!(
+        host.debug_mailbox(&room),
+        vec![format!(
+            "[forwarded from runtime_shell session {main}]\nthe iteration finished"
+        )]
+    );
+}
+
+#[test]
+#[serial]
+fn a_full_mailbox_drops_the_oldest_input_and_says_so() {
+    let (_temp, host) = empty_host();
+    let main = start(&host);
+    host.set_main_session(&main).expect("main");
+    let room = start(&host);
+    host.attach_session_to_main(&room).expect("attach");
+    host.agent_my_team(&main).expect("reveal the room");
+    let _busy = make_busy(&host, &room);
+
+    // Fill the bounded mailbox through the real path: every send finds the
+    // target busy and parks its input.
+    for index in 0..MAX_SESSION_MAILBOX {
+        let sent = host
+            .agent_send_to_session(&main, &room, &format!("m{index}"))
+            .expect("a busy target queues");
+        assert_eq!(sent["queued"], true);
+        assert_eq!(sent["dropped_oldest"], false);
+    }
+    let overflow = host
+        .agent_send_to_session(&main, &room, "m8")
+        .expect("the overflowing send still queues");
+    assert_eq!(overflow["queued"], true);
+    assert_eq!(
+        overflow["dropped_oldest"], true,
+        "the oldest input was dropped"
+    );
+
+    let mailbox = host.debug_mailbox(&room);
+    assert_eq!(mailbox.len(), MAX_SESSION_MAILBOX);
+    assert!(
+        mailbox[0].ends_with("\nm1"),
+        "m1 is now the oldest: {:?}",
+        mailbox[0]
+    );
+    assert!(
+        mailbox.iter().all(|entry| !entry.ends_with("\nm0")),
+        "m0 was dropped: {mailbox:?}"
+    );
+    assert!(
+        mailbox.last().is_some_and(|entry| entry.ends_with("\nm8")),
+        "m8 is the newest: {:?}",
+        mailbox.last()
+    );
+    assert_eq!(
+        mailbox_overflow_diagnostic(&room),
+        format!(
+            "[agent-mailbox] session {room}: queue is full ({MAX_SESSION_MAILBOX}), \
+             dropped the oldest input"
+        )
+    );
+}
+
+#[test]
+#[serial]
+fn queued_input_is_consumed_at_the_next_turn() {
+    let (_temp, host) = provider_host();
+    let room = start(&host);
+    host.queue_session_input(
+        &room,
+        "[forwarded from plugin_iteration session iter-1]\nreport".to_string(),
+    );
+    host.agent_send(&room, "a room message").expect("turn runs");
+    assert!(
+        host.debug_mailbox(&room).is_empty(),
+        "the next turn consumes the queue"
+    );
+}
+
+#[test]
+#[serial]
+fn dropping_a_session_clears_its_mailbox() {
+    let (_temp, host) = empty_host();
+    let room = start(&host);
+    host.queue_session_input(&room, "leftover".to_string());
+    host.drop_session(&room);
+    assert!(host.debug_mailbox(&room).is_empty());
+}
+
+#[test]
+fn queued_inputs_are_folded_into_the_opening_message() {
+    assert_eq!(
+        merge_queued_inputs(Vec::new(), "room message"),
+        "room message"
+    );
+    assert_eq!(
+        merge_queued_inputs(
+            vec!["first".to_string(), "second".to_string()],
+            "room message"
+        ),
+        "first\n\nsecond\n\nroom message"
+    );
+}
+
+// ─────────────── request_iteration carries the caller ───────────────
+
+/// A runner that returns a canned result, so `agent_request_iteration`'s
+/// handler can be exercised without the real iteration pipeline.
+struct FakeIterationRunner;
+
+fn synthetic_iteration_result(iteration_id: &str) -> crate::host::KernelPluginIterationResult {
+    crate::host::KernelPluginIterationResult {
+        iteration_id: iteration_id.to_string(),
+        issue_id: "issue-fake".to_string(),
+        root_plugin_path: "mini".to_string(),
+        target_plugin_paths: Vec::new(),
+        source: None,
+        summary: "fake iteration".to_string(),
+        agent_session_id: None,
+        tool_execution_summary: None,
+        derived_edit_plan: crate::kernel::plugin_iteration::PluginEditPlan {
+            issue_id: "issue-fake".to_string(),
+            patch_id: format!("{iteration_id}-empty"),
+            summary: "fake iteration".to_string(),
+            operations: Vec::new(),
+        },
+        transcript_excerpt: Vec::new(),
+        changed_paths: Vec::new(),
+        rebuilt_artifacts: Vec::new(),
+        candidate: None,
+        verification: None,
+        verifier_verdict: None,
+        canary: None,
+        final_verdict: crate::host::PluginIterationFinalVerdict::Blocked,
+        blocked_reason: None,
+        net_output: crate::execution::engine::ExecutionOutput {
+            execution_id: iteration_id.to_string(),
+            order: Vec::new(),
+            outcomes: std::collections::BTreeMap::new(),
+            keyed_outcomes: std::collections::BTreeMap::new(),
+            metrics: crate::execution::engine::ExecutionMetrics::default(),
+        },
+    }
+}
+
+impl crate::iteration_api::IterationRunner for FakeIterationRunner {
+    fn iterate(
+        &self,
+        _host: &RuntimeHost,
+        _request: crate::kernel::plugin_iteration::KernelPluginIterationRequest,
+        _origin_session_id: Option<&str>,
+    ) -> Result<crate::host::KernelPluginIterationResult, RuntimeError> {
+        Ok(synthetic_iteration_result("iter-fake"))
+    }
+
+    fn approve(
+        &self,
+        _host: &RuntimeHost,
+        _iteration_id: &str,
+    ) -> Result<crate::host::KernelPluginIterationResult, RuntimeError> {
+        Err(RuntimeError::InvalidArgument {
+            message: "fake runner does not approve".to_string(),
+        })
+    }
+}
+
+#[test]
+#[serial]
+fn request_iteration_runs_through_the_installed_runner() {
+    let (_temp, host) = empty_host();
+    let caller = start(&host);
+    let _ = crate::iteration_api::install_iteration_runner(Box::new(FakeIterationRunner));
+
+    let result = AgentToolHost::agent_request_iteration(&host, &caller, "/", "add a node")
+        .expect("the tool reports JSON");
+    assert_eq!(result["iteration_id"], "iter-fake");
+    assert_eq!(result["final_verdict"], "Blocked");
+    assert_eq!(result["ok"], false);
 }

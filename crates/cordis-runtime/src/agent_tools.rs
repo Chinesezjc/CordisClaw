@@ -48,6 +48,79 @@ pub const KERNEL_INTROSPECTION_TOOLS: &[&str] = &[
 pub fn is_kernel_introspection(name: &str) -> bool {
     KERNEL_INTROSPECTION_TOOLS.contains(&name)
 }
+
+/// Does this node speak into a room on the bot's own behalf?
+///
+/// **Channel tools are not first-class tool specs.** The kernel catalogue
+/// (`AgentToolSpec`) is static and identity-checked by name; a channel's
+/// outbound node (`qq_send`, `feishu_send`, …) is a plugin node the model
+/// reaches through the `invoke_plugin` gateway, resolved against the loaded
+/// snapshot. This function classifies that node when the call arrives at the
+/// gateway — it does not imply the name ever appears in `tool_specs()`.
+///
+/// A channel plugin's outbound node is named `<plugin>_send`, with companions
+/// such as `<plugin>_send_image`. That name shape is the structural marker: a
+/// new channel that follows it is covered the day it loads, with no allowlist
+/// to extend and therefore nothing to forget. `plugin_path` may be spelled
+/// with slashes (`/qq`, `nested/qq`); the owning plugin's own name is its last
+/// segment.
+///
+/// `agent_accessible` is a caller precondition — a node the agent may not call
+/// is not a tool at all. [`is_channel_speak_node`] is the gated form for
+/// callers that hold the node document.
+pub fn is_channel_speak_tool(name: &str, plugin_path: &str) -> bool {
+    let plugin = plugin_path.trim_matches('/');
+    let Some(plugin) = plugin.rsplit('/').next().filter(|part| !part.is_empty()) else {
+        return false;
+    };
+    let rest = name
+        .strip_prefix(plugin)
+        .and_then(|rest| rest.strip_prefix('_'));
+    matches!(rest, Some("send") | Some("send_image"))
+}
+
+/// [`is_channel_speak_tool`] for a declared node: the node must also be
+/// `agent_accessible`, i.e. a tool the agent is actually allowed to call.
+pub fn is_channel_speak_node(plugin_path: &str, node: &cordis_plugin_sdk::NodeDoc) -> bool {
+    node.agent_accessible && is_channel_speak_tool(&node.id, plugin_path)
+}
+
+/// The refusal a plugin-iteration session gets when it tries to speak into a
+/// room itself.
+///
+/// An iteration session is not in that conversation: it reports to the session
+/// that started it, and the front desk decides what the room hears. Named and
+/// unit-tested so the wording can be asserted byte for byte.
+pub fn channel_speak_refusal(session_id: &str, plugin_path: &str, node_id: &str) -> RuntimeError {
+    RuntimeError::InvalidArgument {
+        message: format!(
+            "plugin iteration session {session_id} cannot call the channel tool {plugin_path}::{node_id}: \
+             it is not in that conversation. Send to the session that started the iteration instead."
+        ),
+    }
+}
+
+/// Refuse a channel-speaking node to a plugin-iteration session.
+///
+/// `kind` is the caller's session kind and `node` its declaration, if one is
+/// registered. Any other kind, an undeclared node, or a node the agent cannot
+/// call passes through to the normal accessibility check — this guard only
+/// closes the "iteration speaks as the bot" hole.
+pub fn guard_iteration_channel_speak(
+    session_id: &str,
+    kind: Option<&str>,
+    plugin_path: &str,
+    node_id: &str,
+    node: Option<&cordis_plugin_sdk::NodeDoc>,
+) -> Result<(), RuntimeError> {
+    let speaking = kind == Some("plugin_iteration")
+        && node.is_some_and(|node| is_channel_speak_node(plugin_path, node));
+    if speaking {
+        return Err(channel_speak_refusal(session_id, plugin_path, node_id));
+    }
+    Ok(())
+}
+
 /// Strip kernel-introspection tool call/result pairs from a slice of chat
 /// messages before they are persisted to cross-turn history.
 ///
@@ -441,6 +514,7 @@ impl AgentToolHost for RuntimeHost {
 
     fn agent_invoke_plugin(
         &self,
+        session_id: &str,
         plugin_path: &str,
         node_id: &str,
         payload_json: Value,
@@ -454,6 +528,26 @@ impl AgentToolHost for RuntimeHost {
             plugin_path.to_string()
         };
         let plugin_path = resolved.as_str();
+        // The iteration session reports to whoever started it; it never speaks
+        // into a room as the bot. Check before the accessibility gate so the
+        // refusal names the actual reason.
+        let node = self
+            .current_snapshot()
+            .plugin_registry()
+            .get(plugin_path)
+            .and_then(|plugin| plugin.docs)
+            .and_then(|docs| docs.nodes.into_iter().find(|node| node.id == node_id));
+        let kind = self.session_kind(session_id);
+        // Bound before the `?` so the fallible edge shares a line with a
+        // covered binding instead of leaving an uncovered continuation line.
+        let guarded = guard_iteration_channel_speak(
+            session_id,
+            kind.as_deref(),
+            plugin_path,
+            node_id,
+            node.as_ref(),
+        );
+        guarded?;
         self.check_agent_accessible(plugin_path, node_id)?;
         let payload_text =
             serde_json::to_string(&payload_json).map_err(|err| RuntimeError::Invariant {
@@ -992,6 +1086,7 @@ impl AgentToolHost for RuntimeHost {
 
     fn agent_request_iteration(
         &self,
+        session_id: &str,
         plugin_path: &str,
         instruction: &str,
     ) -> Result<Value, RuntimeError> {
@@ -1044,7 +1139,9 @@ impl AgentToolHost for RuntimeHost {
                 "error": crate::iteration_api::missing_runner_error().to_string(),
             }));
         };
-        match runner.iterate(self, request) {
+        // The caller is the front desk this iteration reports back to: the
+        // iteration session is registered as its child.
+        match runner.iterate(self, request, Some(session_id)) {
             // Report the FINAL verdict, not just the verifier's. A rollout that
             // the canary rolled back (or that is blocked awaiting approval)
             // used to be reported as `verdict: Pass`, so the agent believed it
@@ -1533,5 +1630,117 @@ mod tests {
         let neither: ViewImageArgs = serde_json::from_value(json!({})).expect("empty");
         assert_eq!(neither.path, None);
         assert_eq!(neither.sha256, None);
+    }
+
+    // ── channel-speak classification ───────────────────────────────────
+    //
+    // The rule is structural: the plugin's own outbound node is
+    // `<plugin>_send` (plus `<plugin>_send_image`). No plugin allowlist, so a
+    // new channel is covered as soon as it loads with that name shape.
+
+    fn node(id: &str, agent_accessible: bool) -> cordis_plugin_sdk::NodeDoc {
+        cordis_plugin_sdk::NodeDoc {
+            id: id.to_string(),
+            summary: "test node".to_string(),
+            input_schema: json!({"type": "object", "properties": {}}),
+            output_schema: json!({"type": "object", "properties": {}}),
+            side_effects: Vec::new(),
+            failure_modes: Vec::new(),
+            node_type: cordis_plugin_sdk::NodeType::Router,
+            agent_accessible,
+        }
+    }
+
+    #[test]
+    fn channel_speak_tools_are_the_owning_plugins_outbound_nodes() {
+        for (name, plugin) in [
+            ("qq_send", "qq"),
+            ("feishu_send", "feishu"),
+            ("feishu_send_image", "feishu"),
+            ("qq_send", "/qq"),
+            ("qq_send", "nested/qq"),
+        ] {
+            assert!(
+                is_channel_speak_tool(name, plugin),
+                "{name} on {plugin} should speak"
+            );
+        }
+
+        for (name, plugin) in [
+            // A read/search node is not a send node.
+            ("web_search", "web"),
+            ("qq_get_group_info", "qq"),
+            // The node must belong to the plugin it is named after.
+            ("qq_send", "web"),
+            ("qq_send", "qqq"),
+            // No plugin at all (an unowned kernel tool).
+            ("qq_send", ""),
+            ("qq_send", "/"),
+        ] {
+            assert!(
+                !is_channel_speak_tool(name, plugin),
+                "{name} on {plugin} must not speak"
+            );
+        }
+    }
+
+    #[test]
+    fn an_inaccessible_node_is_not_a_speak_tool() {
+        assert!(is_channel_speak_node("qq", &node("qq_send", true)));
+        // The same node is not a tool when the agent may not call it.
+        assert!(!is_channel_speak_node("qq", &node("qq_send", false)));
+        // Accessible, but not an outbound node of that plugin.
+        assert!(!is_channel_speak_node("web", &node("qq_send", true)));
+    }
+
+    /// The other half of the rule: a room session keeps its voice. The node
+    /// catalogue the room is shown still lists `qq_send`, and the classifier
+    /// still recognizes it — only an iteration session is refused.
+    #[test]
+    fn a_room_session_keeps_qq_send_in_its_node_catalogue() {
+        let send = node("qq_send", true);
+        let mut catalogue = String::new();
+        crate::plugin::node_catalog::push_plugin(&mut catalogue, "qq", &[&send]);
+        assert!(catalogue.contains("qq_send"), "{catalogue}");
+        assert!(is_channel_speak_node("qq", &send));
+    }
+
+    #[test]
+    fn an_iteration_session_cannot_call_a_channel_speak_node() {
+        let send = node("qq_send", true);
+        let err = guard_iteration_channel_speak(
+            "plugin-agent-session-1",
+            Some("plugin_iteration"),
+            "qq",
+            "qq_send",
+            Some(&send),
+        )
+        .expect_err("an iteration session must not speak");
+        assert_eq!(
+            err.to_string(),
+            "invalid argument: plugin iteration session plugin-agent-session-1 cannot call the \
+             channel tool qq::qq_send: it is not in that conversation. Send to the session that \
+             started the iteration instead."
+        );
+
+        // Every other combination is not this guard's business: a room
+        // session keeps its voice, a non-channel node passes through, an
+        // inaccessible node is caught by the accessibility check, and an
+        // unknown session kind is left to the normal path.
+        for (kind, node, plugin, id) in [
+            (Some("runtime_shell"), Some(&send), "qq", "qq_send"),
+            (Some("plugin_iteration"), Some(&send), "web", "web_search"),
+            (
+                Some("plugin_iteration"),
+                Some(&node("qq_send", false)),
+                "qq",
+                "qq_send",
+            ),
+            (Some("plugin_iteration"), None, "qq", "qq_send"),
+            (None, Some(&send), "qq", "qq_send"),
+        ] {
+            guard_iteration_channel_speak("s1", kind, plugin, id, node)
+                .expect("not a forbidden channel speak");
+        }
     }
 }

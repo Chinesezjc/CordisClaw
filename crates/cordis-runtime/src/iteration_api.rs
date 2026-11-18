@@ -18,10 +18,15 @@ use crate::kernel::plugin_iteration::KernelPluginIterationRequest;
 /// One iteration runner, as the kernel sees it.
 pub trait IterationRunner: Send + Sync {
     /// Run one plugin iteration to its final verdict.
+    ///
+    /// `origin_session_id` is the session that asked for the iteration, when
+    /// there is one. The iteration session hangs off it so the two can talk;
+    /// `None` (a CLI/operator call) falls back to the main session.
     fn iterate(
         &self,
         host: &RuntimeHost,
         request: KernelPluginIterationRequest,
+        origin_session_id: Option<&str>,
     ) -> Result<KernelPluginIterationResult, RuntimeError>;
 
     /// Promote a previously blocked iteration.
@@ -61,10 +66,14 @@ pub trait IterationHost: Send + Sync {
         session_id: &str,
     ) -> Result<crate::agent_api::AgentSessionStatus, RuntimeError>;
     /// Register a plugin-iteration agent session and return its id.
+    ///
+    /// `origin_session_id` is the session that asked for the iteration; the
+    /// new session becomes its child so the two can talk.
     fn start_iteration_session(
         &self,
         prepared: crate::host::PreparedPluginIteration,
         context_paths: crate::host::PluginIterationContextPaths,
+        origin_session_id: Option<&str>,
     ) -> Result<String, RuntimeError>;
     /// Tool-execution summary of a live iteration session.
     fn iteration_session_tool_summary(
@@ -139,8 +148,9 @@ impl IterationHost for RuntimeHost {
         &self,
         prepared: crate::host::PreparedPluginIteration,
         context_paths: crate::host::PluginIterationContextPaths,
+        origin_session_id: Option<&str>,
     ) -> Result<String, RuntimeError> {
-        RuntimeHost::start_iteration_session(self, prepared, context_paths)
+        RuntimeHost::start_iteration_session(self, prepared, context_paths, origin_session_id)
     }
     fn iteration_session_tool_summary(
         &self,

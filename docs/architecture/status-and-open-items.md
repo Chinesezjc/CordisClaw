@@ -2,7 +2,7 @@
 
 ## 1. 判定口径
 
-- 本文基于当前仓库现状整理，最近更新：2026-11-14。
+- 本文基于当前仓库现状整理，最近更新：2026-11-18。
 - 历史规划蓝图已经吸收进 [design-blueprint.md](./design-blueprint.md)，因此本文结论来自三类证据的交叉比对：
   - 设计蓝图：[design-blueprint.md](./design-blueprint.md)
   - 架构文档：[system-overview.md](./system-overview.md)、[contracts-and-loading.md](./contracts-and-loading.md)、[runtime-semantics.md](./runtime-semantics.md)、[maintenance-guide.md](./maintenance-guide.md)
@@ -74,7 +74,9 @@ policy / driver / backend，`CargoIterationRunner` 实现 kernel 的 `IterationR
   回答"我是谁、我认识谁"。
 - 边从三处赋值：主会话（`cordis-cli` 启动的那个，`spawned_by = None`）、群会话
   （`agent_set_session_address` + `attach_session_to_main` → 主会话）、迭代/子代理
-  （`start_iteration_session`；拿不到发起者时挂主会话，见第 5 节待补）。
+  （`start_iteration_session`；`agent_request_iteration` 把调用方 session id 一路
+  传下来，迭代会话挂到**发起它的前台会话**下；CLI/操作者直接触发或 id 已失效时回落
+  主会话，见 3.42）。
 - 工具：删除 `list_sessions`，新增 `my_team`（无参数）——返回
   `{me, spawned_by, created, same_room, reachable}`。字段名全是中性结构词，
   **不含** `role` / `peer` / `supervisor` / `manager` / `sibling` / "上级" / "同级"
@@ -95,11 +97,14 @@ policy / driver / backend，`CargoIterationRunner` 实现 kernel 的 `IterationR
 `live` 会话，历史孤儿不可见；`send_to_session` 也不再接受"记得住的任意 id"，
 只接受刚被披露过的目标。
 
-**测试**：`host/session_tree_tests.rs`（13 个单测）——主会话是根 / 群会话挂主会话 /
-迭代会话挂主会话（无主会话时是根）/ 只回邻居不回全表 / `reachable` 去重且不含自己 /
-JSON 无角色键 / `send_to_session` 对未披露 id 拒绝（逐字节断言错误文本）/ 对
-`reachable` 内 id 与地址成功 / 恢复会话在未使用前不可见、注册地址或跑 turn 后加入 /
-工具通过 `AgentToolHost` trait 而不是 inherent 方法转发到会话树。
+**测试**：`host/session_tree_tests.rs`（22 个单测）——主会话是根 / 群会话挂主会话 /
+迭代会话挂发起它的前台会话、未知发起方回落主会话、无主会话时是根 / 只回邻居不回全表 /
+`reachable` 去重且不含自己 / JSON 无角色键 / `send_to_session` 对未披露 id 拒绝
+（逐字节断言错误文本）/ 对 `reachable` 内 id 与地址成功 / 转发的消息体带
+`[forwarded from <kind> session <id>]` 前缀（逐字节）/ 目标忙时排队不报错 / 队列满丢
+最旧一条并出诊断 / 队列在下一轮消费 / drop 清队列 / 空闲目标仍立即投递 / 恢复会话在
+未使用前不可见、注册地址或跑 turn 后加入 / 工具通过 `AgentToolHost` trait 而不是
+inherent 方法转发到会话树 / `request_iteration` 经已安装的 runner 执行并带回发起方。
 
 ### 3.0 覆盖率治理战役（2026-07-23 ~ 07-27，已收官）
 
@@ -1010,6 +1015,64 @@ JSON 参数、单引号属性、渲染往返。
 - `tests_command` / `safety_command` 在 `PluginIterationAgentRun` 里本就没有字段，
   driver 的 `state.tests_command` 从未被 agent 的 summary 填充（既有缺口）。
 
+### 3.42 迭代会话不直接对房间说话，只向前台会话汇报（2026-11-18）
+
+**问题**：迭代会话跑在某个群/单聊的对话之外，但它可以用 bot 的身份直接往那个房间
+发消息——群里因此出现一段没有上下文的长篇分析：说话的一方不在那段对话里，听到的
+人却以为它是这个房间里的人。
+
+**规则**：迭代会话可以给前台 bot 会话传话，但不能自己直接对房间说话。
+
+**判据**（`crates/cordis-runtime/src/agent_tools.rs`）：
+
+- `is_channel_speak_tool(name, plugin_path)`——渠道发言工具是**插件自己的出站节点**，
+  命名形状为 `<plugin>_send`（伴随节点 `<plugin>_send_image`）。这是结构性判据，
+  不是插件白名单：新渠道只要按规定命名，加载当天就被覆盖，不存在"下次加渠道又漏"。
+  `plugin_path` 允许带 `/`，取最后一段作为插件名。
+- `is_channel_speak_node(plugin_path, node)`——再要求节点 `agent_accessible`。agent
+  不能调的节点本来就不是工具。
+- `guard_iteration_channel_speak(...)`——真正的闸门在 `agent_invoke_plugin`（调用方
+  session id 现在随调用传入）：会话 kind 为 `plugin_iteration` 且节点是渠道发言节点时，
+  直接返回具名拒绝 `channel_speak_refusal`（错误文本逐字节断言）。即使将来迭代会话
+  意外拿到 `invoke_plugin`，也发不出去。
+- 迭代 agent 的工具目录（`PluginIterationAgentBackend::tool_specs`）是内核工具的
+  allowlist，加上 `my_team` / `send_to_session`；渠道节点不在目录里（单测逐名断言
+  `qq_send` / `feishu_send` / `feishu_send_image` 均缺席）。房间会话仍保留
+  `invoke_plugin` 网关，渠道发言能力没有被误删。
+
+**父子关系**：`agent_request_iteration(session_id, …)` → `IterationRunner::iterate(…,
+origin_session_id)` → `driver::iterate_plugins` → `start_iteration_session`。迭代会话的
+`spawned_by` 是发起它的前台会话（`my_team` 的 `spawned_by` / `reachable` 都指向它）；
+发起方未知（CLI 直接触发）或已失效时回落主会话，无主会话时是根。
+
+**传话的消息体**：`agent_send_to_session` 在投递前加一行
+`[forwarded from <kind> session <id>]\n`（`forwarded_session_input`，逐字节单测）。
+接收方按普通用户输入处理，但能看出这条不是房间里的人说的，从而自己决定要不要、以及
+怎样对群里说。`send_to_session` 的返回值新增 `delivered_input`，便于断言与排障。
+
+**邮箱（目标正在跑 turn 时）**：`agent_send_to_session` 先解析目标；正在跑 turn 的
+会话虽然暂时不在 `agent_sessions` 里，但只要节点树里 `live` 就仍然可寻址
+（`agent_resolve_session` 的节点树回退）。此时 `agent_send` 返回
+`AgentSessionBusy`，`send_to_session` **不再把消息丢掉**，而是压进该会话的待投递
+队列并返回 `{"delivered": false, "queued": true, "dropped_oldest": …}`。
+队列是**每会话独立**的（不能用全局 `AGENT_INJECT_QUEUE`：那个队列会被任意正在跑
+turn 的会话 drain，迭代会话自己就可能把刚排给前台的消息吃掉），上限 8 条；溢出时
+丢弃最旧一条并打印一行具名诊断 `mailbox_overflow_diagnostic`（逐字节单测）。
+`agent_send_inner` 在确认会话可用之后、进入 `respond` 之前取走队列，用
+`merge_queued_inputs` 把排队输入拼到本轮开场用户消息之前——所以前台会话在
+**下一轮**（通常是房间的下一条消息）一定会看到这份汇报，由它决定要不要对群里说。
+会话 `drop_session` 时队列一并清除，避免复用 id 时串话。
+
+**测试**：`agent_tools` 单测（判据正反例 / 不可访问节点 / 闸门拒绝文本 / 房间目录
+仍含 `qq_send`）、`session_tree_tests`（迭代挂发起方、未知发起方回落 main、前缀逐字节、
+目标忙→queued、队列满丢最旧并诊断、下一轮消费、drop 清队列、空闲仍立即投递）、
+`iteration_pipeline`（迭代目录含团队工具且不含渠道发言工具）、`imp`（房间会话保留
+`invoke_plugin` 与 `send_to_session`）。
+
+**遗留**：队列只在**下一次** `agent_send` 时消费；如果前台房间长时间没有新消息，
+汇报会一直待在队列里（不会主动开一轮）。主动开一轮会让 bot 在没人说话的群里发言，
+本就不该做；需要时由 selfcheck/运维触发一轮即可。
+
 ## 4. 部分完成
 
 ### 4.1 Execution engine 有正式入口，数据面验证不足
@@ -1094,12 +1157,12 @@ JSON 参数、单引号属性、渲染往返。
 
 - [x] 根因：共享 repo fixtures 的测试派生同一 `default_snapshot_root`，boot 无条件删除目录下所有 `snapshot-*`，并行 boot 互删对方 in-flight staging（`rename staging -> target failed`，x86_64-linux 实测 5 例）。修复：snapshot 目录名改为 `snapshot-{pid}-{nanos}`，boot 清理抽为 `cleanup_stale_snapshot_dirs`，按目录名 pid 段经 `lock_pid_is_live`（现 `plugin/artifact.rs`，`kill(pid,0)` 探活；5.2.48 拆出 tooling 后由 `pub(crate)` 放宽为 `pub`，供 `cordis-tooling` 复用）只删已死进程的残留；同进程并行测试线程共享活 pid 不再互删，旧格式 `snapshot-{nanos}` 视为 stale。配套单测 `stale_snapshot_cleanup_keeps_live_pid_dirs`（活 pid 保留 / 已死子进程 pid 删除 / 旧格式删除 / 非 snapshot 目录与普通文件不动）。CI 的 `--test-threads=1` 串行开关随之移除。
 
-### 5.1.2 会话组织树的两条待补（2026-11-13）
+### 5.1.2 会话组织树的待补（2026-11-13，第一项 2026-11-18 闭合）
 
-- [ ] **迭代会话的真实发起者** — `KernelPluginIterationRequest` 不带发起会话 id，
-  `start_iteration_session` 只能把 `spawned_by` 挂到主会话。要把调用方
-  `session_id` 从 `agent_request_iteration` 一路传进 runner（或给 request 加
-  `origin_session_id`），迭代会话才能挂到真正发起它的会话下。当前回退见 3.0b。
+- [x] **迭代会话的真实发起者**（2026-11-18）— `agent_request_iteration` 带上调用方
+  `session_id`，经 `IterationRunner::iterate(..., origin_session_id)` 传到
+  `start_iteration_session`，迭代会话挂到真正发起它的前台会话下；发起方未知/已失效
+  时回落主会话。详见 3.42。
 - [ ] **"活着"的可靠判据** — 现在用"本进程启动 / 注册地址 / 跑过 turn"
   （`SessionNode.live`）近似。重启后尚未说过话的历史会话对 `my_team` 不可见，
   直到它被渠道重新注册或跑一轮；这是可接受的收敛，但不是线程级真实存活。

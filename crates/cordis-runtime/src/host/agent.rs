@@ -38,6 +38,13 @@ impl RuntimeHost {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
             .remove(session_id);
+        // A mailbox belongs to the conversation that would have consumed it.
+        // Keeping it after the session is gone would leak another session's
+        // words into a future session reusing the id.
+        self.session_mailbox
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .remove(session_id);
         self.profile_fallback
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
@@ -276,6 +283,31 @@ impl RuntimeHost {
             .and_then(|node| node.spawned_by.clone())
     }
 
+    /// The kind label a live session was created with (`runtime_shell` /
+    /// `plugin_iteration`), if this process still knows the session.
+    ///
+    /// Read from the node map rather than `agent_sessions`: a tool call runs
+    /// while its own session is temporarily out of that map, and the caller's
+    /// kind is exactly what such a call needs to know.
+    pub(crate) fn session_kind(&self, session_id: &str) -> Option<String> {
+        self.session_nodes
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .get(session_id)
+            .filter(|node| node.live)
+            .map(|node| node.kind.clone())
+    }
+
+    /// Whether `session_id` is live in this process, i.e. someone can talk to
+    /// it. Recovered history is `live == false` and does not count.
+    pub(crate) fn session_is_live(&self, session_id: &str) -> bool {
+        self.session_nodes
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .get(session_id)
+            .is_some_and(|node| node.live)
+    }
+
     /// The structural facts about the caller's neighbourhood.
     ///
     /// Pure edges, no labels: who created me, who I created, who shares my
@@ -349,6 +381,11 @@ impl RuntimeHost {
     /// Peer-to-peer sends are allowed — the tree is structure, not a chain of
     /// command — but an id from nowhere is refused: the model has to ask who
     /// it knows before addressing anyone.
+    ///
+    /// A target that is mid-turn cannot take input. That used to surface as
+    /// `AgentSessionBusy` and the message was lost; now the input is parked in
+    /// the target's bounded mailbox for its next turn and the reply reports
+    /// `delivered: false, queued: true`.
     pub fn agent_send_to_session(
         &self,
         caller_session_id: &str,
@@ -367,13 +404,40 @@ impl RuntimeHost {
         if !known.is_some_and(|set| set.contains(&resolved)) {
             return Err(unknown_team_member(target));
         }
-        let reply = self.agent_send(&resolved, input)?;
-        Ok(serde_json::json!({
-            "ok": true,
-            "session_id": resolved,
-            "reply_chars": reply.content.chars().count(),
-            "tool_calls": reply.tool_events.len(),
-        }))
+        // The receiver handles this as a new user turn. Mark who sent it: a
+        // room session must be able to tell a forwarded message from a
+        // person in the room, or it repeats an analysis the room never asked
+        // for in its own voice.
+        let caller_kind = self
+            .session_kind(caller_session_id)
+            .unwrap_or_else(|| "session".to_string());
+        let delivered = forwarded_session_input(&caller_kind, caller_session_id, input);
+        match self.agent_send(&resolved, &delivered) {
+            Ok(reply) => Ok(serde_json::json!({
+                "ok": true,
+                "session_id": resolved,
+                "delivered": true,
+                "queued": false,
+                "delivered_input": delivered,
+                "reply_chars": reply.content.chars().count(),
+                "tool_calls": reply.tool_events.len(),
+            })),
+            // The receiver is mid-turn. Its input cannot be spliced into the
+            // running turn, so park it for the next one instead of dropping
+            // the message. The caller is told plainly that it is queued.
+            Err(RuntimeError::AgentSessionBusy { .. }) => {
+                let dropped_oldest = self.queue_session_input(&resolved, delivered.clone());
+                Ok(serde_json::json!({
+                    "ok": true,
+                    "session_id": resolved,
+                    "delivered": false,
+                    "queued": true,
+                    "dropped_oldest": dropped_oldest,
+                    "delivered_input": delivered,
+                }))
+            }
+            Err(err) => Err(err),
+        }
     }
 
     /// Mark a session's tree node live. Membership in the node map is what
@@ -436,18 +500,37 @@ impl RuntimeHost {
     /// Resolve an id *or* an address to a live session id.
     ///
     /// Ids win: an address is only consulted when no live id matches, so a
-    /// session cannot shadow another by picking a colliding address.
+    /// session cannot shadow another by picking a colliding address. A session
+    /// that is mid-turn is out of `agent_sessions` but still in the node tree;
+    /// it stays addressable so a forwarded input can be queued for it rather
+    /// than reported as an unknown teammate.
     pub fn agent_resolve_session(&self, id_or_address: &str) -> Option<String> {
-        let guard = self
-            .agent_sessions
+        {
+            let guard = self
+                .agent_sessions
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            if guard.contains_key(id_or_address) {
+                return Some(id_or_address.to_string());
+            }
+            let by_address = guard
+                .iter()
+                .find(|(_, managed)| managed.address.as_deref() == Some(id_or_address))
+                .map(|(id, _)| id.clone());
+            if by_address.is_some() {
+                return by_address;
+            }
+        }
+        let nodes = self
+            .session_nodes
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        if guard.contains_key(id_or_address) {
+        if nodes.get(id_or_address).is_some_and(|node| node.live) {
             return Some(id_or_address.to_string());
         }
-        guard
+        nodes
             .iter()
-            .find(|(_, managed)| managed.address.as_deref() == Some(id_or_address))
+            .find(|(_, node)| node.live && node.address.as_deref() == Some(id_or_address))
             .map(|(id, _)| id.clone())
     }
 
@@ -526,12 +609,17 @@ impl RuntimeHost {
         // find its caller. Running a turn also proves the session is alive, so
         // a recovered one joins the tree here.
         self.mark_session_node_live(session_id);
+        // Inputs forwarded while this session was busy become part of this
+        // turn's opening user message. Taking the mailbox only after the
+        // session is known to be available keeps a rejected `send` (Busy)
+        // from consuming another turn's queue.
+        let input = merge_queued_inputs(self.take_session_mailbox(session_id), input);
         let images = self.image_parts_for_batch(image_urls);
         // R1: respond 期间可能 panic（agent 循环内的 assert、越界等）。
         // 用 catch_unwind 包住：panic 也继续走收尾，会话数据不丢失，
         // 返回值换成 Invariant 错误。
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            session.respond_with_images(self, input, &images, notes)
+            session.respond_with_images(self, &input, &images, notes)
         }));
         // P1-25: drain any pending actions queued by tools that couldn't
         // reach the session during `respond` (compact_context et al) and
@@ -869,6 +957,100 @@ impl RuntimeHost {
             })?;
         Ok(session.session.transcript().to_vec())
     }
+
+    /// Park one forwarded input for a mid-turn session.
+    ///
+    /// Returns whether the bounded queue dropped its oldest entry. The caller
+    /// only uses that to report the loss; delivery itself still succeeded into
+    /// the queue.
+    pub(crate) fn queue_session_input(&self, session_id: &str, input: String) -> bool {
+        let mut guard = self
+            .session_mailbox
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let queue = guard.entry(session_id.to_string()).or_default();
+        let dropped_oldest = queue.len() >= MAX_SESSION_MAILBOX;
+        if dropped_oldest {
+            queue.pop_front();
+        }
+        queue.push_back(input);
+        drop(guard);
+        if dropped_oldest {
+            eprintln!("{}", mailbox_overflow_diagnostic(session_id));
+        }
+        dropped_oldest
+    }
+
+    /// Take everything parked for a session. Called at the start of a turn,
+    /// before the session leaves the map, so the queue cannot be read twice.
+    fn take_session_mailbox(&self, session_id: &str) -> Vec<String> {
+        self.session_mailbox
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .remove(session_id)
+            .map(|queue| queue.into_iter().collect::<Vec<_>>())
+            .unwrap_or_default()
+    }
+
+    /// The queued inputs for a session, for tests.
+    #[doc(hidden)]
+    pub fn debug_mailbox(&self, session_id: &str) -> Vec<String> {
+        self.session_mailbox
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .get(session_id)
+            .map(|queue| queue.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+}
+
+/// How many forwarded inputs one session may hold while it is mid-turn.
+///
+/// A bound is necessary because the producer (another session) is not
+/// rate-limited: without it a chatty peer could grow the mailbox forever while
+/// the receiver is busy. Eight is enough for a burst and small enough that
+/// dropping the oldest is cheap and visible.
+pub(crate) const MAX_SESSION_MAILBOX: usize = 8;
+
+/// The one diagnostic line printed when the mailbox overflows.
+///
+/// Kept as a named function so the wording can be asserted without capturing
+/// stderr.
+pub(crate) fn mailbox_overflow_diagnostic(session_id: &str) -> String {
+    format!(
+        "[agent-mailbox] session {session_id}: queue is full ({MAX_SESSION_MAILBOX}), \
+         dropped the oldest input"
+    )
+}
+
+/// Fold parked inputs into the turn's opening user message.
+///
+/// The queued text keeps its own `[forwarded from …]` marker, so the receiver
+/// sees a report from another session ahead of whatever the room just said.
+pub(crate) fn merge_queued_inputs(queued: Vec<String>, input: &str) -> String {
+    if queued.is_empty() {
+        return input.to_string();
+    }
+    format!("{}\n\n{}", queued.join("\n\n"), input)
+}
+
+/// The first line of a message forwarded by `send_to_session`.
+///
+/// The receiver processes it as an ordinary user turn, so without this marker
+/// a room-facing session cannot tell "an iteration reported back" from "a
+/// person in this room said it" — and relays a long analysis the room never
+/// asked for, in the bot's own voice. The exact wording is part of the
+/// contract: `send_to_session` prepends exactly this line.
+///
+/// `caller_kind` is the sender's session kind (`plugin_iteration` /
+/// `runtime_shell`); an unknown kind degrades to `session`, which still names
+/// the id.
+pub(crate) fn forwarded_session_input(
+    caller_kind: &str,
+    caller_session_id: &str,
+    input: &str,
+) -> String {
+    format!("[forwarded from {caller_kind} session {caller_session_id}]\n{input}")
 }
 
 /// The refusal for a `send_to_session` target the caller was never introduced

@@ -1587,7 +1587,7 @@ fn runtime_host_iterate_plugins_agent_retries_on_warning_and_promotes() {
 
 #[serial]
 #[test]
-fn runtime_host_iterate_plugins_agent_retries_on_raw_mod_identifier_and_rolls_back() {
+fn runtime_host_iterate_plugins_agent_retries_on_raw_mod_identifier_and_promotes() {
     // LLM-network coverage: this agent-driven iteration exercises the mock
     // SSE server and `PluginIterationAgentBackend::execute_tool` dispatch
     // (scaffold_child_plugin, replace_file_exact). It no longer skips on
@@ -1648,25 +1648,33 @@ fn runtime_host_iterate_plugins_agent_retries_on_raw_mod_identifier_and_rolls_ba
             verify_profile: Some(VerificationProfile::RustWorkspace),
             quality_score: Some(95),
         })
-        .expect("agent-driven failure should still return rollback result");
+        .expect("an iteration that changed files returns a result");
 
     let requests = requests_rx.recv().expect("captured requests");
     handle.join().expect("join mock server");
 
+    // The iteration used to roll back here only because the summary tool was
+    // never called; the driver now derives the summary from the changed paths,
+    // so a change that verifies is promoted.
     assert_eq!(
         result.final_verdict,
-        PluginIterationFinalVerdict::RolledBack
+        PluginIterationFinalVerdict::Promoted
     );
-    assert!(result
-        .blocked_reason
-        .as_deref()
-        .unwrap_or_default()
-        .contains("record_iteration_summary"));
+    // It promotes, so nothing is blocked. The candidate is consumed by the
+    // promotion, which is why no snapshot is left behind — the same assertion
+    // held before, but for the opposite reason.
+    assert_eq!(result.blocked_reason, None);
     assert!(host.candidate_snapshot().is_none());
-    assert!(requests.len() >= 3);
-    assert!(requests[2].contains("expr/evaluator/mod"));
-    assert!(requests[2].contains("raw Rust identifier `mod` is invalid"));
-    assert!(!fixtures
+    // The rejection reaches the agent on a later request; which index it lands
+    // on depends on how many turns the run needs, so find it instead of
+    // assuming one.
+    let retry = requests
+        .iter()
+        .find(|request| request.contains("raw Rust identifier `mod` is invalid"))
+        .expect("the agent is told the raw identifier is invalid");
+    assert!(retry.contains("expr/evaluator/mod"));
+    // Promoted, so the change stays: the file the agent created is there.
+    assert!(fixtures
         .join("plugins/expr/evaluator/mod/Cargo.toml")
         .exists());
 }

@@ -122,6 +122,7 @@ impl cordis_runtime::agent_loop::AgentSessionApi for imp::AgentSession {
     fn respond_with_iteration(
         &mut self,
         host: &cordis_runtime::host::RuntimeHost,
+        session_id: &str,
         state: &mut cordis_runtime::host::PluginIterationAgentState,
         input: &str,
         images: &[serde_json::Value],
@@ -130,7 +131,11 @@ impl cordis_runtime::agent_loop::AgentSessionApi for imp::AgentSession {
         sink: Option<std::sync::Arc<dyn cordis_runtime::llm_sink::TokenSink>>,
     ) -> Result<cordis_runtime::agent_api::AgentReply, cordis_runtime::core::error::RuntimeError>
     {
-        let mut backend = crate::iteration::backend::PluginIterationAgentBackend { host, state };
+        let mut backend = crate::iteration::backend::PluginIterationAgentBackend {
+            host,
+            state,
+            session_id,
+        };
         imp::AgentSession::respond_with_provider_images(
             self,
             &mut backend,
