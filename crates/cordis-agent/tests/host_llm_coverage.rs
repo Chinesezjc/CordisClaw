@@ -284,14 +284,46 @@ enum ServerStep {
     Reply(String),
 }
 
+/// How long the scripted server waits for the next connection before it
+/// declares the script undialled.
+///
+/// Generous enough for a cold, instrumented boot plus the python proxy's
+/// start-up, but *bounded*: a step nothing ever dials must fail the test that
+/// scripted it, not wedge `handle.join()` (and with it the whole
+/// `cargo test --workspace` run) forever.
+const SCRIPTED_ACCEPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
 fn spawn_scripted_server(steps: Vec<ServerStep>) -> (String, std::thread::JoinHandle<usize>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind scripted server");
+    listener
+        .set_nonblocking(true)
+        .expect("set listener nonblocking");
     let addr = listener.local_addr().expect("addr");
+    let total = steps.len();
     let handle = std::thread::spawn(move || {
         use std::io::{BufRead, BufReader, Read as _, Write as _};
         let mut served = 0usize;
-        for step in steps {
-            let (mut stream, _) = listener.accept().expect("accept scripted request");
+        for (index, step) in steps.into_iter().enumerate() {
+            let started = std::time::Instant::now();
+            let (mut stream, _) = loop {
+                match listener.accept() {
+                    Ok(conn) => break conn,
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            started.elapsed() < SCRIPTED_ACCEPT_TIMEOUT,
+                            "scripted server timed out after {SCRIPTED_ACCEPT_TIMEOUT:?} waiting \
+                             for request {}/{total} (served {served} so far): a ServerStep was \
+                             scripted that nothing dialled",
+                            index + 1,
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(err) => panic!("accept scripted request: {err}"),
+                }
+            };
+            // The accepted socket inherits the listener's non-blocking mode on
+            // some platforms (macOS); the request read below must block.
+            stream.set_nonblocking(false).expect("set stream blocking");
             let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
             let mut line = String::new();
             reader.read_line(&mut line).expect("request line");
@@ -313,23 +345,23 @@ fn spawn_scripted_server(steps: Vec<ServerStep>) -> (String, std::thread::JoinHa
                 ServerStep::Fail503 => {
                     // 503 is retryable (not a permanent 4xx), so the in-profile
                     // retry loop keeps trying up to AGENT_REQUEST_MAX_ATTEMPTS.
-                    write!(
+                    // The client may already have moved on to its next attempt,
+                    // so a reset on this write is its doing — ignore it.
+                    let _ = write!(
                         stream,
                         "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 4\r\nConnection: close\r\n\r\ndown"
-                    )
-                    .expect("write 503");
-                    stream.flush().expect("flush 503");
+                    );
+                    let _ = stream.flush();
                 }
                 ServerStep::Reply(content) => {
-                    write!(
-                        stream,
-                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
-                    )
-                    .expect("headers");
                     // The client may hang up before the body is finished — a
                     // scenario the test is about, since it asserts on the
                     // primary connection failing. A reset here is the client's
                     // doing, not a broken reply, so it cannot be a panic.
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+                    );
                     for (_, chunk) in assistant_reply("scripted", &content) {
                         let _ = write!(stream, "{:X}\r\n{}\r\n", chunk.len(), chunk);
                     }
@@ -665,23 +697,25 @@ fn agent_send_retries_transient_5xx_then_succeeds_without_degrading() {
             served += 1;
             if attempt < 2 {
                 // Transient failure: 500 is retryable (not a permanent 4xx).
-                write!(
+                // The client may already be dialling its next attempt, so a
+                // reset on this write is its doing — ignore it.
+                let _ = write!(
                     stream,
                     "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 5\r\nConnection: close\r\n\r\nretry"
-                )
-                .expect("write 500");
-                stream.flush().expect("flush 500");
+                );
+                let _ = stream.flush();
             } else {
-                write!(
+                // Same as `spawn_scripted_server`: the reader owns the socket
+                // and may close it before this body is finished.
+                let _ = write!(
                     stream,
                     "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
-                )
-                .expect("headers");
+                );
                 for (_, chunk) in assistant_reply("retry_ok", "recovered after retries") {
-                    write!(stream, "{:X}\r\n{}\r\n", chunk.len(), chunk).expect("chunk");
+                    let _ = write!(stream, "{:X}\r\n{}\r\n", chunk.len(), chunk);
                 }
-                write!(stream, "0\r\n\r\n").expect("end");
-                stream.flush().expect("flush");
+                let _ = write!(stream, "0\r\n\r\n");
+                let _ = stream.flush();
             }
         }
         served
