@@ -296,22 +296,28 @@ pub fn spawn_chunked_mock_llm_server_sequence_with_timeouts(
             request.push_str(&String::from_utf8_lossy(&body));
             requests.push(request);
 
-            write!(
+            // 读端占主动：拿到 assistant turn（读到 `data: [DONE]` 就停）或
+            // 直接放弃的客户端会先关连接，收尾写入因此可能以 ECONNRESET 失败。
+            // 那是客户端的主动权，不是 mock 坏了；"最后一块写没写赢"取决于
+            // 机器负载，不是测试语义。断言读的是捕获到的**请求**，不是 server
+            // 能否写完一个没人必须读的 body，所以写/刷新的 Result 一律忽略。
+            let _ = write!(
                 stream,
                 "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
-            )
-            .expect("write response headers");
-            stream.flush().expect("flush response headers");
+            );
+            let _ = stream.flush();
 
             for (delay_ms, chunk) in chunks {
                 thread::sleep(Duration::from_millis(delay_ms));
-                write!(stream, "{:X}\r\n{}\r\n", chunk.len(), chunk).expect("write chunk");
-                stream.flush().expect("flush chunk");
+                let _ = write!(stream, "{:X}\r\n{}\r\n", chunk.len(), chunk);
+                let _ = stream.flush();
             }
-            write!(stream, "0\r\n\r\n").expect("finish chunked response");
-            stream.flush().expect("flush chunked end");
+            let _ = write!(stream, "0\r\n\r\n");
+            let _ = stream.flush();
         }
-        sender.send(requests).expect("send captured requests");
+        // 接收端在整个测试体内都活着（断言要读捕获结果）；只有已经 panic 的
+        // 测试会提前丢掉它，而那个测试本来就在报自己的失败。
+        let _ = sender.send(requests);
     });
 
     (format!("http://{}/v1", address), receiver, handle)
