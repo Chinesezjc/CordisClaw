@@ -1,0 +1,18 @@
+# 锁定工具链：宿主与插件 dylib 必须由同一个 rustc 编译。
+#
+# 为什么必须有这个文件：插件 ABI（`RustPluginApiV2`）是 Rust ABI —— 里面是
+# `fn` 指针，且 `PluginRequest.payload` 按值传 `String`。这不是 C ABI，
+# 跨编译器/跨版本的布局与单态化实例都不保证兼容；缺实例时表现为加载期
+# undefined symbol，而不是一句清晰的错误。
+#
+# `AbiFingerprint` 会在加载时比对 rustc_version 并拒绝不匹配的工件，那是
+# 运行期兜底；本文件是构建期的**预防**：宿主与所有插件在默认情况下用同一
+# 个编译器。CI 的 `dtolnay/rust-toolchain` 步骤显式安装同一版本。
+#
+# 升级方式：改这里的 channel，同步改 .github/workflows/*.yml 里的 toolchain
+# 输入，然后全量重建 fixtures 工件（`prepare-artifacts --full`）——工件的
+# rustc_version 指纹会随之变化。
+[toolchain]
+channel = "1.97.1"
+components = ["clippy", "rustfmt"]
+profile = "minimal"

@@ -13,6 +13,16 @@
     }
   },
   {
+    "plugin_path": "qq",
+    "node_id": "qq_ws_serve",
+    "payload": {
+      "node_id": "qq_ws_serve",
+      "payload": {
+        "port": 8002
+      }
+    }
+  },
+  {
     "plugin_path": "feishu",
     "node_id": "feishu_serve",
     "payload": {

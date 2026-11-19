@@ -1,0 +1,7835 @@
+use chrono::Local;
+use cordis_runtime::agent_api::{AgentSessionSnapshot, LlmProvider};
+use cordis_runtime::agent_tools::*;
+use cordis_runtime::config::LlmApiConfig;
+use cordis_runtime::core::error::RuntimeError;
+use serde_json::{json, Map, Value};
+use std::collections::{BTreeSet, VecDeque};
+use std::env;
+use std::io::Write;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+pub use cordis_runtime::agent_api::{
+    AgentBackend, AgentReply, AgentSessionStatus, AgentToolEvent, AgentToolExecutionSummary,
+    AgentToolHost, AgentToolSpec, AgentTranscriptEntry,
+};
+
+/// Shared queue for Agent message injection.  The inbox thread pushes new
+/// incoming messages here, and the Agent's respond loop drains them
+/// between LLM turns so that late-arriving messages are seen.
+///
+/// P2-32 known limitation: this is a single process-wide queue. When more
+/// than one session runs concurrently (e.g. `RuntimeShell` + a
+/// `PluginIteration` agent driven in parallel from another thread), an
+/// injected message lands in whichever session's `respond` loop happens
+/// to drain first. Per-session queues would require the caller
+/// (`main.rs::run_serve`) to route messages by session id — that
+/// refactor is tracked separately; today's setup runs one primary
+/// session at a time so the mis-routing hazard is latent, not active.
+static AGENT_INJECT_QUEUE: Mutex<Option<Arc<Mutex<VecDeque<String>>>>> = Mutex::new(None);
+
+/// Set the injection queue from the main binary.  Must be called once
+/// before the Agent starts processing messages.
+pub fn set_agent_inject_queue(q: Arc<Mutex<VecDeque<String>>>) {
+    *AGENT_INJECT_QUEUE.lock().unwrap_or_else(|p| p.into_inner()) = Some(q);
+}
+
+/// Drain queued messages for injection into the current Agent turn.
+fn drain_inject_queue() -> Vec<String> {
+    // 测试线程的私有注入优先：进程级队列被整个测试进程共享，塞进去的消息会被
+    // 别的用例的 drain 抢走，"回合中途插话"因此无法确定性重放。
+    #[cfg(test)]
+    if let Some(queued) = take_test_injection() {
+        return queued;
+    }
+    let guard = AGENT_INJECT_QUEUE.lock().unwrap_or_else(|p| p.into_inner());
+    drain_queue(guard.as_ref())
+}
+
+// 测试线程的一次性注入队列；非测试构建里根本不存在。
+#[cfg(test)]
+thread_local! {
+    static TEST_INJECTION: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+fn queue_test_injection(messages: Vec<String>) {
+    TEST_INJECTION.with(|slot| *slot.borrow_mut() = messages);
+}
+
+/// 取走当前线程的注入；空队列当作"没有"，于是落回进程级队列。
+#[cfg(test)]
+fn take_test_injection() -> Option<Vec<String>> {
+    TEST_INJECTION.with(|slot| {
+        let queued = std::mem::take(&mut *slot.borrow_mut());
+        (!queued.is_empty()).then_some(queued)
+    })
+}
+
+/// Drain one injection queue; nothing at all when no queue is installed.
+///
+/// Split out from [`drain_inject_queue`] so the "a queue with content" half can
+/// be tested without installing a process-wide queue that another test's turn
+/// might drain first.
+fn drain_queue(queue: Option<&Arc<Mutex<VecDeque<String>>>>) -> Vec<String> {
+    let Some(queue) = queue else {
+        return Vec::new();
+    };
+    queue
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .drain(..)
+        .collect()
+}
+
+/// How many times one turn re-issues a request the provider answered with
+/// nothing (no content, no tool calls) before reporting a failure.
+const EMPTY_RESPONSE_RETRIES: usize = 1;
+
+/// Hard ceiling on message count, as a backstop.
+///
+/// This is the **only** count-based limit left, and it is an extreme backstop
+/// that normal sessions never reach. History is governed by size (see
+/// [`COMPACT_AT_TOKENS`]); a session that keeps 8192 messages without ever
+/// crossing the token threshold is small enough to keep, and one that crosses
+/// the token threshold is compacted long before the count matters.
+const AGENT_HISTORY_MESSAGE_LIMIT: usize = 8192;
+
+/// The provider's context window.
+///
+/// Everything size-related derives from this one number so the thresholds can
+/// never drift apart again. DeepSeek currently serves 1M tokens.
+pub const CONTEXT_WINDOW_TOKENS: usize = 1_000_000;
+
+/// Compact once the estimated history weight reaches this water line.
+///
+/// This is the **single** trigger for compaction: `estimated_tokens` above
+/// this value. 80% of the window keeps a 200k-token margin for the reply, the
+/// DSML protocol prompt and the current turn's tool output.
+pub const COMPACT_AT_TOKENS: usize = CONTEXT_WINDOW_TOKENS * 8 / 10;
+
+/// How much recent history compaction leaves untouched, as raw messages.
+///
+/// 30% of the window: after compaction the session sits around 300k tokens,
+/// leaving 500k of headroom before [`COMPACT_AT_TOKENS`] fires again — so
+/// compaction is a rare event, not something every turn brushes against.
+pub const KEEP_RECENT_TOKENS: usize = CONTEXT_WINDOW_TOKENS * 3 / 10;
+
+/// Failure fallback: never keep fewer than this many recent messages...
+const COMPACT_FAILURE_KEEP_MESSAGES: usize = 20;
+/// ...and never keep fewer than this many recent tokens (whichever is larger).
+const COMPACT_FAILURE_KEEP_TOKENS: usize = 8_000;
+
+/// One tool result in the summary request is clipped to this many chars.
+///
+/// Tool output is where the bulk of a long history lives (file dumps, command
+/// output); keeping the head is enough to summarise the decision it supported.
+const SUMMARY_TOOL_RESULT_CHARS: usize = 2_000;
+
+/// One message in the failure collage keeps at most this many chars.
+///
+/// This is the old truncate-and-paste behaviour, kept only as a fallback when
+/// the provider cannot produce a real summary.
+const SUMMARY_COLLAGE_MESSAGE_CHARS: usize = 500;
+
+/// Hard cap on the memory text handed back to the model, in chars.
+///
+/// The prompt asks for at most 1500 Chinese characters; a provider that
+/// overruns is clipped so one bad completion cannot refill the window.
+const SUMMARY_MAX_CHARS: usize = 1_500;
+
+/// Prefix marking the single assistant message that holds compacted memory.
+const COMPACT_MEMORY_PREFIX: &str = "[早前对话摘要]";
+
+/// What the summary provider is asked to do.
+const SUMMARY_SYSTEM_PROMPT: &str =
+    "你是对话记忆压缩器。把给你的早期对话压缩成一段可继续使用的记忆。\
+必须保留：出现过的人物与称呼、事实、已做出的决定、尚未解决的问题、当前正在进行的任务。\
+丢掉寒暄与重复。用中文写，不超过 1500 字，直接输出记忆正文，不要标题或解释。";
+
+/// What one inline picture costs in the token budget.
+///
+/// Images are priced per picture by the provider, not per byte; byte size is the
+/// separate `image_budget` channel. 1024 matches the upper end of a vision
+/// model's per-image charge.
+const IMAGE_TOKEN_ESTIMATE: usize = 1024;
+const AGENT_MAX_TOOL_TURNS: usize = 96;
+
+/// 一次模型补全的执行者。
+///
+/// 这是 agent 循环（机制）与供应商传输（可覆写）之间的接缝。循环只要求拿回
+/// **结构化的** `tool_calls`——它在本轮中途就要据此分派工具，因此只回文本的
+/// provider 无法驱动工具调用。
+
+#[derive(Debug, Clone)]
+pub struct AgentSession {
+    kind: String,
+    config: LlmApiConfig,
+    history: Vec<Value>,
+    transcript: Vec<AgentTranscriptEntry>,
+    completed_turns: usize,
+    /// Conservative estimate of total tokens in history: text at chars / 2,
+    /// inline images at base64 length / 4 (see [`estimate_message_tokens`]).
+    estimated_tokens: usize,
+    /// When set, the turn only ends on an explicit `suspend` call.
+    require_end_tool: bool,
+    /// O批: soul scope key ({sender_id}#{conversation_kind}) this session
+    /// serves. Empty = no per-user soul (REPL, legacy callers).
+    soul_key: String,
+    /// P4: this session serves a group room (as opposed to a 1:1 chat).
+    is_group: bool,
+    /// P4: the current speaker is that room's owner/admin. Meaningless for
+    /// private chats, which never gate persona edits on it.
+    caller_is_admin: bool,
+    /// Channel-provided: this speaker may approve a staged iteration.
+    can_approve_iteration: bool,
+}
+
+/// 一次 `respond` 的全部临时状态。回合开始创建，结束即丢弃。
+///
+/// 回合由 [`AgentSession::respond_inner`] 用 `Turn::default()` 打开，随返回值
+/// 交给收尾步骤，然后被丢弃——**没有任何一条路径把它写回 [`AgentSession`]**。
+/// 于是"上一轮的计数漏进下一轮"不再是可能发生的 bug：下一轮拿到的是全新的
+/// 零值对象，而不是会话上残留的字段。
+///
+/// 只放**每轮**状态。`history` / `transcript` / `estimated_tokens` /
+/// `completed_turns` 是跨轮状态，仍留在 [`AgentSession`] 上。
+struct Turn {
+    /// 回合起点，用于总时长预算（`timeout_ms` / `stream_timeout_secs`）。
+    started: Instant,
+    /// 连续"没有调用结束标记"的次数（渠道会话）。
+    no_end_strikes: usize,
+    /// 连续调用不存在工具的次数。
+    unknown_tool_strikes: usize,
+    /// 连续空补全的次数（provider 抖动，重试而非报错）。
+    empty_response_strikes: usize,
+    /// 连续"只有推理、没有正文也没有工具"的次数。
+    reasoning_only_strikes: usize,
+    /// 本轮每次模型调用产出的推理；收尾时并入转录（转录比 history 活得久）。
+    reasoning: Vec<String>,
+    /// 本轮已经因 400 剥掉过图片 part，避免同一轮无限重试。
+    images_stripped: bool,
+    /// `view_image` 取回、待附加到下一次请求的图片（`image_url` content part）。
+    attached: Vec<Value>,
+}
+
+impl Default for Turn {
+    fn default() -> Self {
+        Self {
+            started: Instant::now(),
+            no_end_strikes: 0,
+            unknown_tool_strikes: 0,
+            empty_response_strikes: 0,
+            reasoning_only_strikes: 0,
+            reasoning: Vec::new(),
+            images_stripped: false,
+            attached: Vec::new(),
+        }
+    }
+}
+
+pub type ShellAgentStatus = AgentSessionStatus;
+pub type ShellAgentReply = AgentReply;
+
+/// The tool a channel session calls to close its turn.
+///
+/// The runtime does not infer "done" from the model stopping: a turn ends when
+/// this name appears among the calls, so text-only output keeps the turn alive.
+pub const AGENT_TOOL_END_TURN: &str = "suspend";
+
+/// Plugin-iteration sessions end when the agent records its summary: the
+/// prompt promises "it ends the session immediately", and the promotion
+/// pipeline reads that summary. Without this the loop kept asking for another
+/// turn and the run died on "exited without calling record_iteration_summary".
+pub const AGENT_TOOL_RECORD_ITERATION_SUMMARY: &str = "record_iteration_summary";
+
+#[derive(Debug, Clone)]
+pub struct ShellAgentSession {
+    inner: AgentSession,
+}
+
+/// Conservative token estimate: 1 token per 2 characters (assumes mostly
+/// Chinese text which is more token-dense than English).
+fn estimate_tokens(s: &str) -> usize {
+    s.chars().count() / 2
+}
+
+/// 一条消息的 token 估算：文本按 chars/2，内联图片按 [`IMAGE_TOKEN_ESTIMATE`]。
+///
+/// 计数必须**保守**：压缩阈值是"真实水位"，宁可高估也不能漏算，否则历史会
+/// 在阈值之下悄悄撑爆 provider 的上下文窗口。因此这里逐项计入：
+///
+/// - `content`：字符串按 chars/2；数组遍历每个 part（文本按 chars/2，内联图片
+///   按张计价；远程 `https://` 图片与坏 part 计 0）。
+/// - `reasoning_content`：推理文本同样占用 provider 的上下文，计入。
+/// - `tool_calls[].function.{name,arguments}`：历史恢复出来的原生 tool call
+///   带着参数 JSON，也是真实请求的一部分，计入。
+/// - `role == "tool"` 的消息没有特殊分支：它的 `content` 走上面同一条字符串
+///   路径，因此工具结果（往往是最重的一段）不会被漏掉。
+pub fn estimate_message_tokens(message: &Value) -> usize {
+    let content = match message.get("content") {
+        Some(Value::String(text)) => estimate_tokens(text),
+        Some(Value::Array(parts)) => parts.iter().map(estimate_content_part_tokens).sum(),
+        _ => 0,
+    };
+    let reasoning = message
+        .get("reasoning_content")
+        .and_then(Value::as_str)
+        .map(estimate_tokens)
+        .unwrap_or(0);
+    let tool_calls = message
+        .get("tool_calls")
+        .and_then(Value::as_array)
+        .map(|calls| calls.iter().map(estimate_tool_call_tokens).sum())
+        .unwrap_or(0);
+    content + reasoning + tool_calls
+}
+
+/// 一个原生 tool call 的重量：函数名 + 未解析的参数 JSON。
+///
+/// 参数是模型写出来的真实文本，会随历史一起重发；名字很短但同样计入。
+/// 缺字段的调用计 0，坏形状不会让估算 panic。
+fn estimate_tool_call_tokens(call: &Value) -> usize {
+    let function = call.get("function");
+    let name = function
+        .and_then(|function| function.get("name"))
+        .and_then(Value::as_str)
+        .map(estimate_tokens)
+        .unwrap_or(0);
+    let arguments = function
+        .and_then(|function| function.get("arguments"))
+        .and_then(Value::as_str)
+        .map(estimate_tokens)
+        .unwrap_or(0);
+    name + arguments
+}
+
+/// 一条消息在压缩摘要里的正文：文本 part 拼接，内联图片只记张数。
+///
+/// 带图消息的 `content` 是 `[{type:"text"},{type:"image_url"}]` 数组，旧实现
+/// 只读 `content.as_str()`，于是整条消息在摘要里变成空行——既不摘要也不丢弃。
+/// 这里遍历数组：text part 按顺序拼接（历史里已被字节预算换成占位符的也是
+/// text part，因此占位符原文保留），image_url part 只留一个 `[图片 N 张]`
+/// 标记——摘要不需要 base64。
+///
+/// 返回 `(text, image_count)`，由调用方决定怎么截断与拼标记。
+fn summarize_message_content(content: &Value) -> (String, usize) {
+    match content {
+        Value::String(text) => (text.clone(), 0),
+        Value::Array(parts) => {
+            let mut text = String::new();
+            let mut images = 0;
+            for part in parts {
+                match part.get("type").and_then(Value::as_str) {
+                    Some("text") => {
+                        if let Some(part_text) = part.get("text").and_then(Value::as_str) {
+                            text.push_str(part_text);
+                        }
+                    }
+                    Some("image_url") => images += 1,
+                    _ => {}
+                }
+            }
+            (text, images)
+        }
+        _ => (String::new(), 0),
+    }
+}
+
+/// `content` 数组里的一个 part：文本按 chars/2，内联图片按张计价。
+fn estimate_content_part_tokens(part: &Value) -> usize {
+    match part.get("type").and_then(Value::as_str) {
+        Some("text") => part
+            .get("text")
+            .and_then(Value::as_str)
+            .map(estimate_tokens)
+            .unwrap_or(0),
+        // A picture costs roughly a vision-token budget, not its byte size: the
+        // provider prices it as one image (a few hundred to ~1k tokens), while
+        // the bytes are a separate channel handled by `image_budget`. Charging
+        // bytes here made a single 2 MB picture look like 500k tokens, so the
+        // whole user+assistant pair was pruned the moment it arrived.
+        Some("image_url") => part
+            .get("image_url")
+            .and_then(|image| image.get("url"))
+            .and_then(Value::as_str)
+            .and_then(cordis_runtime::image_budget::inline_image_bytes)
+            .map(|_| IMAGE_TOKEN_ESTIMATE)
+            .unwrap_or(0),
+        _ => 0,
+    }
+}
+
+/// 截断到 `max` 个字符；超长时补一个 `…` 表示后面还有内容。
+///
+/// 按字符而不是字节判断，中文与 ASCII 走同一条规则，不会在半个 UTF-8
+/// 字符上切开。
+fn truncate_chars(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let mut clipped: String = text.chars().take(max).collect();
+    clipped.push('…');
+    clipped
+}
+
+/// 最近消息的起点：从尾部往前累加，保留不超过 `budget` token 的原文。
+///
+/// 至少保留一条消息：单条就超过预算时也留住它，否则压缩会把对话清空。
+fn keep_recent_start(history: &[Value], budget: usize) -> usize {
+    let mut start = history.len();
+    let mut spent = 0;
+    while start > 0 {
+        let cost = estimate_message_tokens(&history[start - 1]);
+        if spent > 0 && spent + cost > budget {
+            break;
+        }
+        spent += cost;
+        start -= 1;
+    }
+    start
+}
+
+/// 失败兜底时的保留起点：`[`COMPACT_FAILURE_KEEP_MESSAGES`]` 条与
+/// `[`COMPACT_FAILURE_KEEP_TOKENS`]` token **取较大者**。
+///
+/// 这是"绝不清空"的最后一道闸：摘要调用失败时，即使旧消息一条都压不动，
+/// 这 20 条 / 8k token 也一定还在。
+fn fallback_keep_start(history: &[Value]) -> usize {
+    let mut start = history.len();
+    let mut spent = 0;
+    while start > 0 && history.len() - start < COMPACT_FAILURE_KEEP_MESSAGES {
+        spent += estimate_message_tokens(&history[start - 1]);
+        start -= 1;
+    }
+    while start > 0 && spent < COMPACT_FAILURE_KEEP_TOKENS {
+        spent += estimate_message_tokens(&history[start - 1]);
+        start -= 1;
+    }
+    start
+}
+
+/// 把一段旧消息渲染成摘要请求里的纯文本：保留 role 与内容。
+///
+/// 工具结果是历史里最占地方的部分，截到 [`SUMMARY_TOOL_RESULT_CHARS`] 字；
+/// 其余消息原样保留（模型要据此提炼人物、决定与未解决的问题）。图片只留
+/// 张数标记，base64 不进摘要请求。空消息跳过，避免摘要里出现空行。
+fn render_for_summary(messages: &[Value]) -> String {
+    let mut lines = Vec::new();
+    for message in messages {
+        let role = message
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let (content, images) =
+            summarize_message_content(message.get("content").unwrap_or(&Value::Null));
+        if content.is_empty() && images == 0 {
+            continue;
+        }
+        let content = if role == "tool" {
+            truncate_chars(&content, SUMMARY_TOOL_RESULT_CHARS)
+        } else {
+            content
+        };
+        let marker = match images {
+            0 => String::new(),
+            count => format!(" [图片 {count} 张]"),
+        };
+        lines.push(format!("[{role}] {content}{marker}"));
+    }
+    lines.join("\n")
+}
+
+/// 摘要调用失败时的旧式截断拼贴：每条旧消息取前
+/// [`SUMMARY_COLLAGE_MESSAGE_CHARS`] 字，按 role 拼起来。
+///
+/// 只在 provider 不可用 / 报错 / 返回空时使用；真正的摘要走
+/// [`AgentSession::request_summary`]。
+fn collage_summary(messages: &[Value]) -> String {
+    let mut lines = Vec::new();
+    for message in messages {
+        let role = message
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let (content, images) =
+            summarize_message_content(message.get("content").unwrap_or(&Value::Null));
+        if content.is_empty() && images == 0 {
+            continue;
+        }
+        let marker = match images {
+            0 => String::new(),
+            count => format!(" [图片 {count} 张]"),
+        };
+        lines.push(format!(
+            "[{role}] {}{marker}",
+            truncate_chars(&content, SUMMARY_COLLAGE_MESSAGE_CHARS)
+        ));
+    }
+    lines.join("\n")
+}
+
+/// 历史开头那条记忆消息：`assistant` + `[早前对话摘要]` 前缀。
+fn memory_message(content: &str) -> Value {
+    json!({
+        "role": "assistant",
+        "content": format!("{COMPACT_MEMORY_PREFIX} {content}"),
+    })
+}
+
+/// 这条消息是否已经是上一次压缩留下的记忆。
+///
+/// 用来防止"只剩记忆 + 一条超预算消息"时反复把记忆再摘要一遍——那种历史
+/// 已经没有可压缩的原文，再调用 provider 只会烧钱并丢掉细节。
+fn is_compact_memory(message: &Value) -> bool {
+    message
+        .get("content")
+        .and_then(Value::as_str)
+        .is_some_and(|content| content.starts_with(COMPACT_MEMORY_PREFIX))
+}
+
+/// 失败诊断行的唯一格式：`agent_compact_failed reason=… kept=…`。
+///
+/// `kept` 是压缩后 `history` 的条数（含那条记忆消息），用来证明"没有清空"。
+fn compact_failure_line(reason: &str, kept: usize) -> String {
+    format!("agent_compact_failed reason={reason} kept={kept}")
+}
+
+impl AgentSession {
+    /// 仍返回 `Result` 以保持调用方签名不变：拆分前这里会构造 reqwest client
+    /// 因而可能失败，现在传输在插件里、本函数不再有失败路径，但把 ~20 处调用
+    /// 点一起改签名不属于本批范围。
+    pub fn new(config: LlmApiConfig, kind: impl Into<String>) -> Result<Self, RuntimeError> {
+        Ok(Self {
+            kind: kind.into(),
+            config,
+            history: Vec::new(),
+            transcript: Vec::new(),
+            completed_turns: 0,
+            estimated_tokens: 0,
+            require_end_tool: false,
+            soul_key: String::new(),
+            is_group: false,
+            caller_is_admin: false,
+            can_approve_iteration: false,
+        })
+    }
+
+    /// P4: bind the caller's role flags. The inbox refreshes these per batch
+    /// (whoever speaks last is the one whose tools run), so a room persona
+    /// edit is refused for plain members. Private chats ignore both flags.
+    pub fn set_caller_policy(&mut self, is_group: bool, is_admin: bool) {
+        self.is_group = is_group;
+        self.caller_is_admin = is_admin;
+    }
+
+    pub fn set_approval_capability(&mut self, can_approve: bool) {
+        self.can_approve_iteration = can_approve;
+    }
+
+    pub fn can_approve_iteration(&self) -> bool {
+        self.can_approve_iteration
+    }
+
+    pub fn caller_policy(&self) -> (bool, bool) {
+        (self.is_group, self.caller_is_admin)
+    }
+
+    /// O批: bind this session to a soul scope key. Set once at
+    /// agent_start; the backend reads it to fetch the persona overlay.
+    pub fn set_soul_key(&mut self, soul_key: impl Into<String>) {
+        self.soul_key = soul_key.into();
+    }
+
+    pub fn soul_key(&self) -> &str {
+        &self.soul_key
+    }
+
+    pub fn reset(&mut self) {
+        self.history.clear();
+        self.transcript.clear();
+        self.completed_turns = 0;
+    }
+
+    /// Swap the LLM config (profile fallback switching). history/transcript
+    /// are untouched so the conversation continues seamlessly on the other
+    /// endpoint.
+    ///
+    /// 拆分前这里要重建 reqwest client（新的 timeout），因而有一条失败臂；
+    /// 现在 timeout 随 `to_transport()` 投影在每次调用时传给插件，本函数只是
+    /// 换个配置结构体。`Result` 保留是为了不动 fallback 链路的调用点。
+    pub fn swap_config(&mut self, config: LlmApiConfig) -> Result<(), RuntimeError> {
+        self.config = config;
+        Ok(())
+    }
+
+    pub fn status(&self) -> AgentSessionStatus {
+        AgentSessionStatus {
+            kind: self.kind.clone(),
+            provider: self.config.provider.clone(),
+            model: self.config.model.clone(),
+            completed_turns: self.completed_turns,
+            stored_messages: self.history.len(),
+            transcript_events: self.transcript.len(),
+        }
+    }
+
+    /// P1-24(b): expose the session's own kind so crash-recovery can
+    /// re-wire it under the correct `AgentSessionKind` instead of
+    /// hardcoding RuntimeShell.
+    pub fn kind(&self) -> &str {
+        &self.kind
+    }
+
+    pub fn transcript(&self) -> &[AgentTranscriptEntry] {
+        &self.transcript
+    }
+
+    pub fn tool_execution_summary(&self) -> AgentToolExecutionSummary {
+        let mut tool_names = BTreeSet::new();
+        let mut total_calls = 0usize;
+        let mut successful_calls = 0usize;
+        let mut failed_calls = 0usize;
+        for entry in &self.transcript {
+            let AgentTranscriptEntry::Tool { name, ok, .. } = entry else {
+                continue;
+            };
+            total_calls += 1;
+            if *ok {
+                successful_calls += 1;
+            } else {
+                failed_calls += 1;
+            }
+            tool_names.insert(name.clone());
+        }
+        AgentToolExecutionSummary {
+            total_calls,
+            successful_calls,
+            failed_calls,
+            tool_names: tool_names.into_iter().collect(),
+        }
+    }
+
+    /// 无 provider 可用时的入口：直接报 [`RuntimeError::NoLlmProvider`]。
+    ///
+    /// LLM 传输已整体移出 kernel（见 `fixtures/plugins/llm_openai`），没有内建
+    /// 兜底。保留本函数是为了让"没装 provider 插件"这件事在调用点就有明确
+    /// 报错，而不是让每个调用方各自处理 `Option<provider>`。
+    ///
+    /// 冷启动不受影响：boot / REPL / `command_router` 都不经这里，无插件时
+    /// `/status`、`/help` 等照常工作，只有真的要跟模型说话才会失败——与拆分前
+    /// "LLM 不可达"的状态同构。
+    pub fn respond<B: AgentBackend + ?Sized>(
+        &mut self,
+        _backend: &mut B,
+        _user_input: &str,
+    ) -> Result<AgentReply, RuntimeError> {
+        Err(RuntimeError::NoLlmProvider)
+    }
+
+    /// P2-31: 出错时若只推了 User 而没有对应的 Assistant，补一条描述错误的
+    /// Assistant 占位。否则同一 session id 重试会看到孤立的 User，模型下一轮
+    /// 会把提示词重复记一遍。
+    fn repair_transcript_on_error(
+        &mut self,
+        transcript_len_before: usize,
+        result: &Result<AgentReply, RuntimeError>,
+    ) {
+        let Err(err) = result else { return };
+        let has_user_without_assistant = self
+            .transcript
+            .iter()
+            .skip(transcript_len_before)
+            .any(|e| matches!(e, AgentTranscriptEntry::User { .. }))
+            && !self
+                .transcript
+                .iter()
+                .skip(transcript_len_before)
+                .any(|e| matches!(e, AgentTranscriptEntry::Assistant { .. }));
+        if has_user_without_assistant {
+            self.transcript.push(AgentTranscriptEntry::Assistant {
+                content: format!("[error] {err}"),
+                tools: Vec::new(),
+                response_id: None,
+                reasoning: None,
+            });
+        }
+    }
+
+    /// 一个回合：在回合起点创建 [`Turn`]（四个计数、推理、剥图标记与附件
+    /// 队列因此全部归零），跑完循环后补齐转录与历史收尾。
+    ///
+    /// 返回 `Turn` 只为让调用方在**同一回合内**做收尾（[`Self::record_turn_end`]
+    /// / [`Self::remember_if_unrecorded`]）；生产入口
+    /// [`Self::respond_with_provider_images`] 取走 `Result` 后立即丢弃它。
+    /// 没有任何一条路径把 `Turn` 的字段写回 `self`，所以下一轮不可能读到
+    /// 这一轮的计数。
+    fn respond_inner<B: AgentBackend + ?Sized>(
+        &mut self,
+        backend: &mut B,
+        user_input: &str,
+        images: &[Value],
+        // 一次性上下文（渠道给的策略/记忆行）：只随本次请求发给模型，
+        // 绝不写进 history —— 每轮重发同一份会白烧几十万字节上下文。
+        notes: &str,
+        provider: &dyn LlmProvider,
+        sink: Option<std::sync::Arc<dyn cordis_runtime::llm_sink::TokenSink>>,
+    ) -> (Result<AgentReply, RuntimeError>, Turn) {
+        let transcript_len_before = self.transcript.len();
+        let history_len_before = self.history.len();
+        // 回合开始：本轮的每个计数都在这里归零。上一轮留下的东西不可能被
+        // 这一轮读到——它们已经随上一轮的 `Turn` 一起丢弃了。
+        let mut turn = Turn::default();
+        let result = self.respond_loop(
+            &mut turn, backend, user_input, images, notes, provider, sink,
+        );
+        self.repair_transcript_on_error(transcript_len_before, &result);
+        self.record_turn_end(transcript_len_before, &result, &turn);
+        self.remember_if_unrecorded(
+            &result,
+            user_input,
+            images,
+            history_len_before,
+            &turn,
+            backend.host(),
+        );
+        (result, turn)
+    }
+
+    /// 把回合中途到达的消息追加到本次请求，并记入转录。
+    ///
+    /// 返回值是"队列里有没有东西"，调用方据此决定是否重入循环——即使整批都是
+    /// 空串也重入，因为是渠道把一次空推送当成了消息。空串本身丢弃：它进请求
+    /// 只会让模型回一句"你想说什么"。
+    ///
+    /// 提成具名方法而不是内联在循环里，是为了让"插话真的进了请求"这件事可以
+    /// 直接单测：进程级注入队列由整个测试进程共享，跑一轮真实的插话无法与其它
+    /// 用例的 drain 互斥。
+    fn push_injected(
+        &mut self,
+        messages: &mut Vec<Value>,
+        queued: Vec<String>,
+        round: usize,
+    ) -> bool {
+        let had_any = !queued.is_empty();
+        for m in queued {
+            if m.trim().is_empty() {
+                continue;
+            }
+            emit_agent_diagnostic(format!(
+                "agent_inject kind={} turn={} len={}",
+                self.kind,
+                round + 1,
+                m.len()
+            ));
+            messages.push(json!({"role": "user", "content": &m}));
+            self.transcript
+                .push(AgentTranscriptEntry::User { content: m });
+        }
+        had_any
+    }
+
+    /// 回合的循环本体。每轮状态全在 `turn` 里；`self` 只被读写跨轮字段
+    /// （`history` / `transcript` / `estimated_tokens` / `completed_turns`）。
+    ///
+    /// `provider` 承担这一轮所有的模型调用；`sink` 决定增量 token 去哪。
+    /// 两者都作为参数传入而非存进 `AgentSession`：该结构体 derive 了
+    /// `Debug + Clone` 并会被快照序列化，塞 `dyn Trait` 会同时破坏这三者。
+    /// 这也与既有的 `backend` 参数保持一致。
+    // 8 个参数都是"这一轮发给模型的输入 + 这一轮的状态"；拆成结构体只是把
+    // 参数换成字段，不减少任何耦合（与 registry::insert_loaded 同一判断）。
+    #[expect(clippy::too_many_arguments)]
+    fn respond_loop<B: AgentBackend + ?Sized>(
+        &mut self,
+        turn: &mut Turn,
+        backend: &mut B,
+        user_input: &str,
+        images: &[Value],
+        notes: &str,
+        provider: &dyn LlmProvider,
+        sink: Option<std::sync::Arc<dyn cordis_runtime::llm_sink::TokenSink>>,
+    ) -> Result<AgentReply, RuntimeError> {
+        let trimmed = user_input.trim();
+        if trimmed.is_empty() {
+            return Err(RuntimeError::InvalidArgument {
+                message: "agent input must not be empty".to_string(),
+            });
+        }
+
+        // 供应商白名单闸门。注意它只是个字符串校验，全仓没有一处按它分支
+        // wire format——C4 接入 provider 解析后本段整体移除。
+        let configured_provider = self.config.provider.trim().to_ascii_lowercase();
+        if configured_provider != "deepseek" && configured_provider != "openai" {
+            return Err(RuntimeError::UnsupportedLlmProvider {
+                provider: self.config.provider.clone(),
+            });
+        }
+
+        // 单一触发条件：`estimated_tokens` 超过 COMPACT_AT_TOKENS 就压缩一次。
+        // 判断在 compact_history 内部，未超阈值时连 provider 都不会碰；请求前
+        // 检查的是**已持久化的历史重量**，不含这一轮还没落库的输入与工具输出。
+        let _ = self.compact_history(Some(provider));
+
+        // 图片除 token 估算外还有一条独立的**字节**约束：保守的 token 折算
+        // 不等于网关的请求体长度上限，所以仍按精确 base64 字节把历史里最老的
+        // 图剥到 `INLINE_IMAGE_BUDGET_BYTES` 以内（见
+        // `cordis_runtime::image_budget` 的模块文档）。
+        //
+        // 两件事同时发生：这一轮新消息里的图片先占掉预算（它们不进 history，
+        // 但照样进请求体），剩下的额度给历史里最老的图片；占位符**就地写回
+        // history**，否则下一轮又从同一批原图重算、白费一遍。
+        let pending_image_bytes = cordis_runtime::image_budget::image_parts_bytes(images);
+        let history_image_budget = cordis_runtime::image_budget::INLINE_IMAGE_BUDGET_BYTES
+            .saturating_sub(pending_image_bytes);
+        let image_plan = cordis_runtime::image_budget::enforce_image_budget(
+            &mut self.history,
+            history_image_budget,
+        );
+        if !image_plan.is_empty() {
+            // 占位符替掉了 base64，token 估算要跟着降；不重算的话
+            // estimated_tokens 会一直按原图的重量触发裁剪 / 压缩。
+            self.estimated_tokens = self.history.iter().map(estimate_message_tokens).sum();
+            emit_agent_diagnostic(format!(
+                "agent_image_budget kind={} omitted={} image_bytes_before={} image_bytes_after={} budget={} pending={}",
+                self.kind,
+                image_plan.omitted(),
+                image_plan.bytes_before,
+                image_plan.bytes_after,
+                history_image_budget,
+                pending_image_bytes,
+            ));
+        }
+
+        let mut tool_specs = backend.tool_specs();
+        if self.require_end_tool {
+            tool_specs.push(end_turn_tool_spec());
+        }
+        let mut messages = Vec::with_capacity(self.history.len() + 4);
+        messages.push(json!({
+            "role": "system",
+            "content": backend.system_prompt(),
+        }));
+        // Tools are not sent as a `tools` array any more: the model calls them
+        // by writing DSML into its message. That keeps the provider out of its
+        // native tool-call path (which is what degenerates into whitespace when
+        // `response_format: json_object` is in play) and matches how this model
+        // already serialises calls on its own.
+        messages.push(json!({
+            "role": "system",
+            "content": dsml_protocol_prompt(&tool_specs, self.require_end_tool),
+        }));
+        // A client-injected failure notice is not conversation: once it sits in
+        // history the model echoes it back verbatim.
+        messages.extend(
+            self.history
+                .iter()
+                .filter(|message| !is_outage_notice_text(message))
+                .cloned(),
+        );
+        // 一次性上下文（策略/记忆行）只随这一条新消息进请求，绝不进 history；
+        // 历史里的图片则由上面的字节预算裁剪（越老的图越先被换成占位符）。
+        let request_text = if notes.trim().is_empty() {
+            trimmed.to_string()
+        } else {
+            format!("{}\n{}", notes.trim(), trimmed)
+        };
+        messages.push(json!({
+            "role": "user",
+            "content": cordis_runtime::image_input::user_content_with_images(&request_text, images),
+        }));
+        self.transcript.push(AgentTranscriptEntry::User {
+            content: trimmed.to_string(),
+        });
+
+        // 预算从"请求即将发出"开始计：前面的压缩（可能含一次摘要调用）不算
+        // 在这一轮的响应预算里——与拆分前 `turn_started` 的起点逐字节一致。
+        turn.started = Instant::now();
+        let mut tool_events = Vec::new();
+
+        for round in 0..AGENT_MAX_TOOL_TURNS {
+            // The backend's tool list is phase dependent: the iteration
+            // summary only becomes callable once a verification succeeded, and
+            // that happens *inside* this loop. Re-read it every turn and keep
+            // the DSML catalogue in sync, otherwise the model's summary call
+            // gets wrapped as `invoke_plugin` and rejected as unknown.
+            let mut tool_specs = backend.tool_specs();
+            if self.require_end_tool {
+                tool_specs.push(end_turn_tool_spec());
+            }
+            if let Some(catalog) = messages.iter_mut().find(|message| {
+                message["role"] == "system"
+                    && message["content"]
+                        .as_str()
+                        .is_some_and(|content| content.starts_with("TOOL PROTOCOL"))
+            }) {
+                *catalog = json!({
+                    "role": "system",
+                    "content": dsml_protocol_prompt(&tool_specs, self.require_end_tool),
+                });
+            }
+
+            // P1-37: unify the two timeout budgets. `timeout_ms` (per
+            // HTTP request) and `stream_timeout_secs * 5` (per-stream
+            // overall) were checked independently — a session where
+            // `stream_timeout_secs` was set generously would keep
+            // running past what `timeout_ms` implied and vice versa.
+            // The effective budget here is
+            //   max(timeout_ms, stream_timeout_secs * 1000 * 5)
+            // × AGENT_MAX_TOOL_TURNS, but since turns share the wall
+            // clock we cap at the larger of the two; the outer caller
+            // still bounds via AGENT_MAX_TOOL_TURNS itself.
+            let per_request_ms = self.config.timeout_ms;
+            let stream_budget_ms = self.config.stream_timeout_secs.saturating_mul(1000 * 5);
+            let effective_budget_ms = per_request_ms.max(stream_budget_ms);
+            if turn.started.elapsed() >= Duration::from_millis(effective_budget_ms) {
+                return Err(RuntimeError::LlmResponseInvalid {
+                    message: format!(
+                        "agent exceeded total response budget after {} tool turns; elapsed_ms={} effective_budget_ms={} (timeout_ms={} stream_secs={})",
+                        round,
+                        turn.started.elapsed().as_millis(),
+                        effective_budget_ms,
+                        self.config.timeout_ms,
+                        self.config.stream_timeout_secs,
+                    ),
+                });
+            }
+
+            // Check for new messages since last turn and inject them.
+            self.push_injected(&mut messages, drain_inject_queue(), round);
+
+            emit_agent_diagnostic(format!(
+                "agent_turn_start kind={} turn={} elapsed_ms={} messages={} tools={}",
+                self.kind,
+                round + 1,
+                turn.started.elapsed().as_millis(),
+                messages.len(),
+                tool_specs.len(),
+            ));
+
+            // Repair broken tool_calls chains before the request goes out.
+            // 链破形有两种方向（assistant 的 call 没应答 / tool 消息成孤儿），
+            // 两者都会让 DeepSeek 整轮 400，见 `agent_toolchain` 模块文档。
+            let repair = cordis_runtime::agent_toolchain::sanitize_tool_chains(&mut messages);
+            if repair.changed() {
+                eprintln!(
+                    "[tool_calls repair] dropped_calls={} dropped_tool_messages={} dropped_assistant_messages={}",
+                    repair.dropped_calls,
+                    repair.dropped_tool_messages,
+                    repair.dropped_assistant_messages,
+                );
+            }
+
+            let request_body = json!({
+                "model": self.config.model,
+                "messages": messages,
+                "temperature": self.config.temperature,
+                "max_tokens": self.config.max_tokens,
+                // No `tools`, `tool_choice` or `response_format`: tool calls
+                // travel as DSML text (see `dsml_protocol_prompt`), so the
+                // provider never takes its native tool path. `response_format:
+                // json_object` forbids tool calls outright, which is what made
+                // the model answer with whitespace and stop.
+            });
+            dump_request(
+                env::var("CORDIS_LLM_DUMP").ok().as_deref(),
+                std::path::Path::new("data/llm-debug"),
+                &request_body,
+            );
+            let parts =
+                match provider.complete(request_body, sink.clone(), self.config.to_transport()) {
+                    Ok(parts) => parts,
+                    // A single unsupported image poisons the whole history: every
+                    // later request replays it and gets the same 400. Drop the image
+                    // parts and try the turn again — text survives, pictures do not.
+                    Err(err) if !turn.images_stripped && err.to_string().contains("image") => {
+                        turn.images_stripped = true;
+                        emit_agent_diagnostic(format!(
+                            "agent_image_rejected kind={} turn={} err={:?}",
+                            self.kind,
+                            round,
+                            err.to_string()
+                        ));
+                        strip_image_parts(&mut messages);
+                        strip_image_parts(&mut self.history);
+                        turn.empty_response_strikes = 0;
+                        continue;
+                    }
+                    // A provider failure after the message went out is not a
+                    // reason to replay the whole turn: the room already heard it.
+                    Err(err) if !tool_events.is_empty() => {
+                        emit_agent_diagnostic(format!(
+                            "agent_provider_failed_after_delivery kind={} turn={} err={:?}",
+                            self.kind,
+                            round,
+                            err.to_string()
+                        ));
+                        self.completed_turns += 1;
+                        return Ok(AgentReply {
+                            response_id: None,
+                            content: String::new(),
+                            tool_events,
+                        });
+                    }
+                    Err(err) => return Err(err),
+                };
+            let (message, response_id, finish_reason) =
+                (parts.message, parts.response_id, parts.finish_reason);
+
+            emit_agent_diagnostic(format!(
+                "agent_turn_result kind={} turn={} response_id={} tool_calls={} content_chars={} reasoning_chars={} finish_reason={}",
+                self.kind,
+                round + 1,
+                response_id.as_deref().unwrap_or("-"),
+                message.tool_calls.len(),
+                message.content.as_deref().map(str::len).unwrap_or(0),
+                message.reasoning_content.as_deref().map(str::len).unwrap_or(0),
+                finish_reason.as_deref().unwrap_or("-"),
+            ));
+
+            // DSML salvage: the provider occasionally serialises a tool call
+            // into the content stream instead of returning `tool_calls`. The
+            // JSON objects in that text ARE the call, so recover them rather
+            // than dropping the turn (a lost reply) or posting the markup
+            // (garbage in the room).
+            let mut message = message;
+            // Collect the reasoning before any branch returns. A turn that ends
+            // on `suspend` leaves before the tool path, and this is the only
+            // record of why it stayed silent.
+            if let Some(reasoning) = message
+                .reasoning_content
+                .as_deref()
+                .filter(|reasoning| !reasoning.trim().is_empty())
+            {
+                turn.reasoning.push(reasoning.to_string());
+            }
+            if message.tool_calls.is_empty() {
+                let raw = message.content.clone().unwrap_or_default();
+                let salvaged = salvage_serialized_tool_calls(&raw, &tool_specs);
+                if !salvaged.is_empty() {
+                    emit_agent_diagnostic(format!(
+                        "agent_dsml_salvage calls={} chars={} raw={:?}",
+                        salvaged.len(),
+                        raw.chars().count(),
+                        raw
+                    ));
+                    message.tool_calls = salvaged;
+                    message.content = None;
+                }
+            }
+
+            // Channel sessions end on an explicit marker, not on silence.
+            let mut end_requested = false;
+            if self.require_end_tool {
+                if let Some(position) = message
+                    .tool_calls
+                    .iter()
+                    .position(|call| call.function.name == AGENT_TOOL_END_TURN)
+                {
+                    message.tool_calls.remove(position);
+                    end_requested = true;
+                }
+                if end_requested && message.tool_calls.is_empty() {
+                    // `suspend` is a decision, not a draft: it ends the turn
+                    // even when nothing was sent. A model that had nothing to
+                    // say and said so must not be argued with — the reply it
+                    // invents under pressure is worse than silence. A model
+                    // that merely stopped talking is still caught below, where
+                    // no marker arrived at all.
+                    if tool_events.is_empty() {
+                        emit_agent_diagnostic(format!(
+                            "agent_suspended_silently kind={} transcript={}",
+                            self.kind,
+                            self.transcript.len()
+                        ));
+                    }
+                    turn.no_end_strikes = 0;
+                    self.completed_turns += 1;
+                    // The transcript keeps the model's reasoning: the live
+                    // history is pruned, so without it "why did it say that"
+                    // becomes unanswerable once the turn leaves the window.
+                    let closing = message.content.unwrap_or_default();
+                    let reasoning = closing_reasoning(&turn.reasoning);
+                    self.transcript.push(AgentTranscriptEntry::Assistant {
+                        content: delivered_text(&tool_events, &closing),
+                        tools: tool_names(&tool_events),
+                        response_id: response_id.clone(),
+                        reasoning,
+                    });
+                    return Ok(AgentReply {
+                        response_id,
+                        content: closing,
+                        tool_events,
+                    });
+                }
+            }
+
+            // A recorded summary closes an iteration turn.
+            // Only iteration backends expose this tool, so no kind gate is
+            // needed — and a kind gate would miss the exact session kind the
+            // host uses for the iteration agent.
+            let ends_after_tools = message
+                .tool_calls
+                .iter()
+                .any(|call| call.function.name == AGENT_TOOL_RECORD_ITERATION_SUMMARY);
+
+            if !message.tool_calls.is_empty() {
+                let available_tools = tool_specs
+                    .iter()
+                    .map(|tool| tool.name.to_string())
+                    .collect::<BTreeSet<_>>();
+                // Separate valid and unknown tool calls.
+                // Unknown tools are NOT added to the tool_calls chain
+                // (avoids DeepSeek tool_call_id mismatch errors).
+                // Instead they end up in the turn's single prompt message,
+                // after every tool result (see `tool_failure_prompts` below).
+                let (valid_calls, unknown_calls): (Vec<_>, Vec<_>) = message
+                    .tool_calls
+                    .iter()
+                    .partition(|tc| available_tools.contains(&tc.function.name));
+                // Push assistant message with only valid tool_calls (if any).
+                if !valid_calls.is_empty() {
+                    let filtered = cordis_plugin_sdk::llm::LlmMessage {
+                        content: message.content.clone(),
+                        reasoning_content: message.reasoning_content.clone(),
+                        tool_calls: valid_calls.iter().map(|&tc| tc.clone()).collect(),
+                    };
+                    messages.push(llm_message_to_request(&filtered));
+                }
+                // Errors for unknown tools are COLLECTED, not pushed here: a
+                // user message sitting between the assistant's tool_calls and
+                // its tool results breaks the chain (this is how a mixed
+                // "one unknown + one valid" turn used to earn a DeepSeek 400).
+                // They are merged with the failed-tool warnings and flushed
+                // once, after every tool result of this turn.
+                let mut tool_failure_prompts: Vec<String> = Vec::new();
+                for tool_call in &unknown_calls {
+                    let tool_name = &tool_call.function.name;
+                    turn.unknown_tool_strikes += 1;
+                    let tool_list = available_tools
+                        .iter()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let err_msg = unknown_tool_message(
+                        tool_name,
+                        turn.unknown_tool_strikes,
+                        UNKNOWN_TOOL_STRIKE_LIMIT,
+                        &backend.tool_scope_label(),
+                        &tool_list,
+                    );
+                    let _ = writeln!(
+                        std::io::stdout(),
+                        "⚙ {} (rejected — unknown tool)",
+                        tool_name
+                    );
+                    let _ = std::io::stdout().flush();
+                    tool_failure_prompts.push(err_msg);
+                }
+                // One blank line before the tool call block.
+                if !valid_calls.is_empty() {
+                    let _ = writeln!(std::io::stdout());
+                }
+                // Failed-tool warnings join the same buffer (declared above) so
+                // that both kinds of turn-local prompt leave in ONE user
+                // message, after every tool result.
+                for tool_call in &valid_calls {
+                    // Announce tool execution in real-time.
+                    let tool_args_preview: String =
+                        serde_json::from_str::<Value>(&tool_call.function.arguments)
+                            .ok()
+                            .and_then(|v| serde_json::to_string(&v).ok())
+                            .unwrap_or_else(|| tool_call.function.arguments.clone());
+                    let _ = writeln!(
+                        std::io::stdout(),
+                        "⚙ {} {}",
+                        tool_call.function.name,
+                        tool_args_preview
+                    );
+                    let _ = std::io::stdout().flush();
+                    let (event, tool_output) = execute_agent_tool_call(
+                        backend,
+                        &available_tools,
+                        &self.kind,
+                        tool_call,
+                        &mut turn.unknown_tool_strikes,
+                        &mut turn.attached,
+                    );
+                    let event_name = event.name.clone();
+                    let terminal_reply = event
+                        .ok
+                        .then_some(())
+                        .and(event.output.as_ref())
+                        .and_then(|output| backend.terminal_tool_reply(&event.name, output));
+                    self.transcript.push(AgentTranscriptEntry::Tool {
+                        name: event.name.clone(),
+                        arguments: event.arguments.clone(),
+                        ok: event.ok,
+                        output: event.output.clone(),
+                        error: event.error.clone(),
+                    });
+                    let tool_ok = event.ok;
+                    let tool_err = event.error.clone();
+                    // Log tool result for debugging.
+                    let preview: String = tool_output.chars().take(300).collect();
+                    let preview = preview.replace('\n', " ");
+                    if tool_ok {
+                        let _ = writeln!(std::io::stdout(), "  -> ok {}", preview);
+                    } else {
+                        let _ = writeln!(std::io::stdout(), "  -> FAIL {}", preview);
+                    }
+                    let _ = std::io::stdout().flush();
+                    tool_events.push(event);
+                    // Reset unknown-tool strikes when a legitimate tool succeeds.
+                    if tool_ok {
+                        turn.unknown_tool_strikes = 0;
+                    }
+                    messages.push(json!({
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "content": tool_output,
+                    }));
+                    // Collect a prominent warning when tools fail so the Agent
+                    // cannot silently continue after an error. Flushed as one
+                    // user message once the whole chain has been pushed.
+                    if !tool_ok {
+                        let err = tool_err.as_deref().unwrap_or("unknown error");
+                        tool_failure_prompts.push(format!(
+                            "🔴 TOOL '{event_name}' FAILED: {err}\n\
+                             Do NOT proceed as if it succeeded. Fix the cause \
+                             and retry, or use a different approach."
+                        ));
+                    }
+                    if let Some(reply_content) = terminal_reply {
+                        if message
+                            .tool_calls
+                            .last()
+                            .is_some_and(|last| last.id != tool_call.id)
+                        {
+                            return Err(RuntimeError::LlmResponseInvalid {
+                                message: format!(
+                                    "terminal agent tool {} must be the last tool call in a {} turn",
+                                    event_name, self.kind
+                                ),
+                            });
+                        }
+                        // Check for late-arriving messages before replying.
+                        // Flush first: this exit skips the post-loop flush, so
+                        // the warnings would be lost.
+                        flush_tool_failure_prompts(&mut messages, &mut tool_failure_prompts);
+                        if !self.push_injected(&mut messages, drain_inject_queue(), round) {
+                            self.remember_exchange(
+                                trimmed,
+                                &reply_content,
+                                message.reasoning_content.as_deref(),
+                                history_images(images, turn.images_stripped),
+                            );
+                            self.completed_turns += 1;
+                            self.transcript.push(AgentTranscriptEntry::Assistant {
+                                content: delivered_text(&tool_events, &reply_content),
+                                tools: tool_names(&tool_events),
+                                response_id: response_id.clone(),
+                                reasoning: closing_reasoning(&turn.reasoning),
+                            });
+                            return Ok(AgentReply {
+                                response_id,
+                                content: reply_content,
+                                tool_events,
+                            });
+                        }
+                    }
+                }
+                // Every tool result of this turn is pushed: merge the collected
+                // failure warnings into one user message (a user message before
+                // this point would sit between two tool results of the same
+                // assistant and break the chain).
+                flush_tool_failure_prompts(&mut messages, &mut tool_failure_prompts);
+                if ends_after_tools {
+                    turn.no_end_strikes = 0;
+                    self.completed_turns += 1;
+                    let closing = message.content.unwrap_or_default();
+                    let reasoning = closing_reasoning(&turn.reasoning);
+                    self.transcript.push(AgentTranscriptEntry::Assistant {
+                        content: delivered_text(&tool_events, &closing),
+                        tools: tool_names(&tool_events),
+                        response_id: response_id.clone(),
+                        reasoning,
+                    });
+                    return Ok(AgentReply {
+                        response_id,
+                        content: closing,
+                        tool_events,
+                    });
+                }
+                // `view_image` 取回的图片进下一次请求：作为一条新的 user 消息
+                // 追加在工具结果之后，模型下一次调用就能重新看到原图。
+                attach_recovered_images(
+                    &mut *turn,
+                    &mut messages,
+                    images,
+                    cordis_runtime::image_budget::INLINE_IMAGE_BUDGET_BYTES,
+                );
+                continue;
+            }
+
+            if self.require_end_tool {
+                // A channel turn ends on `suspend` and nothing else. Asking a
+                // bounded number of times turned a model that forgot the marker
+                // into "LLM outage" spills, so keep asking — `AGENT_MAX_TOOL_TURNS`
+                // remains the only bound.
+                turn.no_end_strikes += 1;
+                emit_agent_diagnostic(format!(
+                    "agent_missing_end_tool kind={} attempt={} acted={}",
+                    self.kind,
+                    turn.no_end_strikes,
+                    !tool_events.is_empty()
+                ));
+                // Only `suspend` ends a channel turn — sending does not. The
+                // ask states the ending protocol and nothing else: how many
+                // messages the turn contains is the model's call.
+                //
+                // But an ask can be answered with the same text again: one turn
+                // repeated an identical 119-character reply 44 times, each round
+                // a billed call. Once something has gone out there is nothing
+                // left to salvage, so stop asking and close the turn.
+                if !tool_events.is_empty() && turn.no_end_strikes > 3 {
+                    emit_agent_diagnostic(format!(
+                        "agent_marker_never_came kind={} attempts={}",
+                        self.kind, turn.no_end_strikes
+                    ));
+                    turn.no_end_strikes = 0;
+                    self.completed_turns += 1;
+                    return Ok(AgentReply {
+                        response_id,
+                        content: String::new(),
+                        tool_events,
+                    });
+                }
+                // The model's own text has to stay in the conversation. Without
+                // it the model sees the same ask repeated with no record of the
+                // answers it already gave, and answers identically every time —
+                // one live turn repeated a 119-character reply 44 times.
+                if let Some(text) = message
+                    .content
+                    .as_deref()
+                    .filter(|text| !text.trim().is_empty())
+                {
+                    messages.push(json!({ "role": "assistant", "content": text }));
+                }
+                let nudge = if tool_events.is_empty() {
+                    "[system] 这一轮还没结束：你还没有发出任何消息。先调用 qq_send 把要说的话发出去，再调用 suspend。正文不会发给任何人。"
+                } else {
+                    "[system] 消息已经发出去了，但这一轮还没结束：调用 suspend 结束这一轮（想继续说也可以继续发）。"
+                };
+                messages.push(json!({ "role": "user", "content": nudge }));
+                continue;
+            }
+
+            // 正文为空才可能是"只有推理"或 provider 空补全；有正文的答复在
+            // 本回合最后一段统一收尾（那里也是唯一需要处理"回合中途插话"的
+            // 文本出口，放在最后才能用落出代码块代替 `continue`）。
+            let Some(content) = message
+                .content
+                .as_deref()
+                .map(str::trim)
+                .filter(|content| !content.is_empty())
+            else {
+                if message
+                    .reasoning_content
+                    .as_deref()
+                    .is_some_and(|value| !value.trim().is_empty())
+                {
+                    messages.push(llm_message_to_request(&message));
+                    turn.reasoning_only_strikes += 1;
+                    if turn.reasoning_only_strikes >= 3 {
+                        backend.host().agent_send_warning_to_test_groups(
+                            "⚠ Agent produced 3 consecutive reasoning-only responses — may be stuck.",
+                        );
+                        turn.reasoning_only_strikes = 0;
+                        turn.empty_response_strikes = 0;
+                    }
+                    messages.push(json!({
+                        "role": "user",
+                        "content": "[system] You produced reasoning but no response. Please output your answer or call a tool.",
+                    }));
+                    continue;
+                }
+                turn.reasoning_only_strikes = 0;
+
+                // A completion with no content and no tool calls is a provider
+                // glitch (the adapter on the other side of this seam may also emit
+                // one). Retry the identical request a couple of times before
+                // giving up: failing here spills the user's message and shows a
+                // failure notice for something a second attempt usually fixes.
+                turn.empty_response_strikes += 1;
+                if turn.empty_response_strikes <= EMPTY_RESPONSE_RETRIES {
+                    // Change the request: re-sending the identical body after a
+                    // deterministic empty reply can only fail again, and the CLI
+                    // retries below multiply that into a dozen wasted calls.
+                    messages.push(json!({
+                        "role": "user",
+                        "content": "[system] Your previous reply was empty. Answer now: \
+                                    call a tool, or write the message body.",
+                    }));
+                    emit_agent_diagnostic(format!(
+                        "agent_empty_response_retry kind={} attempt={}",
+                        self.kind, turn.empty_response_strikes
+                    ));
+                    continue;
+                }
+                turn.empty_response_strikes = 0;
+                // If a message already went out this turn, the turn succeeded even
+                // though the closing reply was empty. Returning an error here made
+                // the channel spill the message to `pending` and replay it later —
+                // the same sentence arriving twice, sometimes a day apart.
+                if !tool_events.is_empty() {
+                    self.completed_turns += 1;
+                    return Ok(AgentReply {
+                        response_id,
+                        content: String::new(),
+                        tool_events,
+                    });
+                }
+                return Err(RuntimeError::LlmResponseInvalid {
+                    message: format!(
+                        "agent response had neither tool_calls nor final content \
+                         (after {} retries)",
+                        EMPTY_RESPONSE_RETRIES
+                    ),
+                });
+            };
+
+            // A message that arrived while the model was answering outranks the
+            // answer: re-enter the loop so the next request carries it. This is
+            // the round's last branch, so falling out of the `if` is `continue`.
+            if !self.push_injected(&mut messages, drain_inject_queue(), round) {
+                // Keep the fact that pictures came with this message: history
+                // used to store the text alone, so the next turn saw "no image"
+                // and answered as if nothing had been sent.
+                let remembered = if images.is_empty() {
+                    trimmed.to_string()
+                } else {
+                    format!(
+                        "{trimmed}\n[附图 {} 张，我在这一轮已经看过它们的内容]",
+                        images.len()
+                    )
+                };
+                self.remember_exchange(
+                    &remembered,
+                    content,
+                    message.reasoning_content.as_deref(),
+                    history_images(images, turn.images_stripped),
+                );
+                self.completed_turns += 1;
+                self.transcript.push(AgentTranscriptEntry::Assistant {
+                    content: delivered_text(&tool_events, content),
+                    tools: tool_names(&tool_events),
+                    response_id: response_id.clone(),
+                    reasoning: closing_reasoning(&turn.reasoning),
+                });
+                return Ok(AgentReply {
+                    response_id,
+                    content: content.to_string(),
+                    tool_events,
+                });
+            }
+        }
+
+        // P1-31: on turn overflow, preserve what was accumulated across
+        // the aborted respond() so a retry with the same session id has
+        // context. The 1-slot skip accounts for the leading system prompt
+        // that `messages` starts with; `self.history` doesn't include it.
+        let system_prompt_offset = 1;
+        // `skip` 链在没有新消息时本来就产出空序列，因此不需要"要不要恢复"的
+        // 分支：空的那一次 extend 是 no-op。
+        let recovered: Vec<_> = messages
+            .iter()
+            .skip(system_prompt_offset)
+            .skip(self.history.len())
+            .cloned()
+            .collect();
+        // Kernel introspection tool call/result pairs describe the
+        // agent's own internal state; drop them before they reach
+        // cross-turn history (and, via `to_snapshot`, on-disk recovery
+        // snapshots) so the LLM doesn't imitate diagnostic call patterns.
+        let recovered = filter_kernel_introspection_messages(&recovered);
+        for msg in &recovered {
+            self.estimated_tokens = self
+                .estimated_tokens
+                .saturating_add(estimate_message_tokens(msg));
+        }
+        self.history.extend(recovered);
+        Err(RuntimeError::LlmResponseInvalid {
+            message: format!(
+                "agent exceeded safety turn limit {} without producing a final response",
+                AGENT_MAX_TOOL_TURNS
+            ),
+        })
+    }
+
+    /// 用调用方给定的 provider 跑一轮。
+    ///
+    /// `respond` 是过渡期的便利入口（内建传输）；C5 删掉内建实现后只剩本函数。
+    /// `sink` 为 `Some` 时 provider 可逐段推增量，忽略它也必须正确工作。
+    #[cfg(test)]
+    pub(crate) fn respond_with_provider<B: AgentBackend + ?Sized>(
+        &mut self,
+        backend: &mut B,
+        user_input: &str,
+        provider: &dyn LlmProvider,
+        sink: Option<std::sync::Arc<dyn cordis_runtime::llm_sink::TokenSink>>,
+    ) -> Result<AgentReply, RuntimeError> {
+        self.respond_with_provider_images(backend, user_input, &[], "", provider, sink)
+    }
+
+    /// [`respond_with_provider`] 的多模态入口：`images` 是已经拼好的
+    /// `image_url` content part（见 `cordis_runtime::image_input`）。空切片等价于纯文本。
+    pub(crate) fn respond_with_provider_images<B: AgentBackend + ?Sized>(
+        &mut self,
+        backend: &mut B,
+        user_input: &str,
+        images: &[Value],
+        notes: &str,
+        provider: &dyn LlmProvider,
+        sink: Option<std::sync::Arc<dyn cordis_runtime::llm_sink::TokenSink>>,
+    ) -> Result<AgentReply, RuntimeError> {
+        // 回合结束：`Turn` 在这里被丢弃。它的任何一个字段都没有写回会话。
+        self.respond_inner(backend, user_input, images, notes, provider, sink)
+            .0
+    }
+
+    /// Record the exchange for a turn the loop did not record itself.
+    ///
+    /// A channel turn that sends through a tool never reaches the branch that
+    /// calls `remember_exchange`, so its history stayed empty and the bot could
+    /// not answer "what did you just say". What it actually said is in the
+    /// turn's tool calls, so the transcript slice is the source.
+    fn remember_if_unrecorded<H: crate::AgentToolHost + ?Sized>(
+        &mut self,
+        result: &Result<AgentReply, RuntimeError>,
+        user_input: &str,
+        images: &[Value],
+        history_len_before: usize,
+        turn: &Turn,
+        host: &H,
+    ) {
+        if self.history.len() > history_len_before {
+            return;
+        }
+        let Ok(reply) = result else { return };
+        let said: Vec<String> = reply
+            .tool_events
+            .iter()
+            .filter(|event| event.delivered())
+            .filter_map(|event| {
+                let arguments = &event.arguments;
+                arguments
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .or_else(|| {
+                        arguments
+                            .get("payload_json")
+                            .and_then(|payload| payload.get("message"))
+                            .and_then(Value::as_str)
+                    })
+                    .map(str::to_string)
+            })
+            .filter(|message| !message.trim().is_empty())
+            .collect();
+        // Store what the room saw, not the harness's own action JSON. A history
+        // full of `{"action":"respond",…}` taught the model to answer with that
+        // JSON — a protocol no prompt line asks for — and it is why replies kept
+        // arriving as plain text that the channel then dropped.
+        // What the turn actually did, so a later turn can tell whether it
+        // really searched or is about to claim it did. History used to record
+        // only the text, which is why the bot both invented "I looked it up"
+        // and later denied a search it had run: it had no record either way.
+        // The call, its arguments and its result — not just the name. The bot
+        // argued with itself about whether it had searched; a record it can
+        // re-read answers that, and an argument-less summary cannot.
+        let performed: Vec<String> = reply
+            .tool_events
+            .iter()
+            .map(|event| render_recorded_call(event, host))
+            .collect();
+        let actions = if performed.is_empty() {
+            "[本轮未调用工具]".to_string()
+        } else {
+            performed.join("\n")
+        };
+        // A silent turn still leaves its reasoning behind. The model has to be
+        // able to see why it said nothing; without that it invents a reason the
+        // next time someone asks. What it must not leave is a sentence saying
+        // "I said nothing" — that taught it to open turns with `suspend`.
+        let reasoning_text = closing_reasoning(&turn.reasoning);
+        if said.is_empty() && performed.is_empty() && reasoning_text.is_none() {
+            return;
+        }
+        let assistant = if said.is_empty() {
+            if performed.is_empty() {
+                String::new()
+            } else {
+                actions
+            }
+        } else {
+            format!("{}\n\n{actions}", said.join("\n"))
+        };
+        // Only the batch body belongs in history. The channel's one-shot
+        // context (reply policy, reply target, group memory) rides in front of
+        // it and must not be replayed: it becomes stale the moment the policy
+        // changes, and it added ~100 bytes to every one of hundreds of entries.
+        let body = user_input
+            .split_once("CURRENT_INCOMING_BATCH_START\n")
+            .and_then(|(_, rest)| {
+                rest.rsplit_once("\nCURRENT_INCOMING_BATCH_END")
+                    .map(|(body, _)| body)
+            })
+            .unwrap_or(user_input);
+        let remembered = if images.is_empty() {
+            body.to_string()
+        } else {
+            format!(
+                "{body}\n[附图 {} 张，我在这一轮已经看过它们的内容]",
+                images.len()
+            )
+        };
+        self.remember_exchange(
+            &remembered,
+            &assistant,
+            reasoning_text.as_deref(),
+            history_images(images, turn.images_stripped),
+        );
+    }
+
+    /// Guarantee one assistant entry per turn.
+    ///
+    /// The loop returns from a dozen different places — a delivered message then
+    /// text, an explicit marker, an iteration summary, a provider failure — and
+    /// only some of them pushed a transcript entry. Rather than patch each one,
+    /// the turn records its own ending here, where every path converges. The
+    /// reasoning accumulated across the turn rides along, because the live
+    /// history is pruned and this is the only durable copy.
+    fn record_turn_end(
+        &mut self,
+        transcript_len_before: usize,
+        result: &Result<AgentReply, RuntimeError>,
+        turn: &Turn,
+    ) {
+        let Ok(reply) = result else { return };
+        let already_recorded = self
+            .transcript
+            .iter()
+            .skip(transcript_len_before)
+            .any(|entry| matches!(entry, AgentTranscriptEntry::Assistant { .. }));
+        if already_recorded {
+            return;
+        }
+        let reasoning = closing_reasoning(&turn.reasoning);
+        self.transcript.push(AgentTranscriptEntry::Assistant {
+            content: delivered_text(&reply.tool_events, &reply.content),
+            tools: tool_names(&reply.tool_events),
+            response_id: reply.response_id.clone(),
+            reasoning,
+        });
+    }
+
+    pub fn respond_with_runtime_host<H: AgentToolHost + ?Sized>(
+        &mut self,
+        host: &H,
+        session_id: &str,
+        user_input: &str,
+    ) -> Result<AgentReply, RuntimeError> {
+        let soul_key = self.soul_key.clone();
+        let mut backend = RuntimeShellAgentBackend {
+            host,
+            session_id,
+            soul_key,
+        };
+        self.respond(&mut backend, user_input)
+    }
+
+    /// 同上，但由调用方提供 provider（走 LLM 插件时用）。
+    ///
+    /// backend 的构造留在本模块：`RuntimeShellAgentBackend` 是私有类型，
+    /// 让 host 去拼装它会迫使它变 public 且暴露内部字段。
+    #[cfg(test)]
+    pub(crate) fn respond_with_runtime_host_via<H: AgentToolHost + ?Sized>(
+        &mut self,
+        host: &H,
+        session_id: &str,
+        user_input: &str,
+        provider: &dyn LlmProvider,
+        sink: Option<std::sync::Arc<dyn cordis_runtime::llm_sink::TokenSink>>,
+    ) -> Result<AgentReply, RuntimeError> {
+        self.respond_capturing_turn(host, session_id, user_input, provider, sink)
+            .0
+    }
+
+    /// 测试用入口：跑完一轮，把这一轮的 [`Turn`] 一并交回。
+    ///
+    /// 生产路径（[`Self::respond_with_provider_images`]）取走 `Result` 就把
+    /// `Turn` 丢掉；这里保留它只为断言"这一轮的计数从哪里开始、到哪里结束"，
+    /// 以及证明回合之间没有任何交接。
+    ///
+    /// 后端构造与 [`Self::respond_with_runtime_host_via`] 完全一致。
+    #[cfg(test)]
+    fn respond_capturing_turn<H: AgentToolHost + ?Sized>(
+        &mut self,
+        host: &H,
+        session_id: &str,
+        user_input: &str,
+        provider: &dyn LlmProvider,
+        sink: Option<std::sync::Arc<dyn cordis_runtime::llm_sink::TokenSink>>,
+    ) -> (Result<AgentReply, RuntimeError>, Turn) {
+        let soul_key = self.soul_key.clone();
+        let mut backend = RuntimeShellAgentBackend {
+            host,
+            session_id,
+            soul_key,
+        };
+        self.respond_inner(&mut backend, user_input, &[], "", provider, sink)
+    }
+
+    /// 同 [`respond_with_runtime_host_via`]，但这次用户消息带图片
+    /// （`images` 是 `image_url` content part，空切片等价于纯文本）。
+    // 8 个参数都是"这一轮发给模型的输入"，拆成结构体只是把参数换成字段，
+    // 不减少任何耦合（与 registry::insert_loaded 同一判断）。
+    #[expect(clippy::too_many_arguments)]
+    pub(crate) fn respond_with_runtime_host_via_images<H: AgentToolHost + ?Sized>(
+        &mut self,
+        host: &H,
+        session_id: &str,
+        user_input: &str,
+        images: &[Value],
+        notes: &str,
+        provider: &dyn LlmProvider,
+        sink: Option<std::sync::Arc<dyn cordis_runtime::llm_sink::TokenSink>>,
+    ) -> Result<AgentReply, RuntimeError> {
+        let soul_key = self.soul_key.clone();
+        let mut backend = RuntimeShellAgentBackend {
+            host,
+            session_id,
+            soul_key,
+        };
+        self.respond_with_provider_images(&mut backend, user_input, images, notes, provider, sink)
+    }
+
+    pub fn history_len(&self) -> usize {
+        self.history.len()
+    }
+
+    /// One entry of the live history, for tests that assert what the model saw.
+    pub fn history_value(&self, index: usize) -> Option<&Value> {
+        self.history.get(index)
+    }
+
+    /// 压缩历史：一个阈值、一次真摘要、永不清空。
+    ///
+    /// 触发条件只有一条——`estimated_tokens > COMPACT_AT_TOKENS`。超过时把
+    /// "最老的那部分"（最近 [`KEEP_RECENT_TOKENS`] 之前的全部）渲染成文本交给
+    /// `provider` 摘要，用一条 assistant 记忆替换掉它们；最近的消息原样保留。
+    ///
+    /// `provider` 为 `None` 或摘要调用失败 / 返回空时，退回旧的截断拼贴，但保留
+    /// 最后 [`COMPACT_FAILURE_KEEP_MESSAGES`] 条与
+    /// [`COMPACT_FAILURE_KEEP_TOKENS`] token 中较大的那部分，**绝不清空
+    /// history**，并打一行 `agent_compact_failed reason=… kept=…`。
+    ///
+    /// 幂等：压完后的估算回落到 [`KEEP_RECENT_TOKENS`] 附近，远低于阈值，重复
+    /// 调用直接 no-op，不会再次调用 provider。
+    pub fn compact_history(&mut self, provider: Option<&dyn LlmProvider>) -> (usize, usize) {
+        let before = self.history.len();
+        if self.estimated_tokens <= COMPACT_AT_TOKENS {
+            return (before, before);
+        }
+        let keep_from = keep_recent_start(&self.history, KEEP_RECENT_TOKENS);
+        // 0 条可压（单条消息就超过保留预算），或旧消息只剩上次的记忆：再压
+        // 只会把记忆本身摘要一遍，没有新信息可提炼。
+        if keep_from == 0 || (keep_from == 1 && is_compact_memory(&self.history[0])) {
+            return (before, before);
+        }
+        let transcript = render_for_summary(&self.history[..keep_from]);
+        // 旧消息没有任何可读文本：摘要没有素材，保持原样优于塞一条空记忆。
+        if transcript.trim().is_empty() {
+            return (before, before);
+        }
+        let tokens_before = self.estimated_tokens;
+        let summary = match provider {
+            Some(provider) => match self.request_summary(provider, &transcript) {
+                Ok(summary) if !summary.is_empty() => summary,
+                Ok(_) => return self.apply_fallback("empty_summary"),
+                Err(_) => return self.apply_fallback("provider_error"),
+            },
+            None => return self.apply_fallback("no_provider"),
+        };
+        let memory = truncate_chars(&summary, SUMMARY_MAX_CHARS);
+        let after = self.install_memory(keep_from, &memory);
+        eprintln!(
+            "agent_compact kind={} removed={} kept={} tokens_before={} tokens_after={} summary_chars={}",
+            self.kind,
+            keep_from,
+            after,
+            tokens_before,
+            self.estimated_tokens,
+            memory.chars().count(),
+        );
+        (before, after)
+    }
+
+    /// 摘要调用失败的兜底：截断拼贴 + 保留最后 20 条 / 8k token。
+    ///
+    /// 若历史本身不到 20 条（例如十几条超大消息），"保留下限"会覆盖全部消息，
+    /// 此时没有可替换的旧段——保持原样好过把全部内容压成一条空记忆。
+    fn apply_fallback(&mut self, reason: &str) -> (usize, usize) {
+        let before = self.history.len();
+        let keep_from = fallback_keep_start(&self.history);
+        if keep_from == 0 {
+            return self.report_fallback(reason, before, before);
+        }
+        let memory = collage_summary(&self.history[..keep_from]);
+        let after = self.install_memory(keep_from, &memory);
+        self.report_fallback(reason, before, after)
+    }
+
+    /// 打一行失败诊断并原样返回计数。
+    fn report_fallback(&self, reason: &str, before: usize, after: usize) -> (usize, usize) {
+        let line = compact_failure_line(reason, after);
+        eprintln!("{line}");
+        #[cfg(test)]
+        record_compact_diagnostic(&line);
+        (before, after)
+    }
+
+    /// 把 `history[..keep_from]` 换成一条记忆消息，保留其后的原文。
+    ///
+    /// 返回值是压缩后的条数；调用方用它打诊断。`estimated_tokens` 在这里按新的
+    /// history 重算，绝不让压缩前的旧计数留到下一轮。
+    fn install_memory(&mut self, keep_from: usize, memory: &str) -> usize {
+        let mut next = Vec::with_capacity(self.history.len() - keep_from + 1);
+        next.push(memory_message(memory));
+        next.extend(self.history.drain(keep_from..));
+        self.history = next;
+        self.recount_tokens();
+        self.history.len()
+    }
+
+    /// 按当前 `history` 重算估算。
+    fn recount_tokens(&mut self) {
+        self.estimated_tokens = self.history.iter().map(estimate_message_tokens).sum();
+    }
+
+    /// 通过既有 provider 接缝要一段真摘要。
+    ///
+    /// 只发一条 system 指令 + 一段渲染好的旧对话；不挂 sink（压缩是内部动作，
+    /// 不向用户流式展示），transport 与会话请求取自同一份配置。
+    fn request_summary(
+        &self,
+        provider: &dyn LlmProvider,
+        transcript: &str,
+    ) -> Result<String, RuntimeError> {
+        let body = json!({
+            "model": self.config.model,
+            "messages": [
+                { "role": "system", "content": SUMMARY_SYSTEM_PROMPT },
+                { "role": "user", "content": transcript },
+            ],
+            "temperature": 0.2,
+            "max_tokens": 2000,
+        });
+        let parts = provider.complete(body, None, self.config.to_transport())?;
+        Ok(parts.message.content.unwrap_or_default().trim().to_string())
+    }
+
+    /// P6: messaging channels send their visible reply through a tool call
+    /// (`qq_send` / `feishu_send`), so the entry written by
+    /// [`Self::remember_exchange`] is only the bare action JSON
+    /// (`{"action":"suspend"}`). Without this replace step the model never sees
+    /// what it actually told the room and contradicts itself on the next turn.
+    ///
+    /// Idempotent: a retried send just overwrites the same placeholder again.
+    /// Returns `true` when the placeholder was replaced; `false` when the last
+    /// assistant entry is already a real reply (nothing to do).
+    pub fn replace_last_action_with_reply(&mut self, reply: &str) -> bool {
+        let Some(Value::Object(obj)) = self.history.last_mut() else {
+            return false;
+        };
+        if obj.get("role").and_then(Value::as_str) != Some("assistant") {
+            return false;
+        }
+        let Some(content) = obj.get("content").and_then(Value::as_str) else {
+            return false;
+        };
+        let action_placeholder = serde_json::from_str::<Value>(content)
+            .ok()
+            .and_then(|v| v.get("action").map(|_| ()))
+            .is_some();
+        if !action_placeholder {
+            return false;
+        }
+        let old = estimate_tokens(content);
+        obj.insert("content".to_string(), Value::String(reply.to_string()));
+        let new = estimate_tokens(reply);
+        self.estimated_tokens = self
+            .estimated_tokens
+            .saturating_sub(old)
+            .saturating_add(new);
+        true
+    }
+
+    fn remember_exchange(
+        &mut self,
+        user_input: &str,
+        assistant_output: &str,
+        reasoning: Option<&str>,
+        images: &[Value],
+    ) {
+        let mut assistant_msg = json!({
+            "role": "assistant",
+            "content": assistant_output,
+        });
+        if let Some(r) = reasoning {
+            if !r.trim().is_empty() {
+                assistant_msg["reasoning_content"] = Value::String(r.to_string());
+            }
+        }
+        // Pictures stay in the history so later turns can look at them again;
+        // only the newest few turns keep them (token cost, and one bad image
+        // poisons every request that replays it).
+        let user_msg = json!({
+            "role": "user",
+            "content": cordis_runtime::image_input::user_content_with_images(user_input, images),
+        });
+        // 图片 base64 也计进 estimated_tokens。旧实现只加 user_input /
+        // assistant_output 的字符串长度，数组 content 里的图片对估算完全不可见，
+        // 按 token 的裁剪因此永远看不到图（见 `estimate_message_tokens`）。
+        self.estimated_tokens +=
+            estimate_message_tokens(&user_msg) + estimate_message_tokens(&assistant_msg);
+        self.history.push(user_msg);
+        self.history.push(assistant_msg);
+        self.trim_history();
+    }
+
+    /// 条数兜底：只有历史超过 [`AGENT_HISTORY_MESSAGE_LIMIT`] 时才丢最老的
+    /// 一对消息。
+    ///
+    /// 这是**极端兜底**，正常永远碰不到：体积由 `compact_history` 在
+    /// [`COMPACT_AT_TOKENS`] 处按 token 压缩。这里不再按 `estimated_tokens`
+    /// 裁剪——那条路径会在计数虚高时一路 drain 到 history 为空。每丢一对仍把
+    /// 它占的估算减掉，免得计数停在旧水位。
+    fn trim_history(&mut self) {
+        while self.history.len() > AGENT_HISTORY_MESSAGE_LIMIT {
+            // Always remove in pairs (user + assistant); a read-only history can
+            // be odd-length, so the last single message is removed on its own.
+            let drained: Vec<Value> = self.history.drain(0..2.min(self.history.len())).collect();
+            let freed: usize = drained.iter().map(estimate_message_tokens).sum();
+            self.estimated_tokens = self.estimated_tokens.saturating_sub(freed);
+        }
+    }
+
+    /// Inject a user→assistant exchange into the agent's history without
+    /// triggering an LLM call. Used by `/` shortcuts so the agent stays
+    /// aware of direct invocations.
+    pub fn inject_exchange(&mut self, user_input: &str, assistant_output: &str) {
+        self.remember_exchange(user_input, assistant_output, None, &[]);
+        self.transcript.push(AgentTranscriptEntry::User {
+            content: user_input.to_string(),
+        });
+        self.transcript.push(AgentTranscriptEntry::Assistant {
+            content: assistant_output.to_string(),
+            tools: Vec::new(),
+            response_id: None,
+            reasoning: None,
+        });
+    }
+
+    /// Append one user message and **no** assistant reply.
+    ///
+    /// This is the read-only channel path: a disabled group still accrues the
+    /// conversation, so when the policy is turned back on the next turn sees
+    /// everything that was said meanwhile. No provider is touched here, which
+    /// is the whole point — nothing is billed and nothing is said.
+    pub fn ingest_user_message(&mut self, user_input: &str) {
+        let user_msg = json!({
+            "role": "user",
+            "content": user_input,
+        });
+        self.estimated_tokens = self
+            .estimated_tokens
+            .saturating_add(estimate_message_tokens(&user_msg));
+        self.history.push(user_msg);
+        self.transcript.push(AgentTranscriptEntry::User {
+            content: user_input.to_string(),
+        });
+        self.trim_history();
+    }
+
+    /// Channels end a turn explicitly, on a `suspend` call.
+    pub fn set_require_end_tool(&mut self, require: bool) {
+        self.require_end_tool = require;
+    }
+
+    /// Create a serializable snapshot of the current session state.
+    ///
+    /// **落盘前剥图**：live history 里的内联图片仍带着几十 MB 的 base64
+    /// （`image_budget` 只把历史压到 10 MiB 内联字节，仍是很大的 JSON），
+    /// `to_snapshot` 是 `data/sessions/<id>.json` 的唯一来源，原样写盘既慢又
+    /// 撑爆磁盘。这里在**克隆**上把每张内联图换成
+    /// [`cordis_runtime::image_budget`] 的短占位符（复用 `placeholder_for`，
+    /// 不复制构造逻辑），live history 本身不动。
+    ///
+    /// **后果（有意接受，必须写清楚）**：快照里没有 base64，所以进程重启后
+    /// 恢复出来的会话只剩占位符：
+    /// `[image omitted to fit request byte budget; sha256:<前8位>; <W>x<H> <fmt>; path data/media/<sha256>]`
+    /// （拿不到尺寸时省掉尺寸段，连字节都解不出时只有 omitted）。占位符不再是
+    /// 单向门——模型可以调 `view_image` 按 `path`（或 `sha256:<hex>` / 裸摘要）
+    /// 把原图取回
+    /// 下一次请求（见 [`attach_recovered_images`]）。前提是原始字节当初落进了
+    /// 内容寻址缓存（`cordis_runtime::image_cache`，入站下载时写入）；缓存被
+    /// 手工清掉或图片早于缓存机制存在时，仍然只能请用户重发。
+    /// 这是 47 MB 快照换来的取舍。
+    ///
+    /// `estimated_tokens` 也按剥图后的 history 重算：恢复出来的会话看到的是
+    /// 占位符，若沿用 live 的（含几十万 / 上百万图片 token 的）估算，恢复后
+    /// 第一轮就会误触发裁剪与压缩。
+    pub fn to_snapshot(&self) -> AgentSessionSnapshot {
+        let mut history = self.history.clone();
+        cordis_runtime::image_budget::strip_inline_images(&mut history);
+        let estimated_tokens = history.iter().map(estimate_message_tokens).sum();
+        AgentSessionSnapshot {
+            kind: self.kind.clone(),
+            config: self.config.clone(),
+            history,
+            transcript: self.transcript.clone(),
+            completed_turns: self.completed_turns,
+            estimated_tokens,
+            require_end_tool: self.require_end_tool,
+            soul_key: self.soul_key.clone(),
+        }
+    }
+
+    /// Reconstruct an AgentSession from a snapshot.
+    ///
+    /// 磁盘 schema 未变：快照本就不存 HTTP client（拆分前是从 config 重建，
+    /// 现在传输在插件里、连重建都不需要了）。
+    ///
+    /// 注意：快照里的内联图片已在 [`Self::to_snapshot`] 落盘前换成占位符，
+    /// 所以恢复出来的会话**看不到**那些历史图片（只剩 sha256 / 尺寸标记）；
+    /// 要再看那张图只能让用户重发。
+    ///
+    /// P2-33 + P0-25: `api_key` is `#[serde(skip_serializing)]`, so a
+    /// recovered snapshot arrives with `config.api_key = None`. 保持 None——
+    /// provider 插件在请求时按 `api_key_env` 从环境读，恢复出来的会话因此拿到
+    /// 本次启动的密钥，而不是烧在磁盘文件里的旧值。
+    ///
+    /// 旧快照里的 `no_end_strikes` / `unknown_tool_strikes` /
+    /// `empty_response_strikes` / `reasoning_only_strikes` 会被 serde 当作未知
+    /// 字段忽略（`AgentSessionSnapshot` 没有 `deny_unknown_fields`），因此老
+    /// 文件照常解析；这些计数本来就不该跨轮，恢复时一律从零开始。
+    pub fn from_snapshot(snapshot: AgentSessionSnapshot) -> Result<Self, RuntimeError> {
+        Ok(Self {
+            kind: snapshot.kind,
+            config: snapshot.config,
+            history: snapshot.history,
+            transcript: snapshot.transcript,
+            completed_turns: snapshot.completed_turns,
+            estimated_tokens: snapshot.estimated_tokens,
+            require_end_tool: snapshot.require_end_tool,
+            soul_key: snapshot.soul_key,
+            // P4: caller flags are per-batch facts, not session state — a
+            // recovered session starts unpinned and is rebound by the next
+            // inbox batch before any tool can run.
+            is_group: false,
+            caller_is_admin: false,
+            can_approve_iteration: false,
+        })
+    }
+}
+
+impl ShellAgentSession {
+    pub fn new(config: LlmApiConfig) -> Result<Self, RuntimeError> {
+        Ok(Self {
+            inner: AgentSession::new(config, "runtime_shell")?,
+        })
+    }
+
+    pub fn reset(&mut self) {
+        self.inner.reset();
+    }
+
+    /// Channel sessions end explicitly, on a `suspend` call.
+    pub fn set_require_end_tool(&mut self, require: bool) {
+        self.inner.set_require_end_tool(require);
+    }
+
+    pub fn status(&self) -> ShellAgentStatus {
+        self.inner.status()
+    }
+
+    pub fn transcript(&self) -> &[AgentTranscriptEntry] {
+        self.inner.transcript()
+    }
+
+    pub fn tool_execution_summary(&self) -> AgentToolExecutionSummary {
+        self.inner.tool_execution_summary()
+    }
+
+    pub fn respond<H: AgentToolHost + ?Sized>(
+        &mut self,
+        host: &H,
+        session_id: &str,
+        user_input: &str,
+    ) -> Result<ShellAgentReply, RuntimeError> {
+        self.inner
+            .respond_with_runtime_host(host, session_id, user_input)
+    }
+
+    /// 测试入口：用给定 provider 跑一轮。
+    ///
+    /// 机制测试（工具分派、终止工具排序、历史）考的是循环本身，不是 wire——
+    /// 拆分后传输在插件里，这些测试改用 `FakeLlmProvider` 直接喂补全，不再起
+    /// mock HTTP server 与解析 SSE。
+    #[cfg(test)]
+    fn respond_via<H: AgentToolHost + ?Sized>(
+        &mut self,
+        host: &H,
+        session_id: &str,
+        user_input: &str,
+        provider: &dyn LlmProvider,
+    ) -> Result<ShellAgentReply, RuntimeError> {
+        self.inner
+            .respond_with_runtime_host_via(host, session_id, user_input, provider, None)
+    }
+
+    #[cfg(test)]
+    fn remember_exchange(&mut self, user_input: &str, assistant_output: &str) {
+        self.inner
+            .remember_exchange(user_input, assistant_output, None, &[]);
+        self.inner.completed_turns += 1;
+    }
+}
+
+/// 一个不存在的工具名要回给模型的纠正语。
+///
+/// 连续踩到 `limit` 次就把措辞换成"停手"，因为模型反复编造工具名时，温和的
+/// 提示会被它当成又一次可用工具说明。两段文本逐字节固定，并各有单测钉住。
+fn unknown_tool_message(
+    tool_name: &str,
+    strikes: usize,
+    limit: usize,
+    scope_label: &str,
+    tool_list: &str,
+) -> String {
+    if strikes >= limit {
+        format!(
+            "STOP — tool '{tool_name}' does not exist. Strike {strikes}/{limit}. You are in a {scope_label} session. Your ONLY tools: {tool_list}",
+        )
+    } else {
+        format!(
+            "Tool '{tool_name}' does not exist (strike {strikes}/{limit}). Available tools: {tool_list}",
+        )
+    }
+}
+
+/// 把本轮收集到的提示（失败的 tool、不存在的 tool）合并成**一条** user 消息
+/// 追加到 `messages`。
+///
+/// 必须在「本轮全部 tool 结果都已 push」之后调用：供应商要求 `role=="tool"`
+/// 的结果紧跟在它所属的 assistant `tool_calls` 之后，任何插在中间的 user
+/// 消息都会让整轮请求 400。多条提示用空行连接，保持各自措辞逐字节不变。
+/// 没有收集到提示时是 no-op（调用点因此可以在所有出口无条件调用）。
+fn flush_tool_failure_prompts(messages: &mut Vec<Value>, prompts: &mut Vec<String>) {
+    if prompts.is_empty() {
+        return;
+    }
+    messages.push(json!({
+        "role": "user",
+        "content": prompts.join("\n\n"),
+    }));
+    prompts.clear();
+}
+
+/// 把一条助手消息序列化回请求里的 message 对象。
+///
+/// 由 `ChatMessage::to_request_message` 原样迁来——它只做 JSON 拼装、不含
+/// wire 解析，因此随契约类型留在 kernel（构造请求体是 kernel 的职责）。
+/// Our own outage notice, not something a person said.
+///
+/// When a turn fails and the message is spilled to `pending`, older builds
+/// posted 「我这边刚才调用模型失败了，你的消息我记下了，稍后会自动重试。」 into the
+/// room. It is machine text, and once it sat in history the model echoed it
+/// back verbatim in unrelated turns — so it never enters a request. Short
+/// matches only, so a person quoting the notice at length is still delivered.
+fn is_outage_notice_text(message: &Value) -> bool {
+    let content = message
+        .get("content")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim();
+    content.starts_with("我这边刚才调用模型失败") && content.chars().count() <= 120
+}
+
+fn llm_message_to_request(message: &cordis_plugin_sdk::llm::LlmMessage) -> Value {
+    let mut out = Map::new();
+    out.insert("role".to_string(), Value::String("assistant".to_string()));
+    let content_value = message
+        .content
+        .as_ref()
+        .map(|content| Value::String(content.clone()))
+        .unwrap_or_else(|| {
+            if message.reasoning_content.is_some() || !message.tool_calls.is_empty() {
+                Value::String(String::new())
+            } else {
+                Value::Null
+            }
+        });
+    out.insert("content".to_string(), content_value);
+    // DeepSeek's thinking mode rejects a request whose assistant turns do not
+    // carry `reasoning_content`: "The `reasoning_content` in the thinking mode
+    // must be passed back to the API." An assistant message that called a tool
+    // therefore echoes the field even when the reasoning came back empty.
+    if let Some(reasoning_content) = message.reasoning_content.as_ref() {
+        out.insert(
+            "reasoning_content".to_string(),
+            Value::String(reasoning_content.clone()),
+        );
+    } else if !message.tool_calls.is_empty() {
+        out.insert(
+            "reasoning_content".to_string(),
+            Value::String(String::new()),
+        );
+    }
+    if !message.tool_calls.is_empty() {
+        out.insert(
+            "tool_calls".to_string(),
+            serde_json::to_value(&message.tool_calls).unwrap_or(Value::Array(Vec::new())),
+        );
+    }
+    Value::Object(out)
+}
+
+struct RuntimeShellAgentBackend<'a, H: AgentToolHost + ?Sized> {
+    host: &'a H,
+    session_id: &'a str,
+    /// O批: soul scope of the owning session ("" = none).
+    soul_key: String,
+}
+
+impl<'a, H: AgentToolHost + ?Sized> AgentBackend for RuntimeShellAgentBackend<'a, H> {
+    type Host = H;
+    fn host(&self) -> &H {
+        self.host
+    }
+    /// Four-part prompt — base, persona overlay, conduct contract, plugin
+    /// hints. The persona overlay only shapes tone (its disclaimer says so
+    /// explicitly) and never overrides the conduct contract, which applies to
+    /// every channel. Plugin hints still land last so channel mechanics keep
+    /// the highest recency.
+    fn system_prompt(&self) -> String {
+        let mut prompt = shell_agent_system_prompt(!self.soul_key.is_empty());
+        // Channel sessions always carry a persona: the room's own soul when it
+        // has one, the built-in default otherwise. Shell sessions (no soul_key)
+        // stay persona-free.
+        if !self.soul_key.is_empty() {
+            let overlay = self.host.agent_soul_overlay(&self.soul_key);
+            let persona = cordis_runtime::soul::persona_or_default(overlay.as_deref());
+            prompt.push_str("\n\n--- Persona (per-user soul) ---\n\n");
+            prompt.push_str(PERSONA_DISCLAIMER);
+            prompt.push_str(persona);
+        }
+        prompt.push_str("\n\n--- Conduct (hard boundaries) ---\n\n");
+        prompt.push_str(CONDUCT_CONTRACT.trim_end());
+        // The bot's own failure record rides last: it is the most specific
+        // instruction in the prompt and the one most easily ignored if buried.
+        if let Some(digest) = self.host.agent_self_check_digest() {
+            prompt.push_str("\n\n--- Your own failure record ---\n\n");
+            prompt.push_str(digest.trim_start_matches("--- Your own failure record ---\n\n"));
+        }
+        let hints = self.host.agent_plugin_hints();
+        if !hints.is_empty() {
+            prompt.push_str("\n\n--- Plugin-specific instructions ---\n\n");
+            for hint in &hints {
+                prompt.push_str(hint);
+                prompt.push_str("\n\n");
+            }
+        }
+        prompt
+    }
+
+    fn tool_specs(&self) -> Vec<AgentToolSpec> {
+        shell_agent_tools()
+    }
+
+    fn execute_tool(
+        &mut self,
+        name: &str,
+        arguments: Value,
+        attachments: &mut Vec<Value>,
+    ) -> Result<Value, RuntimeError> {
+        match name {
+            cordis_runtime::agent_tools::AGENT_TOOL_MY_TEAM => {
+                parse_tool_value_arguments::<EmptyArgs>(arguments, name)?;
+                self.host.agent_my_team(self.session_id)
+            }
+            cordis_runtime::agent_tools::AGENT_TOOL_SEND_TO_SESSION => {
+                let args = parse_tool_value_arguments::<SendToSessionArgs>(arguments, name)?;
+                self.host
+                    .agent_send_to_session(self.session_id, &args.target, &args.message)
+            }
+            AGENT_TOOL_GET_RUNTIME_STATUS => {
+                parse_tool_value_arguments::<EmptyArgs>(arguments, name)?;
+                self.host.agent_runtime_status()
+            }
+            AGENT_TOOL_LIST_PLUGINS => {
+                parse_tool_value_arguments::<EmptyArgs>(arguments, name)?;
+                self.host.agent_list_plugins()
+            }
+            AGENT_TOOL_LIST_NODES => {
+                parse_tool_value_arguments::<EmptyArgs>(arguments, name)?;
+                self.host.agent_list_nodes()
+            }
+            AGENT_TOOL_GET_KERNEL_STATUS => {
+                parse_tool_value_arguments::<EmptyArgs>(arguments, name)?;
+                self.host.agent_kernel_status()
+            }
+            AGENT_TOOL_GET_KERNEL_ISSUES => {
+                parse_tool_value_arguments::<EmptyArgs>(arguments, name)?;
+                self.host.agent_kernel_issues()
+            }
+            AGENT_TOOL_GET_SELF_CHECK => {
+                parse_tool_value_arguments::<EmptyArgs>(arguments, name)?;
+                self.host.agent_self_check()
+            }
+            AGENT_TOOL_RELOAD_RUNTIME => {
+                let args = parse_tool_value_arguments::<ReloadRuntimeArgs>(arguments, name)?;
+                self.host.agent_reload_runtime(&args.plugin_path)
+            }
+            AGENT_TOOL_BUILD_PLUGINS => {
+                let args = parse_tool_value_arguments::<BuildPluginsArgs>(arguments, name)?;
+                self.host.agent_build_plugins(&args.plugin_name)
+            }
+            AGENT_TOOL_INVOKE_PLUGIN => {
+                let args = parse_tool_value_arguments::<InvokePluginArgs>(arguments, name)?;
+                // 渠道提供的一次性元数据（谁在说话、什么会话）由 kernel 注入到
+                // 每次 invoke 的 payload 里：模型自己传的同名字段会被覆盖，
+                // 所以插件可以把它当可信身份用（鉴权靠它，不靠模型自述）。
+                let payload = self
+                    .host
+                    .inject_turn_meta(self.session_id, args.payload_json);
+                self.host.agent_invoke_plugin(
+                    self.session_id,
+                    &args.plugin_path,
+                    &args.node_id,
+                    payload,
+                )
+            }
+            AGENT_TOOL_EXECUTE_TARGET => {
+                let args = parse_tool_value_arguments::<ExecuteTargetArgs>(arguments, name)?;
+                self.host
+                    .agent_execute_target(&args.node_fqn, args.payload_json)
+            }
+            AGENT_TOOL_READ_FILE => {
+                let args = parse_tool_value_arguments::<ReadFileArgs>(arguments, name)?;
+                self.host
+                    .agent_read_file(&args.path, args.offset, args.limit)
+            }
+            AGENT_TOOL_LIST_DIRECTORY => {
+                let args = parse_tool_value_arguments::<ListDirectoryArgs>(arguments, name)?;
+                self.host
+                    .agent_list_directory(args.path.as_deref().unwrap_or("."))
+            }
+            // 取回一张被请求体预算剥成占位符的图片：进本轮的附件队列（由
+            // [`Turn`] 持有），下一次请求带上它。
+            AGENT_TOOL_VIEW_IMAGE => {
+                let args = parse_tool_value_arguments::<ViewImageArgs>(arguments, name)?;
+                let (attached, part) = self
+                    .host
+                    .agent_view_image(args.path.as_deref(), args.sha256.as_deref())?;
+                attachments.push(part);
+                Ok(json!({ "ok": true, "attached": attached }))
+            }
+            AGENT_TOOL_SEARCH_CODE => {
+                let args = parse_tool_value_arguments::<SearchCodeArgs>(arguments, name)?;
+                self.host
+                    .agent_search_code(&args.pattern, args.path.as_deref())
+            }
+            AGENT_TOOL_WRITE_FILE => {
+                let args = parse_tool_value_arguments::<WriteFileArgs>(arguments, name)?;
+                self.host.agent_write_file(&args.path, &args.content)
+            }
+            AGENT_TOOL_REPLACE_IN_FILE => {
+                let args = parse_tool_value_arguments::<ReplaceInFileArgs>(arguments, name)?;
+                self.host
+                    .agent_replace_in_file(&args.path, &args.find, &args.replace)
+            }
+            AGENT_TOOL_REVERT_CHANGES => {
+                parse_tool_value_arguments::<EmptyArgs>(arguments, name)?;
+                self.host.agent_revert_changes()
+            }
+            AGENT_TOOL_DELETE_FILE => {
+                let args = parse_tool_value_arguments::<DeleteFileArgs>(arguments, name)?;
+                self.host.agent_delete_file(&args.path)
+            }
+            AGENT_TOOL_RENAME_FILE => {
+                let args = parse_tool_value_arguments::<RenameFileArgs>(arguments, name)?;
+                self.host.agent_rename_file(&args.path, &args.new_path)
+            }
+            AGENT_TOOL_MOVE_FILE => {
+                let args = parse_tool_value_arguments::<MoveFileArgs>(arguments, name)?;
+                self.host.agent_move_file(&args.path, &args.new_path)
+            }
+            AGENT_TOOL_COPY_FILE => {
+                let args = parse_tool_value_arguments::<CopyFileArgs>(arguments, name)?;
+                self.host.agent_copy_file(&args.path, &args.new_path)
+            }
+            AGENT_TOOL_COMPACT_CONTEXT => {
+                parse_tool_value_arguments::<EmptyArgs>(arguments, name)?;
+                self.host.agent_compact_context(self.session_id)
+            }
+            AGENT_TOOL_RUN_PLUGIN_TEST => {
+                let args = parse_tool_value_arguments::<RunPluginTestArgs>(arguments, name)?;
+                self.host.agent_run_plugin_test(args.command.as_deref())
+            }
+            AGENT_TOOL_REQUEST_ITERATION => {
+                let args = parse_tool_value_arguments::<RequestIterationArgs>(arguments, name)?;
+                self.host.agent_request_iteration(
+                    self.session_id,
+                    &args.plugin_path,
+                    &args.instruction,
+                )
+            }
+            AGENT_TOOL_APPROVE_ITERATION => {
+                let args = parse_tool_value_arguments::<ApproveIterationArgs>(arguments, name)?;
+                self.host
+                    .agent_approve_iteration(self.session_id, &args.iteration_id)
+            }
+            AGENT_TOOL_CREATE_PLUGIN => {
+                let args = parse_tool_value_arguments::<CreatePluginArgs>(arguments, name)?;
+                self.host
+                    .agent_create_plugin(&args.name, args.description.as_deref())
+            }
+            AGENT_TOOL_SET_SOUL => {
+                let args = parse_tool_value_arguments::<SetSoulArgs>(arguments, name)?;
+                // P4: a room persona is shared by everyone in the room, so
+                // only the room's owner/admin may rewrite it. Private chats
+                // stay self-service (the scope is already one person).
+                if let Some(caller) = self.host.agent_session_caller(self.session_id) {
+                    if caller.is_group && !caller.is_admin {
+                        return Err(RuntimeError::InvalidArgument {
+                            message: "only a group owner/admin can change this room's persona"
+                                .to_string(),
+                        });
+                    }
+                }
+                self.host.agent_set_soul(
+                    &self.soul_key,
+                    args.persona.as_deref(),
+                    args.profile.as_deref(),
+                )
+            }
+            other => Err(RuntimeError::InvalidArgument {
+                message: format!("runtime shell agent does not support tool {other}"),
+            }),
+        }
+    }
+
+    fn tool_scope_label(&self) -> String {
+        "runtime_shell".to_string()
+    }
+}
+
+/// A serialised tool call the provider wrote into the content stream.
+///
+/// DeepSeek sometimes emits its internal DSML markup instead of structured
+/// `tool_calls`; the payload is still the tool's JSON arguments, so the call is
+/// recoverable. Only text that actually carries that markup is considered —
+/// an ordinary reply that happens to contain JSON must never execute.
+/// The end-of-turn marker, as a tool the DSML parser can resolve.
+///
+/// Without it a `<|DSML|tool_calls>{"node_id":"suspend"}</|DSML|tool_calls>`
+/// block was parsed as `invoke_plugin` with an empty path (the parser only maps
+/// a name to a direct call when the name is in the tool list), so every channel
+/// turn retried until it gave up — the bot went silent.
+fn end_turn_tool_spec() -> AgentToolSpec {
+    AgentToolSpec {
+        name: AGENT_TOOL_END_TURN,
+        description:
+            "End this turn. Call it after your last message; text alone never ends a turn.",
+        parameters: json!({"type": "object", "properties": {}, "additionalProperties": false}),
+    }
+}
+
+/// 把本轮 `view_image` 取回的图片挂到下一次请求上，并清空队列。
+///
+/// 预算口径与历史图片同一把尺子，**先扣本轮新图、再扣队列**：两者都进同一个
+/// 请求体，历史图片只能吃剩下的额度。队列里放不下的直接丢弃（工具调用早已
+/// 返回，没法再改口），并在附言里写明丢了几张——否则模型会以为图已经看过。
+///
+/// 队列取自本回合的 [`Turn`]：取走即清空，回合结束随 `Turn` 一起消失。
+///
+/// 返回实际附上的张数。
+fn attach_recovered_images(
+    turn: &mut Turn,
+    messages: &mut Vec<Value>,
+    new_images: &[Value],
+    budget: usize,
+) -> usize {
+    let recovered = std::mem::take(&mut turn.attached);
+    if recovered.is_empty() {
+        return 0;
+    }
+    let requested = recovered.len();
+    // 先扣本轮新图：它们已经在这条请求里了，比队列里的图更"当前"。
+    let available =
+        budget.saturating_sub(cordis_runtime::image_budget::image_parts_bytes(new_images));
+    let mut used = 0usize;
+    let mut attached: Vec<Value> = Vec::new();
+    for part in recovered {
+        let bytes = cordis_runtime::image_budget::image_parts_bytes(std::slice::from_ref(&part));
+        if used.saturating_add(bytes) > available {
+            continue;
+        }
+        used += bytes;
+        attached.push(part);
+    }
+    let dropped = requested - attached.len();
+    let text = match (attached.len(), dropped) {
+        (0, dropped) => format!(
+            "[view_image] {dropped} requested image(s) could not be attached: this request already holds the inline image byte budget."
+        ),
+        (count, 0) => format!("[view_image] {count} recovered image(s) attached below."),
+        (count, dropped) => format!(
+            "[view_image] {count} recovered image(s) attached below; {dropped} skipped over the inline image byte budget."
+        ),
+    };
+    messages.push(json!({
+        "role": "user",
+        "content": cordis_runtime::image_input::user_content_with_images(&text, &attached),
+    }));
+    // 整条请求（历史 + 本轮新图 + 取回的图）仍要落回预算内：超了就从最老的
+    // 历史图片开始剥，规则与 `respond_inner` 开头的裁剪完全一致。
+    cordis_runtime::image_budget::enforce_image_budget(messages, budget);
+    attached.len()
+}
+
+/// The text a turn actually delivered, or `fallback` when it delivered none.
+///
+/// The transcript is the record of what happened in the room, so it must hold
+/// what the room saw. It used to hold the model's raw output — a `suspend`
+/// marker or a DSML block — which made every transcript look like silence and
+/// forced any later review to reconstruct the reply from tool arguments.
+fn delivered_text(events: &[cordis_runtime::agent_api::AgentToolEvent], fallback: &str) -> String {
+    let said: Vec<String> = events
+        .iter()
+        .filter(|event| event.delivered())
+        .filter_map(|event| {
+            event
+                .arguments
+                .get("message")
+                .and_then(Value::as_str)
+                .or_else(|| {
+                    event
+                        .arguments
+                        .get("payload_json")
+                        .and_then(|payload| payload.get("message"))
+                        .and_then(Value::as_str)
+                })
+                .map(str::to_string)
+        })
+        .filter(|message| !message.trim().is_empty())
+        .collect();
+    if said.is_empty() {
+        fallback.to_string()
+    } else {
+        said.join("\n")
+    }
+}
+
+/// Node names of the tools a turn ran, for the transcript.
+///
+/// A plugin call arrives as `invoke_plugin`; the node is the part that says what
+/// actually happened.
+fn tool_names(events: &[cordis_runtime::agent_api::AgentToolEvent]) -> Vec<String> {
+    events
+        .iter()
+        .map(|event| {
+            event
+                .arguments
+                .get("node_id")
+                .and_then(Value::as_str)
+                .unwrap_or(&event.name)
+                .to_string()
+        })
+        .collect()
+}
+
+/// How much of a tool result is kept in history.
+///
+/// The full text of a `read_file` on a large file is megabytes; replaying it on
+/// every later request would cost the context window and trip the provider's
+/// body limit. The excerpt keeps the answer recognisable and says what was cut.
+const RECORDED_RESULT_CHARS: usize = 4000;
+
+/// One tool call as it is written back into history.
+///
+/// Shape: `[tool] name {arguments} → result`. A plugin node is named by its node
+/// (`web_search`), not by the `invoke_plugin` wrapper: the node is what answers
+/// "did I actually look this up".
+fn render_recorded_call<H: crate::AgentToolHost + ?Sized>(
+    event: &cordis_runtime::agent_api::AgentToolEvent,
+    host: &H,
+) -> String {
+    let name = event
+        .arguments
+        .get("node_id")
+        .and_then(Value::as_str)
+        .unwrap_or(&event.name);
+    let arguments = event
+        .arguments
+        .get("payload_json")
+        .filter(|_| event.name == cordis_runtime::agent_tools::AGENT_TOOL_INVOKE_PLUGIN)
+        .unwrap_or(&event.arguments);
+    let heading = format!(
+        "[tool] {name} {}",
+        truncate_chars(&arguments.to_string(), 400)
+    );
+    let (result, failed) = match (&event.output, event.ok) {
+        (Some(output), true) => (output.to_string(), false),
+        (Some(output), false) => (output.to_string(), true),
+        (None, true) => return heading,
+        (None, false) => (
+            event
+                .error
+                .as_deref()
+                .unwrap_or("unknown error")
+                .to_string(),
+            true,
+        ),
+    };
+    // A result too big to replay is written to disk; the context keeps its
+    // head, its tail and a pointer. Truncating it instead spent the tokens and
+    // lost the content, which is the worst of both.
+    let result = if crate::spill::needs_spill(&result) {
+        match host.agent_spill(name, &result) {
+            Ok(path) => crate::spill::bound(&result, &path)
+                .unwrap_or_else(|| truncate_chars(&result, RECORDED_RESULT_CHARS)),
+            Err(_) => truncate_chars(&result, RECORDED_RESULT_CHARS),
+        }
+    } else {
+        truncate_chars(&result, RECORDED_RESULT_CHARS)
+    };
+    if failed {
+        format!("{heading} → 失败: {result}")
+    } else {
+        format!("{heading} → {result}")
+    }
+}
+
+/// Remove every image content part from a message list, turning multimodal
+/// user content back into a plain string.
+fn strip_image_parts(messages: &mut [Value]) {
+    for message in messages.iter_mut() {
+        let Some(parts) = message.get_mut("content").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        let text: String = parts
+            .iter()
+            .filter_map(|part| part.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n");
+        *message.get_mut("content").expect("content") = Value::String(text);
+    }
+}
+
+/// Pictures the provider rejected must not go back into history, or the next
+/// turn replays the same 400.
+fn history_images(images: &[Value], stripped: bool) -> &[Value] {
+    if stripped {
+        &[]
+    } else {
+        images
+    }
+}
+
+/// The whole message is one JSON object naming a tool the session offers —
+/// that is the call, not a reply mentioning one.
+///
+/// Channel hints teach this exact form (`{"node_id":"suspend"}`), so the model
+/// writes the payload the hint showed instead of DSML markup. Dropped as text,
+/// the send never happened and the turn never reached its end tool. The bar
+/// stays high: the message must be nothing but that object and `node_id` must
+/// name a tool in `tools`, so a sentence, an example, or a fenced code block is
+/// still text.
+fn bare_tool_object_call(
+    content: &str,
+    tools: &[AgentToolSpec],
+) -> Option<cordis_plugin_sdk::llm::LlmToolCall> {
+    if !content.starts_with('{') || !content.ends_with('}') {
+        return None;
+    }
+    let value: Value = serde_json::from_str(content).ok()?;
+    let node_id = value.get("node_id").and_then(Value::as_str)?;
+    if !tools.iter().any(|tool| tool.name == node_id) {
+        return None;
+    }
+    serialized_call_to_tool_call_at(&value, 0, tools)
+}
+
+fn salvage_serialized_tool_calls(
+    content: &str,
+    tools: &[AgentToolSpec],
+) -> Vec<cordis_plugin_sdk::llm::LlmToolCall> {
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    if !looks_like_serialized_call(trimmed) {
+        // Not DSML markup: the only remaining shape that is still a call is a
+        // message that is nothing but one JSON object naming a known tool.
+        return bare_tool_object_call(trimmed, tools).into_iter().collect();
+    }
+    // The dialect the model writes: `<|DSML|invoke name="...">` with nested
+    // `<|DSML|parameter>` blocks. This is what the prompt and history show, so
+    // it is tried first; the JSON scanner below only exists so old snapshots —
+    // which stored `<|DSML|tool_calls>{"node_id":...}` — still replay.
+    // A malformed hybrid — an `<|DSML|invoke>` wrapper around a bare JSON
+    // object, with no `<|DSML|parameter>` blocks — carries no parameters. The
+    // JSON scanner recovers it, so hand it over instead of resolving an empty
+    // `invoke_plugin`.
+    let parsed = crate::dsml::parse(trimmed);
+    let carries_parameters = parsed.iter().any(|call| !call.params.is_empty());
+    let carries_json = !extract_json_objects(trimmed).is_empty();
+    let parsed = if carries_parameters || !carries_json {
+        parsed
+    } else {
+        Vec::new()
+    };
+    let dsml: Vec<_> = parsed
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, call)| {
+            // Reuse the JSON resolver: it already knows that a kernel tool is
+            // called directly, that `invoke_plugin` unwraps its inner node, and
+            // how a bare plugin node is addressed.
+            let envelope = json!({
+                "node_id": call.name,
+                "payload_json": call.arguments(),
+            });
+            serialized_call_to_tool_call_at(&envelope, index, tools)
+        })
+        .collect();
+    if !dsml.is_empty() {
+        return dsml;
+    }
+    extract_json_objects(trimmed)
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, value)| serialized_call_to_tool_call_at(&value, index, tools))
+        .collect()
+}
+
+/// Does this text carry the provider's serialised-call markup?
+fn looks_like_serialized_call(content: &str) -> bool {
+    let lowered = content.to_ascii_lowercase();
+    lowered.contains("dsml")
+        || content.contains("｜｜")
+        || lowered.contains("<invoke")
+        || lowered.contains("<tool_call")
+}
+
+/// Every top-level JSON object embedded in `text`, in order.
+fn extract_json_objects(text: &str) -> Vec<Value> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut values = Vec::new();
+    let mut index = 0;
+    while index < chars.len() {
+        if chars[index] != '{' {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        let mut depth = 0usize;
+        let mut in_string = false;
+        let mut escaped = false;
+        while index < chars.len() {
+            let ch = chars[index];
+            if in_string {
+                if escaped {
+                    escaped = false;
+                } else if ch == '\\' {
+                    escaped = true;
+                } else if ch == '"' {
+                    in_string = false;
+                }
+            } else if ch == '"' {
+                in_string = true;
+            } else if ch == '{' {
+                depth += 1;
+            } else if ch == '}' {
+                depth -= 1;
+                if depth == 0 {
+                    let candidate: String = chars[start..=index].iter().collect();
+                    if let Ok(value) = serde_json::from_str::<Value>(&candidate) {
+                        values.push(value);
+                    }
+                    break;
+                }
+            }
+            index += 1;
+        }
+        index += 1;
+    }
+    values
+}
+
+/// Turn one recovered JSON object into an `invoke_plugin` call.
+///
+/// A serialised payload is a plugin node request (`node_id` plus that node's
+/// fields). `plugin_path` may be absent — the host resolves it from the loaded
+/// snapshot when exactly one plugin declares the node.
+/// Same, with a call index so two DSML calls to the same node in one turn get
+/// distinct ids — a duplicated `tool_call_id` breaks result pairing.
+/// Peel `payload_json` envelopes off a serialized call.
+///
+/// The model sometimes nests the wrapper it was shown instead of the node's own
+/// arguments: `{"node_id":"qq_send","payload_json":{"node_id":"qq_send",
+/// "payload_json":{"target":…}}}`, which reaches the plugin as a payload with no
+/// `target` and fails with "target is required". Only a bare envelope is peeled
+/// (keys limited to `node_id`/`payload_json`), so a plugin that genuinely takes
+/// a `payload_json` argument keeps it.
+/// Every reasoning string of the turn, joined, capped so a runaway model cannot
+/// balloon the snapshot.
+fn closing_reasoning(parts: &[String]) -> Option<String> {
+    if parts.is_empty() {
+        return None;
+    }
+    let joined = parts.join("\n\n---\n\n");
+    const CAP: usize = 8000;
+    if joined.chars().count() <= CAP {
+        return Some(joined);
+    }
+    Some(joined.chars().take(CAP).collect())
+}
+
+fn peel_envelope(value: &Value) -> Value {
+    let mut current = value.clone();
+    loop {
+        let Some(object) = current.as_object() else {
+            return current;
+        };
+        let bare = object
+            .keys()
+            .all(|key| key == "node_id" || key == "payload_json");
+        let inner = object.get("payload_json").filter(|inner| inner.is_object());
+        match inner {
+            Some(inner) if bare => current = inner.clone(),
+            _ => return current,
+        }
+    }
+}
+
+fn serialized_call_to_tool_call_at(
+    value: &Value,
+    index: usize,
+    tools: &[AgentToolSpec],
+) -> Option<cordis_plugin_sdk::llm::LlmToolCall> {
+    let object = value.as_object()?;
+    let node_id = object.get("node_id").and_then(Value::as_str)?;
+    let plugin_path = object
+        .get("plugin_path")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    // A kernel tool (read_file, run_command, get_runtime_status …) has no plugin
+    // behind it: calling it through `invoke_plugin` with an empty path would
+    // fail. Call it directly with its own parameters instead.
+    // The model sometimes wraps a kernel tool in `invoke_plugin` anyway:
+    // `{"node_id":"invoke_plugin","payload_json":{"node_id":"suspend"}}`. Unwrap
+    // it, otherwise the turn can never end (and every retry looks like work).
+    if node_id == AGENT_TOOL_INVOKE_PLUGIN {
+        let inner = object
+            .get("payload_json")
+            .and_then(|value| value.get("node_id"))
+            .and_then(Value::as_str);
+        if let Some(inner) = inner {
+            if tools.iter().any(|tool| tool.name == inner) {
+                let arguments = object
+                    .get("payload_json")
+                    .and_then(|value| value.get("payload_json"))
+                    .cloned()
+                    .unwrap_or_else(|| json!({}));
+                return Some(cordis_plugin_sdk::llm::LlmToolCall {
+                    id: format!("dsml-{index}-{inner}"),
+                    call_type: "function".to_string(),
+                    function: cordis_plugin_sdk::llm::LlmToolFunction {
+                        name: inner.to_string(),
+                        arguments: arguments.to_string(),
+                    },
+                });
+            }
+        }
+    }
+    if plugin_path.is_empty() && tools.iter().any(|tool| tool.name == node_id) {
+        let arguments = object
+            .get("payload_json")
+            .cloned()
+            .unwrap_or_else(|| Value::Object(object.clone()));
+        return Some(cordis_plugin_sdk::llm::LlmToolCall {
+            id: format!("dsml-{index}-{node_id}"),
+            call_type: "function".to_string(),
+            function: cordis_plugin_sdk::llm::LlmToolFunction {
+                name: node_id.to_string(),
+                arguments: arguments.to_string(),
+            },
+        });
+    }
+    let arguments = json!({
+        "plugin_path": plugin_path,
+        "node_id": node_id,
+        "payload_json": peel_envelope(value),
+    });
+    Some(cordis_plugin_sdk::llm::LlmToolCall {
+        id: format!("dsml-{index}-{node_id}"),
+        call_type: "function".to_string(),
+        function: cordis_plugin_sdk::llm::LlmToolFunction {
+            name: AGENT_TOOL_INVOKE_PLUGIN.to_string(),
+            arguments: arguments.to_string(),
+        },
+    })
+}
+
+#[cfg(test)]
+mod dsml_salvage_tests {
+    use super::{extract_json_objects, looks_like_serialized_call, salvage_serialized_tool_calls};
+
+    /// The tools a session offers; kernel tools are matched by name, plugins by
+    /// the explicit `plugin_path`.
+    fn specs() -> Vec<super::AgentToolSpec> {
+        vec![super::AgentToolSpec {
+            name: super::AGENT_TOOL_READ_FILE,
+            description: "Read a file.",
+            parameters: serde_json::json!({"type":"object","properties":{}}),
+        }]
+    }
+
+    // The channel hint teaches the JSON form (`{"node_id":"suspend"}`,
+    // `{"node_id":"qq_send",...}`). A message that is exactly that object is
+    // the call itself: treating it as text left the send undone and the turn
+    // without its end tool.
+    #[test]
+    fn a_bare_json_object_naming_a_known_tool_is_the_call() {
+        let mut tools = specs();
+        tools.push(super::end_turn_tool_spec());
+        let calls = salvage_serialized_tool_calls(r#"{"node_id":"suspend"}"#, &tools);
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert_eq!(calls[0].function.name, super::AGENT_TOOL_END_TURN);
+
+        let calls = salvage_serialized_tool_calls(
+            r#"{"node_id":"read_file","payload_json":{"path":"/tmp/a"}}"#,
+            &specs(),
+        );
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert_eq!(calls[0].function.name, "read_file");
+    }
+
+    // The provider serialises the call into the content stream; the JSON is the
+    // payload, the DSML markup is decoration. This is the shape seen in the
+    // logs (truncated at 200 chars there, reconstructed here).
+    const LEAK: &str = r#"<｜｜DSML｜｜invoke name="invoke_plugin">
+{"node_id": "qq_send", "target": "group:975594881", "message": "13×7=91，找 9 块喵"}
+</｜｜DSML｜｜ parameter name="plugin_path" string="true">qq</｜｜DSML｜｜>"#;
+
+    #[test]
+    fn recovers_the_call_from_markup() {
+        let calls = salvage_serialized_tool_calls(LEAK, &specs());
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert_eq!(calls[0].function.name, "invoke_plugin");
+        let args: serde_json::Value =
+            serde_json::from_str(&calls[0].function.arguments).expect("args json");
+        assert_eq!(args["node_id"], "qq_send");
+        // plugin_path is absent in the serialised payload; the host resolves it.
+        assert_eq!(args["plugin_path"], "");
+        assert_eq!(args["payload_json"]["message"], "13×7=91，找 9 块喵");
+    }
+
+    // A normal reply that merely mentions JSON must never become a tool call.
+    #[test]
+    fn plain_text_with_json_is_not_a_call() {
+        assert!(salvage_serialized_tool_calls(r#"{"node_id":"qq_send"}"#, &specs()).is_empty());
+        assert!(salvage_serialized_tool_calls(r#"答案是 9 块 {"a":1}"#, &specs()).is_empty());
+        assert!(salvage_serialized_tool_calls("", &specs()).is_empty());
+        assert!(!looks_like_serialized_call("13×7=91"));
+        assert!(looks_like_serialized_call(LEAK));
+    }
+
+    // A kernel tool has no plugin behind it: it must be called directly with
+    // its own parameters, not wrapped in `invoke_plugin`.
+    #[test]
+    fn kernel_tools_are_called_directly() {
+        let text = r#"<|DSML|tool_calls>{"node_id":"read_file","payload_json":{"path":"/tmp/a"}}</|DSML|tool_calls>"#;
+        let calls = salvage_serialized_tool_calls(text, &specs());
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert_eq!(calls[0].function.name, super::AGENT_TOOL_READ_FILE);
+        assert_eq!(calls[0].function.arguments, r#"{"path":"/tmp/a"}"#);
+        assert_eq!(calls[0].id, "dsml-0-read_file");
+    }
+
+    // The model sometimes nests the envelope inside itself. The plugin must
+    // still receive the node's own arguments, or it fails with "target is
+    // required for qq_send" and the turn burns a retry.
+    #[test]
+    fn a_doubly_nested_envelope_reaches_the_plugin_flat() {
+        let text = r#"<|DSML|tool_calls>{"node_id":"qq_send","payload_json":{"node_id":"qq_send","payload_json":{"target":"group:1","message":"hi"}}}</|DSML|tool_calls>"#;
+        let calls = salvage_serialized_tool_calls(text, &specs());
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert_eq!(calls[0].function.name, "invoke_plugin");
+        let args: serde_json::Value =
+            serde_json::from_str(&calls[0].function.arguments).expect("args json");
+        assert_eq!(args["node_id"], "qq_send");
+        assert_eq!(args["payload_json"]["target"], "group:1");
+        assert_eq!(args["payload_json"]["message"], "hi");
+    }
+
+    // A plugin that genuinely takes a `payload_json` argument keeps it: only a
+    // bare `{node_id, payload_json}` envelope is peeled.
+    #[test]
+    fn a_real_payload_json_argument_survives() {
+        let text = r#"<|DSML|tool_calls>{"node_id":"qq_send","target":"group:1","payload_json":{"inner":true}}</|DSML|tool_calls>"#;
+        let calls = salvage_serialized_tool_calls(text, &specs());
+        let args: serde_json::Value =
+            serde_json::from_str(&calls[0].function.arguments).expect("args json");
+        assert_eq!(args["payload_json"]["payload_json"]["inner"], true);
+    }
+
+    // A plugin node keeps the `invoke_plugin` wrapper, and two calls to the same
+    // node get distinct ids so their results can be paired back.
+    #[test]
+    fn plugin_nodes_keep_the_wrapper_and_unique_ids() {
+        let text = r#"<|DSML|tool_calls>
+{"plugin_path":"qq","node_id":"qq_send","payload_json":{"message":"一"}}
+{"plugin_path":"qq","node_id":"qq_send","payload_json":{"message":"二"}}
+</|DSML|tool_calls>"#;
+        let calls = salvage_serialized_tool_calls(text, &specs());
+        assert_eq!(calls.len(), 2, "{calls:?}");
+        assert_eq!(calls[0].function.name, super::AGENT_TOOL_INVOKE_PLUGIN);
+        assert_ne!(calls[0].id, calls[1].id, "ids must be unique");
+        assert_eq!(calls[1].id, "dsml-1-qq_send");
+    }
+
+    #[test]
+    fn multiple_objects_are_recovered_in_order() {
+        let text = r#"<｜｜DSML｜｜invoke>{"node_id":"qq_send","message":"一"}<｜｜DSML｜｜>{"node_id":"qq_send","message":"二"}"#.to_string();
+        let calls = salvage_serialized_tool_calls(&text, &specs());
+        assert_eq!(calls.len(), 2, "{calls:?}");
+        assert!(calls[0].function.arguments.contains("一"));
+        assert!(calls[1].function.arguments.contains("二"));
+    }
+
+    #[test]
+    fn extractor_handles_nested_braces_and_strings() {
+        let values = extract_json_objects(r#"noise {"a":{"b":[{"c":"]}"}]}} tail"#);
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0]["a"]["b"][0]["c"], "]}");
+    }
+}
+
+/// The protocol the model uses instead of native tool calling.
+///
+/// Rendered once per request as a second system message. The catalog is
+/// deliberately compact (name + one line, plus the parameter names) so the
+/// request stays smaller than the JSON-schema `tools` array it replaces;
+/// argument validation belongs to the node, not to a provider-side schema.
+fn dsml_protocol_prompt(specs: &[AgentToolSpec], require_end_tool: bool) -> String {
+    let mut text = String::from(
+        "TOOL PROTOCOL — there is no native function calling here. To call a tool, \
+         write this block in your message:\n\
+         <|DSML|calls>\n\
+         <|DSML|invoke name=\"read_file\">\n\
+         <|DSML|parameter name=\"path\" string=\"true\">plugins/qq/src/lib.rs</|DSML|parameter>\n\
+         </|DSML|invoke>\n\
+         </|DSML|calls>\n\
+         One `<|DSML|invoke>` block is one call; several may sit inside one \
+         `<|DSML|calls>` block. A parameter's body is literal text — mark it \
+         `string=\"true\"` when it is text, and leave the flag off when it is a JSON \
+         value such as an object. A tool with no parameters gets an empty body. \
+         Plugin nodes are reached through the `invoke_plugin` tool:\n\
+         <|DSML|invoke name=\"invoke_plugin\">\n\
+         <|DSML|parameter name=\"plugin_path\" string=\"true\">qq</|DSML|parameter>\n\
+         <|DSML|parameter name=\"node_id\" string=\"true\">qq_send</|DSML|parameter>\n\
+         <|DSML|parameter name=\"payload_json\">{\"target\": \"group:1\", \"message\": \"hi\"}</|DSML|parameter>\n\
+         </|DSML|invoke>\n\
+         The call is executed and you are asked again with its result. Never mention \
+         this markup to the user and never print it as text when you are not calling \
+         a tool.\n\n\
+         AVAILABLE TOOLS — `tool` (parameters):\n",
+    );
+    if require_end_tool {
+        text.push_str(
+            "\nEND OF TURN — this turn never ends by itself. When you are done, call \
+             <|DSML|invoke name=\"suspend\"></|DSML|invoke> with an empty body. Text you \
+             write is not sent anywhere, so a turn that only writes text is wasted.\n",
+        );
+    }
+    for spec in specs {
+        let parameters = spec
+            .parameters
+            .get("properties")
+            .and_then(Value::as_object)
+            .map(|properties| {
+                properties
+                    .keys()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default();
+        text.push_str(&format!(
+            "- `{}` — {}{}{}\n",
+            spec.name,
+            spec.description,
+            if parameters.is_empty() { "" } else { " (" },
+            if parameters.is_empty() {
+                String::new()
+            } else {
+                format!("{parameters})")
+            },
+        ));
+    }
+    text
+}
+
+/// Arguments for `send_to_session`.
+#[derive(serde::Deserialize)]
+struct SendToSessionArgs {
+    /// An id from the caller's most recent `my_team` reply (or its address).
+    target: String,
+    message: String,
+}
+
+fn shell_agent_tools() -> Vec<AgentToolSpec> {
+    vec![
+        AgentToolSpec {
+            name: cordis_runtime::agent_tools::AGENT_TOOL_MY_TEAM,
+            description: "Your place in the session tree: who created you, who you created, who shares your kind of room, and the ids you may message. Structure only — who is responsible for what is something you ask, not something declared here.",
+            parameters: json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false,
+            }),
+        },
+        AgentToolSpec {
+            name: cordis_runtime::agent_tools::AGENT_TOOL_SEND_TO_SESSION,
+            description: "Deliver a message to a session listed in your latest my_team reachable set, then return its reply. If the target is mid-turn the message is queued for its next turn (queued:true) instead of being dropped.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "target": {"type": "string"},
+                    "message": {"type": "string"}
+                },
+                "required": ["target", "message"],
+                "additionalProperties": false,
+            }),
+        },
+        AgentToolSpec {
+            name: AGENT_TOOL_GET_RUNTIME_STATUS,
+            description: "Get the current runtime host status, snapshot ids, candidate status, and recent reload reports.",
+            parameters: json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false,
+            }),
+        },
+        AgentToolSpec {
+            name: AGENT_TOOL_LIST_PLUGINS,
+            description: "List currently registered plugins, their load status, parent relationship, and known node ids.",
+            parameters: json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false,
+            }),
+        },
+        AgentToolSpec {
+            name: AGENT_TOOL_LIST_NODES,
+            description: "List currently registered node FQNs so you can choose a valid execute target.",
+            parameters: json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false,
+            }),
+        },
+        AgentToolSpec {
+            name: AGENT_TOOL_GET_KERNEL_STATUS,
+            description: "Get kernel status including plugin issue counts and blocked iteration counts.",
+            parameters: json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false,
+            }),
+        },
+        AgentToolSpec {
+            name: AGENT_TOOL_GET_KERNEL_ISSUES,
+            description: "List observed kernel plugin issues that may require iteration or reload investigation.",
+            parameters: json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false,
+            }),
+        },
+        AgentToolSpec {
+            name: AGENT_TOOL_GET_SELF_CHECK,
+            description: "Read your own failure report: which mistakes repeat across past turns, how often, with an example and the sessions that hit them. Check it when something keeps going wrong instead of guessing.",
+            parameters: json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false,
+            }),
+        },
+        AgentToolSpec {
+            name: AGENT_TOOL_RELOAD_RUNTIME,
+            description: "Reload the runtime snapshot and return the full reload diagnostics report. Use '/' to reload all plugins, or '/<path>' to reload a specific subtree (e.g. '/qq', '/expr'). Task services are gracefully restarted.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "plugin_path": { "type": "string", "description": "Plugin path: '/' for all, '/qq' for a specific plugin or subtree." }
+                },
+                "required": ["plugin_path"],
+                "additionalProperties": false,
+            }),
+        },
+        AgentToolSpec {
+            name: AGENT_TOOL_BUILD_PLUGINS,
+            description: "Build a plugin crate. Specify plugin_name (e.g. 'qq') or 'all' to build everything. Returns stdout, stderr, and exit_code.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "plugin_name": { "type": "string", "description": "Plugin crate name or 'all'" },
+                },
+                "required": ["plugin_name"],
+                "additionalProperties": false,
+            }),
+        },
+        AgentToolSpec {
+            name: AGENT_TOOL_INVOKE_PLUGIN,
+            description: "Invoke a plugin node directly by plugin path and node id.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "plugin_path": { "type": "string" },
+                    "node_id": { "type": "string" },
+                    "payload_json": {
+                        "type": "object",
+                        "description": "JSON object payload for the plugin invoke request."
+                    }
+                },
+                "required": ["plugin_path", "node_id", "payload_json"],
+                "additionalProperties": false,
+            }),
+        },
+        AgentToolSpec {
+            name: AGENT_TOOL_EXECUTE_TARGET,
+            description: "Execute a registered node target through the runtime execution engine.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "node_fqn": { "type": "string" },
+                    "payload_json": {
+                        "type": "object",
+                        "description": "JSON object payload for the execute request."
+                    }
+                },
+                "required": ["node_fqn", "payload_json"],
+                "additionalProperties": false,
+            }),
+        },
+        AgentToolSpec {
+            name: AGENT_TOOL_READ_FILE,
+            description: "Read a file within the fixtures workspace. Returns line-numbered content. Use offset/limit for large files.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Relative path within the fixtures root." },
+                    "offset": { "type": "integer", "description": "Optional 0-based line offset." },
+                    "limit": { "type": "integer", "description": "Optional max lines to return." }
+                },
+                "required": ["path"],
+                "additionalProperties": false,
+            }),
+        },
+        AgentToolSpec {
+            name: AGENT_TOOL_LIST_DIRECTORY,
+            description: "List files and directories under a path within the fixtures workspace.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Relative path within the fixtures root. Defaults to root." }
+                },
+                "required": [],
+                "additionalProperties": false,
+            }),
+        },
+        AgentToolSpec {
+            name: AGENT_TOOL_VIEW_IMAGE,
+            description: "Reload an image that was omitted from the request by the inline byte budget, or one you just generated with image_gen. The placeholder carries `path data/media/<sha256>` (pass it as `path`) and `sha256:<8 hex>`; image_gen returns a full `sha256` digest. Pass either `sha256:<hex>` or a bare `<64 hex>` digest as `sha256`, or a `data/media/<name>` path. Reads only the local data/media cache — never a URL. The picture is attached to your NEXT request in this turn, so call it and then continue.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Cache path from a placeholder or image_gen result, e.g. data/media/<sha256>.png." },
+                    "sha256": { "type": "string", "description": "`sha256:<hex>` or bare hex: a full 64-char digest from image_gen, or an 8+ char prefix from a placeholder. Must be unique in the cache." }
+                },
+                "required": [],
+                "additionalProperties": false,
+            }),
+        },
+        AgentToolSpec {
+            name: AGENT_TOOL_SEARCH_CODE,
+            description: "Search for a text pattern across source files in the fixtures workspace. Returns up to 40 matches with file path, line number, and line text.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "pattern": { "type": "string", "description": "Text pattern to search for (simple substring match)." },
+                    "path": { "type": "string", "description": "Optional subdirectory to limit the search scope." }
+                },
+                "required": ["pattern"],
+                "additionalProperties": false,
+            }),
+        },
+        // Code editing tools are removed from RuntimeShell.
+        // Plugin code changes must go through PluginIteration.
+        AgentToolSpec {
+            name: AGENT_TOOL_COMPACT_CONTEXT,
+            description: "Compress the conversation history to save context space. Summarizes older messages, keeping the most recent exchanges intact. Use when the conversation is getting long to stay within the context window.",
+            parameters: json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false,
+            }),
+        },
+        AgentToolSpec {
+            name: AGENT_TOOL_RUN_PLUGIN_TEST,
+            description: "Run cargo test in the plugins workspace. Defaults to `cargo test --quiet --manifest-path plugins/Cargo.toml`. Pass a custom command to run a specific test (e.g. `cargo test -p gacha`). Use after making code edits to verify correctness.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "command": { "type": "string", "description": "Optional: custom cargo test command (default runs all plugin tests)" },
+                },
+                "additionalProperties": false,
+            }),
+        },
+        AgentToolSpec {
+            name: AGENT_TOOL_REQUEST_ITERATION,
+            description: "Start a PluginIteration session to safely modify plugin source code. Creates a backup snapshot before changes; on failure, auto-rollbacks to the snapshot. plugin_path: the plugin to modify (e.g. \"/web\"), or \"/\" for root workspace (entire plugins/ directory). instruction: what to change.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "plugin_path": { "type": "string", "description": "Target plugin path, e.g. \"/web\" or \"/qq\". Use \"/\" for root workspace to create new plugins or edit multiple plugins at once." },
+                    "instruction": { "type": "string", "description": "What change to make in this iteration." },
+                },
+                "required": ["plugin_path", "instruction"],
+                "additionalProperties": false,
+            }),
+        },
+        AgentToolSpec {
+            name: AGENT_TOOL_APPROVE_ITERATION,
+            description: "Promote a staged plugin iteration (one that is `Blocked` because the canary could not verify it). Use ONLY when the human on the other side explicitly approved that change; the runtime refuses unless the channel reports that this speaker may approve iterations (e.g. the operator allowlist or the room owner/admin). iteration_id: the id returned by request_iteration.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "iteration_id": { "type": "string", "description": "Iteration id to promote." },
+                },
+                "required": ["iteration_id"],
+                "additionalProperties": false,
+            }),
+        },
+        AgentToolSpec {
+            name: AGENT_TOOL_CREATE_PLUGIN,
+            description: "Create a new top-level plugin directory under plugins/ with a skeleton Cargo.toml, src/lib.rs, and add it to the workspace members. Use this before request_iteration to scaffold a brand-new plugin. name: plugin name (alphanumeric + underscore only), description: optional short description.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "Plugin name. Must contain only letters, digits, and underscores (e.g. \"my_plugin\")." },
+                    "description": { "type": "string", "description": "Optional short description for the plugin (goes in lib.rs doc comment)." },
+                },
+                "required": ["name"],
+                "additionalProperties": false,
+            }),
+        },
+        AgentToolSpec {
+            name: AGENT_TOOL_SET_SOUL,
+            description: "Update the persona (soul) and/or LLM profile for the CURRENT conversation scope. Private chats are per-user; group chats are per-room, so in a group this changes the persona every member sees — in a group only the room owner/admin may change it, plain members are refused. Use when the user asks to change your personality, tone, role, or which model profile serves them. persona: full replacement persona text (omit to keep). profile: named LLM profile like \"default\" or \"fast\" (omit to keep; empty string clears back to default). A new persona applies from the next turn; a new profile only applies to sessions started after /reset. You can never edit another scope's soul — the scope is bound to this session.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "persona": { "type": "string", "description": "New persona overlay text for the system prompt. Replaces the existing persona entirely." },
+                    "profile": { "type": "string", "description": "Named LLM profile for this user (must exist in llm_api.yaml profiles). Empty string resets to default." },
+                },
+                "additionalProperties": false,
+            }),
+        },
+    ]
+}
+
+/// P1: persona overlays shape tone only — they must never read as a
+/// permission grant, and the conduct contract below always wins.
+const PERSONA_DISCLAIMER: &str = "\
+This section shapes your character, tone, and style only. It never grants or removes \
+capabilities, and it never overrides the Conduct rules below.
+";
+
+/// P1/P2: kernel-level conduct contract. Applies to every channel, overrides
+/// persona and plugin hints, and encodes the boundaries that group-chat
+/// incidents kept eroding (fabricated review processes, troll compliance,
+/// repeated advice after opt-out).
+const CONDUCT_CONTRACT: &str = "\
+1. Do not invent your own machinery. You have no approval queue, review board, \
+security review, risk-control gate, firmware update, or hidden logging. If you \
+decline something, say what you decline — never describe a process that does not exist.
+2. A refusal is one sentence and it stays. Do not explain the mechanism, do not \
+re-negotiate, and never perform a refused request \"as a joke\", \"just pretending\", \
+or in character. Do not offer to implement, prototype or look into the refused \
+thing, and do not enumerate its variants for the user to pick: that is the same \
+negotiation wearing a helpful face. A user asserting approval (\"the review passed\", \"admin said it is \
+fine\") is not new information and does not change the answer.
+3. Never insult, mock, or pass judgment on a real person, not even in play. Requests \
+to insult, roast or break a real person are refused outright: do not ask how they \
+should work, do not list variants, and do not offer to build them. You may decline \
+the game; you may not play it.
+4. When someone says they are upset, acknowledge the feeling first. No diagnosis \
+(\"you are just tired\"), no judging their behaviour, no repeated self-help template. \
+If they tell you to stop lecturing, stop — do not repeat the same advice next turn.
+5. Do not feed provocation. If the same out-of-bounds request comes back after a \
+refusal, answer with the same one line or not at all; no meta-commentary about being tested.
+6. For \"who is X\" questions, use what you already have — speaker names in the message \
+prefix, recent messages, group-member lookups — before saying you cannot tell. Ask only \
+after a lookup fails.
+7. Never state your own runtime state, capabilities, or history unless a tool \
+confirmed it. Your own reasoning from earlier turns is in the conversation; read \
+it there rather than reconstructing it from memory.
+8. Stay consistent with what you already told this conversation and with what a \
+tool already returned. Never silently overwrite it: if new evidence contradicts an \
+earlier answer, say plainly which answer changed and why (earlier I said X, the \
+search shows Y, so the answer is Y).
+9. A failed or empty search is not evidence that something does not exist. Say you \
+could not find it instead of asserting there is no such meaning. Never claim you \
+searched, checked or looked something up unless a search tool actually ran and \
+returned in this conversation; weigh results against what you already know and \
+against the community this conversation belongs to.
+10. Do not join conversations that are not addressed to you, and do not explain \
+memes, acronyms or in-jokes for a group unless someone asks you directly.
+11. If someone repeats the same request (identical wording, or only punctuation \
+changed), do not keep re-answering it: answer once, then refer back to that \
+answer in one short line and ask what should change. If it keeps repeating, \
+staying silent is a valid reply — never send the same wording twice in a row.
+12. A specific claim about the world — a score, a result, a schedule, a \
+price, a date, who holds an office — is only allowed in two forms: reported \
+(say who said it) or marked as a guess. If you can search, search first; a \
+statement with no lookup behind it must not be phrased like a fact. This \
+includes anything you inferred from the room's chatter.
+";
+
+/// The base prompt. `chat` selects the identity paragraph: a channel session is
+/// a participant in a room, not a REPL operator, and saying "you are a shell
+/// agent running inside the REPL" to a group chat made the bot answer like a
+/// developer tool.
+fn shell_agent_system_prompt(chat: bool) -> String {
+    let today = Local::now().format("%Y-%m-%d").to_string();
+    let mut prompt = format!("Today's date is {today}.\n\n");
+    if chat {
+        prompt.push_str(
+            "\
+You are a participant in this conversation, talking through the channel tools below.\n\
+The persona section below is who you are and how you talk; this section only covers the tools.\n\
+You are not an operator console: nobody wants to read tool names or internal state.\n\
+",
+        );
+    } else {
+        prompt.push_str(
+            "\
+You are the Cordis shell agent running inside the cordis-runtime serve REPL.\n\
+",
+        );
+    }
+    prompt.push_str("\
+You can read source files, list directories, search code, inspect runtime status, list plugins/nodes, invoke plugins, execute targets, run plugin tests, and reload the runtime.\n\
+To modify plugin source code, use `request_iteration` to start a safe PluginIteration session (supports rollback).\n\
+\n\
+Plugins may provide additional instructions (chat mode protocols, etc.) — see the \"plugin-specific instructions\" section below if present.\n\
+\n\
+Before calling any tool that may block for more than a moment, tell the user what you are about to do. If the platform you're talking through has a send-message ability (check available plugins), use it to send a brief heads-up. Then report the outcome when done. Never go silent for long.\n\
+\n\
+SAFETY RULES — never do these without explicit user request:\n\
+- NEVER create Python scripts, shell scripts, or non-Rust files in the plugins directory. Plugins are Rust dylib crates only.\n\
+- NEVER put output files, logs, or computed results inside any plugin directory.\n\
+- For temporary files, use the `tmp/` directory at the workspace root. The tmp/ directory is gitignored.\n\
+- NEVER leave temporary files behind. Delete them after use.\n\
+- NEVER read, list, or write outside the project workspace. Read the project freely;\n\
+  write only under plugins/. Never touch hidden config dirs, credentials, or system paths.\n\
+- NEVER run commands that access credentials, SSH keys, tokens, or system files.\n\
+- NEVER remove a plugin from its parent's `children` list in Cargo.toml.\n\
+  Removing a child plugin declaration breaks the runtime plugin graph.\n\
+- NEVER delete `docs/` directories or files (overview.md, interfaces.json).\n\
+  These are scaffold artifacts required for plugin validation.\n\
+- NEVER delete source files or test files that you did not create yourself.\n\
+- NEVER modify `Cargo.toml` files beyond adding new dependencies or children\n\
+  you are explicitly told to create.\n\
+- If a build fails, fix YOUR changes — don't remove pre-existing code to\n\
+  make it compile.\n\
+\n\
+IMPORTANT — workspace layout:\n\
+- The plugins workspace is under the `plugins/` directory.\n\
+- ALWAYS run cargo commands from the plugins directory: `cd plugins && cargo ...`\n\
+  Example: `cd plugins && cargo build 2>&1`\n\
+  Example: `cd plugins && cargo test -p expr 2>&1`\n\
+- Plugin source files are under `plugins/<name>/src/`, e.g. `plugins/expr/src/lib.rs`.\n\
+- The fixtures root is `./`, but cargo needs `plugins/` as the working directory.\n\
+- When creating NEW files/directories under plugins/, use write_file or invoke_plugin\n\
+  (e.g. `mkdir -p plugins/expr/evaluator/pow/src`) first — write_file may reject non-existent paths.\n\
+- After editing plugin code, use `build_plugins` with `plugin_name: \"<name>\"` (or `\"all\"`)\n\
+  to compile and sync the .so to artifacts/ automatically.\n\
+- Then use `reload_runtime` with `plugin_path: \"/<name>\"` (or `\"/\"` for all) to load\n\
+  changes into the live runtime.\n\
+- Use `run_plugin_test` to run cargo test (defaults to all plugins; pass a custom command\n\
+  like `cargo test -p gacha` for a specific plugin).\n\
+\n\
+CREATING A NEW PLUGIN — required files (every new plugin MUST have all of these):\n\
+  plugins/<name>/Cargo.toml      — package name = plugin_path = directory name (normalised)\n\
+  plugins/<name>/src/lib.rs       — Rust source with export_plugin_api! macro\n\
+  plugins/<name>/tests/           — at least one .rs test file (e.g. tests/basic.rs)\n\
+  plugins/<name>/docs/human/overview.md  — one-paragraph summary of what the plugin does\n\
+  plugins/<name>/docs/agent/interfaces.json — node docs.  build_plugins regenerates\n\
+    this file from the plugin's docs_value().  After ANY source change that affects\n\
+    node summaries, schemas, or side_effects, run build_plugins to refresh it.\n\
+\n\
+Cargo.toml MUST include these sections:\n\
+  [package.metadata.cordis]\n\
+    plugin_path = \"<name>\"       — same as directory name\n\
+    abi_kind = \"rust\"\n\
+    declared_nodes = [...]        — list every node_id your plugin exports\n\
+    children = []                 — (unless the plugin has child plugins)\n\
+  [package.metadata.cordis.abi_fingerprint]\n\
+    crate_hash = \"crate_<name>_v1\"\n\
+    api_hash = \"api_v2\"           — MUST be \"api_v2\" (same as all other plugins)\n\
+    (do NOT declare rustc_version/target_triple — they default to the\n\
+     current toolchain; in code use AbiFingerprint::current_build)\n\
+\n\
+Plugins workspace membership:\n\
+  After creating a new plugin, add \"<name>\" to the `members` list in plugins/Cargo.toml.\n\
+  After everything compiles, run `build_plugins` with `plugin_name: \"all\"` to sync artifacts.\n\
+  Then `reload_runtime` with `plugin_path: \"/\"` to load the new plugin.\n\
+\n\
+When the user asks you to add a feature or fix a bug in a plugin:\n\
+1. Read the relevant source files to understand the codebase structure.\n\
+2. Call `request_iteration(plugin_path, instruction)` to start a PluginIteration session.\n\
+   This snapshots the plugin, scopes edits to the subtree, and enables rollback on failure.\n\
+3. Inside the iteration, edit, build, test, and reload using iteration tools.\n\
+4. The iteration auto-commits on success or rolls back on failure.\n\
+You cannot edit plugin code directly — always use request_iteration.\n\
+\n\
+Missing a capability is a task, not a refusal.\n\
+When the thing asked for has no tool, do not answer \"I cannot do that\". Build the tool:\n\
+1. Find the plugin that owns the area: list_plugins, then read_file under plugins/<name>/src/.\n\
+2. New plugin: create_plugin. Existing plugin: request_iteration(plugin_path, instruction).\n\
+3. run_plugin_test, then reload_runtime, then do the original thing with the new tool.\n\
+The channel plugin talks to OneBot in plugins/qq/src/lib.rs — copy its HTTP and payload shape.\n\
+Answering \"I have no way to do this\" while a plugin could do it is a failure, not an answer.\n\
+Prefer concise, operator-friendly replies. Mention important tool outcomes plainly.\n\
+Do not invent runtime state or claim a command succeeded unless a tool confirmed it.\n\
+When the same mistake keeps happening, call get_self_check: it ranks your own\n\
+repeated failures from past turns and shows an example of each.\n\
+\n\
+CRITICAL: a turn ends only when you call the suspend tool. Write the DSML block\n\
+below; there is no JSON form and no native function calling.\n\
+To send a reply, call the qq_send node through invoke_plugin (see the tool protocol\n\
+message) instead of outputting text.\n\
+Never output plain text — it will be dropped. All communication goes through tools.\n\
+\n\
+CRITICAL — YOUR TOOLS (only these exist; all others will fail immediately):\n\
+  get_runtime_status, list_plugins, list_nodes, get_kernel_status, get_kernel_issues,\n\
+  get_self_check,\n\
+  reload_runtime, build_plugins, invoke_plugin, execute_target, read_file, search_code,\n\
+  compact_context, list_directory, run_plugin_test, request_iteration\n\
+\n\
+For build: use build_plugins.  For testing: use run_plugin_test (defaults to all plugin tests;\n\
+pass a custom command for specific tests, e.g. `cargo test -p gacha`).\n\
+For plugin node calls: always use invoke_plugin(plugin_path, node_id, payload_json)."
+    );
+    prompt
+}
+
+/// Write the exact request body to `data/llm-debug/` when asked.
+///
+/// Reasoning about "what did the model see" from the code is how the harness got
+/// its own behaviour wrong more than once; the dump is the record.
+///
+/// `enabled` is the raw `CORDIS_LLM_DUMP` value and `dir` the target directory;
+/// both are passed in so the writer can be exercised (including its two silent
+/// failure paths) without touching the repo's `data/`.
+fn dump_request(enabled: Option<&str>, dir: &std::path::Path, body: &Value) {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    if enabled != Some("1") {
+        return;
+    }
+    if std::fs::create_dir_all(dir).is_err() {
+        return;
+    }
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis())
+        .unwrap_or_default();
+    let path = dir.join(format!("request-{millis}.json"));
+    let _ = std::fs::write(path, serde_json::to_string_pretty(body).unwrap_or_default());
+}
+
+fn emit_agent_diagnostic(message: String) {
+    let enabled = env::var(LLM_DEBUG_ENV).ok().as_deref() == Some("1");
+    write_diagnostic(enabled, &message);
+}
+
+/// 真正写一行诊断。
+///
+/// 开关由调用方算好再传进来：这样"开启"分支可以直接单测，而不必在测试进程里
+/// 改进程级环境变量（多线程下修改环境并不安全）。
+fn write_diagnostic(enabled: bool, message: &str) {
+    if enabled {
+        eprintln!("{message}");
+    }
+}
+
+// 压缩失败诊断的测试侧记录。
+//
+// 线上诊断直接 `eprintln!`（压缩是罕见事件，一行值得留在 stderr）；测试无法
+// 在同一进程里捕获 stderr，所以在 `cfg(test)` 下再记一份到线程本地，让用例
+// 能断言"确实打了那一行"。
+#[cfg(test)]
+thread_local! {
+    static COMPACT_DIAGNOSTICS: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+fn record_compact_diagnostic(line: &str) {
+    COMPACT_DIAGNOSTICS.with(|log| log.borrow_mut().push(line.to_string()));
+}
+
+#[cfg(test)]
+fn take_compact_diagnostics() -> Vec<String> {
+    COMPACT_DIAGNOSTICS.with(|log| std::mem::take(&mut *log.borrow_mut()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cordis_runtime::agent_api::LlmCompletionParts;
+
+    // The client's failure notice must never reach the model: it carries no
+    // conversation, and the assistant echoed it verbatim into a group chat.
+    #[test]
+    fn outage_notices_are_dropped_from_requests() {
+        let notice = json!({
+            "role": "user",
+            "content": "我这边刚才调用模型失败了，你的消息我记下了，稍后会自动重试。"
+        });
+        assert!(is_outage_notice_text(&notice));
+        let echoed = json!({
+            "role": "assistant",
+            "content": "我这边刚才调用模型失败了，你的消息我记下了，稍后会自动重试。"
+        });
+        assert!(is_outage_notice_text(&echoed));
+        // Real speech is untouched, including a long quotation of the notice.
+        assert!(!is_outage_notice_text(
+            &json!({"role": "user", "content": "你好"})
+        ));
+        assert!(!is_outage_notice_text(&json!({
+            "role": "user",
+            "content": format!("我这边刚才调用模型失败了{}", "，".repeat(200))
+        })));
+        assert!(!is_outage_notice_text(
+            &json!({"role": "user", "content": 42})
+        ));
+    }
+
+    const TEST_TOOL_RECORD: &str = "record_summary";
+    const TEST_TOOL_READ: &str = "read_context";
+
+    /// 按脚本回放补全的假 provider：让机制测试（工具分派、历史、计数）不再需要
+    /// 起 TCP mock server 与解析 SSE。
+    ///
+    /// 每次 `complete` 弹出一条预置回复；`sink` 非空时按 `stream_as` 逐段推增量，
+    /// 用于验证"展示由调用方决定"这条契约。
+    struct FakeLlmProvider {
+        replies: std::sync::Mutex<std::collections::VecDeque<cordis_plugin_sdk::llm::LlmMessage>>,
+        /// 依次推给 sink 的 (是否推理, 文本) 增量。
+        stream_as: Vec<(bool, String)>,
+        /// 记录收到的请求体，供断言。
+        seen_bodies: std::sync::Mutex<Vec<Value>>,
+    }
+
+    impl FakeLlmProvider {
+        fn new(replies: Vec<cordis_plugin_sdk::llm::LlmMessage>) -> Self {
+            Self {
+                replies: std::sync::Mutex::new(replies.into()),
+                stream_as: Vec::new(),
+                seen_bodies: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn streaming(
+            replies: Vec<cordis_plugin_sdk::llm::LlmMessage>,
+            stream_as: Vec<(bool, String)>,
+        ) -> Self {
+            Self {
+                stream_as,
+                ..Self::new(replies)
+            }
+        }
+    }
+
+    impl LlmProvider for FakeLlmProvider {
+        fn complete(
+            &self,
+            body: Value,
+            sink: Option<std::sync::Arc<dyn cordis_runtime::llm_sink::TokenSink>>,
+            _transport: cordis_plugin_sdk::llm::LlmTransportConfig,
+        ) -> Result<LlmCompletionParts, RuntimeError> {
+            self.seen_bodies.lock().expect("seen_bodies").push(body);
+            if let Some(sink) = sink.as_ref() {
+                for (is_reasoning, text) in &self.stream_as {
+                    if *is_reasoning {
+                        sink.on_reasoning(text);
+                    } else {
+                        sink.on_content(text);
+                    }
+                }
+            }
+            let message = self
+                .replies
+                .lock()
+                .expect("replies")
+                .pop_front()
+                .ok_or_else(|| RuntimeError::LlmRequestFailed {
+                    message: "fake provider ran out of scripted replies".to_string(),
+                })?;
+            let finish = if message.tool_calls.is_empty() {
+                "stop"
+            } else {
+                "tool_calls"
+            };
+            Ok(LlmCompletionParts {
+                message,
+                response_id: Some("resp-fake".to_string()),
+                finish_reason: Some(finish.into()),
+            })
+        }
+    }
+
+    /// 记录增量的 sink，用于断言顺序与分类。
+    #[derive(Default)]
+    struct RecordingTokenSink {
+        events: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl cordis_runtime::llm_sink::TokenSink for RecordingTokenSink {
+        fn on_reasoning(&self, delta: &str) {
+            self.events
+                .lock()
+                .expect("events")
+                .push(format!("r:{delta}"));
+        }
+        fn on_content(&self, delta: &str) {
+            self.events
+                .lock()
+                .expect("events")
+                .push(format!("c:{delta}"));
+        }
+    }
+
+    fn assistant_reply(content: &str) -> cordis_plugin_sdk::llm::LlmMessage {
+        cordis_plugin_sdk::llm::LlmMessage {
+            content: Some(content.to_string()),
+            ..Default::default()
+        }
+    }
+
+    /// 接缝契约：provider 拿到 kernel 构造的请求体，其返回值即权威结果；
+    /// sink 只是旁路，忽略它也必须得到同样的回复。
+    // The protocol message is the only place tools are described now, so its
+    // shape matters: an executable example, the catalog, and a rule against
+    // printing the markup as prose.
+    #[test]
+    fn dsml_protocol_prompt_carries_the_catalog_and_an_example() {
+        let specs = vec![
+            AgentToolSpec {
+                name: AGENT_TOOL_GET_RUNTIME_STATUS,
+                description: "Report runtime status.",
+                parameters: json!({"type":"object","properties":{"verbose":{"type":"boolean"}}}),
+            },
+            AgentToolSpec {
+                name: AGENT_TOOL_READ_FILE,
+                description: "Read a file.",
+                parameters: json!({"type":"object","properties":{}}),
+            },
+        ];
+        let prompt = dsml_protocol_prompt(&specs, false);
+        // The prompt teaches the dialect the model actually writes.
+        assert!(prompt.contains("<|DSML|calls>"), "{prompt}");
+        assert!(
+            prompt.contains("<|DSML|invoke name=\"read_file\">"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("<|DSML|parameter name=\"path\""),
+            "{prompt}"
+        );
+        assert!(prompt.contains("</|DSML|calls>"), "{prompt}");
+        assert!(prompt.contains("AVAILABLE TOOLS"), "{prompt}");
+        assert!(
+            prompt.contains(&format!("`{AGENT_TOOL_GET_RUNTIME_STATUS}`")),
+            "{prompt}"
+        );
+        // Parameter names travel with the entry; a schema-less tool stays clean.
+        assert!(prompt.contains("(verbose)"), "{prompt}");
+        assert!(prompt.contains("`read_file` — Read a file.\n"), "{prompt}");
+        assert!(
+            prompt.contains("never print it as text"),
+            "the model must not dump the markup into the room: {prompt}"
+        );
+    }
+
+    #[test]
+    fn provider_seam_returns_reply_and_sink_is_optional() {
+        let provider = FakeLlmProvider::new(vec![assistant_reply("hello")]);
+        let parts = provider
+            .complete(json!({"model": "m"}), None, Default::default())
+            .expect("complete");
+        let (message, response_id, finish) =
+            (parts.message, parts.response_id, parts.finish_reason);
+        assert_eq!(message.content.as_deref(), Some("hello"));
+        assert_eq!(response_id.as_deref(), Some("resp-fake"));
+        assert_eq!(finish.as_deref(), Some("stop"));
+        // kernel 构造的 body 原样抵达 provider。
+        let bodies = provider.seen_bodies.lock().expect("bodies");
+        assert_eq!(bodies.len(), 1);
+        assert_eq!(bodies[0].get("model").and_then(|v| v.as_str()), Some("m"));
+    }
+
+    /// 有 sink 时增量按序抵达，且**完整内容仍在返回值里**——REPL 靠增量显示，
+    /// inbox/serve 靠返回值，两条路径读的是同一次补全。
+    #[test]
+    fn provider_seam_streams_deltas_to_sink_in_order() {
+        let provider = FakeLlmProvider::streaming(
+            vec![assistant_reply("done")],
+            vec![
+                (true, "thinking".to_string()),
+                (false, "par".to_string()),
+                (false, "tial".to_string()),
+            ],
+        );
+        let sink = std::sync::Arc::new(RecordingTokenSink::default());
+        let parts = provider
+            .complete(
+                json!({}),
+                Some(sink.clone() as std::sync::Arc<dyn cordis_runtime::llm_sink::TokenSink>),
+                Default::default(),
+            )
+            .expect("complete");
+        assert_eq!(
+            *sink.events.lock().expect("events"),
+            vec!["r:thinking", "c:par", "c:tial"]
+        );
+        assert_eq!(parts.message.content.as_deref(), Some("done"));
+    }
+
+    /// provider 用尽脚本回复时报错，而不是静默返回空消息。
+    #[test]
+    fn provider_seam_surfaces_exhausted_script_as_error() {
+        let provider = FakeLlmProvider::new(Vec::new());
+        let err = provider
+            .complete(json!({}), None, Default::default())
+            .expect_err("must fail");
+        assert!(
+            matches!(err, RuntimeError::LlmRequestFailed { .. }),
+            "{err:?}"
+        );
+    }
+
+    /// Host stub for agent-loop tests. `persona` / `hints` default to empty so
+    /// prompt shape is unchanged unless a test opts in.
+    #[derive(Default)]
+    struct FakeHost {
+        persona: Option<String>,
+        hints: Vec<String>,
+        /// P4: role flags for the gated `set_soul` tool; None = untracked.
+        caller: Option<SessionCaller>,
+        /// Session-to-session deliveries, as `"<id>:<message>"`.
+        routed: std::sync::Mutex<Vec<String>>,
+        /// Content-addressed image cache the `view_image` fake reads from.
+        /// Tests point it at a TempDir so the repo's `data/` is never touched.
+        media_dir: std::path::PathBuf,
+        /// `agent_spill` answer: None keeps the trait default (this host cannot
+        /// spill), `Some(path)` pretends the full text landed there.
+        spill_path: Option<String>,
+        /// `agent_self_check_digest` answer: the failure record a real host
+        /// would fold into the system prompt.
+        digest: Option<String>,
+    }
+
+    /// Reference host for backends that never consult soul/hints.
+    static EMPTY_FAKE_HOST: FakeHost = FakeHost {
+        persona: None,
+        hints: Vec::new(),
+        caller: None,
+        routed: std::sync::Mutex::new(Vec::new()),
+        media_dir: std::path::PathBuf::new(),
+        spill_path: None,
+        digest: None,
+    };
+
+    impl AgentToolHost for FakeHost {
+        fn agent_my_team(&self, session_id: &str) -> Result<Value, RuntimeError> {
+            Ok(json!({
+                "me": session_id,
+                "spawned_by": "root",
+                "created": [],
+                "same_room": [],
+                "reachable": ["s2"],
+            }))
+        }
+
+        fn agent_send_to_session(
+            &self,
+            caller_session_id: &str,
+            target: &str,
+            input: &str,
+        ) -> Result<Value, RuntimeError> {
+            self.routed
+                .lock()
+                .expect("routed")
+                .push(format!("{caller_session_id}->{target}:{input}"));
+            Ok(json!({ "ok": true, "session_id": target }))
+        }
+
+        fn agent_runtime_status(&self) -> Result<Value, RuntimeError> {
+            Ok(json!({
+                "current_snapshot_id": "snapshot-demo",
+                "plugin_count": 3,
+            }))
+        }
+
+        fn agent_list_plugins(&self) -> Result<Value, RuntimeError> {
+            Ok(json!({
+                "plugins": [
+                    { "plugin_path": "expr", "node_ids": ["expr_entry"] }
+                ]
+            }))
+        }
+
+        fn agent_list_nodes(&self) -> Result<Value, RuntimeError> {
+            Ok(json!({
+                "nodes": [
+                    { "node_fqn": "expr::expr_entry", "plugin_path": "expr", "node_id": "expr_entry" }
+                ]
+            }))
+        }
+
+        fn agent_kernel_status(&self) -> Result<Value, RuntimeError> {
+            Ok(json!({ "plugin_issue_count": 0 }))
+        }
+
+        fn agent_kernel_issues(&self) -> Result<Value, RuntimeError> {
+            Ok(json!([]))
+        }
+
+        fn agent_reload_runtime(&self, _plugin_path: &str) -> Result<Value, RuntimeError> {
+            Ok(json!({ "ok": true }))
+        }
+
+        fn agent_invoke_plugin(
+            &self,
+            _session_id: &str,
+            plugin_path: &str,
+            node_id: &str,
+            payload_json: Value,
+        ) -> Result<Value, RuntimeError> {
+            Ok(json!({
+                "plugin_path": plugin_path,
+                "node_id": node_id,
+                "payload": payload_json,
+            }))
+        }
+
+        fn agent_execute_target(
+            &self,
+            node_fqn: &str,
+            payload_json: Value,
+        ) -> Result<Value, RuntimeError> {
+            Ok(json!({
+                "node_fqn": node_fqn,
+                "payload": payload_json,
+            }))
+        }
+
+        fn agent_read_file(
+            &self,
+            path: &str,
+            _offset: Option<usize>,
+            _limit: Option<usize>,
+        ) -> Result<Value, RuntimeError> {
+            Ok(json!({
+                "path": path,
+                "total_lines": 1,
+                "lines": [{"line": 1, "text": "fake content"}],
+            }))
+        }
+
+        fn agent_list_directory(&self, path: &str) -> Result<Value, RuntimeError> {
+            Ok(json!({
+                "path": path,
+                "entries": [{"name": "lib.rs", "kind": "file"}],
+            }))
+        }
+
+        /// 跑真的缓存读取：路径校验/解码/编码都在 kernel 的
+        /// [`cordis_runtime::image_cache`] 里，测试只需要把 `media_dir` 指向
+        /// 临时目录。
+        fn agent_view_image(
+            &self,
+            path: Option<&str>,
+            sha256: Option<&str>,
+        ) -> Result<(String, Value), RuntimeError> {
+            cordis_runtime::image_cache::load_part(&self.media_dir, path, sha256).map_err(
+                |message| RuntimeError::InvalidArgument {
+                    message: format!("view_image: {message}"),
+                },
+            )
+        }
+
+        fn agent_search_code(
+            &self,
+            pattern: &str,
+            _path: Option<&str>,
+        ) -> Result<Value, RuntimeError> {
+            Ok(json!({
+                "pattern": pattern,
+                "matches": [],
+            }))
+        }
+
+        fn agent_write_file(&self, path: &str, _content: &str) -> Result<Value, RuntimeError> {
+            Ok(json!({ "path": path, "written_bytes": 0 }))
+        }
+
+        fn agent_replace_in_file(
+            &self,
+            path: &str,
+            _find: &str,
+            _replace: &str,
+        ) -> Result<Value, RuntimeError> {
+            Ok(json!({ "path": path, "replaced": true }))
+        }
+
+        fn agent_run_command(&self, _command: &str) -> Result<Value, RuntimeError> {
+            Ok(json!({ "stdout": "", "stderr": "", "exit_code": 0 }))
+        }
+
+        fn agent_revert_changes(&self) -> Result<Value, RuntimeError> {
+            Ok(json!({ "reverted_files": 0 }))
+        }
+
+        fn agent_delete_file(&self, path: &str) -> Result<Value, RuntimeError> {
+            let _ = path;
+            Ok(json!({ "deleted": true }))
+        }
+
+        fn agent_rename_file(&self, path: &str, new_path: &str) -> Result<Value, RuntimeError> {
+            let _ = (path, new_path);
+            Ok(json!({ "renamed": true }))
+        }
+
+        fn agent_move_file(&self, path: &str, new_path: &str) -> Result<Value, RuntimeError> {
+            let _ = (path, new_path);
+            Ok(json!({ "moved": true }))
+        }
+
+        fn agent_copy_file(&self, path: &str, new_path: &str) -> Result<Value, RuntimeError> {
+            let _ = (path, new_path);
+            Ok(json!({ "copied": true }))
+        }
+
+        fn agent_append_file(&self, _path: &str, content: &str) -> Result<Value, RuntimeError> {
+            Ok(json!({ "appended_bytes": content.len() }))
+        }
+
+        fn agent_compact_context(&self, _session_id: &str) -> Result<Value, RuntimeError> {
+            Ok(json!({ "compacted": true }))
+        }
+
+        fn agent_run_plugin_test(&self, _command: Option<&str>) -> Result<Value, RuntimeError> {
+            Ok(json!({ "success": true, "stdout": "", "stderr": "" }))
+        }
+
+        fn agent_request_iteration(
+            &self,
+            _session_id: &str,
+            _plugin_path: &str,
+            _instruction: &str,
+        ) -> Result<Value, RuntimeError> {
+            Ok(json!({ "ok": true, "summary": "mock iteration", "verdict": "SimulatedSuccess" }))
+        }
+
+        fn agent_create_plugin(
+            &self,
+            name: &str,
+            _description: Option<&str>,
+        ) -> Result<Value, RuntimeError> {
+            Ok(json!({ "ok": true, "plugin_path": format!("/{name}") }))
+        }
+
+        fn agent_approve_iteration(
+            &self,
+            _session_id: &str,
+            iteration_id: &str,
+        ) -> Result<Value, RuntimeError> {
+            Err(RuntimeError::InvalidArgument {
+                message: format!("fake host cannot approve {iteration_id}"),
+            })
+        }
+
+        fn agent_send_warning_to_test_groups(&self, _message: &str) {}
+
+        /// 默认与真实宿主相反：这里没有可写目录，故返回 trait 默认的 Err。
+        /// 需要验证"结果确实落盘了"的用例用 `spill_path` 指定一个路径。
+        fn agent_spill(&self, tool: &str, _text: &str) -> Result<String, RuntimeError> {
+            match &self.spill_path {
+                Some(path) => Ok(path.clone()),
+                None => Err(RuntimeError::InvalidArgument {
+                    message: format!("this host cannot spill {tool} output"),
+                }),
+            }
+        }
+
+        fn agent_self_check_digest(&self) -> Option<String> {
+            self.digest.clone()
+        }
+
+        fn agent_build_plugins(&self, _plugin_name: &str) -> Result<Value, RuntimeError> {
+            Ok(json!({ "ok": true, "exit_code": 0 }))
+        }
+
+        fn agent_plugin_hints(&self) -> Vec<String> {
+            self.hints.clone()
+        }
+
+        fn agent_soul_overlay(&self, _soul_key: &str) -> Option<String> {
+            self.persona.clone()
+        }
+
+        fn agent_session_caller(&self, _session_id: &str) -> Option<SessionCaller> {
+            self.caller
+        }
+
+        fn agent_set_soul(
+            &self,
+            _soul_key: &str,
+            _persona: Option<&str>,
+            _profile: Option<&str>,
+        ) -> Result<Value, RuntimeError> {
+            Ok(json!({ "ok": true }))
+        }
+    }
+
+    /// A channel session is told it is a participant, not a REPL operator.
+    ///
+    /// The identity paragraph used to say "You are the Cordis shell agent running
+    /// inside the cordis-runtime serve REPL" for every session, which is why a
+    /// group chat got answers about plugins and tool names.
+    #[test]
+    fn a_channel_session_gets_the_chat_identity() {
+        let host = FakeHost {
+            persona: Some("毒舌运维".to_string()),
+            hints: Vec::new(),
+            caller: None,
+            routed: std::sync::Mutex::new(Vec::new()),
+            media_dir: std::path::PathBuf::new(),
+            spill_path: None,
+            digest: None,
+        };
+        let channel = RuntimeShellAgentBackend {
+            host: &host,
+            session_id: "chat",
+            soul_key: "qq:group:1".to_string(),
+        };
+        let chat = channel.system_prompt();
+        assert!(chat.contains("You are a participant in this conversation"));
+        assert!(!chat.contains("running inside the cordis-runtime serve REPL"));
+
+        let ops = RuntimeShellAgentBackend {
+            host: &host,
+            session_id: "ops",
+            soul_key: String::new(),
+        };
+        let shell = ops.system_prompt();
+        assert!(shell.contains("running inside the cordis-runtime serve REPL"));
+    }
+
+    /// A missing capability is work, not a refusal.
+    ///
+    /// The bot answered "邀请链接我点不了" when the invite carried no tool: the
+    /// prompt listed its tools but never said that a missing one can be built.
+    #[test]
+    fn system_prompt_says_a_missing_tool_can_be_built() {
+        let host = FakeHost {
+            persona: None,
+            hints: Vec::new(),
+            caller: None,
+            routed: std::sync::Mutex::new(Vec::new()),
+            media_dir: std::path::PathBuf::new(),
+            spill_path: None,
+            digest: None,
+        };
+        let backend = RuntimeShellAgentBackend {
+            host: &host,
+            session_id: "prompt-build",
+            soul_key: String::new(),
+        };
+        let prompt = backend.system_prompt();
+        for marker in [
+            "Missing a capability is a task, not a refusal",
+            "create_plugin",
+            "request_iteration(plugin_path, instruction)",
+            "reload_runtime, then do the original thing",
+        ] {
+            assert!(prompt.contains(marker), "missing {marker}: {prompt}");
+        }
+    }
+
+    /// 拼装顺序契约：base → persona（先免责声明再正文）→ conduct → hints。
+    /// persona 只调语气，conduct 必须压过它，渠道 hints 仍留最末（recency）。
+    #[test]
+    fn system_prompt_orders_persona_conduct_hints() {
+        let host = FakeHost {
+            persona: Some("毒舌运维".to_string()),
+            hints: vec!["HINT-MARK".to_string()],
+            caller: None,
+            routed: std::sync::Mutex::new(Vec::new()),
+            media_dir: std::path::PathBuf::new(),
+            spill_path: None,
+            digest: None,
+        };
+        let backend = RuntimeShellAgentBackend {
+            host: &host,
+            session_id: "prompt-order",
+            soul_key: "user#private".to_string(),
+        };
+        let prompt = backend.system_prompt();
+
+        let persona_header = prompt
+            .find("--- Persona (per-user soul) ---")
+            .expect("persona header");
+        let disclaimer = prompt.find(PERSONA_DISCLAIMER).expect("persona disclaimer");
+        let persona_body = prompt.find("毒舌运维").expect("persona body");
+        let conduct_header = prompt
+            .find("--- Conduct (hard boundaries) ---")
+            .expect("conduct header");
+        let hint = prompt.find("HINT-MARK").expect("plugin hint");
+        assert!(
+            persona_header < disclaimer,
+            "disclaimer must follow the persona header"
+        );
+        assert!(
+            disclaimer < persona_body,
+            "disclaimer must precede the persona body"
+        );
+        assert!(
+            persona_body < conduct_header,
+            "conduct must come after the persona"
+        );
+        assert!(conduct_header < hint, "plugin hints must stay last");
+        // 段落之间恰好两个换行，不堆多余空行。
+        assert!(prompt.contains(&format!(
+            "{PERSONA_DISCLAIMER}毒舌运维\n\n--- Conduct (hard boundaries) ---\n\n"
+        )));
+        assert!(prompt.contains(&format!(
+            "{}\n\n--- Plugin-specific instructions ---",
+            CONDUCT_CONTRACT.trim_end()
+        )));
+    }
+
+    /// 没有 persona / hints 的渠道也必须带上 conduct 契约。
+    #[test]
+    fn system_prompt_always_carries_conduct() {
+        let host = FakeHost::default();
+        let backend = RuntimeShellAgentBackend {
+            host: &host,
+            session_id: "no-overlay",
+            soul_key: String::new(),
+        };
+        let prompt = backend.system_prompt();
+        assert!(prompt.contains("--- Conduct (hard boundaries) ---"));
+        assert!(prompt.contains("Do not invent your own machinery"));
+        assert!(!prompt.contains("--- Persona (per-user soul) ---"));
+        assert!(!prompt.contains("--- Plugin-specific instructions ---"));
+    }
+
+    /// 逐条钉住 conduct 的硬边界关键词，防止后续编辑把它悄悄删掉。
+    #[test]
+    fn conduct_covers_hard_boundaries() {
+        for needle in [
+            "approval queue",
+            "re-negotiate",
+            "prototype",
+            "enumerate",
+            "as a joke",
+            "insult",
+            "diagnosis",
+            "provocation",
+            "lookup",
+            "tool confirmed",
+            "silently",
+            "could not find",
+            "actually ran",
+            "addressed to you",
+            "repeats the same request",
+            "silent is a valid reply",
+        ] {
+            assert!(
+                CONDUCT_CONTRACT.contains(needle),
+                "missing conduct boundary: {needle}"
+            );
+        }
+    }
+
+    // `approve_iteration` is advertised and dispatched through the host; the
+    // permission decision itself lives in the caller fact (see the gate tests).
+    #[test]
+    fn approve_iteration_tool_is_advertised_and_dispatched() {
+        let tools = shell_agent_tools();
+        let spec = tools
+            .iter()
+            .find(|tool| tool.name == AGENT_TOOL_APPROVE_ITERATION)
+            .expect("approve_iteration must be advertised");
+        assert_eq!(spec.parameters["required"], json!(["iteration_id"]));
+
+        let host = FakeHost {
+            caller: None,
+            ..FakeHost::default()
+        };
+        let mut backend = RuntimeShellAgentBackend {
+            host: &host,
+            session_id: "approve-dispatch",
+            soul_key: String::new(),
+        };
+        let err = backend
+            .execute_tool(
+                AGENT_TOOL_APPROVE_ITERATION,
+                json!({ "iteration_id": "it-1" }),
+                &mut Vec::new(),
+            )
+            .expect_err("the fake host must refuse");
+        assert!(err.to_string().contains("cannot approve"), "err: {err}");
+    }
+
+    /// P4 `set_soul` 门控的共用调用面：一个带 soul scope 的 runtime shell
+    /// backend，直接分发 `set_soul` 工具（不经过 LLM）。
+    fn call_set_soul(host: &FakeHost) -> Result<Value, RuntimeError> {
+        let mut backend = RuntimeShellAgentBackend {
+            host,
+            session_id: "soul-gate",
+            soul_key: "qq:group:777".to_string(),
+        };
+        backend.execute_tool(
+            AGENT_TOOL_SET_SOUL,
+            json!({ "persona": "新人格" }),
+            &mut Vec::new(),
+        )
+    }
+
+    fn caller(is_group: bool, is_admin: bool) -> Option<SessionCaller> {
+        Some(SessionCaller {
+            is_group,
+            is_admin,
+            can_approve_iteration: false,
+        })
+    }
+
+    /// 群聊人格是房间级共享资源：普通成员改它就是改所有人的 bot 人格。
+    #[test]
+    fn set_soul_rejects_group_non_admin() {
+        let host = FakeHost {
+            caller: caller(true, false),
+            ..Default::default()
+        };
+        let err = call_set_soul(&host).expect_err("plain member must be refused");
+        let message = err.to_string();
+        assert!(
+            message.contains("owner/admin"),
+            "unexpected error text: {message}"
+        );
+    }
+
+    /// 群主 / 管理员可以改本群人格。
+    #[test]
+    fn set_soul_allows_group_admin() {
+        let host = FakeHost {
+            caller: caller(true, true),
+            ..Default::default()
+        };
+        let out = call_set_soul(&host).expect("room admin may set the persona");
+        assert_eq!(out, json!({ "ok": true }));
+    }
+
+    /// 私聊仍是自助的：不是管理员也照改自己的（自己的 scope 就是自己）。
+    #[test]
+    fn set_soul_allows_private_member() {
+        let host = FakeHost {
+            caller: caller(false, false),
+            ..Default::default()
+        };
+        let out = call_set_soul(&host).expect("private chat is self-service");
+        assert_eq!(out, json!({ "ok": true }));
+    }
+
+    /// 宿主不跟踪调用者角色（`None`）时不加限制——门控只对能判断的宿主动手。
+    #[test]
+    fn set_soul_without_caller_facts_is_ungated() {
+        let host = FakeHost::default();
+        let out = call_set_soul(&host).expect("untracked caller is not gated");
+        assert_eq!(out, json!({ "ok": true }));
+    }
+
+    #[test]
+    fn reasoning_only_request_message_uses_empty_content() {
+        let message = cordis_plugin_sdk::llm::LlmMessage {
+            content: None,
+            reasoning_content: Some("Need another reasoning pass".to_string()),
+            tool_calls: Vec::new(),
+        };
+        let request = llm_message_to_request(&message);
+        assert_eq!(
+            request.get("role").and_then(Value::as_str),
+            Some("assistant")
+        );
+        assert_eq!(request.get("content").and_then(Value::as_str), Some(""));
+        assert_eq!(
+            request.get("reasoning_content").and_then(Value::as_str),
+            Some("Need another reasoning pass")
+        );
+    }
+
+    #[test]
+    fn shell_agent_reset_clears_history() {
+        let config = LlmApiConfig {
+            provider: "deepseek".to_string(),
+            base_url: "http://127.0.0.1:12345/v1".to_string(),
+            api_key: Some("test-key".to_string()),
+            model: "deepseek-reasoner".to_string(),
+            ..LlmApiConfig::default()
+        };
+        let mut session = ShellAgentSession::new(config).expect("build session");
+        session.remember_exchange("hi", "hello");
+        assert_eq!(session.status().completed_turns, 1);
+        session.reset();
+        assert_eq!(session.status().completed_turns, 0);
+        assert_eq!(session.status().stored_messages, 0);
+    }
+
+    fn session_for_reply_tests() -> AgentSession {
+        AgentSession::new(
+            LlmApiConfig {
+                base_url: "http://127.0.0.1:12345/v1".to_string(),
+                api_key: Some("test-key".to_string()),
+                model: "deepseek-reasoner".to_string(),
+                ..LlmApiConfig::default()
+            },
+            "reply-history-test",
+        )
+        .expect("build session")
+    }
+
+    /// P6: the channel-visible reply must replace the bare action placeholder,
+    /// otherwise the model cannot see what it said last turn.
+    #[test]
+    fn replace_last_action_with_reply_rewrites_placeholder() {
+        let mut session = session_for_reply_tests();
+        session.remember_exchange("u", "{\"action\":\"suspend\"}", None, &[]);
+        assert!(session.replace_last_action_with_reply("mpft 是冒泡防踢"));
+        assert_eq!(
+            session.history.last().and_then(|m| m["content"].as_str()),
+            Some("mpft 是冒泡防踢")
+        );
+        // A second record call finds the real reply already in place and does
+        // not duplicate the entry (the inbox ignores the false).
+        assert!(!session.replace_last_action_with_reply("mpft 是冒泡防踢"));
+        assert_eq!(session.history.len(), 2, "no extra history entry");
+    }
+
+    /// A direct answer (no messaging tool call) is already the visible reply —
+    /// never overwrite it, and an empty history has nothing to replace.
+    #[test]
+    fn replace_last_action_with_reply_leaves_real_answers_alone() {
+        let mut session = session_for_reply_tests();
+        assert!(
+            !session.replace_last_action_with_reply("x"),
+            "empty history"
+        );
+        session.remember_exchange("u", "直接回答", None, &[]);
+        assert!(!session.replace_last_action_with_reply("x"));
+        assert_eq!(
+            session.history.last().and_then(|m| m["content"].as_str()),
+            Some("直接回答")
+        );
+    }
+
+    struct TerminalTestBackend {
+        executed_tools: Vec<String>,
+    }
+
+    impl AgentBackend for TerminalTestBackend {
+        type Host = FakeHost;
+        fn host(&self) -> &FakeHost {
+            &EMPTY_FAKE_HOST
+        }
+        fn system_prompt(&self) -> String {
+            "test backend".to_string()
+        }
+
+        fn tool_specs(&self) -> Vec<AgentToolSpec> {
+            vec![
+                AgentToolSpec {
+                    name: TEST_TOOL_RECORD,
+                    description: "Record a terminal summary.",
+                    parameters: json!({"type":"object","properties":{},"additionalProperties":false}),
+                },
+                AgentToolSpec {
+                    name: TEST_TOOL_READ,
+                    description: "Read extra context.",
+                    parameters: json!({"type":"object","properties":{},"additionalProperties":false}),
+                },
+            ]
+        }
+
+        fn execute_tool(
+            &mut self,
+            name: &str,
+            _arguments: Value,
+            _attachments: &mut Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            self.executed_tools.push(name.to_string());
+            Ok(json!({ "tool": name }))
+        }
+
+        fn terminal_tool_reply(&self, name: &str, _output: &Value) -> Option<String> {
+            (name == TEST_TOOL_RECORD).then_some("Terminal summary recorded.".to_string())
+        }
+    }
+
+    /// 循环会分派工具、把结果并回历史，并在下一轮拿到最终答复。
+    /// 拆分后不再需要 mock HTTP：`FakeLlmProvider` 直接按脚本给补全。
+    #[test]
+    fn shell_agent_uses_runtime_tool_and_keeps_history() {
+        let provider = FakeLlmProvider::new(vec![
+            cordis_plugin_sdk::llm::LlmMessage {
+                tool_calls: vec![cordis_plugin_sdk::llm::LlmToolCall {
+                    id: "call_status".to_string(),
+                    call_type: "function".to_string(),
+                    function: cordis_plugin_sdk::llm::LlmToolFunction {
+                        name: AGENT_TOOL_GET_RUNTIME_STATUS.to_string(),
+                        arguments: "{}".to_string(),
+                    },
+                }],
+                ..Default::default()
+            },
+            assistant_reply("Runtime is healthy and loaded."),
+        ]);
+        let mut session = ShellAgentSession::new(LlmApiConfig::default()).expect("build session");
+        let reply = session
+            .respond_via(
+                &EMPTY_FAKE_HOST,
+                "test-session-1",
+                "What is the runtime status right now?",
+                &provider,
+            )
+            .expect("agent reply");
+
+        assert_eq!(reply.content, "Runtime is healthy and loaded.");
+        assert_eq!(reply.tool_events.len(), 1);
+        assert_eq!(reply.tool_events[0].name, AGENT_TOOL_GET_RUNTIME_STATUS);
+        assert_eq!(session.status().completed_turns, 1);
+
+        // 第一轮请求用 DSML 协议 + 目录取代 `tools` 数组；第二轮把工具结果并回历史。
+        let bodies = provider.seen_bodies.lock().expect("bodies");
+        assert_eq!(bodies.len(), 2);
+        assert!(
+            bodies[0].get("tools").is_none(),
+            "tools must not be sent: calls travel as DSML"
+        );
+        let first = bodies[0].to_string();
+        assert!(first.contains("<|DSML|calls>"), "{first}");
+        assert!(
+            first.contains("AVAILABLE TOOLS"),
+            "the catalog must reach the model: {first}"
+        );
+        assert!(
+            bodies[1].to_string().contains("snapshot-demo"),
+            "second turn must carry the tool result back"
+        );
+    }
+
+    // The iteration prompt promises the summary "ends the session
+    // immediately"; without this the loop asked for another turn and the run
+    // failed on "exited without calling record_iteration_summary".
+    #[test]
+    fn recording_the_iteration_summary_ends_the_turn() {
+        let provider = FakeLlmProvider::new(vec![
+            cordis_plugin_sdk::llm::LlmMessage {
+                tool_calls: vec![cordis_plugin_sdk::llm::LlmToolCall {
+                    id: "summary".to_string(),
+                    call_type: "function".to_string(),
+                    function: cordis_plugin_sdk::llm::LlmToolFunction {
+                        name: AGENT_TOOL_RECORD_ITERATION_SUMMARY.to_string(),
+                        arguments: "{}".to_string(),
+                    },
+                }],
+                ..Default::default()
+            },
+            assistant_reply("should never be requested"),
+        ]);
+        let mut session = ShellAgentSession::new(LlmApiConfig::default()).expect("build session");
+        let reply = session
+            .respond_via(
+                &EMPTY_FAKE_HOST,
+                "test-session-summary",
+                "iterate",
+                &provider,
+            )
+            .expect("turn");
+        assert_eq!(session.status().completed_turns, 1);
+        assert_eq!(provider.seen_bodies.lock().expect("bodies").len(), 1);
+        assert!(reply.tool_events.is_empty());
+    }
+
+    /// DSML `{"node_id":"suspend"}` must parse as a direct call: the parser
+    /// only resolves names that are in the tool list, and a missing entry is
+    /// what kept every channel turn retrying until it gave up.
+    #[test]
+    fn the_end_marker_parses_as_a_direct_call() {
+        let mut specs = shell_agent_tools();
+        specs.push(end_turn_tool_spec());
+        let calls = salvage_serialized_tool_calls(
+            "<|DSML|tool_calls>\n{\"node_id\": \"suspend\"}\n</|DSML|tool_calls>",
+            &specs,
+        );
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, AGENT_TOOL_END_TURN);
+    }
+
+    /// History keeps a note that pictures came with the message. Without it the
+    /// next turn sees only text and answers "no image, I can't guess" — the
+    /// reported badcase.
+    #[test]
+    fn a_picture_leaves_a_note_in_history() {
+        let provider = FakeLlmProvider::new(vec![assistant_reply("看起来是个抽卡游戏")]);
+        let mut session =
+            AgentSession::new(LlmApiConfig::default(), "runtime_shell").expect("build session");
+        session
+            .respond_with_runtime_host_via_images(
+                &EMPTY_FAKE_HOST,
+                "test-session-image-note",
+                "你觉得这个游戏怎么样",
+                &[json!({"url": "https://example.com/a.png"})],
+                "",
+                &provider,
+                None,
+            )
+            .expect("turn");
+        let history = serde_json::to_string(&session.history).expect("history json");
+        assert!(
+            history.contains("附图 1 张"),
+            "history must record the picture: {history}"
+        );
+    }
+
+    /// A provider that fails once with an unsupported-image error, then answers.
+    struct FailOnceImageProvider {
+        inner: FakeLlmProvider,
+        calls: std::sync::Mutex<usize>,
+    }
+
+    impl FailOnceImageProvider {
+        fn new(replies: Vec<cordis_plugin_sdk::llm::LlmMessage>) -> Self {
+            Self {
+                inner: FakeLlmProvider::new(replies),
+                calls: std::sync::Mutex::new(0),
+            }
+        }
+    }
+
+    impl LlmProvider for FailOnceImageProvider {
+        fn complete(
+            &self,
+            body: Value,
+            sink: Option<std::sync::Arc<dyn cordis_runtime::llm_sink::TokenSink>>,
+            transport: cordis_plugin_sdk::llm::LlmTransportConfig,
+        ) -> Result<LlmCompletionParts, RuntimeError> {
+            let mut calls = self.calls.lock().expect("calls");
+            *calls += 1;
+            if *calls == 1 {
+                return Err(RuntimeError::LlmRequestFailed {
+                    message: "messages[1].image[0]: You have uploaded an unsupported image"
+                        .to_string(),
+                });
+            }
+            self.inner.complete(body, sink, transport)
+        }
+    }
+
+    /// One unsupported image used to poison the whole session: every later
+    /// request replayed it and got the same 400. The loop drops the image parts
+    /// and retries once.
+    #[test]
+    fn an_unsupported_image_is_dropped_and_the_turn_retried() {
+        let provider = FailOnceImageProvider::new(vec![assistant_reply("我能看到图片了")]);
+        let mut session =
+            AgentSession::new(LlmApiConfig::default(), "runtime_shell").expect("build session");
+        let reply = session
+            .respond_with_runtime_host_via_images(
+                &EMPTY_FAKE_HOST,
+                "test-session-image-drop",
+                "这张图里是什么",
+                &[json!({"url": "https://example.com/broken.png"})],
+                "",
+                &provider,
+                None,
+            )
+            .expect("turn recovers after dropping the image");
+        assert_eq!(reply.content, "我能看到图片了");
+        assert_eq!(*provider.calls.lock().expect("calls"), 2, "one retry");
+        let history = serde_json::to_string(&session.history).expect("history json");
+        assert!(
+            !history.contains("broken.png"),
+            "the image is gone: {history}"
+        );
+    }
+
+    /// Pictures stay in history: a later turn must still be able to look at
+    /// what the user sent earlier (the "没图没名" badcase). Cost is not the
+    /// constraint — one image is a few hundred tokens.
+    #[test]
+    fn a_picture_stays_in_history_across_turns() {
+        let provider = FakeLlmProvider::new(vec![
+            assistant_reply("第一轮看过图"),
+            assistant_reply("第二轮还能看图"),
+        ]);
+        let mut session =
+            AgentSession::new(LlmApiConfig::default(), "runtime_shell").expect("build session");
+        let image = json!({"url": "https://example.com/keep.png"});
+        session
+            .respond_with_runtime_host_via_images(
+                &EMPTY_FAKE_HOST,
+                "s1",
+                "这张图是什么",
+                std::slice::from_ref(&image),
+                "",
+                &provider,
+                None,
+            )
+            .expect("first turn");
+        session
+            .respond_with_runtime_host_via_images(
+                &EMPTY_FAKE_HOST,
+                "s1",
+                "再想想",
+                &[],
+                "",
+                &provider,
+                None,
+            )
+            .expect("second turn");
+        let history = serde_json::to_string(&session.history).expect("history json");
+        assert!(
+            history.contains("keep.png"),
+            "the picture must survive into later turns: {history}"
+        );
+    }
+
+    /// 一张 `size` 字节的内联 PNG part（640x480 IHDR + 填充），用来跨过字节预算。
+    ///
+    /// 注意：图片现在也进 `estimated_tokens`（base64 长度 / 4），所以这种
+    /// 数 MiB 的图不能走 `remember_exchange`——它会被 120k 的 token 上限立刻
+    /// 裁掉。测字节预算的用例用 [`seed_history_exchange`] 直接构造 history。
+    fn inline_png_part(size: usize) -> Value {
+        let mut bytes = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR".to_vec();
+        bytes.extend_from_slice(&640u32.to_be_bytes());
+        bytes.extend_from_slice(&480u32.to_be_bytes());
+        bytes.resize(size, 0);
+        json!({
+            "type": "image_url",
+            "image_url": {
+                "url": format!(
+                    "data:image/png;base64,{}",
+                    cordis_runtime::image_input::base64_encode(&bytes)
+                ),
+            },
+        })
+    }
+
+    /// 直接往 history 里放一对带图消息，绕过 `remember_exchange` 的 token 裁剪。
+    ///
+    /// 数 MiB 的图按 token 折算是几十万起步，`remember_exchange` 会立刻把整对
+    /// 消息裁掉；字节预算要测的却是「history 里已经有图」时怎么剥。直接构造
+    /// history 等价于旧版本留下的、或从快照恢复出来的会话。
+    fn seed_history_exchange(session: &mut AgentSession, text: &str, image: &Value) {
+        let content = cordis_runtime::image_input::user_content_with_images(
+            text,
+            std::slice::from_ref(image),
+        );
+        session
+            .history
+            .push(json!({ "role": "user", "content": content }));
+        session
+            .history
+            .push(json!({ "role": "assistant", "content": "收到" }));
+    }
+
+    /// 请求体里所有消息的内联图片字节。
+    fn request_inline_image_bytes(body: &Value) -> usize {
+        body["messages"]
+            .as_array()
+            .expect("messages array")
+            .iter()
+            .map(|message| {
+                cordis_runtime::image_budget::image_parts_bytes(
+                    message["content"]
+                        .as_array()
+                        .map(Vec::as_slice)
+                        .unwrap_or(&[]),
+                )
+            })
+            .sum()
+    }
+
+    /// 图片攒到超预算时，最老的那些必须换成占位符，而且**写回 history**：
+    /// 只做一次性替换等于下一轮又从原图重算。这条用例钉住 47 MB 请求体被
+    /// 413 拒收的那条线上回归。
+    ///
+    /// 断言看的是**本轮请求体**：图片 token 现在也计入 `estimated_tokens`，
+    /// 数 MiB 的图在回合末会被 token 上限整对裁掉，所以回合后的 history 不能
+    /// 用来验证字节预算（那只证明 token 裁剪生效，不证明字节预算写回了请求）。
+    #[test]
+    fn history_images_over_the_byte_budget_become_durable_placeholders() {
+        const MIB: usize = 1024 * 1024;
+        let huge = inline_png_part(6 * MIB);
+        let mut session =
+            AgentSession::new(LlmApiConfig::default(), "runtime_shell").expect("build session");
+        seed_history_exchange(&mut session, "第一张图", &huge);
+        seed_history_exchange(&mut session, "第二张图", &huge);
+        assert_eq!(session.history_len(), 4);
+
+        let provider = FakeLlmProvider::new(vec![assistant_reply("好")]);
+        session
+            .respond_with_runtime_host_via_images(
+                &EMPTY_FAKE_HOST,
+                "s-budget",
+                "现在呢",
+                &[],
+                "",
+                &provider,
+                None,
+            )
+            .expect("turn");
+
+        // 请求体是在预算写回 history 之后装配的，所以它同时证明了：
+        // 最老的那张已变成占位符、最新的一张仍带着 base64 发给模型。
+        let body = provider.seen_bodies.lock().expect("seen_bodies")[0].clone();
+        let body_text = body.to_string();
+        assert_eq!(
+            body_text.matches("data:image/png;base64,").count(),
+            1,
+            "only the newest image may go out"
+        );
+        // messages[0] 与 [1] 是两条 system prompt，history 从 [2] 开始。
+        let oldest = &body["messages"][2]["content"];
+        let oldest_text = oldest.to_string();
+        assert!(!oldest_text.contains("image_url"), "{oldest_text}");
+        assert!(
+            oldest_text.contains("image omitted to fit request byte budget"),
+            "{oldest_text}"
+        );
+        assert!(oldest_text.contains("sha256:"), "{oldest_text}");
+        assert!(oldest_text.contains("640x480 png"), "{oldest_text}");
+    }
+
+    /// 这一轮新消息里的图片还没进 history，但同样占请求体，必须先扣掉预算。
+    #[test]
+    fn the_new_message_images_are_reserved_before_the_history_budget() {
+        const MIB: usize = 1024 * 1024;
+        let historical = inline_png_part(5 * MIB);
+        let pending = inline_png_part(6 * MIB);
+        let mut session =
+            AgentSession::new(LlmApiConfig::default(), "runtime_shell").expect("build session");
+        seed_history_exchange(&mut session, "历史图", &historical);
+
+        let provider = FakeLlmProvider::new(vec![assistant_reply("这张也看到了")]);
+        session
+            .respond_with_runtime_host_via_images(
+                &EMPTY_FAKE_HOST,
+                "s-pending",
+                "这张新的呢",
+                std::slice::from_ref(&pending),
+                "",
+                &provider,
+                None,
+            )
+            .expect("turn");
+
+        // 6 MiB 新图只给历史留 2 MiB，5 MiB 的历史图必须让位；占位符在装配
+        // 请求体之前就写回了 history（messages[0]/[1] 是 system prompt）。
+        let body = provider.seen_bodies.lock().expect("seen_bodies")[0].clone();
+        assert_eq!(
+            request_inline_image_bytes(&body),
+            cordis_runtime::image_budget::inline_base64_len(6 * MIB),
+            "only the pending image survives"
+        );
+        let history_text = body["messages"][2]["content"].to_string();
+        assert!(!history_text.contains("image_url"), "{history_text}");
+        assert!(history_text.contains("image omitted"), "{history_text}");
+        assert!(
+            request_inline_image_bytes(&body)
+                <= cordis_runtime::image_budget::INLINE_IMAGE_BUDGET_BYTES
+        );
+    }
+
+    /// 一张过小的图不该被剥掉：预算只在真的超了才动手。
+    #[test]
+    fn a_small_inline_image_survives_the_byte_budget() {
+        let small = inline_png_part(1024);
+        let mut session =
+            AgentSession::new(LlmApiConfig::default(), "runtime_shell").expect("build session");
+        session.remember_exchange("小图", "收到", None, std::slice::from_ref(&small));
+        let provider = FakeLlmProvider::new(vec![assistant_reply("好")]);
+        session
+            .respond_with_runtime_host_via_images(
+                &EMPTY_FAKE_HOST,
+                "s-small",
+                "继续",
+                &[],
+                "",
+                &provider,
+                None,
+            )
+            .expect("turn");
+        let kept = session.history_value(0).expect("user message");
+        assert!(kept["content"].to_string().contains("image_url"));
+    }
+
+    /// 一张图按整图计价，不按字节：字节是 `image_budget` 那条独立通道的事。
+    #[test]
+    fn remember_exchange_counts_inline_image_tokens() {
+        let mut session = AgentSession::new(test_config(), "runtime_shell").unwrap();
+        session.remember_exchange("看图", "收到", None, &[inline_png_part(3 * 1024)]);
+        // 文本「看图」「收到」各 1 token，图片 1024。
+        assert_eq!(session.estimated_tokens, 2 + super::IMAGE_TOKEN_ESTIMATE);
+        assert_eq!(session.history_len(), 2);
+    }
+
+    /// 大图不再把整对消息挤掉。
+    ///
+    /// 图片按字节折 token 时，一张 6 MiB 的图等于 200 万 token，`remember_exchange`
+    /// 会立刻把用户的话和回复一起丢掉——正是这个计价方式逼出来的行为。现在图片按
+    /// 整图计价，历史留得住，字节由 `image_budget` 在发送前处理。
+    #[test]
+    fn a_large_inline_image_does_not_prune_the_pair() {
+        const MIB: usize = 1024 * 1024;
+        let mut session = AgentSession::new(test_config(), "runtime_shell").unwrap();
+        session.remember_exchange("大图", "收到", None, &[inline_png_part(6 * MIB)]);
+        assert_eq!(session.history_len(), 2, "the pair survives");
+        assert!(session.estimated_tokens < COMPACT_AT_TOKENS);
+    }
+
+    /// 恢复出来的会话可能带着与 history 不一致的陈旧估算。旧实现会在
+    /// `remember_exchange` 里按这个虚高计数一路 drain 到 history 为空；现在
+    /// 条数兜底不看 token，陈旧计数不会吃掉任何一条消息。
+    #[test]
+    fn remember_exchange_never_clears_history_on_a_stale_estimate() {
+        let mut session = AgentSession::new(test_config(), "runtime_shell").unwrap();
+        session.estimated_tokens = CONTEXT_WINDOW_TOKENS * 2;
+        session.remember_exchange("hi", "ok", None, &[]);
+        assert_eq!(session.history_len(), 2);
+        assert_eq!(
+            session.history_value(0).expect("user")["content"].as_str(),
+            Some("hi")
+        );
+    }
+
+    /// 条数上限是极端兜底：超过 `AGENT_HISTORY_MESSAGE_LIMIT` 才丢最老的一对，
+    /// 并把它们的估算减掉，不会因为 token 计数一路清空。
+    #[test]
+    fn remember_exchange_prunes_by_message_count_backstop_only() {
+        let mut session = AgentSession::new(test_config(), "runtime_shell").unwrap();
+        for i in 0..4200 {
+            session.remember_exchange(&format!("u{i}"), &format!("a{i}"), None, &[]);
+        }
+        assert_eq!(session.history_len(), AGENT_HISTORY_MESSAGE_LIMIT);
+        assert!(session.estimated_tokens > 0);
+        // 留下的是最新的消息，不是被清空。
+        let last = session
+            .history_value(session.history_len() - 1)
+            .expect("last message");
+        assert_eq!(last["content"].as_str(), Some("a4199"));
+    }
+
+    /// 只读群：ingest 只追加一条 user 消息，**不调用 provider**；策略恢复后
+    /// 的下一轮请求能看到这条历史。
+    #[test]
+    fn ingest_user_message_records_context_without_calling_the_provider() {
+        let mut session = AgentSession::new(test_config(), "runtime_shell").unwrap();
+        let provider = FakeLlmProvider::new(vec![assistant_reply("现在可以说了")]);
+        session.ingest_user_message("[QQ group from 1 (user 2)]: 只读群里的消息");
+
+        assert_eq!(
+            session.history_len(),
+            1,
+            "one user message, no assistant reply"
+        );
+        assert!(
+            provider.seen_bodies.lock().expect("bodies").is_empty(),
+            "ingest must not call the provider"
+        );
+        let transcript = session.transcript();
+        assert!(matches!(
+            transcript.last(),
+            Some(AgentTranscriptEntry::User { content }) if content.contains("只读群里的消息")
+        ));
+
+        // The next real turn sees the ingested text and then adds its own pair.
+        session
+            .respond_with_runtime_host_via_images(
+                &EMPTY_FAKE_HOST,
+                "s-ingest",
+                "现在能说话了吗",
+                &[],
+                "",
+                &provider,
+                None,
+            )
+            .expect("real turn");
+        assert_eq!(session.history_len(), 3);
+        let bodies = provider.seen_bodies.lock().expect("bodies");
+        assert_eq!(bodies.len(), 1, "exactly one model call for the real turn");
+        let body = bodies[0].clone();
+        // messages[0] / [1] are the system prompts; history starts at [2].
+        assert_eq!(body["messages"][2]["role"], "user");
+        assert!(body["messages"][2]["content"]
+            .as_str()
+            .expect("history content is text")
+            .contains("只读群里的消息"));
+        assert_eq!(body["messages"][3]["content"], "现在能说话了吗");
+    }
+
+    /// 快照落盘前必须把内联 base64 换成占位符：46 张图的会话历史有几十 MB，
+    /// 原样写 `data/sessions/*.json` 既慢又撑爆磁盘。文本必须完整，**live
+    /// history 不能被改**（进程内还要看图），重启后则只剩占位符。
+    #[test]
+    fn snapshot_strips_inline_images_and_keeps_the_text() {
+        let image = inline_png_part(64 * 1024);
+        let mut session = AgentSession::new(test_config(), "runtime_shell").unwrap();
+        session.remember_exchange(
+            "这张图里是什么",
+            "是一只猫",
+            None,
+            std::slice::from_ref(&image),
+        );
+        let live_json = serde_json::to_string(&session.history).expect("live history json");
+        assert!(live_json.contains("data:image/png;base64,"));
+        let live_tokens = session.estimated_tokens;
+
+        let snapshot = session.to_snapshot();
+        let json = serde_json::to_string(&snapshot).expect("snapshot json");
+        assert!(!json.contains("base64"), "no inline bytes on disk: {json}");
+        assert!(
+            json.contains("image omitted to fit request byte budget"),
+            "{json}"
+        );
+        assert!(json.contains("sha256:"), "{json}");
+        assert!(json.contains("这张图里是什么"), "{json}");
+        assert!(json.contains("是一只猫"), "{json}");
+        let tiny = json.len() < 1024;
+        assert!(tiny, "snapshot should be tiny, got {} bytes", json.len());
+        let shrunk = json.len() * 50 < live_json.len();
+        assert!(shrunk, "snapshot must be far smaller than live history");
+        // live history 原样保留：剥图只发生在落盘副本上。
+        assert_eq!(
+            serde_json::to_string(&session.history).expect("live json"),
+            live_json
+        );
+        // 快照里的估算按占位符重算，不能把原图的几十万 token 带进恢复会话。
+        assert!(
+            snapshot.estimated_tokens < live_tokens,
+            "snapshot estimate {} must shrink from {}",
+            snapshot.estimated_tokens,
+            live_tokens
+        );
+
+        // 典型重启路径：恢复出来的会话只有占位符，模型不能再"看"这张图。
+        let restored = AgentSession::from_snapshot(snapshot).expect("restore");
+        let restored_json = serde_json::to_string(&restored.history).expect("restored json");
+        assert!(restored_json.contains("image omitted to fit request byte budget"));
+        assert!(restored_json.contains("这张图里是什么"));
+        assert!(restored.estimated_tokens < 100);
+    }
+
+    /// A session can see its siblings and hand a message to one of them.
+    #[test]
+    fn a_session_can_inspect_its_tree_and_message_a_neighbour() {
+        let host = FakeHost {
+            persona: None,
+            hints: Vec::new(),
+            caller: None,
+            routed: std::sync::Mutex::new(Vec::new()),
+            media_dir: std::path::PathBuf::new(),
+            spill_path: None,
+            digest: None,
+        };
+        let mut backend = RuntimeShellAgentBackend {
+            host: &host,
+            session_id: "s1",
+            soul_key: String::new(),
+        };
+        let team = AgentBackend::execute_tool(
+            &mut backend,
+            cordis_runtime::agent_tools::AGENT_TOOL_MY_TEAM,
+            json!({}),
+            &mut Vec::new(),
+        )
+        .expect("team");
+        assert_eq!(team["me"], "s1");
+        assert_eq!(team["reachable"], json!(["s2"]));
+        let sent = AgentBackend::execute_tool(
+            &mut backend,
+            cordis_runtime::agent_tools::AGENT_TOOL_SEND_TO_SESSION,
+            json!({"target": "s2", "message": "hi"}),
+            &mut Vec::new(),
+        )
+        .expect("send");
+        assert_eq!(sent["session_id"], "s2");
+        assert_eq!(
+            host.routed.lock().expect("routed").as_slice(),
+            &["s1->s2:hi"]
+        );
+    }
+
+    /// A turn that delivered a message must not come back as an error: the
+    /// channel spills errored turns to `pending` and replays them, which is how
+    /// the same sentence arrived again a day later.
+    #[test]
+    fn a_delivered_turn_survives_an_empty_closing_reply() {
+        let provider = FakeLlmProvider::new(vec![
+            assistant_reply(
+                "<|DSML|tool_calls>\n{\"node_id\": \"invoke_plugin\", \"payload_json\":                  {\"plugin_path\": \"qq\", \"node_id\": \"qq_send\", \"payload_json\":                  {\"message\": \"手脚宝宝是啥\"}}}\n</|DSML|tool_calls>",
+            ),
+            // then the provider runs dry: the turn must still be a success
+        ]);
+        let mut session = ShellAgentSession::new(LlmApiConfig::default()).expect("build session");
+        session.set_require_end_tool(true);
+        let reply = session
+            .respond_via(&EMPTY_FAKE_HOST, "test-session-delivered", "hi", &provider)
+            .expect("a delivered turn is a success");
+        assert_eq!(reply.tool_events.len(), 1);
+        assert_eq!(session.status().completed_turns, 1);
+    }
+
+    /// A text-only reply is nudged without a retry cap — the old three-strike
+    /// limit turned a forgetful model into an "LLM outage" spill.
+    #[test]
+    fn a_silent_model_is_asked_again_until_it_calls_the_marker() {
+        let provider = FakeLlmProvider::new(vec![
+            assistant_reply("第一句"),
+            assistant_reply("第二句"),
+            assistant_reply("第三句"),
+            assistant_reply("第四句"),
+            assistant_reply("<|DSML|tool_calls>\n{\"node_id\": \"suspend\"}\n</|DSML|tool_calls>"),
+        ]);
+        let mut session = ShellAgentSession::new(LlmApiConfig::default()).expect("build session");
+        session.set_require_end_tool(true);
+        let reply = session
+            .respond_via(&EMPTY_FAKE_HOST, "test-session-nudge", "hi", &provider)
+            .expect("turn");
+        assert_eq!(session.status().completed_turns, 1);
+        assert!(reply.tool_events.is_empty());
+        assert_eq!(
+            provider.seen_bodies.lock().expect("bodies").len(),
+            5,
+            "four nudges then the marker: no cap at three"
+        );
+    }
+
+    /// A suspend is a decision, not a draft.
+    ///
+    /// One suspend with nothing sent ends the turn. There is no "are you sure"
+    /// pass: a model that meant to stay quiet and said so must not be pushed
+    /// into speaking, because what it invents under pressure is worse.
+    #[test]
+    fn a_suspend_ends_the_turn_silently() {
+        let provider = FakeLlmProvider::new(vec![assistant_reply(
+            "<|DSML|tool_calls>\n{\"node_id\": \"suspend\"}\n</|DSML|tool_calls>",
+        )]);
+        let mut session = ShellAgentSession::new(LlmApiConfig::default()).expect("build session");
+        session.set_require_end_tool(true);
+        let reply = session
+            .respond_via(&EMPTY_FAKE_HOST, "test-session-quiet", "hi", &provider)
+            .expect("a quiet turn is a success");
+        assert!(reply.tool_events.is_empty(), "nothing was sent");
+        assert_eq!(session.status().completed_turns, 1);
+        assert_eq!(
+            provider.seen_bodies.lock().expect("bodies").len(),
+            1,
+            "the first suspend is honoured"
+        );
+    }
+
+    /// A channel turn that sent through a tool must still land in history.
+    ///
+    /// It never reaches the branch that calls `remember_exchange`, so the bot
+    /// could not answer "what did you just say" about its own previous message.
+    #[test]
+    fn a_tool_sent_channel_turn_is_remembered() {
+        let provider = FakeLlmProvider::new(vec![
+            assistant_reply(
+                "<|DSML|tool_calls>\n{\"node_id\": \"invoke_plugin\", \"payload_json\": {\"plugin_path\": \"qq\", \"node_id\": \"qq_send\", \"payload_json\": {\"message\": \"鸡窝是吧\"}}}\n</|DSML|tool_calls>",
+            ),
+            assistant_reply("<|DSML|tool_calls>\n{\"node_id\": \"suspend\"}\n</|DSML|tool_calls>"),
+        ]);
+        let mut session = ShellAgentSession::new(LlmApiConfig::default()).expect("build session");
+        session.set_require_end_tool(true);
+        session
+            .respond_via(&EMPTY_FAKE_HOST, "test-session-remember", "在吗", &provider)
+            .expect("turn");
+        assert_eq!(
+            session.status().stored_messages,
+            2,
+            "the batch and the reply are both in history"
+        );
+        let assistant = session
+            .inner
+            .history_value(session.inner.history_len() - 1)
+            .expect("assistant message");
+        assert!(
+            assistant.to_string().contains("鸡窝是吧"),
+            "the bot's own words are in history: {assistant}"
+        );
+    }
+
+    /// A delivered turn stops asking once the marker never comes.
+    ///
+    /// One live turn replied with the same 119-character text 44 times, each
+    /// round a billed model call, because every nudge was answered with the same
+    /// message. Nothing is lost by closing: the reply already went out.
+    #[test]
+    fn a_delivered_turn_stops_asking_for_the_marker() {
+        let mut replies = vec![assistant_reply(
+            "<|DSML|tool_calls>\n{\"node_id\": \"invoke_plugin\", \"payload_json\": {\"plugin_path\": \"qq\", \"node_id\": \"qq_send\", \"payload_json\": {\"message\": \"hi\"}}}\n</|DSML|tool_calls>",
+        )];
+        // The model keeps answering the nudge with the same chatter.
+        replies.extend((0..10).map(|_| assistant_reply("说完了")));
+        let provider = FakeLlmProvider::new(replies);
+        let mut session = ShellAgentSession::new(LlmApiConfig::default()).expect("build session");
+        session.set_require_end_tool(true);
+        let reply = session
+            .respond_via(&EMPTY_FAKE_HOST, "test-session-spin", "hi", &provider)
+            .expect("turn");
+        assert_eq!(reply.tool_events.len(), 1, "the message still went out");
+        let calls = provider.seen_bodies.lock().expect("bodies").len();
+        assert!(calls <= 5, "the turn must stop asking, got {calls} calls");
+    }
+
+    /// Sending does not end the turn: only `suspend` does.
+    ///
+    /// The harness once closed a channel turn on any text after a send. That is
+    /// a rule about the model's behaviour, not about the protocol, and it cut
+    /// turns short when the model still had something to say.
+    #[test]
+    fn a_send_does_not_end_the_turn() {
+        let provider = FakeLlmProvider::new(vec![
+            assistant_reply(
+                "<|DSML|tool_calls>\n{\"node_id\": \"invoke_plugin\", \"payload_json\":                  {\"plugin_path\": \"qq\", \"node_id\": \"qq_send\", \"payload_json\":                  {\"message\": \"hi\"}}}\n</|DSML|tool_calls>",
+            ),
+            assistant_reply("说完了"),
+            assistant_reply("<|DSML|tool_calls>\n{\"node_id\": \"suspend\"}\n</|DSML|tool_calls>"),
+        ]);
+        let mut session = ShellAgentSession::new(LlmApiConfig::default()).expect("build session");
+        session.set_require_end_tool(true);
+        let reply = session
+            .respond_via(&EMPTY_FAKE_HOST, "test-session-sent", "hi", &provider)
+            .expect("turn");
+        assert_eq!(session.status().completed_turns, 1);
+        assert_eq!(reply.tool_events.len(), 1, "exactly one tool ran");
+        assert_eq!(
+            provider.seen_bodies.lock().expect("bodies").len(),
+            3,
+            "the turn runs until the marker, not until the text after a send"
+        );
+    }
+
+    // A channel turn is not over when the model stops calling tools: it needs
+    // an explicit `suspend`. A text-only step is nudged and the turn continues.
+    #[test]
+    fn a_channel_turn_ends_only_on_the_suspend_call() {
+        let provider = FakeLlmProvider::new(vec![
+            assistant_reply("我先说一句"),
+            cordis_plugin_sdk::llm::LlmMessage {
+                tool_calls: vec![cordis_plugin_sdk::llm::LlmToolCall {
+                    id: "end".to_string(),
+                    call_type: "function".to_string(),
+                    function: cordis_plugin_sdk::llm::LlmToolFunction {
+                        name: AGENT_TOOL_END_TURN.to_string(),
+                        arguments: "{}".to_string(),
+                    },
+                }],
+                ..Default::default()
+            },
+        ]);
+        let mut session = ShellAgentSession::new(LlmApiConfig::default()).expect("build session");
+        session.set_require_end_tool(true);
+        let reply = session
+            .respond_via(&EMPTY_FAKE_HOST, "test-session-end-tool", "hi", &provider)
+            .expect("turn");
+        assert_eq!(session.status().completed_turns, 1);
+        assert!(reply.tool_events.is_empty(), "the marker is not executed");
+        let bodies = provider.seen_bodies.lock().expect("bodies");
+        assert_eq!(bodies.len(), 2, "text alone must not end the turn");
+        assert!(
+            bodies[1].to_string().contains("这一轮还没结束"),
+            "the model must be told to close the turn"
+        );
+    }
+
+    /// The dialect the model actually writes must end a turn by itself.
+    ///
+    /// This is the whole point of `crate::dsml`: 93 stored turns carried
+    /// `<|DSML|calls><|DSML|invoke name="suspend">…` and produced no call at
+    /// all, so the bot went silent. Here the markup is the only thing the
+    /// provider returns — no structured `tool_calls` — and the turn still ends.
+    #[test]
+    fn a_dsml_invoke_block_ends_the_turn() {
+        let provider = FakeLlmProvider::new(vec![assistant_reply(
+            "<|DSML|calls>\n<|DSML|invoke name=\"suspend\">\n</|DSML|invoke>\n</|DSML|calls>",
+        )]);
+        let mut session = ShellAgentSession::new(LlmApiConfig::default()).expect("build session");
+        session.set_require_end_tool(true);
+        session
+            .respond_via(&EMPTY_FAKE_HOST, "dsml-turn-end", "hi", &provider)
+            .expect("turn");
+        assert_eq!(session.status().completed_turns, 1);
+        assert_eq!(
+            provider.seen_bodies.lock().expect("bodies").len(),
+            1,
+            "the DSML block ends the turn in one call"
+        );
+    }
+
+    /// A plugin node written in the dialect reaches the host as a real call.
+    #[test]
+    fn a_dsml_plugin_node_reaches_the_host() {
+        let send = "<|DSML|calls>\n\
+             <|DSML|invoke name=\"invoke_plugin\">\n\
+             <|DSML|parameter name=\"plugin_path\" string=\"true\">qq</|DSML|parameter>\n\
+             <|DSML|parameter name=\"node_id\" string=\"true\">qq_send</|DSML|parameter>\n\
+             <|DSML|parameter name=\"payload_json\">{\"target\":\"group:1\",\"message\":\"hi\"}</|DSML|parameter>\n\
+             </|DSML|invoke>\n</|DSML|calls>";
+        let provider = FakeLlmProvider::new(vec![
+            assistant_reply(send),
+            assistant_reply(
+                "<|DSML|calls>\n<|DSML|invoke name=\"suspend\"></|DSML|invoke>\n</|DSML|calls>",
+            ),
+        ]);
+        let mut session = ShellAgentSession::new(LlmApiConfig::default()).expect("build session");
+        session.set_require_end_tool(true);
+        let reply = session
+            .respond_via(&EMPTY_FAKE_HOST, "dsml-plugin-node", "hi", &provider)
+            .expect("turn");
+        assert!(
+            reply
+                .tool_events
+                .iter()
+                .any(|event| event.name == AGENT_TOOL_INVOKE_PLUGIN),
+            "{:?}",
+            reply.tool_events
+        );
+    }
+
+    // Without the flag (shell sessions) a text answer still finishes a turn.
+    #[test]
+    fn a_shell_turn_still_ends_on_text() {
+        let provider = FakeLlmProvider::new(vec![assistant_reply("done")]);
+        let mut session = ShellAgentSession::new(LlmApiConfig::default()).expect("build session");
+        let reply = session
+            .respond_via(&EMPTY_FAKE_HOST, "test-session-text-end", "hi", &provider)
+            .expect("turn");
+        assert_eq!(reply.content, "done");
+        assert_eq!(provider.seen_bodies.lock().expect("bodies").len(), 1);
+    }
+
+    // A provider that finishes with neither content nor tool calls used to kill
+    // the whole turn (the inbox then spilled the message and posted a failure
+    // notice). It is a glitch: re-issue the same request first.
+    #[test]
+    fn empty_completions_are_retried_inside_the_turn() {
+        let provider = FakeLlmProvider::new(vec![
+            cordis_plugin_sdk::llm::LlmMessage::default(),
+            assistant_reply("second attempt works"),
+        ]);
+        let mut session = ShellAgentSession::new(LlmApiConfig::default()).expect("build session");
+        let reply = session
+            .respond_via(
+                &EMPTY_FAKE_HOST,
+                "test-session-empty-retry",
+                "hi",
+                &provider,
+            )
+            .expect("the retry must succeed");
+        assert_eq!(reply.content, "second attempt works");
+        let bodies = provider.seen_bodies.lock().expect("bodies");
+        assert_eq!(bodies.len(), 2, "one retry");
+        // The retry must differ from the first request; repeating it verbatim
+        // is what turned one empty reply into a dozen identical provider calls.
+        assert!(
+            !bodies[1].to_string().contains("second attempt"),
+            "sanity: bodies are request payloads"
+        );
+        assert_ne!(
+            bodies[0].to_string(),
+            bodies[1].to_string(),
+            "the retry must change the request"
+        );
+    }
+
+    // Retries are bounded: a provider that keeps returning nothing fails the
+    // turn instead of looping forever.
+    #[test]
+    fn persistent_empty_completions_fail_after_the_retries() {
+        let provider = FakeLlmProvider::new(vec![
+            cordis_plugin_sdk::llm::LlmMessage::default(),
+            cordis_plugin_sdk::llm::LlmMessage::default(),
+            cordis_plugin_sdk::llm::LlmMessage::default(),
+            cordis_plugin_sdk::llm::LlmMessage::default(),
+        ]);
+        let mut session = ShellAgentSession::new(LlmApiConfig::default()).expect("build session");
+        let err = session
+            .respond_via(&EMPTY_FAKE_HOST, "test-session-empty-fail", "hi", &provider)
+            .expect_err("must give up");
+        assert!(
+            matches!(err, RuntimeError::LlmResponseInvalid { .. }),
+            "{err:?}"
+        );
+        assert_eq!(
+            provider.seen_bodies.lock().expect("bodies").len(),
+            EMPTY_RESPONSE_RETRIES + 1,
+            "initial attempt plus the single retry"
+        );
+    }
+
+    /// 终止工具（`terminal_tool_reply` 返回 Some）一出现就结束会话，
+    /// 不再向模型多要一轮。
+    #[test]
+    fn terminal_tool_reply_ends_agent_session_without_extra_turn() {
+        let provider = FakeLlmProvider::new(vec![cordis_plugin_sdk::llm::LlmMessage {
+            tool_calls: vec![cordis_plugin_sdk::llm::LlmToolCall {
+                id: "call_record_summary".to_string(),
+                call_type: "function".to_string(),
+                function: cordis_plugin_sdk::llm::LlmToolFunction {
+                    name: TEST_TOOL_RECORD.to_string(),
+                    arguments: "{}".to_string(),
+                },
+            }],
+            ..Default::default()
+        }]);
+        let mut backend = TerminalTestBackend {
+            executed_tools: Vec::new(),
+        };
+        let mut session =
+            AgentSession::new(LlmApiConfig::default(), "test").expect("build session");
+        let reply = session
+            .respond_with_provider(&mut backend, "Finish the iteration", &provider, None)
+            .expect("agent reply");
+
+        assert_eq!(reply.content, "Terminal summary recorded.");
+        assert_eq!(backend.executed_tools, vec![TEST_TOOL_RECORD.to_string()]);
+        // 关键：只发了一次补全请求——终止工具没有触发第二轮。
+        assert_eq!(provider.seen_bodies.lock().expect("bodies").len(), 1);
+    }
+
+    /// 终止工具必须是本轮最后一个 tool_call：排在它后面的调用不执行，
+    /// 否则会话已结束却还在动工具。
+    #[test]
+    fn terminal_tool_must_be_last_tool_call_in_turn() {
+        let provider = FakeLlmProvider::new(vec![cordis_plugin_sdk::llm::LlmMessage {
+            tool_calls: vec![
+                cordis_plugin_sdk::llm::LlmToolCall {
+                    id: "call_record_summary".to_string(),
+                    call_type: "function".to_string(),
+                    function: cordis_plugin_sdk::llm::LlmToolFunction {
+                        name: TEST_TOOL_RECORD.to_string(),
+                        arguments: "{}".to_string(),
+                    },
+                },
+                cordis_plugin_sdk::llm::LlmToolCall {
+                    id: "call_read_context".to_string(),
+                    call_type: "function".to_string(),
+                    function: cordis_plugin_sdk::llm::LlmToolFunction {
+                        name: TEST_TOOL_READ.to_string(),
+                        arguments: "{}".to_string(),
+                    },
+                },
+            ],
+            ..Default::default()
+        }]);
+        let mut backend = TerminalTestBackend {
+            executed_tools: Vec::new(),
+        };
+        let mut session =
+            AgentSession::new(LlmApiConfig::default(), "test").expect("build session");
+        let err = session
+            .respond_with_provider(&mut backend, "Bad terminal ordering", &provider, None)
+            .expect_err("a terminal tool followed by another call must be rejected");
+
+        // 运行时拒绝整轮而不是"执行前半段"——半执行的轮次会让会话状态含糊。
+        assert!(
+            matches!(&err, RuntimeError::LlmResponseInvalid { message }
+                if message.contains("must be the last tool call")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    fn test_config() -> LlmApiConfig {
+        LlmApiConfig {
+            provider: "deepseek".to_string(),
+            base_url: "http://127.0.0.1:12345/v1".to_string(),
+            api_key: Some("test-key".to_string()),
+            model: "deepseek-reasoner".to_string(),
+            ..LlmApiConfig::default()
+        }
+    }
+
+    /// 造一段真实超过 [`COMPACT_AT_TOKENS`] 的历史：旧消息大、最近消息小。
+    ///
+    /// 80 条 x 20k 字（每条 10k token）= 80 万，再加 10 条 x 20k 字 = 10 万，
+    /// 总量 900k；最近 300k token 的保留线落在旧消息中间，所以压缩确实有
+    /// "最老的那部分"可摘要。
+    fn heavy_session() -> AgentSession {
+        let mut session = AgentSession::new(test_config(), "runtime_shell").unwrap();
+        for i in 0..80 {
+            session.history.push(json!({
+                "role": "user",
+                "content": format!("{}旧消息{i}", "甲".repeat(20_000)),
+            }));
+        }
+        for i in 0..10 {
+            session.history.push(json!({
+                "role": "assistant",
+                "content": format!("{}最近{i}", "乙".repeat(20_000)),
+            }));
+        }
+        session.recount_tokens();
+        session
+    }
+
+    /// 单一阈值 + 真摘要：超过 COMPACT_AT_TOKENS 时只调用一次 provider，把最老
+    /// 的部分换成一条 assistant 记忆，历史显著变短且**非空**。
+    #[test]
+    fn compact_over_threshold_summarizes_oldest_and_keeps_history_nonempty() {
+        let mut session = heavy_session();
+        let before = session.history_len();
+        assert!(
+            session.estimated_tokens > COMPACT_AT_TOKENS,
+            "sanity: {} > {}",
+            session.estimated_tokens,
+            COMPACT_AT_TOKENS
+        );
+        let provider = FakeLlmProvider::new(vec![assistant_reply(
+            "人物：甲。事实：乙。决定：丙。未解决：丁。当前任务：戊。",
+        )]);
+
+        let (old_len, new_len) = session.compact_history(Some(&provider));
+
+        assert_eq!(old_len, before);
+        assert!(new_len < old_len, "expected shrink: {new_len} < {old_len}");
+        assert!(new_len > 0, "history must never be cleared");
+        let head = session.history_value(0).expect("memory message");
+        assert_eq!(head["role"].as_str(), Some("assistant"));
+        let head_text = head["content"].as_str().expect("memory text");
+        assert!(head_text.starts_with(COMPACT_MEMORY_PREFIX), "{head_text}");
+        assert!(head_text.contains("当前任务：戊"), "{head_text}");
+        // 只调用一次 provider。
+        assert_eq!(provider.seen_bodies.lock().expect("seen").len(), 1);
+        // 计数按压缩后的 history 重算，并且回落到阈值以下。
+        let recounted: usize = session.history.iter().map(estimate_message_tokens).sum();
+        assert_eq!(session.estimated_tokens, recounted);
+        assert!(session.estimated_tokens < COMPACT_AT_TOKENS);
+        assert!(session.estimated_tokens > 0);
+        // 最近消息原样保留：最后一条仍是压缩前最后一条。
+        let tail = session
+            .history_value(session.history_len() - 1)
+            .expect("tail");
+        assert!(tail["content"]
+            .as_str()
+            .expect("tail text")
+            .contains("最近9"));
+        // 摘要请求 = system 指令 + 渲染后的旧对话（保留 role 与内容）。
+        let body = provider.seen_bodies.lock().expect("seen")[0].clone();
+        let system = body["messages"][0]["content"].as_str().expect("system");
+        assert!(system.contains("1500"), "{system}");
+        let transcript = body["messages"][1]["content"].as_str().expect("transcript");
+        assert!(transcript.contains("[user] 甲"), "roles preserved");
+        assert!(transcript.contains("旧消息0"), "oldest message summarised");
+        assert!(
+            !transcript.contains("最近0"),
+            "recent messages must stay raw: {transcript}"
+        );
+    }
+
+    /// 摘要调用失败（provider 报错 / 返回空）或根本没有 provider 时：保留最近
+    /// 部分、绝不清空、并打出 `agent_compact_failed reason=… kept=…`。
+    #[test]
+    fn compact_failure_keeps_recent_history_and_reports_diagnostic() {
+        let providers = [
+            ("provider_error", FakeLlmProvider::new(Vec::new())),
+            (
+                "empty_summary",
+                FakeLlmProvider::new(vec![assistant_reply("   ")]),
+            ),
+        ];
+        for (reason, provider) in providers {
+            let _ = take_compact_diagnostics();
+            let mut session = heavy_session();
+            let before = session.history_len();
+
+            let (old_len, new_len) = session.compact_history(Some(&provider));
+
+            assert_eq!(old_len, before);
+            assert!(new_len < old_len, "expected shrink: {new_len} < {old_len}");
+            assert!(new_len > 0, "history must never be cleared");
+            assert!(
+                new_len > COMPACT_FAILURE_KEEP_MESSAGES,
+                "must keep at least the failure floor: {new_len}"
+            );
+            let head = session.history_value(0).expect("memory message");
+            assert!(head["content"]
+                .as_str()
+                .expect("memory text")
+                .starts_with(COMPACT_MEMORY_PREFIX));
+            assert_eq!(
+                take_compact_diagnostics(),
+                vec![compact_failure_line(reason, new_len)],
+                "diagnostic must name the reason and the kept count"
+            );
+            // 最近的消息没被丢掉。
+            assert!(session.history_value(new_len - 1).expect("tail")["content"]
+                .as_str()
+                .expect("tail text")
+                .contains("最近9"));
+            // 兜底后同样重算计数（按 tool 消息在内的估算）。
+            assert_eq!(
+                session.estimated_tokens,
+                session
+                    .history
+                    .iter()
+                    .map(estimate_message_tokens)
+                    .sum::<usize>()
+            );
+        }
+
+        // 没有 provider：同样走兜底，绝不清空。
+        let _ = take_compact_diagnostics();
+        let mut session = heavy_session();
+        let (_, new_len) = session.compact_history(None);
+        assert!(new_len > 0);
+        assert_eq!(
+            take_compact_diagnostics(),
+            vec![compact_failure_line("no_provider", new_len)]
+        );
+
+        // 历史本身不到 20 条：保留下限覆盖全部消息，没有可替换的旧段，保持
+        // 原样（不是压成一条空记忆）。
+        let _ = take_compact_diagnostics();
+        let mut few = AgentSession::new(test_config(), "runtime_shell").unwrap();
+        for i in 0..15 {
+            few.history.push(json!({
+                "role": "user",
+                "content": format!("{}巨{i}", "大".repeat(120_000)),
+            }));
+        }
+        few.recount_tokens();
+        assert!(few.estimated_tokens > COMPACT_AT_TOKENS);
+        let provider = FakeLlmProvider::new(Vec::new());
+        let (old_len, new_len) = few.compact_history(Some(&provider));
+        assert_eq!((old_len, new_len), (15, 15));
+        assert_eq!(few.history_len(), 15, "nothing may be dropped");
+        assert_eq!(
+            take_compact_diagnostics(),
+            vec![compact_failure_line("provider_error", 15)]
+        );
+    }
+
+    /// 未超阈值时连 provider 都不能碰：断言调用次数为 0。
+    #[test]
+    fn compact_below_threshold_never_calls_the_provider() {
+        let mut session = AgentSession::new(test_config(), "runtime_shell").unwrap();
+        for i in 0..10 {
+            session.remember_exchange(&format!("u{i}"), &format!("a{i}"), None, &[]);
+        }
+        let provider = FakeLlmProvider::new(vec![assistant_reply("不应被调用")]);
+        let before = session.history_len();
+
+        let (old_len, new_len) = session.compact_history(Some(&provider));
+
+        assert_eq!((old_len, new_len), (before, before));
+        assert!(provider.seen_bodies.lock().expect("seen").is_empty());
+        assert!(session.estimated_tokens <= COMPACT_AT_TOKENS);
+    }
+
+    /// 幂等：压过一次之后仍在阈值以下，第二次调用不产生变化、不重复摘要。
+    #[test]
+    fn compact_is_idempotent_after_one_summary() {
+        let mut session = heavy_session();
+        let provider = FakeLlmProvider::new(vec![
+            assistant_reply("第一次摘要"),
+            assistant_reply("第二次不应发生"),
+        ]);
+
+        let (_, first) = session.compact_history(Some(&provider));
+        let after_first = serde_json::to_string(&session.history).expect("history json");
+
+        let (old_len, second) = session.compact_history(Some(&provider));
+
+        assert_eq!(old_len, first);
+        assert_eq!(second, first);
+        assert_eq!(provider.seen_bodies.lock().expect("seen").len(), 1);
+        assert_eq!(
+            serde_json::to_string(&session.history).expect("history json"),
+            after_first
+        );
+    }
+
+    /// 摘要正文超过 1500 字时硬截断，避免一次不听话的补全重新撑满窗口。
+    #[test]
+    fn compact_clips_overlong_summary_to_the_char_cap() {
+        let mut session = heavy_session();
+        let provider = FakeLlmProvider::new(vec![assistant_reply(&"密".repeat(2_000))]);
+
+        session.compact_history(Some(&provider));
+
+        let head = session.history_value(0).expect("memory message")["content"]
+            .as_str()
+            .expect("memory text")
+            .to_string();
+        assert!(head.ends_with('…'), "clipped summary gets an ellipsis");
+        assert_eq!(
+            head.chars().count(),
+            COMPACT_MEMORY_PREFIX.chars().count() + 1 + SUMMARY_MAX_CHARS + 1
+        );
+    }
+
+    /// 没有可压缩的旧原文时保持原样：单条消息就超预算、旧消息只剩上次的记忆、
+    /// 或旧消息全是没有正文的空消息。
+    #[test]
+    fn compact_is_a_noop_when_there_is_nothing_old_to_summarize() {
+        let huge = json!({ "role": "user", "content": "巨".repeat(2_000_000) });
+
+        let mut single = AgentSession::new(test_config(), "runtime_shell").unwrap();
+        single.history.push(huge.clone());
+        single.recount_tokens();
+        assert!(single.estimated_tokens > COMPACT_AT_TOKENS);
+        let provider = FakeLlmProvider::new(vec![assistant_reply("不应被调用")]);
+        let (old_len, new_len) = single.compact_history(Some(&provider));
+        assert_eq!(old_len, new_len);
+        assert_eq!(single.history_len(), 1);
+        assert!(provider.seen_bodies.lock().expect("seen").is_empty());
+
+        let mut memory = AgentSession::new(test_config(), "runtime_shell").unwrap();
+        memory.history.push(memory_message("上一轮的记忆"));
+        memory.history.push(huge.clone());
+        memory.recount_tokens();
+        assert!(memory.estimated_tokens > COMPACT_AT_TOKENS);
+        let provider = FakeLlmProvider::new(vec![assistant_reply("不应被调用")]);
+        let (old_len, new_len) = memory.compact_history(Some(&provider));
+        assert_eq!(old_len, new_len);
+        assert!(provider.seen_bodies.lock().expect("seen").is_empty());
+
+        let mut empty = AgentSession::new(test_config(), "runtime_shell").unwrap();
+        empty.history.push(json!({ "role": "user", "content": "" }));
+        empty.history.push(huge);
+        empty.recount_tokens();
+        let provider = FakeLlmProvider::new(vec![assistant_reply("不应被调用")]);
+        let (old_len, new_len) = empty.compact_history(Some(&provider));
+        assert_eq!(old_len, new_len);
+        assert!(provider.seen_bodies.lock().expect("seen").is_empty());
+    }
+
+    #[test]
+    fn estimate_tokens_scales_with_length() {
+        assert_eq!(estimate_tokens(""), 0);
+        let small = estimate_tokens("hello world");
+        let large = estimate_tokens(&"hello world ".repeat(100));
+        assert!(large > small * 50, "large={large} small={small}");
+    }
+
+    /// 摘要失败时的截断拼贴必须保留文本、历史里已有的占位符原文和图片标记，
+    /// 并跳过没有正文的空消息。
+    #[test]
+    fn compact_fallback_collage_keeps_text_placeholder_and_image_marker() {
+        let mut session = AgentSession::new(test_config(), "runtime_shell").unwrap();
+        // 空 content：必须被跳过，不产生空摘要行。
+        session
+            .history
+            .push(json!({ "role": "assistant", "content": "" }));
+        // 文本 + 已被字节预算替换的占位符 + 两张图。
+        session.history.push(json!({
+            "role": "user",
+            "content": [
+                { "type": "text", "text": "看看这两张图" },
+                { "type": "text", "text": "[image omitted to fit request byte budget; sha256:deadbeef]" },
+                { "type": "image_url", "image_url": { "url": "data:image/png;base64,Zm9v" } },
+                { "type": "image_url", "image_url": { "url": "data:image/png;base64,Zm8=" } },
+            ],
+        }));
+        // 纯图消息（text 为空、图非空）：不能因为「文本空」被当成空消息跳过。
+        session.history.push(json!({
+            "role": "user",
+            "content": [
+                { "type": "image_url", "image_url": { "url": "data:image/png;base64,Zm9v" } },
+            ],
+        }));
+        // 超长文本：验证 500 字截断仍然按 char 计，且 `…` 存在。
+        session
+            .history
+            .push(json!({ "role": "user", "content": "长".repeat(600) }));
+        // 让历史真的越过阈值：75 条 x 20k 字 = 75 万 token，再加最近 10 条
+        // x 20k 字 = 10 万，总量超过 COMPACT_AT_TOKENS，保留下限之外确实有
+        // 旧消息可拼贴。
+        for i in 0..75 {
+            session.history.push(json!({
+                "role": "user",
+                "content": format!("{}旧{i}", "甲".repeat(20_000)),
+            }));
+        }
+        for i in 0..10 {
+            session.history.push(json!({
+                "role": "assistant",
+                "content": format!("{}近{i}", "乙".repeat(20_000)),
+            }));
+        }
+        session.recount_tokens();
+
+        let before = session.history_len();
+        // 没有 provider：走截断拼贴兜底（不是真摘要）。
+        let (old_len, after) = session.compact_history(None);
+        assert_eq!(old_len, before);
+        assert!(after < before);
+
+        let summary = session.history_value(0).expect("memory message")["content"]
+            .as_str()
+            .expect("memory text")
+            .to_string();
+        assert!(summary.contains("看看这两张图"), "{summary}");
+        assert!(
+            summary.contains("[image omitted to fit request byte budget; sha256:deadbeef]"),
+            "placeholder text must survive verbatim: {summary}"
+        );
+        assert!(summary.contains("[图片 2 张]"), "{summary}");
+        assert!(
+            summary.contains("[图片 1 张]"),
+            "image-only message must not be skipped: {summary}"
+        );
+        assert!(
+            summary.contains('…'),
+            "long text must be truncated: {summary}"
+        );
+        assert!(!summary.contains("base64"), "{summary}");
+        assert!(
+            !summary.lines().any(|line| line == "[assistant]"),
+            "empty content must be skipped: {summary}"
+        );
+    }
+
+    /// `estimate_message_tokens` 的每条分支：字符串 / 数组 content、文本 /
+    /// 内联图 / 远程图 / 坏 part、`reasoning_content`、非消息值。
+    #[test]
+    fn estimate_message_tokens_counts_text_images_and_reasoning() {
+        assert_eq!(
+            estimate_message_tokens(&json!({ "role": "user", "content": "abcd" })),
+            2
+        );
+        let parts = json!([
+            { "type": "text", "text": "abcd" },
+            // 一张图按整图计价（IMAGE_TOKEN_ESTIMATE），与字节无关。
+            { "type": "image_url", "image_url": { "url": "data:image/png;base64,Zm9v" } },
+            // 远程图不占内联字节。
+            { "type": "image_url", "image_url": { "url": "https://example.com/a.png" } },
+            // 坏 url / 缺 url / 缺 text / 未知 part 都是 0。
+            { "type": "image_url", "image_url": { "url": 7 } },
+            { "type": "image_url" },
+            { "type": "text" },
+            { "type": "text", "text": 7 },
+            { "type": "audio" },
+        ]);
+        assert_eq!(
+            estimate_message_tokens(&json!({ "role": "user", "content": parts })),
+            2 + super::IMAGE_TOKEN_ESTIMATE
+        );
+        // 推理文本也是历史里的真实重量。
+        assert_eq!(
+            estimate_message_tokens(&json!({
+                "role": "assistant",
+                "content": "ab",
+                "reasoning_content": "cdef",
+            })),
+            3
+        );
+        assert_eq!(
+            estimate_message_tokens(&json!({ "role": "user", "content": 42 })),
+            0
+        );
+        assert_eq!(
+            estimate_message_tokens(&json!({ "role": "user", "content": Value::Null })),
+            0
+        );
+        assert_eq!(estimate_message_tokens(&json!({ "role": "user" })), 0);
+        assert_eq!(estimate_message_tokens(&json!("not a message")), 0);
+    }
+
+    /// 计数诚实：tool 消息的 content、原生 tool call 的参数、图片（1024/张）
+    /// 与 reasoning 都进 `estimated_tokens`，压缩后的重算也吃同一套规则。
+    #[test]
+    fn estimate_message_tokens_counts_tool_messages_images_and_tool_calls() {
+        // tool 消息的 content 与 user/assistant 一样计入。
+        assert_eq!(
+            estimate_message_tokens(&json!({
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "content": "abcd",
+            })),
+            2
+        );
+        // 原生 tool call：函数名 + 未解析的参数 JSON。
+        assert_eq!(
+            estimate_message_tokens(&json!({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": { "name": "read_file", "arguments": "{\"path\":\"a\"}" },
+                }],
+            })),
+            estimate_tokens("read_file") + estimate_tokens("{\"path\":\"a\"}")
+        );
+        // 只有名字 / 只有参数也各算一半；坏形状计 0。
+        assert_eq!(
+            estimate_message_tokens(&json!({ "tool_calls": [{ "function": { "name": "abcd" } }] })),
+            2
+        );
+        assert_eq!(
+            estimate_message_tokens(
+                &json!({ "tool_calls": [{ "function": { "arguments": "abcd" } }] })
+            ),
+            2
+        );
+        assert_eq!(
+            estimate_message_tokens(&json!({ "role": "assistant", "tool_calls": "nope" })),
+            0
+        );
+        assert_eq!(
+            estimate_message_tokens(&json!({ "role": "assistant", "tool_calls": [{}] })),
+            0
+        );
+        // 图片按张计价（1024/张），reasoning 也计入。
+        assert_eq!(
+            estimate_message_tokens(&json!({
+                "role": "assistant",
+                "content": [
+                    { "type": "image_url", "image_url": { "url": "data:image/png;base64,Zm9v" } },
+                ],
+                "reasoning_content": "cdef",
+            })),
+            IMAGE_TOKEN_ESTIMATE + 2
+        );
+        // 压缩后的重算把 tool 消息算进去。
+        let mut session = AgentSession::new(test_config(), "runtime_shell").unwrap();
+        session
+            .history
+            .push(json!({ "role": "tool", "content": "abcd" }));
+        session.recount_tokens();
+        assert_eq!(session.estimated_tokens, 2);
+    }
+
+    /// `truncate_chars`：不超限原样返回，超限按字符截断并补 `…`。
+    #[test]
+    fn truncate_chars_never_splits_a_character() {
+        assert_eq!(truncate_chars("abc", 5), "abc");
+        assert_eq!(truncate_chars("abcdef", 3), "abc…");
+        assert_eq!(truncate_chars("中文内容", 2), "中文…");
+    }
+
+    /// `keep_recent_start`：至少保留一条；单条就超预算时也留住它。
+    #[test]
+    fn keep_recent_start_always_keeps_at_least_one_message() {
+        assert_eq!(keep_recent_start(&[], 10), 0);
+        let two = vec![
+            json!({ "role": "user", "content": "abcd" }),
+            json!({ "role": "user", "content": "efgh" }),
+        ];
+        assert_eq!(keep_recent_start(&two, 100), 0);
+        assert_eq!(keep_recent_start(&two, 2), 1);
+        let one_huge = vec![
+            json!({ "role": "user", "content": "abcd" }),
+            json!({ "role": "user", "content": "x".repeat(4_000) }),
+        ];
+        assert_eq!(keep_recent_start(&one_huge, 0), 1);
+    }
+
+    /// `fallback_keep_start`：20 条与 8k token 取较大者。
+    #[test]
+    fn fallback_keep_start_keeps_twenty_messages_or_eight_thousand_tokens() {
+        // 100 条 x 100 token：条数下限 20 条先满足，token 下限继续往前扩到 80 条。
+        let uniform: Vec<Value> = (0..100)
+            .map(|_| json!({ "role": "user", "content": "x".repeat(200) }))
+            .collect();
+        assert_eq!(fallback_keep_start(&uniform), 20);
+        // 最后一条本身就超过 8k token：token 下限已满足，只保留 20 条。
+        let mut heavy = uniform;
+        heavy.push(json!({ "role": "user", "content": "y".repeat(20_000) }));
+        assert_eq!(
+            fallback_keep_start(&heavy),
+            heavy.len() - COMPACT_FAILURE_KEEP_MESSAGES
+        );
+        assert_eq!(fallback_keep_start(&[]), 0);
+    }
+
+    /// `render_for_summary`：保留 role 与正文，工具结果截到 2000 字，图片只留
+    /// 张数标记，空消息跳过，缺 role 记 unknown。
+    #[test]
+    fn render_for_summary_keeps_roles_and_clips_tool_results() {
+        let messages = vec![
+            json!({ "role": "user", "content": "你好" }),
+            json!({ "role": "tool", "content": "t".repeat(2_500) }),
+            json!({
+                "role": "assistant",
+                "content": [
+                    { "type": "image_url", "image_url": { "url": "data:image/png;base64,Zm9v" } },
+                ],
+            }),
+            json!({ "role": "user", "content": "" }),
+            json!({ "content": "没有 role" }),
+        ];
+        let rendered = render_for_summary(&messages);
+        let lines: Vec<&str> = rendered.lines().collect();
+        assert_eq!(lines.len(), 4, "{rendered}");
+        assert_eq!(lines[0], "[user] 你好");
+        assert!(lines[1].starts_with("[tool] tttt"));
+        assert_eq!(
+            lines[1].chars().count(),
+            "[tool] ".chars().count() + SUMMARY_TOOL_RESULT_CHARS + 1
+        );
+        assert_eq!(lines[2], "[assistant]  [图片 1 张]");
+        assert_eq!(lines[3], "[unknown] 没有 role");
+    }
+
+    /// `collage_summary`：每条消息截到 500 字，图片只留标记，空消息跳过。
+    #[test]
+    fn collage_summary_truncates_each_message_and_marks_images() {
+        let messages = vec![
+            json!({ "role": "user", "content": "长".repeat(600) }),
+            json!({
+                "role": "assistant",
+                "content": [
+                    { "type": "image_url", "image_url": { "url": "data:image/png;base64,Zm9v" } },
+                ],
+            }),
+            json!({ "role": "user", "content": "" }),
+        ];
+        let collage = collage_summary(&messages);
+        let lines: Vec<&str> = collage.lines().collect();
+        assert_eq!(lines.len(), 2, "{collage}");
+        assert_eq!(
+            lines[0].chars().count(),
+            "[user] ".chars().count() + SUMMARY_COLLAGE_MESSAGE_CHARS + 1
+        );
+        assert_eq!(lines[1], "[assistant]  [图片 1 张]");
+        assert!(!collage.contains("base64"));
+    }
+
+    /// 记忆消息与诊断行的形状固定，便于日志 grep 与测试断言。
+    #[test]
+    fn compaction_memory_and_diagnostic_shapes_are_stable() {
+        let memory = memory_message("旧对话");
+        assert_eq!(memory["role"].as_str(), Some("assistant"));
+        assert_eq!(memory["content"].as_str(), Some("[早前对话摘要] 旧对话"));
+        assert!(is_compact_memory(&memory));
+        assert!(!is_compact_memory(
+            &json!({ "role": "user", "content": "hi" })
+        ));
+        assert!(!is_compact_memory(
+            &json!({ "role": "user", "content": 42 })
+        ));
+        assert_eq!(
+            compact_failure_line("provider_error", 7),
+            "agent_compact_failed reason=provider_error kept=7"
+        );
+    }
+
+    /// `summarize_message_content` 的逐分支单测：字符串、数组里 text /
+    /// image_url / 其它 part、空数组、非 content 值。
+    #[test]
+    fn summary_of_content_handles_strings_arrays_and_unknown_parts() {
+        assert_eq!(
+            summarize_message_content(&Value::String("纯文本".to_string())),
+            ("纯文本".to_string(), 0)
+        );
+        let content = json!([
+            { "type": "text", "text": "看图：" },
+            { "type": "text", "text": "[image omitted to fit request byte budget; sha256:deadbeef]" },
+            { "type": "image_url", "image_url": { "url": "data:image/png;base64,Zm9v" } },
+            { "type": "image_url", "image_url": { "url": "https://x/y.png" } },
+            { "type": "text" },
+            { "type": "audio" },
+        ]);
+        assert_eq!(
+            summarize_message_content(&content),
+            (
+                "看图：[image omitted to fit request byte budget; sha256:deadbeef]".to_string(),
+                2
+            )
+        );
+        assert_eq!(summarize_message_content(&json!([])), (String::new(), 0));
+        assert_eq!(summarize_message_content(&json!(42)), (String::new(), 0));
+    }
+
+    /// A turn consisting solely of a kernel introspection call and its
+    /// result must leave no trace in persisted history.
+    #[test]
+    fn filter_drops_pure_introspection_turn() {
+        let turn = vec![
+            json!({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": { "name": AGENT_TOOL_GET_RUNTIME_STATUS, "arguments": "{}" }
+                    }
+                ]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "content": "{\"plugin_count\":3}"
+            }),
+        ];
+        let filtered = filter_kernel_introspection_messages(&turn);
+        assert!(
+            filtered.is_empty(),
+            "pure introspection turn should be fully dropped, got {filtered:?}"
+        );
+    }
+
+    /// A turn mixing an introspection call with a conversational tool call
+    /// must drop only the introspection call/result: the assistant message
+    /// survives with its tool_calls array shrunk to the conversational call,
+    /// and the conversational tool result is preserved.
+    #[test]
+    fn filter_shrinks_mixed_turn() {
+        let turn = vec![
+            json!({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_kernel",
+                        "type": "function",
+                        "function": { "name": AGENT_TOOL_LIST_PLUGINS, "arguments": "{}" }
+                    },
+                    {
+                        "id": "call_read",
+                        "type": "function",
+                        "function": { "name": AGENT_TOOL_READ_FILE, "arguments": "{\"path\":\"a\"}" }
+                    }
+                ]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_kernel",
+                "content": "{\"plugins\":[]}"
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_read",
+                "content": "file body"
+            }),
+        ];
+        let filtered = filter_kernel_introspection_messages(&turn);
+        assert_eq!(
+            filtered.len(),
+            2,
+            "expected assistant + read result: {filtered:?}"
+        );
+        let tool_calls = filtered[0]
+            .get("tool_calls")
+            .and_then(|v| v.as_array())
+            .expect("assistant message retains tool_calls");
+        assert_eq!(tool_calls.len(), 1, "tool_calls array should shrink to 1");
+        assert_eq!(
+            tool_calls[0]
+                .get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(|n| n.as_str()),
+            Some(AGENT_TOOL_READ_FILE),
+        );
+        assert_eq!(
+            filtered[1].get("tool_call_id").and_then(|v| v.as_str()),
+            Some("call_read"),
+            "conversational tool result must be preserved"
+        );
+    }
+
+    /// A turn with no kernel introspection tools must pass through the filter
+    /// byte-for-byte unchanged.
+    #[test]
+    fn filter_preserves_ordinary_turn() {
+        let turn = vec![
+            json!({
+                "role": "assistant",
+                "content": "reading now",
+                "tool_calls": [
+                    {
+                        "id": "call_read",
+                        "type": "function",
+                        "function": { "name": AGENT_TOOL_READ_FILE, "arguments": "{\"path\":\"a\"}" }
+                    }
+                ]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_read",
+                "content": "file body"
+            }),
+            json!({ "role": "user", "content": "follow-up" }),
+        ];
+        let filtered = filter_kernel_introspection_messages(&turn);
+        assert_eq!(filtered, turn, "ordinary turn must be unchanged");
+    }
+
+    // -----------------------------------------------------------------
+    // view_image：把被预算剥掉的图片取回下一次请求
+    // -----------------------------------------------------------------
+
+    fn tool_call_message(
+        id: &str,
+        name: &str,
+        arguments: Value,
+    ) -> cordis_plugin_sdk::llm::LlmMessage {
+        cordis_plugin_sdk::llm::LlmMessage {
+            tool_calls: vec![cordis_plugin_sdk::llm::LlmToolCall {
+                id: id.to_string(),
+                call_type: "function".to_string(),
+                function: cordis_plugin_sdk::llm::LlmToolFunction {
+                    name: name.to_string(),
+                    arguments: arguments.to_string(),
+                },
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// 一张 `len` 字节的 PNG content part（只要求魔数与长度）。
+    fn png_part(len: usize) -> Value {
+        let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+        bytes.resize(len.max(8), 0);
+        json!({
+            "type": "image_url",
+            "image_url": {
+                "url": format!(
+                    "data:image/png;base64,{}",
+                    cordis_runtime::image_input::base64_encode(&bytes)
+                ),
+            },
+        })
+    }
+
+    /// 本轮的附件队列只存在于 `Turn` 上：测试直接构造一个带队列的回合。
+    fn turn_with_attachments(parts: Vec<Value>) -> Turn {
+        Turn {
+            attached: parts,
+            ..Turn::default()
+        }
+    }
+
+    #[test]
+    fn view_image_tool_is_advertised_with_both_selectors() {
+        let tools = shell_agent_tools();
+        let spec = tools
+            .iter()
+            .find(|tool| tool.name == AGENT_TOOL_VIEW_IMAGE)
+            .expect("view_image must be advertised");
+        assert_eq!(spec.parameters["additionalProperties"], json!(false));
+        let properties = spec.parameters["properties"].to_string();
+        assert!(properties.contains("path"), "{properties}");
+        assert!(properties.contains("sha256"), "{properties}");
+    }
+
+    /// A room-facing session keeps its voice. Channel send nodes are plugin
+    /// nodes (`qq_send`, `feishu_send`, …), reached through the `invoke_plugin`
+    /// gateway — the kernel catalogue deliberately stays free of
+    /// plugin-discovered names. Guard that gateway: removing it would silence
+    /// every room, which is exactly the regression an over-eager "drop the
+    /// channel tools" filter could cause.
+    #[test]
+    fn a_room_session_keeps_its_channel_gateway() {
+        let tools = shell_agent_tools();
+        assert!(
+            tools
+                .iter()
+                .any(|tool| tool.name == AGENT_TOOL_INVOKE_PLUGIN),
+            "a room session must keep invoke_plugin"
+        );
+        assert!(
+            tools
+                .iter()
+                .any(|tool| tool.name == cordis_runtime::agent_tools::AGENT_TOOL_SEND_TO_SESSION),
+            "a room session must keep send_to_session"
+        );
+        // The node it speaks through is still classified as a channel voice;
+        // only plugin-iteration sessions are refused it by the runtime.
+        assert!(cordis_runtime::agent_tools::is_channel_speak_tool(
+            "qq_send", "qq"
+        ));
+        assert!(cordis_runtime::agent_tools::is_channel_speak_tool(
+            "feishu_send",
+            "feishu"
+        ));
+    }
+
+    /// 端到端：第一轮模型调 `view_image`，**下一次请求**里就带上了原图。
+    #[test]
+    fn view_image_returns_the_cached_picture_on_the_next_request() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let media = dir.path().join("media");
+        std::fs::create_dir_all(&media).expect("media dir");
+        let png: &[u8] = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR";
+        let digest = cordis_runtime::image_cache::digest_hex(png);
+        std::fs::write(media.join(&digest), png).expect("cache the image");
+        let host = FakeHost {
+            media_dir: media,
+            ..FakeHost::default()
+        };
+
+        let placeholder_path = format!("data/media/{digest}");
+        let provider = FakeLlmProvider::new(vec![
+            tool_call_message(
+                "call_view",
+                AGENT_TOOL_VIEW_IMAGE,
+                json!({ "path": placeholder_path }),
+            ),
+            assistant_reply("我看过了，是一只猫。"),
+        ]);
+        let mut session = ShellAgentSession::new(LlmApiConfig::default()).expect("session");
+        let reply = session
+            .respond_via(&host, "view-image", "刚才那张图里是什么？", &provider)
+            .expect("agent reply");
+
+        assert_eq!(reply.content, "我看过了，是一只猫。");
+        assert_eq!(reply.tool_events.len(), 1);
+        assert_eq!(reply.tool_events[0].name, AGENT_TOOL_VIEW_IMAGE);
+        let output = reply.tool_events[0].output.clone().expect("tool output");
+        assert_eq!(output["ok"], json!(true));
+        assert_eq!(output["attached"], json!(placeholder_path));
+
+        // 第二次请求：占位符之外，原图作为 image part 又回到了请求里。
+        let bodies = provider.seen_bodies.lock().expect("bodies");
+        assert_eq!(bodies.len(), 2);
+        let second = bodies[1].to_string();
+        assert!(second.contains("data:image/png;base64,"), "{second}");
+        assert!(
+            second.contains("[view_image] 1 recovered image(s) attached below."),
+            "{second}"
+        );
+        // 第三轮不存在：图片只在取回后的那一次请求里出现。
+        drop(bodies);
+        assert_eq!(
+            session.inner.history_len(),
+            2,
+            "the recovered picture stays out of history"
+        );
+    }
+
+    /// `sha256` 前缀也能取回（占位符里只印了前 8 位）。
+    #[test]
+    fn view_image_tool_accepts_a_digest_prefix() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let media = dir.path().join("media");
+        std::fs::create_dir_all(&media).expect("media dir");
+        let png: &[u8] = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR";
+        let digest = cordis_runtime::image_cache::digest_hex(png);
+        std::fs::write(media.join(&digest), png).expect("cache the image");
+        let host = FakeHost {
+            media_dir: media,
+            ..FakeHost::default()
+        };
+        // 同一张图换个前缀取两次：第二次仍然命中（缓存不消费）。
+        let provider = FakeLlmProvider::new(vec![
+            tool_call_message(
+                "call_prefix",
+                AGENT_TOOL_VIEW_IMAGE,
+                json!({ "sha256": &digest[..8] }),
+            ),
+            assistant_reply("取回来了。"),
+        ]);
+        let mut session = ShellAgentSession::new(LlmApiConfig::default()).expect("session");
+        let reply = session
+            .respond_via(&host, "view-image-prefix", "再看一眼", &provider)
+            .expect("agent reply");
+        assert_eq!(
+            reply.tool_events[0].output.as_ref().expect("output")["attached"],
+            json!(format!("data/media/{digest}"))
+        );
+    }
+
+    /// 生图插件把字节写成 `data/media/<sha256>.png` 并在结果里回传完整摘要；
+    /// 模型用 `sha256:<digest>` 就能把刚画的那张图挂回下一次请求。
+    #[test]
+    fn view_image_tool_accepts_the_prefixed_full_sha256_from_image_gen() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let media = dir.path().join("media");
+        std::fs::create_dir_all(&media).expect("media dir");
+        let png: &[u8] = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR";
+        let digest = cordis_runtime::image_cache::digest_hex(png);
+        std::fs::write(media.join(format!("{digest}.png")), png).expect("cache the image");
+        let host = FakeHost {
+            media_dir: media,
+            ..FakeHost::default()
+        };
+        let provider = FakeLlmProvider::new(vec![
+            tool_call_message(
+                "call_full_hash",
+                AGENT_TOOL_VIEW_IMAGE,
+                json!({ "sha256": format!("sha256:{digest}") }),
+            ),
+            assistant_reply("我看到自己刚画的那张图了。"),
+        ]);
+        let mut session = ShellAgentSession::new(LlmApiConfig::default()).expect("session");
+        let reply = session
+            .respond_via(&host, "view-image-full-hash", "看看你刚画的图", &provider)
+            .expect("agent reply");
+        assert_eq!(
+            reply.tool_events[0].output.as_ref().expect("output")["attached"],
+            json!(format!("data/media/{digest}.png"))
+        );
+    }
+
+    /// 非法路径（`..` 逃逸）在工具层就被拒，不会进本轮的附件队列。
+    #[test]
+    fn view_image_tool_rejects_an_escape_attempt() {
+        let host = FakeHost::default();
+        let mut backend = RuntimeShellAgentBackend {
+            host: &host,
+            session_id: "escape",
+            soul_key: String::new(),
+        };
+        let mut attachments: Vec<Value> = Vec::new();
+        let err = backend
+            .execute_tool(
+                AGENT_TOOL_VIEW_IMAGE,
+                json!({ "path": "data/media/../secret.png" }),
+                &mut attachments,
+            )
+            .expect_err("must reject the escape");
+        assert!(
+            err.to_string().contains("path must be data/media/<sha256>"),
+            "err={err}"
+        );
+        assert!(attachments.is_empty(), "nothing may be queued");
+    }
+
+    /// 空队列：不改动消息，也不写附言。
+    #[test]
+    fn attach_recovered_images_does_nothing_without_a_queue() {
+        let mut turn = turn_with_attachments(Vec::new());
+        let mut messages = vec![json!({ "role": "user", "content": "hi" })];
+        assert_eq!(
+            attach_recovered_images(&mut turn, &mut messages, &[], 1 << 20),
+            0
+        );
+        assert_eq!(messages.len(), 1);
+    }
+
+    /// 没有队列的回合同样安全：不产出附言，也不动消息。
+    #[test]
+    fn a_turn_without_a_queue_attaches_nothing() {
+        let mut turn = Turn::default();
+        let mut messages: Vec<Value> = Vec::new();
+        assert_eq!(
+            attach_recovered_images(&mut turn, &mut messages, &[], 1 << 20),
+            0
+        );
+        assert!(messages.is_empty());
+    }
+
+    /// 队列内容同样受预算约束：装不下的丢掉，并在附言里说清楚。
+    #[test]
+    fn attach_recovered_images_drops_what_does_not_fit() {
+        // 1024 字节 → 内联后 1368 字节。
+        let mut turn = turn_with_attachments(vec![png_part(1024), png_part(1024)]);
+        let mut messages: Vec<Value> = Vec::new();
+        assert_eq!(
+            attach_recovered_images(&mut turn, &mut messages, &[], 1400),
+            1
+        );
+        let content = messages[0]["content"].as_array().expect("text + image");
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[1]["type"], "image_url");
+        assert!(
+            messages[0]["content"].to_string().contains(
+                "1 recovered image(s) attached below; 1 skipped over the inline image byte budget."
+            ),
+            "{messages:?}"
+        );
+        // 队列已清空：同一回合再取一次什么也没有。
+        assert_eq!(
+            attach_recovered_images(&mut turn, &mut messages, &[], 1 << 20),
+            0
+        );
+        assert_eq!(messages.len(), 1);
+    }
+
+    /// 一张都装不下时也要给出明确附言，否则模型会以为图已经看过了。
+    #[test]
+    fn attach_recovered_images_reports_a_fully_dropped_queue() {
+        let mut turn = turn_with_attachments(vec![png_part(1024)]);
+        let mut messages: Vec<Value> = Vec::new();
+        assert_eq!(
+            attach_recovered_images(&mut turn, &mut messages, &[], 10),
+            0
+        );
+        let text = messages[0]["content"].as_str().expect("plain text");
+        assert!(text.contains("could not be attached"), "{text}");
+    }
+
+    /// 先扣本轮新图、再扣队列：新图占掉额度后队列里的图就进不来了。
+    #[test]
+    fn attach_recovered_images_pays_for_the_new_batch_first() {
+        let new_image = png_part(1024);
+        let mut turn = turn_with_attachments(vec![png_part(1024)]);
+        let mut messages: Vec<Value> = Vec::new();
+        assert_eq!(
+            attach_recovered_images(
+                &mut turn,
+                &mut messages,
+                std::slice::from_ref(&new_image),
+                2200
+            ),
+            0
+        );
+        let text = messages[0]["content"].as_str().expect("plain text");
+        assert!(text.contains("could not be attached"), "{text}");
+    }
+
+    /// 取回的图片把请求顶出预算时，从最老的历史图片开始剥（附图自身留下）。
+    #[test]
+    fn attach_recovered_images_strips_history_instead_of_the_recovered_picture() {
+        let mut turn = turn_with_attachments(vec![png_part(1024)]);
+        let mut messages = vec![json!({
+            "role": "user",
+            "content": [
+                { "type": "text", "text": "很久以前的一张图" },
+                png_part(1024),
+            ],
+        })];
+        assert_eq!(
+            attach_recovered_images(&mut turn, &mut messages, &[], 2000),
+            1
+        );
+        assert!(
+            messages[0]["content"]
+                .to_string()
+                .contains("image omitted to fit request byte budget"),
+            "the oldest history picture must make room: {messages:?}"
+        );
+        assert_eq!(
+            messages.last().expect("appended")["content"]
+                .as_array()
+                .expect("array")[1]["type"],
+            "image_url"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // 每轮状态（`Turn`）：跨轮不泄漏
+    // -----------------------------------------------------------------
+
+    fn reasoning_reply(content: &str, reasoning: &str) -> cordis_plugin_sdk::llm::LlmMessage {
+        cordis_plugin_sdk::llm::LlmMessage {
+            content: Some(content.to_string()),
+            reasoning_content: Some(reasoning.to_string()),
+            ..Default::default()
+        }
+    }
+
+    /// 审计确认的泄漏：四个 strike 计数以前挂在 `AgentSession` 上，回合起点
+    /// 不归零。一次瞬态空回复会让下一条用户消息直接 `2 > 1` 失败。
+    ///
+    /// 这里逐轮跑真实的 `respond_inner`：回合一确实留下一次计数，而回合二
+    /// 的四个计数从 0 开始；回合三再遇到一次空回复仍然只是"重试一次"。
+    /// History must say what the turn did, not only what it said: without it a
+    /// later turn cannot tell whether it searched before claiming to have.
+    #[test]
+    fn history_records_the_tools_a_turn_ran() {
+        let provider = FakeLlmProvider::new(vec![
+            assistant_reply(
+                "<|DSML|calls>\n\
+                 <|DSML|invoke name=\"web_search\">\n\
+                 <|DSML|parameter name=\"query\" string=\"true\">worlds 2026</|DSML|parameter>\n\
+                 </|DSML|invoke>\n</|DSML|calls>",
+            ),
+            assistant_reply(
+                "<|DSML|calls>\n<|DSML|invoke name=\"suspend\"></|DSML|invoke>\n</|DSML|calls>",
+            ),
+        ]);
+        let mut session = ShellAgentSession::new(LlmApiConfig::default()).expect("build session");
+        session.set_require_end_tool(true);
+        session
+            .respond_via(&EMPTY_FAKE_HOST, "records-tools", "查一下", &provider)
+            .expect("turn");
+        let recorded: String = session
+            .inner
+            .history
+            .iter()
+            .map(|message| message["content"].as_str().unwrap_or_default().to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        // The call, its arguments and its result all survive.
+        assert!(recorded.contains("[tool] web_search"), "{recorded}");
+        assert!(recorded.contains("\"query\":\"worlds 2026\""), "{recorded}");
+        assert!(recorded.contains("→"), "{recorded}");
+    }
+
+    /// The transcript is the room's record, so it must hold what the room saw,
+    /// not the `suspend` marker the model wrote to end the turn.
+    #[test]
+    fn the_transcript_records_what_was_delivered() {
+        let provider = FakeLlmProvider::new(vec![
+            assistant_reply(
+                "<|DSML|calls>\n\
+                 <|DSML|invoke name=\"qq_send\">\n\
+                 <|DSML|parameter name=\"target\" string=\"true\">group:1</|DSML|parameter>\n\
+                 <|DSML|parameter name=\"message\" string=\"true\">在的</|DSML|parameter>\n\
+                 </|DSML|invoke>\n</|DSML|calls>",
+            ),
+            assistant_reply(
+                "<|DSML|calls>\n<|DSML|invoke name=\"suspend\"></|DSML|invoke>\n</|DSML|calls>",
+            ),
+        ]);
+        let mut session = ShellAgentSession::new(LlmApiConfig::default()).expect("build session");
+        session.set_require_end_tool(true);
+        session
+            .respond_via(&EMPTY_FAKE_HOST, "transcript-delivered", "hi", &provider)
+            .expect("turn");
+        let assistant: Vec<&str> = session
+            .inner
+            .transcript
+            .iter()
+            .filter_map(|entry| match entry {
+                AgentTranscriptEntry::Assistant { content, .. } => Some(content.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            assistant.iter().any(|content| content.contains("在的")),
+            "{assistant:?}"
+        );
+        assert!(
+            !assistant.iter().any(|content| content.contains("suspend")),
+            "{assistant:?}"
+        );
+    }
+
+    /// Silence has to leave its reason behind: asked later why it did not
+    /// answer, the bot invented one when the reasoning was nowhere it could read.
+    #[test]
+    fn a_silent_turn_records_the_reasoning_behind_it() {
+        let reasoning = "这个问题没有事实答案，但也不该沉默";
+        let provider = FakeLlmProvider::new(vec![cordis_plugin_sdk::llm::LlmMessage {
+            content: Some(
+                "<|DSML|calls>\n<|DSML|invoke name=\"suspend\"></|DSML|invoke>\n</|DSML|calls>"
+                    .to_string(),
+            ),
+            reasoning_content: Some(reasoning.to_string()),
+            ..Default::default()
+        }]);
+        let mut session = ShellAgentSession::new(LlmApiConfig::default()).expect("build session");
+        session.set_require_end_tool(true);
+        session
+            .respond_via(
+                &EMPTY_FAKE_HOST,
+                "silent-reasoning",
+                "他们问你个问题",
+                &provider,
+            )
+            .expect("turn");
+        let recorded = session.inner.history.iter().any(|message| {
+            message.get("reasoning_content").and_then(Value::as_str) == Some(reasoning)
+        });
+        assert!(recorded, "{:?}", session.inner.history);
+    }
+
+    #[test]
+    fn a_second_turn_starts_with_zero_strike_counters() {
+        let mut session = ShellAgentSession::new(LlmApiConfig::default()).expect("build session");
+
+        // 回合一：先空补全（重试一次），再正常答复。回合结束时
+        // `empty_response_strikes` 是 1——旧实现把它留在了会话上。
+        let first_provider = FakeLlmProvider::new(vec![
+            cordis_plugin_sdk::llm::LlmMessage::default(),
+            assistant_reply("第一轮答复"),
+        ]);
+        let (first, turn1) = session.inner.respond_capturing_turn(
+            &EMPTY_FAKE_HOST,
+            "leak-1",
+            "第一轮",
+            &first_provider,
+            None,
+        );
+        assert!(first.is_ok());
+        assert_eq!(
+            turn1.empty_response_strikes, EMPTY_RESPONSE_RETRIES,
+            "回合一确实留下了一次计数"
+        );
+
+        // 回合二：一次正常答复不产生任何计数。四个计数（连同从上一轮继承
+        // 的可能性）都必须停在 0——`Turn::default()` 保证的就是这件事。
+        let second_provider = FakeLlmProvider::new(vec![assistant_reply("第二轮答复")]);
+        let (second, turn2) = session.inner.respond_capturing_turn(
+            &EMPTY_FAKE_HOST,
+            "leak-2",
+            "第二轮",
+            &second_provider,
+            None,
+        );
+        assert!(second.is_ok());
+        assert_eq!(
+            (
+                turn2.no_end_strikes,
+                turn2.unknown_tool_strikes,
+                turn2.empty_response_strikes,
+                turn2.reasoning_only_strikes,
+            ),
+            (0, 0, 0, 0),
+            "第二轮开始时 Turn 的四个计数都是 0"
+        );
+
+        // 回合三：同样的"空一次再答复"脚本。旧实现带着前两轮的 1，第二次
+        // 空补全就是 2 > 1，直接失败；新实现从 0 开始，重试一次后成功。
+        let third_provider = FakeLlmProvider::new(vec![
+            cordis_plugin_sdk::llm::LlmMessage::default(),
+            assistant_reply("第三轮答复"),
+        ]);
+        let (third, turn3) = session.inner.respond_capturing_turn(
+            &EMPTY_FAKE_HOST,
+            "leak-3",
+            "第三轮",
+            &third_provider,
+            None,
+        );
+        assert!(
+            third.is_ok(),
+            "第三轮不得继承前两轮的 empty_response 计数: {third:?}"
+        );
+        assert_eq!(
+            turn3.empty_response_strikes, EMPTY_RESPONSE_RETRIES,
+            "第三轮只看到自己那一次空回复"
+        );
+    }
+
+    /// `turn_reasoning` 以前只在回合开头 clear；现在它随 `Turn` 一起重建，
+    /// 第二轮的推理不可能包含第一轮的内容。转录仍保留两轮——那是跨轮历史。
+    #[test]
+    fn reasoning_is_not_carried_into_the_next_turn() {
+        let mut session = ShellAgentSession::new(LlmApiConfig::default()).expect("build session");
+
+        let first_provider = FakeLlmProvider::new(vec![reasoning_reply("答复一", "第一轮推理")]);
+        let (first, turn1) = session.inner.respond_capturing_turn(
+            &EMPTY_FAKE_HOST,
+            "reason-1",
+            "第一轮",
+            &first_provider,
+            None,
+        );
+        assert!(first.is_ok());
+        assert!(
+            turn1.reasoning.iter().any(|r| r.contains("第一轮推理")),
+            "第一轮的 Turn 应当收到自己的推理: {:?}",
+            turn1.reasoning
+        );
+
+        let second_provider = FakeLlmProvider::new(vec![reasoning_reply("答复二", "第二轮推理")]);
+        let (second, turn2) = session.inner.respond_capturing_turn(
+            &EMPTY_FAKE_HOST,
+            "reason-2",
+            "第二轮",
+            &second_provider,
+            None,
+        );
+        assert!(second.is_ok());
+        assert!(
+            turn2.reasoning.iter().all(|r| !r.contains("第一轮推理")),
+            "第二轮不得带上第一轮的推理: {:?}",
+            turn2.reasoning
+        );
+        assert!(
+            turn2.reasoning.iter().any(|r| r.contains("第二轮推理")),
+            "第二轮的 Turn 应当收到自己的推理: {:?}",
+            turn2.reasoning
+        );
+
+        // 转录是跨轮状态：两轮的推理都在，`Turn` 只是不再负责保存它们。
+        let transcripts: Vec<String> = session
+            .inner
+            .transcript()
+            .iter()
+            .filter_map(|entry| match entry {
+                AgentTranscriptEntry::Assistant { reasoning, .. } => reasoning.clone(),
+                _ => None,
+            })
+            .collect();
+        assert!(transcripts.iter().any(|r| r.contains("第一轮推理")));
+        assert!(transcripts.iter().any(|r| r.contains("第二轮推理")));
+    }
+
+    /// `view_image` 的队列以前挂在 backend 上；现在它是 `Turn` 的字段：
+    /// 工具只往调用方的队列里 push，第二轮拿到的是一个空队列。
+    #[test]
+    fn a_second_turn_starts_with_an_empty_attachment_queue() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let media = dir.path().join("media");
+        std::fs::create_dir_all(&media).expect("media dir");
+        let png: &[u8] = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR";
+        let digest = cordis_runtime::image_cache::digest_hex(png);
+        std::fs::write(media.join(&digest), png).expect("cache the image");
+        let host = FakeHost {
+            media_dir: media,
+            ..FakeHost::default()
+        };
+
+        // 队列属于调用方：`view_image` 把图片交给传进去的那个 `Vec`。
+        let mut queue: Vec<Value> = Vec::new();
+        let mut tool_backend = RuntimeShellAgentBackend {
+            host: &host,
+            session_id: "attach-direct",
+            soul_key: String::new(),
+        };
+        let output = tool_backend
+            .execute_tool(
+                AGENT_TOOL_VIEW_IMAGE,
+                json!({ "sha256": &digest[..8] }),
+                &mut queue,
+            )
+            .expect("view_image must find the cached picture");
+        assert_eq!(output["attached"], json!(format!("data/media/{digest}")));
+        assert_eq!(queue.len(), 1, "工具把图片放进调用方的队列");
+
+        // 回合一：`view_image` 之后正常答复——图片被挂到下一次请求上。
+        let first_provider = FakeLlmProvider::new(vec![
+            tool_call_message(
+                "call_view",
+                AGENT_TOOL_VIEW_IMAGE,
+                json!({ "path": format!("data/media/{digest}") }),
+            ),
+            assistant_reply("我看过了。"),
+        ]);
+        let mut session = ShellAgentSession::new(LlmApiConfig::default()).expect("build session");
+        let (first, turn1) = session.inner.respond_capturing_turn(
+            &host,
+            "attach-1",
+            "看看这张图",
+            &first_provider,
+            None,
+        );
+        assert!(first.is_ok());
+        let bodies = first_provider.seen_bodies.lock().expect("bodies");
+        assert_eq!(bodies.len(), 2);
+        assert!(
+            bodies[1].to_string().contains("data:image/png;base64,"),
+            "第一轮取回的图片必须挂到下一次请求上"
+        );
+        drop(bodies);
+        assert!(turn1.attached.is_empty(), "队列在第一轮内已被取走");
+
+        // 回合二：全新 `Turn`，队列为空，上一轮的图片也不会跟着请求走。
+        let second_provider = FakeLlmProvider::new(vec![assistant_reply("第二轮答复")]);
+        let (second, turn2) =
+            session
+                .inner
+                .respond_capturing_turn(&host, "attach-2", "继续", &second_provider, None);
+        assert!(second.is_ok());
+        assert!(turn2.attached.is_empty(), "第二轮开始时队列为空");
+        let bodies = second_provider.seen_bodies.lock().expect("bodies");
+        assert!(
+            !bodies[0].to_string().contains("data:image/png;base64,"),
+            "上一轮的图片不得跟着下一轮的请求"
+        );
+    }
+
+    /// 旧快照兼容：字段被移走后，带同名字段的 JSON 仍必须解析成功，只是那些
+    /// 计数被忽略；新快照也不再写它们。
+    #[test]
+    fn old_snapshots_with_turn_fields_still_restore() {
+        let legacy = json!({
+            "kind": "runtime_shell",
+            "config": serde_json::to_value(LlmApiConfig::default()).expect("config json"),
+            "history": [],
+            "transcript": [],
+            "completed_turns": 3,
+            "estimated_tokens": 0,
+            "reasoning_only_strikes": 2,
+            "empty_response_strikes": 1,
+            "require_end_tool": true,
+            "no_end_strikes": 4,
+            "unknown_tool_strikes": 5,
+            "soul_key": "u#private",
+        });
+        let snapshot: AgentSessionSnapshot =
+            serde_json::from_value(legacy).expect("旧快照必须仍然解析成功");
+        let session = AgentSession::from_snapshot(snapshot).expect("restore the session");
+        assert_eq!(session.status().completed_turns, 3);
+        assert_eq!(session.soul_key(), "u#private");
+        assert!(session.require_end_tool);
+
+        // 新快照不再携带每轮计数：它们是 `Turn` 的字段，不跨轮。
+        let fresh = serde_json::to_value(session.to_snapshot()).expect("fresh snapshot");
+        for field in [
+            "no_end_strikes",
+            "unknown_tool_strikes",
+            "empty_response_strikes",
+            "reasoning_only_strikes",
+        ] {
+            assert!(
+                fresh.get(field).is_none(),
+                "{field} 不属于快照，不得被写出: {fresh}"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // 行覆盖补齐：会话表面（访问器、委派、诊断、注入队列）
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn session_accessors_report_what_was_set() {
+        let mut session =
+            AgentSession::new(LlmApiConfig::default(), "accessor-test").expect("build session");
+        assert_eq!(session.caller_policy(), (false, false));
+        session.set_caller_policy(true, true);
+        assert_eq!(session.caller_policy(), (true, true));
+        assert!(!session.can_approve_iteration());
+        session.set_approval_capability(true);
+        assert!(session.can_approve_iteration());
+        session.set_soul_key("qq:group:1");
+        assert_eq!(session.soul_key(), "qq:group:1");
+
+        // 换配置（profile fallback）不动历史：对话必须无缝接上。
+        session.inject_exchange("问题", "答复");
+        let swapped = LlmApiConfig {
+            model: "另一个模型".to_string(),
+            ..LlmApiConfig::default()
+        };
+        session.swap_config(swapped).expect("swap config");
+        assert_eq!(session.status().model, "另一个模型");
+        assert_eq!(session.status().stored_messages, 2, "换配置不清历史");
+    }
+
+    #[test]
+    fn tool_execution_summary_counts_success_and_failure() {
+        let mut session =
+            AgentSession::new(LlmApiConfig::default(), "summary-test").expect("build session");
+        session.transcript.push(AgentTranscriptEntry::User {
+            content: "hi".to_string(),
+        });
+        session.transcript.push(AgentTranscriptEntry::Tool {
+            name: "read_file".to_string(),
+            arguments: json!({"path": "a"}),
+            ok: true,
+            output: Some(json!({"ok": true})),
+            error: None,
+        });
+        session.transcript.push(AgentTranscriptEntry::Tool {
+            name: "write_file".to_string(),
+            arguments: json!({"path": "b"}),
+            ok: false,
+            output: None,
+            error: Some("denied".to_string()),
+        });
+        let summary = session.tool_execution_summary();
+        assert_eq!(summary.total_calls, 2);
+        assert_eq!(summary.successful_calls, 1);
+        assert_eq!(summary.failed_calls, 1);
+        assert_eq!(
+            summary.tool_names,
+            vec!["read_file".to_string(), "write_file".to_string()],
+            "工具名去重后按字典序"
+        );
+
+        // ShellAgentSession 的委派读的是同一个转录：只有 history 变了。
+        let mut shell = ShellAgentSession::new(LlmApiConfig::default()).expect("build shell");
+        shell.remember_exchange("u", "a");
+        assert_eq!(shell.status().stored_messages, 2);
+        assert_eq!(shell.tool_execution_summary().total_calls, 0);
+        assert!(shell.transcript().is_empty());
+    }
+
+    #[test]
+    fn a_shell_session_without_a_provider_reports_no_llm() {
+        let mut session = ShellAgentSession::new(LlmApiConfig::default()).expect("build session");
+        let err = session
+            .respond(&EMPTY_FAKE_HOST, "no-provider", "hi")
+            .expect_err("kernel has no built-in transport");
+        assert!(matches!(err, RuntimeError::NoLlmProvider), "{err:?}");
+        assert!(session.transcript().is_empty());
+        assert_eq!(session.status().completed_turns, 0);
+    }
+
+    #[test]
+    fn the_process_wide_inject_queue_is_installed() {
+        set_agent_inject_queue(Arc::new(Mutex::new(VecDeque::new())));
+        assert!(drain_inject_queue().is_empty(), "空队列排空后什么都没有");
+    }
+
+    #[test]
+    fn a_queued_injection_is_drained_once() {
+        // 进程级队列由整个测试进程共享，跑一轮真实的插话无法与其它用例的
+        // drain 互斥；这里直接测排空函数本身。
+        let queue = Arc::new(Mutex::new(VecDeque::new()));
+        assert!(drain_queue(None).is_empty(), "没安装队列时为空");
+        queue
+            .lock()
+            .expect("queue")
+            .push_back("晚到的消息".to_string());
+        assert_eq!(drain_queue(Some(&queue)), vec!["晚到的消息".to_string()]);
+        assert!(drain_queue(Some(&queue)).is_empty(), "只取一次");
+    }
+
+    #[test]
+    fn a_message_that_arrives_mid_turn_joins_the_live_request() {
+        let mut session =
+            AgentSession::new(LlmApiConfig::default(), "inject-test").expect("build session");
+        let mut messages = vec![json!({"role": "system", "content": "协议"})];
+
+        assert!(
+            !session.push_injected(&mut messages, Vec::new(), 0),
+            "空队列不重入循环"
+        );
+        assert_eq!(messages.len(), 1);
+
+        // 整批都是空白：丢弃它们，但仍然算"有插话"——调用方据此重入循环。
+        assert!(session.push_injected(&mut messages, vec!["   ".to_string()], 0));
+        assert_eq!(messages.len(), 1, "空白插话不进请求");
+        assert!(session.transcript().is_empty());
+
+        assert!(session.push_injected(&mut messages, vec!["插话".to_string()], 2));
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1], json!({"role": "user", "content": "插话"}));
+        assert_eq!(
+            session.transcript(),
+            [AgentTranscriptEntry::User {
+                content: "插话".to_string()
+            }]
+        );
+    }
+
+    #[test]
+    fn a_request_dump_is_written_only_when_asked() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let body = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]});
+
+        // 没开启时一个文件都不写。
+        dump_request(None, dir.path(), &body);
+        dump_request(Some("0"), dir.path(), &body);
+        assert_eq!(
+            std::fs::read_dir(dir.path()).expect("read dir").count(),
+            0,
+            "未开启时不得落盘"
+        );
+
+        // 开启时写一份完整请求体。
+        dump_request(Some("1"), dir.path(), &body);
+        let dumps: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("read dir")
+            .filter_map(|entry| entry.ok())
+            .collect();
+        assert_eq!(dumps.len(), 1);
+        let text = std::fs::read_to_string(dumps[0].path()).expect("read dump");
+        assert_eq!(serde_json::from_str::<Value>(&text).expect("json"), body);
+
+        // 目录被同名文件占住时静默跳过，绝不 panic。
+        let blocked = dir.path().join("occupied");
+        std::fs::write(&blocked, "x").expect("block the path");
+        dump_request(Some("1"), &blocked, &body);
+    }
+
+    #[test]
+    fn a_diagnostic_line_is_written_only_when_enabled() {
+        write_diagnostic(false, "关掉时不该出现");
+        write_diagnostic(true, "agent_debug_probe");
+    }
+
+    #[test]
+    fn a_recorded_exchange_needs_the_last_entry_to_be_an_action_placeholder() {
+        // 最后一条不是 assistant：不动。
+        let mut session = session_for_reply_tests();
+        session
+            .history
+            .push(json!({"role": "user", "content": "{\"action\":\"x\"}"}));
+        assert!(!session.replace_last_action_with_reply("新回复"));
+
+        // assistant 但正文不是字符串：没有占位符可换。
+        let mut session = session_for_reply_tests();
+        session.history.push(json!({
+            "role": "assistant",
+            "content": [{"type": "text", "text": "数组正文"}],
+        }));
+        assert!(!session.replace_last_action_with_reply("新回复"));
+        assert_eq!(
+            session.history.last().expect("last")["content"][0]["text"],
+            json!("数组正文")
+        );
+    }
+
+    #[test]
+    fn a_message_with_nothing_at_all_serialises_null_content() {
+        let message = cordis_plugin_sdk::llm::LlmMessage::default();
+        let request = llm_message_to_request(&message);
+        assert_eq!(request["role"], json!("assistant"));
+        assert!(request["content"].is_null(), "没有正文就是 null");
+        assert!(request.get("reasoning_content").is_none());
+        assert!(request.get("tool_calls").is_none());
+    }
+
+    #[test]
+    fn the_system_prompt_carries_the_failure_record_once() {
+        let host = FakeHost {
+            digest: Some("--- Your own failure record ---\n\n重复了 3 次空搜索。".to_string()),
+            ..FakeHost::default()
+        };
+        let backend = RuntimeShellAgentBackend {
+            host: &host,
+            session_id: "digest",
+            soul_key: String::new(),
+        };
+        let prompt = backend.system_prompt();
+        assert!(
+            prompt.contains("--- Your own failure record ---\n\n重复了 3 次空搜索。"),
+            "{prompt}"
+        );
+        assert_eq!(
+            prompt.matches("--- Your own failure record ---").count(),
+            1,
+            "标记只出现一次: {prompt}"
+        );
+
+        let bare = RuntimeShellAgentBackend {
+            host: &EMPTY_FAKE_HOST,
+            session_id: "digest",
+            soul_key: String::new(),
+        };
+        assert!(!bare.system_prompt().contains("Your own failure record"));
+    }
+
+    #[test]
+    fn the_runtime_shell_backend_dispatches_every_kernel_tool() {
+        let host = FakeHost::default();
+        let mut backend = RuntimeShellAgentBackend {
+            host: &host,
+            session_id: "dispatch-all",
+            soul_key: String::new(),
+        };
+        let mut attachments = Vec::new();
+        let cases: Vec<(&str, Value)> = vec![
+            (AGENT_TOOL_LIST_PLUGINS, json!({})),
+            (AGENT_TOOL_LIST_NODES, json!({})),
+            (AGENT_TOOL_GET_KERNEL_STATUS, json!({})),
+            (AGENT_TOOL_GET_KERNEL_ISSUES, json!({})),
+            (AGENT_TOOL_RELOAD_RUNTIME, json!({"plugin_path": "/"})),
+            (AGENT_TOOL_BUILD_PLUGINS, json!({"plugin_name": "all"})),
+            (
+                AGENT_TOOL_EXECUTE_TARGET,
+                json!({"node_fqn": "expr::expr_entry", "payload_json": {"x": 1}}),
+            ),
+            (
+                AGENT_TOOL_READ_FILE,
+                json!({"path": "src/lib.rs", "offset": 0, "limit": 2}),
+            ),
+            (AGENT_TOOL_LIST_DIRECTORY, json!({})),
+            (AGENT_TOOL_LIST_DIRECTORY, json!({"path": "src"})),
+            (
+                AGENT_TOOL_SEARCH_CODE,
+                json!({"pattern": "fn", "path": "src"}),
+            ),
+            (
+                AGENT_TOOL_WRITE_FILE,
+                json!({"path": "a.rs", "content": "x"}),
+            ),
+            (
+                AGENT_TOOL_REPLACE_IN_FILE,
+                json!({"path": "a.rs", "find": "x", "replace": "y"}),
+            ),
+            (AGENT_TOOL_REVERT_CHANGES, json!({})),
+            (AGENT_TOOL_DELETE_FILE, json!({"path": "a.rs"})),
+            (
+                AGENT_TOOL_RENAME_FILE,
+                json!({"path": "a.rs", "new_path": "b.rs"}),
+            ),
+            (
+                AGENT_TOOL_MOVE_FILE,
+                json!({"path": "a.rs", "new_path": "b.rs"}),
+            ),
+            (
+                AGENT_TOOL_COPY_FILE,
+                json!({"path": "a.rs", "new_path": "b.rs"}),
+            ),
+            (AGENT_TOOL_COMPACT_CONTEXT, json!({})),
+            (AGENT_TOOL_RUN_PLUGIN_TEST, json!({})),
+            (
+                AGENT_TOOL_RUN_PLUGIN_TEST,
+                json!({"command": "cargo test -p gacha"}),
+            ),
+            (
+                AGENT_TOOL_REQUEST_ITERATION,
+                json!({"plugin_path": "/web", "instruction": "加一个节点"}),
+            ),
+            (
+                AGENT_TOOL_CREATE_PLUGIN,
+                json!({"name": "fresh", "description": "新插件"}),
+            ),
+            (AGENT_TOOL_CREATE_PLUGIN, json!({"name": "bare"})),
+        ];
+        for (name, arguments) in cases {
+            let output = backend
+                .execute_tool(name, arguments, &mut attachments)
+                .unwrap_or_else(|err| panic!("{name} must dispatch: {err}"));
+            assert!(!output.is_null(), "{name} returned null");
+        }
+        assert!(attachments.is_empty(), "这些工具都不挂图片");
+
+        // `get_self_check` 由宿主默认实现报"做不到"：分派本身仍然走通。
+        let err = backend
+            .execute_tool(AGENT_TOOL_GET_SELF_CHECK, json!({}), &mut attachments)
+            .expect_err("the fake host cannot inspect transcripts");
+        assert!(
+            err.to_string().contains("cannot inspect agent transcripts"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn the_runtime_shell_backend_refuses_a_tool_it_does_not_have() {
+        let host = FakeHost::default();
+        let mut backend = RuntimeShellAgentBackend {
+            host: &host,
+            session_id: "unknown-tool",
+            soul_key: String::new(),
+        };
+        let err = backend
+            .execute_tool("qq_send", json!({}), &mut Vec::new())
+            .expect_err("qq_send is a plugin node, not a kernel tool");
+        assert!(
+            err.to_string()
+                .contains("runtime shell agent does not support tool qq_send"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn run_command_and_append_file_reach_the_host() {
+        let host = FakeHost::default();
+        let ran = host.agent_run_command("echo hi").expect("run command");
+        assert_eq!(ran["exit_code"], json!(0));
+        let appended = host.agent_append_file("a.rs", "追加").expect("append file");
+        assert_eq!(appended["appended_bytes"], json!("追加".len()));
+    }
+
+    // -----------------------------------------------------------------
+    // 行覆盖补齐：回合循环的各个出口
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn empty_input_and_an_unknown_provider_are_refused_before_the_provider_runs() {
+        let provider = FakeLlmProvider::new(vec![assistant_reply("never")]);
+        let mut session = ShellAgentSession::new(LlmApiConfig::default()).expect("build session");
+        let err = session
+            .respond_via(&EMPTY_FAKE_HOST, "empty-input", "   ", &provider)
+            .expect_err("empty input must be refused");
+        assert!(err.to_string().contains("must not be empty"), "{err}");
+
+        let mut unsupported = ShellAgentSession::new(LlmApiConfig {
+            provider: "anthropic".to_string(),
+            ..LlmApiConfig::default()
+        })
+        .expect("build session");
+        let err = unsupported
+            .respond_via(&EMPTY_FAKE_HOST, "bad-provider", "hi", &provider)
+            .expect_err("unknown provider must be refused");
+        assert!(
+            matches!(err, RuntimeError::UnsupportedLlmProvider { .. }),
+            "{err:?}"
+        );
+        assert!(
+            provider.seen_bodies.lock().expect("bodies").is_empty(),
+            "两种拒绝都不得碰 provider"
+        );
+    }
+
+    #[test]
+    fn one_shot_notes_ride_along_with_the_request_but_never_enter_history() {
+        let provider = FakeLlmProvider::new(vec![assistant_reply("收到")]);
+        let mut session = ShellAgentSession::new(LlmApiConfig::default()).expect("build session");
+        let reply = session
+            .inner
+            .respond_with_runtime_host_via_images(
+                &EMPTY_FAKE_HOST,
+                "notes",
+                "用户的问题",
+                &[],
+                "策略：只回答一句话",
+                &provider,
+                None,
+            )
+            .expect("agent reply");
+        assert_eq!(reply.content, "收到");
+
+        let bodies = provider.seen_bodies.lock().expect("bodies");
+        let messages = bodies[0]["messages"].as_array().expect("messages");
+        let last = messages.last().expect("the user message");
+        assert_eq!(
+            last["content"],
+            json!("策略：只回答一句话\n用户的问题"),
+            "一次性上下文只随这一条消息进请求"
+        );
+        drop(bodies);
+        assert_eq!(session.inner.history_len(), 2);
+        assert_eq!(
+            session.inner.history_value(0).expect("user")["content"],
+            json!("用户的问题"),
+            "history 不存策略行"
+        );
+    }
+
+    #[test]
+    fn an_exhausted_response_budget_fails_the_turn_before_the_request() {
+        let config = LlmApiConfig {
+            timeout_ms: 0,
+            stream_timeout_secs: 0,
+            ..LlmApiConfig::default()
+        };
+        let mut session = ShellAgentSession::new(config).expect("build session");
+        let provider = FakeLlmProvider::new(vec![assistant_reply("never")]);
+        let err = session
+            .respond_via(&EMPTY_FAKE_HOST, "budget", "hi", &provider)
+            .expect_err("a zero budget is already exhausted");
+        let text = err.to_string();
+        assert!(text.contains("exceeded total response budget"), "{text}");
+        assert!(text.contains("effective_budget_ms=0"), "{text}");
+        assert!(
+            provider.seen_bodies.lock().expect("bodies").is_empty(),
+            "预算用尽时不得发请求"
+        );
+    }
+
+    #[test]
+    fn a_broken_tool_chain_is_repaired_before_the_request() {
+        let provider = FakeLlmProvider::new(vec![assistant_reply("修好了")]);
+        let mut session = ShellAgentSession::new(LlmApiConfig::default()).expect("build session");
+        // 历史里留着一条没有对应 tool 结果的 assistant tool_call：整轮会 400。
+        session.inner.history.push(json!({
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "id": "orphan-call",
+                "type": "function",
+                "function": {"name": "read_file", "arguments": "{\"path\":\"a\"}"}
+            }],
+        }));
+        session
+            .inner
+            .history
+            .push(json!({"role": "user", "content": "继续"}));
+
+        let reply = session
+            .respond_via(&EMPTY_FAKE_HOST, "repair", "在吗", &provider)
+            .expect("reply");
+        assert_eq!(reply.content, "修好了");
+        let bodies = provider.seen_bodies.lock().expect("bodies");
+        let sent = bodies[0]["messages"].to_string();
+        assert!(
+            !sent.contains("orphan-call"),
+            "孤立的 tool_call 必须被丢掉: {sent}"
+        );
+    }
+
+    #[test]
+    fn a_provider_failure_before_any_delivery_fails_the_turn() {
+        let provider = FakeLlmProvider::new(Vec::new());
+        let mut session = ShellAgentSession::new(LlmApiConfig::default()).expect("build session");
+        let err = session
+            .respond_via(&EMPTY_FAKE_HOST, "provider-down", "hi", &provider)
+            .expect_err("the script is exhausted");
+        assert!(
+            matches!(err, RuntimeError::LlmRequestFailed { .. }),
+            "{err:?}"
+        );
+        // 转录补一条描述错误的 Assistant 占位，下一轮不会看到孤立的 User。
+        let transcript = session.transcript();
+        assert_eq!(transcript.len(), 2);
+        assert!(matches!(transcript[0], AgentTranscriptEntry::User { .. }));
+        assert!(matches!(
+            &transcript[1],
+            AgentTranscriptEntry::Assistant { content, .. } if content.starts_with("[error] ")
+        ));
+    }
+
+    #[test]
+    fn an_unknown_tool_is_reported_and_the_turn_goes_on() {
+        let provider = FakeLlmProvider::new(vec![
+            tool_call_message("call_bogus", "no_such_tool", json!({})),
+            assistant_reply("我改用 read_file。"),
+        ]);
+        let mut session = ShellAgentSession::new(LlmApiConfig::default()).expect("build session");
+        let reply = session
+            .respond_via(&EMPTY_FAKE_HOST, "bogus-tool", "hi", &provider)
+            .expect("the turn continues after a bogus tool name");
+        assert_eq!(reply.content, "我改用 read_file。");
+        assert!(reply.tool_events.is_empty(), "不存在的工具不进 tool_events");
+
+        let bodies = provider.seen_bodies.lock().expect("bodies");
+        let second = bodies[1].to_string();
+        assert!(
+            second.contains("STOP — tool 'no_such_tool' does not exist"),
+            "{second}"
+        );
+        assert!(second.contains("Your ONLY tools:"), "{second}");
+    }
+
+    #[test]
+    fn a_failing_tool_is_reported_and_the_turn_continues() {
+        let provider = FakeLlmProvider::new(vec![
+            tool_call_message(
+                "call_approve",
+                AGENT_TOOL_APPROVE_ITERATION,
+                json!({"iteration_id": "it-1"}),
+            ),
+            assistant_reply("工具失败了。"),
+        ]);
+        let mut session = ShellAgentSession::new(LlmApiConfig::default()).expect("build session");
+        let reply = session
+            .respond_via(&EMPTY_FAKE_HOST, "tool-fail", "hi", &provider)
+            .expect("the turn continues after a failed tool");
+        assert_eq!(reply.content, "工具失败了。");
+        assert_eq!(reply.tool_events.len(), 1);
+        assert!(!reply.tool_events[0].ok);
+
+        let bodies = provider.seen_bodies.lock().expect("bodies");
+        let second = bodies[1].to_string();
+        assert!(second.contains("FAILED: "), "{second}");
+        assert!(second.contains("cannot approve it-1"), "{second}");
+        assert!(
+            second.contains("Do NOT proceed as if it succeeded"),
+            "失败必须被显式告知: {second}"
+        );
+        // 失败的调用记进转录，后续复盘能看到。
+        assert!(session
+            .transcript()
+            .iter()
+            .any(|entry| matches!(entry, AgentTranscriptEntry::Tool { ok: false, .. })));
+    }
+
+    #[test]
+    fn three_reasoning_only_replies_trigger_a_stuck_warning() {
+        let provider = FakeLlmProvider::new(vec![
+            reasoning_reply("", "推理一"),
+            reasoning_reply("", "推理二"),
+            reasoning_reply("", "推理三"),
+            assistant_reply("终于有正文了"),
+        ]);
+        let mut session = ShellAgentSession::new(LlmApiConfig::default()).expect("build session");
+        let (result, turn) = session.inner.respond_capturing_turn(
+            &EMPTY_FAKE_HOST,
+            "reasoning-only",
+            "hi",
+            &provider,
+            None,
+        );
+        let reply = result.expect("the fourth round answers");
+        assert_eq!(reply.content, "终于有正文了");
+        assert_eq!(turn.reasoning_only_strikes, 0, "警告之后计数归零");
+        assert!(
+            turn.reasoning
+                .iter()
+                .any(|reason| reason.contains("推理三")),
+            "三条推理都留在回合记录里: {:?}",
+            turn.reasoning
+        );
+
+        let bodies = provider.seen_bodies.lock().expect("bodies");
+        assert_eq!(bodies.len(), 4);
+        assert!(
+            bodies[2].to_string().contains("reasoning but no response"),
+            "每一条只有推理的回复都要被追问"
+        );
+    }
+
+    #[test]
+    fn a_delivered_turn_survives_persistent_empty_replies() {
+        let provider = FakeLlmProvider::new(vec![
+            tool_call_message(
+                "call_send",
+                AGENT_TOOL_SEND_TO_SESSION,
+                json!({"target": "s2", "message": "在的"}),
+            ),
+            cordis_plugin_sdk::llm::LlmMessage::default(),
+            cordis_plugin_sdk::llm::LlmMessage::default(),
+        ]);
+        let mut session = ShellAgentSession::new(LlmApiConfig::default()).expect("build session");
+        let reply = session
+            .respond_via(&EMPTY_FAKE_HOST, "empty-after-send", "hi", &provider)
+            .expect("a delivered turn is not a failure");
+        assert_eq!(reply.content, "");
+        assert_eq!(reply.tool_events.len(), 1);
+        assert_eq!(session.status().completed_turns, 1);
+    }
+
+    #[test]
+    fn the_safety_turn_limit_preserves_what_the_turn_collected() {
+        let replies: Vec<_> = (0..AGENT_MAX_TOOL_TURNS)
+            .map(|index| {
+                tool_call_message(
+                    &format!("call_{index}"),
+                    AGENT_TOOL_GET_RUNTIME_STATUS,
+                    json!({}),
+                )
+            })
+            .collect();
+        let provider = FakeLlmProvider::new(replies);
+        let mut session = ShellAgentSession::new(LlmApiConfig::default()).expect("build session");
+        let err = session
+            .respond_via(&EMPTY_FAKE_HOST, "turn-limit", "hi", &provider)
+            .expect_err("no final answer ever came");
+        assert!(
+            err.to_string().contains("exceeded safety turn limit"),
+            "{err}"
+        );
+        // 溢出时把这一轮攒下的消息并入 history，重试才有上下文。
+        let kept = session.inner.history_len();
+        assert!(
+            kept >= 2,
+            "history must keep what the turn collected, got {kept}"
+        );
+        assert!(session.inner.history_value(0).is_some());
+    }
+
+    #[test]
+    fn a_turn_that_was_not_recorded_keeps_the_batch_body_and_the_image_note() {
+        let mut session =
+            AgentSession::new(LlmApiConfig::default(), "remember-test").expect("build session");
+        let event = AgentToolEvent {
+            name: AGENT_TOOL_SEND_TO_SESSION.to_string(),
+            arguments: json!({"target": "s2", "message": "在的"}),
+            ok: true,
+            output: Some(json!({"ok": true})),
+            error: None,
+        };
+        let result = Ok(AgentReply {
+            response_id: None,
+            content: String::new(),
+            tool_events: vec![event],
+        });
+        let input = "策略：只回一句\nCURRENT_INCOMING_BATCH_START\n真正的问题\nCURRENT_INCOMING_BATCH_END\n尾巴";
+        let images = vec![png_part(64)];
+
+        session.remember_if_unrecorded(
+            &result,
+            input,
+            &images,
+            0,
+            &Turn::default(),
+            &EMPTY_FAKE_HOST,
+        );
+
+        assert_eq!(session.history_len(), 2);
+        let user = session.history_value(0).expect("user").to_string();
+        assert!(user.contains("真正的问题"), "{user}");
+        assert!(
+            !user.contains("策略：只回一句"),
+            "策略行不进 history: {user}"
+        );
+        assert!(!user.contains("尾巴"), "批次外的内容不进 history: {user}");
+        assert!(user.contains("[附图 1 张"), "图片张数要留住: {user}");
+        let assistant = session.history_value(1).expect("assistant").to_string();
+        assert!(assistant.contains("在的"), "{assistant}");
+        assert!(assistant.contains("[tool] send_to_session"), "{assistant}");
+    }
+
+    /// 按脚本回放补全，并在第一次补全**之后**往当前线程的注入队列塞一条消息。
+    ///
+    /// 这正是"模型还在想，inbox 又推来一句"的时序：消息必须在下一轮进请求，
+    /// 而不是被旧答复盖过去。
+    struct LateInjectingProvider {
+        inner: FakeLlmProvider,
+        injected: std::sync::Mutex<bool>,
+    }
+
+    impl LateInjectingProvider {
+        fn new(replies: Vec<cordis_plugin_sdk::llm::LlmMessage>) -> Self {
+            Self {
+                inner: FakeLlmProvider::new(replies),
+                injected: std::sync::Mutex::new(false),
+            }
+        }
+    }
+
+    impl LlmProvider for LateInjectingProvider {
+        fn complete(
+            &self,
+            body: Value,
+            sink: Option<std::sync::Arc<dyn cordis_runtime::llm_sink::TokenSink>>,
+            transport: cordis_plugin_sdk::llm::LlmTransportConfig,
+        ) -> Result<LlmCompletionParts, RuntimeError> {
+            let parts = self.inner.complete(body, sink, transport)?;
+            let mut injected = self.injected.lock().expect("injected");
+            if !*injected {
+                *injected = true;
+                queue_test_injection(vec!["晚到的插话".to_string()]);
+            }
+            Ok(parts)
+        }
+    }
+
+    #[test]
+    fn a_late_message_reenters_the_round_instead_of_being_answered_over() {
+        let provider = LateInjectingProvider::new(vec![
+            assistant_reply("第一版答复"),
+            assistant_reply("带上插话的答复"),
+        ]);
+        let mut session = ShellAgentSession::new(LlmApiConfig::default()).expect("build session");
+        let reply = session
+            .respond_via(&EMPTY_FAKE_HOST, "late-inject", "hi", &provider)
+            .expect("the second round answers");
+        assert_eq!(
+            reply.content, "带上插话的答复",
+            "插话优先：旧答复不得直接收尾"
+        );
+
+        let bodies = provider.inner.seen_bodies.lock().expect("bodies");
+        assert_eq!(bodies.len(), 2, "循环必须因为插话重入一次");
+        let second_request = bodies[1].to_string();
+        drop(bodies);
+        assert!(
+            second_request.contains("晚到的插话"),
+            "插话要进第二轮请求: {second_request}"
+        );
+
+        let in_transcript = session
+            .transcript()
+            .iter()
+            .any(|entry| matches!(entry, AgentTranscriptEntry::User { content } if content == "晚到的插话"));
+        assert!(in_transcript, "插话也要进转录: {:?}", session.transcript());
+    }
+
+    #[test]
+    fn a_late_message_wins_over_a_terminal_tool_reply() {
+        // 终止工具已经产出了收尾答复，插话仍然优先：这一轮重入，答复留给下一轮。
+        let provider = LateInjectingProvider::new(vec![
+            tool_call_message("call_summary", TEST_TOOL_RECORD, json!({})),
+            assistant_reply("第二轮答复"),
+        ]);
+        let mut backend = TerminalTestBackend {
+            executed_tools: Vec::new(),
+        };
+        let mut session =
+            AgentSession::new(LlmApiConfig::default(), "terminal-inject").expect("build session");
+        let (result, turn) = session.respond_inner(&mut backend, "hi", &[], "", &provider, None);
+        let reply = result.expect("the second round answers");
+        assert_eq!(reply.content, "第二轮答复");
+        assert_eq!(backend.executed_tools, vec![TEST_TOOL_RECORD.to_string()]);
+        assert!(turn.attached.is_empty());
+    }
+
+    // -----------------------------------------------------------------
+    // 行覆盖补齐：纯函数
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn both_unknown_tool_messages_are_stable() {
+        assert_eq!(
+            unknown_tool_message("no_such_tool", 1, 1, "runtime_shell", "read_file, suspend"),
+            "STOP — tool 'no_such_tool' does not exist. Strike 1/1. You are in a runtime_shell session. Your ONLY tools: read_file, suspend"
+        );
+        // 未到上限时的措辞（`UNKNOWN_TOOL_STRIKE_LIMIT` 现在是 1，因此这条
+        // 分支只有直接调函数才走得到，但它是给上限调大后准备的）。
+        assert_eq!(
+            unknown_tool_message("no_such_tool", 1, 3, "runtime_shell", "read_file"),
+            "Tool 'no_such_tool' does not exist (strike 1/3). Available tools: read_file"
+        );
+    }
+
+    #[test]
+    fn a_recorded_tool_call_marks_failures_and_spills_big_results() {
+        let host = FakeHost::default();
+        let failed = AgentToolEvent {
+            name: "read_file".to_string(),
+            arguments: json!({"path": "a"}),
+            ok: false,
+            output: None,
+            error: None,
+        };
+        let rendered = render_recorded_call(&failed, &host);
+        assert!(rendered.ends_with("→ 失败: unknown error"), "{rendered}");
+
+        let failed_with_output = AgentToolEvent {
+            ok: false,
+            output: Some(json!({"error": "boom"})),
+            error: Some("ignored when output exists".to_string()),
+            ..failed.clone()
+        };
+        let rendered = render_recorded_call(&failed_with_output, &host);
+        assert!(
+            rendered.ends_with(r#"→ 失败: {"error":"boom"}"#),
+            "{rendered}"
+        );
+
+        // 成功但没有结果体：只留调用本身，不写箭头。
+        let ok_without_output = AgentToolEvent {
+            name: "approve_iteration".to_string(),
+            arguments: json!({"iteration_id": "it-1"}),
+            ok: true,
+            output: None,
+            error: None,
+        };
+        let rendered = render_recorded_call(&ok_without_output, &host);
+        assert!(
+            rendered.starts_with("[tool] approve_iteration "),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains('→'),
+            "没有结果时只留调用本身: {rendered}"
+        );
+
+        let big = "结果行\n".repeat(20_000);
+        let big_event = AgentToolEvent {
+            name: "read_file".to_string(),
+            arguments: json!({"path": "big"}),
+            ok: true,
+            output: Some(Value::String(big.clone())),
+            error: None,
+        };
+        // 宿主没有地方落盘：绝不能被"溢出"吞掉，退回内联截断。
+        let rendered = render_recorded_call(&big_event, &host);
+        assert!(
+            !rendered.contains("完整结果"),
+            "宿主无处落盘时退回内联: {rendered}"
+        );
+        assert!(rendered.chars().count() < 5_000);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let spilling = FakeHost {
+            spill_path: Some(dir.path().join("spill.txt").display().to_string()),
+            ..FakeHost::default()
+        };
+        let rendered = render_recorded_call(&big_event, &spilling);
+        assert!(
+            rendered.contains("完整结果"),
+            "溢出的结果必须指向落盘文件: {rendered}"
+        );
+        assert!(
+            rendered.chars().count() < big.chars().count(),
+            "落盘后上下文里只留头尾"
+        );
+
+        // 路径长到连预览都装不下：`bound` 返回 None，退回内联截断。
+        let tiny_preview = FakeHost {
+            spill_path: Some("x".repeat(30_000)),
+            ..FakeHost::default()
+        };
+        let rendered = render_recorded_call(&big_event, &tiny_preview);
+        assert!(!rendered.contains("完整结果"), "{rendered}");
+        assert!(rendered.chars().count() < 5_000, "退回内联截断");
+    }
+
+    #[test]
+    fn the_extractor_understands_escaped_characters_inside_strings() {
+        let text = r#"前缀 {"path":"C:\\tmp\\x","q":"a\"b"} 后缀"#;
+        let values = extract_json_objects(text);
+        assert_eq!(values.len(), 1, "{values:?}");
+        assert_eq!(values[0]["path"], json!(r"C:\tmp\x"));
+        assert_eq!(values[0]["q"], json!("a\"b"));
+    }
+
+    #[test]
+    fn closing_reasoning_is_capped_so_a_runaway_model_cannot_balloon_a_snapshot() {
+        let long = "推".repeat(9_000);
+        let clipped = closing_reasoning(std::slice::from_ref(&long)).expect("some reasoning");
+        assert_eq!(clipped.chars().count(), 8_000);
+        assert!(closing_reasoning(&[]).is_none());
+    }
+
+    #[test]
+    fn peeling_an_envelope_stops_at_a_non_object() {
+        let scalar = json!("不是对象");
+        assert_eq!(peel_envelope(&scalar), scalar);
+
+        // 两层裸信封都剥掉，直到剩下节点真正的参数。
+        let nested = json!({
+            "node_id": "qq_send",
+            "payload_json": {"node_id": "qq_send", "payload_json": {"target": "u1"}},
+        });
+        assert_eq!(
+            peel_envelope(&nested),
+            json!({"target": "u1"}),
+            "剥到不再是裸信封为止"
+        );
+        // 参数里带别的键就不再是信封，一个字节都不动。
+        let real_arguments =
+            json!({"node_id": "qq_send", "payload_json": {"target": "u1"}, "target": "u1"});
+        assert_eq!(peel_envelope(&real_arguments), real_arguments);
+    }
+
+    #[test]
+    fn a_wrapped_kernel_tool_keeps_its_nested_arguments() {
+        let tools = vec![AgentToolSpec {
+            name: AGENT_TOOL_END_TURN,
+            description: "end the turn",
+            parameters: json!({"type": "object"}),
+        }];
+        let wrapped = json!({
+            "node_id": AGENT_TOOL_INVOKE_PLUGIN,
+            "payload_json": {
+                "node_id": AGENT_TOOL_END_TURN,
+                "payload_json": {"reason": "done"},
+            },
+        });
+        let call = serialized_call_to_tool_call_at(&wrapped, 2, &tools).expect("resolved");
+        assert_eq!(call.function.name, AGENT_TOOL_END_TURN);
+        assert_eq!(
+            call.function.arguments,
+            json!({"reason": "done"}).to_string()
+        );
+        assert_eq!(call.id, format!("dsml-2-{AGENT_TOOL_END_TURN}"));
+
+        // 内层名字不是本会话的工具：不能当直接调用，落回 invoke_plugin 包装。
+        let unknown_inner = json!({
+            "node_id": AGENT_TOOL_INVOKE_PLUGIN,
+            "payload_json": {"node_id": "not_a_tool"},
+        });
+        let call = serialized_call_to_tool_call_at(&unknown_inner, 0, &tools).expect("wrapped");
+        assert_eq!(call.function.name, AGENT_TOOL_INVOKE_PLUGIN);
+
+        // payload 里根本没有内层 node_id：同样落回 invoke_plugin 包装。
+        let no_inner = json!({"node_id": AGENT_TOOL_INVOKE_PLUGIN});
+        let call = serialized_call_to_tool_call_at(&no_inner, 1, &tools).expect("wrapped");
+        assert_eq!(call.function.name, AGENT_TOOL_INVOKE_PLUGIN);
+        assert_eq!(call.id, format!("dsml-1-{AGENT_TOOL_INVOKE_PLUGIN}"));
+    }
+}

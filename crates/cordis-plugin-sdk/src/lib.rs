@@ -215,8 +215,30 @@ pub fn agent_trigger(msg: &str) {
     }
 }
 
+/// Pretty JSON for files on disk: always ends with a newline.
+///
+/// `serde_json::to_string_pretty` omits the trailing newline, so every writer
+/// (docs mirrors, artifact index) used to strip it — a permanent
+/// "\ No newline at end of file" diff on every regeneration.
 pub fn pretty_json<T: Serialize>(value: &T) -> String {
-    serde_json::to_string_pretty(value).expect("plugin sdk serialize pretty json")
+    let mut text = serde_json::to_string_pretty(value).expect("plugin sdk serialize pretty json");
+    text.push('\n');
+    text
+}
+
+#[cfg(test)]
+mod pretty_json_tests {
+    use super::pretty_json;
+
+    // Files written from pretty_json always end with a newline, so a
+    // regeneration is a no-op in git instead of a "no newline" diff.
+    #[test]
+    fn output_ends_with_exactly_one_newline() {
+        let text = pretty_json(&serde_json::json!({ "a": 1 }));
+        assert!(text.ends_with('\n'), "{text:?}");
+        assert!(!text.ends_with("\n\n"), "{text:?}");
+        assert_eq!(text.trim_end(), "{\n  \"a\": 1\n}");
+    }
 }
 
 pub fn plugin_docs(

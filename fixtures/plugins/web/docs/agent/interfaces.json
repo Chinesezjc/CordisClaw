@@ -7,7 +7,7 @@
   "nodes": [
     {
       "id": "web_search",
-      "summary": "Search the web using DeepSeek Anthropic-compatible API. Returns structured results (title + URL per result) plus an AI summary. Use web_fetch to verify specific pages.",
+      "summary": "Search the web. Returns ranked results with title, URL, date and a summary written for a model to read. Use it to check a fact instead of answering from memory; follow up with web_fetch for a full page.",
       "input_schema": {
         "type": "object",
         "required": [
@@ -47,7 +47,7 @@
         }
       },
       "side_effects": [
-        "makes HTTP request to DeepSeek Anthropic-compatible endpoint with native web_search tool"
+        "makes a POST to the DeepSeek Search API"
       ],
       "failure_modes": [
         "api key not configured",
@@ -59,7 +59,7 @@
     },
     {
       "id": "web_fetch",
-      "summary": "Fetch a web page and return plain-text content (HTML tags stripped). Max 8000 chars. Only http/https allowed.",
+      "summary": "Read one web page. Default readable mode returns clean Markdown from the DeepSeek Fetch API (falling back to a local GET that strips HTML, max 8000 chars). Set raw: true to skip the vendor and get the untouched HTTP response body (the HTML source, no tag stripping) — use it for image URLs (<img src>), <meta> tags and JSON-LD that extraction drops. Raw mode has no character cut: it returns the whole body and lets result spilling handle size; only a 16 MiB memory cap refuses outright. Only http/https allowed; private addresses are refused.",
       "input_schema": {
         "type": "object",
         "required": [
@@ -74,6 +74,10 @@
           "url": {
             "type": "string",
             "description": "URL to fetch"
+          },
+          "raw": {
+            "type": "boolean",
+            "description": "Return the untouched response body (HTML source) instead of extracted Markdown. Use it to read <img src> URLs, <meta> tags or JSON-LD that readable mode strips."
           }
         }
       },
@@ -92,6 +96,14 @@
           "truncated": {
             "type": "boolean"
           },
+          "mode": {
+            "type": "string",
+            "enum": [
+              "readable",
+              "raw"
+            ],
+            "description": "Which mode produced text: extracted Markdown or the raw response body"
+          },
           "error": {
             "type": [
               "string",
@@ -101,7 +113,7 @@
         }
       },
       "side_effects": [
-        "makes HTTP GET request to the target URL"
+        "makes a POST to the DeepSeek Fetch API in readable mode; raw mode makes only a local HTTP GET"
       ],
       "failure_modes": [
         "invalid URL",

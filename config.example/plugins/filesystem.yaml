@@ -1,0 +1,19 @@
+# filesystem: 文件读写插件。读取白名单由这里配置，不再写死在插件源码里
+# （旧版本在 src/lib.rs 里硬编码了 /root/Cstar、/root/PJSKBot、/root/HCIProj，
+# 加一个目录就要重新编译，路径失效也不会有人发现——不存在的根只会被静默跳过）。
+#
+# 改完这个文件不用重启：`/reload`（或 agent 的 reload_runtime）会重读 config/，
+# 新 settings 随新快照生效。
+plugin: filesystem
+enabled: true
+settings:
+  # fs_read / fs_list / fs_search 额外允许的目录（绝对路径）。
+  # - 必须是绝对路径；相对路径会被忽略（不会按 cwd 展开，避免配置笔误变成放权）。
+  # - 不存在的路径只是被跳过，不会报错。
+  # - 留空或整段缺失时，只允许 fixtures 根目录（$CORDIS_FIXTURES_ROOT，未设置时
+  #   为进程 cwd）——没有任何内置的兜底目录列表。
+  # - 写入不受影响：fs_write 始终只允许 fixtures/plugins 子树。
+  read_roots:
+    - /root/PJSKBot
+    - /root/HCIProj
+    - /root/dsh-web

@@ -1,26 +1,3 @@
-[workspace]
-members = [
-  "time",
-  "filesystem", "expr", "shell", "qq", "feishu", "web", "git", "vision", "gacha",
-  "soul_store", "llm_openai"]
-exclude = [
-  # `_net` is a utility rlib shared by `web` and `vision` for the SSRF
-  # guard (P2-2); it's not a runtime-loadable plugin. Depended on via
-  # `path = "../_net"` inside those crates.
-  "_net",
-  "expr/lexer",
-  "expr/parser",
-  "expr/evaluator",
-  "expr/evaluator/add",
-  "expr/evaluator/sub",
-  "expr/evaluator/mul",
-  "expr/evaluator/div",
-  "expr/evaluator/pow",
-  "expr/evaluator/modulo",
-  "expr/evaluator/factorial",
-]
-resolver = "2"
-
 [profile.dev]
 # 为体积优化：插件工件按 size 优化编译。dev（而非 release）档承载优化，
 # 使工件与 plugin iteration 跑的 cargo test 共用同一个 profile——两个 profile
@@ -28,3 +5,37 @@ resolver = "2"
 # 实测全部工件 141 MB -> 75 MB，代价是全量构建 65s -> 135s。
 opt-level = "z"
 strip = "symbols"
+
+[workspace]
+exclude = [
+    "_net",
+    # The scaffold placeholder is built and tested as its own manifest (see
+    # scripts/test-fixtures.sh); it is not a runtime-loadable plugin.
+    "root",
+    "expr/lexer",
+    "expr/parser",
+    "expr/evaluator",
+    "expr/evaluator/add",
+    "expr/evaluator/sub",
+    "expr/evaluator/mul",
+    "expr/evaluator/div",
+    "expr/evaluator/pow",
+    "expr/evaluator/modulo",
+    "expr/evaluator/factorial",
+]
+members = [
+    "time",
+    "filesystem",
+    "expr",
+    "shell",
+    "qq",
+    "feishu",
+    "web",
+    "git",
+    "vision",
+    "gacha",
+    "soul_store",
+    "llm_openai",
+    "image_gen",
+]
+resolver = "2"

@@ -206,6 +206,8 @@ struct ChatStreamReadResult {
     event_count: usize,
     saw_done: bool,
     finish_reason: Option<String>,
+    /// First bytes of the raw stream, for diagnosing an empty completion.
+    raw_preview: String,
 }
 
 #[derive(Debug)]
@@ -326,6 +328,7 @@ fn send_chat_request(
         AGENT_REQUEST_MAX_ATTEMPTS, request_summary
     ));
 
+    let mut images_shrunk = false;
     for attempt in 1..=AGENT_REQUEST_MAX_ATTEMPTS {
         let attempt_started = Instant::now();
         let mut http_request = client
@@ -397,13 +400,30 @@ fn send_chat_request(
                     .unwrap_or_else(|| format!("status={} body={}", status, raw_body.trim())),
                 truncate_for_error(&raw_body, 400),
             );
+            let code = status.as_u16();
+            // 413（或供应商针对请求体回的 `INVALID_REQUEST`）说明整个请求体在
+            // 网关侧就被拒了，根本没到模型。kernel 已经按 10 MiB 预算裁过图，
+            // 那就是网关的真实上限比假设更低：把剩余图片预算减半、剥掉最老的一
+            // 批，然后**只重试一次**。不这样做的话整轮失败会落进
+            // `data/pending/` 重放队列，机器人一句话都发不出去。
+            if is_body_size_rejection(code, &raw_body) && !images_shrunk {
+                images_shrunk = true;
+                let before = inline_image_bytes(&request_body);
+                let after = shrink_inline_images(&mut request_body, before / 2);
+                if after < before {
+                    diag(format!(
+                        "{message} retrying with half the inline image budget bytes_before={before} bytes_after={after}"
+                    ));
+                    thread::sleep(Duration::from_millis(AGENT_REQUEST_RETRY_BACKOFF_MS));
+                    continue;
+                }
+            }
             if attempt < AGENT_REQUEST_MAX_ATTEMPTS {
                 // P1-35: don't retry permanent-failure client errors
                 // (4xx except 408 / 429). Bad API key, invalid model,
                 // quota exhausted, permission denied — retrying just
                 // burns network round trips and can trigger rate-
                 // limit escalation.
-                let code = status.as_u16();
                 let is_permanent_4xx = (400..500).contains(&code) && code != 408 && code != 429;
                 if is_permanent_4xx {
                     diag(format!("{message} not-retrying (permanent 4xx)"));
@@ -461,6 +481,43 @@ fn send_chat_request(
             streamed.finish_reason.as_deref().unwrap_or("-"),
             request_summary,
         ));
+
+        // An empty completion is the one case the layers above must retry, and
+        // they can only do it sensibly if the log says what came back. Not
+        // gated behind CORDIS_AGENT_DIAG: this is the failure we chase.
+        if streamed
+            .message
+            .content
+            .as_deref()
+            .unwrap_or_default()
+            .trim()
+            .is_empty()
+            && streamed.message.tool_calls.is_empty()
+        {
+            eprintln!(
+                "[llm_openai] empty completion attempt={attempt} status={} finish_reason={} \
+                 response_bytes={} stream_events={} stream_done={} tool_calls={} \
+                 reasoning_chars={} {}",
+                status.as_u16(),
+                streamed.finish_reason.as_deref().unwrap_or("-"),
+                streamed.raw_bytes,
+                streamed.event_count,
+                streamed.saw_done,
+                streamed.message.tool_calls.len(),
+                streamed
+                    .message
+                    .reasoning_content
+                    .as_deref()
+                    .map(|r| r.chars().count())
+                    .unwrap_or(0),
+                request_summary,
+            );
+            eprintln!(
+                "[llm_openai] empty completion raw preview ({} bytes): {:?}",
+                streamed.raw_preview.len(),
+                streamed.raw_preview
+            );
+        }
 
         return Ok((
             streamed.message,
@@ -525,6 +582,11 @@ fn read_chat_stream(
     });
 
     let mut raw_bytes = 0usize;
+    // Bounded capture of the raw stream: when a completion comes back empty,
+    // the first bytes decide whether the provider sent empty deltas or runaway
+    // whitespace. Never unbounded — a healthy response is hundreds of KB.
+    let mut raw_preview = String::new();
+    const RAW_PREVIEW_LIMIT: usize = 1200;
     let mut event_count = 0usize;
     let mut saw_done = false;
     let mut finish_reason = None;
@@ -590,6 +652,9 @@ fn read_chat_stream(
                     let leftover = std::mem::take(&mut line_buf);
                     let line = String::from_utf8_lossy(&leftover).to_string();
                     raw_bytes += line.len();
+                    if raw_preview.len() < RAW_PREVIEW_LIMIT {
+                        raw_preview.push_str(&line);
+                    }
                     if !pending_data_lines.is_empty() {
                         saw_done = process_stream_event(
                             &pending_data_lines.join("\n"),
@@ -712,6 +777,7 @@ fn read_chat_stream(
         event_count,
         saw_done,
         finish_reason,
+        raw_preview,
     })
 }
 
@@ -845,6 +911,102 @@ fn extract_error_message(raw_body: &str) -> Option<String> {
                 .and_then(Value::as_str)
                 .map(ToString::to_string)
         })
+}
+
+/// 请求体里所有内联 `data:` 图片占的字节（base64 payload 长度，即真正写进
+/// 请求体的那一串）。远程 URL 不占内联字节，不计。
+fn inline_image_bytes(body: &Value) -> usize {
+    body.get("messages")
+        .and_then(Value::as_array)
+        .map(|messages| {
+            messages
+                .iter()
+                .map(|message| {
+                    message
+                        .get("content")
+                        .and_then(Value::as_array)
+                        .map(|parts| {
+                            parts
+                                .iter()
+                                .filter_map(part_inline_uri)
+                                .filter_map(inline_uri_bytes)
+                                .sum()
+                        })
+                        .unwrap_or(0)
+                })
+                .sum()
+        })
+        .unwrap_or(0)
+}
+
+fn part_inline_uri(part: &Value) -> Option<&str> {
+    match part.get("type").and_then(Value::as_str) {
+        Some("image_url") => part.get("image_url")?.get("url")?.as_str(),
+        _ => None,
+    }
+}
+
+/// `data:<mime>;base64,<payload>` 的 payload 长度；不是内联图片就 `None`。
+fn inline_uri_bytes(uri: &str) -> Option<usize> {
+    let rest = uri.strip_prefix("data:")?;
+    let (meta, payload) = rest.split_once(',')?;
+    meta.ends_with(";base64").then_some(payload.len())
+}
+
+/// 把最老的内联图片换成文本占位符，直到剩下的内联字节 ≤ `budget`。
+///
+/// 返回剩下的内联字节。占位符只保留固定前缀：这条路径是网关拒收后的应急
+/// 兜底（真正的历史占位符由 kernel 的 `image_budget` 生成，带 sha256 与尺寸），
+/// 在这里为了一个字符串再解 base64 算哈希不值当。请求体本身不持久化，所以
+/// 这里剥掉的图不会改变 history——kernel 下一轮仍按自己的预算决定留哪张。
+fn shrink_inline_images(body: &mut Value, budget: usize) -> usize {
+    let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
+        return 0;
+    };
+    let mut remaining: usize = messages
+        .iter()
+        .map(|message| {
+            message
+                .get("content")
+                .and_then(Value::as_array)
+                .map(|parts| {
+                    parts
+                        .iter()
+                        .filter_map(part_inline_uri)
+                        .filter_map(inline_uri_bytes)
+                        .sum()
+                })
+                .unwrap_or(0)
+        })
+        .sum();
+    for message in messages.iter_mut() {
+        if remaining <= budget {
+            break;
+        }
+        let Some(parts) = message.get_mut("content").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for part in parts.iter_mut() {
+            if remaining <= budget {
+                break;
+            }
+            let Some(bytes) = part_inline_uri(part).and_then(inline_uri_bytes) else {
+                continue;
+            };
+            remaining -= bytes;
+            *part = json!({
+                "type": "text",
+                "text": "[image omitted to fit request byte budget]",
+            });
+        }
+    }
+    remaining
+}
+
+/// 这次失败是不是「请求体太大」：413 本身就是，400 + `INVALID_REQUEST` 也是
+/// （DeepSeek 对超限请求体偶尔回这个码）。
+fn is_body_size_rejection(status: u16, body: &str) -> bool {
+    status == 413 || (status == 400 && body.contains("INVALID_REQUEST"))
 }
 
 fn truncate_for_error(text: &str, max_chars: usize) -> String {
@@ -1000,4 +1162,245 @@ export_plugin_api! {
     abi_fingerprint = abi_fingerprint_value(),
     docs = docs_value(),
     handle = api_handle,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::BufRead;
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::mpsc::Receiver;
+
+    /// 读一个完整的 HTTP 请求，返回 body 字符串（Content-Length 定长）。
+    fn read_request_body(stream: &mut TcpStream) -> String {
+        let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+        let mut content_length = 0usize;
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).expect("read header line");
+            if line == "\r\n" || line.is_empty() {
+                break;
+            }
+            let lower = line.to_ascii_lowercase();
+            if let Some(value) = lower.strip_prefix("content-length:") {
+                content_length = value.trim().parse().expect("content-length");
+            }
+        }
+        let mut body = vec![0u8; content_length];
+        reader.read_exact(&mut body).expect("read body");
+        String::from_utf8(body).expect("utf8 body")
+    }
+
+    fn respond(stream: &mut TcpStream, status: &str, body: &str) {
+        let response = format!(
+            "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream
+            .write_all(response.as_bytes())
+            .expect("write response");
+        stream.flush().expect("flush response");
+    }
+
+    /// 只服务两轮的最小 HTTP 服务：第一轮 413，第二轮一段 SSE。
+    /// 返回 base_url 与「收到的请求体」通道（断言第二次请求变小了用）。
+    fn serve_413_then_sse() -> (String, Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
+        let base_url = format!("http://{}", listener.local_addr().expect("local addr"));
+        let (sender, receiver) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            for (index, stream) in listener.incoming().enumerate() {
+                let Ok(mut stream) = stream else { break };
+                let body = read_request_body(&mut stream);
+                if index == 0 {
+                    respond(
+                        &mut stream,
+                        "413 Payload Too Large",
+                        r#"{"error":{"code":"INVALID_REQUEST","message":"Failed to buffer the request body: length limit exceeded"}}"#,
+                    );
+                } else {
+                    respond(
+                        &mut stream,
+                        "200 OK",
+                        "data: {\"id\":\"r1\",\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+                    );
+                }
+                sender.send(body).expect("capture request body");
+                if index >= 1 {
+                    break;
+                }
+            }
+        });
+        (base_url, receiver)
+    }
+
+    /// 一张内联图片的 user 消息。
+    fn inline_image_payload(base_url: &str, payload_chars: usize) -> String {
+        json!({
+            "node_id": "llm_complete",
+            "body": {
+                "model": "deepseek-chat",
+                "messages": [
+                    { "role": "system", "content": "sys" },
+                    {
+                        "role": "user",
+                        "content": [
+                            { "type": "text", "text": "看图" },
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": format!("data:image/png;base64,{}", "A".repeat(payload_chars)),
+                                },
+                            },
+                        ],
+                    },
+                ],
+            },
+            "transport": {
+                "base_url": base_url,
+                "api_key_env": "LLM_OPENAI_TEST_API_KEY",
+                "timeout_ms": 10_000,
+                "stream_timeout_secs": 10,
+            },
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn inline_image_bytes_only_counts_data_uris_in_message_parts() {
+        let body = json!({
+            "messages": [
+                { "role": "system", "content": "sys" },
+                {
+                    "role": "user",
+                    "content": [
+                        { "type": "text", "text": "hi" },
+                        { "type": "image_url", "image_url": { "url": "data:image/png;base64,AAAA" } },
+                        { "type": "image_url", "image_url": { "url": "https://x/y.png" } },
+                    ],
+                },
+                { "role": "user", "content": "plain" },
+                { "role": "user", "content": [] },
+            ],
+        });
+        assert_eq!(inline_image_bytes(&body), 4);
+        // 没有 messages / messages 不是数组。
+        assert_eq!(inline_image_bytes(&json!({})), 0);
+        assert_eq!(inline_image_bytes(&json!({ "messages": 7 })), 0);
+    }
+
+    #[test]
+    fn part_inline_uri_needs_the_multimodal_shape() {
+        let inline =
+            json!({ "type": "image_url", "image_url": { "url": "data:image/png;base64,AAAA" } });
+        assert_eq!(part_inline_uri(&inline), Some("data:image/png;base64,AAAA"));
+        assert_eq!(
+            part_inline_uri(&json!({ "type": "text", "text": "hi" })),
+            None
+        );
+        assert_eq!(part_inline_uri(&json!({ "type": "image_url" })), None);
+        assert_eq!(
+            part_inline_uri(&json!({ "type": "image_url", "image_url": {} })),
+            None
+        );
+        assert_eq!(
+            part_inline_uri(&json!({ "type": "image_url", "image_url": { "url": 7 } })),
+            None
+        );
+    }
+
+    #[test]
+    fn inline_uri_bytes_needs_a_base64_data_uri() {
+        assert_eq!(inline_uri_bytes("data:image/png;base64,AAAA"), Some(4));
+        assert_eq!(inline_uri_bytes("data:image/png,AAAA"), None);
+        assert_eq!(inline_uri_bytes("data:image/png;base64"), None);
+        assert_eq!(inline_uri_bytes("https://x/y.png"), None);
+    }
+
+    #[test]
+    fn shrink_inline_images_drops_the_oldest_until_the_budget_fits() {
+        let mut body = json!({
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        { "type": "text", "text": "old" },
+                        { "type": "image_url", "image_url": { "url": "data:image/png;base64,AAAA" } },
+                    ],
+                },
+                { "role": "assistant", "content": "收到" },
+                {
+                    "role": "user",
+                    "content": [
+                        { "type": "text", "text": "new" },
+                        { "type": "image_url", "image_url": { "url": "data:image/png;base64,BBBB" } },
+                    ],
+                },
+            ],
+        });
+        // 总 8 字节，预算 4：只剥最老的那张。
+        assert_eq!(shrink_inline_images(&mut body, 4), 4);
+        let text = body.to_string();
+        assert_eq!(text.matches("data:image/png;base64,").count(), 1);
+        assert_eq!(text.matches("image omitted to fit").count(), 1);
+        // 预算 0：把剩下那张也剥掉。
+        assert_eq!(shrink_inline_images(&mut body, 0), 0);
+        assert!(!body.to_string().contains("data:image"));
+        // 幂等：已经没有图了。
+        assert_eq!(shrink_inline_images(&mut body, 0), 0);
+    }
+
+    #[test]
+    fn shrink_inline_images_ignores_bodies_without_messages() {
+        let mut body = json!({ "model": "deepseek-chat" });
+        assert_eq!(shrink_inline_images(&mut body, 0), 0);
+        let mut body = json!({ "messages": "not an array" });
+        assert_eq!(shrink_inline_images(&mut body, 0), 0);
+    }
+
+    #[test]
+    fn body_size_rejections_are_413_and_invalid_request() {
+        assert!(is_body_size_rejection(413, ""));
+        assert!(is_body_size_rejection(
+            400,
+            r#"{"error":{"code":"INVALID_REQUEST"}}"#
+        ));
+        assert!(!is_body_size_rejection(400, "bad api key"));
+        assert!(!is_body_size_rejection(429, "rate limited"));
+        assert!(!is_body_size_rejection(500, "upstream"));
+    }
+
+    /// 网关 413 时把内联图片预算减半、重试一次，而不是整轮失败进 pending。
+    /// 这条用例走真实 HTTP：客户端 → 本地 mock 服务（413 → SSE）。
+    #[test]
+    fn a_413_is_retried_once_after_halving_the_inline_image_budget() {
+        std::env::set_var("LLM_OPENAI_TEST_API_KEY", "sk-test-value");
+        let (base_url, captured) = serve_413_then_sse();
+        let payload = inline_image_payload(&base_url, 4096);
+        let response: Value = serde_json::from_str(&__test_handle(payload)).expect("json response");
+        assert_eq!(response["ok"], true);
+        assert_eq!(response["message"]["content"], "hi");
+
+        let first: Value = serde_json::from_str(
+            &captured
+                .recv_timeout(Duration::from_secs(10))
+                .expect("first request"),
+        )
+        .expect("first body json");
+        let second: Value = serde_json::from_str(
+            &captured
+                .recv_timeout(Duration::from_secs(10))
+                .expect("second request"),
+        )
+        .expect("second body json");
+        assert_eq!(inline_image_bytes(&first), 4096);
+        // 4096 的一半是 2048，一张图就 4096，所以整张被剥掉。
+        assert_eq!(inline_image_bytes(&second), 0);
+        assert_eq!(
+            second.to_string().matches("image omitted to fit").count(),
+            1
+        );
+        // 只重试一次：服务端不应该再收到第三个请求。
+        assert!(captured.try_recv().is_err());
+    }
 }

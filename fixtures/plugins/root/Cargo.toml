@@ -20,3 +20,7 @@ api_hash = "api_v2"
 
 [package.metadata.cordis.artifact]
 exports = ["service.db", "service.cache"]
+
+# Standalone on purpose: this scaffold is built and tested as its own
+# manifest (scripts/test-fixtures.sh), not as a member of either workspace.
+[workspace]

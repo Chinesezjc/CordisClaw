@@ -1,12 +1,27 @@
 target/
+# 并行 agent 常用 `CARGO_TARGET_DIR=target-<name>` 把构建隔离开，这些目录同样是
+# 纯构建产物，但 `cargo clean` 只清 workspace 的 `target/`，压根碰不到它们
+# （实测仓库根同时存在过 target-cov-imp 19G + target-imgagent 4.6G）。
+/target-*/
 registered-*.html
 config/
 fixtures/artifacts/
 fixtures/tmp/
+# Per-plugin lockfiles are ignored (each plugin can build standalone), but the
+# fixtures *workspace* lock must be tracked: it is what makes
+# `cargo metadata --offline` and plugin builds reproducible from a clean
+# checkout. The negation has to come after the pattern it re-includes.
 fixtures/plugins/**/Cargo.lock
+!fixtures/plugins/Cargo.lock
 .codex
 .claude/
 .cordis-drafts/
 fixtures/.artifacts-build.lock
 data/
 *.profraw
+
+# Scratch space at the repo root (tarballs, jars); never part of the repo.
+/tmp/
+
+# 真实轮次语料（含群聊内容，体积大）
+evals/*.jsonl

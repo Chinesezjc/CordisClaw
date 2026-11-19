@@ -44,7 +44,7 @@
 - `gacha`：原神抽卡模拟器，保底概率模型 + JSON 文件持久化。
 - `web`：网页搜索（DeepSeek Anthropic API）+ 网页抓取。
 - `git`：Git 操作（diff/log/status/commit/amend）。
-- `vision`：图片识别（OCR + 描述）。
+- `vision`：图片下载 / 本地临时文件读取辅助（已无节点；原生图片输入由 kernel `image_input` 负责）。
 - `filesystem`：文件系统操作。
 - `time`：时间查询。
 

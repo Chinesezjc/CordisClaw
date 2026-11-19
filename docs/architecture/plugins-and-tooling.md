@@ -97,7 +97,7 @@ expr
 
 ### 2.1 CLI 能力
 
-[crates/cordis-runtime/src/main.rs](../../crates/cordis-runtime/src/main.rs) 当前暴露的 CLI 命令包括：
+[crates/cordis-cli/src/main.rs](../../crates/cordis-cli/src/main.rs) 当前暴露的 CLI 命令包括：
 
 - `cargo run -p cordis-runtime -- fixtures`
   - 加载 fixtures 并打印插件、节点和指标
@@ -110,8 +110,6 @@ expr
   - 导出已注册节点图 HTML
 - `cargo run -p cordis-runtime -- net-html fixtures --output=...`
   - 导出已注册 net HTML
-- `cargo run -p cordis-runtime -- sync-plugin-docs fixtures`
-  - 从 dylib `docs()` 回写 `interfaces.json`
 - `cargo run -p cordis-runtime -- refresh-artifact-index fixtures`
   - 刷新工件索引中的 `sha256`
 - `cargo run -p cordis-runtime -- rebuild-fixture-artifacts [fixtures_root]`

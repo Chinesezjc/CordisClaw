@@ -16,8 +16,8 @@
   - Agent 插件迭代、rollback、canary 回放、Kernel 状态持久化
 - `auto_update.rs`
   - 自动更新应用、验证失败回滚、路径安全
-- `tooling.rs`
-  - docs 自动回写与 artifact index 自动刷新
+- `tooling.rs`（5.2.48 起在 `crates/cordis-tooling/tests/tooling.rs`）
+  - docs 自动回写、artifact index 自动刷新、prepare/rebuild 构建链
 
 如果你要修改某个子系统，最稳妥的方式不是先猜运行结果，而是先找到对应测试文件看“项目当前把什么行为当成契约”。
 

@@ -232,6 +232,50 @@ impl LlmApiConfig {
     }
 }
 
+/// 入站图片（多模态）预算。默认见 [`ImageSettings::default`]。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageSettings {
+    /// 关掉后入站图片一律不进请求（只保留 `[image: url]` 文本占位符）。
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// 单张图片字节上限。
+    #[serde(default = "default_image_max_bytes")]
+    pub max_bytes: usize,
+    /// 每批最多内联几张。
+    #[serde(default = "default_image_max_per_batch")]
+    pub max_per_batch: usize,
+    /// 单张下载超时（毫秒）。
+    #[serde(default = "default_image_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_image_max_bytes() -> usize {
+    4 * 1024 * 1024
+}
+
+fn default_image_max_per_batch() -> usize {
+    2
+}
+
+fn default_image_timeout_ms() -> u64 {
+    8_000
+}
+
+impl Default for ImageSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_bytes: default_image_max_bytes(),
+            max_per_batch: default_image_max_per_batch(),
+            timeout_ms: default_image_timeout_ms(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct RuntimeSettings {
     #[serde(default)]
@@ -240,6 +284,9 @@ pub struct RuntimeSettings {
     /// 显式配 `0` 表示立即过期。
     #[serde(default)]
     pub snapshot_retention_hours: Option<u64>,
+    /// 入站图片预算（`runtime.images`）。
+    #[serde(default)]
+    pub images: ImageSettings,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -858,5 +905,23 @@ mod load_tests {
         assert!(pc.enabled);
         assert!(pc.plugin.is_empty());
         assert!(pc.settings.is_object());
+    }
+
+    // `runtime.images` with only `enabled` spelled out still has to default the
+    // budget fields, and a bare `{}` must default `enabled` to `true` (the
+    // `default_true` serde default) rather than to `bool`'s `false`, which
+    // would silently drop every inbound image.
+    #[test]
+    fn image_settings_without_enabled_defaults_to_enabled() {
+        let bare: ImageSettings = serde_json::from_str("{}").expect("empty image settings");
+        assert!(bare.enabled);
+        assert_eq!(bare.max_bytes, default_image_max_bytes());
+        assert_eq!(bare.max_per_batch, default_image_max_per_batch());
+        assert_eq!(bare.timeout_ms, default_image_timeout_ms());
+
+        let explicit: ImageSettings =
+            serde_json::from_str(r#"{"enabled": false}"#).expect("explicit image settings");
+        assert!(!explicit.enabled);
+        assert_eq!(explicit.max_bytes, default_image_max_bytes());
     }
 }

@@ -1188,50 +1188,44 @@ mod tests {
         );
     }
 
-    /// `Some(())` when the current euid is not root, else `None`.
+    /// A procfs target: `read_to_string` succeeds but `fs::write` fails, so the
+    /// write-error map inside `apply_one` runs. The rollback then tries to write
+    /// the original bytes back to the same procfs file and fails too, which is
+    /// the "additionally, patch rollback failed" `Invariant` arm.
     ///
-    /// Root bypasses file-mode permission checks (a 0o444 file is still
-    /// writable), so the failure the caller drives cannot occur there. Returning
-    /// an `Option` lets the caller gate with `for`-over-`Option`, which — unlike
-    /// an `if` gate or an early `return` — has no not-taken arm to leave
-    /// permanently uncovered.
-    #[cfg(unix)]
-    fn probe_not_root() -> Option<()> {
-        // SAFETY: `geteuid` is always safe to call and cannot fail.
-        (unsafe { libc::geteuid() } != 0).then_some(())
-    }
-
-    #[cfg(unix)]
+    /// The failure has to be filesystem-level, not mode-level: this suite runs as
+    /// euid 0 in CI, where a `0o444` file is still writable, so a permission-mode
+    /// probe skips the body (and leaves every line in it uncovered). procfs status
+    /// files reject writes for root as well.
+    #[cfg(target_os = "linux")]
     #[test]
     fn text_patch_write_failure_then_rollback_failure_surfaces_invariant() {
-        use std::os::unix::fs::PermissionsExt;
-        for () in probe_not_root().into_iter() {
-            // A read-only target: read_to_string succeeds, but the fs::write inside
-            // apply_one fails (covers the write error map). Rollback then tries to
-            // write the original back to the same read-only file and *also* fails,
-            // covering both the rollback write-error map and the
-            // "additionally, patch rollback failed" Invariant path.
-            let ws = TempDir::new().unwrap();
-            let target = ws.path().join("ro.txt");
-            fs::write(&target, "foo bar").unwrap();
-            let mut perms = fs::metadata(&target).unwrap().permissions();
-            perms.set_mode(0o444);
-            fs::set_permissions(&target, perms).unwrap();
+        let target = Path::new("/proc/self/status");
+        let original = fs::read_to_string(target).expect("procfs status file is readable");
+        assert!(
+            original.matches("TracerPid:").count() == 1,
+            "the probe field must be unique in {target:?}"
+        );
 
-            let updater = AutoUpdater::new(ws.path());
-            let err = updater
-                .execute(
-                    plan(vec![FilePatch::text("ro.txt", "foo", "FOO")]),
-                    verify_ok,
-                )
-                .unwrap_err();
-            let is_rollback_invariant = matches!(&err, RuntimeError::Invariant { message } if message.contains("rollback failed"));
-            assert!(is_rollback_invariant, "expected Invariant, got: {err:?}");
+        let updater = AutoUpdater::new("/proc");
+        let err = updater
+            .execute(
+                plan(vec![FilePatch::text(
+                    "self/status",
+                    "TracerPid:",
+                    "TracerPidX:",
+                )]),
+                verify_ok,
+            )
+            .unwrap_err();
+        let is_rollback_invariant = matches!(&err, RuntimeError::Invariant { message } if message.contains("rollback failed"));
+        assert!(is_rollback_invariant, "expected Invariant, got: {err:?}");
 
-            // Restore perms for TempDir cleanup.
-            let mut perms = fs::metadata(&target).unwrap().permissions();
-            perms.set_mode(0o644);
-            fs::set_permissions(&target, perms).unwrap();
-        }
+        // Both writes failed, so the replacement never landed. The file is
+        // re-read instead of compared byte-for-byte: procfs memory counters
+        // change between two reads of the same status file.
+        let after = fs::read_to_string(target).expect("still readable");
+        assert!(after.contains("TracerPid:"), "the original field is gone");
+        assert!(!after.contains("TracerPidX:"), "the replacement landed");
     }
 }

@@ -28,8 +28,10 @@
 插件工件重建与 docs 同步入口：
 
 1. `cargo run -p cordis-runtime -- rebuild-fixture-artifacts [fixtures_root]`
-2. `cargo run -p cordis-runtime -- sync-plugin-docs fixtures`
-3. `cargo run -p cordis-runtime -- refresh-artifact-index fixtures`
+2. `cargo run -p cordis-runtime -- refresh-artifact-index fixtures`
+
+`prepare-artifacts` / `rebuild-fixture-artifacts` 构建时已自动回写
+`docs/agent/interfaces.json`，不再需要单独的同步命令。
 
 ## 维护约定
 

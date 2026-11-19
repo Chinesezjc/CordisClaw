@@ -10,11 +10,100 @@ concurrency:
   group: coverage-${{ github.ref }}
   cancel-in-progress: true
 
+# 覆盖率门槛：行覆盖 100%（无排除注释，实测 26497/26497）。
+# 排除 main.rs（REPL/signal/exit，现位于 cordis-cli）与 agent.rs（LLM 流式
+# I/O）——均为进程/网络边界，见 CLAUDE.md 覆盖率规范。匹配是"路径包含"语义
+# （llvm-cov 对完整路径做正则 search），绝对路径与 crate 相对路径两种上报形态
+# 都能命中；两个 crate 一并排除。所有分片用同一份正则，合并脚本再按行取并集，
+# 因此门槛与拆分前的全量 `cargo llvm-cov --workspace` 完全一致。
+env:
+  COVERAGE_IGNORE: 'cordis-(runtime|cli)/src/(main|agent)\.rs'
+  # 覆盖率构建有自己的 target 目录（`target/llvm-cov-target`），本地实测其中
+  # incremental 已涨到 900M：cargo-llvm-cov 的 rustc wrapper 只是追加
+  # `-C instrument-coverage --cfg=coverage`，并不会关掉增量。CI 上每次都是
+  # 一次性的全量插桩构建，增量纯属浪费，这里显式关闭。
+  CARGO_INCREMENTAL: "0"
+
 jobs:
+  # 为什么拆 job 而不是拆线程：插桩下 host 系集成测试共享 `fixtures/artifacts/`，
+  # 同一 runner 上并行会因中途重建 dylib 触发 HashMismatch 假失败。所以每个 job
+  # 内部依然 `--test-threads=1`，并行发生在 job 之间（各自独立 runner / 独立
+  # checkout，互不共享工件目录）。
+  #
+  # 为什么按"测试二进制"分组而不是按 crate：`runtime_host` 一个二进制就占全量
+  # 时长的 ~45%（~29 分钟），按 crate 拆只能把 cordis-agent 整包扔进一个 job，
+  # 拆不动它。按二进制分组后它独占一组，其余按 crate / 名称前缀摊成 5 组。
+  #
+  # 每个 shard 的一次"调用"形如 `<要测的包,逗号分隔> <cargo test 目标参数>`，
+  # 例如 `cordis-agent --test host_coverage`。跑的时候统一展开成：
+  #
+  #   cargo llvm-cov --workspace \
+  #     --exclude-from-test <本 shard 不测的每个包> \
+  #     --test host_coverage ... -- --test-threads=1
+  #
+  # 维护约定：workspace 里每新增一个测试二进制，必须把它加到某个 shard 的
+  # invocations 里（且只加一次）。漏加时该二进制的测试根本不会跑，未覆盖行会
+  # 由 merge job 的 100% 门槛报出来——是"响"的失败，但最好还是当场补上。
+  #
+  # 关键点：**必须用 `--workspace` + `--exclude-from-test`，不能用 `-p <包>`。**
+  # `-p` 既限制跑哪些测试、也限制报告范围——实测 `cargo llvm-cov -p cordis-runtime
+  # --lib` 只上报 `crates/cordis-runtime/**`，其它被依赖编译过的 workspace crate
+  # （plugin-sdk / plugin-host / tooling）一个文件都不出现。而 host 系测试、
+  # tooling 测试都会执行 runtime 的代码，丢掉这部分跨 crate 覆盖会让 100% 门槛
+  # 直接崩掉。`--exclude-from-test` 的语义正是"不跑这个包的测试、但保留它在报告
+  # 里"，于是每个分片仍然是一份 workspace 级报告，只是只跑了本组的测试；各组
+  # 分片按行取最大计数合并后，与拆分前单次全量跑的结果等价。
   coverage:
+    name: coverage / ${{ matrix.shard }}
     runs-on: ubuntu-latest
-    # 插桩后的串行全量测试比普通 CI 慢，放宽超时。
-    timeout-minutes: 120
+    # 插桩后的串行全量测试比普通 CI 慢，放宽超时。最慢的一组（runtime_host）
+    # 实测 ~29 分钟；另加冷构建与 fixtures 准备，90 分钟留足余量。
+    timeout-minutes: 90
+    strategy:
+      # 一组失败不要取消其余组：先看清是哪一组、哪几行，也让 merge job 拿到
+      # 其余分片，把"缺哪几行"和"哪组炸了"分开看。
+      fail-fast: false
+      matrix:
+        include:
+          # 最慢的单独一组：`runtime_host` 一个二进制约占全量时长 45%。
+          # 分组只依赖"二进制名"，不枚举用例名——该文件正在被加速改造，用例数
+          # 会变，二进制名不变。
+          - shard: agent-runtime-host
+            invocations: |
+              cordis-agent --test runtime_host
+
+          # host 系覆盖率补测（按名称前缀切两半，避免单组过重）。
+          - shard: agent-host-coverage
+            invocations: |
+              cordis-agent --test host_coverage --test host_coverage_rest
+
+          # iteration 链路：引擎迭代 + 阶段推进 + boot/session 臂。
+          - shard: agent-iteration
+            invocations: |
+              cordis-agent --test iteration_pipeline --test host_iterate_stages --test host_boot_session_arms
+
+          # agent 其余集成二进制 + agent 的 lib 单测。lib 单测里含
+          # `#[cfg(test)]` 模块的行：这类行只在该 crate 的 lib 测试二进制里
+          # 出现，必须让每个 lib crate 都在某个 shard 里跑到 `--lib`，否则合并后
+          # 会缺行。
+          - shard: agent-rest
+            invocations: |
+              cordis-agent --test agent_toolchain_400 --test boot_with_loop --test host_build_coverage --test host_llm_coverage --test host_ops_arms --test host_reload_arms --lib
+
+          # kernel：runtime lib 单测 + 全部 7 个集成二进制。
+          - shard: runtime
+            invocations: |
+              cordis-runtime --lib --test architecture --test auto_update --test crash_recovery --test invoke_coverage --test mock_llm_server --test semantics --test shell_plugin
+
+          # 工具链 + 两个小 crate 的 lib 单测 + cli 二进制单测。
+          # 分两次调用：`--lib` 遇到没有 lib 目标的包（cordis-cli）会直接报
+          # "no library targets found"，所以 cli 的 bin 单测单独一条。
+          # `cordis-cli --bin cordis-runtime` 必须跑到：main.rs 虽被排除在
+          # 报告外，但它的 54 个单测会执行 runtime 侧的代码，漏掉会少行。
+          - shard: tooling-and-libs
+            invocations: |
+              cordis-tooling,cordis-plugin-host,cordis-plugin-sdk --lib --test tooling
+              cordis-cli --bin cordis-runtime
     steps:
       - uses: actions/checkout@v4
 
@@ -36,8 +125,14 @@ jobs:
       - name: fetch fixtures/plugins dependencies
         run: cargo fetch --manifest-path fixtures/plugins/Cargo.toml
 
+      # 每个分片各自准备一次 fixtures 工件（而不是由一个 job 构建后通过
+      # artifact 传下去）：分片之间是独立 runner / 独立 checkout，各自准备才
+      # 保证隔离；走 artifact 只会多一层"分片拿到的工件与本地 index.json 不
+      # 一致"的失败面。这一步同时把 `target/debug/cordis-runtime`（纯 cargo
+      # build 产物）建出来——测试侧的 `support::cli_binary()` 找的就是它，
+      # 见 crates/*/tests/support/mod.rs。
       - name: prepare fixture artifacts
-        run: cargo run --locked -p cordis-runtime -- prepare-artifacts fixtures
+        run: cargo run --locked -p cordis-cli -- prepare-artifacts fixtures
 
       # 若 job 以 root 运行，7 处 `probe_not_root()` 门控的权限失败测试体
       # 不会执行（root 绕过 file-mode 检查），100% 行覆盖门槛会失败。
@@ -69,21 +164,118 @@ jobs:
           echo "host-native fixture artifacts present:"
           ls fixtures/artifacts/*.so | head
 
-      # 覆盖率门槛：行覆盖 100%（无排除注释，实测 26497/26497）。
-      # 排除 main.rs（REPL/signal/exit）与 agent.rs（LLM 流式 I/O）——
-      # 均为进程/网络边界，见 CLAUDE.md 覆盖率规范。
-      # 串行执行：插桩下 host 系集成测试共享 fixtures 工件，并行会因
-      # 中途重建 dylib 触发 HashMismatch 假失败。
-      # 分两步：先无门槛跑出 lcov（保证产物总能上传、失败时能看到缺行），
-      # 再单独判定门槛。cargo-llvm-cov 的 --fail-under-lines 只报一个退出码，
-      # 不打印缺哪几行，排查时看不到任何线索。
-      - name: run tests with coverage
+      # 组内仍然串行（`--test-threads=1`）：这是必需的，不是保守——插桩下
+      # host 系集成测试共享 fixtures/artifacts/，线程并行会因中途重建 dylib
+      # 触发 HashMismatch 假失败。
+      #
+      # 每次调用单独导出一份 lcov（不把不同二进制的 profraw 混进一次 export），
+      # 再由本 job 末尾的合并步骤合成该组的一份：同一行取**最大**计数。
+      - name: run coverage targets for this shard
         run: |
-          cargo llvm-cov --locked --workspace \
-            --ignore-filename-regex 'cordis-runtime/src/(main|agent)\.rs' \
-            --lcov --output-path lcov.info \
-            -- --test-threads=1
+          set -euo pipefail
+          members=$(cargo metadata --locked --no-deps --format-version 1 \
+            | python3 -c 'import json,sys; print(" ".join(p["name"] for p in json.load(sys.stdin)["packages"]))')
+          echo "workspace members: $members"
+          n=0
+          while IFS= read -r spec; do
+            case "$spec" in ''|'#'*) continue;; esac
+            pkgs=${spec%% *}
+            args=${spec#* }
+            if [ "$pkgs" = "$spec" ]; then
+              echo "::error::malformed shard line (expected '<pkgs> <cargo test args>'): $spec"
+              exit 1
+            fi
+            # 只测 pkgs 里的包：其余每个成员都 --exclude-from-test（不进测试，
+            # 但仍进报告），这样每个分片的 lcov 都是 workspace 级报告。
+            excludes=()
+            for p in $members; do
+              case ",$pkgs," in
+                *",$p,"*) ;;
+                *) excludes+=(--exclude-from-test "$p") ;;
+              esac
+            done
+            for p in ${pkgs//,/ }; do
+              case " $members " in
+                *" $p "*) ;;
+                *) echo "::error::unknown package '$p' in shard line: $spec"; exit 1 ;;
+              esac
+            done
+            n=$((n + 1))
+            echo "::group::shard ${{ matrix.shard }} invocation $n: --workspace ${excludes[*]} $args"
+            # shellcheck disable=SC2086  # `args` 是刻意的参数串，需要分词
+            cargo llvm-cov --workspace --locked "${excludes[@]}" $args \
+              --ignore-filename-regex "$COVERAGE_IGNORE" \
+              --lcov --output-path "fragment-$n.info" \
+              -- --test-threads=1
+            echo "::endgroup::"
+          done <<'INVOCATIONS'
+          ${{ matrix.invocations }}
+          INVOCATIONS
 
+      # 即使某条调用失败也上传已有分片，方便 merge job 一并列出"缺哪几行"，
+      # 而不是只剩一句"分片缺失"。
+      - name: merge this shard's fragments (max hit count per line)
+        if: always()
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          fragments=(fragment-*.info)
+          if [ ${#fragments[@]} -eq 0 ]; then
+            echo "::error::shard ${{ matrix.shard }} produced no lcov fragment — every invocation in it failed"
+            exit 1
+          fi
+          python3 scripts/merge_lcov.py --root . \
+            -o "lcov-${{ matrix.shard }}.info" "${fragments[@]}"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: lcov-${{ matrix.shard }}
+          path: lcov-${{ matrix.shard }}.info
+          if-no-files-found: warn
+          retention-days: 30
+
+  # 合并所有分片，再跑原有的 100% 行覆盖判定。
+  # lcov 工具有可能没装（ubuntu-latest 不保证），所以合并用仓库内的 python：
+  # 同一 `SF:` 文件的 `DA:` 行取最大计数，`LF/LH` 重算。
+  merge:
+    name: merge shards + 100% line gate
+    needs: coverage
+    # 有分片失败也要跑：能给出"剩下哪些行没覆盖"，与失败分片的日志互补。
+    # 但整轮被取消（concurrency）时不必跑。
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      # 分片各自上传 `lcov-<shard>.info`（文件名唯一），merge-multiple 后
+      # 全部落在 fragments/ 下，不会互相覆盖。
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: lcov-*
+          path: fragments
+          merge-multiple: true
+
+      - name: merge shard lcov fragments
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          fragments=(fragments/*.info)
+          if [ ${#fragments[@]} -eq 0 ]; then
+            echo "::error::no lcov fragment was downloaded — every shard failed or skipped its upload"
+            exit 1
+          fi
+          python3 scripts/merge_lcov.py --root . -o merged.info \
+            --expect lcov-agent-runtime-host.info \
+            --expect lcov-agent-host-coverage.info \
+            --expect lcov-agent-iteration.info \
+            --expect lcov-agent-rest.info \
+            --expect lcov-runtime.info \
+            --expect lcov-tooling-and-libs.info \
+            "${fragments[@]}"
+
+      # 覆盖率门槛：行覆盖 100%。判定逻辑与拆分前完全一致，只是读合并结果。
       - name: enforce 100% line gate (with uncovered-line listing)
         run: |
           python3 - <<'PY'
@@ -91,10 +283,12 @@ jobs:
           cur = None
           missing = collections.defaultdict(list)
           total = covered = 0
-          for raw in open('lcov.info'):
+          files = set()
+          for raw in open('merged.info'):
               raw = raw.strip()
               if raw.startswith('SF:'):
                   cur = raw[3:]
+                  files.add(cur)
               elif raw.startswith('DA:') and cur:
                   ln, hits = raw[3:].split(',')[:2]
                   total += 1
@@ -103,7 +297,7 @@ jobs:
                   else:
                       missing[cur].append(int(ln))
           pct = 100.0 * covered / total if total else 0.0
-          print(f"line coverage: {covered}/{total} = {pct:.4f}%")
+          print(f"line coverage: {covered}/{total} = {pct:.4f}% over {len(files)} file(s)")
           if not missing:
               print("all lines covered")
               sys.exit(0)
@@ -116,14 +310,47 @@ jobs:
       - name: coverage summary
         if: always()
         run: |
-          echo '## Coverage' >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-          cargo llvm-cov report --summary-only | tee -a "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          if [ ! -f merged.info ]; then
+            echo "no merged lcov — the merge step failed, see its log" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          rows = []
+          total = covered = 0
+          cur = None
+          per_file = {}
+          for raw in open('merged.info'):
+              raw = raw.strip()
+              if raw.startswith('SF:'):
+                  cur = raw[3:]
+                  per_file.setdefault(cur, [0, 0])
+              elif raw.startswith('DA:') and cur:
+                  ln, hits = raw[3:].split(',')[:2]
+                  per_file[cur][0] += 1
+                  if int(hits) > 0:
+                      per_file[cur][1] += 1
+          for path, (lines, hits) in sorted(per_file.items()):
+              total += lines
+              covered += hits
+              rows.append((lines - hits, path, hits, lines))
+          print('## Coverage')
+          print('')
+          print(f'merged line coverage: **{covered}/{total} = {100.0 * covered / total if total else 0.0:.4f}%**')
+          print('')
+          problems = [r for r in sorted(rows, key=lambda r: (-r[0], r[1])) if r[0]]
+          if not problems:
+              print('all files 100% line covered')
+          else:
+              print('| file | lines | uncovered |')
+              print('| --- | ---: | ---: |')
+              for miss, path, hits, lines in problems:
+                  print(f'| `{path}` | {hits}/{lines} | {miss} |')
+          PY
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: lcov
-          path: lcov.info
+          path: merged.info
+          if-no-files-found: warn
           retention-days: 30

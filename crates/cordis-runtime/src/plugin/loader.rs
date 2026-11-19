@@ -41,6 +41,9 @@ pub struct LoaderMetrics {
     pub dylib_no_fallback_total: u64,
     /// Count of plugins marked unavailable.
     pub plugin_unavailable_total: u64,
+    /// Count of plugins skipped because `config/plugins/<name>.yaml` set
+    /// `enabled: false`. They are never staged, loaded or registered.
+    pub disabled_plugins_skipped: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -57,11 +60,29 @@ pub struct LoadOutput {
 #[derive(Debug)]
 pub struct Loader {
     config: LoaderConfig,
+    /// Plugin paths disabled by `config/plugins/<name>.yaml` (`enabled: false`).
+    /// Filtered out of the load entirely: no staging, no dylib open, no node
+    /// registration — so a disabled plugin's Task services never start, and a
+    /// reload that drops it also stops the services it had.
+    disabled: BTreeSet<String>,
 }
 
 impl Loader {
     pub fn new(config: LoaderConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            disabled: BTreeSet::new(),
+        }
+    }
+
+    /// Same loader configuration, but skipping `disabled` plugin paths.
+    pub fn with_disabled(mut self, disabled: BTreeSet<String>) -> Self {
+        self.disabled = disabled;
+        self
+    }
+
+    pub fn disabled(&self) -> &BTreeSet<String> {
+        &self.disabled
     }
 
     pub fn load(&self) -> Result<LoadOutput, RuntimeError> {
@@ -77,10 +98,16 @@ impl Loader {
         let mut index = load_artifact_index(&self.config.artifact_index_path)?;
         self.ensure_not_timed_out(started_at)?;
 
-        let plugin_count = index.entries.len();
+        let enabled_count = index
+            .entries
+            .iter()
+            .filter(|entry| !self.disabled.contains(&entry.plugin_path))
+            .count();
+        let plugin_count = enabled_count;
         let declared_nodes = index
             .entries
             .iter()
+            .filter(|entry| !self.disabled.contains(&entry.plugin_path))
             .map(|entry| entry.docs.nodes.len())
             .sum::<usize>();
         if plugin_count > self.config.budget.max_total_plugins
@@ -135,6 +162,11 @@ impl Loader {
 
         for plugin_path in &index.topo_order {
             self.ensure_not_timed_out(started_at)?;
+            if self.disabled.contains(plugin_path) {
+                metrics.disabled_plugins_skipped += 1;
+                eprintln!("[loader] plugin `{plugin_path}` disabled by config; skipping");
+                continue;
+            }
             let entry =
                 index_map
                     .get(plugin_path)
@@ -402,7 +434,7 @@ impl Loader {
             // instead. The Ok path keeps the docs-drift auto-heal: a
             // readable dylib's docs are ground truth over the cache.
             if !matches!(entry.artifact_kind, ArtifactKind::Json) {
-                match crate::plugin::tooling::read_plugin_docs(&artifact_path) {
+                match crate::plugin::artifact::read_plugin_docs(&artifact_path) {
                     Ok(dylib_docs) => {
                         if dylib_docs != entry.docs {
                             docs_drift.push((plugin_path.clone(), dylib_docs.clone()));
@@ -1365,6 +1397,54 @@ mod loader_flow_tests {
 
     // --- budget --------------------------------------------------------------
 
+    // `enabled: false` filters the plugin out before staging: nothing is
+    // registered, the skip is counted, and the plugin no longer consumes the
+    // plugin budget (so a disabled plugin can't push a load over the limit).
+    #[test]
+    fn load_with_disabled_skips_plugin_and_frees_budget() {
+        let tmp = TempDir::new().unwrap();
+        let artifacts_dir = tmp.path().join("artifacts");
+        fs::create_dir_all(&artifacts_dir).unwrap();
+        let mut entries = Vec::new();
+        for plugin_path in ["alpha", "beta"] {
+            let abi = abi_host("crate_v1", "api_v2");
+            let d = docs(plugin_path);
+            let artifact = PluginArtifact {
+                plugin_path: plugin_path.to_string(),
+                abi_fingerprint: abi.clone(),
+                docs: d.clone(),
+                exports: Vec::new(),
+                execution: None,
+            };
+            let rel = format!("{plugin_path}.json");
+            let (rel, sha) = write_json_artifact(&artifacts_dir, &rel, &artifact);
+            entries.push(json_entry(plugin_path, &rel, &sha, abi, d));
+        }
+        let mut config = write_index(
+            tmp.path(),
+            &ArtifactIndex {
+                schema_version: ARTIFACT_INDEX_SCHEMA_VERSION,
+                generated_at: "now".to_string(),
+                topo_order: vec!["alpha".to_string(), "beta".to_string()],
+                entries,
+            },
+        );
+        // Budget of one plugin would reject the unfiltered tree of two.
+        config.budget.max_total_plugins = 1;
+
+        let loader = Loader::new(config).with_disabled(["alpha".to_string()].into_iter().collect());
+        assert!(loader.disabled().contains("alpha"));
+        let out = loader
+            .load()
+            .expect("disabled plugin must not trip the budget");
+        assert!(out.plugin_registry.get("alpha").is_none());
+        assert!(matches!(
+            out.plugin_registry.get("beta").unwrap().load_result,
+            PluginLoadResult::Loaded
+        ));
+        assert_eq!(out.metrics.disabled_plugins_skipped, 1);
+    }
+
     #[test]
     fn load_budget_exceeded_plugins() {
         let tmp = TempDir::new().unwrap();
@@ -1934,25 +2014,26 @@ mod loader_flow_tests {
     fn drifting_json_plugin_with_plugins_root(
         root: &Path,
         override_plugins_root: PathBuf,
+        plugin_path: &str,
     ) -> LoaderConfig {
         let artifacts_dir = root.join("artifacts");
         fs::create_dir_all(&artifacts_dir).unwrap();
         let abi = abi_host("crate_v1", "api_v2");
-        let mut artifact_docs = docs("alpha");
+        let mut artifact_docs = docs(plugin_path);
         artifact_docs.system_hint = Some("fresh".to_string());
         let artifact = PluginArtifact {
-            plugin_path: "alpha".to_string(),
+            plugin_path: plugin_path.to_string(),
             abi_fingerprint: abi.clone(),
             docs: artifact_docs,
             exports: Vec::new(),
             execution: None,
         };
         let (rel, sha) = write_json_artifact(&artifacts_dir, "alpha.json", &artifact);
-        let entry = json_entry("alpha", &rel, &sha, abi, docs("alpha"));
+        let entry = json_entry(plugin_path, &rel, &sha, abi, docs(plugin_path));
         let index = ArtifactIndex {
             schema_version: ARTIFACT_INDEX_SCHEMA_VERSION,
             generated_at: "now".to_string(),
-            topo_order: vec!["alpha".to_string()],
+            topo_order: vec![plugin_path.to_string()],
             entries: vec![entry],
         };
         let index_path = artifacts_dir.join("index.json");
@@ -1978,7 +2059,8 @@ mod loader_flow_tests {
         // plugins_root sits under a regular file → create_dir_all fails.
         let blocker = tmp.path().join("blocker");
         fs::write(&blocker, b"x").unwrap();
-        let config = drifting_json_plugin_with_plugins_root(tmp.path(), blocker.join("plugins"));
+        let config =
+            drifting_json_plugin_with_plugins_root(tmp.path(), blocker.join("plugins"), "alpha");
         let index_path = config.artifact_index_path.clone();
         // Load must still succeed: interface sync failure is non-fatal.
         let out = Loader::new(config).load().unwrap();
@@ -2007,7 +2089,8 @@ mod loader_flow_tests {
         // Pre-create interfaces.json AS A DIRECTORY so rename onto it fails.
         let iface_as_dir = plugins_root.join("alpha/docs/agent/interfaces.json");
         fs::create_dir_all(&iface_as_dir).unwrap();
-        let config = drifting_json_plugin_with_plugins_root(tmp.path(), plugins_root.clone());
+        let config =
+            drifting_json_plugin_with_plugins_root(tmp.path(), plugins_root.clone(), "alpha");
         let out = Loader::new(config).load().unwrap();
         assert!(matches!(
             out.plugin_registry.get("alpha").unwrap().load_result,
@@ -2023,6 +2106,80 @@ mod loader_flow_tests {
             .filter(|e| e.file_name().to_string_lossy().contains(".cordis-tmp."))
             .collect();
         assert!(leftover.is_empty(), "tmp staging file was not cleaned up");
+    }
+
+    // A directory squatting on the docs-heal lock path makes the lock file
+    // un-openable (EISDIR). The auto-heal must log and continue without a lock
+    // instead of aborting the load, so the drift is still healed.
+    #[test]
+    fn load_docs_drift_lock_open_failure_still_heals() {
+        let tmp = TempDir::new().unwrap();
+        let plugins_root = tmp.path().join("plugins");
+        let config =
+            drifting_json_plugin_with_plugins_root(tmp.path(), plugins_root.clone(), "alpha");
+        // `index.json` → `index.json.heal-lock` is the advisory-lock path.
+        let lock_path = config.artifact_index_path.with_extension("json.heal-lock");
+        fs::create_dir_all(&lock_path).unwrap();
+        let index_path = config.artifact_index_path.clone();
+
+        let out = Loader::new(config).load().unwrap();
+        let state = out.plugin_registry.get("alpha").unwrap();
+        assert!(matches!(state.load_result, PluginLoadResult::Loaded));
+        assert_eq!(
+            state.docs.as_ref().unwrap().system_hint.as_deref(),
+            Some("fresh")
+        );
+        // The unlock-the-heal path still healed both files.
+        assert!(plugins_root
+            .join("alpha/docs/agent/interfaces.json")
+            .exists());
+        let rewritten = load_artifact_index(&index_path).unwrap();
+        assert_eq!(
+            rewritten.entries[0].docs.system_hint.as_deref(),
+            Some("fresh")
+        );
+    }
+
+    /// Skip-the-drift-item arm after a staging (tmp) write failure.
+    ///
+    /// The failure is filesystem-level, not mode-level: CI runs as euid 0, where
+    /// a `0o555` parent directory is still writable, so the mode-based test
+    /// never reaches this arm. `docs/agent` is a symlink to procfs, which exists
+    /// as a directory (`create_dir_all(parent)` succeeds) but refuses to create
+    /// the new `.cordis-tmp.` staging file — for root too.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn load_docs_drift_staging_write_failure_skips_the_item() {
+        let tmp = TempDir::new().unwrap();
+        let plugins_root = tmp.path().join("plugins");
+        let agent_dir = plugins_root.join("alpha/docs/agent");
+        fs::create_dir_all(agent_dir.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink("/proc/sys", &agent_dir).unwrap();
+
+        let config =
+            drifting_json_plugin_with_plugins_root(tmp.path(), plugins_root.clone(), "alpha");
+        let index_path = config.artifact_index_path.clone();
+        let out = Loader::new(config).load().unwrap();
+        let state = out.plugin_registry.get("alpha").unwrap();
+        assert!(matches!(state.load_result, PluginLoadResult::Loaded));
+        assert_eq!(
+            state.docs.as_ref().unwrap().system_hint.as_deref(),
+            Some("fresh")
+        );
+        // The staging write failed, so no interfaces.json was created in procfs,
+        // and the index write-back (a real directory) still ran.
+        assert!(!Path::new("/proc/sys/interfaces.json").exists());
+        assert!(
+            agent_dir
+                .symlink_metadata()
+                .is_ok_and(|meta| meta.file_type().is_symlink()),
+            "the docs dir must still be the procfs symlink"
+        );
+        let rewritten = load_artifact_index(&index_path).unwrap();
+        assert_eq!(
+            rewritten.entries[0].docs.system_hint.as_deref(),
+            Some("fresh")
+        );
     }
 
     // ensure_not_timed_out returns LoadTimeout when the elapsed time since
@@ -2066,7 +2223,8 @@ mod loader_flow_tests {
         fs::create_dir_all(&agent_dir).unwrap();
         fs::set_permissions(&agent_dir, fs::Permissions::from_mode(0o555)).unwrap();
 
-        let config = drifting_json_plugin_with_plugins_root(tmp.path(), plugins_root.clone());
+        let config =
+            drifting_json_plugin_with_plugins_root(tmp.path(), plugins_root.clone(), "alpha");
         let index_path = config.artifact_index_path.clone();
         let out = Loader::new(config).load().unwrap();
         // Load still succeeds with healed docs despite the interfaces sync failure.
@@ -2104,7 +2262,8 @@ mod loader_flow_tests {
         use std::os::unix::fs::PermissionsExt;
         let tmp = TempDir::new().unwrap();
         let plugins_root = tmp.path().join("plugins");
-        let config = drifting_json_plugin_with_plugins_root(tmp.path(), plugins_root.clone());
+        let config =
+            drifting_json_plugin_with_plugins_root(tmp.path(), plugins_root.clone(), "alpha");
         let index_path = config.artifact_index_path.clone();
         let artifacts_dir = index_path.parent().unwrap().to_path_buf();
         // Make the artifacts dir read-only so the index write-back staging write
@@ -2373,7 +2532,7 @@ mod loader_flow_tests {
     /// on hosts where the probe succeeds.
     fn host_native_fixture_docs(name: &str) -> Option<(PathBuf, PluginDocs)> {
         let (src, _) = host_native_fixture(name)?;
-        let docs = crate::plugin::tooling::read_plugin_docs(&src).ok()?;
+        let docs = crate::plugin::artifact::read_plugin_docs(&src).ok()?;
         Some((src, docs))
     }
 
@@ -2613,8 +2772,11 @@ mod auto_heal_file_lock {
         fn drop(&mut self) {
             #[cfg(unix)]
             {
-                if let Some(file) = self.file.as_ref() {
-                    use std::os::unix::io::AsRawFd;
+                use std::os::unix::io::AsRawFd;
+                // `for`-over-`Option` rather than `if let`: the guard either
+                // holds an open lock file or none, with no else arm to leave
+                // permanently uncovered.
+                for file in self.file.as_ref().into_iter() {
                     let _ = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
                 }
             }
