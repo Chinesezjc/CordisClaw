@@ -204,7 +204,11 @@ pub mod test_loop {
         fn replace_last_action_with_reply(&mut self, _reply: &str) -> bool {
             false
         }
-        fn inject_exchange(&mut self, _user_input: &str, _assistant_output: &str) {}
+        fn inject_exchange(&mut self, _user_input: &str, _assistant_output: &str) {
+            // Mirrors the real session: the injected exchange is one user entry
+            // plus one assistant entry, so the counter moves by two.
+            self.history_len += 2;
+        }
         fn ingest_user_message(&mut self, _user_input: &str) {
             self.history_len += 1;
         }
@@ -413,5 +417,13 @@ mod seam_tests {
         assert_eq!(session.tool_execution_summary().total_calls, 0);
         assert!(session.transcript().is_empty());
         assert!(!session.replace_last_action_with_reply("a reply"));
+
+        // The injected exchange is two stored messages — the counter is the
+        // observable the stub keeps. Pinning it here is what stops
+        // `inject_exchange` from silently degrading to a no-op that drops a
+        // shortcut's context.
+        let before = session.history_len();
+        session.inject_exchange("q", "a");
+        assert_eq!(session.history_len(), before + 2);
     }
 }

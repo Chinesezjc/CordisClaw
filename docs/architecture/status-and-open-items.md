@@ -2,7 +2,7 @@
 
 ## 1. 判定口径
 
-- 本文基于当前仓库现状整理，最近更新：2026-11-18。
+- 本文基于当前仓库现状整理，最近更新：2026-11-19。
 - 历史规划蓝图已经吸收进 [design-blueprint.md](./design-blueprint.md)，因此本文结论来自三类证据的交叉比对：
   - 设计蓝图：[design-blueprint.md](./design-blueprint.md)
   - 架构文档：[system-overview.md](./system-overview.md)、[contracts-and-loading.md](./contracts-and-loading.md)、[runtime-semantics.md](./runtime-semantics.md)、[maintenance-guide.md](./maintenance-guide.md)
@@ -1849,6 +1849,74 @@ Loaded plugins:
 - [x] **敏感路径/命令子串黑名单绕过** — 原 `lower.contains(kw)` 子串匹配被 `/etc//passwd`、`/proc//self`、`apikey` / `api-key` 等变体绕过。`check_sensitive_path` 先做纯词法路径规范化（折叠重复 `/`、去尾部 `/`、词法解析 `.`/`..`，不做 fs 操作），再按组件链匹配 `etc/passwd`、`etc/shadow`，按根级组件边界匹配 `proc`/`sys`，按组件前缀匹配 `.ssh`/`.env`/`id_rsa`/`credentials`/`auth.json` 等，并对 `access_token`/`api_key`/`api_secret`/`private_key` 做 `-`、` ` → `_` 归一化（含去下划线紧凑形，拦截 `api-key`/`apikey` 变体）；归一化只作用于这些关键词，`plugins/x/api-utils.rs` 不误伤。`check_sensitive_command` 保留原始子串检查，另加 argv token 级路径门（shell_words 分词，形如路径的 token 跑敏感路径匹配，拦 `head /etc/passwd`、`cat /etc//shadow`、`~/.ssh/` 访问）与 shell 解释器拦截（argv[0] ∈ {sh,bash,dash,ksh,zsh,fish} 且含 `-c`/`-lc`/`--command` → `blocked: shell interpreter invocation`）。
 - [x] **Plugin-iteration 验证命令去 shell**（对齐 P0-17）— `validated_verification_command` 的 `trimmed.starts_with(required_prefix)` 前缀白名单可被 `cargo check && curl x|sh` 绕过，默认命令 `format!("… -p {pp}")` 把 LLM 可控的 plugin_path 拼进 `bash -lc` 字符串。现在：新增共享 argv 门 `validate_verification_argv`（`shell_words::split` 分词、`argv[0]=="cargo"`、`argv[1]` 为所需 op、任何 argv 元素含 `; & | \` $ < > 换行` 即拒），`run_checked_command` 不再经 shell，直接 `Command::new("cargo").args(...)`；默认命令改为 argv 构造 `verification_default_command`，plugin_path 经 `verification_package_segment` 校验（剥离前缀 `/`、拒绝空、拒绝白名单外字符与 `..`，失败返回 InvalidArgument）后作为独立 `["-p", pp]` argv 元素追加；裸别名 `check`/`test` 仍映射到默认 argv。错误文本保持逐字节兼容（`verification tool only allows commands starting with …`）。
 
+### 5.2.41c 插件工件按 size 优化编译；Rust dylib 共享此路不通（2026-08-07；编号与 5.2.41 的两条重复，故加 c 后缀）
+
+**背景**：5.2.40b 补齐 strip 后工件仍有 142 MB，dlopen 时全部进内存。
+
+#### 已落地：`opt-level = "z"`
+
+工件此前是**无优化**的 dev 构建——没有内联、没有死代码消除。给 11 个
+`[profile.dev]`（父 workspace + 10 个 `exclude` 插件，后者是独立 workspace 根，
+收不到父级配置，同 5.2.40b）各加 `opt-level = "z"`：
+
+| | 工件合计 | 全量构建 |
+|---|---|---|
+| 优化前 | 142 MB | 65 s |
+| 优化后 | **79 MB（−44%）** | 135 s |
+
+大插件降幅最明显：llm_openai 18.74 → 8.70、web 18.11 → 8.32、feishu 16.96 →
+7.71、qq 16.37 → 7.49、vision 12.26 → 5.96 MB。
+
+**为什么优化放 dev 档而不是切 release**：`plugin iteration` 对插件跑
+`cargo test`（dev 档）。若工件用 release，插件会被编两遍（两个 profile 各一份），
+构建时间与磁盘都翻倍。dev 档承载优化则共用一份，且 `debug_assertions` 仍开启，
+插件测试语义不变。release + strip 实测 65 MB，只比 dev+opt-level=z 小 10 MB，
+不值那份复杂度。
+
+#### 已否决：把 std / SDK / serde 做成共享 dylib
+
+动机是"22 个插件各带一份 std 与 serde"。实测结论：**共享 Rust 泛型代码不可行**，
+且原因是结构性的，不是配置问题。
+
+- **只共享 libstd 可行**：SDK 保持 rlib，插件加 `-C prefer-dynamic`，宿主以
+  `RTLD_GLOBAL` 预加载 libstd 后 22 个插件全部正常加载。但收益只有
+  142 → 126 MB（−11%），换来一整套预加载与共享目录分发机制，不成比例。
+- **共享 SDK（连带 serde）不可行**：SDK 改 `crate-type = ["rlib", "dylib"]`、
+  全部插件用同一个 `CARGO_TARGET_DIR` 构建、预加载与插件链接的**同一个**
+  SDK dylib 文件后，**22 个插件只有 3 个能加载**。19 个失败，缺的符号各不相同：
+  `core::ptr::drop_glue::<serde_json 类型>`、`alloc::slice::to_vec_in::<u8,…>`、
+  `<Result<(), serde_json::Error> as Try>::from_output`、`serde_core::de::impls::…`。
+
+**根因**：泛型在 Rust 里按实例化单态化编译。`serde_json::from_str::<T>()` 在选定
+`T` 之前不是代码；每个插件的 `#[derive(Deserialize)]` 类型生成各自的机器码。
+所以"22 份 serde 副本"是个误称——那是 **22 份不同的特化**，只在 `Cargo.toml`
+里看起来是同一个依赖。符号统计印证：llm_openai 里 serde 相关代码只有 0.35 MB。
+rustc 在上游以 dylib 形式存在时把这些实例记作"上游提供"、不在本地生成，dylib
+里没有就成了 undefined symbol；而"枚举全部插件可能用到的实例"不是有限任务。
+
+**libstd 为何例外**：由工具链构建分发，rustc 对它有特殊处理，缺的实例会在本地
+生成。这就是"共享 libstd 可行、共享用户 crate 不可行"的分界。
+
+**`dylib` 与 `cdylib`**：只有 `dylib` 能被别的 Rust crate 依赖、从而共享 Rust
+依赖，但代价正是携带元数据与上述单态化记账；`cdylib` 导出纯 C ABI、把全部
+Rust 依赖静态吞入，定义上就无法共享。**不存在"既能共享 serde 又可靠"的
+crate-type**。附带一条现状观察：本仓库插件声明的是 `dylib`，但用法是 `cdylib`
+的场景（dlopen + dlsym 取单一入口、之后只交换 JSON）；`RustPluginApiV2` 虽标
+`#[repr(C)]`，`handle` 却是 Rust ABI 的 `fn` 指针、`PluginRequest.payload` 按值
+传 `String`——这就是"宿主与插件必须同一 rustc 编译"这一隐含约束的来源，而仓库
+尚无 `rust-toolchain.toml` 锁定。
+
+#### 剩余杠杆
+
+- **`llm_openai` / `web` 从 reqwest 换 ureq**：两者用法是纯阻塞，但 reqwest 的
+  blocking 模式仍拉起 tokio 运行时，连带 hyper / hyper-rustls / hyper-util /
+  mio / tokio-rustls 共 10 个异步栈 crate（依赖数 96，而用 ureq 的 vision 是
+  63）。llm_openai 里 tokio/hyper 代码占 1.43 MB。不推翻任何既有决策。
+- **rustls → native-tls（已否决）**：rustls + ring 占 llm_openai 代码的
+  2.82 MB，是单态的密码学与协议代码，换系统 OpenSSL 可经 C ABI 在 5 个网络插件
+  与系统之间真正共享。但这推翻 `llm_openai/Cargo.toml` 里"不依赖系统 OpenSSL"
+  的既有选择，且需要构建机具备 pkg-config 与 OpenSSL 开发包。不做。
+
 ### 5.2.40b 插件工件体积：exclude 清单里的插件收不到 strip profile（2026-08-06；main 侧条目，同上编号重复故加 b 后缀）
 
 **背景**：22 个 `.so` 合计 234 MB，dlopen 全加载时这些体积同时进内存。
@@ -2391,6 +2459,10 @@ cd fixtures/plugins/expr/lexer && cargo test --lib  # excluded, external tests o
 - [x] **P2-28 modtime 失败取 now**（非 UNIX_EPOCH）— dirty-tracking 不再把无法读 mtime 的文件误判为"极老"；log stderr 提示。
 - [x] **P2-29 rebuild_plugin_workspace 加 strip_proxy_envs** — 与 `run_command` 对齐；企业代理下不再挂起。
 - [x] **P2-30 rebuild 加 build timeout** — 新 helper `run_command_with_timeout` (20min 默认，`CORDIS_BUILD_TIMEOUT_SECS` 覆盖) + poll-based kill+wait；死循环 build.rs 不再挂死 iteration 管道。
+- [x] **PR3-P1 tooling 子进程管道并发排空** — `run_command_with_timeout` spawn 后立即把 stdout/stderr 各交给 reader 线程 drain（同 `std::Command::output` 内部做法），轮询循环不变；此前管道要等循环退出才读，>64KiB 输出会阻塞子进程 write，健康构建被 deadline 误杀。kill 失败（注入可测）时记录并跳过 wait，避免无限等待。
+- [x] **PR3-P3 prepare 路径全量超时** — `prepare_artifacts` 链路的 `cargo metadata`（`load_workspace_metadata` / `built_dylib_path`）与 `cargo build`（`build_plugin_artifact` / `build_dirty_dylib_plugins`）全部切换到带超时执行器 `run_command_timed`（复用 `run_command_with_timeout` + `CORDIS_BUILD_TIMEOUT_SECS`，非零退出的错误文本与原 `run_command` 逐字节一致）；原未超时的 `run_command` 已无生产调用点，移除以防"无超时旁路"重新引入。
+- [x] **PR3-P2 verifier 命令管道并发排空 + 进程组击杀** — `run_shell_command` spawn 后立即并发 drain 两条管道（防大输出被误杀）；Unix 上 spawn 前 `process_group(0)`，超时时 `kill(-pid, SIGKILL)` 连孙进程一起杀防孤儿；进程组已消失（ESRCH）时记录并跳过 wait。`poll_until_exit` 注入式测试结构不变。
+- [x] **PR3-P6 输入收集不跟随符号链接 / 防环** — `collect_dir_entry` 改用 `entry.file_type()`（lstat，不跟随）判目录并跳过全部符号链接：crate 内目录链接指向外部时不再把无关文件纳入 `input_probe`/指纹（新增越界回归测试），指向祖先的链接不再无界递归（旧行为 ENAMETOOLONG）；真实目录经共享 `visited` 集合保证至多进入一次。
 - [x] **P2-12 QQ 硬编码路径**（部分修）— 新 `runtime_config_path()` 从 `$CORDIS_FIXTURES_ROOT` 派生；env 未设置时回退到历史 `/root/CordisClaw/...`。
 - [x] **serve 加 `--no-startup-invoke`（本地测试劫持线上流量修复，2026-07-22）** — serve 启动段原先无条件执行 `startup_invoke.json`（起 qq HTTP 8099 + 连真实飞书 WSS）；本地落地测试实例与线上 bot 共用渠道凭证，测试期间飞书把用户消息推给测试实例，实例发出"思考中"两段式占位卡片后被测试脚本 exit 杀掉，内存 `PENDING_CARDS` 丢失，用户侧卡片永久停留（已实际发生）。新增 `--no-startup-invoke` flag + `CORDIS_NO_STARTUP_INVOKE` 环境变量：跳过启动段全部自动 invoke 并打印明确日志，插件加载 / invoke / execute / REPL 不受影响。`parse_root_and_runtime_only` 重构为 `parse_serve_args`（env 读取在外壳，内层纯函数可测），main.rs 补 4 个参数解析单测。约定：本地落地测试一律带该开关。
 - [x] **P2-13 fingerprint per-build**（fixture 迁移完成）— 21 个 fixture 插件的 `abi_fingerprint_value()` 全部从硬编码 `AbiFingerprint { rustc_version: "1.85.1", target_triple: "x86_64-unknown-linux-gnu", ... }` 迁移到 `AbiFingerprint::current_build(crate_hash, api_hash)`；Cargo.toml 的 `[package.metadata.cordis.abi_fingerprint]` 删除 rustc_version/target_triple 两行（SDK 的 `AbiFingerprint` 加 serde default，缺省时填当前工具链值，显式声明仍生效）；host.rs 两处插件脚手架模板与 agent.rs 的插件创建 prompt 同步。修复动机：硬编码 linux triple 导致 macOS 等非 linux-x86 宿主上所有 dylib 插件被 target_triple 预检拒载（`Unavailable(AbiMismatch)`），serve 无法冷启动。SDK 补 serde-default 单测；macOS (aarch64-apple-darwin) 实机 serve + invoke 验证通过。
