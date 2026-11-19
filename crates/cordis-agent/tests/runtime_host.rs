@@ -22,6 +22,7 @@ use std::fs;
 use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Once;
 use tempfile::TempDir;
 
 mod support;
@@ -63,7 +64,31 @@ fn repo_root() -> PathBuf {
         .expect("repo root")
 }
 
+/// 让所有 fixture 工作区的 cargo 构建共用一个 target 目录。
+///
+/// 每次 `setup_fixture_workspace_copy` 都把 fixtures 复制到新的 `TempDir`，
+/// 于是 cargo 的 unit hash 每轮都变：冷缓存下每个用例都要把 reqwest / rustls /
+/// tokio 那一整套依赖重编一遍，这就是迭代类用例上百秒的来源。把
+/// `CARGO_TARGET_DIR` 钉到仓库 `target/fixture-plugins` 之后，registry 依赖
+/// 只编一次，后续用例只重建「路径变了的那几个插件 crate」。
+///
+/// 放在 `target/` 下：`cargo clean` 与 `scripts/clean-build-artifacts.sh`
+/// 都会回收，CI 的 rust-cache 也缓存这一层。子进程（迭代里的 `cargo build`、
+/// 验证阶段 `cargo check` / `cargo test`、`serve` 出来的 CLI）都继承它。
+fn share_fixture_build_target() {
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let dir = repo_root().join("target/fixture-plugins");
+        fs::create_dir_all(&dir).expect("create shared fixture target dir");
+        std::env::set_var("CARGO_TARGET_DIR", dir);
+        // 这些构建是一次性的（temp 路径每轮都变，永远命中不了增量缓存），
+        // 增量编译只会往共享目录里堆 2G+ 的 `incremental/` 却换不来速度。
+        std::env::set_var("CARGO_INCREMENTAL", "0");
+    });
+}
+
 fn setup_fixture_workspace_copy() -> TempDir {
+    share_fixture_build_target();
     let temp = TempDir::new().expect("tempdir");
     let temp_fixtures = temp.path().join("fixtures");
     copy_dir_all(&fixtures_root(), &temp_fixtures);
@@ -214,6 +239,61 @@ fn update_workspace_members(root: &Path, members: &[&str]) {
     );
     text.replace_range(start..=end, &replacement);
     fs::write(&manifest_path, text).expect("write workspace manifest");
+}
+
+/// 把 fixtures 复制品裁成只含 `keep` 里的顶层插件（连同它们的子树）。
+///
+/// 这些用例只驱动一两个插件，但「改了 manifest → 全量重建」这条路会重建
+/// 整个 `plugins` 工作区：qq/web/feishu 的 tokio+reqwest、soul_store 的
+/// bundled sqlite、vision/image_gen … 冷缓存下几十秒到几分钟。把无关的顶
+/// 层插件裁掉后 `prepare_artifacts` 的插件图只剩 `keep`，重建只碰它们；
+/// 用例断言的插件、节点、invocation 全都在保留集里，语义不变。
+///
+/// `artifacts/index.json` 同步裁掉未保留的条目：boot 才不会去 stage 已经
+/// 不存在的插件。
+fn keep_only_plugins(fixtures_root: &Path, keep: &[&str]) {
+    let plugins_root = fixtures_root.join("plugins");
+    for entry in fs::read_dir(&plugins_root).expect("read plugins dir") {
+        let entry = entry.expect("plugins dir entry");
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name == "target" || keep.contains(&name.as_str()) {
+            continue;
+        }
+        if entry.file_type().expect("plugins entry type").is_dir() {
+            fs::remove_dir_all(entry.path()).expect("prune plugin dir");
+        }
+    }
+    update_workspace_members(fixtures_root, keep);
+    prune_artifact_index(fixtures_root, keep);
+}
+
+fn prune_artifact_index(fixtures_root: &Path, keep: &[&str]) {
+    let kept = |plugin_path: &str| {
+        keep.iter()
+            .any(|root| plugin_path == *root || plugin_path.starts_with(&format!("{root}/")))
+    };
+    let index_path = fixtures_root.join("artifacts/index.json");
+    let mut value: Value =
+        serde_json::from_str(&fs::read_to_string(&index_path).expect("read index"))
+            .expect("parse index");
+    for key in ["topo_order", "entries"] {
+        let items = value
+            .get_mut(key)
+            .and_then(|value| value.as_array_mut())
+            .expect("index array");
+        items.retain(|item| {
+            let plugin_path = item
+                .get("plugin_path")
+                .and_then(|value| value.as_str())
+                .or_else(|| item.as_str());
+            plugin_path.map(kept).unwrap_or(false)
+        });
+    }
+    fs::write(
+        &index_path,
+        serde_json::to_string_pretty(&value).expect("serialize index"),
+    )
+    .expect("write pruned index");
 }
 
 fn add_demo_process_plugin(root: &Path, version: &str) {
@@ -517,6 +597,149 @@ fn update_index_node_summary(root: &Path, plugin_path: &str, node_id: &str, summ
         serde_json::to_string_pretty(&value).expect("serialize index"),
     )
     .expect("write index");
+}
+
+/// 只含一个 JSON 工件（`process` 执行）插件的 fixtures 树。
+///
+/// 门禁 / 回滚 / 审批用例测的是内核状态机，不是「cargo 能不能编译一个
+/// dylib」。插件不声明 `crate-type = ["dylib"]`，于是 `prepare_artifacts`
+/// 直接生成 `artifacts/gate.json`（CLAUDE.md「测试提速」），整条迭代链路
+/// 一次 `cargo build` 都不跑。剩下的唯一子进程是 `cargo metadata`——脏判定
+/// 要靠它解析插件图——它只解析、不编译。
+///
+/// `execution.command` 用绝对的 `/bin/sh`：全量重生成会 `remove_dir_all`
+/// 掉 `artifacts/`，把 runner 脚本放进 artifacts 会被一并清掉；绝对命令
+/// 在 `stage_process_command` / `resolve_exec_path` 里都原样采用，不受影响。
+fn setup_json_iteration_fixture() -> TempDir {
+    let temp = TempDir::new().expect("tempdir");
+    let plugins = temp.path().join("plugins");
+    let gate = plugins.join("gate");
+    for dir in ["src", "tests", "docs/agent", "docs/human"] {
+        fs::create_dir_all(gate.join(dir)).expect("create gate dirs");
+    }
+    fs::write(
+        plugins.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"gate\"]\nresolver = \"2\"\n",
+    )
+    .expect("write plugins workspace manifest");
+    fs::write(gate.join("Cargo.toml"), GATE_MANIFEST).expect("write gate manifest");
+    fs::write(gate.join("src/lib.rs"), "pub fn gate_marker() {}\n").expect("write gate src");
+    fs::write(
+        gate.join("docs/human/overview.md"),
+        "# Gate\n\nProcess-backed gate plugin.\n",
+    )
+    .expect("write gate overview");
+    fs::write(gate.join("docs/agent/interfaces.json"), GATE_DOCS).expect("write gate docs");
+    // 只走 `prepare_artifacts` 的 JSON 分支：不 shell 出去跑 `cargo build`。
+    cordis_tooling::rebuild_fixture_artifacts(temp.path()).expect("prepare json artifact");
+    pin_private_snapshot_root(temp.path(), temp.path());
+    temp
+}
+
+/// fixture 里声明的 API 指纹，也是「一次迭代改了什么」的观察点。
+///
+/// 为什么不用节点 summary 当观察点：`docs/agent/interfaces.json` 是
+/// **生成物**，迭代策略对它是只读的（`generated agent docs are read-only
+/// context`）——只有 dylib 插件能靠改 `src/lib.rs` 再重编译把 summary 带出来。
+/// JSON（process）插件没有生成器，它的 `docs/agent/interfaces.json` 就是
+/// 手写源文件，改不动。于是这些用例改用 manifest 里的 `api_hash` 当作
+/// 「候选工件确实换了一份」的观察点：它随重建流进 `artifacts/gate.json`、
+/// 流进 `RegisteredPlugin::abi_fingerprint`，而**不**改变进程的应答，
+/// 所以 canary 重放仍然一致。
+const GATE_API_HASH_V1: &str = "api_v2";
+const GATE_API_HASH_V2: &str = "api_v3";
+
+fn gate_api_hash(snapshot: &RuntimeSnapshot) -> String {
+    snapshot
+        .plugin_registry()
+        .get("gate")
+        .and_then(|plugin| plugin.abi_fingerprint.clone())
+        .map(|fingerprint| fingerprint.api_hash)
+        .expect("gate abi fingerprint should exist")
+}
+
+/// `plugin:` 验证命令：让**候选快照**真的执行一次刚重建出来的工件。
+///
+/// 比 `cargo test` 便宜得多，同时仍然是一次真实的候选行为检查——只有
+/// `artifacts/gate.json` 被正确重建、`execution.command` 仍可执行时才会 Pass。
+const GATE_VERIFY_COMMAND: &str =
+    r#"plugin:{"plugin_path":"gate","node_id":"gate_entry","payload_json":{"message":"verify"}}"#;
+
+/// 不带 `[lib] crate-type`，因此工件类型是 `json`。
+const GATE_MANIFEST: &str = r#"[package]
+name = "gate"
+version = "0.1.0"
+edition = "2021"
+
+[package.metadata.cordis]
+plugin_path = "gate"
+abi_kind = "rust"
+declared_nodes = ["gate_entry"]
+
+[package.metadata.cordis.abi_fingerprint]
+crate_hash = "crate_gate_v1"
+api_hash = "api_v2"
+
+[package.metadata.cordis.artifact]
+execution = { kind = "process", command = "/bin/sh", args = ["-c", "cat >/dev/null; printf '{\"version\":\"v1\"}'"] }
+"#;
+
+const GATE_DOCS: &str = r#"{
+  "plugin_id": "gate",
+  "plugin_path": "gate",
+  "plugin_version": "0.1.0",
+  "abi_version": 2,
+  "nodes": [
+    {
+      "id": "gate_entry",
+      "summary": "echo the gate payload",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "message": { "type": "string" }
+        },
+        "required": ["message"]
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "version": { "type": "string" }
+        }
+      },
+      "side_effects": ["process"],
+      "failure_modes": ["process_error"]
+    }
+  ]
+}
+"#;
+
+/// 一次「换掉 API 指纹」的编辑计划，落在 `gate` 插件目录内。
+///
+/// 改 `Cargo.toml` 是刻意的：`driver` 只有在 `changed_paths` 命中
+/// `Cargo.toml` 时才走全量 `prepare_artifacts`（新子插件可能不在目标插件的
+/// 构建图里）；JSON 工件的重生成也只在这条路径上，定向 `rebuild_plugin`
+/// 是给 dylib 用的。插件只有 `gate` 一个，全量重生成因此仍然零编译。
+fn gate_edit_plan(fixtures: &Path, issue: &str) -> PluginEditPlan {
+    let manifest_before =
+        fs::read_to_string(fixtures.join("plugins/gate/Cargo.toml")).expect("read gate manifest");
+    let old_line = format!("api_hash = \"{GATE_API_HASH_V1}\"");
+    let new_line = format!("api_hash = \"{GATE_API_HASH_V2}\"");
+    let manifest_after = replace_once(&manifest_before, &old_line, &new_line);
+    PluginEditPlan {
+        issue_id: issue.to_string(),
+        patch_id: format!("{issue}-patch"),
+        summary: "bump the gate plugin API hash".to_string(),
+        operations: vec![PluginEditOperation {
+            path: "plugins/gate/Cargo.toml".to_string(),
+            kind: PluginEditOpKind::ReplaceExact,
+            expected_old_string: Some(manifest_before),
+            expected_sha256: None,
+            new_content: Some(manifest_after),
+            pointer: None,
+            dotted_key: None,
+            value: None,
+        }],
+    }
 }
 
 #[test]
@@ -1059,11 +1282,29 @@ fn runtime_host_iterate_plugins_promotes_after_canary_replay() {
     }
     let temp = setup_fixture_workspace_copy();
     let fixtures = temp.path().join("fixtures");
+    // 本用例只驱动 shell；把其余顶层插件裁掉，`cargo check --manifest-path
+    // plugins/Cargo.toml` 才不用把 qq/web/feishu 那一整套依赖也从冷缓存编一遍。
+    keep_only_plugins(&fixtures, &["shell"]);
     let host = RuntimeHost::boot(&fixtures).expect("host should boot");
     let journal_path = plugin_iteration_journal_path(&host.status().snapshot_root);
     let original_summary =
         plugin_node_summary(host.current_snapshot().as_ref(), "shell", "shell_entry");
     let updated_summary = format!("{original_summary} (plugin iteration)");
+    // 顺带把版本从 0.1.0 抬到 0.2.0（manifest + 插件自报的 docs 版本一起改，
+    // 保持 index 与 docs 的 plugin_version 一致）。改 manifest 让 driver 走全量
+    // `prepare_artifacts`：这条路径用 `cargo metadata` 解析 target dir，因此
+    // 上面的共享 `CARGO_TARGET_DIR` 生效；定向 `rebuild_plugin` 那条路读的是
+    // 写死的 `plugins/target/debug`，与共享 target dir 不兼容。
+    let manifest_path = fixtures.join("plugins/shell/Cargo.toml");
+    let manifest_before = fs::read_to_string(&manifest_path).expect("read shell manifest");
+    let manifest_after = replace_once(
+        &manifest_before,
+        "version = \"0.1.0\"",
+        "version = \"0.2.0\"",
+    );
+    let source_before =
+        fs::read_to_string(fixtures.join("plugins/shell/src/lib.rs")).expect("read shell source");
+    let source_after = replace_once(&source_before, "\"0.1.0\"", "\"0.2.0\"");
 
     let response = host
         .invoke(
@@ -1084,28 +1325,68 @@ fn runtime_host_iterate_plugins_promotes_after_canary_replay() {
                 issue_id: "issue-shell-docs".to_string(),
                 patch_id: "patch-shell-docs".to_string(),
                 summary: "update shell docs summary".to_string(),
-                operations: vec![PluginEditOperation {
-                    path: "plugins/shell/src/lib.rs".to_string(),
-                    kind: PluginEditOpKind::ReplaceExact,
-                    expected_old_string: Some(original_summary.clone()),
-                    expected_sha256: None,
-                    new_content: Some(updated_summary.clone()),
-                    pointer: None,
-                    dotted_key: None,
-                    value: None,
-                }],
+                operations: vec![
+                    PluginEditOperation {
+                        path: "plugins/shell/Cargo.toml".to_string(),
+                        kind: PluginEditOpKind::ReplaceExact,
+                        expected_old_string: Some(manifest_before),
+                        expected_sha256: None,
+                        new_content: Some(manifest_after),
+                        pointer: None,
+                        dotted_key: None,
+                        value: None,
+                    },
+                    PluginEditOperation {
+                        path: "plugins/shell/src/lib.rs".to_string(),
+                        kind: PluginEditOpKind::ReplaceExact,
+                        expected_old_string: Some(source_before),
+                        expected_sha256: None,
+                        new_content: Some(source_after),
+                        pointer: None,
+                        dotted_key: None,
+                        value: None,
+                    },
+                    PluginEditOperation {
+                        path: "plugins/shell/src/lib.rs".to_string(),
+                        kind: PluginEditOpKind::ReplaceExact,
+                        expected_old_string: Some(original_summary.clone()),
+                        expected_sha256: None,
+                        new_content: Some(updated_summary.clone()),
+                        pointer: None,
+                        dotted_key: None,
+                        value: None,
+                    },
+                ],
             }),
             manual_approved: false,
             tests_command: Some(
                 "cargo test --quiet --manifest-path plugins/shell/Cargo.toml".to_string(),
             ),
             safety_command: None,
+            // 保留真实 dylib + 真实 `cargo test` + 完整 `RustWorkspace`
+            // （canary 重放用例测的就是「真插件换掉 .so 之后重放仍一致」）。
+            // 整仓 `cargo check` 之所以不再昂贵，是靠上面把 fixtures 裁到
+            // 只剩 shell，而不是把这道检查关掉。
             verify_profile: Some(VerificationProfile::RustWorkspace),
             quality_score: Some(95),
         })
         .expect("plugin iteration should succeed");
 
-    assert_eq!(result.final_verdict, PluginIterationFinalVerdict::Promoted);
+    assert_eq!(
+        result.final_verdict,
+        PluginIterationFinalVerdict::Promoted,
+        "blocked_reason={:?} verifier={:?} canary={:?} verification={:?}",
+        result.blocked_reason,
+        result.verifier_verdict,
+        result
+            .canary
+            .as_ref()
+            .map(|report| (&report.verdict, &report.message)),
+        result
+            .verification
+            .as_ref()
+            .map(|report| (&report.input, report.hash_error.clone())),
+    );
     assert_eq!(result.verifier_verdict, Some(VerifierVerdict::Pass));
     assert_eq!(
         result.canary.as_ref().map(|report| report.verdict),
@@ -1156,6 +1437,9 @@ fn runtime_host_iterate_plugins_agent_adds_dist_child_plugin_and_promotes() {
     // `ensure_fixture_artifacts` rebuilds fixture dylibs for the local target.
     let temp = setup_fixture_workspace_copy();
     let fixtures = temp.path().join("fixtures");
+    // 只留 expr（被测插件）与 llm_openai（provider）：改 manifest 会触发
+    // 全量重建，把无关的 11 个顶层插件留在工作区里就是每次从冷缓存编整棵树。
+    keep_only_plugins(&fixtures, &["expr", "llm_openai"]);
 
     let lexer_before = read_rel(&fixtures, "plugins/expr/lexer/src/core.rs");
     let lexer_after = replace_once(
@@ -1379,6 +1663,8 @@ fn runtime_host_iterate_plugins_agent_retries_on_warning_and_promotes() {
     // warning-recovery re-edit path. No longer linux-gated.
     let temp = setup_fixture_workspace_copy();
     let fixtures = temp.path().join("fixtures");
+    // 只留 expr + llm_openai：见 agent_adds_dist 用例里的同一处说明。
+    keep_only_plugins(&fixtures, &["expr", "llm_openai"]);
 
     let lexer_before = read_rel(&fixtures, "plugins/expr/lexer/src/core.rs");
     let lexer_after = replace_once(
@@ -1596,6 +1882,8 @@ fn runtime_host_iterate_plugins_agent_retries_on_raw_mod_identifier_and_promotes
     // agent loop succeeds on arm64 macOS too.
     let temp = setup_fixture_workspace_copy();
     let fixtures = temp.path().join("fixtures");
+    // 只留 expr + llm_openai：见 agent_adds_dist 用例里的同一处说明。
+    keep_only_plugins(&fixtures, &["expr", "llm_openai"]);
     let evaluator_before = read_rel(&fixtures, "plugins/expr/evaluator/src/core.rs");
     let evaluator_bad = replace_once(
         &evaluator_before,
@@ -1678,49 +1966,42 @@ fn runtime_host_iterate_plugins_agent_retries_on_raw_mod_identifier_and_promotes
 
 #[test]
 fn runtime_host_iterate_plugins_blocks_without_canary_evidence_and_approve_promotes() {
-    if !support::linux_dylib_artifacts_available() {
-        eprintln!("[skip] fixture dylibs are x86_64-linux only; skipping on this host");
-        return;
-    }
-    let temp = setup_fixture_workspace_copy();
-    let fixtures = temp.path().join("fixtures");
-    let host = RuntimeHost::boot(&fixtures).expect("host should boot");
+    // 门禁 + 审批：没有可重放的调用证据 → canary Partial → Blocked；只有
+    // 人工 approve 才 promote。用 JSON 工件 fixture —— 本用例证明的是审批
+    // 状态机，不是「cargo 能不能编译 shell 的 dylib」。
+    let temp = setup_json_iteration_fixture();
+    let fixtures = temp.path();
+    let host = RuntimeHost::boot(fixtures).expect("host should boot");
     let journal_path = plugin_iteration_journal_path(&host.status().snapshot_root);
-    let original_summary =
-        plugin_node_summary(host.current_snapshot().as_ref(), "shell", "shell_entry");
-    let updated_summary = format!("{original_summary} (blocked candidate)");
+    assert_eq!(
+        gate_api_hash(host.current_snapshot().as_ref()),
+        GATE_API_HASH_V1
+    );
 
     let result = host
         .iterate_plugins(KernelPluginIterationRequest {
             issue_id: None,
-            target_plugin_paths: vec!["shell".to_string()],
-            instruction: Some("update shell docs summary without replay evidence".to_string()),
-            edit_plan: Some(PluginEditPlan {
-                issue_id: "issue-shell-blocked".to_string(),
-                patch_id: "patch-shell-blocked".to_string(),
-                summary: "update shell docs summary without replay evidence".to_string(),
-                operations: vec![PluginEditOperation {
-                    path: "plugins/shell/src/lib.rs".to_string(),
-                    kind: PluginEditOpKind::ReplaceExact,
-                    expected_old_string: Some(original_summary.clone()),
-                    expected_sha256: None,
-                    new_content: Some(updated_summary.clone()),
-                    pointer: None,
-                    dotted_key: None,
-                    value: None,
-                }],
-            }),
+            target_plugin_paths: vec!["gate".to_string()],
+            instruction: Some("bump the gate API hash without replay evidence".to_string()),
+            edit_plan: Some(gate_edit_plan(fixtures, "issue-gate-blocked")),
             manual_approved: false,
-            tests_command: Some(
-                "cargo test --quiet --manifest-path plugins/shell/Cargo.toml".to_string(),
-            ),
+            tests_command: Some(GATE_VERIFY_COMMAND.to_string()),
             safety_command: None,
-            verify_profile: Some(VerificationProfile::RustWorkspace),
+            // 默认 profile 不发整仓 `cargo check`；候选工件由
+            // `GATE_VERIFY_COMMAND` 直接执行一遍，验证阶段仍然作用于被测代码。
+            verify_profile: Some(VerificationProfile::Default),
             quality_score: Some(95),
         })
         .expect("plugin iteration should complete in blocked state");
 
-    assert_eq!(result.final_verdict, PluginIterationFinalVerdict::Blocked);
+    assert_eq!(
+        result.final_verdict,
+        PluginIterationFinalVerdict::Blocked,
+        "blocked_reason={:?} verifier={:?} canary={:?}",
+        result.blocked_reason,
+        result.verifier_verdict,
+        result.canary.as_ref().map(|report| &report.verdict),
+    );
     assert_eq!(result.verifier_verdict, Some(VerifierVerdict::Pass));
     assert_eq!(
         result.canary.as_ref().map(|report| report.verdict),
@@ -1729,18 +2010,16 @@ fn runtime_host_iterate_plugins_blocks_without_canary_evidence_and_approve_promo
     assert!(host.candidate_snapshot().is_some());
     assert!(journal_path.exists());
     assert_eq!(
-        plugin_node_summary(host.current_snapshot().as_ref(), "shell", "shell_entry"),
-        original_summary
+        gate_api_hash(host.current_snapshot().as_ref()),
+        GATE_API_HASH_V1
     );
     assert_eq!(
-        plugin_node_summary(
+        gate_api_hash(
             host.candidate_snapshot()
                 .expect("candidate should remain staged")
                 .as_ref(),
-            "shell",
-            "shell_entry",
         ),
-        updated_summary
+        GATE_API_HASH_V2
     );
     assert_eq!(host.kernel().blocked_iterations().len(), 1);
 
@@ -1755,8 +2034,8 @@ fn runtime_host_iterate_plugins_blocks_without_canary_evidence_and_approve_promo
     assert!(host.kernel().blocked_iterations().is_empty());
     assert!(!journal_path.exists());
     assert_eq!(
-        plugin_node_summary(host.current_snapshot().as_ref(), "shell", "shell_entry"),
-        updated_summary
+        gate_api_hash(host.current_snapshot().as_ref()),
+        GATE_API_HASH_V2
     );
     assert_eq!(host.kernel().plugin_history().len(), 1);
     assert_eq!(host.kernel().status().plugin_iteration_total, 1);
@@ -1828,46 +2107,44 @@ fn runtime_host_iterate_plugins_policy_blocks_runtime_paths() {
 
 #[test]
 fn runtime_host_iterate_plugins_rolls_back_invalid_plugin_manifest_and_keeps_runtime_alive() {
-    if !support::linux_dylib_artifacts_available() {
-        eprintln!("[skip] fixture dylibs are x86_64-linux only; skipping on this host");
-        return;
-    }
-    let temp = setup_fixture_workspace_copy();
-    let fixtures = temp.path().join("fixtures");
-    let host = RuntimeHost::boot(&fixtures).expect("host should boot");
+    // 回滚：一次把插件 manifest 改坏的迭代必须整体回滚（源树恢复、journal
+    // 清空、运行时仍可用），并记一条 LoadFailure issue。JSON 工件 fixture：
+    // 证明的是回滚状态机，不是「cargo 能不能编译 dylib」。
+    let temp = setup_json_iteration_fixture();
+    let fixtures = temp.path();
+    let host = RuntimeHost::boot(fixtures).expect("host should boot");
     let journal_path = plugin_iteration_journal_path(&host.status().snapshot_root);
-    // 5.2.27: previously targeted the `root` fixture's `./child` declaration,
-    // but P2-10 removed root/child (root now has `children = []` and is not
-    // even a workspace member). Break the expr tree's `./lexer` child source
-    // instead — same semantics: an edit that corrupts a parent manifest must
-    // roll back and leave the runtime alive.
-    let manifest_path = fixtures.join("plugins/expr/Cargo.toml");
-    let original_manifest = fs::read_to_string(&manifest_path).expect("read expr manifest");
+    // 5.2.27: 原来破坏 `root` fixture 的 `./child` 声明，P2-10 移除 root/child
+    // 后改成破坏 expr 树的 `./lexer` 子源。这里破坏的是同一个语义层——父
+    // manifest 的结构性声明：把插件的 `plugin_path` 改成与目录不一致的值，
+    // 插件图解析会以 PluginPathMismatch 失败。
+    let manifest_path = fixtures.join("plugins/gate/Cargo.toml");
+    let original_manifest = fs::read_to_string(&manifest_path).expect("read gate manifest");
 
     let result = host
         .iterate_plugins(KernelPluginIterationRequest {
             issue_id: None,
-            target_plugin_paths: vec!["expr".to_string()],
-            instruction: Some("break expr child source".to_string()),
+            target_plugin_paths: vec!["gate".to_string()],
+            instruction: Some("corrupt the gate plugin identity declaration".to_string()),
             edit_plan: Some(PluginEditPlan {
-                issue_id: "issue-expr-manifest".to_string(),
-                patch_id: "patch-expr-manifest".to_string(),
-                summary: "break expr child source".to_string(),
+                issue_id: "issue-gate-manifest".to_string(),
+                patch_id: "patch-gate-manifest".to_string(),
+                summary: "corrupt the gate plugin identity declaration".to_string(),
                 operations: vec![PluginEditOperation {
-                    path: "plugins/expr/Cargo.toml".to_string(),
+                    path: "plugins/gate/Cargo.toml".to_string(),
                     kind: PluginEditOpKind::ReplaceExact,
-                    expected_old_string: Some("./lexer".to_string()),
+                    expected_old_string: Some("plugin_path = \"gate\"".to_string()),
                     expected_sha256: None,
-                    new_content: Some("./missing-child".to_string()),
+                    new_content: Some("plugin_path = \"gate-oracle\"".to_string()),
                     pointer: None,
                     dotted_key: None,
                     value: None,
                 }],
             }),
             manual_approved: false,
-            tests_command: None,
+            tests_command: Some(GATE_VERIFY_COMMAND.to_string()),
             safety_command: None,
-            verify_profile: Some(VerificationProfile::RustWorkspace),
+            verify_profile: Some(VerificationProfile::Default),
             quality_score: Some(95),
         })
         .expect("invalid manifest iteration should return rollback result");
@@ -1883,71 +2160,55 @@ fn runtime_host_iterate_plugins_rolls_back_invalid_plugin_manifest_and_keeps_run
         original_manifest
     );
     assert!(host.kernel().plugin_issues().iter().any(|issue| {
-        issue.root_plugin_path == "expr" && issue.source == KernelPluginIssueSource::LoadFailure
+        issue.root_plugin_path == "gate" && issue.source == KernelPluginIssueSource::LoadFailure
     }));
 
     let response = host
         .invoke(
-            "expr",
-            "expr_entry",
-            json!({ "expression": "9 - 4" }).to_string(),
+            "gate",
+            "gate_entry",
+            json!({ "message": "still alive" }).to_string(),
         )
         .expect("runtime should stay usable after rollback");
-    let value: Value = serde_json::from_str(&response.payload).expect("expr response json");
-    assert_eq!(value.get("value").and_then(|v| v.as_f64()), Some(5.0));
+    let value: Value = serde_json::from_str(&response.payload).expect("gate response json");
+    assert_eq!(value.get("version").and_then(|v| v.as_str()), Some("v1"));
 }
 
 #[test]
 fn runtime_host_rollback_candidate_restores_plugin_sources_and_clears_journal() {
-    if !support::linux_dylib_artifacts_available() {
-        eprintln!("[skip] fixture dylibs are x86_64-linux only; skipping on this host");
-        return;
-    }
-    let temp = setup_fixture_workspace_copy();
-    let fixtures = temp.path().join("fixtures");
-    let host = RuntimeHost::boot(&fixtures).expect("host should boot");
+    // 回滚：Blocked 候选被人工 rollback 后，源树返回迭代前内容、journal 清空、
+    // 当前快照不变。JSON 工件 fixture：证明的是回滚状态机，不是 dylib 构建。
+    let temp = setup_json_iteration_fixture();
+    let fixtures = temp.path();
+    let host = RuntimeHost::boot(fixtures).expect("host should boot");
     let journal_path = plugin_iteration_journal_path(&host.status().snapshot_root);
-    let source_path = fixtures.join("plugins/shell/src/lib.rs");
-    let original_source = fs::read_to_string(&source_path).expect("read shell source");
-    let original_summary =
-        plugin_node_summary(host.current_snapshot().as_ref(), "shell", "shell_entry");
-    let updated_summary = format!("{original_summary} (rollback candidate)");
+    let manifest_path = fixtures.join("plugins/gate/Cargo.toml");
+    let original_manifest = fs::read_to_string(&manifest_path).expect("read gate manifest");
 
     let result = host
         .iterate_plugins(KernelPluginIterationRequest {
             issue_id: None,
-            target_plugin_paths: vec!["shell".to_string()],
-            instruction: Some("update shell docs summary without replay evidence".to_string()),
-            edit_plan: Some(PluginEditPlan {
-                issue_id: "issue-shell-rollback".to_string(),
-                patch_id: "patch-shell-rollback".to_string(),
-                summary: "update shell docs summary without replay evidence".to_string(),
-                operations: vec![PluginEditOperation {
-                    path: "plugins/shell/src/lib.rs".to_string(),
-                    kind: PluginEditOpKind::ReplaceExact,
-                    expected_old_string: Some(original_summary.clone()),
-                    expected_sha256: None,
-                    new_content: Some(updated_summary.clone()),
-                    pointer: None,
-                    dotted_key: None,
-                    value: None,
-                }],
-            }),
+            target_plugin_paths: vec!["gate".to_string()],
+            instruction: Some("bump the gate API hash without replay evidence".to_string()),
+            edit_plan: Some(gate_edit_plan(fixtures, "issue-gate-rollback")),
             manual_approved: false,
-            tests_command: Some(
-                "cargo test --quiet --manifest-path plugins/shell/Cargo.toml".to_string(),
-            ),
+            tests_command: Some(GATE_VERIFY_COMMAND.to_string()),
             safety_command: None,
-            verify_profile: Some(VerificationProfile::RustWorkspace),
+            verify_profile: Some(VerificationProfile::Default),
             quality_score: Some(95),
         })
         .expect("plugin iteration should enter blocked state");
 
     assert_eq!(result.final_verdict, PluginIterationFinalVerdict::Blocked);
     assert!(journal_path.exists());
-    assert!(fs::read_to_string(&source_path)
-        .expect("read updated shell source")
-        .contains(&updated_summary));
+    assert_eq!(
+        gate_api_hash(
+            host.candidate_snapshot()
+                .expect("staged candidate")
+                .as_ref()
+        ),
+        GATE_API_HASH_V2
+    );
 
     host.rollback_candidate()
         .expect("manual rollback should discard candidate and restore sources");
@@ -1955,83 +2216,64 @@ fn runtime_host_rollback_candidate_restores_plugin_sources_and_clears_journal() 
     assert!(host.candidate_snapshot().is_none());
     assert!(!journal_path.exists());
     assert_eq!(
-        fs::read_to_string(&source_path).expect("shell source should be restored"),
-        original_source
+        fs::read_to_string(&manifest_path).expect("gate manifest should be restored"),
+        original_manifest
     );
     assert_eq!(
-        plugin_node_summary(host.current_snapshot().as_ref(), "shell", "shell_entry"),
-        original_summary
+        gate_api_hash(host.current_snapshot().as_ref()),
+        GATE_API_HASH_V1
     );
 }
 
 #[test]
 fn runtime_host_boot_recovers_plugin_iteration_journal() {
-    if !support::linux_dylib_artifacts_available() {
-        eprintln!("[skip] fixture dylibs are x86_64-linux only; skipping on this host");
-        return;
-    }
-    let temp = setup_fixture_workspace_copy();
-    let fixtures = temp.path().join("fixtures");
-    let host = RuntimeHost::boot(&fixtures).expect("host should boot");
+    // 崩溃恢复：进程在 Blocked 候选（journal 已落盘）之后重启，boot 必须
+    // 重放 journal、恢复源树、清空 journal。JSON 工件 fixture：证明的是恢复
+    // 状态机，不是 dylib 构建。
+    let temp = setup_json_iteration_fixture();
+    let fixtures = temp.path();
+    let host = RuntimeHost::boot(fixtures).expect("host should boot");
     let journal_path = plugin_iteration_journal_path(&host.status().snapshot_root);
-    let source_path = fixtures.join("plugins/shell/src/lib.rs");
-    let original_source = fs::read_to_string(&source_path).expect("read shell source");
-    let original_summary =
-        plugin_node_summary(host.current_snapshot().as_ref(), "shell", "shell_entry");
-    let updated_summary = format!("{original_summary} (recovery candidate)");
+    let manifest_path = fixtures.join("plugins/gate/Cargo.toml");
+    let original_manifest = fs::read_to_string(&manifest_path).expect("read gate manifest");
 
     let result = host
         .iterate_plugins(KernelPluginIterationRequest {
             issue_id: None,
-            target_plugin_paths: vec!["shell".to_string()],
-            instruction: Some("update shell docs summary without replay evidence".to_string()),
-            edit_plan: Some(PluginEditPlan {
-                issue_id: "issue-shell-recovery".to_string(),
-                patch_id: "patch-shell-recovery".to_string(),
-                summary: "update shell docs summary without replay evidence".to_string(),
-                operations: vec![PluginEditOperation {
-                    path: "plugins/shell/src/lib.rs".to_string(),
-                    kind: PluginEditOpKind::ReplaceExact,
-                    expected_old_string: Some(original_summary.clone()),
-                    expected_sha256: None,
-                    new_content: Some(updated_summary.clone()),
-                    pointer: None,
-                    dotted_key: None,
-                    value: None,
-                }],
-            }),
+            target_plugin_paths: vec!["gate".to_string()],
+            instruction: Some("bump the gate API hash without replay evidence".to_string()),
+            edit_plan: Some(gate_edit_plan(fixtures, "issue-gate-recovery")),
             manual_approved: false,
-            tests_command: Some(
-                "cargo test --quiet --manifest-path plugins/shell/Cargo.toml".to_string(),
-            ),
+            tests_command: Some(GATE_VERIFY_COMMAND.to_string()),
             safety_command: None,
-            verify_profile: Some(VerificationProfile::RustWorkspace),
+            verify_profile: Some(VerificationProfile::Default),
             quality_score: Some(95),
         })
         .expect("plugin iteration should enter blocked state");
 
     assert_eq!(result.final_verdict, PluginIterationFinalVerdict::Blocked);
     assert!(journal_path.exists());
-    assert!(fs::read_to_string(&source_path)
-        .expect("read updated shell source")
-        .contains(&updated_summary));
+    assert_eq!(
+        gate_api_hash(
+            host.candidate_snapshot()
+                .expect("staged candidate")
+                .as_ref()
+        ),
+        GATE_API_HASH_V2
+    );
 
     drop(host);
 
-    let recovered = RuntimeHost::boot(&fixtures).expect("host should recover and boot");
+    let recovered = RuntimeHost::boot(fixtures).expect("host should recover and boot");
     assert!(recovered.candidate_snapshot().is_none());
     assert!(!journal_path.exists());
     assert_eq!(
-        fs::read_to_string(&source_path).expect("shell source should be restored"),
-        original_source
+        fs::read_to_string(&manifest_path).expect("gate manifest should be restored"),
+        original_manifest
     );
     assert_eq!(
-        plugin_node_summary(
-            recovered.current_snapshot().as_ref(),
-            "shell",
-            "shell_entry"
-        ),
-        original_summary
+        gate_api_hash(recovered.current_snapshot().as_ref()),
+        GATE_API_HASH_V1
     );
 }
 
