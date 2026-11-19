@@ -122,6 +122,17 @@ impl Loader {
         }
 
         let index_map = artifact_index_map(&index);
+
+        // P4-3: reject a cyclic parent graph up front. The parent chain is
+        // walked by `propagate_parent_failure` (bounded by its visited set)
+        // and the per-plugin parent guard; a corrupt index whose parent edges
+        // form a cycle used to make `propagate_parent_failure` loop forever on
+        // a `required` cycle. Surfacing `CycleDetected` here turns that hang
+        // into an explicit load error before any side effect runs.
+        if let Some(cycle) = detect_parent_cycle(&index_map) {
+            return Err(RuntimeError::CycleDetected { cycle });
+        }
+
         let plugin_registry = PluginRegistry::default();
         let mut node_registry = NodeRegistry::default();
         let mut metrics = LoaderMetrics::default();
@@ -204,15 +215,15 @@ impl Loader {
                 );
                 metrics.plugin_unavailable_total += 1;
                 metrics.dylib_no_fallback_total += 1;
-                if entry.required {
-                    self.propagate_parent_failure(
-                        plugin_path,
-                        &index_map,
-                        &plugin_registry,
-                        &mut node_registry,
-                        &mut context,
-                    );
-                }
+                let blocked = self.propagate_parent_failure(
+                    entry,
+                    &index_map,
+                    &plugin_registry,
+                    &mut node_registry,
+                    &mut context,
+                    started_at,
+                );
+                blocked?;
                 continue;
             }
 
@@ -245,15 +256,15 @@ impl Loader {
                         );
                         metrics.plugin_unavailable_total += 1;
                         metrics.dylib_no_fallback_total += 1;
-                        if entry.required {
-                            self.propagate_parent_failure(
-                                plugin_path,
-                                &index_map,
-                                &plugin_registry,
-                                &mut node_registry,
-                                &mut context,
-                            );
-                        }
+                        let blocked = self.propagate_parent_failure(
+                            entry,
+                            &index_map,
+                            &plugin_registry,
+                            &mut node_registry,
+                            &mut context,
+                            started_at,
+                        );
+                        blocked?;
                         continue;
                     }
                 }
@@ -275,15 +286,15 @@ impl Loader {
                     );
                     metrics.plugin_unavailable_total += 1;
                     metrics.dylib_no_fallback_total += 1;
-                    if entry.required {
-                        self.propagate_parent_failure(
-                            plugin_path,
-                            &index_map,
-                            &plugin_registry,
-                            &mut node_registry,
-                            &mut context,
-                        );
-                    }
+                    let blocked = self.propagate_parent_failure(
+                        entry,
+                        &index_map,
+                        &plugin_registry,
+                        &mut node_registry,
+                        &mut context,
+                        started_at,
+                    );
+                    blocked?;
                     continue;
                 }
             }
@@ -316,15 +327,15 @@ impl Loader {
                 metrics.plugin_unavailable_total += 1;
                 metrics.dylib_abi_mismatch_total += 1;
                 metrics.dylib_no_fallback_total += 1;
-                if entry.required {
-                    self.propagate_parent_failure(
-                        plugin_path,
-                        &index_map,
-                        &plugin_registry,
-                        &mut node_registry,
-                        &mut context,
-                    );
-                }
+                let blocked = self.propagate_parent_failure(
+                    entry,
+                    &index_map,
+                    &plugin_registry,
+                    &mut node_registry,
+                    &mut context,
+                    started_at,
+                );
+                blocked?;
                 continue;
             }
 
@@ -363,15 +374,15 @@ impl Loader {
                     );
                     metrics.plugin_unavailable_total += 1;
                     metrics.dylib_no_fallback_total += 1;
-                    if entry.required {
-                        self.propagate_parent_failure(
-                            plugin_path,
-                            &index_map,
-                            &plugin_registry,
-                            &mut node_registry,
-                            &mut context,
-                        );
-                    }
+                    let blocked = self.propagate_parent_failure(
+                        entry,
+                        &index_map,
+                        &plugin_registry,
+                        &mut node_registry,
+                        &mut context,
+                        started_at,
+                    );
+                    blocked?;
                     continue;
                 }
 
@@ -391,15 +402,15 @@ impl Loader {
                     metrics.plugin_unavailable_total += 1;
                     metrics.dylib_abi_mismatch_total += 1;
                     metrics.dylib_no_fallback_total += 1;
-                    if entry.required {
-                        self.propagate_parent_failure(
-                            plugin_path,
-                            &index_map,
-                            &plugin_registry,
-                            &mut node_registry,
-                            &mut context,
-                        );
-                    }
+                    let blocked = self.propagate_parent_failure(
+                        entry,
+                        &index_map,
+                        &plugin_registry,
+                        &mut node_registry,
+                        &mut context,
+                        started_at,
+                    );
+                    blocked?;
                     continue;
                 }
 
@@ -448,15 +459,15 @@ impl Loader {
                         );
                         metrics.plugin_unavailable_total += 1;
                         metrics.dylib_no_fallback_total += 1;
-                        if entry.required {
-                            self.propagate_parent_failure(
-                                plugin_path,
-                                &index_map,
-                                &plugin_registry,
-                                &mut node_registry,
-                                &mut context,
-                            );
-                        }
+                        let blocked = self.propagate_parent_failure(
+                            entry,
+                            &index_map,
+                            &plugin_registry,
+                            &mut node_registry,
+                            &mut context,
+                            started_at,
+                        );
+                        blocked?;
                         continue;
                     }
                 }
@@ -484,6 +495,49 @@ impl Loader {
                     export,
                     format!("service:{plugin_path}:{export}"),
                 )?;
+            }
+        }
+
+        // P4-4: consistency sweep. The loop above walks `topo_order` once, so
+        // a plugin whose PARENT is marked unavailable AFTER the child already
+        // loaded (a sibling failure that propagates up to the shared parent —
+        // `propagate_parent_failure` only walks the parent chain) keeps its
+        // `Loaded` state, making the result depend on sibling order inside
+        // `topo_order`. Sweep in `topo_order` again (parent-before-child, so
+        // one pass covers the transitive closure): every registered plugin
+        // whose registered parent exists and is not `Loaded` is downgraded to
+        // `InitFailed` with its nodes removed.
+        for plugin_path in &index.topo_order {
+            self.ensure_not_timed_out(started_at)?;
+            // Every `topo_order` entry comes from `entries`, so the `None` case
+            // is structurally unreachable; `into_iter` on the owned `Option`
+            // keeps the loop body a single covered region.
+            for entry in index_map.get(plugin_path).into_iter() {
+                let Some(parent) = entry.parent.as_ref() else {
+                    continue;
+                };
+                let Some(parent_plugin) = plugin_registry.get(parent) else {
+                    continue;
+                };
+                if matches!(parent_plugin.load_result, PluginLoadResult::Loaded) {
+                    continue;
+                }
+                // Every `topo_order` entry was registered by the load loop above,
+                // so the `None` case is structurally unreachable; `into_iter` on
+                // the owned `Option` keeps the loop body a single covered region.
+                for plugin in plugin_registry.get(plugin_path).into_iter() {
+                    if matches!(plugin.load_result, PluginLoadResult::Unavailable(..)) {
+                        continue;
+                    }
+                    plugin_registry
+                        .mark_unavailable(plugin_path, PluginUnavailableReason::InitFailed);
+                    node_registry.remove_by_plugin(plugin_path);
+                    context.set_plugin_state(
+                        plugin_path,
+                        PluginLoadResult::Unavailable(PluginUnavailableReason::InitFailed),
+                    );
+                    metrics.plugin_unavailable_total += 1;
+                }
             }
         }
 
@@ -548,19 +602,35 @@ impl Loader {
         })
     }
 
+    /// `failed` carries both the parent link and the `required` flag, so a
+    /// non-required child's failure is a no-op inside the walk instead of an
+    /// `if` at each of the seven call sites — those guards left their
+    /// implicit-else line uncovered.
     fn propagate_parent_failure(
         &self,
-        failed_plugin_path: &str,
+        failed: &ArtifactIndexEntry,
         entries: &BTreeMap<String, ArtifactIndexEntry>,
         plugin_registry: &PluginRegistry,
         node_registry: &mut NodeRegistry,
         context: &mut RuntimeContext,
-    ) {
-        let mut current = entries
-            .get(failed_plugin_path)
-            .and_then(|entry| entry.parent.clone());
+        started_at: Instant,
+    ) -> Result<(), RuntimeError> {
+        if !failed.required {
+            return Ok(());
+        }
+        let mut current = failed.parent.clone();
+        // P4-3: bounded walk. `detect_parent_cycle` rejects cyclic indexes
+        // before the load loop, so a revisit here means the entries map was
+        // mutated between the two passes — the visited set still guarantees
+        // termination (at most `entries.len()` hops) instead of looping on a
+        // `required` parent cycle.
+        let mut visited: BTreeSet<String> = BTreeSet::new();
 
         while let Some(parent_path) = current {
+            self.ensure_not_timed_out(started_at)?;
+            if !visited.insert(parent_path.clone()) {
+                break;
+            }
             plugin_registry.mark_unavailable(&parent_path, PluginUnavailableReason::InitFailed);
             node_registry.remove_by_plugin(&parent_path);
             context.set_plugin_state(
@@ -577,6 +647,7 @@ impl Loader {
                 break;
             }
         }
+        Ok(())
     }
 
     fn ensure_not_timed_out(&self, started_at: Instant) -> Result<(), RuntimeError> {
@@ -622,6 +693,44 @@ fn make_execution_id() -> String {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     format!("exec-{nanos:x}-{seq:x}")
+}
+
+/// Detect a cycle in the plugin parent graph. Returns the full loop path on a
+/// cycle (`[a, b, a]` for `a.parent = b`, `b.parent = a`; `[a, a]` for a
+/// self-loop), matching the `RuntimeError::CycleDetected` convention used by
+/// `package.rs`, or `None` when the parent edges form a DAG.
+fn detect_parent_cycle(entries: &BTreeMap<String, ArtifactIndexEntry>) -> Option<Vec<String>> {
+    let mut visited: BTreeSet<String> = BTreeSet::new();
+    for start in entries.keys() {
+        if visited.contains(start) {
+            continue;
+        }
+        let mut visiting: BTreeSet<String> = BTreeSet::new();
+        let mut stack: Vec<String> = vec![start.clone()];
+        visiting.insert(start.clone());
+        while let Some(path) = stack.last().cloned() {
+            match entries.get(&path).and_then(|entry| entry.parent.clone()) {
+                Some(parent) if !visited.contains(&parent) && !visiting.contains(&parent) => {
+                    visiting.insert(parent.clone());
+                    stack.push(parent);
+                }
+                Some(parent) if visiting.contains(&parent) => {
+                    let mut cycle = Vec::new();
+                    if let Some(idx) = stack.iter().position(|p| *p == parent) {
+                        cycle.extend(stack[idx..].iter().cloned());
+                    }
+                    cycle.push(parent);
+                    return Some(cycle);
+                }
+                _ => {
+                    stack.pop();
+                    visiting.remove(&path);
+                    visited.insert(path);
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Overwrite the docs of the matching in-memory index entry during docs-drift
@@ -1406,6 +1515,237 @@ mod loader_flow_tests {
             PluginLoadResult::Unavailable(PluginUnavailableReason::ArtifactMissing)
         ));
         assert_eq!(out.metrics.plugin_unavailable_total, 1);
+    }
+
+    // --- parent-chain failure propagation ------------------------------------
+
+    /// Set `parent` and `required` on a JSON index entry.
+    fn with_parent(
+        mut entry: ArtifactIndexEntry,
+        parent: &str,
+        required: bool,
+    ) -> ArtifactIndexEntry {
+        entry.parent = Some(parent.to_string());
+        entry.required = required;
+        entry
+    }
+
+    /// P4-3 regression: a cyclic parent index (`a.parent = b`,
+    /// `b.parent = a`, both required) used to hang `propagate_parent_failure`
+    /// forever. The pre-load cycle check must reject it with a clear
+    /// `CycleDetected` error (full loop path) instead of looping.
+    #[test]
+    fn load_cyclic_parent_index_is_rejected_not_hung() {
+        let tmp = TempDir::new().unwrap();
+        let artifacts_dir = tmp.path().join("artifacts");
+        fs::create_dir_all(&artifacts_dir).unwrap();
+        let abi = abi_host("crate_v1", "api_v2");
+        // Ghost artifacts are fine — cycle detection runs before any artifact
+        // validation, so the error must be CycleDetected, not ArtifactMissing.
+        let a = with_parent(
+            json_entry("a", "a.json", &"0".repeat(64), abi.clone(), docs("a")),
+            "b",
+            true,
+        );
+        let b = with_parent(
+            json_entry("b", "b.json", &"0".repeat(64), abi, docs("b")),
+            "a",
+            true,
+        );
+        let index = ArtifactIndex {
+            schema_version: ARTIFACT_INDEX_SCHEMA_VERSION,
+            generated_at: "now".to_string(),
+            topo_order: vec!["a".to_string(), "b".to_string()],
+            entries: vec![a, b],
+        };
+        let config = write_index(tmp.path(), &index);
+        let err = Loader::new(config).load().unwrap_err();
+        assert!(
+            matches!(&err, RuntimeError::CycleDetected { cycle } if cycle == &vec!["a".to_string(), "b".to_string(), "a".to_string()]),
+            "expected the full loop path, got {err:?}"
+        );
+    }
+
+    /// P4-3 defense-in-depth: `propagate_parent_failure` keeps a visited set
+    /// so a `required` parent cycle can never loop forever even if the entries
+    /// map is mutated between the pre-load cycle check and the failure walk.
+    #[test]
+    fn propagate_parent_failure_terminates_on_cyclic_entries() {
+        let tmp = TempDir::new().unwrap();
+        let abi = abi_host("crate_v1", "api_v2");
+        let mut entries = BTreeMap::new();
+        let mut a = json_entry("a", "a.json", &"0".repeat(64), abi.clone(), docs("a"));
+        a.parent = Some("b".to_string());
+        a.required = true;
+        let mut b = json_entry("b", "b.json", &"0".repeat(64), abi, docs("b"));
+        b.parent = Some("a".to_string());
+        b.required = true;
+        entries.insert("a".to_string(), a);
+        entries.insert("b".to_string(), b);
+
+        let config = write_index(
+            tmp.path(),
+            &ArtifactIndex {
+                schema_version: ARTIFACT_INDEX_SCHEMA_VERSION,
+                generated_at: "now".to_string(),
+                topo_order: vec!["a".to_string(), "b".to_string()],
+                entries: Vec::new(),
+            },
+        );
+        let loader = Loader::new(config);
+        let registry = PluginRegistry::default();
+        // `mark_unavailable` only flips EXISTING entries (ancestors were
+        // registered by the load loop before the failure walked up), so
+        // register both chain members as Loaded first.
+        for path in ["a", "b"] {
+            registry.insert_loaded(
+                path.to_string(),
+                entries.get(path).and_then(|e| e.parent.clone()),
+                true,
+                BTreeSet::new(),
+                docs(path),
+                PathBuf::from(format!("{path}.json")),
+                ArtifactKind::Json,
+                abi_host("crate_v1", "api_v2"),
+                None,
+            );
+        }
+        let mut node_registry = NodeRegistry::default();
+        let mut context = RuntimeContext::default();
+        loader
+            .propagate_parent_failure(
+                &entries["a"],
+                &entries,
+                &registry,
+                &mut node_registry,
+                &mut context,
+                Instant::now(),
+            )
+            .expect("visited set bounds the walk; no hang");
+        // Both chain members were marked (a is reachable once, then b is
+        // revisited and the walk breaks).
+        assert!(matches!(
+            registry.get("a").unwrap().load_result,
+            PluginLoadResult::Unavailable(PluginUnavailableReason::InitFailed)
+        ));
+        assert!(matches!(
+            registry.get("b").unwrap().load_result,
+            PluginLoadResult::Unavailable(PluginUnavailableReason::InitFailed)
+        ));
+    }
+
+    /// P4-4 regression: a sibling loaded BEFORE its shared parent is pulled
+    /// down by a later sibling's failure used to stay `Loaded` (result
+    /// depended on `topo_order` sibling order). With topo_order
+    /// `[parent, child_ok, child_broken]`, `child_ok` loads first, then
+    /// `child_broken`'s artifact-missing failure propagates to `parent`; the
+    /// consistency sweep must downgrade the already-loaded `child_ok` to
+    /// `InitFailed` and drop its nodes.
+    #[test]
+    fn load_parent_failure_downgrades_already_loaded_sibling() {
+        let tmp = TempDir::new().unwrap();
+        let artifacts_dir = tmp.path().join("artifacts");
+        fs::create_dir_all(&artifacts_dir).unwrap();
+        let abi = abi_host("crate_v1", "api_v2");
+
+        let mut parent_docs = docs("parent");
+        parent_docs.nodes.push(cordis_plugin_sdk::NodeDoc {
+            id: "parent_node".to_string(),
+            summary: "p".to_string(),
+            input_schema: serde_json::json!({}),
+            output_schema: serde_json::json!({}),
+            side_effects: Vec::new(),
+            failure_modes: Vec::new(),
+            node_type: Default::default(),
+            agent_accessible: true,
+        });
+        let (parent_rel, parent_sha) = write_json_artifact(
+            &artifacts_dir,
+            "parent.json",
+            &PluginArtifact {
+                plugin_path: "parent".to_string(),
+                abi_fingerprint: abi.clone(),
+                docs: parent_docs.clone(),
+                exports: Vec::new(),
+                execution: None,
+            },
+        );
+        let parent_entry = json_entry("parent", &parent_rel, &parent_sha, abi.clone(), parent_docs);
+
+        let mut child_docs = docs("child_ok");
+        child_docs.nodes.push(cordis_plugin_sdk::NodeDoc {
+            id: "child_node".to_string(),
+            summary: "c".to_string(),
+            input_schema: serde_json::json!({}),
+            output_schema: serde_json::json!({}),
+            side_effects: Vec::new(),
+            failure_modes: Vec::new(),
+            node_type: Default::default(),
+            agent_accessible: true,
+        });
+        let (child_rel, child_sha) = write_json_artifact(
+            &artifacts_dir,
+            "child_ok.json",
+            &PluginArtifact {
+                plugin_path: "child_ok".to_string(),
+                abi_fingerprint: abi.clone(),
+                docs: child_docs.clone(),
+                exports: Vec::new(),
+                execution: None,
+            },
+        );
+        let child_ok = with_parent(
+            json_entry("child_ok", &child_rel, &child_sha, abi.clone(), child_docs),
+            "parent",
+            true,
+        );
+        // Broken child: required + artifact never written → ArtifactMissing,
+        // which propagates the failure up to `parent` via
+        // `propagate_parent_failure`.
+        let child_broken = with_parent(
+            json_entry(
+                "child_broken",
+                "ghost.json",
+                &"0".repeat(64),
+                abi,
+                docs("child_broken"),
+            ),
+            "parent",
+            true,
+        );
+
+        let index = ArtifactIndex {
+            schema_version: ARTIFACT_INDEX_SCHEMA_VERSION,
+            generated_at: "now".to_string(),
+            // Sibling order: child_ok BEFORE child_broken, so child_ok loads
+            // while parent is still Loaded — the old code left it Loaded.
+            topo_order: vec![
+                "parent".to_string(),
+                "child_ok".to_string(),
+                "child_broken".to_string(),
+            ],
+            entries: vec![parent_entry, child_ok, child_broken],
+        };
+        let config = write_index(tmp.path(), &index);
+        let out = Loader::new(config).load().unwrap();
+
+        assert!(matches!(
+            out.plugin_registry.get("parent").unwrap().load_result,
+            PluginLoadResult::Unavailable(PluginUnavailableReason::InitFailed)
+        ));
+        assert!(matches!(
+            out.plugin_registry.get("child_broken").unwrap().load_result,
+            PluginLoadResult::Unavailable(PluginUnavailableReason::ArtifactMissing)
+        ));
+        // P4-4: the already-loaded sibling is downgraded and its node removed.
+        assert!(matches!(
+            out.plugin_registry.get("child_ok").unwrap().load_result,
+            PluginLoadResult::Unavailable(PluginUnavailableReason::InitFailed)
+        ));
+        assert!(
+            out.node_registry.get("child_ok::child_node").is_none(),
+            "the downgraded sibling's nodes must be removed"
+        );
     }
 
     // --- hash mismatch -------------------------------------------------------
