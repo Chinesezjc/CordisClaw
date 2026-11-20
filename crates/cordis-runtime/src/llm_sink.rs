@@ -380,6 +380,19 @@ mod tests {
         drop(stream);
         drop(listener);
 
+        // The listener drains the connection on its own thread, so dropping the
+        // handles only closes them — it does not mean the lines were read. Poll
+        // instead of asserting immediately, which is how this test failed in a
+        // full run while passing on its own.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while recorder.events.lock().expect("lock").is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the listener never reported the line after the garbage"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
         assert_eq!(*recorder.events.lock().expect("lock"), vec!["c:after"]);
     }
 
