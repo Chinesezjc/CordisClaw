@@ -186,6 +186,9 @@ inherent 方法转发到会话树 / `request_iteration` 经已安装的 runner �
 
 附带修复两个真 flaky：shared_host HashMismatch（boot 前 refresh index）、mock server 非阻塞流 WouldBlock（accept 后切回阻塞）。
 
+- mock server 不再把"客户端提前挂断"当成错误（2026-11-19）：读端拿到完整 assistant turn（读到 `data: [DONE]` 就停）或直接放弃时会先关连接，server 的 `write!`/`flush` 可能以 ECONNRESET 失败；原先的 `.expect(..)` 让 mock 线程 panic，`handle.join()` 于是把"客户端赢了这场写竞争"报成测试失败（实测 `support/mod.rs:314 finish chunked response: Connection reset`，只在全量运行时复现）。现在 `tests/support/mod.rs`、`host_llm_coverage.rs`、`runtime_host.rs` 里所有 mock 写入的 Result 都丢弃——断言读的是"捕获到的请求"，不是 server 能不能写完一个没人必须读的 body；`spawn_scripted_server` 的 accept 另加 120s 上限，脚本没被拨号时失败在具名断言上，而不是挂住整个 suite。
+- **`cargo llvm-cov --workspace` 单次 export 的 LF/LH 不是行覆盖真值**（2026-11-19 查证）：llvm-cov 的 lcov 导出里 `DA` 来自 `Coverage.getCoverageForFile()` 的 segments（只为 region-entry 行发记录），`LF/LH` 来自另行 `prepareFileReports` 得到的 `FileCoverageSummary` line stats；`CoverageMapping.h` 对 GapRegion 的注释写明它的计数「only set as the line execution count when it's the only region in the line」——gap-only 行会进 LF/LH、但永远不会出现在 `DA` 里，count 为 0 时就被算成 missed。本地全量 export 会报 ~508 行 missed，但 raw lcov 里 `DA:*,0` 记录为 **0**（用 `-- --list` 空跑枚举出的 39532 条 instrumented 行与全量跑覆盖的 39532 条**完全相同**）；`scripts/merge_lcov.py` 从 DA 重算 LF/LH，结果是 39532/39532 = 100.0000%。因此比较覆盖率只看 DA 合并值，不要拿单次 export 的 LF/LH 去和合并报告的 39048/39048 对比。
+
 ### 3.1 Stage A-E 已经落地到可运行原型
 
 [system-overview.md](./system-overview.md) 明确把当前实现归纳为 Stage A-E：
