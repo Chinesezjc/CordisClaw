@@ -23,4 +23,4 @@ cordis-plugin-sdk = { path = "../../../crates/cordis-plugin-sdk" }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 # bundled: compile SQLite from source so the cdylib has zero system deps.
-rusqlite = { version = "0.31", features = ["bundled"] }
+rusqlite = { version = "0.43", features = ["bundled"] }
