@@ -8,6 +8,8 @@
 //! - `qq_serve`         — Task node: starts HTTP server to receive OneBot events
 //! - `qq_fetch_messages` — return queued incoming messages (agent polls this)
 //! - `qq_send`          — send a message to a group or private chat
+//! - `qq_group_requests` — list / approve / reject pending group requests
+//!                          (加群申请 / 邀请入群)
 //!
 //! 存图：群消息里的图片除了交给 kernel 内联，还会同步落盘到
 //! `data/media/<群号>/`（`spawn_media_archive`）。不想要就写
@@ -172,6 +174,14 @@ fn cache_mute_probe(group_id: i64, now: u64, result: GroupMute) {
 /// drained by start_agent_poller → agent_trigger → inbox loop.
 static MESSAGE_QUEUE: Mutex<VecDeque<IncomingMessage>> = Mutex::new(VecDeque::new());
 
+/// Pending OneBot v11 group requests (加群申请 / 邀请入群). Filled by
+/// handle_onebot_event, listed/answered by the `qq_group_requests` node.
+/// Bounded: only the most recent [`PENDING_REQUEST_CAP`] flags survive.
+static PENDING_REQUESTS: Mutex<Vec<PendingGroupRequest>> = Mutex::new(Vec::new());
+
+/// How many pending group requests are kept (oldest evicted first).
+const PENDING_REQUEST_CAP: usize = 32;
+
 /// Server running flag.
 static SERVER_RUNNING: Mutex<bool> = Mutex::new(false);
 
@@ -284,6 +294,20 @@ struct OneBotEvent {
     /// wall and "你呢" can be attached to something said hours ago.
     #[serde(default)]
     time: Option<i64>,
+
+    // request events (post_type == "request")
+    /// `group` (加群申请 / 邀请入群) or `friend`.
+    #[serde(default)]
+    request_type: Option<String>,
+    /// `add` (someone asks to join) or `invite` (the bot is invited in).
+    #[serde(default)]
+    sub_type: Option<String>,
+    /// Opaque handle `set_group_add_request` needs to answer the request.
+    #[serde(default)]
+    flag: Option<String>,
+    /// Requester's note (验证消息 / 邀请附言).
+    #[serde(default)]
+    comment: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -298,6 +322,26 @@ struct OneBotSender {
     role: Option<String>,
     #[serde(default)]
     user_id: Option<Value>,
+}
+
+/// One pending OneBot v11 **group** request: someone asking to join a group,
+/// or an invitation for the bot to join one. Kept in [`PENDING_REQUESTS`] until
+/// the agent answers it through the `qq_group_requests` node.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PendingGroupRequest {
+    /// OneBot `flag` — the handle `set_group_add_request` needs.
+    flag: String,
+    /// `add` | `invite` (kept verbatim from the event; may be empty).
+    sub_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    group_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user_id: Option<i64>,
+    /// Sanitized requester note.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    comment: Option<String>,
+    /// When the event arrived, unix ms.
+    time_ms: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -387,6 +431,12 @@ struct NodeRequest {
     payload: Option<Value>,
     #[serde(default)]
     agent_session_id: Option<String>,
+    /// `qq_group_requests`: the OneBot request flag to approve / reject.
+    #[serde(default)]
+    flag: Option<String>,
+    /// `qq_group_requests reject`: optional refusal note.
+    #[serde(default)]
+    reason: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1046,6 +1096,16 @@ fn stop_qq_ws_serve() {
 }
 
 fn handle_onebot_event(event: &OneBotEvent) {
+    // 请求事件（加群申请 / 邀请入群）：以前这里直接 return，请求被整个丢掉，
+    // bot 既看不到也没法答复。现在只把 group 请求收进待处理队列（有界、按 flag
+    // 去重），答复走 `qq_group_requests` 节点；message 之外的一切照旧返回。
+    if event.post_type == "request" {
+        if event.request_type.as_deref().map(str::trim) == Some("group") {
+            enqueue_group_request(event, now_ms());
+        }
+        return;
+    }
+
     if event.post_type != "message" {
         return;
     }
@@ -2500,6 +2560,167 @@ fn handle_qq_get_group_members(req: &NodeRequest) -> Result<NodeResponse, String
     })
 }
 
+/// The forward/merged-message id to read: `payload.id` (string or number),
+/// then `payload.message_id`, then `req.message` (a direct invoke often carries
+/// the bare id there). Blank / non-scalar values count as missing.
+fn forward_msg_id(req: &NodeRequest) -> Option<String> {
+    let payload = req.payload.as_ref();
+    let raw = payload
+        .and_then(|p| p.get("id"))
+        .or_else(|| payload.and_then(|p| p.get("message_id")))
+        .cloned()
+        .or_else(|| req.message.as_ref().map(|message| json!(message)))?;
+    let id = match raw {
+        Value::String(text) => text.trim().to_string(),
+        Value::Number(number) => number.to_string(),
+        _ => String::new(),
+    };
+    (!id.is_empty()).then_some(id)
+}
+
+/// Render one forward node's body as text. Placeholders keep the shape of the
+/// original message without inventing content: the model must be able to tell
+/// "a picture" from "nothing there".
+///
+/// Two shapes reach this function depending on the OneBot backend: a segment
+/// array (`[{"type":"text",…}, …]`) or a plain string (NapCat frequently puts
+/// the body in `message` / `raw_message` as a CQ-encoded string). A string is
+/// trimmed and returned verbatim — it already *is* the readable text.
+fn flatten_forward_segments(content: Option<&Value>) -> String {
+    let Some(content) = content else {
+        return String::new();
+    };
+    if let Some(text) = content.as_str() {
+        return text.trim().to_string();
+    }
+    let Some(segments) = content.as_array() else {
+        return String::new();
+    };
+    let mut parts: Vec<String> = Vec::new();
+    for segment in segments {
+        let kind = segment.get("type").and_then(Value::as_str).unwrap_or("");
+        let data = segment.get("data");
+        let text = match kind {
+            "text" => data
+                .and_then(|d| d.get("text"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            "image" => "[图片]".to_string(),
+            "face" => "[表情]".to_string(),
+            "at" => {
+                let qq = data
+                    .and_then(|d| d.get("qq"))
+                    .map(|qq| match qq {
+                        Value::String(text) => text.clone(),
+                        other => other.to_string(),
+                    })
+                    .unwrap_or_default();
+                format!("[@{qq}]")
+            }
+            "record" => "[语音]".to_string(),
+            "video" => "[视频]".to_string(),
+            "file" => format!(
+                "[文件: {}]",
+                data.and_then(|d| d.get("name"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+            ),
+            "reply" => "[引用]".to_string(),
+            other => format!("[{other}]"),
+        };
+        parts.push(text);
+    }
+    parts.join("")
+}
+
+/// Turn a OneBot `get_forward_msg` response into readable text: one
+/// `<name>: <text>` line per node, `name` = sender card, else nickname, else
+/// `未知`. Accepts the full envelope (`{"data":{"messages":[..]}}`), a bare
+/// `{"messages":[..]}` or the bare node array. An empty / missing message
+/// list renders as `""`.
+///
+/// A node's body comes from the first of `content` → `message` →
+/// `raw_message` that renders non-empty; each may be a segment array or a
+/// plain string.
+fn flatten_forward_nodes(data: &Value) -> String {
+    let messages = data
+        .get("data")
+        .and_then(|d| d.get("messages"))
+        .or_else(|| data.get("messages"))
+        .unwrap_or(data);
+    let Some(nodes) = messages.as_array() else {
+        return String::new();
+    };
+    let mut lines: Vec<String> = Vec::new();
+    for node in nodes {
+        let sender = node.get("sender");
+        let name = sender
+            .and_then(|s| s.get("card"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|card| !card.is_empty())
+            .or_else(|| {
+                sender
+                    .and_then(|s| s.get("nickname"))
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|nickname| !nickname.is_empty())
+            })
+            .unwrap_or("未知");
+        // NapCat does not always fill `content`: the body may arrive as
+        // `message` (segment array) or `raw_message` (CQ-encoded string). Take
+        // the first key that renders non-empty so no node is rendered as a
+        // bare `<name>: ` with nothing behind it.
+        let mut body = String::new();
+        for key in ["content", "message", "raw_message"] {
+            body = flatten_forward_segments(node.get(key));
+            if !body.is_empty() {
+                break;
+            }
+        }
+        lines.push(format!("{name}: {body}"));
+    }
+    lines.join("\n")
+}
+
+/// Read a merged/forwarded chat record by id.
+///
+/// Inbound events only carry `[chat history: id=<id>]`; without this node the
+/// model can see that a record was sent but never what it said.
+fn handle_qq_get_forward_msg(req: &NodeRequest) -> Result<NodeResponse, String> {
+    let id = forward_msg_id(req)
+        .ok_or_else(|| "id is required for qq_get_forward_msg".to_string())?;
+    let (base_url, token) = resolve_onebot_endpoint(req.payload.as_ref())?;
+    let data = onebot_call(
+        &base_url,
+        "get_forward_msg",
+        &json!({ "id": id }),
+        token.as_deref(),
+    )?;
+    let text = flatten_forward_nodes(&data);
+    let line_count = text.lines().count();
+    let messages = data
+        .get("data")
+        .and_then(|d| d.get("messages"))
+        .or_else(|| data.get("messages"))
+        .filter(|value| value.is_array())
+        .cloned();
+
+    Ok(NodeResponse {
+        ok: true,
+        node_id: "qq_get_forward_msg".to_string(),
+        messages: None,
+        message: Some(format!("forward {id} => {line_count} lines")),
+        data: Some(json!({
+            "id": id,
+            "text": text,
+            "messages": messages,
+        })),
+        error: None,
+    })
+}
+
 /// Extract one `{user_id, nickname, card}` entry from a OneBot member object.
 /// `None` when the object carries no `user_id` — nothing to identify it by.
 /// Missing/empty `nickname` or `card` degrade to null instead of dropping the
@@ -3326,6 +3547,222 @@ fn handle_qq_ws_serve(req: &NodeRequest) -> Result<NodeResponse, String> {
     })
 }
 
+// ---------------------------------------------------------------------------
+// OneBot v11 request events (加群申请 / 邀请入群)
+// ---------------------------------------------------------------------------
+//
+// 历史：handle_onebot_event 对非 message 事件直接 return，邀请/加群请求被整个
+// 丢掉。现在事件只入一条有界队列（按 flag 去重、最多 PENDING_REQUEST_CAP 条），
+// 由 `qq_group_requests` 节点列出 / 批准 / 拒绝。队列是进程内状态：插件 reload
+// 后要等 OneBot 重投（重复投递只会刷新同一条，不会刷屏）。
+
+/// 请求附言最长保留的字符数（按字符截，CJK 不被拆坏）。
+const REQUEST_COMMENT_MAX_CHARS: usize = 200;
+
+/// 请求附言清洗：控制字符变空格、空白折叠、截断到
+/// [`REQUEST_COMMENT_MAX_CHARS`] 字符；空白结果降级为 `None`。
+fn sanitize_request_comment(raw: &str) -> Option<String> {
+    let cleaned: String = raw
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let collapsed = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+    let truncated: String = collapsed.chars().take(REQUEST_COMMENT_MAX_CHARS).collect();
+    let trimmed = truncated.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// 把一个 `post_type == "request"`、`request_type == "group"` 的事件收进
+/// 待处理队列。返回是否真的入队：没有 flag 的请求无法答复，直接丢弃。
+///
+/// 同一个 flag 只留一条（重连 / 重放只刷新时间与附言），队列超长时淘汰最旧的。
+fn enqueue_group_request(event: &OneBotEvent, now: u64) -> bool {
+    let Some(flag) = event
+        .flag
+        .as_deref()
+        .map(str::trim)
+        .filter(|flag| !flag.is_empty())
+    else {
+        return false;
+    };
+    let entry = PendingGroupRequest {
+        flag: flag.to_string(),
+        sub_type: event.sub_type.as_deref().unwrap_or_default().trim().to_string(),
+        group_id: event.group_id.as_ref().and_then(extract_i64),
+        user_id: extract_i64(&event.user_id),
+        comment: event.comment.as_deref().and_then(sanitize_request_comment),
+        time_ms: now,
+    };
+    let mut queue = PENDING_REQUESTS.lock().unwrap_or_else(|p| p.into_inner());
+    queue.retain(|pending| pending.flag != entry.flag);
+    queue.push(entry);
+    while queue.len() > PENDING_REQUEST_CAP {
+        queue.remove(0);
+    }
+    true
+}
+
+/// 队列快照（最旧的在前）。
+fn pending_group_requests() -> Vec<PendingGroupRequest> {
+    PENDING_REQUESTS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone()
+}
+
+/// 按 flag 取一条待处理请求。
+fn find_pending_group_request(flag: &str) -> Option<PendingGroupRequest> {
+    PENDING_REQUESTS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .find(|pending| pending.flag == flag)
+        .cloned()
+}
+
+/// 回答成功后把这条请求从队列里移除。返回是否真的移除。
+fn remove_pending_group_request(flag: &str) -> bool {
+    let mut queue = PENDING_REQUESTS.lock().unwrap_or_else(|p| p.into_inner());
+    let before = queue.len();
+    queue.retain(|pending| pending.flag != flag);
+    queue.len() != before
+}
+
+/// Resolve the OneBot HTTP endpoint + token the way the other nodes do:
+/// payload override → in-memory STATE (set by qq_serve / qq_ws_serve) → the
+/// runtime config file written by serve.
+fn resolve_onebot_endpoint(payload: Option<&Value>) -> Result<(String, Option<String>), String> {
+    let base_url = payload
+        .and_then(|p| p.get("onebot_url"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| STATE.lock().ok().and_then(|s| s.onebot_url.clone()))
+        .or_else(|| {
+            load_runtime_config().and_then(|c| c.get("onebot_url")?.as_str().map(|s| s.to_string()))
+        })
+        .ok_or("no OneBot URL configured")?;
+    let token = payload
+        .and_then(|p| p.get("access_token"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| STATE.lock().ok().and_then(|s| s.access_token.clone()))
+        .or_else(|| {
+            load_runtime_config()
+                .and_then(|c| c.get("access_token")?.as_str().map(|s| s.to_string()))
+        });
+    Ok((base_url, token))
+}
+
+/// `qq_group_requests` — list / approve / reject pending OneBot v11 group
+/// requests (加群申请 / 邀请入群).
+///
+/// `set_group_add_request` is the only honest way to answer: a request the bot
+/// never answers stays pending on the OneBot side until it expires.
+fn handle_qq_group_requests(req: &NodeRequest) -> Result<NodeResponse, String> {
+    let payload = req.payload.as_ref();
+    let action = node_str_arg(payload, req.action.as_deref(), "action")
+        .map(|action| action.trim().to_ascii_lowercase())
+        .filter(|action| !action.is_empty())
+        .unwrap_or_else(|| "list".to_string());
+
+    if action == "list" {
+        let requests = pending_group_requests();
+        let count = requests.len();
+        return Ok(NodeResponse {
+            ok: true,
+            node_id: "qq_group_requests".to_string(),
+            messages: None,
+            message: Some(if count == 0 {
+                "no pending group requests".to_string()
+            } else {
+                format!("{count} pending group request(s)")
+            }),
+            data: Some(json!({ "count": count, "requests": requests })),
+            error: None,
+        });
+    }
+
+    if action != "approve" && action != "reject" {
+        return Err(format!(
+            "unknown action '{action}' for qq_group_requests: use list | approve | reject"
+        ));
+    }
+    let approve = action == "approve";
+
+    let flag = node_str_arg(payload, req.flag.as_deref(), "flag")
+        .map(|flag| flag.trim().to_string())
+        .filter(|flag| !flag.is_empty())
+        .ok_or_else(|| {
+            format!(
+                "flag is required to {action} a group request; call action=list to see the pending flags"
+            )
+        })?;
+    let pending = find_pending_group_request(&flag).ok_or_else(|| {
+        format!(
+            "no pending group request with flag '{flag}'; call action=list to see what is waiting \
+             (it may already have been answered or expired)"
+        )
+    })?;
+    // 理由只在 reject 时随请求发出去：approve 带 reason 没有意义。
+    let reason = node_str_arg(payload, req.reason.as_deref(), "reason")
+        .map(|reason| reason.trim().to_string())
+        .filter(|reason| !reason.is_empty() && !approve);
+
+    let (base_url, token) = resolve_onebot_endpoint(payload)?;
+    let mut params = serde_json::Map::new();
+    params.insert("flag".to_string(), json!(pending.flag));
+    // OneBot requires sub_type when it is known; empty means the client did
+    // not report one, so sending the key at all would be a lie.
+    if !pending.sub_type.is_empty() {
+        params.insert("sub_type".to_string(), json!(pending.sub_type));
+    }
+    params.insert("approve".to_string(), json!(approve));
+    if let Some(reason) = reason.as_deref() {
+        params.insert("reason".to_string(), json!(reason));
+    }
+    let data = onebot_call(
+        &base_url,
+        "set_group_add_request",
+        &Value::Object(params),
+        token.as_deref(),
+    )?;
+
+    // Only a *successful* answer leaves the queue: on an API error the request
+    // must stay so the agent can retry it instead of losing it for good.
+    let removed = remove_pending_group_request(&flag);
+    let verb = if approve { "approved" } else { "rejected" };
+    Ok(NodeResponse {
+        ok: true,
+        node_id: "qq_group_requests".to_string(),
+        messages: None,
+        message: Some(format!(
+            "{verb} group request flag={flag} (sub_type={}{})",
+            pending.sub_type,
+            reason
+                .as_deref()
+                .map(|reason| format!(", reason={reason}"))
+                .unwrap_or_default(),
+        )),
+        data: Some(json!({
+            "action": action,
+            "flag": flag,
+            "sub_type": pending.sub_type,
+            "group_id": pending.group_id,
+            "user_id": pending.user_id,
+            "comment": pending.comment,
+            "approve": approve,
+            "reason": reason,
+            "removed": removed,
+            "onebot": data,
+        })),
+        error: None,
+    })
+}
+
 fn handle(req: &NodeRequest) -> Result<NodeResponse, String> {
     match req.node_id.as_str() {
         "qq_serve" => handle_qq_serve(req),
@@ -3333,7 +3770,9 @@ fn handle(req: &NodeRequest) -> Result<NodeResponse, String> {
         "qq_fetch_messages" => handle_qq_fetch_messages(),
         "qq_send" => handle_qq_send(req),
         "qq_get_group_members" => handle_qq_get_group_members(req),
+        "qq_get_forward_msg" => handle_qq_get_forward_msg(req),
         "qq_get_group_roles" => handle_qq_get_group_roles(req),
+        "qq_group_requests" => handle_qq_group_requests(req),
         "qq_get_reply_policy" => handle_qq_get_reply_policy(req),
         "qq_set_reply_policy" => handle_qq_set_reply_policy(req),
         "qq_get_group_memory" => handle_qq_get_group_memory(req),
@@ -3515,6 +3954,55 @@ fn docs_value() -> cordis_plugin_sdk::PluginDocs {
                 ],
     ).with_agent_accessible(),
             node_doc(
+                "qq_group_requests",
+                "List, approve or reject OneBot v11 GROUP requests — someone asking to join a group (`sub_type: add`) or inviting the bot into one (`sub_type: invite`). `action: \"list\"` (the default) returns what is waiting with its `flag`, `sub_type`, `group_id`, `user_id`, `comment` and `time_ms`; `action: \"approve\"` / `\"reject\"` answers ONE request by `flag` via set_group_add_request and drops it from the queue. Only the 32 most recent requests are kept, and a flag disappears once it has been answered — so list first, then answer.",
+                json!({
+                    "type": "object", "required": ["node_id"],
+                    "properties": {
+                        "node_id": { "type": "string", "const": "qq_group_requests" },
+                        "action": { "type": "string", "enum": ["list", "approve", "reject"], "description": "list (default) | approve | reject" },
+                        "flag": { "type": "string", "description": "Request flag taken from action=list (required for approve / reject)" },
+                        "reason": { "type": "string", "description": "Optional refusal note (reject only)" }
+                    }
+                }),
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "ok": { "type": "boolean" },
+                        "message": { "type": ["string", "null"] },
+                        "data": {
+                            "type": "object",
+                            "properties": {
+                                "count": { "type": "integer", "description": "How many requests are waiting" },
+                                "requests": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "flag": { "type": "string" },
+                                            "sub_type": { "type": "string", "description": "add | invite" },
+                                            "group_id": { "type": ["integer", "null"] },
+                                            "user_id": { "type": ["integer", "null"] },
+                                            "comment": { "type": ["string", "null"] },
+                                            "time_ms": { "type": "integer" }
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        "error": { "type": ["string", "null"] }
+                    }
+                }),
+                &["calls OneBot set_group_add_request on approve / reject", "drops an answered request from the queue"],
+                &[
+                    "no OneBot URL configured",
+                    "unknown action",
+                    "flag is required to approve a group request",
+                    "no pending group request with flag '<flag>'",
+                    "OneBot API error",
+                ],
+            ).with_agent_accessible(),
+            node_doc(
                 "qq_get_group_info",
                 "Get a group's name and size (member_count / max_member_count) — use it to tell a two-person group from a busy one. Returns the raw OneBot response, so the fields sit at data.data.",
                 json!({
@@ -3573,6 +4061,43 @@ fn docs_value() -> cordis_plugin_sdk::PluginDocs {
                 }),
                 &["calls OneBot get_group_member_list API"],
                 &["no OneBot URL configured", "target must be group:<id>"],
+            ).with_agent_accessible(),
+            node_doc(
+                "qq_get_forward_msg",
+                "Read the contents of a merged/forwarded chat record (合并转发). Inbound events only show `[chat history: id=<id>]` — pass that id here and the record comes back as readable text: one `<name>: <text>` line per node, with image/face/at/record/video/file/reply segments rendered as placeholders ([图片] [表情] [@<qq>] [语音] [视频] [文件: <name>] [引用]). Each node's body is taken from the first of `content`, `message`, `raw_message` that renders non-empty (a segment array or a plain string), so NapCat-shaped records do not come back as empty lines.",
+                json!({
+                    "type": "object", "required": ["node_id"],
+                    "properties": {
+                        "node_id": { "type": "string", "const": "qq_get_forward_msg" },
+                        "id": { "type": "string", "description": "forward/merged message id, e.g. the number in [chat history: id=...]" },
+                        "message_id": { "type": "string", "description": "Alternative to id (same forward id)" },
+                        "payload": {
+                            "type": "object",
+                            "properties": {
+                                "onebot_url": { "type": "string", "description": "Optional OneBot HTTP API URL override (defaults to STATE / runtime config)" },
+                                "access_token": { "type": "string", "description": "Optional OneBot access token override (defaults to STATE / runtime config)" }
+                            }
+                        }
+                    }
+                }),
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "ok": { "type": "boolean" },
+                        "message": { "type": ["string", "null"] },
+                        "data": {
+                            "type": "object",
+                            "properties": {
+                                "id": { "type": "string", "description": "The forward id that was read" },
+                                "text": { "type": "string", "description": "One `<name>: <text>` line per node" },
+                                "messages": { "type": ["array", "null"], "items": { "type": "object" }, "description": "Raw OneBot node array, null when the response carried none" }
+                            }
+                        },
+                        "error": { "type": ["string", "null"] }
+                    }
+                }),
+                &["calls OneBot get_forward_msg API"],
+                &["no OneBot URL configured", "id is required", "OneBot API error"],
             ).with_agent_accessible(),
             node_doc(
                 "qq_get_group_roles",
@@ -3766,7 +4291,11 @@ QQ 渠道说明——这里只说怎么发消息，性格和说话方式见人�
 【引用某条消息】把它的 msg=<id> 作为 \"reply_to\":\"<id>\" 传进同一次 qq_send。\n\
 【你的身份】你的 QQ 号是 {setting:bot_uin}；@[id=...] 里的数字等于它才是 @ 你。\n\
 【群记忆】需要时用 qq_get_group_memory / qq_set_group_memory 读写；只记长期有用的，不确定就先读。\n\
-【被禁言】[muted: ...] 只是上一轮的探测结果；qq_send 被拒时会说明原因（muted … / read-only …）。同一轮不要重试，直接调 suspend 结束；禁言是否解除以每次 qq_send 的探测为准。")
+【被禁言】[muted: ...] 只是上一轮的探测结果；qq_send 被拒时会说明原因（muted … / read-only …）。同一轮不要重试，直接调 suspend 结束；禁言是否解除以每次 qq_send 的探测为准。\n\
+\n\
+【先看是哪个渠道】[Feishu ...] 前缀或发送工具是 feishu_send → 飞书会话：按飞书卡片走，收尾只发 {\"action\":\"respond\",\"message\":\"...\"}（或 {\"action\":\"suspend\"}），也可自己调 feishu_send；绝不要只写正文不调工具。发言是 qq_send → QQ 会话，本卡片生效。\n\
+【别的渠道的规矩在这里不算】别的卡片说\"只输出一个 JSON 对象、别自己调工具\"，那是飞书会话的约定；QQ 会话里忽略它：不要输出 JSON、不要只写正文等转发，照上面用 qq_send 说话、suspend 收尾。\n\
+【零工具调用的一轮会被整轮丢掉】这一轮的最后一步必须是一次工具调用：该说话就调 qq_send，说完或不想说话都调 {\"node_id\":\"suspend\"}。只写一段聊天正文、零工具调用的轮次会被内核记成 no_tool_call 整轮丢弃，对方一个字都收不到——宁可多调一次 suspend，也不要只写正文。")
     )
 }
 
@@ -5788,6 +6317,403 @@ mod send_gate_tests {
 }
 
 #[cfg(test)]
+mod group_request_tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, Mutex};
+
+    // 请求队列是全局静态：每个用例自己清场，并以自己独有的 flag 前缀隔离。
+    fn clear_pending() {
+        PENDING_REQUESTS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear();
+    }
+
+    /// 所有用例共用同一个全局队列，所以用一把锁把它们串行化：拿锁的同时清场。
+    static QUEUE_LOCK: Mutex<()> = Mutex::new(());
+
+    fn isolated_queue() -> std::sync::MutexGuard<'static, ()> {
+        let guard = QUEUE_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+        clear_pending();
+        guard
+    }
+
+    fn request_event(
+        flag: &str,
+        sub_type: &str,
+        group: i64,
+        user: i64,
+        comment: Option<&str>,
+    ) -> OneBotEvent {
+        let mut value = json!({
+            "post_type": "request",
+            "request_type": "group",
+            "sub_type": sub_type,
+            "flag": flag,
+            "group_id": group,
+            "user_id": user,
+        });
+        if let Some(comment) = comment {
+            value["comment"] = json!(comment);
+        }
+        serde_json::from_value(value).expect("well-formed request event")
+    }
+
+    fn req(value: Value) -> NodeRequest {
+        serde_json::from_value(value).expect("well-formed NodeRequest")
+    }
+
+    /// `set_group_add_request` 的最小 OneBot stub：记录 (path, body)，
+    /// `fail` 为真时回 `status: failed`。只监听 127.0.0.1，不碰真网。
+    fn spawn_fake_onebot(fail: bool) -> (String, Arc<Mutex<Vec<(String, Value)>>>) {
+        let server = tiny_http::Server::http("127.0.0.1:0").expect("bind fake OneBot server");
+        let port = server
+            .server_addr()
+            .to_ip()
+            .expect("fake server must listen on an IP socket")
+            .port();
+        let seen: Arc<Mutex<Vec<(String, Value)>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorder = seen.clone();
+        let fail = AtomicBool::new(fail);
+        thread::spawn(move || {
+            for mut request in server.incoming_requests() {
+                let mut body = String::new();
+                let _ = request.as_reader().read_to_string(&mut body);
+                let params: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+                recorder
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .push((request.url().to_string(), params));
+                let reply = if fail.load(Ordering::SeqCst) {
+                    json!({"status":"failed","retcode":100,"wording":"set_group_add_request failed"})
+                } else {
+                    json!({"status":"ok","retcode":0,"data":{}})
+                };
+                let header =
+                    tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
+                        .expect("static header is valid");
+                let _ = request
+                    .respond(tiny_http::Response::from_string(reply.to_string()).with_header(header));
+            }
+        });
+        (format!("http://127.0.0.1:{port}"), seen)
+    }
+
+    // 加群申请 / 邀请的 group 请求事件（以前被整个丢掉）必须入队；
+    // 同一个 flag 重复投递只刷新一条，不许刷屏。
+    #[test]
+    fn group_request_events_are_queued_and_deduped() {
+        let _guard = isolated_queue();
+        assert!(
+            !enqueue_group_request(&request_event("", "add", 1, 2, None), now_ms()),
+            "没有 flag 的请求无法答复，不能入队"
+        );
+
+        handle_onebot_event(&request_event(
+            "qreq-1",
+            "add",
+            910001,
+            301,
+            Some("  我是  小明 \n"),
+        ));
+        let waiting = pending_group_requests();
+        assert_eq!(waiting.len(), 1, "group 请求事件必须入队");
+        assert_eq!(waiting[0].flag, "qreq-1");
+        assert_eq!(waiting[0].sub_type, "add");
+        assert_eq!(waiting[0].group_id, Some(910001));
+        assert_eq!(waiting[0].user_id, Some(301));
+        assert_eq!(waiting[0].comment.as_deref(), Some("我是 小明"), "附言要清洗");
+        assert!(waiting[0].time_ms > 0);
+
+        // 重复投递：同一个 flag 只留一条。
+        handle_onebot_event(&request_event("qreq-1", "add", 910001, 301, Some("再来一次")));
+        let waiting = pending_group_requests();
+        assert_eq!(waiting.len(), 1, "同一个 flag 不应重复入队");
+        assert_eq!(waiting[0].comment.as_deref(), Some("再来一次"));
+
+        // 非 group 请求 / 非请求事件都不进队列。
+        let friend: OneBotEvent = serde_json::from_value(json!({
+            "post_type": "request",
+            "request_type": "friend",
+            "flag": "friend-1",
+            "user_id": 301
+        }))
+        .expect("friend request");
+        handle_onebot_event(&friend);
+        let meta: OneBotEvent = serde_json::from_value(json!({
+            "post_type": "meta_event",
+            "flag": "meta-1"
+        }))
+        .expect("meta event");
+        handle_onebot_event(&meta);
+        assert_eq!(pending_group_requests().len(), 1, "只有 group 请求入队");
+        clear_pending();
+    }
+
+    // 请求也要正常进入队列，不能因为加群请求把原有 message 逻辑弄坏：
+    // request 事件不污染 MESSAGE_QUEUE。
+    #[test]
+    fn request_events_do_not_touch_the_message_queue() {
+        let _guard = isolated_queue();
+        MESSAGE_QUEUE
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear();
+        handle_onebot_event(&request_event("qreq-2", "invite", 910002, 302, None));
+        let messages = MESSAGE_QUEUE
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .len();
+        assert_eq!(messages, 0, "请求事件不能进消息队列");
+        assert_eq!(pending_group_requests().len(), 1);
+        clear_pending();
+        MESSAGE_QUEUE
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear();
+    }
+
+    // 队列是有界的：最多保留最近 PENDING_REQUEST_CAP 条，最旧的被淘汰。
+    #[test]
+    fn queue_keeps_only_the_most_recent_requests() {
+        let _guard = isolated_queue();
+        for index in 0..(PENDING_REQUEST_CAP + 8) {
+            handle_onebot_event(&request_event(
+                &format!("qreq-cap-{index}"),
+                "add",
+                920000 + index as i64,
+                300,
+                None,
+            ));
+        }
+        let waiting = pending_group_requests();
+        assert_eq!(waiting.len(), PENDING_REQUEST_CAP, "队列必须封顶");
+        let newest = format!("qreq-cap-{}", PENDING_REQUEST_CAP + 7);
+        assert_eq!(waiting.last().map(|r| r.flag.as_str()), Some(newest.as_str()));
+        assert!(
+            find_pending_group_request("qreq-cap-0").is_none(),
+            "最旧的请求应被淘汰"
+        );
+        assert!(find_pending_group_request(&newest).is_some());
+        clear_pending();
+    }
+
+    // list 输出：缺省 action 就是 list，条目字段可直接被模型使用。
+    #[test]
+    fn list_returns_the_pending_requests() {
+        let _guard = isolated_queue();
+        handle_onebot_event(&request_event(
+            "qreq-list",
+            "invite",
+            910003,
+            303,
+            Some("拉你进群"),
+        ));
+        let resp = handle_qq_group_requests(&req(json!({ "node_id": "qq_group_requests" })))
+            .expect("list");
+        assert!(resp.ok);
+        let data = resp.data.expect("data");
+        assert_eq!(data["count"], 1);
+        let requests = data["requests"].as_array().expect("requests array");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0]["flag"], "qreq-list");
+        assert_eq!(requests[0]["sub_type"], "invite");
+        assert_eq!(requests[0]["group_id"], 910003);
+        assert_eq!(requests[0]["user_id"], 303);
+        assert_eq!(requests[0]["comment"], "拉你进群");
+        assert!(requests[0]["time_ms"].as_u64().unwrap_or_default() > 0);
+        // 显式 action=list 与缺省等价。
+        let explicit = handle_qq_group_requests(&req(json!({
+            "node_id": "qq_group_requests",
+            "action": "list"
+        })))
+        .expect("explicit list");
+        assert_eq!(explicit.data.expect("data")["count"], 1);
+        clear_pending();
+
+        let empty = handle_qq_group_requests(&req(json!({
+            "node_id": "qq_group_requests",
+            "action": "list"
+        })))
+        .expect("empty list");
+        let data = empty.data.expect("data");
+        assert_eq!(data["count"], 0);
+        assert!(data["requests"].as_array().expect("array").is_empty());
+    }
+
+    // approve / reject 长走 set_group_add_request，成功后从队列移除。
+    #[test]
+    fn approve_and_reject_call_set_group_add_request() {
+        let _guard = isolated_queue();
+        let (url, seen) = spawn_fake_onebot(false);
+        handle_onebot_event(&request_event("qreq-ok", "add", 930001, 401, Some("放我进去")));
+        handle_onebot_event(&request_event("qreq-no", "invite", 930002, 402, None));
+
+        let approved = handle_qq_group_requests(&req(json!({
+            "node_id": "qq_group_requests",
+            "action": "approve",
+            "flag": "qreq-ok",
+            "payload": { "onebot_url": url },
+        })))
+        .expect("approve");
+        assert!(approved.ok, "{:?}", approved.error);
+        let data = approved.data.expect("data");
+        assert_eq!(data["approve"], true);
+        assert_eq!(data["removed"], true);
+        assert_eq!(data["group_id"], 930001);
+        {
+            let seen = seen.lock().unwrap_or_else(|p| p.into_inner());
+            let (path, params) = seen.last().expect("one set_group_add_request call");
+            assert!(path.ends_with("/set_group_add_request"), "path: {path}");
+            assert_eq!(params["flag"], "qreq-ok");
+            assert_eq!(params["sub_type"], "add");
+            assert_eq!(params["approve"], true);
+            assert!(params.get("reason").is_none(), "approve 不带 reason");
+        }
+        assert!(
+            find_pending_group_request("qreq-ok").is_none(),
+            "批准后从队列移除"
+        );
+        assert!(
+            find_pending_group_request("qreq-no").is_some(),
+            "另一条请求不受影响"
+        );
+
+        let rejected = handle_qq_group_requests(&req(json!({
+            "node_id": "qq_group_requests",
+            "action": "reject",
+            "flag": "qreq-no",
+            "reason": "不认识你",
+            "payload": { "onebot_url": url },
+        })))
+        .expect("reject");
+        assert!(rejected.ok, "{:?}", rejected.error);
+        let data = rejected.data.expect("data");
+        assert_eq!(data["approve"], false);
+        assert_eq!(data["reason"], "不认识你");
+        {
+            let seen = seen.lock().unwrap_or_else(|p| p.into_inner());
+            let (path, params) = seen.last().expect("the reject call");
+            assert!(path.ends_with("/set_group_add_request"), "path: {path}");
+            assert_eq!(params["flag"], "qreq-no");
+            assert_eq!(params["sub_type"], "invite");
+            assert_eq!(params["approve"], false);
+            assert_eq!(params["reason"], "不认识你");
+        }
+        assert!(find_pending_group_request("qreq-no").is_none());
+        clear_pending();
+    }
+
+    // flag 不存在 / 缺 flag / 未知 action 都要给出清晰错误，且不触网。
+    #[test]
+    fn unknown_or_missing_flag_reports_a_clear_error() {
+        let _guard = isolated_queue();
+        let err = handle_qq_group_requests(&req(json!({
+            "node_id": "qq_group_requests",
+            "action": "approve",
+            "flag": "qreq-ghost"
+        })))
+        .expect_err("unknown flag");
+        assert!(
+            err.contains("no pending group request with flag 'qreq-ghost'"),
+            "err: {err}"
+        );
+        assert!(err.contains("action=list"), "err must point at list: {err}");
+
+        let err = handle_qq_group_requests(&req(json!({
+            "node_id": "qq_group_requests",
+            "action": "reject"
+        })))
+        .expect_err("missing flag");
+        assert!(err.starts_with("flag is required to reject"), "err: {err}");
+
+        let err = handle_qq_group_requests(&req(json!({
+            "node_id": "qq_group_requests",
+            "action": "explode"
+        })))
+        .expect_err("unknown action");
+        assert!(err.contains("unknown action 'explode'"), "err: {err}");
+    }
+
+    // OneBot 报错时请求不能丢：它必须留在队列里供下一次重试。
+    #[test]
+    fn failed_answer_keeps_the_request_queued() {
+        let _guard = isolated_queue();
+        let (url, _seen) = spawn_fake_onebot(true);
+        handle_onebot_event(&request_event("qreq-retry", "add", 940001, 501, None));
+        let err = handle_qq_group_requests(&req(json!({
+            "node_id": "qq_group_requests",
+            "action": "approve",
+            "flag": "qreq-retry",
+            "payload": { "onebot_url": url },
+        })))
+        .expect_err("OneBot failure must surface");
+        assert!(err.contains("OneBot API error"), "err: {err}");
+        assert!(
+            find_pending_group_request("qreq-retry").is_some(),
+            "失败的答复不能把请求吃掉"
+        );
+        clear_pending();
+    }
+
+    // 没有 OneBot URL → 明确报错（请求留在队列里，而不是静默消失）。
+    #[test]
+    fn answering_without_onebot_url_is_an_error() {
+        let _guard = isolated_queue();
+        {
+            let mut state = STATE.lock().unwrap_or_else(|p| p.into_inner());
+            state.onebot_url = None;
+            state.access_token = None;
+        }
+        handle_onebot_event(&request_event("qreq-nourl", "add", 950001, 601, None));
+        let err = handle_qq_group_requests(&req(json!({
+            "node_id": "qq_group_requests",
+            "action": "approve",
+            "flag": "qreq-nourl"
+        })))
+        .expect_err("no url");
+        assert_eq!(err, "no OneBot URL configured");
+        assert!(find_pending_group_request("qreq-nourl").is_some());
+        clear_pending();
+    }
+
+    // 节点必须经 handle() 分发（kernel 只经 handle() 调插件）。
+    #[test]
+    fn handle_dispatches_group_requests() {
+        let _guard = isolated_queue();
+        let resp = handle(&req(json!({
+            "node_id": "qq_group_requests",
+            "action": "list"
+        })))
+        .expect("dispatch");
+        assert_eq!(resp.node_id, "qq_group_requests");
+        assert!(resp.ok);
+    }
+
+    // 文档表：节点必须存在且 agent_accessible（kernel 只认 docs 里的标志）。
+    #[test]
+    fn docs_mark_group_requests_agent_accessible() {
+        let node = docs_value()
+            .nodes
+            .into_iter()
+            .find(|node| node.id == "qq_group_requests")
+            .expect("qq_group_requests must be documented");
+        assert!(node.agent_accessible, "agent 必须能答加群请求");
+        let action = &node.input_schema["properties"]["action"];
+        let variants = action["enum"].as_array().expect("action enum");
+        for expected in ["list", "approve", "reject"] {
+            assert!(
+                variants.iter().any(|v| v == expected),
+                "action must offer {expected}: {variants:?}"
+            );
+        }
+        assert!(node.input_schema["properties"].get("flag").is_some());
+        assert!(node.input_schema["properties"].get("reason").is_some());
+    }
+}
+
+#[cfg(test)]
 mod docs_tests {
     use super::*;
 
@@ -5996,12 +6922,18 @@ mod channel_hint_tests {
         }
     }
 
-    // Short enough to stay a channel card rather than a manual.
+    // Short enough to stay a channel card rather than a manual. The cap moved
+    // from 900 to 1000 for the【先看是哪个渠道】paragraph: the card is injected
+    // into every session, so it must say which channel it is talking about (and
+    // that a Feishu session keeps its JSON envelope) before it forbids anything.
+    // It moved again to 1200 for【零工具调用的一轮会被整轮丢掉】: naming the
+    // `no_tool_call` failure is what makes "do not answer with bare chat text"
+    // land, and it has to be the last thing the model reads.
     #[test]
     fn the_hint_stays_a_channel_card() {
         let hint = hint();
         assert!(
-            hint.chars().count() < 900,
+            hint.chars().count() < 1200,
             "channel hint must stay short: {} chars",
             hint.chars().count()
         );
@@ -6441,5 +7373,182 @@ mod media_archive_tests {
         let urls = vec!["https://example.invalid/a.png".to_string()];
         assert!(spawn_media_archive("private", "1", "2", Some(3), &urls).is_none());
         assert!(spawn_media_archive("group", "1", "2", Some(3), &[]).is_none());
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// 合并转发（qq_get_forward_msg）：入站事件只有 `[chat history: id=<id>]`，
+// 节点把那个 id 变成模型能读的文本。flatten 是纯函数，不发网络请求。
+// ═══════════════════════════════════════════════════════════════════════
+#[cfg(test)]
+mod forward_tests {
+    use super::*;
+
+    fn sample_forward() -> Value {
+        json!({
+            "status": "ok",
+            "retcode": 0,
+            "data": {
+                "messages": [
+                    {
+                        "sender": { "nickname": "小红", "card": "小明" },
+                        "content": [
+                            { "type": "text", "data": { "text": "你好" } },
+                            { "type": "image", "data": { "url": "https://e/1.png" } }
+                        ]
+                    },
+                    {
+                        "sender": { "nickname": "小红", "card": "" },
+                        "content": [
+                            { "type": "at", "data": { "qq": "12345" } },
+                            { "type": "face", "data": { "id": "1" } },
+                            { "type": "text", "data": { "text": "看这个" } }
+                        ]
+                    },
+                    {
+                        "content": [{ "type": "text", "data": { "text": "无名字" } }]
+                    }
+                ]
+            }
+        })
+    }
+
+    // 群名片优先，空名片回落昵称，都没有就是「未知」；图片/表情/@ 都是占位符。
+    #[test]
+    fn flatten_renders_card_lines_and_placeholders() {
+        let text = flatten_forward_nodes(&sample_forward());
+        assert_eq!(
+            text,
+            "小明: 你好[图片]\n小红: [@12345][表情]看这个\n未知: 无名字"
+        );
+        assert_eq!(text.lines().count(), 3, "one line per node: {text}");
+
+        // 裸数组（`messages` 本身就是数组）也要接受。
+        let bare = json!(sample_forward()["data"]["messages"].clone());
+        assert_eq!(flatten_forward_nodes(&bare), text);
+    }
+
+    // NapCat 常把节点正文放在 `message`（段数组）或 `raw_message`（CQ 字符串）：
+    // 以前只读 `content`，结果每条都是「昵称: 」后面一片空。
+    #[test]
+    fn flatten_falls_back_to_message_and_raw_message() {
+        let data = json!({
+            "data": { "messages": [
+                {
+                    "sender": { "nickname": "甲" },
+                    "message": [
+                        { "type": "text", "data": { "text": "段数组正文" } },
+                        { "type": "record", "data": {} }
+                    ]
+                },
+                {
+                    "sender": { "nickname": "乙" },
+                    "raw_message": "  CQ 字符串正文  "
+                },
+                {
+                    // content 为空串 → 继续看 message；message 也空 → raw_message。
+                    "sender": { "nickname": "丙" },
+                    "content": "   ",
+                    "message": [],
+                    "raw_message": "最后"
+                },
+                {
+                    // 三个字段都缺：仍然是「未知」昵称 + 空正文，不 panic。
+                    "content": []
+                }
+            ]}
+        });
+        assert_eq!(
+            flatten_forward_nodes(&data),
+            "甲: 段数组正文[语音]\n乙: CQ 字符串正文\n丙: 最后\n未知: "
+        );
+        // content 优先于 message / raw_message。
+        let prefer = json!({"messages": [{
+            "sender": { "card": "名片" },
+            "content": [{ "type": "text", "data": { "text": "content 赢" } }],
+            "message": [{ "type": "text", "data": { "text": "message" } }],
+            "raw_message": "raw"
+        }]});
+        assert_eq!(flatten_forward_nodes(&prefer), "名片: content 赢");
+    }
+
+    // 正文既可以是段数组，也可以是字符串（直接 trim 返回）。
+    #[test]
+    fn flatten_segments_accepts_strings_and_arrays() {
+        assert_eq!(
+            flatten_forward_segments(Some(&json!("  纯文本正文 "))),
+            "纯文本正文"
+        );
+        assert_eq!(flatten_forward_segments(Some(&json!("   "))), "");
+        assert_eq!(flatten_forward_segments(None), "");
+        assert_eq!(flatten_forward_segments(Some(&json!(42))), "");
+        // 占位符渲染不变。
+        assert_eq!(
+            flatten_forward_segments(Some(&json!([
+                { "type": "text", "data": { "text": "看图" } },
+                { "type": "image", "data": { "url": "https://e/1.png" } },
+                { "type": "face", "data": { "id": "1" } },
+                { "type": "video", "data": {} },
+                { "type": "file", "data": { "name": "a.txt" } },
+                { "type": "reply", "data": { "id": "1" } },
+                { "type": "poke", "data": {} }
+            ]))),
+            "看图[图片][表情][视频][文件: a.txt][引用][poke]"
+        );
+    }
+
+    // 空的 message 列表 → 空字符串（不是 `<name>: ` 这种空行）。
+    #[test]
+    fn flatten_of_empty_message_list_is_empty() {
+        assert_eq!(
+            flatten_forward_nodes(&json!({"status":"ok","retcode":0,"data":{"messages":[]}})),
+            ""
+        );
+        assert_eq!(flatten_forward_nodes(&json!({"data":{}})), "");
+        assert_eq!(flatten_forward_nodes(&Value::Null), "");
+    }
+
+    // 没有 id 就走错误路径：不 panic、不发请求、错误文本直接可读。
+    #[test]
+    fn handle_without_id_reports_the_error_path() {
+        let req: NodeRequest =
+            serde_json::from_str(r#"{"node_id":"qq_get_forward_msg"}"#).expect("NodeRequest");
+        let err = handle(&req).expect_err("missing id must be an error");
+        assert_eq!(err, "id is required for qq_get_forward_msg");
+
+        // 空白 id / 非标量 id 同样算缺。
+        let blank: NodeRequest = serde_json::from_value(json!({
+            "node_id": "qq_get_forward_msg",
+            "payload": { "id": "   " }
+        }))
+        .expect("NodeRequest");
+        // A numeric id is accepted (payload.id may be a number).
+        let numeric: NodeRequest = serde_json::from_value(json!({
+            "node_id": "qq_get_forward_msg",
+            "payload": { "id": 123456 }
+        }))
+        .expect("NodeRequest");
+        assert_eq!(forward_msg_id(&blank), None);
+        assert_eq!(forward_msg_id(&numeric).as_deref(), Some("123456"));
+    }
+
+    // kernel 的 `check_agent_accessible` 只认 docs 里的标志。
+    #[test]
+    fn docs_mark_forward_node_agent_accessible() {
+        let node = docs_value()
+            .nodes
+            .into_iter()
+            .find(|node| node.id == "qq_get_forward_msg")
+            .expect("qq_get_forward_msg must be documented");
+        assert!(node.agent_accessible, "agent must be able to read a forward");
+        assert_eq!(
+            node.input_schema["properties"]["node_id"]["const"],
+            "qq_get_forward_msg"
+        );
+        assert!(node.input_schema["properties"].get("id").is_some());
+        assert!(node.input_schema["properties"].get("message_id").is_some());
+        assert!(node.output_schema["properties"]["data"]["properties"]
+            .get("text")
+            .is_some());
     }
 }
