@@ -413,7 +413,10 @@ mod tests {
         let late = Arc::clone(&recorder);
         let thread = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(20));
-            late.events.lock().expect("lock").push("c:after".to_string());
+            late.events
+                .lock()
+                .expect("lock")
+                .push("c:after".to_string());
         });
         wait_for_event(&recorder, Duration::from_secs(5)).expect("the late event is seen");
         thread.join().expect("join");
@@ -424,7 +427,10 @@ mod tests {
         // instead of only its deadline check.
         let empty = Recorder::default();
         let err = wait_for_event(&empty, Duration::from_millis(15)).expect_err("nothing arrives");
-        assert_eq!(err, "the listener never reported the line after the garbage");
+        assert_eq!(
+            err,
+            "the listener never reported the line after the garbage"
+        );
     }
 
     /// 诊断输出受环境变量控制：开关两态都要走到，否则 `tracing_diag` 里的
@@ -536,6 +542,25 @@ mod tests {
             started.elapsed() < Duration::from_secs(5),
             "listener must not hang when the plugin never connects"
         );
+        assert!(recorder.events.lock().expect("lock").is_empty());
+    }
+
+    /// `serve_once` must actually take its "would block, keep waiting" arm.
+    ///
+    /// `listener_gives_up_when_nobody_connects` races the listener thread it
+    /// spawns: if the stop signal wins, the first accept poll already returns
+    /// GiveUp and the sleep arm is skipped — which left line 161 uncovered on
+    /// a fast run. Driving `serve_once` directly with a nonblocking listener
+    /// and no pending connection makes the arm deterministic.
+    #[test]
+    fn serve_once_waits_out_a_would_block_accept() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let recorder = Recorder::default();
+        let (_stop_tx, stop) = mpsc::channel::<()>();
+
+        serve_once(listener, &recorder, "k1", Duration::from_millis(20), &stop);
+
         assert!(recorder.events.lock().expect("lock").is_empty());
     }
 
