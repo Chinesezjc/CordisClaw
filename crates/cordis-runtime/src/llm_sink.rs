@@ -384,16 +384,47 @@ mod tests {
         // handles only closes them — it does not mean the lines were read. Poll
         // instead of asserting immediately, which is how this test failed in a
         // full run while passing on its own.
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while recorder.events.lock().expect("lock").is_empty() {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the listener never reported the line after the garbage"
-            );
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        wait_for_event(&recorder, Duration::from_secs(5)).expect("the listener reports");
 
         assert_eq!(*recorder.events.lock().expect("lock"), vec!["c:after"]);
+    }
+
+    /// Wait until the listener has recorded something, or give up.
+    ///
+    /// Split out of the test so the wait itself can be exercised: in a fast run
+    /// the listener has already recorded by the first check, and an inline loop
+    /// would leave its body unexecuted forever.
+    fn wait_for_event(recorder: &Recorder, budget: Duration) -> Result<(), String> {
+        let deadline = std::time::Instant::now() + budget;
+        loop {
+            if !recorder.events.lock().expect("lock").is_empty() {
+                return Ok(());
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err("the listener never reported the line after the garbage".to_string());
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn wait_for_event_reports_when_nothing_arrives_and_returns_when_it_does() {
+        let recorder = Arc::new(Recorder::default());
+        let late = Arc::clone(&recorder);
+        let thread = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            late.events.lock().expect("lock").push("c:after".to_string());
+        });
+        wait_for_event(&recorder, Duration::from_secs(5)).expect("the late event is seen");
+        thread.join().expect("join");
+        assert_eq!(*recorder.events.lock().expect("lock"), vec!["c:after"]);
+
+        // A positive budget, not ZERO: the loop must actually take its sleep
+        // branch before it can time out, so this test covers the wait itself
+        // instead of only its deadline check.
+        let empty = Recorder::default();
+        let err = wait_for_event(&empty, Duration::from_millis(15)).expect_err("nothing arrives");
+        assert_eq!(err, "the listener never reported the line after the garbage");
     }
 
     /// 诊断输出受环境变量控制：开关两态都要走到，否则 `tracing_diag` 里的
