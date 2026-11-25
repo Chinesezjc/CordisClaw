@@ -1423,11 +1423,7 @@ impl AgentSession {
                 // anything: the room saw nothing, and recording the draft as
                 // speech teaches the model that it answered. Shell sessions are
                 // different — there the text *is* the answer.
-                let spoken = if self.require_end_tool {
-                    delivered_text(&tool_events, "", false)
-                } else {
-                    content.to_string()
-                };
+                let spoken = spoken_for_history(self.require_end_tool, content, &tool_events);
                 self.remember_exchange(
                     &remembered,
                     &spoken,
@@ -2579,6 +2575,26 @@ fn delivered_text(
     }
 }
 
+/// The assistant text a turn leaves in its history.
+///
+/// A channel turn that produced text but delivered nothing said nothing, so its
+/// history body is empty; a shell turn's text is the answer. This lives in its
+/// own function because the session loop closes every channel turn before the
+/// history-recording branch (the `require_end_tool` arm nudges and `continue`s),
+/// so the channel arm is only reachable directly — and it must not silently
+/// regress to recording the draft.
+fn spoken_for_history(
+    require_end_tool: bool,
+    content: &str,
+    events: &[cordis_runtime::agent_api::AgentToolEvent],
+) -> String {
+    if require_end_tool {
+        delivered_text(events, "", false)
+    } else {
+        content.to_string()
+    }
+}
+
 /// Node names of the tools a turn ran, for the transcript.
 ///
 /// A plugin call arrives as `invoke_plugin`; the node is the part that says what
@@ -3260,11 +3276,20 @@ fn shell_agent_tools() -> Vec<AgentToolSpec> {
         },
         AgentToolSpec {
             name: AGENT_TOOL_EXECUTE_TARGET,
-            description: "Execute a registered node target through the runtime execution engine.",
+            description: "Execute a registered node target through the runtime execution engine. \
+                          The FQN is \"<plugin>::<node>\" — double colon, e.g. \
+                          \"expr::expr_entry\" for plugin \"expr\" node \"expr_entry\". A dotted \
+                          form like \"expr.expr_entry\" matches nothing and returns \
+                          \"registered node not found\". Call list_nodes to see the pairs; \
+                          for an ordinary call invoke_plugin takes plugin_path and node_id \
+                          separately and is less error-prone.",
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "node_fqn": { "type": "string" },
+                    "node_fqn": {
+                        "type": "string",
+                        "description": "\"<plugin>::<node>\", e.g. \"qq::qq_get_reply_policy\"."
+                    },
                     "payload_json": {
                         "type": "object",
                         "description": "JSON object payload for the execute request."
@@ -5313,6 +5338,120 @@ mod tests {
         assert!(
             !assistant.iter().any(|content| content.contains(draft)),
             "an abandoned draft must not be recorded as the turn words: {assistant:?}"
+        );
+    }
+
+    /// A channel turn that produced text but delivered nothing records silence.
+    ///
+    /// `suspend` drops the draft, so the room saw nothing: history and
+    /// transcript must both hold the empty string rather than the model's
+    /// unused sentence. Reasoning is present because a turn with no words, no
+    /// tool call and no reasoning leaves no history entry at all.
+    #[test]
+    fn a_channel_turn_that_delivered_nothing_remembers_silence() {
+        let draft = "荷花父子兵，还带zero找卡莎要烟，这视频标题够勾人的";
+        let provider = FakeLlmProvider::new(vec![cordis_plugin_sdk::llm::LlmMessage {
+            content: Some(draft.to_string()),
+            reasoning_content: Some("这条要不要回".to_string()),
+            tool_calls: vec![cordis_plugin_sdk::llm::LlmToolCall {
+                id: "end".to_string(),
+                call_type: "function".to_string(),
+                function: cordis_plugin_sdk::llm::LlmToolFunction {
+                    name: AGENT_TOOL_END_TURN.to_string(),
+                    arguments: "{}".to_string(),
+                },
+            }],
+        }]);
+        let mut session = ShellAgentSession::new(LlmApiConfig::default()).expect("build session");
+        session.set_require_end_tool(true);
+        let reply = session
+            .respond_via(&EMPTY_FAKE_HOST, "channel-draft", "看看这个", &provider)
+            .expect("turn");
+        assert!(reply.tool_events.is_empty(), "nothing was sent");
+
+        let assistant = session
+            .inner
+            .history_value(session.inner.history_len() - 1)
+            .expect("assistant message");
+        assert_eq!(
+            assistant["content"],
+            json!(""),
+            "history must record silence, not the draft: {assistant}"
+        );
+        assert!(
+            !assistant.to_string().contains(draft),
+            "the draft is not the bot's words: {assistant}"
+        );
+
+        let transcript: Vec<&str> = session
+            .inner
+            .transcript
+            .iter()
+            .filter_map(|entry| match entry {
+                AgentTranscriptEntry::Assistant { content, .. } => Some(content.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            transcript,
+            vec![""],
+            "the transcript records what the room saw: {transcript:?}"
+        );
+    }
+
+    /// The same shape in a shell session keeps the text: there the answer has
+    /// no delivery step, so the fallback is the turn's speech.
+    #[test]
+    fn a_shell_turn_keeps_its_text_in_history() {
+        let answer = "直接回答，没有投递工具";
+        let provider = FakeLlmProvider::new(vec![assistant_reply(answer)]);
+        let mut session = ShellAgentSession::new(LlmApiConfig::default()).expect("build session");
+        let reply = session
+            .respond_via(&EMPTY_FAKE_HOST, "shell-text", "看看这个", &provider)
+            .expect("turn");
+        assert!(reply.tool_events.is_empty(), "no tool ran");
+        assert_eq!(reply.content, answer);
+
+        let assistant = session
+            .inner
+            .history_value(session.inner.history_len() - 1)
+            .expect("assistant message");
+        assert_eq!(
+            assistant["content"],
+            json!(answer),
+            "a shell turn's text is the answer: {assistant}"
+        );
+    }
+
+    /// Both arms of the history fallback, driven directly.
+    ///
+    /// The channel arm cannot be reached through a session: the loop nudges a
+    /// channel turn and `continue`s before this decision, so `suspend` ends it.
+    /// The behaviour still matters — a channel draft must never become history.
+    #[test]
+    fn spoken_for_history_drops_a_channel_draft_and_keeps_a_shell_answer() {
+        let draft = "a draft the room never saw";
+        assert_eq!(
+            spoken_for_history(true, draft, &[]),
+            "",
+            "a channel turn that delivered nothing said nothing"
+        );
+        let delivered = cordis_runtime::agent_api::AgentToolEvent {
+            name: "invoke_plugin".to_string(),
+            arguments: json!({ "message": "已经发出去的话" }),
+            ok: true,
+            output: None,
+            error: None,
+        };
+        assert_eq!(
+            spoken_for_history(true, draft, &[delivered]),
+            "已经发出去的话",
+            "a delivered message is what the room saw, not the draft"
+        );
+        assert_eq!(
+            spoken_for_history(false, draft, &[]),
+            draft,
+            "a shell turn's text is the answer"
         );
     }
 
