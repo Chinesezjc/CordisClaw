@@ -154,22 +154,83 @@ fn invalid_argument_message(err: &RuntimeError) -> String {
     }
 }
 
-/// A file outside the structural focus shortlist is refused with the
-/// "hidden behind the shortlist" error until `list_context_files(scope=all)`
-/// expands the visible set — then the same file reads cleanly.
+/// A file that exists inside the iteration's allowed roots reads even though it
+/// was never edited, so it is absent from `all_context_paths`. This is the
+/// deadlock this test pins: "read before you edit" must not require "edit
+/// before you read".
 #[test]
-fn a_context_file_outside_the_focus_shortlist_is_hidden_until_the_scope_expands() {
+fn a_context_file_inside_the_allowed_roots_reads_before_any_edit() {
+    let (_temp, host) = empty_host();
+    let rel = seed_writable_source(&host, "never_edited.rs", "first contact\n");
+    with_backend(&host, |backend| {
+        let listed = backend.list_context_files(ContextFilesScope::Focus);
+        assert_eq!(listed["paths"], json!([]));
+        assert_eq!(listed["hidden_count"], json!(0));
+
+        let read = backend
+            .read_context_files(std::slice::from_ref(&rel))
+            .expect("an allowed-root file is readable before it is ever edited");
+        assert_eq!(read["files"][0]["path"], json!(rel));
+        assert_eq!(read["files"][0]["content"], json!("first contact\n"));
+
+        // `./` is normalized away before admission, so the same file is
+        // readable through a non-canonical spelling too.
+        let dotted = format!("./{rel}");
+        let read = backend
+            .read_context_files(&[dotted])
+            .expect("normalization happens before the root check");
+        assert_eq!(read["files"][0]["path"], json!(rel));
+    });
+}
+
+/// Root mode (`request_iteration {"plugin_path":"/"}`) records the `plugins`
+/// catch-all root, so any plugin file reads on the first tool turn — the
+/// reported failure was a read refused with "context file is not available in
+/// this plugin iteration session" before any edit landed. Preparation goes
+/// through the real `begin_plugin_iteration`, so the roots come from the same
+/// code path a live request uses.
+#[test]
+fn a_root_mode_iteration_reads_a_plugin_file_before_any_edit() {
+    let (_temp, host) = empty_host();
+    let rel = seed_writable_source(&host, "root_mode.rs", "root mode\n");
+    let snapshot = host.current_snapshot();
+    let prepared = host
+        .kernel_state()
+        .begin_plugin_iteration(snapshot.as_ref(), &iteration_request())
+        .expect("root mode prepares on an empty registry");
+    let mut state = PluginIterationAgentState::new(
+        prepared,
+        PluginIterationContextPaths {
+            focus_paths: Vec::new(),
+            all_paths: Vec::new(),
+        },
+        host.fixtures_root(),
+    );
+    let backend = PluginIterationAgentBackend {
+        host: &host,
+        state: &mut state,
+        session_id: "iteration-session-root-mode",
+    };
+
+    let read = backend
+        .read_context_files(std::slice::from_ref(&rel))
+        .expect("root mode admits every path under plugins/");
+    assert_eq!(read["files"][0]["content"], json!("root mode\n"));
+}
+
+/// A file outside the structural focus shortlist is still readable without
+/// expanding the scope: the shortlist only orders the listing. `list_context_files`
+/// keeps its focus/all semantics and `hidden_count`.
+#[test]
+fn a_context_file_hidden_by_the_focus_shortlist_still_reads() {
     let (_temp, host) = empty_host();
     let visible = "plugins/mini/src/lib.rs".to_string();
-    let hidden = "plugins/mini/src/nested/deep.rs".to_string();
-    let absolute = host.fixtures_root().join(&hidden);
-    fs::create_dir_all(absolute.parent().expect("parent")).expect("mkdir nested");
-    fs::write(&absolute, "deep\n").expect("seed hidden file");
+    let hidden = seed_writable_source(&host, "nested/deep.rs", "deep\n");
 
     let prepared = prepared_for("mini", &["mini"]);
     let context_paths = PluginIterationContextPaths {
         focus_paths: vec![visible.clone()],
-        all_paths: vec![visible, hidden.clone()],
+        all_paths: vec![visible.clone(), hidden.clone()],
     };
     let mut state = PluginIterationAgentState::new(prepared, context_paths, host.fixtures_root());
     let mut backend = PluginIterationAgentBackend {
@@ -178,23 +239,124 @@ fn a_context_file_outside_the_focus_shortlist_is_hidden_until_the_scope_expands(
         session_id: "iteration-session-hidden-context",
     };
 
-    // Not expanded yet: the focus shortlist governs what is readable.
-    let err = backend
-        .read_context_files(std::slice::from_ref(&hidden))
-        .expect_err("a file behind the shortlist must be refused");
-    assert!(
-        invalid_argument_message(&err).contains("hidden behind the structural focus shortlist"),
-        "got {err}"
-    );
-
-    let listed = backend.list_context_files(ContextFilesScope::All);
-    assert_eq!(listed["scope_expanded"], json!(true));
-    assert_eq!(listed["hidden_count"], json!(0));
+    // Not expanded: the file is hidden from the list, but not from the reader.
+    let listed = backend.list_context_files(ContextFilesScope::Focus);
+    assert_eq!(listed["scope"], json!("focus"));
+    assert_eq!(listed["scope_expanded"], json!(false));
+    assert_eq!(listed["hidden_count"], json!(1));
+    assert_eq!(listed["paths"], json!([visible]));
+    assert_eq!(listed["focus_paths"], json!([visible]));
 
     let read = backend
-        .read_context_files(&[hidden])
-        .expect("the same file is readable once the scope is expanded");
+        .read_context_files(std::slice::from_ref(&hidden))
+        .expect("the shortlist does not gate reads");
     assert_eq!(read["files"][0]["content"], json!("deep\n"));
+
+    // `scope=all` still expands the listing and clears `hidden_count`.
+    let listed = backend.list_context_files(ContextFilesScope::All);
+    assert_eq!(listed["scope"], json!("all"));
+    assert_eq!(listed["scope_expanded"], json!(true));
+    assert_eq!(listed["hidden_count"], json!(0));
+    assert_eq!(
+        listed["paths"],
+        json!(["plugins/mini/src/lib.rs", "plugins/mini/src/nested/deep.rs"])
+    );
+    assert_eq!(listed["focus_paths"], json!([visible]));
+}
+
+/// Paths outside the iteration's allowed roots are refused, and the refusal is
+/// byte-stable. `plugins/mini-evil` also pins segment-aware containment: a root
+/// must not admit a sibling whose name merely starts with the same characters.
+#[test]
+fn a_context_path_outside_the_allowed_plugin_roots_is_refused() {
+    let (_temp, host) = empty_host();
+    with_backend(&host, |backend| {
+        for path in [
+            "plugins/other/src/lib.rs",
+            "plugins/mini-evil/src/lib.rs",
+            "crates/cordis-runtime/src/lib.rs",
+        ] {
+            let err = backend
+                .read_context_files(&[path.to_string()])
+                .expect_err("a path outside the allowed roots must be refused");
+            assert_eq!(
+                invalid_argument_message(&err),
+                format!("path is outside this iteration's plugin roots: {path}")
+            );
+        }
+
+        // Lexical escapes never reach the containment check: `normalize_rel_path`
+        // rejects them first, and their messages are unchanged by this fix.
+        for (path, expected) in [
+            (
+                "../escape.rs",
+                "auto update invalid patch path ../escape.rs: parent directory traversal (..) is not allowed",
+            ),
+            (
+                "/etc/passwd",
+                "auto update invalid patch path /etc/passwd: absolute path is not allowed",
+            ),
+        ] {
+            let err = backend
+                .read_context_files(&[path.to_string()])
+                .expect_err("lexical escapes must be refused");
+            assert_eq!(err.to_string(), expected);
+        }
+    });
+}
+
+/// The workspace manifest is editable by policy in every iteration (a new
+/// top-level plugin must be registered as a workspace member), so it is
+/// readable too — even in a single-plugin iteration whose roots do not contain
+/// it. Another plugin's source stays out of reach.
+#[test]
+fn a_single_plugin_iteration_reads_the_workspace_manifest_but_no_other_plugin() {
+    let (_temp, host) = empty_host();
+    let manifest = "plugins/Cargo.toml";
+    let manifest_abs = host.fixtures_root().join(manifest);
+    fs::create_dir_all(manifest_abs.parent().expect("parent")).expect("mkdir plugins");
+    fs::write(&manifest_abs, "[workspace]\n").expect("seed workspace manifest");
+
+    with_backend(&host, |backend| {
+        let read = backend
+            .read_context_files(&[manifest.to_string()])
+            .expect("the workspace manifest is readable");
+        assert_eq!(read["files"][0]["content"], json!("[workspace]\n"));
+
+        let err = backend
+            .read_context_files(&["plugins/other/src/lib.rs".to_string()])
+            .expect_err("another plugin's source stays outside this iteration");
+        assert_eq!(
+            invalid_argument_message(&err),
+            "path is outside this iteration's plugin roots: plugins/other/src/lib.rs"
+        );
+    });
+}
+
+/// An empty or whitespace-only path names no file under any root, so it is
+/// refused by the same admission check (not by a filesystem read).
+#[test]
+fn an_empty_or_whitespace_context_path_is_refused() {
+    let (_temp, host) = empty_host();
+    with_backend(&host, |backend| {
+        let err = backend
+            .read_context_files(&[String::new()])
+            .expect_err("an empty path must be refused");
+        assert_eq!(
+            invalid_argument_message(&err),
+            "path is outside this iteration's plugin roots: "
+        );
+
+        for path in ["   ", "\n\t"] {
+            let err = backend
+                .read_context_files(&[path.to_string()])
+                .expect_err("a whitespace-only path must be refused");
+            assert_eq!(
+                invalid_argument_message(&err),
+                format!("path is outside this iteration's plugin roots: {path}")
+            );
+        }
+    });
 }
 
 fn iteration_request() -> KernelPluginIterationRequest {

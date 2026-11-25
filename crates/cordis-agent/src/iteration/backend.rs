@@ -151,14 +151,6 @@ impl<'a> PluginIterationAgentBackend<'a> {
         }
     }
 
-    pub(crate) fn visible_context_paths(&self) -> &[String] {
-        if self.state.context_scope_expanded {
-            &self.state.all_context_paths
-        } else {
-            &self.state.focus_context_paths
-        }
-    }
-
     pub fn list_context_files(&mut self, scope: ContextFilesScope) -> Value {
         if scope == ContextFilesScope::All {
             self.state.context_scope_expanded = true;
@@ -187,27 +179,28 @@ impl<'a> PluginIterationAgentBackend<'a> {
 
     pub(crate) fn read_context_path(&self, path: &str) -> Result<Value, RuntimeError> {
         let normalized = normalize_rel_path(path)?;
-        if !self
+        // Admission is the iteration's writable surface, not the structural
+        // focus shortlist. Gating reads on `all_context_paths` (which only grows
+        // when an edit lands) deadlocked the agent: it had to edit a file before
+        // it could read the file it was asked to edit. The shortlist now only
+        // orders `list_context_files`; readability is "inside a plugin root this
+        // iteration may modify", the same containment rule edits use.
+        let writable_roots = self
             .state
-            .all_context_paths
-            .iter()
-            .any(|item| item == &normalized)
-        {
+            .prepared
+            .allowed_plugin_roots
+            .values()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        // Readability must cover the edit surface. `PluginIterationPolicy::validate_path`
+        // admits the workspace manifest unconditionally (a new top-level plugin has to
+        // be registered as a workspace member), so `plugins/Cargo.toml` is readable even
+        // when the selected subtrees do not contain it.
+        let readable = deepest_matching_writable_root(&normalized, &writable_roots).is_some()
+            || normalized == "plugins/Cargo.toml";
+        if !readable {
             return Err(RuntimeError::InvalidArgument {
-                message: format!(
-                    "context file is not available in this plugin iteration session: {normalized}"
-                ),
-            });
-        }
-        if !self
-            .visible_context_paths()
-            .iter()
-            .any(|item| item == &normalized)
-        {
-            return Err(RuntimeError::InvalidArgument {
-                message: format!(
-                    "context file is currently hidden behind the structural focus shortlist: {normalized}. Call list_context_files with `{{\"scope\":\"all\"}}` before reading deeper subtree files."
-                ),
+                message: format!("path is outside this iteration's plugin roots: {normalized}"),
             });
         }
         let abs_path = self.host.fixtures_root().join(&normalized);
@@ -491,8 +484,8 @@ impl<'a> AgentBackend for PluginIterationAgentBackend<'a> {
             "You are the Cordis plugin-iteration agent.\n\
 Work directly through tools instead of proposing a large final JSON plan.\n\
 You may only modify the selected plugin subtree rooted at {}.\n\
-Start by calling list_context_files to inspect the current structural shortlist of readable files.\n\
-The default context scope exposes structural source anchors for the root plugin, its direct children, and one nested child-plugin source layer. If you need deeper tests, docs, or additional subtree files, call list_context_files with `{{\"scope\":\"all\"}}` before reading them.\n\
+Start by calling list_context_files to inspect the current structural shortlist of context files. The shortlist orders suggestions only: any file inside the selected plugin subtree is readable, whether or not it has been edited yet.\n\
+The default context scope exposes structural source anchors for the root plugin, its direct children, and one nested child-plugin source layer. If you need the full inventory of deeper tests, docs, or additional subtree files, call list_context_files with `{{\"scope\":\"all\"}}` for a complete listing.\n\
 Use read_context_files in batches instead of one file at a time, and avoid repeated list/read loops once you have enough structure to edit.\n\
 Use replace_files_exact for source edits, including related updates across multiple files or multiple exact replacements you already understand. Group related edits into as few tool turns as possible.\n\
 If an exact-replace tool reports invalid JSON or a stale exact-match pattern, reread the affected file and retry with a smaller replacement call instead of continuing from stale assumptions.\n\
@@ -531,12 +524,12 @@ Do not attempt to modify runtime crates, repository root manifests, config, .git
             },
             AgentToolSpec {
                 name: PLUGIN_AGENT_TOOL_LIST_CONTEXT_FILES,
-                description: "List readable context files for the selected plugin subtree. Defaults to the structural focus shortlist; use scope=all to expand the visible context set.",
+                description: "List context files for the selected plugin subtree. Defaults to the structural focus shortlist; use scope=all for the complete list. Listing order does not restrict what can be read.",
                 parameters: json!({"type":"object","properties":{"scope":{"type":"string","enum":["focus","all"]}},"additionalProperties":false}),
             },
             AgentToolSpec {
                 name: PLUGIN_AGENT_TOOL_READ_CONTEXT_FILES,
-                description: "Read multiple currently visible context files in one call. If a needed file is hidden behind the focus shortlist, expand first with list_context_files(scope=all).",
+                description: "Read multiple context files in one call. Any file inside the selected plugin subtree is readable; the focus shortlist only orders suggestions, so use list_context_files(scope=all) when you want a complete listing.",
                 parameters: json!({"type":"object","properties":{"paths":{"type":"array","items":{"type":"string"}}},"required":["paths"],"additionalProperties":false}),
             },
             AgentToolSpec {
