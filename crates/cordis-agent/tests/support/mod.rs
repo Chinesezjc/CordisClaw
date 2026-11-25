@@ -299,22 +299,32 @@ pub fn spawn_chunked_mock_llm_server_sequence_with_timeouts(
             request.push_str(&String::from_utf8_lossy(&body));
             requests.push(request);
 
-            write!(
+            // The reader owns the socket: a consumer that has its assistant
+            // turn (it stops at `data: [DONE]`) or that gives up closes the
+            // connection while these writes are still in flight. A reset here
+            // is the client's doing, not a broken mock — and whether the last
+            // chunk wins that race is machine load, not test semantics. The
+            // assertions read the captured *requests*, never the server's
+            // ability to finish a body nobody is obliged to read, so the write
+            // and flush results are ignored.
+            let _ = write!(
                 stream,
                 "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
-            )
-            .expect("write response headers");
-            stream.flush().expect("flush response headers");
+            );
+            let _ = stream.flush();
 
             for (delay_ms, chunk) in chunks {
                 thread::sleep(Duration::from_millis(delay_ms));
-                write!(stream, "{:X}\r\n{}\r\n", chunk.len(), chunk).expect("write chunk");
-                stream.flush().expect("flush chunk");
+                let _ = write!(stream, "{:X}\r\n{}\r\n", chunk.len(), chunk);
+                let _ = stream.flush();
             }
-            write!(stream, "0\r\n\r\n").expect("finish chunked response");
-            stream.flush().expect("flush chunked end");
+            let _ = write!(stream, "0\r\n\r\n");
+            let _ = stream.flush();
         }
-        sender.send(requests).expect("send captured requests");
+        // The receiver is held for the whole test body (the assertions read the
+        // captured requests); only a panicking test drops it early, and that
+        // test is already reporting its own failure.
+        let _ = sender.send(requests);
     });
 
     (format!("http://{}/v1", address), receiver, handle)

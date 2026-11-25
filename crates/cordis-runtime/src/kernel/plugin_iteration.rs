@@ -1400,7 +1400,15 @@ fn reserved_child_keyword_identifier_error(path: &str, keyword: &str) -> Runtime
     }
 }
 
-pub(crate) fn deepest_matching_writable_root<'a>(
+/// The deepest writable root that contains `path`, if any.
+///
+/// This is the one containment rule for the plugin-iteration surface: an edit
+/// is accepted when the normalized path falls under a writable root, and a
+/// read is admitted by the same test so that the agent can always read a file
+/// it is allowed to modify. `path` must already be normalized by
+/// [`normalize_rel_path`] (no `..`, no absolute path); matching is
+/// segment-aware, so `plugins/ab` does not contain `plugins/abc`.
+pub fn deepest_matching_writable_root<'a>(
     path: &str,
     writable_roots: &'a BTreeSet<String>,
 ) -> Option<&'a str> {

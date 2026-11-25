@@ -380,7 +380,57 @@ mod tests {
         drop(stream);
         drop(listener);
 
+        // The listener drains the connection on its own thread, so dropping the
+        // handles only closes them — it does not mean the lines were read. Poll
+        // instead of asserting immediately, which is how this test failed in a
+        // full run while passing on its own.
+        wait_for_event(&recorder, Duration::from_secs(5)).expect("the listener reports");
+
         assert_eq!(*recorder.events.lock().expect("lock"), vec!["c:after"]);
+    }
+
+    /// Wait until the listener has recorded something, or give up.
+    ///
+    /// Split out of the test so the wait itself can be exercised: in a fast run
+    /// the listener has already recorded by the first check, and an inline loop
+    /// would leave its body unexecuted forever.
+    fn wait_for_event(recorder: &Recorder, budget: Duration) -> Result<(), String> {
+        let deadline = std::time::Instant::now() + budget;
+        loop {
+            if !recorder.events.lock().expect("lock").is_empty() {
+                return Ok(());
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err("the listener never reported the line after the garbage".to_string());
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn wait_for_event_reports_when_nothing_arrives_and_returns_when_it_does() {
+        let recorder = Arc::new(Recorder::default());
+        let late = Arc::clone(&recorder);
+        let thread = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            late.events
+                .lock()
+                .expect("lock")
+                .push("c:after".to_string());
+        });
+        wait_for_event(&recorder, Duration::from_secs(5)).expect("the late event is seen");
+        thread.join().expect("join");
+        assert_eq!(*recorder.events.lock().expect("lock"), vec!["c:after"]);
+
+        // A positive budget, not ZERO: the loop must actually take its sleep
+        // branch before it can time out, so this test covers the wait itself
+        // instead of only its deadline check.
+        let empty = Recorder::default();
+        let err = wait_for_event(&empty, Duration::from_millis(15)).expect_err("nothing arrives");
+        assert_eq!(
+            err,
+            "the listener never reported the line after the garbage"
+        );
     }
 
     /// 诊断输出受环境变量控制：开关两态都要走到，否则 `tracing_diag` 里的
@@ -492,6 +542,25 @@ mod tests {
             started.elapsed() < Duration::from_secs(5),
             "listener must not hang when the plugin never connects"
         );
+        assert!(recorder.events.lock().expect("lock").is_empty());
+    }
+
+    /// `serve_once` must actually take its "would block, keep waiting" arm.
+    ///
+    /// `listener_gives_up_when_nobody_connects` races the listener thread it
+    /// spawns: if the stop signal wins, the first accept poll already returns
+    /// GiveUp and the sleep arm is skipped — which left line 161 uncovered on
+    /// a fast run. Driving `serve_once` directly with a nonblocking listener
+    /// and no pending connection makes the arm deterministic.
+    #[test]
+    fn serve_once_waits_out_a_would_block_accept() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let recorder = Recorder::default();
+        let (_stop_tx, stop) = mpsc::channel::<()>();
+
+        serve_once(listener, &recorder, "k1", Duration::from_millis(20), &stop);
+
         assert!(recorder.events.lock().expect("lock").is_empty());
     }
 

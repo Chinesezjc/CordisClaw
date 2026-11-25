@@ -97,12 +97,45 @@ source}`. Aggregates `get_group_member_list` (`role` = `owner`/`admin`/`member`)
 when the member list carries no owner it falls back to `get_group_info_ex`
 (`extInfo.groupOwnerId.memberUin`).
 
+### `qq_get_forward_msg`
+读合并转发（合并聊天记录）正文。入站事件里只有一个 `[chat history: id=<id>]`，把那个 id 传进来
+就得到可读文本：每个节点一行 `<昵称>: <正文>`，昵称取群名片 → 昵称 → `未知`，图片 / 表情 /
+@ / 语音 / 视频 / 文件 / 引用渲染成 `[图片] [表情] [@<qq>] [语音] [视频] [文件: <name>] [引用]`。
+
+节点正文按 `content` → `message` → `raw_message` 顺序取第一个非空结果。NapCat 经常把正文放在
+`message`（段数组）或 `raw_message`（CQ 码字符串）里，只读 `content` 会让每条都变成
+`昵称: ` 后面一片空。字符串正文直接 trim 后返回。
+
 ### `qq_get_reply_policy` / `qq_set_reply_policy`
 Read/persist the **reply gate** used for every inbound message. The policy lives
 in `data/qq_reply_policy.json` (explicit `data_dir` payload →
 `$CORDIS_FIXTURES_ROOT/../data` → cwd-relative `data/`) and is shipped to the
 model as a `[reply policy: …]` first line on every message. Changing it takes
 effect on the next message — no rebuild, no restart. An empty policy is rejected.
+
+### `qq_group_requests`
+List / approve / reject OneBot v11 **group requests** — 加群申请（`sub_type: add`）与
+邀请入群（`sub_type: invite`）。
+
+`handle_onebot_event` 以前对 `post_type != "message"` 直接 `return`，邀请/加群请求被整个
+丢掉：bot 既看不到也答不了。现在 `post_type == "request"` 且 `request_type == "group"`
+的事件会被收进进程内的待处理队列（按 `flag` 去重，最多保留最近 32 条，最旧的先淘汰），
+然后照旧 `return` —— message 路径逐字节不变，请求也不进 `MESSAGE_QUEUE`。
+
+```json
+{ "node_id": "qq_group_requests", "action": "list" }
+{ "node_id": "qq_group_requests", "action": "approve", "flag": "<flag>" }
+{ "node_id": "qq_group_requests", "action": "reject", "flag": "<flag>", "reason": "不认识" }
+```
+
+- `list`（缺省）：`{count, requests:[{flag, sub_type, group_id, user_id, comment, time_ms}]}`。
+  `comment` 是清洗过的验证消息（控制字符变空格、空白折叠、截断到 200 字符）。
+- `approve` / `reject`：调 OneBot `set_group_add_request`（`flag` / `sub_type` / `approve`
+  / 可选 `reason`），**只有成功才**把请求从队列移除；API 报错时请求留在队列里可重试。
+- `flag` 不存在或缺失 → 明确报错（`no pending group request with flag '…'` /
+  `flag is required to …`），不触网。
+
+队列是进程内状态：插件 reload 后要等 OneBot 重投（重复投递只刷新同一条，不会刷屏）。
 
 ## Agent 意图判断规则
 
@@ -166,6 +199,28 @@ prefix cache 行为不变。事件里缺 `self_id`（非标准 adapter）时不�
 门控的唯一权威是每条消息首行的 `[reply policy: …]`。hint 里显式写明：图片、表情、
 闲聊**不是**"立即挂起"的理由——这类消息只是不许调用内核自省工具，是否回复仍按策略判断。
 （2026-10-23 之前 hint 里有一条 `… suspend immediately …`，模型据此把沉默当默认，连 @ 都会漏答。）
+
+## 别的渠道的规矩在这里不算（按渠道分界）
+
+kernel 把**每个**插件的 `system_hint` 注入到**每一个**会话，不分渠道。飞书的卡片因此
+带着一条「最后一轮必须只输出一个 JSON 对象，运行时会自动把你的 `respond` 转发回飞书
+聊天，不要自己调 `feishu_send`」。QQ 群会话里模型照做了：写一行聊天正文、一次工具都不
+调，整轮被判 `no_tool_call` 丢掉。
+
+QQ 插件改不了别人的卡片，runtime 也不归它管，所以 QQ 卡片**先认渠道、再讲规矩**：
+
+1. 【先看是哪个渠道】消息前缀是 `[Feishu ...]`、或这一轮要用的发送工具是 `feishu_send`，
+   那就是**飞书会话** —— 按飞书卡片走，收尾只发一个 JSON 对象
+   `{"action":"respond","message":"..."}`（或 `{"action":"suspend"}`），也可以自己调
+   `feishu_send`；本卡片的 QQ 规矩对飞书会话**不适用**，飞书会话绝不能只写正文、一次
+   工具都不调。没有飞书前缀、发言就是 `qq_send`，才是 **QQ 会话**，本卡片才对它生效。
+2. 【别的渠道的规矩在这里不算】（**最后一段**，hint 里最强势的位置）上下文里可能还有
+   别的渠道的卡片，那是飞书会话那边的约定：**QQ 会话里**不要输出 JSON、也不要只写正文等
+   转发，照上面的 `qq_send` / `suspend` 走；**飞书会话**则按飞书卡片走，忽略这一条。
+
+也就是说「不要输出 JSON」是**QQ 会话专属**的条件句，不是全局禁令——把它写成全局禁令
+就是 `no_tool_call` 的成因。改名/改词后这两段必须仍然存在，且 override 段必须排在
+【发言必须走工具】之后：`tests/hint_scope.rs` 断言的正是渠道关键字与这个顺序。
 
 ## 入站图片（多模态）
 

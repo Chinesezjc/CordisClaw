@@ -2,7 +2,7 @@
 
 ## 1. 判定口径
 
-- 本文基于当前仓库现状整理，最近更新：2026-11-19。
+- 本文基于当前仓库现状整理，最近更新：2026-11-25。
 - 历史规划蓝图已经吸收进 [design-blueprint.md](./design-blueprint.md)，因此本文结论来自三类证据的交叉比对：
   - 设计蓝图：[design-blueprint.md](./design-blueprint.md)
   - 架构文档：[system-overview.md](./system-overview.md)、[contracts-and-loading.md](./contracts-and-loading.md)、[runtime-semantics.md](./runtime-semantics.md)、[maintenance-guide.md](./maintenance-guide.md)
@@ -185,6 +185,9 @@ inherent 方法转发到会话树 / `request_iteration` 经已安装的 runner �
 - 行为等价保证：重构后用字符串字面量多重集差分自检，删除集须为空（确认生产错误文本逐字节未变）。
 
 附带修复两个真 flaky：shared_host HashMismatch（boot 前 refresh index）、mock server 非阻塞流 WouldBlock（accept 后切回阻塞）。
+
+- mock server 不再把"客户端提前挂断"当成错误（2026-11-19）：读端拿到完整 assistant turn（读到 `data: [DONE]` 就停）或直接放弃时会先关连接，server 的 `write!`/`flush` 可能以 ECONNRESET 失败；原先的 `.expect(..)` 让 mock 线程 panic，`handle.join()` 于是把"客户端赢了这场写竞争"报成测试失败（实测 `support/mod.rs:314 finish chunked response: Connection reset`，只在全量运行时复现）。现在 `tests/support/mod.rs`、`host_llm_coverage.rs`、`runtime_host.rs` 里所有 mock 写入的 Result 都丢弃——断言读的是"捕获到的请求"，不是 server 能不能写完一个没人必须读的 body；`spawn_scripted_server` 的 accept 另加 120s 上限，脚本没被拨号时失败在具名断言上，而不是挂住整个 suite。
+- **`cargo llvm-cov --workspace` 单次 export 的 LF/LH 不是行覆盖真值**（2026-11-19 查证）：llvm-cov 的 lcov 导出里 `DA` 来自 `Coverage.getCoverageForFile()` 的 segments（只为 region-entry 行发记录），`LF/LH` 来自另行 `prepareFileReports` 得到的 `FileCoverageSummary` line stats；`CoverageMapping.h` 对 GapRegion 的注释写明它的计数「only set as the line execution count when it's the only region in the line」——gap-only 行会进 LF/LH、但永远不会出现在 `DA` 里，count 为 0 时就被算成 missed。本地全量 export 会报 ~508 行 missed，但 raw lcov 里 `DA:*,0` 记录为 **0**（用 `-- --list` 空跑枚举出的 39532 条 instrumented 行与全量跑覆盖的 39532 条**完全相同**）；`scripts/merge_lcov.py` 从 DA 重算 LF/LH，结果是 39532/39532 = 100.0000%。因此比较覆盖率只看 DA 合并值，不要拿单次 export 的 LF/LH 去和合并报告的 39048/39048 对比。
 
 ### 3.1 Stage A-E 已经落地到可运行原型
 
@@ -407,6 +410,8 @@ system prompt 里"你的 QQ 号"比对，插件不再逐条消息打标记。
 2. **迭代读不到 `plugins/Cargo.toml`**：新插件要进 workspace members，策略允许带 `expected_sha256`
    改它，但可读集合不含这个文件 → 算不出 sha，edit 被 `stale edit precondition` 拒。
    现在 `collect_plugin_context_paths` 把它放进 `all_paths`。
+   （「进了 `all_paths` 才可读」这一准入机制已被 3.43 取代：读取准入改为
+   「在允许根之内」，`all_paths` 只影响 `list_context_files` 的列表。）
 3. **`request_iteration` 的坏路径没有可操作信息**：`plugin_path` 空/未知时只报
    `plugin subtree not found for `。现在空根给出"传 "/<plugin>" 或 "/" 加可用插件列表"的提示，
    `agent_request_iteration` 也会容忍 `plugins/<name>` 写法并列出已加载插件。
@@ -989,7 +994,9 @@ JSON 参数、单引号属性、渲染往返。
   再原子写目标：
   - `persona` → `RuntimeHost::set_soul`。**权威存储由 host 每次解析**：加载了
     `soul_store` 插件（`data/souls.db` SQLite）时走插件，否则回落 kernel 的
-    `data/souls/*.json`；CLI 不链 rusqlite。
+    `data/souls/*.json`；CLI 不链 rusqlite。**人格现在是累积式**：复盘提示词带上
+    当前人格全文，模型必须给出完整新版本；应用前 `dropped_without_leave` 拒绝任何
+    未在 `drops` 里声明的旧句删除。
   - `policy` → 只改 `data/qq_reply_policies.json` 的 `groups[<gid>].policy`，`enabled` 不动。
   - `memory` → 追加到 `data/qq_group_memory.json` 对应群的 `memory`。
 - 下一次复盘把仍处于 `Applied` 的改动连预期一起放进提示词，要求逐条回答
@@ -1125,6 +1132,44 @@ turn 的会话 drain，迭代会话自己就可能把刚排给前台的消息吃
 **遗留**：队列只在**下一次** `agent_send` 时消费；如果前台房间长时间没有新消息，
 汇报会一直待在队列里（不会主动开一轮）。主动开一轮会让 bot 在没人说话的群里发言，
 本就不该做；需要时由 selfcheck/运维触发一轮即可。
+
+### 3.43 迭代读文件不再要求「先改过」：准入与排序分家（2026-11-25）
+
+`request_iteration {"plugin_path":"/"}` 的 agent 第一步读文件就被拒：
+`context file is not available in this plugin iteration session: …`。原因：`read_context_path`
+的准入绑在 `all_context_paths` 上，而后者只在 `apply_operations` 里对**已编辑**路径追加
+→「改文件前要先读」与「读之前要先改过」互为前置，死锁。
+
+现在把**准入**与**排序**分开：
+
+- 准入只看**规范化后的路径是否落在本次迭代允许修改的根之内**
+  （`PreparedPluginIteration.allowed_plugin_roots`）。判断复用
+  `kernel::plugin_iteration::deepest_matching_writable_root`——与编辑校验同一套
+  segment-aware 包含规则（`plugins/ab` 不含 `plugins/abc`），`..` 与绝对路径由
+  `normalize_rel_path` 先挡掉。越界文本逐字节稳定：
+  `path is outside this iteration's plugin roots: <path>`。
+- `focus_context_paths` / `all_context_paths` 彻底退出准入：前者只决定
+  `list_context_files` 的瘦身列表与提示顺序，原先用于准入的 `visible_context_paths`
+  已删除。`list_context_files` 的 `focus` / `all`、`scope_expanded`、`hidden_count` 语义不变。
+- 「hidden behind the structural focus shortlist」拒绝臂删除（它也是准入，不是排序）；
+  system prompt 与 `read_context_files` / `list_context_files` 工具描述同步为
+  「短名单只影响建议顺序，子树内文件都可读」。
+- root 模式的允许根含 `plugins` catch-all，所以 `plugins/` 下任意文件（包括
+  `plugins/Cargo.toml` 与还没被编辑过的新文件）第一轮就可读；单插件迭代的可读面
+  是该插件根（`plugins/<root>/…`）**外加 workspace 根 manifest**——edit policy 对
+  `plugins/Cargo.toml` 有无条件特例（新顶层插件要进 workspace members），可读面
+  严格覆盖可改面。`docs/agent/**` 这类只读生成文档仍可读，但可读集合不再受
+  `all_paths` 影响。
+
+**测试**（`crates/cordis-agent/tests/iteration_pipeline.rs`）：
+`a_context_file_inside_the_allowed_roots_reads_before_any_edit`、
+`a_root_mode_iteration_reads_a_plugin_file_before_any_edit`、
+`a_context_file_hidden_by_the_focus_shortlist_still_reads`（含 `hidden_count` / `scope_expanded` 断言）、
+`a_context_path_outside_the_allowed_plugin_roots_is_refused`（`plugins/mini-evil` 验证
+segment-aware 包含；`../`、`/etc/passwd` 的文本逐字节断言）、
+`a_single_plugin_iteration_reads_the_workspace_manifest_but_no_other_plugin`（单插件
+迭代读得到 `plugins/Cargo.toml`、读不到别的插件源码）、
+`an_empty_or_whitespace_context_path_is_refused`。
 
 ## 4. 部分完成
 

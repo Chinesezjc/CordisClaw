@@ -2422,17 +2422,20 @@ fn serve_one_sse(
         }
         let mut body = vec![0u8; content_length];
         reader.read_exact(&mut body).expect("request body");
-        write!(
+        // The reader owns the socket and may hang up before the body is
+        // finished (a drop-session or fallback case is exactly what these
+        // tests exercise), so a reset here is the client's doing and must not
+        // panic the mock thread: the assertions read the captured requests.
+        let _ = write!(
             stream,
             "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
-        )
-        .expect("headers");
+        );
         for (delay_ms, chunk) in &chunks {
             std::thread::sleep(std::time::Duration::from_millis(*delay_ms));
-            write!(stream, "{:X}\r\n{}\r\n", chunk.len(), chunk).expect("chunk");
+            let _ = write!(stream, "{:X}\r\n{}\r\n", chunk.len(), chunk);
         }
-        write!(stream, "0\r\n\r\n").expect("chunked end");
-        stream.flush().expect("flush");
+        let _ = write!(stream, "0\r\n\r\n");
+        let _ = stream.flush();
         1
     })
 }
@@ -2914,17 +2917,20 @@ fn spawn_blocking_mock_llm_server(
         started_tx.send(()).expect("signal started");
         // 等测试释放（期间测试可以 drop_session / 并发 agent_send）。
         release_rx.recv().expect("release signal");
-        write!(
+        // The reader owns the socket and may hang up before the body is
+        // finished (a drop-session or fallback case is exactly what these
+        // tests exercise), so a reset here is the client's doing and must not
+        // panic the mock thread: the assertions read the captured requests.
+        let _ = write!(
             stream,
             "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
-        )
-        .expect("headers");
+        );
         for (delay_ms, chunk) in &chunks {
             std::thread::sleep(std::time::Duration::from_millis(*delay_ms));
-            write!(stream, "{:X}\r\n{}\r\n", chunk.len(), chunk).expect("chunk");
+            let _ = write!(stream, "{:X}\r\n{}\r\n", chunk.len(), chunk);
         }
-        write!(stream, "0\r\n\r\n").expect("chunked end");
-        stream.flush().expect("flush");
+        let _ = write!(stream, "0\r\n\r\n");
+        let _ = stream.flush();
     });
     (format!("http://{addr}/v1"), started_rx, release_tx, handle)
 }

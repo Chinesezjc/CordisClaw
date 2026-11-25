@@ -2339,22 +2339,31 @@ mod tests {
 
     // ---------- kill_zombie_services: recovered-with-error / panicked arms ----
 
+    /// Wait for a spawned handle to finish.
+    ///
+    /// Sleeps before the first check: a `while !handle.is_finished()` loop skips
+    /// its body when the thread wins the race, which left the sleep line
+    /// uncovered on fast machines and made the coverage gate flaky.
+    fn wait_until_finished<T>(handle: &std::thread::JoinHandle<T>) {
+        let mut finished = false;
+        while !finished {
+            std::thread::sleep(Duration::from_millis(5));
+            finished = handle.is_finished();
+        }
+    }
+
     #[test]
     fn kill_zombie_recovered_error_and_panic_arms() {
         let registry = ServiceRegistry::new();
 
         // A finished handle that returned Err -> "zombie stop error" arm.
         let errored = std::thread::spawn(|| Err::<(), String>("boom".to_string()));
-        while !errored.is_finished() {
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        wait_until_finished(&errored);
         // A finished handle that panicked -> "zombie stop panicked" arm.
         let panicked = std::thread::spawn(|| -> Result<(), String> {
             panic!("zombie panic");
         });
-        while !panicked.is_finished() {
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        wait_until_finished(&panicked);
 
         {
             let mut z = registry.zombies.lock().unwrap();
