@@ -1052,7 +1052,7 @@ impl AgentSession {
                     let closing = message.content.unwrap_or_default();
                     let reasoning = closing_reasoning(&turn.reasoning);
                     self.transcript.push(AgentTranscriptEntry::Assistant {
-                        content: delivered_text(&tool_events, &closing),
+                        content: delivered_text(&tool_events, &closing, !self.require_end_tool),
                         tools: tool_names(&tool_events),
                         response_id: response_id.clone(),
                         reasoning,
@@ -1227,7 +1227,11 @@ impl AgentSession {
                             );
                             self.completed_turns += 1;
                             self.transcript.push(AgentTranscriptEntry::Assistant {
-                                content: delivered_text(&tool_events, &reply_content),
+                                content: delivered_text(
+                                    &tool_events,
+                                    &reply_content,
+                                    !self.require_end_tool,
+                                ),
                                 tools: tool_names(&tool_events),
                                 response_id: response_id.clone(),
                                 reasoning: closing_reasoning(&turn.reasoning),
@@ -1251,7 +1255,7 @@ impl AgentSession {
                     let closing = message.content.unwrap_or_default();
                     let reasoning = closing_reasoning(&turn.reasoning);
                     self.transcript.push(AgentTranscriptEntry::Assistant {
-                        content: delivered_text(&tool_events, &closing),
+                        content: delivered_text(&tool_events, &closing, !self.require_end_tool),
                         tools: tool_names(&tool_events),
                         response_id: response_id.clone(),
                         reasoning,
@@ -1415,15 +1419,24 @@ impl AgentSession {
                         images.len()
                     )
                 };
+                // A channel turn that ended with text and no delivery never said
+                // anything: the room saw nothing, and recording the draft as
+                // speech teaches the model that it answered. Shell sessions are
+                // different — there the text *is* the answer.
+                let spoken = if self.require_end_tool {
+                    delivered_text(&tool_events, "", false)
+                } else {
+                    content.to_string()
+                };
                 self.remember_exchange(
                     &remembered,
-                    content,
+                    &spoken,
                     message.reasoning_content.as_deref(),
                     history_images(images, turn.images_stripped),
                 );
                 self.completed_turns += 1;
                 self.transcript.push(AgentTranscriptEntry::Assistant {
-                    content: delivered_text(&tool_events, content),
+                    content: delivered_text(&tool_events, content, !self.require_end_tool),
                     tools: tool_names(&tool_events),
                     response_id: response_id.clone(),
                     reasoning: closing_reasoning(&turn.reasoning),
@@ -1627,7 +1640,7 @@ impl AgentSession {
         }
         let reasoning = closing_reasoning(&turn.reasoning);
         self.transcript.push(AgentTranscriptEntry::Assistant {
-            content: delivered_text(&reply.tool_events, &reply.content),
+            content: delivered_text(&reply.tool_events, &reply.content, !self.require_end_tool),
             tools: tool_names(&reply.tool_events),
             response_id: reply.response_id.clone(),
             reasoning,
@@ -2207,6 +2220,17 @@ fn llm_message_to_request(message: &cordis_plugin_sdk::llm::LlmMessage) -> Value
     Value::Object(out)
 }
 
+/// Said once, ahead of the plugin hint blocks.
+///
+/// The kernel hands the system hint of every loaded plugin to every session,
+/// whatever channel that session belongs to. A hint phrased as an
+/// unconditional command (your final output MUST be one JSON object) was
+/// therefore obeyed in channels it was never written for: a QQ group turn
+/// answered with one bare line and no tool call, and the whole turn was
+/// discarded as no_tool_call. Each block names the channel it was written
+/// for; the rule in front of them makes that scope binding.
+const PLUGIN_HINT_SCOPE_RULE: &str = "Each block below is written for one channel, the channel it names. Obey a block only when the inbound messages of this session come from that channel. In any other session ignore that block completely: do not copy its end-of-turn format, do not follow its send rules, do not obey its do-not-call-this-tool rules; the card of the channel that is actually speaking wins. The node catalogue above is not a channel block and always applies.";
+
 struct RuntimeShellAgentBackend<'a, H: AgentToolHost + ?Sized> {
     host: &'a H,
     session_id: &'a str,
@@ -2247,6 +2271,8 @@ impl<'a, H: AgentToolHost + ?Sized> AgentBackend for RuntimeShellAgentBackend<'a
         let hints = self.host.agent_plugin_hints();
         if !hints.is_empty() {
             prompt.push_str("\n\n--- Plugin-specific instructions ---\n\n");
+            prompt.push_str(PLUGIN_HINT_SCOPE_RULE);
+            prompt.push_str("\n\n");
             for hint in &hints {
                 prompt.push_str(hint);
                 prompt.push_str("\n\n");
@@ -2517,7 +2543,11 @@ fn attach_recovered_images(
 /// what the room saw. It used to hold the model's raw output — a `suspend`
 /// marker or a DSML block — which made every transcript look like silence and
 /// forced any later review to reconstruct the reply from tool arguments.
-fn delivered_text(events: &[cordis_runtime::agent_api::AgentToolEvent], fallback: &str) -> String {
+fn delivered_text(
+    events: &[cordis_runtime::agent_api::AgentToolEvent],
+    fallback: &str,
+    allow_fallback: bool,
+) -> String {
     let said: Vec<String> = events
         .iter()
         .filter(|event| event.delivered())
@@ -2537,10 +2567,15 @@ fn delivered_text(events: &[cordis_runtime::agent_api::AgentToolEvent], fallback
         })
         .filter(|message| !message.trim().is_empty())
         .collect();
-    if said.is_empty() {
+    if !said.is_empty() {
+        return said.join("\n");
+    }
+    // A channel turn that ended with text it never sent said nothing; a shell
+    // turn's text is the answer.
+    if allow_fallback {
         fallback.to_string()
     } else {
-        said.join("\n")
+        String::new()
     }
 }
 
@@ -4251,6 +4286,61 @@ mod tests {
         )));
     }
 
+    /// The kernel injects every plugin hint into every session, whatever
+    /// channel that session belongs to, so a hint written as an unconditional
+    /// command was obeyed in channels it was never meant for: a QQ group turn
+    /// answered with one bare line and no tool call, discarded as no_tool_call.
+    #[test]
+    fn plugin_hints_are_scoped_to_their_own_channel() {
+        let host = FakeHost {
+            persona: None,
+            hints: vec![
+                "CATALOG-MARK".to_string(),
+                "You are chatting in Feishu (Lark). Your FINAL output each turn MUST be exactly one JSON object.".to_string(),
+            ],
+            caller: None,
+            routed: std::sync::Mutex::new(Vec::new()),
+            media_dir: std::path::PathBuf::new(),
+            spill_path: None,
+            digest: None,
+        };
+        let backend = RuntimeShellAgentBackend {
+            host: &host,
+            session_id: "qq-group-turn",
+            soul_key: "qq:group:1".to_string(),
+        };
+        let prompt = backend.system_prompt();
+        let header = prompt
+            .find("--- Plugin-specific instructions ---")
+            .expect("hint header");
+        let rule = prompt
+            .find(PLUGIN_HINT_SCOPE_RULE)
+            .expect("the scope rule must precede the hint blocks");
+        let catalogue = prompt.find("CATALOG-MARK").expect("catalogue block");
+        let foreign = prompt.find("FINAL output each turn").expect("foreign hint");
+        assert!(header < rule, "rule at {rule}, header at {header}");
+        assert!(rule < catalogue, "rule at {rule}, catalogue at {catalogue}");
+        assert!(
+            rule < foreign,
+            "the caveat must be read before the command it limits: rule at {rule}, hint at {foreign}"
+        );
+        for marker in [
+            "only when the inbound messages of this session come from that channel",
+            "ignore that block completely",
+            "do-not-call-this-tool",
+        ] {
+            assert!(prompt.contains(marker), "missing {marker}: {prompt}");
+        }
+        let bare_host = FakeHost::default();
+        let bare = RuntimeShellAgentBackend {
+            host: &bare_host,
+            session_id: "no-hints",
+            soul_key: String::new(),
+        }
+        .system_prompt();
+        assert!(!bare.contains(PLUGIN_HINT_SCOPE_RULE));
+    }
+
     /// 没有 persona / hints 的渠道也必须带上 conduct 契约。
     #[test]
     fn system_prompt_always_carries_conduct() {
@@ -5180,6 +5270,49 @@ mod tests {
             provider.seen_bodies.lock().expect("bodies").len(),
             1,
             "the first suspend is honoured"
+        );
+    }
+
+    /// A turn that delivered nothing spoke to nobody.
+    ///
+    /// The provider returned the chat line and a native `suspend` call in the
+    /// same message, so the prose never left the process (no send tool ran).
+    /// The transcript still recorded that line as the turn words: the self-check
+    /// then counted the abandoned draft as a `no_tool_call` failure, and a
+    /// reflection session went chasing a sentence the room never received.
+    #[test]
+    fn an_unsent_draft_is_not_recorded_as_spoken() {
+        let draft = "荷花父子兵，还带zero找卡莎要烟，这视频标题够勾人的";
+        let provider = FakeLlmProvider::new(vec![cordis_plugin_sdk::llm::LlmMessage {
+            content: Some(draft.to_string()),
+            tool_calls: vec![cordis_plugin_sdk::llm::LlmToolCall {
+                id: "end".to_string(),
+                call_type: "function".to_string(),
+                function: cordis_plugin_sdk::llm::LlmToolFunction {
+                    name: AGENT_TOOL_END_TURN.to_string(),
+                    arguments: "{}".to_string(),
+                },
+            }],
+            ..Default::default()
+        }]);
+        let mut session = ShellAgentSession::new(LlmApiConfig::default()).expect("build session");
+        session.set_require_end_tool(true);
+        let reply = session
+            .respond_via(&EMPTY_FAKE_HOST, "unsent-draft", "看看这个", &provider)
+            .expect("turn");
+        assert!(reply.tool_events.is_empty(), "nothing was sent");
+        let assistant: Vec<&str> = session
+            .inner
+            .transcript
+            .iter()
+            .filter_map(|entry| match entry {
+                AgentTranscriptEntry::Assistant { content, .. } => Some(content.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !assistant.iter().any(|content| content.contains(draft)),
+            "an abandoned draft must not be recorded as the turn words: {assistant:?}"
         );
     }
 
