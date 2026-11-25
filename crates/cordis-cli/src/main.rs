@@ -2804,7 +2804,12 @@ fn review_recent_conversations(
     // Only unsettled changes are worth asking about; a settled verdict would
     // otherwise be re-asked every hour forever.
     let pending: Vec<Change> = Change::pending(&changes).into_iter().cloned().collect();
-    let prompt = review_prompt_after(&exchanges, &previous, &pending);
+    let souls = HostSouls { host };
+    // A persona change is a complete replacement, so the review must see the
+    // current text of every room it just read; otherwise it can only invent
+    // one and the validator refuses it.
+    let current_persona = current_personas(&souls, &exchanges);
+    let prompt = review_prompt_after(&exchanges, &previous, &pending, current_persona.as_deref());
     let started = host.agent_start_with(
         cordis_runtime::host::AgentSessionKind::RuntimeShell,
         cordis_runtime::host::AgentStartOptions {
@@ -2836,7 +2841,6 @@ fn review_recent_conversations(
         return;
     };
     let now_ms = wall_clock_ms();
-    let souls = HostSouls { host };
     let patches = WorkingTreePatches {
         root: workspace_root(host),
     };
@@ -2869,6 +2873,34 @@ fn review_recent_conversations(
         eprintln!("self-check: {error}");
     }
     eprintln!("self-check: wrote a conversation review");
+}
+
+/// The personas behind the rooms a review just read, newest room first.
+///
+/// `apply_persona` validates a new value against the target room's old persona,
+/// so the prompt has to carry that old text. A review that cannot see it would
+/// either erase the room's rules or have every change refused.
+fn current_personas(
+    souls: &dyn cordis_runtime::selfcheck::PersonaSink,
+    exchanges: &[cordis_runtime::selfcheck::Exchange],
+) -> Option<String> {
+    const MAX_ROOMS: usize = 6;
+    let mut seen: Vec<&str> = Vec::new();
+    let mut rooms = Vec::new();
+    for exchange in exchanges.iter().rev() {
+        let key = exchange.soul_key.as_str();
+        if key.is_empty() || seen.contains(&key) {
+            continue;
+        }
+        seen.push(key);
+        if let Ok(Some(persona)) = souls.persona(key) {
+            rooms.push((key.to_string(), persona));
+        }
+        if seen.len() >= MAX_ROOMS {
+            break;
+        }
+    }
+    cordis_runtime::selfcheck::persona_overview(&rooms)
 }
 
 /// Apply one gated proposal (`code` or `capability`) through the gate.

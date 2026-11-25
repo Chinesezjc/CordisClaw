@@ -244,6 +244,11 @@ pub struct ProposedChange {
     /// `code` and `capability`) a one-line description of the patch.
     #[serde(default)]
     pub value: String,
+    /// Persona lane: the exact sentences this change removes. A persona value
+    /// is the complete new text, so every sentence that vanishes from the old
+    /// text must be named here or the change is refused.
+    #[serde(default)]
+    pub drops: Vec<String>,
     /// Which room/soul this applies to: a group id, a `qq:group:<id>` key, or
     /// a full soul key. Empty is an error for the data lanes.
     #[serde(default)]
@@ -419,6 +424,10 @@ pub fn digest(report: &SelfCheck, top: usize) -> Option<String> {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Exchange {
     pub session: String,
+    /// The soul whose persona shaped the reply. Empty for snapshots written
+    /// before the field existed; those cannot contribute a persona.
+    #[serde(default)]
+    pub soul_key: String,
     /// What the bot said, as the room saw it.
     pub reply: String,
     /// The first message(s) after it, verbatim.
@@ -459,6 +468,11 @@ pub fn recent_exchanges(root: &Path, max: usize) -> Vec<Exchange> {
         let Some(history) = snapshot.get("history").and_then(|value| value.as_array()) else {
             continue;
         };
+        let soul_key = snapshot
+            .get("soul_key")
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .to_string();
         let session = path
             .file_stem()
             .and_then(|name| name.to_str())
@@ -493,6 +507,7 @@ pub fn recent_exchanges(root: &Path, max: usize) -> Vec<Exchange> {
                 .collect();
             exchanges.push(Exchange {
                 session: session.clone(),
+                soul_key: soul_key.clone(),
                 reply: spoken,
                 after,
             });
@@ -544,7 +559,7 @@ fn unwrap_envelope(text: &str) -> String {
 /// The question is deliberately open: "which of these landed badly" is not a
 /// property of words, so it cannot be answered by matching them.
 pub fn review_prompt(exchanges: &[Exchange]) -> String {
-    review_prompt_after(exchanges, &[], &[])
+    review_prompt_after(exchanges, &[], &[], None)
 }
 
 /// The review prompt, with the model's own earlier conclusions in front.
@@ -552,10 +567,15 @@ pub fn review_prompt(exchanges: &[Exchange]) -> String {
 /// `changes` are the still-unjudged changes from the previous review. Carrying
 /// them turns "write another note" into a closed loop: the model is told what
 /// it changed, what that was supposed to achieve, and asked whether it did.
+///
+/// `current_persona` is the persona the review may replace, in full. Without
+/// it the model invents a persona from nothing and every review erases the
+/// rules earlier reviews accumulated.
 pub fn review_prompt_after(
     exchanges: &[Exchange],
     previous: &[String],
     changes: &[Change],
+    current_persona: Option<&str>,
 ) -> String {
     let mut text = String::new();
     if !previous.is_empty() {
@@ -571,9 +591,52 @@ pub fn review_prompt_after(
             ));
         }
     }
+    if let Some(persona) = current_persona {
+        text.push_str(&persona_section(persona));
+    }
     text.push_str(&change_section(changes));
     text.push_str(&review_body(exchanges));
     text
+}
+
+/// The block that shows the model the persona a change will replace.
+///
+/// A persona value is a complete replacement, so this text is the difference
+/// between "add one rule" and "keep every rule that still holds". An empty
+/// persona adds no section at all.
+fn persona_section(persona: &str) -> String {
+    let persona = persona.trim();
+    if persona.is_empty() {
+        return String::new();
+    }
+    format!(
+        "--- 你现在的人格（全文） ---\n{persona}\n\n\
+         A `persona` change replaces this text in full: write the **complete new \
+         version**, keeping every sentence that is still true. To remove a \
+         sentence, put its exact original text in the change's `drops` array. \
+         A sentence that disappears without a `drops` entry makes the whole \
+         change refused.\n\n"
+    )
+}
+
+/// The current text of several rooms, labelled by soul key.
+///
+/// A review reads conversations from more than one room, and a persona change
+/// is validated against the room's own old text. Showing only one room would
+/// make the model erase the others, so each room it read gets its own section.
+pub fn persona_overview(personas: &[(String, String)]) -> Option<String> {
+    let sections: Vec<String> = personas
+        .iter()
+        .filter(|(_, persona)| !persona.trim().is_empty())
+        .map(|(soul_key, persona)| format!("[{soul_key}]\n{}", persona.trim()))
+        .collect();
+    if sections.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "Each section starts with its soul key in [brackets]; use that key as `scope`.\n\n{}",
+        sections.join("\n\n")
+    ))
 }
 
 /// The block that asks the model to judge what it changed last time.
@@ -632,9 +695,12 @@ fn review_body(exchanges: &[Exchange]) -> String {
          {\"changes\":[{\"target\":\"persona|policy|memory|code|capability\",\
          \"scope\":\"<group id or soul key>\",\"summary\":\"one line\",\
          \"expectation\":\"an outcome that can be checked next time\",\
-         \"value\":\"the new text\"}],\
+         \"value\":\"the complete new text\",\
+         \"drops\":[\"exact original sentence you removed\"]}],\
          \"verdicts\":[{\"id\":\"<id shown above>\",\"state\":\"kept|reverted\",\
          \"reason\":\"one sentence\"}]}\n\
+         `drops` is required whenever a persona sentence is removed; an \
+         undeclared removal is refused. \
          Use `\"changes\":[]` or `\"verdicts\":[]` when you have none. \
          A `code` change is not applied by you: it needs \"package\", \"test\" \
          and a unified \"patch\" diff; without those it is not machine-checkable \
@@ -876,6 +942,62 @@ fn persona_soul_key(scope: &str) -> Result<String, String> {
     Ok(scope.to_string())
 }
 
+/// Sentences that vanished from `old` without being declared in `drops`.
+///
+/// A persona change is the complete new text, so a rule that is absent from
+/// `new` is either an intentional removal (named in `drops`) or a regression
+/// that would silently delete what earlier reviews learned. Sentences are the
+/// unit because that is how the persona is written: split on `。`, `！`, `？`
+/// and newlines, keeping the punctuation.
+///
+/// A `drops` entry matches when it and the sentence are substrings of each
+/// other after whitespace is removed, so `"别顶回去"` declares `"别顶回去。"`
+/// and a line re-wrapped in the new text still matches.
+pub fn dropped_without_leave(old: &str, new: &str, drops: &[String]) -> Vec<String> {
+    // An empty declaration would otherwise be a substring of every sentence
+    // and silently declare all removals.
+    let declared: Vec<String> = drops
+        .iter()
+        .map(|drop| without_whitespace(drop))
+        .filter(|drop| !drop.is_empty())
+        .collect();
+    split_sentences(old)
+        .into_iter()
+        .filter(|sentence| !new.contains(sentence))
+        .filter(|sentence| {
+            let sentence = without_whitespace(sentence);
+            !declared
+                .iter()
+                .any(|drop| sentence.contains(drop) || drop.contains(&sentence))
+        })
+        .collect()
+}
+
+/// The sentences of a persona, punctuation kept and empty lines dropped.
+fn split_sentences(text: &str) -> Vec<String> {
+    let mut sentences = Vec::new();
+    let mut current = String::new();
+    for ch in text.chars() {
+        current.push(ch);
+        if matches!(ch, '。' | '！' | '？' | '\n') {
+            let sentence = current.trim();
+            if !sentence.is_empty() {
+                sentences.push(sentence.to_string());
+            }
+            current.clear();
+        }
+    }
+    let sentence = current.trim();
+    if !sentence.is_empty() {
+        sentences.push(sentence.to_string());
+    }
+    sentences
+}
+
+fn without_whitespace(text: &str) -> String {
+    text.chars().filter(|ch| !ch.is_whitespace()).collect()
+}
+
 fn apply_persona(
     data_dir: &Path,
     proposal: &ProposedChange,
@@ -885,6 +1007,17 @@ fn apply_persona(
 ) -> Result<serde_json::Value, String> {
     let soul_key = persona_soul_key(&proposal.scope)?;
     let old = souls.persona(&soul_key)?;
+    let dropped = dropped_without_leave(
+        old.as_deref().unwrap_or(""),
+        &proposal.value,
+        &proposal.drops,
+    );
+    if !dropped.is_empty() {
+        return Err(format!(
+            "persona change {id} drops rules without saying so: {}",
+            dropped.join(" | ")
+        ));
+    }
     let rollback = serde_json::json!({"kind": "persona", "soul_key": &soul_key, "persona": old});
     write_backup(data_dir, id, now_ms, &rollback)?;
     souls.set_persona(&soul_key, &proposal.value)?;
@@ -1846,6 +1979,7 @@ mod tests {
     fn recent_exchanges_pair_a_reply_with_what_followed_it() {
         let dir = tempfile::tempdir().unwrap();
         let snapshot = serde_json::json!({
+            "soul_key": "qq:group:1",
             "history": [
                 {"role": "user", "content": "你怎么看"},
                 {"role": "assistant", "content": "先当假的看\n\n[tool] qq_send {}"},
@@ -1859,6 +1993,7 @@ mod tests {
         .unwrap();
         let exchanges = recent_exchanges(dir.path(), 10);
         assert_eq!(exchanges.len(), 1);
+        assert_eq!(exchanges[0].soul_key, "qq:group:1");
         assert_eq!(exchanges[0].reply, "先当假的看");
         assert_eq!(exchanges[0].after, vec!["你能不能换个说法".to_string()]);
     }
@@ -1867,6 +2002,7 @@ mod tests {
     fn a_review_prompt_carries_the_conversation_and_asks_for_judgement() {
         let exchanges = vec![Exchange {
             session: "s".to_string(),
+            soul_key: "qq:group:1".to_string(),
             reply: "先当假的看".to_string(),
             after: vec!["换个说法".to_string()],
         }];
@@ -1916,10 +2052,11 @@ mod tests {
     fn a_review_prompt_carries_the_earlier_conclusions() {
         let exchanges = vec![Exchange {
             session: "s".to_string(),
+            soul_key: "qq:group:1".to_string(),
             reply: "嗯".to_string(),
             after: vec!["你怎么不说话".to_string()],
         }];
-        let prompt = review_prompt_after(&exchanges, &["下次先接半句".to_string()], &[]);
+        let prompt = review_prompt_after(&exchanges, &["下次先接半句".to_string()], &[], None);
         assert!(prompt.contains("下次先接半句"), "{prompt}");
         assert!(
             prompt.contains("judge whether you actually did them"),
@@ -1933,6 +2070,40 @@ mod tests {
     }
 
     #[test]
+    fn a_review_prompt_carries_the_current_persona_in_full() {
+        let persona = "别人说气，先接住。\n不顶回去。";
+        let prompt = review_prompt_after(&[], &[], &[], Some(persona));
+        assert!(prompt.contains("你现在的人格（全文）"), "{prompt}");
+        assert!(prompt.contains(persona), "{prompt}");
+        // The contract the validator enforces is stated in the prompt.
+        assert!(prompt.contains("drops"), "{prompt}");
+        assert!(prompt.contains("complete new version"), "{prompt}");
+        // An absent or blank persona adds no empty section.
+        for none in [None, Some("   ")] {
+            let prompt = review_prompt_after(&[], &[], &[], none);
+            let present = prompt.contains("你现在的人格（全文）");
+            assert!(!present, "{prompt}");
+        }
+    }
+
+    #[test]
+    fn a_multi_room_review_lists_each_rooms_persona() {
+        let rooms = vec![
+            ("qq:group:1".to_string(), "甲。".to_string()),
+            ("qq:group:2".to_string(), "  ".to_string()),
+            ("qq:group:3".to_string(), "乙。".to_string()),
+        ];
+        let overview = persona_overview(&rooms).expect("two rooms");
+        assert!(overview.contains("use that key as `scope`"), "{overview}");
+        assert!(overview.contains("[qq:group:1]\n甲。"), "{overview}");
+        assert!(overview.contains("[qq:group:3]\n乙。"), "{overview}");
+        // A room with no persona contributes nothing.
+        assert!(!overview.contains("qq:group:2"), "{overview}");
+        assert!(persona_overview(&[]).is_none());
+        assert!(persona_overview(&[("k".to_string(), " ".to_string())]).is_none());
+    }
+
+    #[test]
     fn a_review_prompt_carries_pending_changes_and_asks_for_a_verdict() {
         let change = Change {
             id: "persona-qq_group_1-abc".to_string(),
@@ -1943,7 +2114,7 @@ mod tests {
             rollback: serde_json::json!({"persona": "旧句子"}),
             state: ChangeState::Applied,
         };
-        let prompt = review_prompt_after(&[], &[], &[change]);
+        let prompt = review_prompt_after(&[], &[], &[change], None);
         assert!(prompt.contains("persona-qq_group_1-abc"), "{prompt}");
         assert!(prompt.contains("先接半句"), "{prompt}");
         assert!(prompt.contains("6 小时内同类抱怨减少"), "{prompt}");
@@ -1955,6 +2126,7 @@ mod tests {
     fn a_review_prompt_asks_which_requests_were_out_of_reach() {
         let exchanges = vec![Exchange {
             session: "s".to_string(),
+            soul_key: "qq:group:1".to_string(),
             reply: "我没有工具看视频".to_string(),
             after: vec!["那你能看这个图吗".to_string()],
         }];
@@ -2052,6 +2224,7 @@ mod tests {
             summary: "一句话".to_string(),
             expectation: "六小时内变好".to_string(),
             value: value.to_string(),
+            drops: Vec::new(),
             scope: scope.to_string(),
             package: String::new(),
             test: String::new(),
@@ -2228,6 +2401,21 @@ mod tests {
         assert_eq!(review.changes[2].test, "tests::x");
         assert_eq!(review.changes[2].patch, "diff");
         assert!(review.verdicts.is_empty());
+    }
+
+    #[test]
+    fn a_proposed_change_carries_its_declared_drops() {
+        let with = serde_json::from_str::<ProposedChange>(
+            r#"{"target":"persona","summary":"s","value":"v","drops":["旧句。"]}"#,
+        )
+        .unwrap();
+        assert_eq!(with.drops, vec!["旧句。".to_string()]);
+        // Reviews written before `drops` existed still parse.
+        let without = serde_json::from_str::<ProposedChange>(
+            r#"{"target":"persona","summary":"s","value":"v"}"#,
+        )
+        .unwrap();
+        assert!(without.drops.is_empty());
     }
 
     #[test]
@@ -2416,26 +2604,134 @@ mod tests {
     }
 
     #[test]
+    fn a_persona_sentence_that_vanishes_without_a_drop_is_reported() {
+        // Everything still present: nothing to declare.
+        assert!(dropped_without_leave("甲。乙！", "甲。乙！丙。", &[]).is_empty());
+        // One sentence gone and not declared: it is reported verbatim.
+        assert_eq!(
+            dropped_without_leave("甲。乙。", "甲。", &[]),
+            vec!["乙。".to_string()]
+        );
+        // Declared without its punctuation: the drop is a substring of the
+        // sentence, so it counts as declared.
+        assert!(
+            dropped_without_leave("别顶回去。看截图。", "看截图。", &["别顶回去".to_string()])
+                .is_empty()
+        );
+        // The declaration may also be longer than the sentence.
+        assert!(dropped_without_leave("乙。", "甲。", &["甲。乙。".to_string()]).is_empty());
+        // Whitespace differences do not matter.
+        assert!(dropped_without_leave("甲。 乙。", "甲。", &[" 乙 ".to_string()]).is_empty());
+        // An empty declaration cannot silently cover every sentence.
+        assert_eq!(
+            dropped_without_leave("甲。", "乙。", &["".to_string(), "  ".to_string()]),
+            vec!["甲。".to_string()]
+        );
+        // No old persona means no rule can be lost.
+        assert!(dropped_without_leave("", "甲。", &[]).is_empty());
+        // An empty new persona drops every old sentence.
+        assert_eq!(
+            dropped_without_leave("甲。乙。", "", &[]),
+            vec!["甲。".to_string(), "乙。".to_string()]
+        );
+        // All three sentence separators plus newlines, and a final sentence
+        // without punctuation.
+        assert_eq!(
+            dropped_without_leave("甲！乙？丙\n丁", "", &[]),
+            vec![
+                "甲！".to_string(),
+                "乙？".to_string(),
+                "丙".to_string(),
+                "丁".to_string()
+            ]
+        );
+        // Blank lines between sentences are not sentences of their own.
+        assert_eq!(
+            dropped_without_leave("\n甲。\n\n", "", &[]),
+            vec!["甲。".to_string()]
+        );
+    }
+
+    #[test]
     fn persona_changes_are_backed_up_before_they_are_written() {
         let dir = tempfile::tempdir().unwrap();
         let souls = TestSouls::default();
-        souls.set_persona("qq:group:1", "旧句子").unwrap();
+        souls
+            .set_persona("qq:group:1", "旧句子。仍然成立。")
+            .unwrap();
         let change = apply_proposed(
             dir.path(),
-            &proposed(ChangeTarget::Persona, "1", "新句子"),
+            &proposed(ChangeTarget::Persona, "1", "旧句子。仍然成立。新句子。"),
             5,
             &souls,
         )
         .unwrap();
         assert_eq!(change.state, ChangeState::Applied);
-        assert_eq!(souls.persona("qq:group:1").unwrap().unwrap(), "新句子");
+        assert_eq!(
+            souls.persona("qq:group:1").unwrap().unwrap(),
+            "旧句子。仍然成立。新句子。"
+        );
         let rollback = &change.rollback;
-        assert_eq!(rollback["persona"], "旧句子");
+        assert_eq!(rollback["persona"], "旧句子。仍然成立。");
         let backup = dir
             .path()
             .join("changes-backup")
             .join(format!("{}-5.json", change.id));
-        assert!(std::fs::read_to_string(backup).unwrap().contains("旧句子"));
+        assert!(std::fs::read_to_string(backup)
+            .unwrap()
+            .contains("旧句子。仍然成立。"));
+    }
+
+    #[test]
+    fn a_declared_persona_deletion_is_applied() {
+        let dir = tempfile::tempdir().unwrap();
+        let souls = TestSouls::default();
+        souls
+            .set_persona("qq:group:1", "别顶回去。看截图。")
+            .unwrap();
+        let mut proposal = proposed(ChangeTarget::Persona, "1", "看截图。");
+        proposal.drops = vec!["别顶回去".to_string()];
+        apply_proposed(dir.path(), &proposal, 5, &souls).unwrap();
+        assert_eq!(souls.persona("qq:group:1").unwrap().unwrap(), "看截图。");
+    }
+
+    #[test]
+    fn an_undeclared_persona_deletion_is_refused_without_writing_anything() {
+        let dir = tempfile::tempdir().unwrap();
+        let souls = TestSouls::default();
+        souls
+            .set_persona("qq:group:1", "别顶回去。看截图。")
+            .unwrap();
+        let proposal = proposed(ChangeTarget::Persona, "1", "看截图。");
+        let id = change_id(
+            proposal.target,
+            &proposal.scope,
+            &proposal.summary,
+            &proposal.value,
+        );
+        let error = apply_proposed(dir.path(), &proposal, 5, &souls).unwrap_err();
+        assert_eq!(
+            error,
+            format!("persona change {id} drops rules without saying so: 别顶回去。")
+        );
+        // Refused before the backup: nothing was written and the persona is
+        // exactly what it was.
+        assert!(!dir.path().join("changes-backup").exists());
+        assert_eq!(
+            souls.persona("qq:group:1").unwrap().unwrap(),
+            "别顶回去。看截图。"
+        );
+    }
+
+    #[test]
+    fn an_empty_persona_value_deletes_everything_only_when_declared() {
+        let dir = tempfile::tempdir().unwrap();
+        let souls = TestSouls::default();
+        souls.set_persona("qq:group:1", "甲。乙！").unwrap();
+        let mut proposal = proposed(ChangeTarget::Persona, "1", "");
+        proposal.drops = vec!["甲。".to_string(), "乙！".to_string()];
+        apply_proposed(dir.path(), &proposal, 5, &souls).unwrap();
+        assert_eq!(souls.persona("qq:group:1").unwrap().unwrap(), "");
     }
 
     #[test]
