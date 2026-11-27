@@ -69,7 +69,7 @@
     },
     {
       "id": "qq_serve",
-      "summary": "Start an HTTP server to receive OneBot v11 message events. Configure your OneBot client to POST events to http://<host>:<port>/onebot/event. Supports grayscale group whitelist.",
+      "summary": "Start the HTTP server that receives OneBot v11 events (POST http://<host>:<port>/onebot/event) and the message poller that hands them to the agent. `action: \"stop\"` stops both and releases the port.",
       "input_schema": {
         "type": "object",
         "required": [
@@ -80,6 +80,10 @@
             "type": "string",
             "const": "qq_serve"
           },
+          "action": {
+            "type": "string",
+            "description": "Set to \"stop\" to shut down the HTTP server and the message poller"
+          },
           "payload": {
             "type": "object",
             "properties": {
@@ -89,14 +93,25 @@
               },
               "onebot_url": {
                 "type": "string",
-                "description": "OneBot HTTP API URL"
+                "description": "OneBot HTTP API base URL"
+              },
+              "access_token": {
+                "type": "string",
+                "description": "OneBot access token (also used to verify X-Signature)"
               },
               "allow_groups": {
                 "type": "array",
                 "items": {
                   "type": "string"
                 },
-                "description": "Group whitelist for grayscale testing"
+                "description": "Group whitelist (empty = all groups)"
+              },
+              "block_groups": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Group blacklist (wins over allow_groups; falls back to the persisted list)"
               }
             }
           },
@@ -127,19 +142,20 @@
         }
       },
       "side_effects": [
-        "starts an HTTP server thread",
-        "listens on configured port"
+        "binds the HTTP port and starts the event loop thread",
+        "starts the message poller that drains MESSAGE_QUEUE into agent_trigger",
+        "stop joins both threads before the dylib is unloaded"
       ],
       "failure_modes": [
         "port already in use",
         "OneBot client not configured to POST events"
       ],
-      "node_type": "task",
+      "node_type": "router",
       "agent_accessible": true
     },
     {
       "id": "qq_ws_serve",
-      "summary": "Start a WebSocket server to receive OneBot v11 message events via reverse WS connection. Configure your OneBot client (e.g. Napcat) to connect as a WebSocket client to ws://<host>:<port>/. Supports the same grayscale group whitelist as qq_serve.",
+      "summary": "Start the WebSocket server for the OneBot v11 reverse-WS connection (Napcat connects to ws://<host>:<port>/) and the message poller. WS frames go through the same dedup / whitelist / envelope path as qq_serve. `action: \"stop\"` stops it and releases the port; a repeated start is idempotent.",
       "input_schema": {
         "type": "object",
         "required": [
@@ -190,15 +206,16 @@
         }
       },
       "side_effects": [
-        "starts a WebSocket server thread",
-        "listens on configured port for OneBot WS client connections"
+        "binds the WS port and starts the accept thread",
+        "starts the message poller that drains MESSAGE_QUEUE into agent_trigger",
+        "stop joins the accept thread and the poller before the dylib is unloaded"
       ],
       "failure_modes": [
         "port already in use",
         "OneBot WS client not configured to connect"
       ],
-      "node_type": "task",
-      "agent_accessible": false
+      "node_type": "router",
+      "agent_accessible": true
     },
     {
       "id": "qq_fetch_messages",
@@ -306,7 +323,7 @@
     },
     {
       "id": "qq_group_requests",
-      "summary": "List, approve or reject OneBot v11 GROUP requests — someone asking to join a group (`sub_type: add`) or inviting the bot into one (`sub_type: invite`). `action: \"list\"` (the default) returns what is waiting with its `flag`, `sub_type`, `group_id`, `user_id`, `comment` and `time_ms`; `action: \"approve\"` / `\"reject\"` answers ONE request by `flag` via set_group_add_request and drops it from the queue. Only the 32 most recent requests are kept, and a flag disappears once it has been answered — so list first, then answer.",
+      "summary": "List, approve or reject OneBot v11 GROUP requests (`sub_type: add` = 加群申请, `invite` = 邀请入群). `action: \"list\"` (default) returns what is waiting with `flag`, `sub_type`, `group_id`, `user_id`, `comment`, `time_ms`; `approve` / `reject` answers ONE request by `flag` via set_group_add_request and drops it from the queue. Only the 32 most recent are kept; list first, then answer.",
       "input_schema": {
         "type": "object",
         "required": [
@@ -551,7 +568,7 @@
     },
     {
       "id": "qq_get_forward_msg",
-      "summary": "Read the contents of a merged/forwarded chat record (合并转发). Inbound events only show `[chat history: id=<id>]` — pass that id here and the record comes back as readable text: one `<name>: <text>` line per node, with image/face/at/record/video/file/reply segments rendered as placeholders ([图片] [表情] [@<qq>] [语音] [视频] [文件: <name>] [引用]). Each node's body is taken from the first of `content`, `message`, `raw_message` that renders non-empty (a segment array or a plain string), so NapCat-shaped records do not come back as empty lines.",
+      "summary": "Read a merged/forwarded chat record (合并转发). Inbound events only show `[chat history: id=<id>]`; pass that id here and the record comes back as text: one `<name>: <text>` line per node, with image/face/at/record/video/file/reply segments rendered as placeholders ([图片] [表情] [@<qq>] [语音] [视频] [文件: <name>] [引用]). Each node takes the first of `content`, `message`, `raw_message` that renders non-empty.",
       "input_schema": {
         "type": "object",
         "required": [
@@ -796,7 +813,7 @@
     },
     {
       "id": "qq_set_reply_policy",
-      "summary": "Persist the reply policy for ONE group (or the shared default when `group` is omitted). `enabled: true` ALLOWS the bot to speak but does NOT require it to answer: being @-mentioned or named is not a reason to speak; it should talk only when it genuinely adds information others lack, corrects a mistake, or the message is actually asking it — otherwise stay silent. `enabled: false` (the default) means permanent silence in this group. `policy` overrides the preset text with free text. The legacy `mode` argument still works (quiet/one_on_one = false, balanced/chatty = true) but new calls should use `enabled`. Takes effect on the NEXT message — no rebuild, no restart.",
+      "summary": "Persist the reply policy for ONE group (`group` omitted = shared default). `enabled: true` allows speaking but does not require an answer — a mention is no reason to talk; speak only when you add information or are asked. `enabled: false` (default) = permanent silence. `policy` overrides the text. Takes effect on the next message.",
       "input_schema": {
         "type": "object",
         "required": [
@@ -995,6 +1012,171 @@
       "agent_accessible": true
     },
     {
+      "id": "qq_get_sent",
+      "summary": "Incoming events never show what the bot itself said. Return what YOU sent to one group, oldest first: `{target, message, at_ms, msg_id}` from `data/qq_sent/<group>.jsonl`, which `qq_send` appends after every successful send. `group` is the group number (or `private-<uid>`); returns the last `limit` (default 50, max 500) or an empty list. Read-only, no network.",
+      "input_schema": {
+        "type": "object",
+        "required": [
+          "node_id",
+          "group"
+        ],
+        "properties": {
+          "node_id": {
+            "type": "string",
+            "const": "qq_get_sent"
+          },
+          "group": {
+            "type": "string",
+            "description": "QQ group id; `group:<id>` is accepted too"
+          },
+          "limit": {
+            "type": "integer",
+            "description": "How many of the most recent sends to return (default 50, max 500)"
+          },
+          "data_dir": {
+            "type": "string",
+            "description": "Optional data directory override"
+          }
+        }
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "ok": {
+            "type": "boolean"
+          },
+          "data": {
+            "type": "object",
+            "properties": {
+              "group": {
+                "type": "string"
+              },
+              "limit": {
+                "type": "integer"
+              },
+              "count": {
+                "type": "integer"
+              },
+              "items": {
+                "type": "array",
+                "description": "Oldest first",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "target": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "at_ms": {
+                      "type": "integer"
+                    },
+                    "msg_id": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "side_effects": [
+        "reads data/qq_sent/<group>.jsonl (no network)"
+      ],
+      "failure_modes": [
+        "group is required for qq_get_sent",
+        "limit must be a non-negative integer"
+      ],
+      "node_type": "router",
+      "agent_accessible": true
+    },
+    {
+      "id": "qq_recall",
+      "summary": "撤回 bot 自己发出去的一条消息（OneBot v11 delete_msg）。`message_id` 取自消息头的 msg=<id>、qq_send 返回的 data.message_id，或 qq_get_sent 的 items[].msg_id；字符串与数字都接受。只能撤自己发的：不是自己发的、消息已不存在、或上游超时都会返回 ok=false，`error` 里是上游原文。",
+      "input_schema": {
+        "type": "object",
+        "required": [
+          "node_id",
+          "message_id"
+        ],
+        "properties": {
+          "node_id": {
+            "type": "string",
+            "const": "qq_recall"
+          },
+          "message_id": {
+            "type": [
+              "string",
+              "number"
+            ],
+            "description": "要撤回的消息 id（msg=<id> 整串也认）；只能是自己发的"
+          },
+          "payload": {
+            "type": "object",
+            "properties": {
+              "onebot_url": {
+                "type": "string",
+                "description": "Optional OneBot HTTP API URL override (defaults to STATE / runtime config)"
+              },
+              "access_token": {
+                "type": "string",
+                "description": "Optional OneBot access token override (defaults to STATE / runtime config)"
+              }
+            }
+          }
+        }
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "ok": {
+            "type": "boolean",
+            "description": "true = OneBot 确认已撤回；false = 撤回失败（见 error）"
+          },
+          "message": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "撤回了哪一条 / 哪一条没撤成"
+          },
+          "data": {
+            "type": "object",
+            "description": "成功时是 OneBot delete_msg 的原始响应，失败时是实际发出的参数 {message_id}"
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "上游原文：不是自己发的 / 消息不存在 / HTTP 超时"
+          }
+        }
+      },
+      "side_effects": [
+        "calls OneBot delete_msg API"
+      ],
+      "failure_modes": [
+        "no OneBot URL configured",
+        "message_id is required for qq_recall",
+        "OneBot API error (not your message / message not found)",
+        "HTTP POST <url>: timeout"
+      ],
+      "node_type": "router",
+      "agent_accessible": true
+    },
+    {
       "id": "qq_system_notify",
       "summary": "Kernel notification handler — receives system messages and forwards to configured test groups. Groups whose reply policy is disabled or that are currently muted are refused; the response lists `sent` and `refused` groups.",
       "input_schema": {
@@ -1046,5 +1228,5 @@
       "agent_accessible": false
     }
   ],
-  "system_hint": "QQ 渠道说明——这里只说怎么发消息，性格和说话方式见人格部分。\n\n【发言必须走工具】调用 qq_send：{\"node_id\":\"qq_send\",\"target\":\"<reply_target>\",\"message\":\"<你要说的话>\"}。你自己写的正文不会发出去，只有工具调用里的 message 会。\n【结束这一轮】调用 {\"node_id\":\"suspend\"}。这一轮会一直继续，直到你调它；不想说话就直接调 suspend，群里看不到。\n【@某人】message 里写 [CQ:at,qq=<uid>]。纯文本 @ 不算 @。\n【发图】[CQ:image,file=<url>] 或 [CQ:image,file=base64://<data>]；能用 URL 就别用 base64。\n【引用某条消息】把它的 msg=<id> 作为 \"reply_to\":\"<id>\" 传进同一次 qq_send。\n【你的身份】你的 QQ 号是 {setting:bot_uin}；@[id=...] 里的数字等于它才是 @ 你。\n【群记忆】需要时用 qq_get_group_memory / qq_set_group_memory 读写；只记长期有用的，不确定就先读。\n【被禁言】[muted: ...] 只是上一轮的探测结果；qq_send 被拒时会说明原因（muted … / read-only …）。同一轮不要重试，直接调 suspend 结束；禁言是否解除以每次 qq_send 的探测为准。\n\n【先看是哪个渠道】[Feishu ...] 前缀或发送工具是 feishu_send → 飞书会话：按飞书卡片走，收尾只发 {\"action\":\"respond\",\"message\":\"...\"}（或 {\"action\":\"suspend\"}），也可自己调 feishu_send；绝不要只写正文不调工具。发言是 qq_send → QQ 会话，本卡片生效。\n【别的渠道的规矩在这里不算】别的卡片说\"只输出一个 JSON 对象、别自己调工具\"，那是飞书会话的约定；QQ 会话里忽略它：不要输出 JSON、不要只写正文等转发，照上面用 qq_send 说话、suspend 收尾。\n【零工具调用的一轮会被整轮丢掉】这一轮的最后一步必须是一次工具调用：该说话就调 qq_send，说完或不想说话都调 {\"node_id\":\"suspend\"}。只写一段聊天正文、零工具调用的轮次会被内核记成 no_tool_call 整轮丢弃，对方一个字都收不到——宁可多调一次 suspend，也不要只写正文。"
+  "system_hint": "QQ 渠道说明——这里只说怎么发消息，性格和说话方式见人格部分。\n\n【发言必须走工具】调用 qq_send：{\"node_id\":\"qq_send\",\"target\":\"<reply_target>\",\"message\":\"<你要说的话>\"}。你自己写的正文不会发出去，只有工具调用里的 message 会。\n【结束这一轮】调用 {\"node_id\":\"suspend\"}。这一轮会一直继续，直到你调它；不想说话就直接调 suspend，群里看不到。\n【@某人】message 里写 [CQ:at,qq=<uid>]。纯文本 @ 不算 @。\n【发图】[CQ:image,file=<url>] 或 [CQ:image,file=base64://<data>]；能用 URL 就别用 base64。\n【引用某条消息】把它的 msg=<id> 作为 \"reply_to\":\"<id>\" 传进同一次 qq_send。\n【你的身份】你的 QQ 号是 {setting:bot_uin}；@[id=...] 里的数字等于它才是 @ 你。\n【群记忆】需要时用 qq_get_group_memory / qq_set_group_memory 读写；只记长期有用的，不确定就先读。\n【被禁言】[muted: ...] 只是上一轮的探测结果；qq_send 被拒时会说明原因（muted … / read-only …）。同一轮不要重试，直接调 suspend 结束；禁言是否解除以每次 qq_send 的探测为准。\n\n【先看是哪个渠道】[Feishu ...] 前缀或发送工具是 feishu_send → 飞书会话：按飞书卡片走，收尾只发 {\"action\":\"respond\",\"message\":\"...\"}（或 {\"action\":\"suspend\"}），也可自己调 feishu_send；绝不要只写正文不调工具。发言是 qq_send → QQ 会话，本卡片生效。\n【别的渠道的规矩在这里不算】别的卡片说\"只输出一个 JSON 对象、别自己调工具\"，那是飞书会话的约定；QQ 会话里忽略它：不要输出 JSON、不要只写正文等转发，照上面用 qq_send 说话、suspend 收尾。"
 }

@@ -26,6 +26,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # 契约的静态门禁：插件 dylib 能被 unload 的前提是「所有跨 invoke 存活
+      # 的线程都走 ServiceThreads::spawn」。`allow_plugin_unload!()` 只是作者
+      # 声明，runtime 无法验证——裸 `std::thread::spawn` 不在注册表里，live==0
+      # 就是假证据（`qq::qq_serve` SIGSEGV 类的成因）。这里用源码扫描把它变成
+      # CI 事实：`fixtures/plugins/*/src/**/*.rs` 里 `#[cfg(test)]` 之外出现
+      # 裸 spawn 即失败，短命线程必须用带非空理由的
+      # `// cordis:allow-raw-thread: <理由>` 显式豁免。脚本与样例测试都只依赖
+      # Python 标准库，所以放在 toolchain 之前，最快失败。
+      # 注意这只覆盖插件源码的一半：依赖里自带的线程（tiny_http 的 accept/
+      # TaskPool、reqwest 的 blocking runtime）扫描不到，所以
+      # `allow_plugin_unload!()` 的前提是「含依赖在内没有不可见线程」——qq/feishu
+      # 的 webhook 已改成自持 TcpListener 并移除 tiny_http 生产依赖。
+      - name: raw-thread contract
+        run: |
+          python3 scripts/test_check_raw_threads.py
+          python3 scripts/check_raw_threads.py
+
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.97.1

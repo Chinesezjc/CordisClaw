@@ -1,7 +1,10 @@
 use serde::{Deserialize, Serialize};
 
 pub mod llm;
+pub mod service_threads;
 pub mod workflow;
+
+pub use service_threads::{JoinOutcome, ServiceThreads, ThreadTicket};
 
 pub use llm::{
     LlmCompletion, LlmCompletionRequest, LlmMessage, LlmStreamFrame, LlmToolCall, LlmToolFunction,
@@ -322,10 +325,52 @@ macro_rules! export_plugin_api {
             docs: __cordis_sdk_docs,
             handle: $handle,
         };
+
+        /// Runtime → plugin: join every thread this plugin image spawned.
+        ///
+        /// Returns the number of threads still running after `timeout_ms`;
+        /// `0` is the only value that permits the runtime to `dlclose` the
+        /// dylib. See `cordis_plugin_sdk::service_threads`.
+        #[no_mangle]
+        pub extern "C" fn _cordis_join_service_threads(timeout_ms: u64) -> u64 {
+            $crate::service_threads::join_all_timeout_ms(timeout_ms)
+        }
+
+        /// Runtime → plugin: threads spawned by this image that have not
+        /// exited. A non-zero value keeps the dylib mapped until unload.
+        #[no_mangle]
+        pub extern "C" fn _cordis_live_service_threads() -> u64 {
+            $crate::service_threads::ServiceThreads::live_count() as u64
+        }
     };
 }
 
 // ── Service Factory Bridge ─────────────────────────────────────────────
+
+/// Opt in to runtime unloading of this plugin's dylib.
+///
+/// A plugin may only call this after migrating **every** background thread to
+/// [`ServiceThreads::spawn`](service_threads::ServiceThreads::spawn). It emits
+/// `_cordis_allows_unload() -> bool`, which the runtime combines with the
+/// live-thread count before it dares to `dlclose`:
+///
+/// - symbol missing (legacy artifact) → the runtime never unloads the image;
+/// - symbol present → unload is allowed once every registered thread exited.
+///
+/// Without this opt-in a raw `std::thread::spawn` thread would be invisible to
+/// the runtime, and "zero registered threads" would be a lie — exactly the
+/// condition that produced the 2026-11-26 `qq::qq_serve` SIGSEGV.
+#[macro_export]
+macro_rules! allow_plugin_unload {
+    () => {
+        /// Plugin → runtime: "every background thread I spawn is registered
+        /// with `ServiceThreads`, so joining them makes `dlclose` safe."
+        #[no_mangle]
+        pub extern "C" fn _cordis_allows_unload() -> bool {
+            true
+        }
+    };
+}
 
 /// C-compatible function table for a Service.
 /// Plugins fill this in and return it from `_cordis_create_service`.
@@ -737,6 +782,9 @@ pub extern "C" fn _cordis_agent_trigger(msg: *const c_char) {
 
         #[test]
         fn macro_generated_vtable_dispatches() {
+            // `_cordis_join_service_threads` flips the SDK-wide shutdown flag,
+            // so serialize with the service-thread tests that own it.
+            let _guard = crate::service_threads::test_lock();
             assert!(matches!(
                 cordis_plugin_api_rust_v2.abi_kind,
                 DylibAbiKind::Rust
@@ -755,6 +803,11 @@ pub extern "C" fn _cordis_agent_trigger(msg: *const c_char) {
                 payload: "ping".to_string(),
             });
             assert_eq!(resp.payload, "echo:ping");
+            // The thread-contract entry points only run inside plugin dylibs,
+            // which are separate compilation units; call them here so their
+            // macro-expanded lines stay in the workspace coverage report.
+            assert_eq!(_cordis_live_service_threads(), 0);
+            assert_eq!(_cordis_join_service_threads(0), 0);
         }
     }
 }

@@ -1,5 +1,6 @@
 use super::{RuntimeHost, TEST_AGENT_RESPOND_PANIC_INJECTION, TEST_STOP_HANDLER_PANIC_INJECTION};
 use crate::core::error::RuntimeError;
+use crate::plugin::dynamic::released_dylib_count;
 use cordis_plugin_sdk::{AbiFingerprint, NodeDoc, NodeType, PluginDocs};
 use serde_json::json;
 use serial_test::serial;
@@ -406,14 +407,18 @@ fn stop_handler_panic_is_caught_and_reload_path_survives() {
         .canonicalize()
         .expect("fixtures root");
     let host = RuntimeHost::boot(&fixtures).expect("host should boot on the repo fixtures");
+    // The stop-handler loop only runs for `NodeType::Task` nodes, so pick a
+    // plugin that still declares one. `qq::qq_serve` is no longer a Task node
+    // — it is a plain service node now, so `qq` has no stop handler to invoke
+    // (and its dylib is kept alive by the dylib-layer retention instead).
     let task_fqns = host.current_snapshot().node_registry().task_node_fqns();
     assert!(
-        task_fqns.iter().any(|fqn| fqn == "qq::qq_serve"),
-        "qq::qq_serve Task node must be registered, got: {task_fqns:?}"
+        task_fqns.iter().any(|fqn| fqn == "feishu::feishu_serve"),
+        "feishu::feishu_serve Task node must be registered, got: {task_fqns:?}"
     );
 
     TEST_STOP_HANDLER_PANIC_INJECTION.store(true, SeqCst);
-    let reload_result = host.reload("qq");
+    let reload_result = host.reload("feishu");
     assert!(
         !TEST_STOP_HANDLER_PANIC_INJECTION.load(SeqCst),
         "stop-handler injection flag must be reset after firing"
@@ -421,6 +426,55 @@ fn stop_handler_panic_is_caught_and_reload_path_survives() {
     assert!(
         reload_result.is_ok(),
         "a panic in a stop handler must not abort the reload: {reload_result:?}"
+    );
+}
+
+// The non-panicking Task stop path: Phase 2 invokes `action: "stop"` on every
+// Task node, then runs the diagnostic helper. The panic-injection test only
+// covers the `catch_unwind` Err arm, so this one covers the invoke and the
+// silent `for_each` chain on a *successful* stop.
+#[test]
+#[serial]
+fn reload_invokes_task_stop_handler_without_panic() {
+    let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures")
+        .canonicalize()
+        .expect("fixtures root");
+    let host = RuntimeHost::boot(&fixtures).expect("host should boot on the repo fixtures");
+    assert!(
+        !TEST_STOP_HANDLER_PANIC_INJECTION.load(SeqCst),
+        "panic injection must be off for this test"
+    );
+    let report = host.reload_with_diagnostics("feishu");
+    assert_eq!(
+        report.status,
+        crate::host::ReloadAttemptStatus::Reloaded,
+        "a successful stop handler must not fail the reload"
+    );
+}
+
+// Regression for the Phase-1 validation handle: it must be released before
+// Phase 2 stops the old generation. When both handles map the same artifact
+// file (a reload without a rebuild) and the validation handle is still held,
+// the old image stays mapped, the restart opens that same image, sees its
+// `SERVER_RUNNING` statics still true, and does nothing — the plugin ends up
+// with no threads. Releasing the handle makes the second reload unload and
+// genuinely restart: both the validation handle and the held generation are
+// `dlclose`d (2 releases, not 1).
+#[test]
+#[serial]
+fn reloading_the_same_artifact_twice_releases_both_handles() {
+    let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures")
+        .canonicalize()
+        .expect("fixtures root");
+    let host = RuntimeHost::boot(&fixtures).expect("host should boot on the repo fixtures");
+    host.reload("feishu").expect("first reload");
+    let released_after_first = released_dylib_count();
+    host.reload("feishu").expect("second reload");
+    assert!(
+        released_dylib_count() >= released_after_first + 2,
+        "second reload must release the validation handle and the held generation"
     );
 }
 

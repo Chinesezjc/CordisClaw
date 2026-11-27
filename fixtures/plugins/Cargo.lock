@@ -319,7 +319,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "tiny_http",
  "tungstenite 0.27.0",
  "ureq",
 ]

@@ -20,6 +20,7 @@
 //! - `feishu_entry` (Router) — configure (persist app_id/secret/policies),
 //!   approve_pairing / list_pending, status.
 
+use cordis_plugin_sdk::service_threads::{ServiceThreads, ThreadTicket};
 use cordis_plugin_sdk::{
     export_plugin_api, json_response, node_doc, plugin_docs, task_node_doc, AbiFingerprint,
     PluginRequest, PluginResponse,
@@ -142,7 +143,10 @@ const RECENT_IDS_CAP: usize = 200;
 
 static SERVER_RUNNING: Mutex<bool> = Mutex::new(false);
 static SERVER_SHUTDOWN: AtomicBool = AtomicBool::new(false);
-static EVENT_LOOP_HANDLE: Mutex<Option<thread::JoinHandle<()>>> = Mutex::new(None);
+/// Joinable tickets for the event loop and the message poller. Registered with
+/// the SDK so the runtime joins them before unloading `feishu.so`.
+static EVENT_LOOP_TICKET: Mutex<Option<ThreadTicket>> = Mutex::new(None);
+static POLLER_TICKET: Mutex<Option<ThreadTicket>> = Mutex::new(None);
 static POLLER_STARTED: AtomicBool = AtomicBool::new(false);
 
 const DEFAULT_API_BASE: &str = "https://open.feishu.cn";
@@ -1782,6 +1786,8 @@ pub(crate) fn apply_config_to_state(s: &mut FeishuState, config: &Value) {
 fn handle_feishu_serve(req: &NodeRequest) -> Result<NodeResponse, String> {
     if req.action.as_deref() == Some("stop") {
         SERVER_SHUTDOWN.store(true, Ordering::SeqCst);
+        join_event_loop();
+        join_agent_poller();
         *SERVER_RUNNING.lock().map_err(|e| format!("lock: {e}"))? = false;
         return Ok(NodeResponse {
             ok: true,
@@ -1826,21 +1832,21 @@ fn handle_feishu_serve(req: &NodeRequest) -> Result<NodeResponse, String> {
             .and_then(|v| v.as_u64())
             .map(|v| v as u16)
             .unwrap_or(DEFAULT_PORT);
-        let server = tiny_http::Server::http(format!("0.0.0.0:{port}"))
+        let listener = std::net::TcpListener::bind(format!("0.0.0.0:{port}"))
             .map_err(|e| format!("feishu_serve: cannot bind port {port}: {e}"))?;
         SERVER_SHUTDOWN.store(false, Ordering::SeqCst);
-        let handle = thread::spawn(move || run_event_loop(server));
-        if let Ok(mut guard) = EVENT_LOOP_HANDLE.lock() {
-            *guard = Some(handle);
+        let ticket = ServiceThreads::spawn("feishu.http", move || run_event_loop(listener));
+        if let Ok(mut guard) = EVENT_LOOP_TICKET.lock() {
+            *guard = Some(ticket);
         }
         format!("HTTP server listening on port {port}, path /feishu/event")
     } else {
         // Long-connection (openclaw-style default): dial out to Feishu.
         // Credentials may be configured later; the loop waits for them.
         SERVER_SHUTDOWN.store(false, Ordering::SeqCst);
-        let handle = thread::spawn(ws::run_ws_loop);
-        if let Ok(mut guard) = EVENT_LOOP_HANDLE.lock() {
-            *guard = Some(handle);
+        let ticket = ServiceThreads::spawn("feishu.ws", ws::run_ws_loop);
+        if let Ok(mut guard) = EVENT_LOOP_TICKET.lock() {
+            *guard = Some(ticket);
         }
         "long-connection (wss) event loop started".to_string()
     };
@@ -1858,73 +1864,166 @@ fn handle_feishu_serve(req: &NodeRequest) -> Result<NodeResponse, String> {
     })
 }
 
-fn run_event_loop(server: tiny_http::Server) {
-    loop {
-        if SERVER_SHUTDOWN.load(Ordering::SeqCst) {
+/// One parsed webhook request. Hand-rolled instead of `tiny_http::Server`:
+/// tiny_http starts unnamed accept and connection-pool threads that
+/// `ServiceThreads` cannot register, so "0 registered threads" would be false
+/// evidence and `dlclose` could unmap code a hidden thread still runs (the
+/// reload SIGSEGV class). Everything here runs on the contracted `feishu.http`
+/// thread.
+fn read_webhook_request(
+    stream: &mut std::net::TcpStream,
+) -> Result<(String, String, Vec<u8>), String> {
+    use std::io::Read;
+    const MAX_HEAD_BYTES: usize = 64 * 1024;
+    const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
+    let mut buffer = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let head_end = loop {
+        if let Some(position) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
+            break position;
+        }
+        if buffer.len() > MAX_HEAD_BYTES {
+            return Err("request headers too large".to_string());
+        }
+        let read = stream
+            .read(&mut chunk)
+            .map_err(|e| format!("read headers: {e}"))?;
+        if read == 0 {
+            return Err("connection closed before request headers".to_string());
+        }
+        buffer.extend_from_slice(&chunk[..read]);
+    };
+    let head = String::from_utf8_lossy(&buffer[..head_end]).into_owned();
+    let mut lines = head.split("\r\n");
+    let request_line = lines
+        .next()
+        .ok_or_else(|| "missing request line".to_string())?;
+    let mut parts = request_line.split_whitespace();
+    let method = parts
+        .next()
+        .ok_or_else(|| "missing method".to_string())?
+        .to_string();
+    let path = parts
+        .next()
+        .ok_or_else(|| "missing path".to_string())?
+        .to_string();
+    let mut content_length = 0usize;
+    for line in lines {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if name.trim().eq_ignore_ascii_case("content-length") {
+            content_length = value
+                .trim()
+                .parse()
+                .map_err(|_| format!("bad content-length: {}", value.trim()))?;
+        }
+    }
+    if content_length > MAX_BODY_BYTES {
+        return Err(format!("request body too large: {content_length} bytes"));
+    }
+    let mut body = buffer[head_end + 4..].to_vec();
+    while body.len() < content_length {
+        let read = stream
+            .read(&mut chunk)
+            .map_err(|e| format!("read body: {e}"))?;
+        if read == 0 {
             break;
         }
-        let request = match server.recv_timeout(Duration::from_millis(500)) {
-            Ok(Some(r)) => r,
-            Ok(None) => continue,
-            Err(_) => break,
-        };
-        let url = request.url().to_string();
-        let method = request.method().clone();
+        body.extend_from_slice(&chunk[..read]);
+    }
+    body.truncate(content_length);
+    Ok((method, path, body))
+}
 
-        if url == "/health" {
-            let _ = request.respond(tiny_http::Response::from_string("ok"));
-            continue;
+fn write_webhook_response(stream: &mut std::net::TcpStream, status: u16, reason: &str, body: &str) {
+    use std::io::Write;
+    let response = format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let _ = stream.write_all(response.as_bytes());
+    let _ = stream.flush();
+}
+
+fn handle_webhook_request(stream: &mut std::net::TcpStream) {
+    let (method, path, raw_body) = match read_webhook_request(stream) {
+        Ok(request) => request,
+        Err(error) => {
+            eprintln!("[feishu] http request error: {error}");
+            write_webhook_response(stream, 400, "Bad Request", "bad body");
+            return;
         }
-        if url != "/feishu/event" || method != tiny_http::Method::Post {
-            let _ = request
-                .respond(tiny_http::Response::from_string("not found").with_status_code(404));
-            continue;
+    };
+    if path == "/health" {
+        write_webhook_response(stream, 200, "OK", "ok");
+        return;
+    }
+    if path != "/feishu/event" || method != "POST" {
+        write_webhook_response(stream, 404, "Not Found", "not found");
+        return;
+    }
+    let body = match String::from_utf8(raw_body) {
+        Ok(body) => body,
+        Err(_) => {
+            write_webhook_response(stream, 400, "Bad Request", "bad body");
+            return;
         }
+    };
 
-        let mut request = request;
-        let mut body = String::new();
-        if request.as_reader().read_to_string(&mut body).is_err() {
-            let _ =
-                request.respond(tiny_http::Response::from_string("bad body").with_status_code(400));
-            continue;
+    let (vtoken, ekey, bot) = {
+        let state = STATE.lock().unwrap_or_else(|poison| poison.into_inner());
+        (
+            state.verification_token.clone(),
+            state.encrypt_key.clone(),
+            state.bot_open_id.clone(),
+        )
+    };
+    let policy = current_policy();
+
+    match interpret_inbound(
+        &body,
+        vtoken.as_deref(),
+        ekey.as_deref(),
+        bot.as_deref(),
+        &policy,
+    ) {
+        InboundOutcome::Challenge(response) => {
+            write_webhook_response(stream, 200, "OK", &response);
         }
+        InboundOutcome::Rejected(reason) => {
+            eprintln!("[feishu] rejected: {reason}");
+            write_webhook_response(stream, 401, "Unauthorized", "unauthorized");
+        }
+        outcome => {
+            // Always 200 first so Feishu doesn't retry.
+            write_webhook_response(stream, 200, "OK", r#"{"code":0}"#);
+            process_outcome(outcome);
+        }
+    }
+}
 
-        let (vtoken, ekey, bot) = {
-            let s = STATE.lock().unwrap_or_else(|p| p.into_inner());
-            (
-                s.verification_token.clone(),
-                s.encrypt_key.clone(),
-                s.bot_open_id.clone(),
-            )
-        };
-        let policy = current_policy();
-
-        match interpret_inbound(
-            &body,
-            vtoken.as_deref(),
-            ekey.as_deref(),
-            bot.as_deref(),
-            &policy,
-        ) {
-            InboundOutcome::Challenge(resp) => {
-                let _ = request.respond(
-                    tiny_http::Response::from_string(resp).with_header(
-                        "Content-Type: application/json"
-                            .parse::<tiny_http::Header>()
-                            .unwrap(),
-                    ),
-                );
+fn run_event_loop(listener: std::net::TcpListener) {
+    // Non-blocking accept + 500 ms sleeps: the shutdown check runs every tick,
+    // so `join` does not have to wait out a blocking `accept()`.
+    let _ = listener.set_nonblocking(true);
+    loop {
+        if SERVER_SHUTDOWN.load(Ordering::SeqCst) || ServiceThreads::shutdown_requested() {
+            break;
+        }
+        match listener.accept() {
+            Ok((mut stream, _address)) => {
+                // Bound a slow client so a half-sent request cannot delay the
+                // join past its timeout.
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                handle_webhook_request(&mut stream);
             }
-            InboundOutcome::Rejected(reason) => {
-                eprintln!("[feishu] rejected: {reason}");
-                let _ = request.respond(
-                    tiny_http::Response::from_string("unauthorized").with_status_code(401),
-                );
+            Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(500));
             }
-            outcome => {
-                // Always 200 first so Feishu doesn't retry.
-                let _ = request.respond(tiny_http::Response::from_string(r#"{"code":0}"#));
-                process_outcome(outcome);
+            Err(error) => {
+                eprintln!("[feishu] server accept error: {error}");
+                thread::sleep(Duration::from_millis(100));
             }
         }
     }
@@ -1995,14 +2094,33 @@ fn enqueue_message(im: IncomingMessage) {
     queue.push_back(im);
 }
 
+/// Sleep in 100 ms slices, returning `false` when a shutdown was requested.
+/// Both the plugin's own stop flag and the runtime's unload signal
+/// (`ServiceThreads::join_all`) interrupt the wait, so a join does not have to
+/// run into its 5 s timeout.
+fn poller_wait(total: Duration) -> bool {
+    let mut remaining = total;
+    while !remaining.is_zero() {
+        if SERVER_SHUTDOWN.load(Ordering::SeqCst) || ServiceThreads::shutdown_requested() {
+            return false;
+        }
+        let slice = remaining.min(Duration::from_millis(100));
+        thread::sleep(slice);
+        remaining = remaining.saturating_sub(slice);
+    }
+    true
+}
+
 fn start_agent_poller() {
     if POLLER_STARTED.swap(true, Ordering::SeqCst) {
         return;
     }
-    thread::spawn(move || {
-        thread::sleep(Duration::from_secs(2));
+    let ticket = ServiceThreads::spawn("feishu.poller", move || {
+        if !poller_wait(Duration::from_secs(2)) {
+            return;
+        }
         loop {
-            if SERVER_SHUTDOWN.load(Ordering::SeqCst) {
+            if !poller_wait(Duration::from_secs(5)) {
                 break;
             }
             let msgs: Vec<IncomingMessage> = {
@@ -2021,9 +2139,29 @@ fn start_agent_poller() {
                 let envelope = build_envelope(&msg);
                 cordis_plugin_sdk::agent_trigger(&envelope);
             }
-            thread::sleep(Duration::from_secs(5));
         }
     });
+    if let Ok(mut guard) = POLLER_TICKET.lock() {
+        *guard = Some(ticket);
+    }
+}
+
+/// Join the event-loop thread (idempotent). Called from the plugin's `stop`
+/// branch and mirrored by the runtime's `ServiceThreads::join_all`.
+fn join_event_loop() {
+    if let Ok(mut guard) = EVENT_LOOP_TICKET.lock() {
+        if let Some(ticket) = guard.take() {
+            ticket.join();
+        }
+    }
+}
+
+fn join_agent_poller() {
+    if let Ok(mut guard) = POLLER_TICKET.lock() {
+        if let Some(ticket) = guard.take() {
+            ticket.join();
+        }
+    }
 }
 
 fn card_replies_enabled() -> bool {
@@ -2080,6 +2218,15 @@ fn should_process(msg: &IncomingMessage) -> bool {
     t.chars().count() > 1 || msg.has_media
 }
 
+/// Per-turn restatement of the turn contract. The session-start `system_hint`
+/// (`docs_value`) says the same thing, but on a long session that text sits
+/// hundreds of turns behind the generation point and the model drifts back to
+/// plain chat prose — the runtime then drops the whole turn as `no_tool_call`
+/// and nobody sees the reply. So the rule rides along with every envelope in
+/// the one-shot `notes` field (context only: never part of `display`, i.e.
+/// never part of the history text).
+const TURN_CONTRACT_NOTE: &str = r#"[turn contract: 这一轮必须以工具调用收尾——要回话就收尾于 {"action":"respond","message":"<回复正文>"}（也可以自己调 feishu_send 主动发）；不说话就 {"action":"suspend"}。只写正文、一次工具都不调，整轮会被 runtime 判 no_tool_call 丢弃，聊天里一个字也看不到。]"#;
+
 /// Build the runtime routing envelope for a message.
 fn build_envelope(msg: &IncomingMessage) -> String {
     let reply_target = format!("chat:{}", msg.chat_id);
@@ -2119,6 +2266,8 @@ fn build_envelope(msg: &IncomingMessage) -> String {
         "conversation_kind": scope,
         "message_type": msg.message_type,
         "has_media": msg.has_media,
+        // One-shot per-turn context, deliberately NOT part of `display`.
+        "notes": TURN_CONTRACT_NOTE,
     });
     // Prefer threaded reply if the message is in a thread.
     if let Some(root) = &msg.root_id {
@@ -2248,12 +2397,15 @@ fn docs_value() -> cordis_plugin_sdk::PluginDocs {
             ).with_agent_accessible(),
         ],
         Some(
-            "You are chatting in Feishu (Lark). Each incoming message is prefixed with its source, e.g. \"[Feishu group from <chat_id> (user <open_id>)]: <text>\"; when the speaker's display name could be resolved the identity reads (user <open_id>, name \"<name>\").\n\
+            "【先看是哪个渠道】本条消息前缀是 \"[Feishu ...]\"、或本轮的发送工具是 feishu_send → 这是飞书会话,下面这张卡适用。\n\
+否则(比如前缀是 \"[QQ ...]\"、说话走 qq_send 等别的工具)→ 不是飞书会话,本卡\"最终输出必须是一个 JSON 对象\"的规则不适用于它:按那个渠道自己的卡片走(它自己的发送工具 / suspend),也绝不要只写正文就结束、一个工具都不调。\n\
+You are chatting in Feishu (Lark). Each incoming message is prefixed with its source, e.g. \"[Feishu group from <chat_id> (user <open_id>)]: <text>\"; when the speaker's display name could be resolved the identity reads (user <open_id>, name \"<name>\").\n\
 If an open_id has no name and you need to know who it is, call invoke_plugin(feishu, feishu_get_chat_members, {\"node_id\":\"feishu_get_chat_members\",\"payload\":{\"chat_id\":\"<chat_id>\"}}) to list group members with their names.\n\
-Your FINAL output each turn MUST be exactly one JSON object:\n\
-  {\"action\":\"respond\",\"message\":\"<reply text>\"}  — to reply to the chat, OR\n\
+In a Feishu session the normal way to reply is to end the turn with exactly one JSON object:\n\
+  {\"action\":\"respond\",\"message\":\"<reply text>\"}  — to reply to the chat (the runtime routes it back to the originating Feishu chat automatically), OR\n\
   {\"action\":\"suspend\"}  — when no reply is warranted.\n\
-The runtime routes your \"respond\" back to the originating Feishu chat automatically; do NOT call feishu_send yourself for the direct reply.\n\
+Calling feishu_send / feishu_send_image / feishu_fetch_resource / feishu_fetch_image DURING the turn is allowed and expected (progress updates, extra messages, media); the respond envelope is the normal reply path, it does not forbid those tools.\n\
+Ending a turn with bare prose and no tool call at all (只写正文、一次工具都不调) is exactly what gets the turn dropped as no_tool_call — nobody sees it, so always finish with a tool call.\n\
 To proactively send an extra message (e.g. a progress update) to a chat: invoke_plugin(feishu, feishu_send, {\"node_id\":\"feishu_send\",\"target\":\"chat:<chat_id>\",\"message\":\"<text>\"}).\n\
 When you receive a media placeholder like \"[image file_key=...]\", \"[file file_key=... name=...]\", \"[audio ...]\", \"[video ...]\" or \"[sticker ...]\", the resource is not inlined: read the message_id from the display prefix's msg=<message_id>, then call invoke_plugin(feishu, feishu_fetch_resource, {\"node_id\":\"feishu_fetch_resource\",\"payload\":{\"message_id\":\"<id>\",\"file_key\":\"<key>\",\"type\":\"image|file\"}}) to get a local {path}. Use type=image for image placeholders (image messages and post img runs) and type=file for file/audio/video/sticker.\n\
 Keep replies concise and helpful; a short honest \"not sure\" beats a long wrong answer.",
@@ -2271,9 +2423,129 @@ export_plugin_api! {
     handle = api_handle,
 }
 
+// `allow_plugin_unload!()` is honest here: the webhook accept loop, the
+// long-connection WS loop and the agent poller are all spawned through
+// `ServiceThreads::spawn`. The webhook mode used to be `tiny_http::Server`,
+// which starts unnamed accept/task-pool threads the contract cannot register;
+// `run_event_loop` now owns a plain `TcpListener` on its contracted thread.
+cordis_plugin_sdk::allow_plugin_unload!();
+
 // ---------------------------------------------------------------------------
 // Tests (no network)
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod webhook_server_tests {
+    use super::{handle_webhook_request, read_webhook_request};
+    use std::io::{Read, Write};
+    use std::net::{Shutdown, TcpListener, TcpStream};
+    use std::thread;
+    use std::time::Duration;
+
+    /// Feed `request` to `handle_webhook_request` over a loopback socket and
+    /// return the raw response.
+    fn round_trip(request: &'static [u8]) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let addr = listener.local_addr().expect("addr");
+        let client = thread::spawn(move || {
+            let mut stream = TcpStream::connect(addr).expect("connect");
+            stream.write_all(request).expect("write request");
+            stream.shutdown(Shutdown::Write).expect("shutdown write");
+            let mut response = String::new();
+            stream.read_to_string(&mut response).expect("read response");
+            response
+        });
+        let (mut stream, _) = listener.accept().expect("accept");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("read timeout");
+        handle_webhook_request(&mut stream);
+        drop(stream);
+        client.join().expect("client")
+    }
+
+    fn parse(request: &'static [u8]) -> Result<(String, String, Vec<u8>), String> {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let addr = listener.local_addr().expect("addr");
+        let client = thread::spawn(move || {
+            let mut stream = TcpStream::connect(addr).expect("connect");
+            // The server may reject before reading the whole request.
+            let _ = stream.write_all(request);
+            let _ = stream.shutdown(Shutdown::Write);
+        });
+        let (mut stream, _) = listener.accept().expect("accept");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("read timeout");
+        let parsed = read_webhook_request(&mut stream);
+        drop(stream);
+        client.join().expect("client");
+        parsed
+    }
+
+    #[test]
+    fn parses_method_path_and_body() {
+        let (method, path, body) = parse(
+            b"POST /feishu/event HTTP/1.1\r\nContent-Length: 15\r\n\r\n{\"type\":\"x\"}1",
+        )
+        .expect("request must parse");
+        assert_eq!(method, "POST");
+        assert_eq!(path, "/feishu/event");
+        assert_eq!(body, b"{\"type\":\"x\"}1");
+    }
+
+    #[test]
+    fn rejects_a_connection_closed_before_headers() {
+        let error = parse(b"POST /feishu/event").expect_err("partial request must fail");
+        assert!(error.contains("closed"), "{error}");
+    }
+
+    #[test]
+    fn rejects_bad_content_length() {
+        let error = parse(b"POST /feishu/event HTTP/1.1\r\nContent-Length: nope\r\n\r\n")
+            .expect_err("bad content-length must fail");
+        assert!(error.contains("bad content-length"), "{error}");
+    }
+
+    #[test]
+    fn rejects_oversized_body_declaration() {
+        let error = parse(b"POST /feishu/event HTTP/1.1\r\nContent-Length: 20000000\r\n\r\n")
+            .expect_err("oversized body must fail");
+        assert!(error.contains("body too large"), "{error}");
+    }
+
+    #[test]
+    fn health_route_responds_ok() {
+        let response = round_trip(b"GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+        assert!(response.ends_with("ok"), "{response}");
+    }
+
+    #[test]
+    fn unknown_route_is_not_found() {
+        let response = round_trip(b"GET /nope HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        assert!(response.starts_with("HTTP/1.1 404 Not Found"), "{response}");
+        assert!(response.contains("not found"), "{response}");
+    }
+
+    #[test]
+    fn malformed_request_line_is_bad_request() {
+        let response = round_trip(b"garbage\r\n\r\n");
+        assert!(
+            response.starts_with("HTTP/1.1 400 Bad Request"),
+            "{response}"
+        );
+    }
+
+    #[test]
+    fn invalid_utf8_body_is_bad_request() {
+        let response = round_trip(b"POST /feishu/event HTTP/1.1\r\nContent-Length: 1\r\n\r\n\xff");
+        assert!(
+            response.starts_with("HTTP/1.1 400 Bad Request"),
+            "{response}"
+        );
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -3400,6 +3672,76 @@ mod tests {
                 "{chat_type} media={has_media} name={sender_name:?}"
             );
         }
+    }
+
+    // ---- Per-turn turn-contract note ------------------------------------
+
+    fn envelope_of(im: &IncomingMessage) -> Value {
+        serde_json::from_str(&build_envelope(im)).unwrap()
+    }
+
+    // 每一种 envelope（群 / 私聊 / 媒体）都必须带 notes，并在里面重申这一轮
+    // 的收尾约定：respond / suspend / 只写正文 三条都要在。
+    #[test]
+    fn envelope_notes_restate_the_turn_contract() {
+        let cases = [
+            display_msg("group", false, None),
+            display_msg("p2p", false, None),
+            display_msg("group", true, None),
+            display_msg("p2p", true, Some("小明")),
+        ];
+        for im in cases {
+            let env = envelope_of(&im);
+            let notes = env["notes"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{} envelope must carry notes", im.chat_type));
+            for needle in ["respond", "suspend", "只写正文", "feishu_send", "no_tool_call"] {
+                assert!(
+                    notes.contains(needle),
+                    "notes must repeat {needle:?}, got: {notes}"
+                );
+            }
+            // One line only — a per-turn hint must stay short.
+            assert!(!notes.contains('\n'), "notes must stay one line: {notes}");
+        }
+    }
+
+    // notes 是每轮一次的上下文，不能混进 display（display 是历史正文）。
+    #[test]
+    fn envelope_notes_never_leak_into_display() {
+        for im in [
+            display_msg("group", false, None),
+            display_msg("p2p", false, Some("小明")),
+            display_msg("group", true, None),
+        ] {
+            let env = envelope_of(&im);
+            let display = env["display"].as_str().unwrap();
+            let notes = env["notes"].as_str().unwrap();
+            assert!(!display.contains("turn contract"), "display: {display}");
+            assert!(!display.contains(notes), "display must not embed notes");
+            assert!(!display.contains("no_tool_call"), "display: {display}");
+            // No other field echoes the note either.
+            for (key, value) in env.as_object().unwrap() {
+                if key == "notes" {
+                    continue;
+                }
+                assert!(
+                    !value.to_string().contains("turn contract"),
+                    "only notes may carry the contract, but {key} does"
+                );
+            }
+        }
+    }
+
+    // 群消息和私聊消息一样，每轮都附上约定。
+    #[test]
+    fn turn_contract_note_is_attached_for_group_and_private_alike() {
+        let group = envelope_of(&display_msg("group", false, None));
+        let private = envelope_of(&display_msg("p2p", false, None));
+        assert_eq!(group["notes"], private["notes"]);
+        assert_eq!(group["notes"].as_str().unwrap(), TURN_CONTRACT_NOTE);
+        assert_eq!(private["conversation_kind"], "private");
+        assert_eq!(group["conversation_kind"], "group");
     }
 
     // A resolved name must not disturb the routing/identity fields.

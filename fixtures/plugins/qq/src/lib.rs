@@ -5,20 +5,24 @@
 //!
 //! Nodes:
 //! - `qq_entry`         — original multi-action entry (configure/send/status/call/block/unblock)
-//! - `qq_serve`         — Task node: starts HTTP server to receive OneBot events
+//! - `qq_serve`         — starts the HTTP server (and the poller) that receives OneBot events
+//! - `qq_ws_serve`      — same, over the OneBot reverse-WebSocket connection
 //! - `qq_fetch_messages` — return queued incoming messages (agent polls this)
 //! - `qq_send`          — send a message to a group or private chat
 //! - `qq_group_requests` — list / approve / reject pending group requests
 //!                          (加群申请 / 邀请入群)
+//! - `qq_get_sent`      — read back what the bot itself sent to a group
+//!                        (`data/qq_sent/<group>.jsonl`, written by `qq_send`)
 //!
 //! 存图：群消息里的图片除了交给 kernel 内联，还会同步落盘到
 //! `data/media/<群号>/`（`spawn_media_archive`）。不想要就写
 //! `data/qq_media_archive.json`：`{"enabled": false}`，只想存部分群就写
 //! `{"groups": ["<群号>"]}`。
 
+use cordis_plugin_sdk::service_threads::{ServiceThreads, ThreadTicket};
 use cordis_plugin_sdk::{
-    export_plugin_api, json_response, node_doc, plugin_docs, task_node_doc, AbiFingerprint,
-    PluginRequest, PluginResponse,
+    export_plugin_api, json_response, node_doc, plugin_docs, AbiFingerprint, PluginRequest,
+    PluginResponse,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -186,15 +190,18 @@ const PENDING_REQUEST_CAP: usize = 32;
 static SERVER_RUNNING: Mutex<bool> = Mutex::new(false);
 
 static SERVER_SHUTDOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-static EVENT_LOOP_HANDLE: Mutex<Option<std::thread::JoinHandle<()>>> = Mutex::new(None);
+/// Ticket for the HTTP accept thread. Registered with the SDK so the runtime
+/// can join it before unloading `qq.so` (see `ServiceThreads`).
+static EVENT_LOOP_TICKET: Mutex<Option<ThreadTicket>> = Mutex::new(None);
 
 /// WebSocket reverse-connection server state (Napcat connects here as a WS
 /// client). Kept separate from the HTTP server's SERVER_SHUTDOWN /
-/// EVENT_LOOP_HANDLE / SERVER_RUNNING so stopping one server never trips the
+/// EVENT_LOOP_TICKET / SERVER_RUNNING so stopping one server never trips the
 /// other's accept loop.
 static WS_SERVER_SHUTDOWN: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
-static WS_SERVER_HANDLE: Mutex<Option<std::thread::JoinHandle<()>>> = Mutex::new(None);
+/// Ticket for the WebSocket accept thread (joinable by the runtime).
+static WS_SERVER_TICKET: Mutex<Option<ThreadTicket>> = Mutex::new(None);
 /// WebSocket server running flag — makes repeated qq_ws_serve start idempotent.
 static WS_SERVER_RUNNING: Mutex<bool> = Mutex::new(false);
 
@@ -227,9 +234,10 @@ static POLLER_STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::Atomic
 /// (SIGSEGV, observed 2026-10-27).
 static POLLER_SHUTDOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Handle of the running poller thread, so `stop` can join it instead of
-/// leaving it to race with the reload that is unloading this dylib.
-static POLLER_HANDLE: std::sync::OnceLock<Mutex<Option<std::thread::JoinHandle<()>>>> =
+/// Ticket of the running poller thread, so `stop` — and the runtime before it
+/// unloads this dylib — can join it instead of leaving it to race with the
+/// unload.
+static POLLER_TICKET: std::sync::OnceLock<Mutex<Option<ThreadTicket>>> =
     std::sync::OnceLock::new();
 
 // ---------------------------------------------------------------------------
@@ -437,6 +445,15 @@ struct NodeRequest {
     /// `qq_group_requests reject`: optional refusal note.
     #[serde(default)]
     reason: Option<String>,
+    /// `qq_get_sent`: how many of the most recent sends to return (default 50,
+    /// capped at 500). Accepted as a number or a numeric string.
+    #[serde(default)]
+    limit: Option<Value>,
+    /// `qq_recall`: the message to delete, accepted at the top level (number or
+    /// string) as well as in `payload.message_id` — a direct invoke often
+    /// carries the bare id there.
+    #[serde(default)]
+    message_id: Option<Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -893,97 +910,231 @@ fn handle_call(req: QqRequest) -> Result<QqResponse, String> {
 
 fn stop_qq_serve() {
     SERVER_SHUTDOWN.store(true, Ordering::SeqCst);
-    if let Ok(mut guard) = EVENT_LOOP_HANDLE.lock() {
-        if let Some(handle) = guard.take() {
-            let _ = handle.join();
+    if let Ok(mut guard) = EVENT_LOOP_TICKET.lock() {
+        if let Some(ticket) = guard.take() {
+            ticket.join();
         }
     }
     SERVER_SHUTDOWN.store(false, Ordering::SeqCst);
 }
 
-fn run_event_loop(server: tiny_http::Server) {
-    loop {
-        if SERVER_SHUTDOWN.load(Ordering::SeqCst) {
+/// One parsed HTTP/1.1 request from the OneBot webhook.
+///
+/// The server is hand-rolled instead of `tiny_http::Server`: tiny_http starts
+/// its own unnamed accept thread *and* a pool of connection threads. Neither is
+/// visible to `ServiceThreads`, so `_cordis_live_service_threads() == 0` would
+/// be false evidence and `dlclose` would unmap code a hidden thread is still
+/// running — the reload SIGSEGV class. This loop runs entirely on the
+/// contracted `qq.http` thread, so joining that thread really does mean "no
+/// code from this image is executing".
+#[derive(Debug)]
+struct HttpRequest {
+    method: String,
+    path: String,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+}
+
+impl HttpRequest {
+    /// Header lookup is case-insensitive (`X-Signature` / `x-signature`).
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    }
+}
+
+/// Read one request. Headers are capped at 64 KiB and bodies at 16 MiB so a
+/// hostile client cannot grow the plugin's heap without bound.
+fn read_http_request(stream: &mut std::net::TcpStream) -> Result<HttpRequest, String> {
+    use std::io::Read;
+    const MAX_HEAD_BYTES: usize = 64 * 1024;
+    const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
+    let mut buffer = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let head_end = loop {
+        if let Some(position) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
+            break position;
+        }
+        if buffer.len() > MAX_HEAD_BYTES {
+            return Err("request headers too large".to_string());
+        }
+        let read = stream
+            .read(&mut chunk)
+            .map_err(|e| format!("read headers: {e}"))?;
+        if read == 0 {
+            return Err("connection closed before request headers".to_string());
+        }
+        buffer.extend_from_slice(&chunk[..read]);
+    };
+    let head = String::from_utf8_lossy(&buffer[..head_end]).into_owned();
+    let mut lines = head.split("\r\n");
+    let request_line = lines
+        .next()
+        .ok_or_else(|| "missing request line".to_string())?;
+    let mut parts = request_line.split_whitespace();
+    let method = parts
+        .next()
+        .ok_or_else(|| "missing method".to_string())?
+        .to_string();
+    let path = parts
+        .next()
+        .ok_or_else(|| "missing path".to_string())?
+        .to_string();
+    let mut headers = Vec::new();
+    let mut content_length = 0usize;
+    for line in lines {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        let name = name.trim().to_ascii_lowercase();
+        let value = value.trim().to_string();
+        if name == "content-length" {
+            content_length = value
+                .parse()
+                .map_err(|_| format!("bad content-length: {value}"))?;
+        }
+        headers.push((name, value));
+    }
+    if content_length > MAX_BODY_BYTES {
+        return Err(format!("request body too large: {content_length} bytes"));
+    }
+    let mut body = buffer[head_end + 4..].to_vec();
+    while body.len() < content_length {
+        let read = stream
+            .read(&mut chunk)
+            .map_err(|e| format!("read body: {e}"))?;
+        if read == 0 {
             break;
         }
-        match server.recv_timeout(Duration::from_millis(500)) {
-            Ok(Some(mut request)) => {
-                if request.url() == "/onebot/event" && request.method() == &tiny_http::Method::Post
-                {
-                    // P0-23: OneBot v11 signs the request body with HMAC-SHA1
-                    // keyed by `access_token`, and passes it in the
-                    // `X-Signature: sha1=<hex>` header. If a token is
-                    // configured we MUST verify — otherwise anyone who can
-                    // reach the port could push arbitrary "user messages"
-                    // into the agent.  If no token is configured, log a
-                    // warning and accept (backwards-compat with dev setups);
-                    // production deployments should always set access_token.
-                    let signature_header = request
-                        .headers()
-                        .iter()
-                        .find(|h| h.field.equiv("X-Signature"))
-                        .map(|h| h.value.as_str().to_string());
-                    let mut body = String::new();
-                    if request.as_reader().read_to_string(&mut body).is_ok() {
-                        let expected_token = STATE
-                            .lock()
-                            .ok()
-                            .and_then(|s| s.access_token.clone())
-                            .or_else(|| {
-                                load_runtime_config()
-                                    .and_then(|c| c.get("access_token")?.as_str().map(String::from))
-                            });
-                        if let Some(token) = expected_token.as_deref() {
-                            let ok = signature_header
-                                .as_deref()
-                                .map(|s| verify_onebot_signature(token, body.as_bytes(), s))
-                                .unwrap_or(false);
-                            if !ok {
-                                eprintln!("[qq] webhook signature check failed");
-                                let _ = request.respond(
-                                    tiny_http::Response::from_string("bad signature")
-                                        .with_status_code(401),
-                                );
-                                continue;
-                            }
-                        } else {
-                            eprintln!(
-                                "[qq] warning: /onebot/event received with no access_token \
-                                 configured; accepting without signature check"
-                            );
-                        }
-                        let _ = request.respond(tiny_http::Response::from_string(
-                            serde_json::to_string(&json!({"status":"ok"})).unwrap_or_default(),
-                        ));
-                        if let Ok(event) = serde_json::from_str::<OneBotEvent>(&body) {
-                            handle_onebot_event(&event);
-                        }
-                    } else {
-                        let _ = request.respond(
-                            tiny_http::Response::from_string("bad request").with_status_code(400),
-                        );
-                    }
-                } else if request.url() == "/health" {
-                    let _ = request.respond(tiny_http::Response::from_string(
-                        // P2-35: unwrap_or_default keeps the response body
-                        // empty on a JSON-encode failure rather than panic
-                        // the whole event loop.
-                        serde_json::to_string(&json!({"status":"ok"})).unwrap_or_default(),
-                    ));
-                } else {
-                    let _ = request.respond(
-                        tiny_http::Response::from_string("not found").with_status_code(404),
-                    );
-                }
+        body.extend_from_slice(&chunk[..read]);
+    }
+    body.truncate(content_length);
+    Ok(HttpRequest {
+        method,
+        path,
+        headers,
+        body,
+    })
+}
+
+fn write_http_response(
+    stream: &mut std::net::TcpStream,
+    status: u16,
+    reason: &str,
+    content_type: &str,
+    body: &str,
+) {
+    use std::io::Write;
+    let response = format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let _ = stream.write_all(response.as_bytes());
+    let _ = stream.flush();
+}
+
+/// P0-23: OneBot v11 signs the request body with HMAC-SHA1 keyed by
+/// `access_token`, passed in `X-Signature: sha1=<hex>`. If a token is
+/// configured we MUST verify — otherwise anyone who can reach the port could
+/// push arbitrary "user messages" into the agent. No token = dev setup: accept
+/// and warn (production must set access_token).
+fn webhook_signature_ok(expected_token: Option<&str>, signature: Option<&str>, body: &[u8]) -> bool {
+    expected_token.is_none_or(|token| {
+        signature.is_some_and(|value| verify_onebot_signature(token, body, value))
+    })
+}
+
+fn handle_http_request(stream: &mut std::net::TcpStream) {
+    let request = match read_http_request(stream) {
+        Ok(request) => request,
+        Err(error) => {
+            eprintln!("[qq] http request error: {error}");
+            write_http_response(stream, 400, "Bad Request", "text/plain", "bad request");
+            return;
+        }
+    };
+    if request.path == "/health" {
+        // P2-35: unwrap_or_default keeps the response body empty on a
+        // JSON-encode failure rather than panic the whole event loop.
+        let body = serde_json::to_string(&json!({"status":"ok"})).unwrap_or_default();
+        write_http_response(stream, 200, "OK", "application/json", &body);
+        return;
+    }
+    if request.path != "/onebot/event" || request.method != "POST" {
+        write_http_response(stream, 404, "Not Found", "text/plain", "not found");
+        return;
+    }
+    let expected_token = STATE
+        .lock()
+        .ok()
+        .and_then(|state| state.access_token.clone())
+        .or_else(|| {
+            load_runtime_config().and_then(|config| {
+                config.get("access_token")?.as_str().map(String::from)
+            })
+        });
+    let signature_ok = webhook_signature_ok(
+        expected_token.as_deref(),
+        request.header("x-signature"),
+        &request.body,
+    );
+    if !signature_ok {
+        eprintln!("[qq] webhook signature check failed");
+        write_http_response(stream, 401, "Unauthorized", "text/plain", "bad signature");
+        return;
+    }
+    if expected_token.is_none() {
+        eprintln!(
+            "[qq] warning: /onebot/event received with no access_token \
+             configured; accepting without signature check"
+        );
+    }
+    let body = match String::from_utf8(request.body) {
+        Ok(body) => body,
+        Err(_) => {
+            write_http_response(stream, 400, "Bad Request", "text/plain", "bad request");
+            return;
+        }
+    };
+    // Ack first: OneBot must see `ok` even if parsing/handling fails below.
+    let ack = serde_json::to_string(&json!({"status":"ok"})).unwrap_or_default();
+    write_http_response(stream, 200, "OK", "application/json", &ack);
+    if let Ok(event) = serde_json::from_str::<OneBotEvent>(&body) {
+        handle_onebot_event(&event);
+    }
+}
+
+fn run_event_loop(listener: std::net::TcpListener) {
+    // Non-blocking accept + 500 ms sleeps: the loop checks the shutdown flags
+    // every tick, so `join` does not have to wait out a blocking `accept()`.
+    let _ = listener.set_nonblocking(true);
+    loop {
+        // Stop on the plugin's own flag or on the runtime's unload signal
+        // (`ServiceThreads::join_all`); either way the thread must be gone
+        // before `qq.so` is unmapped.
+        if SERVER_SHUTDOWN.load(Ordering::SeqCst) || ServiceThreads::shutdown_requested() {
+            break;
+        }
+        match listener.accept() {
+            Ok((mut stream, _address)) => {
+                // Bound a slow client so a half-sent request cannot delay the
+                // join past its timeout.
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                handle_http_request(&mut stream);
             }
-            Ok(None) => {}
-            Err(e) => {
-                eprintln!("[qq] server recv error: {e}");
-                break;
+            Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(500));
+            }
+            Err(error) => {
+                eprintln!("[qq] server accept error: {error}");
+                thread::sleep(Duration::from_millis(100));
             }
         }
     }
 }
+
 // P1-40 had removed the WebSocket reverse-connection code as unwired dead
 // code. It is restored below and wired through the node dispatch, because
 // production Napcat connects over a WS port rather than posting HTTP webhooks.
@@ -1003,7 +1154,7 @@ fn start_ws_server(listener: std::net::TcpListener, port: u16) -> Result<(), Str
         .map_err(|e| format!("ws: set_nonblocking: {e}"))?;
     eprintln!("[qq] WebSocket server listening on port {port}");
     loop {
-        if WS_SERVER_SHUTDOWN.load(Ordering::SeqCst) {
+        if WS_SERVER_SHUTDOWN.load(Ordering::SeqCst) || ServiceThreads::shutdown_requested() {
             eprintln!("[qq] WebSocket server shutting down");
             break;
         }
@@ -1040,7 +1191,7 @@ fn start_ws_server(listener: std::net::TcpListener, port: u16) -> Result<(), Str
 /// go through the same dedup / whitelist / envelope machinery as HTTP.
 fn handle_ws_connection(mut ws: tungstenite::WebSocket<std::net::TcpStream>) {
     loop {
-        if WS_SERVER_SHUTDOWN.load(Ordering::SeqCst) {
+        if WS_SERVER_SHUTDOWN.load(Ordering::SeqCst) || ServiceThreads::shutdown_requested() {
             let _ = ws.close(None);
             break;
         }
@@ -1084,9 +1235,9 @@ fn handle_ws_connection(mut ws: tungstenite::WebSocket<std::net::TcpStream>) {
 /// state so a later start can rebind the port cleanly.
 fn stop_qq_ws_serve() {
     WS_SERVER_SHUTDOWN.store(true, Ordering::SeqCst);
-    if let Ok(mut guard) = WS_SERVER_HANDLE.lock() {
-        if let Some(handle) = guard.take() {
-            let _ = handle.join();
+    if let Ok(mut guard) = WS_SERVER_TICKET.lock() {
+        if let Some(ticket) = guard.take() {
+            ticket.join();
         }
     }
     WS_SERVER_SHUTDOWN.store(false, Ordering::SeqCst);
@@ -1964,7 +2115,9 @@ fn spawn_media_archive(
         .collect();
     // 名字是 spawn 就得真的 spawn：下载在 OneBot 事件线程上做，一张 20MB 图
     // （或一个 10s 超时）会把收消息整个堵住。
-    std::thread::spawn(move || media_archive_fetch_all(&targets));
+    let _ticket = ServiceThreads::spawn("qq.media-archive", move || {
+        media_archive_fetch_all(&targets)
+    });
     Some(dir)
 }
 
@@ -1991,6 +2144,146 @@ fn media_archive_download(url: &str, path: &std::path::Path) -> Result<(), Strin
         .read_to_end(&mut body)
         .map_err(|e| format!("read body: {e}"))?;
     std::fs::write(path, &body).map_err(|e| format!("write {}: {e}", path.display()))
+}
+
+// ── 出站记录（qq_sent）──────────────────────────────────────────────────
+//
+// 入站消息有 envelope 交给模型，出站消息却只活在 QQ 客户端里：换一轮会话，
+// 模型就不知道自己上一条说了什么。所以 `qq_send` 每次**成功**发出后追加一
+// 行 JSON 到 `data/qq_sent/<群号>.jsonl`（一个群一个文件，私聊写
+// `private-<uid>.jsonl`），`qq_get_sent` 只读这一条路径读回来。
+//
+// 两条硬性约束：
+//   1. 记录是旁路——写盘失败只打一行日志，已经发出去的消息不能因此变成
+//      "发送失败"（[`record_sent_message`] 永不返回错误）。
+//   2. 读路径不接受任意文件名——文件名永远由群号（清洗后）拼出来，
+//      `qq_get_sent` 没有 path 参数，所以既不会目录穿越，也不会顺手读到
+//      别人的数据。
+
+/// `qq_get_sent` 缺省返回条数。
+const SENT_HISTORY_DEFAULT_LIMIT: usize = 50;
+
+/// `qq_get_sent` 硬上限：再多也不给，避免一次把上下文塞满。
+const SENT_HISTORY_MAX_LIMIT: usize = 500;
+
+/// 一条出站记录（落盘一行）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct SentRecord {
+    /// 发送目标，原样保留：`group:<id>` / `private:<id>`。
+    target: String,
+    /// 发出的正文（CQ 码原样）。
+    message: String,
+    /// 发出时刻，unix ms。
+    at_ms: u64,
+    /// OneBot 回的 message_id；渠道没给就是 null。
+    msg_id: Option<i64>,
+}
+
+/// `data/qq_sent/`（路径解析与其它 data 文件一致）。
+fn sent_history_dir(data_dir: Option<&str>) -> std::path::PathBuf {
+    data_path(data_dir, "qq_sent")
+}
+
+/// 会话 → 文件名成分：群消息用群号，私聊用 `private-<uid>`。
+fn sent_history_bucket(kind: TargetKind, id: i64) -> String {
+    match kind {
+        TargetKind::Group => id.to_string(),
+        TargetKind::Private => format!("private-{id}"),
+    }
+}
+
+/// `<data>/qq_sent/<bucket>.jsonl`。`bucket` 一定先经
+/// [`sanitize_path_component`]，所以结果永远是数据目录下的单层文件名。
+fn sent_history_path(data_dir: Option<&str>, bucket: &str) -> std::path::PathBuf {
+    sent_history_dir(data_dir).join(format!("{}.jsonl", sanitize_path_component(bucket)))
+}
+
+/// 追加一条出站记录。**永不失败**：磁盘满 / 目录被占 / 编码失败都只打一行
+/// 日志——记录历史是旁路，不能把已经发出去的消息报成失败。
+fn record_sent_message(
+    data_dir: Option<&str>,
+    target: &str,
+    bucket: &str,
+    message: &str,
+    msg_id: Option<i64>,
+) {
+    let record = SentRecord {
+        target: target.to_string(),
+        message: message.to_string(),
+        at_ms: now_ms(),
+        msg_id,
+    };
+    let Ok(line) = serde_json::to_string(&record) else {
+        return;
+    };
+    let path = sent_history_path(data_dir, bucket);
+    if let Some(parent) = path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            eprintln!("[qq] sent history: create {}: {e}", parent.display());
+            return;
+        }
+    }
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        Ok(mut file) => {
+            use std::io::Write;
+            if let Err(e) = writeln!(file, "{line}") {
+                eprintln!("[qq] sent history: append {}: {e}", path.display());
+            }
+        }
+        Err(e) => eprintln!("[qq] sent history: open {}: {e}", path.display()),
+    }
+}
+
+/// 最近 `limit` 条记录，按时间升序（最旧在前）。文件不存在 → 空数组。
+///
+/// 落盘顺序就是时间顺序，所以只切尾部；坏行（半行 / 手改坏）跳过，一条坏
+/// 记录不能让整份历史读不出来。
+fn read_sent_history(data_dir: Option<&str>, bucket: &str, limit: usize) -> Vec<SentRecord> {
+    let Ok(raw) = std::fs::read_to_string(sent_history_path(data_dir, bucket)) else {
+        return Vec::new();
+    };
+    let mut records: Vec<SentRecord> = raw
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .filter_map(|line| serde_json::from_str::<SentRecord>(line).ok())
+        .collect();
+    let start = records.len().saturating_sub(limit);
+    records.drain(..start);
+    records
+}
+
+/// `group` 入参归一化：模型常把 `reply_target` 整串抄过来，所以
+/// `group:123456` 与 `123456` 等价。
+fn sent_history_group(raw: &str) -> String {
+    let trimmed = raw.trim();
+    trimmed
+        .strip_prefix("group:")
+        .unwrap_or(trimmed)
+        .trim()
+        .to_string()
+}
+
+/// `limit` 入参：payload 优先、顶层字段兜底；缺省 50，上限 500。
+/// 数字和数字字符串都接受，其它给可读错误。
+fn node_limit_arg(payload: Option<&Value>, top_level: Option<&Value>) -> Result<usize, String> {
+    let raw = payload
+        .and_then(|p| p.get("limit"))
+        .or(top_level)
+        .filter(|value| !value.is_null());
+    let Some(raw) = raw else {
+        return Ok(SENT_HISTORY_DEFAULT_LIMIT);
+    };
+    let parsed = match raw {
+        Value::Number(number) => number.as_u64(),
+        Value::String(text) => text.trim().parse::<u64>().ok(),
+        _ => None,
+    };
+    let limit = parsed.ok_or_else(|| format!("limit must be a non-negative integer, got {raw}"))?;
+    Ok(limit.min(SENT_HISTORY_MAX_LIMIT as u64) as usize)
 }
 
 /// 从渲染后的正文里按顺序收集 `[image: <url>]` 里的 URL。
@@ -2109,6 +2402,16 @@ fn build_envelope(msg: &IncomingMessage) -> String {
         notes.push(' ');
         notes.push_str(&mute_note(until, now_ms()));
     }
+    // 工具契约每轮重申一次：卡片只在会话开头注入，几百轮后离生成点太远，
+    // 模型会写一行正文就停（runtime 判 no_tool_call，整轮丢弃）。
+    // `notes` 随每条消息下发、且不写进 history，是唯一每轮都在场的槽位。
+    //
+    // 只说"必须以工具调用收尾"不够：第 338 轮那个失败样例里，模型记不住
+    // `qq_send` 的参数名，就把想说的话写成正文交上去了。契约自己必须带一个
+    // **可照抄**的调用形状，并且说清正文不会被转发/补发。
+    notes.push_str(
+        " [turn contract: 这一轮必须以工具调用收尾。要说话就把想说的字全部放进 message，照抄这个形状：{\"node_id\":\"qq_send\",\"target\":\"<上面的 reply target>\",\"message\":\"<你要说的那句话>\"}；不说话、本群不允许发言或被禁言，就用 {\"node_id\":\"suspend\"} 收尾。只写正文、不带任何工具调用，运行时不会转发也不会替你补发：整轮按 no_tool_call 丢弃，群里一个字也看不到。]",
+    );
     let session_key = format!("qq:{reply_target}");
     // 有展示名就带上（群名片/昵称，已清洗）；没有则保持旧格式。名字插在
     // `(user <uid>` 之后、`)` 之前，所以 runtime 按 "(user " 切分还原 gid 的
@@ -2181,7 +2484,7 @@ fn start_agent_poller() {
         return;
     }
     POLLER_SHUTDOWN.store(false, Ordering::SeqCst);
-    let handle = thread::spawn(move || {
+    let ticket = ServiceThreads::spawn("qq.poller", move || {
         // Sliced sleeps so `stop_agent_poller` joins promptly instead of
         // waiting out a full interval.
         if !poller_sleep(Duration::from_secs(2)) {
@@ -2203,8 +2506,8 @@ fn start_agent_poller() {
             }
         }
     });
-    if let Ok(mut guard) = POLLER_HANDLE.get_or_init(|| Mutex::new(None)).lock() {
-        *guard = Some(handle);
+    if let Ok(mut guard) = POLLER_TICKET.get_or_init(|| Mutex::new(None)).lock() {
+        *guard = Some(ticket);
     }
 }
 
@@ -2219,7 +2522,7 @@ fn poller_sleep(total: Duration) -> bool {
 fn poller_sleep_while(total: Duration, stopped: impl Fn() -> bool) -> bool {
     let mut remaining = total;
     loop {
-        if stopped() {
+        if stopped() || ServiceThreads::shutdown_requested() {
             return false;
         }
         if remaining.is_zero() {
@@ -2236,10 +2539,10 @@ fn poller_sleep_while(total: Duration, stopped: impl Fn() -> bool) -> bool {
 /// the runtime is about to unload.
 fn stop_agent_poller() {
     POLLER_SHUTDOWN.store(true, Ordering::SeqCst);
-    if let Some(cell) = POLLER_HANDLE.get() {
+    if let Some(cell) = POLLER_TICKET.get() {
         if let Ok(mut guard) = cell.lock() {
-            if let Some(handle) = guard.take() {
-                let _ = handle.join();
+            if let Some(ticket) = guard.take() {
+                ticket.join();
             }
         }
     }
@@ -2357,18 +2660,20 @@ fn handle_qq_serve(req: &NodeRequest) -> Result<NodeResponse, String> {
         *AGENT_SESSION_ID.lock().map_err(|e| format!("lock: {e}"))? = Some(sid.clone());
     }
 
-    // Start HTTP server in background thread.  Bind synchronously so we
-    // can report errors, then spawn the accept loop.
+    // Start HTTP server in background thread. Bind synchronously (before
+    // flipping `running`) so a port conflict is reported to the caller and the
+    // next start can retry instead of believing a dead server is running.
     {
         let mut running = SERVER_RUNNING.lock().map_err(|e| format!("lock: {e}"))?;
         if !*running {
+            let addr = format!("0.0.0.0:{port}");
+            let listener = std::net::TcpListener::bind(&addr)
+                .map_err(|e| format!("qq_serve: cannot bind {addr}: {e}"))?;
             *running = true;
             drop(running);
-            let server = tiny_http::Server::http(format!("0.0.0.0:{port}"))
-                .map_err(|e| format!("qq_serve: cannot bind port {port}: {e}"))?;
-            let handle = thread::spawn(move || run_event_loop(server));
-            if let Ok(mut guard) = EVENT_LOOP_HANDLE.lock() {
-                *guard = Some(handle);
+            let ticket = ServiceThreads::spawn("qq.http", move || run_event_loop(listener));
+            if let Ok(mut guard) = EVENT_LOOP_TICKET.lock() {
+                *guard = Some(ticket);
             }
             start_agent_poller();
         }
@@ -3460,10 +3765,20 @@ fn handle_qq_send(req: &NodeRequest) -> Result<NodeResponse, String> {
             onebot_send_private_msg(&base_url, id, message, reply_to, token.as_deref())?
         }
     };
-    let _msg_id = data
+    let msg_id = data
         .get("data")
         .and_then(|d| d.get("message_id"))
         .and_then(|v| v.as_i64());
+    // 记录是旁路：写盘失败只打日志，已经发出去的消息仍然是成功的。
+    // 群号取 target 里的 id（私聊落 `private-<uid>`），`qq_get_sent` 只读这
+    // 一条路径，不接受任意文件名。
+    record_sent_message(
+        data_dir.as_deref(),
+        target,
+        &sent_history_bucket(kind, id),
+        message,
+        msg_id,
+    );
     let reply_note = reply_to
         .map(|mid| format!(" (reply to {})", mid))
         .unwrap_or_default();
@@ -3481,6 +3796,118 @@ fn handle_qq_send(req: &NodeRequest) -> Result<NodeResponse, String> {
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
+
+/// `qq_get_sent` — 读回 bot 自己发到某个群的消息。
+///
+/// 入站事件只带别人说了什么，出站消息没有任何回读通道：`qq_send` 每次成功
+/// 发送后把一条记录追加到 `data/qq_sent/<群号>.jsonl`，这个节点就在那条路径
+/// 上回答「我在这里说过什么」——不触网，也不接受任意文件路径。
+///
+/// 文件不存在 = 没有历史 = 空数组（不是错误）。
+fn handle_qq_get_sent(req: &NodeRequest) -> Result<NodeResponse, String> {
+    let payload = req.payload.as_ref();
+    let data_dir = node_str_arg(payload, req.data_dir.as_deref(), "data_dir");
+    let group = node_str_arg(payload, req.group.as_deref(), "group")
+        .map(|group| sent_history_group(&group))
+        .filter(|group| !group.is_empty())
+        .ok_or_else(|| "group is required for qq_get_sent".to_string())?;
+    let limit = node_limit_arg(payload, req.limit.as_ref())?;
+    let items = read_sent_history(data_dir.as_deref(), &group, limit);
+    let count = items.len();
+    Ok(NodeResponse {
+        ok: true,
+        node_id: "qq_get_sent".to_string(),
+        messages: None,
+        message: Some(format!("{count} sent message(s) in {group}")),
+        data: Some(json!({
+            "group": group,
+            "limit": limit,
+            "count": count,
+            "items": items,
+        })),
+        error: None,
+    })
+}
+
+// ── 撤回（qq_recall）────────────────────────────────────────────────────
+//
+// 模型说错话时只能看着它留在群里：OneBot v11 的 `delete_msg` 插件从没接过。
+// 现在 `qq_recall` 把一个 message_id 变成 `delete_msg`，只用于撤自己发的那
+// 条——消息头里的 `msg=<id>`、`qq_send` 返回的 `data.message_id`、
+// `qq_get_sent` 的 `items[].msg_id` 都是同一个 id。
+//
+// 撤回失败（不是自己发的、消息已不存在、上游超时）**不是**节点错误：调用方
+// 要的是事实，所以仍回 ok=false + `error` 里带上游原文，模型据此判断是放弃
+// 还是换个 id，而不是像 `Err` 那样只剩一句本地文案。
+
+/// `qq_recall` 的 `message_id` 归一化：数字、数字字符串、以及消息头里整串
+/// 抄过来的 `msg=<id>` 都收敛成裸 id。空白 / 非标量一律当作没给。
+///
+/// 取值顺序：`payload.message_id` → `payload.id` → 顶层 `message_id` →
+/// 顶层 `message`（直接 invoke 常常把裸 id 塞在这两处）。
+fn recall_message_id(req: &NodeRequest) -> Option<String> {
+    let payload = req.payload.as_ref();
+    let raw = payload
+        .and_then(|p| p.get("message_id"))
+        .or_else(|| payload.and_then(|p| p.get("id")))
+        .cloned()
+        .or_else(|| req.message_id.clone())
+        .or_else(|| req.message.as_ref().map(|text| json!(text)))?;
+    let id = match raw {
+        Value::String(text) => {
+            let trimmed = text.trim();
+            trimmed
+                .strip_prefix("msg=")
+                .unwrap_or(trimmed)
+                .trim()
+                .to_string()
+        }
+        Value::Number(number) => number.to_string(),
+        _ => String::new(),
+    };
+    (!id.is_empty()).then_some(id)
+}
+
+/// `delete_msg` 的参数形态：能当整数就发整数（go-cqhttp / NapCat 都按 int
+/// 解析），否则原样发字符串（有些后端用字符串 id，硬转会把一个合法 id 弄坏）。
+fn recall_id_param(id: &str) -> Value {
+    match id.parse::<i64>() {
+        Ok(number) => json!(number),
+        Err(_) => json!(id),
+    }
+}
+
+/// `qq_recall` — 按 message_id 撤回 bot 自己发的消息。
+fn handle_qq_recall(req: &NodeRequest) -> Result<NodeResponse, String> {
+    let payload = req.payload.as_ref();
+    let message_id = recall_message_id(req).ok_or_else(|| {
+        "message_id is required for qq_recall (the msg=<id> in the message header, or the \
+         message_id returned by qq_send)"
+            .to_string()
+    })?;
+    let (base_url, token) = resolve_onebot_endpoint(payload)?;
+    let params = json!({ "message_id": recall_id_param(&message_id) });
+    match onebot_call(&base_url, "delete_msg", &params, token.as_deref()) {
+        Ok(data) => Ok(NodeResponse {
+            ok: true,
+            node_id: "qq_recall".to_string(),
+            messages: None,
+            message: Some(format!("recalled message {message_id}")),
+            data: Some(data),
+            error: None,
+        }),
+        // 失败仍然是一个**回答**：ok=false，error 里是上游原话（"不是自己发的" /
+        // "消息不存在" / HTTP 超时都靠它区分），message 说明撤的是哪一条。
+        Err(error) => Ok(NodeResponse {
+            ok: false,
+            node_id: "qq_recall".to_string(),
+            messages: None,
+            message: Some(format!("failed to recall message {message_id}")),
+            data: Some(params),
+            error: Some(error),
+        }),
+    }
+}
 
 fn handle_qq_ws_serve(req: &NodeRequest) -> Result<NodeResponse, String> {
     if req.action.as_deref() == Some("stop") {
@@ -3525,13 +3952,13 @@ fn handle_qq_ws_serve(req: &NodeRequest) -> Result<NodeResponse, String> {
             WS_SERVER_SHUTDOWN.store(false, Ordering::SeqCst);
             *running = true;
             drop(running);
-            let handle = thread::spawn(move || {
+            let ticket = ServiceThreads::spawn("qq.ws", move || {
                 if let Err(e) = start_ws_server(listener, port) {
                     eprintln!("[qq] ws server error: {e}");
                 }
             });
-            if let Ok(mut guard) = WS_SERVER_HANDLE.lock() {
-                *guard = Some(handle);
+            if let Ok(mut guard) = WS_SERVER_TICKET.lock() {
+                *guard = Some(ticket);
             }
             start_agent_poller();
         }
@@ -3779,6 +4206,8 @@ fn handle(req: &NodeRequest) -> Result<NodeResponse, String> {
         "qq_set_group_memory" => handle_qq_set_group_memory(req),
         "qq_system_notify" => handle_qq_system_notify(req),
         "qq_get_group_info" => handle_qq_get_group_info(req),
+        "qq_get_sent" => handle_qq_get_sent(req),
+        "qq_recall" => handle_qq_recall(req),
         // For qq_entry, delegate to legacy handler.
         "qq_entry" => {
             let legacy = QqRequest {
@@ -3847,19 +4276,26 @@ fn docs_value() -> cordis_plugin_sdk::PluginDocs {
                 &["requires OneBot HTTP server running"],
                 &["no OneBot URL configured", "invalid target format", "message is empty", "OneBot API error", "unsupported action"],
     ).with_agent_accessible(),
-            task_node_doc(
+            // qq_serve / qq_ws_serve 是 handle() 分发的真实节点（也在 list_nodes
+            // 里），所以必须用 node_doc 写进「真实节点」区：task_node_doc 写的是
+            // 任务节点区，kernel 不把它算进已文档节点，声明 16 个却只有 14 个，
+            // reload 直接被 `docs mismatch` 拒绝。
+            node_doc(
                 "qq_serve",
-                "Start an HTTP server to receive OneBot v11 message events. Configure your OneBot client to POST events to http://<host>:<port>/onebot/event. Supports grayscale group whitelist.",
+                "Start the HTTP server that receives OneBot v11 events (POST http://<host>:<port>/onebot/event) and the message poller that hands them to the agent. `action: \"stop\"` stops both and releases the port.",
                 json!({
                     "type": "object", "required": ["node_id"],
                     "properties": {
                         "node_id": { "type": "string", "const": "qq_serve" },
+                        "action": { "type": "string", "description": "Set to \"stop\" to shut down the HTTP server and the message poller" },
                         "payload": {
                             "type": "object",
                             "properties": {
                                 "port": { "type": "integer", "description": "HTTP listen port (default 8080)" },
-                                "onebot_url": { "type": "string", "description": "OneBot HTTP API URL" },
-                                "allow_groups": { "type": "array", "items": { "type": "string" }, "description": "Group whitelist for grayscale testing" }
+                                "onebot_url": { "type": "string", "description": "OneBot HTTP API base URL" },
+                                "access_token": { "type": "string", "description": "OneBot access token (also used to verify X-Signature)" },
+                                "allow_groups": { "type": "array", "items": { "type": "string" }, "description": "Group whitelist (empty = all groups)" },
+                                "block_groups": { "type": "array", "items": { "type": "string" }, "description": "Group blacklist (wins over allow_groups; falls back to the persisted list)" }
                             }
                         },
                         "agent_session_id": { "type": "string", "description": "Optional: agent session ID for message routing" }
@@ -3873,12 +4309,16 @@ fn docs_value() -> cordis_plugin_sdk::PluginDocs {
                         "error": { "type": ["string", "null"] }
                     }
                 }),
-                &["starts an HTTP server thread", "listens on configured port"],
+                &[
+                    "binds the HTTP port and starts the event loop thread",
+                    "starts the message poller that drains MESSAGE_QUEUE into agent_trigger",
+                    "stop joins both threads before the dylib is unloaded",
+                ],
                 &["port already in use", "OneBot client not configured to POST events"],
             ).with_agent_accessible(),
-            task_node_doc(
+            node_doc(
                 "qq_ws_serve",
-                "Start a WebSocket server to receive OneBot v11 message events via reverse WS connection. Configure your OneBot client (e.g. Napcat) to connect as a WebSocket client to ws://<host>:<port>/. Supports the same grayscale group whitelist as qq_serve.",
+                "Start the WebSocket server for the OneBot v11 reverse-WS connection (Napcat connects to ws://<host>:<port>/) and the message poller. WS frames go through the same dedup / whitelist / envelope path as qq_serve. `action: \"stop\"` stops it and releases the port; a repeated start is idempotent.",
                 json!({
                     "type": "object", "required": ["node_id"],
                     "properties": {
@@ -3901,9 +4341,13 @@ fn docs_value() -> cordis_plugin_sdk::PluginDocs {
                         "error": { "type": ["string", "null"] }
                     }
                 }),
-                &["starts a WebSocket server thread", "listens on configured port for OneBot WS client connections"],
+                &[
+                    "binds the WS port and starts the accept thread",
+                    "starts the message poller that drains MESSAGE_QUEUE into agent_trigger",
+                    "stop joins the accept thread and the poller before the dylib is unloaded",
+                ],
                 &["port already in use", "OneBot WS client not configured to connect"],
-            ),
+            ).with_agent_accessible(),
             node_doc(
                 "qq_fetch_messages",
                 "Fetch queued incoming QQ messages received by qq_serve. Returns all messages and drains the queue. Agent should poll this periodically.",
@@ -3955,7 +4399,7 @@ fn docs_value() -> cordis_plugin_sdk::PluginDocs {
     ).with_agent_accessible(),
             node_doc(
                 "qq_group_requests",
-                "List, approve or reject OneBot v11 GROUP requests — someone asking to join a group (`sub_type: add`) or inviting the bot into one (`sub_type: invite`). `action: \"list\"` (the default) returns what is waiting with its `flag`, `sub_type`, `group_id`, `user_id`, `comment` and `time_ms`; `action: \"approve\"` / `\"reject\"` answers ONE request by `flag` via set_group_add_request and drops it from the queue. Only the 32 most recent requests are kept, and a flag disappears once it has been answered — so list first, then answer.",
+                "List, approve or reject OneBot v11 GROUP requests (`sub_type: add` = 加群申请, `invite` = 邀请入群). `action: \"list\"` (default) returns what is waiting with `flag`, `sub_type`, `group_id`, `user_id`, `comment`, `time_ms`; `approve` / `reject` answers ONE request by `flag` via set_group_add_request and drops it from the queue. Only the 32 most recent are kept; list first, then answer.",
                 json!({
                     "type": "object", "required": ["node_id"],
                     "properties": {
@@ -4064,7 +4508,7 @@ fn docs_value() -> cordis_plugin_sdk::PluginDocs {
             ).with_agent_accessible(),
             node_doc(
                 "qq_get_forward_msg",
-                "Read the contents of a merged/forwarded chat record (合并转发). Inbound events only show `[chat history: id=<id>]` — pass that id here and the record comes back as readable text: one `<name>: <text>` line per node, with image/face/at/record/video/file/reply segments rendered as placeholders ([图片] [表情] [@<qq>] [语音] [视频] [文件: <name>] [引用]). Each node's body is taken from the first of `content`, `message`, `raw_message` that renders non-empty (a segment array or a plain string), so NapCat-shaped records do not come back as empty lines.",
+                "Read a merged/forwarded chat record (合并转发). Inbound events only show `[chat history: id=<id>]`; pass that id here and the record comes back as text: one `<name>: <text>` line per node, with image/face/at/record/video/file/reply segments rendered as placeholders ([图片] [表情] [@<qq>] [语音] [视频] [文件: <name>] [引用]). Each node takes the first of `content`, `message`, `raw_message` that renders non-empty.",
                 json!({
                     "type": "object", "required": ["node_id"],
                     "properties": {
@@ -4168,7 +4612,7 @@ fn docs_value() -> cordis_plugin_sdk::PluginDocs {
             ).with_agent_accessible(),
             node_doc(
                 "qq_set_reply_policy",
-                "Persist the reply policy for ONE group (or the shared default when `group` is omitted). `enabled: true` ALLOWS the bot to speak but does NOT require it to answer: being @-mentioned or named is not a reason to speak; it should talk only when it genuinely adds information others lack, corrects a mistake, or the message is actually asking it — otherwise stay silent. `enabled: false` (the default) means permanent silence in this group. `policy` overrides the preset text with free text. The legacy `mode` argument still works (quiet/one_on_one = false, balanced/chatty = true) but new calls should use `enabled`. Takes effect on the NEXT message — no rebuild, no restart.",
+                "Persist the reply policy for ONE group (`group` omitted = shared default). `enabled: true` allows speaking but does not require an answer — a mention is no reason to talk; speak only when you add information or are asked. `enabled: false` (default) = permanent silence. `policy` overrides the text. Takes effect on the next message.",
                 json!({
                     "type": "object", "required": ["node_id"],
                     "properties": {
@@ -4256,6 +4700,89 @@ fn docs_value() -> cordis_plugin_sdk::PluginDocs {
                 &["group is required for qq_set_group_memory"],
             ).with_agent_accessible(),
             node_doc(
+                "qq_get_sent",
+                "Incoming events never show what the bot itself said. Return what YOU sent to one group, oldest first: `{target, message, at_ms, msg_id}` from `data/qq_sent/<group>.jsonl`, which `qq_send` appends after every successful send. `group` is the group number (or `private-<uid>`); returns the last `limit` (default 50, max 500) or an empty list. Read-only, no network.",
+                json!({
+                    "type": "object", "required": ["node_id", "group"],
+                    "properties": {
+                        "node_id": { "type": "string", "const": "qq_get_sent" },
+                        "group": { "type": "string", "description": "QQ group id; `group:<id>` is accepted too" },
+                        "limit": { "type": "integer", "description": "How many of the most recent sends to return (default 50, max 500)" },
+                        "data_dir": { "type": "string", "description": "Optional data directory override" }
+                    }
+                }),
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "ok": { "type": "boolean" },
+                        "data": {
+                            "type": "object",
+                            "properties": {
+                                "group": { "type": "string" },
+                                "limit": { "type": "integer" },
+                                "count": { "type": "integer" },
+                                "items": {
+                                    "type": "array",
+                                    "description": "Oldest first",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "target": { "type": "string" },
+                                            "message": { "type": "string" },
+                                            "at_ms": { "type": "integer" },
+                                            "msg_id": { "type": ["integer", "null"] }
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        "error": { "type": ["string", "null"] }
+                    }
+                }),
+                &["reads data/qq_sent/<group>.jsonl (no network)"],
+                &[
+                    "group is required for qq_get_sent",
+                    "limit must be a non-negative integer",
+                ],
+            ).with_agent_accessible(),
+            node_doc(
+                "qq_recall",
+                "撤回 bot 自己发出去的一条消息（OneBot v11 delete_msg）。`message_id` 取自消息头的 msg=<id>、qq_send 返回的 data.message_id，或 qq_get_sent 的 items[].msg_id；字符串与数字都接受。只能撤自己发的：不是自己发的、消息已不存在、或上游超时都会返回 ok=false，`error` 里是上游原文。",
+                json!({
+                    "type": "object", "required": ["node_id", "message_id"],
+                    "properties": {
+                        "node_id": { "type": "string", "const": "qq_recall" },
+                        "message_id": { "type": ["string", "number"], "description": "要撤回的消息 id（msg=<id> 整串也认）；只能是自己发的" },
+                        "payload": {
+                            "type": "object",
+                            "properties": {
+                                "onebot_url": { "type": "string", "description": "Optional OneBot HTTP API URL override (defaults to STATE / runtime config)" },
+                                "access_token": { "type": "string", "description": "Optional OneBot access token override (defaults to STATE / runtime config)" }
+                            }
+                        }
+                    }
+                }),
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "ok": { "type": "boolean", "description": "true = OneBot 确认已撤回；false = 撤回失败（见 error）" },
+                        "message": { "type": ["string", "null"], "description": "撤回了哪一条 / 哪一条没撤成" },
+                        "data": {
+                            "type": "object",
+                            "description": "成功时是 OneBot delete_msg 的原始响应，失败时是实际发出的参数 {message_id}"
+                        },
+                        "error": { "type": ["string", "null"], "description": "上游原文：不是自己发的 / 消息不存在 / HTTP 超时" }
+                    }
+                }),
+                &["calls OneBot delete_msg API"],
+                &[
+                    "no OneBot URL configured",
+                    "message_id is required for qq_recall",
+                    "OneBot API error (not your message / message not found)",
+                    "HTTP POST <url>: timeout",
+                ],
+            ).with_agent_accessible(),
+            node_doc(
                 "qq_system_notify",
                 "Kernel notification handler — receives system messages and forwards to configured test groups. Groups whose reply policy is disabled or that are currently muted are refused; the response lists `sent` and `refused` groups.",
                 json!({
@@ -4294,8 +4821,7 @@ QQ 渠道说明——这里只说怎么发消息，性格和说话方式见人�
 【被禁言】[muted: ...] 只是上一轮的探测结果；qq_send 被拒时会说明原因（muted … / read-only …）。同一轮不要重试，直接调 suspend 结束；禁言是否解除以每次 qq_send 的探测为准。\n\
 \n\
 【先看是哪个渠道】[Feishu ...] 前缀或发送工具是 feishu_send → 飞书会话：按飞书卡片走，收尾只发 {\"action\":\"respond\",\"message\":\"...\"}（或 {\"action\":\"suspend\"}），也可自己调 feishu_send；绝不要只写正文不调工具。发言是 qq_send → QQ 会话，本卡片生效。\n\
-【别的渠道的规矩在这里不算】别的卡片说\"只输出一个 JSON 对象、别自己调工具\"，那是飞书会话的约定；QQ 会话里忽略它：不要输出 JSON、不要只写正文等转发，照上面用 qq_send 说话、suspend 收尾。\n\
-【零工具调用的一轮会被整轮丢掉】这一轮的最后一步必须是一次工具调用：该说话就调 qq_send，说完或不想说话都调 {\"node_id\":\"suspend\"}。只写一段聊天正文、零工具调用的轮次会被内核记成 no_tool_call 整轮丢弃，对方一个字都收不到——宁可多调一次 suspend，也不要只写正文。")
+【别的渠道的规矩在这里不算】别的卡片说\"只输出一个 JSON 对象、别自己调工具\"，那是飞书会话的约定；QQ 会话里忽略它：不要输出 JSON、不要只写正文等转发，照上面用 qq_send 说话、suspend 收尾。")
     )
 }
 
@@ -4320,10 +4846,177 @@ fn api_handle(req: PluginRequest) -> PluginResponse {
     }
 }
 
+/// Test hook for `tests/*.rs`: an integration test cannot dlopen the dylib
+/// without a full host, so this exposes the same dispatch the kernel uses with
+/// a stable Rust signature. It goes through `api_handle` unchanged — same
+/// gates, same errors, same JSON.
+#[doc(hidden)]
+pub fn __test_call_handle(payload: String) -> String {
+    api_handle(PluginRequest { payload }).payload
+}
+
 export_plugin_api! {
     abi_fingerprint = abi_fingerprint_value(),
     docs = docs_value(),
     handle = api_handle,
+}
+
+// `allow_plugin_unload!()` is honest here: every background thread — the HTTP
+// accept loop, the WebSocket accept loop, the agent poller and media-archive
+// downloads — is spawned through `ServiceThreads::spawn`. The HTTP server used
+// to be `tiny_http::Server`, which starts unnamed accept/task-pool threads the
+// contract cannot register; `run_event_loop` now owns a plain `TcpListener` on
+// its contracted thread, so joining really does mean "no code from this image
+// is running".
+cordis_plugin_sdk::allow_plugin_unload!();
+
+#[cfg(test)]
+mod http_server_tests {
+    use super::{handle_http_request, read_http_request, webhook_signature_ok};
+    use std::io::{Read, Write};
+    use std::net::{Shutdown, TcpListener, TcpStream};
+    use std::thread;
+    use std::time::Duration;
+
+    /// Feed `request` to `handle_http_request` over a loopback socket and
+    /// return the raw response. The client thread is joined, so the response is
+    /// complete before the assertion runs.
+    fn round_trip(request: &'static [u8]) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let addr = listener.local_addr().expect("addr");
+        let client = thread::spawn(move || {
+            let mut stream = TcpStream::connect(addr).expect("connect");
+            stream.write_all(request).expect("write request");
+            stream.shutdown(Shutdown::Write).expect("shutdown write");
+            let mut response = String::new();
+            stream.read_to_string(&mut response).expect("read response");
+            response
+        });
+        let (mut stream, _) = listener.accept().expect("accept");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("read timeout");
+        handle_http_request(&mut stream);
+        drop(stream);
+        client.join().expect("client")
+    }
+
+    fn parse(request: &'static [u8]) -> Result<super::HttpRequest, String> {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let addr = listener.local_addr().expect("addr");
+        let client = thread::spawn(move || {
+            let mut stream = TcpStream::connect(addr).expect("connect");
+            // A server that rejects early stops reading; ignore the resulting
+            // write error instead of panicking in this helper thread.
+            let _ = stream.write_all(request);
+            let _ = stream.shutdown(Shutdown::Write);
+        });
+        let (mut stream, _) = listener.accept().expect("accept");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("read timeout");
+        let parsed = read_http_request(&mut stream);
+        drop(stream);
+        client.join().expect("client");
+        parsed
+    }
+
+    fn signature_for(token: &str, body: &[u8]) -> String {
+        use hmac::{Hmac, Mac};
+        use sha1::Sha1;
+        let mut mac = Hmac::<Sha1>::new_from_slice(token.as_bytes()).expect("hmac key");
+        mac.update(body);
+        format!("sha1={}", hex::encode(mac.finalize().into_bytes()))
+    }
+
+    #[test]
+    fn parses_method_path_headers_and_body() {
+        let request = parse(
+            b"POST /onebot/event HTTP/1.1\r\nHost: localhost\r\nX-Signature: sha1=abc\r\nContent-Length: 7\r\n\r\npayload",
+        )
+        .expect("request must parse");
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.path, "/onebot/event");
+        assert_eq!(request.header("x-signature"), Some("sha1=abc"));
+        assert_eq!(request.header("X-SIGNATURE"), Some("sha1=abc"));
+        assert_eq!(request.header("missing"), None);
+        assert_eq!(request.body, b"payload");
+    }
+
+    #[test]
+    fn rejects_a_connection_closed_before_headers() {
+        let error = parse(b"GET /health").expect_err("partial request must fail");
+        assert!(error.contains("closed"), "{error}");
+    }
+
+    #[test]
+    fn rejects_oversized_headers() {
+        let request: &'static [u8] = Box::leak(
+            format!("GET / HTTP/1.1\r\nX-Pad: {}\r\n\r\n", "a".repeat(70 * 1024))
+                .into_boxed_str(),
+        )
+        .as_bytes();
+        let error = parse(request).expect_err("oversized headers must fail");
+        assert!(error.contains("too large"), "{error}");
+    }
+
+    #[test]
+    fn rejects_bad_content_length() {
+        let error = parse(b"POST /onebot/event HTTP/1.1\r\nContent-Length: nope\r\n\r\n")
+            .expect_err("bad content-length must fail");
+        assert!(error.contains("bad content-length"), "{error}");
+    }
+
+    #[test]
+    fn rejects_oversized_body_declaration() {
+        let error = parse(b"POST /onebot/event HTTP/1.1\r\nContent-Length: 20000000\r\n\r\n")
+            .expect_err("oversized body must fail");
+        assert!(error.contains("body too large"), "{error}");
+    }
+
+    #[test]
+    fn truncated_body_is_what_arrived_before_eof() {
+        let request = parse(b"POST /onebot/event HTTP/1.1\r\nContent-Length: 10\r\n\r\nabc")
+            .expect("request must parse");
+        assert_eq!(request.body, b"abc");
+    }
+
+    #[test]
+    fn health_route_responds_ok() {
+        let response = round_trip(b"GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+        assert!(response.contains("\"status\":\"ok\""), "{response}");
+    }
+
+    #[test]
+    fn unknown_route_is_not_found() {
+        let response = round_trip(b"GET /nope HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        assert!(response.starts_with("HTTP/1.1 404 Not Found"), "{response}");
+        assert!(response.contains("not found"), "{response}");
+    }
+
+    #[test]
+    fn malformed_request_line_is_bad_request() {
+        let response = round_trip(b"garbage\r\n\r\n");
+        assert!(
+            response.starts_with("HTTP/1.1 400 Bad Request"),
+            "{response}"
+        );
+    }
+
+    #[test]
+    fn signature_is_required_only_when_a_token_is_configured() {
+        let body = b"{\"post_type\":\"message\"}";
+        assert!(webhook_signature_ok(None, None, body));
+        assert!(!webhook_signature_ok(Some("token"), None, body));
+        assert!(!webhook_signature_ok(Some("token"), Some("sha1=dead"), body));
+        let signature = signature_for("token", body);
+        assert!(webhook_signature_ok(
+            Some("token"),
+            Some(&signature),
+            body
+        ));
+    }
 }
 
 #[cfg(test)]
@@ -5420,6 +6113,100 @@ mod reply_policy_tests {
             let read_back =
                 group_memory(Some(data_dir.to_str().unwrap_or_default()), Some("123456"));
             assert_eq!(read_back.as_deref(), Some("喜欢玩笑"));
+        });
+    }
+
+    // 工具契约必须每轮都在场：卡片只在会话开头注入一次，几百轮之后离生成点
+    // 太远，模型会写一行正文就停（整轮被 runtime 判 no_tool_call 丢掉）。
+    #[test]
+    fn envelope_notes_restate_the_tool_contract() {
+        with_isolated_fixtures(|root| {
+            let data_dir = root.join("data");
+            let notes_of = |msg: &IncomingMessage| {
+                let env: Value = serde_json::from_str(&build_envelope(msg)).expect("env");
+                env["notes"].as_str().unwrap_or_default().to_string()
+            };
+            let assert_contract = |notes: &str, case: &str| {
+                assert!(notes.starts_with("[reply policy: "), "{case}: {notes}");
+                assert!(
+                    notes.contains("只写正文"),
+                    "{case} must restate the contract: {notes}"
+                );
+                assert!(
+                    notes.contains("suspend"),
+                    "{case} must name the end tool: {notes}"
+                );
+            };
+
+            // ① 群默认（关闭）：不许发言，但仍必须以工具调用收尾。
+            let notes = notes_of(&sample_msg());
+            assert_contract(&notes, "disabled group");
+            assert!(notes.contains("保持沉默"), "{notes}");
+            // 契约只进 notes，绝不进 history 里的 display。
+            let display = display_of(&build_envelope(&sample_msg()));
+            assert!(
+                !display.contains("只写正文") && !display.contains("turn contract"),
+                "the contract must stay out of history: {display}"
+            );
+
+            // ② 私聊：永远可发言，同样带契约。
+            let mut private = sample_msg();
+            private.message_type = "private".to_string();
+            private.sender_id = "789".to_string();
+            assert_contract(&notes_of(&private), "private");
+
+            // ③ 群被禁言：禁言提示之外也要有契约。
+            handle_qq_set_reply_policy(&set_enabled(
+                "qq_set_reply_policy",
+                &data_dir,
+                Some("123456"),
+                true,
+            ))
+            .expect("set enabled");
+            record_mute(123456, now_ms() as i64 + 600_000);
+            let muted = notes_of(&sample_msg());
+            assert!(muted.contains("[muted:"), "{muted}");
+            assert_contract(&muted, "muted group");
+            clear_mute(123456);
+        });
+    }
+
+    // 契约必须自带**可照抄**的调用形状：长会话里卡片离生成点几百轮远，模型
+    // 记不住 `qq_send` 的参数名，就把想说的话写成正文交上去，整轮被丢成
+    // no_tool_call（失败样例在第 338 轮）。所以只要 notes 还在，形状就必须在。
+    #[test]
+    fn turn_contract_note_is_copyable() {
+        with_isolated_fixtures(|_root| {
+            let env: Value = serde_json::from_str(&build_envelope(&sample_msg())).expect("env");
+            let notes = env["notes"].as_str().unwrap_or_default().to_string();
+            for required in [
+                "\"node_id\":\"qq_send\"",
+                "\"target\"",
+                "\"message\"",
+                "\"node_id\":\"suspend\"",
+                "不会转发",
+            ] {
+                assert!(
+                    notes.contains(required),
+                    "the contract must be copyable ({required}): {notes}"
+                );
+            }
+            // 契约仍是 notes 的**最后一段**：尾巴里不能再出现别的 note 标记，
+            // 否则它会被挤到中间，模型更容易只读到前半句。
+            assert!(notes.starts_with("[reply policy: "), "{notes}");
+            let contract = notes
+                .rsplit_once("[turn contract: ")
+                .map(|(_, tail)| tail)
+                .unwrap_or_default();
+            assert!(!contract.is_empty(), "the turn contract must be the last note: {notes}");
+            let has_marker = contract.contains('[');
+            assert!(!has_marker, "nothing may follow the contract: {contract}");
+            // 契约只进 notes，绝不进 history 里的 display。
+            let display = display_of(&build_envelope(&sample_msg()));
+            assert!(
+                !display.contains("turn contract") && !display.contains("只写正文"),
+                "the contract must stay out of history: {display}"
+            );
         });
     }
 
@@ -6717,12 +7504,90 @@ mod group_request_tests {
 mod docs_tests {
     use super::*;
 
+    /// Longest node summary the kernel keeps; anything longer is dropped from
+    /// the generated artifact, which then fails the reload check with
+    /// `docs mismatch: expected N nodes, got N-1`.
+    const SUMMARY_CHAR_CAP: usize = 400;
+
+    /// The node ids `Cargo.toml` declares, read from the manifest itself so the
+    /// test fails as soon as the two drift apart.
+    fn declared_node_ids() -> Vec<String> {
+        let manifest = include_str!("../Cargo.toml");
+        let start = manifest
+            .find("declared_nodes")
+            .expect("declared_nodes in Cargo.toml");
+        let rest = &manifest[start..];
+        let open = rest.find('[').expect("declared_nodes list");
+        let close = rest[open..].find(']').expect("declared_nodes list closes");
+        rest[open + 1..open + close]
+            .split(',')
+            .map(|entry| entry.trim().trim_matches('"').trim().to_string())
+            .filter(|id| !id.is_empty())
+            .collect()
+    }
+
+    /// docs_value() as the artifact sees it: plain JSON, same key names.
+    fn docs_json() -> Value {
+        serde_json::to_value(docs_value()).expect("docs must serialise")
+    }
+
     fn accessible_ids() -> Vec<String> {
         let mut ids: Vec<String> = Vec::new();
         for node in docs_value().nodes.iter().filter(|n| n.agent_accessible) {
             ids.push(node.id.clone());
         }
         ids
+    }
+
+    // declared_nodes 与 docs 必须一一对应：少一条就是 reload 的 docs mismatch，
+    // 多一条就是文档里出现了 Cargo.toml 认不出的节点。
+    #[test]
+    fn every_declared_node_is_documented() {
+        let docs = docs_json();
+        let documented: Vec<String> = docs["nodes"]
+            .as_array()
+            .expect("nodes array")
+            .iter()
+            .filter_map(|node| node["id"].as_str().map(str::to_string))
+            .collect();
+        let declared = declared_node_ids();
+        let missing: Vec<&String> = declared
+            .iter()
+            .filter(|id| !documented.contains(id))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "declared in Cargo.toml but missing from docs_value(): {missing:?}"
+        );
+        let undeclared: Vec<&String> = documented
+            .iter()
+            .filter(|id| !declared.contains(id))
+            .collect();
+        assert!(
+            undeclared.is_empty(),
+            "documented but not declared in Cargo.toml: {undeclared:?}"
+        );
+        assert_eq!(documented.len(), declared.len(), "{documented:?}");
+    }
+
+    // 摘要超长会被 kernel 从产物里丢掉，节点看起来就像没写文档。
+    #[test]
+    fn every_node_summary_fits_the_kernels_size_cap() {
+        let docs = docs_json();
+        let mut offenders: Vec<String> = Vec::new();
+        for node in docs["nodes"].as_array().expect("nodes array") {
+            let id = node["id"].as_str().unwrap_or("<missing id>");
+            let summary = node["summary"].as_str().unwrap_or("");
+            let len = summary.chars().count();
+            if len > SUMMARY_CHAR_CAP {
+                offenders.push(format!("{id}: {len} chars"));
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "summaries above {SUMMARY_CHAR_CAP} chars are dropped from the artifact \
+             (docs mismatch on reload): {offenders:?}"
+        );
     }
 
     // 群主/管理员与回复策略节点必须对 agent 开放。
@@ -6734,6 +7599,8 @@ mod docs_tests {
             "qq_get_group_roles",
             "qq_get_reply_policy",
             "qq_set_reply_policy",
+            "qq_get_sent",
+            "qq_recall",
         ] {
             let found = ids.iter().any(|id| id == expected);
             assert!(
@@ -6768,6 +7635,84 @@ mod docs_tests {
     // plain text starting with a `[id=...]` fragment), which the runtime cannot
     // parse. The hint must state that the final output is JSON-only and that
     // chat text (including CQ codes) belongs inside a qq_send message.
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// 声明 ↔ 文档：`[package.metadata.cordis] declared_nodes` 里的每一个 id 都
+// 必须真的出现在 `docs_value()` 里，而且只能出现在「真实节点」那一段。
+//
+// 为什么要有这条：`task_node_doc(...)` 写的是任务节点区，kernel 算文档节点
+// 数时**不数**它，于是 declared_nodes 说有 16 个、产物里只有 14 个：
+//
+//   ABI mismatch for plugin qq: ... diff=["docs mismatch: expected 16 nodes, got 14"]
+//
+// 插件因此根本加载不起来。方向永远是「把节点写进文档」，不是「少声明几个」。
+// ═══════════════════════════════════════════════════════════════════════
+#[cfg(test)]
+mod declared_node_docs_tests {
+    use super::*;
+
+    /// `declared_nodes` 里列出的节点 id，从 crate 自己的 Cargo.toml 读出来
+    /// （与 `tests/docs_summary_budget.rs::declared_node_ids` 同一套解析），
+    /// 这样声明和文档一漂移，测试立刻炸。
+    fn declared_node_ids() -> Vec<String> {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+        let manifest = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let start = manifest
+            .find("declared_nodes")
+            .expect("declared_nodes in Cargo.toml");
+        let rest = &manifest[start..];
+        let open = rest.find('[').expect("declared_nodes list");
+        let close = rest[open..].find(']').expect("declared_nodes list closes");
+        rest[open + 1..open + close]
+            .split(',')
+            .map(|entry| entry.trim().trim_matches('"').trim().to_string())
+            .filter(|id| !id.is_empty())
+            .collect()
+    }
+
+    /// `docs_value()` 里 kernel 会算数的那批节点 id：序列化后的 JSON 形状就是
+    /// 产物 `docs/agent/interfaces.json` 的形状，`node_type: "task"` 的节点
+    /// kernel 不计入「已文档节点」（`task_node_doc` 写的就是这一段），所以这里
+    /// 与 kernel 同样把它们排除。用 JSON 而不是结构体字段，是为了和 16 vs 14
+    /// 的那条 ABI diff 用同一份依据。
+    fn documented_node_ids() -> Vec<String> {
+        let docs = serde_json::to_value(docs_value()).expect("docs must serialise");
+        docs["nodes"]
+            .as_array()
+            .expect("nodes array")
+            .iter()
+            .filter(|node| node["node_type"].as_str() != Some("task"))
+            .filter_map(|node| node["id"].as_str().map(str::to_string))
+            .collect()
+    }
+
+    /// 每个声明的节点都必须被 `docs_value()` 记为真实节点；反过来，docs 里
+    /// 也不许冒出 Cargo.toml 认不出的节点。任务节点算「没写文档」——这正是
+    /// docs mismatch 的成因。
+    #[test]
+    fn docs_value_documents_every_declared_node() {
+        let declared = declared_node_ids();
+        assert!(!declared.is_empty(), "Cargo.toml declares no nodes");
+        let documented = documented_node_ids();
+        let missing: Vec<&String> = declared
+            .iter()
+            .filter(|id| !documented.contains(id))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "declared in Cargo.toml but not documented by docs_value(): {missing:?}"
+        );
+        let undeclared: Vec<&String> = documented
+            .iter()
+            .filter(|id| !declared.contains(id))
+            .collect();
+        assert!(
+            undeclared.is_empty(),
+            "documented by docs_value() but not declared in Cargo.toml: {undeclared:?}"
+        );
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -6926,14 +7871,11 @@ mod channel_hint_tests {
     // from 900 to 1000 for the【先看是哪个渠道】paragraph: the card is injected
     // into every session, so it must say which channel it is talking about (and
     // that a Feishu session keeps its JSON envelope) before it forbids anything.
-    // It moved again to 1200 for【零工具调用的一轮会被整轮丢掉】: naming the
-    // `no_tool_call` failure is what makes "do not answer with bare chat text"
-    // land, and it has to be the last thing the model reads.
     #[test]
     fn the_hint_stays_a_channel_card() {
         let hint = hint();
         assert!(
-            hint.chars().count() < 1200,
+            hint.chars().count() < 1000,
             "channel hint must stay short: {} chars",
             hint.chars().count()
         );
@@ -7377,6 +8319,148 @@ mod media_archive_tests {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
+// 出站记录（qq_sent）：qq_send 追加、qq_get_sent 读回。只走一条固定路径。
+// ═══════════════════════════════════════════════════════════════════════
+#[cfg(test)]
+mod sent_history_tests {
+    use super::test_support::temp_dir;
+    use super::*;
+
+    fn req(value: Value) -> NodeRequest {
+        serde_json::from_value(value).expect("NodeRequest")
+    }
+
+    fn data_of(resp: &NodeResponse) -> Value {
+        resp.data.clone().unwrap_or(Value::Null)
+    }
+
+    // 路径只由群号拼出来：`<data_dir>/qq_sent/<群号>.jsonl`，没有第二个入口。
+    #[test]
+    fn history_path_is_built_from_the_group_id_only() {
+        let dir = temp_dir();
+        let dir_s = dir.to_str().unwrap_or_default();
+        assert_eq!(
+            sent_history_path(Some(dir_s), "123456"),
+            dir.join("qq_sent").join("123456.jsonl")
+        );
+        // 私聊目标落到 private-<uid>，和群分开。
+        assert_eq!(sent_history_bucket(TargetKind::Group, 123456), "123456");
+        assert_eq!(sent_history_bucket(TargetKind::Private, 789), "private-789");
+        // 路径穿越没有意义：分隔符在拼文件名之前就收成下划线。
+        let escaped = sent_history_path(Some(dir_s), "../../etc/passwd");
+        assert_eq!(escaped.parent(), Some(dir.join("qq_sent").as_path()));
+        let name = escaped
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .to_string();
+        assert!(!name.contains('/') && !name.contains(".."), "{name}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // 追加 → 读回；按时间升序；坏行跳过；文件不存在是空数组。
+    #[test]
+    fn append_and_read_roundtrip_keeps_order() {
+        let dir = temp_dir();
+        let dir_s = dir.to_str().unwrap_or_default();
+        assert!(
+            read_sent_history(Some(dir_s), "42", 50).is_empty(),
+            "缺文件 = 没有历史 = 空数组"
+        );
+
+        record_sent_message(Some(dir_s), "group:42", "42", "第一条", Some(1));
+        record_sent_message(Some(dir_s), "group:42", "42", "第二条", None);
+        let items = read_sent_history(Some(dir_s), "42", 50);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].message, "第一条");
+        assert_eq!(items[1].message, "第二条");
+        assert!(items[0].at_ms <= items[1].at_ms, "升序");
+        assert_eq!(items[0].msg_id, Some(1));
+        assert_eq!(items[1].msg_id, None, "渠道没给 message_id 就是 null");
+
+        // 只给尾部 limit 条，仍保持升序；limit = 0 一条都不给。
+        let tail = read_sent_history(Some(dir_s), "42", 1);
+        assert_eq!(tail.len(), 1);
+        assert_eq!(tail[0].message, "第二条");
+        assert!(read_sent_history(Some(dir_s), "42", 0).is_empty());
+
+        // 坏行不会让整份历史读不出来。
+        let path = sent_history_path(Some(dir_s), "42");
+        let mut body = std::fs::read_to_string(&path).expect("read history");
+        body.push_str("{not json\n");
+        std::fs::write(&path, body).expect("write history");
+        assert_eq!(read_sent_history(Some(dir_s), "42", 50).len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // 写盘失败不能影响发送：记录函数自己吞掉错误。
+    #[test]
+    fn write_failure_is_not_fatal() {
+        let dir = temp_dir();
+        // 普通文件占住 `qq_sent`，create_dir_all 必然失败。
+        std::fs::write(dir.join("qq_sent"), b"not a directory").expect("occupy qq_sent");
+        let dir_s = dir.to_str().unwrap_or_default();
+        record_sent_message(Some(dir_s), "group:1", "1", "x", None);
+        assert!(read_sent_history(Some(dir_s), "1", 10).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // limit 解析：缺省 50、上限 500、数字字符串也认、负数/非数字报错。
+    #[test]
+    fn limit_defaults_and_is_capped() {
+        assert_eq!(node_limit_arg(None, None), Ok(SENT_HISTORY_DEFAULT_LIMIT));
+        assert_eq!(node_limit_arg(Some(&json!({})), None), Ok(50));
+        assert_eq!(node_limit_arg(Some(&json!({ "limit": 3 })), None), Ok(3));
+        assert_eq!(node_limit_arg(Some(&json!({ "limit": "7" })), None), Ok(7));
+        assert_eq!(node_limit_arg(Some(&json!({ "limit": 10_000 })), None), Ok(500));
+        assert_eq!(node_limit_arg(Some(&json!({ "limit": null })), None), Ok(50));
+        // 顶层字段（直接 invoke）同样生效，payload 优先。
+        assert_eq!(node_limit_arg(None, Some(&json!(9))), Ok(9));
+        assert_eq!(
+            node_limit_arg(Some(&json!({ "limit": 2 })), Some(&json!(9))),
+            Ok(2)
+        );
+        let err = node_limit_arg(Some(&json!({ "limit": -1 })), None).expect_err("负数");
+        assert!(err.contains("limit must be a non-negative integer"), "{err}");
+        let err = node_limit_arg(Some(&json!({ "limit": "many" })), None).expect_err("非数字");
+        assert!(err.contains("limit must be a non-negative integer"), "{err}");
+    }
+
+    // 节点：group 必填、`group:<id>` 前缀也认、经 handle() 分发。
+    #[test]
+    fn node_requires_group_and_dispatches() {
+        let dir = temp_dir();
+        let dir_s = dir.to_str().unwrap_or_default();
+        let err = handle(&req(json!({ "node_id": "qq_get_sent", "data_dir": dir_s })))
+            .expect_err("group is required");
+        assert_eq!(err, "group is required for qq_get_sent");
+        let blank = req(json!({ "node_id": "qq_get_sent", "data_dir": dir_s, "group": "   " }));
+        assert_eq!(
+            handle(&blank).expect_err("blank group"),
+            "group is required for qq_get_sent"
+        );
+
+        record_sent_message(Some(dir_s), "group:555", "555", "hi", Some(9));
+        for group in ["555", "group:555", " group:555 "] {
+            let resp = handle(&req(json!({
+                "node_id": "qq_get_sent",
+                "data_dir": dir_s,
+                "group": group,
+            })))
+            .expect("dispatch");
+            assert_eq!(resp.node_id, "qq_get_sent");
+            assert!(resp.ok);
+            assert_eq!(
+                data_of(&resp)["items"].as_array().map(Vec::len),
+                Some(1),
+                "{group}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
 // 合并转发（qq_get_forward_msg）：入站事件只有 `[chat history: id=<id>]`，
 // 节点把那个 id 变成模型能读的文本。flatten 是纯函数，不发网络请求。
 // ═══════════════════════════════════════════════════════════════════════
@@ -7550,5 +8634,235 @@ mod forward_tests {
         assert!(node.output_schema["properties"]["data"]["properties"]
             .get("text")
             .is_some());
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// 撤回（qq_recall）：OneBot v11 `delete_msg`。
+//
+// 三重约定：
+//   1. `message_id` 字符串 / 数字 / `msg=<id>` 整串都接受；缺了报清楚。
+//   2. 成功 → ok=true + message（撤的是哪一条）+ data（上游原响应）。
+//   3. 失败（不是自己发的 / 消息不存在 / 上游超时）→ ok=false，`error`
+//      **带上游原文**；不是本地 Err，因为调用方要的是事实。
+// ═══════════════════════════════════════════════════════════════════════
+#[cfg(test)]
+mod recall_tests {
+    use super::test_support::with_isolated_fixtures;
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    fn req(value: Value) -> NodeRequest {
+        serde_json::from_value(value).expect("well-formed NodeRequest")
+    }
+
+    type SeenCalls = Arc<Mutex<Vec<(String, Value)>>>;
+
+    /// 最小 OneBot stub：记录 (path, 参数)，`fail` 为真时回 `status: failed`。
+    /// 只监听 127.0.0.1，不碰真网。
+    fn spawn_fake_onebot(fail: bool) -> (String, SeenCalls) {
+        let server = tiny_http::Server::http("127.0.0.1:0").expect("bind fake OneBot server");
+        let port = server
+            .server_addr()
+            .to_ip()
+            .expect("fake server must listen on an IP socket")
+            .port();
+        let seen: SeenCalls = Arc::new(Mutex::new(Vec::new()));
+        let recorder = seen.clone();
+        thread::spawn(move || {
+            for mut request in server.incoming_requests() {
+                let mut body = String::new();
+                let _ = request.as_reader().read_to_string(&mut body);
+                let params: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+                recorder
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .push((request.url().to_string(), params));
+                let reply = if fail {
+                    json!({
+                        "status": "failed",
+                        "retcode": 100,
+                        "wording": "delete_msg failed: message not found"
+                    })
+                } else {
+                    json!({"status":"ok","retcode":0,"data":{}})
+                };
+                let header =
+                    tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
+                        .expect("static header is valid");
+                let _ = request
+                    .respond(tiny_http::Response::from_string(reply.to_string()).with_header(header));
+            }
+        });
+        (format!("http://127.0.0.1:{port}"), seen)
+    }
+
+    // 数字 / 数字字符串 / `msg=<id>` 都收敛成同一个裸 id；空白与非标量算没给。
+    #[test]
+    fn message_id_accepts_numbers_strings_and_the_header_fragment() {
+        let one = |value: Value| recall_message_id(&req(json!({ "node_id": "qq_recall", "payload": { "message_id": value } })));
+        assert_eq!(one(json!(42)).as_deref(), Some("42"));
+        assert_eq!(one(json!("42")).as_deref(), Some("42"));
+        assert_eq!(one(json!("  42  ")).as_deref(), Some("42"));
+        assert_eq!(one(json!("msg=42")).as_deref(), Some("42"));
+        assert_eq!(one(json!(" msg=42 ")).as_deref(), Some("42"));
+        // 非数字 id（有些后端用字符串）原样保留。
+        assert_eq!(one(json!("abc-1")).as_deref(), Some("abc-1"));
+        // 空白 / null / 对象 / 布尔都不是 id。
+        assert_eq!(one(json!("   ")), None);
+        assert_eq!(one(json!(null)), None);
+        assert_eq!(one(json!({ "x": 1 })), None);
+        assert_eq!(one(json!(true)), None);
+
+        // 没给 payload.message_id 时退到 payload.id、顶层 message_id、顶层
+        // message（直接 invoke 常常把裸 id 放在这几处）。
+        assert_eq!(
+            recall_message_id(&req(json!({
+                "node_id": "qq_recall",
+                "payload": { "id": 7 }
+            })))
+            .as_deref(),
+            Some("7")
+        );
+        assert_eq!(
+            recall_message_id(&req(json!({"node_id": "qq_recall", "message_id": 8})))
+                .as_deref(),
+            Some("8")
+        );
+        assert_eq!(
+            recall_message_id(&req(json!({"node_id": "qq_recall", "message": " 9 "})))
+                .as_deref(),
+            Some("9")
+        );
+        assert_eq!(recall_message_id(&req(json!({"node_id": "qq_recall"}))), None);
+        // payload 优先于顶层。
+        assert_eq!(
+            recall_message_id(&req(json!({
+                "node_id": "qq_recall",
+                "message_id": 2,
+                "payload": { "message_id": 1 }
+            })))
+            .as_deref(),
+            Some("1")
+        );
+    }
+
+    // 参数形态：能当整数就发数字（go-cqhttp / NapCat 按 int 解析），
+    // 否则原样发字符串，不把一个合法 id 弄坏。
+    #[test]
+    fn message_id_goes_upstream_as_a_number_when_it_parses() {
+        assert_eq!(recall_id_param("42"), json!(42));
+        assert_eq!(recall_id_param("-7"), json!(-7));
+        assert_eq!(recall_id_param("abc-1"), json!("abc-1"));
+    }
+
+    // 成功：真的调 delete_msg，参数就是那个 id，响应带 message 与上游 data。
+    #[test]
+    fn recall_calls_delete_msg_and_reports_success() {
+        let (url, seen) = spawn_fake_onebot(false);
+        let resp = handle(&req(json!({
+            "node_id": "qq_recall",
+            "message_id": 4242,
+            "payload": { "onebot_url": url },
+        })))
+        .expect("recall through handle");
+        assert!(resp.ok, "{:?}", resp.error);
+        assert_eq!(resp.node_id, "qq_recall");
+        assert_eq!(resp.message.as_deref(), Some("recalled message 4242"));
+        assert!(resp.error.is_none());
+        assert_eq!(resp.data.expect("data")["status"], "ok");
+
+        let calls = seen.lock().unwrap_or_else(|p| p.into_inner());
+        let (path, params) = calls.last().expect("one delete_msg call");
+        assert!(path.ends_with("/delete_msg"), "path: {path}");
+        assert_eq!(params["message_id"], json!(4242));
+    }
+
+    // 失败：ok=false，error 里是上游原文（retcode + wording），不是本地文案。
+    #[test]
+    fn upstream_failure_surfaces_as_ok_false_with_the_raw_error() {
+        let (url, _seen) = spawn_fake_onebot(true);
+        let resp = handle_qq_recall(&req(json!({
+            "node_id": "qq_recall",
+            "payload": { "message_id": "555", "onebot_url": url },
+        })))
+        .expect("a failed recall is still an answer");
+        assert!(!resp.ok);
+        assert_eq!(resp.node_id, "qq_recall");
+        assert_eq!(resp.message.as_deref(), Some("failed to recall message 555"));
+        let error = resp.error.expect("error carries the upstream text");
+        assert!(error.contains("retcode=100"), "err: {error}");
+        assert!(
+            error.contains("delete_msg failed: message not found"),
+            "upstream wording must survive verbatim: {error}"
+        );
+        // 实际发出去的参数也回给调用方，方便核对撤的是哪一条。
+        assert_eq!(resp.data.expect("data")["message_id"], json!(555));
+    }
+
+    // 传输层失败（没起 OneBot / 超时）同样落到 ok=false + 上游原文。
+    #[test]
+    fn transport_failure_also_reports_the_upstream_text() {
+        let resp = handle_qq_recall(&req(json!({
+            "node_id": "qq_recall",
+            "message_id": 1,
+            "payload": { "onebot_url": "http://127.0.0.1:1" },
+        })))
+        .expect("transport failure is an answer, not a local Err");
+        assert!(!resp.ok);
+        let error = resp.error.unwrap_or_default();
+        assert!(error.contains("HTTP POST"), "err: {error}");
+    }
+
+    // 缺 message_id / 全空白 → 本地可读错误，不触网。
+    #[test]
+    fn missing_message_id_is_rejected_before_any_network() {
+        for request in [
+            json!({ "node_id": "qq_recall" }),
+            json!({ "node_id": "qq_recall", "payload": { "message_id": "   " } }),
+            json!({ "node_id": "qq_recall", "message_id": null }),
+        ] {
+            let err = handle_qq_recall(&req(request)).expect_err("message_id is required");
+            assert!(
+                err.starts_with("message_id is required for qq_recall"),
+                "err: {err}"
+            );
+        }
+    }
+
+    // 没有 OneBot 地址 → 明确报错（和其它节点同一句文案）。
+    #[test]
+    fn recall_without_onebot_url_is_an_error() {
+        with_isolated_fixtures(|_root| {
+            {
+                let mut state = STATE.lock().unwrap_or_else(|p| p.into_inner());
+                state.onebot_url = None;
+                state.access_token = None;
+            }
+            let err = handle_qq_recall(&req(json!({
+                "node_id": "qq_recall",
+                "message_id": 1
+            })))
+            .expect_err("no url configured");
+            assert_eq!(err, "no OneBot URL configured");
+        });
+    }
+
+    // 文档表：节点必须在 docs 里且 agent_accessible（kernel 只认这个标志），
+    // 否则模型调它会被拒成 "not allowed to call qq::qq_recall"。
+    #[test]
+    fn docs_mark_recall_agent_accessible() {
+        let node = docs_value()
+            .nodes
+            .into_iter()
+            .find(|node| node.id == "qq_recall")
+            .expect("qq_recall must be documented");
+        assert!(node.agent_accessible, "agent 必须能撤回自己发的消息");
+        assert_eq!(
+            node.input_schema["properties"]["node_id"]["const"],
+            "qq_recall"
+        );
+        assert!(node.input_schema["properties"].get("message_id").is_some());
+        assert!(node.output_schema["properties"].get("error").is_some());
     }
 }

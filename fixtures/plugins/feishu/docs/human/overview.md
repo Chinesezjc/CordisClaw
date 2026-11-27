@@ -29,6 +29,19 @@
 invoke feishu feishu_entry --payload-json='{"node_id":"feishu_entry","action":"configure","payload":{"app_id":"cli_...","app_secret":"...","bot_open_id":"ou_...","dm_policy":"pairing","group_policy":"allowlist","group_allow_from":["oc_..."]}}'
 ```
 
+## 每轮重申收尾约定(notes)
+
+agent 的最终输出必须是恰好一个 JSON 对象:回话用 `{"action":"respond","message":"..."}`,不回话用 `{"action":"suspend"}`。这条规则写在 plugin 的 session-start `system_hint` 里,但长会话(实测在 ~750 轮)时那段文字离生成点有几百轮远,模型会漂回直接写聊天正文;runtime 于是把整轮判成 `no_tool_call` 丢掉,聊天里一个字也看不到。
+
+另外,kernel 会把**每个** plugin 的 `system_hint` 注入**每一个**会话(不分渠道),而旧版 hint 把“每个回合的最终输出必须是一个 JSON 对象、别自己调 `feishu_send`”写成了不带前提的全局命令:在 QQ 会话里(入站是 `[QQ ...]`、说话走 `qq_send`)它既越权又自相矛盾,模型于是一行正文、零工具调用收尾,整轮被判 `no_tool_call`。现在 `system_hint` 是**按渠道自我限定**的:
+
+- 第一段先看渠道 —— 消息前缀是 `[Feishu ...]` / 本轮发送工具是 `feishu_send` → 飞书会话,本卡规则适用;否则(`[QQ ...]` 等) → 不是飞书会话,本卡“最终输出必须是一个 JSON 对象”的规则不适用,按那个渠道自己的卡走,也不要只写正文就结束。
+- 回复段不再禁止工具:`respond` / `suspend` 只是**常规回话路径**,轮内调 `feishu_send` / `feishu_send_image` / `feishu_fetch_*`(进度更新、额外消息、媒体)是允许且被期待的;并明确写出**只写正文、一次工具都不调**会被判 `no_tool_call` 整轮丢弃。
+
+除了 hint 的渠道限定,每个轮次还有一层重述:envelope 的 `notes` 字段。
+
+和 `qq` 插件一致:每条 envelope 都带一个 `notes` 字段,把同一份约定在每个轮次里重述一遍(含 `respond` / `suspend` / `只写正文` / `no_tool_call` 字样)。`notes` 是**每轮一次的上下文提示**,只进上下文,不进 `display`(display 是历史正文),也不会出现在 envelope 的其它字段里,所以不会污染会话历史;session-start 的 `system_hint` 原样保留,两层是叠加关系。
+
 ## 消息路由
 
 runtime 是协议无关的:poller 发的 envelope 带 `source_plugin=feishu`/`reply_node=feishu_send`/`session_key=feishu:chat:<id>`/`reply_target`/`reply_to`,runtime inbox 按 session_key 分 session,agent `respond` 时自动回调 `feishu_send`。见 `docs/architecture/status-and-open-items.md` 消息路由解耦一节。
@@ -40,6 +53,7 @@ runtime 是协议无关的:poller 发的 envelope 带 `source_plugin=feishu`/`re
 - 有名字:`[Feishu group from <chat_id> (user <open_id>, name "<name>")]: <text>`
 - 无名字:保持旧格式 `[Feishu group from <chat_id> (user <open_id>)]: <text>`
 - 媒体消息仍在身份括号后带 `msg=<message_id>`。
+- 名字只在 display 里;`notes` 里的收尾约定不参与这段格式(见下一节)。
 
 名字只是 display 提示,不进 envelope 的其它字段;查不到(无凭证 / 缺权限 / 网络失败)静默降级为无名字,不影响投递。需要按 `open_id` 反查人时可显式调 `feishu_get_chat_members`。
 

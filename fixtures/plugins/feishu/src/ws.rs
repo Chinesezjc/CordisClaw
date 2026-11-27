@@ -28,6 +28,7 @@ use crate::{
     api_base, current_policy, interpret_inbound, process_outcome, InboundOutcome, SERVER_SHUTDOWN,
     STATE,
 };
+use cordis_plugin_sdk::service_threads::ServiceThreads;
 
 // ---------------------------------------------------------------------------
 // Protobuf Frame (hand-rolled proto2 codec; 9 fields, varint + bytes only)
@@ -424,7 +425,7 @@ fn now_jitter_ms(max_secs: u64) -> u64 {
 fn sleep_interruptible(total: Duration) {
     let deadline = Instant::now() + total;
     while Instant::now() < deadline {
-        if SERVER_SHUTDOWN.load(Ordering::SeqCst) {
+        if SERVER_SHUTDOWN.load(Ordering::SeqCst) || ServiceThreads::shutdown_requested() {
             return;
         }
         std::thread::sleep(Duration::from_millis(200).min(deadline - Instant::now()));
@@ -436,7 +437,7 @@ fn sleep_interruptible(total: Duration) {
 pub(crate) fn run_ws_loop() {
     let mut announced_waiting = false;
     loop {
-        if SERVER_SHUTDOWN.load(Ordering::SeqCst) {
+        if SERVER_SHUTDOWN.load(Ordering::SeqCst) || ServiceThreads::shutdown_requested() {
             break;
         }
 
@@ -526,7 +527,7 @@ fn pump_connection(endpoint: &str, cfg: WsClientConfig) -> Result<(), String> {
     ));
 
     loop {
-        if SERVER_SHUTDOWN.load(Ordering::SeqCst) {
+        if SERVER_SHUTDOWN.load(Ordering::SeqCst) || ServiceThreads::shutdown_requested() {
             let _ = socket.close(None);
             return Ok(());
         }

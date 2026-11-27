@@ -1,9 +1,12 @@
-//! Image generation plugin — text-to-image through an OpenAI-compatible
-//! `/v1/images/generations` endpoint.
+//! Image generation plugin — text-to-image and base-image editing through the
+//! OpenAI-compatible `/v1/images/generations` and `/v1/images/edits` endpoints.
 //!
-//! Node:
+//! Nodes:
 //! - `generate_image` — render one prompt to a file on disk and return the
 //!   absolute path plus a ready-to-send `[CQ:image,file=…]` snippet.
+//! - `edit_image` — POST a local base image plus a prompt as
+//!   `multipart/form-data` to `/images/edits` (restyle, composite, overlay
+//!   text) and return the same result shape as `generate_image`.
 //!
 //! Why a plugin and not a kernel tool: this runtime has no shell tool, so an
 //! HTTP image API is only reachable from the agent through a plugin node. The
@@ -38,6 +41,7 @@ use cordis_plugin_sdk::{
     PluginResponse,
 };
 use reqwest::blocking::Client;
+use reqwest::header::CONTENT_TYPE;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -62,10 +66,14 @@ const MODEL_SUNBURST: &str = "gpt-image-2.5-sunburst";
 static FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Deserialize)]
-struct NodeRequest {
+pub struct NodeRequest {
     node_id: String,
     #[serde(default)]
     prompt: Option<String>,
+    /// Base image for `edit_image`: a local path inside `data/media/` or the
+    /// image output directory.
+    #[serde(default)]
+    image: Option<String>,
     #[serde(default)]
     model: Option<String>,
     #[serde(default)]
@@ -75,7 +83,7 @@ struct NodeRequest {
 }
 
 #[derive(Debug, Clone)]
-struct Config {
+pub struct Config {
     base_url: String,
     key_env: String,
     default_model: String,
@@ -120,9 +128,65 @@ fn resolve_model(requested: Option<&str>, default_model: &str) -> String {
     }
 }
 
-/// `base` + `/images/generations`, tolerating a trailing slash on either side.
-fn endpoint(base_url: &str) -> String {
-    format!("{}/images/generations", base_url.trim_end_matches('/'))
+/// `base` + `/images/<sub>`, tolerating a trailing slash on the base.
+///
+/// `generate_image` uses `generations` and `edit_image` uses `edits`; both hang
+/// off the same OpenAI-compatible prefix, so one helper serves both.
+fn endpoint_for(base_url: &str, sub: &str) -> String {
+    format!("{}/images/{sub}", base_url.trim_end_matches('/'))
+}
+
+/// Multipart boundary for one `/images/edits` request.
+///
+/// Nothing upstream parses the boundary back to us, so a timestamp, the pid and
+/// the shared counter are enough to keep two concurrent requests apart.
+fn multipart_boundary() -> String {
+    let counter = FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("image-gen-{}-{}-{counter}", now_millis(), std::process::id())
+}
+
+/// Declared media type of the file part, sniffed from the bytes themselves.
+fn mime_for(bytes: &[u8]) -> &'static str {
+    match image_extension(bytes) {
+        "png" => "image/png",
+        "jpg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        _ => "application/octet-stream",
+    }
+}
+
+/// Encode one `multipart/form-data` body: text fields first, then the base
+/// image as a single `file` part, then the closing boundary.
+///
+/// Built by hand (like `sha256_hex`) so the plugin keeps one HTTP stack instead
+/// of pulling in reqwest's `multipart` feature just to wrap a byte slice.
+fn multipart_body(
+    boundary: &str,
+    text_fields: &[(&str, &str)],
+    file_name: &str,
+    file_bytes: &[u8],
+) -> Vec<u8> {
+    let mut body = Vec::with_capacity(file_bytes.len() + 512);
+    for (name, value) in text_fields {
+        body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+        body.extend_from_slice(
+            format!("Content-Disposition: form-data; name=\"{name}\"\r\n\r\n").as_bytes(),
+        );
+        body.extend_from_slice(value.as_bytes());
+        body.extend_from_slice(b"\r\n");
+    }
+    body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+    body.extend_from_slice(
+        format!(
+            "Content-Disposition: form-data; name=\"image\"; filename=\"{file_name}\"\r\n"
+        )
+        .as_bytes(),
+    );
+    body.extend_from_slice(format!("Content-Type: {}\r\n\r\n", mime_for(file_bytes)).as_bytes());
+    body.extend_from_slice(file_bytes);
+    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+    body
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -329,17 +393,9 @@ fn generate_image(config: &Config, request: &NodeRequest) -> Value {
         return json!({ "ok": false, "error": "prompt is required and must not be empty" });
     };
     let model = resolve_model(request.model.as_deref(), &config.default_model);
-    let token = match std::env::var(&config.key_env) {
-        Ok(value) if !value.trim().is_empty() => value.trim().to_string(),
-        _ => {
-            return json!({
-                "ok": false,
-                "error": format!(
-                    "image API token is not configured: environment variable {} is unset or empty",
-                    config.key_env
-                ),
-            })
-        }
+    let token = match resolve_token(config) {
+        Ok(token) => token,
+        Err(error) => return error,
     };
 
     // No `response_format` field: the upstream behind this gateway rejects it
@@ -364,13 +420,38 @@ fn generate_image(config: &Config, request: &NodeRequest) -> Value {
         Ok(client) => client,
         Err(error) => return json!({ "ok": false, "error": format!("http client: {error}") }),
     };
-    let url = endpoint(&config.base_url);
-    let response = match client
-        .post(&url)
-        .bearer_auth(&token)
-        .json(&payload)
-        .send()
-    {
+    let url = endpoint_for(&config.base_url, "generations");
+    let request = client.post(&url).bearer_auth(&token).json(&payload);
+    execute(config, "generate_image", &model, &url, request)
+}
+
+/// The bearer token, or the agent-facing failure payload.
+fn resolve_token(config: &Config) -> Result<String, Value> {
+    match std::env::var(&config.key_env) {
+        Ok(value) if !value.trim().is_empty() => Ok(value.trim().to_string()),
+        _ => Err(json!({
+            "ok": false,
+            "error": format!(
+                "image API token is not configured: environment variable {} is unset or empty",
+                config.key_env
+            ),
+        })),
+    }
+}
+
+/// Shared HTTP leg: send one prepared request, then fold the response into the
+/// node result.
+///
+/// `generate_image` posts JSON and `edit_image` posts multipart, but the status,
+/// body, base64 and cache handling are identical, so it lives here once.
+fn execute(
+    config: &Config,
+    node_id: &str,
+    model: &str,
+    url: &str,
+    request: reqwest::blocking::RequestBuilder,
+) -> Value {
+    let response = match request.send() {
         Ok(response) => response,
         Err(error) => {
             return json!({
@@ -388,6 +469,17 @@ fn generate_image(config: &Config, request: &NodeRequest) -> Value {
             return json!({ "ok": false, "error": format!("read response body: {error}"), "model": model })
         }
     };
+    render_outcome(config, node_id, model, status, body_text)
+}
+
+/// Turn the upstream JSON body into the agent-facing result and cache the bytes.
+fn render_outcome(
+    config: &Config,
+    node_id: &str,
+    model: &str,
+    status: reqwest::StatusCode,
+    body_text: String,
+) -> Value {
     let body: Value = match serde_json::from_str(&body_text) {
         Ok(value) => value,
         Err(error) => {
@@ -467,7 +559,7 @@ fn generate_image(config: &Config, request: &NodeRequest) -> Value {
     let absolute = path.display().to_string();
     json!({
         "ok": true,
-        "node_id": "generate_image",
+        "node_id": node_id,
         "model": model,
         "path": absolute,
         "cq_image": format!("[CQ:image,file={absolute}]"),
@@ -480,11 +572,156 @@ fn generate_image(config: &Config, request: &NodeRequest) -> Value {
     })
 }
 
+/// Absolute form of `path`, canonicalised when it already exists.
+fn absolute_path(path: &Path) -> PathBuf {
+    if let Ok(resolved) = std::fs::canonicalize(path) {
+        return resolved;
+    }
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    }
+}
+
+/// Resolve the base image for `edit_image`.
+///
+/// Only two directories are readable this way: the content-addressed media
+/// cache the kernel's `view_image` already reads, and this plugin's own output
+/// directory. Anything else (a repo file, `/etc/passwd`, `../…`) is refused
+/// before a single byte is read, so the node never becomes a general
+/// file-exfiltration primitive for the agent.
+fn source_image_path(raw: &str, media_dir: &Path, output_dir: &Path) -> Result<PathBuf, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("image is required: pass the local path of an existing image under data/media/ or the image output directory".to_string());
+    }
+    let candidate = absolute_path(Path::new(trimmed));
+    let allowed = [absolute_path(media_dir), absolute_path(output_dir)];
+    if !allowed.iter().any(|root| candidate.starts_with(root)) {
+        return Err(format!(
+            "image path {trimmed} is outside the allowed image directories ({} and {}); copy the base image into data/media/ first",
+            allowed[0].display(),
+            allowed[1].display()
+        ));
+    }
+    match std::fs::metadata(&candidate) {
+        Ok(metadata) if metadata.is_file() => Ok(candidate),
+        Ok(_) => Err(format!("image path {trimmed} is not a regular file")),
+        Err(error) => Err(format!("image path {trimmed} cannot be read: {error}")),
+    }
+}
+
+/// Base-image edit: read a cached picture, upload it as a `multipart/form-data`
+/// file part plus the prompt, and render the result exactly like
+/// `generate_image` does.
+fn edit_image(config: &Config, request: &NodeRequest) -> Value {
+    let prompt = request
+        .prompt
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let Some(prompt) = prompt else {
+        return json!({ "ok": false, "error": "prompt is required and must not be empty" });
+    };
+    let raw_image = request
+        .image
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let Some(raw_image) = raw_image else {
+        return json!({
+            "ok": false,
+            "error": "image is required: pass the local path of an existing image under data/media/ or the image output directory",
+        });
+    };
+    let image_path = match source_image_path(raw_image, &config.media_dir, &config.output_dir) {
+        Ok(path) => path,
+        Err(error) => return json!({ "ok": false, "error": error }),
+    };
+    let image_bytes = match std::fs::read(&image_path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return json!({
+                "ok": false,
+                "error": format!("read base image {}: {error}", image_path.display()),
+            })
+        }
+    };
+    if image_bytes.is_empty() {
+        return json!({ "ok": false, "error": "base image is empty" });
+    }
+    if image_bytes.len() > MAX_IMAGE_BYTES {
+        return json!({
+            "ok": false,
+            "error": format!(
+                "base image is {} bytes, above the {} byte limit",
+                image_bytes.len(),
+                MAX_IMAGE_BYTES
+            ),
+        });
+    }
+
+    let model = resolve_model(request.model.as_deref(), &config.default_model);
+    let token = match resolve_token(config) {
+        Ok(token) => token,
+        Err(error) => return error,
+    };
+    let size = request
+        .size
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("1024x1024");
+    let quality = request
+        .quality
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    let mut fields: Vec<(&str, &str)> = vec![
+        ("model", model.as_str()),
+        ("prompt", prompt),
+        ("size", size),
+        ("n", "1"),
+    ];
+    if let Some(quality) = quality {
+        fields.push(("quality", quality));
+    }
+    let file_name = image_path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| format!("base.{}", image_extension(&image_bytes)));
+    let boundary = multipart_boundary();
+    let body = multipart_body(&boundary, &fields, &file_name, &image_bytes);
+
+    let client = match Client::builder().timeout(config.timeout).build() {
+        Ok(client) => client,
+        Err(error) => return json!({ "ok": false, "error": format!("http client: {error}") }),
+    };
+    let url = endpoint_for(&config.base_url, "edits");
+    let request = client
+        .post(&url)
+        .bearer_auth(&token)
+        .header(
+            CONTENT_TYPE,
+            format!("multipart/form-data; boundary={boundary}"),
+        )
+        .body(body);
+    execute(config, "edit_image", &model, &url, request)
+}
+
 fn handle(request: NodeRequest) -> Result<Value, String> {
     match request.node_id.as_str() {
         "generate_image" => {
             let config = Config::from_env();
             Ok(generate_image(&config, &request))
+        }
+        "edit_image" => {
+            let config = Config::from_env();
+            Ok(edit_image(&config, &request))
         }
         other => Err(format!("unknown node_id: {other}")),
     }
@@ -539,6 +776,53 @@ fn docs_value() -> cordis_plugin_sdk::PluginDocs {
                 "media cache not writable (logged as a diagnostic; the image is still returned)",
             ],
         )
+        .with_agent_accessible(),
+        node_doc(
+            "edit_image",
+            "Edit one existing local picture with a prompt through the gpt-image-2.5 image API (/images/edits) and save the result on this host. The base image must already live in data/media/ or the image output directory (any other path is refused). Use it to restyle a picture, compose a variation, or overlay text on an image you generated earlier. Returns the same path, cq_image, sha256, media_path and bytes as generate_image.",
+            json!({
+                "type": "object",
+                "required": ["node_id", "image", "prompt"],
+                "properties": {
+                    "node_id": { "type": "string", "const": "edit_image" },
+                    "image": { "type": "string", "description": "Local base image path: a data/media/<sha256>.png cache entry, or a file under the image output directory (data/images). Paths outside those directories are rejected with an error containing 'outside'." },
+                    "prompt": { "type": "string", "description": "How to change the picture: new style, added or replaced elements, and the exact wording of any text to overlay." },
+                    "model": { "type": "string", "description": "Optional image model: 'flare' (default) or 'sunburst'; a full model id is also accepted." },
+                    "size": { "type": "string", "description": "Optional pixel size, e.g. 1024x1024 (default)." },
+                    "quality": { "type": "string", "description": "Optional quality hint passed to the API (e.g. low, medium, high)." }
+                }
+            }),
+            json!({
+                "type": "object",
+                "properties": {
+                    "ok": { "type": "boolean" },
+                    "model": { "type": "string" },
+                    "path": { "type": "string", "description": "Absolute path of the edited file on this host" },
+                    "cq_image": { "type": "string", "description": "[CQ:image,file=<path>] ready for qq_send's message" },
+                    "sha256": { "type": "string", "description": "Lowercase SHA-256 of the edited bytes; pass it to view_image as sha256:<digest>" },
+                    "media_path": { "type": "string", "description": "Cache address of the same bytes, e.g. data/media/<sha256>.png" },
+                    "media_cached": { "type": "boolean", "description": "Whether the media cache write succeeded; false is diagnostic only and the edited image is still returned" },
+                    "bytes": { "type": "integer" },
+                    "format": { "type": "string" },
+                    "revised_prompt": { "type": ["string", "null"] },
+                    "error": { "type": "string" }
+                }
+            }),
+            &[
+                "reads one local image file from data/media/ or the image output directory",
+                "writes one image file under the configured output directory",
+                "writes the same bytes to the content-addressed media cache data/media/<sha256>.png",
+                "makes a POST to the image API",
+            ],
+            &[
+                "image path outside data/media/ and the output directory (error contains 'outside')",
+                "base image missing or unreadable",
+                "token environment variable not configured",
+                "upstream rejected the request (HTTP error)",
+                "request timed out",
+                "output directory not writable",
+            ],
+        )
         .with_agent_accessible()],
         Some(
             "生图（image_gen）：有人要你画图、生成图片、做图时用它。\n\
@@ -547,9 +831,70 @@ fn docs_value() -> cordis_plugin_sdk::PluginDocs {
 【结果】ok=true 时返回 path（本机绝对路径）、cq_image（[CQ:image,file=<path>]）和 sha256（这张图的内容摘要）。\n\
 【发图】把 cq_image 原样放进 qq_send 的 message，可以和说明文字同一条；不要只发路径、不要自己拼 base64、不要拿网图冒充。\n\
 【自查】生成时同一份字节已按内容寻址写进 data/media/<sha256>.png。想确认画面有没有崩，调 view_image {\"sha256\":\"sha256:<sha256>\"}（或 {\"path\":\"data/media/<sha256>.png\"}），图会挂到下一轮请求上。view_image 只读这台机器上已缓存的图片，不接受 URL；这条通道不是文件读取权限，也不给你写文件的能力。\n\
+【改图】已有图片要改风格、做变体、叠字时用 edit_image：\n\
+invoke_plugin {\"plugin_path\":\"image_gen\",\"node_id\":\"edit_image\",\"payload_json\":{\"image\":\"data/media/<sha256>.png\",\"prompt\":\"<怎么改：改成什么风格、加/换什么、要叠的确切文字>\",\"model\":\"flare\"}}\n\
+【底图】image 只能是本机已缓存的图：data/media/<sha256>.png，或 data/images/ 下这张插件生成的图。其它路径（包括仓库文件、系统文件、../ 之类）一律被拒，error 会含 outside；这种情况不要换路径硬试，改成让 generate_image 先生成一张，或直接用手里已有的 sha256。\n\
+【改图结果】返回字段与 generate_image 完全一致（path、cq_image、sha256、media_path、bytes），同样把 cq_image 交给 qq_send，也同样能用 view_image 回看。\n\
 【失败】ok=false 时 error 写明原因（token 未配置 / 上游拒绝 / 超时）。把原因简短告诉对方，同一轮不要反复重试同一条。",
         ),
     )
+}
+
+/// Test-only handle on the wire-level pieces of the plugin.
+///
+/// In production every call arrives through the exported ABI and picks its
+/// `Config` up from the environment, but an integration test
+/// (`tests/edit_image.rs`) has to point the node at a loopback mock server and
+/// inspect the exact multipart bytes that go out. Nothing here adds behaviour:
+/// each function forwards to the real private item, so the tests exercise the
+/// same code path the agent does.
+#[doc(hidden)]
+pub mod testing {
+    use super::*;
+
+    /// `Config` with explicit directories instead of the environment defaults.
+    pub fn config(base_url: &str, output_dir: PathBuf, media_dir: PathBuf, key_env: &str) -> Config {
+        Config {
+            base_url: base_url.to_string(),
+            key_env: key_env.to_string(),
+            default_model: DEFAULT_MODEL.to_string(),
+            output_dir,
+            media_dir,
+            timeout: Duration::from_secs(10),
+        }
+    }
+
+    /// `edit_image` payload; every optional knob stays unset.
+    pub fn edit_request(image: &str, prompt: &str) -> NodeRequest {
+        NodeRequest {
+            node_id: "edit_image".to_string(),
+            prompt: Some(prompt.to_string()),
+            image: Some(image.to_string()),
+            model: None,
+            size: None,
+            quality: None,
+        }
+    }
+
+    /// Run the real `edit_image` node body against `config`.
+    pub fn edit_image(config: &Config, request: &NodeRequest) -> Value {
+        crate::edit_image(config, request)
+    }
+
+    /// The hand-built `multipart/form-data` body for `/images/edits`.
+    pub fn multipart_body(
+        boundary: &str,
+        text_fields: &[(&str, &str)],
+        file_name: &str,
+        file_bytes: &[u8],
+    ) -> Vec<u8> {
+        crate::multipart_body(boundary, text_fields, file_name, file_bytes)
+    }
+
+    /// `base_url` + `/images/<sub>`.
+    pub fn endpoint_for(base_url: &str, sub: &str) -> String {
+        crate::endpoint_for(base_url, sub)
+    }
 }
 
 fn abi_fingerprint_value() -> AbiFingerprint {
@@ -600,7 +945,10 @@ mod tests {
     }
 
     /// Serve exactly one HTTP request with `body`, then close.
-    fn mock_server(status: &str, body: String) -> (String, thread::JoinHandle<()>) {
+    ///
+    /// The returned handle yields the request head (request line + headers) so a
+    /// test can assert which path and content type went out.
+    fn mock_server(status: &str, body: String) -> (String, thread::JoinHandle<String>) {
         let status = status.to_string();
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
         let addr = listener.local_addr().expect("mock addr");
@@ -637,11 +985,17 @@ mod tests {
                     Err(_) => break,
                 }
             }
+            let head_end = buffer
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .unwrap_or(buffer.len());
+            let head = String::from_utf8_lossy(&buffer[..head_end]).to_string();
             let response = format!(
                 "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
                 body.len()
             );
             let _ = stream.write_all(response.as_bytes());
+            head
         });
         (format!("http://{addr}"), handle)
     }
@@ -662,7 +1016,19 @@ mod tests {
         NodeRequest {
             node_id: "generate_image".to_string(),
             prompt: Some(prompt.to_string()),
+            image: None,
             model: model.map(str::to_string),
+            size: None,
+            quality: None,
+        }
+    }
+
+    fn edit_request(image: &str, prompt: &str) -> NodeRequest {
+        NodeRequest {
+            node_id: "edit_image".to_string(),
+            prompt: Some(prompt.to_string()),
+            image: Some(image.to_string()),
+            model: None,
             size: None,
             quality: None,
         }
@@ -681,14 +1047,50 @@ mod tests {
     }
 
     #[test]
-    fn endpoint_joins_without_doubling_slashes() {
+    fn endpoint_for_joins_without_doubling_slashes() {
         assert_eq!(
-            endpoint("http://127.0.0.1:8792/v1"),
+            endpoint_for("http://127.0.0.1:8792/v1", "generations"),
             "http://127.0.0.1:8792/v1/images/generations"
         );
         assert_eq!(
-            endpoint("http://127.0.0.1:8792/v1/"),
+            endpoint_for("http://127.0.0.1:8792/v1/", "generations"),
             "http://127.0.0.1:8792/v1/images/generations"
+        );
+        assert_eq!(
+            endpoint_for("http://127.0.0.1:8792/v1/", "edits"),
+            "http://127.0.0.1:8792/v1/images/edits"
+        );
+    }
+
+    #[test]
+    fn multipart_body_carries_the_image_as_a_file_part() {
+        let boundary = "image-gen-boundary-123";
+        let image = decode_png();
+        let body = multipart_body(
+            boundary,
+            &[("model", MODEL_FLARE), ("prompt", "overlay BIG SALE")],
+            "base.png",
+            &image,
+        );
+        let text = String::from_utf8_lossy(&body);
+
+        assert!(
+            text.contains("name=\"image\"; filename=\"base.png\""),
+            "the file part must be named image: {text}"
+        );
+        assert!(
+            text.contains("Content-Disposition: form-data; name=\"prompt\""),
+            "text fields must be present: {text}"
+        );
+        assert!(text.contains("Content-Type: image/png"), "body: {text}");
+        assert!(
+            body.ends_with(format!("\r\n--{boundary}--\r\n").as_bytes()),
+            "the body must close on the boundary"
+        );
+        assert!(
+            body.windows(image.len())
+                .any(|window| window == image.as_slice()),
+            "the raw base image bytes must be in the body"
         );
     }
 
@@ -847,6 +1249,94 @@ mod tests {
         handle.join().expect("mock server thread");
     }
 
+    /// 底图只允许来自 data/media/ 或图片输出目录；仓库文件之类的路径直接被拒。
+    #[test]
+    fn edit_rejects_a_base_image_outside_the_allowed_directories() {
+        let dir = temp_dir("edit-outside");
+        let config = test_config(
+            "http://127.0.0.1:1/v1".to_string(),
+            dir.clone(),
+            "IMAGE_GEN_TEST_TOKEN_EDIT_OUTSIDE",
+        );
+        std::env::set_var("IMAGE_GEN_TEST_TOKEN_EDIT_OUTSIDE", "test-token");
+
+        let output = edit_image(&config, &edit_request("Cargo.toml", "add a red frame"));
+
+        assert_eq!(output["ok"], json!(false), "output: {output}");
+        let error = output["error"].as_str().expect("error");
+        assert!(error.contains("outside"), "error: {error}");
+
+        std::env::remove_var("IMAGE_GEN_TEST_TOKEN_EDIT_OUTSIDE");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 底图走 multipart 上传到 /images/edits；返回与 generate_image 同形，
+    /// 并按同样规则写进 data/media/<sha256>.png。
+    #[test]
+    fn edits_a_cached_base_image_and_caches_the_result() {
+        let body = format!(
+            r#"{{"created":1,"data":[{{"b64_json":"{TINY_PNG_B64}","revised_prompt":"BIG SALE on the poster"}}]}}"#
+        );
+        let (base_url, handle) = mock_server("200 OK", body);
+        let dir = temp_dir("edit-ok");
+        let config = test_config(base_url, dir.clone(), "IMAGE_GEN_TEST_TOKEN_EDIT_OK_SET");
+        std::env::set_var("IMAGE_GEN_TEST_TOKEN_EDIT_OK_SET", "test-token");
+
+        let media_dir = dir.join("media");
+        std::fs::create_dir_all(&media_dir).expect("media dir");
+        let base_image = media_dir.join("base.png");
+        std::fs::write(&base_image, decode_png()).expect("write base image");
+
+        let output = edit_image(
+            &config,
+            &edit_request(
+                &base_image.display().to_string(),
+                "add the words BIG SALE",
+            ),
+        );
+
+        assert_eq!(output["ok"], json!(true), "output: {output}");
+        assert_eq!(output["node_id"], json!("edit_image"));
+        assert_eq!(output["sha256"], json!(TINY_PNG_SHA256));
+        assert_eq!(output["format"], json!("png"));
+        assert_eq!(output["bytes"], json!(decode_png().len()));
+        let path = PathBuf::from(output["path"].as_str().expect("path"));
+        assert!(path.is_absolute(), "path should be absolute: {path:?}");
+        assert_eq!(
+            std::fs::read(&path).expect("read edited image"),
+            decode_png()
+        );
+        assert_eq!(
+            output["cq_image"],
+            json!(format!("[CQ:image,file={}]", path.display()))
+        );
+        assert_eq!(output["revised_prompt"], json!("BIG SALE on the poster"));
+        assert_eq!(output["media_cached"], json!(true));
+        let media = media_dir.join(format!("{TINY_PNG_SHA256}.png"));
+        assert_eq!(
+            output["media_path"],
+            json!(media.display().to_string()),
+            "media_path must be the cache address"
+        );
+        assert_eq!(
+            std::fs::read(&media).expect("read media cache"),
+            decode_png()
+        );
+
+        std::env::remove_var("IMAGE_GEN_TEST_TOKEN_EDIT_OK_SET");
+        let _ = std::fs::remove_dir_all(&dir);
+        let head = handle.join().expect("mock server thread");
+        assert!(
+            head.starts_with("POST /images/edits "),
+            "request line: {head}"
+        );
+        assert!(
+            head.to_ascii_lowercase()
+                .contains("content-type: multipart/form-data; boundary="),
+            "request head: {head}"
+        );
+    }
+
     fn decode_png() -> Vec<u8> {
         base64::engine::general_purpose::STANDARD
             .decode(TINY_PNG_B64)
@@ -922,6 +1412,7 @@ mod tests {
         let error = handle(NodeRequest {
             node_id: "nope".to_string(),
             prompt: None,
+            image: None,
             model: None,
             size: None,
             quality: None,

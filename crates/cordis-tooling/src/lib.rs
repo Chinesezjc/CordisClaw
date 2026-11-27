@@ -944,7 +944,7 @@ fn build_dirty_dylib_plugins(
 fn inspect_dylib_contract(
     artifact_path: &Path,
 ) -> Result<(PluginDocs, cordis_runtime::core::models::AbiFingerprint), RuntimeError> {
-    let dylib = LoadedDylibApi::open(artifact_path)?;
+    let mut dylib = LoadedDylibApi::open(artifact_path)?;
     // Both payloads are pulled out into locals first so each
     // `parse_dylib_payload(..)?` call fits on a single line; the `?` error edge
     // then shares a line with the call rather than trailing on its own.
@@ -952,6 +952,11 @@ fn inspect_dylib_contract(
     let docs: PluginDocs = parse_dylib_payload(artifact_path, &docs_payload, "docs")?;
     let fp_payload = (dylib.api().abi_fingerprint)().payload;
     let fingerprint = parse_dylib_payload(artifact_path, &fp_payload, "fingerprint")?;
+    // Reading the contract never calls the plugin's `handle`, so this image
+    // has no plugin thread. Release it instead of pinning the artifact while
+    // `stage_then_rename_file` replaces it: a mapping of the *old* inode under
+    // the same path is what makes a later `dlsym` land on a stale link_map.
+    dylib.release_on_drop();
     Ok((docs, fingerprint))
 }
 

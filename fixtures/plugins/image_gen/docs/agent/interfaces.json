@@ -97,7 +97,107 @@
       ],
       "node_type": "router",
       "agent_accessible": true
+    },
+    {
+      "id": "edit_image",
+      "summary": "Edit one existing local picture with a prompt through the gpt-image-2.5 image API (/images/edits) and save the result on this host. The base image must already live in data/media/ or the image output directory (any other path is refused). Use it to restyle a picture, compose a variation, or overlay text on an image you generated earlier. Returns the same path, cq_image, sha256, media_path and bytes as generate_image.",
+      "input_schema": {
+        "type": "object",
+        "required": [
+          "node_id",
+          "image",
+          "prompt"
+        ],
+        "properties": {
+          "node_id": {
+            "type": "string",
+            "const": "edit_image"
+          },
+          "image": {
+            "type": "string",
+            "description": "Local base image path: a data/media/<sha256>.png cache entry, or a file under the image output directory (data/images). Paths outside those directories are rejected with an error containing 'outside'."
+          },
+          "prompt": {
+            "type": "string",
+            "description": "How to change the picture: new style, added or replaced elements, and the exact wording of any text to overlay."
+          },
+          "model": {
+            "type": "string",
+            "description": "Optional image model: 'flare' (default) or 'sunburst'; a full model id is also accepted."
+          },
+          "size": {
+            "type": "string",
+            "description": "Optional pixel size, e.g. 1024x1024 (default)."
+          },
+          "quality": {
+            "type": "string",
+            "description": "Optional quality hint passed to the API (e.g. low, medium, high)."
+          }
+        }
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "ok": {
+            "type": "boolean"
+          },
+          "model": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string",
+            "description": "Absolute path of the edited file on this host"
+          },
+          "cq_image": {
+            "type": "string",
+            "description": "[CQ:image,file=<path>] ready for qq_send's message"
+          },
+          "sha256": {
+            "type": "string",
+            "description": "Lowercase SHA-256 of the edited bytes; pass it to view_image as sha256:<digest>"
+          },
+          "media_path": {
+            "type": "string",
+            "description": "Cache address of the same bytes, e.g. data/media/<sha256>.png"
+          },
+          "media_cached": {
+            "type": "boolean",
+            "description": "Whether the media cache write succeeded; false is diagnostic only and the edited image is still returned"
+          },
+          "bytes": {
+            "type": "integer"
+          },
+          "format": {
+            "type": "string"
+          },
+          "revised_prompt": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "error": {
+            "type": "string"
+          }
+        }
+      },
+      "side_effects": [
+        "reads one local image file from data/media/ or the image output directory",
+        "writes one image file under the configured output directory",
+        "writes the same bytes to the content-addressed media cache data/media/<sha256>.png",
+        "makes a POST to the image API"
+      ],
+      "failure_modes": [
+        "image path outside data/media/ and the output directory (error contains 'outside')",
+        "base image missing or unreadable",
+        "token environment variable not configured",
+        "upstream rejected the request (HTTP error)",
+        "request timed out",
+        "output directory not writable"
+      ],
+      "node_type": "router",
+      "agent_accessible": true
     }
   ],
-  "system_hint": "生图（image_gen）：有人要你画图、生成图片、做图时用它。\n【调用】invoke_plugin {\"plugin_path\":\"image_gen\",\"node_id\":\"generate_image\",\"payload_json\":{\"prompt\":\"<画面描述：主体、风格、构图、要出现的文字>\",\"model\":\"flare\"}}\n【模型】model 可选 flare（默认）或 sunburst，是两种不同的出图模型；对方没指定就用默认，指定了另一种就换。\n【结果】ok=true 时返回 path（本机绝对路径）、cq_image（[CQ:image,file=<path>]）和 sha256（这张图的内容摘要）。\n【发图】把 cq_image 原样放进 qq_send 的 message，可以和说明文字同一条；不要只发路径、不要自己拼 base64、不要拿网图冒充。\n【自查】生成时同一份字节已按内容寻址写进 data/media/<sha256>.png。想确认画面有没有崩，调 view_image {\"sha256\":\"sha256:<sha256>\"}（或 {\"path\":\"data/media/<sha256>.png\"}），图会挂到下一轮请求上。view_image 只读这台机器上已缓存的图片，不接受 URL；这条通道不是文件读取权限，也不给你写文件的能力。\n【失败】ok=false 时 error 写明原因（token 未配置 / 上游拒绝 / 超时）。把原因简短告诉对方，同一轮不要反复重试同一条。"
+  "system_hint": "生图（image_gen）：有人要你画图、生成图片、做图时用它。\n【调用】invoke_plugin {\"plugin_path\":\"image_gen\",\"node_id\":\"generate_image\",\"payload_json\":{\"prompt\":\"<画面描述：主体、风格、构图、要出现的文字>\",\"model\":\"flare\"}}\n【模型】model 可选 flare（默认）或 sunburst，是两种不同的出图模型；对方没指定就用默认，指定了另一种就换。\n【结果】ok=true 时返回 path（本机绝对路径）、cq_image（[CQ:image,file=<path>]）和 sha256（这张图的内容摘要）。\n【发图】把 cq_image 原样放进 qq_send 的 message，可以和说明文字同一条；不要只发路径、不要自己拼 base64、不要拿网图冒充。\n【自查】生成时同一份字节已按内容寻址写进 data/media/<sha256>.png。想确认画面有没有崩，调 view_image {\"sha256\":\"sha256:<sha256>\"}（或 {\"path\":\"data/media/<sha256>.png\"}），图会挂到下一轮请求上。view_image 只读这台机器上已缓存的图片，不接受 URL；这条通道不是文件读取权限，也不给你写文件的能力。\n【改图】已有图片要改风格、做变体、叠字时用 edit_image：\ninvoke_plugin {\"plugin_path\":\"image_gen\",\"node_id\":\"edit_image\",\"payload_json\":{\"image\":\"data/media/<sha256>.png\",\"prompt\":\"<怎么改：改成什么风格、加/换什么、要叠的确切文字>\",\"model\":\"flare\"}}\n【底图】image 只能是本机已缓存的图：data/media/<sha256>.png，或 data/images/ 下这张插件生成的图。其它路径（包括仓库文件、系统文件、../ 之类）一律被拒，error 会含 outside；这种情况不要换路径硬试，改成让 generate_image 先生成一张，或直接用手里已有的 sha256。\n【改图结果】返回字段与 generate_image 完全一致（path、cq_image、sha256、media_path、bytes），同样把 cq_image 交给 qq_send，也同样能用 view_image 回看。\n【失败】ok=false 时 error 写明原因（token 未配置 / 上游拒绝 / 超时）。把原因简短告诉对方，同一轮不要反复重试同一条。"
 }

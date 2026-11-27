@@ -7,13 +7,21 @@ QQ adapter using the NoneBot (OneBot v11) protocol.
 ### `qq_entry`
 Legacy multi-action node: configure, send, status, call.
 
-### `qq_serve` (Task)
-Start an HTTP server to receive OneBot v11 message events.
+### `qq_serve`
+Start an HTTP server (and the message poller) to receive OneBot v11 message events.
 Configure your OneBot client to POST events to `http://<host>:<port>/onebot/event`.
 
-Supports grayscale testing via `allow_groups` whitelist.
+Supports grayscale testing via `allow_groups` whitelist (`block_groups` wins over it).
+`{"node_id":"qq_serve","action":"stop"}` stops the server and the poller.
 
-### `qq_ws_serve` (Task)
+`qq_serve` / `qq_ws_serve` 是**真实节点**（`handle()` 分发、`list_nodes` 可见），
+所以文档里必须写成 `node_doc(...)`：`task_node_doc(...)` 落的是任务节点区，
+kernel 不算进「已文档节点」，于是 `declared_nodes` 有 16 个、产物只有 14 个，
+reload 直接被 `ABI mismatch … docs mismatch: expected 16 nodes, got 14` 拒绝。
+`mod declared_node_docs_tests::docs_value_documents_every_declared_node` 就是这条
+约束的回归测试（declared_nodes 从 `Cargo.toml` 原地读）。
+
+### `qq_ws_serve`
 Start a WebSocket server for the OneBot v11 reverse WS connection.
 Configure your OneBot client (e.g. Napcat) to connect as a WebSocket client to `ws://<host>:<port>/` (default port 8002).
 Inbound WS event frames go through the same dedup / grayscale whitelist / envelope path as `qq_serve`.
@@ -40,6 +48,45 @@ Send a message to a QQ group or private chat.
 `[CQ:at,qq=<qq>]` at 段，也就是真正圈人。发送者的 QQ 号就在消息头 `(user <uid>)` 里，所以
 「圈一下刚才说话的人」= ``@[id=<uid>] 收到``。没有 id 的裸 `@昵称` 原样当文字发出；`@[id=abc]`
 这类畸形标记同样原样保留，不会吞字。`reply_to` 仍然排在 at 段之前（`[CQ:reply,…][CQ:at,…]`）。
+
+### `qq_get_sent`
+读回 bot 自己发出去的消息。
+
+每次 `qq_send` **成功**发送后追加一行到 `data/qq_sent/<群号>.jsonl`（私聊写
+`private-<uid>.jsonl`），内容是 `{target, message, at_ms, msg_id}`。写盘失败只打
+一行日志，不影响发送结果——记录是旁路，已经发出去的消息不能因此被报成失败。
+
+```json
+{ "node_id": "qq_get_sent", "group": "<群号>" }
+```
+
+返回最近 `limit` 条（缺省 50，上限 500）的 `{ok, data:{group, limit, count, items}}`，
+`items` 按时间升序（最旧在前），每条 `{target, message, at_ms, msg_id}`（`msg_id` 渠道
+没给就是 `null`）。文件不存在时是空数组而不是报错。
+
+只读 `qq_send` 自己写的那条路径：文件名永远由群号（清洗后）拼出来，节点没有 path
+参数，所以既不接受任意文件路径，也不会目录穿越。
+
+### `qq_recall`
+按 `message_id` 撤回 bot **自己发的**消息（OneBot v11 `delete_msg`）。
+
+```json
+{ "node_id": "qq_recall", "message_id": 4242 }
+```
+
+`message_id` 是必填项，**字符串和数字都接受**；消息头里的 `msg=<id>` 整串抄过来
+也行（`"msg=4242"`）。同一个 id 有三个出处：入站消息头的 `msg=<id>`、
+`qq_send` 返回的 `data.message_id`、`qq_get_sent` 的 `items[].msg_id`。
+
+- 成功 → `{ok: true, message: "recalled message 4242", data: <delete_msg 原始响应>}`。
+- 失败 → `{ok: false, message: "failed to recall message 4242", data: {message_id: 4242},
+  error: "<上游原文>"}`。不是自己发的、消息已不存在、上游超时都走这一条，`error`
+  里是上游原话（`OneBot API error (retcode=…): <wording>` 或 `HTTP POST <url>: …`），
+  调用方据此判断是放弃还是换个 id——所以失败仍然是**回答**，不是本地 `Err`。
+- 能当整数就发整数（go-cqhttp / NapCat 按 int 解析 `message_id`），非数字 id 原样
+  发字符串。
+
+不经过回复策略闸门：撤回是自己的清理动作，不是在本群发言。
 
 ## LunaBot 消息中转
 
@@ -187,12 +234,17 @@ prefix cache 行为不变。事件里缺 `self_id`（非标准 adapter）时不�
 
 | 文件 | 内容 |
 |---|---|
-| `data/qq_reply_policies.json` | `{default, groups{gid}}`，每项 `{mode, policy, …}`；老的 `qq_reply_policy.json` 仍当 default 读 |
-| `data/qq_group_memory.json` | `{gid: {memory, …}}`，每群备忘 ≤ 800 字符 |
+| `data/qq_reply_policies.json` | `{default, groups{gid}}`，每项 `{enabled, policy, …}`；老的 `qq_reply_policy.json` 仍当 default 读 |
+| `data/qq_group_memory.json` | `{gid: {memory, …}}`，每群备忘无长度上限（只建议写长期的） |
 
 四种 mode：`quiet`（只 @/点名）· `balanced`（语境判断，默认）· `chatty`（主动参与，不抢别人的话头）· `one_on_one`（当私聊，必答）。节点：`qq_set_reply_policy {group?, mode?, policy?}` / `qq_get_reply_policy {group?}`（返回实际生效的 `source`）/ `qq_get_group_memory` / `qq_set_group_memory`。
 
-每条消息首行 `[reply policy: <mode> — <text>]`，写过记忆的群再加 `[group memory: …]`。
+每条消息首行 `[reply policy: <enabled|disabled> — <text>]`，写过记忆的群再加一条
+`[group memory: <N> 字已保存, …]` 指针（正文由模型自己调 `qq_get_group_memory` 读，
+不随每条消息下发）。末尾还会附上本轮的工具契约（必须调 `qq_send` 或 `suspend` 收尾），
+契约里带**可照抄的调用形状** `{"node_id":"qq_send","target":"<reply target>","message":"<你要说的话>"}`
+（不说话 / 不许发言 / 被禁言用 `{"node_id":"suspend"}` 收尾），并写明只写正文时运行时不转发、
+不补发，整轮按 `no_tool_call` 丢弃。长会话（卡片离生成点几百轮）靠这一段才记得住参数名。
 
 ## 沉默不是默认
 

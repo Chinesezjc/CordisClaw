@@ -26,7 +26,6 @@ serde_json = { version = "1", features = ["preserve_order"] }
 cordis-plugin-sdk = { path = "../../../crates/cordis-plugin-sdk" }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
-tiny_http = "0.12"
 # TLS feature is required — unlike qq (which only talks to a local OneBot
 # over http), feishu sends HTTPS to open.feishu.cn.
 ureq = { version = "2", features = ["tls", "json"] }

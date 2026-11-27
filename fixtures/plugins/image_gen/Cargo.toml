@@ -9,7 +9,7 @@ crate-type = ["rlib", "dylib"]
 [package.metadata.cordis]
 plugin_path = "image_gen"
 abi_kind = "rust"
-declared_nodes = ["generate_image"]
+declared_nodes = ["generate_image", "edit_image"]
 children = []
 
 [package.metadata.cordis.abi_fingerprint]

@@ -305,8 +305,13 @@ pub fn parse_dylib_payload<T: serde::de::DeserializeOwned>(
 /// building/verifying artifacts, so the two paths can never drift.
 pub fn read_plugin_docs(artifact_path: &Path) -> Result<PluginDocs, RuntimeError> {
     if is_dylib_path(artifact_path) {
-        let dylib = LoadedDylibApi::open(artifact_path)?;
-        parse_dylib_payload(artifact_path, &(dylib.api().docs)().payload, "docs")
+        let mut dylib = LoadedDylibApi::open(artifact_path)?;
+        let docs = parse_dylib_payload(artifact_path, &(dylib.api().docs)().payload, "docs")?;
+        // Contract inspection never calls `handle`, so no plugin thread can
+        // exist in this image; releasing keeps the artifact from being pinned
+        // while a rebuild renames a new file over it.
+        dylib.release_on_drop();
+        Ok(docs)
     } else {
         let artifact = load_plugin_artifact(artifact_path)?;
         Ok(artifact.docs)

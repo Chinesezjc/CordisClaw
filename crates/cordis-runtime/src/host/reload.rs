@@ -188,14 +188,18 @@ impl RuntimeHost {
         // ── Phase 1: pre-load and validate all new dylibs ─────────────
         // No side effects — if anything fails, old plugins keep running.
         //
-        // P1-20: `_dylib` is held as a struct-owned by-value handle for the
-        // lifetime of `prepared` (drops at fn return, i.e. AFTER Phase 2
-        // has updated the registry). The invoke path opens the artifact
-        // fresh each time via `LoadedDylibApi::open`, so we don't hand any
-        // function pointer from Phase 1 across to the registry — no
-        // dangling reference to worry about. Keeping `_dylib` here still
-        // matters because it validates the fingerprint before we mutate
-        // the registry and gives us "old plugins keep running" on failure.
+        // P1-20: the validation handle is *not* kept across Phase 2. The
+        // invoke path opens the artifact fresh each time via
+        // `LoadedDylibApi::open`, so no function pointer escapes this loop —
+        // and holding the handle would keep the just-validated image mapped
+        // while Phase 2 stops the old generation's threads. When both handles
+        // map the same file (a reload without a rebuild), that shared image
+        // keeps its `SERVER_RUNNING` statics: the stop path joins the threads
+        // and sets shutdown, the restart sees "already running", and the
+        // plugin comes back with no threads at all. Releasing the validation
+        // handle before Phase 2 lets the image unload so the restart really
+        // starts a fresh one. The old plugin still keeps running if any later
+        // plugin fails validation (that returns before Phase 2).
         struct Prepared {
             plugin_path: String,
             docs: PluginDocs,
@@ -203,7 +207,6 @@ impl RuntimeHost {
             /// Artifact the reload just validated; repointed in the registry so
             /// the next invoke runs THIS build instead of the boot-staged one.
             artifact_path: PathBuf,
-            _dylib: crate::plugin::dynamic::LoadedDylibApi,
         }
         let mut prepared: Vec<Prepared> = Vec::new();
 
@@ -215,10 +218,11 @@ impl RuntimeHost {
 
             let resolved =
                 crate::plugin::artifact::resolve_artifact_path(&index_path, &entry.artifact_path);
-            let dylib = crate::plugin::dynamic::LoadedDylibApi::open(&resolved).map_err(|e| {
-                let attempt = self.make_failed_attempt(&previous_snapshot, started_at, &e);
-                (e, Box::new(attempt))
-            })?;
+            let mut dylib =
+                crate::plugin::dynamic::LoadedDylibApi::open(&resolved).map_err(|e| {
+                    let attempt = self.make_failed_attempt(&previous_snapshot, started_at, &e);
+                    (e, Box::new(attempt))
+                })?;
             let api = dylib.api();
 
             // Strict docs comparison.
@@ -257,12 +261,16 @@ impl RuntimeHost {
                 return Err((err, Box::new(attempt)));
             }
 
+            // Validation only: this handle never runs `handle`, so dropping
+            // it is safe and (see P1-20 above) required for a fresh image on
+            // the next restart.
+            dylib.release_on_drop();
+            drop(dylib);
             prepared.push(Prepared {
                 plugin_path: plugin_path.clone(),
                 docs: new_docs,
                 abi_fingerprint: actual_fingerprint,
                 artifact_path: resolved.clone(),
-                _dylib: dylib,
             });
         }
 
@@ -327,15 +335,12 @@ impl RuntimeHost {
                     eprintln!("[reload] stop handler for {plugin_id}::{node_id} panicked: {msg}");
                 }
             }
-            // Retire the keep-alive dylib handle for this plugin path. The
-            // handle is moved to a retained list, NOT dropped: unloading a
-            // Task-node dylib unmaps code that the plugin's own detached
-            // threads may still be executing (observed as SIGSEGV right after
-            // a `reload /qq`, whose message poller never stops). A `stop`
-            // handler is not required to join every thread, so the mapping
-            // stays until process exit; the cost is one mapping per reload of
-            // a Task-node plugin.
-            crate::plugin::invoke::unregister_task_library(plugin_path);
+            // Ordered teardown: the plugin's services were stopped above,
+            // now join its registered threads and only then unload. A legacy
+            // dylib (no thread contract) or one whose threads refuse to exit
+            // is retained with the diagnostic instead of being `dlclose`d
+            // under a live thread.
+            crate::plugin::invoke::unload_plugin_library(plugin_path);
         }
 
         for p in &prepared {
@@ -687,6 +692,8 @@ impl RuntimeHost {
         for plugin_path in previous_plugins.difference(&next_plugins) {
             self.service_registry
                 .stop_plugin_services_timed(plugin_path);
+            // Join the removed plugin's threads before dropping its mapping.
+            crate::plugin::invoke::unload_plugin_library(plugin_path);
             stopped_services.push(plugin_path.clone());
         }
         // Also stop services for plugins whose docs changed (the new snapshot
@@ -701,6 +708,9 @@ impl RuntimeHost {
             if prev_docs != next_docs {
                 self.service_registry
                     .stop_plugin_services_timed(plugin_path);
+                // The new snapshot may load a rebuilt artifact; join and unload
+                // the old generation first (stop → join → drop).
+                crate::plugin::invoke::unload_plugin_library(plugin_path);
                 stopped_services.push(plugin_path.clone());
             }
         }

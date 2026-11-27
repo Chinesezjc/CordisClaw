@@ -27,9 +27,13 @@ use cordis_runtime::core::error::RuntimeError;
 use cordis_runtime::core::models::{
     AbiFingerprint, ArtifactKind, PluginDocs, PluginExecution, PluginUnavailableReason,
 };
-use cordis_runtime::plugin::dynamic::LoadedDylibApi;
+use cordis_runtime::plugin::dynamic::{
+    last_retention_diagnostic_for, released_dylib_count, retained_dylib_count,
+    retention_diagnostic, LoadedDylibApi,
+};
 use cordis_runtime::plugin::invoke::{
-    invoke_registered_plugin, retained_task_library_count, unregister_task_library, PluginInvoker,
+    invoke_registered_plugin, is_plugin_library_held, unload_plugin_library,
+    unload_plugin_library_with_timeout, PluginInvoker,
 };
 use cordis_runtime::plugin::registry::PluginRegistry;
 use std::collections::BTreeSet;
@@ -313,17 +317,17 @@ fn loaded_dylib_task_node_keeps_alive_and_returns() {
     assert!(!resp2.payload.is_empty());
 }
 
-// `unregister_task_library` drops the keep-alive dylib handle for a plugin.
-// It is `remove`-based, so calling it for a path that was never inserted is a
-// harmless no-op; calling it after a Task invocation releases the handle.
-// Exercises the public reload-support entrypoint (lines 42-44).
+// `unload_plugin_library` is the reload-path teardown. It is `remove`-based,
+// so calling it for a path that was never held is a harmless no-op; calling it
+// after a Task invocation joins the plugin's threads and then releases the
+// handle (this fixture has no live threads, so the join is immediate).
 #[test]
-fn unregister_task_library_is_idempotent_noop_for_unknown() {
+fn unload_plugin_library_is_idempotent_noop_for_unknown() {
     // Never registered — must not panic.
-    unregister_task_library("no/such/task/plugin");
+    unload_plugin_library("no/such/task/plugin");
 
-    // After a real Task invocation the handle exists; dropping it twice is
-    // still safe.
+    // After a real Task invocation the handle exists; joining twice is still
+    // safe.
     let registry = PluginRegistry::default();
     register_loaded_dylib(
         &registry,
@@ -332,8 +336,8 @@ fn unregister_task_library_is_idempotent_noop_for_unknown() {
     );
     let _ = invoke_registered_plugin(&registry, "feishu", "feishu_send", "{}".to_string())
         .expect("task invoke");
-    unregister_task_library("feishu");
-    unregister_task_library("feishu");
+    unload_plugin_library("feishu");
+    unload_plugin_library("feishu");
 }
 
 // ---------------------------------------------------------------------------
@@ -857,13 +861,20 @@ fn json_artifact_stdin_write_failure_is_reported() {
 //     `(vtable.start)(vtable.data)` call.
 //   - `svc_null`: `_cordis_create_service` returns null → exercises the
 //     `if !vtable.is_null()` false branch (create called, no start).
+//
+// ...plus one non-Task node:
+//   - `svc_service`: a plain node whose `handle` spawns a detached thread that
+//     writes a marker (via COV_SVC_THREAD_OUT) after a short delay → the
+//     regression guard for a service node's dylib being unloaded while its
+//     thread still runs (the `qq::qq_serve` SIGSEGV).
 
 /// lib.rs for the `svcmini` service plugin. Kept in the test so the fixture is
 /// self-contained and versioned with the coverage it drives.
 const SVCMINI_LIB_RS: &str = r##"//! svcmini — a minimal Task-node plugin exporting `_cordis_create_service`.
 
+use cordis_plugin_sdk::service_threads::ServiceThreads;
 use cordis_plugin_sdk::{
-    export_plugin_api, json_response, service_vtable, task_node_doc, AbiFingerprint,
+    export_plugin_api, json_response, node_doc, service_vtable, task_node_doc, AbiFingerprint,
     PluginRequest, PluginResponse, ServiceVTable,
 };
 use serde_json::json;
@@ -925,6 +936,33 @@ fn docs_value() -> cordis_plugin_sdk::PluginDocs {
                 &[],
             )
             .with_agent_accessible(),
+            node_doc(
+                "svc_service",
+                "A plain node that starts a background service thread.",
+                json!({ "type": "object" }),
+                json!({ "type": "object" }),
+                &[],
+                &[],
+            )
+            .with_agent_accessible(),
+            node_doc(
+                "svc_stuck",
+                "A plain node whose registered thread ignores the shutdown flag.",
+                json!({ "type": "object" }),
+                json!({ "type": "object" }),
+                &[],
+                &[],
+            )
+            .with_agent_accessible(),
+            node_doc(
+                "svc_ping",
+                "A plain node that starts no thread at all.",
+                json!({ "type": "object" }),
+                json!({ "type": "object" }),
+                &[],
+                &[],
+            )
+            .with_agent_accessible(),
         ],
         None,
     )
@@ -934,7 +972,48 @@ fn abi_fingerprint_value() -> AbiFingerprint {
     AbiFingerprint::current_build("crate_svcmini_v1", "api_v2")
 }
 
-fn api_handle(_req: PluginRequest) -> PluginResponse {
+/// Start the detached thread that models a plugin's background service (HTTP
+/// server / message poller). It keeps running after `handle` returns, i.e.
+/// while the host has already dropped the dylib handle it opened.
+fn spawn_service_thread() {
+    // Registered with the SDK, so the runtime can join it before `dlclose`.
+    let _ticket = ServiceThreads::spawn("svcmini.service", || {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        if let Ok(path) = std::env::var("COV_SVC_THREAD_OUT") {
+            let _ = std::fs::write(path, svc_thread_marker());
+        }
+    });
+}
+
+/// Models a plugin whose thread ignores the unload signal: `join_all` must
+/// time out, and the runtime must keep the mapping instead of unmapping code
+/// under the still-running thread.
+fn spawn_stuck_thread() {
+    let _ticket = ServiceThreads::spawn("svcmini.stuck", || {
+        while std::env::var("COV_SVC_STUCK_RELEASE").is_err() {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    });
+}
+
+/// Kept out of line so the marker text really is produced by code in this
+/// dylib's text segment: if the mapping were released, the thread would jump
+/// into unmapped memory (SIGSEGV) instead of reaching this function.
+#[inline(never)]
+fn svc_thread_marker() -> &'static str {
+    "thread-still-running"
+}
+
+fn api_handle(req: PluginRequest) -> PluginResponse {
+    let node_id = serde_json::from_str::<serde_json::Value>(&req.payload)
+        .ok()
+        .and_then(|value| value.get("node_id").and_then(|id| id.as_str()).map(String::from));
+    if node_id.as_deref() == Some("svc_service") {
+        spawn_service_thread();
+    }
+    if node_id.as_deref() == Some("svc_stuck") {
+        spawn_stuck_thread();
+    }
     json_response(&json!({ "ok": true }))
 }
 
@@ -943,6 +1022,8 @@ export_plugin_api! {
     docs = docs_value(),
     handle = api_handle,
 }
+
+cordis_plugin_sdk::allow_plugin_unload!();
 "##;
 
 /// Repo root (three levels up from this test crate's manifest).
@@ -953,21 +1034,24 @@ fn svc_repo_root() -> PathBuf {
         .expect("repo root")
 }
 
-/// Build the `svcmini` service dylib in a TempDir and return (temp, dylib_path).
+/// Build a purpose-built plugin dylib in a TempDir and return
+/// `(temp, dylib_path)`.
+///
 /// The dylib depends on `cordis-plugin-sdk` via a `crates/` symlink back to the
 /// repo, so it is compiled with the same SDK source + toolchain as the host
 /// (making `AbiFingerprint::current_build` match at invoke time). Returns None
 /// if cargo/rustc is unavailable so callers can skip rather than fail.
-fn build_svcmini_dylib() -> Option<(tempfile::TempDir, PathBuf)> {
+fn build_plugin_dylib(package: &str, lib_rs: &str) -> Option<(tempfile::TempDir, PathBuf)> {
     let temp = tempfile::TempDir::new().expect("tempdir");
     let root = temp.path();
-    let plugin_dir = root.join("svcmini");
-    std::fs::create_dir_all(plugin_dir.join("src")).expect("svcmini src");
+    let plugin_dir = root.join(package);
+    std::fs::create_dir_all(plugin_dir.join("src")).expect("plugin src");
 
     std::fs::write(
         plugin_dir.join("Cargo.toml"),
-        r#"[package]
-name = "svcmini"
+        format!(
+            r#"[package]
+name = "{package}"
 version = "0.1.0"
 edition = "2021"
 
@@ -975,21 +1059,22 @@ edition = "2021"
 crate-type = ["rlib", "dylib"]
 
 [package.metadata.cordis]
-plugin_path = "svcmini"
+plugin_path = "{package}"
 abi_kind = "rust"
 
 [package.metadata.cordis.abi_fingerprint]
-crate_hash = "crate_svcmini_v1"
+crate_hash = "crate_{package}_v1"
 api_hash = "api_v2"
 
 [dependencies]
-cordis-plugin-sdk = { path = "../crates/cordis-plugin-sdk" }
-serde = { version = "1", features = ["derive"] }
-serde_json = { version = "1", features = ["preserve_order"] }
-"#,
+cordis-plugin-sdk = {{ path = "../crates/cordis-plugin-sdk" }}
+serde = {{ version = "1", features = ["derive"] }}
+serde_json = {{ version = "1", features = ["preserve_order"] }}
+"#
+        ),
     )
-    .expect("write svcmini manifest");
-    std::fs::write(plugin_dir.join("src/lib.rs"), SVCMINI_LIB_RS).expect("write svcmini lib.rs");
+    .expect("write plugin manifest");
+    std::fs::write(plugin_dir.join("src/lib.rs"), lib_rs).expect("write plugin lib.rs");
 
     // The manifest's `../crates/cordis-plugin-sdk` path dependency resolves via
     // this symlink to the repo `crates/`.
@@ -1005,28 +1090,94 @@ serde_json = { version = "1", features = ["preserve_order"] }
     // process's CARGO_TARGET_DIR: `std::env::set_var`/`remove_var` are
     // process-global and would race with sibling tests running in parallel.
     // `.env(...)` scopes the override to the child only.
-    let target_dir = root.join("svcmini-target");
+    let target_dir = root.join(format!("{package}-target"));
     let status = std::process::Command::new("cargo")
         .arg("build")
         .current_dir(&plugin_dir)
         .env("CARGO_TARGET_DIR", &target_dir)
         .status();
     let Ok(status) = status else {
-        eprintln!("[skip] cargo not runnable for svcmini build");
+        eprintln!("[skip] cargo not runnable for {package} build");
         return None;
     };
     if !status.success() {
-        eprintln!("[skip] svcmini build failed");
+        eprintln!("[skip] {package} build failed");
         return None;
     }
 
     let dylib = target_dir.join("debug").join(format!(
-        "{}svcmini{}",
+        "{}{package}{}",
         std::env::consts::DLL_PREFIX,
         std::env::consts::DLL_SUFFIX
     ));
     dylib.exists().then_some((temp, dylib))
 }
+
+fn build_svcmini_dylib() -> Option<(tempfile::TempDir, PathBuf)> {
+    build_plugin_dylib("svcmini", SVCMINI_LIB_RS)
+}
+
+fn build_legacy_dylib() -> Option<(tempfile::TempDir, PathBuf)> {
+    build_plugin_dylib("legacy", LEGACY_LIB_RS)
+}
+
+/// A plugin built *without* the SDK's `export_plugin_api!` macro: it exports
+/// the vtable by hand and therefore has no `_cordis_join_service_threads`
+/// symbol. This is exactly the shape of every artifact built before the
+/// thread-contract change, and it must take the retain-fallback path.
+const LEGACY_LIB_RS: &str = r##"//! legacy — a pre-thread-contract plugin: raw thread, no join symbols.
+
+use cordis_plugin_sdk::{
+    json_response, node_doc, plugin_docs, AbiFingerprint, DylibAbiKind, PluginRequest,
+    PluginResponse, RustPluginApiV2,
+};
+use serde_json::json;
+
+fn docs_value() -> PluginResponse {
+    json_response(&plugin_docs(
+        "legacy",
+        "legacy",
+        "0.1.0",
+        None,
+        vec![node_doc(
+            "legacy_serve",
+            "Spawns a raw, unregistered thread.",
+            json!({ "type": "object" }),
+            json!({ "type": "object" }),
+            &[],
+            &[],
+        )],
+        None,
+    ))
+}
+
+fn fingerprint_value() -> PluginResponse {
+    json_response(&AbiFingerprint::current_build("crate_legacy_v1", "api_v2"))
+}
+
+fn api_handle(_req: PluginRequest) -> PluginResponse {
+    std::thread::spawn(|| {
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        if let Ok(path) = std::env::var("COV_LEGACY_THREAD_OUT") {
+            let _ = std::fs::write(path, legacy_marker());
+        }
+    });
+    json_response(&json!({ "ok": true }))
+}
+
+#[inline(never)]
+fn legacy_marker() -> &'static str {
+    "legacy-thread-ran"
+}
+
+#[no_mangle]
+pub static cordis_plugin_api_rust_v2: RustPluginApiV2 = RustPluginApiV2 {
+    abi_kind: DylibAbiKind::Rust,
+    abi_fingerprint: fingerprint_value,
+    docs: docs_value,
+    handle: api_handle,
+};
+"##;
 
 // The full service path: a Task node whose dylib exports
 // `_cordis_create_service` returning a non-null vtable. Invoking it must reach
@@ -1058,42 +1209,50 @@ fn task_service_vtable_start_is_invoked() {
 
     std::env::remove_var("COV_SVC_OUT");
     // Release the keep-alive dylib handle registered by the Task invoke.
-    unregister_task_library("svcmini");
+    unload_plugin_library("svcmini");
 }
 
-// A reload replaces a Task-node plugin's keep-alive handle. The old dylib must
-// be *retained*, not dlclosed: a plugin's stop handler is not required to join
-// its threads, and unmapping a dylib that a live thread still executes is
-// exactly how `reload /qq` used to SIGSEGV (its message poller never stopped).
+// A Task node's handle is joined and then released when the reload path
+// unloads it. `svcmini`'s Task service spawns no thread, so the join is
+// immediate and the mapping is really `dlclose`d — the no-leak half of the
+// fix. (The old behaviour retained every Task mapping forever.)
 #[test]
 #[serial_test::serial]
-fn task_library_handles_are_retained_instead_of_unloaded() {
-    let Some((temp, dylib)) = build_svcmini_dylib() else {
+fn task_library_is_joined_and_released_on_unload() {
+    let Some((_temp, dylib)) = build_svcmini_dylib() else {
         return; // skip: toolchain unavailable
     };
     let registry = PluginRegistry::default();
     register_loaded_dylib(&registry, "svcmini", &dylib);
-    std::env::set_var("COV_SVC_OUT", temp.path().join("retain.marker"));
+    std::env::set_var("COV_SVC_OUT", _temp.path().join("release.marker"));
 
-    let before = retained_task_library_count();
-    // Two Task invokes: the second replaces the keep-alive handle.
+    // Two Task invokes: the second replaces the held handle with the same
+    // image, which releases the duplicate `dlopen` reference instead of
+    // accumulating mappings.
+    assert!(!is_plugin_library_held("svcmini"));
     invoke_registered_plugin(&registry, "svcmini", "svc_task", "{}".to_string())
         .expect("first task invoke");
     invoke_registered_plugin(&registry, "svcmini", "svc_task", "{}".to_string())
         .expect("second task invoke");
     assert!(
-        retained_task_library_count() > before,
-        "the replaced handle must be retained, not dropped"
+        is_plugin_library_held("svcmini"),
+        "one handle per plugin path, not one per invocation"
     );
 
-    // The reload path calls this; it must retire the handle instead of freeing it.
-    let before_unregister = retained_task_library_count();
-    unregister_task_library("svcmini");
+    let released_before = released_dylib_count();
+    let retained_before = retained_dylib_count();
+    unload_plugin_library("svcmini");
     assert_eq!(
-        retained_task_library_count(),
-        before_unregister + 1,
-        "unregister_task_library must retain the mapping"
+        released_dylib_count(),
+        released_before + 1,
+        "a clean join must release the dylib, not retain it"
     );
+    assert_eq!(
+        retained_dylib_count(),
+        retained_before,
+        "no leak after a clean unload"
+    );
+    assert!(!is_plugin_library_held("svcmini"));
 
     std::env::remove_var("COV_SVC_OUT");
 }
@@ -1127,5 +1286,214 @@ fn task_service_null_vtable_skips_start() {
     );
 
     std::env::remove_var("COV_SVC_OUT");
-    unregister_task_library("svcmini");
+    unload_plugin_library("svcmini");
+}
+
+// A node that starts a background service is not necessarily declared
+// `NodeType::Task`: `qq::qq_serve` (HTTP server + message poller) is a plain
+// node, so the invoke path used to drop the dylib handle it opened once
+// `handle` returned. If that drop `dlclose`s the library, the service's own
+// thread keeps running in unmapped code — the 2026-11-26 SIGSEGV, whose gdb
+// backtrace showed the thread entry jumping to address 0.
+//
+// `svc_service` registers its thread through the SDK; invoking it must hold
+// the dylib, and unloading must join the thread *before* releasing the
+// mapping. The marker is written by `#[inline(never)]` dylib code after the
+// invoke returned, so a premature `dlclose` would fault instead of writing it.
+#[serial_test::serial]
+#[test]
+fn service_node_threads_keep_the_dylib_mapped_until_joined() {
+    let Some((temp, dylib)) = build_svcmini_dylib() else {
+        return; // skip: toolchain unavailable
+    };
+    let registry = PluginRegistry::default();
+    register_loaded_dylib(&registry, "svcmini", &dylib);
+
+    let marker = temp.path().join("svc_thread.marker");
+    std::env::set_var("COV_SVC_THREAD_OUT", &marker);
+    let _ = std::fs::remove_file(&marker);
+
+    let released_before = released_dylib_count();
+    let resp = invoke_registered_plugin(&registry, "svcmini", "svc_service", "{}".to_string())
+        .expect("service-node invoke should succeed");
+    let value: serde_json::Value = serde_json::from_str(&resp.payload).expect("json");
+    assert_eq!(value.get("ok").and_then(|v| v.as_bool()), Some(true));
+
+    // The dylib opened for this invoke was kept mapped because its registered
+    // thread is still running.
+    assert!(
+        is_plugin_library_held("svcmini"),
+        "a service node with live threads must keep its dylib mapped"
+    );
+    assert_eq!(
+        released_dylib_count(),
+        released_before,
+        "the mapping must not be dlclose'd while a thread is registered"
+    );
+
+    // Ordered unload: join (waits for the 300 ms thread) → drop. The marker
+    // can only be written if the thread ran to completion while the dylib was
+    // still mapped.
+    unload_plugin_library("svcmini");
+    assert_eq!(
+        released_dylib_count(),
+        released_before + 1,
+        "after a clean join the mapping is released, not retained"
+    );
+    assert!(!is_plugin_library_held("svcmini"));
+    assert_eq!(
+        std::fs::read_to_string(&marker)
+            .expect("the service thread must finish before the dylib is unloaded"),
+        "thread-still-running"
+    );
+
+    std::env::remove_var("COV_SVC_THREAD_OUT");
+}
+
+// Opted-in plugin, no thread started by this node: the invoke path may
+// `dlclose` immediately. That is the "join clean → no mapping leak" branch.
+#[serial_test::serial]
+#[test]
+fn an_opted_in_plugin_without_threads_is_released_at_invoke() {
+    let Some((_temp, dylib)) = build_svcmini_dylib() else {
+        return; // skip: toolchain unavailable
+    };
+    let registry = PluginRegistry::default();
+    register_loaded_dylib(&registry, "svcmini", &dylib);
+
+    let released_before = released_dylib_count();
+    invoke_registered_plugin(&registry, "svcmini", "svc_ping", "{}".to_string())
+        .expect("svc_ping invoke should succeed");
+    assert_eq!(
+        released_dylib_count(),
+        released_before + 1,
+        "an opted-in plugin with zero live threads must be unloaded"
+    );
+    assert!(
+        !is_plugin_library_held("svcmini"),
+        "nothing holds an opted-in, thread-free plugin"
+    );
+}
+
+// Replacing a held handle with one that maps a *different* image (a rebuilt
+// artifact) must join the old image's threads instead of releasing a duplicate
+// reference: the two images have separate thread sets.
+#[serial_test::serial]
+#[test]
+fn replacing_the_artifact_image_joins_the_old_handle() {
+    let Some((_temp, dylib)) = build_svcmini_dylib() else {
+        return; // skip: toolchain unavailable
+    };
+    let registry = PluginRegistry::default();
+    register_loaded_dylib(&registry, "svcmini", &dylib);
+    invoke_registered_plugin(&registry, "svcmini", "svc_task", "{}".to_string())
+        .expect("first invoke");
+    assert!(is_plugin_library_held("svcmini"));
+
+    // A copy is a distinct inode → distinct image.
+    let copy = _temp
+        .path()
+        .join(format!("libsvcmini-copy{}", std::env::consts::DLL_SUFFIX));
+    std::fs::copy(&dylib, &copy).expect("copy dylib");
+    register_loaded_dylib(&registry, "svcmini", &copy);
+    let released_before = released_dylib_count();
+    invoke_registered_plugin(&registry, "svcmini", "svc_task", "{}".to_string())
+        .expect("second invoke");
+    assert_eq!(
+        released_dylib_count(),
+        released_before + 1,
+        "the old image's handle must be joined and released"
+    );
+    assert!(is_plugin_library_held("svcmini"));
+    unload_plugin_library("svcmini");
+}
+
+// A registered thread that ignores the shutdown flag makes the join time out.
+// The runtime must not unload the dylib in that case: it keeps the mapping and
+// emits the exact diagnostic.
+#[serial_test::serial]
+#[test]
+fn a_thread_that_refuses_to_exit_keeps_the_dylib_retained() {
+    let Some((_temp, dylib)) = build_svcmini_dylib() else {
+        return; // skip: toolchain unavailable
+    };
+    let registry = PluginRegistry::default();
+    register_loaded_dylib(&registry, "svcmini", &dylib);
+
+    std::env::remove_var("COV_SVC_STUCK_RELEASE");
+    invoke_registered_plugin(&registry, "svcmini", "svc_stuck", "{}".to_string())
+        .expect("svc_stuck invoke should succeed");
+
+    let retained_before = retained_dylib_count();
+    unload_plugin_library_with_timeout("svcmini", 50);
+    assert!(
+        retained_dylib_count() > retained_before,
+        "an unjoined thread must keep its mapping alive"
+    );
+    assert_eq!(
+        last_retention_diagnostic_for(&dylib),
+        Some(retention_diagnostic(&dylib)),
+        "the retention diagnostic must name the plugin path verbatim"
+    );
+
+    // Release the thread; the mapping stays retained (that is the point of the
+    // fallback) but the thread must not outlive this test.
+    std::env::set_var("COV_SVC_STUCK_RELEASE", "1");
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    std::env::remove_var("COV_SVC_STUCK_RELEASE");
+}
+
+// A dylib built *before* the thread contract has no join symbols at all. The
+// runtime cannot know when its threads are gone, so it must retain the mapping
+// and report `plugin {path} unloaded without joined threads; retained`.
+#[serial_test::serial]
+#[test]
+fn a_legacy_dylib_without_the_thread_contract_is_retained_with_a_diagnostic() {
+    let Some((temp, dylib)) = build_legacy_dylib() else {
+        return; // skip: toolchain unavailable
+    };
+    let registry = PluginRegistry::default();
+    register_loaded_dylib(&registry, "legacy", &dylib);
+
+    let marker = temp.path().join("legacy.thread");
+    std::env::set_var("COV_LEGACY_THREAD_OUT", &marker);
+    let _ = std::fs::remove_file(&marker);
+
+    invoke_registered_plugin(&registry, "legacy", "legacy_serve", "{}".to_string())
+        .expect("legacy invoke should succeed");
+
+    // No opt-in: the handle is held (never released on the invoke path).
+    assert!(
+        is_plugin_library_held("legacy"),
+        "a dylib without `_cordis_allows_unload` must not be released"
+    );
+
+    // The reload path asks to unload; with no opt-in the runtime must keep the
+    // mapping and say so.
+    let retained_before = retained_dylib_count();
+    unload_plugin_library("legacy");
+    assert!(
+        retained_dylib_count() > retained_before,
+        "a pre-opt-in dylib must be retained instead of dlclose'd"
+    );
+    assert!(!is_plugin_library_held("legacy"));
+    assert_eq!(
+        last_retention_diagnostic_for(&dylib),
+        Some(retention_diagnostic(&dylib)),
+        "the fallback diagnostic must be byte-exact and name the dylib path"
+    );
+    // The raw thread keeps executing the retained mapping and writes its
+    // marker; this is why retaining (instead of unloading) is the safe
+    // fallback.
+    let mut written = None;
+    for _ in 0..100 {
+        written = std::fs::read_to_string(&marker).ok();
+        if written.is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert_eq!(written.as_deref(), Some("legacy-thread-ran"));
+
+    std::env::remove_var("COV_LEGACY_THREAD_OUT");
 }

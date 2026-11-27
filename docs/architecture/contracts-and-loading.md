@@ -218,11 +218,67 @@ kernel 默认实现：`FileSoulProvider`（`data/souls/{sanitized_key}.json`）�
 host 侧监听器在预算内超时后自行收工。`sink_key` 用于并发下拒绝串台连接
 （invoke 不持锁、`handle` 可被多会话并发进入）。
 
-**实现约束**：provider 插件应把节点声明为 `NodeType::Task`（`task_node_doc`）。
-Router 节点每次 invoke 后会 `dlclose`，而 HTTP 客户端（reqwest 等）会在 dylib 里注册
-TLS 析构函数，进程退出时那些指针已随 unmap 失效 → segfault。`TASK_LIBRARIES` 对 Task
-节点保持 dylib 常驻，规避该问题。同理，插件在 `handle` 里 spawn 的任何线程都必须在
-返回前 join。
+**实现约束：插件只能在自己能 join 线程的前提下被卸载。** `handle` 里 spawn 的长期线程
+（HTTP server、message poller、SSE reader）必须通过
+`cordis_plugin_sdk::ServiceThreads::spawn` 创建——它返回 `ThreadTicket` 并登记到插件镜像内的
+注册表。`export_plugin_api!` 因此为每个插件导出两个符号：
+
+- `_cordis_live_service_threads() -> u64`：当前还活着的已登记线程数；
+- `_cordis_join_service_threads(timeout_ms: u64) -> u64`：置插件级 shutdown 标志、join 全部
+  已登记线程，返回超时后仍存活的线程数。
+
+线程数只是必要条件，**不是充分条件**：裸 `std::thread::spawn` 起的线程根本不在契约里，
+live 计数天然是 0。因此还有第二个、显式的许可符号，由
+`cordis_plugin_sdk::allow_plugin_unload!()` 导出：
+
+- `_cordis_allows_unload() -> bool`：插件声明「我所有后台线程都走 `ServiceThreads::spawn`，
+  join 完就可以 unmap」。**默认没有**（旧工件、未迁移插件都缺这个符号）＝永远不卸载。
+
+runtime 的使用方式（`plugin/invoke.rs` + `plugin/dynamic.rs`）：
+
+- invoke 返回后：`NodeType::Task`、live > 0、或插件未声明 `_cordis_allows_unload` → 句柄进
+  `HELD_PLUGIN_LIBRARIES`，dylib 保持映射（`UnloadPolicy::Retain`）。
+- 只有 `!is_task && _cordis_allows_unload() == true && live == 0` 才在 invoke 返回时立即
+  `dlclose`（`UnloadPolicy::Release`）——「join 干净 → 不泄漏」。
+- reload / 插件移除 / 文档变更前先 `unload_plugin_library`：有许可才 `join(timeout)`；
+  join 后仍 0 存活线程才 `dlclose`。没有许可、或 join 超时，一律保留并打印诊断
+  `plugin <path> unloaded without joined threads; retained`。
+- 句柄的默认策略是 `Retain`：没人担保的句柄不会 unmap。所以「invoke 返回即 unmap 掉仍在跑
+  的线程」不会再发生；「进程退出时 `__call_tls_dtors` 调用已失效指针」也不会（映射仍在）。
+- 只读检查（loader 的 `read_plugin_docs`、tooling 的 `inspect_dylib_contract`）从不调用
+  `handle`，因此镜像内不可能有插件线程：它们读完后显式 `release_on_drop`，不把旧 inode
+  钉在 artifact 路径上（否则 `stage_then_rename_file` 换文件后，下一次 `dlopen` 会撞上
+  同名同路径的陈旧 link_map）。
+
+**因此：插件里任何跨 invoke 存活的线程都要走 `ServiceThreads::spawn`，并显式
+`allow_plugin_unload!()` 才算"承认干净"。** 没有许可的插件永远 retain——这正是
+2026-11-26 `qq::qq_serve` SIGSEGV 的防线（线程入口跳到地址 0 的形态不会再出现）。
+短命线程在 `handle` 返回前自己 join 掉则不受影响。
+
+**静态门禁（声明 → 可机械检查的事实）**：`_cordis_allows_unload` 是作者声明，运行期无法
+验证；因此 CI 在源码层核对它。`scripts/check_raw_threads.py` 扫描
+`fixtures/plugins/*/src/**/*.rs`，在 `#[cfg(test)]` 之外发现裸 `std::thread::spawn` /
+`thread::spawn` 即失败，逐条打印 `文件:行: 违规`；确实短命、且调用方在函数内 join 得住的
+线程，必须在紧邻的上一非空行写 `// cordis:allow-raw-thread: <非空理由>` 才豁免（空理由
+同样算违规）。脚本自带合成样例测试，作为 ci.yml 的 `raw-thread contract` step 先于
+toolchain 运行。运行期的「没有许可就不卸载」兜底保持不变：静态门禁防的是新代码写错，
+兜底防的是旧工件/漏网声明。
+
+**依赖里的隐藏线程同样会让声明失真。** `tiny_http::Server` 自带一个 accept 线程和一个连接
+线程池（`TaskPool`），它们直接 `thread::spawn`，无法登记到 `ServiceThreads`；插件源码里一个
+裸 spawn 都没有，`live == 0` 仍然是假证据——2026-11-27 的 qq reload SIGSEGV 就是这种形态
+（gdb 里故障线程无名，栈全落在已卸载的 qq.so）。因此 qq / feishu 的 webhook 服务器改为在
+契约线程上直接持有 `std::net::TcpListener` 跑手写 HTTP/1.1（qq：`/health` + `/onebot/event`；
+feishu：`/health` + `/feishu/event`），生产依赖里不再有 tiny_http（`src/lib.rs` 的测试 stub
+仍通过 dev-dependency 使用它）。`allow_plugin_unload!()` 的正确口径是「**含依赖在内**，没有
+`ServiceThreads` 看不见的线程」，源码级的裸 spawn 检查只是其中一半。
+
+声明 `NodeType::Task`（`task_node_doc`）只影响**服务生命周期**语义（`task_node_fqns` 驱动的
+stop 调用、服务注册），不再是"保命"手段。
+
+代价：无法 join 的插件（旧工件、线程拒绝退出）每次 reload 泄漏一份映射；能 join 的插件
+reload 时正常释放。线程仍应在 reload 后主动退出（`ServiceThreads::shutdown_requested()`），
+既为了 join 不超时，也为了不双 drain 输入。
 
 样例：`fixtures/plugins/llm_openai`（OpenAI 兼容，含 SSE 解析与 5xx 重试）。
 

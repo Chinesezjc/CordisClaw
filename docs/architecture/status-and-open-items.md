@@ -2,7 +2,7 @@
 
 ## 1. 判定口径
 
-- 本文基于当前仓库现状整理，最近更新：2026-11-25。
+- 本文基于当前仓库现状整理，最近更新：2026-11-27。
 - 历史规划蓝图已经吸收进 [design-blueprint.md](./design-blueprint.md)，因此本文结论来自三类证据的交叉比对：
   - 设计蓝图：[design-blueprint.md](./design-blueprint.md)
   - 架构文档：[system-overview.md](./system-overview.md)、[contracts-and-loading.md](./contracts-and-loading.md)、[runtime-semantics.md](./runtime-semantics.md)、[maintenance-guide.md](./maintenance-guide.md)
@@ -29,7 +29,7 @@
 | 插件封装形态蓝图 | 部分完成 | `dylib` + JSON artifact + process 已落地；`cdylib` / `WASM` 未实现 |
 | 更真实的运行入口与服务化边界 | 部分完成 | `RuntimeHost`、`serve` REPL、agent chat、shell console 可用；尚未稳定化为外部服务边界 |
 | YAML 配置入口 | 已完成 | runtime / kernel / llm_api / plugins 配置模型完整 |
-| CI | 已完成 | GitHub Actions（`.github/workflows/ci.yml`）：push main + PR 触发，ubuntu-latest 上执行 fmt / clippy `-D warnings` / prepare-artifacts / build / test（并行）；x86_64-linux 门控恒真，dylib 集成测试全量执行，fixture 插件经 `prepare-artifacts` 预构建并由 rust-cache 缓存。并行安全：snapshot 目录名带创建者 pid，boot 的 stale 清理只删已死进程的残留（`cleanup_stale_snapshot_dirs`）；mock LLM server accept 超时 CI 下 900s / 本地 30s（`mock_llm_accept_timeout`，冷缓存 runner 上迭代测试中途 cargo build 远超 30s）。工具链由 `rust-toolchain.toml` 钉在 1.97.1，CI 同步 `toolchain: 1.97.1`（见 5.2.53）；fixtures 测试（12 个 member + 10 个 excluded expr 子 crate + root 占位）由 `scripts/test-fixtures.sh` 跑进同一 job（见 5.2.54） |
+| CI | 已完成 | GitHub Actions（`.github/workflows/ci.yml`）：push main + PR 触发，ubuntu-latest 上执行 raw-thread 契约扫描（`scripts/check_raw_threads.py` + 样例测试）/ fmt / clippy `-D warnings` / prepare-artifacts / build / test（并行）；x86_64-linux 门控恒真，dylib 集成测试全量执行，fixture 插件经 `prepare-artifacts` 预构建并由 rust-cache 缓存。并行安全：snapshot 目录名带创建者 pid，boot 的 stale 清理只删已死进程的残留（`cleanup_stale_snapshot_dirs`）；mock LLM server accept 超时 CI 下 900s / 本地 30s（`mock_llm_accept_timeout`，冷缓存 runner 上迭代测试中途 cargo build 远超 30s）。工具链由 `rust-toolchain.toml` 钉在 1.97.1，CI 同步 `toolchain: 1.97.1`（见 5.2.53）；fixtures 测试（12 个 member + 10 个 excluded expr 子 crate + root 占位）由 `scripts/test-fixtures.sh` 跑进同一 job（见 5.2.54） |
 
 ## 3. 已完成
 
@@ -304,11 +304,13 @@ Agent 现在可以自主完成：读代码 → 理解结构 → 写/改文件 �
 ### 3.9 reload 不再卸载 Task 插件的 dylib（2026-10-27，修 SIGSEGV）
 
 线上 `reload /qq` 成功后 1 秒进程 SIGSEGV。链路：`reload_subtree` 停完服务（WS/HTTP 线程都 join 了）
-→ `unregister_task_library("qq")` → `dlclose` 旧 `qq.so`；而 qq 还有一条**永不停止**的 detached
+→ `unload_plugin_library("qq")`（当时叫 `unregister_task_library`）→ `dlclose` 旧 `qq.so`；而 qq 还有一条**永不停止**的 detached
 线程（`start_agent_poller`，没有 shutdown flag、没有 join），它下一次醒来执行的就是已 unmap 的代码。
 
 - kernel：`TASK_LIBRARIES` 里被替换/摘除的句柄现在移入 `RETAINED_TASK_LIBRARIES`，**永不 drop**
   （`unregister_task_library` 语义改为"退役"）。`retained_task_library_count()` 供测试断言。
+  **（已被 3.44 的线程契约取代：该函数改名为 `unload_plugin_library`，"退役"仅在无卸载许可或
+  join 超时时发生；能 join 干净的插件 reload 时正常释放。）**
   代价：每次 reload 一个 Task 插件泄漏一份映射（qq.so ~18MB），进程退出才回收。理由：插件的
   `stop` 契约不要求 join 所有线程，无法安全判定何时可以 `dlclose`。
 - qq：poller 加 `POLLER_SHUTDOWN` + 句柄 join（`stop_agent_poller`，在 `qq_serve` / `qq_ws_serve`
@@ -1170,6 +1172,117 @@ segment-aware 包含；`../`、`/etc/passwd` 的文本逐字节断言）、
 `a_single_plugin_iteration_reads_the_workspace_manifest_but_no_other_plugin`（单插件
 迭代读得到 `plugins/Cargo.toml`、读不到别的插件源码）、
 `an_empty_or_whitespace_context_path_is_refused`。
+
+### 3.44 服务节点不再被 `dlclose`：线程契约 + 默认 Retain（2026-11-26，修 SIGSEGV）
+
+线上 `serve` 每次启动都 SIGSEGV（systemd 已重启 2613 次）。gdb 回溯里 fault 线程的入口跳到
+地址 0（`alloc::boxed::call_once` → `std::sys::thread::unix::thread_start`），是典型的
+「线程还在跑、代码段已被 unmap」。
+
+根因：`plugin/invoke.rs` 的 keep-alive（`TASK_LIBRARIES` / `RETAINED_TASK_LIBRARIES`）只对
+`NodeType::Task` 节点生效。`qq::qq_serve` 现在是普通节点（`node_doc`），invoke 返回时它 open
+的 `LoadedDylibApi` 被 drop → `dlclose`，而 `handle` 里 spawn 的 HTTP server / message poller
+线程还在 `qq.so` 的代码里 → 下一次醒来跳到未映射地址。
+
+修法分两层，合起来保证「只要插件线程可能还在跑，映射就还在」：
+
+- **默认 Retain**：`LoadedDylibApi` 的 drop 策略默认是 `UnloadPolicy::Retain`——没人担保的
+  句柄绝不 unmap（旧行为是无条件 `dlclose`）。这样 invoke 路径即使完全不认识节点类型也不会
+  再犯这次的错；artifact docs 提取、tooling 的 docs 回写等 open 点同样受益。
+- **可 join 的线程契约**（不再只用「泄漏映射」换安全）：SDK 新增
+  `service_threads` 模块与 `ServiceThreads::spawn`（返回 `ThreadTicket`），`export_plugin_api!`
+  随之导出 `_cordis_live_service_threads` / `_cordis_join_service_threads`。invoke 返回后
+  runtime 读 live 计数：>0（或 `NodeType::Task`）→ 句柄进 `HELD_PLUGIN_LIBRARIES`；reload /
+  插件移除 / 文档变更时先 `unload_plugin_library` → `join(timeout)` → 只有 0 存活线程才
+  `dlclose`。同镜像替换（identity 相同）只释放旧的 `dlopen` 引用，不 unmapped。
+- **显式卸载许可**：`cordis_plugin_sdk::allow_plugin_unload!()` 导出
+  `_cordis_allows_unload() -> bool`（默认缺符号＝false）。live 计数不是充分条件——裸
+  `std::thread::spawn` 的线程根本不在契约里，计数天然是 0。所以 `UnloadPolicy::Release`
+  只在「有许可 **且** live==0」时生效；未声明许可的镜像永远 retain。qq / feishu /
+  llm_openai 在把全部后台线程迁到 `ServiceThreads::spawn` 后各自声明了许可。
+- **无法证明就保留**：没有许可的旧工件、没有 join 契约、或线程超过
+  `THREAD_JOIN_TIMEOUT_MS`（5s）拒绝退出，一律保留映射并打印
+  `plugin <path> unloaded without joined threads; retained`（`retain_with_diagnostic`，
+  消息逐字节测试）。
+- **只读检查不钉旧 inode**：`read_plugin_docs` / `inspect_dylib_contract` 从不调用
+  `handle`，读完即 `release_on_drop`。此前它们用默认 Retain 把旧 inode 钉在 artifact
+  路径上，`stage_then_rename_file` 换文件后下一次 `dlopen` 会撞上同名路径的陈旧
+  link_map（`dlsym` 读坏 `strtab` → SIGSEGV）。这是排查本轮时在
+  `host_build_coverage::iterate_plugins_rolls_back_on_rebuild_failure` 上暴露并修掉的
+  第二个崩溃。
+- `TASK_LIBRARIES` 改名 `HELD_PLUGIN_LIBRARIES`：不再只服务 Task 节点，且按
+  `(path, dev/ino)` 决定「同镜像释放引用」还是「换镜像先 join 再卸载」。
+
+**约定（写进 contracts-and-loading 4.1）**：插件里任何跨 invoke 存活的线程都必须用
+`ServiceThreads::spawn`；裸 `std::thread::spawn` 不计入契约，runtime 会判定可安全卸载——正是
+这次事故的形态。qq / feishu / llm_openai 的 HTTP、WS、poller、SSE reader 已全部迁移。
+
+**2026-11-27 第二次 SIGSEGV：根因在依赖，不在插件源码。** 迁移完插件自己的线程后，reload qq
+仍在 6 秒内崩。gdb 抓到故障线程**没有名字**（`ServiceThreads::spawn` 会命名线程），栈全在
+已卸载的 `qq.so` 上：`tiny_http::Server` 内部 `thread::spawn` 出 accept 线程和连接池
+（`TaskPool`）线程，`ServiceThreads` 注册不到它们——所以 `live == 0` 是假证据，
+`allow_plugin_unload!()` 的声明在依赖层面是假的。修法不是再加一个源码正则，而是把隐藏线程
+消掉：qq / feishu 的 webhook `run_event_loop` 改为在契约线程上直接持有 `TcpListener` 跑
+手写 HTTP/1.1（qq：`/health`、`/onebot/event`；feishu：`/health`、`/feishu/event`），
+生产依赖里删掉 tiny_http（`src/lib.rs` 的测试 stub 走 dev-dependency）。插件源码的裸 spawn
+检查（`scripts/check_raw_threads.py` + CI）仍然必要，但口径是「**含依赖在内**没有不可见
+线程」，源码检查只覆盖一半。
+
+**reload 的校验句柄必须验完即释放。** `host/reload.rs` Phase 1 以前把
+`Prepared._dylib` 一直持有到函数返回。第二次 reload 同一个 artifact（未重建 → 同一 inode）
+时，这个句柄与旧 generation 共享映射：Phase 2 join 掉旧线程并置 shutdown，restart 打开同一
+镜像看到 `SERVER_RUNNING == true` 直接空转，随后句柄 drop，插件没有任何线程（`/health`
+无响应）。现在校验完立即 `release_on_drop()` + `drop`，Phase 2 才能真卸掉旧镜像，restart
+拿到全新镜像。回归：连续 reload qq 两次，两次后 `/health` 均 200，`qq.http / qq.ws /
+qq.poller` 线程都在。
+
+**测试**：
+
+- `plugin::dynamic::tests::dropping_a_loaded_dylib_keeps_its_code_mapped`（lib）——打开 fixture
+  dylib、复制 vtable 的 `docs` 函数指针、drop 句柄，断言句柄进了 retained 列表且函数指针仍可
+  调用；`retain_with_diagnostic_records_the_message_and_keeps_the_mapping` 断言诊断文本与保留
+  行为；`release_on_drop_really_closes_the_mapping` 断言 join 干净后才真的 `dlclose`；
+  `retention_diagnostic_is_byte_exact` 锁死诊断文本。
+- `tests/invoke_coverage.rs`（集成，全部用 `svcmini` 现场编译的 dylib，不真起 HTTP 服务）：
+  `service_node_threads_keep_the_dylib_mapped_until_joined`（非 Task 服务节点 + 已登记线程 →
+  保留且线程继续执行 dylib 代码）、`a_thread_that_refuses_to_exit_keeps_the_dylib_retained`
+  （join 超时 → 保留 + 诊断）、
+  `a_legacy_dylib_without_the_thread_contract_is_retained_with_a_diagnostic`（无许可旧 dylib →
+  retain + 逐字节诊断 + 裸线程仍能写 marker）、`task_library_is_joined_and_released_on_unload`
+  （join 干净 → 释放）、`an_opted_in_plugin_without_threads_is_released_at_invoke`
+  （有许可 + live==0 → invoke 返回即释放）、
+  `replacing_the_artifact_image_joins_the_old_handle`（换镜像先 join 旧句柄再释放）。
+  四条判据各有一条用例：有许可+live==0 → 释放；有许可+live>0 → 保留；
+  无许可 → 保留（即使 live==0）；符号缺失 → 保留 + 逐字节诊断。
+- `fixtures/plugins/{qq,feishu}` 的 `http_server_tests` / `webhook_server_tests`（插件单测）：
+  手写 HTTP 解析的 method/path/headers/body、64 KiB 头上限、16 MiB body 上限、截断 body、
+  `/health` 200、未知路由 404、畸形请求 400，以及 OneBot 签名「有 token 才校验」的判定。
+- `host::ffi_panic_seam_tests::reloading_the_same_artifact_twice_releases_both_handles`：
+  第二次 reload 同一 artifact 时必须释放「Phase-1 校验句柄 + 旧 generation」两个引用
+  （否则旧镜像被钉住，restart 打开同一镜像空转，插件丢了全部线程）；
+  `reload_invokes_task_stop_handler_without_panic` 覆盖正常 stop 路径（invoke + 静默诊断）。
+- `scripts/test_check_raw_threads.py`（标准库 unittest，CI 门禁）：为脚本建合成
+  `plugins/*/src/**/*.rs` 树，覆盖违规 / 带非空理由的豁免 / 空理由 / `#[cfg(test)]` 模块与
+  单条目内 / 注释掉的代码与字符串 / `tests/` 目录不扫，断言退出码与 `文件:行: 违规` 输出。
+- 反向验证：把 `Drop` 改回 `drop(lib)` 后
+  `service_node_threads_keep_the_dylib_mapped_until_joined` 以 `signal: 11, SIGSEGV` 失败。
+- 顺带修 `host::ffi_panic_seam_tests::stop_handler_panic_is_caught_and_reload_path_survives`：
+  它靠 `qq::qq_serve` 是 Task 节点来触发 stop handler，改为 reload `feishu`
+  （`feishu_serve` 仍是 Task），断言与注入逻辑不变。
+
+**已知限制与静态补强**：`_cordis_allows_unload` 在运行期无法验证——裸
+`std::thread::spawn` 不在注册表里，`live == 0` 只是假证据。运行期防线仍是「没有许可就不
+卸载」，而「有许可」这一半现在由 CI 静态门禁兜住：`scripts/check_raw_threads.py` 扫描
+`fixtures/plugins/*/src/**/*.rs`，`#[cfg(test)]` 之外出现裸 `std::thread::spawn` /
+`thread::spawn` 即失败并逐条打印 `文件:行: 违规`；确实短命、调用方在函数内 join 得住的线程
+必须在上一非空行写 `// cordis:allow-raw-thread: <非空理由>` 才豁免（空理由同样失败）。
+脚本只依赖 Python 标准库，自带合成样例测试（违规 / 有理由豁免 / 空理由 / 测试模块内 /
+注释掉的代码 / 字符串 / `tests/` 目录），并挂进 ci.yml 的 `raw-thread contract` step。
+于是「声明」与「事实」之间的缺口从今天起是 CI 红灯，而不是等下一次 SIGSEGV 才发现。
+代价：未迁移的插件每次 reload 泄漏一份映射（线程无法 join，只能保留）；已迁移的插件
+reload 时正常释放。qq / feishu / llm_openai 已迁移；其它内置插件没有跨 invoke 线程，保持
+默认（不声明许可，保留映射）。
+
 
 ## 4. 部分完成
 
@@ -2134,7 +2247,7 @@ SSE 读取线程原本**故意不 join**（kernel 里原注释称其"有界且�
 
 **遗留**（未在本批修）：
 - `verifier.rs` 的 `tests_passed` / `safety_checks_passed` 只看 `.success` 布尔，盘满的 `cargo check` 与插件编译错仍同形；`CommandCheckResult` 已结构化保留 stderr，后续可在此加 infra 嗅探。
-- `unregister_task_library` 生产环境只有 `reload_subtree` 一个调用点，`reload_internal` / `promote_candidate` 都不调，Task 节点旧 dylib 会留在进程级 `TASK_LIBRARIES` 里继续跑旧代码、磁盘块要等进程退出才归还。
+- ~~`unregister_task_library` 生产环境只有 `reload_subtree` 一个调用点~~ **已修（2026-11-26）**：改名为 `unload_plugin_library`，`reload_subtree` 与 `reload_internal`（移除/文档变更的插件）都会调用它；有卸载许可且 join 干净的旧 dylib 会真正释放。
 
 ### 5.2.36 minori 生产分支定向移植（port-minori-fixes 批，2026-07-24）
 

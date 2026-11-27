@@ -7,6 +7,7 @@
 | 文件 | 职责定位 | 关键入口 |
 |---|---|---|
 | `crates/cordis-plugin-sdk/src/lib.rs` | shell/expr 等外部 dylib 插件共用的 Rust ABI、docs helper 与导出宏 | `RustPluginApiV2`、`plugin_docs()`、`node_doc()`、`export_plugin_api!` |
+| `crates/cordis-plugin-sdk/src/service_threads.rs` | 插件后台线程的注册/join 契约：`ServiceThreads::spawn` 返回 `ThreadTicket`，runtime 在 unload 前 join；`allow_plugin_unload!` 显式声明可卸载 | `ServiceThreads`、`ThreadTicket`、`JoinOutcome`、`_cordis_join_service_threads`、`_cordis_allows_unload` |
 | `crates/cordis-plugin-sdk/src/llm.rs` | kernel↔provider 插件的 LLM 契约类型；只以 JSON 过 payload，不改 vtable 布局故无需 ABI bump | `LlmCompletionRequest`、`LlmCompletion`、`LlmMessage`、`LlmStreamFrame` |
 | `crates/cordis-plugin-sdk/src/workflow.rs` | 非宏 async workflow 作者接口：受控 await 原语、wait 句柄、runtime 提交/轮询/取消边界 | `WorkflowRuntime`、`WorkflowSession`、`WaitSpec`、`WaitFuture` |
 

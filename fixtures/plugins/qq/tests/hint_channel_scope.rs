@@ -56,29 +56,3 @@ fn qq_card_scopes_the_no_json_rule_to_qq_sessions() {
         );
     }
 }
-
-// A turn whose last step is bare chat text and zero tool calls is recorded as
-// `no_tool_call` and discarded whole — the other side receives nothing. The card
-// has to say that out loud, and say it last, where a hint's strongest words sit.
-#[test]
-fn a_turn_must_end_with_a_tool_call() {
-    let hint = system_hint();
-    for required in ["no_tool_call", "qq_send", "suspend"] {
-        assert!(
-            hint.contains(required),
-            "the card must name the no_tool_call hazard and the way out; \
-             missing {required:?} in:\n{hint}"
-        );
-    }
-    let turn_rule = hint
-        .find("零工具调用")
-        .unwrap_or_else(|| panic!("the no_tool_call paragraph is missing:\n{hint}"));
-    let override_at = hint
-        .find("别的渠道")
-        .unwrap_or_else(|| panic!("the cross-channel override is missing:\n{hint}"));
-    assert!(
-        override_at < turn_rule,
-        "the no_tool_call rule must be the last word \
-         (override at {override_at}, turn rule at {turn_rule}):\n{hint}"
-    );
-}

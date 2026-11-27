@@ -3,7 +3,7 @@ use crate::core::models::{
     ArtifactKind, DylibAbiKind, PluginExecution, PluginLoadResult, PluginUnavailableReason,
 };
 use crate::plugin::abi::{PluginRequest, PluginResponse};
-use crate::plugin::dynamic::{is_dylib_path, LoadedDylibApi};
+use crate::plugin::dynamic::{is_dylib_path, LoadedDylibApi, UnloadPolicy};
 use crate::plugin::loader::{default_loader_config, Loader};
 use crate::plugin::registry::PluginRegistry;
 use cordis_plugin_sdk::NodeType;
@@ -13,67 +13,113 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
-/// Keep-alive storage for dylib Libraries of Task nodes.
+/// Plugin dylib handles that must stay mapped after `invoke` returns.
 ///
-/// These libraries must stay resident because the plugin's background threads
-/// (HTTP servers, pollers) run code from them.
+/// A handle lands here when the invocation left background work behind: either
+/// a `NodeType::Task` service, or a plugin that reports live service threads
+/// through its SDK-exported thread contract (`_cordis_live_service_threads`).
 ///
-/// P0-16: was `Mutex<Vec<LoadedDylibApi>>` which pushed one fresh entry per
-/// invocation — a Task node called N times would keep N copies of its dylib
-/// mapped. Now keyed by plugin path so re-entrant invokes replace the
-/// existing handle in-place.
-///
-/// The replaced handle is **retained, not dropped** (see
-/// `RETAINED_TASK_LIBRARIES`): dropping it would `dlclose` a dylib whose
-/// detached threads may still be running plugin code. That is exactly how a
-/// `reload /qq` used to take the process down with SIGSEGV — the old
-/// `qq.so` was unmapped while its message-poller thread kept sleeping in it.
-/// There is no portable way to know a plugin's threads are gone (stop
-/// handlers are not required to join them), so the mapping is kept until
-/// process exit. Cost: one mapping per reload of a Task-node plugin.
-static TASK_LIBRARIES: OnceLock<Mutex<HashMap<String, LoadedDylibApi>>> = OnceLock::new();
+/// Keyed by plugin path so re-entrant invokes replace instead of accumulate.
+/// A replacement handle that maps the *same* image releases the old handle
+/// (`dlclose` decrements the refcount; the new handle keeps the mapping), so
+/// repeated invokes of a running service do not leak. A replacement that maps
+/// a *different* image (the artifact was rebuilt) owns a different thread set,
+/// so the old handle is joined and only then unloaded.
+static HELD_PLUGIN_LIBRARIES: OnceLock<Mutex<HashMap<String, LoadedDylibApi>>> = OnceLock::new();
 
-/// Handles retired from `TASK_LIBRARIES` (replaced by a newer generation or
-/// removed on reload). Never dropped while the process runs — dropping would
-/// unmap a dylib that plugin-owned threads may still execute.
-static RETAINED_TASK_LIBRARIES: OnceLock<Mutex<Vec<LoadedDylibApi>>> = OnceLock::new();
+/// How long the reload/unload path waits for a plugin's threads to exit.
+///
+/// A `stop` handler that does not join its threads now has a bounded window
+/// before the runtime gives up, keeps the mapping, and says so.
+pub const THREAD_JOIN_TIMEOUT_MS: u64 = 5_000;
 
-/// Access the task-library map with a tolerant lock policy: a poisoned lock
+/// Access the held-library map with a tolerant lock policy: a poisoned lock
 /// is recovered (the underlying data is invariant-free — it's a keep-alive
 /// registry). Previously we called `.lock().unwrap()`, which turned any
 /// poison in the invoke hot path into a hard runtime crash.
-fn task_libraries_lock() -> std::sync::MutexGuard<'static, HashMap<String, LoadedDylibApi>> {
-    TASK_LIBRARIES
+fn held_libraries_lock() -> std::sync::MutexGuard<'static, HashMap<String, LoadedDylibApi>> {
+    HELD_PLUGIN_LIBRARIES
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
         .unwrap_or_else(|poison| poison.into_inner())
 }
 
-fn retained_task_libraries_lock() -> std::sync::MutexGuard<'static, Vec<LoadedDylibApi>> {
-    RETAINED_TASK_LIBRARIES
-        .get_or_init(|| Mutex::new(Vec::new()))
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner())
+/// Whether `plugin_path` currently has a held dylib handle. Per-path so tests
+/// are not perturbed by other plugins being held concurrently.
+pub fn is_plugin_library_held(plugin_path: &str) -> bool {
+    held_libraries_lock().contains_key(plugin_path)
 }
 
-/// Move a keep-alive handle out of the live map without unloading the dylib.
+/// Keep `dylib` mapped under `plugin_path`, replacing a previous handle.
 ///
-/// Called by the reload path when a Task-node plugin is being replaced. The
-/// handle goes to the retained list instead of being dropped: `dlclose` on a
-/// dylib whose threads are still alive is undefined behaviour (SIGSEGV in
-/// practice), and a plugin's `stop` handler is not required to join every
-/// thread it ever spawned.
-pub fn unregister_task_library(plugin_path: &str) {
-    let retired = task_libraries_lock().remove(plugin_path);
-    retired
-        .into_iter()
-        .for_each(|dylib| retained_task_libraries_lock().push(dylib));
+/// Same-image replacements release the old `dlopen` reference: the new handle
+/// already keeps that exact mapping alive, so `dlclose` only drops a refcount.
+/// Different-image replacements (a rebuilt artifact) may still have threads
+/// running the old code; that handle goes through the join-before-unload path.
+fn hold_plugin_library(plugin_path: &str, dylib: LoadedDylibApi) {
+    let identity = dylib.identity();
+    let previous = held_libraries_lock().insert(plugin_path.to_string(), dylib);
+    previous.into_iter().for_each(|mut old| {
+        if identity.is_some() && old.identity() == identity {
+            // Same mapping: the new handle keeps it alive, so this only drops
+            // a duplicate `dlopen` reference.
+            old.release_on_drop();
+            drop(old);
+        } else {
+            // A different image (the artifact was rebuilt): its thread set is
+            // not the one the new handle owns, so join it before dropping.
+            unload_joined(old);
+        }
+    });
 }
 
-/// Number of retired Task-node dylibs still mapped. Exposed for tests that
-/// assert a reload keeps the old mapping alive instead of unloading it.
-pub fn retained_task_library_count() -> usize {
-    retained_task_libraries_lock().len()
+/// Join a plugin's threads, then unload it only when every thread exited.
+///
+/// This is the ordered teardown the fix is about: `stop` (by the caller) →
+/// `join` → reference check → `drop`. A legacy dylib without the thread
+/// contract, or one whose threads refuse to exit inside
+/// [`THREAD_JOIN_TIMEOUT_MS`], is not unloaded: it is retained with the
+/// diagnostic `plugin {path} unloaded without joined threads; retained`.
+fn unload_joined_with_timeout(mut dylib: LoadedDylibApi, timeout_ms: u64) {
+    // Explicit permission first. A plugin that never opted in has no way to
+    // report threads it spawned with a raw `std::thread::spawn`, so a zero
+    // count proves nothing — such an image is never unloaded.
+    let permitted = dylib.allows_unload();
+    let unjoined = permitted.then(|| {
+        dylib.thread_contract().map(|contract| {
+            contract.join(timeout_ms);
+            contract.live()
+        })
+    });
+    match unjoined {
+        Some(Some(0)) => dylib.release_on_drop(),
+        // Missing contract, missing opt-in, or threads that refused to exit:
+        // keep the mapping and report it.
+        _ => dylib.retain_with_diagnostic(),
+    }
+    drop(dylib);
+}
+
+fn unload_joined(dylib: LoadedDylibApi) {
+    unload_joined_with_timeout(dylib, THREAD_JOIN_TIMEOUT_MS);
+}
+
+/// Release the held handle for `plugin_path` after joining its threads.
+///
+/// Called by the reload path before the old snapshot's artifact goes away.
+/// Dropping the handle is safe only once `unload_joined` has seen zero live
+/// threads; otherwise the mapping is retained (and a diagnostic printed).
+pub fn unload_plugin_library(plugin_path: &str) {
+    unload_plugin_library_with_timeout(plugin_path, THREAD_JOIN_TIMEOUT_MS);
+}
+
+/// [`unload_plugin_library`] with an explicit join timeout (tests use a short
+/// one to exercise the "threads refused to exit" fallback without waiting the
+/// production five seconds).
+pub fn unload_plugin_library_with_timeout(plugin_path: &str, timeout_ms: u64) {
+    let held = held_libraries_lock().remove(plugin_path);
+    held.into_iter()
+        .for_each(|dylib| unload_joined_with_timeout(dylib, timeout_ms));
 }
 use std::process::{Command, Stdio};
 
@@ -197,7 +243,7 @@ pub fn invoke_registered_plugin_with_settings(
         return invoke_json_artifact(plugin_path, artifact_path, execution, payload);
     }
 
-    let dylib = match LoadedDylibApi::open(artifact_path) {
+    let mut dylib = match LoadedDylibApi::open(artifact_path) {
         Ok(dylib) => dylib,
         Err(err) => {
             plugin_registry.mark_runtime_unavailable(
@@ -286,7 +332,8 @@ pub fn invoke_registered_plugin_with_settings(
 
     let response = call_handle_catch_unwind(plugin_path, api.handle, PluginRequest { payload })?;
 
-    // For Task nodes: keep the dylib alive and look up the Service VTable.
+    // For Task nodes: look up the Service VTable and start it. Task services
+    // run until the reload path stops them, so their dylib stays mapped.
     let is_task = docs
         .nodes
         .iter()
@@ -324,14 +371,30 @@ pub fn invoke_registered_plugin_with_settings(
                 );
             }
         }
-        // Keep dylib alive — Task nodes spawn background threads. Keyed by
-        // plugin_path so repeated invocations don't leak fresh copies; a
-        // replaced handle is retained (never dlclosed) for the same reason
-        // `unregister_task_library` retains instead of dropping.
-        let replaced = task_libraries_lock().insert(plugin_path.to_string(), dylib);
-        replaced
-            .into_iter()
-            .for_each(|old| retained_task_libraries_lock().push(old));
+    }
+
+    // ── Thread-aware unload ─────────────────────────────────────────────
+    // A plugin's `handle` may spawn threads that outlive this call (HTTP
+    // servers, message pollers, streaming readers). The SDK exports a joinable
+    // thread contract; the runtime may only `dlclose` once every thread has
+    // exited, otherwise the thread jumps into unmapped code (the 2026-11-26
+    // `qq::qq_serve` SIGSEGV).
+    // Explicit opt-in: only a plugin that declares "every background thread I
+    // spawn is registered with ServiceThreads" may be unloaded. A raw
+    // `std::thread::spawn` is invisible to the thread contract, so a zero
+    // count alone must never be taken as proof.
+    let may_unload = dylib.allows_unload();
+    let live_threads = dylib.thread_contract().map(|contract| contract.live());
+    if !is_task && may_unload && live_threads == Some(0) {
+        // Opted in and no thread is running: `dlclose` is safe and the
+        // mapping does not leak.
+        dylib.release_on_drop();
+        drop(dylib);
+    } else {
+        // Task services, live threads, and plugins that did not opt in keep
+        // one handle per plugin path; the reload path joins and unloads it.
+        dylib.set_unload_policy(UnloadPolicy::Retain);
+        hold_plugin_library(plugin_path, dylib);
     }
 
     Ok(response)

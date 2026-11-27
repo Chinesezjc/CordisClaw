@@ -26,6 +26,7 @@
 //! SSE 读取里，导致 inbox/serve 路径无法关掉流式；现在增量只推给 sink，
 //! 由 host 决定展示与否。
 
+use cordis_plugin_sdk::service_threads::ServiceThreads;
 use cordis_plugin_sdk::llm::{
     LlmCompletionRequest, LlmMessage, LlmStreamFrame, LlmToolCall, LlmToolFunction,
     LlmTransportConfig,
@@ -557,7 +558,11 @@ fn read_chat_stream(
     // the thread hits an Io error, sees `tx.send(Err(e))` fail (rx has
     // been dropped) and exits. Not zero-cost — one temporarily-alive
     // reader thread per failed attempt — but bounded and self-cleaning.
-    let _reader_thread = thread::spawn(move || {
+    // Registered with the SDK: if the thread outlives this call, the runtime
+    // keeps the dylib mapped and joins it before unloading (`qq::qq_serve`
+    // SIGSEGV class). The ticket is dropped immediately; the registry owns the
+    // join handle.
+    let _ticket = ServiceThreads::spawn("llm_openai.reader", move || {
         let mut reader = BufReader::new(response);
         loop {
             let mut buf = vec![0u8; 8192];
@@ -1163,6 +1168,10 @@ export_plugin_api! {
     docs = docs_value(),
     handle = api_handle,
 }
+
+// Every background thread in this plugin is spawned through
+// `ServiceThreads::spawn`, so joining them makes `dlclose` safe.
+cordis_plugin_sdk::allow_plugin_unload!();
 
 #[cfg(test)]
 mod tests {

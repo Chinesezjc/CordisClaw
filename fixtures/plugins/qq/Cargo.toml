@@ -9,7 +9,7 @@ crate-type = ["rlib", "dylib"]
 [package.metadata.cordis]
 plugin_path = "qq"
 abi_kind = "rust"
-declared_nodes = ["qq_entry", "qq_serve", "qq_ws_serve", "qq_fetch_messages", "qq_send", "qq_group_requests", "qq_get_group_members", "qq_get_group_roles", "qq_get_group_info", "qq_get_reply_policy", "qq_set_reply_policy", "qq_system_notify", "qq_get_group_memory", "qq_set_group_memory", "qq_get_forward_msg"]
+declared_nodes = ["qq_entry", "qq_serve", "qq_ws_serve", "qq_fetch_messages", "qq_send", "qq_group_requests", "qq_get_group_members", "qq_get_group_roles", "qq_get_group_info", "qq_get_reply_policy", "qq_set_reply_policy", "qq_system_notify", "qq_get_group_memory", "qq_set_group_memory", "qq_get_forward_msg", "qq_get_sent", "qq_recall"]
 children = []
 
 [package.metadata.cordis.abi_fingerprint]
@@ -19,12 +19,17 @@ api_hash = "api_v2"
 [build-dependencies]
 serde_json = { version = "1", features = ["preserve_order"] }
 
+[dev-dependencies]
+# Unit tests under `src/lib.rs` use tiny_http to fake the OneBot peer. Production
+# code no longer does: tiny_http::Server spawns unnamed accept/task-pool threads
+# that the ServiceThreads contract cannot register.
+tiny_http = "0.12"
+
 [dependencies]
 chrono = "0.4"
 cordis-plugin-sdk = { path = "../../../crates/cordis-plugin-sdk" }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
-tiny_http = "0.12"
 tungstenite = "0.26"
 ureq = "2"
 # P0-23: HMAC-SHA1 for OneBot v11 X-Signature webhook verification.
